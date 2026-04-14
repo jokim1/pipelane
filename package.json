@@ -1,0 +1,16 @@
+{
+  "name": "workflow-kit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "workflow-kit": "./bin/workflow-kit"
+  },
+  "scripts": {
+    "test": "node --test",
+    "smoke": "node ./src/cli.ts --help"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

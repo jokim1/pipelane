@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "projectKey": "{{PROJECT_KEY}}",
+  "displayName": "{{DISPLAY_NAME}}",
+  "baseBranch": "{{BASE_BRANCH}}",
+  "stateDir": "{{STATE_DIR}}",
+  "taskWorktreeDirName": "{{TASK_WORKTREE_DIR_NAME}}",
+  "surfaces": ["frontend", "edge", "sql"],
+  "aliases": {
+    "devmode": "/devmode",
+    "new": "/new",
+    "resume": "/resume",
+    "pr": "/pr",
+    "merge": "/merge",
+    "deploy": "/deploy",
+    "clean": "/clean"
+  },
+  "prePrChecks": [
+    "npm run test",
+    "npm run typecheck",
+    "npm run build"
+  ],
+  "deployWorkflowName": "{{DEPLOY_WORKFLOW_NAME}}",
+  "buildMode": {
+    "description": "Fast lane. Production deploy is expected to happen after merge.",
+    "autoDeployOnMerge": true
+  },
+  "releaseMode": {
+    "description": "Protected lane. Promote the same merged SHA through staging before prod.",
+    "requireStagingPromotion": true
+  }
+}

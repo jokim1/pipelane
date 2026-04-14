@@ -1,0 +1,10 @@
+{
+  "name": "sample-repo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node -e \"console.log('test ok')\"",
+    "typecheck": "node -e \"console.log('typecheck ok')\"",
+    "build": "node -e \"console.log('build ok')\""
+  }
+}
