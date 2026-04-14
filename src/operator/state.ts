@@ -5,6 +5,17 @@ import path from 'node:path';
 
 export type Mode = 'build' | 'release';
 export type KnownSurface = 'frontend' | 'edge' | 'sql';
+export const WORKFLOW_COMMANDS = ['devmode', 'new', 'resume', 'pr', 'merge', 'deploy', 'clean'] as const;
+export type WorkflowCommand = (typeof WORKFLOW_COMMANDS)[number];
+export const DEFAULT_WORKFLOW_ALIASES: Record<WorkflowCommand, string> = {
+  devmode: '/devmode',
+  new: '/new',
+  resume: '/resume',
+  pr: '/pr',
+  merge: '/merge',
+  deploy: '/deploy',
+  clean: '/clean',
+};
 
 export interface WorkflowConfig {
   version: number;
@@ -14,7 +25,7 @@ export interface WorkflowConfig {
   stateDir: string;
   taskWorktreeDirName: string;
   surfaces: string[];
-  aliases: Record<string, string>;
+  aliases: Record<WorkflowCommand, string>;
   prePrChecks: string[];
   deployWorkflowName: string;
   buildMode: {
@@ -111,15 +122,7 @@ export function defaultWorkflowConfig(projectKey: string, displayName: string): 
     stateDir: 'workflow-kit-state',
     taskWorktreeDirName: `${projectKey}-worktrees`,
     surfaces: [...DEFAULT_SURFACES],
-    aliases: {
-      devmode: '/devmode',
-      new: '/new',
-      resume: '/resume',
-      pr: '/pr',
-      merge: '/merge',
-      deploy: '/deploy',
-      clean: '/clean',
-    },
+    aliases: { ...DEFAULT_WORKFLOW_ALIASES },
     prePrChecks: [
       'npm run test',
       'npm run typecheck',
@@ -256,11 +259,18 @@ export function loadWorkflowConfig(repoRoot: string): WorkflowConfig {
     throw new Error(`No ${CONFIG_FILENAME} found in ${repoRoot}. Run workflow-kit init first.`);
   }
 
-  return JSON.parse(readFileSync(configPath, 'utf8')) as WorkflowConfig;
+  const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as WorkflowConfig;
+  return {
+    ...parsed,
+    aliases: resolveWorkflowAliases(parsed.aliases),
+  };
 }
 
 export function writeWorkflowConfig(repoRoot: string, config: WorkflowConfig): void {
-  writeJsonFile(resolveConfigPath(repoRoot), config);
+  writeJsonFile(resolveConfigPath(repoRoot), {
+    ...config,
+    aliases: resolveWorkflowAliases(config.aliases),
+  });
 }
 
 export function resolveStateDir(commonDir: string, config: WorkflowConfig): string {
@@ -427,6 +437,40 @@ export function inferProjectKey(projectName: string): string {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '') || 'project';
+}
+
+export function normalizeWorkflowAlias(alias: string, fallback: string): string {
+  const raw = (alias || fallback).trim().toLowerCase();
+  const prefixed = raw.startsWith('/') ? raw : `/${raw}`;
+
+  if (!/^\/[a-z0-9][a-z0-9-_]*$/.test(prefixed)) {
+    throw new Error(`Invalid workflow alias "${alias || fallback}". Use slash commands like /new or /release-pr.`);
+  }
+
+  return prefixed;
+}
+
+export function resolveWorkflowAliases(
+  aliases: Partial<Record<WorkflowCommand, string>> | Record<string, string> | undefined,
+): Record<WorkflowCommand, string> {
+  const next = {} as Record<WorkflowCommand, string>;
+  const seen = new Map<string, WorkflowCommand>();
+
+  for (const command of WORKFLOW_COMMANDS) {
+    const resolved = normalizeWorkflowAlias(aliases?.[command] ?? DEFAULT_WORKFLOW_ALIASES[command], DEFAULT_WORKFLOW_ALIASES[command]);
+    const conflict = seen.get(resolved);
+    if (conflict) {
+      throw new Error(`Workflow aliases must be unique. ${conflict} and ${command} both resolve to ${resolved}.`);
+    }
+    seen.set(resolved, command);
+    next[command] = resolved;
+  }
+
+  return next;
+}
+
+export function aliasCommandName(alias: string): string {
+  return normalizeWorkflowAlias(alias, alias).slice(1);
 }
 
 export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {

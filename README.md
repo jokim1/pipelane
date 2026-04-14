@@ -63,6 +63,31 @@ follow it safely and a human can predict what will happen next.
 - generic Codex slash wrappers
 - a reusable release workflow doc for new maintainers
 
+## Alias configuration
+
+The default slash surface is:
+
+- `/devmode`
+- `/new`
+- `/resume`
+- `/pr`
+- `/merge`
+- `/deploy`
+- `/clean`
+
+Those names come from `.project-workflow.json` under `aliases`.
+
+If you change them:
+
+- rerun `npm run workflow:setup`
+- each Codex user must rerun setup on their own machine
+- if Claude or Codex was already open, reopen the repo or restart the client so the new command names are picked up
+- aliases must be unique
+- setup fails closed if an alias would overwrite an unrelated Claude command or Codex skill
+- Codex resolves aliases per repo at runtime, so different workflow-kit repos can reuse the same alias name for different commands safely
+
+Repo-native commands do not change. `npm run workflow:*` stays the fallback and source of truth.
+
 ## Two dev modes
 
 `workflow-kit` has two lanes.
@@ -220,6 +245,42 @@ That adds:
 - `docs/RELEASE_WORKFLOW.md`
 - workflow sections in `README.md` and `CONTRIBUTING.md`
 - canonical `package.json` workflow scripts
+
+## What users still need to do
+
+There are two setup layers: repo-tracked setup and machine-local setup.
+
+### One repo maintainer does this once
+
+1. `npm install -D workflow-kit`
+2. `npx workflow-kit init --project "Project Name"`
+3. Review `.project-workflow.json`, especially `aliases`, `prePrChecks`, and deploy defaults.
+4. Commit the tracked workflow files.
+
+### Every Claude user does this
+
+1. Pull the repo after the tracked workflow files are committed.
+2. Open the repo in Claude Code.
+3. If Claude was already open before the workflow files existed or the aliases changed, reopen the repo or restart the client.
+
+Claude slash commands are repo-tracked through `.claude/commands/*`. Claude users do not need to install separate global wrappers.
+
+### Every Codex user does this
+
+1. Pull the repo after the tracked workflow files are committed.
+2. Run `npm run workflow:setup` inside that repo.
+3. If Codex was already open, restart it or reopen the repo.
+
+Codex wrappers are machine-global. Every Codex user must run setup locally on their own machine. If aliases change later, each Codex user must rerun setup.
+
+### Any user who will deploy in release mode does this
+
+1. Run `npm run workflow:setup` if they have not already.
+2. Open local `CLAUDE.md`.
+3. Fill in the machine-readable deploy configuration for staging and production.
+4. Verify with `npm run workflow:release-check`.
+
+Without local deploy config, release mode stays fail-closed.
 
 ## First adoption caveat
 

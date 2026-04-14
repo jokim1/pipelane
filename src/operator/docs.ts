@@ -1,9 +1,22 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { WorkflowConfig } from './state.ts';
-import { CONFIG_FILENAME, defaultWorkflowConfig, inferProjectKey, resolveRepoRoot, runGit, writeWorkflowConfig } from './state.ts';
+import {
+  aliasCommandName,
+  CONFIG_FILENAME,
+  defaultWorkflowConfig,
+  inferProjectKey,
+  readJsonFile,
+  resolveRepoRoot,
+  resolveWorkflowAliases,
+  runGit,
+  WORKFLOW_COMMANDS,
+  type WorkflowCommand,
+  writeJsonFile,
+  writeWorkflowConfig,
+} from './state.ts';
 import { emptyDeployConfig, renderDeployConfigSection } from './release-gate.ts';
 import { installCodexWrappers } from './codex-install.ts';
 
@@ -13,6 +26,38 @@ const CONTRIBUTING_MARKER_START = '<!-- workflow-kit:contributing:start -->';
 const CONTRIBUTING_MARKER_END = '<!-- workflow-kit:contributing:end -->';
 const AGENTS_MARKER_START = '<!-- workflow-kit:agents:start -->';
 const AGENTS_MARKER_END = '<!-- workflow-kit:agents:end -->';
+const CLAUDE_COMMAND_MARKER = '<!-- workflow-kit:command:';
+const MANAGED_CLAUDE_COMMANDS_FILENAME = '.workflow-kit-managed.json';
+const LEGACY_CLAUDE_SIGNATURES: Record<WorkflowCommand, string[]> = {
+  clean: [
+    'Report workflow cleanup status and prune stale task locks when requested.',
+    'npm run workflow:clean -- <args-from-user>',
+  ],
+  deploy: [
+    'Deploy the merged SHA for this repo.',
+    'npm run workflow:deploy -- <args-from-user>',
+  ],
+  devmode: [
+    "Switch or check the repo's development mode (build or release).",
+    'npm run workflow:devmode -- <args-from-user>',
+  ],
+  merge: [
+    "Merge the current task's pull request.",
+    'npm run workflow:merge -- <args-from-user>',
+  ],
+  new: [
+    'Create a fresh task workspace for this repo.',
+    'npm run workflow:new -- <args-from-user>',
+  ],
+  pr: [
+    'Prepare and open, or update, a pull request for the current task.',
+    'npm run workflow:pr -- <args-from-user>',
+  ],
+  resume: [
+    'Resume an existing task workspace for this repo.',
+    'npm run workflow:resume -- <args-from-user>',
+  ],
+};
 
 function kitRoot(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -26,7 +71,12 @@ function readTemplate(relativePath: string): string {
   return readFileSync(templatePath(relativePath), 'utf8');
 }
 
+function managedClaudeCommandsPath(commandsDir: string): string {
+  return path.join(commandsDir, MANAGED_CLAUDE_COMMANDS_FILENAME);
+}
+
 function renderTemplate(template: string, config: WorkflowConfig): string {
+  const aliases = resolveWorkflowAliases(config.aliases);
   const replacements: Record<string, string> = {
     PROJECT_KEY: config.projectKey,
     DISPLAY_NAME: config.displayName,
@@ -36,12 +86,99 @@ function renderTemplate(template: string, config: WorkflowConfig): string {
     DEPLOY_WORKFLOW_NAME: config.deployWorkflowName,
     SURFACES_CSV: config.surfaces.join(', '),
     PREPR_CHECKS_BULLETS: config.prePrChecks.map((entry) => `- \`${entry}\``).join('\n'),
+    ALIAS_DEVMODE: aliases.devmode,
+    ALIAS_NEW: aliases.new,
+    ALIAS_RESUME: aliases.resume,
+    ALIAS_PR: aliases.pr,
+    ALIAS_MERGE: aliases.merge,
+    ALIAS_DEPLOY: aliases.deploy,
+    ALIAS_CLEAN: aliases.clean,
   };
 
   return Object.entries(replacements).reduce(
     (content, [key, value]) => content.replaceAll(`{{${key}}}`, value),
     template,
   );
+}
+
+function detectLegacyClaudeCommand(content: string): WorkflowCommand | null {
+  for (const command of WORKFLOW_COMMANDS) {
+    const signatures = LEGACY_CLAUDE_SIGNATURES[command];
+    if (signatures.every((signature) => content.includes(signature))) {
+      return command;
+    }
+  }
+
+  return null;
+}
+
+function isManagedClaudeCommand(filename: string, content: string): boolean {
+  if (content.includes(CLAUDE_COMMAND_MARKER)) {
+    return true;
+  }
+
+  return detectLegacyClaudeCommand(content) !== null;
+}
+
+function loadManagedClaudeCommands(commandsDir: string): Set<string> {
+  const managed = new Set<string>();
+  const manifest = readJsonFile(managedClaudeCommandsPath(commandsDir), { files: [] as string[] });
+
+  if (!existsSync(commandsDir)) {
+    return managed;
+  }
+
+  for (const entry of manifest.files) {
+    const targetPath = path.join(commandsDir, entry);
+    if (!existsSync(targetPath)) {
+      continue;
+    }
+    if (isManagedClaudeCommand(entry, readFileSync(targetPath, 'utf8'))) {
+      managed.add(entry);
+    }
+  }
+
+  for (const entry of readdirSync(commandsDir)) {
+    if (!entry.endsWith('.md')) {
+      continue;
+    }
+
+    const targetPath = path.join(commandsDir, entry);
+    const content = readFileSync(targetPath, 'utf8');
+    if (isManagedClaudeCommand(entry, content)) {
+      managed.add(entry);
+    }
+  }
+
+  return managed;
+}
+
+function assertNoClaudeCollisions(commandsDir: string, desiredFiles: Set<string>, managedFiles: Set<string>): void {
+  for (const entry of desiredFiles) {
+    const targetPath = path.join(commandsDir, entry);
+    if (existsSync(targetPath) && !managedFiles.has(entry)) {
+      throw new Error(
+        `Claude command alias collision: ${targetPath} already exists and is not managed by workflow-kit. Choose a different alias in .project-workflow.json or rename the conflicting command.`,
+      );
+    }
+  }
+}
+
+function pruneManagedClaudeCommands(commandsDir: string, desiredFiles: Set<string>, managedFiles: Set<string>): void {
+  for (const entry of managedFiles) {
+    if (!desiredFiles.has(entry)) {
+      const targetPath = path.join(commandsDir, entry);
+      if (existsSync(targetPath) && isManagedClaudeCommand(entry, readFileSync(targetPath, 'utf8'))) {
+        unlinkSync(targetPath);
+      }
+    }
+  }
+}
+
+function saveManagedClaudeCommands(commandsDir: string, desiredFiles: Set<string>): void {
+  writeJsonFile(managedClaudeCommandsPath(commandsDir), {
+    files: [...desiredFiles].sort(),
+  });
 }
 
 function replaceMarkedSection(targetPath: string, startMarker: string, endMarker: string, rendered: string, defaultHeading = ''): void {
@@ -88,15 +225,26 @@ export function ensurePackageScripts(repoRoot: string): void {
 }
 
 export function syncConsumerDocs(repoRoot: string, config: WorkflowConfig): void {
-  mkdirSync(path.join(repoRoot, '.claude', 'commands'), { recursive: true });
+  const commandsDir = path.join(repoRoot, '.claude', 'commands');
+  mkdirSync(commandsDir, { recursive: true });
   mkdirSync(path.join(repoRoot, 'workflow'), { recursive: true });
   mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
 
-  const commandTemplates = ['devmode', 'new', 'resume', 'pr', 'merge', 'deploy', 'clean'];
-  for (const name of commandTemplates) {
-    const rendered = renderTemplate(readTemplate(`.claude/commands/${name}.md`), config);
-    writeFileSync(path.join(repoRoot, '.claude', 'commands', `${name}.md`), rendered, 'utf8');
+  const aliases = resolveWorkflowAliases(config.aliases);
+  const managedCommandFiles = loadManagedClaudeCommands(commandsDir);
+  const desiredCommandFiles = new Set<string>();
+  for (const name of WORKFLOW_COMMANDS) {
+    const commandFilename = `${aliasCommandName(aliases[name])}.md`;
+    desiredCommandFiles.add(commandFilename);
   }
+  assertNoClaudeCollisions(commandsDir, desiredCommandFiles, managedCommandFiles);
+  pruneManagedClaudeCommands(commandsDir, desiredCommandFiles, managedCommandFiles);
+  for (const name of WORKFLOW_COMMANDS) {
+    const rendered = renderTemplate(readTemplate(`.claude/commands/${name}.md`), config);
+    const commandFilename = `${aliasCommandName(aliases[name])}.md`;
+    writeFileSync(path.join(commandsDir, commandFilename), rendered, 'utf8');
+  }
+  saveManagedClaudeCommands(commandsDir, desiredCommandFiles);
 
   writeFileSync(
     path.join(repoRoot, 'workflow', 'CLAUDE.template.md'),
@@ -165,7 +313,11 @@ export function setupConsumerRepo(cwd: string): {
     throw new Error(`No ${CONFIG_FILENAME} found in ${repoRoot}. Run workflow-kit init first.`);
   }
 
-  const config = JSON.parse(readFileSync(configPath, 'utf8')) as WorkflowConfig;
+  const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as WorkflowConfig;
+  const config = {
+    ...parsed,
+    aliases: resolveWorkflowAliases(parsed.aliases),
+  };
   syncConsumerDocs(repoRoot, config);
 
   const claudePath = path.join(repoRoot, 'CLAUDE.md');
@@ -176,7 +328,7 @@ export function setupConsumerRepo(cwd: string): {
     createdClaude = true;
   }
 
-  const codex = installCodexWrappers();
+  const codex = installCodexWrappers({ repoRoot, aliases: config.aliases });
 
   return {
     repoRoot,

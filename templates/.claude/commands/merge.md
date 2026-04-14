@@ -1,3 +1,4 @@
+<!-- workflow-kit:command:merge -->
 Merge the current task's pull request.
 
 Run:

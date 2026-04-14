@@ -6,7 +6,7 @@ This file is local-only operator state. Keep it git-ignored.
 
 - Treat `release` as the standard shipping mode.
 - Use `build` only for fallback, recovery, or an explicit user request.
-- Use `/new`, not manual branch creation, for normal task starts.
+- Use `{{ALIAS_NEW}}`, not manual branch creation, for normal task starts.
 - Preferred operator path:
   1. `npm run workflow:devmode -- release`
   2. `npm run workflow:new -- --task "<task-name>"`
@@ -16,6 +16,7 @@ This file is local-only operator state. Keep it git-ignored.
   6. `npm run workflow:deploy -- prod`
   7. `npm run workflow:clean`
 - Use `npm run workflow:resume -- --task "<task-name>"` only when returning to an existing task workspace.
+- If `.project-workflow.json` aliases change, rerun `npm run workflow:setup` and reopen Claude/Codex so the new command names appear.
 - `{{DEPLOY_WORKFLOW_NAME}}` is the canonical deploy workflow label for this repo.
 
 ## Skill Routing
@@ -24,12 +25,12 @@ When the user's request matches an available skill, invoke it first.
 
 Key routing rules:
 
-- Start a new task workspace -> `new`
-- Resume an existing task workspace -> `resume`
-- Prepare or update a PR -> `pr`
-- Merge the current PR -> `merge`
-- Deploy the merged SHA -> `deploy`
-- Cleanup or stale workspace inspection -> `clean`
+- Start a new task workspace -> `{{ALIAS_NEW}}`
+- Resume an existing task workspace -> `{{ALIAS_RESUME}}`
+- Prepare or update a PR -> `{{ALIAS_PR}}`
+- Merge the current PR -> `{{ALIAS_MERGE}}`
+- Deploy the merged SHA -> `{{ALIAS_DEPLOY}}`
+- Cleanup or stale workspace inspection -> `{{ALIAS_CLEAN}}`
 - Architecture review -> `plan-eng-review`
 - QA, test the site, find bugs -> `qa`
 - Code review, check my diff -> `review`

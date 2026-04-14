@@ -28,16 +28,16 @@ If that is how you work, this package is for you.
 
 `workflow-kit` provides a standalone, versioned workflow package that product repos consume.
 
-- Product repos keep the tracked workflow contract and prompts.
-- `workflow-kit` owns the operator logic and bootstrap behavior.
-- The canonical task flow is `/new` -> `/resume` -> `/pr` -> `/merge` -> `/deploy` -> `/clean`.
-- `repo-guard` remains an internal guardrail rather than the main human entrypoint.
+- product repos keep the tracked workflow contract and prompts
+- `workflow-kit` owns the operator logic and bootstrap behavior
+- the canonical task flow is `/new` -> `/resume` -> `/pr` -> `/merge` -> `/deploy` -> `/clean`
+- `repo-guard` remains an internal guardrail rather than the main human entrypoint
 
 ## Supported Operator Surfaces
 
 `workflow-kit` supports two operator surfaces.
 
-### Repo-native CLI surface
+### Repo-native CLI Surface
 
 This is the source of truth:
 
@@ -52,13 +52,34 @@ This is the source of truth:
 - `npm run workflow:deploy -- staging|prod ...`
 - `npm run workflow:clean`
 
-### AI-client slash surface
+### AI-client Slash Surface
 
 The slash surface is intentionally thin.
 
 - Claude uses tracked `.claude/commands/*`.
 - Codex uses generic machine-global wrapper skills installed by `workflow-kit install-codex`.
 - Both adapter layers dispatch back to the repo-native `npm run workflow:*` scripts.
+
+Default slash aliases are:
+
+- `/devmode`
+- `/new`
+- `/resume`
+- `/pr`
+- `/merge`
+- `/deploy`
+- `/clean`
+
+Consumer repos can override those names in `.project-workflow.json` under `aliases`.
+
+When aliases change:
+
+- rerun `npm run workflow:setup`
+- each Codex user must rerun setup on their own machine
+- reopen the repo or restart Claude/Codex if the old names are still cached
+- aliases must be unique
+- setup fails closed if an alias would overwrite an unrelated command or skill
+- Codex resolves aliases per repo at runtime, so different workflow-kit repos can safely reuse the same alias name for different commands
 
 There is no workflow logic inside the slash wrappers.
 
@@ -348,6 +369,40 @@ It should contain:
 
 `workflow-kit setup` creates it from `workflow/CLAUDE.template.md` if it does not already exist.
 
+## What each user must do
+
+### One repo maintainer
+
+1. install `workflow-kit`
+2. run `workflow-kit init`
+3. review `.project-workflow.json`, especially `aliases`
+4. commit the tracked workflow files
+
+### Each Claude user
+
+1. pull the committed workflow files
+2. open the repo in Claude
+3. reopen or restart Claude if aliases changed or command files were added while it was already open
+
+Claude commands are repo-tracked via `.claude/commands/*`.
+
+### Each Codex user
+
+1. pull the committed workflow files
+2. run `npm run workflow:setup`
+3. reopen or restart Codex if the new command names do not appear immediately
+
+Codex wrappers are machine-global, so every Codex user must run setup on their own machine. If
+aliases change later, rerun setup again.
+
+### Each release operator
+
+1. run `npm run workflow:setup`
+2. fill local deploy config in `CLAUDE.md`
+3. verify with `npm run workflow:release-check`
+
+Release mode stays fail-closed until that local deploy config exists.
+
 ## Install In A New Repo
 
 Inside the target repo:
@@ -358,34 +413,23 @@ npx workflow-kit init --project "Next Project"
 npm run workflow:setup
 ```
 
-That creates the tracked workflow contract and local machine-specific operator file.
-
 For first-time adoption in an existing remote-backed repo, commit the tracked workflow files
-before using `workflow:new`. New task worktrees are created from the repo base branch, so the
-workflow contract needs to be present there first.
+before using `workflow:new`. New task worktrees are created from the base branch, so the
+workflow contract needs to exist there first.
 
 ## Day-One Operator Journey
 
-For a new workflow-kit repo consumer:
+1. `npm run workflow:setup`
+2. `npm run workflow:devmode -- status`
+3. `npm run workflow:new -- --task "<task-name>"`
+4. implement and verify
+5. `npm run workflow:pr -- --title "<pr title>"`
 
-1. install the package
-2. run `workflow-kit init`
-3. review `.project-workflow.json`
-4. run `npm run workflow:setup`
-5. check `npm run workflow:devmode -- status`
-6. start work with `npm run workflow:new -- --task "<task-name>"`
+## Troubleshooting and Common Failures
 
-## Troubleshooting
-
-Common failures:
-
-- `No .project-workflow.json found`
-  - run `workflow-kit init` in the repo root
-- `workflow:new requires --task`
-  - pass a human task label, not a branch id
-- `Task X is already active`
-  - use `workflow:resume -- --task "X"`
-- `Release mode blocked`
-  - run `npm run workflow:setup` and fill in local `CLAUDE.md`
-- `No active task lock matches this branch/worktree`
-  - you are not in the saved task workspace, or the task should be resumed by name
+- missing `.project-workflow.json`
+  - run `workflow-kit init`
+- task already active
+  - use `workflow:resume -- --task "<task-name>"`
+- release mode blocked
+  - complete local `CLAUDE.md`

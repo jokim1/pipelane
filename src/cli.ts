@@ -29,6 +29,7 @@ async function main(): Promise<void> {
       `Config: ${result.configPath}`,
       'Commit the tracked workflow files before using workflow:new from a remote-backed repo.',
       'Next: run npm run workflow:setup',
+      'Each Codex user must run setup locally on their own machine.',
     ].join('\n') + '\n');
     return;
   }
@@ -39,7 +40,10 @@ async function main(): Promise<void> {
       `Workflow setup complete in ${result.repoRoot}`,
       result.createdClaude ? 'Created local CLAUDE.md from workflow template.' : 'Preserved existing local CLAUDE.md.',
       `Installed Codex wrappers in ${result.codexHome}`,
-      `Wrappers: ${result.installedWrappers.join(', ')}`,
+      `Slash commands: ${result.installedWrappers.join(', ')}`,
+      'Each Codex user must run npm run workflow:setup on their own machine.',
+      'If Claude or Codex was already open, reopen the repo or restart the client to refresh slash commands.',
+      'Release mode still requires local deploy configuration in CLAUDE.md.',
     ].join('\n') + '\n');
     return;
   }
@@ -51,7 +55,7 @@ async function main(): Promise<void> {
   }
 
   if (command === 'install-codex') {
-    const result = installCodexWrappers();
+    const result = installCodexWrappers({ repoRoot: process.cwd() });
     process.stdout.write(`Installed Codex wrappers in ${result.codexHome}: ${result.installed.join(', ')}\n`);
     return;
   }

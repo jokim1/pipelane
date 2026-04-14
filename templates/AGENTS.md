@@ -4,6 +4,7 @@ This repo uses `workflow-kit` for task workspaces, PR prep, merge handoff, and d
 
 ### Command surface
 
+- Default slash aliases are `{{ALIAS_DEVMODE}}`, `{{ALIAS_NEW}}`, `{{ALIAS_RESUME}}`, `{{ALIAS_PR}}`, `{{ALIAS_MERGE}}`, `{{ALIAS_DEPLOY}}`, and `{{ALIAS_CLEAN}}`.
 - Use `npm run workflow:new -- --task "<task-name>"` to start new work.
 - Use `npm run workflow:resume -- --task "<task-name>"` to return to an existing task workspace.
 - Use `npm run workflow:devmode -- status|build|release` to inspect or switch lanes.
@@ -17,7 +18,7 @@ This repo uses `workflow-kit` for task workspaces, PR prep, merge handoff, and d
 - Treat `workflow:new` as the canonical task-start command.
 - Treat `workflow:resume` as the recovery command.
 - Treat `workflow-kit run repo-guard` as an internal guardrail, not the default human entrypoint.
-- Re-check `npm run workflow:task-lock -- verify --task "<task-name>"` before implementation, `/pr`, `/merge`, and `/deploy`.
+- Re-check `npm run workflow:task-lock -- verify --task "<task-name>"` before implementation, `{{ALIAS_PR}}`, `{{ALIAS_MERGE}}`, and `{{ALIAS_DEPLOY}}`.
 - `workflow:pr` stages the active task worktree with `git add -A`, so keep the task workspace isolated.
 - When backend or multi-surface impact is plausible, use explicit `--surfaces`.
 
