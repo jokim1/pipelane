@@ -106,6 +106,7 @@ Properties:
 - `/new` refreshes `origin/<base>` first and fails closed unless `--offline` is explicitly passed
 - `/new` inherits the current dev mode and requested surfaces
 - `/new` refuses to start the same task twice and redirects to `/resume`
+- `/new` accepts an optional `--task "<task-name>"`; when omitted, it generates a `task-<hex>` slug so an isolated worktree can be spun up without naming the task up front
 
 `/resume` is the recovery path, not the normal happy path.
 
@@ -381,8 +382,8 @@ Common failures:
 
 - `No .project-workflow.json found`
   - run `workflow-kit init` in the repo root
-- `workflow:new requires --task`
-  - pass a human task label, not a branch id
+- `/new` generated a `task-<hex>` slug you did not expect
+  - you ran `/new` without `--task`; pass `--task "<label>"` explicitly to choose a human-readable slug
 - `Task X is already active`
   - use `workflow:resume -- --task "X"`
 - `Release mode blocked`

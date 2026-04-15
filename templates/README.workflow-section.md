@@ -75,7 +75,7 @@ Canonical repo-native commands:
 
 - `npm run workflow:setup`
 - `npm run workflow:devmode -- ...`
-- `npm run workflow:new -- --task "<task-name>"`
+- `npm run workflow:new -- --task "<task-name>"` (the `--task` flag is optional; omitting it generates a `task-<hex>` slug)
 - `npm run workflow:resume -- --task "<task-name>"`
 - `npm run workflow:pr -- ...`
 - `npm run workflow:merge`

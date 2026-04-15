@@ -160,7 +160,7 @@ gate.
 ## Command reference
 
 - `/devmode`: inspect or switch between `build` and `release`.
-- `/new`: create a fresh isolated task workspace on a new `codex/<task>-<4hex>` branch.
+- `/new`: create a fresh isolated task workspace on a new `codex/<task>-<4hex>` branch. The `<task-name>` argument is optional — when omitted, a `task-<hex>` slug is generated automatically so you can spin up an isolated worktree without naming the task up front.
 - `/resume`: recover an existing task workspace by task name when you come back later.
 - `/pr`: verify, stage, commit, push, and create or update the current task PR.
 - `/merge`: merge the task PR and record the merged SHA for later deploy flow.
