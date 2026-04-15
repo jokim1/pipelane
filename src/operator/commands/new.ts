@@ -10,6 +10,7 @@ import {
   buildCurrentWorkspaceReasons,
   buildTaskWorkspaceOutput,
   findPrunedTaskLock,
+  generateHex,
   generateUniqueTaskWorkspace,
   pruneDeadTaskLocks,
   resolveTaskBaseRef,
@@ -21,12 +22,11 @@ import { runGit } from '../state.ts';
 import { resolveCommandSurfaces } from './helpers.ts';
 
 export async function handleNew(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
-  if (!parsed.flags.task.trim()) {
-    throw new Error('workflow:new requires --task <task-name>.');
-  }
+  const rawTask = parsed.flags.task.trim();
+  const effectiveTask = rawTask || `task-${generateHex()}`;
 
   const context = resolveWorkflowContext(cwd);
-  const { taskName, taskSlug } = resolveTaskCommandIdentity(parsed.flags.task);
+  const { taskName, taskSlug } = resolveTaskCommandIdentity(effectiveTask);
   const mode = context.modeState.mode;
   const surfaces = resolveCommandSurfaces(context, parsed.flags.surfaces);
   const removedLocks = pruneDeadTaskLocks(context.commonDir, context.config);

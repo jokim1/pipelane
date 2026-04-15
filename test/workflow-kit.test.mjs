@@ -176,6 +176,24 @@ test('new creates a fresh task workspace and resume restores it', () => {
   }
 });
 
+test('new generates a task-<hex> slug when --task is omitted', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+
+    const created = JSON.parse(runCli(['run', 'new', '--json'], repoRoot).stdout);
+    assert.match(created.taskSlug, /^task-[0-9a-f]{4}$/);
+    assert.equal(created.createdWorktree, true);
+    assert.ok(created.worktreePath.includes(created.taskSlug));
+    assert.equal(run('git', ['branch', '--show-current'], created.worktreePath), created.branch);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('release-check fails closed before local CLAUDE is configured', () => {
   const repoRoot = createRepo();
 

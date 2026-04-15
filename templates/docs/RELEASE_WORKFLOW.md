@@ -85,6 +85,7 @@ Properties:
 - refreshes `origin/{{BASE_BRANCH}}` first
 - inherits the current dev mode
 - fails closed if the task already exists and points to `/resume`
+- `--task "<task-name>"` is optional; when omitted, `/new` generates a `task-<hex>` slug automatically
 
 `/resume` is the recovery path, not the normal happy path.
 
