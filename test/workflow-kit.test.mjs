@@ -1,11 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
+import { createServer as createNetServer } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const KIT_ROOT = '/tmp/workflow-kit-build';
+const KIT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CLI_PATH = path.join(KIT_ROOT, 'src', 'cli.ts');
 const FIXTURE_ROOT = path.join(KIT_ROOT, 'test', 'fixtures', 'sample-repo');
 
@@ -118,6 +121,500 @@ if (args[0] === 'workflow' && args[1] === 'run') {
 }
 process.exit(0);
 `, { mode: 0o755, encoding: 'utf8' });
+}
+
+function writeFakeNpm(binDir, stateFile) {
+  mkdirSync(binDir, { recursive: true });
+  const targetPath = path.join(binDir, 'npm');
+  writeFileSync(targetPath, `#!/usr/bin/env node
+const fs = require('node:fs');
+
+const args = process.argv.slice(2);
+const statePath = process.env.WORKFLOW_API_FIXTURE_FILE;
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const markerIndex = args.indexOf('--');
+const workflowArgs = markerIndex === -1 ? args : args.slice(markerIndex + 1);
+
+const valueAfter = (flag) => {
+  const index = workflowArgs.indexOf(flag);
+  return index === -1 ? '' : workflowArgs[index + 1] || '';
+};
+
+const respond = (payload, status = 0, stderr = '') => {
+  if (stderr) {
+    process.stderr.write(stderr);
+  }
+  process.stdout.write(JSON.stringify(payload, null, 2));
+  process.exit(status);
+};
+
+const command = workflowArgs[0];
+if (command === 'snapshot') {
+  respond(state.snapshot, state.snapshotExitCode || 0);
+}
+
+if (command === 'branch') {
+  const branchName = valueAfter('--branch');
+  const branchState = state.branches[branchName];
+  if (!branchState) {
+    process.stderr.write('unknown branch');
+    process.exit(1);
+  }
+
+  if (workflowArgs.includes('--patch')) {
+    const filePath = valueAfter('--file');
+    const scope = valueAfter('--scope') || 'branch';
+    const patchKey = scope + ':' + filePath;
+    if (!branchState.patches[patchKey]) {
+      process.stderr.write('unknown patch');
+      process.exit(1);
+    }
+    respond(branchState.patches[patchKey], branchState.patchExitCode || 0);
+  }
+
+  respond(branchState.details, branchState.detailsExitCode || 0);
+}
+
+if (command === 'action') {
+  const actionId = workflowArgs[1];
+  const actionState = state.actions[actionId];
+  if (!actionState) {
+    process.stderr.write('unknown action');
+    process.exit(1);
+  }
+
+  if (workflowArgs.includes('--execute')) {
+    if (actionState.executeStderr) {
+      process.stderr.write(actionState.executeStderr);
+    }
+    setTimeout(() => {
+      respond(actionState.execute, actionState.executeExitCode || 0);
+    }, actionState.executeDelayMs || 15);
+    return;
+  }
+
+  respond(actionState.preflight, actionState.preflightExitCode || 0);
+}
+
+process.stderr.write('unsupported fake npm invocation');
+process.exit(1);
+`, { mode: 0o755, encoding: 'utf8' });
+}
+
+async function getFreePort() {
+  const server = createNetServer();
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+  server.close();
+  await once(server, 'close');
+  return port;
+}
+
+async function startDashboardServer(repoRoot, env = {}) {
+  const port = await getFreePort();
+  const processHandle = spawn('node', [CLI_PATH, 'dashboard', '--repo', repoRoot, '--port', String(port)], {
+    cwd: KIT_ROOT,
+    env: { ...process.env, ...env },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let stdout = '';
+  let stderr = '';
+  processHandle.stdout.on('data', (chunk) => {
+    stdout += chunk.toString('utf8');
+  });
+  processHandle.stderr.on('data', (chunk) => {
+    stderr += chunk.toString('utf8');
+  });
+
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error(`Dashboard server did not start in time.\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+    }, 4000);
+
+    const handleExit = (code) => {
+      clearTimeout(timeout);
+      reject(new Error(`Dashboard server exited early with ${code}.\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+    };
+    const handleStdout = () => {
+      if (!stdout.includes(`Dashboard: http://127.0.0.1:${port}`)) {
+        return;
+      }
+      clearTimeout(timeout);
+      processHandle.stdout.off('data', handleStdout);
+      processHandle.off('exit', handleExit);
+      resolve();
+    };
+
+    processHandle.stdout.on('data', handleStdout);
+    processHandle.once('exit', handleExit);
+    handleStdout();
+  });
+
+  return {
+    port,
+    baseUrl: `http://127.0.0.1:${port}`,
+    processHandle,
+  };
+}
+
+function setWorkflowApiScript(repoRoot) {
+  const packageJsonPath = path.join(repoRoot, 'package.json');
+  const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+  packageJson.scripts = {
+    ...(packageJson.scripts || {}),
+    'workflow:api': 'node fake-workflow-api.js',
+  };
+  writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 2) + '\n', 'utf8');
+}
+
+function makeDashboardFixture() {
+  const branchRow = {
+    name: 'codex/pipeline-board-1234',
+    status: 'open-pr',
+    current: true,
+    note: 'Ready for staging deploy.',
+    task: {
+      taskSlug: 'pipeline-board',
+      mode: 'release',
+      worktreePath: '/tmp/pipeline-board',
+      updatedAt: '2026-04-14T20:00:00.000Z',
+    },
+    surfaces: ['frontend', 'sql'],
+    cleanup: {
+      available: false,
+      eligible: false,
+      reason: 'Cleanup should wait until the branch is live.',
+    },
+    pr: {
+      number: 77,
+      state: 'OPEN',
+      url: 'https://example.test/pr/77',
+      title: 'Pipeline board',
+      mergedAt: null,
+    },
+    mergedSha: null,
+    lanes: {
+      local: {
+        state: 'healthy',
+        reason: 'local worktree exists and is clean',
+        detail: '',
+        freshness: { checkedAt: '2026-04-14T20:00:00.000Z', observedAt: '2026-04-14T20:00:00.000Z', state: 'fresh' },
+      },
+      pr: {
+        state: 'running',
+        reason: 'PR #77 is open',
+        detail: '',
+        freshness: { checkedAt: '2026-04-14T20:00:00.000Z', observedAt: '2026-04-14T20:00:00.000Z', state: 'fresh' },
+      },
+      base: {
+        state: 'unknown',
+        reason: 'branch has not landed on main yet',
+        detail: 'Base: main',
+        freshness: { checkedAt: '2026-04-14T20:00:00.000Z', observedAt: '2026-04-14T20:00:00.000Z', state: 'fresh' },
+      },
+      staging: {
+        state: 'awaiting_preflight',
+        reason: 'ready for staging preflight',
+        detail: '',
+        freshness: { checkedAt: '2026-04-14T20:00:00.000Z', observedAt: '2026-04-14T20:00:00.000Z', state: 'fresh' },
+      },
+      production: {
+        state: 'blocked',
+        reason: 'merge the branch before production deploy',
+        detail: '',
+        freshness: { checkedAt: '2026-04-14T20:00:00.000Z', observedAt: '2026-04-14T20:00:00.000Z', state: 'fresh' },
+      },
+    },
+    availableActions: [
+      {
+        id: 'deploy.staging',
+        label: 'Deploy staging',
+        state: 'awaiting_preflight',
+        reason: 'run staging preflight for this task',
+        risky: false,
+        requiresConfirmation: false,
+        freshness: { checkedAt: '2026-04-14T20:00:00.000Z', observedAt: '2026-04-14T20:00:00.000Z', state: 'fresh' },
+      },
+      {
+        id: 'deploy.prod',
+        label: 'Deploy production',
+        state: 'blocked',
+        reason: 'merge the branch before production deploy',
+        risky: true,
+        requiresConfirmation: true,
+        freshness: { checkedAt: '2026-04-14T20:00:00.000Z', observedAt: '2026-04-14T20:00:00.000Z', state: 'fresh' },
+      },
+    ],
+  };
+
+  return {
+    snapshot: {
+      schemaVersion: '2026-04-14',
+      command: 'workflow.api.snapshot',
+      ok: true,
+      message: 'workflow operator snapshot ready',
+      warnings: [],
+      issues: [],
+      data: {
+        boardContext: {
+          mode: 'release',
+          baseBranch: 'main',
+          laneOrder: ['Local', 'PR', 'Base: main', 'Staging', 'Production'],
+          releaseReadiness: {
+            state: 'healthy',
+            reason: 'release readiness is healthy',
+            requestedSurfaces: ['frontend', 'sql'],
+            blockedSurfaces: [],
+            effectiveOverride: null,
+            localReady: true,
+            hostedReady: true,
+            freshness: { checkedAt: '2026-04-14T20:00:00.000Z', observedAt: '2026-04-14T20:00:00.000Z', state: 'fresh' },
+          },
+          activeTask: {
+            taskSlug: 'pipeline-board',
+            branchName: 'codex/pipeline-board-1234',
+            worktreePath: '/tmp/pipeline-board',
+            updatedAt: '2026-04-14T20:00:00.000Z',
+          },
+          overallFreshness: {
+            checkedAt: '2026-04-14T20:00:00.000Z',
+            observedAt: '2026-04-14T20:00:00.000Z',
+            state: 'fresh',
+          },
+        },
+        sourceHealth: [
+          {
+            name: 'git.local',
+            state: 'healthy',
+            blocking: false,
+            reason: 'local branches loaded',
+            freshness: { checkedAt: '2026-04-14T20:00:00.000Z', observedAt: '2026-04-14T20:00:00.000Z', state: 'fresh' },
+          },
+        ],
+        attention: [
+          {
+            severity: 'warning',
+            branch: 'codex/pipeline-board-1234',
+            lane: 'Staging',
+            reason: 'Staging deploy has not run yet.',
+            freshness: { checkedAt: '2026-04-14T20:00:00.000Z', observedAt: '2026-04-14T20:00:00.000Z', state: 'fresh' },
+            safeNextAction: 'deploy.staging',
+          },
+        ],
+        availableActions: [
+          {
+            id: 'clean.plan',
+            label: 'Plan cleanup',
+            state: 'awaiting_preflight',
+            reason: 'review cleanup candidates',
+            risky: false,
+            requiresConfirmation: false,
+            freshness: { checkedAt: '2026-04-14T20:00:00.000Z', observedAt: '2026-04-14T20:00:00.000Z', state: 'fresh' },
+          },
+        ],
+        branches: [branchRow],
+      },
+    },
+    branches: {
+      'codex/pipeline-board-1234': {
+        details: {
+          schemaVersion: '2026-04-14',
+          command: 'workflow.api.branch',
+          ok: true,
+          message: 'branch details ready for codex/pipeline-board-1234',
+          warnings: [],
+          issues: [],
+          data: {
+            branch: branchRow,
+            branchFiles: [
+              {
+                path: 'src/dashboard.ts',
+                changeType: 'modified',
+                oldPath: '',
+                scope: 'branch',
+                patchAvailable: true,
+                reason: '',
+              },
+            ],
+            workspaceFiles: [
+              {
+                path: 'README.md',
+                changeType: 'modified',
+                oldPath: '',
+                scope: 'workspace',
+                patchAvailable: true,
+                reason: '',
+              },
+              {
+                path: 'notes.txt',
+                changeType: 'untracked',
+                oldPath: '',
+                scope: 'workspace',
+                patchAvailable: false,
+                reason: 'patch preview is unavailable for untracked files',
+              },
+            ],
+            counts: {
+              branchFiles: 1,
+              workspaceFiles: 2,
+            },
+            baseBranch: 'main',
+            freshness: {
+              checkedAt: '2026-04-14T20:00:00.000Z',
+              observedAt: '2026-04-14T20:00:00.000Z',
+              state: 'fresh',
+            },
+          },
+        },
+        patches: {
+          'branch:src/dashboard.ts': {
+            schemaVersion: '2026-04-14',
+            command: 'workflow.api.branch.patch',
+            ok: true,
+            message: 'patch preview ready for src/dashboard.ts',
+            warnings: [],
+            issues: [],
+            data: {
+              branch: 'codex/pipeline-board-1234',
+              path: 'src/dashboard.ts',
+              scope: 'branch',
+              patch: '@@ -1,3 +1,3 @@\\n-console.log(\"old\");\\n+console.log(\"new\");\\n',
+              truncated: false,
+              reason: '',
+            },
+          },
+          'workspace:README.md': {
+            schemaVersion: '2026-04-14',
+            command: 'workflow.api.branch.patch',
+            ok: true,
+            message: 'patch preview ready for README.md',
+            warnings: [],
+            issues: [],
+            data: {
+              branch: 'codex/pipeline-board-1234',
+              path: 'README.md',
+              scope: 'workspace',
+              patch: '@@ -1 +1 @@\\n-old\\n+new\\n',
+              truncated: false,
+              reason: '',
+            },
+          },
+        },
+      },
+    },
+    actions: {
+      'deploy.staging': {
+        preflight: {
+          schemaVersion: '2026-04-14',
+          command: 'workflow.api.action',
+          ok: true,
+          message: 'preflight ready',
+          warnings: [],
+          issues: [],
+          data: {
+            action: {
+              id: 'deploy.staging',
+              label: 'Deploy staging',
+              risky: false,
+            },
+            preflight: {
+              allowed: true,
+              state: 'healthy',
+              reason: 'staging deploy can run',
+              warnings: [],
+              issues: [],
+              normalizedInputs: {
+                taskSlug: 'pipeline-board',
+              },
+              requiresConfirmation: false,
+              confirmation: null,
+              freshness: { checkedAt: '2026-04-14T20:00:00.000Z', observedAt: '2026-04-14T20:00:00.000Z', state: 'fresh' },
+            },
+          },
+        },
+        execute: {
+          schemaVersion: '2026-04-14',
+          command: 'workflow.api.action',
+          ok: true,
+          message: 'staging deploy started',
+          warnings: [],
+          issues: [],
+          data: {
+            action: {
+              id: 'deploy.staging',
+              label: 'Deploy staging',
+              risky: false,
+            },
+            execution: {
+              result: {
+                environment: 'staging',
+                sha: 'deadbeefcafebabe',
+              },
+            },
+          },
+        },
+        executeStderr: 'Deploying staging...\\n',
+      },
+      'deploy.prod': {
+        preflight: {
+          schemaVersion: '2026-04-14',
+          command: 'workflow.api.action',
+          ok: false,
+          message: 'confirmation required',
+          warnings: [],
+          issues: [],
+          data: {
+            action: {
+              id: 'deploy.prod',
+              label: 'Deploy production',
+              risky: true,
+            },
+            preflight: {
+              allowed: true,
+              state: 'blocked',
+              reason: 'Confirm production deploy.',
+              warnings: [],
+              issues: [],
+              normalizedInputs: {
+                taskSlug: 'pipeline-board',
+              },
+              requiresConfirmation: true,
+              confirmation: {
+                token: 'confirm-prod-token',
+              },
+              freshness: { checkedAt: '2026-04-14T20:00:00.000Z', observedAt: '2026-04-14T20:00:00.000Z', state: 'fresh' },
+            },
+          },
+        },
+        preflightExitCode: 1,
+        execute: {
+          schemaVersion: '2026-04-14',
+          command: 'workflow.api.action',
+          ok: true,
+          message: 'production deploy started',
+          warnings: [],
+          issues: [],
+          data: {
+            action: {
+              id: 'deploy.prod',
+              label: 'Deploy production',
+              risky: true,
+            },
+            execution: {
+              result: {
+                environment: 'prod',
+                sha: 'deadbeefcafebabe',
+              },
+            },
+          },
+        },
+        executeStderr: 'Deploying production...\\n',
+      },
+    },
+  };
 }
 
 test('init writes tracked workflow files and setup seeds CLAUDE plus Codex wrappers', () => {
@@ -272,5 +769,104 @@ test('clean --apply prunes stale task locks', () => {
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('dashboard proxies workflow:api routes and persists local board settings', async () => {
+  const repoRoot = createRepo();
+  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-dashboard-bin-'));
+  const fixtureFile = path.join(fakeBin, 'workflow-api-fixture.json');
+  const fixture = makeDashboardFixture();
+  const env = {
+    PATH: `${fakeBin}:${process.env.PATH}`,
+    WORKFLOW_API_FIXTURE_FILE: fixtureFile,
+  };
+
+  writeFakeNpm(fakeBin, fixtureFile);
+  writeFileSync(fixtureFile, JSON.stringify(fixture, null, 2) + '\n', 'utf8');
+  setWorkflowApiScript(repoRoot);
+
+  let server;
+
+  try {
+    server = await startDashboardServer(repoRoot, env);
+
+    const health = await fetch(`${server.baseUrl}/api/health`).then((response) => response.json());
+    assert.equal(health.workflowApiConfigured, true);
+    assert.equal(health.repoExists, true);
+    assert.ok(health.settingsPath);
+
+    const settingsBefore = await fetch(`${server.baseUrl}/api/settings`).then((response) => response.json());
+    assert.equal(settingsBefore.settings.boardTitle, `${path.basename(repoRoot)} Branch Pipeline Board`);
+    assert.equal(settingsBefore.settings.preferredPort, 3033);
+
+    const settingsUpdateResponse = await fetch(`${server.baseUrl}/api/settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        settings: {
+          boardTitle: 'Operator Cockpit',
+          boardSubtitle: 'Opinionated branch operations board.',
+          preferredPort: 4044,
+          autoRefreshSeconds: 45,
+        },
+      }),
+    });
+    assert.equal(settingsUpdateResponse.status, 200);
+    const settingsUpdate = await settingsUpdateResponse.json();
+    assert.equal(settingsUpdate.settings.boardTitle, 'Operator Cockpit');
+    assert.equal(settingsUpdate.settings.autoRefreshSeconds, 45);
+    assert.equal(settingsUpdate.restartRequired, true);
+
+    const savedSettings = JSON.parse(readFileSync(settingsUpdate.settingsPath, 'utf8'));
+    assert.equal(savedSettings.boardTitle, 'Operator Cockpit');
+    assert.equal(savedSettings.preferredPort, 4044);
+
+    const snapshot = await fetch(`${server.baseUrl}/api/snapshot`).then((response) => response.json());
+    assert.equal(snapshot.command, 'workflow.api.snapshot');
+    assert.equal(snapshot.data.branches[0].name, 'codex/pipeline-board-1234');
+
+    const branch = await fetch(`${server.baseUrl}/api/branch/${encodeURIComponent('codex/pipeline-board-1234')}`).then((response) => response.json());
+    assert.equal(branch.command, 'workflow.api.branch');
+    assert.equal(branch.data.branchFiles[0].path, 'src/dashboard.ts');
+    assert.equal(branch.data.workspaceFiles[1].patchAvailable, false);
+
+    const patch = await fetch(`${server.baseUrl}/api/branch/${encodeURIComponent('codex/pipeline-board-1234')}/patch?file=${encodeURIComponent('src/dashboard.ts')}&scope=branch`).then((response) => response.json());
+    assert.equal(patch.command, 'workflow.api.branch.patch');
+    assert.match(patch.data.patch, /console\.log\("new"\)/);
+
+    const preflightResponse = await fetch(`${server.baseUrl}/api/action/${encodeURIComponent('deploy.staging')}/preflight`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ params: { task: 'pipeline-board' } }),
+    });
+    assert.equal(preflightResponse.status, 200);
+    const preflight = await preflightResponse.json();
+    assert.equal(preflight.data.preflight.allowed, true);
+
+    const executeResponse = await fetch(`${server.baseUrl}/api/action/${encodeURIComponent('deploy.prod')}/execute`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ params: { task: 'pipeline-board' }, confirmToken: 'confirm-prod-token' }),
+    });
+    assert.equal(executeResponse.status, 202);
+    const executePayload = await executeResponse.json();
+    assert.ok(executePayload.executionId);
+
+    const streamText = await fetch(`${server.baseUrl}/api/executions/${executePayload.executionId}/events`).then((response) => response.text());
+    assert.match(streamText, /event: start/);
+    assert.match(streamText, /event: stderr/);
+    assert.match(streamText, /event: final/);
+
+    const execution = await fetch(`${server.baseUrl}/api/executions/${executePayload.executionId}`).then((response) => response.json());
+    assert.equal(execution.execution.status, 'completed');
+    assert.equal(execution.execution.finalEnvelope.data.execution.result.environment, 'prod');
+  } finally {
+    if (server?.processHandle) {
+      server.processHandle.kill('SIGTERM');
+      await once(server.processHandle, 'exit').catch(() => undefined);
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
   }
 });

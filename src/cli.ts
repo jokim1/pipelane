@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { getDashboardOptions, startDashboardServer } from './dashboard/server.ts';
 import { installCodexWrappers } from './operator/codex-install.ts';
 import { initConsumerRepo, setupConsumerRepo, syncDocsOnly } from './operator/docs.ts';
 import { runOperator } from './operator/index.ts';
@@ -9,11 +10,28 @@ function valueAfter(args: string[], flag: string): string {
   return index === -1 ? '' : args[index + 1] ?? '';
 }
 
+function printTopLevelHelp(): void {
+  process.stdout.write(`workflow-kit
+
+Commands:
+  init --project "Project Name"
+  setup
+  sync-docs
+  install-codex
+  dashboard [--repo <repo-root>] [--host <host>] [--port <port>]
+  run <workflow command...>
+
+Examples:
+  workflow-kit dashboard --repo /Users/josephkim/dev/rocketboard
+  workflow-kit run new --task "My Task"
+`);
+}
+
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
 
   if (!command || command === '--help' || command === '-h') {
-    await runOperator(process.cwd(), ['--help']);
+    printTopLevelHelp();
     return;
   }
 
@@ -53,6 +71,12 @@ async function main(): Promise<void> {
   if (command === 'install-codex') {
     const result = installCodexWrappers();
     process.stdout.write(`Installed Codex wrappers in ${result.codexHome}: ${result.installed.join(', ')}\n`);
+    return;
+  }
+
+  if (command === 'dashboard') {
+    const options = getDashboardOptions(rest, process.cwd());
+    await startDashboardServer(options);
     return;
   }
 

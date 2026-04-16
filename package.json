@@ -8,7 +8,8 @@
   },
   "scripts": {
     "test": "node --test",
-    "smoke": "node ./src/cli.ts --help"
+    "smoke": "node ./src/cli.ts --help",
+    "dashboard": "node ./src/cli.ts dashboard"
   },
   "engines": {
     "node": ">=22.0.0"
