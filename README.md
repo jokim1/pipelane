@@ -62,6 +62,49 @@ follow it safely and a human can predict what will happen next.
 - tracked Claude command files
 - generic Codex slash wrappers
 - a reusable release workflow doc for new maintainers
+- a local Branch Pipeline Board reference dashboard for workflow-aware repos
+
+## Branch Pipeline Board
+
+`workflow-kit` ships a local reference dashboard for repos that expose a public `workflow:api`
+surface.
+
+Run it against a target repo:
+
+```bash
+npm run dashboard -- --repo /absolute/path/to/your/repo
+```
+
+What it is:
+
+- a development dashboard reference design, not the workflow source of truth
+- a thin local adapter over the repo's CLI JSON contract
+- an opinionated branch-operations cockpit for triage, deploy handoff, cleanup, and follow-through
+
+What it shows:
+
+- `Attention` and repo-wide release context first
+- a kanban-like branch ledger with one active pipeline card per branch
+- branch detail with lane reasons, history, row actions, changed files, and lazy patch previews
+- action feedback and execution streaming for preflighted workflow actions
+
+Local settings are stored per repo in:
+
+```text
+~/.workflow-kit/dashboard/<repo>-<hash>.json
+```
+
+Use the board's Settings button to customize:
+
+- board name
+- board subtitle
+- preferred port for future launches
+- auto-refresh interval
+
+Docs:
+
+- [Branch Pipeline Board reference design](docs/BRANCH_PIPELINE_BOARD.md)
+- [Dashboard implementation guide](src/dashboard/README.md)
 
 ## Two dev modes
 

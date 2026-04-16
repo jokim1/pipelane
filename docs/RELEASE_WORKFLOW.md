@@ -62,6 +62,27 @@ The slash surface is intentionally thin.
 
 There is no workflow logic inside the slash wrappers.
 
+### Local Branch Pipeline Board
+
+`workflow-kit` also ships a local dashboard reference design:
+
+```bash
+npm run dashboard -- --repo /absolute/path/to/your/repo
+```
+
+This is intentionally an adapter over the repo's public `workflow:api` contract, not a second
+workflow source of truth.
+
+Use it when you want:
+
+- an operator view of every branch moving through `Local -> PR -> Base -> Staging -> Production`
+- contextual action preflight and execution feedback without memorizing every command
+- branch detail with lane reasons, history, file lists, and lazy patch previews
+- a stronger, opinionated development cockpit for AI-first release operations
+
+The dashboard stays local-only. Its settings live in a per-repo JSON file under
+`~/.workflow-kit/dashboard/`, and the board can be customized from its Settings drawer.
+
 ## workflow-kit and gstack
 
 Use both.

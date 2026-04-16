@@ -1,0 +1,3118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Workflow Kit Dashboard</title>
+  <style>
+    :root {
+      --bg: #071015;
+      --bg-panel: rgba(8, 18, 24, 0.86);
+      --bg-panel-strong: #0d1b22;
+      --bg-panel-soft: #10232c;
+      --line: rgba(132, 169, 189, 0.18);
+      --line-strong: rgba(132, 169, 189, 0.3);
+      --text: #e9f1f4;
+      --muted: #95a9b3;
+      --subtle: #6e828c;
+      --healthy: #58d68d;
+      --running: #6cb4ee;
+      --blocked: #ff6b6b;
+      --failed: #ff6b6b;
+      --degraded: #ff8f5a;
+      --stale: #ffb347;
+      --unknown: #7f8c8d;
+      --bypassed: #7f8c8d;
+      --awaiting: #53d1c8;
+      --cleanup: #e3b341;
+      --executing: #8ea3b0;
+      --accent: #6cb4ee;
+      --accent-soft: rgba(108, 180, 238, 0.12);
+      --danger-soft: rgba(255, 107, 107, 0.12);
+      --warning-soft: rgba(245, 176, 65, 0.12);
+      --healthy-soft: rgba(88, 214, 141, 0.12);
+      --shadow: 0 18px 60px rgba(0, 0, 0, 0.35);
+      --radius: 18px;
+      --mono: "SFMono-Regular", "Iosevka Term", "IBM Plex Mono", ui-monospace, monospace;
+      --sans: "Avenir Next", "Segoe UI Variable", "Inter", system-ui, sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      font-family: var(--sans);
+      background:
+        radial-gradient(circle at top left, rgba(108, 180, 238, 0.18), transparent 28%),
+        radial-gradient(circle at top right, rgba(88, 214, 141, 0.12), transparent 24%),
+        linear-gradient(180deg, #091319 0%, #071015 55%, #050b0f 100%);
+    }
+
+    button,
+    input,
+    textarea,
+    select {
+      font: inherit;
+    }
+
+    a {
+      color: inherit;
+    }
+
+    .app {
+      padding: 18px;
+    }
+
+    .stack {
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      min-width: 0;
+    }
+
+    .panel {
+      background: var(--bg-panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+      overflow: hidden;
+    }
+
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 18px 20px 12px;
+    }
+
+    .panel-title {
+      font-size: 12px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--muted);
+      font-family: var(--mono);
+    }
+
+    .panel-body {
+      padding: 0 20px 20px;
+    }
+
+    .hero {
+      padding: 22px 24px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 16px;
+      align-items: start;
+    }
+
+    .hero-title {
+      margin: 0;
+      font-size: clamp(30px, 4vw, 42px);
+      line-height: 0.95;
+      letter-spacing: -0.05em;
+    }
+
+    .hero-copy {
+      margin: 10px 0 0;
+      max-width: 68ch;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .hero-actions {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 10px;
+    }
+
+    .button-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .button {
+      appearance: none;
+      border: 1px solid var(--line-strong);
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--text);
+      padding: 10px 14px;
+      border-radius: 999px;
+      cursor: pointer;
+      transition: border-color 120ms ease, background 120ms ease, transform 120ms ease;
+      font-size: 13px;
+    }
+
+    .button:hover:not(:disabled) {
+      border-color: var(--accent);
+      background: rgba(108, 180, 238, 0.1);
+      transform: translateY(-1px);
+    }
+
+    .button:disabled {
+      opacity: 0.48;
+      cursor: not-allowed;
+    }
+
+    .button.primary {
+      background: linear-gradient(135deg, rgba(108, 180, 238, 0.3), rgba(108, 180, 238, 0.12));
+      border-color: rgba(108, 180, 238, 0.55);
+    }
+
+    .button.danger {
+      border-color: rgba(255, 107, 107, 0.55);
+      background: rgba(255, 107, 107, 0.08);
+    }
+
+    .button.subtle {
+      color: var(--muted);
+    }
+
+    .pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 16px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      padding: 7px 12px;
+      color: var(--muted);
+      background: rgba(255, 255, 255, 0.03);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .pill strong {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .meta-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+    }
+
+    .meta-card {
+      padding: 14px 16px;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.025);
+      min-width: 0;
+    }
+
+    .meta-card-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .meta-card .eyebrow {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--subtle);
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      margin-bottom: 8px;
+    }
+
+    .meta-card .headline {
+      font-size: 18px;
+      line-height: 1.15;
+      margin-bottom: 6px;
+      word-break: break-word;
+    }
+
+    .meta-card .caption {
+      color: var(--muted);
+      font-size: 13px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .meta-card .caption + .footer-note {
+      margin-top: 10px;
+    }
+
+    .menu-shell {
+      position: relative;
+      display: inline-flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 8px;
+    }
+
+    .menu-button {
+      appearance: none;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--text);
+      border-radius: 999px;
+      width: 34px;
+      height: 34px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 14px;
+      line-height: 1;
+    }
+
+    .menu-button:hover {
+      border-color: var(--accent);
+      background: rgba(108, 180, 238, 0.08);
+    }
+
+    .menu-button:disabled {
+      opacity: 0.65;
+      cursor: default;
+    }
+
+    .menu-button[aria-expanded="true"] {
+      border-color: rgba(108, 180, 238, 0.45);
+      background: rgba(108, 180, 238, 0.12);
+    }
+
+    .menu-button .chevron {
+      transition: transform 160ms ease;
+    }
+
+    .menu-button[aria-expanded="true"] .chevron {
+      transform: rotate(180deg);
+    }
+
+    .menu-popover {
+      position: absolute;
+      top: calc(100% + 8px);
+      right: 0;
+      min-width: 220px;
+      display: none;
+      flex-direction: column;
+      gap: 6px;
+      padding: 8px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: rgba(6, 16, 21, 0.98);
+      box-shadow: 0 18px 44px rgba(0, 0, 0, 0.32);
+      z-index: 8;
+    }
+
+    .menu-popover.open {
+      display: flex;
+    }
+
+    .menu-item {
+      appearance: none;
+      border: 1px solid transparent;
+      background: rgba(255, 255, 255, 0.02);
+      color: var(--text);
+      border-radius: 12px;
+      padding: 10px 12px;
+      cursor: pointer;
+      text-align: left;
+    }
+
+    .menu-item:hover:not(:disabled) {
+      border-color: var(--accent);
+      background: rgba(108, 180, 238, 0.08);
+    }
+
+    .menu-item:disabled {
+      opacity: 0.65;
+      cursor: default;
+    }
+
+    .menu-item .action-label,
+    .context-menu-item .action-label {
+      display: block;
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .menu-item .action-reason,
+    .context-menu-item .action-reason {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      margin-top: 4px;
+    }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+    }
+
+    .attention-card {
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.025);
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .attention-card.blocker {
+      border-color: rgba(255, 107, 107, 0.36);
+      background: rgba(255, 107, 107, 0.08);
+    }
+
+    .attention-card.warning {
+      border-color: rgba(245, 176, 65, 0.36);
+      background: rgba(245, 176, 65, 0.08);
+    }
+
+    .attention-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+    }
+
+    .attention-severity {
+      font-family: var(--mono);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+    }
+
+    .attention-severity.blocker {
+      color: var(--blocked);
+    }
+
+    .attention-severity.warning {
+      color: var(--running);
+    }
+
+    .attention-reason {
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .attention-next {
+      font-family: var(--mono);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .table-wrap {
+      overflow: auto;
+      border-top: 1px solid var(--line);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 1240px;
+    }
+
+    th,
+    td {
+      padding: 14px 16px;
+      text-align: left;
+      vertical-align: top;
+      border-bottom: 1px solid var(--line);
+    }
+
+    thead th {
+      font-family: var(--mono);
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      background: rgba(255, 255, 255, 0.02);
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+
+    tbody tr {
+      cursor: pointer;
+      transition: background 120ms ease;
+    }
+
+    tbody tr:hover {
+      background: rgba(255, 255, 255, 0.025);
+    }
+
+    tbody tr.selected {
+      background: rgba(108, 180, 238, 0.08);
+    }
+
+    .branch-sticky-head,
+    .branch-sticky-cell {
+      position: sticky;
+      left: 0;
+      min-width: 280px;
+      max-width: 280px;
+      z-index: 4;
+      background: var(--bg-panel-strong);
+      box-shadow: 12px 0 20px -20px rgba(0, 0, 0, 0.9);
+      border-right: 1px solid var(--line);
+    }
+
+    .branch-sticky-head {
+      z-index: 6;
+      background: rgba(13, 27, 34, 0.98);
+    }
+
+    .branch-sticky-cell {
+      z-index: 3;
+      background: rgba(13, 27, 34, 0.96);
+    }
+
+    tbody tr.selected .branch-sticky-cell {
+      background: rgba(17, 39, 51, 0.98);
+    }
+
+    .branch-name {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .branch-name strong {
+      font-family: var(--mono);
+      font-size: 13px;
+      word-break: normal;
+      overflow-wrap: break-word;
+    }
+
+    .branch-note {
+      color: var(--muted);
+      font-size: 12px;
+      max-width: 280px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .mini-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .mini-pill {
+      border-radius: 999px;
+      padding: 4px 8px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.025);
+      color: var(--muted);
+      font-size: 11px;
+      font-family: var(--mono);
+    }
+
+    .ledger-lane-cell {
+      min-width: 220px;
+      width: 220px;
+      padding-top: 12px;
+      padding-bottom: 12px;
+    }
+
+    .lane-track {
+      position: relative;
+      height: 110px;
+      width: 100%;
+    }
+
+    .lane-track::before {
+      content: "";
+      position: absolute;
+      left: 18px;
+      right: 18px;
+      top: 50%;
+      height: 1px;
+      background: rgba(132, 169, 189, 0.14);
+      transform: translateY(-50%);
+    }
+
+    .lane-track::after {
+      content: "";
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      transform: translate(-50%, -50%);
+      background: rgba(132, 169, 189, 0.28);
+      border: 1px solid rgba(132, 169, 189, 0.18);
+    }
+
+    .lane-track.complete::before {
+      background: rgba(88, 214, 141, 0.22);
+    }
+
+    .lane-track.complete::after {
+      background: rgba(88, 214, 141, 0.8);
+      border-color: rgba(88, 214, 141, 0.4);
+    }
+
+    .pipeline-card {
+      width: 100%;
+      min-height: 110px;
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      padding: 14px;
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--text);
+      text-align: left;
+      cursor: pointer;
+      box-shadow: var(--shadow);
+      transition: transform 140ms ease, border-color 140ms ease, box-shadow 140ms ease, background 140ms ease;
+    }
+
+    .pipeline-card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 20px 36px rgba(0, 0, 0, 0.34);
+    }
+
+    .pipeline-card.tone-good {
+      border-color: rgba(88, 214, 141, 0.38);
+      background: linear-gradient(180deg, rgba(88, 214, 141, 0.16), rgba(88, 214, 141, 0.07));
+    }
+
+    .pipeline-card.tone-caution {
+      border-color: rgba(255, 143, 90, 0.4);
+      background: linear-gradient(180deg, rgba(255, 143, 90, 0.16), rgba(255, 143, 90, 0.06));
+    }
+
+    .pipeline-card.tone-running {
+      border-color: rgba(108, 180, 238, 0.42);
+      background: linear-gradient(180deg, rgba(108, 180, 238, 0.18), rgba(108, 180, 238, 0.06));
+    }
+
+    .pipeline-card.tone-ready {
+      border-color: rgba(83, 209, 200, 0.42);
+      background: linear-gradient(180deg, rgba(83, 209, 200, 0.18), rgba(83, 209, 200, 0.06));
+    }
+
+    .pipeline-card.tone-stale {
+      border-color: rgba(245, 176, 65, 0.4);
+      background: linear-gradient(180deg, rgba(245, 176, 65, 0.16), rgba(245, 176, 65, 0.06));
+    }
+
+    .pipeline-card.tone-neutral {
+      border-color: rgba(132, 169, 189, 0.34);
+      background: linear-gradient(180deg, rgba(132, 169, 189, 0.12), rgba(132, 169, 189, 0.04));
+    }
+
+    .pipeline-card.tone-cleanup {
+      border-color: rgba(227, 179, 65, 0.46);
+      background: linear-gradient(180deg, rgba(227, 179, 65, 0.2), rgba(227, 179, 65, 0.07));
+    }
+
+    .pipeline-card.tone-danger {
+      border-color: rgba(255, 107, 107, 0.45);
+      background: linear-gradient(180deg, rgba(255, 107, 107, 0.17), rgba(255, 107, 107, 0.07));
+    }
+
+    .pipeline-card.tone-locked {
+      border-color: rgba(142, 163, 176, 0.42);
+      background: linear-gradient(180deg, rgba(142, 163, 176, 0.18), rgba(142, 163, 176, 0.08));
+    }
+
+    .pipeline-card.is-locked {
+      cursor: default;
+    }
+
+    .pipeline-card.is-locked:hover {
+      transform: none;
+      box-shadow: var(--shadow);
+    }
+
+    .pipeline-card-head {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    .pipeline-card-title {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      width: 100%;
+      min-width: 0;
+    }
+
+    .pipeline-card-title strong {
+      font-size: 13px;
+      line-height: 1.4;
+      word-break: normal;
+      overflow-wrap: break-word;
+    }
+
+    .pipeline-card-title span {
+      color: var(--muted);
+      font-size: 11px;
+      font-family: var(--mono);
+    }
+
+    .pipeline-card-reason {
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.5;
+      display: -webkit-box;
+      -webkit-line-clamp: 3;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-bottom: 10px;
+    }
+
+    .pipeline-card-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 11px;
+      font-family: var(--mono);
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      align-self: flex-start;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      padding: 4px 8px;
+      font-size: 11px;
+      font-family: var(--mono);
+      background: rgba(255, 255, 255, 0.04);
+      text-transform: capitalize;
+      white-space: nowrap;
+    }
+
+    .tone-good .status-pill {
+      color: var(--healthy);
+      border-color: rgba(88, 214, 141, 0.28);
+    }
+
+    .tone-caution .status-pill {
+      color: var(--degraded);
+      border-color: rgba(255, 143, 90, 0.34);
+    }
+
+    .tone-running .status-pill {
+      color: var(--running);
+      border-color: rgba(108, 180, 238, 0.34);
+    }
+
+    .tone-ready .status-pill {
+      color: var(--awaiting);
+      border-color: rgba(83, 209, 200, 0.34);
+    }
+
+    .tone-stale .status-pill {
+      color: var(--stale);
+      border-color: rgba(255, 179, 71, 0.34);
+    }
+
+    .tone-neutral .status-pill {
+      color: var(--unknown);
+      border-color: rgba(132, 169, 189, 0.3);
+    }
+
+    .tone-cleanup .status-pill {
+      color: var(--cleanup);
+      border-color: rgba(227, 179, 65, 0.38);
+    }
+
+    .tone-danger .status-pill {
+      color: var(--blocked);
+      border-color: rgba(255, 107, 107, 0.34);
+    }
+
+    .tone-locked .status-pill {
+      color: var(--executing);
+      border-color: rgba(142, 163, 176, 0.36);
+    }
+
+    .state-healthy .state { color: var(--healthy); }
+    .state-running .state { color: var(--running); }
+    .state-blocked .state { color: var(--blocked); }
+    .state-failed .state { color: var(--failed); }
+    .state-degraded .state { color: var(--degraded); }
+    .state-stale .state { color: var(--stale); }
+    .state-unknown .state { color: var(--unknown); }
+    .state-bypassed .state { color: var(--bypassed); }
+    .state-awaiting_preflight .state { color: var(--awaiting); }
+
+    .detail-overlay {
+      position: fixed;
+      inset: 0;
+      display: none;
+      z-index: 70;
+      pointer-events: none;
+    }
+
+    .detail-overlay.open {
+      display: block;
+    }
+
+    .detail-backdrop {
+      display: none;
+    }
+
+    .detail-shell {
+      position: absolute;
+      inset: 0 0 0 auto;
+      width: min(560px, 100vw);
+      display: flex;
+      justify-content: flex-end;
+      pointer-events: none;
+    }
+
+    .detail-panel {
+      pointer-events: auto;
+      width: min(560px, 100vw);
+      height: 100%;
+      background: rgba(6, 16, 21, 0.96);
+      border-left: 1px solid var(--line);
+      box-shadow: -18px 0 60px rgba(0, 0, 0, 0.42);
+      display: flex;
+      flex-direction: column;
+    }
+
+    .settings-overlay {
+      position: fixed;
+      inset: 0;
+      display: none;
+      z-index: 72;
+      pointer-events: none;
+    }
+
+    .settings-overlay.open {
+      display: block;
+    }
+
+    .settings-shell {
+      position: absolute;
+      inset: 0 0 0 auto;
+      width: min(460px, 100vw);
+      display: flex;
+      justify-content: flex-end;
+      pointer-events: none;
+    }
+
+    .settings-panel {
+      pointer-events: auto;
+      width: min(460px, 100vw);
+      height: 100%;
+      background: rgba(6, 16, 21, 0.98);
+      border-left: 1px solid var(--line);
+      box-shadow: -18px 0 60px rgba(0, 0, 0, 0.42);
+      display: flex;
+      flex-direction: column;
+    }
+
+    .detail-panel-header {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 18px 20px 14px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(6, 16, 21, 0.96);
+      backdrop-filter: blur(12px);
+    }
+
+    .settings-panel-header {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 18px 20px 14px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(6, 16, 21, 0.98);
+      backdrop-filter: blur(12px);
+    }
+
+    .detail-panel-body {
+      flex: 1;
+      overflow: auto;
+      padding: 18px 20px 22px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .settings-panel-body {
+      flex: 1;
+      overflow: auto;
+      padding: 18px 20px 22px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .detail-close {
+      appearance: none;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--text);
+      border-radius: 999px;
+      width: 36px;
+      height: 36px;
+      cursor: pointer;
+      font-size: 18px;
+      line-height: 1;
+    }
+
+    .detail-close:hover {
+      border-color: var(--accent);
+      background: rgba(108, 180, 238, 0.08);
+    }
+
+    .settings-form {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .settings-field {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .settings-label {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--subtle);
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+    }
+
+    .settings-input,
+    .settings-textarea {
+      width: 100%;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--text);
+      padding: 11px 12px;
+    }
+
+    .settings-textarea {
+      min-height: 96px;
+      resize: vertical;
+      line-height: 1.5;
+    }
+
+    .detail-empty {
+      padding: 20px;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .detail-title {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .detail-title h2 {
+      margin: 0;
+      font-size: 24px;
+      letter-spacing: -0.04em;
+      word-break: break-word;
+    }
+
+    .detail-title p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .lane-list,
+    .source-list,
+    .file-list,
+    .log-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .lane-card,
+    .source-card,
+    .file-card,
+    .log-entry,
+    .preflight-card,
+    .confirmation-card,
+    .history-card {
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.025);
+      border-radius: 16px;
+      padding: 14px 16px;
+    }
+
+    .lane-card.state-blocked,
+    .preflight-card.state-blocked,
+    .confirmation-card.danger,
+    .history-card.state-blocked {
+      border-color: rgba(255, 107, 107, 0.4);
+      background: rgba(255, 107, 107, 0.08);
+    }
+
+    .lane-card.state-degraded,
+    .preflight-card.state-degraded,
+    .history-card.state-degraded {
+      border-color: rgba(255, 143, 90, 0.4);
+      background: rgba(255, 143, 90, 0.08);
+    }
+
+    .preflight-card.state-running {
+      border-color: rgba(108, 180, 238, 0.4);
+      background: rgba(108, 180, 238, 0.08);
+    }
+
+    .preflight-card.state-awaiting_preflight {
+      border-color: rgba(83, 209, 200, 0.4);
+      background: rgba(83, 209, 200, 0.08);
+    }
+
+    .preflight-card.state-stale {
+      border-color: rgba(255, 179, 71, 0.4);
+      background: rgba(255, 179, 71, 0.08);
+    }
+
+    .preflight-card.state-unknown {
+      border-color: rgba(132, 169, 189, 0.34);
+      background: rgba(132, 169, 189, 0.06);
+    }
+
+    .lane-card.state-healthy,
+    .preflight-card.state-healthy,
+    .history-card.state-healthy {
+      border-color: rgba(88, 214, 141, 0.32);
+      background: rgba(88, 214, 141, 0.08);
+    }
+
+    .lane-head,
+    .source-head,
+    .file-head,
+    .log-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+      margin-bottom: 8px;
+    }
+
+    .lane-head strong,
+    .source-head strong,
+    .file-head strong,
+    .log-head strong {
+      font-size: 13px;
+    }
+
+    .reason-block,
+    .log-text {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .section-copy {
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: -2px;
+      margin-bottom: 14px;
+      line-height: 1.55;
+    }
+
+    .action-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .action-button {
+      min-width: 0;
+      border-radius: 14px;
+      padding: 10px 12px;
+      text-align: left;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.025);
+      color: var(--text);
+      cursor: pointer;
+      max-width: 100%;
+    }
+
+    .action-button:hover:not(:disabled) {
+      border-color: var(--accent);
+      background: rgba(108, 180, 238, 0.1);
+    }
+
+    .action-button .action-label {
+      display: block;
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .action-button .action-reason {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      margin-top: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 240px;
+    }
+
+    .action-button.state-blocked,
+    .action-button.state-failed {
+      border-color: rgba(255, 107, 107, 0.4);
+    }
+
+    .action-button.state-degraded {
+      border-color: rgba(255, 143, 90, 0.4);
+    }
+
+    .action-button.state-healthy,
+    .action-button.state-awaiting_preflight,
+    .action-button.state-running {
+      border-color: rgba(108, 180, 238, 0.4);
+    }
+
+    .file-section {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .history-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 10px;
+    }
+
+    .history-card {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .history-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: flex-start;
+    }
+
+    .history-title {
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .history-meta {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .history-label {
+      font-size: 11px;
+      color: var(--subtle);
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      font-family: var(--mono);
+    }
+
+    .history-time {
+      font-size: 14px;
+      color: var(--text);
+      line-height: 1.4;
+    }
+
+    .history-time.empty {
+      color: var(--muted);
+      font-weight: 500;
+    }
+
+    .file-card button {
+      width: 100%;
+      background: transparent;
+      border: 0;
+      color: inherit;
+      text-align: left;
+      padding: 0;
+      cursor: pointer;
+    }
+
+    .file-card.selected {
+      border-color: rgba(108, 180, 238, 0.45);
+      background: rgba(108, 180, 238, 0.08);
+    }
+
+    .file-card.disabled {
+      opacity: 0.65;
+    }
+
+    .file-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .code-block {
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: #071015;
+      padding: 14px 16px;
+      overflow: auto;
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.55;
+      white-space: pre;
+      color: #d8f3ff;
+    }
+
+    .empty-state {
+      padding: 14px 16px;
+      border-radius: 16px;
+      border: 1px dashed var(--line-strong);
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .footer-note {
+      font-size: 12px;
+      color: var(--subtle);
+      line-height: 1.55;
+    }
+
+    .inline-code {
+      font-family: var(--mono);
+      color: var(--text);
+    }
+
+    .context-menu {
+      position: fixed;
+      display: none;
+      min-width: 240px;
+      max-width: min(320px, calc(100vw - 24px));
+      padding: 8px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: rgba(6, 16, 21, 0.98);
+      box-shadow: 0 18px 44px rgba(0, 0, 0, 0.34);
+      z-index: 85;
+    }
+
+    .context-menu.open {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .context-menu-item {
+      appearance: none;
+      border: 1px solid transparent;
+      background: rgba(255, 255, 255, 0.02);
+      color: var(--text);
+      border-radius: 12px;
+      padding: 10px 12px;
+      cursor: pointer;
+      text-align: left;
+    }
+
+    .context-menu-item:hover:not(:disabled) {
+      border-color: var(--accent);
+      background: rgba(108, 180, 238, 0.08);
+    }
+
+    .context-menu-item:disabled {
+      opacity: 0.65;
+      cursor: default;
+    }
+
+    .context-menu-empty {
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px dashed var(--line-strong);
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    @media (max-width: 760px) {
+      .hero {
+        grid-template-columns: 1fr;
+      }
+
+      .hero-actions {
+        align-items: flex-start;
+      }
+
+      .panel-header,
+      .panel-body,
+      .hero {
+        padding-left: 16px;
+        padding-right: 16px;
+      }
+
+      th,
+      td {
+        padding-left: 12px;
+        padding-right: 12px;
+      }
+
+      .app {
+        padding: 12px;
+      }
+
+      .branch-sticky-head,
+      .branch-sticky-cell {
+        min-width: 220px;
+        max-width: 220px;
+      }
+
+      .ledger-lane-cell {
+        min-width: 220px;
+        width: 220px;
+      }
+
+      .detail-panel {
+        width: 100vw;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <main class="stack">
+      <section class="panel">
+        <div class="hero">
+          <div>
+            <h1 class="hero-title" id="hero-title">Branch Pipeline Board</h1>
+            <p class="hero-copy" id="hero-copy">This view is driven directly from Rocketboard’s public workflow:api contract. Click any branch to inspect lane reasons, row actions, changed files, and lazy patch previews.</p>
+            <div class="pill-row" id="hero-pills"></div>
+          </div>
+          <div class="hero-actions">
+            <div class="button-row">
+              <button class="button" id="settings-button" type="button" data-settings-open="true">Settings</button>
+              <button class="button primary" id="refresh-button" type="button">Refresh snapshot</button>
+            </div>
+            <div class="footer-note" id="health-note">Checking local dashboard health…</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div class="panel-title">Attention</div>
+          <div class="footer-note" id="attention-summary">Waiting for snapshot…</div>
+        </div>
+        <div class="panel-body">
+          <div class="cards" id="attention-list"></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div class="panel-title">Board Context</div>
+          <div class="footer-note" id="task-meta"></div>
+        </div>
+        <div class="panel-body">
+          <div class="meta-grid" id="active-task-grid"></div>
+          <div id="board-actions-wrap">
+            <div class="panel-title" style="margin-top:18px">Repository Cleanup</div>
+            <p class="section-copy">Cleanup is the remaining board-wide maintenance action. Branch-specific actions live on the branch card, in the detail drawer, and in the card context menu.</p>
+            <div class="action-grid" id="board-actions"></div>
+          </div>
+          <div id="action-feedback-wrap" style="display:none">
+            <div class="panel-title" style="margin-top:18px">Action Feedback</div>
+            <p class="section-copy">Every action runs a Rocketboard preflight first. This shows what most recently happened after a click, even if no detail drawer is open.</p>
+            <div id="action-feedback"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div class="panel-title">Branch Ledger</div>
+          <div class="footer-note" id="branch-summary"></div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead id="branch-head"></thead>
+            <tbody id="branch-body"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="context-menu" id="branch-context-menu" aria-hidden="true"></div>
+
+  <div class="settings-overlay" id="settings-overlay" aria-hidden="true">
+    <div class="settings-shell">
+      <section class="settings-panel">
+        <div class="settings-panel-header">
+          <div>
+            <div class="panel-title">Board Settings</div>
+            <div class="footer-note" id="settings-status">Loading settings…</div>
+          </div>
+          <button class="detail-close" type="button" aria-label="Close settings" data-settings-close="button">×</button>
+        </div>
+        <div class="settings-panel-body" id="settings-content"></div>
+      </section>
+    </div>
+  </div>
+
+  <div class="detail-overlay" id="detail-overlay" aria-hidden="true">
+    <div class="detail-backdrop" data-detail-close="backdrop"></div>
+    <div class="detail-shell">
+      <section class="detail-panel">
+        <div class="detail-panel-header">
+          <div>
+            <div class="panel-title">Branch Detail</div>
+            <div class="footer-note" id="detail-status">No branch selected</div>
+          </div>
+          <button class="detail-close" type="button" aria-label="Close branch detail" data-detail-close="button">×</button>
+        </div>
+        <div class="detail-panel-body" id="detail-content">
+          <div class="detail-empty">Select a branch card to inspect its lane reasons, available actions, changed files, and patch preview.</div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    const DEFAULT_BOARD_TITLE = 'Branch Pipeline Board';
+    const DEFAULT_BOARD_SUBTITLE = 'Opinionated workflow board for branch pipeline triage, action preflight, execution follow-through, and cleanup discipline.';
+
+    const state = {
+      health: null,
+      settings: null,
+      settingsPath: '',
+      settingsOpen: false,
+      settingsDraft: null,
+      settingsNotice: '',
+      snapshot: null,
+      selectedBranchName: '',
+      detailOpen: false,
+      devModeMenuOpen: false,
+      branchContextMenu: {
+        open: false,
+        branchName: '',
+        x: 0,
+        y: 0,
+      },
+      branchDetails: null,
+      selectedFileKey: '',
+      patchEnvelope: null,
+      lastPreflight: null,
+      actionFeedback: null,
+      lastActionContext: null,
+      pendingConfirmation: null,
+      executionId: '',
+      executionEvents: [],
+      executionSnapshot: null,
+      eventSource: null,
+      loading: {
+        settings: false,
+        snapshot: false,
+        branch: false,
+        patch: false,
+        action: false,
+      },
+      refreshTimer: null,
+    };
+
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    function stateClass(value) {
+      return `state-${String(value || 'unknown').replaceAll(/[^a-z0-9_]/gi, '_').toLowerCase()}`;
+    }
+
+    function titleAttr(value) {
+      return value ? ` title="${escapeHtml(value)}"` : '';
+    }
+
+    function currentSettings() {
+      return state.settings || {
+        boardTitle: DEFAULT_BOARD_TITLE,
+        boardSubtitle: DEFAULT_BOARD_SUBTITLE,
+        preferredPort: 3033,
+        autoRefreshSeconds: 30,
+      };
+    }
+
+    function currentAutoRefreshMs() {
+      return Math.max(10_000, Number(currentSettings().autoRefreshSeconds || 30) * 1000);
+    }
+
+    function settingsStatusText() {
+      if (state.loading.settings) {
+        return 'Loading settings…';
+      }
+      if (state.settingsNotice) {
+        return state.settingsNotice;
+      }
+      if (state.settingsPath) {
+        return `Stored locally at ${state.settingsPath}`;
+      }
+      return 'Settings are local to this machine.';
+    }
+
+    function syncSettingsDraft() {
+      state.settingsDraft = {
+        ...currentSettings(),
+      };
+    }
+
+    function openSettings() {
+      state.settingsOpen = true;
+      syncSettingsDraft();
+      closeMenus();
+      render();
+    }
+
+    function closeSettings(resetDraft = true) {
+      state.settingsOpen = false;
+      if (resetDraft) {
+        syncSettingsDraft();
+      }
+      render();
+    }
+
+    function updateSettingsDraft(field, value) {
+      state.settingsDraft = {
+        ...(state.settingsDraft || currentSettings()),
+        [field]: value,
+      };
+    }
+
+    function renderSettingsPanel() {
+      const overlay = document.getElementById('settings-overlay');
+      const content = document.getElementById('settings-content');
+      const status = document.getElementById('settings-status');
+      const settings = state.settingsDraft || currentSettings();
+
+      status.textContent = settingsStatusText();
+
+      if (!state.settingsOpen) {
+        overlay.classList.remove('open');
+        overlay.setAttribute('aria-hidden', 'true');
+        content.innerHTML = '';
+        return;
+      }
+
+      overlay.classList.add('open');
+      overlay.setAttribute('aria-hidden', 'false');
+      content.innerHTML = `
+        <div class="section-copy">These settings are stored per target repo on your machine. This dashboard is intentionally opinionated: use it as a developer operations cockpit for branch flow, action discipline, and cleanup readiness.</div>
+        <form class="settings-form" id="settings-form">
+          <label class="settings-field">
+            <span class="settings-label">Board Name</span>
+            <input class="settings-input" type="text" data-settings-field="boardTitle" value="${escapeHtml(settings.boardTitle || '')}" placeholder="Branch Pipeline Board">
+          </label>
+
+          <label class="settings-field">
+            <span class="settings-label">Board Subtitle</span>
+            <textarea class="settings-textarea" data-settings-field="boardSubtitle" placeholder="Opinionated workflow board for branch pipeline triage...">${escapeHtml(settings.boardSubtitle || '')}</textarea>
+          </label>
+
+          <label class="settings-field">
+            <span class="settings-label">Preferred Port</span>
+            <input class="settings-input" type="number" min="1024" max="65535" step="1" data-settings-field="preferredPort" value="${escapeHtml(settings.preferredPort || 3033)}">
+            <span class="footer-note">Applied the next time you start <span class="inline-code">workflow-kit dashboard</span>.</span>
+          </label>
+
+          <label class="settings-field">
+            <span class="settings-label">Auto Refresh (seconds)</span>
+            <input class="settings-input" type="number" min="10" max="300" step="5" data-settings-field="autoRefreshSeconds" value="${escapeHtml(settings.autoRefreshSeconds || 30)}">
+            <span class="footer-note">The dashboard refreshes snapshot data and the selected branch detail on this cadence.</span>
+          </label>
+        </form>
+
+        <div class="lane-card state-unknown">
+          <div class="lane-head">
+            <strong>Settings File</strong>
+            <span class="mini-pill">local only</span>
+          </div>
+          <div class="reason-block">${escapeHtml(state.settingsPath || 'Settings path unavailable.')}</div>
+        </div>
+
+        <div class="button-row">
+          <button class="button primary" type="button" data-settings-save="true" ${state.loading.settings ? 'disabled' : ''}>Save settings</button>
+          <button class="button" type="button" data-settings-revert="true" ${state.loading.settings ? 'disabled' : ''}>Revert changes</button>
+        </div>
+      `;
+    }
+
+    function formatDate(value) {
+      if (!value) {
+        return '—';
+      }
+      const parsed = new Date(value);
+      if (Number.isNaN(parsed.getTime())) {
+        return value;
+      }
+      return parsed.toLocaleString([], {
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+      });
+    }
+
+    function relativeTime(value) {
+      if (!value) {
+        return 'unknown';
+      }
+      const parsed = new Date(value);
+      if (Number.isNaN(parsed.getTime())) {
+        return value;
+      }
+      const minutes = Math.round((Date.now() - parsed.getTime()) / 60000);
+      if (minutes < 1) {
+        return 'just now';
+      }
+      if (minutes < 60) {
+        return `${minutes}m ago`;
+      }
+      const hours = Math.round(minutes / 60);
+      if (hours < 24) {
+        return `${hours}h ago`;
+      }
+      const days = Math.round(hours / 24);
+      return `${days}d ago`;
+    }
+
+    function formatDateWithRelative(value) {
+      if (!value) {
+        return '';
+      }
+      return `${formatDate(value)} · ${relativeTime(value)}`;
+    }
+
+    function firstTimestamp(...values) {
+      for (const value of values) {
+        if (!value) {
+          continue;
+        }
+        const parsed = new Date(value);
+        if (!Number.isNaN(parsed.getTime())) {
+          return value;
+        }
+      }
+      return '';
+    }
+
+    function extractRecordedTimestamp(reason) {
+      if (!reason) {
+        return '';
+      }
+
+      const patterns = [
+        /recorded on ([^.;\n]+)/i,
+        /deployed on ([^.;\n]+)/i,
+        /merged on ([^.;\n]+)/i,
+        /landed on ([^.;\n]+)/i,
+      ];
+
+      for (const pattern of patterns) {
+        const match = reason.match(pattern);
+        if (!match?.[1]) {
+          continue;
+        }
+        const candidate = match[1].trim();
+        const parsed = new Date(candidate);
+        if (!Number.isNaN(parsed.getTime())) {
+          return parsed.toISOString();
+        }
+      }
+
+      return '';
+    }
+
+    async function fetchJson(path, options = {}) {
+      const response = await fetch(path, {
+        headers: {
+          'Content-Type': 'application/json',
+          ...(options.headers || {}),
+        },
+        ...options,
+      });
+      const text = await response.text();
+      const data = text ? JSON.parse(text) : {};
+
+      if (!response.ok) {
+        const message = data.message || data.error || `HTTP ${response.status}`;
+        throw new Error(message);
+      }
+
+      return data;
+    }
+
+    function getSelectedBranch() {
+      return state.snapshot?.data?.branches?.find((branch) => branch.name === state.selectedBranchName) || null;
+    }
+
+    function laneOrder() {
+      return state.snapshot?.data?.boardContext?.laneOrder || ['Local', 'PR', 'Base', 'Staging', 'Production'];
+    }
+
+    function mapLaneKey(label) {
+      if (label === 'Local') return 'local';
+      if (label === 'PR') return 'pr';
+      if (label.startsWith('Base')) return 'base';
+      if (label === 'Staging') return 'staging';
+      if (label === 'Production') return 'production';
+      return label.toLowerCase();
+    }
+
+    function boardActions() {
+      return state.snapshot?.data?.availableActions || [];
+    }
+
+    function devModeActions() {
+      return boardActions().filter((action) => action.id.startsWith('devmode.'));
+    }
+
+    function cleanupBoardActions() {
+      return boardActions().filter((action) => !action.id.startsWith('devmode.'));
+    }
+
+    function currentActionPhase() {
+      if (state.eventSource) {
+        return 'executing';
+      }
+      if (state.loading.action) {
+        return 'working';
+      }
+      if (state.pendingConfirmation) {
+        return 'confirm';
+      }
+      return 'idle';
+    }
+
+    function hasActionLock() {
+      return currentActionPhase() !== 'idle' && Boolean(state.lastActionContext);
+    }
+
+    function activeBranchLock(branchName) {
+      return hasActionLock()
+        && state.lastActionContext?.scope === 'branch'
+        && state.lastActionContext?.branchName === branchName
+        && currentActionPhase() !== 'confirm';
+    }
+
+    function activeRepoLock() {
+      return hasActionLock() && state.lastActionContext?.scope === 'board';
+    }
+
+    function actionControlDisabled(scope, branchName = '') {
+      if (!hasActionLock()) {
+        return false;
+      }
+
+      if (activeRepoLock()) {
+        return true;
+      }
+
+      if (scope === 'board') {
+        return true;
+      }
+
+      return state.lastActionContext?.scope === 'branch'
+        && state.lastActionContext?.branchName === branchName;
+    }
+
+    function executionStatusLabel() {
+      const phase = currentActionPhase();
+      if (phase === 'executing') {
+        return 'Executing';
+      }
+      if (phase === 'working') {
+        return 'Working';
+      }
+      return 'Locked';
+    }
+
+    function isLaneComplete(lane) {
+      return lane?.state === 'healthy' || lane?.state === 'bypassed';
+    }
+
+    function laneTone(stateValue) {
+      if (stateValue === 'blocked' || stateValue === 'failed') {
+        return 'danger';
+      }
+      if (stateValue === 'running') {
+        return 'running';
+      }
+      if (stateValue === 'awaiting_preflight') {
+        return 'ready';
+      }
+      if (stateValue === 'stale') {
+        return 'stale';
+      }
+      if (stateValue === 'degraded') {
+        return 'caution';
+      }
+      if (stateValue === 'unknown' || stateValue === 'bypassed') {
+        return 'neutral';
+      }
+      return 'good';
+    }
+
+    function resolveActiveLane(branch) {
+      const labels = laneOrder();
+      let fallbackLabel = labels[labels.length - 1] || 'Production';
+
+      for (const label of labels) {
+        const lane = branch.lanes?.[mapLaneKey(label)] || {};
+        fallbackLabel = label;
+        if (!isLaneComplete(lane)) {
+          return {
+            label,
+            lane,
+            key: mapLaneKey(label),
+            tone: laneTone(lane.state),
+          };
+        }
+      }
+
+      const finalLane = branch.lanes?.[mapLaneKey(fallbackLabel)] || {};
+      return {
+        label: fallbackLabel,
+        lane: finalLane,
+        key: mapLaneKey(fallbackLabel),
+        tone: laneTone(finalLane.state),
+      };
+    }
+
+    function releaseReadinessHeadline(mode, release) {
+      if (mode === 'release') {
+        if (release.state === 'healthy') {
+          return 'Release mode ready';
+        }
+        if (release.state === 'degraded') {
+          return 'Release mode needs setup';
+        }
+        if (release.state === 'blocked') {
+          return 'Release mode blocked';
+        }
+        return 'Release mode status unknown';
+      }
+
+      return mode === 'build' ? 'Build mode active' : `${mode || 'Unknown'} mode`;
+    }
+
+    function releaseReadinessCaption(mode, release) {
+      const requestedSurfaces = (release.requestedSurfaces || []).join(', ') || 'frontend';
+      const blockedSurfaces = release.blockedSurfaces || [];
+      const baseBlockedNote = blockedSurfaces.length ? ` Blocked surfaces: ${blockedSurfaces.join(', ')}.` : '';
+
+      if (mode === 'release') {
+        if (release.state === 'healthy') {
+          return `Release mode is active and ${requestedSurfaces} is ready for the protected staging and production lane.${baseBlockedNote}`;
+        }
+
+        if ((release.reason || '').includes('hosted bootstrap pending')) {
+          return `Release mode is active, but hosted bootstrap / external checks are incomplete.${baseBlockedNote}`;
+        }
+
+        if (release.reason) {
+          return `Release mode is active, but ${release.reason}.${baseBlockedNote}`;
+        }
+
+        return `Release mode is active, but readiness details are incomplete.${baseBlockedNote}`;
+      }
+
+      return `Build mode is active. Requested release surfaces: ${requestedSurfaces}.${baseBlockedNote}`;
+    }
+
+    function cleanupCardPresentation(branch, activeLane) {
+      if (activeLane.key === 'production' && branch.cleanup?.eligible) {
+        return {
+          tone: 'cleanup',
+          stateLabel: 'Ready to Clean',
+          reason: branch.cleanup.reason || activeLane.lane.reason || 'This branch is live and ready for cleanup.',
+        };
+      }
+
+      return {
+        tone: activeLane.tone,
+        stateLabel: activeLane.lane.state || 'unknown',
+        reason: activeLane.lane.reason || branch.note || 'No reason provided.',
+      };
+    }
+
+    function lockCardPresentation(branch, cardPresentation) {
+      if (!activeBranchLock(branch.name)) {
+        return cardPresentation;
+      }
+
+      return {
+        tone: 'locked',
+        stateLabel: executionStatusLabel(),
+        reason: state.lastActionContext?.label
+          ? `${state.lastActionContext.label} is in progress for this branch. Other actions are temporarily locked.`
+          : 'A branch action is in progress. Other actions are temporarily locked.',
+        locked: true,
+      };
+    }
+
+    function branchAuthorLabel(branch) {
+      const name = branch?.author?.name || branch?.author?.display || '';
+      return name ? `author ${name}` : 'author unavailable';
+    }
+
+    function closeBranchContextMenu() {
+      state.branchContextMenu.open = false;
+      state.branchContextMenu.branchName = '';
+    }
+
+    function closeMenus() {
+      state.devModeMenuOpen = false;
+      closeBranchContextMenu();
+    }
+
+    function setActionFeedback(feedback) {
+      state.actionFeedback = {
+        at: new Date().toISOString(),
+        ...feedback,
+      };
+    }
+
+    function renderHero() {
+      const settings = currentSettings();
+      const boardContext = state.snapshot?.data?.boardContext;
+      document.getElementById('hero-title').textContent = settings.boardTitle || DEFAULT_BOARD_TITLE;
+      document.getElementById('hero-copy').textContent = settings.boardSubtitle || DEFAULT_BOARD_SUBTITLE;
+      document.title = settings.boardTitle || DEFAULT_BOARD_TITLE;
+      const pills = [];
+      if (boardContext) {
+        pills.push(`<div class="pill"><span>Mode</span><strong>${escapeHtml(boardContext.mode || 'unknown')}</strong></div>`);
+        pills.push(`<div class="pill"><span>Base</span><strong>${escapeHtml(boardContext.baseBranch || 'main')}</strong></div>`);
+        pills.push(`<div class="pill"><span>Freshness</span><strong>${escapeHtml(boardContext.overallFreshness?.state || 'unknown')}</strong></div>`);
+        pills.push(`<div class="pill"><span>Last Checked</span><strong>${escapeHtml(relativeTime(boardContext.overallFreshness?.checkedAt))}</strong></div>`);
+      }
+      document.getElementById('hero-pills').innerHTML = pills.join('') || '<div class="pill"><span>Snapshot</span><strong>Loading…</strong></div>';
+
+      const health = state.health;
+      const healthNote = document.getElementById('health-note');
+      if (!health) {
+        healthNote.textContent = 'Checking local dashboard health…';
+        return;
+      }
+      if (!health.workflowApiConfigured) {
+        healthNote.textContent = `Repo ${health.repoRoot} is reachable, but workflow:api is not configured there.`;
+        return;
+      }
+      healthNote.textContent = `Serving ${health.repoRoot} · workflow:api ready · refreshed ${relativeTime(state.snapshot?.data?.boardContext?.overallFreshness?.checkedAt)}`;
+    }
+
+    function renderAttention() {
+      const attention = state.snapshot?.data?.attention || [];
+      const list = document.getElementById('attention-list');
+      const summary = document.getElementById('attention-summary');
+
+      if (!attention.length) {
+        summary.textContent = 'No blockers or warnings surfaced by the snapshot.';
+        list.innerHTML = '<div class="empty-state">No attention items. The board is quiet right now.</div>';
+        return;
+      }
+
+      const blockers = attention.filter((item) => item.severity === 'blocker').length;
+      summary.textContent = `${blockers} blocker${blockers === 1 ? '' : 's'} · ${attention.length} total items`;
+
+      list.innerHTML = attention.map((item) => `
+        <article class="attention-card ${escapeHtml(item.severity || 'warning')}">
+          <div class="attention-head">
+            <div class="attention-severity ${escapeHtml(item.severity || 'warning')}">${escapeHtml(item.severity || 'warning')}</div>
+            <div class="footer-note">${escapeHtml(item.branch || item.lane || 'board')}</div>
+          </div>
+          <div class="attention-reason">${escapeHtml(item.reason || 'No reason provided.')}</div>
+          <div class="attention-next">${item.safeNextAction ? `Safe next action: ${escapeHtml(item.safeNextAction)}` : 'No safe next action suggested.'}</div>
+        </article>
+      `).join('');
+    }
+
+    function renderActiveTask() {
+      const boardContext = state.snapshot?.data?.boardContext || {};
+      const activeTask = boardContext.activeTask;
+      const release = boardContext.releaseReadiness || {};
+      const mode = boardContext.mode || 'unknown';
+      const taskMeta = document.getElementById('task-meta');
+      taskMeta.textContent = activeTask ? `Task lock updated ${relativeTime(activeTask.updatedAt)}` : 'No active task lock in this checkout.';
+
+      const cards = [];
+      const modeActions = devModeActions();
+      const cleanupActions = cleanupBoardActions();
+
+      cards.push(`
+        <article class="meta-card">
+          <div class="eyebrow">Current Checkout</div>
+          <div class="headline">${escapeHtml(activeTask?.taskSlug || 'No active task')}</div>
+          <div class="caption">${escapeHtml(activeTask?.branchName || 'No task lock is active in the checkout this dashboard is pointed at.')}</div>
+          <div class="footer-note">${escapeHtml(activeTask?.worktreePath ? `Worktree: ${activeTask.worktreePath}` : 'The branch board still works even when the current checkout is not inside a task worktree.')}</div>
+        </article>
+      `);
+
+      cards.push(`
+        <article class="meta-card">
+          <div class="eyebrow">Release Readiness</div>
+          <div class="headline">${escapeHtml(releaseReadinessHeadline(mode, release))}</div>
+          <div class="caption">${escapeHtml(releaseReadinessCaption(mode, release))}</div>
+          <div class="footer-note">${escapeHtml(`Requested surfaces: ${(release.requestedSurfaces || []).join(', ') || '—'}`)}</div>
+        </article>
+      `);
+
+      cards.push(`
+        <article class="meta-card">
+          <div class="meta-card-head">
+            <div>
+              <div class="eyebrow">Dev Mode</div>
+              <div class="headline">${escapeHtml(mode)}</div>
+            </div>
+            <div class="menu-shell">
+              <button
+                class="menu-button"
+                type="button"
+                data-devmode-toggle="true"
+                aria-label="Open dev mode menu"
+                aria-expanded="${state.devModeMenuOpen ? 'true' : 'false'}"
+                ${actionControlDisabled('board') ? 'disabled' : ''}
+              >
+                <span class="chevron">⌄</span>
+              </button>
+              <div class="menu-popover ${state.devModeMenuOpen ? 'open' : ''}">
+                ${modeActions.length
+                  ? modeActions.map((action) => `
+                    <button class="menu-item" type="button" data-devmode-action="${escapeHtml(action.id)}" ${actionControlDisabled('board') ? 'disabled' : ''}>
+                      <span class="action-label">${escapeHtml(action.label || action.id)}</span>
+                      <span class="action-reason">${escapeHtml(action.reason || 'No reason provided.')}</span>
+                    </button>
+                  `).join('')
+                  : '<div class="context-menu-empty">No mode-switch actions are available right now.</div>'}
+              </div>
+            </div>
+          </div>
+          <div class="caption">${escapeHtml(mode === 'release' ? 'Protected lane is active. Use the menu to switch between build and release modes.' : 'Fast build lane is active. Use the menu to switch between build and release modes.')}</div>
+          <div class="footer-note">${escapeHtml((release.blockedSurfaces || []).length ? `Blocked surfaces: ${(release.blockedSurfaces || []).join(', ')}` : `Requested release surfaces: ${(release.requestedSurfaces || []).join(', ') || '—'}`)}</div>
+        </article>
+      `);
+
+      document.getElementById('active-task-grid').innerHTML = cards.join('');
+
+      const boardActions = document.getElementById('board-actions');
+      const boardActionsWrap = document.getElementById('board-actions-wrap');
+      if (!cleanupActions.length) {
+        boardActionsWrap.style.display = 'none';
+        boardActions.innerHTML = '';
+      } else {
+        boardActionsWrap.style.display = '';
+        boardActions.innerHTML = cleanupActions.map((action) => actionButtonMarkup(action, 'board')).join('');
+      }
+
+      renderActionFeedback();
+    }
+
+    function renderBranchContextMenu() {
+      const menu = document.getElementById('branch-context-menu');
+      const { open, branchName, x, y } = state.branchContextMenu;
+
+      if (!open || !branchName) {
+        menu.className = 'context-menu';
+        menu.setAttribute('aria-hidden', 'true');
+        menu.innerHTML = '';
+        menu.style.left = '0px';
+        menu.style.top = '0px';
+        return;
+      }
+
+      const branch = state.snapshot?.data?.branches?.find((entry) => entry.name === branchName);
+      const actions = branch?.availableActions || [];
+      const detailButton = `
+        <button class="context-menu-item" type="button" data-context-open="${encodeURIComponent(branchName)}">
+          <span class="action-label">Open branch detail</span>
+          <span class="action-reason">Inspect lane reasons, files, patch previews, and cleanup state.</span>
+        </button>
+      `;
+
+      const actionButtons = actions.length
+        ? actions.map((action) => `
+            <button class="context-menu-item" type="button" data-context-action="${escapeHtml(action.id)}" data-context-branch="${encodeURIComponent(branchName)}" ${actionControlDisabled('branch', branchName) ? 'disabled' : ''}>
+              <span class="action-label">${escapeHtml(action.label || action.id)}</span>
+              <span class="action-reason">${escapeHtml(action.reason || 'No reason provided.')}</span>
+            </button>
+          `).join('')
+        : '<div class="context-menu-empty">No branch-scoped actions are available for this card right now.</div>';
+
+      menu.className = 'context-menu open';
+      menu.setAttribute('aria-hidden', 'false');
+      menu.style.left = `${Math.max(12, Math.min(x, window.innerWidth - 332))}px`;
+      menu.style.top = `${Math.max(12, Math.min(y, window.innerHeight - 260))}px`;
+      menu.innerHTML = `${detailButton}${actionButtons}`;
+    }
+
+    function renderActionFeedback() {
+      const wrap = document.getElementById('action-feedback-wrap');
+      const container = document.getElementById('action-feedback');
+      const feedback = state.actionFeedback;
+
+      if (!feedback) {
+        wrap.style.display = 'none';
+        container.innerHTML = '';
+        return;
+      }
+
+      wrap.style.display = '';
+      container.innerHTML = `
+        <article class="preflight-card ${stateClass(feedback.state)}">
+          <div class="lane-head">
+            <strong>${escapeHtml(feedback.label || 'Action update')}</strong>
+            <span class="mini-pill">${escapeHtml(feedback.state || 'unknown')}</span>
+          </div>
+          <div class="reason-block">${escapeHtml(feedback.reason || 'No action feedback available.')}</div>
+          <div class="footer-note" style="margin-top:10px">${escapeHtml(feedback.detail || `Updated ${relativeTime(feedback.at)}`)}</div>
+        </article>
+      `;
+    }
+
+    function actionButtonMarkup(action, scope, branchName = '') {
+      return `
+        <button
+          class="action-button ${stateClass(action.state)}"
+          type="button"
+          data-action-trigger="${escapeHtml(action.id)}"
+          data-action-scope="${escapeHtml(scope)}"
+          ${actionControlDisabled(scope, branchName) ? 'disabled' : ''}
+          ${titleAttr(action.reason)}
+        >
+          <span class="action-label">${escapeHtml(action.label || action.id)}</span>
+          <span class="action-reason">${escapeHtml(action.reason || 'No reason provided.')}</span>
+        </button>
+      `;
+    }
+
+    function renderBranchTable() {
+      const branches = state.snapshot?.data?.branches || [];
+      const selectedBranchName = state.selectedBranchName;
+      document.getElementById('branch-summary').textContent = `${branches.length} branches · one active release card per branch`;
+
+      document.getElementById('branch-head').innerHTML = `
+        <tr>
+          <th class="branch-sticky-head">Branch</th>
+          ${laneOrder().map((label) => `<th>${escapeHtml(label)}</th>`).join('')}
+        </tr>
+      `;
+
+      if (!branches.length) {
+        document.getElementById('branch-body').innerHTML = `<tr><td colspan="${laneOrder().length + 1}"><div class="empty-state">No branches were returned by the snapshot.</div></td></tr>`;
+        return;
+      }
+
+      document.getElementById('branch-body').innerHTML = branches.map((branch) => {
+        const activeLane = resolveActiveLane(branch);
+        const cardPresentation = lockCardPresentation(branch, cleanupCardPresentation(branch, activeLane));
+        const laneCells = laneOrder().map((label) => {
+          const lane = branch.lanes?.[mapLaneKey(label)] || {};
+          if (label === activeLane.label) {
+            return `
+              <td class="ledger-lane-cell">
+                <button
+                  class="pipeline-card tone-${cardPresentation.tone}${cardPresentation.locked ? ' is-locked' : ''}"
+                  type="button"
+                  data-branch-open="${encodeURIComponent(branch.name)}"
+                  data-branch-card="${encodeURIComponent(branch.name)}"
+                  ${titleAttr(cardPresentation.reason)}
+                >
+                  <div class="pipeline-card-head">
+                    <div class="pipeline-card-title">
+                      <strong>${escapeHtml(branch.name)}</strong>
+                      <span>${escapeHtml(label)}</span>
+                    </div>
+                    <span class="status-pill">${escapeHtml(cardPresentation.stateLabel)}</span>
+                  </div>
+                  <div class="pipeline-card-reason">${escapeHtml(cardPresentation.reason)}</div>
+                  <div class="pipeline-card-footer">
+                    <span>${escapeHtml(branch.task?.taskSlug ? `task ${branch.task.taskSlug}` : 'no active task')}</span>
+                    <span>${escapeHtml(branchAuthorLabel(branch))}</span>
+                  </div>
+                </button>
+              </td>
+            `;
+          }
+
+          const trackClass = isLaneComplete(lane) ? 'complete' : 'pending';
+          return `
+            <td class="ledger-lane-cell" ${titleAttr(lane.reason)}>
+              <div class="lane-track ${trackClass}" aria-hidden="true"></div>
+            </td>
+          `;
+        }).join('');
+
+        return `
+          <tr class="${branch.name === selectedBranchName && state.detailOpen ? 'selected' : ''}">
+            <td class="branch-sticky-cell">
+              <div class="branch-name">
+                <strong>${escapeHtml(branch.name)}</strong>
+                <div class="branch-note">${escapeHtml(branch.note || (branch.task?.taskSlug ? `Task ${branch.task.taskSlug}` : 'No branch note.'))}</div>
+                <div class="mini-pills" style="margin-top:8px">
+                  ${(branch.surfaces || []).map((surface) => `<span class="mini-pill">${escapeHtml(surface)}</span>`).join('') || '<span class="mini-pill">none</span>'}
+                </div>
+              </div>
+            </td>
+            ${laneCells}
+          </tr>
+        `;
+      }).join('');
+    }
+
+    function renderSourceHealth(items) {
+      if (!items.length) {
+        return '<div class="empty-state">No source health diagnostics in this snapshot.</div>';
+      }
+
+      return `
+        <div class="source-list">
+          ${items.map((item) => `
+            <article class="source-card ${stateClass(item.state)}">
+              <div class="source-head">
+                <strong>${escapeHtml(item.name)}</strong>
+                <span class="mini-pill">${escapeHtml(item.state)}</span>
+              </div>
+              <div class="reason-block">${escapeHtml(item.reason || 'No source-health reason provided.')}</div>
+            </article>
+          `).join('')}
+        </div>
+      `;
+    }
+
+    function buildHistoryEntries(detailBranch) {
+      return laneOrder().map((label) => {
+        const key = mapLaneKey(label);
+        const lane = detailBranch.lanes?.[key] || {};
+        const observedAt = firstTimestamp(lane.freshness?.checkedAt, lane.freshness?.observedAt);
+        const recordedAt = extractRecordedTimestamp(lane.reason);
+
+        if (key === 'local') {
+          return {
+            label,
+            state: lane.state || 'unknown',
+            primaryLabel: detailBranch.task?.updatedAt ? 'Task/worktree updated' : 'Observed',
+            primaryAt: firstTimestamp(detailBranch.task?.updatedAt, observedAt),
+            emptyText: 'No local timestamp available.',
+            note: detailBranch.task?.worktreePath
+              ? `Worktree: ${detailBranch.task.worktreePath}`
+              : (lane.reason || 'No local history recorded.'),
+            secondaryLabel: detailBranch.task?.updatedAt && observedAt && detailBranch.task.updatedAt !== observedAt ? 'Observed' : '',
+            secondaryAt: detailBranch.task?.updatedAt && detailBranch.task.updatedAt !== observedAt ? observedAt : '',
+          };
+        }
+
+        if (key === 'pr') {
+          const prNote = detailBranch.pr?.number
+            ? `PR #${detailBranch.pr.number}${detailBranch.pr.state ? ` · ${detailBranch.pr.state.toLowerCase()}` : ''}${detailBranch.pr.url ? ` · ${detailBranch.pr.url}` : ''}`
+            : (lane.reason || 'No PR recorded for this branch.');
+
+          return {
+            label,
+            state: lane.state || 'unknown',
+            primaryLabel: detailBranch.pr?.mergedAt ? 'Merged' : 'Observed',
+            primaryAt: firstTimestamp(detailBranch.pr?.mergedAt, observedAt),
+            emptyText: detailBranch.pr?.number
+              ? 'PR transition time is not exposed by the current snapshot.'
+              : 'No PR history recorded yet.',
+            note: detailBranch.pr?.number && !detailBranch.pr?.mergedAt
+              ? `${prNote}. The snapshot does not currently expose when the PR was first opened.`
+              : prNote,
+            secondaryLabel: detailBranch.pr?.mergedAt && observedAt && detailBranch.pr.mergedAt !== observedAt ? 'Observed' : '',
+            secondaryAt: detailBranch.pr?.mergedAt && detailBranch.pr.mergedAt !== observedAt ? observedAt : '',
+          };
+        }
+
+        if (key === 'base') {
+          const baseNote = detailBranch.mergedSha
+            ? `Merged SHA ${detailBranch.mergedSha.slice(0, 7)} is recorded for this branch.`
+            : (lane.reason || 'No base-branch history recorded.');
+
+          return {
+            label,
+            state: lane.state || 'unknown',
+            primaryLabel: recordedAt ? 'Recorded on base' : 'Observed',
+            primaryAt: firstTimestamp(recordedAt, observedAt),
+            emptyText: detailBranch.mergedSha
+              ? 'Exact base-entry time is not exposed by the current snapshot.'
+              : 'No base-branch history recorded yet.',
+            note: detailBranch.mergedSha && !recordedAt
+              ? `${baseNote} The exact time it landed on base is not currently exposed.`
+              : baseNote,
+            secondaryLabel: recordedAt && observedAt && recordedAt !== observedAt ? 'Observed' : '',
+            secondaryAt: recordedAt && recordedAt !== observedAt ? observedAt : '',
+          };
+        }
+
+        const deployLabel = key === 'staging' ? 'Staging deploy recorded' : 'Production deploy recorded';
+        const defaultDeployNote = key === 'staging'
+          ? 'No staging deploy history recorded.'
+          : 'No production deploy history recorded.';
+
+        return {
+          label,
+          state: lane.state || 'unknown',
+          primaryLabel: recordedAt ? deployLabel : 'Observed',
+          primaryAt: firstTimestamp(recordedAt, observedAt),
+          emptyText: defaultDeployNote,
+          note: lane.reason || defaultDeployNote,
+          secondaryLabel: recordedAt && observedAt && recordedAt !== observedAt ? 'Observed' : '',
+          secondaryAt: recordedAt && recordedAt !== observedAt ? observedAt : '',
+        };
+      });
+    }
+
+    function historyCardMarkup(entry) {
+      return `
+        <article class="history-card ${stateClass(entry.state)}">
+          <div class="history-head">
+            <div class="history-title">${escapeHtml(entry.label)}</div>
+            <span class="mini-pill">${escapeHtml(entry.state || 'unknown')}</span>
+          </div>
+          <div class="history-meta">
+            <span class="history-label">${escapeHtml(entry.primaryLabel)}</span>
+            <strong class="history-time ${entry.primaryAt ? '' : 'empty'}">${escapeHtml(entry.primaryAt ? formatDateWithRelative(entry.primaryAt) : entry.emptyText)}</strong>
+          </div>
+          ${entry.secondaryAt ? `
+            <div class="history-meta">
+              <span class="history-label">${escapeHtml(entry.secondaryLabel)}</span>
+              <strong class="history-time">${escapeHtml(formatDateWithRelative(entry.secondaryAt))}</strong>
+            </div>
+          ` : ''}
+          <div class="reason-block">${escapeHtml(entry.note || 'No history note available.')}</div>
+        </article>
+      `;
+    }
+
+    function renderDetail() {
+      const container = document.getElementById('detail-content');
+      const detailStatus = document.getElementById('detail-status');
+      const overlay = document.getElementById('detail-overlay');
+      const selectedBranch = getSelectedBranch();
+
+      if (!state.detailOpen || !selectedBranch) {
+        overlay.classList.remove('open');
+        overlay.setAttribute('aria-hidden', 'true');
+        detailStatus.textContent = 'No branch selected';
+        container.innerHTML = '<div class="detail-empty">Select a branch card to inspect its lane reasons, file lists, and patch preview.</div>';
+        return;
+      }
+
+      overlay.classList.add('open');
+      overlay.setAttribute('aria-hidden', 'false');
+      detailStatus.textContent = state.loading.branch ? 'Loading branch detail…' : selectedBranch.name;
+
+      const branchData = state.branchDetails?.data;
+      const detailBranch = branchData?.branch || selectedBranch;
+      const availableActions = detailBranch.availableActions || [];
+      const branchFiles = branchData?.branchFiles || [];
+      const workspaceFiles = branchData?.workspaceFiles || [];
+      const patchData = state.patchEnvelope?.data;
+      const selectedFileReason = patchData?.reason || '';
+      const preflightData = state.lastPreflight?.data?.preflight || null;
+      const preflightAction = state.lastPreflight?.data?.action || null;
+      const executionEvents = state.executionEvents;
+
+      const laneCards = laneOrder().map((label) => {
+        const lane = detailBranch.lanes?.[mapLaneKey(label)] || {};
+        return `
+          <article class="lane-card ${stateClass(lane.state)}">
+            <div class="lane-head">
+              <strong>${escapeHtml(label)}</strong>
+              <span class="mini-pill">${escapeHtml(lane.state || 'unknown')}</span>
+            </div>
+            <div class="reason-block">${escapeHtml(lane.reason || 'No reason provided.')}</div>
+          </article>
+        `;
+      }).join('');
+
+      const renderFileSection = (title, files, scope) => {
+        if (!files.length) {
+          return `
+            <div class="file-section">
+              <div class="panel-title">${escapeHtml(title)}</div>
+              <div class="empty-state">No ${escapeHtml(scope)} file changes for this branch.</div>
+            </div>
+          `;
+        }
+
+        return `
+          <div class="file-section">
+            <div class="panel-title">${escapeHtml(title)}</div>
+            <div class="file-list">
+              ${files.map((file) => {
+                const fileKey = `${file.scope}:${file.path}`;
+                const selected = state.selectedFileKey === fileKey;
+                const disabled = !file.patchAvailable;
+                return `
+                  <article class="file-card ${selected ? 'selected' : ''} ${disabled ? 'disabled' : ''}">
+                    <button
+                      type="button"
+                      data-file-select="${encodeURIComponent(file.path)}"
+                      data-file-scope="${escapeHtml(file.scope)}"
+                      ${disabled ? 'disabled' : ''}
+                    >
+                      <div class="file-head">
+                        <strong>${escapeHtml(file.path)}</strong>
+                        <span class="mini-pill">${escapeHtml(file.changeType)}</span>
+                      </div>
+                      <div class="reason-block">${escapeHtml(file.oldPath ? `Renamed from ${file.oldPath}` : file.reason || (file.patchAvailable ? 'Click to load the patch preview.' : 'Patch preview unavailable.'))}</div>
+                      <div class="file-meta">
+                        <span class="mini-pill">${escapeHtml(file.scope)}</span>
+                        <span>${file.patchAvailable ? 'Patch preview ready' : escapeHtml(file.reason || 'Patch preview unavailable')}</span>
+                      </div>
+                    </button>
+                  </article>
+                `;
+              }).join('')}
+            </div>
+          </div>
+        `;
+      };
+
+      const preflightMarkup = preflightData ? `
+        <div>
+          <div class="panel-title">Latest Preflight</div>
+          <article class="preflight-card ${stateClass(preflightData.state)}">
+            <div class="lane-head">
+              <strong>${escapeHtml(preflightAction?.label || preflightAction?.id || 'Action preflight')}</strong>
+              <span class="mini-pill">${escapeHtml(preflightData.state || 'unknown')}</span>
+            </div>
+            <div class="reason-block">${escapeHtml(preflightData.reason || 'No preflight reason provided.')}</div>
+          </article>
+        </div>
+      ` : '';
+
+      const confirmationMarkup = state.pendingConfirmation ? `
+        <div>
+          <div class="panel-title">Confirmation Required</div>
+          <article class="confirmation-card danger">
+            <div class="reason-block">${escapeHtml(state.pendingConfirmation.preflight?.data?.preflight?.reason || 'This action requires explicit confirmation.')}</div>
+            <div class="button-row" style="margin-top:12px">
+              <button class="button danger" type="button" data-confirm-action="yes">Confirm and execute</button>
+              <button class="button subtle" type="button" data-confirm-action="no">Cancel</button>
+            </div>
+          </article>
+        </div>
+      ` : '';
+
+      const executionMarkup = executionEvents.length ? `
+        <div>
+          <div class="panel-title">Execution Console</div>
+          <div class="log-list">
+            ${executionEvents.map((entry) => `
+              <article class="log-entry">
+                <div class="log-head">
+                  <strong>${escapeHtml(entry.type)}</strong>
+                  <span class="mini-pill">${escapeHtml(formatDate(entry.at))}</span>
+                </div>
+                <div class="log-text">${escapeHtml(entry.text)}</div>
+              </article>
+            `).join('')}
+          </div>
+        </div>
+      ` : '';
+
+      const historyMarkup = `
+        <div>
+          <div class="panel-title">History</div>
+          <p class="section-copy">This timeline uses the exact timestamps exposed by Rocketboard today. When the contract does not expose a true transition time yet, the panel shows the latest observed time instead of guessing.</p>
+          <div class="history-grid">
+            ${buildHistoryEntries(detailBranch).map((entry) => historyCardMarkup(entry)).join('')}
+          </div>
+        </div>
+      `;
+
+      const patchMarkup = patchData ? `
+        <div>
+          <div class="panel-title">Patch Preview</div>
+          ${patchData.patch ? `
+            <div class="code-block">${escapeHtml(patchData.patch)}</div>
+          ` : `
+            <div class="empty-state">${escapeHtml(selectedFileReason || 'Patch preview is unavailable for this file.')}</div>
+          `}
+          <div class="footer-note" style="margin-top:10px">
+            ${patchData.truncated ? 'Patch preview truncated by Rocketboard.' : 'Patch preview loaded lazily from Rocketboard.'}
+          </div>
+        </div>
+      ` : `
+        <div>
+          <div class="panel-title">Patch Preview</div>
+          <div class="empty-state">${state.loading.patch ? 'Loading patch preview…' : 'Select a file to load its patch preview.'}</div>
+        </div>
+      `;
+
+      container.innerHTML = `
+        <div class="detail-title">
+          <h2>${escapeHtml(detailBranch.name)}</h2>
+          <p>${escapeHtml(detailBranch.note || 'No branch note available.')}</p>
+          <div class="mini-pills">
+            ${(detailBranch.surfaces || []).map((surface) => `<span class="mini-pill">${escapeHtml(surface)}</span>`).join('') || '<span class="mini-pill">no surfaces</span>'}
+            ${detailBranch.task?.taskSlug ? `<span class="mini-pill">task ${escapeHtml(detailBranch.task.taskSlug)}</span>` : ''}
+            ${detailBranch.pr?.number ? `<span class="mini-pill">PR #${escapeHtml(detailBranch.pr.number)}</span>` : '<span class="mini-pill">No PR linked</span>'}
+          </div>
+        </div>
+
+        <div>
+          <div class="panel-title">Lane Reasons</div>
+          <p class="section-copy">These reasons come directly from <span class="inline-code">snapshot.data.branches[].lanes</span>. Red and degraded states should be read literally, not inferred from color alone.</p>
+          <div class="lane-list">${laneCards}</div>
+        </div>
+
+        ${historyMarkup}
+
+        <div>
+          <div class="panel-title">Row Actions</div>
+          <p class="section-copy">Action buttons use <span class="inline-code">branch.availableActions</span>, then call <span class="inline-code">workflow:api action</span> for exact preflight before execution.</p>
+          <div class="action-grid">
+            ${availableActions.length ? availableActions.map((action) => actionButtonMarkup(action, 'branch', detailBranch.name)).join('') : '<div class="empty-state">No row-scoped actions are available for this branch in the current snapshot.</div>'}
+          </div>
+        </div>
+
+        ${preflightMarkup}
+        ${confirmationMarkup}
+        ${executionMarkup}
+
+        <div>
+          <div class="panel-title">Branch Files</div>
+          <p class="section-copy">Committed changes relative to base stay separate from live dirty worktree changes. Patch previews are loaded only when you click a file.</p>
+          ${renderFileSection('Committed Branch Diff', branchFiles, 'branch')}
+          ${renderFileSection('Workspace Diff', workspaceFiles, 'workspace')}
+        </div>
+
+        ${patchMarkup}
+
+        <div>
+          <div class="panel-title">Cleanup</div>
+          <article class="lane-card ${detailBranch.cleanup?.eligible ? 'state-degraded' : 'state-unknown'}">
+            <div class="lane-head">
+              <strong>${escapeHtml(detailBranch.cleanup?.eligible ? 'Ready to Clean' : 'Hold')}</strong>
+              <span class="mini-pill">${escapeHtml(detailBranch.cleanup?.available ? 'available' : 'not available')}</span>
+            </div>
+            <div class="reason-block">${escapeHtml(detailBranch.cleanup?.reason || 'No cleanup guidance provided.')}</div>
+          </article>
+        </div>
+
+        <div>
+          <div class="panel-title">Snapshot Diagnostics</div>
+          ${renderSourceHealth(state.snapshot?.data?.sourceHealth || [])}
+        </div>
+      `;
+    }
+
+    async function loadHealth() {
+      state.health = await fetchJson('/api/health');
+      renderHero();
+    }
+
+    async function loadSettings() {
+      state.loading.settings = true;
+      renderSettingsPanel();
+      try {
+        const response = await fetchJson('/api/settings');
+        state.settings = response.settings || currentSettings();
+        state.settingsPath = response.settingsPath || '';
+        syncSettingsDraft();
+        state.settingsNotice = state.settingsPath
+          ? `Stored locally at ${state.settingsPath}`
+          : 'Settings are local to this machine.';
+      } finally {
+        state.loading.settings = false;
+        render();
+      }
+    }
+
+    async function saveSettings() {
+      state.loading.settings = true;
+      state.settingsNotice = 'Saving settings…';
+      render();
+      try {
+        const response = await fetchJson('/api/settings', {
+          method: 'PUT',
+          body: JSON.stringify({ settings: state.settingsDraft || currentSettings() }),
+        });
+        state.settings = response.settings || currentSettings();
+        state.settingsPath = response.settingsPath || state.settingsPath;
+        syncSettingsDraft();
+        state.settingsNotice = response.message
+          ? `${response.message}${state.settingsPath ? ` · ${state.settingsPath}` : ''}`
+          : (state.settingsPath ? `Stored locally at ${state.settingsPath}` : 'Settings saved.');
+        scheduleAutoRefresh();
+      } catch (error) {
+        state.settingsNotice = error instanceof Error ? error.message : String(error);
+      } finally {
+        state.loading.settings = false;
+        render();
+      }
+    }
+
+    async function loadSnapshot(force = false) {
+      state.loading.snapshot = true;
+      render();
+      try {
+        state.snapshot = await fetchJson(`/api/snapshot${force ? '?refresh=1' : ''}`);
+        const branches = state.snapshot?.data?.branches || [];
+        const stillExists = branches.some((branch) => branch.name === state.selectedBranchName);
+        if (!stillExists) {
+          state.selectedBranchName = '';
+          state.detailOpen = false;
+          state.branchDetails = null;
+          state.patchEnvelope = null;
+          state.selectedFileKey = '';
+        }
+      } finally {
+        state.loading.snapshot = false;
+        render();
+      }
+    }
+
+    async function loadBranch(branchName, force = false) {
+      if (!branchName) {
+        return;
+      }
+      state.selectedBranchName = branchName;
+      state.detailOpen = true;
+      state.loading.branch = true;
+      if (force) {
+        state.patchEnvelope = null;
+        state.selectedFileKey = '';
+      }
+      render();
+      try {
+        state.branchDetails = await fetchJson(`/api/branch/${encodeURIComponent(branchName)}`);
+      } finally {
+        state.loading.branch = false;
+        render();
+      }
+    }
+
+    async function loadPatch(filePath, scope) {
+      const branchName = state.selectedBranchName;
+      if (!branchName || !filePath || !scope) {
+        return;
+      }
+      state.selectedFileKey = `${scope}:${filePath}`;
+      state.loading.patch = true;
+      render();
+      try {
+        const search = new URLSearchParams({ file: filePath, scope });
+        state.patchEnvelope = await fetchJson(`/api/branch/${encodeURIComponent(branchName)}/patch?${search.toString()}`);
+      } finally {
+        state.loading.patch = false;
+        render();
+      }
+    }
+
+    function recordExecutionEvent(type, payload) {
+      const text = payload?.chunk
+        || payload?.message
+        || payload?.envelope?.message
+        || payload?.envelope?.data?.preflight?.reason
+        || JSON.stringify(payload, null, 2);
+
+      state.executionEvents.push({
+        type,
+        at: payload?.at || new Date().toISOString(),
+        text,
+      });
+      renderDetail();
+    }
+
+    function closeExecutionStream() {
+      if (state.eventSource) {
+        state.eventSource.close();
+        state.eventSource = null;
+      }
+    }
+
+    async function refreshAfterExecution() {
+      await loadSnapshot(true);
+      if (state.selectedBranchName) {
+        await loadBranch(state.selectedBranchName, true);
+      }
+    }
+
+    function attachExecutionStream(executionId) {
+      closeExecutionStream();
+      state.executionId = executionId;
+      state.executionEvents = [];
+      state.executionSnapshot = null;
+      setActionFeedback({
+        label: state.lastActionContext?.label || 'Action execution',
+        state: 'running',
+        reason: 'Execution started.',
+        detail: state.lastActionContext?.branchName
+          ? `Branch action for ${state.lastActionContext.branchName}.`
+          : 'Repository action.',
+      });
+
+      const source = new EventSource(`/api/executions/${executionId}/events`);
+      state.eventSource = source;
+
+      source.addEventListener('start', (event) => {
+        const parsed = JSON.parse(event.data);
+        recordExecutionEvent('start', parsed.payload);
+      });
+      source.addEventListener('stdout', (event) => {
+        const parsed = JSON.parse(event.data);
+        recordExecutionEvent('stdout', parsed.payload);
+      });
+      source.addEventListener('stderr', (event) => {
+        const parsed = JSON.parse(event.data);
+        recordExecutionEvent('stderr', parsed.payload);
+      });
+      source.addEventListener('error', async (event) => {
+        if (event.data) {
+          const parsed = JSON.parse(event.data);
+          recordExecutionEvent('error', parsed.payload);
+          setActionFeedback({
+            label: state.lastActionContext?.label || 'Action execution',
+            state: 'failed',
+            reason: parsed.payload?.message || 'Execution failed.',
+            detail: state.lastActionContext?.branchName
+              ? `Branch action for ${state.lastActionContext.branchName}.`
+              : 'Repository action.',
+          });
+          render();
+        }
+      });
+      source.addEventListener('final', async (event) => {
+        const parsed = JSON.parse(event.data);
+        recordExecutionEvent('final', parsed.payload);
+        closeExecutionStream();
+        state.pendingConfirmation = null;
+        state.lastPreflight = parsed.payload?.envelope || state.lastPreflight;
+        setActionFeedback({
+          label: state.lastActionContext?.label || parsed.payload?.envelope?.data?.action?.label || 'Action execution',
+          state: parsed.payload?.envelope?.ok ? 'healthy' : (parsed.payload?.envelope?.data?.preflight?.state || 'blocked'),
+          reason: parsed.payload?.envelope?.message
+            || parsed.payload?.envelope?.data?.preflight?.reason
+            || 'Execution finished.',
+          detail: state.lastActionContext?.branchName
+            ? `Branch action for ${state.lastActionContext.branchName} finished ${relativeTime(new Date().toISOString())}.`
+            : 'Repository action finished.',
+        });
+        await refreshAfterExecution();
+      });
+    }
+
+    function defaultActionParams(action, scope) {
+      const params = {};
+      const detailBranch = state.branchDetails?.data?.branch || getSelectedBranch();
+      if (scope === 'branch' && detailBranch?.task?.taskSlug && !action.id.startsWith('clean.') && !action.id.startsWith('devmode.') && action.id !== 'new' && action.id !== 'resume') {
+        params.task = detailBranch.task.taskSlug;
+      }
+      return params;
+    }
+
+    async function gatherActionParams(action, scope) {
+      const params = defaultActionParams(action, scope);
+
+      if (action.id === 'pr') {
+        const detailBranch = state.branchDetails?.data?.branch || getSelectedBranch();
+        const suggestedTitle = detailBranch?.pr?.title || detailBranch?.task?.taskSlug || detailBranch?.name || 'Update branch';
+        const title = window.prompt('PR title', suggestedTitle);
+        if (!title) {
+          return null;
+        }
+        params.title = title;
+      }
+
+      return params;
+    }
+
+    async function runAction(actionId, scope) {
+      const snapshotBranch = getSelectedBranch();
+      const branchName = scope === 'branch' ? (state.selectedBranchName || snapshotBranch?.name || '') : '';
+      const actionSource = scope === 'board'
+        ? boardActions().find((entry) => entry.id === actionId)
+        : (state.branchDetails?.data?.branch?.availableActions || snapshotBranch?.availableActions || []).find((entry) => entry.id === actionId);
+
+      if (!actionSource) {
+        return;
+      }
+
+      const params = await gatherActionParams(actionSource, scope);
+      if (params === null) {
+        return;
+      }
+
+      state.loading.action = true;
+      state.pendingConfirmation = null;
+      state.lastActionContext = {
+        actionId,
+        label: actionSource.label || actionSource.id || actionId,
+        scope,
+        branchName,
+      };
+      setActionFeedback({
+        label: actionSource.label || actionSource.id || actionId,
+        state: 'awaiting_preflight',
+        reason: `Checking ${actionSource.label || actionSource.id || actionId} before execution.`,
+        detail: branchName
+          ? `Branch action for ${branchName}.`
+          : 'Repository action.',
+      });
+      closeMenus();
+      render();
+      try {
+        const envelope = await fetchJson(`/api/action/${encodeURIComponent(actionId)}/preflight`, {
+          method: 'POST',
+          body: JSON.stringify({ params }),
+        });
+        state.lastPreflight = envelope;
+        const preflight = envelope?.data?.preflight;
+        if (preflight?.requiresConfirmation) {
+          setActionFeedback({
+            label: actionSource.label || actionSource.id || actionId,
+            state: preflight.state || 'blocked',
+            reason: preflight.reason || 'Confirmation is required before this action can run.',
+            detail: branchName
+              ? `Branch action for ${branchName}. Confirmation is required before execution.`
+              : 'Repository action requires explicit confirmation before execution.',
+          });
+          state.pendingConfirmation = {
+            actionId,
+            params,
+            preflight: envelope,
+          };
+        } else if (preflight?.allowed) {
+          setActionFeedback({
+            label: actionSource.label || actionSource.id || actionId,
+            state: preflight.state || 'healthy',
+            reason: preflight.reason || 'Preflight passed. Starting execution.',
+            detail: branchName
+              ? `Branch action for ${branchName}. Execution is starting.`
+              : 'Repository action is starting.',
+          });
+          const result = await fetchJson(`/api/action/${encodeURIComponent(actionId)}/execute`, {
+            method: 'POST',
+            body: JSON.stringify({ params }),
+          });
+          attachExecutionStream(result.executionId);
+        } else {
+          setActionFeedback({
+            label: actionSource.label || actionSource.id || actionId,
+            state: preflight?.state || 'blocked',
+            reason: preflight?.reason || envelope?.message || 'This action did not start.',
+            detail: branchName
+              ? `Branch action for ${branchName}. No execution started.`
+              : 'Repository action did not start.',
+          });
+        }
+      } catch (error) {
+        setActionFeedback({
+          label: actionSource.label || actionSource.id || actionId,
+          state: 'failed',
+          reason: error instanceof Error ? error.message : String(error),
+          detail: branchName
+            ? `Branch action for ${branchName} failed before execution.`
+            : 'Repository action failed before execution.',
+        });
+      } finally {
+        state.loading.action = false;
+        render();
+      }
+    }
+
+    async function confirmPendingAction() {
+      if (!state.pendingConfirmation) {
+        return;
+      }
+      const { actionId, params, preflight } = state.pendingConfirmation;
+      const confirmToken = preflight?.data?.preflight?.confirmation?.token || '';
+      state.loading.action = true;
+      setActionFeedback({
+        label: state.lastActionContext?.label || actionId,
+        state: 'running',
+        reason: 'Confirmation accepted. Starting execution.',
+        detail: state.lastActionContext?.branchName
+          ? `Branch action for ${state.lastActionContext.branchName}.`
+          : 'Repository action.',
+      });
+      render();
+      try {
+        const result = await fetchJson(`/api/action/${encodeURIComponent(actionId)}/execute`, {
+          method: 'POST',
+          body: JSON.stringify({ params, confirmToken }),
+        });
+        attachExecutionStream(result.executionId);
+      } finally {
+        state.loading.action = false;
+        render();
+      }
+    }
+
+    function clearPendingConfirmation() {
+      state.pendingConfirmation = null;
+      setActionFeedback({
+        label: state.lastActionContext?.label || 'Action cancelled',
+        state: 'blocked',
+        reason: 'Action cancelled before execution.',
+        detail: state.lastActionContext?.branchName
+          ? `Branch action for ${state.lastActionContext.branchName}.`
+          : 'Repository action.',
+      });
+      render();
+    }
+
+    function closeDetail() {
+      state.detailOpen = false;
+      state.pendingConfirmation = null;
+      closeMenus();
+      render();
+    }
+
+    function scheduleAutoRefresh() {
+      clearTimeout(state.refreshTimer);
+      state.refreshTimer = setTimeout(async () => {
+        await loadSnapshot(false);
+        if (state.selectedBranchName && state.branchDetails) {
+          await loadBranch(state.selectedBranchName, false);
+        }
+        scheduleAutoRefresh();
+      }, currentAutoRefreshMs());
+    }
+
+    function render() {
+      renderSettingsPanel();
+      renderHero();
+      renderAttention();
+      renderActiveTask();
+      renderBranchTable();
+      renderBranchContextMenu();
+      renderDetail();
+      document.getElementById('refresh-button').disabled = state.loading.snapshot;
+    }
+
+    document.body.addEventListener('click', async (event) => {
+      const target = event.target.closest('[data-branch-open], [data-file-select], [data-action-trigger], [data-confirm-action], [data-detail-close], [data-devmode-toggle], [data-devmode-action], [data-context-action], [data-context-open], [data-settings-open], [data-settings-close], [data-settings-save], [data-settings-revert]');
+      if (!target) {
+        if (state.devModeMenuOpen || state.branchContextMenu.open) {
+          closeMenus();
+          render();
+        }
+        return;
+      }
+
+      if (!target.closest('.menu-shell') && state.devModeMenuOpen) {
+        state.devModeMenuOpen = false;
+      }
+
+      if (!target.closest('.context-menu') && !target.closest('[data-branch-card]') && state.branchContextMenu.open) {
+        closeBranchContextMenu();
+      }
+
+      if (target.dataset.devmodeToggle) {
+        state.devModeMenuOpen = !state.devModeMenuOpen;
+        closeBranchContextMenu();
+        render();
+        return;
+      }
+
+      if (target.dataset.devmodeAction) {
+        state.devModeMenuOpen = false;
+        render();
+        await runAction(target.dataset.devmodeAction, 'board');
+        return;
+      }
+
+      if (target.dataset.settingsOpen) {
+        openSettings();
+        return;
+      }
+
+      if (target.dataset.settingsClose) {
+        closeSettings(true);
+        return;
+      }
+
+      if (target.dataset.settingsRevert) {
+        syncSettingsDraft();
+        state.settingsNotice = state.settingsPath
+          ? `Reverted unsaved changes. Stored locally at ${state.settingsPath}`
+          : 'Reverted unsaved changes.';
+        render();
+        return;
+      }
+
+      if (target.dataset.settingsSave) {
+        await saveSettings();
+        return;
+      }
+
+      if (target.dataset.contextOpen) {
+        closeBranchContextMenu();
+        await loadBranch(decodeURIComponent(target.dataset.contextOpen), true);
+        return;
+      }
+
+      if (target.dataset.contextAction) {
+        closeBranchContextMenu();
+        state.selectedBranchName = decodeURIComponent(target.dataset.contextBranch || '');
+        render();
+        await runAction(target.dataset.contextAction, 'branch');
+        return;
+      }
+
+      if (target.dataset.branchOpen) {
+        closeBranchContextMenu();
+        await loadBranch(decodeURIComponent(target.dataset.branchOpen), true);
+        return;
+      }
+
+      if (target.dataset.fileSelect) {
+        await loadPatch(decodeURIComponent(target.dataset.fileSelect), target.dataset.fileScope);
+        return;
+      }
+
+      if (target.dataset.actionTrigger) {
+        await runAction(target.dataset.actionTrigger, target.dataset.actionScope);
+        return;
+      }
+
+      if (target.dataset.confirmAction === 'yes') {
+        await confirmPendingAction();
+        return;
+      }
+
+      if (target.dataset.confirmAction === 'no') {
+        clearPendingConfirmation();
+        return;
+      }
+
+      if (target.dataset.detailClose) {
+        closeDetail();
+      }
+    });
+
+    document.body.addEventListener('input', (event) => {
+      const field = event.target.closest('[data-settings-field]');
+      if (!field) {
+        return;
+      }
+
+      updateSettingsDraft(field.dataset.settingsField, field.value);
+    });
+
+    document.getElementById('refresh-button').addEventListener('click', async () => {
+      closeMenus();
+      await loadSnapshot(true);
+      if (state.selectedBranchName) {
+        await loadBranch(state.selectedBranchName, true);
+      }
+      scheduleAutoRefresh();
+    });
+
+    document.body.addEventListener('contextmenu', (event) => {
+      const card = event.target.closest('[data-branch-card]');
+      if (!card) {
+        if (state.branchContextMenu.open) {
+          closeBranchContextMenu();
+          render();
+        }
+        return;
+      }
+
+      event.preventDefault();
+      state.selectedBranchName = decodeURIComponent(card.dataset.branchCard || '');
+      state.branchContextMenu = {
+        open: true,
+        branchName: decodeURIComponent(card.dataset.branchCard || ''),
+        x: event.clientX,
+        y: event.clientY,
+      };
+      state.devModeMenuOpen = false;
+      render();
+    });
+
+    window.addEventListener('beforeunload', () => {
+      closeExecutionStream();
+      clearTimeout(state.refreshTimer);
+    });
+
+    window.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && state.settingsOpen) {
+        closeSettings(true);
+        return;
+      }
+
+      if (event.key === 'Escape' && (state.devModeMenuOpen || state.branchContextMenu.open)) {
+        closeMenus();
+        render();
+        return;
+      }
+
+      if (event.key === 'Escape' && state.detailOpen) {
+        closeDetail();
+      }
+    });
+
+    (async () => {
+      await loadSettings();
+      await loadHealth();
+      await loadSnapshot(true);
+      render();
+      scheduleAutoRefresh();
+    })().catch((error) => {
+      document.getElementById('detail-content').innerHTML = `<div class="detail-empty">${escapeHtml(error.message || String(error))}</div>`;
+    });
+  </script>
+</body>
+</html>
