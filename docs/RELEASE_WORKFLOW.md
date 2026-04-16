@@ -1,392 +1,540 @@
-# Release Workflow
+# Pipelane: Release Workflow (Target Spec)
 
-Last updated: April 13, 2026
-Status: canonical shared workflow spec
+Last updated: April 16, 2026
+Status: **target-state spec** (some features are not yet implemented; see
+`docs/CHANGE_MANIFEST.md` for the shippable path from today's repo to this
+spec)
 
-This document is the full maintainer and operator guide for repositories that use
-`workflow-kit`.
+This document describes how Pipelane *should* work for the AI vibe coder
+journey — as synthesized by a cross-functional review team (Lead PM, expert
+vibe coder, Scrum master, CI/CD release manager). The current package
+(`workflow-kit`) implements roughly 60% of this spec today. The rest is
+enumerated as concrete changes in the change manifest.
 
-It is intentionally more detailed than the README. The README answers "what is this, who is it
-for, and how do the two lanes work?" This document answers "how does this workflow actually work,
-end to end, and what should the operator do in each case?"
+Every section below is tagged with an implementation marker:
+
+- **[shipped]** already works
+- **[v0]** must ship in the first implementation sprint
+- **[v1]** second wave, trust + recovery
+- **[v2]** polish, product positioning
+
+## What Pipelane is
+
+**Pipelane** is the release cockpit for AI vibe coders and small AI
+vibe-coding teams.
+
+It gives every repo one screen where you can see:
+
+- which tasks are in flight
+- where each task's code is on the pipeline (branch → PR → CI → main →
+  staging → prod)
+- what the next safe action is
+
+And one command surface that the AI can execute without improvising
+dangerous repo behavior:
+
+- isolated task workspaces (`/new`, `/resume`)
+- a reviewed PR + merge flow (`/pr`, `/merge`)
+- same-SHA staged deploys with verification (`/deploy`)
+- one-command rollback (`/rollback`)
+- guided configuration (`/doctor`)
+- a single visual pipeline view (`/status`)
+
+The two dev modes are lanes:
+
+- **Build lane** — fast path, short handoff from merge to production
+- **Release lane** — protected path, same merged SHA moves staging → prod
+  in order with verification
+
+Tasks move through lanes. The `/status` cockpit shows where every task
+is right now.
 
 ## Who this is for
 
-`workflow-kit` is designed for AI-first builders: solo maintainers and small teams using Claude,
-Codex, or both as their primary operator layer.
+Pipelane is designed for AI-first builders: solo maintainers and small
+teams using Claude Code, Codex, or both as their primary operator.
 
-The workflow assumes:
+The core assumptions:
 
-- the AI should be able to follow explicit repo-native commands without guessing
-- the repo should distinguish fast shipping from protected release promotion
-- task work should be isolated, recoverable, and easy to resume later
-- local machine-specific deploy state should not be mixed into tracked repo policy
+- The AI should follow explicit repo-native commands without improvising
+- Branch, PR, and deploy state should be **visible**, not implicit
+- Release actions should require confirmation proportional to their
+  blast radius
+- Every mutating step should be **error-aware**, not fire-and-forget
+- Local machine-specific deploy state should not leak into tracked repo
+  policy, but also should not be a silent trust boundary the AI can
+  flip at 2am
 
-If that is how you work, this package is for you.
+## The cockpit: `/status`
 
-## Current Status
+**[v0]** `/status` is the primary surface of Pipelane.
 
-`workflow-kit` provides a standalone, versioned workflow package that product repos consume.
+It is a single-screen terminal view rendered from existing state (task
+locks, PR records, deploy records) plus two `gh` calls. It is read-only.
+It is safe to run at any time.
 
-- Product repos keep the tracked workflow contract and prompts.
-- `workflow-kit` owns the operator logic and bootstrap behavior.
-- The canonical task flow is `/new` -> `/resume` -> `/pr` -> `/merge` -> `/deploy` -> `/clean`.
-- `repo-guard` remains an internal guardrail rather than the main human entrypoint.
+```
+demo-app   mode: release   base: main (fetched 4m ago)
 
-## Supported Operator Surfaces
+ACTIVE TASKS (2)
+  stripe-webhooks   codex/stripe-webhooks-a9f2    3 ahead, 0 behind
+    PR #412 open     CI: 4/4 pass    merge ready
+    [ branch ]--( PR 412 )--> [ main ]    [ staging ]    [ prod ]
+                                              ^ next: /merge
 
-`workflow-kit` supports two operator surfaces.
+  hotfix-500        codex/hotfix-500-b73d         1 ahead
+    no PR yet
+    [ branch ]    ( PR )    [ main ]    [ staging ]    [ prod ]
 
-### Repo-native CLI surface
+RECENT RELEASES
+  feat: email auth      sha 8c21a4f
+    [ main OK ]--> [ staging OK 2h ago (healthcheck 200) ]--> [ prod PENDING ]
+                                             next: /deploy prod
+  chore: dep bump       sha 5f09c11
+    [ main OK ]--> [ staging OK 1d ago ]--> [ prod OK 22h ago ]
 
-This is the source of truth:
-
-- `npm run workflow:setup`
-- `npm run workflow:devmode -- ...`
-- `npm run workflow:new -- --task "<task-name>"`
-- `npm run workflow:resume -- --task "<task-name>"`
-- `npm run workflow:pr -- ...`
-- `npm run workflow:merge`
-- `npm run workflow:release-check`
-- `npm run workflow:task-lock -- verify --task "<task-name>"`
-- `npm run workflow:deploy -- staging|prod ...`
-- `npm run workflow:clean`
-
-### AI-client slash surface
-
-The slash surface is intentionally thin.
-
-- Claude uses tracked `.claude/commands/*`.
-- Codex uses generic machine-global wrapper skills installed by `workflow-kit install-codex`.
-- Both adapter layers dispatch back to the repo-native `npm run workflow:*` scripts.
-
-There is no workflow logic inside the slash wrappers.
-
-## workflow-kit and gstack
-
-Use both.
-
-`workflow-kit` is the repo-specific workflow layer. gstack remains the generic higher-level
-workflow layer.
-
-`workflow-kit` owns:
-
-- `/devmode`
-- `/new`
-- `/resume`
-- `/pr`
-- `/merge`
-- `/deploy`
-- `/clean`
-- task workspace state
-- release discipline and same-SHA promotion rules
-
-gstack is still recommended for:
-
-- `review`
-- `qa`
-- `plan-eng-review`
-- `setup-deploy`
-- documentation flows
-- investigations and debugging
-- standalone Codex workflows
-
-The important line is that `workflow-kit` intentionally does not rely on generic gstack `/ship`
-for release management. If a repo uses `workflow-kit`, prefer the workflow-kit PR, merge, and
-deploy flow over `/ship`.
-
-## Task Workspace Flow
-
-`/new` is the canonical task-start command.
-
-Properties:
-
-- `/new` always creates a fresh isolated sibling worktree
-- `/new` always creates a new `codex/<task>-<4hex>` branch
-- `/new` refreshes `origin/<base>` first and fails closed unless `--offline` is explicitly passed
-- `/new` inherits the current dev mode and requested surfaces
-- `/new` refuses to start the same task twice and redirects to `/resume`
-- `/new` accepts an optional `--task "<task-name>"`; when omitted, it generates a `task-<hex>` slug so an isolated worktree can be spun up without naming the task up front
-
-`/resume` is the recovery path, not the normal happy path.
-
-Properties:
-
-- `/resume --task "<task-name>"` resolves by task name slug, not branch id
-- `/resume` never creates a workspace
-- `/resume` returns the saved branch, worktree path, mode, and next action
-- `/resume` heals stale locks and redirects back to `/new` if the saved workspace is gone
-- `/resume` with no args lists active task workspaces and tells the operator what to resume
-
-The chat or IDE workspace does not move automatically. Command output must say that clearly.
-
-## `/new` behavior
-
-Typical result:
-
-```text
-Continue this task in: ../my-project-worktrees/my-task-ab12
-Task: My Task
-Slug: my-task
-Branch: codex/my-task-ab12
-Mode: build
-Chat has not moved. Switch this chat/workspace to that path before editing.
+STALE (run /clean --apply --all-stale to prune)
+  old-experiment   worktree missing    3 days old
 ```
 
-`/new` is the happy path. Use it unless you are explicitly returning to existing work.
+Flags:
 
-## `/resume` behavior
+- `/status` — now view (default).
+- `/status --week` — shipped in the last 7 days, throughput, cycle time.
+- `/status --stuck` — tasks idle >72h, merges without deploys, staging
+  deploys with no prod promotion.
+- `/status --blast <sha>` — surfaces changed by this SHA vs. the last
+  one on the target env.
 
-If one task is active, `/resume` may return that task directly. If several are active,
-`/resume` without `--task` lists them:
+Run it before you start a task. Run it when you come back on Monday.
+Run it before `/deploy prod`. One screen, every time.
 
-```text
-Active task workspaces:
-- project-api: codex/project-api-4fd2 @ ../my-project-worktrees/project-api-4fd2
-- billing-cleanup: codex/billing-cleanup-a912 @ ../my-project-worktrees/billing-cleanup-a912
-Next: run workflow:resume -- --task "<task-name>"
+## Build lane user journey
+
+**Build lane** is the fast path. Use it when you want the shortest
+possible route from merge to production and you do not need same-SHA
+staging validation.
+
+### Happy path
+
+```
+/status                    # orient yourself (v0)
+/devmode build             # confirm or switch lane (shipped)
+/new billing-cleanup       # fresh branch + worktree (shipped)
+                           # cd into the printed worktree path
+                           # implement, verify locally
+/pr                        # preview + stage + commit + push + open PR (hardened v0)
+/merge                     # confirm + squash-merge + poll mergeCommit.oid (hardened v0)
+                           # CI runs; if auto-deploy is wired, prod picks it up
+/status                    # confirm prod deploy succeeded and healthcheck is green (v0)
+/clean                     # prune the local workspace (shipped)
 ```
 
-This keeps `/resume` rare in the happy path while still making recovery simple.
-
-## Build vs Release user journeys
-
-Both dev modes use the same command surface, but they mean different things.
-
-### Build mode user journey
-
-Build mode is the fast lane.
-
-Use it when:
-
-- you want the shortest path from merge to production
-- no staging promotion step is required
-- the repo is optimized for speed over staged rollout discipline
-
-User-facing slash journey:
-
-1. `/devmode build`
-2. `/new <task-name>`
-3. implement and verify
-4. `/pr`
-5. `/merge`
-6. verify production
-7. `/clean`
-
-Repo-native journey:
-
-1. `npm run workflow:devmode -- build`
-2. `npm run workflow:new -- --task "<task-name>"`
-3. implement and verify
-4. `npm run workflow:pr -- --title "<pr title>"`
-5. `npm run workflow:merge`
-6. verify production
-7. `npm run workflow:clean`
-
-### Release mode user journey
-
-Release mode is the protected lane.
-
-Use it when:
-
-- staging must validate the release before prod
-- backend or multi-surface work needs stricter discipline
-- the same merged SHA should move through staging and then production in order
-
-User-facing slash journey:
-
-1. `/devmode release`
-2. `/new <task-name>`
-3. implement and verify
-4. `/pr`
-5. `/merge`
-6. `/deploy staging`
-7. verify staging
-8. `/deploy prod`
-9. verify production
-10. `/clean`
-
-Repo-native journey:
-
-1. `npm run workflow:devmode -- release`
-2. `npm run workflow:new -- --task "<task-name>"`
-3. implement and verify
-4. `npm run workflow:pr -- --title "<pr title>"`
-5. `npm run workflow:merge`
-6. `npm run workflow:deploy -- staging`
-7. verify staging
-8. `npm run workflow:deploy -- prod`
-9. verify production
-10. `npm run workflow:clean`
-
-## Build Mode
-
-Build mode is the fast lane.
-
-- use it when the repo wants the shortest path from PR merge to production
-- no staging promotion step is required
-- production deploy is expected to happen automatically after merge if the repo is configured that way
-
-Advanced build-mode deploy usage still exists:
-
-- `npm run workflow:deploy -- prod`
-- `npm run workflow:deploy -- prod edge`
-- `npm run workflow:deploy -- prod sql`
-
-Those are manual or recovery paths, not the normal happy path.
-
-## Release Mode
-
-Release mode is the protected lane.
-
-- it is fail-closed
-- staging must be configured before the repo switches to release mode
-- the same merged SHA must go through staging before production promotion
-
-Release mode keeps staging and production tied to the same merged SHA. That is the whole point.
-
-## Release Readiness Gate
-
-Release mode is gated by local `CLAUDE.md`.
-
-`workflow-kit` expects a machine-readable `## Deploy Configuration` block in local
-`CLAUDE.md`. It does not track this file in git.
-
-The gate checks:
-
-- configured production and staging deploy info for relevant surfaces
-- staging readiness flags
-- distinct staging and production frontend URLs
-- deploy orchestration metadata needed to make release mode safe
-
-If the gate fails:
-
-- mode stays `build`
-- blocked surfaces are reported explicitly
-- the operator is pointed at `npm run workflow:setup`
-
-## Environment and Surface Names
-
-Environment names:
-
-- `staging`
-- `prod`
-- `production` as an alias for `prod`
-
-Surface names in v1:
-
-- `frontend`
-- `edge`
-- `sql`
-
-Consumer repos can choose which subset they actually use.
-
-## Cleanup
-
-`workflow:clean` is report-first.
-
-It shows:
-
-- current active task locks
-- stale task locks
-- the next safe cleanup action
-
-With `--apply`, it prunes stale task locks. It does not blindly delete dirty worktrees.
-
-## Supporting Files
-
-Tracked files:
-
-- `.project-workflow.json`
-- `AGENTS.md`
-- `.claude/commands/*`
-- `workflow/CLAUDE.template.md`
-- `docs/RELEASE_WORKFLOW.md`
-
-Local-only file:
-
-- `CLAUDE.md`
-
-## Required `.project-workflow.json`
-
-Each consumer repo must track `.project-workflow.json`.
-
-Required fields:
-
-- `projectKey`
-- `displayName`
-- `baseBranch`
-- `stateDir`
-- `taskWorktreeDirName`
-- `surfaces`
-- `aliases`
-- `prePrChecks`
-- `deployWorkflowName`
-- `buildMode`
-- `releaseMode`
-
-## Required `AGENTS.md`
-
-`AGENTS.md` carries the tracked repo policy.
-
-At minimum it should define:
-
-- `/new` as the task-start command
-- `/resume` as the recovery command
-- `repo-guard` as an internal guardrail
-- task-lock verification before mutating release steps
-- the supported slash and repo-native command surfaces
-
-## Required local `CLAUDE.md`
-
-`CLAUDE.md` is local-only operator state.
-
-It should contain:
-
-- local operator defaults
-- skill routing rules
-- deploy configuration JSON
-
-`workflow-kit setup` creates it from `workflow/CLAUDE.template.md` if it does not already exist.
-
-## Install In A New Repo
-
-Inside the target repo:
-
-```bash
-npm install -D /Users/josephkim/dev/workflow-kit
-npx workflow-kit init --project "Next Project"
-npm run workflow:setup
+### What each step guarantees
+
+**`/status`** — [v0] You see where every task is before you start a
+new one. Soft warns at 3+ active tasks.
+
+**`/devmode build`** — [shipped] Records build lane in state. Every
+subsequent command inherits this lane.
+
+**`/new <task-name>`** — [shipped] Creates a fresh worktree and a
+`codex/<task-name>-<4hex>` branch from the refreshed base branch. Fails
+closed if the base branch is stale and `--offline` was not passed.
+Refuses to start the same task slug twice and points you at `/resume`.
+
+**`/pr`** — [v0-hardened] Before committing it:
+
+- Prints the list of files about to be staged
+- Denies `CLAUDE.md`, `.env*`, `*.pem`, and anything matching `.gitignore`
+  patterns unless `--force-include <path>` is passed
+- Shows a 10-line summary of staged diff
+- Prompts `Commit and open PR? [y/N]`
+- Runs `prePrChecks` with live stdio (`npm test`, etc.) before pushing
+- Opens or updates the PR via `gh pr create`
+
+**`/merge`** — [v0-hardened]:
+
+- Prompts `Merge PR #<n>: "<title>" → main? [y/N]`
+- Runs `gh pr merge --squash --delete-branch`
+- **Polls** `gh pr view` until `mergeCommit.oid` resolves (bounded 30s)
+- Fails closed if the SHA does not resolve (never falls back to
+  `rev-parse origin/main`)
+- Stamps `PrRecord.mergedSha` with the verified SHA
+
+**`/status`** — [v0] After build lane merge, the auto-deploy workflow
+(if configured) fires on main. `/status` shows whether prod deploy
+succeeded and healthcheck passed. You watch the cockpit, not the GH
+Actions tab.
+
+**`/clean`** — [shipped + hardened v0] Report-first. `--apply` requires
+`--task <slug>` or `--all-stale`; refuses to prune any lock newer
+than 5 minutes.
+
+### When build lane breaks
+
+- **CI failed on main after merge.** Run `/rollback` (v1) to redeploy
+  last-known-good SHA immediately; open a revert PR manually or via
+  `/rollback --revert-pr`.
+- **Auto-deploy workflow failed.** `/status` shows red. Run
+  `/deploy prod` manually to retry, or `/rollback` to go back.
+- **You committed to the wrong branch.** `/status --stuck` surfaces it;
+  `/resume` points you back at the right worktree.
+
+## Release lane user journey
+
+**Release lane** is the protected path. Use it when the same merged
+SHA must move staging → prod in order with verification, when
+multi-surface coordination matters, or when a stricter gate makes
+sense for the repo.
+
+### Setup (once per machine, per repo)
+
+```
+npx pipelane init --project "My App"    # scaffolds tracked files (shipped)
+npm run pipelane:setup                  # installs aliases + writes templates (shipped)
+/doctor --fix                            # interactive config wizard (v1)
+/doctor --probe                          # verify healthcheck URLs respond (v1)
 ```
 
-That creates the tracked workflow contract and local machine-specific operator file.
+Release lane is **fail-closed until ****`/doctor --probe`**** returns all green**.
 
-For first-time adoption in an existing remote-backed repo, commit the tracked workflow files
-before using `workflow:new`. New task worktrees are created from the repo base branch, so the
-workflow contract needs to be present there first.
+### Happy path
 
-## Day-One Operator Journey
+```
+/status                    # orient
+/devmode release           # switch lane (shipped); fails closed if config is incomplete
+/new stripe-webhooks       # fresh workspace (shipped)
+                           # implement, verify
+/pr                        # preview + stage + commit + push + open PR (hardened v0)
+/merge                     # confirm + squash-merge + poll SHA (hardened v0)
+/deploy staging            # deploy to staging, watch the run, probe healthcheck (v0)
+/status                    # verify staging shows green with healthcheck timestamp (v0)
+/deploy prod               # confirm + deploy prod, watch the run, probe healthcheck (v0)
+/status                    # verify prod shows green (v0)
+/clean                     # prune (shipped)
+```
 
-For a new workflow-kit repo consumer:
+### What each step guarantees beyond build lane
 
-1. install the package
-2. run `workflow-kit init`
-3. review `.project-workflow.json`
-4. run `npm run workflow:setup`
-5. check `npm run workflow:devmode -- status`
-6. start work with `npm run workflow:new -- --task "<task-name>"`
+**`/devmode release`** — [shipped + v1 hardened] Fails closed if any
+required deploy-config field is missing in `CLAUDE.md` OR if the most
+recent `/doctor --probe` result is stale (>24h) or red. Accepts
+`--override --reason <text>` only when a human is explicitly opting out,
+with an audit record.
+
+**`/deploy staging`** — [v0-hardened]:
+
+1. Reads `deployConfig.frontend.staging.deployWorkflow` (no stored
+   `ready:true` flag — readiness is derived live)
+2. Prompts `Deploy sha abc1234 (surfaces: frontend, edge) to staging? [y/N]`
+3. Fires `gh workflow run`
+4. Resolves `workflowRunId` from `gh run list`
+5. Writes a `DeployRecord` with `status: 'requested'`, `taskSlug`,
+   `idempotencyKey`
+6. **Watches the workflow run** via `gh run watch --exit-status`
+7. On success, probes `healthcheckUrl` (2xx required, twice, 10s apart)
+8. Stamps the record `status: 'succeeded'` + `verification` block
+9. On failure, stamps `status: 'failed'` + `failureReason` and exits
+   non-zero
+
+**`/deploy prod`** — [v0-hardened] Same as staging, plus the
+same-SHA-from-staging gate:
+
+1. Looks up the most recent `DeployRecord` where `environment='staging'`
+   AND `sha = mergedSha` AND `surfaces ⊇ requestedSurfaces` AND
+   `status='succeeded'` AND `verification.statusCode < 300` AND
+   `verifiedAt < 24h ago`
+2. If missing or any condition fails, **hard-fails with a specific
+   reason** ("staging for this SHA never succeeded", "staging verification
+   is 27h stale", "surface `edge` was never verified on staging")
+3. Prompts `Deploy abc1234 (staging verified 2h ago) to PROD? Type SHA prefix to confirm:`
+4. Requires typing the 4-char SHA prefix, not `y`
+5. Runs the same polling + healthcheck flow as staging
+6. Records outcome
+
+The same-SHA gate is now based on **verified outcomes**, not requests.
+
+### Release lane failure paths
+
+- **Staging deploy failed.** `/deploy staging` exits non-zero, `/status`
+  shows the failure row red. Fix the code, `/pr`, `/merge`, retry.
+- **Staging green but prod deploy failed.** `/rollback` (v1) redeploys
+  the last-known-good prod SHA. Staging result is preserved for retry.
+- **Prod regression discovered post-deploy.** `/rollback` redeploys
+  the previous `status='succeeded'` prod SHA. Optionally auto-emits a
+  `git revert <mergeCommit>` PR via `/rollback --revert-pr` so `main`
+  stops lying.
+- **Prod deploy succeeded but healthcheck failed.** Hard fail. Record
+  marks `status='failed'` with `failureReason='healthcheck 500'`.
+  `/rollback` is the next action.
+- **You need a hotfix that skips staging.** Use `/devmode build
+  --override --reason "hotfix: <incident>"`. One-shot; the override is
+  recorded and the next command resets to release.
+
+## `/rollback` [v1]
+
+One command. Safe at 2am.
+
+```
+/rollback prod
+
+Rolling back prod:
+  current: abc1234 (status: failed 4m ago, healthcheck: 500)
+  target:  def5678 (last green, deployed 2h ago, healthcheck: 200 @ 12ms)
+  surfaces: frontend, edge
+
+Type the SHA prefix to confirm: _
+```
+
+Behavior:
+
+- **Build lane ****`/rollback prod`** redeploys the last `DeployRecord`
+  where `environment='prod'`, `status='succeeded'`,
+  `verification.statusCode < 300`, excluding the current failure.
+  Writes a new `DeployRecord` with `rollbackOfSha = currentSha`.
+- **Release lane ****`/rollback prod`** same behavior, plus optional
+  `--revert-pr` flag that opens a `git revert <mergeCommit>` PR so
+  `main` reflects the rolled-back state.
+- Never auto-pushes the revert. Never deletes history. Audit trail is
+  a first-class "ROLLBACK" row in `/status`.
+
+## `/doctor` [v1]
+
+Replaces the current all-or-nothing `release-check`.
+
+```
+/doctor                    # diagnose (read-only)
+/doctor --fix              # interactive config wizard
+/doctor --probe            # probe healthcheck URLs, report statuses
+```
+
+`/doctor --fix` detects the platform from the repo (Vercel, Fly,
+Netlify, Render, GH Actions), asks 4 questions (staging URL, prod
+URL, deploy workflow name, healthcheck path), writes the
+`## Deploy Configuration` JSON block to local `CLAUDE.md`, and runs
+`--probe` automatically to validate. It does **not** set any
+`ready: true` flag — readiness is derived live at deploy time.
+
+`/doctor --probe` hits each configured `healthcheckUrl` and reports
+HTTP status + latency. Release lane consults the most recent probe
+result (cached 24h) as the freshness check.
+
+## State model
+
+### What `/status` reads
+
+- `task-locks/<slug>.json` — active task workspaces
+- `pr-state.json` — PR metadata per task, including `mergedSha`
+- `deploy-state.json` — `DeployRecord[]` with verified outcomes
+- `gh pr view <n>` — live PR state + CI check summary
+- `gh run list` — live workflow run statuses
+
+### `DeployRecord` schema [v0]
+
+```ts
+export type DeployStatus =
+  | 'requested'
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+  | 'unknown';
+
+export interface DeployRecord {
+  id: string;                     // ULID
+  idempotencyKey: string;         // sha256(env|sha|surfaces|taskSlug)
+  taskSlug: string;               // per-task identity, kills cross-task unlock
+  environment: 'staging' | 'prod';
+  sha: string;
+  surfaces: string[];
+  workflowName: string;
+  workflowRunId?: number;
+  workflowRunUrl?: string;
+  status: DeployStatus;
+  requestedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  durationMs?: number;
+  verifiedAt?: string;            // healthcheck success timestamp
+  verification?: {
+    url: string;
+    statusCode: number;
+    latencyMs: number;
+  };
+  rollbackOfSha?: string;         // set when this deploy rolls back another
+  triggeredBy: string;            // git user.email or 'claude' / 'codex'
+  failureReason?: string;
+}
+```
+
+### `TaskLock.nextAction` [v1]
+
+A narrow addition. The last agent turn writes a one-liner describing
+what the operator intended next, so a new session or another agent
+can pick up coherently.
+
+```ts
+export interface TaskLock {
+  // ... existing fields
+  nextAction?: string;   // e.g. "merged, waiting on staging deploy"
+}
+```
+
+## AI operator conventions
+
+Pipelane is designed for AI operators. These conventions exist because
+AI operators amend commits, run commands speculatively, and don't feel
+the weight of a prod deploy the way a human does.
+
+**Things the AI must do:**
+
+- Run `/status` before `/new`
+- Confirm all merges and prod deploys by showing the prompt to the human
+- Never bypass `/pr`'s staged-file deny-list silently; surface `--force-include`
+  decisions explicitly
+- Never flip a `ready:` boolean (there should be none in v1)
+- Write `nextAction` on the task lock before ending a turn mid-task
+
+**Things the AI must not do:**
+
+- Call `git commit --amend` on a merged commit
+- Call `git push --force` to any tracked branch
+- Call `/clean --apply` without `--task <slug>` or `--all-stale`
+- Flip `/devmode build` in the middle of a release-lane task without
+  `--override --reason`
+- Run `/deploy prod` with `--sha <other>` (hard-blocked in release lane;
+  soft-warned in build lane)
+
+These are enforced by the command layer where possible, and documented
+in `AGENTS.md` where enforcement is social.
+
+## Command reference
+
+### Operator commands
+
+| Slash | Repo-native | Purpose | Status |
+| --- | --- | --- | --- |
+| `/status` | `npm run pipelane:status` | Cockpit view; tasks + pipeline state | v0 |
+| `/devmode` | `npm run pipelane:devmode -- ...` | Inspect / switch build ↔ release lane | shipped |
+| `/new` | `npm run pipelane:new -- --task "<name>"` | Fresh isolated task workspace | shipped |
+| `/resume` | `npm run pipelane:resume -- --task "<name>"` | Recover an existing workspace | shipped |
+| `/pr` | `npm run pipelane:pr -- --title "<t>"` | Preview + stage + commit + push + open PR | v0-hardened |
+| `/merge` | `npm run pipelane:merge` | Confirm + squash-merge + poll SHA | v0-hardened |
+| `/deploy` | `npm run pipelane:deploy -- staging\ | prod` | Deploy + watch + verify | v0-hardened |
+| `/rollback` | `npm run pipelane:rollback -- staging\ | prod` | Redeploy last-known-good | v1 |
+| `/doctor` | `npm run pipelane:doctor [--fix\ | --probe]` | Diagnose / configure / probe | v1 |
+| `/clean` | `npm run pipelane:clean [--apply]` | Prune stale task locks | shipped + v0-hardened |
+
+### Setup commands
+
+| Command | Purpose | Status |
+| --- | --- | --- |
+| `npx pipelane init --project "<name>"` | Scaffold tracked files in a new repo | rename-pending |
+| `npm run pipelane:setup` | Install aliases, templates, Claude commands | rename-pending |
+
+## Configuration
+
+### Tracked in git (repo policy)
+
+- `.project-workflow.json` — baseBranch, surfaces, aliases, prePrChecks, deploy workflow names
+- `AGENTS.md` — policy for AI operators
+- `.claude/commands/*` — thin slash adapters
+- `workflow/CLAUDE.template.md` — template used to bootstrap local operator state
+- `docs/RELEASE_WORKFLOW.md` — this file
+
+### Local-only (operator state, git-ignored)
+
+- `CLAUDE.md` — local deploy config and operator defaults
+
+Note: the `ready: true` boolean previously carried in this file is
+**removed** in v1 and replaced by live probe results. Do not rely on it.
+
+### Internal state (git common-dir, shared across worktrees)
+
+- `workflow-kit-state/task-locks/<slug>.json` — active task identities
+- `workflow-kit-state/pr-state.json` — per-task PR records
+- `workflow-kit-state/deploy-state.json` — deploy records (new schema in v0)
+
+State lives in `git common-dir` intentionally so multiple worktrees for
+the same repo share one state view. Do not move this.
+
+## Modes are lanes
+
+Pipelane's dev-mode concept is a lane:
+
+| Lane | Path | Verification | Use when |
+| --- | --- | --- | --- |
+| Build | merge → prod (auto or manual) | post-deploy healthcheck | speed matters, no staging gate required |
+| Release | merge → staging (verified) → prod (verified) | pre-deploy same-SHA gate + post-deploy healthcheck on both envs | multi-surface coordination, stricter gate, same-SHA promotion required |
+
+A repo picks one as its default. Individual tasks can override via
+`/devmode build|release`, but release-lane tasks require the deploy
+config to be healthy.
+
+The `/status` cockpit shows the active lane top-right. You should
+always know which lane you're in.
+
+## Failure modes that are now closed
+
+These are bugs in the current (pre-v0) implementation that the target
+spec fixes. The change manifest tracks which PR closes each one.
+
+- [v0] **Silent SHA mispromotion at merge.** `merge.ts` used to fall back
+  to `git rev-parse origin/main` when `mergeCommit.oid` didn't resolve.
+  v0 polls until resolution or fails closed.
+- [v0] **Cross-task deploy collision.** `DeployRecord` was global + unkeyed.
+  v0 keys by `taskSlug` and requires `status='succeeded'` for the gate.
+- [v0] **Fire-and-forget ****`gh workflow run`****.** v0 watches the run,
+  probes the healthcheck, and records the verified outcome.
+- [v1] **Honor-system ****`ready:true`****.** Removed. Replaced by live probe
+  via `/doctor --probe` + per-deploy healthcheck.
+- [v0] **Silent ****`/pr`**** with ****`git add -A`****.** v0 previews staged files,
+  enforces a deny-list, and prompts before commit.
+- [v0] **Zero-confirmation ****`/merge`**** and ****`/deploy prod`****.** v0 requires
+  explicit confirmation (`y/N` for merge; typed SHA prefix for prod).
+- [v0] **No visibility.** `/status` renders the full pipeline state
+  from existing + v0 data.
+- [v1] **No rollback.** `/rollback` ships.
+- [v0] **`/clean --apply`**** too aggressive.** Requires `--task` or
+  `--all-stale`; refuses recent locks.
 
 ## Troubleshooting
 
-Common failures:
+- **Missing ****`.project-workflow.json`** → `npx pipelane init`
+- **Task already active** → `/resume --task "<slug>"`
+- **Release lane blocked** → `/doctor` (diagnose), `/doctor --fix`
+  (configure), `/doctor --probe` (verify)
+- **`/deploy prod`**** says "staging never succeeded for this SHA"** →
+  `/deploy staging`, wait for it to verify, then retry prod
+- **`/deploy prod`**** says "staging verification is stale (>24h)"** →
+  re-run `/deploy staging` to refresh the verified-at timestamp
+- **Prod healthcheck failed post-deploy** → `/rollback prod`
+- **You want to skip staging for a hotfix** →
+  `/devmode build --override --reason "hotfix: <incident>"` then
+  `/deploy prod` directly
 
-- `No .project-workflow.json found`
-  - run `workflow-kit init` in the repo root
-- `/new` generated a `task-<hex>` slug you did not expect
-  - you ran `/new` without `--task`; pass `--task "<label>"` explicitly to choose a human-readable slug
-- `Task X is already active`
-  - use `workflow:resume -- --task "X"`
-- `Release mode blocked`
-  - run `npm run workflow:setup` and fill in local `CLAUDE.md`
-- `No active task lock matches this branch/worktree`
-  - you are not in the saved task workspace, or the task should be resumed by name
+## Implementation status at a glance
+
+| Feature | Status |
+| --- | --- |
+| `/new`, `/resume` task workspaces | shipped |
+| `/devmode` with build + release lanes | shipped |
+| `/pr`, `/merge`, basic `/deploy`, `/clean` | shipped (unhardened) |
+| Fail-closed release mode | shipped |
+| Same-SHA staging-before-prod gate (by *request*) | shipped (gaps in v0) |
+| `/status` cockpit | **v0** |
+| `DeployRecord` v2 schema + polling + verification | **v0** |
+| `/pr` preview + deny-list + confirm | **v0** |
+| `/merge` confirm + SHA poll + fail-closed | **v0** |
+| `/deploy` confirm + watch + verify | **v0** |
+| `/clean` hardening | **v0** |
+| `/rollback` | **v1** |
+| `/doctor` + `/doctor --fix` + `/doctor --probe` | **v1** |
+| `TaskLock.nextAction` | **v1** |
+| `/status --week / --stuck / --blast` | **v1** |
+| WIP soft warn at 3 | **v1** |
+| `workflow-kit` → `pipelane` rename | **v2** |
+| Cut Codex dual-install surface | **v2** |
+
+See `docs/CHANGE_MANIFEST.md` for the concrete file-by-file change list.
