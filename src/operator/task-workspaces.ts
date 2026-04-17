@@ -22,6 +22,17 @@ export interface RemovedTaskLock {
   reasons: string[];
 }
 
+export interface SkippedTaskLock {
+  taskSlug: string;
+  branchName: string;
+  worktreePath: string;
+  reason: string;
+}
+
+// v0.7: /clean --apply must not yank a lock out from under a task that was
+// just started. Locks refreshed within this window are treated as live.
+export const TASK_LOCK_MIN_PRUNE_AGE_MS = 5 * 60 * 1000;
+
 export function readWorktreeStatus(repoRoot: string): { branchName: string; statusLines: string[]; dirty: boolean } {
   const branchName = runGit(repoRoot, ['branch', '--show-current']) ?? '';
   const statusText = runGit(repoRoot, ['status', '--short'], true) ?? '';
@@ -228,10 +239,38 @@ export function buildCurrentWorkspaceReasons(options: {
   return reasons;
 }
 
-export function pruneDeadTaskLocks(commonDir: string, config: WorkflowConfig): RemovedTaskLock[] {
+export interface PruneDeadTaskLocksOptions {
+  // Restrict pruning to a single task slug. When set, only that lock is
+  // considered; everything else is ignored. Used by `/clean --apply --task`.
+  taskSlug?: string;
+  // Minimum age (ms) a lock must have before it is eligible for pruning.
+  // Defaults to TASK_LOCK_MIN_PRUNE_AGE_MS so an interrupted operator can't
+  // sweep a lock that another operator just wrote.
+  minAgeMs?: number;
+  // Override the clock for tests.
+  now?: () => number;
+}
+
+export interface PruneDeadTaskLocksResult {
+  removed: RemovedTaskLock[];
+  skipped: SkippedTaskLock[];
+}
+
+export function pruneDeadTaskLocks(
+  commonDir: string,
+  config: WorkflowConfig,
+  options: PruneDeadTaskLocksOptions = {},
+): PruneDeadTaskLocksResult {
   const removed: RemovedTaskLock[] = [];
+  const skipped: SkippedTaskLock[] = [];
+  const minAgeMs = options.minAgeMs ?? TASK_LOCK_MIN_PRUNE_AGE_MS;
+  const now = (options.now ?? (() => Date.now()))();
 
   for (const lock of loadAllTaskLocks(commonDir, config)) {
+    if (options.taskSlug && lock.taskSlug !== options.taskSlug) {
+      continue;
+    }
+
     const reasons: string[] = [];
 
     if (!existsSync(lock.worktreePath)) {
@@ -247,6 +286,17 @@ export function pruneDeadTaskLocks(commonDir: string, config: WorkflowConfig): R
       continue;
     }
 
+    const lockAgeMs = lockAge(lock.updatedAt, now);
+    if (lockAgeMs !== null && lockAgeMs < minAgeMs) {
+      skipped.push({
+        taskSlug: lock.taskSlug,
+        branchName: lock.branchName,
+        worktreePath: lock.worktreePath,
+        reason: `updatedAt ${lock.updatedAt} is ${Math.round(lockAgeMs / 1000)}s old — below the ${Math.round(minAgeMs / 1000)}s prune floor`,
+      });
+      continue;
+    }
+
     const targetPath = taskLockPath(commonDir, config, lock.taskSlug);
     if (existsSync(targetPath)) {
       unlinkSync(targetPath);
@@ -259,7 +309,14 @@ export function pruneDeadTaskLocks(commonDir: string, config: WorkflowConfig): R
     });
   }
 
-  return removed;
+  return { removed, skipped };
+}
+
+function lockAge(updatedAt: string | undefined, now: number): number | null {
+  if (!updatedAt) return null;
+  const parsed = Date.parse(updatedAt);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.max(0, now - parsed);
 }
 
 export function findPrunedTaskLock(removed: RemovedTaskLock[], taskSlug: string): RemovedTaskLock | null {

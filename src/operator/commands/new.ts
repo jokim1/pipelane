@@ -29,7 +29,7 @@ export async function handleNew(cwd: string, parsed: ParsedOperatorArgs): Promis
   const { taskName, taskSlug } = resolveTaskCommandIdentity(effectiveTask);
   const mode = context.modeState.mode;
   const surfaces = resolveCommandSurfaces(context, parsed.flags.surfaces);
-  const removedLocks = pruneDeadTaskLocks(context.commonDir, context.config);
+  const { removed: removedLocks } = pruneDeadTaskLocks(context.commonDir, context.config, { minAgeMs: 0 });
   const existingLock = loadTaskLock(context.commonDir, context.config, taskSlug);
   const prunedTaskLock = findPrunedTaskLock(removedLocks, taskSlug);
   const warnings = prunedTaskLock

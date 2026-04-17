@@ -14,13 +14,23 @@ import {
 
 const hasRocketboard = existsSync(ROCKETBOARD_OPERATOR);
 
+// Per-action argv augmentations. Pipelane's preflight now gates on operator
+// scope for some actions (e.g. v0.7 requires clean.apply scope). Without
+// these flags, Pipelane emits allowed:false + state:blocked and the risky/
+// requiresConfirmation assertions below wouldn't exercise the happy path.
+// Rocketboard accepts the same flags as a no-op.
+const PREFLIGHT_EXTRA_ARGS = {
+  'clean.apply': ['--all-stale'],
+};
+
 test('action preflight differential: risky flag and label match across all 11 stable IDs', { skip: !hasRocketboard && 'Rocketboard operator not available' }, () => {
   const repoRoot = setupMinimalFixture();
   try {
     const divergences = [];
     for (const actionId of STABLE_ACTION_IDS) {
-      const pipelaneResult = runPipelane(repoRoot, ['api', 'action', actionId]);
-      const rocketboardResult = runRocketboard(repoRoot, ['api', 'action', actionId]);
+      const extra = PREFLIGHT_EXTRA_ARGS[actionId] ?? [];
+      const pipelaneResult = runPipelane(repoRoot, ['api', 'action', actionId, ...extra]);
+      const rocketboardResult = runRocketboard(repoRoot, ['api', 'action', actionId, ...extra]);
 
       const pEnv = parseEnvelope(pipelaneResult.stdout);
       const rEnv = parseEnvelope(rocketboardResult.stdout);
@@ -61,6 +71,7 @@ test('action preflight: token issuance follows allowed/blocked semantics', { ski
   const repoRoot = setupMinimalFixture();
   try {
     const permissiveDivergences = [];
+    const stricterDivergences = [];
 
     for (const actionId of RISKY_ACTION_IDS) {
       const pEnv = parseEnvelope(runPipelane(repoRoot, ['api', 'action', actionId]).stdout);
@@ -85,12 +96,39 @@ test('action preflight: token issuance follows allowed/blocked semantics', { ski
       if (pEnv.data.preflight.allowed && !rEnv.data.preflight.allowed) {
         permissiveDivergences.push(`${actionId}: Pipelane allowed=true but Rocketboard blocked (reason: ${rEnv.data.preflight.reason})`);
       }
+      // v0.7+ intentional divergence in the other direction: Pipelane is
+      // stricter than Rocketboard (e.g. clean.apply blocks when scope is
+      // ambiguous). Log so we can see the surface shrinking session over session.
+      if (!pEnv.data.preflight.allowed && rEnv.data.preflight.allowed) {
+        stricterDivergences.push(`${actionId}: Pipelane blocked (reason: ${pEnv.data.preflight.reason}) but Rocketboard allowed`);
+      }
     }
 
     if (permissiveDivergences.length > 0) {
       console.log('\n[differential] action preflight: Pipelane preflight too permissive (step 6 backlog):');
       for (const entry of permissiveDivergences) console.log(`  - ${entry}`);
     }
+    if (stricterDivergences.length > 0) {
+      console.log('\n[differential] action preflight: Pipelane stricter than Rocketboard (intentional, tracked in CHANGE_MANIFEST):');
+      for (const entry of stricterDivergences) console.log(`  - ${entry}`);
+    }
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('action preflight: clean.apply without scope is blocked by Pipelane (v0.7 intentional divergence)', { skip: !hasRocketboard && 'Rocketboard operator not available' }, () => {
+  const repoRoot = setupMinimalFixture();
+  try {
+    const pipelaneResult = runPipelane(repoRoot, ['api', 'action', 'clean.apply']);
+    const envelope = parseEnvelope(pipelaneResult.stdout);
+    assert.ok(envelope, 'Pipelane envelope parsed');
+    assert.equal(envelope.ok, false, 'envelope.ok false when preflight is blocked');
+    assert.equal(envelope.data.preflight.allowed, false);
+    assert.equal(envelope.data.preflight.state, 'blocked');
+    assert.equal(envelope.data.preflight.requiresConfirmation, false);
+    assert.equal(envelope.data.preflight.confirmation, null);
+    assert.match(envelope.data.preflight.reason, /requires scope/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }

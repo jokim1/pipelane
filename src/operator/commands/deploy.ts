@@ -1,3 +1,5 @@
+import readline from 'node:readline';
+
 import { buildReleaseCheckMessage, emptyDeployConfig, evaluateReleaseReadiness, loadDeployConfig, normalizeDeployEnvironment } from '../release-gate.ts';
 import {
   loadDeployState,
@@ -128,6 +130,16 @@ export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Pro
       ].join('\n'),
     });
     return;
+  }
+
+  // v0.5: prod deploys require typed-SHA confirmation so an AI can't one-char
+  // approve production. Runs AFTER the staging + idempotency gates so a human
+  // isn't asked to confirm a deploy that would be rejected or short-circuited.
+  // The API path bypasses via PIPELANE_DEPLOY_PROD_API_CONFIRMED — it's already
+  // consumed an HMAC confirm token. --override bypasses the release-readiness
+  // gate but NOT this check: an AI can set --override too.
+  if (environment === 'prod' && context.modeState.mode === 'release') {
+    await requireProdConfirmation(target.sha);
   }
 
   const workflowName = environment === 'staging'
@@ -331,6 +343,66 @@ function watchWorkflowRun(
     ok: result.ok,
     reason: result.ok ? undefined : (result.stderr || result.stdout || undefined),
   };
+}
+
+export const PROD_CONFIRM_PREFIX_LENGTH = 4;
+
+// v0.5: interactive typed-SHA prefix prompt. Callers must land here only
+// when a human-in-the-loop confirmation is actually required — the API
+// execute path sets PIPELANE_DEPLOY_PROD_API_CONFIRMED=1 to skip.
+export async function requireProdConfirmation(sha: string): Promise<void> {
+  if (process.env.PIPELANE_DEPLOY_PROD_API_CONFIRMED === '1') return;
+
+  const expected = sha.slice(0, PROD_CONFIRM_PREFIX_LENGTH).toLowerCase();
+  if (!expected || expected.length < PROD_CONFIRM_PREFIX_LENGTH) {
+    throw new Error(`deploy prod blocked: resolved SHA "${sha}" is too short to derive a confirmation prefix.`);
+  }
+
+  // Test hook: lets the integration suite simulate the prompt without a TTY.
+  // The stub value is the characters the operator would have typed.
+  const stub = process.env.PIPELANE_DEPLOY_PROD_CONFIRM_STUB;
+  if (typeof stub === 'string') {
+    if (stub.trim().toLowerCase() !== expected) {
+      throw new Error([
+        'deploy prod blocked: typed SHA prefix did not match.',
+        `Expected the first ${PROD_CONFIRM_PREFIX_LENGTH} characters of ${sha}.`,
+      ].join('\n'));
+    }
+    return;
+  }
+
+  if (!process.stdin.isTTY) {
+    throw new Error([
+      'deploy prod blocked: typed SHA prefix confirmation is required.',
+      `Re-run from a TTY and type the first ${PROD_CONFIRM_PREFIX_LENGTH} characters of ${sha}`,
+      'when prompted, or drive this deploy through `pipelane run api action deploy.prod`',
+      'which uses the HMAC confirm-token flow.',
+    ].join('\n'));
+  }
+
+  const typed = await promptForProdConfirmPrefix(sha, expected);
+  if (typed.trim().toLowerCase() !== expected) {
+    throw new Error([
+      'deploy prod blocked: typed SHA prefix did not match.',
+      `Expected the first ${PROD_CONFIRM_PREFIX_LENGTH} characters of ${sha}.`,
+    ].join('\n'));
+  }
+}
+
+function promptForProdConfirmPrefix(fullSha: string, expected: string): Promise<string> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+  const prompt = [
+    '',
+    `You are about to deploy ${fullSha} to PRODUCTION.`,
+    `To confirm, type the first ${expected.length} characters of that SHA:`,
+    '> ',
+  ].join('\n');
+  return new Promise<string>((resolve) => {
+    rl.question(prompt, (answer) => {
+      rl.close();
+      resolve(answer);
+    });
+  });
 }
 
 async function probeHealthcheck(url: string): Promise<DeployVerification> {

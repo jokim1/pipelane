@@ -88,6 +88,30 @@ export function buildActionPreflightEnvelope(cwd: string, actionId: StableAction
   const risky = API_RISKY_ACTION_IDS.has(actionId);
   const checkedAt = nowIso();
 
+  const gate = evaluatePreflightGate(actionId, normalizedInputs);
+  if (!gate.allowed) {
+    const data: ActionPreflightData = {
+      action: { id: actionId, label: ACTION_LABELS[actionId], risky },
+      preflight: {
+        allowed: false,
+        state: 'blocked',
+        reason: gate.reason,
+        warnings: [],
+        issues: [],
+        normalizedInputs,
+        requiresConfirmation: false,
+        confirmation: null,
+        freshness: buildFreshness({ checkedAt, stale: true }),
+      },
+    };
+    return buildApiEnvelope<ActionPreflightData>({
+      command: 'workflow.api.action',
+      ok: false,
+      message: gate.reason,
+      data,
+    });
+  }
+
   let confirmation: { token: string; expiresAt: string } | null = null;
   if (risky) {
     const fingerprint = buildActionFingerprint(actionId, normalizedInputs);
@@ -120,6 +144,35 @@ export function buildActionPreflightEnvelope(cwd: string, actionId: StableAction
     message: `${actionId} preflight ready`,
     data,
   });
+}
+
+// v0.7: scope-aware preflight gating. Actions that need operator scope
+// (e.g. clean.apply requires --task or --all-stale) emit
+// allowed:false + state:blocked before a confirm token is ever issued.
+// The CLI still enforces the same rule at execute time.
+type PreflightGateResult =
+  | { allowed: true; reason?: undefined }
+  | { allowed: false; reason: string };
+
+function evaluatePreflightGate(actionId: StableActionId, inputs: Record<string, unknown>): PreflightGateResult {
+  if (actionId === 'clean.apply') {
+    const taskRaw = inputs.task;
+    const task = typeof taskRaw === 'string' ? taskRaw.trim() : '';
+    const allStale = inputs.allStale === true;
+    if (!task && !allStale) {
+      return {
+        allowed: false,
+        reason: '/clean --apply requires scope: pass --task <slug> or --all-stale.',
+      };
+    }
+    if (task && allStale) {
+      return {
+        allowed: false,
+        reason: '/clean --apply cannot combine --task and --all-stale.',
+      };
+    }
+  }
+  return { allowed: true };
 }
 
 export async function runActionExecute(cwd: string, actionId: StableActionId, parsed: ParsedOperatorArgs, confirmToken: string): Promise<ApiEnvelope<ActionExecutionData | ActionPreflightData>> {
@@ -158,7 +211,13 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
   }
 
   const underlyingArgs = buildUnderlyingArgs(actionId, parsed);
-  const result = runCliWithJson(cwd, underlyingArgs);
+  // deploy.prod's CLI shim also requires human confirmation. The API path
+  // has already proved humanness via the HMAC confirm-token consume above,
+  // so tell the child CLI it can skip the typed-SHA TTY prompt.
+  const childEnv = actionId === 'deploy.prod'
+    ? { ...process.env, PIPELANE_DEPLOY_PROD_API_CONFIRMED: '1' }
+    : process.env;
+  const result = runCliWithJson(cwd, underlyingArgs, childEnv);
 
   const data: ActionExecutionData = {
     action: { id: actionId, label: ACTION_LABELS[actionId], risky },
@@ -212,7 +271,7 @@ function normalizeInputs(actionId: StableActionId, parsed: ParsedOperatorArgs): 
     case 'clean.plan':
       return {};
     case 'clean.apply':
-      return {};
+      return { task: flags.task, allStale: flags.allStale };
   }
 }
 
@@ -277,6 +336,8 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
       break;
     case 'clean.apply':
       args.push('clean', '--apply');
+      pushOpt('--task', flags.task);
+      if (flags.allStale) args.push('--all-stale');
       break;
   }
 
@@ -284,10 +345,11 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
   return args;
 }
 
-function runCliWithJson(cwd: string, args: string[]): { ok: boolean; exitCode: number; stdout: string; stderr: string; parsed: unknown } {
+function runCliWithJson(cwd: string, args: string[], env: NodeJS.ProcessEnv = process.env): { ok: boolean; exitCode: number; stdout: string; stderr: string; parsed: unknown } {
   const cliPath = resolveCliEntry();
   const result = spawnSync(process.execPath, [cliPath, ...args], {
     cwd,
+    env,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
