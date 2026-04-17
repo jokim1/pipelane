@@ -8,13 +8,29 @@
     "pipelane": "./bin/pipelane",
     "workflow-kit": "./bin/workflow-kit"
   },
+  "files": [
+    "bin",
+    "dist",
+    "templates",
+    "workflow",
+    "docs/RELEASE_WORKFLOW.md",
+    "docs/PIPELANE_BOARD.md",
+    "README.md"
+  ],
   "scripts": {
     "test": "node --test",
     "smoke": "node ./src/cli.ts --help",
     "dashboard": "node ./src/cli.ts dashboard",
-    "board": "node ./src/cli.ts board"
+    "board": "node ./src/cli.ts board",
+    "build": "tsc -p tsconfig.build.json && node -e \"import('node:fs').then(m=>m.cpSync('src/dashboard/public','dist/dashboard/public',{recursive:true}))\"",
+    "prepare": "npm run build",
+    "clean": "rm -rf dist"
   },
   "engines": {
     "node": ">=22.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.17",
+    "typescript": "^5.9.3"
   }
 }

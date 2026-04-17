@@ -1,12 +1,19 @@
 #!/usr/bin/env node
 // Launcher for the Pipelane CLI.
 //
-// Why this is a Node.js script rather than a shell wrapper:
-// npm symlinks bin entries into node_modules/.bin, and a shell wrapper
-// that computes paths relative to `$0` resolves them relative to the
-// symlink (node_modules/.bin/) rather than the real installed package
-// (node_modules/pipelane/bin/). Node's `import.meta.url` always reports
-// the real file URL, so this script locates `../src/cli.ts` correctly
-// whether the bin is run from the installed package, from a worktree,
-// or via `npx`.
-await import('../src/cli.ts');
+// Prefer the compiled `dist/cli.js` when present (how consumers see it
+// after `npm install`). Fall back to `src/cli.ts` for in-repo development
+// where `npm run build` hasn't been run yet.
+//
+// Node's `import.meta.url` reports this script's real file URL (after
+// symlink resolution), so the relative lookups below work identically
+// whether the bin is invoked from a worktree, an installed package in
+// node_modules, or via `npx`.
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
+const distUrl = new URL('../dist/cli.js', import.meta.url);
+const srcUrl = new URL('../src/cli.ts', import.meta.url);
+const target = existsSync(fileURLToPath(distUrl)) ? distUrl : srcUrl;
+
+await import(target.href);

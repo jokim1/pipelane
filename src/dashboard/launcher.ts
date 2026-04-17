@@ -151,6 +151,12 @@ function clearPidFile(repoRoot: string): void {
 }
 
 function resolveCliEntrypoint(): string {
+  // Prefer compiled cli.js when running from dist/ (installed packages),
+  // fall back to cli.ts when running in-repo from src/.
+  const jsPath = fileURLToPath(new URL('../cli.js', import.meta.url));
+  if (existsSync(jsPath)) {
+    return jsPath;
+  }
   return fileURLToPath(new URL('../cli.ts', import.meta.url));
 }
 
@@ -190,10 +196,11 @@ async function runStart(argv: string[], cwd: string): Promise<void> {
   const logPath = logFilePath(options.repoRoot);
   const logFd = openSync(logPath, 'a');
 
+  const cliEntrypoint = resolveCliEntrypoint();
+  const needsTsStripping = cliEntrypoint.endsWith('.ts');
   const spawnArgs = [
-    '--experimental-strip-types',
-    '--disable-warning=ExperimentalWarning',
-    resolveCliEntrypoint(),
+    ...(needsTsStripping ? ['--experimental-strip-types', '--disable-warning=ExperimentalWarning'] : []),
+    cliEntrypoint,
     'dashboard',
     '--repo',
     options.repoRoot,
