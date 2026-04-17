@@ -1197,6 +1197,112 @@ test('api snapshot marks staging as bypassed in build mode', () => {
   }
 });
 
+test('api action preflight: non-risky action returns no confirmation', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+
+    const envelope = JSON.parse(runCli(['run', 'api', 'action', 'resume'], repoRoot).stdout);
+    assert.equal(envelope.schemaVersion, '2026-04-14');
+    assert.equal(envelope.command, 'workflow.api.action');
+    assert.equal(envelope.data.action.id, 'resume');
+    assert.equal(envelope.data.action.risky, false);
+    assert.equal(envelope.data.preflight.requiresConfirmation, false);
+    assert.equal(envelope.data.preflight.confirmation, null);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('api action preflight: risky action issues a confirmation token', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+
+    const envelope = JSON.parse(runCli(['run', 'api', 'action', 'merge'], repoRoot).stdout);
+    assert.equal(envelope.data.action.risky, true);
+    assert.equal(envelope.data.preflight.requiresConfirmation, true);
+    assert.ok(envelope.data.preflight.confirmation?.token);
+    assert.match(envelope.data.preflight.confirmation.token, /^[a-f0-9]{32}$/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('api action execute: risky action rejects missing or bad tokens', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+
+    const noToken = runCli(['run', 'api', 'action', 'merge', '--execute'], repoRoot, {}, true);
+    assert.equal(noToken.status, 1);
+    const envelope1 = JSON.parse(noToken.stdout);
+    assert.equal(envelope1.ok, false);
+    assert.match(envelope1.data.preflight.reason, /No confirmation token/);
+
+    const badToken = runCli(
+      ['run', 'api', 'action', 'merge', '--execute', '--confirm-token', 'deadbeefdeadbeefdeadbeefdeadbeef'],
+      repoRoot,
+      {},
+      true,
+    );
+    assert.equal(badToken.status, 1);
+    const envelope2 = JSON.parse(badToken.stdout);
+    assert.equal(envelope2.ok, false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('api action execute: risky action accepts a matching confirm token and runs the handler', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+
+    const preflight = JSON.parse(runCli(['run', 'api', 'action', 'clean.apply'], repoRoot).stdout);
+    const token = preflight.data.preflight.confirmation.token;
+    assert.ok(token);
+
+    const executed = runCli(
+      ['run', 'api', 'action', 'clean.apply', '--execute', '--confirm-token', token],
+      repoRoot,
+    );
+    assert.equal(executed.status, 0);
+    const envelope = JSON.parse(executed.stdout);
+    assert.equal(envelope.ok, true);
+    assert.equal(envelope.data.action.id, 'clean.apply');
+    assert.equal(envelope.data.execution.exitCode, 0);
+    assert.ok(envelope.data.execution.result, 'handler output parsed');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('api action execute: non-risky action runs without a token', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+
+    const executed = runCli(['run', 'api', 'action', 'clean.plan', '--execute'], repoRoot);
+    const envelope = JSON.parse(executed.stdout);
+    assert.equal(envelope.ok, true);
+    assert.equal(envelope.data.action.risky, false);
+    assert.equal(envelope.data.execution.exitCode, 0);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('pipelane help prints subcommand list', () => {
   const result = runCli(['pipelane', '--help'], process.cwd());
   assert.equal(result.status, 0);
