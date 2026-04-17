@@ -19,6 +19,9 @@ function normalizeNames(values: unknown): string[] {
 }
 
 function readGhStub(): Record<string, string[]> | null {
+  // Gated to NODE_ENV==='test' so a stray env var in a shared production
+  // shell cannot silently short-circuit the secrets check.
+  if (process.env.NODE_ENV !== 'test') return null;
   const raw = process.env[GH_SECRETS_STUB_ENV];
   if (!raw) return null;
   try {
@@ -49,8 +52,17 @@ function listGhSecrets(cwd: string, environment: '' | 'staging' | 'production'):
     return { ok: false, error: result.stderr || result.stdout || `gh secret list exited ${result.exitCode}` };
   }
   try {
-    const parsed = JSON.parse(result.stdout) as Array<{ name: string }>;
-    return { ok: true, names: normalizeNames(parsed.map((entry) => entry.name)) };
+    const parsed = JSON.parse(result.stdout);
+    if (!Array.isArray(parsed)) {
+      return {
+        ok: false,
+        error: `gh secret list returned unexpected shape: expected array, got ${typeof parsed}`,
+      };
+    }
+    return {
+      ok: true,
+      names: normalizeNames((parsed as Array<{ name?: unknown }>).map((entry) => entry?.name)),
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { ok: false, error: `could not parse gh secret list output: ${message}` };

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 
 import { runCommandCapture } from '../state.ts';
@@ -25,21 +25,39 @@ function loadManifest(manifestPath: string): { manifest: SecretManifest | null; 
   if (!existsSync(manifestPath)) {
     return { manifest: null, error: `secret manifest not found at ${manifestPath}` };
   }
+  let raw: unknown;
   try {
-    const parsed = JSON.parse(readFileSync(manifestPath, 'utf8')) as Partial<SecretManifest>;
-    return {
-      manifest: {
-        required: normalizeNames(parsed.required),
-        optional: normalizeNames(parsed.optional),
-      },
-    };
+    raw = JSON.parse(readFileSync(manifestPath, 'utf8'));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { manifest: null, error: `failed to parse ${manifestPath}: ${message}` };
   }
+  // Require an object with an explicitly-present `required` array. Accepting
+  // bare {} or [] would let any unrelated JSON file pass as "empty manifest"
+  // and silently defeat the gate.
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { manifest: null, error: `${manifestPath}: manifest must be a JSON object with a "required" field` };
+  }
+  const parsed = raw as Record<string, unknown>;
+  if (parsed.required === undefined) {
+    return { manifest: null, error: `${manifestPath}: manifest is missing required "required" field` };
+  }
+  if (!Array.isArray(parsed.required)) {
+    return { manifest: null, error: `${manifestPath}: "required" must be an array of strings` };
+  }
+  return {
+    manifest: {
+      required: normalizeNames(parsed.required),
+      optional: normalizeNames(parsed.optional),
+    },
+  };
 }
 
 function readSupabaseStub(): Record<string, string[]> | null {
+  // Gated to NODE_ENV==='test' so a stray env var in a shared production
+  // shell cannot silently short-circuit the secrets check. Same rationale
+  // as PIPELANE_DEPLOY_PROD_CONFIRM_STUB in v0.5.
+  if (process.env.NODE_ENV !== 'test') return null;
   const raw = process.env[SUPABASE_SECRETS_STUB_ENV];
   if (!raw) return null;
   try {
@@ -68,8 +86,17 @@ function listSupabaseSecrets(cwd: string, projectRef: string): { ok: true; names
     return { ok: false, error: result.stderr || result.stdout || `supabase secrets list exited ${result.exitCode}` };
   }
   try {
-    const parsed = JSON.parse(result.stdout) as Array<{ name: string }>;
-    return { ok: true, names: normalizeNames(parsed.map((entry) => entry.name)) };
+    const parsed = JSON.parse(result.stdout);
+    if (!Array.isArray(parsed)) {
+      return {
+        ok: false,
+        error: `supabase secrets list returned unexpected shape for ${projectRef}: expected array, got ${typeof parsed}`,
+      };
+    }
+    return {
+      ok: true,
+      names: normalizeNames((parsed as Array<{ name?: unknown }>).map((entry) => entry?.name)),
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { ok: false, error: `could not parse supabase secrets list output for ${projectRef}: ${message}` };
@@ -91,7 +118,54 @@ export const secretManifestCheck: Check = {
       };
     }
 
-    const absolutePath = path.isAbsolute(manifestPath) ? manifestPath : path.join(context.repoRoot, manifestPath);
+    // Defense-in-depth: keep the manifest read inside the repo root.
+    // `path.resolve` catches `../` path traversal; `realpathSync` catches
+    // symlink escapes (e.g. the manifest file is a symlink to /etc/passwd).
+    // Attacker would need repo write access to plant either form, but we
+    // still refuse to read outside the tree regardless.
+    const absolutePath = path.resolve(context.repoRoot, manifestPath);
+    const repoRootResolved = path.resolve(context.repoRoot);
+    const isInsideRepo = (candidate: string): boolean =>
+      candidate === repoRootResolved || candidate.startsWith(repoRootResolved + path.sep);
+    if (!isInsideRepo(absolutePath)) {
+      return {
+        plugin: SECRET_MANIFEST_PLUGIN,
+        ok: false,
+        findings: [{
+          plugin: SECRET_MANIFEST_PLUGIN,
+          reason: `secretManifestPath resolves outside the repo (${manifestPath}); refusing to read`,
+        }],
+      };
+    }
+    if (existsSync(absolutePath)) {
+      // Follow symlinks and verify the canonical path is still inside the
+      // repo. If realpathSync throws (broken symlink, permission), surface
+      // as a finding rather than letting it bubble up.
+      try {
+        const canonical = realpathSync(absolutePath);
+        const canonicalRepo = realpathSync(repoRootResolved);
+        if (!(canonical === canonicalRepo || canonical.startsWith(canonicalRepo + path.sep))) {
+          return {
+            plugin: SECRET_MANIFEST_PLUGIN,
+            ok: false,
+            findings: [{
+              plugin: SECRET_MANIFEST_PLUGIN,
+              reason: `secretManifestPath symlinks outside the repo (${manifestPath}); refusing to read`,
+            }],
+          };
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          plugin: SECRET_MANIFEST_PLUGIN,
+          ok: false,
+          findings: [{
+            plugin: SECRET_MANIFEST_PLUGIN,
+            reason: `failed to canonicalize secretManifestPath (${manifestPath}): ${message}`,
+          }],
+        };
+      }
+    }
     const loaded = loadManifest(absolutePath);
     if (!loaded.manifest) {
       return {

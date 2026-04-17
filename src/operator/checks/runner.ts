@@ -17,11 +17,27 @@ export interface ChecksReport {
 export async function runChecks(context: CheckContext, plugins: Check[] = BUILT_IN_CHECKS): Promise<ChecksReport> {
   const outcomes: CheckOutcome[] = [];
   for (const plugin of plugins) {
-    const outcome = await plugin.run(context);
-    if (outcome) outcomes.push(outcome);
+    // Contain plugin throws. A buggy plugin must not crash release-check —
+    // treat an uncaught throw as a fail-closed outcome for that plugin and
+    // let the others still run.
+    try {
+      const outcome = await plugin.run(context);
+      if (outcome) outcomes.push(outcome);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      outcomes.push({
+        plugin: plugin.name,
+        ok: false,
+        findings: [{ plugin: plugin.name, reason: `plugin threw: ${message}` }],
+        error: message,
+      });
+    }
   }
   return {
-    ok: outcomes.every((outcome) => outcome.ok),
+    // Don't trust a plugin's self-reported `ok`. A buggy plugin that returns
+    // ok:true alongside findings or an error must not clear the gate. Derive
+    // effectiveOk from the observable state.
+    ok: outcomes.every((outcome) => outcome.ok && !outcome.error && outcome.findings.length === 0),
     outcomes,
   };
 }

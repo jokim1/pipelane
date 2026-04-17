@@ -347,6 +347,8 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
 const TEST_HOOK_ENV_KEYS = [
   'PIPELANE_DEPLOY_PROD_CONFIRM_STUB',
   'PIPELANE_CLEAN_MIN_AGE_MS',
+  'PIPELANE_CHECKS_SUPABASE_SECRETS_STUB',
+  'PIPELANE_CHECKS_GH_SECRETS_STUB',
 ];
 
 function buildChildEnv(actionId: StableActionId): NodeJS.ProcessEnv {
