@@ -766,10 +766,8 @@ test('release-check fails closed before local CLAUDE is configured', () => {
 // .ready:true flag. The flag now has no authority — only DeployRecord history
 // matters. These tests prove (a) flipping .ready:true does NOT clear the
 // gate, and (b) a real staging-succeeded record DOES.
-function writeFullDeployConfigClaude(repoRoot, options = {}) {
-  const claudeMdPath = path.join(repoRoot, 'CLAUDE.md');
-  const existing = readFileSync(claudeMdPath, 'utf8');
-  const fullConfig = {
+function buildFullDeployConfig(options = {}) {
+  return {
     platform: 'fly.io',
     frontend: {
       production: {
@@ -816,6 +814,12 @@ function writeFullDeployConfigClaude(repoRoot, options = {}) {
       production: { projectRef: 'production-ref' },
     },
   };
+}
+
+function writeFullDeployConfigClaude(repoRoot, options = {}) {
+  const claudeMdPath = path.join(repoRoot, 'CLAUDE.md');
+  const existing = readFileSync(claudeMdPath, 'utf8');
+  const fullConfig = buildFullDeployConfig(options);
   const newSection = [
     '## Deploy Configuration',
     '',
@@ -831,11 +835,22 @@ function writeFullDeployConfigClaude(repoRoot, options = {}) {
     newSection,
   );
   writeFileSync(claudeMdPath, replaced, 'utf8');
+  return fullConfig;
 }
 
-function writeStagingSucceededRecord(repoRoot, surfaces) {
+async function fingerprintForFullConfig(options = {}) {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'release-gate.ts'));
+  return mod.computeDeployConfigFingerprint(buildFullDeployConfig(options));
+}
+
+async function writeStagingSucceededRecord(repoRoot, surfaces) {
   const stateDir = path.join(repoRoot, '.git', 'workflow-kit-state');
   mkdirSync(stateDir, { recursive: true });
+  const fingerprint = await fingerprintForFullConfig();
+  const verificationBySurface = Object.fromEntries(surfaces.map((s) => [
+    s,
+    { healthcheckUrl: 'https://staging.example.test/' + s + '-health', statusCode: 200, latencyMs: 50, probes: 2 },
+  ]));
   const records = [{
     environment: 'staging',
     sha: '1111111111111111111111111111111111111111',
@@ -848,7 +863,9 @@ function writeStagingSucceededRecord(repoRoot, surfaces) {
     status: 'succeeded',
     workflowRunId: 'run-1',
     verifiedAt: '2026-04-15T00:01:30Z',
-    verification: { healthcheckUrl: 'https://staging.example.test/health', statusCode: 200, latencyMs: 50, probes: 2 },
+    verification: verificationBySurface['frontend'] ?? verificationBySurface[surfaces[0]],
+    verificationBySurface,
+    configFingerprint: fingerprint,
     idempotencyKey: 'bootstrap-1',
     triggeredBy: 'test',
   }];
@@ -893,13 +910,13 @@ test('release-check ignores legacy .ready:true flag (v1.2 honor-system kill)', (
   }
 });
 
-test('release-check passes when a staging-succeeded DeployRecord covers every requested surface', () => {
+test('release-check passes when a staging-succeeded DeployRecord covers every requested surface', async () => {
   const repoRoot = createRepo();
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
     runCli(['setup'], repoRoot);
     writeFullDeployConfigClaude(repoRoot);
-    writeStagingSucceededRecord(repoRoot, ['frontend', 'edge', 'sql']);
+    await writeStagingSucceededRecord(repoRoot, ['frontend', 'edge', 'sql']);
 
     const result = runCli(['run', 'release-check', '--json'], repoRoot);
     const output = JSON.parse(result.stdout);
@@ -911,19 +928,253 @@ test('release-check passes when a staging-succeeded DeployRecord covers every re
   }
 });
 
-test('release-check still blocks the surfaces that lack a staging-succeeded record', () => {
+test('release-check still blocks the surfaces that lack a staging-succeeded record', async () => {
   const repoRoot = createRepo();
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
     runCli(['setup'], repoRoot);
     writeFullDeployConfigClaude(repoRoot);
     // Only frontend has been observed-succeeded. edge + sql still blocked.
-    writeStagingSucceededRecord(repoRoot, ['frontend']);
+    await writeStagingSucceededRecord(repoRoot, ['frontend']);
 
     const result = runCli(['run', 'release-check', '--json'], repoRoot, {}, true);
     const output = JSON.parse(result.stdout);
     assert.equal(result.status, 1);
     assert.equal(output.ready, false);
+    assert.deepEqual(output.blockedSurfaces.sort(), ['edge', 'sql']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check: a later staging failure re-blocks a previously-succeeded surface', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    const fingerprint = await fingerprintForFullConfig();
+
+    const stateDir = path.join(repoRoot, '.git', 'workflow-kit-state');
+    mkdirSync(stateDir, { recursive: true });
+    // Records are ordered oldest → newest. A fresh succeeded deploy
+    // followed by a failed re-deploy of the same surface must re-block.
+    const okProbe = { healthcheckUrl: 'x', statusCode: 200, latencyMs: 10, probes: 2 };
+    writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({
+      records: [
+        {
+          environment: 'staging', sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          surfaces: ['frontend', 'edge', 'sql'], workflowName: 'Deploy Hosted',
+          requestedAt: '2026-04-10T00:00:00Z', finishedAt: '2026-04-10T00:01:00Z',
+          taskSlug: 'bootstrap', status: 'succeeded',
+          verifiedAt: '2026-04-10T00:01:30Z',
+          verification: okProbe,
+          verificationBySurface: { frontend: okProbe, edge: okProbe, sql: okProbe },
+          configFingerprint: fingerprint,
+          idempotencyKey: 'old-1', triggeredBy: 'test',
+        },
+        {
+          environment: 'staging', sha: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+          surfaces: ['frontend'], workflowName: 'Deploy Hosted',
+          requestedAt: '2026-04-15T00:00:00Z', finishedAt: '2026-04-15T00:01:00Z',
+          taskSlug: 'regression', status: 'failed',
+          failureReason: 'healthcheck returned HTTP 503',
+          configFingerprint: fingerprint,
+          idempotencyKey: 'new-1', triggeredBy: 'test',
+        },
+      ],
+    }, null, 2), 'utf8');
+
+    const result = runCli(['run', 'release-check', '--json'], repoRoot, {}, true);
+    const output = JSON.parse(result.stdout);
+    assert.equal(result.status, 1);
+    // frontend's latest record is FAILED → blocked. edge/sql's latest is
+    // the earlier succeeded record → still cleared.
+    assert.deepEqual(output.blockedSurfaces, ['frontend']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check rejects staging success records without verifiedAt', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+
+    const stateDir = path.join(repoRoot, '.git', 'workflow-kit-state');
+    mkdirSync(stateDir, { recursive: true });
+    // Hand-forged record with status:'succeeded' but no verifiedAt and no
+    // verification block. handleDeploy never produces this shape; only a
+    // human or an AI writing deploy-state.json directly would.
+    writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({
+      records: [{
+        environment: 'staging', sha: 'cccccccccccccccccccccccccccccccccccccccc',
+        surfaces: ['frontend', 'edge', 'sql'], workflowName: 'Deploy Hosted',
+        requestedAt: '2026-04-15T00:00:00Z',
+        taskSlug: 'forged', status: 'succeeded',
+        idempotencyKey: 'forged-1',
+      }],
+    }, null, 2), 'utf8');
+
+    const result = runCli(['run', 'release-check', '--json'], repoRoot, {}, true);
+    const output = JSON.parse(result.stdout);
+    assert.equal(result.status, 1);
+    assert.equal(output.ready, false);
+    assert.match(output.message, /no succeeded deploy observed/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('parseDeployConfigMarkdown preserves legacy .ready:true for backwards compat', async () => {
+  // Guards against a silent parse regression: the flag is ignored by the
+  // evaluator, but must still round-trip through the schema so old consumer
+  // CLAUDE.md files don't produce undefined-property crashes.
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'release-gate.ts'));
+  const markdown = [
+    '## Deploy Configuration',
+    '',
+    '```json',
+    JSON.stringify({
+      platform: '',
+      frontend: { production: { url: '', deployWorkflow: '', autoDeployOnMain: false, healthcheckUrl: '' },
+        staging: { url: '', deployWorkflow: '', healthcheckUrl: '', ready: true } },
+      edge: { staging: { deployCommand: '', verificationCommand: '', healthcheckUrl: '', ready: true },
+        production: { deployCommand: '', verificationCommand: '', healthcheckUrl: '' } },
+      sql: { staging: { applyCommand: '', verificationCommand: '', healthcheckUrl: '', ready: true },
+        production: { applyCommand: '', verificationCommand: '', healthcheckUrl: '' } },
+      supabase: { staging: { projectRef: '' }, production: { projectRef: '' } },
+    }, null, 2),
+    '```',
+  ].join('\n');
+
+  const parsed = mod.parseDeployConfigMarkdown(markdown);
+  assert.ok(parsed, 'markdown parsed');
+  assert.equal(parsed.frontend.staging.ready, true, 'frontend.staging.ready round-trips');
+  assert.equal(parsed.edge.staging.ready, true, 'edge.staging.ready round-trips');
+  assert.equal(parsed.sql.staging.ready, true, 'sql.staging.ready round-trips');
+});
+
+test('release-check re-blocks when the deploy config fingerprint drifts', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    await writeStagingSucceededRecord(repoRoot, ['frontend', 'edge', 'sql']);
+
+    // Baseline: record fingerprint matches current config → cleared.
+    const baseline = JSON.parse(runCli(['run', 'release-check', '--json'], repoRoot).stdout);
+    assert.equal(baseline.ready, true);
+
+    // Now rotate the staging URL in CLAUDE.md. The record's stored
+    // configFingerprint no longer matches → gate re-blocks, operator must
+    // re-run staging to re-register against the new config shape.
+    const claudeMdPath = path.join(repoRoot, 'CLAUDE.md');
+    const existing = readFileSync(claudeMdPath, 'utf8');
+    writeFileSync(
+      claudeMdPath,
+      existing.replace('staging.example.test', 'staging-v2.example.test'),
+      'utf8',
+    );
+
+    const drifted = runCli(['run', 'release-check', '--json'], repoRoot, {}, true);
+    const output = JSON.parse(drifted.stdout);
+    assert.equal(drifted.status, 1);
+    assert.equal(output.ready, false);
+    // The "no succeeded deploy observed" message is accurate: under the new
+    // fingerprint, none of the existing records qualify.
+    assert.match(output.message, /no succeeded deploy observed/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check accepts HMAC-signed records when PIPELANE_DEPLOY_STATE_KEY is configured', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+
+    const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'release-gate.ts'));
+    const fingerprint = await fingerprintForFullConfig();
+    const key = 'deadbeef'.repeat(8);
+    const okProbe = { healthcheckUrl: 'https://staging.example.test/health', statusCode: 200, latencyMs: 50, probes: 2 };
+    const record = {
+      environment: 'staging',
+      sha: '1111111111111111111111111111111111111111',
+      surfaces: ['frontend', 'edge', 'sql'],
+      workflowName: 'Deploy Hosted',
+      requestedAt: '2026-04-15T00:00:00Z',
+      finishedAt: '2026-04-15T00:01:00Z',
+      durationMs: 60000,
+      taskSlug: 'bootstrap',
+      status: 'succeeded',
+      workflowRunId: 'run-1',
+      verifiedAt: '2026-04-15T00:01:30Z',
+      verification: okProbe,
+      verificationBySurface: { frontend: okProbe, edge: okProbe, sql: okProbe },
+      configFingerprint: fingerprint,
+      idempotencyKey: 'signed-1',
+      triggeredBy: 'test',
+    };
+    const signed = { ...record, signature: mod.signDeployRecord(record, key) };
+    const stateDir = path.join(repoRoot, '.git', 'workflow-kit-state');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({ records: [signed] }, null, 2), 'utf8');
+
+    // With the key set, signed record clears the gate.
+    const ok = runCli(['run', 'release-check', '--json'], repoRoot, { PIPELANE_DEPLOY_STATE_KEY: key });
+    assert.equal(ok.status, 0);
+    assert.equal(JSON.parse(ok.stdout).ready, true);
+
+    // With a DIFFERENT key configured, the same record's signature no longer
+    // verifies → gate blocks. Proves the key actually participates.
+    const blocked = runCli(['run', 'release-check', '--json'], repoRoot, { PIPELANE_DEPLOY_STATE_KEY: 'a'.repeat(64) }, true);
+    assert.equal(blocked.status, 1);
+    assert.equal(JSON.parse(blocked.stdout).ready, false);
+
+    // Without the key configured, signature is ignored and the record clears
+    // (backwards-compat path for consumers who haven't opted into signing).
+    const unkeyed = runCli(['run', 'release-check', '--json'], repoRoot);
+    assert.equal(unkeyed.status, 0);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check: legacy aggregate verification only credits frontend', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    const fingerprint = await fingerprintForFullConfig();
+
+    // Legacy-style record: no verificationBySurface, only the aggregate
+    // verification block. Surfaces ['frontend','edge','sql'] — under the
+    // new gate edge/sql lack their own probe results and must block.
+    const stateDir = path.join(repoRoot, '.git', 'workflow-kit-state');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({
+      records: [{
+        environment: 'staging', sha: '1111111111111111111111111111111111111111',
+        surfaces: ['frontend', 'edge', 'sql'], workflowName: 'Deploy Hosted',
+        requestedAt: '2026-04-15T00:00:00Z', finishedAt: '2026-04-15T00:01:00Z',
+        taskSlug: 'legacy', status: 'succeeded',
+        verifiedAt: '2026-04-15T00:01:30Z',
+        verification: { healthcheckUrl: 'x', statusCode: 200, latencyMs: 10, probes: 2 },
+        configFingerprint: fingerprint,
+        idempotencyKey: 'legacy-1', triggeredBy: 'test',
+      }],
+    }, null, 2), 'utf8');
+
+    const result = runCli(['run', 'release-check', '--json'], repoRoot, {}, true);
+    const output = JSON.parse(result.stdout);
+    assert.equal(result.status, 1);
     assert.deepEqual(output.blockedSurfaces.sort(), ['edge', 'sql']);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });

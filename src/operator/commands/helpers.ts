@@ -165,21 +165,34 @@ export function resolveHealthcheckUrl(
   deployConfig: DeployConfig,
   environment: 'staging' | 'prod',
 ): string {
-  // Frontend is the primary surface for post-deploy probes today. edge/sql
-  // healthchecks (when they ship) layer on top of this and get their own
-  // probe entries in the verification record.
-  if (environment === 'staging') {
-    return (
-      deployConfig.frontend.staging.healthcheckUrl
-      || deployConfig.frontend.staging.url
-      || ''
-    );
+  // Kept for legacy call sites. Prefer `resolveSurfaceHealthcheckUrl` so
+  // each surface gets its own probe.
+  return resolveSurfaceHealthcheckUrl(deployConfig, environment, 'frontend');
+}
+
+// v1.2: per-surface probe URL. Multi-surface staging deploys now probe each
+// surface separately so edge/sql can't inherit readiness from a frontend-only
+// healthcheck. Returns '' when the surface has no probe configured; the
+// caller decides whether to treat that as unverified.
+export function resolveSurfaceHealthcheckUrl(
+  deployConfig: DeployConfig,
+  environment: 'staging' | 'prod',
+  surface: string,
+): string {
+  const staging = environment === 'staging';
+  if (surface === 'frontend') {
+    const fe = staging ? deployConfig.frontend.staging : deployConfig.frontend.production;
+    return fe.healthcheckUrl || fe.url || '';
   }
-  return (
-    deployConfig.frontend.production.healthcheckUrl
-    || deployConfig.frontend.production.url
-    || ''
-  );
+  if (surface === 'edge') {
+    const edge = staging ? deployConfig.edge.staging : deployConfig.edge.production;
+    return edge.healthcheckUrl || '';
+  }
+  if (surface === 'sql') {
+    const sql = staging ? deployConfig.sql.staging : deployConfig.sql.production;
+    return sql.healthcheckUrl || '';
+  }
+  return '';
 }
 
 export function buildPrBody(title: string, checks: string[]): string {

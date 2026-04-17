@@ -1,6 +1,16 @@
 import readline from 'node:readline';
 
-import { buildReleaseCheckMessage, emptyDeployConfig, evaluateReleaseReadiness, loadDeployConfig, normalizeDeployEnvironment } from '../release-gate.ts';
+import {
+  buildReleaseCheckMessage,
+  computeDeployConfigFingerprint,
+  emptyDeployConfig,
+  evaluateReleaseReadiness,
+  loadDeployConfig,
+  normalizeDeployEnvironment,
+  resolveDeployStateKey,
+  signDeployRecord,
+  verifyDeployRecord,
+} from '../release-gate.ts';
 import {
   loadDeployState,
   loadPrRecord,
@@ -22,6 +32,7 @@ import {
   resolveCommandSurfaces,
   resolveDeployTargetForTask,
   resolveHealthcheckUrl,
+  resolveSurfaceHealthcheckUrl,
 } from './helpers.ts';
 
 function surfacesKey(surfaces: string[]): string {
@@ -45,6 +56,51 @@ function findMatchingSucceededDeploy(options: {
     && surfacesKey(record.surfaces) === key
     && (!record.taskSlug || record.taskSlug === options.taskSlug)
   ) ?? null;
+}
+
+// v1.2: per-surface verification + fingerprint + signature check for the
+// prod-gate record. Returns the first reason the record fails to qualify, or
+// null when everything checks out. Keeps the prod gate as tight as the
+// staging-readiness gate.
+function disqualifyStagingRecord(options: {
+  record: DeployRecord;
+  surfaces: string[];
+  expectedFingerprint: string;
+  stateKey: string | undefined;
+}): string | null {
+  const { record, surfaces, expectedFingerprint, stateKey } = options;
+  if (!record.verifiedAt) {
+    return `record lacks verifiedAt timestamp (status "${record.status ?? 'unknown'}" without verified probe)`;
+  }
+  if (record.configFingerprint && record.configFingerprint !== expectedFingerprint) {
+    return 'deploy config has drifted since this record was written; re-run staging to re-register';
+  }
+  if (!record.configFingerprint) {
+    return 'record lacks configFingerprint (legacy pre-v1.2 record, cannot prove config parity)';
+  }
+  if (stateKey && !verifyDeployRecord(record, stateKey)) {
+    return 'HMAC signature missing or invalid under PIPELANE_DEPLOY_STATE_KEY';
+  }
+  for (const surface of surfaces) {
+    const probe = record.verificationBySurface?.[surface];
+    if (!probe) {
+      if (surface === 'frontend' && record.verification) {
+        // Legacy aggregate-only verification (pre-per-surface). Only accepts
+        // frontend, matching hasObservedStagingSuccess's legacy fallback.
+        const code = record.verification.statusCode;
+        if (typeof code !== 'number' || code < 200 || code >= 300) {
+          return `frontend: legacy verification is non-2xx (${code ?? 'missing'})`;
+        }
+        continue;
+      }
+      return `${surface}: no per-surface verification recorded`;
+    }
+    const code = probe.statusCode;
+    if (typeof code !== 'number' || code < 200 || code >= 300) {
+      return `${surface}: healthcheck returned ${code ?? 'no status'}`;
+    }
+  }
+  return null;
 }
 
 export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
@@ -98,10 +154,18 @@ export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Pro
         'Run workflow:deploy -- staging first, wait for it to report status=succeeded.',
       ].join('\n'));
     }
-    if (staging.verification && typeof staging.verification.statusCode === 'number' && staging.verification.statusCode >= 300) {
+    // v1.2: tighten the prod gate with the same per-surface + fingerprint +
+    // signature invariants as the staging-readiness gate.
+    const disqualification = disqualifyStagingRecord({
+      record: staging,
+      surfaces,
+      expectedFingerprint: computeDeployConfigFingerprint(deployConfig),
+      stateKey: resolveDeployStateKey(),
+    });
+    if (disqualification) {
       throw new Error([
-        `deploy prod blocked: the matching staging deploy verified as HTTP ${staging.verification.statusCode}.`,
-        'Staging needs a clean 2xx healthcheck before prod promotion.',
+        `deploy prod blocked: matching staging record is not promotable — ${disqualification}.`,
+        'Re-run workflow:deploy -- staging and let it verify before promoting.',
       ].join('\n'));
     }
   }
@@ -210,22 +274,52 @@ export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Pro
   let failureReason = watched.ok ? undefined : (watched.reason || 'workflow run reported non-zero exit');
 
   let verification: DeployVerification | undefined;
+  let verificationBySurface: Record<string, DeployVerification> | undefined;
   if (watched.ok) {
-    const healthcheckUrl = resolveHealthcheckUrl(deployConfig, environment);
+    // v1.2: per-surface probing. A multi-surface deploy produces one probe
+    // entry per surface so a frontend healthcheck can't credit edge or sql.
+    // If any surface returns non-2xx (or lacks a probe URL entirely), the
+    // whole deploy flips to failed.
+    verificationBySurface = {};
+    const perSurfaceFailures: string[] = [];
     const stubStatus = process.env.PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS;
-    if (healthcheckUrl || stubStatus) {
-      verification = await probeHealthcheck(healthcheckUrl);
-      if (typeof verification.statusCode !== 'number' || verification.statusCode < 200 || verification.statusCode >= 300) {
-        status = 'failed';
-        failureReason = verification.error
-          ?? (verification.statusCode
-            ? `healthcheck returned HTTP ${verification.statusCode}`
-            : 'healthcheck did not return a 2xx');
+
+    for (const surface of surfaces) {
+      const surfaceUrl = resolveSurfaceHealthcheckUrl(deployConfig, environment, surface);
+      if (!surfaceUrl && !stubStatus) {
+        const empty: DeployVerification = { healthcheckUrl: '', probes: 0 };
+        verificationBySurface[surface] = empty;
+        perSurfaceFailures.push(`${surface}: no healthcheck URL configured`);
+        continue;
       }
-    } else {
-      verification = { healthcheckUrl: '', probes: 0 };
+      const probe = await probeHealthcheck(surfaceUrl);
+      verificationBySurface[surface] = probe;
+      const code = probe.statusCode;
+      if (typeof code !== 'number' || code < 200 || code >= 300) {
+        perSurfaceFailures.push(
+          probe.error
+            ?? (code
+              ? `${surface}: healthcheck returned HTTP ${code}`
+              : `${surface}: healthcheck did not return a 2xx`),
+        );
+      }
+    }
+
+    // Aggregate block kept for back-compat with pre-v1.2 consumers of the
+    // DeployRecord shape (dashboard, Rocketboard). Picks frontend when
+    // present, otherwise the first surface probed.
+    verification = verificationBySurface['frontend']
+      ?? verificationBySurface[surfaces[0]]
+      ?? { healthcheckUrl: '', probes: 0 };
+
+    if (perSurfaceFailures.length > 0) {
+      status = 'failed';
+      failureReason = perSurfaceFailures.join('; ');
     }
   }
+
+  const verifiedAt = status === 'succeeded' ? nowIso() : undefined;
+  const configFingerprint = computeDeployConfigFingerprint(deployConfig);
 
   record = {
     ...record,
@@ -233,9 +327,19 @@ export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Pro
     finishedAt,
     durationMs,
     verification,
-    verifiedAt: status === 'succeeded' ? nowIso() : undefined,
+    verificationBySurface,
+    verifiedAt,
+    configFingerprint,
     failureReason,
   };
+
+  // v1.2: sign the record if the consumer has opted in via the state-key
+  // env var. Unsigned records still ship; they're accepted by the gate only
+  // when no key is configured.
+  const stateKey = resolveDeployStateKey();
+  if (stateKey) {
+    record = { ...record, signature: signDeployRecord(record, stateKey) };
+  }
 
   const latestState = loadDeployState(context.commonDir, context.config);
   persistRecord(context.commonDir, context.config, latestState.records, record);

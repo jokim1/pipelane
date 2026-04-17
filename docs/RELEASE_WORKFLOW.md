@@ -199,6 +199,28 @@ npm run pipelane:setup                  # installs aliases + writes templates (s
 
 Release lane is **fail-closed until ****`/doctor --probe`**** returns all green**.
 
+### Bootstrapping release lane (v1.2+)
+
+On a fresh repo, or when upgrading an older pipelane consumer to v1.2+,
+`/devmode release` will fail closed with `no succeeded deploy observed`
+for every surface you plan to ship. That is the gate doing its job:
+release readiness is no longer a boolean you flip, it is earned by
+running one verified staging deploy per surface.
+
+One-time bootstrap:
+
+```
+/devmode build                            # build lane skips the readiness gate
+/deploy staging [frontend,edge,sql]       # watches gh run + 2xx healthcheck, writes DeployRecord
+/devmode release                          # now sees the succeeded record and clears
+```
+
+You only need to do this once per surface per repo. After the first
+verified staging deploy, subsequent `/devmode release` is a no-op.
+The bootstrap is the same whether the repo is brand-new or migrating
+from pre-v1.2 (where `.staging.ready: true` used to be the honor-system
+escape hatch).
+
 ### Happy path
 
 ```
