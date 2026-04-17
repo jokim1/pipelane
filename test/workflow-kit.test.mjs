@@ -838,9 +838,9 @@ function writeFullDeployConfigClaude(repoRoot, options = {}) {
   return fullConfig;
 }
 
-async function fingerprintForFullConfig(options = {}) {
+async function fingerprintForFullConfig(options = {}, environment = 'staging') {
   const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'release-gate.ts'));
-  return mod.computeDeployConfigFingerprint(buildFullDeployConfig(options));
+  return mod.computeDeployConfigFingerprint(buildFullDeployConfig(options), environment);
 }
 
 async function writeStagingSucceededRecord(repoRoot, surfaces) {
@@ -1022,7 +1022,10 @@ test('release-check rejects staging success records without verifiedAt', () => {
     const output = JSON.parse(result.stdout);
     assert.equal(result.status, 1);
     assert.equal(output.ready, false);
-    assert.match(output.message, /no succeeded deploy observed/);
+    // Diagnostic must specifically call out the missing verifiedAt — not
+    // just the generic "no succeeded deploy" reason. This protects against
+    // a regression that removes the verifiedAt check.
+    assert.match(output.message, /lacks verifiedAt/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -1084,9 +1087,109 @@ test('release-check re-blocks when the deploy config fingerprint drifts', async 
     const output = JSON.parse(drifted.stdout);
     assert.equal(drifted.status, 1);
     assert.equal(output.ready, false);
-    // The "no succeeded deploy observed" message is accurate: under the new
-    // fingerprint, none of the existing records qualify.
-    assert.match(output.message, /no succeeded deploy observed/);
+    // Diagnostic must specifically call out fingerprint mismatch, not just
+    // the generic "no record" reason. Otherwise a regression that silently
+    // dropped the fingerprint check would be invisible to this test.
+    assert.match(output.message, /config drift|fingerprint mismatch/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check: rotating prod-only config does NOT invalidate staging records', async () => {
+  // Fingerprint is environment-scoped. Rotating frontend.production.url
+  // shouldn't make a staging-succeeded record fail the gate, since the
+  // record was registered against the staging slice of the config.
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    await writeStagingSucceededRecord(repoRoot, ['frontend', 'edge', 'sql']);
+
+    // Baseline: cleared.
+    const baseline = JSON.parse(runCli(['run', 'release-check', '--json'], repoRoot).stdout);
+    assert.equal(baseline.ready, true);
+
+    // Rotate ONLY production fields. Staging-side config is untouched, so
+    // the staging fingerprint must remain stable and the gate must stay open.
+    const claudeMdPath = path.join(repoRoot, 'CLAUDE.md');
+    const existing = readFileSync(claudeMdPath, 'utf8');
+    writeFileSync(
+      claudeMdPath,
+      existing.replace('https://app.example.test', 'https://app-v2.example.test'),
+      'utf8',
+    );
+
+    const after = JSON.parse(runCli(['run', 'release-check', '--json'], repoRoot).stdout);
+    assert.equal(after.ready, true, 'prod-only config rotation must not re-block staging');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check: an attacker-planted unsigned failed record is invisible when key is set', async () => {
+  // Codex-flagged P1 DoS path: with PIPELANE_DEPLOY_STATE_KEY set, an
+  // attacker with fs-write access to deploy-state.json would otherwise be
+  // able to plant an unsigned `status: 'failed'` record and make it the
+  // "latest" for a surface, blocking release readiness. Trusted-records
+  // filtering must skip unsigned records entirely so a real signed success
+  // earlier in history remains authoritative.
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+
+    const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'release-gate.ts'));
+    const fingerprint = await fingerprintForFullConfig();
+    const key = 'beefcafe'.repeat(8);
+    const okProbe = { healthcheckUrl: 'x', statusCode: 200, latencyMs: 10, probes: 2 };
+    const goodRecord = {
+      environment: 'staging',
+      sha: '1'.repeat(40),
+      surfaces: ['frontend'],
+      workflowName: 'Deploy Hosted',
+      requestedAt: '2026-04-15T00:00:00Z',
+      finishedAt: '2026-04-15T00:01:00Z',
+      taskSlug: 'real',
+      status: 'succeeded',
+      verifiedAt: '2026-04-15T00:01:30Z',
+      verification: okProbe,
+      verificationBySurface: { frontend: okProbe },
+      configFingerprint: fingerprint,
+      idempotencyKey: 'real-1',
+      triggeredBy: 'test',
+    };
+    const goodSigned = { ...goodRecord, signature: mod.signDeployRecord(goodRecord, key) };
+    // Attacker plants an unsigned failed record AFTER the good one.
+    const plantedFailure = {
+      environment: 'staging',
+      sha: 'b'.repeat(40),
+      surfaces: ['frontend'],
+      workflowName: 'Deploy Hosted',
+      requestedAt: '2026-04-16T00:00:00Z',
+      finishedAt: '2026-04-16T00:00:30Z',
+      taskSlug: 'planted',
+      status: 'failed',
+      configFingerprint: fingerprint,
+      failureReason: 'attacker plant',
+      idempotencyKey: 'plant-1',
+    };
+    const stateDir = path.join(repoRoot, '.git', 'workflow-kit-state');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({
+      records: [goodSigned, plantedFailure],
+    }, null, 2), 'utf8');
+
+    // With the key set, the unsigned planted failure is filtered out and
+    // the real signed success remains authoritative for frontend.
+    const result = runCli(['run', 'release-check', '--surfaces', 'frontend', '--json'], repoRoot, {
+      PIPELANE_DEPLOY_STATE_KEY: key,
+    });
+    const output = JSON.parse(result.stdout);
+    assert.equal(result.status, 0, `expected success, got: ${output.message}`);
+    assert.equal(output.ready, true);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -1144,6 +1247,53 @@ test('release-check accepts HMAC-signed records when PIPELANE_DEPLOY_STATE_KEY i
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
+});
+
+test('makeIdempotencyKey includes configFingerprint so drift forces a re-dispatch', async () => {
+  // Regression: if two deploys with the same sha/surfaces/taskSlug run under
+  // different configs, they must produce different idempotency keys.
+  // Otherwise the short-circuit in handleDeploy would skip the re-dispatch
+  // and falsely report "already succeeded" under the new config.
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'helpers.ts'));
+  const base = { environment: 'staging', sha: 'a'.repeat(40), surfaces: ['frontend'], taskSlug: 'drift' };
+  const keyA = mod.makeIdempotencyKey({ ...base, configFingerprint: 'f'.repeat(64) });
+  const keyB = mod.makeIdempotencyKey({ ...base, configFingerprint: 'e'.repeat(64) });
+  assert.notEqual(keyA, keyB, 'different fingerprints -> different idempotency keys');
+
+  // And without a fingerprint (legacy caller), the key is stable.
+  const legacyA = mod.makeIdempotencyKey(base);
+  const legacyB = mod.makeIdempotencyKey(base);
+  assert.equal(legacyA, legacyB, 'omitted fingerprint -> stable legacy key');
+});
+
+test('signDeployRecord signature survives JSON round-trip with undefined nested fields', async () => {
+  // Regression: canonicalize() must strip undefined-valued keys from objects
+  // the same way JSON.stringify does on write. Otherwise a record signed
+  // in-memory (with e.g. `verification.error: undefined` from a successful
+  // probe) fails its own signature after being read back from disk.
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'release-gate.ts'));
+  const key = 'a'.repeat(64);
+  const probe = { healthcheckUrl: 'x', statusCode: 200, latencyMs: 10, probes: 2, error: undefined };
+  const record = {
+    environment: 'staging',
+    sha: '1'.repeat(40),
+    surfaces: ['frontend'],
+    workflowName: 'Deploy Hosted',
+    requestedAt: '2026-04-15T00:00:00Z',
+    finishedAt: '2026-04-15T00:01:00Z',
+    status: 'succeeded',
+    verifiedAt: '2026-04-15T00:01:30Z',
+    verification: probe,
+    verificationBySurface: { frontend: probe },
+    configFingerprint: 'f'.repeat(64),
+    idempotencyKey: 'k1',
+    triggeredBy: 'test',
+  };
+  const signed = { ...record, signature: mod.signDeployRecord(record, key) };
+  assert.equal(mod.verifyDeployRecord(signed, key), true, 'in-memory record verifies');
+
+  const onDisk = JSON.parse(JSON.stringify(signed));
+  assert.equal(mod.verifyDeployRecord(onDisk, key), true, 'record survives JSON round-trip');
 });
 
 test('release-check: legacy aggregate verification only credits frontend', async () => {
@@ -1208,7 +1358,8 @@ test('release-check does not count failed staging records as observed success', 
     const output = JSON.parse(result.stdout);
     assert.equal(result.status, 1);
     assert.equal(output.ready, false);
-    assert.match(output.message, /no succeeded deploy observed/);
+    // Specific reason: latest record was failed, not just "no record."
+    assert.match(output.message, /latest record has status "failed"/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }

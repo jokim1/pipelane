@@ -120,6 +120,14 @@ export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Pro
   });
 
   const deployState = loadDeployState(context.commonDir, context.config);
+  // v1.2: when signing is configured, attacker-planted records (unsigned or
+  // bad-sig) are filtered out of every gate consult. They remain on disk and
+  // get naturally displaced by persistRecord's slice(-100), but they can't
+  // become "latest" for a surface or short-circuit an idempotency check.
+  const stateKey = resolveDeployStateKey();
+  const trustedRecords = stateKey
+    ? deployState.records.filter((record) => verifyDeployRecord(record, stateKey))
+    : deployState.records;
 
   if (context.modeState.mode === 'release') {
     // v1.2 readiness is now observed, not asserted. Callers to prod are also
@@ -128,7 +136,7 @@ export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Pro
     const readiness = evaluateReleaseReadiness({
       config: context.config,
       deployConfig,
-      deployRecords: deployState.records,
+      deployRecords: trustedRecords,
       surfaces,
     });
     if (!readiness.ready && !context.modeState.override) {
@@ -141,7 +149,7 @@ export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Pro
   // qualify — legacy records fail closed.
   if (context.modeState.mode === 'release' && environment === 'prod') {
     const staging = findMatchingSucceededDeploy({
-      records: deployState.records,
+      records: trustedRecords,
       environment: 'staging',
       sha: target.sha,
       surfaces,
@@ -159,8 +167,10 @@ export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Pro
     const disqualification = disqualifyStagingRecord({
       record: staging,
       surfaces,
-      expectedFingerprint: computeDeployConfigFingerprint(deployConfig),
-      stateKey: resolveDeployStateKey(),
+      // The record being checked is a STAGING record, so compare its stored
+      // fingerprint against the current STAGING config slice, not prod.
+      expectedFingerprint: computeDeployConfigFingerprint(deployConfig, 'staging'),
+      stateKey,
     });
     if (disqualification) {
       throw new Error([
@@ -175,12 +185,14 @@ export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Pro
     sha: target.sha,
     surfaces,
     taskSlug,
+    configFingerprint: computeDeployConfigFingerprint(deployConfig, environment),
   });
 
   // Short-circuit: if we already have a succeeded deploy with this key,
-  // don't re-dispatch. Return the existing record.
+  // don't re-dispatch. Return the existing record. Uses trusted records so
+  // an attacker can't plant a sig-invalid success to DoS legitimate deploys.
   const existingSucceeded = findMatchingSucceededDeploy({
-    records: deployState.records,
+    records: trustedRecords,
     environment,
     sha: target.sha,
     surfaces,
@@ -319,7 +331,7 @@ export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Pro
   }
 
   const verifiedAt = status === 'succeeded' ? nowIso() : undefined;
-  const configFingerprint = computeDeployConfigFingerprint(deployConfig);
+  const configFingerprint = computeDeployConfigFingerprint(deployConfig, environment);
 
   record = {
     ...record,
@@ -335,8 +347,8 @@ export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Pro
 
   // v1.2: sign the record if the consumer has opted in via the state-key
   // env var. Unsigned records still ship; they're accepted by the gate only
-  // when no key is configured.
-  const stateKey = resolveDeployStateKey();
+  // when no key is configured. Reuses the `stateKey` resolved at the top of
+  // this function.
   if (stateKey) {
     record = { ...record, signature: signDeployRecord(record, stateKey) };
   }

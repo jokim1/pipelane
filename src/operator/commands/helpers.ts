@@ -151,12 +151,18 @@ export function makeIdempotencyKey(options: {
   sha: string;
   surfaces: string[];
   taskSlug: string;
+  // v1.2: rolling the deploy config (healthcheck URL, deploy workflow,
+  // staging URL) should force a re-dispatch rather than short-circuit on a
+  // stale succeeded record. Include it in the key so different configs
+  // produce different keys naturally.
+  configFingerprint?: string;
 }): string {
   const canonical = JSON.stringify({
     environment: options.environment,
     sha: options.sha,
     surfaces: [...options.surfaces].sort(),
     taskSlug: options.taskSlug,
+    configFingerprint: options.configFingerprint ?? '',
   });
   return createHash('sha256').update(canonical).digest('hex').slice(0, 24);
 }
