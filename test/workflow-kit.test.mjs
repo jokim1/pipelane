@@ -1117,6 +1117,86 @@ test('update fails clearly when pipelane is not installed in consumer', () => {
   }
 });
 
+test('api snapshot emits a wire-compatible envelope', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    runCli(['run', 'new', '--task', 'Snapshot Task', '--json'], repoRoot);
+
+    const result = runCli(['run', 'api', 'snapshot'], repoRoot);
+    const envelope = JSON.parse(result.stdout);
+
+    assert.equal(envelope.schemaVersion, '2026-04-14');
+    assert.equal(envelope.command, 'workflow.api.snapshot');
+    assert.equal(envelope.ok, true);
+    assert.ok(Array.isArray(envelope.warnings));
+    assert.ok(Array.isArray(envelope.issues));
+    assert.ok(envelope.data, 'data object present');
+
+    const { boardContext, sourceHealth, attention, availableActions, branches } = envelope.data;
+    assert.ok(boardContext);
+    assert.equal(boardContext.baseBranch, 'main');
+    assert.deepEqual(boardContext.laneOrder, ['Local', 'PR', 'Base: main', 'Staging', 'Production']);
+    assert.ok(boardContext.overallFreshness?.checkedAt);
+    assert.ok(Array.isArray(sourceHealth) && sourceHealth.length >= 1);
+    assert.ok(sourceHealth.find((entry) => entry.name === 'git.local'));
+    assert.ok(sourceHealth.find((entry) => entry.name === 'task-locks'));
+    assert.ok(Array.isArray(attention));
+    assert.ok(Array.isArray(availableActions));
+
+    assert.ok(Array.isArray(branches) && branches.length === 1);
+    const [branch] = branches;
+    assert.match(branch.name, /^codex\/snapshot-task-[a-f0-9]{4}$/);
+    assert.equal(branch.task.taskSlug, 'snapshot-task');
+    for (const laneKey of ['local', 'pr', 'base', 'staging', 'production']) {
+      assert.ok(branch.lanes[laneKey], `lane ${laneKey} present`);
+      assert.ok(typeof branch.lanes[laneKey].state === 'string');
+      assert.ok(branch.lanes[laneKey].freshness?.state);
+    }
+    assert.equal(branch.lanes.pr.state, 'awaiting_preflight', 'no PR opened yet');
+    assert.equal(branch.lanes.base.state, 'awaiting_preflight', 'branch has not landed');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('api snapshot marks staging as bypassed in build mode', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    // Force a merged PR state so staging/production lanes are computed
+    // beyond the "awaiting_preflight" fast-path.
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Bypass Check', '--json'], repoRoot).stdout);
+    const prStatePath = path.join(repoRoot, '.git', 'workflow-kit-state', 'pr-state.json');
+    mkdirSync(path.dirname(prStatePath), { recursive: true });
+    writeFileSync(prStatePath, JSON.stringify({
+      records: {
+        'bypass-check': {
+          taskSlug: 'bypass-check',
+          branchName: created.branch,
+          title: 'bypass check',
+          number: 42,
+          url: 'https://example.test/pr/42',
+          mergedSha: 'deadbeefcafebabe00000000000000000000abcd',
+          mergedAt: '2026-04-17T00:00:00Z',
+          updatedAt: '2026-04-17T00:00:00Z',
+        },
+      },
+    }, null, 2), 'utf8');
+
+    const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    const [branch] = envelope.data.branches;
+    assert.equal(branch.lanes.staging.state, 'bypassed', 'build mode bypasses staging');
+    assert.equal(branch.lanes.production.state, 'awaiting_preflight', 'no prod deploy recorded');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('pipelane help prints subcommand list', () => {
   const result = runCli(['pipelane', '--help'], process.cwd());
   assert.equal(result.status, 0);

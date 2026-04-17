@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { handleApi } from './commands/api.ts';
 import { handleClean } from './commands/clean.ts';
 import { handleDevmode } from './commands/devmode.ts';
 import { handleDeploy } from './commands/deploy.ts';
@@ -93,6 +94,11 @@ export async function runOperator(cwd: string, argv: string[]): Promise<void> {
     return;
   }
 
+  if (command === 'api') {
+    await handleApi(cwd, parsed);
+    return;
+  }
+
   throw new Error(`Unknown workflow command "${command}".`);
 }
 
@@ -116,5 +122,6 @@ Workflow commands:
   task-lock
   deploy
   clean
+  api snapshot
 `);
 }
