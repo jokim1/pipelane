@@ -63,18 +63,22 @@ export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Pro
     mode: context.modeState.mode,
   });
 
+  const deployState = loadDeployState(context.commonDir, context.config);
+
   if (context.modeState.mode === 'release') {
+    // v1.2 readiness is now observed, not asserted. Callers to prod are also
+    // allowed to promote the same SHA they just verified in staging, so
+    // release-readiness for prod deploys counts the current deployState.
     const readiness = evaluateReleaseReadiness({
       config: context.config,
       deployConfig,
+      deployRecords: deployState.records,
       surfaces,
     });
     if (!readiness.ready && !context.modeState.override) {
       throw new Error(buildReleaseCheckMessage(readiness, surfaces));
     }
   }
-
-  const deployState = loadDeployState(context.commonDir, context.config);
 
   // Prod gate (v0.2): staging must have a verified-succeeded deploy for
   // the same (sha, surfaces, taskSlug). Records missing `status` don't

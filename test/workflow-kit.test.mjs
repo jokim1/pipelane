@@ -762,6 +762,207 @@ test('release-check fails closed before local CLAUDE is configured', () => {
   }
 });
 
+// v1.2: derive readiness from observed staging deploys, not a stored
+// .ready:true flag. The flag now has no authority — only DeployRecord history
+// matters. These tests prove (a) flipping .ready:true does NOT clear the
+// gate, and (b) a real staging-succeeded record DOES.
+function writeFullDeployConfigClaude(repoRoot, options = {}) {
+  const claudeMdPath = path.join(repoRoot, 'CLAUDE.md');
+  const existing = readFileSync(claudeMdPath, 'utf8');
+  const fullConfig = {
+    platform: 'fly.io',
+    frontend: {
+      production: {
+        url: 'https://app.example.test',
+        deployWorkflow: 'Deploy Hosted',
+        autoDeployOnMain: false,
+        healthcheckUrl: 'https://app.example.test/health',
+      },
+      staging: {
+        url: 'https://staging.example.test',
+        deployWorkflow: 'Deploy Hosted',
+        healthcheckUrl: 'https://staging.example.test/health',
+        ready: options.legacyReady === true,
+      },
+    },
+    edge: {
+      staging: {
+        deployCommand: 'supabase functions deploy --staging',
+        verificationCommand: 'supabase functions test',
+        healthcheckUrl: 'https://staging.example.test/edge-health',
+        ready: options.legacyReady === true,
+      },
+      production: {
+        deployCommand: 'supabase functions deploy',
+        verificationCommand: 'supabase functions test',
+        healthcheckUrl: 'https://app.example.test/edge-health',
+      },
+    },
+    sql: {
+      staging: {
+        applyCommand: 'supabase db push --staging',
+        verificationCommand: 'supabase db lint',
+        healthcheckUrl: 'https://staging.example.test/db-health',
+        ready: options.legacyReady === true,
+      },
+      production: {
+        applyCommand: 'supabase db push',
+        verificationCommand: 'supabase db lint',
+        healthcheckUrl: 'https://app.example.test/db-health',
+      },
+    },
+    supabase: {
+      staging: { projectRef: 'staging-ref' },
+      production: { projectRef: 'production-ref' },
+    },
+  };
+  const newSection = [
+    '## Deploy Configuration',
+    '',
+    '```json',
+    JSON.stringify(fullConfig, null, 2),
+    '```',
+    '',
+  ].join('\n');
+  // Replace the existing Deploy Configuration block (placed by setup) with
+  // the populated one.
+  const replaced = existing.replace(
+    /## Deploy Configuration[\s\S]*?(?=\n##\s|$)/,
+    newSection,
+  );
+  writeFileSync(claudeMdPath, replaced, 'utf8');
+}
+
+function writeStagingSucceededRecord(repoRoot, surfaces) {
+  const stateDir = path.join(repoRoot, '.git', 'workflow-kit-state');
+  mkdirSync(stateDir, { recursive: true });
+  const records = [{
+    environment: 'staging',
+    sha: '1111111111111111111111111111111111111111',
+    surfaces,
+    workflowName: 'Deploy Hosted',
+    requestedAt: '2026-04-15T00:00:00Z',
+    finishedAt: '2026-04-15T00:01:00Z',
+    durationMs: 60000,
+    taskSlug: 'bootstrap',
+    status: 'succeeded',
+    workflowRunId: 'run-1',
+    verifiedAt: '2026-04-15T00:01:30Z',
+    verification: { healthcheckUrl: 'https://staging.example.test/health', statusCode: 200, latencyMs: 50, probes: 2 },
+    idempotencyKey: 'bootstrap-1',
+    triggeredBy: 'test',
+  }];
+  writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({ records }, null, 2), 'utf8');
+}
+
+test('release-check blocks when CLAUDE config is full but no staging deploy record exists', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+
+    const result = runCli(['run', 'release-check', '--json'], repoRoot, {}, true);
+    const output = JSON.parse(result.stdout);
+    assert.equal(result.status, 1);
+    assert.equal(output.ready, false);
+    assert.deepEqual(output.blockedSurfaces.sort(), ['edge', 'frontend', 'sql']);
+    assert.match(output.message, /no succeeded deploy observed/);
+    assert.match(output.message, /workflow:deploy -- staging/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check ignores legacy .ready:true flag (v1.2 honor-system kill)', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    // Pre-v1.2 honor system: just flip .ready:true and the gate cleared.
+    // Now it must NOT clear without an observed deploy record.
+    writeFullDeployConfigClaude(repoRoot, { legacyReady: true });
+
+    const result = runCli(['run', 'release-check', '--json'], repoRoot, {}, true);
+    const output = JSON.parse(result.stdout);
+    assert.equal(result.status, 1);
+    assert.equal(output.ready, false);
+    assert.match(output.message, /no succeeded deploy observed/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check passes when a staging-succeeded DeployRecord covers every requested surface', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    writeStagingSucceededRecord(repoRoot, ['frontend', 'edge', 'sql']);
+
+    const result = runCli(['run', 'release-check', '--json'], repoRoot);
+    const output = JSON.parse(result.stdout);
+    assert.equal(result.status, 0);
+    assert.equal(output.ready, true);
+    assert.deepEqual(output.blockedSurfaces, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check still blocks the surfaces that lack a staging-succeeded record', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    // Only frontend has been observed-succeeded. edge + sql still blocked.
+    writeStagingSucceededRecord(repoRoot, ['frontend']);
+
+    const result = runCli(['run', 'release-check', '--json'], repoRoot, {}, true);
+    const output = JSON.parse(result.stdout);
+    assert.equal(result.status, 1);
+    assert.equal(output.ready, false);
+    assert.deepEqual(output.blockedSurfaces.sort(), ['edge', 'sql']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check does not count failed staging records as observed success', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+
+    const stateDir = path.join(repoRoot, '.git', 'workflow-kit-state');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({
+      records: [{
+        environment: 'staging',
+        sha: '2222222222222222222222222222222222222222',
+        surfaces: ['frontend', 'edge', 'sql'],
+        workflowName: 'Deploy Hosted',
+        requestedAt: '2026-04-15T00:00:00Z',
+        finishedAt: '2026-04-15T00:00:30Z',
+        status: 'failed',
+        failureReason: 'workflow run reported non-zero exit',
+        idempotencyKey: 'fail-1',
+      }],
+    }, null, 2), 'utf8');
+
+    const result = runCli(['run', 'release-check', '--json'], repoRoot, {}, true);
+    const output = JSON.parse(result.stdout);
+    assert.equal(result.status, 1);
+    assert.equal(output.ready, false);
+    assert.match(output.message, /no succeeded deploy observed/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('pr, merge, deploy, and task-lock work with a fake gh adapter', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-gh-'));

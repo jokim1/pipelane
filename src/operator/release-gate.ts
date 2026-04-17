@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import type { WorkflowConfig } from './state.ts';
+import type { DeployRecord, WorkflowConfig } from './state.ts';
 
 export interface DeployConfig {
   platform: string;
@@ -190,7 +190,9 @@ export function renderDeployConfigSection(config: DeployConfig): string {
   return `## Deploy Configuration
 
 This section is machine-readable. Keep the JSON valid.
-Set each \`.staging.ready\` flag to \`true\` only after that surface is fully configured and verified in staging.
+Release readiness is derived from observed staging deploy records (v1.2); the legacy
+\`.staging.ready\` boolean is ignored. Run \`workflow:deploy -- staging <surface>\` once
+to register a succeeded deploy for each surface you plan to ship.
 
 \`\`\`json
 ${JSON.stringify(config, null, 2)}
@@ -198,9 +200,25 @@ ${JSON.stringify(config, null, 2)}
 `;
 }
 
+// v1.2: readiness is observed, not asserted. A surface is release-ready if at
+// least one staging DeployRecord exists with status==='succeeded' covering it.
+// That record is only written by handleDeploy after gh workflow run watch +
+// the healthcheck probe pass, so the "ready" signal can't be forged by
+// flipping a flag in CLAUDE.md.
+export function hasObservedStagingSuccess(records: DeployRecord[], surface: string): boolean {
+  return records.some((record) =>
+    record.status === 'succeeded'
+    && record.environment === 'staging'
+    && record.surfaces.includes(surface)
+  );
+}
+
 export function evaluateReleaseReadiness(options: {
   config: WorkflowConfig;
   deployConfig: DeployConfig;
+  // v1.2: passed explicitly so readiness is derived from observed deploy
+  // history rather than a stored flag. Callers load via loadDeployState().
+  deployRecords: DeployRecord[];
   surfaces: string[];
 }): {
   ready: boolean;
@@ -208,6 +226,10 @@ export function evaluateReleaseReadiness(options: {
   results: Record<string, { ready: boolean; missing: string[] }>;
 } {
   const results: Record<string, { ready: boolean; missing: string[] }> = {};
+  const observedStagingSuccess = (surface: string): string | null =>
+    hasObservedStagingSuccess(options.deployRecords, surface)
+      ? null
+      : `${surface} staging: no succeeded deploy observed. Run \`workflow:deploy -- staging ${surface}\` first.`;
 
   for (const surface of options.surfaces) {
     const missing: string[] = [];
@@ -241,9 +263,8 @@ export function evaluateReleaseReadiness(options: {
       if (stagingHealthcheck && isLocalUrl(stagingHealthcheck)) {
         missing.push('frontend staging health check must not be localhost');
       }
-      if (!options.deployConfig.frontend.staging.ready) {
-        missing.push('frontend staging readiness flag');
-      }
+      const observed = observedStagingSuccess('frontend');
+      if (observed) missing.push(observed);
     } else if (surface === 'edge') {
       if (!options.deployConfig.edge.staging.deployCommand) {
         missing.push('edge staging deploy command');
@@ -254,9 +275,8 @@ export function evaluateReleaseReadiness(options: {
       if (!options.deployConfig.edge.staging.verificationCommand && !options.deployConfig.edge.production.verificationCommand && !options.deployConfig.edge.staging.healthcheckUrl && !options.deployConfig.edge.production.healthcheckUrl) {
         missing.push('edge verification command or health check');
       }
-      if (!options.deployConfig.edge.staging.ready) {
-        missing.push('edge staging readiness flag');
-      }
+      const observed = observedStagingSuccess('edge');
+      if (observed) missing.push(observed);
     } else if (surface === 'sql') {
       if (!options.deployConfig.sql.staging.applyCommand) {
         missing.push('sql staging apply/reset path');
@@ -267,9 +287,8 @@ export function evaluateReleaseReadiness(options: {
       if (!options.deployConfig.sql.staging.verificationCommand && !options.deployConfig.sql.production.verificationCommand && !options.deployConfig.sql.staging.healthcheckUrl && !options.deployConfig.sql.production.healthcheckUrl) {
         missing.push('sql verification step');
       }
-      if (!options.deployConfig.sql.staging.ready) {
-        missing.push('sql staging readiness flag');
-      }
+      const observed = observedStagingSuccess('sql');
+      if (observed) missing.push(observed);
     }
 
     results[surface] = {

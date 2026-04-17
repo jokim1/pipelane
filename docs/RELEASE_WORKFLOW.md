@@ -448,7 +448,10 @@ in `AGENTS.md` where enforcement is social.
 - `CLAUDE.md` — local deploy config and operator defaults
 
 Note: the `ready: true` boolean previously carried in this file is
-**removed** in v1 and replaced by live probe results. Do not rely on it.
+**ignored** as of v1.2 (pipelane #20). The field is still accepted in the
+JSON shape for backwards compatibility, but it is never consulted. Release
+readiness is derived live from observed staging `DeployRecord` history —
+no flag can substitute for a succeeded, verified staging deploy. Do not rely on it.
 
 ### Internal state (git common-dir, shared across worktrees)
 
@@ -487,8 +490,11 @@ spec fixes. The change manifest tracks which PR closes each one.
   v0 keys by `taskSlug` and requires `status='succeeded'` for the gate.
 - [v0] **Fire-and-forget ****`gh workflow run`****.** v0 watches the run,
   probes the healthcheck, and records the verified outcome.
-- [v1] **Honor-system ****`ready:true`****.** Removed. Replaced by live probe
-  via `/doctor --probe` + per-deploy healthcheck.
+- [v1.2] **Honor-system ****`ready:true`****.** Shipped in pipelane #20.
+  The flag is retained in the JSON schema but ignored; release readiness
+  is derived from observed staging `DeployRecord.status === 'succeeded'`
+  history via the same `verification` block the post-deploy healthcheck
+  writes. No flag can substitute for a verified deploy.
 - [v0] **Silent ****`/pr`**** with ****`git add -A`****.** v0 previews staged files,
   enforces a deny-list, and prompts before commit.
 - [v0] **Zero-confirmation ****`/merge`**** and ****`/deploy prod`****.** v0 requires

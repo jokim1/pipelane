@@ -44,8 +44,8 @@ mirrors it.
 | 5 | Differential test harness (dual-binary, Phase 3 gate) | ✅ merged | pipelane #15 |
 | 6.1 | v0.3 merge SHA hardening + v0.4 /pr deny-list | ✅ merged | pipelane #16 |
 | 6.2 | v0.1 DeployRecord schema + v0.2 deploy verify flow | ✅ merged | pipelane #17 |
-| 6.3 | v0.7 /clean --apply scope + v0.5 deploy.prod typed-SHA confirm | ⏭ next | — |
-| 6.4 | v1.2 kill `ready:true` honor-system flag | pending | — |
+| 6.3 | v0.7 /clean --apply scope + v0.5 deploy.prod typed-SHA confirm | ✅ merged | pipelane #19 |
+| 6.4 | v1.2 kill `ready:true` honor-system flag | ⏭ next | — |
 | 4 | `checks.*` plugin system | pending (non-gating) | — |
 | 7 | Rocketboard Phase 3 swap | pending (gated by 6 complete) | — |
 

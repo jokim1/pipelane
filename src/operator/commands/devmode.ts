@@ -1,5 +1,5 @@
 import { buildReleaseCheckMessage, emptyDeployConfig, evaluateReleaseReadiness, loadDeployConfig } from '../release-gate.ts';
-import { printResult, saveModeState, type ParsedOperatorArgs, type WorkflowContext } from '../state.ts';
+import { loadDeployState, printResult, saveModeState, type ParsedOperatorArgs, type WorkflowContext } from '../state.ts';
 import { resolveWorkflowContext } from '../state.ts';
 import { resolveCommandSurfaces } from './helpers.ts';
 
@@ -45,9 +45,11 @@ export async function handleDevmode(cwd: string, parsed: ParsedOperatorArgs): Pr
 
   if (action === 'release') {
     const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
+    const deployState = loadDeployState(context.commonDir, context.config);
     const readiness = evaluateReleaseReadiness({
       config: context.config,
       deployConfig,
+      deployRecords: deployState.records,
       surfaces,
     });
 
