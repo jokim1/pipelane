@@ -221,6 +221,39 @@ The bootstrap is the same whether the repo is brand-new or migrating
 from pre-v1.2 (where `.staging.ready: true` used to be the honor-system
 escape hatch).
 
+### Pluggable release checks (v4)
+
+`release-check` runs the built-in observed-deploys gate, then dispatches
+any consumer-configured plugin checks. Plugins are opt-in via the
+`checks` block in `.project-workflow.json`:
+
+```json
+{
+  "checks": {
+    "requireSecretManifest": true,
+    "secretManifestPath": "supabase/functions/secrets.manifest.json",
+    "requiredRepoSecrets": ["SUPABASE_ACCESS_TOKEN", "CLOUDFLARE_API_TOKEN"],
+    "requiredEnvironmentSecrets": ["SUPABASE_PROJECT_REF", "APP_URL"]
+  }
+}
+```
+
+Built-in plugins:
+
+- **`secret-manifest`** (gate: `requireSecretManifest: true`). Reads
+  the manifest at `secretManifestPath` and checks that every `required`
+  name exists in each configured Supabase project's secrets
+  (`supabase.staging.projectRef`, `supabase.production.projectRef`).
+- **`gh-required-secrets`** (gate: `requiredRepoSecrets` or
+  `requiredEnvironmentSecrets` non-empty). Calls `gh secret list` to
+  verify the named secrets exist at the repo level, and
+  `gh secret list --env {staging,production}` for each named
+  environment secret.
+
+A failing plugin flips overall readiness to `FAIL` even when the
+observed-deploys gate is clean. Absent config = no plugins dispatched;
+consumers stay on a clean default.
+
 ### Happy path
 
 ```

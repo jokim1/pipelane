@@ -6,6 +6,24 @@ import path from 'node:path';
 export type Mode = 'build' | 'release';
 export type KnownSurface = 'frontend' | 'edge' | 'sql';
 
+// v4: optional-plugin checks declared per-consumer. Absent = no checks run.
+// Each field enables a specific plugin; consumers opt in per-project. Today
+// only secret-manifest + gh-required-secrets are implemented; the shape is
+// forward-compatible for future checks (SBOM, license scan, coverage floor).
+export interface ChecksConfig {
+  // Supabase function secret manifest check. Reads the manifest file and
+  // verifies every `required` name appears in the configured supabase
+  // projects (staging + production). Requires secretManifestPath.
+  requireSecretManifest?: boolean;
+  secretManifestPath?: string;
+  // GitHub repo-level secrets that must exist (no env scope). Checked via
+  // `gh secret list`.
+  requiredRepoSecrets?: string[];
+  // GitHub environment-level secrets (staging + production) that must exist.
+  // Checked via `gh secret list --env <name>` for each environment.
+  requiredEnvironmentSecrets?: string[];
+}
+
 export interface WorkflowConfig {
   version: number;
   projectKey: string;
@@ -28,6 +46,8 @@ export interface WorkflowConfig {
     description: string;
     requireStagingPromotion: boolean;
   };
+  // Optional; absent in default config. See ChecksConfig for semantics.
+  checks?: ChecksConfig;
 }
 
 export const DEFAULT_BRANCH_PREFIX = 'codex/';
@@ -329,6 +349,23 @@ export function normalizeWorkflowConfig(raw: Partial<WorkflowConfig>): WorkflowC
     branchPrefix: normalizeBranchPrefix(raw.branchPrefix ?? DEFAULT_BRANCH_PREFIX),
     legacyBranchPrefixes: (raw.legacyBranchPrefixes ?? []).map(normalizeBranchPrefix),
     prPathDenyList: raw.prPathDenyList ?? [...DEFAULT_PR_PATH_DENY_LIST],
+    checks: normalizeChecksConfig(raw.checks),
+  };
+}
+
+// v4: preserve the checks field if present; returning undefined keeps the
+// default "no checks" semantics for consumers that never opted in.
+function normalizeChecksConfig(raw: ChecksConfig | undefined): ChecksConfig | undefined {
+  if (!raw) return undefined;
+  return {
+    requireSecretManifest: raw.requireSecretManifest === true,
+    secretManifestPath: typeof raw.secretManifestPath === 'string' ? raw.secretManifestPath.trim() : undefined,
+    requiredRepoSecrets: Array.isArray(raw.requiredRepoSecrets)
+      ? raw.requiredRepoSecrets.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+      : undefined,
+    requiredEnvironmentSecrets: Array.isArray(raw.requiredEnvironmentSecrets)
+      ? raw.requiredEnvironmentSecrets.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+      : undefined,
   };
 }
 

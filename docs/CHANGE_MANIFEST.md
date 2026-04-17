@@ -46,8 +46,8 @@ mirrors it.
 | 6.2 | v0.1 DeployRecord schema + v0.2 deploy verify flow | ✅ merged | pipelane #17 |
 | 6.3 | v0.7 /clean --apply scope + v0.5 deploy.prod typed-SHA confirm | ✅ merged | pipelane #19 |
 | 6.4 | v1.2 kill `ready:true` + per-surface verification + config fingerprint + HMAC signing | ✅ merged | pipelane #20 |
-| 4 | `checks.*` plugin system | pending (non-gating) | — |
-| 7 | Rocketboard Phase 3 swap | ⏭ next (step 6 complete, gate cleared) | — |
+| 4 | `checks.*` plugin system (secret-manifest + gh-required-secrets) | ⏭ next | — |
+| 7 | Rocketboard Phase 3 swap | pending (gated by step 4 for Rocketboard parity) | — |
 
 Ship items in this exact order. Each is its own PR in Pipelane unless
 noted. Catalog IDs reference the detailed sections below.
