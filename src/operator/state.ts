@@ -82,6 +82,8 @@ export interface OperatorFlags {
   message: string;
   mode: string;
   surfaces: string[];
+  execute: boolean;
+  confirmToken: string;
 }
 
 export interface ParsedOperatorArgs {
@@ -464,6 +466,8 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     message: '',
     mode: '',
     surfaces: [],
+    execute: false,
+    confirmToken: '',
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -521,6 +525,17 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
 
     if (token === '--mode') {
       flags.mode = argv[index + 1] ?? '';
+      index += 1;
+      continue;
+    }
+
+    if (token === '--execute') {
+      flags.execute = true;
+      continue;
+    }
+
+    if (token === '--confirm-token') {
+      flags.confirmToken = argv[index + 1] ?? '';
       index += 1;
       continue;
     }
