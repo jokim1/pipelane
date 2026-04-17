@@ -1,5 +1,5 @@
-#!/bin/sh
-set -eu
-
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-exec node "$SCRIPT_DIR/../src/cli.ts" "$@"
+#!/usr/bin/env node
+// Legacy `workflow-kit` bin — delegates to the same CLI as `pipelane`.
+// See bin/pipelane for the rationale for using a Node.js launcher rather
+// than a shell wrapper.
+await import('../src/cli.ts');

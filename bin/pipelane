@@ -1,5 +1,12 @@
-#!/bin/sh
-set -eu
-
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-exec node "$SCRIPT_DIR/../src/cli.ts" "$@"
+#!/usr/bin/env node
+// Launcher for the Pipelane CLI.
+//
+// Why this is a Node.js script rather than a shell wrapper:
+// npm symlinks bin entries into node_modules/.bin, and a shell wrapper
+// that computes paths relative to `$0` resolves them relative to the
+// symlink (node_modules/.bin/) rather than the real installed package
+// (node_modules/pipelane/bin/). Node's `import.meta.url` always reports
+// the real file URL, so this script locates `../src/cli.ts` correctly
+// whether the bin is run from the installed package, from a worktree,
+// or via `npx`.
+await import('../src/cli.ts');
