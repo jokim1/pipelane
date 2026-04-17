@@ -87,7 +87,7 @@ if (args[0] === 'pr' && args[1] === 'create') {
   const head = findFlag('--head');
   const title = findFlag('--title');
   const number = Object.keys(state.prs).length + 1;
-  const pr = { number, title, url: 'https://example.test/pr/' + number, mergeCommit: null, mergedAt: null };
+  const pr = { number, title, url: 'https://example.test/pr/' + number, state: 'OPEN', mergeCommit: null, mergedAt: null };
   state.prs[head] = pr;
   writeState();
   process.stdout.write(pr.url + '\\n');
@@ -109,6 +109,7 @@ if (args[0] === 'pr' && args[1] === 'merge') {
   const number = Number(args[2]);
   const pr = Object.values(state.prs).find((entry) => entry.number === number);
   if (pr) {
+    pr.state = 'MERGED';
     pr.mergeCommit = { oid: 'deadbeefcafebabe' };
     pr.mergedAt = '2026-04-13T00:00:00Z';
     writeState();
@@ -787,6 +788,100 @@ test('pr, merge, deploy, and task-lock work with a fake gh adapter', () => {
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
     assert.equal(ghState.workflows.length, 1);
     assert.equal(ghState.workflows[0].name, 'Deploy Hosted');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('merge fails closed when gh never reports mergeCommit.oid', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  // Break the merge step: pr.state flips to MERGED but mergeCommit stays null,
+  // so the poller sees a half-merged PR and must fail rather than invent a SHA.
+  const ghPath = path.join(ghBin, 'gh');
+  const original = readFileSync(ghPath, 'utf8');
+  writeFileSync(
+    ghPath,
+    original.replace(
+      "pr.mergeCommit = { oid: 'deadbeefcafebabe' };",
+      "pr.state = 'MERGED'; pr.mergeCommit = null;",
+    ),
+    { mode: 0o755, encoding: 'utf8' },
+  );
+
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_MERGE_POLL_TIMEOUT_MS: '200',
+    PIPELANE_MERGE_POLL_INTERVAL_MS: '50',
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'SHA Miss', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'SHA Miss', '--json'], created.worktreePath, env);
+
+    const failed = runCli(['run', 'merge', '--json'], created.worktreePath, env, true);
+    assert.equal(failed.status, 1);
+    assert.match(failed.stderr, /Timed out waiting for GitHub to report PR #\d+ as MERGED with a merge commit/);
+    assert.doesNotMatch(failed.stderr, /rev-parse/);
+
+    const prState = readFileSync(path.join(repoRoot, '.git', 'workflow-kit-state', 'pr-state.json'), 'utf8');
+    assert.doesNotMatch(prState, /mergedSha/, 'no mergedSha recorded on failure');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('pr blocks denied paths and --force-include overrides per-path', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Deny Guard', '--json'], repoRoot).stdout);
+    // A denied file (operator-local CLAUDE.md) + a .env secret + a harmless
+    // feature file. The first two should block; the third is fine.
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'feature\n', 'utf8');
+    writeFileSync(path.join(created.worktreePath, 'CLAUDE.md'), '# local\n', 'utf8');
+    writeFileSync(path.join(created.worktreePath, '.env'), 'TOKEN=secret\n', 'utf8');
+
+    const blocked = runCli(['run', 'pr', '--title', 'Deny Guard', '--json'], created.worktreePath, env, true);
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /prPathDenyList/);
+    assert.match(blocked.stderr, /CLAUDE\.md \(matched CLAUDE\.md\)/);
+    assert.match(blocked.stderr, /\.env \(matched \.env\)/);
+
+    // Nothing should have been staged or committed yet.
+    const stagedAfterBlock = execFileSync('git', ['diff', '--cached', '--name-only'], {
+      cwd: created.worktreePath,
+      encoding: 'utf8',
+    }).trim();
+    assert.equal(stagedAfterBlock, '', 'no files staged after deny-list block');
+
+    // Force-include both denied files to allow the PR through. This is
+    // explicit, per-path: no global flag to disable the check.
+    const ok = runCli(
+      ['run', 'pr', '--title', 'Deny Guard', '--force-include', 'CLAUDE.md', '--force-include', '.env', '--json'],
+      created.worktreePath,
+      env,
+    );
+    assert.equal(ok.status, 0);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });

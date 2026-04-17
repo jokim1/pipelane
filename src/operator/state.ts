@@ -18,6 +18,7 @@ export interface WorkflowConfig {
   surfaces: string[];
   aliases: Record<string, string>;
   prePrChecks: string[];
+  prPathDenyList: string[];
   deployWorkflowName: string;
   buildMode: {
     description: string;
@@ -30,6 +31,21 @@ export interface WorkflowConfig {
 }
 
 export const DEFAULT_BRANCH_PREFIX = 'codex/';
+
+// Patterns matched against changed-file basenames during `pipelane run pr`
+// before the silent `git add -A`. Keep this list short and unambiguous —
+// the goal is "operator forgot to gitignore their secrets" not general
+// pre-commit hooks. Override in .project-workflow.json when a repo legit
+// tracks one of these (e.g. a docs-only `CLAUDE.md`).
+export const DEFAULT_PR_PATH_DENY_LIST = [
+  'CLAUDE.md',
+  '.env',
+  '.env.*',
+  '*.pem',
+  '*.p12',
+  'id_rsa*',
+  '*.key',
+];
 
 export interface ModeState {
   mode: Mode;
@@ -84,6 +100,7 @@ export interface OperatorFlags {
   surfaces: string[];
   execute: boolean;
   confirmToken: string;
+  forceInclude: string[];
 }
 
 export interface ParsedOperatorArgs {
@@ -133,6 +150,7 @@ export function defaultWorkflowConfig(projectKey: string, displayName: string): 
       'npm run typecheck',
       'npm run build',
     ],
+    prPathDenyList: [...DEFAULT_PR_PATH_DENY_LIST],
     deployWorkflowName: 'Deploy Hosted',
     buildMode: {
       description: 'Fast lane. Production deploy is expected to happen after merge.',
@@ -273,6 +291,7 @@ export function normalizeWorkflowConfig(raw: Partial<WorkflowConfig>): WorkflowC
     ...(raw as WorkflowConfig),
     branchPrefix: normalizeBranchPrefix(raw.branchPrefix ?? DEFAULT_BRANCH_PREFIX),
     legacyBranchPrefixes: (raw.legacyBranchPrefixes ?? []).map(normalizeBranchPrefix),
+    prPathDenyList: raw.prPathDenyList ?? [...DEFAULT_PR_PATH_DENY_LIST],
   };
 }
 
@@ -468,6 +487,7 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     surfaces: [],
     execute: false,
     confirmToken: '',
+    forceInclude: [],
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -536,6 +556,13 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
 
     if (token === '--confirm-token') {
       flags.confirmToken = argv[index + 1] ?? '';
+      index += 1;
+      continue;
+    }
+
+    if (token === '--force-include') {
+      const raw = argv[index + 1] ?? '';
+      flags.forceInclude.push(...raw.split(',').map((item) => item.trim()).filter(Boolean));
       index += 1;
       continue;
     }

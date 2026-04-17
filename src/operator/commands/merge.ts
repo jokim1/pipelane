@@ -1,5 +1,5 @@
 import { printResult, resolveWorkflowContext, runGh, runGit, savePrRecord, type ParsedOperatorArgs } from '../state.ts';
-import { ensureTaskLockMatchesCurrent, inferActiveTaskLock, loadPrDetails, loadPrForBranch, watchPrChecks } from './helpers.ts';
+import { ensureTaskLockMatchesCurrent, inferActiveTaskLock, loadPrForBranch, pollForMergedSha, watchPrChecks } from './helpers.ts';
 
 export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const context = resolveWorkflowContext(cwd);
@@ -15,25 +15,26 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
   watchPrChecks(context.repoRoot, pr.number);
   runGh(context.repoRoot, ['pr', 'merge', String(pr.number), '--squash', '--delete-branch']);
 
-  const details = loadPrDetails(context.repoRoot, pr.number);
-  const mergedSha = details.mergeCommit?.oid
-    || (runGit(context.repoRoot, ['rev-parse', '--verify', `origin/${context.config.baseBranch}`], true)
-      ?? runGit(context.repoRoot, ['rev-parse', '--verify', context.config.baseBranch], true)
-      ?? '').trim();
+  // Poll gh until the PR reports state === "MERGED" AND mergeCommit.oid
+  // is present. Fail closed on timeout. Never fall back to
+  // rev-parse origin/<base> — that silently promoted unrelated commits
+  // in earlier versions.
+  const merged = await pollForMergedSha(context.repoRoot, pr.number);
+  const mergedSha = merged.sha;
 
   savePrRecord(context.commonDir, context.config, taskSlug, {
     branchName,
-    title: details.title,
-    number: details.number,
-    url: details.url,
+    title: merged.title,
+    number: merged.number,
+    url: merged.url,
     mergedSha,
-    mergedAt: details.mergedAt ?? new Date().toISOString(),
+    mergedAt: merged.mergedAt ?? new Date().toISOString(),
   });
 
   const lines = [
     'Pull request merged.',
     `Task: ${taskSlug}`,
-    `Merged SHA: ${mergedSha || 'unknown'}`,
+    `Merged SHA: ${mergedSha}`,
   ];
 
   if (context.modeState.mode === 'build') {

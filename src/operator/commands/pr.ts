@@ -1,4 +1,13 @@
-import { ensureTaskLockMatchesCurrent, buildPrBody, hasStagedChanges, latestCommitSubject, loadPrForBranch, resolveCommandSurfaces } from './helpers.ts';
+import {
+  buildPrBody,
+  collectChangedPaths,
+  ensureTaskLockMatchesCurrent,
+  findDenyListHits,
+  hasStagedChanges,
+  latestCommitSubject,
+  loadPrForBranch,
+  resolveCommandSurfaces,
+} from './helpers.ts';
 import { emptyDeployConfig, evaluateReleaseReadiness, loadDeployConfig } from '../release-gate.ts';
 import {
   loadPrRecord,
@@ -48,6 +57,22 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
   }
 
   if (dirty) {
+    const changedPaths = collectChangedPaths(context.repoRoot);
+    const denyHits = findDenyListHits(
+      changedPaths,
+      context.config.prPathDenyList,
+      parsed.flags.forceInclude,
+    );
+    if (denyHits.length > 0) {
+      throw new Error([
+        `Refusing to include ${denyHits.length} file(s) that match prPathDenyList:`,
+        ...denyHits.map(({ path: denyPath, pattern }) => `- ${denyPath} (matched ${pattern})`),
+        'These look like secrets or agent-local config. Either gitignore them,',
+        'or override on a per-path basis with --force-include <path>.',
+        'Edit .project-workflow.json:prPathDenyList to adjust globally.',
+      ].join('\n'));
+    }
+
     runGit(context.repoRoot, ['add', '-A']);
     if (!hasStagedChanges(context.repoRoot)) {
       throw new Error('No staged changes were found after git add -A.');

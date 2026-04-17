@@ -23,6 +23,15 @@
     "npm run typecheck",
     "npm run build"
   ],
+  "prPathDenyList": [
+    "CLAUDE.md",
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.p12",
+    "id_rsa*",
+    "*.key"
+  ],
   "deployWorkflowName": "{{DEPLOY_WORKFLOW_NAME}}",
   "buildMode": {
     "description": "Fast lane. Production deploy is expected to happen after merge.",
