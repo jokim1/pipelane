@@ -2,15 +2,18 @@ import { nowIso } from '../state.ts';
 
 export const WORKFLOW_API_SCHEMA_VERSION = '2026-04-14';
 
-export type LaneState =
-  | 'healthy'
-  | 'running'
-  | 'blocked'
-  | 'degraded'
-  | 'stale'
-  | 'unknown'
-  | 'bypassed'
-  | 'awaiting_preflight';
+export const CANONICAL_LANE_STATES = [
+  'healthy',
+  'running',
+  'blocked',
+  'degraded',
+  'stale',
+  'unknown',
+  'bypassed',
+  'awaiting_preflight',
+] as const;
+
+export type LaneState = (typeof CANONICAL_LANE_STATES)[number];
 
 export type IssueSeverity = 'info' | 'warning' | 'error';
 
