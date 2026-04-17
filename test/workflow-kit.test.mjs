@@ -680,6 +680,47 @@ test('new creates a fresh task workspace and resume restores it', () => {
   }
 });
 
+test('new uses the default codex/ branch prefix', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Default Prefix', '--json'], repoRoot).stdout);
+    assert.match(created.branch, /^codex\/default-prefix-[a-f0-9]{4}$/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('new honors a custom branchPrefix from .project-workflow.json', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.project-workflow.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.branchPrefix = 'task/';
+    config.legacyBranchPrefixes = ['codex/'];
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt workflow-kit');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Custom Prefix', '--json'], repoRoot).stdout);
+    assert.match(created.branch, /^task\/custom-prefix-[a-f0-9]{4}$/);
+
+    // Repo-guard should still accept a legacy `codex/` branch for this task.
+    execFileSync('git', ['checkout', '-b', 'codex/legacy-task-abcd'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const guarded = JSON.parse(runCli(['run', 'repo-guard', '--task', 'legacy-task', '--json'], repoRoot).stdout);
+    assert.equal(guarded.createdWorktree, false, 'legacy prefix branch should satisfy repo-guard');
+    assert.equal(guarded.lock.branchName, 'codex/legacy-task-abcd');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('new generates a task-<hex> slug when --task is omitted', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
 

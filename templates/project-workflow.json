@@ -5,6 +5,8 @@
   "baseBranch": "{{BASE_BRANCH}}",
   "stateDir": "{{STATE_DIR}}",
   "taskWorktreeDirName": "{{TASK_WORKTREE_DIR_NAME}}",
+  "branchPrefix": "codex/",
+  "legacyBranchPrefixes": [],
   "surfaces": ["frontend", "edge", "sql"],
   "aliases": {
     "devmode": "/devmode",

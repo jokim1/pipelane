@@ -29,6 +29,7 @@ export async function handleRepoGuard(cwd: string, parsed: ParsedOperatorArgs): 
   const { branchName, statusLines } = readWorktreeStatus(context.repoRoot);
   const existingLock = loadTaskLock(context.commonDir, context.config, taskSlug);
   const reasons = computeRepoGuardUnsafeReasons({
+    config: context.config,
     branchName,
     baseBranch: context.config.baseBranch,
     statusLines,

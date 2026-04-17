@@ -1,11 +1,13 @@
 import type { WorkflowConfig } from './state.ts';
 import { normalizePath } from './state.ts';
 
-export function taskBranchMatches(taskSlug: string, branchName: string): boolean {
-  return branchName.startsWith(`codex/${taskSlug}`);
+export function taskBranchMatches(config: WorkflowConfig, taskSlug: string, branchName: string): boolean {
+  const prefixes = [config.branchPrefix, ...config.legacyBranchPrefixes];
+  return prefixes.some((prefix) => branchName.startsWith(`${prefix}${taskSlug}`));
 }
 
 export function computeRepoGuardUnsafeReasons(options: {
+  config: WorkflowConfig;
   branchName: string;
   baseBranch: string;
   statusLines: string[];
@@ -25,7 +27,7 @@ export function computeRepoGuardUnsafeReasons(options: {
     reasons.push('worktree has uncommitted changes');
   }
 
-  if (!taskBranchMatches(options.taskSlug, options.branchName)) {
+  if (!taskBranchMatches(options.config, options.taskSlug, options.branchName)) {
     reasons.push(`branch ${options.branchName} does not belong to task ${options.taskSlug}`);
   }
 

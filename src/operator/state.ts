@@ -13,6 +13,8 @@ export interface WorkflowConfig {
   baseBranch: string;
   stateDir: string;
   taskWorktreeDirName: string;
+  branchPrefix: string;
+  legacyBranchPrefixes: string[];
   surfaces: string[];
   aliases: Record<string, string>;
   prePrChecks: string[];
@@ -26,6 +28,8 @@ export interface WorkflowConfig {
     requireStagingPromotion: boolean;
   };
 }
+
+export const DEFAULT_BRANCH_PREFIX = 'codex/';
 
 export interface ModeState {
   mode: Mode;
@@ -110,6 +114,8 @@ export function defaultWorkflowConfig(projectKey: string, displayName: string): 
     baseBranch: 'main',
     stateDir: 'workflow-kit-state',
     taskWorktreeDirName: `${projectKey}-worktrees`,
+    branchPrefix: DEFAULT_BRANCH_PREFIX,
+    legacyBranchPrefixes: [],
     surfaces: [...DEFAULT_SURFACES],
     aliases: {
       devmode: '/devmode',
@@ -256,7 +262,22 @@ export function loadWorkflowConfig(repoRoot: string): WorkflowConfig {
     throw new Error(`No ${CONFIG_FILENAME} found in ${repoRoot}. Run workflow-kit init first.`);
   }
 
-  return JSON.parse(readFileSync(configPath, 'utf8')) as WorkflowConfig;
+  const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as Partial<WorkflowConfig>;
+  return normalizeWorkflowConfig(parsed);
+}
+
+export function normalizeWorkflowConfig(raw: Partial<WorkflowConfig>): WorkflowConfig {
+  return {
+    ...(raw as WorkflowConfig),
+    branchPrefix: normalizeBranchPrefix(raw.branchPrefix ?? DEFAULT_BRANCH_PREFIX),
+    legacyBranchPrefixes: (raw.legacyBranchPrefixes ?? []).map(normalizeBranchPrefix),
+  };
+}
+
+function normalizeBranchPrefix(prefix: string): string {
+  const trimmed = prefix.trim();
+  if (!trimmed) return DEFAULT_BRANCH_PREFIX;
+  return trimmed.endsWith('/') ? trimmed : `${trimmed}/`;
 }
 
 export function writeWorkflowConfig(repoRoot: string, config: WorkflowConfig): void {

@@ -46,16 +46,16 @@ export function generateHex(): string {
   return crypto.randomBytes(2).toString('hex');
 }
 
-export function generateUniqueBranch(repoRoot: string, taskSlug: string): { branchName: string; hex: string } {
+export function generateUniqueBranch(repoRoot: string, config: WorkflowConfig, taskSlug: string): { branchName: string; hex: string } {
   let hex = generateHex();
-  let branchName = `codex/${taskSlug}-${hex}`;
+  let branchName = `${config.branchPrefix}${taskSlug}-${hex}`;
 
   while (
     runGit(repoRoot, ['branch', '--list', branchName], true)?.trim()
     || runGit(repoRoot, ['ls-remote', '--heads', 'origin', branchName], true)?.trim()
   ) {
     hex = generateHex();
-    branchName = `codex/${taskSlug}-${hex}`;
+    branchName = `${config.branchPrefix}${taskSlug}-${hex}`;
   }
 
   return { branchName, hex };
@@ -66,11 +66,11 @@ export function generateUniqueTaskWorkspace(repoRoot: string, commonDir: string,
   hex: string;
   worktreePath: string;
 } {
-  let unique = generateUniqueBranch(repoRoot, taskSlug);
+  let unique = generateUniqueBranch(repoRoot, config, taskSlug);
   let worktreePath = normalizePath(path.join(resolveTaskWorktreeRoot(commonDir, config), `${taskSlug}-${unique.hex}`));
 
   while (existsSync(worktreePath)) {
-    unique = generateUniqueBranch(repoRoot, taskSlug);
+    unique = generateUniqueBranch(repoRoot, config, taskSlug);
     worktreePath = normalizePath(path.join(resolveTaskWorktreeRoot(commonDir, config), `${taskSlug}-${unique.hex}`));
   }
 
