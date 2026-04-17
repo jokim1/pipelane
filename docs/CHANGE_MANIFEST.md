@@ -33,6 +33,22 @@ installed in Rocketboard, Pipelane Board renders Rocketboard's live
 resume plan at `~/.claude/plans/noble-conjuring-spring.md`; this prelude
 mirrors it.
 
+### Shipped to date (2026-04-17)
+
+| Step | Scope | Status | PR(s) |
+|------|-------|--------|-------|
+| 1 | `/pipelane update` | ✅ merged | pipelane #11, rocketboard #321 (dep bump) |
+| 2 | Configurable branchPrefix + legacyBranchPrefixes | ✅ merged | pipelane #12 |
+| 3a | `workflow:api snapshot` (envelope + snapshot) | ✅ merged | pipelane #13 |
+| 3b | `workflow:api action` (registry + preflight/execute + confirm tokens) | ✅ merged | pipelane #14 |
+| 5 | Differential test harness (dual-binary, Phase 3 gate) | ✅ merged | pipelane #15 |
+| 6.1 | v0.3 merge SHA hardening + v0.4 /pr deny-list | ✅ merged | pipelane #16 |
+| 6.2 | v0.1 DeployRecord schema + v0.2 deploy verify flow | ✅ merged | pipelane #17 |
+| 6.3 | v0.7 /clean --apply scope + v0.5 deploy.prod typed-SHA confirm | ⏭ next | — |
+| 6.4 | v1.2 kill `ready:true` honor-system flag | pending | — |
+| 4 | `checks.*` plugin system | pending (non-gating) | — |
+| 7 | Rocketboard Phase 3 swap | pending (gated by 6 complete) | — |
+
 Ship items in this exact order. Each is its own PR in Pipelane unless
 noted. Catalog IDs reference the detailed sections below.
 
