@@ -81,6 +81,7 @@ export function ensurePackageScripts(repoRoot: string): void {
     'pipelane:deploy': 'pipelane run deploy',
     'pipelane:clean': 'pipelane run clean',
     'pipelane:board': 'pipelane board',
+    'pipelane:update': 'pipelane update',
     'workflow:setup': 'pipelane setup',
     'workflow:devmode': 'pipelane run devmode',
     'workflow:new': 'pipelane run new',

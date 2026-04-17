@@ -945,6 +945,137 @@ test('pipelane status reports unreachable port and no PID file', async () => {
   }
 });
 
+function makeFakeUpdateBin(binDir, { latestSha, aheadCommits = [] }) {
+  mkdirSync(binDir, { recursive: true });
+  const gitPath = path.join(binDir, 'git');
+  writeFileSync(gitPath, `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === 'ls-remote' && args[2] === 'main') {
+  process.stdout.write(${JSON.stringify(latestSha)} + '\\trefs/heads/main\\n');
+  process.exit(0);
+}
+const { spawnSync } = require('node:child_process');
+const res = spawnSync('/usr/bin/git', args, { stdio: 'inherit' });
+process.exit(res.status ?? 1);
+`, { mode: 0o755, encoding: 'utf8' });
+
+  const ghPath = path.join(binDir, 'gh');
+  writeFileSync(ghPath, `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === 'api' && /compare/.test(args[1] || '')) {
+  const commits = ${JSON.stringify(aheadCommits)};
+  process.stdout.write(JSON.stringify({ ahead_by: commits.length, commits: commits.map((c) => ({ sha: c.sha, commit: { message: c.subject } })) }));
+  process.exit(0);
+}
+process.stderr.write('unsupported fake gh call: ' + args.join(' '));
+process.exit(1);
+`, { mode: 0o755, encoding: 'utf8' });
+}
+
+function writeFakeConsumer(consumerRoot, { installedVersion, installedSha }) {
+  mkdirSync(path.join(consumerRoot, 'node_modules', 'pipelane'), { recursive: true });
+  writeFileSync(
+    path.join(consumerRoot, 'node_modules', 'pipelane', 'package.json'),
+    JSON.stringify({ name: 'pipelane', version: installedVersion }, null, 2),
+    'utf8',
+  );
+  writeFileSync(
+    path.join(consumerRoot, 'package.json'),
+    JSON.stringify({ name: 'fake-consumer', version: '0.0.1' }, null, 2),
+    'utf8',
+  );
+  writeFileSync(
+    path.join(consumerRoot, 'package-lock.json'),
+    JSON.stringify({
+      name: 'fake-consumer',
+      version: '0.0.1',
+      lockfileVersion: 3,
+      packages: {
+        '': { name: 'fake-consumer', version: '0.0.1' },
+        'node_modules/pipelane': {
+          version: installedVersion,
+          resolved: `git+ssh://git@github.com/jokim1/pipelane.git#${installedSha}`,
+        },
+      },
+    }, null, 2),
+    'utf8',
+  );
+}
+
+test('update reports up-to-date when installed sha matches remote main', () => {
+  const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-consumer-'));
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-bin-'));
+  const sha = '0123456789abcdef0123456789abcdef01234567';
+  try {
+    writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: sha });
+    makeFakeUpdateBin(binDir, { latestSha: sha });
+
+    const result = spawnSync('node', [CLI_PATH, 'update', '--check', '--json'], {
+      cwd: consumerRoot,
+      env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` },
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.action, 'up-to-date');
+    assert.equal(parsed.status.upToDate, true);
+    assert.equal(parsed.status.installedSha, sha);
+  } finally {
+    rmSync(consumerRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('update --check reports the commit list when behind', () => {
+  const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-consumer-'));
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-bin-'));
+  const oldSha = '1111111111111111111111111111111111111111';
+  const newSha = '2222222222222222222222222222222222222222';
+  const commits = [
+    { sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', subject: 'feat: first change\n\nbody' },
+    { sha: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', subject: 'fix: second change' },
+  ];
+  try {
+    writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    makeFakeUpdateBin(binDir, { latestSha: newSha, aheadCommits: commits });
+
+    const result = spawnSync('node', [CLI_PATH, 'update', '--check'], {
+      cwd: consumerRoot,
+      env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` },
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /updates available/);
+    assert.match(result.stdout, /Installed: 1111111 \(v0\.2\.0\)/);
+    assert.match(result.stdout, /Latest main: 2222222/);
+    assert.match(result.stdout, /2 commits ahead/);
+    assert.match(result.stdout, /feat: first change/);
+    assert.match(result.stdout, /fix: second change/);
+  } finally {
+    rmSync(consumerRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('update fails clearly when pipelane is not installed in consumer', () => {
+  const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-missing-'));
+  try {
+    writeFileSync(
+      path.join(consumerRoot, 'package.json'),
+      JSON.stringify({ name: 'fake-consumer', version: '0.0.1' }, null, 2),
+      'utf8',
+    );
+    const result = spawnSync('node', [CLI_PATH, 'update', '--check'], {
+      cwd: consumerRoot,
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /pipelane is not installed/);
+  } finally {
+    rmSync(consumerRoot, { recursive: true, force: true });
+  }
+});
+
 test('pipelane help prints subcommand list', () => {
   const result = runCli(['pipelane', '--help'], process.cwd());
   assert.equal(result.status, 0);
