@@ -1,22 +1,22 @@
 # Pipelane: Release Workflow (Target Spec)
 
-Last updated: April 16, 2026
-Status: **target-state spec** (some features are not yet implemented; see
-`docs/CHANGE_MANIFEST.md` for the shippable path from today's repo to this
-spec)
+Last updated: April 17, 2026
+Status: **target-state spec**. The [v0] correctness wave has shipped (PRs
+#16–#22); the [v1] recovery surface (`/rollback`, `/doctor`, `/status`)
+is described here for direction but is **not yet implemented**. See
+`docs/CHANGE_MANIFEST.md` for the authoritative shipped-vs-planned status.
 
 This document describes how Pipelane *should* work for the AI vibe coder
 journey — as synthesized by a cross-functional review team (Lead PM, expert
-vibe coder, Scrum master, CI/CD release manager). The current package
-(`workflow-kit`) implements roughly 60% of this spec today. The rest is
-enumerated as concrete changes in the change manifest.
+vibe coder, Scrum master, CI/CD release manager).
 
 Every section below is tagged with an implementation marker:
 
-- **[shipped]** already works
-- **[v0]** must ship in the first implementation sprint
-- **[v1]** second wave, trust + recovery
-- **[v2]** polish, product positioning
+- **[shipped]** already works (verify against CHANGE_MANIFEST before relying)
+- **[v0]** correctness wave — **all shipped** via step 6 (pipelane #16–#22)
+- **[v1]** second wave, trust + recovery — **not yet shipped**; descriptions
+  of `/rollback`, `/doctor`, `/status` are aspirational
+- **[v2]** polish, product positioning — deferred
 
 ## What Pipelane is
 

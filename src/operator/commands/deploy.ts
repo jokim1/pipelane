@@ -31,7 +31,6 @@ import {
   makeIdempotencyKey,
   resolveCommandSurfaces,
   resolveDeployTargetForTask,
-  resolveHealthcheckUrl,
   resolveSurfaceHealthcheckUrl,
 } from './helpers.ts';
 

@@ -54,10 +54,15 @@ words, you stop debating and ship it.
 
 ## Critical bugs (release-engineering findings)
 
+> **Update 2026-04-17: all 5 critical bugs below shipped.** Fixes landed
+> across pipelane PRs #16–#22 (step 6 + step 4). This section is kept for
+> historical context. See `docs/CHANGE_MANIFEST.md` "Shipped to date" for
+> the current status of every bug called out here.
+
 These are correctness issues, not product polish. They block the "error-free"
 claim until they're fixed.
 
-### 1. `merge.ts:19-22` — silent SHA mispromotion
+### 1. `merge.ts:19-22` — silent SHA mispromotion [✅ SHIPPED pipelane #16]
 
 When `gh pr merge` returns and `loadPrDetails` has a race or
 network hiccup, `mergeCommit?.oid` can come back null. The fallback is
@@ -70,7 +75,7 @@ operator never saw on staging.
 **Fix:** after `gh pr merge`, poll `gh pr view` until `mergeCommit.oid` is
 present, bounded (30s). Fail closed if it never arrives. Do not invent a SHA.
 
-### 2. `DeployRecord` is global and unkeyed (`state.ts:72-78`)
+### 2. `DeployRecord` is global and unkeyed (`state.ts:72-78`) [✅ SHIPPED pipelane #17]
 
 The record carries `environment`, `sha`, `surfaces`, `requestedAt` — no task
 identity. Two tasks that touch the same surface set can cross-unlock each
@@ -79,7 +84,7 @@ other's prod promotion. The same-SHA gate is checking a stranger's deploy.
 **Fix:** add `taskSlug` to `DeployRecord`. Key the gate on
 `(taskSlug, env, sha, surfaces)`.
 
-### 3. `deploy.ts:53-74` — fire-and-forget deploy
+### 3. `deploy.ts:53-74` — fire-and-forget deploy [✅ SHIPPED pipelane #17]
 
 `gh workflow run` is dispatched, the record is written with `requestedAt`,
 the CLI exits. There is no polling, no success/failure capture, no healthcheck.
@@ -88,7 +93,7 @@ it **succeeded**. This is the central bug in the error-free claim.
 
 **Fix:** see data-model and control-flow proposals below.
 
-### 4. `CLAUDE.md` `ready: true` is honor-system
+### 4. `CLAUDE.md` `ready: true` is honor-system [✅ SHIPPED pipelane #20]
 
 Documented as "set to true only after verified in staging." In practice this
 is a boolean in a human-edited markdown file that the AI will flip during
@@ -98,7 +103,7 @@ deploy at 2am with no probe.
 **Fix:** kill `ready:true` as a stored primitive. Derive readiness at deploy
 time by probing `healthcheckUrl`. Cache the probe for ~60s in deploy state.
 
-### 5. `/clean --apply` can drop an in-flight task mid-pipeline
+### 5. `/clean --apply` can drop an in-flight task mid-pipeline [✅ SHIPPED pipelane #19]
 
 `pruneDeadTaskLocks` is tamer than feared — it doesn't touch `deployState`
 or `prState` — but if an AI fires it with a transiently missing worktree,

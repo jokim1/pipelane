@@ -167,15 +167,6 @@ export function makeIdempotencyKey(options: {
   return createHash('sha256').update(canonical).digest('hex').slice(0, 24);
 }
 
-export function resolveHealthcheckUrl(
-  deployConfig: DeployConfig,
-  environment: 'staging' | 'prod',
-): string {
-  // Kept for legacy call sites. Prefer `resolveSurfaceHealthcheckUrl` so
-  // each surface gets its own probe.
-  return resolveSurfaceHealthcheckUrl(deployConfig, environment, 'frontend');
-}
-
 // v1.2: per-surface probe URL. Multi-surface staging deploys now probe each
 // surface separately so edge/sql can't inherit readiness from a frontend-only
 // healthcheck. Returns '' when the surface has no probe configured; the
