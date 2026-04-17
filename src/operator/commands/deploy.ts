@@ -351,7 +351,13 @@ export const PROD_CONFIRM_PREFIX_LENGTH = 4;
 // when a human-in-the-loop confirmation is actually required — the API
 // execute path sets PIPELANE_DEPLOY_PROD_API_CONFIRMED=1 to skip.
 export async function requireProdConfirmation(sha: string): Promise<void> {
-  if (process.env.PIPELANE_DEPLOY_PROD_API_CONFIRMED === '1') return;
+  if (process.env.PIPELANE_DEPLOY_PROD_API_CONFIRMED === '1') {
+    // Consume and scrub so any post-confirmation subprocess this deploy
+    // spawns (healthcheck scripts, retries, nested CLI re-entry) does not
+    // inherit an open prod-confirm flag.
+    delete process.env.PIPELANE_DEPLOY_PROD_API_CONFIRMED;
+    return;
+  }
 
   const expected = sha.slice(0, PROD_CONFIRM_PREFIX_LENGTH).toLowerCase();
   if (!expected || expected.length < PROD_CONFIRM_PREFIX_LENGTH) {
@@ -359,10 +365,21 @@ export async function requireProdConfirmation(sha: string): Promise<void> {
   }
 
   // Test hook: lets the integration suite simulate the prompt without a TTY.
-  // The stub value is the characters the operator would have typed.
+  // The stub value is the characters the operator would have typed. Gated to
+  // NODE_ENV==='test' so a stray env var in a shared production shell cannot
+  // defeat the gate. A fire still emits a loud stderr warning.
   const stub = process.env.PIPELANE_DEPLOY_PROD_CONFIRM_STUB;
   if (typeof stub === 'string') {
-    if (stub.trim().toLowerCase() !== expected) {
+    if (process.env.NODE_ENV !== 'test') {
+      throw new Error([
+        'deploy prod blocked: PIPELANE_DEPLOY_PROD_CONFIRM_STUB is set but NODE_ENV is not "test".',
+        'This is a test hook. Unset PIPELANE_DEPLOY_PROD_CONFIRM_STUB in this shell and re-run.',
+      ].join('\n'));
+    }
+    process.stderr.write(
+      '[pipelane] WARNING: PIPELANE_DEPLOY_PROD_CONFIRM_STUB is active (NODE_ENV=test).\n',
+    );
+    if (!matchesShaPrefix(stub, expected)) {
       throw new Error([
         'deploy prod blocked: typed SHA prefix did not match.',
         `Expected the first ${PROD_CONFIRM_PREFIX_LENGTH} characters of ${sha}.`,
@@ -381,12 +398,21 @@ export async function requireProdConfirmation(sha: string): Promise<void> {
   }
 
   const typed = await promptForProdConfirmPrefix(sha, expected);
-  if (typed.trim().toLowerCase() !== expected) {
+  if (!matchesShaPrefix(typed, expected)) {
     throw new Error([
       'deploy prod blocked: typed SHA prefix did not match.',
       `Expected the first ${PROD_CONFIRM_PREFIX_LENGTH} characters of ${sha}.`,
     ].join('\n'));
   }
+}
+
+// Compare against the first PROD_CONFIRM_PREFIX_LENGTH chars of the typed
+// input so operators can paste the full SHA and the 4-char prefix check still
+// succeeds. Also absorbs trailing whitespace, CR, and pasted newlines.
+function matchesShaPrefix(typed: string, expected: string): boolean {
+  const cleaned = typed.trim().toLowerCase();
+  if (cleaned.length < expected.length) return false;
+  return cleaned.slice(0, expected.length) === expected;
 }
 
 function promptForProdConfirmPrefix(fullSha: string, expected: string): Promise<string> {

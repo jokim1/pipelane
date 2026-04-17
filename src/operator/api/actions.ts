@@ -211,12 +211,7 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
   }
 
   const underlyingArgs = buildUnderlyingArgs(actionId, parsed);
-  // deploy.prod's CLI shim also requires human confirmation. The API path
-  // has already proved humanness via the HMAC confirm-token consume above,
-  // so tell the child CLI it can skip the typed-SHA TTY prompt.
-  const childEnv = actionId === 'deploy.prod'
-    ? { ...process.env, PIPELANE_DEPLOY_PROD_API_CONFIRMED: '1' }
-    : process.env;
+  const childEnv = buildChildEnv(actionId);
   const result = runCliWithJson(cwd, underlyingArgs, childEnv);
 
   const data: ActionExecutionData = {
@@ -343,6 +338,34 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
 
   args.push('--json');
   return args;
+}
+
+// Env vars that exist only as test hooks for the CLI. The API action executor
+// is a long-lived parent (board, dashboard, CI dispatcher) — if any of these
+// happen to be exported in its shell, we don't want them leaking into every
+// CLI child and silently bypassing a gate.
+const TEST_HOOK_ENV_KEYS = [
+  'PIPELANE_DEPLOY_PROD_CONFIRM_STUB',
+  'PIPELANE_CLEAN_MIN_AGE_MS',
+];
+
+function buildChildEnv(actionId: StableActionId): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of TEST_HOOK_ENV_KEYS) {
+    delete env[key];
+  }
+  if (actionId === 'deploy.prod') {
+    // deploy.prod's CLI shim also requires human confirmation. The API path
+    // has already proved humanness via the HMAC confirm-token consume above,
+    // so tell the child CLI it can skip the typed-SHA TTY prompt. The child
+    // scrubs this flag the moment it reads it so grandchild subprocesses
+    // don't inherit an open prod-confirm bit.
+    env.PIPELANE_DEPLOY_PROD_API_CONFIRMED = '1';
+  } else {
+    // Never let a stray bypass leak into other actions' execution.
+    delete env.PIPELANE_DEPLOY_PROD_API_CONFIRMED;
+  }
+  return env;
 }
 
 function runCliWithJson(cwd: string, args: string[], env: NodeJS.ProcessEnv = process.env): { ok: boolean; exitCode: number; stdout: string; stderr: string; parsed: unknown } {

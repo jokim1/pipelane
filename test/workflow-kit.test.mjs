@@ -13,6 +13,12 @@ const KIT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const CLI_PATH = path.join(KIT_ROOT, 'src', 'cli.ts');
 const FIXTURE_ROOT = path.join(KIT_ROOT, 'test', 'fixtures', 'sample-repo');
 
+// Mark this process + every child spawn as a test run. Production-gated test
+// hooks (PIPELANE_DEPLOY_PROD_CONFIRM_STUB, PIPELANE_CLEAN_MIN_AGE_MS) only
+// activate when NODE_ENV is 'test', which prevents a stray env var in a
+// shared shell from disabling a safety gate.
+process.env.NODE_ENV = 'test';
+
 function run(command, args, cwd, env = {}) {
   return execFileSync(command, args, {
     cwd,
@@ -959,6 +965,44 @@ test('deploy prod proceeds when typed-SHA prefix matches via confirm stub', () =
   }
 });
 
+test('deploy prod rejects PIPELANE_DEPLOY_PROD_CONFIRM_STUB outside NODE_ENV=test', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const baseEnv = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    runCli(['run', 'devmode', 'release', '--override', '--reason', 'confirm-stub-gate', '--json'], repoRoot);
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Stub Gate', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Stub Gate', '--json'], created.worktreePath, baseEnv);
+    runCli(['run', 'merge', '--json'], created.worktreePath, baseEnv);
+    runCli(['run', 'deploy', 'staging', '--json'], created.worktreePath, baseEnv);
+
+    // NODE_ENV explicitly NOT 'test'. CONFIRM_STUB must be rejected even
+    // though its value would otherwise satisfy the prefix.
+    const blocked = runCli(['run', 'deploy', 'prod', '--json'], created.worktreePath, {
+      ...baseEnv,
+      NODE_ENV: 'production',
+      PIPELANE_DEPLOY_PROD_CONFIRM_STUB: 'DEAD',
+    }, true);
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /NODE_ENV is not "test"/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
 test('api action deploy.prod --execute bypasses the TTY prompt via the API env var', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-gh-'));
@@ -1222,6 +1266,41 @@ test('clean --apply --task prunes just the named lock', () => {
     // keep-me's lock file must still exist.
     const keepLockPath = path.join(repoRoot, '.git', 'workflow-kit-state', 'task-locks', 'keep-me.json');
     assert.ok(existsSync(keepLockPath), 'targeted prune did not touch keep-me');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean --apply refuses to prune locks with a missing or unparseable updatedAt', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Corrupt Meta', '--json'], repoRoot).stdout);
+
+    execFileSync('git', ['worktree', 'remove', '--force', created.worktreePath], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    execFileSync('git', ['branch', '-D', created.branch], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    // Corrupt the lock: remove updatedAt so lockAge() returns null. The
+    // pruner must fail closed and skip, not sweep.
+    const lockPath = path.join(repoRoot, '.git', 'workflow-kit-state', 'task-locks', 'corrupt-meta.json');
+    const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+    delete lock.updatedAt;
+    writeFileSync(lockPath, JSON.stringify(lock, null, 2), 'utf8');
+
+    const result = runCli(['run', 'clean', '--apply', '--all-stale', '--json'], repoRoot);
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.removed, []);
+    assert.equal(envelope.skipped.length, 1);
+    assert.match(envelope.skipped[0].reason, /missing or unparseable/);
+    assert.ok(existsSync(lockPath), 'corrupt lock preserved');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });

@@ -286,20 +286,40 @@ export function pruneDeadTaskLocks(
       continue;
     }
 
-    const lockAgeMs = lockAge(lock.updatedAt, now);
-    if (lockAgeMs !== null && lockAgeMs < minAgeMs) {
-      skipped.push({
-        taskSlug: lock.taskSlug,
-        branchName: lock.branchName,
-        worktreePath: lock.worktreePath,
-        reason: `updatedAt ${lock.updatedAt} is ${Math.round(lockAgeMs / 1000)}s old — below the ${Math.round(minAgeMs / 1000)}s prune floor`,
-      });
-      continue;
+    if (minAgeMs > 0) {
+      const lockAgeMs = lockAge(lock.updatedAt, now);
+      if (lockAgeMs === null) {
+        // Fail-closed: a corrupt/missing updatedAt is *more* suspicious, not
+        // less. We don't know if it's in flight or a legacy artifact, so we
+        // refuse to prune under the age floor and let the operator decide.
+        skipped.push({
+          taskSlug: lock.taskSlug,
+          branchName: lock.branchName,
+          worktreePath: lock.worktreePath,
+          reason: `updatedAt is missing or unparseable ("${lock.updatedAt ?? ''}") — refusing to prune under the ${Math.round(minAgeMs / 1000)}s floor`,
+        });
+        continue;
+      }
+      if (lockAgeMs < minAgeMs) {
+        skipped.push({
+          taskSlug: lock.taskSlug,
+          branchName: lock.branchName,
+          worktreePath: lock.worktreePath,
+          reason: `updatedAt ${lock.updatedAt} is ${Math.round(lockAgeMs / 1000)}s old — below the ${Math.round(minAgeMs / 1000)}s prune floor`,
+        });
+        continue;
+      }
     }
 
     const targetPath = taskLockPath(commonDir, config, lock.taskSlug);
-    if (existsSync(targetPath)) {
+    try {
       unlinkSync(targetPath);
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      // Two parallel `/clean --apply --all-stale` runs will both observe a
+      // dead lock and race to delete. Second deleter gets ENOENT; swallow it
+      // — the lock is already gone, which is the outcome we wanted.
+      if (err.code !== 'ENOENT') throw error;
     }
     removed.push({
       taskSlug: lock.taskSlug,

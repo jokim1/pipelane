@@ -133,3 +133,23 @@ test('action preflight: clean.apply without scope is blocked by Pipelane (v0.7 i
     rmSync(repoRoot, { recursive: true, force: true });
   }
 });
+
+// The risky-flag-and-label differential test runs Rocketboard with Pipelane's
+// --all-stale flag to hit the "allowed" codepath on the Pipelane side. That
+// only works if Rocketboard treats --all-stale as a no-op (its operator was
+// written before the flag existed). Assert it explicitly instead of trusting
+// the other test's silence.
+test('differential: Rocketboard treats Pipelane --all-stale as a no-op on clean.apply', { skip: !hasRocketboard && 'Rocketboard operator not available' }, () => {
+  const repoRoot = setupMinimalFixture();
+  try {
+    const withoutFlag = parseEnvelope(runRocketboard(repoRoot, ['api', 'action', 'clean.apply']).stdout);
+    const withFlag = parseEnvelope(runRocketboard(repoRoot, ['api', 'action', 'clean.apply', '--all-stale']).stdout);
+    assert.ok(withoutFlag, 'Rocketboard envelope without flag');
+    assert.ok(withFlag, 'Rocketboard envelope with --all-stale');
+    assert.equal(withFlag.ok, withoutFlag.ok, 'envelope.ok unchanged by --all-stale');
+    assert.equal(withFlag.data.preflight.allowed, withoutFlag.data.preflight.allowed, 'preflight.allowed unchanged');
+    assert.equal(withFlag.data.action.risky, withoutFlag.data.action.risky, 'action.risky unchanged');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});

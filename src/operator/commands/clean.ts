@@ -81,10 +81,12 @@ export async function handleClean(cwd: string, parsed: ParsedOperatorArgs): Prom
   printResult(parsed.flags, { message: lines.join('\n') });
 }
 
-// Test hook: override the 5-min prune floor. Production sets no env, callers
-// fall through to TASK_LOCK_MIN_PRUNE_AGE_MS. Accepts a non-negative integer
-// number of milliseconds; malformed values fall through to the default.
+// Test hook: override the 5-min prune floor. Gated to NODE_ENV==='test' so a
+// stray env var in a shared production shell cannot quietly disable the
+// safety gate. Accepts a non-negative integer number of milliseconds;
+// malformed values fall through to the default.
 function readMinAgeOverride(): number | undefined {
+  if (process.env.NODE_ENV !== 'test') return undefined;
   const raw = process.env.PIPELANE_CLEAN_MIN_AGE_MS;
   if (raw === undefined) return undefined;
   const parsed = Number.parseInt(raw, 10);
