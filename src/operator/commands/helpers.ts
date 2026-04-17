@@ -87,26 +87,27 @@ export function latestCommitSubject(repoRoot: string): string {
 }
 
 export function collectChangedPaths(repoRoot: string): string[] {
-  const raw = runGit(repoRoot, ['status', '--porcelain'], true) ?? '';
+  // -z disables C-quoting and uses NUL separators, so tabs, newlines,
+  // non-ASCII, and literal ` -> ` in filenames round-trip cleanly.
+  const raw = runGit(repoRoot, ['status', '--porcelain', '-z'], true) ?? '';
+  const entries = raw.split('\0').filter((entry) => entry.length > 0);
   const paths: string[] = [];
-  for (const line of raw.split('\n')) {
-    if (!line.trim()) continue;
-    // Porcelain format: XY<space>path (rename has `orig -> new`).
-    const payload = line.length > 3 ? line.slice(3) : '';
-    if (!payload) continue;
-    const renameIndex = payload.indexOf(' -> ');
-    const rawPath = renameIndex === -1 ? payload : payload.slice(renameIndex + 4);
-    paths.push(unquoteGitPath(rawPath.trim()));
-  }
-  return paths;
-}
 
-function unquoteGitPath(candidate: string): string {
-  if (!candidate.startsWith('"') || !candidate.endsWith('"')) return candidate;
-  return candidate
-    .slice(1, -1)
-    .replace(/\\"/g, '"')
-    .replace(/\\\\/g, '\\');
+  for (let i = 0; i < entries.length; i += 1) {
+    const entry = entries[i];
+    // Each record is `XY<space>path`. For renames/copies (-z emits the NEW
+    // name first, then the OLD name as a separate NUL-delimited entry),
+    // we record the new name and skip the old one.
+    const xy = entry.slice(0, 2);
+    const payload = entry.length > 3 ? entry.slice(3) : '';
+    if (!payload) continue;
+    paths.push(payload);
+    if (xy[0] === 'R' || xy[0] === 'C') {
+      i += 1; // consume the "from" entry that follows
+    }
+  }
+
+  return paths;
 }
 
 export function findDenyListHits(
