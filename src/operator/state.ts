@@ -103,6 +103,18 @@ export interface DeployRecord {
   durationMs?: number;
   verifiedAt?: string;
   verification?: DeployVerification;
+  // v1.2: per-surface verification. A multi-surface deploy writes one entry
+  // per surface so a frontend-only healthcheck can't credit edge/sql.
+  verificationBySurface?: Record<string, DeployVerification>;
+  // v1.2: fingerprint of deployConfig at deploy time. The observed-success
+  // gate re-blocks when the current config has drifted (staging URL rotated,
+  // healthcheck path changed, etc.). Computed by computeDeployConfigFingerprint.
+  configFingerprint?: string;
+  // v1.2 (optional): HMAC-SHA256 over canonical record fields using the key
+  // at env PIPELANE_DEPLOY_STATE_KEY. Unsigned records are accepted when no
+  // key is configured; when a key IS configured, unsigned + invalid-sig
+  // records are rejected on load. Defense-in-depth against fs-forged records.
+  signature?: string;
   rollbackOfSha?: string;
   idempotencyKey?: string;
   triggeredBy?: string;

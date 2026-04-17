@@ -199,6 +199,28 @@ npm run pipelane:setup                  # installs aliases + writes templates (s
 
 Release lane is **fail-closed until ****`/doctor --probe`**** returns all green**.
 
+### Bootstrapping release lane (v1.2+)
+
+On a fresh repo, or when upgrading an older pipelane consumer to v1.2+,
+`/devmode release` will fail closed with `no succeeded deploy observed`
+for every surface you plan to ship. That is the gate doing its job:
+release readiness is no longer a boolean you flip, it is earned by
+running one verified staging deploy per surface.
+
+One-time bootstrap:
+
+```
+/devmode build                            # build lane skips the readiness gate
+/deploy staging [frontend,edge,sql]       # watches gh run + 2xx healthcheck, writes DeployRecord
+/devmode release                          # now sees the succeeded record and clears
+```
+
+You only need to do this once per surface per repo. After the first
+verified staging deploy, subsequent `/devmode release` is a no-op.
+The bootstrap is the same whether the repo is brand-new or migrating
+from pre-v1.2 (where `.staging.ready: true` used to be the honor-system
+escape hatch).
+
 ### Happy path
 
 ```
@@ -448,7 +470,10 @@ in `AGENTS.md` where enforcement is social.
 - `CLAUDE.md` — local deploy config and operator defaults
 
 Note: the `ready: true` boolean previously carried in this file is
-**removed** in v1 and replaced by live probe results. Do not rely on it.
+**ignored** as of v1.2 (pipelane #20). The field is still accepted in the
+JSON shape for backwards compatibility, but it is never consulted. Release
+readiness is derived live from observed staging `DeployRecord` history —
+no flag can substitute for a succeeded, verified staging deploy. Do not rely on it.
 
 ### Internal state (git common-dir, shared across worktrees)
 
@@ -487,8 +512,11 @@ spec fixes. The change manifest tracks which PR closes each one.
   v0 keys by `taskSlug` and requires `status='succeeded'` for the gate.
 - [v0] **Fire-and-forget ****`gh workflow run`****.** v0 watches the run,
   probes the healthcheck, and records the verified outcome.
-- [v1] **Honor-system ****`ready:true`****.** Removed. Replaced by live probe
-  via `/doctor --probe` + per-deploy healthcheck.
+- [v1.2] **Honor-system ****`ready:true`****.** Shipped in pipelane #20.
+  The flag is retained in the JSON schema but ignored; release readiness
+  is derived from observed staging `DeployRecord.status === 'succeeded'`
+  history via the same `verification` block the post-deploy healthcheck
+  writes. No flag can substitute for a verified deploy.
 - [v0] **Silent ****`/pr`**** with ****`git add -A`****.** v0 previews staged files,
   enforces a deny-list, and prompts before commit.
 - [v0] **Zero-confirmation ****`/merge`**** and ****`/deploy prod`****.** v0 requires

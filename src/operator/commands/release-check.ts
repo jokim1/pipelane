@@ -1,14 +1,16 @@
 import { buildReleaseCheckMessage, emptyDeployConfig, evaluateReleaseReadiness, loadDeployConfig } from '../release-gate.ts';
-import { printResult, resolveWorkflowContext, type ParsedOperatorArgs } from '../state.ts';
+import { loadDeployState, printResult, resolveWorkflowContext, type ParsedOperatorArgs } from '../state.ts';
 import { resolveCommandSurfaces } from './helpers.ts';
 
 export async function handleReleaseCheck(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const context = resolveWorkflowContext(cwd);
   const surfaces = resolveCommandSurfaces(context, parsed.flags.surfaces);
   const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
+  const deployState = loadDeployState(context.commonDir, context.config);
   const readiness = evaluateReleaseReadiness({
     config: context.config,
     deployConfig,
+    deployRecords: deployState.records,
     surfaces,
   });
 

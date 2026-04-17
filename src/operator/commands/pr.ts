@@ -10,6 +10,7 @@ import {
 } from './helpers.ts';
 import { emptyDeployConfig, evaluateReleaseReadiness, loadDeployConfig } from '../release-gate.ts';
 import {
+  loadDeployState,
   loadPrRecord,
   printResult,
   resolveWorkflowContext,
@@ -28,9 +29,11 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
 
   const surfaces = resolveCommandSurfaces(context, parsed.flags.surfaces, lock.surfaces);
   if (context.modeState.mode === 'release') {
+    const deployState = loadDeployState(context.commonDir, context.config);
     const readiness = evaluateReleaseReadiness({
       config: context.config,
       deployConfig: loadDeployConfig(context.repoRoot) ?? emptyDeployConfig(),
+      deployRecords: deployState.records,
       surfaces,
     });
     if (!readiness.ready && !context.modeState.override) {

@@ -1,7 +1,17 @@
+import crypto from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import type { WorkflowConfig } from './state.ts';
+import type { DeployRecord, WorkflowConfig } from './state.ts';
+
+// v1.2 env var: opaque HMAC-SHA256 signing key. Accepts any non-empty string;
+// we recommend ≥32 bytes of cryptographic-random (e.g. `openssl rand -hex 32`)
+// but don't enforce a format — that's the operator's call. When set,
+// handleDeploy signs every new DeployRecord and the observed-success gate
+// drops any record that fails signature verification (it becomes invisible
+// to the gate, not authoritative). When unset, records ship unsigned and the
+// signature step is skipped for backwards compat.
+export const DEPLOY_STATE_KEY_ENV = 'PIPELANE_DEPLOY_STATE_KEY';
 
 export interface DeployConfig {
   platform: string;
@@ -190,7 +200,9 @@ export function renderDeployConfigSection(config: DeployConfig): string {
   return `## Deploy Configuration
 
 This section is machine-readable. Keep the JSON valid.
-Set each \`.staging.ready\` flag to \`true\` only after that surface is fully configured and verified in staging.
+Release readiness is derived from observed staging deploy records (v1.2); the legacy
+\`.staging.ready\` boolean is ignored. Run \`workflow:deploy -- staging <surface>\` once
+to register a succeeded deploy for each surface you plan to ship.
 
 \`\`\`json
 ${JSON.stringify(config, null, 2)}
@@ -198,9 +210,184 @@ ${JSON.stringify(config, null, 2)}
 `;
 }
 
+// v1.2: canonicalize then hash. Any semantic change to the environment-scoped
+// slice of deployConfig (staging URL, healthcheck path, workflow name
+// rotation) produces a new fingerprint, which invalidates prior DeployRecords
+// for that environment's readiness gate. Environments are fingerprinted
+// separately so rotating a prod-only field does NOT invalidate staging
+// readiness (and vice versa).
+export function computeDeployConfigFingerprint(
+  deployConfig: DeployConfig,
+  environment: 'staging' | 'prod',
+): string {
+  const scoped = environment === 'staging'
+    ? {
+      platform: deployConfig.platform,
+      frontend: deployConfig.frontend.staging,
+      edge: deployConfig.edge.staging,
+      sql: deployConfig.sql.staging,
+      supabase: deployConfig.supabase.staging,
+    }
+    : {
+      platform: deployConfig.platform,
+      frontend: deployConfig.frontend.production,
+      edge: deployConfig.edge.production,
+      sql: deployConfig.sql.production,
+      supabase: deployConfig.supabase.production,
+    };
+  return crypto.createHash('sha256').update(canonicalize(scoped)).digest('hex');
+}
+
+function canonicalize(value: unknown): string {
+  if (value === undefined) {
+    // JSON.stringify drops undefined properties when writing to disk; the
+    // canonical form must match so sign-time and verify-time produce the
+    // same string after an on-disk round-trip.
+    return 'undefined';
+  }
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    // Arrays: JSON.stringify turns undefined entries into null, keeping the
+    // slot. Mirror that so the canonical form survives JSON round-trip.
+    return `[${value.map((entry) => (entry === undefined ? 'null' : canonicalize(entry))).join(',')}]`;
+  }
+  // Object: skip keys whose value is undefined, same as JSON.stringify. Sort
+  // remaining keys for determinism.
+  const entries: string[] = [];
+  for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+    const v = (value as Record<string, unknown>)[key];
+    if (v === undefined) continue;
+    entries.push(`${JSON.stringify(key)}:${canonicalize(v)}`);
+  }
+  return `{${entries.join(',')}}`;
+}
+
+// Sign every field of the record except `signature` itself. Using the
+// compiler-enforced destructure (instead of a hand-maintained allowlist)
+// means any future DeployRecord field is signed by default; forgetting to
+// update an allowlist can't silently leave a field unsigned.
+function canonicalRecordPayload(record: DeployRecord): string {
+  const { signature: _signature, ...rest } = record;
+  return canonicalize(rest);
+}
+
+export function signDeployRecord(record: DeployRecord, key: string): string {
+  return crypto.createHmac('sha256', key).update(canonicalRecordPayload(record)).digest('hex');
+}
+
+export function verifyDeployRecord(record: DeployRecord, key: string): boolean {
+  if (typeof record.signature !== 'string' || record.signature.length !== 64) return false;
+  const expected = signDeployRecord(record, key);
+  // Length-aware compare. Not strictly constant-time — the length check
+  // above leaks whether the hex was 64 chars — but signatures are a fixed
+  // size so length is public anyway. timingSafeEqual guards the byte-wise
+  // compare once both buffers are 32 bytes.
+  const a = Buffer.from(record.signature, 'hex');
+  const b = Buffer.from(expected, 'hex');
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+export function resolveDeployStateKey(): string | undefined {
+  const raw = process.env[DEPLOY_STATE_KEY_ENV];
+  if (!raw || raw.trim().length === 0) return undefined;
+  return raw.trim();
+}
+
+function resolveSurfaceVerification(record: DeployRecord, surface: string): DeployVerificationResult {
+  const perSurface = record.verificationBySurface?.[surface];
+  if (perSurface) return { kind: 'per-surface', verification: perSurface };
+  // Legacy records (pre-v1.2) only have the aggregate `verification` block,
+  // which in practice probed only the frontend. We only accept it as a
+  // fallback for the frontend surface; edge/sql under legacy records are
+  // treated as unverified so they don't inherit a probe that didn't happen.
+  if (surface === 'frontend' && record.verification) {
+    return { kind: 'aggregate', verification: record.verification };
+  }
+  return { kind: 'missing', verification: undefined };
+}
+
+type DeployVerification = NonNullable<DeployRecord['verification']>;
+type DeployVerificationResult =
+  | { kind: 'per-surface' | 'aggregate'; verification: DeployVerification }
+  | { kind: 'missing'; verification: undefined };
+
+function verificationPassed(verification: DeployVerification): boolean {
+  // A DeployVerification with no statusCode is a deploy where no
+  // healthcheckUrl was configured. Treat that as unverified (fail closed)
+  // under the v1.2 gate even though status==='succeeded' was written.
+  const code = verification.statusCode;
+  if (typeof code !== 'number') return false;
+  return code >= 200 && code < 300;
+}
+
+export type ObservedStagingResult =
+  | { ok: true; reason?: undefined }
+  | { ok: false; reason: string };
+
+// v1.2: readiness is observed, not asserted. Walks records newest-first and
+// the *most recent* VALID staging deploy touching the surface is
+// authoritative. When a signing key is configured, unsigned/invalid-sig
+// records are treated as invisible (not as "latest"), so an attacker with
+// fs-write access can't plant a record to DoS the gate.
+//
+// A record only counts when: valid HMAC signature (when key set),
+// status==='succeeded', verifiedAt is present, per-surface verification has a
+// 2xx probe, configFingerprint matches the current staging-scoped config.
+// Each closes one class of forged-record attack on deploy-state.json.
+export function explainObservedStagingSuccess(
+  records: DeployRecord[],
+  surface: string,
+  options: { deployConfig?: DeployConfig; key?: string } = {},
+): ObservedStagingResult {
+  const expectedFingerprint = options.deployConfig
+    ? computeDeployConfigFingerprint(options.deployConfig, 'staging')
+    : undefined;
+  for (let i = records.length - 1; i >= 0; i -= 1) {
+    const record = records[i];
+    if (record.environment !== 'staging') continue;
+    if (!Array.isArray(record.surfaces) || !record.surfaces.includes(surface)) continue;
+    // Signing gate: invalid records don't participate at all, so they can't
+    // be "latest" for a surface and can't DoS the gate with a fake failure.
+    if (options.key && !verifyDeployRecord(record, options.key)) continue;
+
+    if (record.status !== 'succeeded') {
+      return { ok: false, reason: `latest record has status "${record.status ?? 'unknown'}"` };
+    }
+    if (!record.verifiedAt) {
+      return { ok: false, reason: 'latest record lacks verifiedAt (unverified deploy)' };
+    }
+    if (expectedFingerprint && record.configFingerprint !== expectedFingerprint) {
+      return { ok: false, reason: 'deploy config drift since record (fingerprint mismatch); re-run staging' };
+    }
+    const probe = resolveSurfaceVerification(record, surface);
+    if (probe.kind === 'missing') {
+      return { ok: false, reason: 'no per-surface verification recorded for this surface' };
+    }
+    if (!verificationPassed(probe.verification)) {
+      return { ok: false, reason: `healthcheck did not return 2xx (HTTP ${probe.verification.statusCode ?? 'none'})` };
+    }
+    return { ok: true };
+  }
+  return { ok: false, reason: 'no succeeded deploy observed' };
+}
+
+export function hasObservedStagingSuccess(
+  records: DeployRecord[],
+  surface: string,
+  options: { deployConfig?: DeployConfig; key?: string } = {},
+): boolean {
+  return explainObservedStagingSuccess(records, surface, options).ok;
+}
+
 export function evaluateReleaseReadiness(options: {
   config: WorkflowConfig;
   deployConfig: DeployConfig;
+  // v1.2: passed explicitly so readiness is derived from observed deploy
+  // history rather than a stored flag. Callers load via loadDeployState().
+  deployRecords: DeployRecord[];
   surfaces: string[];
 }): {
   ready: boolean;
@@ -208,6 +395,12 @@ export function evaluateReleaseReadiness(options: {
   results: Record<string, { ready: boolean; missing: string[] }>;
 } {
   const results: Record<string, { ready: boolean; missing: string[] }> = {};
+  const gateOptions = { deployConfig: options.deployConfig, key: resolveDeployStateKey() };
+  const observedStagingSuccess = (surface: string): string | null => {
+    const result = explainObservedStagingSuccess(options.deployRecords, surface, gateOptions);
+    if (result.ok) return null;
+    return `${surface} staging: ${result.reason}. Run \`workflow:deploy -- staging ${surface}\` first.`;
+  };
 
   for (const surface of options.surfaces) {
     const missing: string[] = [];
@@ -241,9 +434,8 @@ export function evaluateReleaseReadiness(options: {
       if (stagingHealthcheck && isLocalUrl(stagingHealthcheck)) {
         missing.push('frontend staging health check must not be localhost');
       }
-      if (!options.deployConfig.frontend.staging.ready) {
-        missing.push('frontend staging readiness flag');
-      }
+      const observed = observedStagingSuccess('frontend');
+      if (observed) missing.push(observed);
     } else if (surface === 'edge') {
       if (!options.deployConfig.edge.staging.deployCommand) {
         missing.push('edge staging deploy command');
@@ -254,9 +446,8 @@ export function evaluateReleaseReadiness(options: {
       if (!options.deployConfig.edge.staging.verificationCommand && !options.deployConfig.edge.production.verificationCommand && !options.deployConfig.edge.staging.healthcheckUrl && !options.deployConfig.edge.production.healthcheckUrl) {
         missing.push('edge verification command or health check');
       }
-      if (!options.deployConfig.edge.staging.ready) {
-        missing.push('edge staging readiness flag');
-      }
+      const observed = observedStagingSuccess('edge');
+      if (observed) missing.push(observed);
     } else if (surface === 'sql') {
       if (!options.deployConfig.sql.staging.applyCommand) {
         missing.push('sql staging apply/reset path');
@@ -267,9 +458,8 @@ export function evaluateReleaseReadiness(options: {
       if (!options.deployConfig.sql.staging.verificationCommand && !options.deployConfig.sql.production.verificationCommand && !options.deployConfig.sql.staging.healthcheckUrl && !options.deployConfig.sql.production.healthcheckUrl) {
         missing.push('sql verification step');
       }
-      if (!options.deployConfig.sql.staging.ready) {
-        missing.push('sql staging readiness flag');
-      }
+      const observed = observedStagingSuccess('sql');
+      if (observed) missing.push(observed);
     }
 
     results[surface] = {
@@ -301,7 +491,20 @@ export function buildReleaseCheckMessage(readiness: ReturnType<typeof evaluateRe
         lines.push(`  - ${missing}`);
       }
     }
-    lines.push('Next: run npm run workflow:setup and complete local CLAUDE.md.');
+    // v1.2: split remediation. If every blocker is "no succeeded deploy
+    // observed" (a bootstrap state), point the operator at the deploy-first
+    // path; otherwise the CLAUDE.md config still needs completing.
+    const allObserveBlockers = readiness.blockedSurfaces.every((surface) =>
+      readiness.results[surface].missing.length > 0
+      && readiness.results[surface].missing.every((reason) => reason.includes('no succeeded deploy observed')),
+    );
+    if (allObserveBlockers) {
+      lines.push('Next: run `npm run workflow:devmode -- build`, then `npm run workflow:deploy -- staging` once per surface,');
+      lines.push('then `npm run workflow:devmode -- release`. The readiness gate is observed, not asserted.');
+    } else {
+      lines.push('Next: run npm run workflow:setup and complete local CLAUDE.md, then');
+      lines.push('`npm run workflow:devmode -- build` and `npm run workflow:deploy -- staging` to register a staging success.');
+    }
   }
 
   return lines.join('\n');
