@@ -111,6 +111,7 @@ export interface DeployRecord {
 
 export interface OperatorFlags {
   apply: boolean;
+  allStale: boolean;
   json: boolean;
   offline: boolean;
   override: boolean;
@@ -499,6 +500,7 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
   const positional: string[] = [];
   const flags: OperatorFlags = {
     apply: false,
+    allStale: false,
     json: false,
     offline: false,
     override: false,
@@ -520,6 +522,11 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
 
     if (token === '--apply') {
       flags.apply = true;
+      continue;
+    }
+
+    if (token === '--all-stale') {
+      flags.allStale = true;
       continue;
     }
 

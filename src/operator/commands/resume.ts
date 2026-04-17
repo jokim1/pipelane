@@ -10,7 +10,9 @@ import { loadTaskLock } from '../state.ts';
 
 export async function handleResume(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const context = resolveWorkflowContext(cwd);
-  const removedLocks = pruneDeadTaskLocks(context.commonDir, context.config);
+  // Implicit prune on resume keeps the no-arg flow working even if a prior
+  // session left half-written locks. The 5-min floor is /clean --apply's job.
+  const { removed: removedLocks } = pruneDeadTaskLocks(context.commonDir, context.config, { minAgeMs: 0 });
 
   if (!parsed.flags.task.trim()) {
     const activeLocks = listActiveTaskLocks(context.commonDir, context.config);

@@ -13,6 +13,12 @@ const KIT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const CLI_PATH = path.join(KIT_ROOT, 'src', 'cli.ts');
 const FIXTURE_ROOT = path.join(KIT_ROOT, 'test', 'fixtures', 'sample-repo');
 
+// Mark this process + every child spawn as a test run. Production-gated test
+// hooks (PIPELANE_DEPLOY_PROD_CONFIRM_STUB, PIPELANE_CLEAN_MIN_AGE_MS) only
+// activate when NODE_ENV is 'test', which prevents a stray env var in a
+// shared shell from disabling a safety gate.
+process.env.NODE_ENV = 'test';
+
 function run(command, args, cwd, env = {}) {
   return execFileSync(command, args, {
     cwd,
@@ -878,6 +884,175 @@ test('deploy fails closed when healthcheck returns non-2xx', () => {
   }
 });
 
+test('deploy prod blocks without typed-SHA confirmation in a non-TTY', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    runCli(['run', 'devmode', 'release', '--override', '--reason', 'prod-confirm-test', '--json'], repoRoot);
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Prod Confirm', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Prod Confirm', '--json'], created.worktreePath, env);
+    runCli(['run', 'merge', '--json'], created.worktreePath, env);
+
+    // Succeed staging so the prod staging gate clears, which lets us exercise
+    // the typed-SHA confirmation path.
+    runCli(['run', 'deploy', 'staging', '--json'], created.worktreePath, env);
+
+    // No PIPELANE_DEPLOY_PROD_CONFIRM_STUB, no TTY → confirmation must fail.
+    const blocked = runCli(['run', 'deploy', 'prod', '--json'], created.worktreePath, env, true);
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /typed SHA prefix confirmation is required/);
+    assert.match(blocked.stderr, /deadbeefcafebabe/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('deploy prod proceeds when typed-SHA prefix matches via confirm stub', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const base = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    runCli(['run', 'devmode', 'release', '--override', '--reason', 'prod-confirm-test', '--json'], repoRoot);
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Prod Confirm OK', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Prod Confirm OK', '--json'], created.worktreePath, base);
+    runCli(['run', 'merge', '--json'], created.worktreePath, base);
+    runCli(['run', 'deploy', 'staging', '--json'], created.worktreePath, base);
+
+    // Wrong prefix → rejected.
+    const wrong = runCli(['run', 'deploy', 'prod', '--json'], created.worktreePath, {
+      ...base,
+      PIPELANE_DEPLOY_PROD_CONFIRM_STUB: 'beef',
+    }, true);
+    assert.equal(wrong.status, 1);
+    assert.match(wrong.stderr, /typed SHA prefix did not match/);
+
+    // Correct prefix (first 4 chars of 'deadbeefcafebabe') → dispatches.
+    const ok = JSON.parse(runCli(['run', 'deploy', 'prod', '--json'], created.worktreePath, {
+      ...base,
+      PIPELANE_DEPLOY_PROD_CONFIRM_STUB: 'DEAD',
+    }).stdout);
+    assert.equal(ok.status, 'succeeded');
+    assert.equal(ok.environment, 'prod');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('deploy prod rejects PIPELANE_DEPLOY_PROD_CONFIRM_STUB outside NODE_ENV=test', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const baseEnv = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    runCli(['run', 'devmode', 'release', '--override', '--reason', 'confirm-stub-gate', '--json'], repoRoot);
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Stub Gate', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Stub Gate', '--json'], created.worktreePath, baseEnv);
+    runCli(['run', 'merge', '--json'], created.worktreePath, baseEnv);
+    runCli(['run', 'deploy', 'staging', '--json'], created.worktreePath, baseEnv);
+
+    // NODE_ENV explicitly NOT 'test'. CONFIRM_STUB must be rejected even
+    // though its value would otherwise satisfy the prefix.
+    const blocked = runCli(['run', 'deploy', 'prod', '--json'], created.worktreePath, {
+      ...baseEnv,
+      NODE_ENV: 'production',
+      PIPELANE_DEPLOY_PROD_CONFIRM_STUB: 'DEAD',
+    }, true);
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /NODE_ENV is not "test"/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('api action deploy.prod --execute bypasses the TTY prompt via the API env var', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    runCli(['run', 'devmode', 'release', '--override', '--reason', 'prod-api-test', '--json'], repoRoot);
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Prod Api', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Prod Api', '--json'], created.worktreePath, env);
+    runCli(['run', 'merge', '--json'], created.worktreePath, env);
+    runCli(['run', 'deploy', 'staging', '--json'], created.worktreePath, env);
+
+    // Preflight issues a token fingerprinted on the normalized deploy.prod inputs.
+    const preflight = JSON.parse(runCli(
+      ['run', 'api', 'action', 'deploy.prod', '--task', 'Prod Api'],
+      created.worktreePath,
+      env,
+    ).stdout);
+    const token = preflight.data.preflight.confirmation.token;
+    assert.ok(token);
+
+    // Execute goes through the CLI without a TTY and without a stub: the API
+    // path injects PIPELANE_DEPLOY_PROD_API_CONFIRMED=1, which must skip the prompt.
+    const executed = runCli(
+      ['run', 'api', 'action', 'deploy.prod', '--task', 'Prod Api', '--execute', '--confirm-token', token],
+      created.worktreePath,
+      env,
+    );
+    const envelope = JSON.parse(executed.stdout);
+    assert.equal(envelope.ok, true);
+    assert.equal(envelope.data.execution.exitCode, 0);
+    assert.equal(envelope.data.execution.result.status, 'succeeded');
+    assert.equal(envelope.data.execution.result.environment, 'prod');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
 test('deploy prod blocks when release-mode staging lacks a succeeded record', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-gh-'));
@@ -1004,7 +1179,7 @@ test('pr blocks denied paths and --force-include overrides per-path', () => {
   }
 });
 
-test('clean --apply prunes stale task locks', () => {
+test('clean --apply --all-stale prunes stale task locks', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
 
   try {
@@ -1021,9 +1196,144 @@ test('clean --apply prunes stale task locks', () => {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    const result = runCli(['run', 'clean', '--apply'], repoRoot);
+    // PIPELANE_CLEAN_MIN_AGE_MS=0 bypasses the 5-minute prune floor for tests.
+    const result = runCli(['run', 'clean', '--apply', '--all-stale'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    });
     assert.match(result.stdout, /Pruned stale task locks/);
     assert.match(result.stdout, /cleanup-me/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean --apply without scope refuses to run', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    const failed = runCli(['run', 'clean', '--apply'], repoRoot, {}, true);
+    assert.equal(failed.status, 1);
+    assert.match(failed.stderr, /requires scope/);
+    assert.match(failed.stderr, /--task <slug>/);
+    assert.match(failed.stderr, /--all-stale/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean --apply cannot combine --task and --all-stale', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    const failed = runCli(['run', 'clean', '--apply', '--task', 'Anything', '--all-stale'], repoRoot, {}, true);
+    assert.equal(failed.status, 1);
+    assert.match(failed.stderr, /cannot combine --task and --all-stale/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean --apply --task prunes just the named lock', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    const keep = JSON.parse(runCli(['run', 'new', '--task', 'Keep Me', '--json'], repoRoot).stdout);
+    const drop = JSON.parse(runCli(['run', 'new', '--task', 'Drop Me', '--json'], repoRoot).stdout);
+
+    for (const created of [keep, drop]) {
+      execFileSync('git', ['worktree', 'remove', '--force', created.worktreePath], {
+        cwd: repoRoot,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      execFileSync('git', ['branch', '-D', created.branch], {
+        cwd: repoRoot,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    }
+
+    const result = runCli(['run', 'clean', '--apply', '--task', 'Drop Me', '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    });
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.removed, ['drop-me']);
+
+    // keep-me's lock file must still exist.
+    const keepLockPath = path.join(repoRoot, '.git', 'workflow-kit-state', 'task-locks', 'keep-me.json');
+    assert.ok(existsSync(keepLockPath), 'targeted prune did not touch keep-me');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean --apply refuses to prune locks with a missing or unparseable updatedAt', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Corrupt Meta', '--json'], repoRoot).stdout);
+
+    execFileSync('git', ['worktree', 'remove', '--force', created.worktreePath], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    execFileSync('git', ['branch', '-D', created.branch], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    // Corrupt the lock: remove updatedAt so lockAge() returns null. The
+    // pruner must fail closed and skip, not sweep.
+    const lockPath = path.join(repoRoot, '.git', 'workflow-kit-state', 'task-locks', 'corrupt-meta.json');
+    const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+    delete lock.updatedAt;
+    writeFileSync(lockPath, JSON.stringify(lock, null, 2), 'utf8');
+
+    const result = runCli(['run', 'clean', '--apply', '--all-stale', '--json'], repoRoot);
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.removed, []);
+    assert.equal(envelope.skipped.length, 1);
+    assert.match(envelope.skipped[0].reason, /missing or unparseable/);
+    assert.ok(existsSync(lockPath), 'corrupt lock preserved');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean --apply refuses to prune locks younger than 5 minutes', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Too Young', '--json'], repoRoot).stdout);
+
+    // Kill the worktree + branch so the lock looks dead, but leave the
+    // lock file's updatedAt at "just now". Default 5-minute floor applies.
+    execFileSync('git', ['worktree', 'remove', '--force', created.worktreePath], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    execFileSync('git', ['branch', '-D', created.branch], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const result = runCli(['run', 'clean', '--apply', '--all-stale', '--json'], repoRoot);
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.removed, []);
+    assert.equal(envelope.skipped.length, 1);
+    assert.equal(envelope.skipped[0].taskSlug, 'too-young');
+    assert.match(envelope.skipped[0].reason, /below the 300s prune floor/);
+    // The lock file should still exist.
+    const lockPath = path.join(repoRoot, '.git', 'workflow-kit-state', 'task-locks', 'too-young.json');
+    assert.ok(existsSync(lockPath), 'young lock kept');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -1476,12 +1786,14 @@ test('api action execute: risky action accepts a matching confirm token and runs
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt workflow-kit');
 
-    const preflight = JSON.parse(runCli(['run', 'api', 'action', 'clean.apply'], repoRoot).stdout);
+    // clean.apply now requires scope. Pass --all-stale so the preflight is
+    // allowed and the confirm token binds to that scope via the fingerprint.
+    const preflight = JSON.parse(runCli(['run', 'api', 'action', 'clean.apply', '--all-stale'], repoRoot).stdout);
     const token = preflight.data.preflight.confirmation.token;
     assert.ok(token);
 
     const executed = runCli(
-      ['run', 'api', 'action', 'clean.apply', '--execute', '--confirm-token', token],
+      ['run', 'api', 'action', 'clean.apply', '--all-stale', '--execute', '--confirm-token', token],
       repoRoot,
     );
     assert.equal(executed.status, 0);
@@ -1490,6 +1802,28 @@ test('api action execute: risky action accepts a matching confirm token and runs
     assert.equal(envelope.data.action.id, 'clean.apply');
     assert.equal(envelope.data.execution.exitCode, 0);
     assert.ok(envelope.data.execution.result, 'handler output parsed');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('api action preflight: clean.apply without scope returns allowed:false state:blocked and no token', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+
+    const result = runCli(['run', 'api', 'action', 'clean.apply'], repoRoot, {}, true);
+    // Envelope is emitted even when preflight is blocked; exit is non-zero.
+    assert.notEqual(result.status, 0);
+    const envelope = JSON.parse(result.stdout);
+    assert.equal(envelope.ok, false);
+    assert.equal(envelope.data.preflight.allowed, false);
+    assert.equal(envelope.data.preflight.state, 'blocked');
+    assert.equal(envelope.data.preflight.requiresConfirmation, false);
+    assert.equal(envelope.data.preflight.confirmation, null);
+    assert.match(envelope.data.preflight.reason, /requires scope/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });

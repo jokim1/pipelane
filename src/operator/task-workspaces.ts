@@ -22,6 +22,17 @@ export interface RemovedTaskLock {
   reasons: string[];
 }
 
+export interface SkippedTaskLock {
+  taskSlug: string;
+  branchName: string;
+  worktreePath: string;
+  reason: string;
+}
+
+// v0.7: /clean --apply must not yank a lock out from under a task that was
+// just started. Locks refreshed within this window are treated as live.
+export const TASK_LOCK_MIN_PRUNE_AGE_MS = 5 * 60 * 1000;
+
 export function readWorktreeStatus(repoRoot: string): { branchName: string; statusLines: string[]; dirty: boolean } {
   const branchName = runGit(repoRoot, ['branch', '--show-current']) ?? '';
   const statusText = runGit(repoRoot, ['status', '--short'], true) ?? '';
@@ -228,10 +239,38 @@ export function buildCurrentWorkspaceReasons(options: {
   return reasons;
 }
 
-export function pruneDeadTaskLocks(commonDir: string, config: WorkflowConfig): RemovedTaskLock[] {
+export interface PruneDeadTaskLocksOptions {
+  // Restrict pruning to a single task slug. When set, only that lock is
+  // considered; everything else is ignored. Used by `/clean --apply --task`.
+  taskSlug?: string;
+  // Minimum age (ms) a lock must have before it is eligible for pruning.
+  // Defaults to TASK_LOCK_MIN_PRUNE_AGE_MS so an interrupted operator can't
+  // sweep a lock that another operator just wrote.
+  minAgeMs?: number;
+  // Override the clock for tests.
+  now?: () => number;
+}
+
+export interface PruneDeadTaskLocksResult {
+  removed: RemovedTaskLock[];
+  skipped: SkippedTaskLock[];
+}
+
+export function pruneDeadTaskLocks(
+  commonDir: string,
+  config: WorkflowConfig,
+  options: PruneDeadTaskLocksOptions = {},
+): PruneDeadTaskLocksResult {
   const removed: RemovedTaskLock[] = [];
+  const skipped: SkippedTaskLock[] = [];
+  const minAgeMs = options.minAgeMs ?? TASK_LOCK_MIN_PRUNE_AGE_MS;
+  const now = (options.now ?? (() => Date.now()))();
 
   for (const lock of loadAllTaskLocks(commonDir, config)) {
+    if (options.taskSlug && lock.taskSlug !== options.taskSlug) {
+      continue;
+    }
+
     const reasons: string[] = [];
 
     if (!existsSync(lock.worktreePath)) {
@@ -247,9 +286,40 @@ export function pruneDeadTaskLocks(commonDir: string, config: WorkflowConfig): R
       continue;
     }
 
+    if (minAgeMs > 0) {
+      const lockAgeMs = lockAge(lock.updatedAt, now);
+      if (lockAgeMs === null) {
+        // Fail-closed: a corrupt/missing updatedAt is *more* suspicious, not
+        // less. We don't know if it's in flight or a legacy artifact, so we
+        // refuse to prune under the age floor and let the operator decide.
+        skipped.push({
+          taskSlug: lock.taskSlug,
+          branchName: lock.branchName,
+          worktreePath: lock.worktreePath,
+          reason: `updatedAt is missing or unparseable ("${lock.updatedAt ?? ''}") — refusing to prune under the ${Math.round(minAgeMs / 1000)}s floor`,
+        });
+        continue;
+      }
+      if (lockAgeMs < minAgeMs) {
+        skipped.push({
+          taskSlug: lock.taskSlug,
+          branchName: lock.branchName,
+          worktreePath: lock.worktreePath,
+          reason: `updatedAt ${lock.updatedAt} is ${Math.round(lockAgeMs / 1000)}s old — below the ${Math.round(minAgeMs / 1000)}s prune floor`,
+        });
+        continue;
+      }
+    }
+
     const targetPath = taskLockPath(commonDir, config, lock.taskSlug);
-    if (existsSync(targetPath)) {
+    try {
       unlinkSync(targetPath);
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      // Two parallel `/clean --apply --all-stale` runs will both observe a
+      // dead lock and race to delete. Second deleter gets ENOENT; swallow it
+      // — the lock is already gone, which is the outcome we wanted.
+      if (err.code !== 'ENOENT') throw error;
     }
     removed.push({
       taskSlug: lock.taskSlug,
@@ -259,7 +329,14 @@ export function pruneDeadTaskLocks(commonDir: string, config: WorkflowConfig): R
     });
   }
 
-  return removed;
+  return { removed, skipped };
+}
+
+function lockAge(updatedAt: string | undefined, now: number): number | null {
+  if (!updatedAt) return null;
+  const parsed = Date.parse(updatedAt);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.max(0, now - parsed);
 }
 
 export function findPrunedTaskLock(removed: RemovedTaskLock[], taskSlug: string): RemovedTaskLock | null {
