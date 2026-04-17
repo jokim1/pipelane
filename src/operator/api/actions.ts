@@ -17,8 +17,6 @@ import {
   createActionConfirmation,
 } from './confirm-tokens.ts';
 
-export const API_RISKY_ACTION_IDS = new Set(['clean.apply', 'merge', 'deploy.prod']);
-
 export const STABLE_ACTION_IDS = [
   'new',
   'resume',
@@ -34,6 +32,14 @@ export const STABLE_ACTION_IDS = [
 ] as const;
 
 export type StableActionId = (typeof STABLE_ACTION_IDS)[number];
+
+// Typed risky set so TS flags a forgotten entry instead of silently
+// dropping a new risky action into the non-risky path.
+export const API_RISKY_ACTION_IDS: ReadonlySet<StableActionId> = new Set<StableActionId>([
+  'clean.apply',
+  'merge',
+  'deploy.prod',
+]);
 
 const ACTION_LABELS: Record<StableActionId, string> = {
   new: 'Create task workspace',
@@ -206,8 +212,6 @@ function normalizeInputs(actionId: StableActionId, parsed: ParsedOperatorArgs): 
     case 'clean.plan':
       return {};
     case 'clean.apply':
-      return {};
-    default:
       return {};
   }
 }

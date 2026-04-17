@@ -62,16 +62,36 @@ export function sweepExpiredApiConfirmations(commonDir: string, config: Workflow
     return;
   }
   const now = Date.now();
+  const consumingStaleCutoff = now - API_CONFIRMATION_TTL_MS * 2;
+
   for (const entry of entries) {
-    if (!entry.endsWith('.json')) continue;
     const filePath = path.join(dir, entry);
-    try {
-      const record = JSON.parse(readFileSync(filePath, 'utf8')) as ConfirmationRecord;
-      if (!record.expiresAt || Date.parse(record.expiresAt) < now) {
-        unlinkSync(filePath);
+
+    if (entry.endsWith('.json')) {
+      try {
+        const record = JSON.parse(readFileSync(filePath, 'utf8')) as ConfirmationRecord;
+        if (!record.expiresAt || Date.parse(record.expiresAt) < now) {
+          unlinkSync(filePath);
+        }
+      } catch {
+        // best-effort cleanup
       }
-    } catch {
-      // best-effort cleanup
+      continue;
+    }
+
+    // Orphaned `.consuming.<pid>.<ts>` files from a consume that failed
+    // between rename and unlink. Reap once they're clearly stale so the
+    // directory doesn't grow unbounded.
+    const consumingMatch = entry.match(/\.consuming\.\d+\.(\d+)$/);
+    if (consumingMatch) {
+      const createdAt = Number(consumingMatch[1]);
+      if (Number.isFinite(createdAt) && createdAt < consumingStaleCutoff) {
+        try {
+          unlinkSync(filePath);
+        } catch {
+          // best-effort cleanup
+        }
+      }
     }
   }
 }
