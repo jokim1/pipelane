@@ -638,6 +638,7 @@ test('init writes tracked workflow files and setup seeds CLAUDE plus Codex wrapp
 
     const setupResult = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
     assert.match(setupResult.stdout, /[Pp]ipelane setup complete/);
+    assert.match(setupResult.stdout, /Each Codex user must run npm run workflow:setup/);
     assert.ok(existsSync(path.join(repoRoot, 'CLAUDE.md')));
     assert.ok(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')));
 
@@ -650,6 +651,324 @@ test('init writes tracked workflow files and setup seeds CLAUDE plus Codex wrapp
     // the rename so existing Claude slash commands don't break.
     assert.equal(packageJson.scripts['workflow:new'], 'pipelane run new');
     assert.equal(packageJson.scripts['workflow:resume'], 'pipelane run resume');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('custom aliases drive generated Claude commands, docs, and Codex wrappers', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'new.md')));
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')));
+
+    const configPath = path.join(repoRoot, '.project-workflow.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.aliases.new = '/branch';
+    config.aliases.resume = '/back';
+    config.aliases.pr = '/draft-pr';
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    const setupResult = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+    assert.match(setupResult.stdout, /Slash commands: .*\/branch.*\/back.*\/draft-pr/);
+
+    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'branch.md')));
+    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'back.md')));
+    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'draft-pr.md')));
+    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'new.md')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'resume.md')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'pr.md')), false);
+
+    const readme = readFileSync(path.join(repoRoot, 'README.md'), 'utf8');
+    const workflowDoc = readFileSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md'), 'utf8');
+    assert.match(readme, /\/branch/);
+    assert.match(readme, /Each Codex user runs `npm run workflow:setup`/);
+    assert.match(workflowDoc, /\/branch/);
+    assert.match(workflowDoc, /Codex wrappers are machine-global/);
+
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'branch', 'SKILL.md')));
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'back', 'SKILL.md')));
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'draft-pr', 'SKILL.md')));
+    assert.equal(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')), false);
+    assert.equal(existsSync(path.join(codexHome, 'skills', 'resume', 'SKILL.md')), false);
+    assert.equal(existsSync(path.join(codexHome, 'skills', 'pr', 'SKILL.md')), false);
+    assert.match(readFileSync(path.join(codexHome, 'skills', 'branch', 'SKILL.md'), 'utf8'), /run-workflow\.sh --alias \/branch/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('setup fails closed when an alias would overwrite an unrelated Claude command', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    mkdirSync(path.join(repoRoot, '.claude', 'commands'), { recursive: true });
+    writeFileSync(path.join(repoRoot, '.claude', 'commands', 'branch.md'), 'custom branch command\n', 'utf8');
+
+    const configPath = path.join(repoRoot, '.project-workflow.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.aliases.new = '/branch';
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    const result = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome }, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Claude command alias collision/);
+    assert.equal(readFileSync(path.join(repoRoot, '.claude', 'commands', 'branch.md'), 'utf8'), 'custom branch command\n');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('setup fails closed when an alias would overwrite an unrelated Codex skill', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    mkdirSync(path.join(codexHome, 'skills', 'branch'), { recursive: true });
+    writeFileSync(path.join(codexHome, 'skills', 'branch', 'SKILL.md'), 'custom branch skill\n', 'utf8');
+
+    const configPath = path.join(repoRoot, '.project-workflow.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.aliases.new = '/branch';
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    const result = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome }, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Codex skill alias collision/);
+    assert.equal(readFileSync(path.join(codexHome, 'skills', 'branch', 'SKILL.md'), 'utf8'), 'custom branch skill\n');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('legacy workflow-generated Claude commands and Codex skills are pruned on alias rename', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    writeFileSync(
+      path.join(repoRoot, '.claude', 'commands', 'new.md'),
+      [
+        'Create a fresh task workspace for this repo.',
+        '',
+        'Run:',
+        '',
+        '```bash',
+        'npm run workflow:new -- <args-from-user>',
+        '```',
+        '',
+        'Display the output directly. Call out that the chat/workspace has not moved automatically yet.',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    writeFileSync(
+      path.join(repoRoot, '.claude', 'commands', 'resume.md'),
+      [
+        'Resume an existing task workspace for this repo.',
+        '',
+        'Run:',
+        '',
+        '```bash',
+        'npm run workflow:resume -- <args-from-user>',
+        '```',
+        '',
+        'Display the output directly. Call out that the chat/workspace has not moved automatically yet.',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    writeFileSync(
+      path.join(repoRoot, '.claude', 'commands', 'pr.md'),
+      [
+        'Prepare and open, or update, a pull request for the current task.',
+        '',
+        'Run:',
+        '',
+        '```bash',
+        'npm run workflow:pr -- <args-from-user>',
+        '```',
+        '',
+        'Display the output directly.',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+
+    for (const skill of ['new', 'resume', 'pr']) {
+      mkdirSync(path.join(codexHome, 'skills', skill), { recursive: true });
+      writeFileSync(
+        path.join(codexHome, 'skills', skill, 'SKILL.md'),
+        `legacy skill\n~/.codex/skills/rocketboard-workflow/bin/run-workflow.sh ${skill}\n`,
+        'utf8',
+      );
+    }
+
+    const configPath = path.join(repoRoot, '.project-workflow.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.aliases.new = '/branch';
+    config.aliases.resume = '/back';
+    config.aliases.pr = '/draft-pr';
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'new.md')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'resume.md')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'pr.md')), false);
+    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'branch.md')));
+    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'back.md')));
+    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'draft-pr.md')));
+
+    assert.equal(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')), false);
+    assert.equal(existsSync(path.join(codexHome, 'skills', 'resume', 'SKILL.md')), false);
+    assert.equal(existsSync(path.join(codexHome, 'skills', 'pr', 'SKILL.md')), false);
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'branch', 'SKILL.md')));
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'back', 'SKILL.md')));
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'draft-pr', 'SKILL.md')));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('Codex alias wrappers stay safe when different repos map the same alias differently', () => {
+  const repoOne = createRepo();
+  const repoTwo = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Repo One'], repoOne);
+    runCli(['init', '--project', 'Repo Two'], repoTwo);
+
+    const repoOneConfigPath = path.join(repoOne, '.project-workflow.json');
+    const repoOneConfig = JSON.parse(readFileSync(repoOneConfigPath, 'utf8'));
+    repoOneConfig.aliases.new = '/branch';
+    repoOneConfig.aliases.resume = '/back';
+    writeFileSync(repoOneConfigPath, `${JSON.stringify(repoOneConfig, null, 2)}\n`, 'utf8');
+
+    const repoTwoConfigPath = path.join(repoTwo, '.project-workflow.json');
+    const repoTwoConfig = JSON.parse(readFileSync(repoTwoConfigPath, 'utf8'));
+    repoTwoConfig.aliases.resume = '/branch';
+    writeFileSync(repoTwoConfigPath, `${JSON.stringify(repoTwoConfig, null, 2)}\n`, 'utf8');
+
+    runCli(['setup'], repoOne, { CODEX_HOME: codexHome });
+    runCli(['setup'], repoTwo, { CODEX_HOME: codexHome });
+
+    const branchSkill = readFileSync(path.join(codexHome, 'skills', 'branch', 'SKILL.md'), 'utf8');
+    assert.match(branchSkill, /run-workflow\.sh --alias \/branch/);
+    assert.doesNotMatch(branchSkill, /run-workflow\.sh new/);
+    assert.doesNotMatch(branchSkill, /run-workflow\.sh resume/);
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'back', 'SKILL.md')));
+  } finally {
+    rmSync(repoOne, { recursive: true, force: true });
+    rmSync(repoTwo, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('setup migrates legacy managed-skills.json without preserving stale aliases', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    mkdirSync(path.join(codexHome, 'skills', 'workflow-kit'), { recursive: true });
+    writeFileSync(
+      path.join(codexHome, 'skills', 'workflow-kit', 'managed-skills.json'),
+      `${JSON.stringify({ skills: ['new', 'resume', 'pr'] }, null, 2)}\n`,
+      'utf8',
+    );
+
+    for (const skill of ['new', 'resume', 'pr']) {
+      mkdirSync(path.join(codexHome, 'skills', skill), { recursive: true });
+      writeFileSync(
+        path.join(codexHome, 'skills', skill, 'SKILL.md'),
+        `legacy skill\n~/.codex/skills/rocketboard-workflow/bin/run-workflow.sh ${skill}\n`,
+        'utf8',
+      );
+    }
+
+    const configPath = path.join(repoRoot, '.project-workflow.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.aliases.new = '/branch';
+    config.aliases.resume = '/back';
+    config.aliases.pr = '/draft-pr';
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    assert.equal(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')), false);
+    assert.equal(existsSync(path.join(codexHome, 'skills', 'resume', 'SKILL.md')), false);
+    assert.equal(existsSync(path.join(codexHome, 'skills', 'pr', 'SKILL.md')), false);
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'branch', 'SKILL.md')));
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'back', 'SKILL.md')));
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'draft-pr', 'SKILL.md')));
+
+    const manifest = JSON.parse(readFileSync(path.join(codexHome, 'skills', 'workflow-kit', 'managed-skills.json'), 'utf8'));
+    assert.equal(manifest.version, 2);
+    assert.deepEqual(Object.keys(manifest.repos), [realpathSync(repoRoot)]);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('setup upgrades pre-marker alias-generated Claude commands and prunes them on rename', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    const configPath = path.join(repoRoot, '.project-workflow.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.aliases.new = '/branch';
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    writeFileSync(
+      path.join(repoRoot, '.claude', 'commands', 'branch.md'),
+      [
+        'Create a fresh task workspace for this repo.',
+        '',
+        'Run:',
+        '',
+        '```bash',
+        'npm run workflow:new -- <args-from-user>',
+        '```',
+        '',
+        'Display the output directly. Call out that the chat/workspace has not moved automatically yet.',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    const upgradedBranch = readFileSync(path.join(repoRoot, '.claude', 'commands', 'branch.md'), 'utf8');
+    assert.match(upgradedBranch, /<!-- workflow-kit:command:new -->/);
+
+    config.aliases.new = '/fresh';
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'branch.md')), false);
+    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'fresh.md')));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });

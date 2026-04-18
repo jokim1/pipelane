@@ -1,3 +1,4 @@
+<!-- workflow-kit:command:devmode -->
 Switch or check the repo's development mode (build or release).
 
 Run:

@@ -17,8 +17,8 @@ follow safely without improvising repo behavior.
 
 - repo-native scripts are the source of truth
 - slash wrappers are thin adapters only
-- `/new` is the canonical task-start command
-- `/resume` is the recovery command
+- `{{ALIAS_NEW}}` is the canonical task-start command
+- `{{ALIAS_RESUME}}` is the recovery command
 - `repo-guard` is internal-only
 
 ## Supported Operator Surfaces
@@ -40,13 +40,17 @@ follow safely without improvising repo behavior.
 
 This repo exposes the following user-facing slash commands through Claude/Codex adapters:
 
-- `/devmode`
-- `/new`
-- `/resume`
-- `/pr`
-- `/merge`
-- `/deploy`
-- `/clean`
+- `{{ALIAS_DEVMODE}}`
+- `{{ALIAS_NEW}}`
+- `{{ALIAS_RESUME}}`
+- `{{ALIAS_PR}}`
+- `{{ALIAS_MERGE}}`
+- `{{ALIAS_DEPLOY}}`
+- `{{ALIAS_CLEAN}}`
+
+If aliases change in `.project-workflow.json`, rerun `npm run workflow:setup` and reopen Claude/Codex so the new command names are picked up.
+Aliases must be unique, and setup fails closed if an alias would overwrite an unrelated command or skill.
+Codex resolves aliases per repo at runtime, so the same alias name can map to different workflow commands in different workflow-kit repos on one machine.
 
 ## workflow-kit and gstack
 
@@ -54,13 +58,13 @@ Use both.
 
 `workflow-kit` owns the repo-specific workflow contract:
 
-- `/devmode`
-- `/new`
-- `/resume`
-- `/pr`
-- `/merge`
-- `/deploy`
-- `/clean`
+- `{{ALIAS_DEVMODE}}`
+- `{{ALIAS_NEW}}`
+- `{{ALIAS_RESUME}}`
+- `{{ALIAS_PR}}`
+- `{{ALIAS_MERGE}}`
+- `{{ALIAS_DEPLOY}}`
+- `{{ALIAS_CLEAN}}`
 
 gstack is still recommended for:
 
@@ -76,7 +80,7 @@ This repo should prefer the workflow-kit release flow over generic gstack `/ship
 
 ## Task Workspace Flow
 
-`/new` is the canonical task-start command.
+`{{ALIAS_NEW}}` is the canonical task-start command.
 
 Properties:
 
@@ -84,22 +88,22 @@ Properties:
 - creates a sibling worktree under `../{{TASK_WORKTREE_DIR_NAME}}/`
 - refreshes `origin/{{BASE_BRANCH}}` first
 - inherits the current dev mode
-- fails closed if the task already exists and points to `/resume`
-- `--task "<task-name>"` is optional; when omitted, `/new` generates a `task-<hex>` slug automatically
+- fails closed if the task already exists and points to `{{ALIAS_RESUME}}`
+- `--task "<task-name>"` is optional; when omitted, `{{ALIAS_NEW}}` generates a `task-<hex>` slug automatically
 
-`/resume` is the recovery path, not the normal happy path.
+`{{ALIAS_RESUME}}` is the recovery path, not the normal happy path.
 
 Properties:
 
 - resolves by task slug, not branch id
 - returns the saved workspace and mode
 - does not create a workspace
-- redirects back to `/new` if the saved workspace is gone
+- redirects back to `{{ALIAS_NEW}}` if the saved workspace is gone
 - lists active tasks when called without `--task`
 
 The chat/workspace does not move automatically. Switch into the reported path before editing.
 
-## `/new` behavior
+## `{{ALIAS_NEW}}` behavior
 
 Typical result:
 
@@ -112,7 +116,7 @@ Mode: build
 Chat has not moved. Switch this chat/workspace to that path before editing.
 ```
 
-## `/resume` behavior
+## `{{ALIAS_RESUME}}` behavior
 
 Normal use:
 
@@ -140,11 +144,11 @@ Use it when:
 
 User-facing journey:
 
-1. `/devmode build`
-2. `/new <task-name>`
-3. `/pr`
-4. `/merge`
-5. `/clean`
+1. `{{ALIAS_DEVMODE}} build`
+2. `{{ALIAS_NEW}} <task-name>`
+3. `{{ALIAS_PR}}`
+4. `{{ALIAS_MERGE}}`
+5. `{{ALIAS_CLEAN}}`
 
 Repo-native journey:
 
@@ -166,13 +170,13 @@ Use it when:
 
 User-facing journey:
 
-1. `/devmode release`
-2. `/new <task-name>`
-3. `/pr`
-4. `/merge`
-5. `/deploy staging`
-6. `/deploy prod`
-7. `/clean`
+1. `{{ALIAS_DEVMODE}} release`
+2. `{{ALIAS_NEW}} <task-name>`
+3. `{{ALIAS_PR}}`
+4. `{{ALIAS_MERGE}}`
+5. `{{ALIAS_DEPLOY}} staging`
+6. `{{ALIAS_DEPLOY}} prod`
+7. `{{ALIAS_CLEAN}}`
 
 Repo-native journey:
 
@@ -246,6 +250,35 @@ This repo tracks `AGENTS.md` as the repo policy surface for workflow-kit.
 ## Required local `CLAUDE.md`
 
 `CLAUDE.md` is machine-local and git-ignored. `npm run workflow:setup` creates it if missing.
+
+## What each user must do
+
+### One repo maintainer
+
+1. install `workflow-kit`
+2. run `workflow-kit init`
+3. review `.project-workflow.json`, especially `aliases`
+4. commit the tracked workflow files
+
+### Each Claude user
+
+1. pull the committed workflow files
+2. open the repo in Claude
+3. reopen or restart Claude if aliases changed or the command files were added while it was already open
+
+### Each Codex user
+
+1. pull the committed workflow files
+2. run `npm run workflow:setup`
+3. reopen or restart Codex if the new command names do not appear immediately
+
+Codex wrappers are machine-global, so every Codex user must run setup on their own machine. If aliases change later, rerun setup again.
+
+### Each release operator
+
+1. run `npm run workflow:setup`
+2. fill local deploy config in `CLAUDE.md`
+3. verify with `npm run workflow:release-check`
 
 ## Install In A New Repo
 

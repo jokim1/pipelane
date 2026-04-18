@@ -1,3 +1,4 @@
+<!-- workflow-kit:command:clean -->
 Report workflow cleanup status and prune stale task locks when requested.
 
 Run:

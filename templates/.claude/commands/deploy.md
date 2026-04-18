@@ -1,3 +1,4 @@
+<!-- workflow-kit:command:deploy -->
 Deploy the merged SHA for this repo.
 
 Run:

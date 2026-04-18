@@ -1,3 +1,4 @@
+<!-- workflow-kit:command:pr -->
 Prepare and open, or update, a pull request for the current task.
 
 Run:
