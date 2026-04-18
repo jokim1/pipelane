@@ -153,8 +153,10 @@ export function parseDeployConfigMarkdown(markdown: string): DeployConfig | null
   // Anchor both fences to newlines. JSON.stringify never emits a literal
   // newline inside a string (they're escaped as \n), so a command value with
   // embedded backticks — e.g. `deployCommand: "echo \`\`\` hi"` — can't trick
-  // the regex into terminating early and truncating the JSON body.
-  const jsonMatch = section.match(/```json\n([\s\S]*?)\n```/i);
+  // the regex into terminating early and truncating the JSON body. Use
+  // `\r?\n` so CRLF-checked-out CLAUDE.md (Windows, core.autocrlf=true)
+  // still parses.
+  const jsonMatch = section.match(/```json\r?\n([\s\S]*?)\r?\n```/i);
   if (!jsonMatch) {
     return null;
   }

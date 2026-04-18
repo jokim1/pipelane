@@ -2102,6 +2102,39 @@ test('parseDeployConfigMarkdown preserves legacy .ready:true for backwards compa
   assert.equal(parsed.sql.staging.ready, true, 'sql.staging.ready round-trips');
 });
 
+test('parseDeployConfigMarkdown handles CRLF-normalized CLAUDE.md', async () => {
+  // Codex-identified regression from PR #27: the tightened fenced-block regex
+  // used `\n` literally, so any CLAUDE.md checked out with CRLF (Windows, or
+  // `core.autocrlf=true`) would silently return null and make every downstream
+  // command (release-check, devmode, deploy, pr) treat the repo as having no
+  // deploy config. Fence anchors now accept `\r?\n`.
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'release-gate.ts'));
+  const lfMarkdown = [
+    '## Deploy Configuration',
+    '',
+    '```json',
+    JSON.stringify({
+      platform: 'fly.io',
+      frontend: { production: { url: 'https://p.test', deployWorkflow: '', autoDeployOnMain: false, healthcheckUrl: '' },
+        staging: { url: 'https://s.test', deployWorkflow: '', healthcheckUrl: '', ready: false } },
+      edge: { staging: { deployCommand: '', verificationCommand: '', healthcheckUrl: '', ready: false },
+        production: { deployCommand: '', verificationCommand: '', healthcheckUrl: '' } },
+      sql: { staging: { applyCommand: '', verificationCommand: '', healthcheckUrl: '', ready: false },
+        production: { applyCommand: '', verificationCommand: '', healthcheckUrl: '' } },
+      supabase: { staging: { projectRef: 's' }, production: { projectRef: 'p' } },
+    }, null, 2),
+    '```',
+  ].join('\n');
+  const crlfMarkdown = lfMarkdown.replace(/\n/g, '\r\n');
+  assert.notEqual(crlfMarkdown, lfMarkdown, 'test fixture actually differs from LF input');
+
+  const lfParsed = mod.parseDeployConfigMarkdown(lfMarkdown);
+  const crlfParsed = mod.parseDeployConfigMarkdown(crlfMarkdown);
+  assert.ok(lfParsed, 'LF markdown parses');
+  assert.ok(crlfParsed, 'CRLF markdown also parses (regression: PR #27 tightened regex broke this)');
+  assert.deepEqual(crlfParsed, lfParsed, 'LF and CRLF inputs yield identical parsed DeployConfig');
+});
+
 test('release-check re-blocks when the deploy config fingerprint drifts', async () => {
   const repoRoot = createRepo();
   try {
