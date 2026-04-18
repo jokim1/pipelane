@@ -59,6 +59,42 @@ export interface WorkflowConfig {
   };
   // Optional; absent in default config. See ChecksConfig for semantics.
   checks?: ChecksConfig;
+  // Optional; absent in default config. Per-surface opt-outs for
+  // syncConsumerDocs. Missing entry = default true (current behavior).
+  syncDocs?: SyncDocsConfig;
+}
+
+// Per-surface opt-out flags for `pipelane setup` / `pipelane sync-docs`.
+// Absent or undefined means "sync this surface" (default true). Consumers
+// that want partial regeneration (e.g. commands regen but NO marker
+// injection into README/AGENTS/CONTRIBUTING) set the surfaces they want
+// skipped to false.
+export interface SyncDocsConfig {
+  claudeCommands?: boolean;
+  readmeSection?: boolean;
+  contributingSection?: boolean;
+  agentsSection?: boolean;
+  docsReleaseWorkflow?: boolean;
+  workflowClaudeTemplate?: boolean;
+  packageScripts?: boolean;
+}
+
+export const DEFAULT_SYNC_DOCS: Required<SyncDocsConfig> = {
+  claudeCommands: true,
+  readmeSection: true,
+  contributingSection: true,
+  agentsSection: true,
+  docsReleaseWorkflow: true,
+  workflowClaudeTemplate: true,
+  packageScripts: true,
+};
+
+export function resolveSyncDocs(raw: SyncDocsConfig | undefined): Required<SyncDocsConfig> {
+  if (!raw) return { ...DEFAULT_SYNC_DOCS };
+  return {
+    ...DEFAULT_SYNC_DOCS,
+    ...raw,
+  };
 }
 
 export const DEFAULT_BRANCH_PREFIX = 'codex/';
@@ -354,7 +390,32 @@ export function normalizeWorkflowConfig(raw: Partial<WorkflowConfig>): WorkflowC
     prPathDenyList: raw.prPathDenyList ?? [...DEFAULT_PR_PATH_DENY_LIST],
     aliases: resolveWorkflowAliases(raw.aliases),
     checks: normalizeChecksConfig(raw.checks),
+    syncDocs: normalizeSyncDocsConfig(raw.syncDocs),
   };
+}
+
+// Strip non-boolean and unknown keys. Returning undefined when every
+// declared flag is either absent or true keeps the serialized config
+// minimal — consumers that don't opt out never see the block.
+function normalizeSyncDocsConfig(raw: SyncDocsConfig | undefined): SyncDocsConfig | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const keys: (keyof SyncDocsConfig)[] = [
+    'claudeCommands',
+    'readmeSection',
+    'contributingSection',
+    'agentsSection',
+    'docsReleaseWorkflow',
+    'workflowClaudeTemplate',
+    'packageScripts',
+  ];
+  const out: SyncDocsConfig = {};
+  for (const key of keys) {
+    const value = raw[key];
+    if (typeof value === 'boolean') {
+      out[key] = value;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 // v4: preserve the checks field if present; returning undefined keeps the

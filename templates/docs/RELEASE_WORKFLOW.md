@@ -243,6 +243,45 @@ Local-only:
 
 This repo tracks `.project-workflow.json` as the workflow contract.
 
+### Optional `syncDocs` opt-outs
+
+By default, `pipelane setup` and `pipelane sync-docs` write every surface:
+regenerate `.claude/commands/*.md`, inject marker sections into
+`README.md` / `CONTRIBUTING.md` / `AGENTS.md`, create or refresh
+`docs/RELEASE_WORKFLOW.md` and `workflow/CLAUDE.template.md`, and ensure
+the `workflow:*` / `pipelane:*` scripts in `package.json`.
+
+Consumers that want partial regeneration can opt out per surface by
+adding a `syncDocs` block. Every flag defaults to `true`; absent or
+`true` = sync that surface, `false` = leave it alone.
+
+```json
+{
+  "syncDocs": {
+    "claudeCommands": true,
+    "readmeSection": false,
+    "contributingSection": false,
+    "agentsSection": false,
+    "docsReleaseWorkflow": false,
+    "workflowClaudeTemplate": false,
+    "packageScripts": true
+  }
+}
+```
+
+| Flag | Controls |
+| --- | --- |
+| `claudeCommands` | `.claude/commands/*.md` regeneration, including `pipelane.md` and the managed manifest. |
+| `readmeSection` | Marker-wrapped `README.md` section. |
+| `contributingSection` | Marker-wrapped `CONTRIBUTING.md` section. |
+| `agentsSection` | Marker-wrapped `AGENTS.md` section. |
+| `docsReleaseWorkflow` | `docs/RELEASE_WORKFLOW.md` file write. |
+| `workflowClaudeTemplate` | `workflow/CLAUDE.template.md` file write. |
+| `packageScripts` | `workflow:*` + `pipelane:*` script entries in `package.json`. |
+
+Opting out never removes content that a previous sync already wrote; it
+just stops future syncs from touching the surface.
+
 ## Required `AGENTS.md`
 
 This repo tracks `AGENTS.md` as the repo policy surface for workflow-kit.

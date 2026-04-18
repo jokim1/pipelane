@@ -1134,6 +1134,202 @@ test('consumer-extension survives an alias rename after the content was added', 
   }
 });
 
+test('syncDocs.readmeSection: false leaves README.md untouched', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    const readmePath = path.join(repoRoot, 'README.md');
+    // Consumer owns README entirely — no workflow-kit markers, original
+    // content must survive.
+    writeFileSync(readmePath, '# Owned By Consumer\n\nHand-written README.\n', 'utf8');
+
+    const configPath = path.join(repoRoot, '.project-workflow.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.syncDocs = { readmeSection: false };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    const after = readFileSync(readmePath, 'utf8');
+    assert.equal(after, '# Owned By Consumer\n\nHand-written README.\n');
+    assert.doesNotMatch(after, /workflow-kit:readme:start/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('syncDocs.contributingSection + agentsSection: false leave those files untouched', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    writeFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), '# Consumer Contributing\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'AGENTS.md'), '# Consumer Agents\n', 'utf8');
+
+    const configPath = path.join(repoRoot, '.project-workflow.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.syncDocs = { contributingSection: false, agentsSection: false };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    assert.equal(readFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), 'utf8'), '# Consumer Contributing\n');
+    assert.equal(readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8'), '# Consumer Agents\n');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('syncDocs.docsReleaseWorkflow + workflowClaudeTemplate: false skip those file writes', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    const configPath = path.join(repoRoot, '.project-workflow.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.syncDocs = { docsReleaseWorkflow: false, workflowClaudeTemplate: false };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    // Clear files that init already wrote with the default config so the
+    // assertion exercises "setup with opt-out doesn't recreate them."
+    rmSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md'), { force: true });
+    rmSync(path.join(repoRoot, 'workflow', 'CLAUDE.template.md'), { force: true });
+
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    assert.equal(existsSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'workflow', 'CLAUDE.template.md')), false);
+    // Opting out of one surface must not suppress others — commands still regen.
+    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'clean.md')));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('syncDocs.claudeCommands: false skips the entire command-regen path', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    const configPath = path.join(repoRoot, '.project-workflow.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.syncDocs = { claudeCommands: false };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    // Wipe what init pre-created so the assertion exercises "opt-out
+    // skips the write," not "file never existed."
+    rmSync(path.join(repoRoot, '.claude'), { recursive: true, force: true });
+
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'clean.md')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'pipelane.md')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', '.workflow-kit-managed.json')), false);
+    // Non-command surfaces still land.
+    assert.ok(existsSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md')));
+    assert.ok(existsSync(path.join(repoRoot, 'README.md')));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('syncDocs.packageScripts: false leaves package.json scripts untouched', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    const packageJsonPath = path.join(repoRoot, 'package.json');
+    const consumerPackage = {
+      name: 'consumer-app',
+      private: true,
+      type: 'module',
+      scripts: { build: 'my-build' },
+    };
+    writeFileSync(packageJsonPath, `${JSON.stringify(consumerPackage, null, 2)}\n`, 'utf8');
+
+    const configPath = path.join(repoRoot, '.project-workflow.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.syncDocs = { packageScripts: false };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    const after = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+    assert.deepEqual(after.scripts, { build: 'my-build' });
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('syncDocs absent preserves current all-surfaces-sync behavior', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'clean.md')));
+    assert.ok(existsSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md')));
+    assert.ok(existsSync(path.join(repoRoot, 'workflow', 'CLAUDE.template.md')));
+    assert.match(readFileSync(path.join(repoRoot, 'README.md'), 'utf8'), /workflow-kit:readme:start/);
+    assert.match(readFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), 'utf8'), /workflow-kit:contributing:start/);
+    assert.match(readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8'), /workflow-kit:agents:start/);
+    const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    assert.equal(pkg.scripts['workflow:setup'], 'pipelane setup');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('syncDocs normalizer strips non-boolean junk values', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    const configPath = path.join(repoRoot, '.project-workflow.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    // Garbage values: string, number, null. Should be silently discarded so
+    // a malformed config can't crash setup or accidentally skip a surface.
+    config.syncDocs = { readmeSection: 'nope', agentsSection: 42, packageScripts: null, docsReleaseWorkflow: false };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    rmSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md'), { force: true });
+
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    // The only legitimate opt-out is docsReleaseWorkflow: false. Everything
+    // else should have fallen back to default-true.
+    assert.equal(existsSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md')), false);
+    assert.match(readFileSync(path.join(repoRoot, 'README.md'), 'utf8'), /workflow-kit:readme:start/);
+    assert.match(readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8'), /workflow-kit:agents:start/);
+    const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    assert.equal(pkg.scripts['workflow:setup'], 'pipelane setup');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
 test('Codex alias wrappers stay safe when different repos map the same alias differently', () => {
   const repoOne = createRepo();
   const repoTwo = createRepo();
