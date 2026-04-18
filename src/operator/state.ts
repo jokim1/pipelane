@@ -90,11 +90,25 @@ export const DEFAULT_SYNC_DOCS: Required<SyncDocsConfig> = {
 };
 
 export function resolveSyncDocs(raw: SyncDocsConfig | undefined): Required<SyncDocsConfig> {
-  if (!raw) return { ...DEFAULT_SYNC_DOCS };
-  return {
-    ...DEFAULT_SYNC_DOCS,
-    ...raw,
-  };
+  // Defense in depth: setupConsumerRepo and syncDocsOnly call JSON.parse
+  // directly and do NOT route through normalizeWorkflowConfig, so junk
+  // values (string "false", null, arrays, spread-of-a-string) can reach
+  // here unsanitized. Per-key type-check at use time guarantees that
+  // only real booleans flip a surface, and any non-boolean value (or a
+  // non-object `raw`) falls back to the declared default. This is what
+  // prevents `{ "readmeSection": "false" }` from injecting the README
+  // section (truthy string) when the consumer clearly meant to skip it.
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ...DEFAULT_SYNC_DOCS };
+  }
+  const resolved: Required<SyncDocsConfig> = { ...DEFAULT_SYNC_DOCS };
+  for (const key of Object.keys(DEFAULT_SYNC_DOCS) as (keyof SyncDocsConfig)[]) {
+    const value = (raw as Record<string, unknown>)[key];
+    if (typeof value === 'boolean') {
+      resolved[key] = value;
+    }
+  }
+  return resolved;
 }
 
 export const DEFAULT_BRANCH_PREFIX = 'codex/';
@@ -394,9 +408,12 @@ export function normalizeWorkflowConfig(raw: Partial<WorkflowConfig>): WorkflowC
   };
 }
 
-// Strip non-boolean and unknown keys. Returning undefined when every
-// declared flag is either absent or true keeps the serialized config
-// minimal — consumers that don't opt out never see the block.
+// Strip non-boolean and unknown keys. Returns undefined when no boolean
+// flags remain so the serialized config stays minimal for consumers that
+// never opt out. Explicit `true` values are preserved as-is (they don't
+// collapse to undefined). Runs on the `loadWorkflowConfig` path only;
+// setup + sync-docs bypass it and rely on `resolveSyncDocs` at use-time
+// for runtime defense.
 function normalizeSyncDocsConfig(raw: SyncDocsConfig | undefined): SyncDocsConfig | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const keys: (keyof SyncDocsConfig)[] = [

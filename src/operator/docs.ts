@@ -350,9 +350,11 @@ export function syncConsumerDocs(repoRoot: string, config: WorkflowConfig): void
     }
     saveManagedClaudeCommands(commandsDir, desiredCommandFiles);
 
-    // pipelane.md is not a workflow command (it opens the board, not a
-    // task-flow step), so it is not aliased and sits outside the managed set.
-    // Always regenerate it from the template; collision guard ignores it.
+    // pipelane.md is a Claude command file but not a workflow command (it
+    // opens the board, not a task-flow step), so it isn't aliased and sits
+    // outside the managed set. It regenerates alongside the managed commands
+    // whenever `claudeCommands` is enabled; when the surface is opted out,
+    // pipelane.md is skipped too (which is why it lives inside this block).
     writeFileSync(
       path.join(commandsDir, 'pipelane.md'),
       renderTemplate(readTemplate('.claude/commands/pipelane.md'), config),
