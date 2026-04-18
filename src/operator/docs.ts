@@ -109,6 +109,18 @@ function renderTemplate(template: string, config: WorkflowConfig): string {
   );
 }
 
+// Single source of truth for seeding a fresh CLAUDE.md from the workflow template.
+// Used by setupConsumerRepo (creating CLAUDE.md on first init) and handleConfigure
+// (seeding when a consumer ran init long ago and has since deleted CLAUDE.md).
+// Keeping this in docs.ts means any new {{TEMPLATE_VAR}} added to renderTemplate
+// above automatically flows through both callers — no parallel implementation to
+// keep in sync.
+export function renderClaudeMdFromTemplate(config: WorkflowConfig): string {
+  const rendered = renderTemplate(readTemplate('workflow/CLAUDE.template.md'), config);
+  const emptySection = renderDeployConfigSection(emptyDeployConfig()).trimEnd();
+  return rendered.replace('{{DEPLOY_CONFIG_SECTION}}', emptySection);
+}
+
 function detectLegacyClaudeCommand(content: string): WorkflowCommand | null {
   for (const command of WORKFLOW_COMMANDS) {
     const signatures = LEGACY_CLAUDE_SIGNATURES[command];
@@ -488,8 +500,7 @@ export function setupConsumerRepo(cwd: string): {
   const claudePath = path.join(repoRoot, 'CLAUDE.md');
   let createdClaude = false;
   if (!existsSync(claudePath)) {
-    const rendered = renderTemplate(readTemplate('workflow/CLAUDE.template.md'), config);
-    writeFileSync(claudePath, rendered.replace('{{DEPLOY_CONFIG_SECTION}}', renderDeployConfigSection(emptyDeployConfig()).trimEnd()), 'utf8');
+    writeFileSync(claudePath, renderClaudeMdFromTemplate(config), 'utf8');
     createdClaude = true;
   }
 

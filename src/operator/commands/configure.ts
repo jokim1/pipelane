@@ -1,19 +1,16 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline/promises';
-import { fileURLToPath } from 'node:url';
 
+import { renderClaudeMdFromTemplate } from '../docs.ts';
 import {
   emptyDeployConfig,
-  loadDeployConfig,
-  renderDeployConfigSection,
+  parseDeployConfigMarkdown,
   replaceDeployConfigSection,
   type DeployConfig,
 } from '../release-gate.ts';
 import {
   CONFIG_FILENAME,
-  defaultWorkflowConfig,
-  inferProjectKey,
   resolveRepoRoot,
   resolveWorkflowAliases,
   type WorkflowConfig,
@@ -150,11 +147,13 @@ export async function handleConfigure(cwd: string, argv: string[]): Promise<Conf
   if (existsSync(claudePath)) {
     markdown = readFileSync(claudePath, 'utf8');
   } else {
-    markdown = renderClaudeFromTemplate(repoRoot);
+    markdown = renderClaudeMdFromTemplate(loadWorkflowConfigOrThrow(repoRoot));
     createdClaude = true;
   }
 
-  const baseConfig = loadDeployConfig(repoRoot) ?? emptyDeployConfig();
+  // parseDeployConfigMarkdown over the in-memory markdown avoids a second
+  // readFileSync(CLAUDE.md) inside release-gate.loadDeployConfig.
+  const baseConfig = parseDeployConfigMarkdown(markdown) ?? emptyDeployConfig();
   const flagged = applyFlagOverrides(baseConfig, options);
   const finalConfig = options.json ? flagged : await promptForValues(flagged);
 
@@ -173,47 +172,17 @@ export async function handleConfigure(cwd: string, argv: string[]): Promise<Conf
   return { repoRoot, claudePath, createdClaude, config: finalConfig };
 }
 
-function renderClaudeFromTemplate(repoRoot: string): string {
-  const templatePath = path.join(kitRoot(), 'templates', 'workflow', 'CLAUDE.template.md');
-  const raw = readFileSync(templatePath, 'utf8');
-  const config = readWorkflowConfigOrDefault(repoRoot);
-  const rendered = renderTemplateVariables(raw, config);
-  return rendered.replace('{{DEPLOY_CONFIG_SECTION}}', renderDeployConfigSection(emptyDeployConfig()).trimEnd());
-}
-
-function kitRoot(): string {
-  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
-}
-
-function readWorkflowConfigOrDefault(repoRoot: string): WorkflowConfig {
+// Matches setupConsumerRepo's strict invariant: configure cannot seed a fresh
+// CLAUDE.md without a .project-workflow.json to render template variables
+// (DISPLAY_NAME, ALIAS_*, DEPLOY_WORKFLOW_NAME) against. An operator who hits
+// this error ran configure before init; the fix is to run `pipelane init` first.
+function loadWorkflowConfigOrThrow(repoRoot: string): WorkflowConfig {
   const configPath = path.join(repoRoot, CONFIG_FILENAME);
-  if (existsSync(configPath)) {
-    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as WorkflowConfig;
-    return { ...parsed, aliases: resolveWorkflowAliases(parsed.aliases) };
+  if (!existsSync(configPath)) {
+    throw new Error(`No ${CONFIG_FILENAME} found in ${repoRoot}. Run \`pipelane init\` first to seed CLAUDE.md.`);
   }
-  const name = path.basename(repoRoot) || 'project';
-  return defaultWorkflowConfig(inferProjectKey(name), name);
-}
-
-function renderTemplateVariables(template: string, config: WorkflowConfig): string {
-  const aliases = resolveWorkflowAliases(config.aliases);
-  const replacements: Record<string, string> = {
-    PROJECT_KEY: config.projectKey,
-    DISPLAY_NAME: config.displayName,
-    BASE_BRANCH: config.baseBranch,
-    STATE_DIR: config.stateDir,
-    TASK_WORKTREE_DIR_NAME: config.taskWorktreeDirName,
-    DEPLOY_WORKFLOW_NAME: config.deployWorkflowName,
-    SURFACES_CSV: config.surfaces.join(', '),
-    ALIAS_DEVMODE: aliases.devmode,
-    ALIAS_NEW: aliases.new,
-    ALIAS_RESUME: aliases.resume,
-    ALIAS_PR: aliases.pr,
-    ALIAS_MERGE: aliases.merge,
-    ALIAS_DEPLOY: aliases.deploy,
-    ALIAS_CLEAN: aliases.clean,
-  };
-  return template.replace(/\{\{([A-Z0-9_]+)\}\}/g, (match, key: string) => replacements[key] ?? match);
+  const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as WorkflowConfig;
+  return { ...parsed, aliases: resolveWorkflowAliases(parsed.aliases) };
 }
 
 function applyFlagOverrides(base: DeployConfig, options: ConfigureOptions): DeployConfig {

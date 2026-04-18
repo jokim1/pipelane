@@ -4075,3 +4075,125 @@ test('setup installs workflow:configure + pipelane:configure scripts and rewrite
     rmSync(repoRoot, { recursive: true, force: true });
   }
 });
+
+test('configure bare boolean flag (`--frontend-staging-ready`) sets true; `=false` sets false', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const bareResult = runCli(['configure', '--json', '--frontend-staging-ready'], repoRoot);
+    const bareConfig = JSON.parse(bareResult.stdout);
+    assert.equal(bareConfig.frontend.staging.ready, true, 'bare flag sets true');
+
+    const explicitResult = runCli(['configure', '--json', '--frontend-staging-ready=false'], repoRoot);
+    const explicitConfig = JSON.parse(explicitResult.stdout);
+    assert.equal(explicitConfig.frontend.staging.ready, false, '=false explicitly sets false');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure preserves previously-set fields across runs with disjoint flag sets', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    // Run 1: set platform + a frontend-staging field.
+    runCli(['configure', '--json', '--platform=fly.io', '--frontend-staging-url=https://s.example.test'], repoRoot);
+    // Run 2: set a different field (frontend-production). Must NOT clobber run 1's values.
+    runCli(['configure', '--json', '--frontend-production-url=https://p.example.test'], repoRoot);
+
+    const claude = readFileSync(path.join(repoRoot, 'CLAUDE.md'), 'utf8');
+    const jsonMatch = claude.match(/## Deploy Configuration[\s\S]*?```json\s*([\s\S]*?)```/);
+    assert.ok(jsonMatch, 'Deploy Configuration JSON block present');
+    const merged = JSON.parse(jsonMatch[1]);
+    assert.equal(merged.platform, 'fly.io', 'run 1 platform preserved');
+    assert.equal(merged.frontend.staging.url, 'https://s.example.test', 'run 1 frontend.staging.url preserved');
+    assert.equal(merged.frontend.production.url, 'https://p.example.test', 'run 2 frontend.production.url applied');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('replaceDeployConfigSection appends a deploy block when markdown has no Deploy Configuration section', async () => {
+  // Unit-level coverage for the append branch in release-gate.replaceDeployConfigSection
+  // (the CLI tests exercise the replace branch; a consumer with a hand-authored
+  // CLAUDE.md that never had the deploy block hits this path).
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'release-gate.ts'));
+  const existing = '# Repo Notes\n\nHand-authored preamble.\n';
+  const config = mod.emptyDeployConfig();
+  config.platform = 'fly.io';
+
+  const updated = mod.replaceDeployConfigSection(existing, config);
+  assert.ok(updated.startsWith(existing.trimEnd()), 'prefix preserved verbatim');
+  assert.match(updated, /## Deploy Configuration/);
+  assert.match(updated, /"platform": "fly.io"/);
+  // Exactly `\n\n` separates the operator-authored body from the appended block.
+  const boundary = existing.trimEnd() + '\n\n## Deploy Configuration';
+  assert.ok(updated.includes(boundary), 'block is separated from existing body by one blank line');
+});
+
+test('configure rejects malformed boolean flag values', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const result = runCli(['configure', '--json', '--frontend-staging-ready=yes'], repoRoot, {}, true);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /expects true\/false/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure rejects string flags passed without `=value`', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    // `--platform fly.io` (space) instead of `--platform=fly.io` — common typo.
+    // The parser must reject it rather than silently skipping or grabbing a
+    // neighboring positional.
+    const result = runCli(['configure', '--json', '--platform', 'fly.io'], repoRoot, {}, true);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /requires a value/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure --help prints usage and does not modify CLAUDE.md', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const claudePath = path.join(repoRoot, 'CLAUDE.md');
+    const before = readFileSync(claudePath, 'utf8');
+    const result = runCli(['configure', '--help'], repoRoot);
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /pipelane configure/);
+    assert.match(result.stdout, /--frontend-staging-url/);
+    const after = readFileSync(claudePath, 'utf8');
+    assert.equal(before, after, '--help must not mutate CLAUDE.md');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure throws when seeding a missing CLAUDE.md without a .project-workflow.json', () => {
+  const repoRoot = createRepo();
+  try {
+    // Deliberately skip `init` — no .project-workflow.json present.
+    // CLAUDE.md is also missing. configure must refuse to seed from template
+    // because it has no displayName / aliases to render, matching
+    // setupConsumerRepo's strict invariant.
+    const result = runCli(['configure', '--json', '--platform=fly.io'], repoRoot, {}, true);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /pipelane init/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
