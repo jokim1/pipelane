@@ -109,6 +109,18 @@ function renderTemplate(template: string, config: WorkflowConfig): string {
   );
 }
 
+// Single source of truth for seeding a fresh CLAUDE.md from the workflow template.
+// Used by setupConsumerRepo (creating CLAUDE.md on first init) and handleConfigure
+// (seeding when a consumer ran init long ago and has since deleted CLAUDE.md).
+// Keeping this in docs.ts means any new {{TEMPLATE_VAR}} added to renderTemplate
+// above automatically flows through both callers — no parallel implementation to
+// keep in sync.
+export function renderClaudeMdFromTemplate(config: WorkflowConfig): string {
+  const rendered = renderTemplate(readTemplate('workflow/CLAUDE.template.md'), config);
+  const emptySection = renderDeployConfigSection(emptyDeployConfig()).trimEnd();
+  return rendered.replace('{{DEPLOY_CONFIG_SECTION}}', emptySection);
+}
+
 function detectLegacyClaudeCommand(content: string): WorkflowCommand | null {
   for (const command of WORKFLOW_COMMANDS) {
     const signatures = LEGACY_CLAUDE_SIGNATURES[command];
@@ -288,6 +300,7 @@ export function ensurePackageScripts(repoRoot: string): void {
   const scripts = {
     ...(typeof current.scripts === 'object' && current.scripts ? current.scripts as Record<string, string> : {}),
     'pipelane:setup': 'pipelane setup',
+    'pipelane:configure': 'pipelane configure',
     'pipelane:devmode': 'pipelane run devmode',
     'pipelane:new': 'pipelane run new',
     'pipelane:resume': 'pipelane run resume',
@@ -302,6 +315,7 @@ export function ensurePackageScripts(repoRoot: string): void {
     'pipelane:api': 'pipelane run api',
     'workflow:api': 'pipelane run api',
     'workflow:setup': 'pipelane setup',
+    'workflow:configure': 'pipelane configure',
     'workflow:devmode': 'pipelane run devmode',
     'workflow:new': 'pipelane run new',
     'workflow:resume': 'pipelane run resume',
@@ -338,7 +352,11 @@ function assertPackageScriptConsistency(repoRoot: string, syncDocs: Required<Syn
     ? (JSON.parse(readFileSync(packageJsonPath, 'utf8')) as { scripts?: Record<string, string> })
     : {};
   const scripts = pkg.scripts ?? {};
-  const required = WORKFLOW_COMMANDS.map((cmd) => `workflow:${cmd}`);
+  // `workflow:configure` lives outside WORKFLOW_COMMANDS (it's a one-shot setup
+  // subcommand, not an operator action), but `devmode.md` references it as the
+  // remediation path when release mode blocks. A consumer that opts out of
+  // packageScripts needs it defined or they'll hit a broken pointer.
+  const required = [...WORKFLOW_COMMANDS.map((cmd) => `workflow:${cmd}`), 'workflow:configure'];
   const missing = required.filter((script) => typeof scripts[script] !== 'string');
   if (missing.length === 0) {
     return;
@@ -486,8 +504,7 @@ export function setupConsumerRepo(cwd: string): {
   const claudePath = path.join(repoRoot, 'CLAUDE.md');
   let createdClaude = false;
   if (!existsSync(claudePath)) {
-    const rendered = renderTemplate(readTemplate('workflow/CLAUDE.template.md'), config);
-    writeFileSync(claudePath, rendered.replace('{{DEPLOY_CONFIG_SECTION}}', renderDeployConfigSection(emptyDeployConfig()).trimEnd()), 'utf8');
+    writeFileSync(claudePath, renderClaudeMdFromTemplate(config), 'utf8');
     createdClaude = true;
   }
 

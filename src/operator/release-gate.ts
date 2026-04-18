@@ -124,7 +124,10 @@ function isLocalUrl(value: string): boolean {
 }
 
 function findDeployConfigSectionRange(markdown: string): { start: number; end: number } | null {
-  const start = markdown.search(/^## Deploy Configuration\b/m);
+  // Require end-of-line after the heading text so consumer-authored sections
+  // like `## Deploy Configuration Notes` or `## Deploy Configuration v2` don't
+  // collide with the machine-managed block and get silently overwritten.
+  const start = markdown.search(/^## Deploy Configuration\s*$/m);
   if (start === -1) {
     return null;
   }
@@ -147,7 +150,11 @@ export function parseDeployConfigMarkdown(markdown: string): DeployConfig | null
     return null;
   }
 
-  const jsonMatch = section.match(/```json\s*([\s\S]*?)```/i);
+  // Anchor both fences to newlines. JSON.stringify never emits a literal
+  // newline inside a string (they're escaped as \n), so a command value with
+  // embedded backticks — e.g. `deployCommand: "echo \`\`\` hi"` — can't trick
+  // the regex into terminating early and truncating the JSON body.
+  const jsonMatch = section.match(/```json\n([\s\S]*?)\n```/i);
   if (!jsonMatch) {
     return null;
   }
@@ -208,6 +215,22 @@ to register a succeeded deploy for each surface you plan to ship.
 ${JSON.stringify(config, null, 2)}
 \`\`\`
 `;
+}
+
+// Swap only the `## Deploy Configuration` block inside a CLAUDE.md body,
+// preserving everything before and after. When the block is missing, append
+// it at the end separated by a blank line. `configure` uses this to target
+// exactly the deploy block without disturbing operator notes or skill routing
+// rules the consumer has hand-edited above/below it.
+export function replaceDeployConfigSection(markdown: string, config: DeployConfig): string {
+  const rendered = renderDeployConfigSection(config);
+  const range = findDeployConfigSectionRange(markdown);
+  if (range) {
+    return `${markdown.slice(0, range.start)}${rendered}${markdown.slice(range.end)}`;
+  }
+  const trimmed = markdown.replace(/\s+$/u, '');
+  const separator = trimmed ? '\n\n' : '';
+  return `${trimmed}${separator}${rendered}`;
 }
 
 // v1.2: canonicalize then hash. Any semantic change to the environment-scoped
@@ -502,7 +525,7 @@ export function buildReleaseCheckMessage(readiness: ReturnType<typeof evaluateRe
       lines.push('Next: run `npm run workflow:devmode -- build`, then `npm run workflow:deploy -- staging` once per surface,');
       lines.push('then `npm run workflow:devmode -- release`. The readiness gate is observed, not asserted.');
     } else {
-      lines.push('Next: run npm run workflow:setup and complete local CLAUDE.md, then');
+      lines.push('Next: run `npm run workflow:configure` to fill in the Deploy Configuration block in CLAUDE.md, then');
       lines.push('`npm run workflow:devmode -- build` and `npm run workflow:deploy -- staging` to register a staging success.');
     }
   }

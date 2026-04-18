@@ -1266,6 +1266,10 @@ test('syncDocs.packageScripts: false preserves consumer-customized workflow scri
       'workflow:deploy': 'my-wrapper deploy',
       'workflow:clean': 'my-wrapper clean',
       'workflow:devmode': 'my-wrapper devmode',
+      // devmode.md tells operators to run `workflow:configure` when release
+      // mode is blocked; the consistency check requires consumers opting out
+      // of packageScripts to define it themselves.
+      'workflow:configure': 'my-wrapper configure',
     };
     const consumerPackage = {
       name: 'consumer-app',
@@ -3906,4 +3910,412 @@ test('pipelane help prints subcommand list', () => {
   assert.match(result.stdout, /start Pipelane Board/);
   assert.match(result.stdout, /stop the Pipelane Board/);
   assert.match(result.stdout, /--no-open/);
+});
+
+test('configure --json writes a Deploy Configuration block byte-identical to renderDeployConfigSection', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const result = runCli([
+      'configure',
+      '--json',
+      '--platform=fly.io',
+      '--frontend-staging-url=https://staging.example.test',
+      '--frontend-staging-workflow=Deploy Hosted',
+      '--frontend-staging-healthcheck=https://staging.example.test/health',
+      '--frontend-staging-ready=true',
+      '--frontend-production-url=https://app.example.test',
+      '--frontend-production-workflow=Deploy Hosted',
+      '--frontend-production-auto-deploy-on-main=false',
+      '--frontend-production-healthcheck=https://app.example.test/health',
+      '--edge-staging-deploy-command=supabase functions deploy --staging',
+      '--edge-staging-verification-command=supabase functions test',
+      '--edge-staging-healthcheck=https://staging.example.test/edge-health',
+      '--edge-staging-ready=false',
+      '--edge-production-deploy-command=supabase functions deploy',
+      '--edge-production-verification-command=supabase functions test',
+      '--edge-production-healthcheck=https://app.example.test/edge-health',
+      '--sql-staging-apply-command=supabase db push --staging',
+      '--sql-staging-verification-command=supabase db lint',
+      '--sql-staging-healthcheck=https://staging.example.test/db-health',
+      '--sql-staging-ready=false',
+      '--sql-production-apply-command=supabase db push',
+      '--sql-production-verification-command=supabase db lint',
+      '--sql-production-healthcheck=https://app.example.test/db-health',
+      '--supabase-staging-project-ref=staging-ref',
+      '--supabase-production-project-ref=production-ref',
+    ], repoRoot);
+    assert.equal(result.status, 0);
+
+    const emitted = JSON.parse(result.stdout);
+    assert.equal(emitted.platform, 'fly.io');
+    assert.equal(emitted.frontend.staging.url, 'https://staging.example.test');
+    assert.equal(emitted.supabase.production.projectRef, 'production-ref');
+
+    const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'release-gate.ts'));
+    const expectedSection = mod.renderDeployConfigSection(emitted).trimEnd();
+    const claudeMd = readFileSync(path.join(repoRoot, 'CLAUDE.md'), 'utf8');
+    // The rendered block inside CLAUDE.md must match renderDeployConfigSection
+    // exactly (trimmed), so release-gate's canonical format stays the single
+    // source of truth — no drift between what `configure` writes and what
+    // `parseDeployConfigMarkdown` reads.
+    const deployRange = claudeMd.match(/## Deploy Configuration[\s\S]*?(?=\n##\s|$)/);
+    assert.ok(deployRange, 'Deploy Configuration block exists in CLAUDE.md');
+    assert.equal(deployRange[0].trimEnd(), expectedSection);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure --json is idempotent: re-running with the same flags produces identical CLAUDE.md', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const args = [
+      'configure',
+      '--json',
+      '--platform=fly.io',
+      '--frontend-staging-url=https://staging.example.test',
+      '--frontend-staging-workflow=Deploy Hosted',
+      '--frontend-staging-healthcheck=https://staging.example.test/health',
+    ];
+    runCli(args, repoRoot);
+    const first = readFileSync(path.join(repoRoot, 'CLAUDE.md'), 'utf8');
+    runCli(args, repoRoot);
+    const second = readFileSync(path.join(repoRoot, 'CLAUDE.md'), 'utf8');
+    assert.equal(first, second, 're-run must produce byte-identical CLAUDE.md');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure leaves sections outside Deploy Configuration untouched', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const claudePath = path.join(repoRoot, 'CLAUDE.md');
+    const original = readFileSync(claudePath, 'utf8');
+    // Append a consumer-owned section that configure must not touch.
+    const withCustom = `${original}\n## Operator Notes\n\n- never drop this section\n- seriously, never\n`;
+    writeFileSync(claudePath, withCustom, 'utf8');
+
+    runCli([
+      'configure',
+      '--json',
+      '--frontend-staging-url=https://staging.example.test',
+    ], repoRoot);
+    const after = readFileSync(claudePath, 'utf8');
+    assert.match(after, /## Operator Notes\n\n- never drop this section\n- seriously, never\n/);
+    assert.match(after, /https:\/\/staging\.example\.test/);
+    // The prefix above the Deploy Configuration block (Local Operator Defaults,
+    // Skill Routing, etc.) must survive the rewrite unchanged.
+    const originalPrefix = original.split('## Deploy Configuration')[0];
+    assert.ok(after.startsWith(originalPrefix), 'CLAUDE.md prefix above the deploy block is preserved');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure seeds CLAUDE.md from the workflow template when it is missing', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const claudePath = path.join(repoRoot, 'CLAUDE.md');
+    rmSync(claudePath, { force: true });
+    assert.equal(existsSync(claudePath), false);
+
+    runCli([
+      'configure',
+      '--json',
+      '--frontend-staging-url=https://staging.example.test',
+    ], repoRoot);
+    const after = readFileSync(claudePath, 'utf8');
+    assert.match(after, /Demo App Local Operator Context/);
+    assert.match(after, /## Deploy Configuration/);
+    assert.match(after, /https:\/\/staging\.example\.test/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure errors on unknown flag instead of silently ignoring it', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const result = runCli(['configure', '--json', '--not-a-real-flag=oops'], repoRoot, {}, true);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Unknown flag for pipelane configure/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup installs workflow:configure + pipelane:configure scripts and rewrites devmode.md pointer', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    assert.equal(pkg.scripts['workflow:configure'], 'pipelane configure');
+    assert.equal(pkg.scripts['pipelane:configure'], 'pipelane configure');
+
+    const devmode = readFileSync(path.join(repoRoot, '.claude', 'commands', 'devmode.md'), 'utf8');
+    // The devmode slash command previously told operators to run
+    // `npm run workflow:setup`, which Rocketboard (and any consumer with
+    // `syncDocs.packageScripts: false`) doesn't define. Now it points at the
+    // scoped `workflow:configure` entry that configure.ts wires in.
+    assert.match(devmode, /npm run workflow:configure/);
+    assert.doesNotMatch(devmode, /run `npm run workflow:setup`/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure bare boolean flag (`--frontend-staging-ready`) sets true; `=false` sets false', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const bareResult = runCli(['configure', '--json', '--frontend-staging-ready'], repoRoot);
+    const bareConfig = JSON.parse(bareResult.stdout);
+    assert.equal(bareConfig.frontend.staging.ready, true, 'bare flag sets true');
+
+    const explicitResult = runCli(['configure', '--json', '--frontend-staging-ready=false'], repoRoot);
+    const explicitConfig = JSON.parse(explicitResult.stdout);
+    assert.equal(explicitConfig.frontend.staging.ready, false, '=false explicitly sets false');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure preserves previously-set fields across runs with disjoint flag sets', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    // Run 1: set platform + a frontend-staging field.
+    runCli(['configure', '--json', '--platform=fly.io', '--frontend-staging-url=https://s.example.test'], repoRoot);
+    // Run 2: set a different field (frontend-production). Must NOT clobber run 1's values.
+    runCli(['configure', '--json', '--frontend-production-url=https://p.example.test'], repoRoot);
+
+    const claude = readFileSync(path.join(repoRoot, 'CLAUDE.md'), 'utf8');
+    const jsonMatch = claude.match(/## Deploy Configuration[\s\S]*?```json\s*([\s\S]*?)```/);
+    assert.ok(jsonMatch, 'Deploy Configuration JSON block present');
+    const merged = JSON.parse(jsonMatch[1]);
+    assert.equal(merged.platform, 'fly.io', 'run 1 platform preserved');
+    assert.equal(merged.frontend.staging.url, 'https://s.example.test', 'run 1 frontend.staging.url preserved');
+    assert.equal(merged.frontend.production.url, 'https://p.example.test', 'run 2 frontend.production.url applied');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('replaceDeployConfigSection appends a deploy block when markdown has no Deploy Configuration section', async () => {
+  // Unit-level coverage for the append branch in release-gate.replaceDeployConfigSection
+  // (the CLI tests exercise the replace branch; a consumer with a hand-authored
+  // CLAUDE.md that never had the deploy block hits this path).
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'release-gate.ts'));
+  const existing = '# Repo Notes\n\nHand-authored preamble.\n';
+  const config = mod.emptyDeployConfig();
+  config.platform = 'fly.io';
+
+  const updated = mod.replaceDeployConfigSection(existing, config);
+  assert.ok(updated.startsWith(existing.trimEnd()), 'prefix preserved verbatim');
+  assert.match(updated, /## Deploy Configuration/);
+  assert.match(updated, /"platform": "fly.io"/);
+  // Exactly `\n\n` separates the operator-authored body from the appended block.
+  const boundary = existing.trimEnd() + '\n\n## Deploy Configuration';
+  assert.ok(updated.includes(boundary), 'block is separated from existing body by one blank line');
+});
+
+test('configure rejects malformed boolean flag values', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const result = runCli(['configure', '--json', '--frontend-staging-ready=yes'], repoRoot, {}, true);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /expects true\/false/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure rejects string flags passed without `=value`', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    // `--platform fly.io` (space) instead of `--platform=fly.io` — common typo.
+    // The parser must reject it rather than silently skipping or grabbing a
+    // neighboring positional.
+    const result = runCli(['configure', '--json', '--platform', 'fly.io'], repoRoot, {}, true);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /requires a value/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure --help prints usage and does not modify CLAUDE.md', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const claudePath = path.join(repoRoot, 'CLAUDE.md');
+    const before = readFileSync(claudePath, 'utf8');
+    const result = runCli(['configure', '--help'], repoRoot);
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /pipelane configure/);
+    assert.match(result.stdout, /--frontend-staging-url/);
+    const after = readFileSync(claudePath, 'utf8');
+    assert.equal(before, after, '--help must not mutate CLAUDE.md');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure throws when seeding a missing CLAUDE.md without a .project-workflow.json', () => {
+  const repoRoot = createRepo();
+  try {
+    // Deliberately skip `init` — no .project-workflow.json present.
+    // CLAUDE.md is also missing. configure must refuse to seed from template
+    // because it has no displayName / aliases to render, matching
+    // setupConsumerRepo's strict invariant.
+    const result = runCli(['configure', '--json', '--platform=fly.io'], repoRoot, {}, true);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /pipelane init/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure survives roundtrip with backticks in deploy command values', () => {
+  // Codex-identified: the pre-existing JSON-block regex was non-greedy and
+  // matched ``` anywhere — a legitimate command like `echo \`\`\` test` inside
+  // edge.staging.deployCommand would truncate the JSON block on the next
+  // read, bricking every downstream command that calls loadDeployConfig.
+  // Configure now persists + re-reads values with embedded backticks cleanly.
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const backtickCmd = 'echo ``` hi';
+    runCli([
+      'configure',
+      '--json',
+      `--edge-staging-deploy-command=${backtickCmd}`,
+    ], repoRoot);
+
+    // Second configure run parses the just-written CLAUDE.md via
+    // parseDeployConfigMarkdown. If the regex breaks on the inner ```, this
+    // call either crashes on JSON.parse or silently reverts to empty defaults.
+    const second = runCli(['configure', '--json', '--platform=fly.io'], repoRoot);
+    const config = JSON.parse(second.stdout);
+    assert.equal(config.edge.staging.deployCommand, backtickCmd,
+      'backtick-bearing value must survive a roundtrip through CLAUDE.md');
+    assert.equal(config.platform, 'fly.io');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure does not overwrite a sibling `## Deploy Configuration Notes` section', () => {
+  // Codex-identified: findDeployConfigSectionRange previously used `\b` which
+  // matched `## Deploy Configuration Notes` as a false positive and would
+  // overwrite the consumer's notes. The tightened regex requires end-of-line
+  // after the heading text.
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const claudePath = path.join(repoRoot, 'CLAUDE.md');
+    const original = readFileSync(claudePath, 'utf8');
+    const withNearbyHeading = `${original}\n## Deploy Configuration Notes\n\nhand-written notes nobody should clobber\n`;
+    writeFileSync(claudePath, withNearbyHeading, 'utf8');
+
+    runCli(['configure', '--json', '--frontend-staging-url=https://s.example.test'], repoRoot);
+
+    const after = readFileSync(claudePath, 'utf8');
+    assert.match(after, /## Deploy Configuration Notes\n\nhand-written notes nobody should clobber/);
+    assert.match(after, /https:\/\/s\.example\.test/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure without --json errors when stdin is not a TTY', () => {
+  // Codex-identified: interactive path used to hang on closed stdin. Now it
+  // fails fast with guidance to use --json.
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const result = spawnSync('node', [CLI_PATH, 'configure'], {
+      cwd: repoRoot,
+      env: { ...process.env, NODE_ENV: 'test' },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /requires a TTY|use `--json`/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup consistency check requires workflow:configure when opting out of packageScripts', () => {
+  // Regression for Codex #4: the required-scripts list now includes
+  // workflow:configure because devmode.md points operators at it. A consumer
+  // who defines every workflow:<cmd> script EXCEPT workflow:configure would
+  // previously pass setup silently; now they get a clear error.
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-codex-'));
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    const packageJsonPath = path.join(repoRoot, 'package.json');
+    writeFileSync(packageJsonPath, `${JSON.stringify({
+      name: 'consumer-app',
+      private: true,
+      type: 'module',
+      scripts: {
+        'workflow:new': 'x new',
+        'workflow:resume': 'x resume',
+        'workflow:pr': 'x pr',
+        'workflow:merge': 'x merge',
+        'workflow:deploy': 'x deploy',
+        'workflow:clean': 'x clean',
+        'workflow:devmode': 'x devmode',
+        // Deliberately missing workflow:configure
+      },
+    }, null, 2)}\n`, 'utf8');
+
+    const configPath = path.join(repoRoot, '.project-workflow.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.syncDocs = { packageScripts: false };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    const result = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome }, true);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /workflow:configure/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
 });
