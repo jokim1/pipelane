@@ -190,17 +190,22 @@ function saveManagedClaudeCommands(commandsDir: string, desiredFiles: Set<string
 
 function extractConsumerExtension(content: string): string | null {
   const startIndex = content.indexOf(CONSUMER_EXTENSION_MARKER_START);
-  const endIndex = content.indexOf(CONSUMER_EXTENSION_MARKER_END);
+  // Use lastIndexOf for the end marker so a consumer who pastes content
+  // that itself contains the literal `:end -->` marker doesn't truncate
+  // their own extension on the next re-sync.
+  const endIndex = content.lastIndexOf(CONSUMER_EXTENSION_MARKER_END);
   if (startIndex === -1 || endIndex === -1 || endIndex < startIndex) {
     return null;
   }
 
   const innerStart = startIndex + CONSUMER_EXTENSION_MARKER_START.length;
   const inner = content.slice(innerStart, endIndex);
-  // Strip the single leading/trailing newline that brackets the marker line
-  // itself. Anything deeper than that (including blank lines the consumer
-  // deliberately placed inside the extension) is preserved verbatim.
-  const trimmed = inner.replace(/^\n/, '').replace(/\n$/, '');
+  // Strip the one newline immediately after the start marker and the one
+  // immediately before the end marker (these terminate the marker lines
+  // themselves). `\r?\n` handles CRLF-saved files from Windows editors.
+  // Any blank lines the consumer intentionally placed inside the extension
+  // are preserved verbatim.
+  const trimmed = inner.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
   return trimmed;
 }
 
