@@ -3907,3 +3907,171 @@ test('pipelane help prints subcommand list', () => {
   assert.match(result.stdout, /stop the Pipelane Board/);
   assert.match(result.stdout, /--no-open/);
 });
+
+test('configure --json writes a Deploy Configuration block byte-identical to renderDeployConfigSection', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const result = runCli([
+      'configure',
+      '--json',
+      '--platform=fly.io',
+      '--frontend-staging-url=https://staging.example.test',
+      '--frontend-staging-workflow=Deploy Hosted',
+      '--frontend-staging-healthcheck=https://staging.example.test/health',
+      '--frontend-staging-ready=true',
+      '--frontend-production-url=https://app.example.test',
+      '--frontend-production-workflow=Deploy Hosted',
+      '--frontend-production-auto-deploy-on-main=false',
+      '--frontend-production-healthcheck=https://app.example.test/health',
+      '--edge-staging-deploy-command=supabase functions deploy --staging',
+      '--edge-staging-verification-command=supabase functions test',
+      '--edge-staging-healthcheck=https://staging.example.test/edge-health',
+      '--edge-staging-ready=false',
+      '--edge-production-deploy-command=supabase functions deploy',
+      '--edge-production-verification-command=supabase functions test',
+      '--edge-production-healthcheck=https://app.example.test/edge-health',
+      '--sql-staging-apply-command=supabase db push --staging',
+      '--sql-staging-verification-command=supabase db lint',
+      '--sql-staging-healthcheck=https://staging.example.test/db-health',
+      '--sql-staging-ready=false',
+      '--sql-production-apply-command=supabase db push',
+      '--sql-production-verification-command=supabase db lint',
+      '--sql-production-healthcheck=https://app.example.test/db-health',
+      '--supabase-staging-project-ref=staging-ref',
+      '--supabase-production-project-ref=production-ref',
+    ], repoRoot);
+    assert.equal(result.status, 0);
+
+    const emitted = JSON.parse(result.stdout);
+    assert.equal(emitted.platform, 'fly.io');
+    assert.equal(emitted.frontend.staging.url, 'https://staging.example.test');
+    assert.equal(emitted.supabase.production.projectRef, 'production-ref');
+
+    const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'release-gate.ts'));
+    const expectedSection = mod.renderDeployConfigSection(emitted).trimEnd();
+    const claudeMd = readFileSync(path.join(repoRoot, 'CLAUDE.md'), 'utf8');
+    // The rendered block inside CLAUDE.md must match renderDeployConfigSection
+    // exactly (trimmed), so release-gate's canonical format stays the single
+    // source of truth — no drift between what `configure` writes and what
+    // `parseDeployConfigMarkdown` reads.
+    const deployRange = claudeMd.match(/## Deploy Configuration[\s\S]*?(?=\n##\s|$)/);
+    assert.ok(deployRange, 'Deploy Configuration block exists in CLAUDE.md');
+    assert.equal(deployRange[0].trimEnd(), expectedSection);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure --json is idempotent: re-running with the same flags produces identical CLAUDE.md', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const args = [
+      'configure',
+      '--json',
+      '--platform=fly.io',
+      '--frontend-staging-url=https://staging.example.test',
+      '--frontend-staging-workflow=Deploy Hosted',
+      '--frontend-staging-healthcheck=https://staging.example.test/health',
+    ];
+    runCli(args, repoRoot);
+    const first = readFileSync(path.join(repoRoot, 'CLAUDE.md'), 'utf8');
+    runCli(args, repoRoot);
+    const second = readFileSync(path.join(repoRoot, 'CLAUDE.md'), 'utf8');
+    assert.equal(first, second, 're-run must produce byte-identical CLAUDE.md');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure leaves sections outside Deploy Configuration untouched', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const claudePath = path.join(repoRoot, 'CLAUDE.md');
+    const original = readFileSync(claudePath, 'utf8');
+    // Append a consumer-owned section that configure must not touch.
+    const withCustom = `${original}\n## Operator Notes\n\n- never drop this section\n- seriously, never\n`;
+    writeFileSync(claudePath, withCustom, 'utf8');
+
+    runCli([
+      'configure',
+      '--json',
+      '--frontend-staging-url=https://staging.example.test',
+    ], repoRoot);
+    const after = readFileSync(claudePath, 'utf8');
+    assert.match(after, /## Operator Notes\n\n- never drop this section\n- seriously, never\n/);
+    assert.match(after, /https:\/\/staging\.example\.test/);
+    // The prefix above the Deploy Configuration block (Local Operator Defaults,
+    // Skill Routing, etc.) must survive the rewrite unchanged.
+    const originalPrefix = original.split('## Deploy Configuration')[0];
+    assert.ok(after.startsWith(originalPrefix), 'CLAUDE.md prefix above the deploy block is preserved');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure seeds CLAUDE.md from the workflow template when it is missing', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const claudePath = path.join(repoRoot, 'CLAUDE.md');
+    rmSync(claudePath, { force: true });
+    assert.equal(existsSync(claudePath), false);
+
+    runCli([
+      'configure',
+      '--json',
+      '--frontend-staging-url=https://staging.example.test',
+    ], repoRoot);
+    const after = readFileSync(claudePath, 'utf8');
+    assert.match(after, /Demo App Local Operator Context/);
+    assert.match(after, /## Deploy Configuration/);
+    assert.match(after, /https:\/\/staging\.example\.test/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure errors on unknown flag instead of silently ignoring it', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const result = runCli(['configure', '--json', '--not-a-real-flag=oops'], repoRoot, {}, true);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Unknown flag for pipelane configure/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup installs workflow:configure + pipelane:configure scripts and rewrites devmode.md pointer', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    assert.equal(pkg.scripts['workflow:configure'], 'pipelane configure');
+    assert.equal(pkg.scripts['pipelane:configure'], 'pipelane configure');
+
+    const devmode = readFileSync(path.join(repoRoot, '.claude', 'commands', 'devmode.md'), 'utf8');
+    // The devmode slash command previously told operators to run
+    // `npm run workflow:setup`, which Rocketboard (and any consumer with
+    // `syncDocs.packageScripts: false`) doesn't define. Now it points at the
+    // scoped `workflow:configure` entry that configure.ts wires in.
+    assert.match(devmode, /npm run workflow:configure/);
+    assert.doesNotMatch(devmode, /run `npm run workflow:setup`/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});

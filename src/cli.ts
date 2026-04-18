@@ -3,6 +3,7 @@
 import { handlePipelane } from './dashboard/launcher.ts';
 import { getDashboardOptions, startDashboardServer } from './dashboard/server.ts';
 import { installCodexWrappers } from './operator/codex-install.ts';
+import { handleConfigure } from './operator/commands/configure.ts';
 import { initConsumerRepo, setupConsumerRepo, syncDocsOnly } from './operator/docs.ts';
 import { runOperator } from './operator/index.ts';
 import { parseUpdateArgs, runUpdate } from './operator/update.ts';
@@ -20,6 +21,7 @@ Commands:
   init --project "Project Name"
   setup
   sync-docs
+  configure [--json] [surface flags...]
   install-codex
   update [--check] [--yes] [--json]
   dashboard [--repo <repo-root>] [--host <host>] [--port <port>]
@@ -77,6 +79,11 @@ async function main(): Promise<void> {
   if (command === 'sync-docs') {
     const result = syncDocsOnly(process.cwd());
     process.stdout.write(`Synced Pipelane docs for ${result.repoRoot}\n`);
+    return;
+  }
+
+  if (command === 'configure') {
+    await handleConfigure(process.cwd(), rest);
     return;
   }
 

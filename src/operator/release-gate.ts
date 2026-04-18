@@ -210,6 +210,22 @@ ${JSON.stringify(config, null, 2)}
 `;
 }
 
+// Swap only the `## Deploy Configuration` block inside a CLAUDE.md body,
+// preserving everything before and after. When the block is missing, append
+// it at the end separated by a blank line. `configure` uses this to target
+// exactly the deploy block without disturbing operator notes or skill routing
+// rules the consumer has hand-edited above/below it.
+export function replaceDeployConfigSection(markdown: string, config: DeployConfig): string {
+  const rendered = renderDeployConfigSection(config);
+  const range = findDeployConfigSectionRange(markdown);
+  if (range) {
+    return `${markdown.slice(0, range.start)}${rendered}${markdown.slice(range.end)}`;
+  }
+  const trimmed = markdown.replace(/\s+$/u, '');
+  const separator = trimmed ? '\n\n' : '';
+  return `${trimmed}${separator}${rendered}`;
+}
+
 // v1.2: canonicalize then hash. Any semantic change to the environment-scoped
 // slice of deployConfig (staging URL, healthcheck path, workflow name
 // rotation) produces a new fingerprint, which invalidates prior DeployRecords

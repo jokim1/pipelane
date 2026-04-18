@@ -288,6 +288,7 @@ export function ensurePackageScripts(repoRoot: string): void {
   const scripts = {
     ...(typeof current.scripts === 'object' && current.scripts ? current.scripts as Record<string, string> : {}),
     'pipelane:setup': 'pipelane setup',
+    'pipelane:configure': 'pipelane configure',
     'pipelane:devmode': 'pipelane run devmode',
     'pipelane:new': 'pipelane run new',
     'pipelane:resume': 'pipelane run resume',
@@ -302,6 +303,7 @@ export function ensurePackageScripts(repoRoot: string): void {
     'pipelane:api': 'pipelane run api',
     'workflow:api': 'pipelane run api',
     'workflow:setup': 'pipelane setup',
+    'workflow:configure': 'pipelane configure',
     'workflow:devmode': 'pipelane run devmode',
     'workflow:new': 'pipelane run new',
     'workflow:resume': 'pipelane run resume',

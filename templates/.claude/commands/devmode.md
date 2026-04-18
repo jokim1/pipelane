@@ -14,7 +14,7 @@ Display the output directly. The key line is:
 - `Dev Mode: [build]`
 - `Dev Mode: [release]`
 
-If release mode is blocked, show the blocked surfaces and tell the user to run `npm run workflow:setup`.
+If release mode is blocked, show the blocked surfaces and tell the user to run `npm run workflow:configure`.
 
 <!-- workflow-kit:consumer-extension:start -->
 <!-- workflow-kit:consumer-extension:end -->

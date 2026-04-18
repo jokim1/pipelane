@@ -33,7 +33,7 @@ installed in Rocketboard, Pipelane Board renders Rocketboard's live
 resume plan at `~/.claude/plans/noble-conjuring-spring.md`; this prelude
 mirrors it.
 
-### Shipped to date (2026-04-17)
+### Shipped to date (2026-04-18)
 
 | Step | Scope | Status | PR(s) |
 |------|-------|--------|-------|
@@ -47,7 +47,11 @@ mirrors it.
 | 6.3 | v0.7 /clean --apply scope + v0.5 deploy.prod typed-SHA confirm | ✅ merged | pipelane #19 |
 | 6.4 | v1.2 kill `ready:true` + per-surface verification + config fingerprint + HMAC signing | ✅ merged | pipelane #20 |
 | 4 | `checks.*` plugin system (secret-manifest + gh-required-secrets) | ✅ merged | pipelane #22 |
-| 7 | Rocketboard Phase 3 swap | ⏭ next (all gates cleared) | — |
+| 7 | Rocketboard Phase 3 swap | ✅ merged | rocketboard #331 (`ef53550`) |
+| 8.1 | Post-step-4 cleanup (docs + dead code) | ✅ merged | pipelane #23 |
+| 8.2 | Portable workflow aliases (port of #1) | ✅ merged | pipelane #24 |
+| 8.3 | Consumer-extension markers in managed Claude commands | ✅ merged | pipelane #25 |
+| 8.4 | `.project-workflow.json:syncDocs` opt-out block | ✅ merged | pipelane #26 |
 
 Ship items in this exact order. Each is its own PR in Pipelane unless
 noted. Catalog IDs reference the detailed sections below.
