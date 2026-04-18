@@ -59,6 +59,56 @@ export interface WorkflowConfig {
   };
   // Optional; absent in default config. See ChecksConfig for semantics.
   checks?: ChecksConfig;
+  // Optional; absent in default config. Per-surface opt-outs for
+  // syncConsumerDocs. Missing entry = default true (current behavior).
+  syncDocs?: SyncDocsConfig;
+}
+
+// Per-surface opt-out flags for `pipelane setup` / `pipelane sync-docs`.
+// Absent or undefined means "sync this surface" (default true). Consumers
+// that want partial regeneration (e.g. commands regen but NO marker
+// injection into README/AGENTS/CONTRIBUTING) set the surfaces they want
+// skipped to false.
+export interface SyncDocsConfig {
+  claudeCommands?: boolean;
+  readmeSection?: boolean;
+  contributingSection?: boolean;
+  agentsSection?: boolean;
+  docsReleaseWorkflow?: boolean;
+  workflowClaudeTemplate?: boolean;
+  packageScripts?: boolean;
+}
+
+export const DEFAULT_SYNC_DOCS: Required<SyncDocsConfig> = {
+  claudeCommands: true,
+  readmeSection: true,
+  contributingSection: true,
+  agentsSection: true,
+  docsReleaseWorkflow: true,
+  workflowClaudeTemplate: true,
+  packageScripts: true,
+};
+
+export function resolveSyncDocs(raw: SyncDocsConfig | undefined): Required<SyncDocsConfig> {
+  // Defense in depth: setupConsumerRepo and syncDocsOnly call JSON.parse
+  // directly and do NOT route through normalizeWorkflowConfig, so junk
+  // values (string "false", null, arrays, spread-of-a-string) can reach
+  // here unsanitized. Per-key type-check at use time guarantees that
+  // only real booleans flip a surface, and any non-boolean value (or a
+  // non-object `raw`) falls back to the declared default. This is what
+  // prevents `{ "readmeSection": "false" }` from injecting the README
+  // section (truthy string) when the consumer clearly meant to skip it.
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ...DEFAULT_SYNC_DOCS };
+  }
+  const resolved: Required<SyncDocsConfig> = { ...DEFAULT_SYNC_DOCS };
+  for (const key of Object.keys(DEFAULT_SYNC_DOCS) as (keyof SyncDocsConfig)[]) {
+    const value = (raw as Record<string, unknown>)[key];
+    if (typeof value === 'boolean') {
+      resolved[key] = value;
+    }
+  }
+  return resolved;
 }
 
 export const DEFAULT_BRANCH_PREFIX = 'codex/';
@@ -354,7 +404,35 @@ export function normalizeWorkflowConfig(raw: Partial<WorkflowConfig>): WorkflowC
     prPathDenyList: raw.prPathDenyList ?? [...DEFAULT_PR_PATH_DENY_LIST],
     aliases: resolveWorkflowAliases(raw.aliases),
     checks: normalizeChecksConfig(raw.checks),
+    syncDocs: normalizeSyncDocsConfig(raw.syncDocs),
   };
+}
+
+// Strip non-boolean and unknown keys. Returns undefined when no boolean
+// flags remain so the serialized config stays minimal for consumers that
+// never opt out. Explicit `true` values are preserved as-is (they don't
+// collapse to undefined). Runs on the `loadWorkflowConfig` path only;
+// setup + sync-docs bypass it and rely on `resolveSyncDocs` at use-time
+// for runtime defense.
+function normalizeSyncDocsConfig(raw: SyncDocsConfig | undefined): SyncDocsConfig | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const keys: (keyof SyncDocsConfig)[] = [
+    'claudeCommands',
+    'readmeSection',
+    'contributingSection',
+    'agentsSection',
+    'docsReleaseWorkflow',
+    'workflowClaudeTemplate',
+    'packageScripts',
+  ];
+  const out: SyncDocsConfig = {};
+  for (const key of keys) {
+    const value = raw[key];
+    if (typeof value === 'boolean') {
+      out[key] = value;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 // v4: preserve the checks field if present; returning undefined keeps the

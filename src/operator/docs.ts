@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFile
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import type { WorkflowConfig } from './state.ts';
+import type { SyncDocsConfig, WorkflowConfig } from './state.ts';
 import {
   aliasCommandName,
   CONFIG_FILENAME,
@@ -10,6 +10,7 @@ import {
   inferProjectKey,
   readJsonFile,
   resolveRepoRoot,
+  resolveSyncDocs,
   resolveWorkflowAliases,
   runGit,
   WORKFLOW_COMMANDS,
@@ -321,79 +322,130 @@ export function ensurePackageScripts(repoRoot: string): void {
   writeFileSync(targetPath, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
 }
 
+// Generated slash-command templates and Codex wrappers all invoke
+// `npm run workflow:<cmd>`. If a consumer opts out of packageScripts but
+// keeps claudeCommands, the commands would reference npm scripts that
+// don't exist — slash commands fail silently post-setup. Catch the
+// inconsistency here with a clear error + escape hatches instead of
+// letting the user debug "why does /clean do nothing" at runtime.
+function assertPackageScriptConsistency(repoRoot: string, syncDocs: Required<SyncDocsConfig>): void {
+  if (syncDocs.packageScripts || !syncDocs.claudeCommands) {
+    return;
+  }
+
+  const packageJsonPath = path.join(repoRoot, 'package.json');
+  const pkg = existsSync(packageJsonPath)
+    ? (JSON.parse(readFileSync(packageJsonPath, 'utf8')) as { scripts?: Record<string, string> })
+    : {};
+  const scripts = pkg.scripts ?? {};
+  const required = WORKFLOW_COMMANDS.map((cmd) => `workflow:${cmd}`);
+  const missing = required.filter((script) => typeof scripts[script] !== 'string');
+  if (missing.length === 0) {
+    return;
+  }
+
+  throw new Error(
+    `syncDocs.packageScripts is false but package.json is missing required npm scripts: ${missing.join(', ')}. ` +
+      `The generated .claude/commands/*.md templates and Codex wrappers invoke these via \`npm run workflow:<cmd>\`. ` +
+      `Fix it one of three ways: ` +
+      `(a) add the missing scripts to package.json yourself, ` +
+      `(b) set syncDocs.packageScripts to true (or drop the flag), or ` +
+      `(c) also set syncDocs.claudeCommands to false so the command files aren't generated.`,
+  );
+}
+
 export function syncConsumerDocs(repoRoot: string, config: WorkflowConfig): void {
-  const commandsDir = path.join(repoRoot, '.claude', 'commands');
-  mkdirSync(commandsDir, { recursive: true });
-  mkdirSync(path.join(repoRoot, 'workflow'), { recursive: true });
-  mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+  const syncDocs = resolveSyncDocs(config.syncDocs);
+  assertPackageScriptConsistency(repoRoot, syncDocs);
 
-  const aliases = resolveWorkflowAliases(config.aliases);
-  const managedCommandFiles = loadManagedClaudeCommands(commandsDir);
-  // Capture before prune so the extension follows the command through
-  // alias renames (old filename gets pruned but its content survives).
-  const capturedExtensions = captureManagedExtensionsByCommand(commandsDir, managedCommandFiles);
-  const desiredCommandFiles = new Set<string>();
-  for (const name of WORKFLOW_COMMANDS) {
-    const commandFilename = `${aliasCommandName(aliases[name])}.md`;
-    desiredCommandFiles.add(commandFilename);
+  if (syncDocs.claudeCommands) {
+    const commandsDir = path.join(repoRoot, '.claude', 'commands');
+    mkdirSync(commandsDir, { recursive: true });
+
+    const aliases = resolveWorkflowAliases(config.aliases);
+    const managedCommandFiles = loadManagedClaudeCommands(commandsDir);
+    // Capture before prune so the extension follows the command through
+    // alias renames (old filename gets pruned but its content survives).
+    const capturedExtensions = captureManagedExtensionsByCommand(commandsDir, managedCommandFiles);
+    const desiredCommandFiles = new Set<string>();
+    for (const name of WORKFLOW_COMMANDS) {
+      const commandFilename = `${aliasCommandName(aliases[name])}.md`;
+      desiredCommandFiles.add(commandFilename);
+    }
+    assertNoClaudeCollisions(commandsDir, desiredCommandFiles, managedCommandFiles);
+    pruneManagedClaudeCommands(commandsDir, desiredCommandFiles, managedCommandFiles);
+    for (const name of WORKFLOW_COMMANDS) {
+      const rendered = renderTemplate(readTemplate(`.claude/commands/${name}.md`), config);
+      const commandFilename = `${aliasCommandName(aliases[name])}.md`;
+      const targetPath = path.join(commandsDir, commandFilename);
+      const output = injectConsumerExtension(rendered, capturedExtensions.get(name) ?? null);
+      writeFileSync(targetPath, output, 'utf8');
+    }
+    saveManagedClaudeCommands(commandsDir, desiredCommandFiles);
+
+    // pipelane.md is a Claude command file but not a workflow command (it
+    // opens the board, not a task-flow step), so it isn't aliased and sits
+    // outside the managed set. It regenerates alongside the managed commands
+    // whenever `claudeCommands` is enabled; when the surface is opted out,
+    // pipelane.md is skipped too (which is why it lives inside this block).
+    writeFileSync(
+      path.join(commandsDir, 'pipelane.md'),
+      renderTemplate(readTemplate('.claude/commands/pipelane.md'), config),
+      'utf8',
+    );
   }
-  assertNoClaudeCollisions(commandsDir, desiredCommandFiles, managedCommandFiles);
-  pruneManagedClaudeCommands(commandsDir, desiredCommandFiles, managedCommandFiles);
-  for (const name of WORKFLOW_COMMANDS) {
-    const rendered = renderTemplate(readTemplate(`.claude/commands/${name}.md`), config);
-    const commandFilename = `${aliasCommandName(aliases[name])}.md`;
-    const targetPath = path.join(commandsDir, commandFilename);
-    const output = injectConsumerExtension(rendered, capturedExtensions.get(name) ?? null);
-    writeFileSync(targetPath, output, 'utf8');
+
+  if (syncDocs.workflowClaudeTemplate) {
+    mkdirSync(path.join(repoRoot, 'workflow'), { recursive: true });
+    writeFileSync(
+      path.join(repoRoot, 'workflow', 'CLAUDE.template.md'),
+      renderTemplate(readTemplate('workflow/CLAUDE.template.md'), config),
+      'utf8',
+    );
   }
-  saveManagedClaudeCommands(commandsDir, desiredCommandFiles);
 
-  // pipelane.md is not a workflow command (it opens the board, not a
-  // task-flow step), so it is not aliased and sits outside the managed set.
-  // Always regenerate it from the template; collision guard ignores it.
-  writeFileSync(
-    path.join(commandsDir, 'pipelane.md'),
-    renderTemplate(readTemplate('.claude/commands/pipelane.md'), config),
-    'utf8',
-  );
+  if (syncDocs.docsReleaseWorkflow) {
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(
+      path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md'),
+      renderTemplate(readTemplate('docs/RELEASE_WORKFLOW.md'), config),
+      'utf8',
+    );
+  }
 
-  writeFileSync(
-    path.join(repoRoot, 'workflow', 'CLAUDE.template.md'),
-    renderTemplate(readTemplate('workflow/CLAUDE.template.md'), config),
-    'utf8',
-  );
+  if (syncDocs.readmeSection) {
+    replaceMarkedSection(
+      path.join(repoRoot, 'README.md'),
+      README_MARKER_START,
+      README_MARKER_END,
+      renderTemplate(readTemplate('README.workflow-section.md'), config),
+      `# ${config.displayName}\n\n`,
+    );
+  }
 
-  writeFileSync(
-    path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md'),
-    renderTemplate(readTemplate('docs/RELEASE_WORKFLOW.md'), config),
-    'utf8',
-  );
+  if (syncDocs.contributingSection) {
+    replaceMarkedSection(
+      path.join(repoRoot, 'CONTRIBUTING.md'),
+      CONTRIBUTING_MARKER_START,
+      CONTRIBUTING_MARKER_END,
+      renderTemplate(readTemplate('CONTRIBUTING.workflow-section.md'), config),
+      '# Contributing\n\n',
+    );
+  }
 
-  replaceMarkedSection(
-    path.join(repoRoot, 'README.md'),
-    README_MARKER_START,
-    README_MARKER_END,
-    renderTemplate(readTemplate('README.workflow-section.md'), config),
-    `# ${config.displayName}\n\n`,
-  );
+  if (syncDocs.agentsSection) {
+    replaceMarkedSection(
+      path.join(repoRoot, 'AGENTS.md'),
+      AGENTS_MARKER_START,
+      AGENTS_MARKER_END,
+      renderTemplate(readTemplate('AGENTS.md'), config),
+      `# ${config.displayName} Repo Context\n\n`,
+    );
+  }
 
-  replaceMarkedSection(
-    path.join(repoRoot, 'CONTRIBUTING.md'),
-    CONTRIBUTING_MARKER_START,
-    CONTRIBUTING_MARKER_END,
-    renderTemplate(readTemplate('CONTRIBUTING.workflow-section.md'), config),
-    '# Contributing\n\n',
-  );
-
-  replaceMarkedSection(
-    path.join(repoRoot, 'AGENTS.md'),
-    AGENTS_MARKER_START,
-    AGENTS_MARKER_END,
-    renderTemplate(readTemplate('AGENTS.md'), config),
-    `# ${config.displayName} Repo Context\n\n`,
-  );
-
-  ensurePackageScripts(repoRoot);
+  if (syncDocs.packageScripts) {
+    ensurePackageScripts(repoRoot);
+  }
 }
 
 export function initConsumerRepo(cwd: string, projectName: string): { repoRoot: string; configPath: string } {
