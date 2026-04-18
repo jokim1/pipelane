@@ -552,12 +552,17 @@ export function inferProjectKey(projectName: string): string {
     .replace(/^-+|-+$/g, '') || 'project';
 }
 
-export function normalizeWorkflowAlias(alias: string, fallback: string): string {
-  const raw = (alias || fallback).trim().toLowerCase();
+export function normalizeWorkflowAlias(alias: unknown, fallback: string): string {
+  // Coerce to string before `.trim()` so a consumer writing `"aliases": {
+  // "clean": 42 }` gets the nice "Invalid workflow alias" error instead of
+  // a cryptic `.trim is not a function` crash.
+  const aliasValue = typeof alias === 'string' ? alias : '';
+  const raw = (aliasValue || fallback).trim().toLowerCase();
   const prefixed = raw.startsWith('/') ? raw : `/${raw}`;
 
   if (!/^\/[a-z0-9][a-z0-9-_]*$/.test(prefixed)) {
-    throw new Error(`Invalid workflow alias "${alias || fallback}". Use slash commands like /new or /release-pr.`);
+    const display = typeof alias === 'string' ? alias : String(alias);
+    throw new Error(`Invalid workflow alias "${display || fallback}". Use slash commands like /new or /release-pr.`);
   }
 
   return prefixed;
@@ -568,6 +573,19 @@ export function resolveWorkflowAliases(
 ): Record<WorkflowCommand, string> {
   const next = {} as Record<WorkflowCommand, string>;
   const seen = new Map<string, WorkflowCommand>();
+
+  // Flag typos like `cleanup: '/cleanup'` when the actual command is `clean`
+  // before silently dropping them. The user gets told which keys pipelane
+  // accepts so they can fix the spelling.
+  if (aliases && typeof aliases === 'object') {
+    const known = new Set<string>(WORKFLOW_COMMANDS);
+    const unknown = Object.keys(aliases).filter((key) => !known.has(key));
+    if (unknown.length > 0) {
+      throw new Error(
+        `Unknown workflow alias key(s): ${unknown.join(', ')}. Known keys: ${WORKFLOW_COMMANDS.join(', ')}.`,
+      );
+    }
+  }
 
   for (const command of WORKFLOW_COMMANDS) {
     const resolved = normalizeWorkflowAlias(aliases?.[command] ?? DEFAULT_WORKFLOW_ALIASES[command], DEFAULT_WORKFLOW_ALIASES[command]);

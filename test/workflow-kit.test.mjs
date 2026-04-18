@@ -685,6 +685,12 @@ test('custom aliases drive generated Claude commands, docs, and Codex wrappers',
     assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'resume.md')), false);
     assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'pr.md')), false);
 
+    // Cross-reference placeholders must render to the consumer's renamed
+    // slash, not leak literal `{{ALIAS_RESUME}}` into the shipped doc.
+    const branchDoc = readFileSync(path.join(repoRoot, '.claude', 'commands', 'branch.md'), 'utf8');
+    assert.match(branchDoc, /\/back/);
+    assert.equal(branchDoc.includes('{{ALIAS_'), false, 'unresolved alias placeholder in branch.md');
+
     const readme = readFileSync(path.join(repoRoot, 'README.md'), 'utf8');
     const workflowDoc = readFileSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md'), 'utf8');
     assert.match(readme, /\/branch/);

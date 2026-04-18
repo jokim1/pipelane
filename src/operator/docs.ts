@@ -28,34 +28,39 @@ const AGENTS_MARKER_START = '<!-- workflow-kit:agents:start -->';
 const AGENTS_MARKER_END = '<!-- workflow-kit:agents:end -->';
 const CLAUDE_COMMAND_MARKER = '<!-- workflow-kit:command:';
 const MANAGED_CLAUDE_COMMANDS_FILENAME = '.workflow-kit-managed.json';
+// Two-signature legacy detection: first-line description + the command's
+// npm script prefix. Truncated to `npm run workflow:<cmd>` so the match
+// survives any `-- $ARGUMENTS` / `-- --apply` / bare-invocation variant
+// current-main templates have emitted. Consumers that had these files
+// generated before this PR carry no marker, so detection falls back here.
 const LEGACY_CLAUDE_SIGNATURES: Record<WorkflowCommand, string[]> = {
   clean: [
     'Report workflow cleanup status and prune stale task locks when requested.',
-    'npm run workflow:clean -- <args-from-user>',
+    'npm run workflow:clean',
   ],
   deploy: [
     'Deploy the merged SHA for this repo.',
-    'npm run workflow:deploy -- <args-from-user>',
+    'npm run workflow:deploy',
   ],
   devmode: [
     "Switch or check the repo's development mode (build or release).",
-    'npm run workflow:devmode -- <args-from-user>',
+    'npm run workflow:devmode',
   ],
   merge: [
     "Merge the current task's pull request.",
-    'npm run workflow:merge -- <args-from-user>',
+    'npm run workflow:merge',
   ],
   new: [
     'Create a fresh task workspace for this repo.',
-    'npm run workflow:new -- <args-from-user>',
+    'npm run workflow:new',
   ],
   pr: [
     'Prepare and open, or update, a pull request for the current task.',
-    'npm run workflow:pr -- <args-from-user>',
+    'npm run workflow:pr',
   ],
   resume: [
     'Resume an existing task workspace for this repo.',
-    'npm run workflow:resume -- <args-from-user>',
+    'npm run workflow:resume',
   ],
 };
 
