@@ -1266,6 +1266,10 @@ test('syncDocs.packageScripts: false preserves consumer-customized workflow scri
       'workflow:deploy': 'my-wrapper deploy',
       'workflow:clean': 'my-wrapper clean',
       'workflow:devmode': 'my-wrapper devmode',
+      // devmode.md tells operators to run `workflow:configure` when release
+      // mode is blocked; the consistency check requires consumers opting out
+      // of packageScripts to define it themselves.
+      'workflow:configure': 'my-wrapper configure',
     };
     const consumerPackage = {
       name: 'consumer-app',
@@ -4195,5 +4199,123 @@ test('configure throws when seeding a missing CLAUDE.md without a .project-workf
     assert.match(result.stderr, /pipelane init/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure survives roundtrip with backticks in deploy command values', () => {
+  // Codex-identified: the pre-existing JSON-block regex was non-greedy and
+  // matched ``` anywhere — a legitimate command like `echo \`\`\` test` inside
+  // edge.staging.deployCommand would truncate the JSON block on the next
+  // read, bricking every downstream command that calls loadDeployConfig.
+  // Configure now persists + re-reads values with embedded backticks cleanly.
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const backtickCmd = 'echo ``` hi';
+    runCli([
+      'configure',
+      '--json',
+      `--edge-staging-deploy-command=${backtickCmd}`,
+    ], repoRoot);
+
+    // Second configure run parses the just-written CLAUDE.md via
+    // parseDeployConfigMarkdown. If the regex breaks on the inner ```, this
+    // call either crashes on JSON.parse or silently reverts to empty defaults.
+    const second = runCli(['configure', '--json', '--platform=fly.io'], repoRoot);
+    const config = JSON.parse(second.stdout);
+    assert.equal(config.edge.staging.deployCommand, backtickCmd,
+      'backtick-bearing value must survive a roundtrip through CLAUDE.md');
+    assert.equal(config.platform, 'fly.io');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure does not overwrite a sibling `## Deploy Configuration Notes` section', () => {
+  // Codex-identified: findDeployConfigSectionRange previously used `\b` which
+  // matched `## Deploy Configuration Notes` as a false positive and would
+  // overwrite the consumer's notes. The tightened regex requires end-of-line
+  // after the heading text.
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const claudePath = path.join(repoRoot, 'CLAUDE.md');
+    const original = readFileSync(claudePath, 'utf8');
+    const withNearbyHeading = `${original}\n## Deploy Configuration Notes\n\nhand-written notes nobody should clobber\n`;
+    writeFileSync(claudePath, withNearbyHeading, 'utf8');
+
+    runCli(['configure', '--json', '--frontend-staging-url=https://s.example.test'], repoRoot);
+
+    const after = readFileSync(claudePath, 'utf8');
+    assert.match(after, /## Deploy Configuration Notes\n\nhand-written notes nobody should clobber/);
+    assert.match(after, /https:\/\/s\.example\.test/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure without --json errors when stdin is not a TTY', () => {
+  // Codex-identified: interactive path used to hang on closed stdin. Now it
+  // fails fast with guidance to use --json.
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const result = spawnSync('node', [CLI_PATH, 'configure'], {
+      cwd: repoRoot,
+      env: { ...process.env, NODE_ENV: 'test' },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /requires a TTY|use `--json`/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup consistency check requires workflow:configure when opting out of packageScripts', () => {
+  // Regression for Codex #4: the required-scripts list now includes
+  // workflow:configure because devmode.md points operators at it. A consumer
+  // who defines every workflow:<cmd> script EXCEPT workflow:configure would
+  // previously pass setup silently; now they get a clear error.
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-codex-'));
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    const packageJsonPath = path.join(repoRoot, 'package.json');
+    writeFileSync(packageJsonPath, `${JSON.stringify({
+      name: 'consumer-app',
+      private: true,
+      type: 'module',
+      scripts: {
+        'workflow:new': 'x new',
+        'workflow:resume': 'x resume',
+        'workflow:pr': 'x pr',
+        'workflow:merge': 'x merge',
+        'workflow:deploy': 'x deploy',
+        'workflow:clean': 'x clean',
+        'workflow:devmode': 'x devmode',
+        // Deliberately missing workflow:configure
+      },
+    }, null, 2)}\n`, 'utf8');
+
+    const configPath = path.join(repoRoot, '.project-workflow.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.syncDocs = { packageScripts: false };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    const result = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome }, true);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /workflow:configure/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
   }
 });

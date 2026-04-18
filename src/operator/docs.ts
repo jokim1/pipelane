@@ -352,7 +352,11 @@ function assertPackageScriptConsistency(repoRoot: string, syncDocs: Required<Syn
     ? (JSON.parse(readFileSync(packageJsonPath, 'utf8')) as { scripts?: Record<string, string> })
     : {};
   const scripts = pkg.scripts ?? {};
-  const required = WORKFLOW_COMMANDS.map((cmd) => `workflow:${cmd}`);
+  // `workflow:configure` lives outside WORKFLOW_COMMANDS (it's a one-shot setup
+  // subcommand, not an operator action), but `devmode.md` references it as the
+  // remediation path when release mode blocks. A consumer that opts out of
+  // packageScripts needs it defined or they'll hit a broken pointer.
+  const required = [...WORKFLOW_COMMANDS.map((cmd) => `workflow:${cmd}`), 'workflow:configure'];
   const missing = required.filter((script) => typeof scripts[script] !== 'string');
   if (missing.length === 0) {
     return;

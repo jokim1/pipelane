@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline/promises';
 
@@ -155,10 +155,19 @@ export async function handleConfigure(cwd: string, argv: string[]): Promise<Conf
   // readFileSync(CLAUDE.md) inside release-gate.loadDeployConfig.
   const baseConfig = parseDeployConfigMarkdown(markdown) ?? emptyDeployConfig();
   const flagged = applyFlagOverrides(baseConfig, options);
+  if (!options.json && !process.stdin.isTTY) {
+    throw new Error(
+      'pipelane configure requires a TTY for interactive prompts. Use `--json` with flags for non-interactive use.',
+    );
+  }
   const finalConfig = options.json ? flagged : await promptForValues(flagged);
 
-  const nextMarkdown = replaceDeployConfigSection(markdown, finalConfig);
-  writeFileSync(claudePath, ensureTrailingNewline(nextMarkdown), 'utf8');
+  // Temp-file-and-rename keeps CLAUDE.md atomic: a crash mid-write can't
+  // leave a truncated file that later bricks parseDeployConfigMarkdown for
+  // every other command.
+  const tmpPath = `${claudePath}.pipelane.tmp`;
+  writeFileSync(tmpPath, ensureTrailingNewline(replaceDeployConfigSection(markdown, finalConfig)), 'utf8');
+  renameSync(tmpPath, claudePath);
 
   if (options.json) {
     process.stdout.write(`${JSON.stringify(finalConfig, null, 2)}\n`);
