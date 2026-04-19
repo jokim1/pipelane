@@ -1,23 +1,34 @@
 import { existsSync } from 'node:fs';
 
-import type { DeployRecord, PrRecord, TaskLock, WorkflowConfig } from '../state.ts';
+import type { DeployRecord, PrRecord, ProbeState, TaskLock, WorkflowConfig } from '../state.ts';
 import {
   DEFAULT_MODE,
   loadAllTaskLocks,
   loadDeployState,
   loadPrState,
+  loadProbeState,
   nowIso,
   resolveWorkflowContext,
   runGit,
 } from '../state.ts';
 import {
+  emptyDeployConfig,
+  explainSurfaceProbe,
+  loadDeployConfig,
+  type DeployConfig,
+  type ProbeFreshnessState,
+  type ProbeSurfaceFreshness,
+} from '../release-gate.ts';
+import {
   buildApiActionState,
   buildApiEnvelope,
+  buildApiIssue,
   buildApiStatusCell,
   buildFreshness,
   buildSourceHealthEntry,
   type ApiActionState,
   type ApiEnvelope,
+  type ApiIssue,
   type ApiStatusCell,
   type LaneState,
   type SourceHealthEntry,
@@ -77,6 +88,13 @@ export interface SnapshotData {
       // override is switched off. Null when no override has ever been
       // recorded, or after a fresh mode-state.json.
       lastOverride: null | { reason: string; setAt: string; setBy: string };
+      // v1.2: rollup of per-surface staging probes. `healthy` = every
+      // configured staging probe succeeded within PROBE_STALE_MS;
+      // `degraded` = at least one probe's most recent record failed;
+      // `stale` = at least one probe is past the 24h threshold; `unknown`
+      // = no probes recorded yet, or no probe targets configured. Drives
+      // the cockpit probe banner and the attention[] blocker rows.
+      probeState: ProbeFreshnessState;
       localReady: boolean;
       hostedReady: boolean;
       freshness: ReturnType<typeof buildFreshness>;
@@ -108,6 +126,14 @@ export function buildWorkflowApiSnapshot(cwd: string): ApiEnvelope<SnapshotData>
   const locks = loadAllTaskLocks(context.commonDir, context.config);
   const prState = loadPrState(context.commonDir, context.config);
   const deployState = loadDeployState(context.commonDir, context.config);
+  const probeState = loadProbeState(context.commonDir, context.config);
+  const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
+  const surfaceProbes = collectSurfaceProbes({
+    deployConfig,
+    probeState,
+    surfaces: context.config.surfaces,
+  });
+  const probeRollup = rollupProbeState(surfaceProbes);
   const baseBranchSha = runGit(context.repoRoot, ['rev-parse', '--verify', `origin/${baseBranch}`], true)?.trim() ?? '';
 
   const branches: BranchRow[] = locks.map((lock) =>
@@ -137,7 +163,30 @@ export function buildWorkflowApiSnapshot(cwd: string): ApiEnvelope<SnapshotData>
       reason: locks.length === 0 ? 'no active task locks' : `${locks.length} active task lock(s)`,
       checkedAt,
     }),
+    ...surfaceProbes.map((entry) => buildSourceHealthEntry({
+      name: `deployProbe.${entry.surface}`,
+      state: mapProbeStateToLaneState(entry.result.state),
+      blocking: entry.result.state === 'stale' || entry.result.state === 'degraded',
+      reason: describeSurfaceProbe(entry),
+      checkedAt,
+      observedAt: entry.result.probe?.probedAt,
+      stale: entry.result.state === 'stale',
+    })),
   ];
+
+  const attention: ApiIssue[] = [];
+  for (const entry of surfaceProbes) {
+    if (entry.result.state !== 'stale' && entry.result.state !== 'degraded') continue;
+    attention.push(buildApiIssue({
+      code: entry.result.state === 'degraded' ? 'probe.degraded' : 'probe.stale',
+      severity: entry.result.state === 'degraded' ? 'error' : 'warning',
+      message: `staging ${entry.surface} probe ${entry.result.state}: ${entry.result.reason}. Run \`workflow:doctor --probe\`.`,
+      source: 'probeState',
+      blocking: true,
+      lane: 'staging',
+      action: 'doctor.probe',
+    }));
+  }
 
   const boardMessage = mode === 'release'
     ? 'Release mode: promote merged SHA through staging before prod.'
@@ -159,6 +208,7 @@ export function buildWorkflowApiSnapshot(cwd: string): ApiEnvelope<SnapshotData>
           blockedSurfaces: [],
           effectiveOverride: context.modeState.override ?? null,
           lastOverride: context.modeState.lastOverride ?? null,
+          probeState: probeRollup,
           localReady: false,
           hostedReady: false,
           freshness: buildFreshness({ checkedAt }),
@@ -177,11 +227,65 @@ export function buildWorkflowApiSnapshot(cwd: string): ApiEnvelope<SnapshotData>
         overallFreshness: buildFreshness({ checkedAt }),
       },
       sourceHealth,
-      attention: [],
+      attention,
       availableActions: [],
       branches,
     },
   });
+}
+
+interface SurfaceProbeEntry {
+  surface: string;
+  result: ProbeSurfaceFreshness;
+}
+
+// Only the surfaces the release-gate would probe end up here. `frontend`
+// is always probed (the URL or healthcheckUrl is the target); `edge`/`sql`
+// probe only when an explicit healthcheckUrl is wired — many consumers
+// keep those unset and gate on observed-staging-success alone.
+function collectSurfaceProbes(options: {
+  deployConfig: DeployConfig;
+  probeState: ProbeState;
+  surfaces: string[];
+}): SurfaceProbeEntry[] {
+  const { deployConfig, probeState, surfaces } = options;
+  const entries: SurfaceProbeEntry[] = [];
+  for (const surface of surfaces) {
+    if (surface === 'frontend') {
+      entries.push({ surface, result: explainSurfaceProbe({ probeState, surface, environment: 'staging' }) });
+    } else if (surface === 'edge' && deployConfig.edge.staging.healthcheckUrl) {
+      entries.push({ surface, result: explainSurfaceProbe({ probeState, surface, environment: 'staging' }) });
+    } else if (surface === 'sql' && deployConfig.sql.staging.healthcheckUrl) {
+      entries.push({ surface, result: explainSurfaceProbe({ probeState, surface, environment: 'staging' }) });
+    }
+  }
+  return entries;
+}
+
+function rollupProbeState(entries: SurfaceProbeEntry[]): ProbeFreshnessState {
+  if (entries.length === 0) return 'unknown';
+  const states = entries.map((entry) => entry.result.state);
+  if (states.includes('degraded')) return 'degraded';
+  if (states.includes('stale')) return 'stale';
+  if (states.includes('unknown')) return 'unknown';
+  return 'healthy';
+}
+
+function mapProbeStateToLaneState(state: ProbeFreshnessState): LaneState {
+  switch (state) {
+    case 'healthy': return 'healthy';
+    case 'stale': return 'stale';
+    case 'degraded': return 'degraded';
+    case 'unknown':
+    default: return 'unknown';
+  }
+}
+
+function describeSurfaceProbe(entry: SurfaceProbeEntry): string {
+  const { surface, result } = entry;
+  if (result.reason) return `staging ${surface}: ${result.reason}`;
+  if (result.state === 'healthy') return `staging ${surface} probe healthy`;
+  return `staging ${surface} probe ${result.state}`;
 }
 
 function buildBranchRow(options: {
