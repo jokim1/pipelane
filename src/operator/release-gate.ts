@@ -401,6 +401,11 @@ export function hasObservedStagingSuccess(
   return explainObservedStagingSuccess(records, surface, options).ok;
 }
 
+// Tolerate up to 5 minutes of clock skew between the probing machine and
+// the consumer of probe-state. Records more than this in the future are
+// treated as stale (either broken clock or a forged record).
+const FUTURE_SKEW_MS = 5 * 60 * 1000;
+
 export type ProbeFreshnessState = 'healthy' | 'stale' | 'degraded' | 'unknown';
 
 export interface ProbeSurfaceFreshness {
@@ -438,6 +443,13 @@ export function explainSurfaceProbe(options: {
 
   if (ageMs === null) {
     return { state: 'stale', reason: `probe record has an unparseable probedAt "${match.probedAt}"`, probe: match, ageMs: null };
+  }
+  // Future-dated probedAt is either clock skew (harmless) or a forged
+  // record (malicious). A record more than FUTURE_SKEW_MS in the future
+  // can't have been produced by a real probe on this machine; treat it as
+  // stale so the release gate falls closed.
+  if (probedAt > now + FUTURE_SKEW_MS) {
+    return { state: 'stale', reason: `probe record probedAt "${match.probedAt}" is in the future`, probe: match, ageMs: null };
   }
   if (ageMs > staleMs) {
     const ageHours = Math.round(ageMs / (60 * 60 * 1000));

@@ -8,6 +8,7 @@ import {
   replaceDeployConfigSection,
   type DeployConfig,
 } from '../release-gate.ts';
+import { sanitizeForTerminal } from './helpers.ts';
 import {
   loadProbeState,
   printResult,
@@ -186,7 +187,11 @@ export interface ProbeOutcome {
 async function runProbe(context: WorkflowContext, parsed: ParsedOperatorArgs): Promise<void> {
   const outcome = await executeProbe(context);
   printResult(parsed.flags, outcome);
-  if (outcome.records.some((record) => !record.ok)) {
+  // Only staging probes gate release. A flaky production probe is worth
+  // recording but shouldn't flip the exit code for scripted callers (e.g.
+  // `npm run workflow:doctor -- --probe` in CI before `workflow:pr`).
+  const stagingFailed = outcome.records.some((record) => record.environment === 'staging' && !record.ok);
+  if (stagingFailed) {
     process.exitCode = 1;
   }
 }
@@ -218,10 +223,14 @@ export async function executeProbe(context: WorkflowContext, nowFn: () => Date =
     lines.push('  No probe targets — CLAUDE.md has no configured healthcheck URLs.');
   } else {
     for (const record of records) {
+      const errorText = record.error ? sanitizeForTerminal(record.error) : 'no response';
       const status = record.ok
         ? `OK (HTTP ${record.statusCode ?? '?'}, ${record.latencyMs ?? '?'}ms)`
-        : `FAILED (${record.statusCode ? `HTTP ${record.statusCode}` : record.error ?? 'no response'})`;
-      lines.push(`  ${record.environment}:${record.surface}: ${status} @ ${record.url}`);
+        : `FAILED (${record.statusCode ? `HTTP ${record.statusCode}` : errorText})`;
+      // URLs come from CLAUDE.md (operator-owned) but probe records are
+      // unsigned state, so scrub before rendering — mirrors the v1.5
+      // ANSI-injection defense on override reasons/setBy.
+      lines.push(`  ${record.environment}:${record.surface}: ${status} @ ${sanitizeForTerminal(record.url)}`);
     }
   }
   const updatedAt = merged.length > 0 ? `Updated ${now}` : '';
