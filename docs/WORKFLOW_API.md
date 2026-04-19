@@ -1,0 +1,161 @@
+# `workflow:api` — Pipelane operator contract
+
+This is the machine-readable surface every Pipelane consumer (CLI `/status`,
+the Pipelane Board, editor integrations, dashboards) reads from. It is the
+**single source of truth** for workflow state — slash commands, the web
+board, and the terminal cockpit all derive from the same envelope.
+
+Two commands:
+
+```bash
+npm run workflow:api -- snapshot [--json]
+npm run workflow:api -- action <actionId> [--execute] [--confirm-token <t>] [--json]
+```
+
+`--json` is assumed by programmatic callers; human-facing renderers also
+accept `--text`. Every response is an `ApiEnvelope` (see below).
+
+## Envelope shape
+
+```json
+{
+  "schemaVersion": "2026-04-18",
+  "command": "workflow.api.snapshot" | "workflow.api.action",
+  "ok": true,
+  "message": "",
+  "warnings": [],
+  "issues": [],
+  "data": { /* command-specific */ }
+}
+```
+
+The `schemaVersion` is bumped only on additive-breaking changes — readers
+that ignore unknown fields parse every revision transparently. See
+`src/operator/api/envelope.ts` for the current canonical types.
+
+### Lane states
+
+`LaneState` is the shared vocabulary every status cell + action report uses:
+
+| State | Meaning |
+|-------|---------|
+| `healthy` | Lane is live and current. |
+| `running` | Work in flight (PR open, deploy pending, etc.). |
+| `blocked` | Something failed and blocks downstream work. |
+| `degraded` | Signal observed but unhealthy (e.g. probe returned 5xx). |
+| `stale` | Data exists but past its freshness window. |
+| `unknown` | No observation on record. |
+| `bypassed` | Intentionally skipped (e.g. staging in `build` mode). |
+| `awaiting_preflight` | Lane is waiting on upstream work. |
+
+## `snapshot` data
+
+`data` carries the full board state:
+
+- `boardContext.mode` — `build` | `release`.
+- `boardContext.baseBranch` — default branch (typically `main`).
+- `boardContext.laneOrder` — column order for UI rendering.
+- `boardContext.releaseReadiness` — release-gate rollup. Notable fields:
+  - `state`, `reason`, `message`
+  - `requestedSurfaces` / `blockedSurfaces`
+  - `effectiveOverride` — currently-active gate override (`null` when none).
+  - `lastOverride` — durable audit of the most-recent override.
+  - `probeState` — rollup of per-surface staging probes: one of
+    `healthy | degraded | stale | unknown`. See `doctor.probe` below.
+- `boardContext.activeTask` / `overallFreshness`.
+- `sourceHealth[]` — per-source liveness cells. Always includes
+  `git.local` and `task-locks`; v1.2 adds one entry per configured staging
+  probe surface (e.g. `deployProbe.frontend`, `deployProbe.edge`,
+  `deployProbe.sql`).
+- `attention[]` — `ApiIssue` list. Each entry carries `action` pointing at
+  the action ID the operator should invoke to resolve it (e.g.
+  `doctor.probe` when a staging surface is stale or degraded).
+- `availableActions[]` — unblocked actions for the active branch.
+- `branches[]` — per-branch rows with `lanes.{local,pr,base,staging,production}`.
+
+## `action` data — the action registry
+
+Every mutating workflow step is exposed as a stable action ID. Callers
+`action <id>` with no flags to get the **preflight** (state, reason,
+whether a confirm token is required); `action <id> --execute` with the
+returned token to actually run it.
+
+Risky actions (`merge`, `deploy.prod`, `clean.apply`) always require a
+fresh confirmation token. Non-risky actions complete in one call.
+
+| Action ID | Risky? | Purpose |
+|-----------|--------|---------|
+| `new` | no | Create a task workspace (branch + worktree). |
+| `resume` | no | Reopen an existing task workspace. |
+| `devmode.build` | no | Switch to build mode. |
+| `devmode.release` | no | Switch to release mode. |
+| `taskLock.verify` | no | Revalidate the current branch's task lock. |
+| `pr` | no | Prepare or refresh the PR. |
+| `merge` | **yes** | Squash-merge the PR and delete the branch. |
+| `deploy.staging` | no | Deploy the merged SHA to staging. |
+| `deploy.prod` | **yes** | Deploy the merged SHA to production. |
+| `clean.plan` | no | Preview workspace cleanup. |
+| `clean.apply` | **yes** | Apply workspace cleanup (delete branches/worktrees). |
+| `doctor.diagnose` | no | Read CLAUDE.md, detect platform, list missing config + probe status. |
+| `doctor.probe` | no | Hit every configured staging healthcheck URL and persist the result to `probe-state.json`. |
+
+`doctor.fix` is intentionally **not** exposed as an API action — it is
+interactive (TTY prompts for platform + URLs) and lives behind
+`npm run workflow:doctor -- --fix`. Scripted config goes through
+`pipelane configure --json=...` instead.
+
+## `probe-state.json` (v1.2)
+
+Location: `<commonDir>/workflow-kit-state/probe-state.json`.
+
+Written by `doctor.probe` and `doctor.fix` (which runs a probe after
+updating the deploy-config block). Read by the release gate as a
+freshness check alongside observed-staging-success: a surface must have a
+successful probe newer than `PROBE_STALE_MS` (24 hours) before the gate
+green-lights production promotion for that surface.
+
+```json
+{
+  "records": [
+    {
+      "environment": "staging" | "production",
+      "surface": "frontend" | "edge" | "sql",
+      "url": "https://staging.example.com/healthz",
+      "ok": true,
+      "statusCode": 200,
+      "latencyMs": 42,
+      "error": "HTTP 502",            // absent on success
+      "probedAt": "2026-04-19T18:00:00.000Z"
+    }
+  ],
+  "updatedAt": "2026-04-19T18:00:00.000Z"
+}
+```
+
+Records are keyed on `(environment, surface)`. Partial re-probes (one
+surface at a time) merge on top of the previous snapshot — previously
+probed surfaces are preserved until `doctor.probe` replaces them.
+
+Probe freshness rollup (`boardContext.releaseReadiness.probeState`):
+
+- `healthy` — every configured staging surface has an OK probe within
+  `PROBE_STALE_MS`.
+- `degraded` — at least one surface's most recent probe failed.
+- `stale` — at least one surface has a probe older than 24 hours.
+- `unknown` — no probes recorded yet, or no probe targets configured.
+
+`degraded` surfaces show up in `sourceHealth[]` with `state: 'degraded'`
+and in `attention[]` with `action: 'doctor.probe'`. `stale` surfaces
+emit warnings; `healthy` and `unknown` stay silent — the release gate's
+missing-probe messaging handles the "never probed" case directly.
+
+## Compatibility
+
+- Schema is additive-only within a `schemaVersion`. New fields may appear
+  in any minor bump; readers must ignore unknown fields.
+- `STABLE_ACTION_IDS` is append-only. Removing or renaming an ID is a
+  breaking change and bumps the schema version.
+- Lane states in `CANONICAL_LANE_STATES` are append-only.
+
+Source: `src/operator/api/envelope.ts`, `src/operator/api/actions.ts`,
+`src/operator/api/snapshot.ts`.
