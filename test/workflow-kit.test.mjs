@@ -6722,6 +6722,103 @@ test('v1.1 codex fixup: --revert-pr honors --sha when passed explicitly', () => 
   }
 });
 
+// Codex P1 (round 2): /rollback prod must require typed-SHA confirmation
+// even in build mode. Earlier gate was `environment === 'prod' && mode ===
+// 'release'`, which let build-mode operators skip the prompt entirely. The
+// API bypass via PIPELANE_DEPLOY_PROD_API_CONFIRMED is still honored.
+test('v1.1 codex fixup: /rollback prod requires typed-SHA confirmation in build mode too', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+    // NO PIPELANE_DEPLOY_PROD_CONFIRM_STUB, NO PIPELANE_DEPLOY_PROD_API_CONFIRMED —
+    // we want the prompt to actually fire and block (exits with non-zero).
+  };
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    // Stay in build mode (default after init).
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Build Mode Prod', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'v.txt'), 'x\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Build Mode Prod', '--json'], created.worktreePath, env);
+    runCli(['run', 'merge', '--json'], created.worktreePath, env);
+    // Swap fake-gh's bogus merge for a real sha.
+    const goodSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
+    const prStatePath = path.join(repoRoot, '.git', 'workflow-kit-state', 'pr-state.json');
+    const prState = JSON.parse(readFileSync(prStatePath, 'utf8'));
+    prState.records[Object.keys(prState.records)[0]].mergedSha = goodSha;
+    writeFileSync(prStatePath, JSON.stringify(prState, null, 2), 'utf8');
+    // Seed deploy state with a good prod + a failed prod to roll back FROM.
+    const stateDir = path.join(repoRoot, '.git', 'workflow-kit-state');
+    const okProbe = { statusCode: 200, latencyMs: 10, probes: 2 };
+    writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({ records: [
+      { environment: 'prod', sha: goodSha, surfaces: ['frontend', 'edge', 'sql'],
+        workflowName: 'Deploy Hosted', requestedAt: '2026-04-10T00:00:00Z',
+        status: 'succeeded', verifiedAt: '2026-04-10T00:01:00Z', verification: okProbe },
+      { environment: 'prod', sha: '1'.repeat(40), surfaces: ['frontend', 'edge', 'sql'],
+        workflowName: 'Deploy Hosted', requestedAt: '2026-04-11T00:00:00Z',
+        status: 'failed', verification: { statusCode: 503 } },
+    ] }, null, 2), 'utf8');
+
+    // No TTY, no stub, no API bypass → requireProdConfirmation refuses.
+    const refused = runCli(['run', 'rollback', 'prod', '--json'], created.worktreePath, env, true);
+    assert.notEqual(refused.status, 0);
+    // Error mentions typed-SHA prefix confirmation.
+    assert.match(refused.stderr, /typed SHA prefix/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+// Codex P1 (round 2): retrying a failed rollback must target the SAME sha,
+// not walk further back. Earlier behavior: the R5 cascade guard only
+// special-cased status=succeeded, so a failed rollback left the next
+// /rollback invocation with excludeSha=rollbackTarget, which skipped the
+// target and picked an even-older good sha.
+test('v1.1 codex fixup: retrying a failed rollback pins the same target sha', async () => {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'helpers.ts'));
+  const ok = (statusCode) => ({ healthcheckUrl: 'x', statusCode, latencyMs: 10, probes: 2 });
+  const records = [
+    // Oldest good — if retry logic is broken, findLastGoodDeploy lands here.
+    { environment: 'prod', sha: 'ancientgood', surfaces: ['frontend'], workflowName: 'X',
+      requestedAt: '2026-04-08T00:00:00Z', status: 'succeeded', verifiedAt: '2026-04-08T00:01:00Z',
+      verification: ok(200) },
+    // The good we WANT to roll back to.
+    { environment: 'prod', sha: 'correcttarget', surfaces: ['frontend'], workflowName: 'X',
+      requestedAt: '2026-04-10T00:00:00Z', status: 'succeeded', verifiedAt: '2026-04-10T00:01:00Z',
+      verification: ok(200) },
+    // The failing prod deploy that triggered rollback.
+    { environment: 'prod', sha: 'brokenprod', surfaces: ['frontend'], workflowName: 'X',
+      requestedAt: '2026-04-12T00:00:00Z', status: 'failed', verification: ok(503) },
+    // The first rollback attempt — dispatched but failed (workflow error or
+    // healthcheck 5xx). sha=correcttarget, rollbackOfSha=brokenprod, status=failed.
+    { environment: 'prod', sha: 'correcttarget', surfaces: ['frontend'], workflowName: 'X',
+      requestedAt: '2026-04-12T01:00:00Z', status: 'failed', rollbackOfSha: 'brokenprod',
+      verification: ok(503) },
+  ];
+  // Retry: excludeSha should be rollbackOfSha (brokenprod), not
+  // currentRecord.sha (correcttarget). Target picks up 'correcttarget'
+  // again from the earlier succeeded+verified record.
+  const excludeSha = records[3].rollbackOfSha; // 'brokenprod'
+  const target = mod.findLastGoodDeploy({
+    records, environment: 'prod', surfaces: ['frontend'], excludeSha,
+  });
+  assert.equal(target?.sha, 'correcttarget', 'retry must pin the same target, not walk further back');
+  // Sanity: if the OLD buggy excludeSha (currentRecord.sha) were used,
+  // the target would be ancientgood.
+  const buggy = mod.findLastGoodDeploy({
+    records, environment: 'prod', surfaces: ['frontend'], excludeSha: 'correcttarget',
+  });
+  assert.equal(buggy?.sha, 'ancientgood', 'sanity: buggy path would have picked ancientgood');
+});
+
 test('v1.1 fixup: capDeployHistory preserves the most recent verified record per (env, surfaces)', async () => {
   const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'deploy.ts'));
   const ok = (statusCode) => ({ healthcheckUrl: 'x', statusCode, latencyMs: 10, probes: 2 });

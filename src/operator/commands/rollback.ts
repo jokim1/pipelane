@@ -82,11 +82,13 @@ export async function handleRollback(cwd: string, parsed: ParsedOperatorArgs): P
   }
 
   // Short-circuit when the environment is already at the result of a
-  // prior rollback. Without this guard, re-running /rollback cascades
-  // BACKWARD: findLastGoodDeploy walks past the successful rollback
+  // prior SUCCESSFUL rollback. Without this guard, re-running /rollback
+  // cascades BACKWARD: findLastGoodDeploy walks past the rollback
   // record (status=succeeded, excluded by sha) and picks the NEXT-older
   // good sha, dispatching a rollback to a still-earlier revision on
-  // every repeated invocation.
+  // every repeated invocation. Applies only to succeeded rollbacks —
+  // failed/pending retries fall through so the operator can retry the
+  // same target (handled by the excludeSha logic below).
   if (currentRecord.status === 'succeeded' && currentRecord.rollbackOfSha) {
     throw new Error([
       `rollback ${environment} is a no-op: ${environment} is already at the result of a prior rollback`,
@@ -95,11 +97,20 @@ export async function handleRollback(cwd: string, parsed: ParsedOperatorArgs): P
     ].join('\n'));
   }
 
+  // When the current record is a failed/pending rollback (rollbackOfSha
+  // set + status != succeeded), the environment is still at the
+  // originally-failing sha, not at currentRecord.sha. Use rollbackOfSha
+  // as the excludeSha so findLastGoodDeploy re-picks the same target —
+  // a retry of the same rollback, not a walk further back. Without this
+  // guard, the first retry excludes the prior target sha and lands on
+  // an even-older good deploy, which is almost never what the operator
+  // intended.
+  const excludeSha = currentRecord.rollbackOfSha ?? currentRecord.sha;
   const target = findLastGoodDeploy({
     records: trustedRecords,
     environment,
     surfaces,
-    excludeSha: currentRecord.sha,
+    excludeSha,
     configFingerprint: computeDeployConfigFingerprint(deployConfig, environment),
   });
   if (!target) {
@@ -122,10 +133,14 @@ export async function handleRollback(cwd: string, parsed: ParsedOperatorArgs): P
   }
 
   // Prod rollbacks join the risky set — same typed-SHA prefix gate as
-  // deploy.prod. Confirms on the TARGET sha (what's about to become
-  // production), not the failing sha. API path bypasses via
-  // PIPELANE_DEPLOY_PROD_API_CONFIRMED after consuming an HMAC token.
-  if (environment === 'prod' && context.modeState.mode === 'release') {
+  // deploy.prod. Confirmation is required regardless of mode: build
+  // mode is the default after `pipelane init`, and without this gate
+  // `/rollback prod` in build mode would dispatch with zero human
+  // confirmation (no staging gate, no release-readiness gate, and
+  // Codex caught the mode-only guard as a P1). API path still bypasses
+  // via PIPELANE_DEPLOY_PROD_API_CONFIRMED after consuming an HMAC
+  // token, so programmatic callers aren't blocked.
+  if (environment === 'prod') {
     await requireProdConfirmation(target.sha);
   }
 
