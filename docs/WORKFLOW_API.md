@@ -162,20 +162,26 @@ one may be passed per call; passing two throws. `--json` is respected
 by every view and produces a structured payload (shape described
 below).
 
-- `--week` — groups `DeployRecord` entries from the last 7 UTC days
-  into `days[]` with `succeeded`, `failed`, and `p50CycleMs`
-  (verifiedAt − requestedAt for succeeded + verified deploys). `totals`
-  covers the full window plus `distinctShas`.
+- `--week` — groups `DeployRecord` entries into the 7 UTC days ending
+  at today's UTC date. Every `days[]` entry has `succeeded`, `failed`,
+  and `p50CycleMs` (verifiedAt − requestedAt across succeeded + verified
+  deploys). `totals` covers the full window plus `distinctShas`. The
+  window is UTC-midnight-aligned so wall-clock-`now` invocations emit a
+  stable 7-element `days[]` array.
 - `--stuck` — surfaces operator-actionable drift: release-mode task
-  locks idle >72h, merged PRs (last 14 days) with no DeployRecord for
-  their `mergedSha`, and staging DeployRecords without a matching
-  `succeeded` prod promotion for the same sha after 48h.
-- `--blast <sha>` — runs `git diff --name-only <base>..<sha>` and
+  locks strictly idle >72h, merged PRs (last 14 days) with no
+  DeployRecord for their `mergedSha`, and staging DeployRecords
+  without a matching `succeeded` prod promotion for the same sha after
+  48h.
+- `--blast <sha>` — runs `git diff --name-only -z <base>..<sha>` and
   groups files by `surfacePathMap`. The base anchor is the most recent
   succeeded prod DeployRecord sha if one exists (tag `prod-deploy`),
-  otherwise the repo's `baseBranch` HEAD (`base-branch`), finally
-  `merge-base` as a last resort. Files that don't match any mapped
-  prefix fall to `other`.
+  otherwise the repo's `baseBranch` — first trying local HEAD, then
+  `origin/<baseBranch>` — and finally `merge-base(HEAD, sha)` as a
+  last resort for fresh clones. Files that don't match any mapped
+  prefix fall to `other`. Accepts any rev-parseable ref; passing a
+  flag-shaped arg (`--json`, `-x`) errors instead of silently
+  swallowing it.
 
 ### `.project-workflow.json:surfacePathMap` (optional, v1.4+)
 
@@ -198,6 +204,13 @@ bucket and the render adds a one-line hint pointing at this key.
 Unknown keys inside the map are accepted — the key string is the
 surface label. Non-string-array values are dropped by
 `normalizeWorkflowConfig`; an all-invalid map collapses to `undefined`.
+Patterns are normalized to POSIX separators (backslashes are rewritten
+to forward slashes) so Windows-authored maps match git's forward-slash
+path output.
+
+When two surfaces overlap on the same file, the alphabetically-earlier
+surface name wins. Design your map so patterns don't overlap if that
+matters for your use case.
 
 ## Compatibility
 

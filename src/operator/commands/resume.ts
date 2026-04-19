@@ -41,6 +41,17 @@ export async function handleResume(cwd: string, parsed: ParsedOperatorArgs): Pro
       return;
     }
 
+    const renderedLocks = activeLocks.map((lock) => {
+      const breadcrumb = lock.nextAction?.trim() || null;
+      return {
+        taskSlug: lock.taskSlug,
+        taskName: lock.taskName ?? null,
+        branchName: lock.branchName,
+        worktreePath: lock.worktreePath,
+        mode: lock.mode,
+        lockNextAction: breadcrumb,
+      };
+    });
     const lines = [
       'Active task workspaces:',
       ...activeLocks.map((lock) => {
@@ -50,7 +61,12 @@ export async function handleResume(cwd: string, parsed: ParsedOperatorArgs): Pro
       }),
       'Next: run workflow:resume -- --task "<task-name>"',
     ];
-    printResult(parsed.flags, { message: lines.join('\n') });
+    // `activeLocks` gives JSON consumers structured per-lock data
+    // (including the v1.4 `lockNextAction` breadcrumb) so the multi-lock
+    // --json shape exposes the same breadcrumb field as the single-lock
+    // and single-task branches. Additive — existing consumers that only
+    // read `message` keep working.
+    printResult(parsed.flags, { message: lines.join('\n'), activeLocks: renderedLocks });
     return;
   }
 

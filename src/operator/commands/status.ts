@@ -369,10 +369,17 @@ const ANSI = {
 // promotion", 14 days is how far back we'll look for PR-without-deploy
 // orphans (longer windows spam /status with ancient merges the operator
 // has consciously moved on from).
-const WEEK_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const WEEK_WINDOW_DAYS = 7;
 const STUCK_IDLE_MS = 72 * 60 * 60 * 1000;
 const STAGING_WITHOUT_PROD_MS = 48 * 60 * 60 * 1000;
-const ORPHAN_PR_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
+const ORPHAN_PR_WINDOW_MS = 14 * DAY_MS;
+// --week table / --stuck sha displays. 12 chars matches the default /status
+// cockpit sha renders; 7 chars matches git's default short-sha shape and is
+// used only for the merge-base label where it lines up with `git log
+// --oneline` output the operator will compare against.
+const SHORT_SHA_LEN = 12;
+const MERGE_BASE_SHA_LEN = 7;
 
 // ─────────────────────────────────────────────────────────────────────
 // v1.4 --week
@@ -382,7 +389,6 @@ export interface WeekDay {
   date: string; // YYYY-MM-DD (UTC)
   succeeded: number;
   failed: number;
-  cycleSamplesMs: number[];
   p50CycleMs: number | null;
 }
 
@@ -403,14 +409,20 @@ export function buildWeekView(
   config: WorkflowConfig,
   now: Date = new Date(),
 ): WeekView {
-  const to = now.getTime();
-  const from = to - WEEK_WINDOW_MS;
+  // UTC-midnight-aligned window. Without alignment the 7 pre-seeded day
+  // labels can disagree with the per-record utcDay bucket labels when
+  // `now` is an unaligned wall-clock time, producing an 8th day in the
+  // output. Align both sides to UTC midnight so the day set is stable.
+  const ref = new Date(now.getTime());
+  const toDayStart = Date.UTC(ref.getUTCFullYear(), ref.getUTCMonth(), ref.getUTCDate());
+  const fromDayStart = toDayStart - (WEEK_WINDOW_DAYS - 1) * DAY_MS;
+  const toExclusive = toDayStart + DAY_MS; // include everything up to end-of-today UTC
   const { records } = loadDeployState(commonDir, config);
 
   const byDay = new Map<string, { succeeded: number; failed: number; cycles: number[] }>();
-  // Pre-seed 7 days so every day shows up even when idle.
-  for (let i = 6; i >= 0; i -= 1) {
-    const day = utcDay(new Date(to - i * 24 * 60 * 60 * 1000));
+  // Pre-seed 7 UTC days so every day shows up even when idle.
+  for (let i = WEEK_WINDOW_DAYS - 1; i >= 0; i -= 1) {
+    const day = utcDay(new Date(toDayStart - i * DAY_MS));
     byDay.set(day, { succeeded: 0, failed: 0, cycles: [] });
   }
 
@@ -421,8 +433,12 @@ export function buildWeekView(
 
   for (const record of records) {
     const requestedMs = Date.parse(record.requestedAt);
-    if (!Number.isFinite(requestedMs) || requestedMs < from || requestedMs > to) continue;
+    if (!Number.isFinite(requestedMs)) continue;
+    if (requestedMs < fromDayStart || requestedMs >= toExclusive) continue;
     const day = utcDay(new Date(requestedMs));
+    // Pre-seed guarantees the bucket exists for every day in the window,
+    // so this get() is never undefined in practice. Guard stays for belt
+    // + braces against a future refactor that changes seeding.
     const bucket = byDay.get(day) ?? { succeeded: 0, failed: 0, cycles: [] };
     if (record.status === 'succeeded') {
       bucket.succeeded += 1;
@@ -448,13 +464,15 @@ export function buildWeekView(
       date,
       succeeded: entry.succeeded,
       failed: entry.failed,
-      cycleSamplesMs: entry.cycles,
       p50CycleMs: median(entry.cycles),
     }));
 
   return {
     view: 'week',
-    window: { fromIso: new Date(from).toISOString(), toIso: new Date(to).toISOString() },
+    window: {
+      fromIso: new Date(fromDayStart).toISOString(),
+      toIso: new Date(toDayStart).toISOString(),
+    },
     days,
     totals: {
       succeeded: succeededTotal,
@@ -541,7 +559,9 @@ export function buildStuckView(
     const updatedMs = Date.parse(lock.updatedAt);
     if (!Number.isFinite(updatedMs)) continue;
     const idleMs = nowMs - updatedMs;
-    if (idleMs < STUCK_IDLE_MS) continue;
+    // Spec is "idle > 72h" (strict). Using `<=` to skip means exactly-72h
+    // is NOT flagged, matching the manifest's `updatedAt > 72h` language.
+    if (idleMs <= STUCK_IDLE_MS) continue;
     idleTasks.push({
       taskSlug: lock.taskSlug,
       taskName: lock.taskName ?? null,
@@ -624,15 +644,21 @@ export function renderStuckView(view: StuckView): string {
     return lines.join('\n');
   }
 
+  // All string fields sourced from on-disk JSON (task-locks, pr-state,
+  // deploy-state) pass through sanitizeForTerminal before being echoed.
+  // A tampered state file could otherwise smuggle ANSI escapes / OSC-8
+  // hyperlinks into the operator's terminal via /status --stuck. Same
+  // defense posture as the cockpit's renderBranch on line 231.
+  const s = sanitizeForTerminal;
   lines.push('  idle >72h (release mode):');
   if (view.idleTasks.length === 0) {
     lines.push('    (none)');
   } else {
     for (const task of view.idleTasks) {
-      const head = `    ${task.taskSlug}  branch=${task.branchName}  idle=${formatDuration(task.idleMs)}`;
+      const head = `    ${s(task.taskSlug)}  branch=${s(task.branchName)}  idle=${formatDuration(task.idleMs)}`;
       lines.push(head);
       if (task.nextAction) {
-        lines.push(`      next: ${sanitizeForTerminal(task.nextAction)}`);
+        lines.push(`      next: ${s(task.nextAction)}`);
       }
     }
   }
@@ -644,7 +670,7 @@ export function renderStuckView(view: StuckView): string {
     for (const pr of view.orphanMergedPrs) {
       const prLabel = pr.number !== null ? `PR #${pr.number}` : 'PR (no number)';
       lines.push(
-        `    ${prLabel}  task=${pr.taskSlug}  mergedSha=${pr.mergedSha ?? '?'}  mergedAt=${pr.mergedAt ?? '?'}`,
+        `    ${prLabel}  task=${s(pr.taskSlug)}  mergedSha=${s(pr.mergedSha ?? '?')}  mergedAt=${s(pr.mergedAt ?? '?')}`,
       );
     }
   }
@@ -654,8 +680,11 @@ export function renderStuckView(view: StuckView): string {
     lines.push('    (none)');
   } else {
     for (const staging of view.staleStaging) {
+      const shaDisplay = s(staging.sha).slice(0, SHORT_SHA_LEN);
+      const surfacesDisplay = staging.surfaces.map(s).join(',') || '(none)';
+      const verifiedDisplay = s(staging.verifiedAt ?? '?');
       lines.push(
-        `    sha=${staging.sha.slice(0, 12)}  surfaces=${staging.surfaces.join(',') || '(none)'}  verifiedAt=${staging.verifiedAt ?? '?'}  age=${formatDuration(staging.ageMs)}`,
+        `    sha=${shaDisplay}  surfaces=${surfacesDisplay}  verifiedAt=${verifiedDisplay}  age=${formatDuration(staging.ageMs)}`,
       );
     }
   }
@@ -686,52 +715,84 @@ export function buildBlastView(
   config: WorkflowConfig,
   sha: string,
 ): BlastView {
-  const resolvedSha = runGit(repoRoot, ['rev-parse', sha], true);
+  // `rev-parse --verify <ref>` rejects any arg that starts with `-`
+  // (git reads it as an unknown flag and fails rather than resolving),
+  // so user-supplied shas can't smuggle options into rev-parse.
+  // execFileSync already blocks shell metachar injection, but argument
+  // injection is orthogonal.
+  const resolvedSha = runGit(repoRoot, ['rev-parse', '--verify', sha], true);
   if (!resolvedSha) {
     throw new Error(`Could not resolve "${sha}" in this repo. Pass a commit sha or rev-parseable ref.`);
   }
 
   // Prefer the most recent succeeded prod DeployRecord as the base. That's
-  // the "what's currently in prod" anchor. Fall back to baseBranch HEAD if
-  // no prod deploys have ever happened, and finally to merge-base if the
-  // baseBranch ref can't be resolved.
+  // the "what's currently in prod" anchor. Fall back to baseBranch (local
+  // HEAD, then origin/) if no prod deploys have ever happened, and
+  // finally to merge-base as a last resort for fresh/partial clones.
   const { records } = loadDeployState(commonDir, config);
-  const lastGood = records
-    .filter((r) => r.environment === 'prod' && r.status === 'succeeded' && r.sha)
-    .sort((a, b) => (b.verifiedAt ?? b.requestedAt).localeCompare(a.verifiedAt ?? a.requestedAt))[0];
+  const lastGood = records.reduce<DeployRecord | null>((best, record) => {
+    if (record.environment !== 'prod' || record.status !== 'succeeded' || !record.sha) return best;
+    if (!best) return record;
+    const bestKey = best.verifiedAt ?? best.requestedAt;
+    const curKey = record.verifiedAt ?? record.requestedAt;
+    return curKey.localeCompare(bestKey) > 0 ? record : best;
+  }, null);
   let base: BlastView['base'];
-  if (lastGood?.sha && runGit(repoRoot, ['cat-file', '-e', lastGood.sha], true) !== null) {
+  if (lastGood?.sha && runGit(repoRoot, ['cat-file', '-e', '--end-of-options', lastGood.sha], true) !== null) {
     base = {
       kind: 'prod-deploy',
       sha: lastGood.sha,
-      label: `last succeeded prod deploy @ ${lastGood.verifiedAt ?? lastGood.requestedAt}`,
+      label: `last succeeded prod deploy @ ${sanitizeForTerminal(lastGood.verifiedAt ?? lastGood.requestedAt)}`,
     };
   } else {
-    const baseSha = runGit(repoRoot, ['rev-parse', config.baseBranch], true);
+    const baseSha =
+      runGit(repoRoot, ['rev-parse', '--verify', config.baseBranch], true)
+      ?? runGit(repoRoot, ['rev-parse', '--verify', `origin/${config.baseBranch}`], true);
     if (baseSha) {
       base = { kind: 'base-branch', sha: baseSha, label: `${config.baseBranch} HEAD` };
     } else {
       const mergeBase = runGit(repoRoot, ['merge-base', 'HEAD', resolvedSha], true);
       if (!mergeBase) {
         throw new Error(
-          `No prior prod deploy and baseBranch "${config.baseBranch}" is unresolvable — cannot compute blast radius.`,
+          `No prior prod deploy and baseBranch "${config.baseBranch}" is unresolvable (tried local + origin/). Cannot compute blast radius.`,
         );
       }
-      base = { kind: 'merge-base', sha: mergeBase, label: `merge-base(HEAD, ${resolvedSha.slice(0, 7)})` };
+      base = {
+        kind: 'merge-base',
+        sha: mergeBase,
+        label: `merge-base(HEAD, ${resolvedSha.slice(0, MERGE_BASE_SHA_LEN)})`,
+      };
     }
   }
 
-  const diffOutput = runGit(repoRoot, ['diff', '--name-only', `${base.sha}..${resolvedSha}`], true) ?? '';
+  // -z + NUL-split neutralises git's core.quotePath escaping (which
+  // would otherwise wrap non-ASCII filenames in quotes that break
+  // prefix matching). base.sha and resolvedSha are always hex outputs
+  // of rev-parse at this point, so the range `a..b` string can't start
+  // with a dash and no argument-injection guard is needed here.
+  const diffOutput = runGit(
+    repoRoot,
+    ['diff', '--name-only', '-z', `${base.sha}..${resolvedSha}`],
+    true,
+  ) ?? '';
   const files = diffOutput
-    .split('\n')
+    .split('\0')
     .map((line) => line.trim())
     .filter(Boolean);
 
   const map = config.surfacePathMap ?? {};
+  // Precompute normalized patterns once so matchSurface doesn't re-sort
+  // keys or recompute directory suffixes per file (O(F × K log K) → O(K
+  // log K + F × K)). Also normalize backslashes to forward slashes on
+  // both sides — git emits forward slashes on every platform but Windows
+  // authors writing surfacePathMap may use backslashes, which would
+  // otherwise silently send every file to `other`.
+  const normalizedMap = buildNormalizedSurfaceMap(map);
   const surfaceBuckets: Record<string, string[]> = {};
   const other: string[] = [];
   for (const file of files) {
-    const matched = matchSurface(file, map);
+    const normalizedFile = toPosixPath(file);
+    const matched = matchSurfaceFast(normalizedFile, normalizedMap);
     if (matched) {
       if (!surfaceBuckets[matched]) surfaceBuckets[matched] = [];
       surfaceBuckets[matched].push(file);
@@ -760,15 +821,23 @@ export function buildBlastView(
 }
 
 export function renderBlastView(view: BlastView): string {
+  const s = sanitizeForTerminal;
   const lines: string[] = [];
-  const shortSha = view.resolvedSha.slice(0, 12);
-  const shortBase = view.base.sha.slice(0, 12);
-  lines.push(`BLAST ${shortSha}  (base: ${view.base.kind} ${shortBase} — ${view.base.label})`);
+  const shortSha = view.resolvedSha.slice(0, SHORT_SHA_LEN);
+  const shortBase = view.base.sha.slice(0, SHORT_SHA_LEN);
+  // view.base.label is partly sourced from DeployRecord.verifiedAt
+  // (untrusted on-disk JSON), so it goes through sanitizeForTerminal.
+  // view.resolvedSha and view.base.sha are both outputs of runGit, so
+  // they're trusted hex and don't need sanitizing.
+  lines.push(`BLAST ${shortSha}  (base: ${view.base.kind} ${shortBase} — ${s(view.base.label)})`);
   lines.push(`  ${view.totalFiles} file(s) changed.`);
   lines.push('');
 
   if (view.totalFiles === 0) {
     lines.push('  (no files changed between base and target)');
+    if (view.base.sha === view.resolvedSha) {
+      lines.push('  note: base resolves to the same commit as target — check your baseBranch / fetch origin/<base>.');
+    }
     if (view.hint) lines.push(`  hint: ${view.hint}`);
     return lines.join('\n');
   }
@@ -776,12 +845,12 @@ export function renderBlastView(view: BlastView): string {
   const surfaceNames = Object.keys(view.surfaces).sort();
   for (const surface of surfaceNames) {
     const files = view.surfaces[surface];
-    lines.push(`  ${surface} (${files.length} file${files.length === 1 ? '' : 's'}):`);
-    for (const file of files) lines.push(`    ${file}`);
+    lines.push(`  ${s(surface)} (${files.length} file${files.length === 1 ? '' : 's'}):`);
+    for (const file of files) lines.push(`    ${s(file)}`);
   }
   if (view.other.length > 0) {
     lines.push(`  other (${view.other.length} file${view.other.length === 1 ? '' : 's'}):`);
-    for (const file of view.other) lines.push(`    ${file}`);
+    for (const file of view.other) lines.push(`    ${s(file)}`);
   }
   if (view.hint) {
     lines.push('');
@@ -790,22 +859,59 @@ export function renderBlastView(view: BlastView): string {
   return lines.join('\n');
 }
 
-// Match a POSIX-ish file path against a surface map. A file matches when
-// one of the map's prefixes is either an exact string equal to the file,
-// or a directory prefix (ending in '/' or treated as one). First match
-// wins in surface-insertion order; ties go to the shorter key name so
-// tests stay deterministic regardless of Object.keys iteration.
-function matchSurface(file: string, map: Record<string, string[]>): string | null {
+// Map a surface map to a pre-normalized list used by matchSurfaceFast.
+// Keys are pre-sorted alphabetically so iteration order is deterministic
+// across Node versions (Object.keys is insertion-ordered per spec, but
+// stable sort makes the choice explicit for the overlap-tiebreak case).
+// Each pattern is classified as exact-file vs directory-prefix once,
+// avoiding the endsWith/`+ '/'` recomputation on every file.
+interface NormalizedSurface {
+  surface: string;
+  exactFiles: Set<string>;
+  dirPrefixes: string[];
+}
+function buildNormalizedSurfaceMap(map: Record<string, string[]>): NormalizedSurface[] {
   const surfaces = Object.keys(map).sort();
-  for (const surface of surfaces) {
-    for (const pattern of map[surface] ?? []) {
-      if (!pattern) continue;
-      if (pattern === file) return surface;
-      const dirPattern = pattern.endsWith('/') ? pattern : `${pattern}/`;
-      if (file.startsWith(dirPattern)) return surface;
+  return surfaces.map((surface) => {
+    const exactFiles = new Set<string>();
+    const dirPrefixes: string[] = [];
+    for (const rawPattern of map[surface] ?? []) {
+      if (!rawPattern) continue;
+      const pattern = toPosixPath(rawPattern);
+      if (pattern.endsWith('/')) {
+        dirPrefixes.push(pattern);
+      } else {
+        // A pattern with a path separator but no trailing slash could be
+        // either an exact file (`openapi.yaml`) or a directory (`src/foo`).
+        // Accept both interpretations: try exact first, then as dir prefix.
+        exactFiles.add(pattern);
+        dirPrefixes.push(`${pattern}/`);
+      }
+    }
+    return { surface, exactFiles, dirPrefixes };
+  });
+}
+
+// Match a POSIX-normalized file path against the pre-normalized surface
+// list. Surfaces are tried in alphabetical order of key name, first hit
+// wins. When two surfaces overlap on the same file the alphabetically
+// earlier surface wins; design maps so patterns don't overlap if that
+// matters for your use case.
+function matchSurfaceFast(file: string, surfaces: NormalizedSurface[]): string | null {
+  for (const { surface, exactFiles, dirPrefixes } of surfaces) {
+    if (exactFiles.has(file)) return surface;
+    for (const prefix of dirPrefixes) {
+      if (file.startsWith(prefix)) return surface;
     }
   }
   return null;
+}
+
+function toPosixPath(file: string): string {
+  // git emits forward slashes on every platform but surfacePathMap
+  // authors on Windows may naturally write backslashes. Normalize so
+  // either style works.
+  return file.replace(/\\/g, '/');
 }
 
 // ─────────────────────────────────────────────────────────────────────

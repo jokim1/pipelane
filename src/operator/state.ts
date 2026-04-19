@@ -999,7 +999,16 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     }
 
     if (token === '--blast') {
-      flags.blastSha = argv[index + 1] ?? '';
+      const next = argv[index + 1];
+      // Reject a flag-shaped next token so `/status --blast --json`
+      // doesn't silently swallow `--json` as the sha and fall through to
+      // rev-parse. Value-taking flags elsewhere in this parser are
+      // looser for historical reasons; scoping this guard to --blast
+      // avoids regressing existing call sites.
+      if (next === undefined || next.startsWith('--')) {
+        throw new Error('--blast requires a commit sha or rev-parseable ref as the next argument.');
+      }
+      flags.blastSha = next;
       index += 1;
       continue;
     }

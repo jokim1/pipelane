@@ -5770,7 +5770,10 @@ test('v1.4 --week groups DeployRecords by UTC day and computes p50 cycle time', 
     // median(60000, 120000, 180000) = 120000
     assert.equal(view.totals.p50CycleMs, 120000);
     const rendered = mod.renderWeekView(view);
-    assert.match(rendered, /SHIPPED \(last 7 days, 2026-04-12 → 2026-04-19\)/);
+    // Window is UTC-midnight-aligned — 7 UTC days ending at today's UTC
+    // date (2026-04-13 → 2026-04-19 inclusive). Pre-alignment the header
+    // was off-by-one when `now` wasn't UTC midnight.
+    assert.match(rendered, /SHIPPED \(last 7 days, 2026-04-13 → 2026-04-19\)/);
     assert.match(rendered, /2026-04-19\s+2\s+1/);
     assert.match(rendered, /TOTAL\s+3\s+1/);
     assert.match(rendered, /distinct shas deployed: 4/);
@@ -6008,6 +6011,139 @@ test('v1.4 /resume surfaces TaskLock.nextAction breadcrumb when set by a prior c
     const payload = JSON.parse(result.stdout);
     assert.equal(payload.lockNextAction, 'PR #7 open, awaiting CI');
     assert.match(payload.message, /Last logged step: PR #7 open, awaiting CI/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+// Review fixup: normalizeSurfacePathMap drops every malformed shape.
+test('v1.4 normalizeSurfacePathMap filters garbage and collapses an all-invalid map to undefined', async () => {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+  // Non-object / array input returns undefined wholesale.
+  assert.equal(mod.normalizeWorkflowConfig({ surfacePathMap: 'not-a-map' }).surfacePathMap, undefined);
+  assert.equal(mod.normalizeWorkflowConfig({ surfacePathMap: ['an', 'array'] }).surfacePathMap, undefined);
+  // Non-array value dropped; empty surface key dropped; non-string entries filtered; all-invalid collapses.
+  const mixed = mod.normalizeWorkflowConfig({ surfacePathMap: {
+    frontend: ['src/frontend/', 42, null, ''],
+    '': ['ignored'],
+    notArray: 'nope',
+    allBlank: ['', '   '],
+    sql: ['supabase/'],
+  }}).surfacePathMap;
+  assert.deepEqual(mixed, { frontend: ['src/frontend/'], sql: ['supabase/'] });
+  const allBad = mod.normalizeWorkflowConfig({ surfacePathMap: { '': ['x'], bad: 'nope' } }).surfacePathMap;
+  assert.equal(allBad, undefined);
+});
+
+// Review fixup: buildBlastView throws on unresolvable sha (first user-facing error path).
+test('v1.4 --blast throws a clear error on an unresolvable sha', async () => {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'status.ts'));
+  const repoRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-blast-bad-'));
+  try {
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['config', 'user.email', 'a@b.c'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['config', 'user.name', 'T'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    writeFileSync(path.join(repoRoot, 'seed.txt'), 'a', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'base'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    const commonDir = path.join(repoRoot, '.git');
+    v14SeedState(commonDir, { deployRecords: [] });
+    assert.throws(
+      () => mod.buildBlastView(repoRoot, commonDir, v14StubConfig(), 'definitely-not-a-real-ref-12345'),
+      /Could not resolve "definitely-not-a-real-ref-12345"/,
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+// Review fixup: --blast on a Windows-style surfacePathMap should match git's forward-slash paths.
+test('v1.4 --blast normalizes backslash surfacePathMap entries to POSIX separators', async () => {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'status.ts'));
+  const repoRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-blast-win-'));
+  try {
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['config', 'user.email', 'a@b.c'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['config', 'user.name', 'T'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    mkdirSync(path.join(repoRoot, 'src', 'frontend'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'src', 'frontend', 'App.tsx'), 'v1', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'base'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['switch', '-c', 'feature'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    writeFileSync(path.join(repoRoot, 'src', 'frontend', 'App.tsx'), 'v2', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'target'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    const commonDir = path.join(repoRoot, '.git');
+    v14SeedState(commonDir, { deployRecords: [] });
+    const config = { ...v14StubConfig(), surfacePathMap: { frontend: ['src\\frontend\\'] } };
+    const view = mod.buildBlastView(repoRoot, commonDir, config, 'HEAD');
+    assert.deepEqual(view.surfaces.frontend, ['src/frontend/App.tsx']);
+    assert.deepEqual(view.other, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+// Review fixup: --blast <sha> without a value must error, not swallow the next flag.
+test('v1.4 --blast rejects a flag-shaped next argument instead of swallowing it', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const result = runCli(['run', 'status', '--blast', '--json'], repoRoot, {}, true);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /--blast requires a commit sha/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+// Review fixup: --stuck exactly at 72h idle is not stuck; 72h+1ms is.
+test('v1.4 --stuck idle threshold is strictly > 72h (not >=)', async () => {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'status.ts'));
+  const commonDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-stuck-boundary-'));
+  try {
+    const now = new Date('2026-04-19T12:00:00Z');
+    const exactSeventyTwo = new Date(now.getTime() - 72 * 3600 * 1000).toISOString();
+    const overSeventyTwo = new Date(now.getTime() - 72 * 3600 * 1000 - 1).toISOString();
+    v14SeedState(commonDir, { taskLocks: [
+      { taskSlug: 'exact', branchName: 'codex/exact', worktreePath: '/t/e',
+        mode: 'release', surfaces: ['frontend'], updatedAt: exactSeventyTwo },
+      { taskSlug: 'over', branchName: 'codex/over', worktreePath: '/t/o',
+        mode: 'release', surfaces: ['frontend'], updatedAt: overSeventyTwo },
+    ]});
+    const view = mod.buildStuckView(commonDir, v14StubConfig(), now);
+    assert.deepEqual(view.idleTasks.map((t) => t.taskSlug), ['over']);
+  } finally {
+    rmSync(commonDir, { recursive: true, force: true });
+  }
+});
+
+// Review fixup: /resume --json multi-lock emits structured activeLocks[] with per-lock breadcrumbs.
+test('v1.4 /resume --json multi-lock emits activeLocks[] with per-lock lockNextAction', () => {
+  const { repoRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    commitAll(repoRoot, 'post-setup');
+    runCli(['run', 'new', '--task', 'Task A'], repoRoot);
+    runCli(['run', 'new', '--task', 'Task B'], repoRoot);
+    const locksDir = path.join(repoRoot, '.git', 'workflow-kit-state', 'task-locks');
+    const a = JSON.parse(readFileSync(path.join(locksDir, 'task-a.json'), 'utf8'));
+    a.nextAction = 'CI running';
+    writeFileSync(path.join(locksDir, 'task-a.json'), JSON.stringify(a), 'utf8');
+    const b = JSON.parse(readFileSync(path.join(locksDir, 'task-b.json'), 'utf8'));
+    b.nextAction = '   '; // whitespace-only → trimmed to null
+    writeFileSync(path.join(locksDir, 'task-b.json'), JSON.stringify(b), 'utf8');
+    const result = runCli(['run', 'resume', '--json'], repoRoot);
+    const payload = JSON.parse(result.stdout);
+    assert.ok(Array.isArray(payload.activeLocks));
+    assert.equal(payload.activeLocks.length, 2);
+    const aLock = payload.activeLocks.find((l) => l.taskSlug === 'task-a');
+    const bLock = payload.activeLocks.find((l) => l.taskSlug === 'task-b');
+    assert.equal(aLock.lockNextAction, 'CI running');
+    assert.equal(bLock.lockNextAction, null);
+    assert.match(payload.message, /Task A.*\n\s+last logged step: CI running/);
+    assert.doesNotMatch(payload.message, /Task B.*\n\s+last logged step:/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
