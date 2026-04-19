@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 import type { ParsedOperatorArgs } from '../state.ts';
-import { loadDeployState, nowIso, resolveWorkflowContext } from '../state.ts';
+import { loadDeployState, nowIso, resolveWorkflowContext, type DeployRecord } from '../state.ts';
 import {
   computeDeployConfigFingerprint,
   emptyDeployConfig,
@@ -303,10 +303,14 @@ function normalizeInputs(actionId: StableActionId, parsed: ParsedOperatorArgs, c
       return {};
     case 'doctor.probe':
       return {};
-    case 'rollback.staging':
-      return { task: flags.task, surfaces: flags.surfaces, targetSha: resolveRollbackTargetSha(cwd, 'staging', flags.surfaces, flags.task) };
-    case 'rollback.prod':
-      return { task: flags.task, surfaces: flags.surfaces, targetSha: resolveRollbackTargetSha(cwd, 'prod', flags.surfaces, flags.task) };
+    case 'rollback.staging': {
+      const resolved = resolveRollbackInputs(cwd, 'staging', flags.surfaces, flags.task);
+      return { task: flags.task, surfaces: flags.surfaces, resolvedSurfaces: resolved?.surfaces, targetSha: resolved?.targetSha };
+    }
+    case 'rollback.prod': {
+      const resolved = resolveRollbackInputs(cwd, 'prod', flags.surfaces, flags.task);
+      return { task: flags.task, surfaces: flags.surfaces, resolvedSurfaces: resolved?.surfaces, targetSha: resolved?.targetSha };
+    }
   }
 }
 
@@ -328,12 +332,12 @@ function normalizeInputs(actionId: StableActionId, parsed: ParsedOperatorArgs, c
 // fingerprint value is stable across failed-resolution calls. Failed
 // resolution still lets preflight hand out a token, but the subsequent
 // handleRollback invocation will throw a clear error anyway.
-function resolveRollbackTargetSha(
+function resolveRollbackInputs(
   cwd: string | undefined,
   environment: 'staging' | 'prod',
   surfaceFlags: string[],
   taskFlag: string,
-): string | undefined {
+): { surfaces: string[]; targetSha: string } | undefined {
   if (!cwd) return undefined;
   try {
     const context = resolveWorkflowContext(cwd);
@@ -359,9 +363,13 @@ function resolveRollbackTargetSha(
       // to modeState.requestedSurfaces and then config.surfaces.
     }
     const surfaces = [...resolveCommandSurfaces(context, surfaceFlags, lockSurfaces)].sort();
-    // Current sha = latest record for this (env, surfaces); excludeSha
-    // for target picks skips it.
-    let currentSha = '';
+    // Current record = latest record for this (env, surfaces). We need
+    // the whole record (not just sha) so we can mirror handleRollback's
+    // excludeSha logic: prefer rollbackOfSha (the original broken sha)
+    // when the latest record is itself a failed/pending rollback. Codex
+    // round 4 P1: preflight used record.sha unconditionally, which
+    // drifted from execute on retry scenarios.
+    let currentRecord: DeployRecord | null = null;
     const sortedKey = surfaces.join(',');
     for (let i = trustedRecords.length - 1; i >= 0; i -= 1) {
       const record = trustedRecords[i];
@@ -369,17 +377,25 @@ function resolveRollbackTargetSha(
       if (!record.sha) continue;
       const recordKey = [...(record.surfaces ?? [])].sort().join(',');
       if (recordKey !== sortedKey) continue;
-      currentSha = record.sha;
+      currentRecord = record;
       break;
     }
+    if (!currentRecord) return undefined;
+    // Mirror handleRollback's cascade guard + excludeSha selection.
+    if (currentRecord.status === 'succeeded' && currentRecord.rollbackOfSha) {
+      // No rollback target when already at a prior rollback result.
+      return undefined;
+    }
+    const excludeSha = currentRecord.rollbackOfSha ?? currentRecord.sha;
     const target = findLastGoodDeploy({
       records: trustedRecords,
       environment,
       surfaces,
-      excludeSha: currentSha,
+      excludeSha,
       configFingerprint: computeDeployConfigFingerprint(deployConfig, environment),
     });
-    return target?.sha;
+    if (!target?.sha) return undefined;
+    return { surfaces, targetSha: target.sha };
   } catch {
     return undefined;
   }

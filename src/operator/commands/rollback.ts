@@ -51,13 +51,24 @@ export async function handleRollback(cwd: string, parsed: ParsedOperatorArgs): P
   const context = resolveWorkflowContext(cwd);
   const environment = normalizeDeployEnvironment(parsed.positional[0] ?? '');
   const explicitSurfaces = [...parsed.flags.surfaces, ...parsed.positional.slice(1)];
-  const { taskSlug, lock } = inferActiveTaskLock(context, parsed.flags.task);
-  const surfaces = resolveCommandSurfaces(context, explicitSurfaces, lock.surfaces);
 
+  // --revert-pr has an explicit --sha path that doesn't need a task
+  // lock — operators often run `/rollback prod --revert-pr --sha <merge>`
+  // from `main` after `/clean` has pruned the lock. Defer lock lookup
+  // for this branch so the escape hatch stays available. Codex r4 P2.
   if (parsed.flags.revertPr) {
-    await handleRevertPr(cwd, parsed, { taskSlug });
+    let taskSlugForRevert = '';
+    try {
+      taskSlugForRevert = inferActiveTaskLock(context, parsed.flags.task).taskSlug;
+    } catch {
+      // No task lock — handleRevertPr falls back to --sha / base branch.
+    }
+    await handleRevertPr(cwd, parsed, { taskSlug: taskSlugForRevert });
     return;
   }
+
+  const { taskSlug, lock } = inferActiveTaskLock(context, parsed.flags.task);
+  const surfaces = resolveCommandSurfaces(context, explicitSurfaces, lock.surfaces);
 
   const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
   const deployState = loadDeployState(context.commonDir, context.config);
