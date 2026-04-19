@@ -41,6 +41,10 @@ export interface BranchRow {
     mode: string;
     worktreePath: string;
     updatedAt: string | null;
+    // v1.3: persistent breadcrumb surfaced by /status and /resume. Written
+    // by state-mutating commands (pr/merge/deploy). Null when the lock
+    // hasn't been touched by a state mutation yet.
+    nextAction: string | null;
   } | null;
   surfaces: string[];
   cleanup: { available: boolean; eligible: boolean; reason: string };
@@ -258,6 +262,7 @@ function buildBranchRow(options: {
       mode: lock.mode,
       worktreePath: lock.worktreePath,
       updatedAt: lock.updatedAt ?? null,
+      nextAction: lock.nextAction ?? null,
     },
     surfaces: lock.surfaces ?? [],
     cleanup: {

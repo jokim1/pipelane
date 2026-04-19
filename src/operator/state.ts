@@ -5,7 +5,7 @@ import path from 'node:path';
 
 export type Mode = 'build' | 'release';
 export type KnownSurface = 'frontend' | 'edge' | 'sql';
-export const WORKFLOW_COMMANDS = ['devmode', 'new', 'resume', 'pr', 'merge', 'deploy', 'clean'] as const;
+export const WORKFLOW_COMMANDS = ['devmode', 'new', 'resume', 'pr', 'merge', 'deploy', 'clean', 'status'] as const;
 export type WorkflowCommand = (typeof WORKFLOW_COMMANDS)[number];
 export const DEFAULT_WORKFLOW_ALIASES: Record<WorkflowCommand, string> = {
   devmode: '/devmode',
@@ -15,6 +15,7 @@ export const DEFAULT_WORKFLOW_ALIASES: Record<WorkflowCommand, string> = {
   merge: '/merge',
   deploy: '/deploy',
   clean: '/clean',
+  status: '/status',
 };
 
 // Managed Claude command files that aren't workflow operator actions. These
@@ -155,6 +156,11 @@ export interface TaskLock {
   mode: Mode;
   surfaces: string[];
   updatedAt: string;
+  // v1.3: persistent breadcrumb for AI↔AI handoff across sessions. Set by
+  // state-mutating commands (/pr, /merge, /deploy) and surfaced by /status
+  // today; /resume render integration is queued for the next slice. Absent
+  // on fresh locks until the first mutation writes it.
+  nextAction?: string;
 }
 
 export interface PrRecord {

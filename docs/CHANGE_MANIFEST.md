@@ -55,6 +55,8 @@ mirrors it.
 | 8.5 | `pipelane configure` subcommand (CLAUDE.md Deploy Configuration seed) | ✅ merged | pipelane #27 |
 | 8.6 | CRLF line endings fix in `parseDeployConfigMarkdown` fence regex | ✅ merged | pipelane #28 |
 | 8.7 | `pipelane.md` folded into managed-command set (+ residual #2 `.project-workflow.json:aliases` cleanup) | ✅ merged | pipelane #29 |
+| 8.8 | v0 brand-pass close-out in manifest (v0.8 + v0.9 ✅ SHIPPED annotations) | ✅ merged | pipelane #30 |
+| 9.1 | v0.6 `/status` cockpit V0 + v1.3 `TaskLock.nextAction` breadcrumb | ✅ merged | pipelane #31 |
 
 Ship items in this exact order. Each is its own PR in Pipelane unless
 noted. Catalog IDs reference the detailed sections below.
@@ -417,7 +419,7 @@ the exact sha/surfaces/env triple from preflight.
 
 ---
 
-### v0.6 — `/status` cockpit V0 (envelope renderer)
+### v0.6 — `/status` cockpit V0 (envelope renderer) ✅ SHIPPED (pipelane #31)
 
 **Goal.** Ship the stated #1 objective: one-screen terminal cockpit
 that renders the `workflow:api snapshot` envelope. Same data as the
@@ -517,10 +519,10 @@ doc lives at `docs/PIPELANE_BOARD.md`. Default `boardTitle` is
 
 ### v0 summary
 
-v0 is ~90% shipped across commit `2e588c4` + pipelane #5 + pipelane
+v0 is 100% shipped across commit `2e588c4` + pipelane #5 + pipelane
 #6 (v0.8 + v0.9), #13 + #14 (v0.0 snapshot + action), #16 (v0.3 +
-v0.4), #17 (v0.1 + v0.2), and #19 (v0.5 + v0.7). v0.6 `/status`
-cockpit is the last catalog item still open.
+v0.4), #17 (v0.1 + v0.2), #19 (v0.5 + v0.7), and #31 (v0.6 `/status`
+cockpit — bundled with v1.3 `TaskLock.nextAction`).
 
 Current state:
 
@@ -640,7 +642,7 @@ dashboard can run them from the UI.
 
 ---
 
-### v1.3 — `TaskLock.nextAction`
+### v1.3 — `TaskLock.nextAction` ✅ SHIPPED (pipelane #31)
 
 **Goal.** Persistent breadcrumb for AI↔AI handoff across sessions.
 

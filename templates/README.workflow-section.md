@@ -75,6 +75,7 @@ npm run workflow:clean
 - `{{ALIAS_MERGE}}`
 - `{{ALIAS_DEPLOY}}`
 - `{{ALIAS_CLEAN}}`
+- `{{ALIAS_STATUS}}`
 
 Canonical repo-native commands:
 
@@ -88,6 +89,7 @@ Canonical repo-native commands:
 - `npm run workflow:task-lock -- verify --task "<task-name>"`
 - `npm run workflow:deploy -- staging|prod ...`
 - `npm run workflow:clean`
+- `npm run workflow:status`
 
 ### workflow-kit + gstack
 

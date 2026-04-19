@@ -1,6 +1,10 @@
 import { nowIso } from '../state.ts';
 
-export const WORKFLOW_API_SCHEMA_VERSION = '2026-04-14';
+// Bumped 2026-04-18: BranchRow.task gained `nextAction: string | null` so
+// consumers (Pipelane Board + any future envelope reader) can tell a v1.3+
+// pipelane from a pre-v1.3 one. Additive non-breaking change — readers
+// that ignore the new field still parse correctly.
+export const WORKFLOW_API_SCHEMA_VERSION = '2026-04-18';
 
 export const CANONICAL_LANE_STATES = [
   'healthy',

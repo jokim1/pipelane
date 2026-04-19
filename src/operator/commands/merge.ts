@@ -1,5 +1,5 @@
 import { printResult, resolveWorkflowContext, runGh, runGit, savePrRecord, type ParsedOperatorArgs } from '../state.ts';
-import { ensureTaskLockMatchesCurrent, inferActiveTaskLock, loadPrForBranch, pollForMergedSha, watchPrChecks } from './helpers.ts';
+import { ensureTaskLockMatchesCurrent, inferActiveTaskLock, loadPrForBranch, pollForMergedSha, setNextAction, watchPrChecks } from './helpers.ts';
 
 export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const context = resolveWorkflowContext(cwd);
@@ -30,6 +30,12 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
     mergedSha,
     mergedAt: merged.mergedAt ?? new Date().toISOString(),
   });
+
+  const shortSha = mergedSha.slice(0, 7);
+  const nextActionText = context.modeState.mode === 'build'
+    ? `merged at ${shortSha}, awaiting auto-deploy`
+    : `merged at ${shortSha}, deploy to staging`;
+  setNextAction(context.commonDir, context.config, taskSlug, nextActionText);
 
   const lines = [
     'Pull request merged.',

@@ -11,6 +11,7 @@ import { handlePr } from './commands/pr.ts';
 import { handleReleaseCheck } from './commands/release-check.ts';
 import { handleRepoGuard } from './commands/repo-guard.ts';
 import { handleResume } from './commands/resume.ts';
+import { handleStatus } from './commands/status.ts';
 import { handleTaskLock } from './commands/task-lock.ts';
 import { loadDeployConfig } from './release-gate.ts';
 import {
@@ -94,6 +95,11 @@ export async function runOperator(cwd: string, argv: string[]): Promise<void> {
     return;
   }
 
+  if (command === 'status') {
+    await handleStatus(cwd, parsed);
+    return;
+  }
+
   if (command === 'api') {
     await handleApi(cwd, parsed);
     return;
@@ -122,6 +128,7 @@ Workflow commands:
   task-lock
   deploy
   clean
+  status
   api snapshot
 `);
 }

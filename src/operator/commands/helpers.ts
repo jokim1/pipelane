@@ -1,16 +1,20 @@
 import { createHash } from 'node:crypto';
 
 import type { DeployConfig } from '../release-gate.ts';
-import type { WorkflowContext } from '../state.ts';
+import type { ApiStatusCell, LaneState } from '../api/envelope.ts';
+import type { BranchLanes } from '../api/snapshot.ts';
+import type { WorkflowConfig, WorkflowContext } from '../state.ts';
 import {
   DEFAULT_MODE,
   loadAllTaskLocks,
   loadTaskLock,
   normalizePath,
+  nowIso,
   parseSurfaceList,
   runCommandCapture,
   runGh,
   runGit,
+  saveTaskLock,
   slugifyTaskName,
   type PrRecord,
   type TaskLock,
@@ -322,6 +326,63 @@ export function watchPrChecks(repoRoot: string, prNumber: number): void {
   runCommandCapture('gh', ['pr', 'checks', String(prNumber), '--required', '--watch', '--fail-fast'], {
     cwd: repoRoot,
   });
+}
+
+// v1.3: persistent breadcrumb for AI↔AI handoff across sessions. Each
+// state-mutating command calls this after savePrRecord / saveDeployState
+// so `/status` and `/resume` can surface what to do next without the next
+// operator re-deriving it from logs. Silently skips when no lock exists —
+// `api snapshot` / top-level commands can be exercised outside a task.
+export function setNextAction(
+  commonDir: string,
+  config: WorkflowConfig,
+  taskSlug: string,
+  text: string,
+): TaskLock | null {
+  const lock = loadTaskLock(commonDir, config, taskSlug);
+  if (!lock) return null;
+  return saveTaskLock(commonDir, config, taskSlug, {
+    ...lock,
+    nextAction: text,
+    updatedAt: nowIso(),
+  });
+}
+
+// v0.6: 1-char glyph per canonical lane state. Uses UTF-8 symbols — tested
+// terminals render them correctly (macOS Terminal, iTerm2, modern Linux
+// terminals, Windows Terminal). Code-page 437/850 cmd.exe will mangle them;
+// consumers stuck on legacy Windows should set NO_COLOR and expect `?`-like
+// boxes. Mapping mirrors docs/PIPELANE_BOARD.md color language for symmetry
+// with the web dashboard.
+export function renderStateGlyph(state: LaneState): string {
+  switch (state) {
+    case 'healthy': return '✓';
+    case 'running': return '⟳';
+    case 'blocked': return '✗';
+    case 'degraded': return '!';
+    case 'stale': return '~';
+    case 'awaiting_preflight': return '·';
+    case 'bypassed': return '-';
+    case 'unknown':
+    default: return '?';
+  }
+}
+
+// v0.6: fixed 5-lane line per branch. `[Local] [PR] [Base: <base>]
+// [Staging] [Production]`. Base label carries the configured base-branch
+// name so a consumer on `trunk` doesn't read "Base: main". Lane labels
+// stay verbatim so grep-for-state tooling keeps working.
+export function renderLaneLine(lanes: BranchLanes, baseBranch: string): string {
+  const cells: Array<{ label: string; cell: ApiStatusCell }> = [
+    { label: 'Local', cell: lanes.local },
+    { label: 'PR', cell: lanes.pr },
+    { label: `Base: ${baseBranch}`, cell: lanes.base },
+    { label: 'Staging', cell: lanes.staging },
+    { label: 'Production', cell: lanes.production },
+  ];
+  return cells
+    .map(({ label, cell }) => `[${label} ${renderStateGlyph(cell.state)}]`)
+    .join(' ');
 }
 
 export function resolveDeployTargetForTask(options: {

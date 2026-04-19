@@ -71,6 +71,10 @@ export const LEGACY_CLAUDE_SIGNATURES: Record<ManagedCommand, string[]> = {
     'Resume an existing task workspace for this repo.',
     'npm run workflow:resume',
   ],
+  status: [
+    'Render a one-screen terminal cockpit of the workflow:api snapshot.',
+    'npm run workflow:status',
+  ],
   // `pipelane` shipped without a marker on main before this PR landed, so
   // existing consumers have a `.claude/commands/pipelane.md` we need to
   // upgrade in place on the next setup run. Three distinctive strings
@@ -119,6 +123,7 @@ function renderTemplate(template: string, config: WorkflowConfig): string {
     ALIAS_MERGE: aliases.merge,
     ALIAS_DEPLOY: aliases.deploy,
     ALIAS_CLEAN: aliases.clean,
+    ALIAS_STATUS: aliases.status,
   };
 
   return Object.entries(replacements).reduce(
@@ -343,6 +348,7 @@ export function ensurePackageScripts(repoRoot: string): void {
     'pipelane:task-lock': 'pipelane run task-lock',
     'pipelane:deploy': 'pipelane run deploy',
     'pipelane:clean': 'pipelane run clean',
+    'pipelane:status': 'pipelane run status',
     'pipelane:board': 'pipelane board',
     'pipelane:update': 'pipelane update',
     'pipelane:api': 'pipelane run api',
@@ -358,6 +364,7 @@ export function ensurePackageScripts(repoRoot: string): void {
     'workflow:task-lock': 'pipelane run task-lock',
     'workflow:deploy': 'pipelane run deploy',
     'workflow:clean': 'pipelane run clean',
+    'workflow:status': 'pipelane run status',
     'workflow:pipelane': 'pipelane board',
   };
 

@@ -32,6 +32,7 @@ import {
   resolveCommandSurfaces,
   resolveDeployTargetForTask,
   resolveSurfaceHealthcheckUrl,
+  setNextAction,
 } from './helpers.ts';
 
 function surfacesKey(surfaces: string[]): string {
@@ -362,6 +363,12 @@ export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Pro
       run?.url ? `Workflow: ${run.url}` : '',
     ].filter(Boolean).join('\n'));
   }
+
+  const shortSha = target.sha.slice(0, 7);
+  const nextStage = environment === 'staging'
+    ? `staging verified at ${shortSha}, deploy to prod`
+    : `prod verified at ${shortSha}, run workflow:clean`;
+  setNextAction(context.commonDir, context.config, taskSlug, nextStage);
 
   printResult(parsed.flags, {
     ...record,

@@ -35,6 +35,7 @@ follow safely without improvising repo behavior.
 - `npm run workflow:task-lock -- verify --task "<task-name>"`
 - `npm run workflow:deploy -- staging|prod ...`
 - `npm run workflow:clean`
+- `npm run workflow:status`
 
 ### AI-client Slash Surface
 
@@ -47,6 +48,7 @@ This repo exposes the following user-facing slash commands through Claude/Codex 
 - `{{ALIAS_MERGE}}`
 - `{{ALIAS_DEPLOY}}`
 - `{{ALIAS_CLEAN}}`
+- `{{ALIAS_STATUS}}`
 
 If aliases change in `.project-workflow.json`, rerun `npm run workflow:setup` and reopen Claude/Codex so the new command names are picked up.
 Aliases must be unique, and setup fails closed if an alias would overwrite an unrelated command or skill.
@@ -65,6 +67,7 @@ Use both.
 - `{{ALIAS_MERGE}}`
 - `{{ALIAS_DEPLOY}}`
 - `{{ALIAS_CLEAN}}`
+- `{{ALIAS_STATUS}}`
 
 gstack is still recommended for:
 

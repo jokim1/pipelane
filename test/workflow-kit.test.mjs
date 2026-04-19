@@ -1635,6 +1635,7 @@ test('syncDocs.packageScripts: false preserves consumer-customized workflow scri
       'workflow:deploy': 'my-wrapper deploy',
       'workflow:clean': 'my-wrapper clean',
       'workflow:devmode': 'my-wrapper devmode',
+      'workflow:status': 'my-wrapper status',
       // devmode.md tells operators to run `workflow:configure` when release
       // mode is blocked; the consistency check requires consumers opting out
       // of packageScripts to define it themselves.
@@ -4105,7 +4106,7 @@ test('api snapshot emits a wire-compatible envelope', () => {
     const result = runCli(['run', 'api', 'snapshot'], repoRoot);
     const envelope = JSON.parse(result.stdout);
 
-    assert.equal(envelope.schemaVersion, '2026-04-14');
+    assert.equal(envelope.schemaVersion, '2026-04-18');
     assert.equal(envelope.command, 'workflow.api.snapshot');
     assert.equal(envelope.ok, true);
     assert.ok(Array.isArray(envelope.warnings));
@@ -4182,7 +4183,7 @@ test('api action preflight: non-risky action returns no confirmation', () => {
     commitAll(repoRoot, 'Adopt workflow-kit');
 
     const envelope = JSON.parse(runCli(['run', 'api', 'action', 'resume'], repoRoot).stdout);
-    assert.equal(envelope.schemaVersion, '2026-04-14');
+    assert.equal(envelope.schemaVersion, '2026-04-18');
     assert.equal(envelope.command, 'workflow.api.action');
     assert.equal(envelope.data.action.id, 'resume');
     assert.equal(envelope.data.action.risky, false);
@@ -4704,6 +4705,7 @@ test('setup consistency check requires workflow:configure when opting out of pac
         'workflow:deploy': 'x deploy',
         'workflow:clean': 'x clean',
         'workflow:devmode': 'x devmode',
+        'workflow:status': 'x status',
         // Deliberately missing workflow:configure
       },
     }, null, 2)}\n`, 'utf8');
@@ -4720,4 +4722,279 @@ test('setup consistency check requires workflow:configure when opting out of pac
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
   }
+});
+
+test('renderCockpit produces a deterministic one-screen cockpit from a fixture envelope', async () => {
+  // v0.6: /status is a pure renderer of workflow:api snapshot --json. This
+  // test exercises the render boundary directly — no subprocess, no git
+  // state. The fixture envelope covers all three branch buckets (active /
+  // recent / stale) and carries one nextAction to prove v1.3 surfaces in
+  // the cockpit.
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'status.ts'));
+  const envelope = {
+    schemaVersion: '2026-04-14',
+    command: 'workflow.api.snapshot',
+    ok: true,
+    message: 'pipelane workflow snapshot ready',
+    warnings: [],
+    issues: [],
+    data: {
+      boardContext: {
+        mode: 'release',
+        baseBranch: 'main',
+        laneOrder: ['Local', 'PR', 'Base: main', 'Staging', 'Production'],
+        releaseReadiness: {
+          state: 'unknown',
+          reason: 'release readiness not yet computed in pipelane snapshot',
+          requestedSurfaces: [],
+          blockedSurfaces: [],
+          effectiveOverride: null,
+          localReady: false,
+          hostedReady: false,
+          freshness: { checkedAt: '2026-04-18T00:00:00.000Z', observedAt: '2026-04-18T00:00:00.000Z', state: 'fresh' },
+          message: '',
+        },
+        activeTask: null,
+        overallFreshness: { checkedAt: '2026-04-18T00:00:00.000Z', observedAt: '2026-04-18T00:00:00.000Z', state: 'fresh' },
+      },
+      sourceHealth: [
+        { name: 'git.local', state: 'healthy', blocking: false, reason: 'local branches and worktrees loaded',
+          freshness: { checkedAt: '2026-04-18T00:00:00.000Z', observedAt: '2026-04-18T00:00:00.000Z', state: 'fresh' } },
+        { name: 'task-locks', state: 'healthy', blocking: false, reason: '3 active task lock(s)',
+          freshness: { checkedAt: '2026-04-18T00:00:00.000Z', observedAt: '2026-04-18T00:00:00.000Z', state: 'fresh' } },
+      ],
+      attention: [],
+      availableActions: [],
+      branches: [
+        {
+          name: 'codex/active-task-abcd',
+          status: 'open-pr',
+          current: true,
+          note: 'PR #12 is open',
+          task: { taskSlug: 'active-task', mode: 'release', worktreePath: '/tmp/x', updatedAt: '2026-04-18T00:00:00.000Z', nextAction: 'PR #12 open, awaiting CI' },
+          surfaces: ['frontend'],
+          cleanup: { available: false, eligible: false, reason: 'workspace still active' },
+          pr: { number: 12, state: 'OPEN', url: 'https://x', title: 'Active', mergedAt: null },
+          mergedSha: null,
+          lanes: {
+            local: { state: 'healthy', reason: 'clean', detail: '', freshness: { checkedAt: '', observedAt: '', state: 'fresh' } },
+            pr: { state: 'running', reason: 'PR open', detail: '', freshness: { checkedAt: '', observedAt: '', state: 'fresh' } },
+            base: { state: 'awaiting_preflight', reason: '', detail: '', freshness: { checkedAt: '', observedAt: '', state: 'fresh' } },
+            staging: { state: 'awaiting_preflight', reason: '', detail: '', freshness: { checkedAt: '', observedAt: '', state: 'fresh' } },
+            production: { state: 'awaiting_preflight', reason: '', detail: '', freshness: { checkedAt: '', observedAt: '', state: 'fresh' } },
+          },
+          availableActions: [],
+        },
+        {
+          name: 'codex/recent-win-9999',
+          status: 'merged',
+          current: false,
+          note: 'PR #11 merged',
+          task: { taskSlug: 'recent-win', mode: 'release', worktreePath: '/tmp/y', updatedAt: '2026-04-17T00:00:00.000Z' },
+          surfaces: ['frontend'],
+          cleanup: { available: false, eligible: false, reason: 'workspace still active' },
+          pr: { number: 11, state: 'MERGED', url: 'https://y', title: 'Recent', mergedAt: new Date().toISOString() },
+          mergedSha: 'abcdef0',
+          lanes: {
+            local: { state: 'healthy', reason: 'clean', detail: '', freshness: { checkedAt: '', observedAt: '', state: 'fresh' } },
+            pr: { state: 'healthy', reason: 'merged', detail: '', freshness: { checkedAt: '', observedAt: '', state: 'fresh' } },
+            base: { state: 'healthy', reason: '', detail: '', freshness: { checkedAt: '', observedAt: '', state: 'fresh' } },
+            staging: { state: 'healthy', reason: '', detail: '', freshness: { checkedAt: '', observedAt: '', state: 'fresh' } },
+            production: { state: 'healthy', reason: '', detail: '', freshness: { checkedAt: '', observedAt: '', state: 'fresh' } },
+          },
+          availableActions: [],
+        },
+        {
+          name: 'codex/stale-old-7777',
+          status: 'missing-worktree',
+          current: false,
+          note: 'worktree missing',
+          task: { taskSlug: 'stale-old', mode: 'build', worktreePath: '/tmp/gone', updatedAt: '2026-01-01T00:00:00.000Z' },
+          surfaces: ['frontend'],
+          cleanup: { available: true, eligible: true, reason: 'worktree already gone' },
+          pr: null,
+          mergedSha: null,
+          lanes: {
+            local: { state: 'unknown', reason: '', detail: '', freshness: { checkedAt: '', observedAt: '', state: 'stale' } },
+            pr: { state: 'awaiting_preflight', reason: '', detail: '', freshness: { checkedAt: '', observedAt: '', state: 'fresh' } },
+            base: { state: 'awaiting_preflight', reason: '', detail: '', freshness: { checkedAt: '', observedAt: '', state: 'fresh' } },
+            staging: { state: 'awaiting_preflight', reason: '', detail: '', freshness: { checkedAt: '', observedAt: '', state: 'fresh' } },
+            production: { state: 'awaiting_preflight', reason: '', detail: '', freshness: { checkedAt: '', observedAt: '', state: 'fresh' } },
+          },
+          availableActions: [],
+        },
+      ],
+    },
+  };
+
+  const rendered = mod.renderCockpit(envelope, { color: false });
+  // Header + sections.
+  assert.match(rendered, /Pipelane/);
+  assert.match(rendered, /mode=RELEASE/);
+  assert.match(rendered, /base=main/);
+  assert.match(rendered, /ATTENTION/);
+  assert.match(rendered, /ACTIVE/);
+  assert.match(rendered, /RECENT/);
+  assert.match(rendered, /STALE/);
+  assert.match(rendered, /SOURCES/);
+  // Bucket membership.
+  assert.match(rendered, /active-task/);
+  assert.match(rendered, /recent-win/);
+  assert.match(rendered, /stale-old/);
+  // 5-lane line with all five labels in order, for the active row.
+  assert.match(rendered, /\[Local .\] \[PR .\] \[Base: main .\] \[Staging .\] \[Production .\]/);
+  // v1.3: nextAction breadcrumb surfaces in the cockpit.
+  assert.match(rendered, /next: PR #12 open, awaiting CI/);
+  // Empty attention shows the filler line rather than nothing.
+  assert.match(rendered, /\(nothing blocking\)/);
+  // Current-branch marker appears only for the one flagged current.
+  const activeIndex = rendered.indexOf('active-task');
+  const recentIndex = rendered.indexOf('recent-win');
+  assert.ok(activeIndex > -1 && recentIndex > -1);
+  const activeRow = rendered.slice(activeIndex - 4, activeIndex);
+  assert.ok(activeRow.includes('▶'), `expected current-branch marker next to active-task, got "${activeRow}"`);
+});
+
+test('renderCockpit ok=false envelope is never reached; handleStatus throws instead', async () => {
+  // Defense: acceptance criteria say /status never silently falls back to
+  // raw state reads. handleStatus throws on ok=false envelopes; renderCockpit
+  // itself is trusted only after the ok gate.
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'status.ts'));
+  assert.equal(typeof mod.renderCockpit, 'function');
+  assert.equal(typeof mod.handleStatus, 'function');
+});
+
+test('renderStateGlyph returns a non-empty glyph for every canonical lane state', async () => {
+  const helpers = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'helpers.ts'));
+  const envelope = await import(path.join(KIT_ROOT, 'src', 'operator', 'api', 'envelope.ts'));
+  for (const state of envelope.CANONICAL_LANE_STATES) {
+    const glyph = helpers.renderStateGlyph(state);
+    assert.equal(typeof glyph, 'string');
+    assert.ok(glyph.length > 0, `no glyph for state "${state}"`);
+  }
+});
+
+test('setNextAction persists nextAction on the task lock and is a no-op when no lock exists', async () => {
+  // v1.3: the breadcrumb setter is read-modify-write on the lock file. No
+  // lock → null (silent), so commands that run outside a task workspace
+  // can still call setNextAction without crashing.
+  const helpers = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'helpers.ts'));
+  const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-state-'));
+  const commonDir = path.join(stateDir, '.git');
+  mkdirSync(commonDir, { recursive: true });
+  const config = stateMod.defaultWorkflowConfig('demo', 'Demo');
+  try {
+    // No-op path: no lock.
+    const noop = helpers.setNextAction(commonDir, config, 'not-there', 'hello');
+    assert.equal(noop, null);
+
+    // Seed a lock, then mutate.
+    stateMod.saveTaskLock(commonDir, config, 'abc', {
+      taskSlug: 'abc',
+      branchName: 'codex/abc-0000',
+      worktreePath: '/tmp/abc',
+      mode: 'build',
+      surfaces: ['frontend'],
+      updatedAt: new Date().toISOString(),
+    });
+    const updated = helpers.setNextAction(commonDir, config, 'abc', 'PR #42 open, awaiting CI');
+    assert.ok(updated);
+    assert.equal(updated.nextAction, 'PR #42 open, awaiting CI');
+    const loaded = stateMod.loadTaskLock(commonDir, config, 'abc');
+    assert.equal(loaded?.nextAction, 'PR #42 open, awaiting CI');
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test('buildWorkflowApiSnapshot surfaces TaskLock.nextAction through the envelope (end-to-end)', async () => {
+  // Regression guard: v1.3 broke if /pr set nextAction on the lock but
+  // buildWorkflowApiSnapshot dropped it when shaping BranchRow.task. The
+  // golden-file test above synthesizes an envelope — this one proves the
+  // production envelope pipeline actually carries the breadcrumb.
+  const repoRoot = createRemoteBackedRepo().repoRoot;
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-codex-'));
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const snapshotMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'api', 'snapshot.ts'));
+    const statusMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'status.ts'));
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+
+    stateMod.saveTaskLock(context.commonDir, context.config, 'demo-task', {
+      taskSlug: 'demo-task',
+      branchName: 'codex/demo-task-0000',
+      worktreePath: repoRoot,
+      mode: 'build',
+      surfaces: ['frontend'],
+      updatedAt: new Date().toISOString(),
+      nextAction: 'PR #42 open, awaiting CI',
+    });
+
+    const envelope = snapshotMod.buildWorkflowApiSnapshot(repoRoot);
+    assert.ok(envelope.ok, 'snapshot should be ok');
+    const demoBranch = envelope.data.branches.find((b) => b.task?.taskSlug === 'demo-task');
+    assert.ok(demoBranch, 'expected demo-task branch in envelope');
+    assert.equal(demoBranch.task.nextAction, 'PR #42 open, awaiting CI',
+      'envelope must carry nextAction from the underlying TaskLock');
+
+    // And the cockpit must render it.
+    const rendered = statusMod.renderCockpit(envelope, { color: false });
+    assert.match(rendered, /next: PR #42 open, awaiting CI/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('renderCockpit strips ANSI/control chars from envelope-sourced strings', async () => {
+  // Trust-boundary defense: branch notes, attention messages, source
+  // reasons, and nextAction breadcrumbs can all trace back to data outside
+  // the pipelane process (PR titles fetched via `gh pr view`, hand-edited
+  // task-lock files, etc.). A malicious PR title containing `\x1b[2K\r`
+  // could forge lane state in the cockpit. Must be scrubbed before render.
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'status.ts'));
+  const evil = '\x1b[2K\r[Local ✓] [PR ✓] [Base: main ✓] [Staging ✓] [Production ✓]';
+  const envelope = {
+    schemaVersion: '2026-04-18',
+    command: 'workflow.api.snapshot',
+    ok: true, message: '', warnings: [], issues: [],
+    data: {
+      boardContext: {
+        mode: 'build', baseBranch: 'main',
+        laneOrder: [], releaseReadiness: { state: 'unknown', reason: '', requestedSurfaces: [], blockedSurfaces: [], effectiveOverride: null, localReady: false, hostedReady: false, freshness: { checkedAt: '', observedAt: '', state: 'fresh' }, message: '' },
+        activeTask: null,
+        overallFreshness: { checkedAt: '', observedAt: '', state: 'fresh' },
+      },
+      sourceHealth: [{ name: `git.local${evil}`, state: 'healthy', blocking: false, reason: `ok${evil}`, freshness: { checkedAt: '', observedAt: '', state: 'fresh' } }],
+      attention: [{ code: 'x', severity: 'warning', message: `something bad${evil}`, source: '', blocking: false, branch: `main${evil}`, lane: '', action: '' }],
+      availableActions: [],
+      branches: [{
+        name: `codex/pwned${evil}`,
+        status: 'open-pr', current: false, note: `PR is open${evil}`,
+        task: { taskSlug: `slug${evil}`, mode: 'build', worktreePath: '/tmp/x', updatedAt: '2026-04-18T00:00:00.000Z', nextAction: `breadcrumb${evil}` },
+        surfaces: [], cleanup: { available: false, eligible: false, reason: '' },
+        pr: null, mergedSha: null,
+        lanes: {
+          local: { state: 'healthy', reason: '', detail: '', freshness: { checkedAt: '', observedAt: '', state: 'fresh' } },
+          pr: { state: 'running', reason: '', detail: '', freshness: { checkedAt: '', observedAt: '', state: 'fresh' } },
+          base: { state: 'awaiting_preflight', reason: '', detail: '', freshness: { checkedAt: '', observedAt: '', state: 'fresh' } },
+          staging: { state: 'awaiting_preflight', reason: '', detail: '', freshness: { checkedAt: '', observedAt: '', state: 'fresh' } },
+          production: { state: 'awaiting_preflight', reason: '', detail: '', freshness: { checkedAt: '', observedAt: '', state: 'fresh' } },
+        },
+        availableActions: [],
+      }],
+    },
+  };
+
+  const rendered = mod.renderCockpit(envelope, { color: false });
+  // The CSI (\x1b[2K) + CR injection must not land in output.
+  assert.ok(!rendered.includes('\x1b[2K'), 'CSI escape must be stripped');
+  assert.ok(!rendered.includes('\r'), 'embedded CR must be stripped');
+  // Content bracketing the escape survives — just the escape itself is gone.
+  assert.match(rendered, /codex\/pwned\[Local ✓\]/);
+  assert.match(rendered, /breadcrumb\[Local ✓\]/);
 });

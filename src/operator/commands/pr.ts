@@ -7,6 +7,7 @@ import {
   latestCommitSubject,
   loadPrForBranch,
   resolveCommandSurfaces,
+  setNextAction,
 } from './helpers.ts';
 import { emptyDeployConfig, evaluateReleaseReadiness, loadDeployConfig } from '../release-gate.ts';
 import {
@@ -122,6 +123,13 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
     number: prNumber,
     url: prUrl,
   });
+
+  setNextAction(
+    context.commonDir,
+    context.config,
+    taskSlug,
+    prNumber ? `PR #${prNumber} open, awaiting CI` : 'PR created, awaiting CI',
+  );
 
   printResult(parsed.flags, {
     taskSlug,
