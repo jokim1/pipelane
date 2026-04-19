@@ -1,6 +1,6 @@
 # Pipelane Change Manifest
 
-Last updated: April 16, 2026 (revised after `workflow:api` + dashboard discovery)
+Last updated: April 18, 2026 (v0 brand pass closed — v0.8 + v0.9 shipped in pipelane #5)
 Status: **execution plan** for reaching the target-state spec in
 `docs/RELEASE_WORKFLOW.md`
 
@@ -54,6 +54,7 @@ mirrors it.
 | 8.4 | `.project-workflow.json:syncDocs` opt-out block | ✅ merged | pipelane #26 |
 | 8.5 | `pipelane configure` subcommand (CLAUDE.md Deploy Configuration seed) | ✅ merged | pipelane #27 |
 | 8.6 | CRLF line endings fix in `parseDeployConfigMarkdown` fence regex | ✅ merged | pipelane #28 |
+| 8.7 | `pipelane.md` folded into managed-command set (+ residual #2 `.project-workflow.json:aliases` cleanup) | ✅ merged | pipelane #29 |
 
 Ship items in this exact order. Each is its own PR in Pipelane unless
 noted. Catalog IDs reference the detailed sections below.
@@ -110,7 +111,7 @@ not gating the Rocketboard swap.
 
 After v0.0 lands, **every mutating command in Pipelane is an action
 exposed over `workflow:api`**, and every read surface (`/status`, the
-Branch Pipeline Board dashboard, third-party clients) consumes the same
+Pipelane Board dashboard, third-party clients) consumes the same
 envelope grammar. The target is Rocketboard-compatible so any client
 that speaks Rocketboard's contract speaks Pipelane's.
 
@@ -420,7 +421,7 @@ the exact sha/surfaces/env triple from preflight.
 
 **Goal.** Ship the stated #1 objective: one-screen terminal cockpit
 that renders the `workflow:api snapshot` envelope. Same data as the
-Branch Pipeline Board dashboard, zero derivation drift.
+Pipelane Board dashboard, zero derivation drift.
 
 **Files touched.**
 - `src/operator/commands/status.ts` — new command. **Does not** read
@@ -431,8 +432,7 @@ Branch Pipeline Board dashboard, zero derivation drift.
      (mode, base, overallFreshness), then `data.branches[]` grouped
      into active / recent / stale, then `data.sourceHealth[]`.
   - Color-maps the canonical 8-state vocabulary to terminal colors
-    (same mapping documented in `docs/BRANCH_PIPELINE_BOARD.md` →
-    now `docs/PIPELANE_BOARD.md`).
+    (same mapping documented in `docs/PIPELANE_BOARD.md`).
   - Renders the fixed 5-lane line per branch:
     `[Local] [PR] [Base: main] [Staging] [Production]` with state
     glyphs.
@@ -486,90 +486,48 @@ task.
 
 ---
 
-### v0.8 — Branch Pipeline Board: merge into Pipelane
+### v0.8 — Pipelane Board: merge into Pipelane ✅ SHIPPED
 
-**Goal.** Bring the dashboard implementation (currently on sibling
-branches `codex/alias-dashboard-integration` /
-`codex/pipeline-dashboard-v1` / `codex/dashboard-reference-design`)
-into the same branch as the v0.0 `workflow:api` implementation so the
-two ship together.
-
-**Files touched.**
-- Merge `src/dashboard/` (server.ts + public/index.html +
-  src/dashboard/README.md) from the latest dashboard branch
-  (currently `codex/alias-dashboard-integration` — commit `2e588c4`).
-- `docs/BRANCH_PIPELINE_BOARD.md` → rename to `docs/PIPELANE_BOARD.md`
-  and rewrite references from "Branch Pipeline Board" to "Pipelane
-  Board" (the web cockpit of Pipelane).
-- `src/dashboard/server.ts` — change default titles and subtitles
-  (see v0.9 rename pass).
-- Test wiring from the dashboard branch: `test/workflow-kit.test.mjs`
-  gets the dashboard integration test block.
-- `package.json` — keep the existing `"dashboard": "node ./src/cli.ts
-  dashboard"` script.
-
-**Acceptance criteria.**
-- `npm run dashboard -- --repo .` (pointed at workflow-kit itself)
-  connects and renders because v0.0 gives workflow-kit a
-  `workflow:api` of its own.
-- `npm run dashboard -- --repo /path/to/rocketboard` still works
-  unchanged.
-- The dashboard integration test passes in CI.
-
-**Effort.** 0.5 day (merge + rename strings).
-**Depends on.** v0.0 (no sense merging the adapter until workflow-kit
-produces an envelope), v0.9 (rename pass catches the title strings).
+**Shipped across three landings.** Commit `2e588c4` merged the
+reference dashboard into main (`src/dashboard/server.ts`,
+`src/dashboard/public/index.html`, `src/dashboard/README.md`, plus
+the reference-design doc that pipelane #5 later renamed to
+`docs/PIPELANE_BOARD.md`). Pipelane #5 (`db5c2d7`) re-skinned it
+for the Pipelane brand (see v0.9 below). Pipelane #6 (`b348a79`) then added
+`src/dashboard/launcher.ts` and the `/pipelane` slash command that
+boots the board. Tests cover the dashboard launcher + settings
+round-trip in `test/workflow-kit.test.mjs`. `npm run dashboard`
+boots against any repo exposing `workflow:api`.
 
 ---
 
-### v0.9 — String-level Pipelane Board rename pass
+### v0.9 — String-level Pipelane Board rename pass ✅ SHIPPED
 
-**Goal.** Because pipelane.dev is registered and Pipelane is
-committed, rename every instance of "Branch Pipeline Board" →
-"Pipelane Board" and every default board-title string to use
-"Pipelane" directly. This is a string-only pass; no package rename
-yet (that's v2.1).
-
-**Files touched.**
-- `src/dashboard/server.ts` — `defaultDashboardSettings`:
-  - `boardTitle`: `${repoName} Pipelane` (was `${repoName} Branch
-    Pipeline Board`)
-  - `boardSubtitle`: "Release cockpit for AI vibe coders. Branch
-    pipeline triage, action preflight, execution follow-through, and
-    cleanup discipline." (concise rewrite)
-  - `DEFAULT_BOARD_SUBTITLE` constant updated.
-- `src/dashboard/public/index.html` — rewrite hero copy and every
-  literal "Branch Pipeline Board" reference. Update the landing copy
-  about "Rocketboard's workflow:api" to "your repo's workflow:api
-  contract" (it's repo-agnostic).
-- `docs/BRANCH_PIPELINE_BOARD.md` → `docs/PIPELANE_BOARD.md`. Rewrite
-  all references; redirect internal links in `README.md` and
-  `docs/RELEASE_WORKFLOW.md`.
-- `src/dashboard/README.md` — Pipelane Board references.
-- `README.md` — one-liner intro swap.
-
-**Acceptance criteria.**
-- `grep -r "Branch Pipeline Board"` returns zero matches in the repo.
-- Default dashboard title is `${repoName} Pipelane`.
-- Existing user-written `~/.workflow-kit/dashboard/<slug>-<hash>.json`
-  settings files still work (boardTitle is a user-overridable field).
-
-**Effort.** 0.5 day.
-**Depends on.** Nothing. Safe to do first if the dashboard branch
-lands before v0.0.
+**Shipped as pipelane #5 (`db5c2d7`) — the brand re-skin of the
+reference dashboard that commit `2e588c4` had already merged to
+main.** Every legacy literal in code, templates, tests, and
+user-facing docs now reads "Pipelane Board"; the reference-design
+doc lives at `docs/PIPELANE_BOARD.md`. Default `boardTitle` is
+`${repoName} Pipelane`; user overrides stored in
+`~/.workflow-kit/dashboard/<slug>-<hash>.json` are preserved by the
+`boardTitle`/`boardSubtitle` fallback logic in
+`src/dashboard/server.ts`.
 
 ---
 
 ### v0 summary
 
-Total v0 effort: ~10–11 days (up from ~7–8 due to v0.0, v0.8, v0.9).
+v0 is ~90% shipped across commit `2e588c4` + pipelane #5 + pipelane
+#6 (v0.8 + v0.9), #13 + #14 (v0.0 snapshot + action), #16 (v0.3 +
+v0.4), #17 (v0.1 + v0.2), and #19 (v0.5 + v0.7). v0.6 `/status`
+cockpit is the last catalog item still open.
 
-After v0 ships:
+Current state:
 
 - Workflow-kit has its own `workflow:api` — wire-compatible with
   Rocketboard, consumable by the dashboard and every future client.
-- The cockpit objective is delivered in two forms: CLI `/status` and
-  web Pipelane Board, both reading the same envelope.
+- The web Pipelane Board renders the cockpit today; CLI `/status`
+  (v0.6) is queued so both surfaces read the same envelope.
 - Every mutating command is exposed through preflight/execute with
   confirm-token binding.
 - Every deploy is verified end-to-end.
@@ -922,7 +880,7 @@ After each phase, update:
 
 | Phase | Focus | Days | Outcome |
 |-------|-------|------|---------|
-| v0 | Contract + correctness + visibility | ~10–11 | `workflow:api` ported from Rocketboard, CLI `/status` + web Pipelane Board both reading the same envelope, preflight/execute for every mutating action, verified deploys, silent-SHA bugs closed, Pipelane brand across all user-visible strings |
+| v0 | Contract + correctness + visibility | ~10–11 | `workflow:api` ported from Rocketboard, web Pipelane Board reading the envelope today (matching CLI `/status` queued as v0.6), preflight/execute for every mutating action, verified deploys, silent-SHA bugs closed, Pipelane brand across all user-visible strings |
 | v1 | Trust + recovery | ~6 | `rollback.*`, `doctor.*`, live probe, richer `/status`, action-wired for dashboard |
 | v2 | Positioning + package rename | ~3 | Package renamed to `pipelane`, pipelane.dev live, Codex dual-install removed |
 
@@ -931,18 +889,14 @@ on its two strongest objectives (visual pipeline + error-free release)
 across both CLI and web surfaces — with one canonical contract — and
 earns trust. Everything else is additive.
 
-## First-move checklist
+## Historical sequencing
 
-Because v0.9 (string rename to Pipelane) has no code dependencies and
-pipelane.dev is already registered, it can land before or alongside
-v0.0. Suggested order:
-
-1. **v0.9** — one afternoon, string rename, ship the Pipelane brand.
-2. **v0.0** — the load-bearing work; port `workflow:api` into workflow-kit.
-3. **v0.8** — merge the dashboard branch in once v0.0 provides an
-   envelope source.
-4. **v0.1 → v0.7** — correctness fixes, now expressed as actions in
-   the v0.0 registry.
-5. **v1 phase** — rollback, doctor, nextAction, status flags,
-   WIP + override.
-6. **v2 phase** — package rename + Codex cut.
+The original plan called for v0.9 → v0.0 → v0.8 → v0.1–v0.7 → v1 →
+v2. Execution diverged: v0.8 + v0.9 shipped first via commit `2e588c4`
+(dashboard surfaces) + pipelane #5 (rename) + pipelane #6
+(launcher) — the dashboard rendered Rocketboard's `workflow:api`
+before workflow-kit produced its own in pipelane #13/#14. And
+v0.3/v0.4 (#16) + v0.1/v0.2 (#17) + v0.5/v0.7 (#19) + the
+ready:true kill (#20) each bundled siblings. The canonical shipped order is in the
+"Shipped to date" table above; the one remaining v0 item is v0.6
+`/status`.
