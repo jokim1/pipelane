@@ -5,7 +5,7 @@ import path from 'node:path';
 
 export type Mode = 'build' | 'release';
 export type KnownSurface = 'frontend' | 'edge' | 'sql';
-export const WORKFLOW_COMMANDS = ['devmode', 'new', 'resume', 'pr', 'merge', 'deploy', 'clean', 'status'] as const;
+export const WORKFLOW_COMMANDS = ['devmode', 'new', 'resume', 'pr', 'merge', 'deploy', 'clean', 'status', 'doctor'] as const;
 export type WorkflowCommand = (typeof WORKFLOW_COMMANDS)[number];
 export const DEFAULT_WORKFLOW_ALIASES: Record<WorkflowCommand, string> = {
   devmode: '/devmode',
@@ -16,6 +16,7 @@ export const DEFAULT_WORKFLOW_ALIASES: Record<WorkflowCommand, string> = {
   deploy: '/deploy',
   clean: '/clean',
   status: '/status',
+  doctor: '/doctor',
 };
 
 // Managed Claude command files that aren't workflow operator actions. These
@@ -266,7 +267,34 @@ export const CONFIG_FILENAME = '.project-workflow.json';
 const MODE_STATE_FILENAME = 'mode-state.json';
 const PR_STATE_FILENAME = 'pr-state.json';
 const DEPLOY_STATE_FILENAME = 'deploy-state.json';
+const PROBE_STATE_FILENAME = 'probe-state.json';
 const TASK_LOCKS_DIRNAME = 'task-locks';
+
+// v1.2: doctor.probe records. One entry per (environment, surface). Written
+// by `/doctor --probe` and read by the release-gate as a liveness check:
+// a probe succeeded + fresh (<PROBE_STALE_MS) gates release alongside the
+// observed-staging-success check. Stale or failed probes block release
+// until the operator re-probes or confirms the surface is healthy some
+// other way.
+export const PROBE_STALE_MS = 24 * 60 * 60 * 1000;
+
+export type ProbeEnvironment = 'staging' | 'production';
+
+export interface ProbeRecord {
+  environment: ProbeEnvironment;
+  surface: string;
+  url: string;
+  ok: boolean;
+  statusCode: number | null;
+  latencyMs: number | null;
+  error?: string;
+  probedAt: string;
+}
+
+export interface ProbeState {
+  records: ProbeRecord[];
+  updatedAt: string;
+}
 
 export function defaultWorkflowConfig(projectKey: string, displayName: string): WorkflowConfig {
   return {
@@ -509,6 +537,56 @@ export function deployStatePath(commonDir: string, config: WorkflowConfig): stri
 
 export function prStatePath(commonDir: string, config: WorkflowConfig): string {
   return path.join(resolveStateDir(commonDir, config), PR_STATE_FILENAME);
+}
+
+export function probeStatePath(commonDir: string, config: WorkflowConfig): string {
+  return path.join(resolveStateDir(commonDir, config), PROBE_STATE_FILENAME);
+}
+
+export function loadProbeState(commonDir: string, config: WorkflowConfig): ProbeState {
+  const raw = readJsonFile<ProbeState>(probeStatePath(commonDir, config), { records: [] as ProbeRecord[], updatedAt: '' });
+  return normalizeProbeState(raw);
+}
+
+// v1.2: mirror `normalizeModeState` — a malformed probe-state.json (valid
+// JSON but missing `records`, or records with unexpected shape) otherwise
+// crashes every consumer of explainSurfaceProbe with `undefined is not
+// iterable`. Silently coerce the container shape and drop individual
+// records that don't look right. Half-written files from an interrupted
+// save, hand-edits, and future schema evolutions all fail-closed to an
+// empty probe set rather than bricking the release gate.
+function normalizeProbeState(raw: ProbeState): ProbeState {
+  const source = (raw ?? {}) as Partial<ProbeState>;
+  const records = Array.isArray(source.records) ? source.records : [];
+  const updatedAt = typeof source.updatedAt === 'string' ? source.updatedAt : '';
+  const valid: ProbeRecord[] = [];
+  for (const entry of records) {
+    const record = entry as Partial<ProbeRecord> | null;
+    if (!record || typeof record !== 'object') continue;
+    if (record.environment !== 'staging' && record.environment !== 'production') continue;
+    if (typeof record.surface !== 'string' || record.surface.length === 0) continue;
+    if (typeof record.url !== 'string') continue;
+    if (typeof record.ok !== 'boolean') continue;
+    if (typeof record.probedAt !== 'string') continue;
+    const statusCode = typeof record.statusCode === 'number' ? record.statusCode : null;
+    const latencyMs = typeof record.latencyMs === 'number' ? record.latencyMs : null;
+    valid.push({
+      environment: record.environment,
+      surface: record.surface,
+      url: record.url,
+      ok: record.ok,
+      statusCode,
+      latencyMs,
+      error: typeof record.error === 'string' ? record.error : undefined,
+      probedAt: record.probedAt,
+    });
+  }
+  return { records: valid, updatedAt };
+}
+
+export function saveProbeState(commonDir: string, config: WorkflowConfig, value: ProbeState): void {
+  ensureStateDir(commonDir, config);
+  writeJsonFile(probeStatePath(commonDir, config), value);
 }
 
 export function taskLockPath(commonDir: string, config: WorkflowConfig, taskSlug: string): string {

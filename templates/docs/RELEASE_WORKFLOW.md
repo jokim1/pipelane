@@ -36,6 +36,7 @@ follow safely without improvising repo behavior.
 - `npm run workflow:deploy -- staging|prod ...`
 - `npm run workflow:clean`
 - `npm run workflow:status`
+- `npm run workflow:doctor` (add `-- --probe` for staging healthchecks, `-- --fix` for the guided wizard)
 
 ### AI-client Slash Surface
 
@@ -49,6 +50,7 @@ This repo exposes the following user-facing slash commands through Claude/Codex 
 - `{{ALIAS_DEPLOY}}`
 - `{{ALIAS_CLEAN}}`
 - `{{ALIAS_STATUS}}`
+- `{{ALIAS_DOCTOR}}`
 
 If aliases change in `.project-workflow.json`, rerun `npm run workflow:setup` and reopen Claude/Codex so the new command names are picked up.
 Aliases must be unique, and setup fails closed if an alias would overwrite an unrelated command or skill.
@@ -68,6 +70,7 @@ Use both.
 - `{{ALIAS_DEPLOY}}`
 - `{{ALIAS_CLEAN}}`
 - `{{ALIAS_STATUS}}`
+- `{{ALIAS_DOCTOR}}`
 
 gstack is still recommended for:
 

@@ -76,6 +76,7 @@ npm run workflow:clean
 - `{{ALIAS_DEPLOY}}`
 - `{{ALIAS_CLEAN}}`
 - `{{ALIAS_STATUS}}`
+- `{{ALIAS_DOCTOR}}`
 
 Canonical repo-native commands:
 
@@ -90,6 +91,7 @@ Canonical repo-native commands:
 - `npm run workflow:deploy -- staging|prod ...`
 - `npm run workflow:clean`
 - `npm run workflow:status`
+- `npm run workflow:doctor` (add `-- --probe` for live healthchecks, `-- --fix` for the guided wizard)
 
 ### workflow-kit + gstack
 

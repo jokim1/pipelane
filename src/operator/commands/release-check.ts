@@ -1,6 +1,6 @@
 import { formatChecksReport, runChecks } from '../checks/runner.ts';
 import { buildReleaseCheckMessage, emptyDeployConfig, evaluateReleaseReadiness, loadDeployConfig } from '../release-gate.ts';
-import { loadDeployState, printResult, resolveWorkflowContext, type ParsedOperatorArgs } from '../state.ts';
+import { loadDeployState, loadProbeState, printResult, resolveWorkflowContext, type ParsedOperatorArgs } from '../state.ts';
 import { resolveCommandSurfaces } from './helpers.ts';
 
 export async function handleReleaseCheck(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
@@ -8,10 +8,12 @@ export async function handleReleaseCheck(cwd: string, parsed: ParsedOperatorArgs
   const surfaces = resolveCommandSurfaces(context, parsed.flags.surfaces);
   const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
   const deployState = loadDeployState(context.commonDir, context.config);
+  const probeState = loadProbeState(context.commonDir, context.config);
   const readiness = evaluateReleaseReadiness({
     config: context.config,
     deployConfig,
     deployRecords: deployState.records,
+    probeState,
     surfaces,
   });
 

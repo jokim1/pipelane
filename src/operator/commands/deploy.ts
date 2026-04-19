@@ -14,6 +14,7 @@ import {
 import {
   loadDeployState,
   loadPrRecord,
+  loadProbeState,
   nowIso,
   printResult,
   resolveWorkflowContext,
@@ -133,10 +134,12 @@ export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Pro
     // v1.2 readiness is now observed, not asserted. Callers to prod are also
     // allowed to promote the same SHA they just verified in staging, so
     // release-readiness for prod deploys counts the current deployState.
+    const probeState = loadProbeState(context.commonDir, context.config);
     const readiness = evaluateReleaseReadiness({
       config: context.config,
       deployConfig,
       deployRecords: trustedRecords,
+      probeState,
       surfaces,
     });
     if (!readiness.ready && !context.modeState.override) {

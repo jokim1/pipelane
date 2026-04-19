@@ -29,6 +29,15 @@ export const STABLE_ACTION_IDS = [
   'deploy.prod',
   'clean.plan',
   'clean.apply',
+  // v1.2: doctor.* actions — both non-risky. doctor.diagnose is a pure
+  // read; doctor.probe writes probe-state.json but only stores observed
+  // liveness (never changes runtime behavior outside its own lane).
+  // doctor.fix is interactive and lives behind the CLI today; it's NOT
+  // registered as an API action because it needs TTY prompts — exposing
+  // it over the API would either require a config-shape payload (which
+  // duplicates `pipelane configure`) or a long-lived stdin proxy.
+  'doctor.diagnose',
+  'doctor.probe',
 ] as const;
 
 export type StableActionId = (typeof STABLE_ACTION_IDS)[number];
@@ -53,6 +62,8 @@ const ACTION_LABELS: Record<StableActionId, string> = {
   'deploy.prod': 'Deploy production',
   'clean.plan': 'Plan cleanup',
   'clean.apply': 'Apply cleanup',
+  'doctor.diagnose': 'Diagnose deploy configuration',
+  'doctor.probe': 'Run live healthcheck probe',
 };
 
 export interface ActionPreflightData {
@@ -267,6 +278,10 @@ function normalizeInputs(actionId: StableActionId, parsed: ParsedOperatorArgs): 
       return {};
     case 'clean.apply':
       return { task: flags.task, allStale: flags.allStale };
+    case 'doctor.diagnose':
+      return {};
+    case 'doctor.probe':
+      return {};
   }
 }
 
@@ -334,6 +349,12 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
       pushOpt('--task', flags.task);
       if (flags.allStale) args.push('--all-stale');
       break;
+    case 'doctor.diagnose':
+      args.push('doctor');
+      break;
+    case 'doctor.probe':
+      args.push('doctor', 'probe');
+      break;
   }
 
   args.push('--json');
@@ -349,6 +370,15 @@ const TEST_HOOK_ENV_KEYS = [
   'PIPELANE_CLEAN_MIN_AGE_MS',
   'PIPELANE_CHECKS_SUPABASE_SECRETS_STUB',
   'PIPELANE_CHECKS_GH_SECRETS_STUB',
+  // v1.2: doctor.probe (dispatched via the API) re-reads the deploy config
+  // and runs real fetches. Neither doctor stub should pass through from a
+  // parent board/CI shell. The stubs are also gated on NODE_ENV==='test' at
+  // the CLI; scrubbing here is belt-and-suspenders.
+  // PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS is intentionally NOT scrubbed —
+  // the API→CLI deploy.prod flow relies on it passing through (see
+  // "api action deploy.prod --execute bypasses the TTY prompt via the API env var").
+  'PIPELANE_DOCTOR_PROBE_STUB_STATUS',
+  'PIPELANE_DOCTOR_FIX_STUB',
 ];
 
 function buildChildEnv(actionId: StableActionId): NodeJS.ProcessEnv {

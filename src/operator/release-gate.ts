@@ -2,7 +2,8 @@ import crypto from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import type { DeployRecord, WorkflowConfig } from './state.ts';
+import type { DeployRecord, ProbeEnvironment, ProbeRecord, ProbeState, WorkflowConfig } from './state.ts';
+import { PROBE_STALE_MS } from './state.ts';
 
 // v1.2 env var: opaque HMAC-SHA256 signing key. Accepts any non-empty string;
 // we recommend ≥32 bytes of cryptographic-random (e.g. `openssl rand -hex 32`)
@@ -26,7 +27,6 @@ export interface DeployConfig {
       url: string;
       deployWorkflow: string;
       healthcheckUrl: string;
-      ready: boolean;
     };
   };
   edge: {
@@ -34,7 +34,6 @@ export interface DeployConfig {
       deployCommand: string;
       verificationCommand: string;
       healthcheckUrl: string;
-      ready: boolean;
     };
     production: {
       deployCommand: string;
@@ -47,7 +46,6 @@ export interface DeployConfig {
       applyCommand: string;
       verificationCommand: string;
       healthcheckUrl: string;
-      ready: boolean;
     };
     production: {
       applyCommand: string;
@@ -79,7 +77,6 @@ export function emptyDeployConfig(): DeployConfig {
         url: '',
         deployWorkflow: '',
         healthcheckUrl: '',
-        ready: false,
       },
     },
     edge: {
@@ -87,7 +84,6 @@ export function emptyDeployConfig(): DeployConfig {
         deployCommand: '',
         verificationCommand: '',
         healthcheckUrl: '',
-        ready: false,
       },
       production: {
         deployCommand: '',
@@ -100,7 +96,6 @@ export function emptyDeployConfig(): DeployConfig {
         applyCommand: '',
         verificationCommand: '',
         healthcheckUrl: '',
-        ready: false,
       },
       production: {
         applyCommand: '',
@@ -172,12 +167,10 @@ export function parseDeployConfigMarkdown(markdown: string): DeployConfig | null
   config.frontend.staging.url = parsed.frontend?.staging?.url ?? '';
   config.frontend.staging.deployWorkflow = parsed.frontend?.staging?.deployWorkflow ?? '';
   config.frontend.staging.healthcheckUrl = parsed.frontend?.staging?.healthcheckUrl ?? '';
-  config.frontend.staging.ready = Boolean(parsed.frontend?.staging?.ready);
 
   config.edge.staging.deployCommand = parsed.edge?.staging?.deployCommand ?? '';
   config.edge.staging.verificationCommand = parsed.edge?.staging?.verificationCommand ?? '';
   config.edge.staging.healthcheckUrl = parsed.edge?.staging?.healthcheckUrl ?? '';
-  config.edge.staging.ready = Boolean(parsed.edge?.staging?.ready);
   config.edge.production.deployCommand = parsed.edge?.production?.deployCommand ?? '';
   config.edge.production.verificationCommand = parsed.edge?.production?.verificationCommand ?? '';
   config.edge.production.healthcheckUrl = parsed.edge?.production?.healthcheckUrl ?? '';
@@ -185,7 +178,6 @@ export function parseDeployConfigMarkdown(markdown: string): DeployConfig | null
   config.sql.staging.applyCommand = parsed.sql?.staging?.applyCommand ?? '';
   config.sql.staging.verificationCommand = parsed.sql?.staging?.verificationCommand ?? '';
   config.sql.staging.healthcheckUrl = parsed.sql?.staging?.healthcheckUrl ?? '';
-  config.sql.staging.ready = Boolean(parsed.sql?.staging?.ready);
   config.sql.production.applyCommand = parsed.sql?.production?.applyCommand ?? '';
   config.sql.production.verificationCommand = parsed.sql?.production?.verificationCommand ?? '';
   config.sql.production.healthcheckUrl = parsed.sql?.production?.healthcheckUrl ?? '';
@@ -209,9 +201,11 @@ export function renderDeployConfigSection(config: DeployConfig): string {
   return `## Deploy Configuration
 
 This section is machine-readable. Keep the JSON valid.
-Release readiness is derived from observed staging deploy records (v1.2); the legacy
-\`.staging.ready\` boolean is ignored. Run \`workflow:deploy -- staging <surface>\` once
-to register a succeeded deploy for each surface you plan to ship.
+Release readiness is derived from (a) observed staging deploy records and (b) a
+fresh \`/doctor --probe\` that healthchecks the configured staging URLs. Run
+\`workflow:deploy -- staging <surface>\` once per surface to register a succeeded
+deploy, then \`workflow:doctor --probe\` to register liveness. Probes older than
+24h flip the release lane fail-closed.
 
 \`\`\`json
 ${JSON.stringify(config, null, 2)}
@@ -407,12 +401,77 @@ export function hasObservedStagingSuccess(
   return explainObservedStagingSuccess(records, surface, options).ok;
 }
 
+// Tolerate up to 5 minutes of clock skew between the probing machine and
+// the consumer of probe-state. Records more than this in the future are
+// treated as stale (either broken clock or a forged record).
+const FUTURE_SKEW_MS = 5 * 60 * 1000;
+
+export type ProbeFreshnessState = 'healthy' | 'stale' | 'degraded' | 'unknown';
+
+export interface ProbeSurfaceFreshness {
+  state: ProbeFreshnessState;
+  reason: string;
+  probe: ProbeRecord | null;
+  ageMs: number | null;
+}
+
+// v1.2: reconciles a probeState snapshot against the current clock + staling
+// threshold. Returns a per-surface classification the release gate, /status
+// cockpit, and dashboard share. Called from one place so the vocabulary is
+// identical everywhere: `healthy` = probe succeeded within the window;
+// `degraded` = probe present + fresh but non-2xx; `stale` = probe present
+// but older than PROBE_STALE_MS; `unknown` = no probe on record.
+export function explainSurfaceProbe(options: {
+  probeState: ProbeState;
+  surface: string;
+  environment: ProbeEnvironment;
+  now?: number;
+  staleMs?: number;
+}): ProbeSurfaceFreshness {
+  const now = options.now ?? Date.now();
+  const staleMs = options.staleMs ?? PROBE_STALE_MS;
+  const match = [...options.probeState.records]
+    .reverse()
+    .find((record) => record.environment === options.environment && record.surface === options.surface);
+
+  if (!match) {
+    return { state: 'unknown', reason: 'no probe recorded yet', probe: null, ageMs: null };
+  }
+
+  const probedAt = Date.parse(match.probedAt);
+  const ageMs = Number.isFinite(probedAt) ? Math.max(0, now - probedAt) : null;
+
+  if (ageMs === null) {
+    return { state: 'stale', reason: `probe record has an unparseable probedAt "${match.probedAt}"`, probe: match, ageMs: null };
+  }
+  // Future-dated probedAt is either clock skew (harmless) or a forged
+  // record (malicious). A record more than FUTURE_SKEW_MS in the future
+  // can't have been produced by a real probe on this machine; treat it as
+  // stale so the release gate falls closed.
+  if (probedAt > now + FUTURE_SKEW_MS) {
+    return { state: 'stale', reason: `probe record probedAt "${match.probedAt}" is in the future`, probe: match, ageMs: null };
+  }
+  if (ageMs > staleMs) {
+    const ageHours = Math.round(ageMs / (60 * 60 * 1000));
+    return { state: 'stale', reason: `probe is ${ageHours}h old (>24h threshold)`, probe: match, ageMs };
+  }
+  if (!match.ok) {
+    const detail = match.statusCode ? `HTTP ${match.statusCode}` : (match.error || 'no response');
+    return { state: 'degraded', reason: `probe failed: ${detail}`, probe: match, ageMs };
+  }
+  return { state: 'healthy', reason: '', probe: match, ageMs };
+}
+
 export function evaluateReleaseReadiness(options: {
   config: WorkflowConfig;
   deployConfig: DeployConfig;
   // v1.2: passed explicitly so readiness is derived from observed deploy
   // history rather than a stored flag. Callers load via loadDeployState().
   deployRecords: DeployRecord[];
+  // v1.2: probe freshness is a second liveness gate alongside the observed
+  // staging success. An empty `{ records: [] }` is allowed — it maps to
+  // "probeState unknown", which still blocks until /doctor --probe runs.
+  probeState?: ProbeState;
   surfaces: string[];
 }): {
   ready: boolean;
@@ -425,6 +484,15 @@ export function evaluateReleaseReadiness(options: {
     const result = explainObservedStagingSuccess(options.deployRecords, surface, gateOptions);
     if (result.ok) return null;
     return `${surface} staging: ${result.reason}. Run \`workflow:deploy -- staging ${surface}\` first.`;
+  };
+  const probeState = options.probeState ?? { records: [], updatedAt: '' };
+  const probeFreshness = (surface: string): string | null => {
+    const probe = explainSurfaceProbe({ probeState, surface, environment: 'staging' });
+    if (probe.state === 'healthy') return null;
+    if (probe.state === 'unknown') {
+      return `${surface} staging: no probe recorded. Run \`workflow:doctor --probe\`.`;
+    }
+    return `${surface} staging probe is ${probe.state}: ${probe.reason}. Re-run \`workflow:doctor --probe\`.`;
   };
 
   for (const surface of options.surfaces) {
@@ -461,6 +529,8 @@ export function evaluateReleaseReadiness(options: {
       }
       const observed = observedStagingSuccess('frontend');
       if (observed) missing.push(observed);
+      const probe = probeFreshness('frontend');
+      if (probe) missing.push(probe);
     } else if (surface === 'edge') {
       if (!options.deployConfig.edge.staging.deployCommand) {
         missing.push('edge staging deploy command');
@@ -473,6 +543,13 @@ export function evaluateReleaseReadiness(options: {
       }
       const observed = observedStagingSuccess('edge');
       if (observed) missing.push(observed);
+      // Edge + sql probes only run when an explicit healthcheckUrl is
+      // configured for them — many consumers don't have one. When unset,
+      // fall back to the observed-staging-success gate alone.
+      if (options.deployConfig.edge.staging.healthcheckUrl) {
+        const probe = probeFreshness('edge');
+        if (probe) missing.push(probe);
+      }
     } else if (surface === 'sql') {
       if (!options.deployConfig.sql.staging.applyCommand) {
         missing.push('sql staging apply/reset path');
@@ -485,6 +562,10 @@ export function evaluateReleaseReadiness(options: {
       }
       const observed = observedStagingSuccess('sql');
       if (observed) missing.push(observed);
+      if (options.deployConfig.sql.staging.healthcheckUrl) {
+        const probe = probeFreshness('sql');
+        if (probe) missing.push(probe);
+      }
     }
 
     results[surface] = {

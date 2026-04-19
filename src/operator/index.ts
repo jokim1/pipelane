@@ -5,6 +5,7 @@ import { handleApi } from './commands/api.ts';
 import { handleClean } from './commands/clean.ts';
 import { handleDevmode } from './commands/devmode.ts';
 import { handleDeploy } from './commands/deploy.ts';
+import { handleDoctor } from './commands/doctor.ts';
 import { handleMerge } from './commands/merge.ts';
 import { handleNew } from './commands/new.ts';
 import { handlePr } from './commands/pr.ts';
@@ -100,6 +101,11 @@ export async function runOperator(cwd: string, argv: string[]): Promise<void> {
     return;
   }
 
+  if (command === 'doctor') {
+    await handleDoctor(cwd, parsed);
+    return;
+  }
+
   if (command === 'api') {
     await handleApi(cwd, parsed);
     return;
@@ -129,6 +135,7 @@ Workflow commands:
   deploy
   clean
   status
+  doctor [--probe | --fix]
   api snapshot
 `);
 }

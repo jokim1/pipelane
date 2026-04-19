@@ -13,6 +13,7 @@ import { emptyDeployConfig, evaluateReleaseReadiness, loadDeployConfig } from '.
 import {
   loadDeployState,
   loadPrRecord,
+  loadProbeState,
   printResult,
   resolveWorkflowContext,
   runGh,
@@ -31,10 +32,12 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
   const surfaces = resolveCommandSurfaces(context, parsed.flags.surfaces, lock.surfaces);
   if (context.modeState.mode === 'release') {
     const deployState = loadDeployState(context.commonDir, context.config);
+    const probeState = loadProbeState(context.commonDir, context.config);
     const readiness = evaluateReleaseReadiness({
       config: context.config,
       deployConfig: loadDeployConfig(context.repoRoot) ?? emptyDeployConfig(),
       deployRecords: deployState.records,
+      probeState,
       surfaces,
     });
     if (!readiness.ready && !context.modeState.override) {

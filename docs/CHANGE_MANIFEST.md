@@ -58,6 +58,7 @@ mirrors it.
 | 8.8 | v0 brand-pass close-out in manifest (v0.8 + v0.9 ✅ SHIPPED annotations) | ✅ merged | pipelane #30 |
 | 9.1 | v0.6 `/status` cockpit V0 + v1.3 `TaskLock.nextAction` breadcrumb | ✅ merged | pipelane #31 |
 | 9.2 | v1.5 WIP soft warn (`/new` at ≥3 active) + `--override --reason` auditability | ✅ merged | pipelane #32 |
+| 9.3 | v1.2 `doctor.*` (diagnose + `--probe` + `--fix` wizard) + probe-state release gate + first `docs/WORKFLOW_API.md` | ✅ merged | pipelane #33 |
 
 Ship items in this exact order. Each is its own PR in Pipelane unless
 noted. Catalog IDs reference the detailed sections below.
@@ -591,7 +592,7 @@ new action IDs to the contract: `rollback.staging` and `rollback.prod`.
 
 ---
 
-### v1.2 — `doctor.*` actions
+### v1.2 — `doctor.*` actions ✅ SHIPPED (pipelane #33)
 
 **Goal.** Replace the all-or-nothing release-check with a guided
 config + probe flow. Kill `ready:true` as a stored primitive. Expose

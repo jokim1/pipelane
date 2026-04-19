@@ -17,6 +17,7 @@ This file is local-only operator state. Keep it git-ignored.
   7. `npm run workflow:clean`
 - Use `npm run workflow:resume -- --task "<task-name>"` only when returning to an existing task workspace.
 - Use `npm run workflow:status` (or `{{ALIAS_STATUS}}`) to see the cockpit before acting.
+- Use `npm run workflow:doctor` (or `{{ALIAS_DOCTOR}}`) to diagnose deploy config and probe staging health. Run `npm run workflow:doctor -- --probe` after a staging deploy to refresh the release gate's freshness check.
 - If `.project-workflow.json` aliases change, rerun `npm run workflow:setup` and reopen Claude/Codex so the new command names appear.
 - `{{DEPLOY_WORKFLOW_NAME}}` is the canonical deploy workflow label for this repo.
 
@@ -33,6 +34,7 @@ Key routing rules:
 - Deploy the merged SHA -> `{{ALIAS_DEPLOY}}`
 - Cleanup or stale workspace inspection -> `{{ALIAS_CLEAN}}`
 - One-screen cockpit of task + lane state -> `{{ALIAS_STATUS}}`
+- Diagnose deploy config or refresh staging probes -> `{{ALIAS_DOCTOR}}`
 - Architecture review -> `plan-eng-review`
 - QA, test the site, find bugs -> `qa`
 - Code review, check my diff -> `review`

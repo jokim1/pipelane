@@ -27,18 +27,15 @@ export interface ConfigureOptions {
   frontendStagingUrl?: string;
   frontendStagingWorkflow?: string;
   frontendStagingHealthcheck?: string;
-  frontendStagingReady?: boolean;
   edgeStagingDeployCommand?: string;
   edgeStagingVerificationCommand?: string;
   edgeStagingHealthcheck?: string;
-  edgeStagingReady?: boolean;
   edgeProductionDeployCommand?: string;
   edgeProductionVerificationCommand?: string;
   edgeProductionHealthcheck?: string;
   sqlStagingApplyCommand?: string;
   sqlStagingVerificationCommand?: string;
   sqlStagingHealthcheck?: string;
-  sqlStagingReady?: boolean;
   sqlProductionApplyCommand?: string;
   sqlProductionVerificationCommand?: string;
   sqlProductionHealthcheck?: string;
@@ -79,10 +76,17 @@ const STRING_FLAGS: Array<[string, keyof ConfigureOptions]> = [
 
 const BOOLEAN_FLAGS: Array<[string, keyof ConfigureOptions]> = [
   ['--frontend-production-auto-deploy-on-main', 'frontendProductionAutoDeployOnMain'],
-  ['--frontend-staging-ready', 'frontendStagingReady'],
-  ['--edge-staging-ready', 'edgeStagingReady'],
-  ['--sql-staging-ready', 'sqlStagingReady'],
 ];
+
+// v1.2: --frontend-staging-ready / --edge-staging-ready / --sql-staging-ready
+// were removed when release readiness stopped reading the `.ready` boolean.
+// Scripts that still pass the flags get a clear error instead of a silently
+// ignored value.
+const REMOVED_BOOLEAN_FLAGS = new Set<string>([
+  '--frontend-staging-ready',
+  '--edge-staging-ready',
+  '--sql-staging-ready',
+]);
 
 export function parseConfigureArgs(argv: string[]): ConfigureOptions {
   const options: ConfigureOptions = { json: false, help: false };
@@ -98,6 +102,15 @@ export function parseConfigureArgs(argv: string[]): ConfigureOptions {
     }
 
     const bag = options as unknown as Record<string, unknown>;
+
+    const removedMatch = [...REMOVED_BOOLEAN_FLAGS].find((flag) => token === flag || token.startsWith(`${flag}=`));
+    if (removedMatch) {
+      throw new Error([
+        `Flag ${removedMatch} was removed in v1.2.`,
+        'Release readiness now derives from observed staging deploys + a fresh /doctor --probe.',
+        'Drop the flag from your script; no replacement needed.',
+      ].join('\n'));
+    }
 
     const matchedBool = BOOLEAN_FLAGS.find(([flag]) => token === flag || token.startsWith(`${flag}=`));
     if (matchedBool) {
@@ -204,18 +217,15 @@ function applyFlagOverrides(base: DeployConfig, options: ConfigureOptions): Depl
   if (options.frontendStagingUrl !== undefined) next.frontend.staging.url = options.frontendStagingUrl;
   if (options.frontendStagingWorkflow !== undefined) next.frontend.staging.deployWorkflow = options.frontendStagingWorkflow;
   if (options.frontendStagingHealthcheck !== undefined) next.frontend.staging.healthcheckUrl = options.frontendStagingHealthcheck;
-  if (options.frontendStagingReady !== undefined) next.frontend.staging.ready = options.frontendStagingReady;
   if (options.edgeStagingDeployCommand !== undefined) next.edge.staging.deployCommand = options.edgeStagingDeployCommand;
   if (options.edgeStagingVerificationCommand !== undefined) next.edge.staging.verificationCommand = options.edgeStagingVerificationCommand;
   if (options.edgeStagingHealthcheck !== undefined) next.edge.staging.healthcheckUrl = options.edgeStagingHealthcheck;
-  if (options.edgeStagingReady !== undefined) next.edge.staging.ready = options.edgeStagingReady;
   if (options.edgeProductionDeployCommand !== undefined) next.edge.production.deployCommand = options.edgeProductionDeployCommand;
   if (options.edgeProductionVerificationCommand !== undefined) next.edge.production.verificationCommand = options.edgeProductionVerificationCommand;
   if (options.edgeProductionHealthcheck !== undefined) next.edge.production.healthcheckUrl = options.edgeProductionHealthcheck;
   if (options.sqlStagingApplyCommand !== undefined) next.sql.staging.applyCommand = options.sqlStagingApplyCommand;
   if (options.sqlStagingVerificationCommand !== undefined) next.sql.staging.verificationCommand = options.sqlStagingVerificationCommand;
   if (options.sqlStagingHealthcheck !== undefined) next.sql.staging.healthcheckUrl = options.sqlStagingHealthcheck;
-  if (options.sqlStagingReady !== undefined) next.sql.staging.ready = options.sqlStagingReady;
   if (options.sqlProductionApplyCommand !== undefined) next.sql.production.applyCommand = options.sqlProductionApplyCommand;
   if (options.sqlProductionVerificationCommand !== undefined) next.sql.production.verificationCommand = options.sqlProductionVerificationCommand;
   if (options.sqlProductionHealthcheck !== undefined) next.sql.production.healthcheckUrl = options.sqlProductionHealthcheck;
@@ -237,7 +247,6 @@ async function promptForValues(base: DeployConfig): Promise<DeployConfig> {
     next.frontend.staging.url = await promptString(rl, '  URL:', next.frontend.staging.url);
     next.frontend.staging.deployWorkflow = await promptString(rl, '  Deploy workflow name:', next.frontend.staging.deployWorkflow);
     next.frontend.staging.healthcheckUrl = await promptString(rl, '  Healthcheck URL:', next.frontend.staging.healthcheckUrl);
-    next.frontend.staging.ready = await promptBool(rl, '  Ready flag (legacy):', next.frontend.staging.ready);
 
     process.stdout.write('\nFrontend (production):\n');
     next.frontend.production.url = await promptString(rl, '  URL:', next.frontend.production.url);
@@ -249,7 +258,6 @@ async function promptForValues(base: DeployConfig): Promise<DeployConfig> {
     next.edge.staging.deployCommand = await promptString(rl, '  Deploy command:', next.edge.staging.deployCommand);
     next.edge.staging.verificationCommand = await promptString(rl, '  Verification command:', next.edge.staging.verificationCommand);
     next.edge.staging.healthcheckUrl = await promptString(rl, '  Healthcheck URL:', next.edge.staging.healthcheckUrl);
-    next.edge.staging.ready = await promptBool(rl, '  Ready flag (legacy):', next.edge.staging.ready);
 
     process.stdout.write('\nEdge (production):\n');
     next.edge.production.deployCommand = await promptString(rl, '  Deploy command:', next.edge.production.deployCommand);
@@ -260,7 +268,6 @@ async function promptForValues(base: DeployConfig): Promise<DeployConfig> {
     next.sql.staging.applyCommand = await promptString(rl, '  Apply command:', next.sql.staging.applyCommand);
     next.sql.staging.verificationCommand = await promptString(rl, '  Verification command:', next.sql.staging.verificationCommand);
     next.sql.staging.healthcheckUrl = await promptString(rl, '  Healthcheck URL:', next.sql.staging.healthcheckUrl);
-    next.sql.staging.ready = await promptBool(rl, '  Ready flag (legacy):', next.sql.staging.ready);
 
     process.stdout.write('\nSQL (production):\n');
     next.sql.production.applyCommand = await promptString(rl, '  Apply command:', next.sql.production.applyCommand);
@@ -312,18 +319,15 @@ Flags (all optional; any omitted field keeps its current value):
   --frontend-staging-url=<url>
   --frontend-staging-workflow=<name>
   --frontend-staging-healthcheck=<url>
-  --frontend-staging-ready[=true|false]
   --edge-staging-deploy-command=<cmd>
   --edge-staging-verification-command=<cmd>
   --edge-staging-healthcheck=<url>
-  --edge-staging-ready[=true|false]
   --edge-production-deploy-command=<cmd>
   --edge-production-verification-command=<cmd>
   --edge-production-healthcheck=<url>
   --sql-staging-apply-command=<cmd>
   --sql-staging-verification-command=<cmd>
   --sql-staging-healthcheck=<url>
-  --sql-staging-ready[=true|false]
   --sql-production-apply-command=<cmd>
   --sql-production-verification-command=<cmd>
   --sql-production-healthcheck=<url>

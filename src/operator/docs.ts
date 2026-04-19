@@ -75,6 +75,10 @@ export const LEGACY_CLAUDE_SIGNATURES: Record<ManagedCommand, string[]> = {
     'Render a one-screen terminal cockpit of the workflow:api snapshot.',
     'npm run workflow:status',
   ],
+  doctor: [
+    'Diagnose deploy configuration, run live probes, or launch the fix wizard.',
+    'npm run workflow:doctor',
+  ],
   // `pipelane` shipped without a marker on main before this PR landed, so
   // existing consumers have a `.claude/commands/pipelane.md` we need to
   // upgrade in place on the next setup run. Three distinctive strings
@@ -124,6 +128,7 @@ function renderTemplate(template: string, config: WorkflowConfig): string {
     ALIAS_DEPLOY: aliases.deploy,
     ALIAS_CLEAN: aliases.clean,
     ALIAS_STATUS: aliases.status,
+    ALIAS_DOCTOR: aliases.doctor,
   };
 
   return Object.entries(replacements).reduce(
@@ -349,6 +354,7 @@ export function ensurePackageScripts(repoRoot: string): void {
     'pipelane:deploy': 'pipelane run deploy',
     'pipelane:clean': 'pipelane run clean',
     'pipelane:status': 'pipelane run status',
+    'pipelane:doctor': 'pipelane run doctor',
     'pipelane:board': 'pipelane board',
     'pipelane:update': 'pipelane update',
     'pipelane:api': 'pipelane run api',
@@ -365,6 +371,7 @@ export function ensurePackageScripts(repoRoot: string): void {
     'workflow:deploy': 'pipelane run deploy',
     'workflow:clean': 'pipelane run clean',
     'workflow:status': 'pipelane run status',
+    'workflow:doctor': 'pipelane run doctor',
     'workflow:pipelane': 'pipelane board',
   };
 

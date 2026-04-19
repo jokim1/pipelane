@@ -85,6 +85,22 @@ export function renderCockpit(
     lines.push('');
   }
 
+  // v1.2: probe banner mirrors the override banner pattern. Red for
+  // degraded (a probe actively failed), yellow for stale (a probe exists
+  // but is past PROBE_STALE_MS). Healthy + unknown stay silent; unknown
+  // is nudged through attention[] rows (when stale/degraded surfaces exist)
+  // or by the release gate's own "run /doctor --probe" message.
+  const probeState = boardContext.releaseReadiness?.probeState;
+  if (probeState === 'degraded') {
+    lines.push(colorize('⚠ DEPLOY PROBE DEGRADED', color, 'red'));
+    lines.push('  run `workflow:doctor --probe` to re-probe staging surfaces.');
+    lines.push('');
+  } else if (probeState === 'stale') {
+    lines.push(colorize('ℹ DEPLOY PROBE STALE', color, 'yellow'));
+    lines.push('  last probe is >24h old. Run `workflow:doctor --probe` to refresh.');
+    lines.push('');
+  }
+
   lines.push(...renderAttention(attention as ApiIssue[], color));
   lines.push('');
 
