@@ -12,6 +12,7 @@ import {
   findPrunedTaskLock,
   generateHex,
   generateUniqueTaskWorkspace,
+  listActiveTaskLocks,
   pruneDeadTaskLocks,
   resolveTaskBaseRef,
   resolveTaskCommandIdentity,
@@ -20,6 +21,12 @@ import {
 } from '../task-workspaces.ts';
 import { runGit } from '../state.ts';
 import { resolveCommandSurfaces } from './helpers.ts';
+
+// v1.5: soft-warn when the operator has 3+ active tasks. Never blocks —
+// small teams legitimately juggle several lanes, but 24 half-alive
+// worktrees is a scope-explosion smell the operator should see before
+// starting yet another one. Uses stderr so `--json` stays clean.
+export const WIP_SOFT_WARN_THRESHOLD = 3;
 
 export async function handleNew(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const rawTask = parsed.flags.task.trim();
@@ -35,6 +42,21 @@ export async function handleNew(cwd: string, parsed: ParsedOperatorArgs): Promis
   const warnings = prunedTaskLock
     ? [`Removed stale task lock for ${taskSlug}.`, ...prunedTaskLock.reasons]
     : [];
+
+  // v1.5: soft warn for WIP explosion. Runs AFTER pruneDeadTaskLocks so
+  // the count reflects genuinely-active locks, not zombies a previous
+  // session left behind.
+  const activeLocks = listActiveTaskLocks(context.commonDir, context.config);
+  if (activeLocks.length >= WIP_SOFT_WARN_THRESHOLD && !parsed.flags.json) {
+    const oldestAgeHours = computeOldestLockAgeHours(activeLocks);
+    const ageNote = oldestAgeHours !== null ? `, oldest updated ${oldestAgeHours}h ago` : '';
+    process.stderr.write([
+      `⚠  You have ${activeLocks.length} tasks in flight${ageNote}.`,
+      `   Consider /resume on an existing task instead of piling on another.`,
+      `   Continuing (this is a warning, not a block).`,
+      '',
+    ].join('\n'));
+  }
 
   if (existingLock) {
     throw new Error([
@@ -80,4 +102,18 @@ export async function handleNew(cwd: string, parsed: ParsedOperatorArgs): Promis
     warnings: [...baseRef.warnings, ...warnings],
     reasons,
   }));
+}
+
+function computeOldestLockAgeHours(locks: Array<{ updatedAt?: string }>): number | null {
+  const now = Date.now();
+  let oldestMs: number | null = null;
+  for (const lock of locks) {
+    if (!lock.updatedAt) continue;
+    const parsed = Date.parse(lock.updatedAt);
+    if (!Number.isFinite(parsed)) continue;
+    const ageMs = now - parsed;
+    if (oldestMs === null || ageMs > oldestMs) oldestMs = ageMs;
+  }
+  if (oldestMs === null) return null;
+  return Math.max(0, Math.round(oldestMs / (60 * 60 * 1000)));
 }

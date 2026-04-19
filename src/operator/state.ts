@@ -145,6 +145,16 @@ export interface ModeState {
     reason: string;
     timestamp: string;
   };
+  // v1.5: audit trail for the most recent release override. Unlike `override`
+  // which is cleared when switching back to `build`, `lastOverride` persists
+  // so `/status` can keep surfacing "this repo has previously bypassed the
+  // release gate" even after the gate is re-armed. Always set whenever a
+  // non-null `override` is written; never cleared by mode flips.
+  lastOverride?: {
+    reason: string;
+    setAt: string;
+    setBy: string;
+  };
   updatedAt: string | null;
 }
 

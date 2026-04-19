@@ -65,6 +65,19 @@ export function renderCockpit(
   lines.push(renderHeader(envelope, color));
   lines.push('');
 
+  // v1.5: persistent OVERRIDE ACTIVE banner. When the release gate has
+  // been manually bypassed, the cockpit shouts about it every time the
+  // operator looks at it — this is the whole point of making overrides
+  // auditable. Rendered before ATTENTION so it can't get scrolled away
+  // by a long issues list.
+  const override = boardContext.releaseReadiness?.effectiveOverride;
+  if (override) {
+    lines.push(colorize('⚠ OVERRIDE ACTIVE', color, 'red'));
+    lines.push(`  reason: ${sanitizeForTerminal(override.reason)}`);
+    lines.push(`  since: ${sanitizeForTerminal(override.timestamp)}`);
+    lines.push('');
+  }
+
   lines.push(...renderAttention(attention as ApiIssue[], color));
   lines.push('');
 

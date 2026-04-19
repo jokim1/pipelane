@@ -57,6 +57,7 @@ mirrors it.
 | 8.7 | `pipelane.md` folded into managed-command set (+ residual #2 `.project-workflow.json:aliases` cleanup) | ✅ merged | pipelane #29 |
 | 8.8 | v0 brand-pass close-out in manifest (v0.8 + v0.9 ✅ SHIPPED annotations) | ✅ merged | pipelane #30 |
 | 9.1 | v0.6 `/status` cockpit V0 + v1.3 `TaskLock.nextAction` breadcrumb | ✅ merged | pipelane #31 |
+| 9.2 | v1.5 WIP soft warn (`/new` at ≥3 active) + `--override --reason` auditability | ✅ merged | pipelane #32 |
 
 Ship items in this exact order. Each is its own PR in Pipelane unless
 noted. Catalog IDs reference the detailed sections below.
@@ -697,7 +698,7 @@ dashboard can run them from the UI.
 
 ---
 
-### v1.5 — WIP soft warn + override confirmations
+### v1.5 — WIP soft warn + override confirmations ✅ SHIPPED (pipelane #32)
 
 **Goal.** Prevent accidental scope explosion; make overrides auditable.
 
