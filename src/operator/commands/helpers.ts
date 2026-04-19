@@ -328,6 +328,21 @@ export function watchPrChecks(repoRoot: string, prNumber: number): void {
   });
 }
 
+// v1.5: strip terminal control characters before embedding untrusted
+// strings in CLI output. Defends against ANSI injection via fields that
+// trace back to outside-the-process inputs — PR titles fetched via
+// `gh pr view`, task-lock files that could be hand-edited, and env-derived
+// attribution like GITHUB_ACTOR (attacker-controlled under
+// pull_request_target). Matches CSI/OSC sequences plus all C0 control
+// chars except tab (\x09) and LF (\x0A), DEL (\x7F), and C1 control
+// chars (\x80-\x9F). CR (\x0D) is stripped so embedded \r can't return
+// the cursor to column 0 and overwrite earlier output.
+export function sanitizeForTerminal(raw: string): string {
+  if (!raw) return '';
+  // eslint-disable-next-line no-control-regex
+  return raw.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|[\x00-\x08\x0B-\x1F\x7F\x80-\x9F]/g, '');
+}
+
 // v1.3: persistent breadcrumb for AI↔AI handoff across sessions. Each
 // state-mutating command calls this after savePrRecord / saveDeployState
 // so `/status` and `/resume` can surface what to do next without the next

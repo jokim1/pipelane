@@ -4,7 +4,7 @@ import {
   printResult,
   type ParsedOperatorArgs,
 } from '../state.ts';
-import { renderLaneLine, renderStateGlyph } from './helpers.ts';
+import { renderLaneLine, renderStateGlyph, sanitizeForTerminal } from './helpers.ts';
 
 // v0.6: `/status` terminal cockpit. Shells out to workflow:api snapshot
 // via the in-process `buildWorkflowApiSnapshot` builder — same envelope
@@ -65,16 +65,23 @@ export function renderCockpit(
   lines.push(renderHeader(envelope, color));
   lines.push('');
 
-  // v1.5: persistent OVERRIDE ACTIVE banner. When the release gate has
-  // been manually bypassed, the cockpit shouts about it every time the
-  // operator looks at it — this is the whole point of making overrides
-  // auditable. Rendered before ATTENTION so it can't get scrolled away
-  // by a long issues list.
+  // v1.5: persistent OVERRIDE banners. When the release gate is
+  // currently bypassed, shout about it in red. Even after the gate is
+  // re-armed, keep a softer yellow banner so "this repo has bypassed
+  // release at least once" doesn't quietly disappear the moment someone
+  // flips back to build. Both banners land above ATTENTION so a long
+  // issues list can't scroll either off the screen.
   const override = boardContext.releaseReadiness?.effectiveOverride;
+  const lastOverride = boardContext.releaseReadiness?.lastOverride;
   if (override) {
     lines.push(colorize('⚠ OVERRIDE ACTIVE', color, 'red'));
     lines.push(`  reason: ${sanitizeForTerminal(override.reason)}`);
     lines.push(`  since: ${sanitizeForTerminal(override.timestamp)}`);
+    lines.push('');
+  } else if (lastOverride) {
+    lines.push(colorize('ℹ RELEASE GATE PREVIOUSLY BYPASSED', color, 'yellow'));
+    lines.push(`  reason: ${sanitizeForTerminal(lastOverride.reason)}`);
+    lines.push(`  at: ${sanitizeForTerminal(lastOverride.setAt)} by ${sanitizeForTerminal(lastOverride.setBy)}`);
     lines.push('');
   }
 
@@ -172,22 +179,6 @@ function renderSource(src: SourceHealthEntry, color: boolean): string {
   const glyph = renderStateGlyph(src.state);
   const tinted = colorize(glyph, color, toneForState(src.state));
   return `${tinted} ${sanitizeForTerminal(src.name)}: ${sanitizeForTerminal(src.reason)}`;
-}
-
-// Strip terminal control characters from envelope-sourced strings before
-// embedding in cockpit output. Defends against ANSI injection via fields
-// that ultimately trace back to outside-the-process inputs — PR titles
-// fetched via `gh pr view`, task-lock files that could be hand-edited,
-// and any free-form string the envelope surfaces. The cockpit's own
-// color/bold escapes are added AFTER sanitization, so style for
-// rendering stays intact. Matches CSI/OSC sequences plus all C0 control
-// chars except tab (\x09) and LF (\x0A), DEL (\x7F), and C1 control
-// chars (\x80-\x9F). CR is stripped — embedded \r would return the
-// cursor to column 0 and let an attacker overwrite earlier output.
-function sanitizeForTerminal(raw: string): string {
-  if (!raw) return '';
-  // eslint-disable-next-line no-control-regex
-  return raw.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|[\x00-\x08\x0B-\x1F\x7F\x80-\x9F]/g, '');
 }
 
 function colorizeLanes(lanes: BranchRow['lanes'], baseBranch: string, color: boolean): string {

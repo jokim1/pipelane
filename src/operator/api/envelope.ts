@@ -1,9 +1,13 @@
 import { nowIso } from '../state.ts';
 
-// Bumped 2026-04-18: BranchRow.task gained `nextAction: string | null` so
-// consumers (Pipelane Board + any future envelope reader) can tell a v1.3+
-// pipelane from a pre-v1.3 one. Additive non-breaking change — readers
-// that ignore the new field still parse correctly.
+// Bumped 2026-04-18: two additive-only extensions shipped on the same
+// date and share this version string.
+//  - v1.3 (pipelane #31): BranchRow.task gained `nextAction: string | null`.
+//  - v1.5 (pipelane #32): boardContext.releaseReadiness gained
+//    `lastOverride: { reason, setAt, setBy } | null` for the durable
+//    gate-bypass audit trail.
+// Readers that ignore the new fields still parse correctly. Schema version
+// stays fixed within the batch so downstream pinning doesn't churn.
 export const WORKFLOW_API_SCHEMA_VERSION = '2026-04-18';
 
 export const CANONICAL_LANE_STATES = [

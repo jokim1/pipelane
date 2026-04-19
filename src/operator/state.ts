@@ -529,12 +529,41 @@ export function writeJsonFile(targetPath: string, value: unknown): void {
 }
 
 export function loadModeState(commonDir: string, config: WorkflowConfig): ModeState {
-  return readJsonFile(modeStatePath(commonDir, config), {
+  const raw = readJsonFile<ModeState>(modeStatePath(commonDir, config), {
     mode: DEFAULT_MODE,
     requestedSurfaces: [...config.surfaces],
     override: null,
     updatedAt: null,
-  } satisfies ModeState);
+  });
+  return normalizeModeState(raw);
+}
+
+// v1.5: drop malformed fields on load rather than letting them crash
+// renderers downstream (`/devmode status` prints `last.setBy.length`
+// directly). A corrupt or hand-edited mode-state.json where
+// `lastOverride` is a string, array, or missing one of its three
+// required subfields gets silently dropped back to `undefined`. Strict:
+// all three strings, all non-empty — partials are as suspicious as
+// fully-malformed entries.
+function normalizeModeState(raw: ModeState): ModeState {
+  const last = raw.lastOverride as unknown;
+  if (last && typeof last === 'object' && !Array.isArray(last)) {
+    const entry = last as Record<string, unknown>;
+    if (
+      typeof entry.reason === 'string' && entry.reason.length > 0
+      && typeof entry.setAt === 'string' && entry.setAt.length > 0
+      && typeof entry.setBy === 'string' && entry.setBy.length > 0
+    ) {
+      return {
+        ...raw,
+        lastOverride: { reason: entry.reason, setAt: entry.setAt, setBy: entry.setBy },
+      };
+    }
+  }
+  if (raw.lastOverride !== undefined) {
+    return { ...raw, lastOverride: undefined };
+  }
+  return raw;
 }
 
 export function saveModeState(commonDir: string, config: WorkflowConfig, value: ModeState): void {

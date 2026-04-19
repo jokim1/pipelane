@@ -5120,3 +5120,132 @@ test('renderCockpit surfaces persistent OVERRIDE ACTIVE banner when release gate
   // Banner must precede ATTENTION header so it can't get scrolled off.
   assert.ok(rendered.indexOf('OVERRIDE ACTIVE') < rendered.indexOf('ATTENTION'));
 });
+
+test('setBy whitelist rejects attacker-controlled ANSI escapes in attribution envs', async () => {
+  // Regression guard: a CI context with attacker-controlled GITHUB_ACTOR
+  // (e.g. pull_request_target) must NOT plant ANSI escapes into
+  // mode-state.json via lastOverride.setBy. The whitelist strips to
+  // [A-Za-z0-9_.-]{1,64} and falls through to the next env.
+  const { repoRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    runCli(
+      ['run', 'devmode', 'release', '--override', '--reason', 'hotfix'],
+      repoRoot,
+      {
+        PIPELANE_OVERRIDE_SET_BY: '\x1b[31mEVIL\x1b[0m',
+        GITHUB_ACTOR: '',
+        USER: 'benign',
+      },
+    );
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+    assert.ok(context.modeState.lastOverride);
+    assert.equal(context.modeState.lastOverride.setBy, 'benign',
+      `expected whitelist to reject ANSI and fall through to USER; got "${context.modeState.lastOverride.setBy}"`);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('loadModeState drops a malformed lastOverride entry instead of crashing renderers', async () => {
+  // A corrupt or hand-edited mode-state.json where lastOverride is a
+  // string, array, or missing setBy crashes `/devmode status` via
+  // `last.setBy.length`. loadModeState normalizes on load: require
+  // all three strings non-empty, else drop the field.
+  const { repoRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    // Materialize the state dir via a normal mode write, then replace
+    // mode-state.json with a corrupt lastOverride shape (simulates
+    // hand-edit / partial write / attacker-planted entry).
+    runCli(['run', 'devmode', 'build'], repoRoot);
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+    const modeStateFile = stateMod.modeStatePath(context.commonDir, context.config);
+    writeFileSync(modeStateFile, JSON.stringify({
+      mode: 'build',
+      requestedSurfaces: ['frontend'],
+      override: null,
+      lastOverride: 'definitely not an object',
+      updatedAt: null,
+    }, null, 2), 'utf8');
+
+    const loaded = stateMod.loadModeState(context.commonDir, context.config);
+    assert.equal(loaded.lastOverride, undefined,
+      `malformed lastOverride must be dropped, got ${JSON.stringify(loaded.lastOverride)}`);
+
+    // /devmode status must not crash.
+    const result = runCli(['run', 'devmode'], repoRoot);
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /Last override: none recorded/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('renderCockpit shows RELEASE GATE PREVIOUSLY BYPASSED banner when override cleared but lastOverride persists', async () => {
+  // The audit trail must outlive the active-override flag. After
+  // /devmode build, effectiveOverride is null but lastOverride persists
+  // and the cockpit shouts about it (softer yellow banner, still before
+  // ATTENTION so a long issues list can't scroll it away).
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'status.ts'));
+  const envelope = {
+    schemaVersion: '2026-04-18',
+    command: 'workflow.api.snapshot',
+    ok: true, message: '', warnings: [], issues: [],
+    data: {
+      boardContext: {
+        mode: 'build', baseBranch: 'main',
+        laneOrder: [],
+        releaseReadiness: {
+          state: 'unknown', reason: '', requestedSurfaces: [], blockedSurfaces: [],
+          effectiveOverride: null,
+          lastOverride: { reason: 'shipping hotfix TICKET-42', setAt: '2026-04-18T20:00:00.000Z', setBy: 'alice' },
+          localReady: false, hostedReady: false,
+          freshness: { checkedAt: '', observedAt: '', state: 'fresh' },
+          message: '',
+        },
+        activeTask: null,
+        overallFreshness: { checkedAt: '', observedAt: '', state: 'fresh' },
+      },
+      sourceHealth: [],
+      attention: [],
+      availableActions: [],
+      branches: [],
+    },
+  };
+
+  const rendered = mod.renderCockpit(envelope, { color: false });
+  assert.match(rendered, /RELEASE GATE PREVIOUSLY BYPASSED/);
+  assert.match(rendered, /shipping hotfix TICKET-42/);
+  assert.match(rendered, /by alice/);
+  assert.ok(rendered.indexOf('PREVIOUSLY BYPASSED') < rendered.indexOf('ATTENTION'),
+    'previous-bypass banner must appear before ATTENTION header');
+  // Not the red active banner (override is null).
+  assert.ok(!/OVERRIDE ACTIVE/.test(rendered));
+});
+
+test('WIP warn message describes post-save count so operator sees "about to start Nth"', () => {
+  // Regression guard for off-by-one copy: the count is taken BEFORE the
+  // new lock is saved, so a message like "You have 3 tasks in flight"
+  // alone undercounts. The fix is to name the POST-save ordinal
+  // explicitly.
+  const { repoRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+
+    runCli(['run', 'new', '--task', 'alpha'], repoRoot);
+    runCli(['run', 'new', '--task', 'bravo'], repoRoot);
+    runCli(['run', 'new', '--task', 'charlie'], repoRoot);
+    const result = runCli(['run', 'new', '--task', 'delta'], repoRoot);
+
+    assert.match(result.stderr, /about to start a 4th/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});

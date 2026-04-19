@@ -71,6 +71,12 @@ export interface SnapshotData {
       requestedSurfaces: string[];
       blockedSurfaces: string[];
       effectiveOverride: null | { reason: string; timestamp: string };
+      // v1.5: durable audit trail of the most recent override. Persists
+      // across mode=build flips so the cockpit can keep flagging "this
+      // repo has a history of bypassing the gate" long after the active
+      // override is switched off. Null when no override has ever been
+      // recorded, or after a fresh mode-state.json.
+      lastOverride: null | { reason: string; setAt: string; setBy: string };
       localReady: boolean;
       hostedReady: boolean;
       freshness: ReturnType<typeof buildFreshness>;
@@ -152,6 +158,7 @@ export function buildWorkflowApiSnapshot(cwd: string): ApiEnvelope<SnapshotData>
           requestedSurfaces: context.modeState.requestedSurfaces ?? [],
           blockedSurfaces: [],
           effectiveOverride: context.modeState.override ?? null,
+          lastOverride: context.modeState.lastOverride ?? null,
           localReady: false,
           hostedReady: false,
           freshness: buildFreshness({ checkedAt }),

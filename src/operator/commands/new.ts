@@ -45,13 +45,16 @@ export async function handleNew(cwd: string, parsed: ParsedOperatorArgs): Promis
 
   // v1.5: soft warn for WIP explosion. Runs AFTER pruneDeadTaskLocks so
   // the count reflects genuinely-active locks, not zombies a previous
-  // session left behind.
+  // session left behind. Message is worded around the POST-save count so
+  // the operator sees "about to hit N+1" rather than the pre-save N
+  // (undercount by one).
   const activeLocks = listActiveTaskLocks(context.commonDir, context.config);
   if (activeLocks.length >= WIP_SOFT_WARN_THRESHOLD && !parsed.flags.json) {
     const oldestAgeHours = computeOldestLockAgeHours(activeLocks);
     const ageNote = oldestAgeHours !== null ? `, oldest updated ${oldestAgeHours}h ago` : '';
+    const after = activeLocks.length + 1;
     process.stderr.write([
-      `⚠  You have ${activeLocks.length} tasks in flight${ageNote}.`,
+      `⚠  You have ${activeLocks.length} tasks in flight${ageNote}; about to start a ${ordinal(after)}.`,
       `   Consider /resume on an existing task instead of piling on another.`,
       `   Continuing (this is a warning, not a block).`,
       '',
@@ -102,6 +105,21 @@ export async function handleNew(cwd: string, parsed: ParsedOperatorArgs): Promis
     warnings: [...baseRef.warnings, ...warnings],
     reasons,
   }));
+}
+
+function ordinal(n: number): string {
+  // Small table for the common cases the WIP warn actually hits (≥ 4th).
+  // Fall through to the generic rule for 21st/22nd/23rd etc., which can
+  // happen if the warn is raised late in a very-long-running operator
+  // session.
+  const mod100 = n % 100;
+  if (mod100 >= 11 && mod100 <= 13) return `${n}th`;
+  switch (n % 10) {
+    case 1: return `${n}st`;
+    case 2: return `${n}nd`;
+    case 3: return `${n}rd`;
+    default: return `${n}th`;
+  }
 }
 
 function computeOldestLockAgeHours(locks: Array<{ updatedAt?: string }>): number | null {
