@@ -36,16 +36,37 @@ export async function handleResume(cwd: string, parsed: ParsedOperatorArgs): Pro
           ? [`Current Dev Mode is ${context.modeState.mode}, but this task is locked to ${lock.mode}. Switch back before /pr or /merge.`]
           : [],
         reasons: ['resuming the only active task workspace'],
+        lockNextAction: lock.nextAction ?? null,
       }));
       return;
     }
 
+    const renderedLocks = activeLocks.map((lock) => {
+      const breadcrumb = lock.nextAction?.trim() || null;
+      return {
+        taskSlug: lock.taskSlug,
+        taskName: lock.taskName ?? null,
+        branchName: lock.branchName,
+        worktreePath: lock.worktreePath,
+        mode: lock.mode,
+        lockNextAction: breadcrumb,
+      };
+    });
     const lines = [
       'Active task workspaces:',
-      ...activeLocks.map((lock) => `- ${lock.taskName || lock.taskSlug}: ${lock.branchName} @ ${lock.worktreePath}`),
+      ...activeLocks.map((lock) => {
+        const breadcrumb = lock.nextAction?.trim();
+        const base = `- ${lock.taskName || lock.taskSlug}: ${lock.branchName} @ ${lock.worktreePath}`;
+        return breadcrumb ? `${base}\n  last logged step: ${breadcrumb}` : base;
+      }),
       'Next: run workflow:resume -- --task "<task-name>"',
     ];
-    printResult(parsed.flags, { message: lines.join('\n') });
+    // `activeLocks` gives JSON consumers structured per-lock data
+    // (including the v1.4 `lockNextAction` breadcrumb) so the multi-lock
+    // --json shape exposes the same breadcrumb field as the single-lock
+    // and single-task branches. Additive — existing consumers that only
+    // read `message` keep working.
+    printResult(parsed.flags, { message: lines.join('\n'), activeLocks: renderedLocks });
     return;
   }
 
@@ -74,5 +95,6 @@ export async function handleResume(cwd: string, parsed: ParsedOperatorArgs): Pro
       ? [`Current Dev Mode is ${context.modeState.mode}, but this task is locked to ${lock.mode}. Switch back before /pr or /merge.`]
       : [],
     reasons: ['resuming the existing task workspace for this task'],
+    lockNextAction: lock.nextAction ?? null,
   }));
 }

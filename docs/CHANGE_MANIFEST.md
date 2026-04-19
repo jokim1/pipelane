@@ -59,6 +59,7 @@ mirrors it.
 | 9.1 | v0.6 `/status` cockpit V0 + v1.3 `TaskLock.nextAction` breadcrumb | ✅ merged | pipelane #31 |
 | 9.2 | v1.5 WIP soft warn (`/new` at ≥3 active) + `--override --reason` auditability | ✅ merged | pipelane #32 |
 | 9.3 | v1.2 `doctor.*` (diagnose + `--probe` + `--fix` wizard) + probe-state release gate + first `docs/WORKFLOW_API.md` | ✅ merged | pipelane #33 |
+| 9.4 | v1.4 `/status --week / --stuck / --blast` + `surfacePathMap` config + v1.3 `/resume` nextAction fold-in | 🟡 in PR | pipelane next-1 |
 
 Ship items in this exact order. Each is its own PR in Pipelane unless
 noted. Catalog IDs reference the detailed sections below.
@@ -672,7 +673,7 @@ dashboard can run them from the UI.
 
 ---
 
-### v1.4 — `/status --week / --stuck / --blast`
+### v1.4 — `/status --week / --stuck / --blast` 🟡 IN PR (pipelane next-1)
 
 **Goal.** Collapsed ceremonies (shipped / retro / impact) as flags.
 

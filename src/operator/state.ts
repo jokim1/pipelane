@@ -73,6 +73,12 @@ export interface WorkflowConfig {
   // Optional; absent in default config. Per-surface opt-outs for
   // syncConsumerDocs. Missing entry = default true (current behavior).
   syncDocs?: SyncDocsConfig;
+  // v1.4: path-prefix map for `/status --blast <sha>`. Keys are surface
+  // names (typically the entries in `surfaces`), values are POSIX
+  // directory prefixes ("src/frontend/") or exact filenames matched
+  // against `git diff --name-only` output. Empty / absent = all changes
+  // land in the "other" bucket with a hint to configure the map.
+  surfacePathMap?: Record<string, string[]>;
 }
 
 // Per-surface opt-out flags for `pipelane setup` / `pipelane sync-docs`.
@@ -245,6 +251,12 @@ export interface OperatorFlags {
   confirmToken: string;
   forceInclude: string[];
   async: boolean;
+  // v1.4: mutually exclusive `/status` view selectors. Default (all false
+  // and blastSha empty) renders the existing cockpit. Only one may be
+  // set; handleStatus throws when two collide.
+  week: boolean;
+  stuck: boolean;
+  blastSha: string;
 }
 
 export interface ParsedOperatorArgs {
@@ -480,7 +492,29 @@ export function normalizeWorkflowConfig(raw: Partial<WorkflowConfig>): WorkflowC
     aliases: resolveWorkflowAliases(raw.aliases),
     checks: normalizeChecksConfig(raw.checks),
     syncDocs: normalizeSyncDocsConfig(raw.syncDocs),
+    surfacePathMap: normalizeSurfacePathMap(raw.surfacePathMap),
   };
+}
+
+// Accept a surface→path-list map only when both shape and value types
+// check out. Garbage keys and non-string-array values are dropped rather
+// than crashing loadWorkflowConfig, matching how checks/syncDocs handle
+// malformed input. Returns undefined when nothing survives so the
+// serialized config stays minimal.
+function normalizeSurfacePathMap(
+  raw: Record<string, string[]> | undefined,
+): Record<string, string[]> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const out: Record<string, string[]> = {};
+  for (const [surface, patterns] of Object.entries(raw)) {
+    if (typeof surface !== 'string' || !surface.trim()) continue;
+    if (!Array.isArray(patterns)) continue;
+    const cleaned = patterns.filter(
+      (entry): entry is string => typeof entry === 'string' && entry.trim().length > 0,
+    );
+    if (cleaned.length > 0) out[surface] = cleaned;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 // Strip non-boolean and unknown keys. Returns undefined when no boolean
@@ -855,6 +889,9 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     confirmToken: '',
     forceInclude: [],
     async: false,
+    week: false,
+    stuck: false,
+    blastSha: '',
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -947,6 +984,31 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     if (token === '--surfaces') {
       const raw = argv[index + 1] ?? '';
       flags.surfaces.push(...raw.split(',').map((item) => item.trim()).filter(Boolean));
+      index += 1;
+      continue;
+    }
+
+    if (token === '--week') {
+      flags.week = true;
+      continue;
+    }
+
+    if (token === '--stuck') {
+      flags.stuck = true;
+      continue;
+    }
+
+    if (token === '--blast') {
+      const next = argv[index + 1];
+      // Reject a flag-shaped next token so `/status --blast --json`
+      // doesn't silently swallow `--json` as the sha and fall through to
+      // rev-parse. Value-taking flags elsewhere in this parser are
+      // looser for historical reasons; scoping this guard to --blast
+      // avoids regressing existing call sites.
+      if (next === undefined || next.startsWith('--')) {
+        throw new Error('--blast requires a commit sha or rev-parseable ref as the next argument.');
+      }
+      flags.blastSha = next;
       index += 1;
       continue;
     }

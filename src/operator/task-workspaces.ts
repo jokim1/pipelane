@@ -157,6 +157,10 @@ export function buildTaskWorkspaceOutput(options: {
   resumed: boolean;
   warnings?: string[];
   reasons?: string[];
+  // v1.4: persisted TaskLock.nextAction breadcrumb (set by /pr, /merge,
+  // /deploy, etc.). Surfaced by /resume so AI↔AI handoff picks up where
+  // the prior session left off. Null/blank = no breadcrumb yet.
+  lockNextAction?: string | null;
 }): {
   taskName: string;
   taskSlug: string;
@@ -165,6 +169,7 @@ export function buildTaskWorkspaceOutput(options: {
   worktreeDisplayPath: string;
   mode: Mode;
   nextAction: string;
+  lockNextAction: string | null;
   chatMoved: boolean;
   createdWorktree: boolean;
   resumed: boolean;
@@ -176,6 +181,7 @@ export function buildTaskWorkspaceOutput(options: {
   const reasons = options.reasons ?? [];
   const worktreeDisplayPath = formatWorktreeDisplayPath(options.repoRoot, options.worktreePath);
   const nextAction = `Switch this chat/workspace to ${worktreeDisplayPath}, then continue the task there.`;
+  const lockNextAction = options.lockNextAction?.trim() || null;
   const lines = [
     `Continue this task in: ${worktreeDisplayPath}`,
     `Task: ${options.taskName}`,
@@ -183,6 +189,10 @@ export function buildTaskWorkspaceOutput(options: {
     `Branch: ${options.branchName}`,
     `Mode: ${options.mode}`,
   ];
+
+  if (lockNextAction) {
+    lines.push(`Last logged step: ${lockNextAction}`);
+  }
 
   if (warnings.length > 0) {
     lines.push('Warnings:');
@@ -204,6 +214,7 @@ export function buildTaskWorkspaceOutput(options: {
     worktreeDisplayPath,
     mode: options.mode,
     nextAction,
+    lockNextAction,
     chatMoved: false,
     createdWorktree: options.createdWorktree,
     resumed: options.resumed,

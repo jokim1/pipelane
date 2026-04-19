@@ -1,8 +1,18 @@
 import { buildWorkflowApiSnapshot, type BranchRow, type SnapshotData } from '../api/snapshot.ts';
 import type { ApiEnvelope, ApiIssue, LaneState, SourceHealthEntry } from '../api/envelope.ts';
 import {
+  loadAllTaskLocks,
+  loadDeployState,
+  loadPrState,
   printResult,
+  resolveWorkflowContext,
+  runGit,
+  type DeployRecord,
+  type Mode,
   type ParsedOperatorArgs,
+  type PrRecord,
+  type TaskLock,
+  type WorkflowConfig,
 } from '../state.ts';
 import { renderLaneLine, renderStateGlyph, sanitizeForTerminal } from './helpers.ts';
 
@@ -19,7 +29,52 @@ import { renderLaneLine, renderStateGlyph, sanitizeForTerminal } from './helpers
 //
 // Tests exercise renderCockpit directly with a fixture envelope (see
 // the golden-file case in test/workflow-kit.test.mjs).
+//
+// v1.4 extensions: --week / --stuck / --blast are alternate views on the
+// same underlying state. They read DeployRecord + TaskLock + git diff
+// directly (not the envelope) because they're time-series / set-diff
+// questions the snapshot doesn't pre-aggregate. Only one view flag may
+// be set at a time; the default (no flag) still renders the cockpit.
 export async function handleStatus(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
+  const { week, stuck, blastSha, json } = parsed.flags;
+  const viewCount = [week, stuck, Boolean(blastSha.trim())].filter(Boolean).length;
+  if (viewCount > 1) {
+    throw new Error('Pass only one of --week, --stuck, --blast at a time.');
+  }
+
+  if (week) {
+    const context = resolveWorkflowContext(cwd);
+    const view = buildWeekView(context.commonDir, context.config);
+    if (json) {
+      printResult(parsed.flags, view);
+      return;
+    }
+    process.stdout.write(renderWeekView(view) + '\n');
+    return;
+  }
+
+  if (stuck) {
+    const context = resolveWorkflowContext(cwd);
+    const view = buildStuckView(context.commonDir, context.config);
+    if (json) {
+      printResult(parsed.flags, view);
+      return;
+    }
+    process.stdout.write(renderStuckView(view) + '\n');
+    return;
+  }
+
+  if (blastSha.trim()) {
+    const context = resolveWorkflowContext(cwd);
+    const view = buildBlastView(context.repoRoot, context.commonDir, context.config, blastSha.trim());
+    if (json) {
+      printResult(parsed.flags, view);
+      return;
+    }
+    process.stdout.write(renderBlastView(view) + '\n');
+    return;
+  }
+
   let envelope: ApiEnvelope<SnapshotData>;
   try {
     envelope = buildWorkflowApiSnapshot(cwd);
@@ -33,7 +88,7 @@ export async function handleStatus(cwd: string, parsed: ParsedOperatorArgs): Pro
     throw new Error(envelope.message || 'workflow:api snapshot returned ok=false');
   }
 
-  if (parsed.flags.json) {
+  if (json) {
     printResult(parsed.flags, envelope);
     return;
   }
@@ -308,3 +363,613 @@ const ANSI = {
   red: '\x1b[31m',
   gray: '\x1b[90m',
 } as const;
+
+// v1.4 constants. Thresholds match the manifest's acceptance criteria:
+// 72h idle is "stuck in release", 48h is "staging without prod
+// promotion", 14 days is how far back we'll look for PR-without-deploy
+// orphans (longer windows spam /status with ancient merges the operator
+// has consciously moved on from).
+const DAY_MS = 24 * 60 * 60 * 1000;
+const WEEK_WINDOW_DAYS = 7;
+const STUCK_IDLE_MS = 72 * 60 * 60 * 1000;
+const STAGING_WITHOUT_PROD_MS = 48 * 60 * 60 * 1000;
+const ORPHAN_PR_WINDOW_MS = 14 * DAY_MS;
+// --week table / --stuck sha displays. 12 chars matches the default /status
+// cockpit sha renders; 7 chars matches git's default short-sha shape and is
+// used only for the merge-base label where it lines up with `git log
+// --oneline` output the operator will compare against.
+const SHORT_SHA_LEN = 12;
+const MERGE_BASE_SHA_LEN = 7;
+
+// ─────────────────────────────────────────────────────────────────────
+// v1.4 --week
+// ─────────────────────────────────────────────────────────────────────
+
+export interface WeekDay {
+  date: string; // YYYY-MM-DD (UTC)
+  succeeded: number;
+  failed: number;
+  p50CycleMs: number | null;
+}
+
+export interface WeekView {
+  view: 'week';
+  window: { fromIso: string; toIso: string };
+  days: WeekDay[];
+  totals: {
+    succeeded: number;
+    failed: number;
+    distinctShas: number;
+    p50CycleMs: number | null;
+  };
+}
+
+export function buildWeekView(
+  commonDir: string,
+  config: WorkflowConfig,
+  now: Date = new Date(),
+): WeekView {
+  // UTC-midnight-aligned window. Without alignment the 7 pre-seeded day
+  // labels can disagree with the per-record utcDay bucket labels when
+  // `now` is an unaligned wall-clock time, producing an 8th day in the
+  // output. Align both sides to UTC midnight so the day set is stable.
+  const ref = new Date(now.getTime());
+  const toDayStart = Date.UTC(ref.getUTCFullYear(), ref.getUTCMonth(), ref.getUTCDate());
+  const fromDayStart = toDayStart - (WEEK_WINDOW_DAYS - 1) * DAY_MS;
+  const toExclusive = toDayStart + DAY_MS; // include everything up to end-of-today UTC
+  const { records } = loadDeployState(commonDir, config);
+
+  const byDay = new Map<string, { succeeded: number; failed: number; cycles: number[] }>();
+  // Pre-seed 7 UTC days so every day shows up even when idle.
+  for (let i = WEEK_WINDOW_DAYS - 1; i >= 0; i -= 1) {
+    const day = utcDay(new Date(toDayStart - i * DAY_MS));
+    byDay.set(day, { succeeded: 0, failed: 0, cycles: [] });
+  }
+
+  let succeededTotal = 0;
+  let failedTotal = 0;
+  const shas = new Set<string>();
+  const allCycles: number[] = [];
+
+  for (const record of records) {
+    const requestedMs = Date.parse(record.requestedAt);
+    if (!Number.isFinite(requestedMs)) continue;
+    if (requestedMs < fromDayStart || requestedMs >= toExclusive) continue;
+    const day = utcDay(new Date(requestedMs));
+    // Pre-seed guarantees the bucket exists for every day in the window,
+    // so this get() is never undefined in practice. Guard stays for belt
+    // + braces against a future refactor that changes seeding.
+    const bucket = byDay.get(day) ?? { succeeded: 0, failed: 0, cycles: [] };
+    if (record.status === 'succeeded') {
+      bucket.succeeded += 1;
+      succeededTotal += 1;
+      const verifiedMs = record.verifiedAt ? Date.parse(record.verifiedAt) : NaN;
+      if (Number.isFinite(verifiedMs) && verifiedMs >= requestedMs) {
+        const cycle = verifiedMs - requestedMs;
+        bucket.cycles.push(cycle);
+        allCycles.push(cycle);
+      }
+    } else if (record.status === 'failed') {
+      bucket.failed += 1;
+      failedTotal += 1;
+    }
+    if (record.sha) shas.add(record.sha);
+    byDay.set(day, bucket);
+  }
+
+  // Sort days oldest→newest so the render reads like a timeline.
+  const days: WeekDay[] = [...byDay.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([date, entry]) => ({
+      date,
+      succeeded: entry.succeeded,
+      failed: entry.failed,
+      p50CycleMs: median(entry.cycles),
+    }));
+
+  return {
+    view: 'week',
+    window: {
+      fromIso: new Date(fromDayStart).toISOString(),
+      toIso: new Date(toDayStart).toISOString(),
+    },
+    days,
+    totals: {
+      succeeded: succeededTotal,
+      failed: failedTotal,
+      distinctShas: shas.size,
+      p50CycleMs: median(allCycles),
+    },
+  };
+}
+
+export function renderWeekView(view: WeekView): string {
+  const header = `SHIPPED (last 7 days, ${view.window.fromIso.slice(0, 10)} → ${view.window.toIso.slice(0, 10)})`;
+  const rows: string[][] = [['date', 'ok', 'fail', 'p50-cycle']];
+  for (const day of view.days) {
+    rows.push([
+      day.date,
+      String(day.succeeded),
+      String(day.failed),
+      formatDurationOrDash(day.p50CycleMs),
+    ]);
+  }
+  rows.push([
+    'TOTAL',
+    String(view.totals.succeeded),
+    String(view.totals.failed),
+    formatDurationOrDash(view.totals.p50CycleMs),
+  ]);
+  const tableLines = renderTable(rows, { indent: '  ' });
+  const summaryLines = [
+    `  distinct shas deployed: ${view.totals.distinctShas}`,
+  ];
+  return [header, '', ...tableLines, '', ...summaryLines].join('\n');
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// v1.4 --stuck
+// ─────────────────────────────────────────────────────────────────────
+
+export interface StuckIdleTask {
+  taskSlug: string;
+  taskName: string | null;
+  branchName: string;
+  mode: Mode;
+  idleMs: number;
+  updatedAt: string;
+  nextAction: string | null;
+}
+
+export interface StuckOrphanPr {
+  taskSlug: string;
+  number: number | null;
+  title: string;
+  mergedSha: string | null;
+  mergedAt: string | null;
+}
+
+export interface StuckStaleStaging {
+  sha: string;
+  surfaces: string[];
+  verifiedAt: string | null;
+  ageMs: number;
+}
+
+export interface StuckView {
+  view: 'stuck';
+  idleTasks: StuckIdleTask[];
+  orphanMergedPrs: StuckOrphanPr[];
+  staleStaging: StuckStaleStaging[];
+}
+
+export function buildStuckView(
+  commonDir: string,
+  config: WorkflowConfig,
+  now: Date = new Date(),
+): StuckView {
+  const nowMs = now.getTime();
+  const locks = loadAllTaskLocks(commonDir, config);
+  const { records } = loadDeployState(commonDir, config);
+  const prRecords = Object.values(loadPrState(commonDir, config).records);
+
+  const idleTasks: StuckIdleTask[] = [];
+  for (const lock of locks) {
+    if (lock.mode !== 'release') continue;
+    const updatedMs = Date.parse(lock.updatedAt);
+    if (!Number.isFinite(updatedMs)) continue;
+    const idleMs = nowMs - updatedMs;
+    // Spec is "idle > 72h" (strict). Using `<=` to skip means exactly-72h
+    // is NOT flagged, matching the manifest's `updatedAt > 72h` language.
+    if (idleMs <= STUCK_IDLE_MS) continue;
+    idleTasks.push({
+      taskSlug: lock.taskSlug,
+      taskName: lock.taskName ?? null,
+      branchName: lock.branchName,
+      mode: lock.mode,
+      idleMs,
+      updatedAt: lock.updatedAt,
+      nextAction: lock.nextAction?.trim() || null,
+    });
+  }
+  idleTasks.sort((a, b) => b.idleMs - a.idleMs);
+
+  // "PRs merged with no matching DeployRecord" — a DeployRecord matches
+  // when it shares the mergedSha and environment='staging' or 'prod'.
+  // We don't require success here; the signal is "we merged but never
+  // even tried to deploy this sha," which is the state operators want
+  // to be reminded of.
+  const deployedShas = new Set(records.map((record) => record.sha).filter(Boolean));
+  const orphanMergedPrs: StuckOrphanPr[] = [];
+  for (const pr of prRecords) {
+    if (!pr.mergedSha || !pr.mergedAt) continue;
+    const mergedMs = Date.parse(pr.mergedAt);
+    if (!Number.isFinite(mergedMs)) continue;
+    if (nowMs - mergedMs > ORPHAN_PR_WINDOW_MS) continue;
+    if (deployedShas.has(pr.mergedSha)) continue;
+    orphanMergedPrs.push({
+      taskSlug: pr.taskSlug,
+      number: pr.number ?? null,
+      title: pr.title ?? '',
+      mergedSha: pr.mergedSha,
+      mergedAt: pr.mergedAt,
+    });
+  }
+  orphanMergedPrs.sort((a, b) => (a.mergedAt ?? '').localeCompare(b.mergedAt ?? ''));
+
+  // "Staging DeployRecords with no prod promotion after 48h" — for each
+  // succeeded+verified staging record whose sha never shows up in a
+  // succeeded prod record, warn if verifiedAt is older than 48h.
+  const prodShas = new Set(
+    records.filter((r) => r.environment === 'prod' && r.status === 'succeeded').map((r) => r.sha),
+  );
+  const stagingByShaSurfaces = new Map<string, DeployRecord>();
+  for (const record of records) {
+    if (record.environment !== 'staging') continue;
+    if (record.status !== 'succeeded') continue;
+    if (!record.sha) continue;
+    const key = `${record.sha}:${[...(record.surfaces ?? [])].sort().join(',')}`;
+    const prev = stagingByShaSurfaces.get(key);
+    const prevVerifiedMs = prev?.verifiedAt ? Date.parse(prev.verifiedAt) : 0;
+    const curVerifiedMs = record.verifiedAt ? Date.parse(record.verifiedAt) : 0;
+    if (!prev || curVerifiedMs > prevVerifiedMs) stagingByShaSurfaces.set(key, record);
+  }
+  const staleStaging: StuckStaleStaging[] = [];
+  for (const record of stagingByShaSurfaces.values()) {
+    if (prodShas.has(record.sha)) continue;
+    const verifiedMs = record.verifiedAt ? Date.parse(record.verifiedAt) : NaN;
+    if (!Number.isFinite(verifiedMs)) continue;
+    const ageMs = nowMs - verifiedMs;
+    if (ageMs < STAGING_WITHOUT_PROD_MS) continue;
+    staleStaging.push({
+      sha: record.sha,
+      surfaces: [...(record.surfaces ?? [])].sort(),
+      verifiedAt: record.verifiedAt ?? null,
+      ageMs,
+    });
+  }
+  staleStaging.sort((a, b) => b.ageMs - a.ageMs);
+
+  return { view: 'stuck', idleTasks, orphanMergedPrs, staleStaging };
+}
+
+export function renderStuckView(view: StuckView): string {
+  const lines: string[] = ['STUCK'];
+  const nothingStuck =
+    view.idleTasks.length === 0 &&
+    view.orphanMergedPrs.length === 0 &&
+    view.staleStaging.length === 0;
+  if (nothingStuck) {
+    lines.push('  (nothing stuck)');
+    return lines.join('\n');
+  }
+
+  // All string fields sourced from on-disk JSON (task-locks, pr-state,
+  // deploy-state) pass through sanitizeForTerminal before being echoed.
+  // A tampered state file could otherwise smuggle ANSI escapes / OSC-8
+  // hyperlinks into the operator's terminal via /status --stuck. Same
+  // defense posture as the cockpit's renderBranch on line 231.
+  const s = sanitizeForTerminal;
+  lines.push('  idle >72h (release mode):');
+  if (view.idleTasks.length === 0) {
+    lines.push('    (none)');
+  } else {
+    for (const task of view.idleTasks) {
+      const head = `    ${s(task.taskSlug)}  branch=${s(task.branchName)}  idle=${formatDuration(task.idleMs)}`;
+      lines.push(head);
+      if (task.nextAction) {
+        lines.push(`      next: ${s(task.nextAction)}`);
+      }
+    }
+  }
+
+  lines.push('  merged PRs without DeployRecord (last 14d):');
+  if (view.orphanMergedPrs.length === 0) {
+    lines.push('    (none)');
+  } else {
+    for (const pr of view.orphanMergedPrs) {
+      const prLabel = pr.number !== null ? `PR #${pr.number}` : 'PR (no number)';
+      lines.push(
+        `    ${prLabel}  task=${s(pr.taskSlug)}  mergedSha=${s(pr.mergedSha ?? '?')}  mergedAt=${s(pr.mergedAt ?? '?')}`,
+      );
+    }
+  }
+
+  lines.push('  staging without prod promotion (>48h):');
+  if (view.staleStaging.length === 0) {
+    lines.push('    (none)');
+  } else {
+    for (const staging of view.staleStaging) {
+      const shaDisplay = s(staging.sha).slice(0, SHORT_SHA_LEN);
+      const surfacesDisplay = staging.surfaces.map(s).join(',') || '(none)';
+      const verifiedDisplay = s(staging.verifiedAt ?? '?');
+      lines.push(
+        `    sha=${shaDisplay}  surfaces=${surfacesDisplay}  verifiedAt=${verifiedDisplay}  age=${formatDuration(staging.ageMs)}`,
+      );
+    }
+  }
+
+  return lines.join('\n');
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// v1.4 --blast
+// ─────────────────────────────────────────────────────────────────────
+
+export type BlastBaseKind = 'prod-deploy' | 'merge-base' | 'base-branch';
+
+export interface BlastView {
+  view: 'blast';
+  sha: string;
+  resolvedSha: string;
+  base: { kind: BlastBaseKind; sha: string; label: string };
+  surfaces: Record<string, string[]>;
+  other: string[];
+  totalFiles: number;
+  hint: string | null;
+}
+
+export function buildBlastView(
+  repoRoot: string,
+  commonDir: string,
+  config: WorkflowConfig,
+  sha: string,
+): BlastView {
+  // `rev-parse --verify <ref>` rejects any arg that starts with `-`
+  // (git reads it as an unknown flag and fails rather than resolving),
+  // so user-supplied shas can't smuggle options into rev-parse.
+  // execFileSync already blocks shell metachar injection, but argument
+  // injection is orthogonal.
+  const resolvedSha = runGit(repoRoot, ['rev-parse', '--verify', sha], true);
+  if (!resolvedSha) {
+    throw new Error(`Could not resolve "${sha}" in this repo. Pass a commit sha or rev-parseable ref.`);
+  }
+
+  // Prefer the most recent succeeded prod DeployRecord as the base. That's
+  // the "what's currently in prod" anchor. Fall back to baseBranch (local
+  // HEAD, then origin/) if no prod deploys have ever happened, and
+  // finally to merge-base as a last resort for fresh/partial clones.
+  const { records } = loadDeployState(commonDir, config);
+  const lastGood = records.reduce<DeployRecord | null>((best, record) => {
+    if (record.environment !== 'prod' || record.status !== 'succeeded' || !record.sha) return best;
+    if (!best) return record;
+    const bestKey = best.verifiedAt ?? best.requestedAt;
+    const curKey = record.verifiedAt ?? record.requestedAt;
+    return curKey.localeCompare(bestKey) > 0 ? record : best;
+  }, null);
+  let base: BlastView['base'];
+  if (lastGood?.sha && runGit(repoRoot, ['cat-file', '-e', '--end-of-options', lastGood.sha], true) !== null) {
+    base = {
+      kind: 'prod-deploy',
+      sha: lastGood.sha,
+      label: `last succeeded prod deploy @ ${sanitizeForTerminal(lastGood.verifiedAt ?? lastGood.requestedAt)}`,
+    };
+  } else {
+    const baseSha =
+      runGit(repoRoot, ['rev-parse', '--verify', config.baseBranch], true)
+      ?? runGit(repoRoot, ['rev-parse', '--verify', `origin/${config.baseBranch}`], true);
+    if (baseSha) {
+      base = { kind: 'base-branch', sha: baseSha, label: `${config.baseBranch} HEAD` };
+    } else {
+      const mergeBase = runGit(repoRoot, ['merge-base', 'HEAD', resolvedSha], true);
+      if (!mergeBase) {
+        throw new Error(
+          `No prior prod deploy and baseBranch "${config.baseBranch}" is unresolvable (tried local + origin/). Cannot compute blast radius.`,
+        );
+      }
+      base = {
+        kind: 'merge-base',
+        sha: mergeBase,
+        label: `merge-base(HEAD, ${resolvedSha.slice(0, MERGE_BASE_SHA_LEN)})`,
+      };
+    }
+  }
+
+  // -z + NUL-split neutralises git's core.quotePath escaping (which
+  // would otherwise wrap non-ASCII filenames in quotes that break
+  // prefix matching). base.sha and resolvedSha are always hex outputs
+  // of rev-parse at this point, so the range `a..b` string can't start
+  // with a dash and no argument-injection guard is needed here.
+  const diffOutput = runGit(
+    repoRoot,
+    ['diff', '--name-only', '-z', `${base.sha}..${resolvedSha}`],
+    true,
+  ) ?? '';
+  const files = diffOutput
+    .split('\0')
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const map = config.surfacePathMap ?? {};
+  // Precompute normalized patterns once so matchSurface doesn't re-sort
+  // keys or recompute directory suffixes per file (O(F × K log K) → O(K
+  // log K + F × K)). Also normalize backslashes to forward slashes on
+  // both sides — git emits forward slashes on every platform but Windows
+  // authors writing surfacePathMap may use backslashes, which would
+  // otherwise silently send every file to `other`.
+  const normalizedMap = buildNormalizedSurfaceMap(map);
+  const surfaceBuckets: Record<string, string[]> = {};
+  const other: string[] = [];
+  for (const file of files) {
+    const normalizedFile = toPosixPath(file);
+    const matched = matchSurfaceFast(normalizedFile, normalizedMap);
+    if (matched) {
+      if (!surfaceBuckets[matched]) surfaceBuckets[matched] = [];
+      surfaceBuckets[matched].push(file);
+    } else {
+      other.push(file);
+    }
+  }
+  for (const list of Object.values(surfaceBuckets)) list.sort();
+  other.sort();
+
+  const hint =
+    Object.keys(map).length === 0
+      ? 'configure `surfacePathMap` in .project-workflow.json to group these files by surface.'
+      : null;
+
+  return {
+    view: 'blast',
+    sha,
+    resolvedSha,
+    base,
+    surfaces: surfaceBuckets,
+    other,
+    totalFiles: files.length,
+    hint,
+  };
+}
+
+export function renderBlastView(view: BlastView): string {
+  const s = sanitizeForTerminal;
+  const lines: string[] = [];
+  const shortSha = view.resolvedSha.slice(0, SHORT_SHA_LEN);
+  const shortBase = view.base.sha.slice(0, SHORT_SHA_LEN);
+  // view.base.label is partly sourced from DeployRecord.verifiedAt
+  // (untrusted on-disk JSON), so it goes through sanitizeForTerminal.
+  // view.resolvedSha and view.base.sha are both outputs of runGit, so
+  // they're trusted hex and don't need sanitizing.
+  lines.push(`BLAST ${shortSha}  (base: ${view.base.kind} ${shortBase} — ${s(view.base.label)})`);
+  lines.push(`  ${view.totalFiles} file(s) changed.`);
+  lines.push('');
+
+  if (view.totalFiles === 0) {
+    lines.push('  (no files changed between base and target)');
+    if (view.base.sha === view.resolvedSha) {
+      lines.push('  note: base resolves to the same commit as target — check your baseBranch / fetch origin/<base>.');
+    }
+    if (view.hint) lines.push(`  hint: ${view.hint}`);
+    return lines.join('\n');
+  }
+
+  const surfaceNames = Object.keys(view.surfaces).sort();
+  for (const surface of surfaceNames) {
+    const files = view.surfaces[surface];
+    lines.push(`  ${s(surface)} (${files.length} file${files.length === 1 ? '' : 's'}):`);
+    for (const file of files) lines.push(`    ${s(file)}`);
+  }
+  if (view.other.length > 0) {
+    lines.push(`  other (${view.other.length} file${view.other.length === 1 ? '' : 's'}):`);
+    for (const file of view.other) lines.push(`    ${s(file)}`);
+  }
+  if (view.hint) {
+    lines.push('');
+    lines.push(`  hint: ${view.hint}`);
+  }
+  return lines.join('\n');
+}
+
+// Map a surface map to a pre-normalized list used by matchSurfaceFast.
+// Keys are pre-sorted alphabetically so iteration order is deterministic
+// across Node versions (Object.keys is insertion-ordered per spec, but
+// stable sort makes the choice explicit for the overlap-tiebreak case).
+// Each pattern is classified as exact-file vs directory-prefix once,
+// avoiding the endsWith/`+ '/'` recomputation on every file.
+interface NormalizedSurface {
+  surface: string;
+  exactFiles: Set<string>;
+  dirPrefixes: string[];
+}
+function buildNormalizedSurfaceMap(map: Record<string, string[]>): NormalizedSurface[] {
+  const surfaces = Object.keys(map).sort();
+  return surfaces.map((surface) => {
+    const exactFiles = new Set<string>();
+    const dirPrefixes: string[] = [];
+    for (const rawPattern of map[surface] ?? []) {
+      if (!rawPattern) continue;
+      const pattern = toPosixPath(rawPattern);
+      if (pattern.endsWith('/')) {
+        dirPrefixes.push(pattern);
+      } else {
+        // A pattern with a path separator but no trailing slash could be
+        // either an exact file (`openapi.yaml`) or a directory (`src/foo`).
+        // Accept both interpretations: try exact first, then as dir prefix.
+        exactFiles.add(pattern);
+        dirPrefixes.push(`${pattern}/`);
+      }
+    }
+    return { surface, exactFiles, dirPrefixes };
+  });
+}
+
+// Match a POSIX-normalized file path against the pre-normalized surface
+// list. Surfaces are tried in alphabetical order of key name, first hit
+// wins. When two surfaces overlap on the same file the alphabetically
+// earlier surface wins; design maps so patterns don't overlap if that
+// matters for your use case.
+function matchSurfaceFast(file: string, surfaces: NormalizedSurface[]): string | null {
+  for (const { surface, exactFiles, dirPrefixes } of surfaces) {
+    if (exactFiles.has(file)) return surface;
+    for (const prefix of dirPrefixes) {
+      if (file.startsWith(prefix)) return surface;
+    }
+  }
+  return null;
+}
+
+function toPosixPath(file: string): string {
+  // git emits forward slashes on every platform but surfacePathMap
+  // authors on Windows may naturally write backslashes. Normalize so
+  // either style works.
+  return file.replace(/\\/g, '/');
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// v1.4 helpers
+// ─────────────────────────────────────────────────────────────────────
+
+function utcDay(date: Date): string {
+  // Use toISOString so daylight-saving never shifts the bucket; month
+  // and day always land on UTC boundaries.
+  return date.toISOString().slice(0, 10);
+}
+
+function median(samples: number[]): number | null {
+  if (samples.length === 0) return null;
+  const sorted = [...samples].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 0) {
+    return Math.round((sorted[mid - 1] + sorted[mid]) / 2);
+  }
+  return sorted[mid];
+}
+
+function formatDurationOrDash(ms: number | null): string {
+  if (ms === null) return '—';
+  return formatDuration(ms);
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 0) return '0s';
+  const totalSeconds = Math.round(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours >= 24) {
+    const days = Math.floor(hours / 24);
+    const remHours = hours % 24;
+    return remHours > 0 ? `${days}d${remHours}h` : `${days}d`;
+  }
+  if (hours > 0) {
+    return `${hours}h${String(minutes).padStart(2, '0')}m`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m${String(seconds).padStart(2, '0')}s`;
+  }
+  return `${seconds}s`;
+}
+
+// Left-aligned fixed-width table. No color, no unicode box-drawing —
+// terminals behave predictably and the output diff-compares cleanly for
+// golden-file tests.
+function renderTable(rows: string[][], options: { indent?: string } = {}): string[] {
+  if (rows.length === 0) return [];
+  const indent = options.indent ?? '';
+  const widths = rows[0].map((_, colIndex) =>
+    rows.reduce((max, row) => Math.max(max, (row[colIndex] ?? '').length), 0),
+  );
+  return rows.map((row) => {
+    const parts = row.map((cell, i) => (i === row.length - 1 ? cell : cell.padEnd(widths[i])));
+    return `${indent}${parts.join('  ')}`;
+  });
+}
