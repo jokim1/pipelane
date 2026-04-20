@@ -74,7 +74,7 @@ async function main(): Promise<void> {
   if (command === 'bootstrap') {
     const options = parseBootstrapArgs(rest);
     const result = runBootstrap(process.cwd(), options);
-    process.stdout.write([
+    const lines = [
       `Bootstrapped pipelane in ${result.repoRoot}`,
       result.installedPackage ? 'Installed repo-local pipelane dependency.' : 'Reused existing repo-local pipelane dependency.',
       result.initializedRepo
@@ -86,7 +86,12 @@ async function main(): Promise<void> {
       'Commit the tracked Pipelane files before using pipelane:new from a remote-backed repo.',
       'Claude picks up the tracked .claude/commands files after the repo is initialized.',
       'If Codex was already open, reopen the repo or restart the client to refresh slash commands.',
-    ].join('\n') + '\n');
+    ];
+    if (result.warnings.length > 0) {
+      lines.push('Readiness warnings:');
+      lines.push(...result.warnings.map((warning) => `- ${warning}`));
+    }
+    process.stdout.write(lines.join('\n') + '\n');
     return;
   }
 

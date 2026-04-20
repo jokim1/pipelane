@@ -680,6 +680,9 @@ test('bootstrap installs pipelane, initializes the repo, and seeds the global bo
     assert.match(result.stdout, /Installed repo-local pipelane dependency/);
     assert.match(result.stdout, /Initialized tracked Pipelane files for Demo App/);
     assert.match(result.stdout, /Slash commands: .*\/init-pipelane.*\/new/);
+    assert.match(result.stdout, /Readiness warnings:/);
+    assert.match(result.stdout, /This repo has no commits yet/);
+    assert.match(result.stdout, /No `origin` remote detected/);
     assert.ok(existsSync(path.join(repoRoot, '.pipelane.json')));
     assert.ok(existsSync(path.join(repoRoot, 'CLAUDE.md')));
     assert.ok(existsSync(path.join(repoRoot, 'node_modules', 'pipelane', 'package.json')));
@@ -689,6 +692,28 @@ test('bootstrap installs pipelane, initializes the repo, and seeds the global bo
     const packageJson = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
     assert.equal(typeof packageJson.devDependencies.pipelane, 'string');
     assert.equal(packageJson.scripts['pipelane:new'], 'pipelane run new');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('bootstrap in a non-git directory warns that workflow commands still need git', () => {
+  const repoRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-bootstrap-nogit-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    const result = runCli(
+      ['bootstrap', '--project', 'Demo App'],
+      repoRoot,
+      { CODEX_HOME: codexHome, PIPELANE_INSTALL_SPEC: LOCAL_PIPELANE_INSTALL_SPEC },
+    );
+
+    assert.match(result.stdout, /Bootstrapped pipelane/);
+    assert.match(result.stdout, /Readiness warnings:/);
+    assert.match(result.stdout, /No git repository detected/);
+    assert.equal(existsSync(path.join(repoRoot, '.git')), false);
+    assert.ok(existsSync(path.join(repoRoot, '.pipelane.json')));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });

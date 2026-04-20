@@ -16,6 +16,7 @@ export interface BootstrapResult {
   createdClaude: boolean;
   codexHome: string;
   installedWrappers: string[];
+  warnings: string[];
 }
 
 function hasPipelaneDependency(repoRoot: string): boolean {
@@ -88,6 +89,49 @@ function readDisplayName(repoRoot: string): string {
   }
 }
 
+function readBaseBranch(repoRoot: string): string {
+  const configPath = path.join(repoRoot, CONFIG_FILENAME);
+  if (!existsSync(configPath)) {
+    return 'main';
+  }
+
+  try {
+    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as { baseBranch?: string };
+    return parsed.baseBranch?.trim() || 'main';
+  } catch {
+    return 'main';
+  }
+}
+
+function collectBootstrapWarnings(repoRoot: string): string[] {
+  const baseBranch = readBaseBranch(repoRoot);
+  const warnings: string[] = [];
+  const gitRepo = runCommandCapture('git', ['rev-parse', '--show-toplevel'], { cwd: repoRoot });
+
+  if (!gitRepo.ok) {
+    warnings.push(
+      'No git repository detected. `bootstrap` scaffolded the files successfully, but `/new`, `/pr`, `/merge`, and `/deploy` require a git repo. Clone the target repo or run `git init -b main` before using the workflow.',
+    );
+    return warnings;
+  }
+
+  const head = runCommandCapture('git', ['rev-parse', '--verify', 'HEAD'], { cwd: repoRoot });
+  if (!head.ok) {
+    warnings.push(
+      `This repo has no commits yet. Create the initial \`${baseBranch}\` commit before using \`/new\` so task worktrees have a real base to branch from.`,
+    );
+  }
+
+  const origin = runCommandCapture('git', ['remote', 'get-url', 'origin'], { cwd: repoRoot });
+  if (!origin.ok) {
+    warnings.push(
+      `No \`origin\` remote detected. \`/new\` refreshes \`origin/${baseBranch}\` by default and will fail until that remote exists and the base branch is pushed. If you intentionally want a local-only flow, rerun \`pipelane:new\` with \`--offline\`.`,
+    );
+  }
+
+  return warnings;
+}
+
 export function parseBootstrapArgs(argv: string[]): BootstrapOptions {
   const options: BootstrapOptions = {};
   for (let index = 0; index < argv.length; index += 1) {
@@ -136,5 +180,6 @@ export function runBootstrap(cwd: string, options: BootstrapOptions): BootstrapR
     createdClaude: parsedSetup.createdClaude,
     codexHome: parsedSetup.codexHome,
     installedWrappers: parsedSetup.installedWrappers,
+    warnings: collectBootstrapWarnings(repoRoot),
   };
 }
