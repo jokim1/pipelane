@@ -512,7 +512,7 @@ in `AGENTS.md` where enforcement is social.
 - `AGENTS.md` — policy for AI operators
 - `.claude/commands/*` — thin slash adapters
 - `pipelane/CLAUDE.template.md` — template used to bootstrap local operator state
-- `docs/RELEASE_WORKFLOW.md` — this file
+- `docs/RELEASE_WORKFLOW.md` — rendered from the pipelane template; pipelane's own copy of this reference lives at `docs/public/RELEASE_WORKFLOW.md`
 
 ### Local-only (operator state, git-ignored)
 
