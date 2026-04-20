@@ -804,7 +804,13 @@ user-visible strings ahead of this; v2.1 is the package/bin flip.
   release to avoid re-migrations" guidance. Same logic applies to the
   `~/.workflow-kit/dashboard/` per-repo dashboard state and
   `~/.codex/skills/workflow-kit/` codex skill dir — all deferred.
-- `src/operator/codex-install.ts` prose untouched because the file is
+- `src/operator/codex-install.ts` partial sweep: user-visible prose +
+  the run-script wrapper now reference `pipelane` (`pipelane init`,
+  `pipelane:setup`, `pipelane:$subcommand`). The load-bearing legacy
+  detection markers (`WORKFLOW_KIT_SKILL_MARKER`,
+  `LEGACY_ROCKETBOARD_SKILL_MARKER`) and the `~/.codex/skills/workflow-kit/`
+  skill-folder name stay on the legacy name so previously-installed
+  Codex skills can still be detected and managed. Whole file is
   scheduled for deletion in v2.2.
 
 ---

@@ -16,7 +16,7 @@ function buildSkill(slashAlias: string, codexHome: string): string {
   return `---
 name: ${aliasCommandName(slashAlias)}
 version: 1.0.0
-description: Run the workflow-kit command currently mapped to ${slashAlias} in this repo.
+description: Run the pipelane command currently mapped to ${slashAlias} in this repo.
 allowed-tools:
   - Bash
 ---
@@ -28,7 +28,7 @@ Run the generic workflow-kit wrapper for this repo.
 3. Run:
    \`${codexHome}/skills/workflow-kit/bin/run-workflow.sh --alias ${slashAlias} <parsed arguments>\`
 4. Stream the command output directly.
-5. If the current repo is not workflow-kit enabled, return the refusal unchanged.
+5. If the current repo is not pipelane enabled, return the refusal unchanged.
 `;
 }
 
@@ -46,12 +46,12 @@ shift
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 if [ -z "$repo_root" ]; then
-  echo "This command only works inside a workflow-kit repo." >&2
+  echo "This command only works inside a pipelane repo." >&2
   exit 2
 fi
 
 if [ ! -f "$repo_root/.project-workflow.json" ]; then
-  echo "This repo is not workflow-kit enabled. Run workflow-kit init first." >&2
+  echo "This repo is not pipelane enabled. Run pipelane init first." >&2
   exit 2
 fi
 
@@ -113,7 +113,23 @@ NODE
 fi
 
 cd "$repo_root"
-exec npm run "pipelane:$subcommand" -- "$@"
+# v2.1 deprecation window: prefer the canonical pipelane:* script name,
+# but fall back to the legacy workflow:* alias when only the old name is
+# defined. The Codex wrapper is machine-global, so a single repo upgrading
+# to v2.1 regenerates this script for every co-resident repo on the same
+# machine. Without the fallback, repos still pinned to a pre-rename
+# pipelane (which only emits workflow:* in package.json) would see every
+# Codex slash command fail with "Missing script: pipelane:<cmd>" the
+# moment any other repo on the machine bumped pipelane. Grep on the JSON
+# is intentionally conservative: a false positive (e.g., a description
+# string mentioning the script name) just means we run the canonical name
+# anyway, and npm exits with the same "Missing script" error it would
+# have raised without the fallback — never worse than baseline.
+if grep -q "\"pipelane:$subcommand\"" "$repo_root/package.json" 2>/dev/null; then
+  exec npm run "pipelane:$subcommand" -- "$@"
+else
+  exec npm run "workflow:$subcommand" -- "$@"
+fi
 `;
 }
 

@@ -1624,24 +1624,27 @@ test('syncDocs.packageScripts: false preserves consumer-customized workflow scri
 
     // Simulate a consumer that wants its own wrappers around pipelane:
     // they're opting out of packageScripts precisely so their customized
-    // workflow:* entries don't get overwritten on every re-sync.
+    // pipelane:* entries don't get overwritten on every re-sync. Names
+    // use the post-v2.1 pipelane:* primary surface so the consistency
+    // check (which now matches what generated .claude/commands/*.md
+    // actually invoke) is satisfied.
     const packageJsonPath = path.join(repoRoot, 'package.json');
     const customScripts = {
       build: 'my-build',
-      'workflow:new': 'my-wrapper new',
-      'workflow:resume': 'my-wrapper resume',
-      'workflow:pr': 'my-wrapper pr',
-      'workflow:merge': 'my-wrapper merge',
-      'workflow:deploy': 'my-wrapper deploy',
-      'workflow:clean': 'my-wrapper clean',
-      'workflow:devmode': 'my-wrapper devmode',
-      'workflow:status': 'my-wrapper status',
-      'workflow:doctor': 'my-wrapper doctor',
-      'workflow:rollback': 'my-wrapper rollback',
-      // devmode.md tells operators to run `workflow:configure` when release
+      'pipelane:new': 'my-wrapper new',
+      'pipelane:resume': 'my-wrapper resume',
+      'pipelane:pr': 'my-wrapper pr',
+      'pipelane:merge': 'my-wrapper merge',
+      'pipelane:deploy': 'my-wrapper deploy',
+      'pipelane:clean': 'my-wrapper clean',
+      'pipelane:devmode': 'my-wrapper devmode',
+      'pipelane:status': 'my-wrapper status',
+      'pipelane:doctor': 'my-wrapper doctor',
+      'pipelane:rollback': 'my-wrapper rollback',
+      // devmode.md tells operators to run `pipelane:configure` when release
       // mode is blocked; the consistency check requires consumers opting out
       // of packageScripts to define it themselves.
-      'workflow:configure': 'my-wrapper configure',
+      'pipelane:configure': 'my-wrapper configure',
     };
     const consumerPackage = {
       name: 'consumer-app',
@@ -1666,14 +1669,14 @@ test('syncDocs.packageScripts: false preserves consumer-customized workflow scri
   }
 });
 
-test('syncDocs.packageScripts: false without required workflow:* scripts throws with guidance', () => {
+test('syncDocs.packageScripts: false without required pipelane:* scripts throws with guidance', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-codex-'));
 
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
 
-    // Consumer wipes the kit-installed workflow:* scripts but forgot to
+    // Consumer wipes the kit-installed pipelane:* scripts but forgot to
     // either replace them or also opt out of claudeCommands. Setup must
     // fail loudly, not silently leave a broken slash-command config.
     const packageJsonPath = path.join(repoRoot, 'package.json');
@@ -1693,7 +1696,7 @@ test('syncDocs.packageScripts: false without required workflow:* scripts throws 
     const result = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome }, true);
     assert.equal(result.status, 1);
     assert.match(result.stderr, /packageScripts is false but package\.json is missing required npm scripts/);
-    assert.match(result.stderr, /workflow:clean/);
+    assert.match(result.stderr, /pipelane:clean/);
     // Error message must list the three escape hatches so the consumer
     // can recover without digging into the codebase.
     assert.match(result.stderr, /set syncDocs\.packageScripts to true/);
@@ -4846,11 +4849,16 @@ test('configure without --json errors when stdin is not a TTY', () => {
   }
 });
 
-test('setup consistency check requires workflow:configure when opting out of packageScripts', () => {
-  // Regression for Codex #4: the required-scripts list now includes
-  // workflow:configure because devmode.md points operators at it. A consumer
-  // who defines every workflow:<cmd> script EXCEPT workflow:configure would
-  // previously pass setup silently; now they get a clear error.
+test('setup consistency check requires pipelane:configure when opting out of packageScripts', () => {
+  // Regression for Codex #4 + v2.1 rename: the required-scripts list
+  // includes pipelane:configure because devmode.md points operators at it.
+  // A consumer who defines every pipelane:<cmd> script EXCEPT
+  // pipelane:configure would previously pass setup silently; now they get
+  // a clear error. Names use the post-v2.1 pipelane:* primary surface that
+  // the generated .claude/commands/*.md templates actually invoke; the
+  // legacy workflow:* aliases alone are not sufficient for opt-out
+  // consumers because the generated slash commands no longer reference
+  // them as the canonical name.
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-codex-'));
   try {
@@ -4862,16 +4870,17 @@ test('setup consistency check requires workflow:configure when opting out of pac
       private: true,
       type: 'module',
       scripts: {
-        'workflow:new': 'x new',
-        'workflow:resume': 'x resume',
-        'workflow:pr': 'x pr',
-        'workflow:merge': 'x merge',
-        'workflow:deploy': 'x deploy',
-        'workflow:clean': 'x clean',
-        'workflow:devmode': 'x devmode',
-        'workflow:status': 'x status',
-        'workflow:doctor': 'x doctor',
-        // Deliberately missing workflow:configure
+        'pipelane:new': 'x new',
+        'pipelane:resume': 'x resume',
+        'pipelane:pr': 'x pr',
+        'pipelane:merge': 'x merge',
+        'pipelane:deploy': 'x deploy',
+        'pipelane:clean': 'x clean',
+        'pipelane:devmode': 'x devmode',
+        'pipelane:status': 'x status',
+        'pipelane:doctor': 'x doctor',
+        'pipelane:rollback': 'x rollback',
+        // Deliberately missing pipelane:configure
       },
     }, null, 2)}\n`, 'utf8');
 
@@ -4882,7 +4891,7 @@ test('setup consistency check requires workflow:configure when opting out of pac
 
     const result = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome }, true);
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /workflow:configure/);
+    assert.match(result.stderr, /pipelane:configure/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });

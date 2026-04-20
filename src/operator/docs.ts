@@ -391,11 +391,18 @@ export function ensurePackageScripts(repoRoot: string): void {
 }
 
 // Generated slash-command templates and Codex wrappers all invoke
-// `npm run workflow:<cmd>`. If a consumer opts out of packageScripts but
-// keeps claudeCommands, the commands would reference npm scripts that
-// don't exist — slash commands fail silently post-setup. Catch the
-// inconsistency here with a clear error + escape hatches instead of
-// letting the user debug "why does /clean do nothing" at runtime.
+// `npm run pipelane:<cmd>` post-v2.1. If a consumer opts out of
+// packageScripts but keeps claudeCommands, the commands would reference
+// npm scripts that don't exist — slash commands fail silently post-setup.
+// Catch the inconsistency here with a clear error + escape hatches instead
+// of letting the user debug "why does /clean do nothing" at runtime.
+//
+// v2.1 deprecation note: this check used to require `workflow:*` script
+// names. After the surface flip, it requires `pipelane:*` to match what
+// the regenerated templates actually invoke. Consumers running this
+// version of pipelane setup for the first time after the rename will see
+// a loud upfront error pointing at the missing `pipelane:*` aliases
+// instead of mysterious silent slash-command failures.
 function assertPackageScriptConsistency(repoRoot: string, syncDocs: Required<SyncDocsConfig>): void {
   if (syncDocs.packageScripts || !syncDocs.claudeCommands) {
     return;
@@ -406,11 +413,11 @@ function assertPackageScriptConsistency(repoRoot: string, syncDocs: Required<Syn
     ? (JSON.parse(readFileSync(packageJsonPath, 'utf8')) as { scripts?: Record<string, string> })
     : {};
   const scripts = pkg.scripts ?? {};
-  // `workflow:configure` lives outside WORKFLOW_COMMANDS (it's a one-shot setup
+  // `pipelane:configure` lives outside WORKFLOW_COMMANDS (it's a one-shot setup
   // subcommand, not an operator action), but `devmode.md` references it as the
   // remediation path when release mode blocks. A consumer that opts out of
   // packageScripts needs it defined or they'll hit a broken pointer.
-  const required = [...WORKFLOW_COMMANDS.map((cmd) => `workflow:${cmd}`), 'workflow:configure'];
+  const required = [...WORKFLOW_COMMANDS.map((cmd) => `pipelane:${cmd}`), 'pipelane:configure'];
   const missing = required.filter((script) => typeof scripts[script] !== 'string');
   if (missing.length === 0) {
     return;
@@ -418,7 +425,9 @@ function assertPackageScriptConsistency(repoRoot: string, syncDocs: Required<Syn
 
   throw new Error(
     `syncDocs.packageScripts is false but package.json is missing required npm scripts: ${missing.join(', ')}. ` +
-      `The generated .claude/commands/*.md templates and Codex wrappers invoke these via \`npm run workflow:<cmd>\`. ` +
+      `The generated .claude/commands/*.md templates and Codex wrappers invoke these via \`npm run pipelane:<cmd>\` ` +
+      `(legacy \`workflow:*\` aliases are emitted as deprecation aliases when packageScripts is on, but opt-out ` +
+      `consumers must define the canonical \`pipelane:*\` names manually). ` +
       `Fix it one of three ways: ` +
       `(a) add the missing scripts to package.json yourself, ` +
       `(b) set syncDocs.packageScripts to true (or drop the flag), or ` +
