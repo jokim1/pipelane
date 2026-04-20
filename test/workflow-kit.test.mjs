@@ -6885,6 +6885,74 @@ test('v1.1 fixup: capDeployHistory preserves the most recent verified record per
   assert.ok(capped.length <= 110, `capped length ${capped.length} exceeds expected upper bound`);
 });
 
+// Claude r3 P1: in-flight guard must expire when the async workflow dies.
+// A fresh requested record blocks re-dispatch; a stale one (older than
+// PIPELANE_ROLLBACK_INFLIGHT_TIMEOUT_MS, default 30min) falls through so
+// the operator isn't permanently locked out.
+test('v1.1 claude r3 fixup: stale in-flight rollback request bypasses the guard, fresh one still blocks', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  // Generous threshold (60s) so the fresh-record block check doesn't race
+  // the subprocess startup. Stale records land 2h in the past so they
+  // clearly exceed the threshold.
+  const baseEnv = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+    PIPELANE_ROLLBACK_INFLIGHT_TIMEOUT_MS: '60000',
+  };
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Stale Guard', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'v.txt'), 'x\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Stale Guard', '--json'], created.worktreePath, baseEnv);
+    runCli(['run', 'merge', '--json'], created.worktreePath, baseEnv);
+    const goodSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
+    const prStatePath = path.join(repoRoot, '.git', 'workflow-kit-state', 'pr-state.json');
+    const prState = JSON.parse(readFileSync(prStatePath, 'utf8'));
+    prState.records[Object.keys(prState.records)[0]].mergedSha = goodSha;
+    writeFileSync(prStatePath, JSON.stringify(prState, null, 2), 'utf8');
+    runCli(['run', 'deploy', 'staging', '--json'], created.worktreePath, baseEnv);
+
+    const stateDir = path.join(repoRoot, '.git', 'workflow-kit-state');
+    const deployStatePath = path.join(stateDir, 'deploy-state.json');
+
+    // --- Case 1: FRESH requested record (just now) blocks within 60s threshold.
+    const freshState = JSON.parse(readFileSync(deployStatePath, 'utf8'));
+    freshState.records.push({
+      environment: 'staging', sha: goodSha, surfaces: ['frontend', 'edge', 'sql'],
+      workflowName: 'Deploy Hosted', requestedAt: new Date().toISOString(),
+      taskSlug: created.taskSlug, status: 'requested',
+      rollbackOfSha: '0'.repeat(40),
+      idempotencyKey: 'fresh-rollback-key',
+    });
+    writeFileSync(deployStatePath, JSON.stringify(freshState, null, 2), 'utf8');
+    const blocked = runCli(['run', 'rollback', 'staging', '--json'], created.worktreePath, baseEnv, true);
+    assert.notEqual(blocked.status, 0, 'fresh in-flight record must block');
+    assert.match(blocked.stderr, /a prior rollback is still in flight/);
+
+    // --- Case 2: STALE requested record (2h old) bypasses the guard.
+    const staleState = JSON.parse(readFileSync(deployStatePath, 'utf8'));
+    staleState.records[staleState.records.length - 1].requestedAt =
+      new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    writeFileSync(deployStatePath, JSON.stringify(staleState, null, 2), 'utf8');
+    const bypassed = runCli(['run', 'rollback', 'staging', '--json'], created.worktreePath, baseEnv, true);
+    // The guard MUST not fire. Rollback may succeed or fail for another
+    // reason (e.g. no earlier good deploy to target) — that's fine.
+    assert.doesNotMatch(bypassed.stderr, /a prior rollback is still in flight/,
+      'stale requested records must bypass the in-flight guard');
+    assert.match(bypassed.stderr, /treating as dead and re-dispatching/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
 // Claude r2 CRITICAL: in-flight rollback guard. r6 signed 'requested'
 // records so they're visible in trustedRecords — without this guard, a
 // second /rollback while an async attempt is still 'requested' would

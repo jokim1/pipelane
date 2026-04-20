@@ -142,17 +142,33 @@ export async function handleRollback(cwd: string, parsed: ParsedOperatorArgs): P
   // flight. r6 made 'requested' records visible in trustedRecords
   // (signed on persist) — without this guard, a second /rollback sees
   // the in-flight attempt, treats it as a retry, and dispatches a
-  // COMPETING gh workflow run to the same environment. Two workflows
-  // race on healthchecks and the second overwrites the first's
-  // breadcrumb via idempotencyKey dedup. Operators running --async
-  // then re-running /rollback hit this. Second-review catch from
-  // Claude after 7 codex rounds.
+  // COMPETING gh workflow run to the same environment.
+  //
+  // Staleness threshold (r3 fix): if the async workflow dies on
+  // GitHub's side, the 'requested' record never gets updated and the
+  // guard would permanently lock out /rollback for this env+surfaces
+  // until the operator hand-edits deploy-state.json. After the
+  // threshold, we let the retry proceed — persistRecord's
+  // idempotencyKey dedup will replace the stale record. Override via
+  // PIPELANE_ROLLBACK_INFLIGHT_TIMEOUT_MS (default 30 minutes — covers
+  // normal deploy windows; raise for very slow workflows).
   if (currentRecord.status === 'requested' && currentRecord.rollbackOfSha) {
-    throw new Error([
-      `rollback ${environment} blocked: a prior rollback is still in flight`,
-      `(requested at ${currentRecord.requestedAt}, rolling ${currentRecord.rollbackOfSha.slice(0, 7)} → ${currentRecord.sha.slice(0, 7)}).`,
-      'Wait for the prior dispatch to finalize (watch `gh run list`), or clear the record manually if the workflow is known-dead.',
-    ].join('\n'));
+    const requestedMs = Date.parse(currentRecord.requestedAt);
+    const timeoutMs = Number.parseInt(process.env.PIPELANE_ROLLBACK_INFLIGHT_TIMEOUT_MS ?? '', 10);
+    const threshold = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 30 * 60 * 1000;
+    const age = Number.isFinite(requestedMs) ? Date.now() - requestedMs : 0;
+    if (age < threshold) {
+      throw new Error([
+        `rollback ${environment} blocked: a prior rollback is still in flight`,
+        `(requested at ${currentRecord.requestedAt}, rolling ${currentRecord.rollbackOfSha.slice(0, 7)} → ${currentRecord.sha.slice(0, 7)}).`,
+        'Wait for the prior dispatch to finalize (watch `gh run list`).',
+        `The guard auto-expires after ${Math.round(threshold / 60000)} minutes; set PIPELANE_ROLLBACK_INFLIGHT_TIMEOUT_MS to override.`,
+      ].join('\n'));
+    }
+    // Stale requested record → proceed. Log once so operators see it.
+    process.stderr.write(
+      `[pipelane] prior rollback request is stale (${Math.round(age / 60000)} min old > ${Math.round(threshold / 60000)} min threshold); treating as dead and re-dispatching.\n`,
+    );
   }
 
   // When the current record is a failed/pending rollback (rollbackOfSha

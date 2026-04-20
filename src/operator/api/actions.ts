@@ -390,7 +390,19 @@ function resolveRollbackInputs(
       return undefined;
     }
     if (currentRecord.status === 'requested' && currentRecord.rollbackOfSha) {
-      return undefined;
+      // Mirror handleRollback's staleness threshold (r3 fix): a dead
+      // async workflow leaves a stale 'requested' record that would
+      // otherwise block preflight forever. Let stale records fall
+      // through to normal target resolution; handleRollback logs the
+      // stale-retry warning at execute time.
+      const requestedMs = Date.parse(currentRecord.requestedAt);
+      const timeoutMs = Number.parseInt(process.env.PIPELANE_ROLLBACK_INFLIGHT_TIMEOUT_MS ?? '', 10);
+      const threshold = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 30 * 60 * 1000;
+      const age = Number.isFinite(requestedMs) ? Date.now() - requestedMs : 0;
+      if (age < threshold) {
+        return undefined;
+      }
+      // Stale → fall through.
     }
     const excludeSha = currentRecord.rollbackOfSha ?? currentRecord.sha;
     const target = findLastGoodDeploy({
