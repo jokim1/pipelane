@@ -389,12 +389,13 @@ function resolveRollbackInputs(
     if (currentRecord.status === 'succeeded' && currentRecord.rollbackOfSha) {
       return undefined;
     }
-    if (currentRecord.status === 'requested' && currentRecord.rollbackOfSha) {
-      // Mirror handleRollback's staleness threshold (r3 fix): a dead
-      // async workflow leaves a stale 'requested' record that would
-      // otherwise block preflight forever. Let stale records fall
-      // through to normal target resolution; handleRollback logs the
-      // stale-retry warning at execute time.
+    if (currentRecord.status === 'requested') {
+      // Mirror handleRollback's widened in-flight guard (Codex r8 P1):
+      // block on any 'requested' record, not just rollback ones. An
+      // async deploy in flight also disqualifies preflight from
+      // minting a valid target. Staleness threshold matches execute
+      // so preflight and execute agree on when a stale record
+      // bypasses the guard.
       const requestedMs = Date.parse(currentRecord.requestedAt);
       const timeoutMs = Number.parseInt(process.env.PIPELANE_ROLLBACK_INFLIGHT_TIMEOUT_MS ?? '', 10);
       const threshold = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 30 * 60 * 1000;

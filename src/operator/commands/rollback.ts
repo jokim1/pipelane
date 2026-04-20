@@ -53,6 +53,23 @@ export async function handleRollback(cwd: string, parsed: ParsedOperatorArgs): P
   const environment = normalizeDeployEnvironment(parsed.positional[0] ?? '');
   const explicitSurfaces = [...parsed.flags.surfaces, ...parsed.positional.slice(1)];
 
+  // Codex r8 P2: --async is unsafe for rollback. The async path persists
+  // a 'requested' record and exits without watching; nothing ever
+  // updates the record to succeeded/failed. Since the in-flight guard
+  // gates future /rollback invocations on 'requested' records, an
+  // operator who uses --async gets stuck for up to
+  // PIPELANE_ROLLBACK_INFLIGHT_TIMEOUT_MS before retries unblock. Deploy
+  // has the same structural issue but is less painful because deploy's
+  // idempotency short-circuit recognizes a later successful retry.
+  // Refuse the flag rather than ship a known-broken code path.
+  if (parsed.flags.async && !parsed.flags.revertPr) {
+    throw new Error([
+      '/rollback does not support --async: rollback needs to watch the workflow and record the final status.',
+      'Async rollback would leave deploy-state.json with a stuck "requested" record that blocks future /rollback attempts until the staleness timeout expires.',
+      'Drop --async (or use --revert-pr for a no-dispatch recovery path).',
+    ].join('\n'));
+  }
+
   // --revert-pr has an explicit --sha path that doesn't need a task
   // lock — operators often run `/rollback prod --revert-pr --sha <merge>`
   // from `main` after `/clean` has pruned the lock. Defer lock lookup
@@ -138,36 +155,45 @@ export async function handleRollback(cwd: string, parsed: ParsedOperatorArgs): P
     ].join('\n'));
   }
 
-  // Block a duplicate dispatch while an async rollback is still in
-  // flight. r6 made 'requested' records visible in trustedRecords
-  // (signed on persist) — without this guard, a second /rollback sees
-  // the in-flight attempt, treats it as a retry, and dispatches a
-  // COMPETING gh workflow run to the same environment.
+  // Block a duplicate dispatch while ANY deploy (rollback or normal) is
+  // still in flight. r6 made 'requested' records visible in
+  // trustedRecords (signed on persist) — without this guard, a second
+  // /rollback sees the in-flight attempt and dispatches a COMPETING gh
+  // workflow run to the same environment. Codex r8 caught an earlier
+  // version that only guarded against in-flight ROLLBACKS; an async
+  // /deploy leaves a 'requested' record with no rollbackOfSha set, and
+  // a subsequent /rollback would happily dispatch while the deploy was
+  // still running. Widen the check to all 'requested' records for this
+  // (env, surfaces) pair.
   //
-  // Staleness threshold (r3 fix): if the async workflow dies on
-  // GitHub's side, the 'requested' record never gets updated and the
-  // guard would permanently lock out /rollback for this env+surfaces
-  // until the operator hand-edits deploy-state.json. After the
-  // threshold, we let the retry proceed — persistRecord's
-  // idempotencyKey dedup will replace the stale record. Override via
-  // PIPELANE_ROLLBACK_INFLIGHT_TIMEOUT_MS (default 30 minutes — covers
-  // normal deploy windows; raise for very slow workflows).
-  if (currentRecord.status === 'requested' && currentRecord.rollbackOfSha) {
+  // Staleness threshold (r3 fix): if the workflow dies on GitHub's
+  // side, the 'requested' record never gets updated and the guard
+  // would permanently lock out /rollback until the operator hand-edits
+  // deploy-state.json. After the threshold, we let the retry proceed —
+  // persistRecord's idempotencyKey dedup will replace the stale
+  // record. Override via PIPELANE_ROLLBACK_INFLIGHT_TIMEOUT_MS
+  // (default 30 minutes — covers normal deploy windows; raise for
+  // very slow workflows).
+  if (currentRecord.status === 'requested') {
     const requestedMs = Date.parse(currentRecord.requestedAt);
     const timeoutMs = Number.parseInt(process.env.PIPELANE_ROLLBACK_INFLIGHT_TIMEOUT_MS ?? '', 10);
     const threshold = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 30 * 60 * 1000;
     const age = Number.isFinite(requestedMs) ? Date.now() - requestedMs : 0;
+    const kind = currentRecord.rollbackOfSha ? 'rollback' : 'deploy';
+    const summary = currentRecord.rollbackOfSha
+      ? `rolling ${currentRecord.rollbackOfSha.slice(0, 7)} → ${currentRecord.sha.slice(0, 7)}`
+      : `deploying ${currentRecord.sha.slice(0, 7)}`;
     if (age < threshold) {
       throw new Error([
-        `rollback ${environment} blocked: a prior rollback is still in flight`,
-        `(requested at ${currentRecord.requestedAt}, rolling ${currentRecord.rollbackOfSha.slice(0, 7)} → ${currentRecord.sha.slice(0, 7)}).`,
+        `rollback ${environment} blocked: a prior ${kind} is still in flight`,
+        `(requested at ${currentRecord.requestedAt}, ${summary}).`,
         'Wait for the prior dispatch to finalize (watch `gh run list`).',
         `The guard auto-expires after ${Math.round(threshold / 60000)} minutes; set PIPELANE_ROLLBACK_INFLIGHT_TIMEOUT_MS to override.`,
       ].join('\n'));
     }
     // Stale requested record → proceed. Log once so operators see it.
     process.stderr.write(
-      `[pipelane] prior rollback request is stale (${Math.round(age / 60000)} min old > ${Math.round(threshold / 60000)} min threshold); treating as dead and re-dispatching.\n`,
+      `[pipelane] prior ${kind} request is stale (${Math.round(age / 60000)} min old > ${Math.round(threshold / 60000)} min threshold); treating as dead and re-dispatching.\n`,
     );
   }
 
@@ -312,24 +338,11 @@ export async function handleRollback(cwd: string, parsed: ParsedOperatorArgs): P
   }
   persistRecord(context.commonDir, context.config, deployState.records, record);
 
-  if (parsed.flags.async) {
-    printResult(parsed.flags, {
-      ...record,
-      message: [
-        `Rollback dispatched (async): ${environment}`,
-        `Task: ${taskSlug}`,
-        `From: ${originalFailingSha.slice(0, 7)} (original failing sha)`,
-        `To:   ${target.sha.slice(0, 7)} (${target.verifiedAt ? `verified ${target.verifiedAt}` : 'last-good'})`,
-        `Surfaces: ${surfaces.join(', ')}`,
-        `Workflow: ${workflowName}`,
-        run?.id ? `Workflow run: ${run.url ?? run.id}` : 'Workflow run: not yet resolvable',
-        'Exit without watching per --async.',
-      ].filter(Boolean).join('\n'),
-    });
-    return;
-  }
-
-  // Watch + probe. The verification logic mirrors deploy.ts so the
+  // No --async branch: rejected at the top of this handler. Rollback
+  // always watches + reconciles the record. Watch + probe logic
+  // mirrors deploy.ts so the rollback record carries the same
+  // per-surface verification shape the release gate + dashboard
+  // already consume.
   // rollback record carries the same per-surface verification shape
   // the release gate + dashboard already consume.
   const watched = watchWorkflowRun(context.repoRoot, run?.id);
@@ -563,7 +576,18 @@ async function handleRevertPr(
 
   try {
     runGit(context.repoRoot, ['switch', '-c', revertBranch, baseRef]);
-    const revertResult = runGit(context.repoRoot, ['revert', '--no-edit', mergedSha], true);
+    // Detect merge commits (multi-parent). GitHub's "Merge pull request"
+    // button produces a real merge commit; git revert needs -m <parent>
+    // to know which side to keep. Parent 1 is the base branch, so -m 1
+    // reverts the feature changes. Squash-merged commits have a single
+    // parent and don't need -m. Codex r8 P2 caught this on repos that
+    // merge via the "Merge pull request" path instead of squash.
+    const parentList = runGit(context.repoRoot, ['rev-list', '--parents', '-n', '1', mergedSha], true);
+    const parentCount = parentList ? parentList.trim().split(/\s+/).length - 1 : 1;
+    const revertArgs = parentCount > 1
+      ? ['revert', '--no-edit', '-m', '1', mergedSha]
+      : ['revert', '--no-edit', mergedSha];
+    const revertResult = runGit(context.repoRoot, revertArgs, true);
     if (revertResult === null) {
       runGit(context.repoRoot, ['revert', '--abort'], true);
       restoreOriginalRef();

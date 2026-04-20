@@ -7063,3 +7063,118 @@ test('v1.1 claude r2 fixup: --revert-pr does not false-trigger on a same-name ta
     rmSync(ghBin, { recursive: true, force: true });
   }
 });
+
+// Codex r8 P1: in-flight guard must block when the current record is
+// an in-flight DEPLOY (not just an in-flight rollback). Previously the
+// guard only fired on rollbackOfSha being set; a plain async deploy
+// with status=requested was invisible to the guard, letting /rollback
+// dispatch and race the deploy.
+test('v1.1 codex r8 fixup: in-flight deploy blocks /rollback (not just in-flight rollbacks)', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+    PIPELANE_ROLLBACK_INFLIGHT_TIMEOUT_MS: '60000',
+  };
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Deploy In Flight', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'v.txt'), 'x\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Deploy In Flight', '--json'], created.worktreePath, env);
+    runCli(['run', 'merge', '--json'], created.worktreePath, env);
+    const goodSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
+    const prStatePath = path.join(repoRoot, '.git', 'workflow-kit-state', 'pr-state.json');
+    const prState = JSON.parse(readFileSync(prStatePath, 'utf8'));
+    prState.records[Object.keys(prState.records)[0]].mergedSha = goodSha;
+    writeFileSync(prStatePath, JSON.stringify(prState, null, 2), 'utf8');
+    runCli(['run', 'deploy', 'staging', '--json'], created.worktreePath, env);
+
+    // Seed an in-flight DEPLOY record (not a rollback): requested, no rollbackOfSha.
+    const stateDir = path.join(repoRoot, '.git', 'workflow-kit-state');
+    const deployStatePath = path.join(stateDir, 'deploy-state.json');
+    const deployState = JSON.parse(readFileSync(deployStatePath, 'utf8'));
+    deployState.records.push({
+      environment: 'staging', sha: goodSha, surfaces: ['frontend', 'edge', 'sql'],
+      workflowName: 'Deploy Hosted', requestedAt: new Date().toISOString(),
+      taskSlug: created.taskSlug, status: 'requested',
+      idempotencyKey: 'inflight-deploy-key',
+    });
+    writeFileSync(deployStatePath, JSON.stringify(deployState, null, 2), 'utf8');
+
+    const blocked = runCli(['run', 'rollback', 'staging', '--json'], created.worktreePath, env, true);
+    assert.notEqual(blocked.status, 0);
+    assert.match(blocked.stderr, /a prior deploy is still in flight/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+// Codex r8 P2: --async is unsafe for rollback (no reconciliation path).
+test('v1.1 codex r8 fixup: /rollback --async is explicitly refused', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const refused = runCli(['run', 'rollback', 'staging', '--async', '--json'], repoRoot, {}, true);
+    assert.notEqual(refused.status, 0);
+    assert.match(refused.stderr, /does not support --async/);
+    assert.match(refused.stderr, /stuck "requested" record/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+// Codex r8 P2: --revert-pr must handle real merge commits (multi-parent)
+// via -m 1, not just squash-merge single-parent commits.
+test('v1.1 codex r8 fixup: --revert-pr reverts a real merge commit with -m 1', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = { PATH: `${ghBin}:${process.env.PATH}`, GH_STATE_FILE: ghStateFile };
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Merge Commit Revert', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'v.txt'), 'x\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Merge Commit Revert', '--json'], created.worktreePath, env);
+    runCli(['run', 'merge', '--json'], created.worktreePath, env);
+    runCli(['run', 'devmode', 'release', '--override', '--reason', 'merge-revert-test', '--json'], created.worktreePath);
+
+    // Create a REAL merge commit on origin/main via --no-ff.
+    execFileSync('git', ['switch', '-c', 'feature-mc'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    writeFileSync(path.join(repoRoot, 'feature.txt'), 'f\n', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'feature change'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['switch', 'main'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['merge', '--no-ff', 'feature-mc', '-m', 'Merge pull request #1'], {
+      cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    execFileSync('git', ['push', 'origin', 'main'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    const mergeSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim();
+
+    // Verify it's actually a merge commit (two parents).
+    const parents = execFileSync('git', ['rev-list', '--parents', '-n', '1', mergeSha], {
+      cwd: repoRoot, encoding: 'utf8',
+    }).trim().split(/\s+/);
+    assert.equal(parents.length, 3, 'fixture must produce a real merge commit with 2 parents');
+
+    execFileSync('git', ['fetch', 'origin', 'main'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    const result = JSON.parse(runCli(
+      ['run', 'rollback', 'prod', '--revert-pr', '--sha', mergeSha, '--json'],
+      created.worktreePath, env,
+    ).stdout);
+    assert.equal(result.revertedSha, mergeSha, 'merge commit must be revertable via -m 1');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
