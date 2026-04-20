@@ -71,6 +71,10 @@ export const LEGACY_CLAUDE_SIGNATURES: Record<ManagedCommand, string[]> = {
     'Resume an existing task workspace for this repo.',
     'npm run pipelane:resume',
   ],
+  'repo-guard': [
+    'Verify the current checkout is safe for a task, or create an isolated task worktree when it is not.',
+    'npm run workflow:repo-guard',
+  ],
   status: [
     'Render a one-screen terminal cockpit of the pipelane:api snapshot.',
     'npm run pipelane:status',
@@ -127,6 +131,7 @@ function renderTemplate(template: string, config: WorkflowConfig): string {
     ALIAS_DEVMODE: aliases.devmode,
     ALIAS_NEW: aliases.new,
     ALIAS_RESUME: aliases.resume,
+    ALIAS_REPO_GUARD: aliases['repo-guard'],
     ALIAS_PR: aliases.pr,
     ALIAS_MERGE: aliases.merge,
     ALIAS_DEPLOY: aliases.deploy,
@@ -349,6 +354,7 @@ export function ensurePackageScripts(repoRoot: string): void {
     'pipelane:devmode': 'pipelane run devmode',
     'pipelane:new': 'pipelane run new',
     'pipelane:resume': 'pipelane run resume',
+    'pipelane:repo-guard': 'pipelane run repo-guard',
     'pipelane:pr': 'pipelane run pr',
     'pipelane:merge': 'pipelane run merge',
     'pipelane:release-check': 'pipelane run release-check',

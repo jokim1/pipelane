@@ -6,6 +6,7 @@ import {
   emptyDeployConfig,
   loadDeployConfig,
   replaceDeployConfigSection,
+  saveSharedDeployConfig,
   type DeployConfig,
 } from '../release-gate.ts';
 import { sanitizeForTerminal } from './helpers.ts';
@@ -364,6 +365,7 @@ async function runFix(context: WorkflowContext, parsed: ParsedOperatorArgs): Pro
   const claudePath = path.join(context.repoRoot, 'CLAUDE.md');
   const existing = existsSync(claudePath) ? readFileSync(claudePath, 'utf8') : '';
   writeFileSync(claudePath, replaceDeployConfigSection(existing, next), 'utf8');
+  saveSharedDeployConfig(context.repoRoot, next);
 
   const outcome = await executeProbe(context);
   const lines = [
@@ -441,4 +443,3 @@ function ask(rl: readline.Interface, label: string, current: string): Promise<st
     });
   });
 }
-

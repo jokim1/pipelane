@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer as createNetServer } from 'node:net';
@@ -654,11 +654,9 @@ test('init writes tracked Pipelane files and setup seeds CLAUDE plus Codex wrapp
     // Canonical pipelane:* script names
     assert.equal(packageJson.scripts['pipelane:new'], 'pipelane run new');
     assert.equal(packageJson.scripts['pipelane:resume'], 'pipelane run resume');
+    assert.equal(packageJson.scripts['pipelane:repo-guard'], 'pipelane run repo-guard');
     assert.equal(packageJson.scripts['pipelane:board'], 'pipelane board');
-    // Deprecation aliases for one release window — keep working through
-    // the rename so existing Claude slash commands don't break.
-    assert.equal(packageJson.scripts['pipelane:new'], 'pipelane run new');
-    assert.equal(packageJson.scripts['pipelane:resume'], 'pipelane run resume');
+    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'repo-guard.md')));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -1739,6 +1737,7 @@ test('syncDocs.packageScripts: false preserves consumer-customized workflow scri
       build: 'my-build',
       'pipelane:new': 'my-wrapper new',
       'pipelane:resume': 'my-wrapper resume',
+      'pipelane:repo-guard': 'my-wrapper repo-guard',
       'pipelane:pr': 'my-wrapper pr',
       'pipelane:merge': 'my-wrapper merge',
       'pipelane:deploy': 'my-wrapper deploy',
@@ -2269,6 +2268,69 @@ test('new generates a task-<hex> slug when --task is omitted', () => {
   }
 });
 
+test('new links shared node_modules into a created sibling worktree when available', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    mkdirSync(path.join(repoRoot, 'node_modules', 'pipelane'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'node_modules', 'pipelane', 'package.json'), '{"name":"pipelane"}\n', 'utf8');
+    commitAll(repoRoot, 'Adopt workflow-kit');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Link Modules', '--json'], repoRoot).stdout);
+    const linkedNodeModules = path.join(created.worktreePath, 'node_modules');
+    assert.ok(lstatSync(linkedNodeModules).isSymbolicLink());
+    assert.equal(realpathSync(linkedNodeModules), realpathSync(path.join(repoRoot, 'node_modules')));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('resume backfills the shared node_modules link for an existing sibling worktree', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Resume Link', '--json'], repoRoot).stdout);
+    const linkedNodeModules = path.join(created.worktreePath, 'node_modules');
+    assert.equal(existsSync(linkedNodeModules), false);
+
+    mkdirSync(path.join(repoRoot, 'node_modules', 'pipelane'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'node_modules', 'pipelane', 'package.json'), '{"name":"pipelane"}\n', 'utf8');
+
+    runCli(['run', 'resume', '--task', 'Resume Link', '--json'], repoRoot);
+    assert.ok(lstatSync(linkedNodeModules).isSymbolicLink());
+    assert.equal(realpathSync(linkedNodeModules), realpathSync(path.join(repoRoot, 'node_modules')));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('repo-guard links shared node_modules when it creates a new isolated worktree', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    mkdirSync(path.join(repoRoot, 'node_modules', 'pipelane'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'node_modules', 'pipelane', 'package.json'), '{"name":"pipelane"}\n', 'utf8');
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    writeFileSync(path.join(repoRoot, 'dirty.txt'), 'dirty\n', 'utf8');
+
+    const guarded = JSON.parse(runCli(['run', 'repo-guard', '--task', 'Guard Link', '--json'], repoRoot).stdout);
+    assert.equal(guarded.createdWorktree, true);
+    const linkedNodeModules = path.join(guarded.lock.worktreePath, 'node_modules');
+    assert.ok(lstatSync(linkedNodeModules).isSymbolicLink());
+    assert.equal(realpathSync(linkedNodeModules), realpathSync(path.join(repoRoot, 'node_modules')));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('release-check fails closed before local CLAUDE is configured', () => {
   const repoRoot = createRepo();
 
@@ -2359,6 +2421,17 @@ function writeFullDeployConfigClaude(repoRoot, options = {}) {
   );
   writeFileSync(claudeMdPath, replaced, 'utf8');
   return fullConfig;
+}
+
+function writeSharedDeployConfig(repoRoot, config = buildFullDeployConfig()) {
+  const stateDir = path.join(repoRoot, '.git', 'pipelane-state');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(
+    path.join(stateDir, 'deploy-config.json'),
+    `${JSON.stringify(config, null, 2)}\n`,
+    'utf8',
+  );
+  return config;
 }
 
 async function fingerprintForFullConfig(options = {}, environment = 'staging') {
@@ -2645,6 +2718,21 @@ test('parseDeployConfigMarkdown handles CRLF-normalized CLAUDE.md', async () => 
   assert.ok(lfParsed, 'LF markdown parses');
   assert.ok(crlfParsed, 'CRLF markdown also parses (regression: PR #27 tightened regex broke this)');
   assert.deepEqual(crlfParsed, lfParsed, 'LF and CRLF inputs yield identical parsed DeployConfig');
+});
+
+test('loadDeployConfig falls back to shared deploy-config.json when CLAUDE.md is absent', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const expected = writeSharedDeployConfig(repoRoot);
+    rmSync(path.join(repoRoot, 'CLAUDE.md'), { force: true });
+
+    const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'release-gate.ts'));
+    const loaded = mod.loadDeployConfig(repoRoot);
+    assert.deepEqual(loaded, expected);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
 });
 
 test('release-check re-blocks when the deploy config fingerprint drifts', async () => {
@@ -3384,6 +3472,8 @@ test('pr, merge, deploy, and task-lock work with a fake gh adapter', () => {
 
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     const created = JSON.parse(runCli(['run', 'new', '--task', 'API Work', '--json'], repoRoot).stdout);
     writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
@@ -3505,11 +3595,47 @@ test('deploy verifies via gh run watch + healthcheck stubs and records status=su
   }
 });
 
+test('deploy in a task worktree falls back to the shared repo-root CLAUDE.md when the worktree has no local CLAUDE.md', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Shared Deploy Config', '--json'], repoRoot).stdout);
+    rmSync(path.join(created.worktreePath, 'CLAUDE.md'), { force: true });
+    assert.equal(existsSync(path.join(created.worktreePath, 'CLAUDE.md')), false, 'task worktree should rely on the shared root CLAUDE.md');
+
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
+    const deployed = JSON.parse(runCli(['run', 'deploy', 'staging', '--sha', sha, '--json'], created.worktreePath, env).stdout);
+
+    assert.equal(deployed.status, 'succeeded');
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.workflows.length, 1);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
 test('deploy fails closed when healthcheck returns non-2xx', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
   const ghStateFile = path.join(ghBin, 'gh-state.json');
   writeFakeGh(ghBin, ghStateFile);
+  writeFileSync(ghStateFile, JSON.stringify({ prs: {}, workflows: [] }, null, 2), 'utf8');
   const env = {
     PATH: `${ghBin}:${process.env.PATH}`,
     GH_STATE_FILE: ghStateFile,
@@ -3535,6 +3661,45 @@ test('deploy fails closed when healthcheck returns non-2xx', () => {
     assert.equal(latest.status, 'failed');
     assert.equal(latest.verification.statusCode, 503);
     assert.equal(latest.taskSlug, 'bad-healthcheck');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('deploy fails before dispatch when a requested surface has no configured healthcheck URL', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  writeFileSync(ghStateFile, JSON.stringify({ prs: {}, workflows: [] }, null, 2), 'utf8');
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const config = buildFullDeployConfig();
+    config.edge.staging.healthcheckUrl = '';
+    writeSharedDeployConfig(repoRoot, config);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Missing Healthcheck', '--json'], repoRoot).stdout);
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
+    const blocked = runCli(
+      ['run', 'deploy', 'staging', '--surfaces', 'edge', '--sha', sha, '--json'],
+      created.worktreePath,
+      env,
+      true,
+    );
+
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /Deploy blocked: staging/);
+    assert.match(blocked.stderr, /edge staging health check/);
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.workflows.length, 0, 'deploy should fail before gh workflow dispatch');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -3637,6 +3802,8 @@ test('deploy prod rejects PIPELANE_DEPLOY_PROD_CONFIRM_STUB outside NODE_ENV=tes
 
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     runCli(['run', 'devmode', 'release', '--override', '--reason', 'confirm-stub-gate', '--json'], repoRoot);
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Stub Gate', '--json'], repoRoot).stdout);
@@ -3723,6 +3890,8 @@ test('deploy prod blocks when release-mode staging lacks a succeeded record', ()
 
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     // Switch to release mode with override (we're testing the prod gate,
     // not the release-readiness gate).
@@ -5092,6 +5261,7 @@ test('setup consistency check requires pipelane:configure when opting out of pac
       scripts: {
         'pipelane:new': 'x new',
         'pipelane:resume': 'x resume',
+        'pipelane:repo-guard': 'x repo-guard',
         'pipelane:pr': 'x pr',
         'pipelane:merge': 'x merge',
         'pipelane:deploy': 'x deploy',
@@ -7255,6 +7425,10 @@ test('v1.1 claude r2 fixup: --revert-pr does not false-trigger on a same-name ta
   };
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.buildMode.autoDeployOnMerge = false;
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     commitAll(repoRoot, 'Adopt pipelane');
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Tag Collision', '--json'], repoRoot).stdout);
     writeFileSync(path.join(created.worktreePath, 'v.txt'), 'x\n', 'utf8');
@@ -7370,6 +7544,10 @@ test('v1.1 codex r8 fixup: --revert-pr reverts a real merge commit with -m 1', (
   const env = { PATH: `${ghBin}:${process.env.PATH}`, GH_STATE_FILE: ghStateFile };
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.buildMode.autoDeployOnMerge = false;
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     commitAll(repoRoot, 'Adopt pipelane');
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Merge Commit Revert', '--json'], repoRoot).stdout);
     writeFileSync(path.join(created.worktreePath, 'v.txt'), 'x\n', 'utf8');

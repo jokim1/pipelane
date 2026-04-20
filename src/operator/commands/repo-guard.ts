@@ -11,6 +11,7 @@ import {
   type ParsedOperatorArgs,
 } from '../state.ts';
 import {
+  ensureSharedNodeModulesLink,
   generateUniqueTaskWorkspace,
   readWorktreeStatus,
   resolveTaskBaseRef,
@@ -69,6 +70,9 @@ export async function handleRepoGuard(cwd: string, parsed: ParsedOperatorArgs): 
   const workspace = generateUniqueTaskWorkspace(context.repoRoot, context.commonDir, context.config, taskSlug);
   mkdirSync(resolveTaskWorktreeRoot(context.commonDir, context.config), { recursive: true });
   runGit(context.repoRoot, ['worktree', 'add', workspace.worktreePath, '-b', workspace.branchName, baseRef.sourceRef]);
+  const nodeModulesWarning = ensureSharedNodeModulesLink(context.commonDir, workspace.worktreePath, {
+    replaceExistingDirectory: true,
+  });
 
   const lock = saveTaskLock(context.commonDir, context.config, taskSlug, {
     taskSlug,
@@ -84,13 +88,14 @@ export async function handleRepoGuard(cwd: string, parsed: ParsedOperatorArgs): 
     createdWorktree: true,
     lock,
     reasons,
-    warnings: baseRef.warnings,
+    warnings: [...baseRef.warnings, ...(nodeModulesWarning ? [nodeModulesWarning] : [])],
     message: [
       'Repo Guard: created a new isolated worktree.',
       `Task: ${taskName}`,
       `Branch: ${workspace.branchName}`,
       `Worktree: ${workspace.worktreePath}`,
       ...baseRef.warnings.map((warning) => `Warning: ${warning}`),
+      ...(nodeModulesWarning ? [`Warning: ${nodeModulesWarning}`] : []),
       'Why:',
       ...reasons.map((reason) => `- ${reason}`),
     ].join('\n'),

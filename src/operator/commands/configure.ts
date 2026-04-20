@@ -7,6 +7,7 @@ import {
   emptyDeployConfig,
   parseDeployConfigMarkdown,
   replaceDeployConfigSection,
+  saveSharedDeployConfig,
   type DeployConfig,
 } from '../release-gate.ts';
 import {
@@ -181,6 +182,7 @@ export async function handleConfigure(cwd: string, argv: string[]): Promise<Conf
   const tmpPath = `${claudePath}.pipelane.tmp`;
   writeFileSync(tmpPath, ensureTrailingNewline(replaceDeployConfigSection(markdown, finalConfig)), 'utf8');
   renameSync(tmpPath, claudePath);
+  saveSharedDeployConfig(repoRoot, finalConfig);
 
   if (options.json) {
     process.stdout.write(`${JSON.stringify(finalConfig, null, 2)}\n`);

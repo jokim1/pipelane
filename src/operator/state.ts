@@ -5,12 +5,13 @@ import path from 'node:path';
 
 export type Mode = 'build' | 'release';
 export type KnownSurface = 'frontend' | 'edge' | 'sql';
-export const WORKFLOW_COMMANDS = ['devmode', 'new', 'resume', 'pr', 'merge', 'deploy', 'clean', 'status', 'doctor', 'rollback'] as const;
+export const WORKFLOW_COMMANDS = ['devmode', 'new', 'resume', 'repo-guard', 'pr', 'merge', 'deploy', 'clean', 'status', 'doctor', 'rollback'] as const;
 export type WorkflowCommand = (typeof WORKFLOW_COMMANDS)[number];
 export const DEFAULT_WORKFLOW_ALIASES: Record<WorkflowCommand, string> = {
   devmode: '/devmode',
   new: '/new',
   resume: '/resume',
+  'repo-guard': '/repo-guard',
   pr: '/pr',
   merge: '/merge',
   deploy: '/deploy',
@@ -288,6 +289,7 @@ export const CONFIG_FILENAME = '.pipelane.json';
 const MODE_STATE_FILENAME = 'mode-state.json';
 const PR_STATE_FILENAME = 'pr-state.json';
 const DEPLOY_STATE_FILENAME = 'deploy-state.json';
+const DEPLOY_CONFIG_FILENAME = 'deploy-config.json';
 const PROBE_STATE_FILENAME = 'probe-state.json';
 const TASK_LOCKS_DIRNAME = 'task-locks';
 
@@ -598,6 +600,10 @@ export function modeStatePath(commonDir: string, config: WorkflowConfig): string
 
 export function deployStatePath(commonDir: string, config: WorkflowConfig): string {
   return path.join(resolveStateDir(commonDir, config), DEPLOY_STATE_FILENAME);
+}
+
+export function deployConfigPath(commonDir: string, config: WorkflowConfig): string {
+  return path.join(resolveStateDir(commonDir, config), DEPLOY_CONFIG_FILENAME);
 }
 
 export function prStatePath(commonDir: string, config: WorkflowConfig): string {

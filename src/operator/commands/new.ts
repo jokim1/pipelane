@@ -9,6 +9,7 @@ import {
 import {
   buildCurrentWorkspaceReasons,
   buildTaskWorkspaceOutput,
+  ensureSharedNodeModulesLink,
   findPrunedTaskLock,
   generateHex,
   generateUniqueTaskWorkspace,
@@ -82,6 +83,9 @@ export async function handleNew(cwd: string, parsed: ParsedOperatorArgs): Promis
 
   mkdirSync(resolveTaskWorktreeRoot(context.commonDir, context.config), { recursive: true });
   runGit(context.repoRoot, ['worktree', 'add', workspace.worktreePath, '-b', workspace.branchName, baseRef.sourceRef]);
+  const nodeModulesWarning = ensureSharedNodeModulesLink(context.commonDir, workspace.worktreePath, {
+    replaceExistingDirectory: true,
+  });
   saveNewTaskLock({
     commonDir: context.commonDir,
     config: context.config,
@@ -102,7 +106,7 @@ export async function handleNew(cwd: string, parsed: ParsedOperatorArgs): Promis
     mode,
     createdWorktree: true,
     resumed: false,
-    warnings: [...baseRef.warnings, ...warnings],
+    warnings: [...baseRef.warnings, ...warnings, ...(nodeModulesWarning ? [nodeModulesWarning] : [])],
     reasons,
   }));
 }

@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { handleApi } from './commands/api.ts';
@@ -30,7 +30,9 @@ export interface LoadedContext extends WorkflowContext {
 export function loadWorkflowContext(cwd: string): LoadedContext {
   const context = resolveWorkflowContext(cwd);
   const claudePath = path.join(context.repoRoot, 'CLAUDE.md');
-  const deployConfigText = loadDeployConfig(context.repoRoot) ? readFileSync(claudePath, 'utf8') : '';
+  const deployConfigText = loadDeployConfig(context.repoRoot) && existsSync(claudePath)
+    ? readFileSync(claudePath, 'utf8')
+    : '';
 
   return {
     ...context,
@@ -136,6 +138,7 @@ Pipelane commands:
   devmode
   new
   resume
+  repo-guard
   pr
   merge
   release-check

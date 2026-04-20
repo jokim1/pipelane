@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
@@ -51,6 +51,53 @@ export function resolveSharedRepoRoot(commonDir: string): string {
 export function resolveTaskWorktreeRoot(commonDir: string, config: WorkflowConfig): string {
   const sharedRepoRoot = resolveSharedRepoRoot(commonDir);
   return path.join(path.dirname(sharedRepoRoot), config.taskWorktreeDirName);
+}
+
+export function ensureSharedNodeModulesLink(
+  commonDir: string,
+  worktreePath: string,
+  options: { replaceExistingDirectory?: boolean } = {},
+): string | null {
+  const sharedRepoRoot = resolveSharedRepoRoot(commonDir);
+  const normalizedSharedRepoRoot = normalizePath(sharedRepoRoot);
+  const normalizedWorktreePath = normalizePath(worktreePath);
+
+  if (normalizedSharedRepoRoot === normalizedWorktreePath) {
+    return null;
+  }
+
+  const sourceNodeModules = path.join(sharedRepoRoot, 'node_modules');
+  if (!existsSync(sourceNodeModules)) {
+    return null;
+  }
+
+  const targetNodeModules = path.join(worktreePath, 'node_modules');
+
+  try {
+    const existing = lstatSync(targetNodeModules);
+    if (existing.isSymbolicLink()) {
+      if (existsSync(targetNodeModules)) {
+        return null;
+      }
+      unlinkSync(targetNodeModules);
+    }
+
+    if (existing.isDirectory() && options.replaceExistingDirectory) {
+      rmSync(targetNodeModules, { recursive: true, force: true });
+    } else {
+      return null;
+    }
+  } catch {
+    // Missing target is the normal case for a fresh worktree.
+  }
+
+  try {
+    symlinkSync(sourceNodeModules, targetNodeModules, process.platform === 'win32' ? 'junction' : 'dir');
+    return null;
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    return `Could not link shared node_modules into ${worktreePath}: ${err.message}`;
+  }
 }
 
 export function generateHex(): string {
