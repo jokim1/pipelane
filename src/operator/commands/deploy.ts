@@ -104,6 +104,59 @@ function disqualifyStagingRecord(options: {
   return null;
 }
 
+function deployEnvironmentLabel(environment: 'staging' | 'prod'): 'staging' | 'production' {
+  return environment === 'prod' ? 'production' : 'staging';
+}
+
+function listMissingDeployConfiguration(options: {
+  config: ReturnType<typeof emptyDeployConfig>;
+  environment: 'staging' | 'prod';
+  surfaces: string[];
+  defaultWorkflowName: string;
+}): string[] {
+  const missing = new Set<string>();
+  const label = deployEnvironmentLabel(options.environment);
+  const frontend = options.environment === 'staging'
+    ? options.config.frontend.staging
+    : options.config.frontend.production;
+
+  if (!frontend.deployWorkflow && !options.defaultWorkflowName) {
+    missing.add(`frontend ${label} deploy workflow`);
+  }
+
+  for (const surface of options.surfaces) {
+    if (surface === 'frontend') {
+      if (!frontend.url && !frontend.deployWorkflow && !options.defaultWorkflowName) {
+        missing.add(`frontend ${label} URL or deploy workflow`);
+      }
+      if (!resolveSurfaceHealthcheckUrl(options.config, options.environment, surface)) {
+        missing.add(`frontend ${label} health check`);
+      }
+      continue;
+    }
+
+    if (!resolveSurfaceHealthcheckUrl(options.config, options.environment, surface)) {
+      missing.add(`${surface} ${label} health check`);
+    }
+  }
+
+  return [...missing];
+}
+
+function buildDeployConfigurationError(options: {
+  environment: 'staging' | 'prod';
+  surfaces: string[];
+  missing: string[];
+}): string {
+  return [
+    `Deploy blocked: ${options.environment}`,
+    `Requested surfaces: ${options.surfaces.join(', ')}`,
+    'Missing deploy configuration:',
+    ...options.missing.map((entry) => `- ${entry}`),
+    'Fix the Deploy Configuration block in CLAUDE.md before running workflow:deploy again.',
+  ].join('\n');
+}
+
 export interface DispatchDeployOptions {
   environment?: 'staging' | 'prod';
   explicitSurfaces?: string[];
@@ -131,6 +184,17 @@ export async function dispatchDeploy(
   const { taskSlug, lock } = inferActiveTaskLock(context, options.explicitTask ?? parsed.flags.task);
   const surfaces = resolveCommandSurfaces(context, explicitSurfaces, lock.surfaces);
   const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
+  const allowHealthcheckStubBypass = process.env.NODE_ENV === 'test'
+    && Boolean(process.env.PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS);
+  const missingConfig = listMissingDeployConfiguration({
+    config: deployConfig,
+    environment,
+    surfaces,
+    defaultWorkflowName: context.config.deployWorkflowName,
+  }).filter((entry) => !allowHealthcheckStubBypass || !entry.endsWith('health check'));
+  if (missingConfig.length > 0) {
+    throw new Error(buildDeployConfigurationError({ environment, surfaces, missing: missingConfig }));
+  }
   const prRecord = loadPrRecord(context.commonDir, context.config, taskSlug);
   const target = resolveDeployTargetForTask({
     repoRoot: context.repoRoot,

@@ -1,6 +1,7 @@
 import { printResult, resolveWorkflowContext, type ParsedOperatorArgs } from '../state.ts';
 import {
   buildTaskWorkspaceOutput,
+  ensureSharedNodeModulesLink,
   findPrunedTaskLock,
   listActiveTaskLocks,
   pruneDeadTaskLocks,
@@ -23,6 +24,7 @@ export async function handleResume(cwd: string, parsed: ParsedOperatorArgs): Pro
 
     if (activeLocks.length === 1) {
       const lock = activeLocks[0];
+      const nodeModulesWarning = ensureSharedNodeModulesLink(context.commonDir, lock.worktreePath);
       printResult(parsed.flags, buildTaskWorkspaceOutput({
         repoRoot: context.repoRoot,
         taskName: lock.taskName || lock.taskSlug,
@@ -32,9 +34,12 @@ export async function handleResume(cwd: string, parsed: ParsedOperatorArgs): Pro
         mode: lock.mode,
         createdWorktree: false,
         resumed: true,
-        warnings: context.modeState.mode !== lock.mode
-          ? [`Current Dev Mode is ${context.modeState.mode}, but this task is locked to ${lock.mode}. Switch back before /pr or /merge.`]
-          : [],
+        warnings: [
+          ...(context.modeState.mode !== lock.mode
+            ? [`Current Dev Mode is ${context.modeState.mode}, but this task is locked to ${lock.mode}. Switch back before /pr or /merge.`]
+            : []),
+          ...(nodeModulesWarning ? [nodeModulesWarning] : []),
+        ],
         reasons: ['resuming the only active task workspace'],
         lockNextAction: lock.nextAction ?? null,
       }));
@@ -82,6 +87,7 @@ export async function handleResume(cwd: string, parsed: ParsedOperatorArgs): Pro
     ].join('\n'));
   }
 
+  const nodeModulesWarning = ensureSharedNodeModulesLink(context.commonDir, lock.worktreePath);
   printResult(parsed.flags, buildTaskWorkspaceOutput({
     repoRoot: context.repoRoot,
     taskName,
@@ -91,9 +97,12 @@ export async function handleResume(cwd: string, parsed: ParsedOperatorArgs): Pro
     mode: lock.mode,
     createdWorktree: false,
     resumed: true,
-    warnings: context.modeState.mode !== lock.mode
-      ? [`Current Dev Mode is ${context.modeState.mode}, but this task is locked to ${lock.mode}. Switch back before /pr or /merge.`]
-      : [],
+    warnings: [
+      ...(context.modeState.mode !== lock.mode
+        ? [`Current Dev Mode is ${context.modeState.mode}, but this task is locked to ${lock.mode}. Switch back before /pr or /merge.`]
+        : []),
+      ...(nodeModulesWarning ? [nodeModulesWarning] : []),
+    ],
     reasons: ['resuming the existing task workspace for this task'],
     lockNextAction: lock.nextAction ?? null,
   }));

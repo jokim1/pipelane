@@ -3,7 +3,14 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import type { DeployRecord, ProbeEnvironment, ProbeRecord, ProbeState, WorkflowConfig } from './state.ts';
-import { PROBE_STALE_MS } from './state.ts';
+import {
+  deployConfigPath,
+  loadWorkflowConfig,
+  PROBE_STALE_MS,
+  readJsonFile,
+  resolveGitCommonDir,
+  writeJsonFile,
+} from './state.ts';
 
 // v1.2 env var: opaque HMAC-SHA256 signing key. Accepts any non-empty string;
 // we recommend ≥32 bytes of cryptographic-random (e.g. `openssl rand -hex 32`)
@@ -138,26 +145,12 @@ export function extractDeployConfigSection(markdown: string): string | null {
   return range ? markdown.slice(range.start, range.end).trimEnd() : null;
 }
 
-export function parseDeployConfigMarkdown(markdown: string): DeployConfig | null {
-  const section = extractDeployConfigSection(markdown);
-
-  if (!section) {
-    return null;
-  }
-
-  // Anchor both fences to newlines. JSON.stringify never emits a literal
-  // newline inside a string (they're escaped as \n), so a command value with
-  // embedded backticks — e.g. `deployCommand: "echo \`\`\` hi"` — can't trick
-  // the regex into terminating early and truncating the JSON body. Use
-  // `\r?\n` so CRLF-checked-out CLAUDE.md (Windows, core.autocrlf=true)
-  // still parses.
-  const jsonMatch = section.match(/```json\r?\n([\s\S]*?)\r?\n```/i);
-  if (!jsonMatch) {
-    return null;
-  }
-
-  const parsed = JSON.parse(jsonMatch[1]) as Partial<DeployConfig>;
+function hydrateDeployConfig(parsed: Partial<DeployConfig> | null | undefined): DeployConfig {
   const config = emptyDeployConfig();
+
+  if (!parsed) {
+    return config;
+  }
 
   config.platform = parsed.platform ?? '';
   config.frontend.production.url = parsed.frontend?.production?.url ?? '';
@@ -187,14 +180,67 @@ export function parseDeployConfigMarkdown(markdown: string): DeployConfig | null
   return config;
 }
 
-export function loadDeployConfig(repoRoot: string): DeployConfig | null {
-  const claudePath = path.join(repoRoot, 'CLAUDE.md');
+export function parseDeployConfigMarkdown(markdown: string): DeployConfig | null {
+  const section = extractDeployConfigSection(markdown);
 
-  if (!existsSync(claudePath)) {
+  if (!section) {
     return null;
   }
 
-  return parseDeployConfigMarkdown(readFileSync(claudePath, 'utf8'));
+  // Anchor both fences to newlines. JSON.stringify never emits a literal
+  // newline inside a string (they're escaped as \n), so a command value with
+  // embedded backticks — e.g. `deployCommand: "echo \`\`\` hi"` — can't trick
+  // the regex into terminating early and truncating the JSON body. Use
+  // `\r?\n` so CRLF-checked-out CLAUDE.md (Windows, core.autocrlf=true)
+  // still parses.
+  const jsonMatch = section.match(/```json\r?\n([\s\S]*?)\r?\n```/i);
+  if (!jsonMatch) {
+    return null;
+  }
+
+  const parsed = JSON.parse(jsonMatch[1]) as Partial<DeployConfig>;
+  return hydrateDeployConfig(parsed);
+}
+
+function loadDeployConfigFromClaude(targetPath: string): DeployConfig | null {
+  if (!existsSync(targetPath)) {
+    return null;
+  }
+
+  return parseDeployConfigMarkdown(readFileSync(targetPath, 'utf8'));
+}
+
+export function loadDeployConfig(repoRoot: string): DeployConfig | null {
+  const claudePath = path.join(repoRoot, 'CLAUDE.md');
+  const localConfig = loadDeployConfigFromClaude(claudePath);
+  if (localConfig) {
+    return localConfig;
+  }
+
+  try {
+    const commonDir = resolveGitCommonDir(repoRoot);
+    const sharedRepoRoot = path.dirname(commonDir);
+    const sharedClaudePath = path.join(sharedRepoRoot, 'CLAUDE.md');
+
+    if (path.resolve(sharedClaudePath) !== path.resolve(claudePath)) {
+      const sharedRootConfig = loadDeployConfigFromClaude(sharedClaudePath);
+      if (sharedRootConfig) {
+        return sharedRootConfig;
+      }
+    }
+
+    const config = loadWorkflowConfig(repoRoot);
+    const sharedState = readJsonFile<Partial<DeployConfig> | null>(deployConfigPath(commonDir, config), null);
+    return sharedState ? hydrateDeployConfig(sharedState) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveSharedDeployConfig(repoRoot: string, deployConfig: DeployConfig): void {
+  const commonDir = resolveGitCommonDir(repoRoot);
+  const config = loadWorkflowConfig(repoRoot);
+  writeJsonFile(deployConfigPath(commonDir, config), deployConfig);
 }
 
 export function renderDeployConfigSection(config: DeployConfig): string {
