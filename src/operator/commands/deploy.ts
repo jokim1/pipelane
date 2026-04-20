@@ -262,7 +262,13 @@ export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Pro
   };
 
   // Persist the 'requested' record immediately so an interrupted run
-  // still leaves a breadcrumb in deploy-state.json.
+  // still leaves a breadcrumb in deploy-state.json. Sign it if signing
+  // is enabled — otherwise an async deploy's initial record would be
+  // invisible to verifyDeployRecord filters and rollback would miss
+  // in-flight deploys on signed repos (Codex r6 P2).
+  if (stateKey) {
+    record = { ...record, signature: signDeployRecord(record, stateKey) };
+  }
   persistRecord(context.commonDir, context.config, deployState.records, record);
 
   if (parsed.flags.async) {
@@ -392,21 +398,60 @@ export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Pro
   });
 }
 
-function persistRecord(
+export function persistRecord(
   commonDir: string,
   config: WorkflowConfig,
   records: DeployRecord[],
   record: DeployRecord,
 ): void {
-  const next = [
+  const deduped = [
     ...records.filter((existing) => existing.idempotencyKey !== record.idempotencyKey
       || existing.status === 'failed'),
     record,
-  ].slice(-100);
-  saveDeployState(commonDir, config, { records: next });
+  ];
+  saveDeployState(commonDir, config, { records: capDeployHistory(deduped) });
 }
 
-function resolveTriggeredBy(): string {
+// v1.1 R10 fix: the simple `.slice(-100)` tail-cap used to silently
+// evict the last-known-good DeployRecord on a long-lived repo, which
+// breaks /rollback (findLastGoodDeploy sees an empty post-slice
+// window). Preserve the most recent succeeded + verified record for
+// every (environment, surfaces-key) as a pinned checkpoint beyond the
+// recency cap. Keep the tail-100 window for everything else so state
+// files still stay bounded.
+const DEPLOY_HISTORY_TAIL = 100;
+export function capDeployHistory(records: DeployRecord[]): DeployRecord[] {
+  if (records.length <= DEPLOY_HISTORY_TAIL) return records;
+  const tail = records.slice(-DEPLOY_HISTORY_TAIL);
+  const tailSet = new Set(tail);
+  // Walk the full history and pick the most recent verified checkpoint
+  // per (environment, sorted-surfaces) that isn't already in the tail.
+  const pinned = new Map<string, DeployRecord>();
+  for (const record of records) {
+    if (tailSet.has(record)) continue;
+    if (record.status !== 'succeeded') continue;
+    if (!record.verifiedAt) continue;
+    if (!record.sha) continue;
+    const key = `${record.environment}:${[...(record.surfaces ?? [])].sort().join(',')}`;
+    const prev = pinned.get(key);
+    const prevTime = prev?.verifiedAt ? Date.parse(prev.verifiedAt) : 0;
+    const curTime = Date.parse(record.verifiedAt);
+    if (!prev || (Number.isFinite(curTime) && curTime > prevTime)) {
+      pinned.set(key, record);
+    }
+  }
+  if (pinned.size === 0) return tail;
+  // Preserve the original insertion order across pinned + tail so the
+  // newest-last invariant that findLastGoodDeploy relies on still
+  // holds. Pinned records come first (they're older than the tail).
+  const pinnedOrdered = records.filter((record) => {
+    for (const value of pinned.values()) if (value === record) return true;
+    return false;
+  });
+  return [...pinnedOrdered, ...tail];
+}
+
+export function resolveTriggeredBy(): string {
   return (
     process.env.PIPELANE_DEPLOY_TRIGGERED_BY
     || process.env.GITHUB_ACTOR
@@ -415,11 +460,12 @@ function resolveTriggeredBy(): string {
   );
 }
 
-function findRecentRun(
+export function findRecentRun(
   repoRoot: string,
   workflowName: string,
   sha: string,
   dispatchedAfter: number,
+  options: { strict?: boolean } = {},
 ): { id: string; url?: string } | null {
   const output = runCommandCapture('gh', [
     'run',
@@ -439,8 +485,23 @@ function findRecentRun(
       createdAt: string;
       url?: string;
     }>;
+    // strict=true requires BOTH sha match AND recency-after-dispatch.
+    // Rollback always re-dispatches a known sha, so the default
+    // "match on sha OR recency" filter can attach to an older
+    // successful run of the same sha (Codex r5 P1). Dropping the sha
+    // clause entirely goes the other way — an unrelated run of the
+    // same workflow dispatched in the same 5s window would match
+    // (Codex r6 P1). Both clauses required keeps the match unique
+    // to our dispatch. Deploy keeps the permissive default because
+    // its idempotency short-circuit prevents same-sha re-dispatch.
+    const minCreated = dispatchedAfter - 5_000;
     const candidate = runs
-      .filter((run) => run.headSha === sha || Date.parse(run.createdAt) >= dispatchedAfter - 5_000)
+      .filter((run) => {
+        if (options.strict) {
+          return run.headSha === sha && Date.parse(run.createdAt) >= minCreated;
+        }
+        return run.headSha === sha || Date.parse(run.createdAt) >= minCreated;
+      })
       .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
     if (!candidate) return null;
     return { id: String(candidate.databaseId), url: candidate.url };
@@ -449,7 +510,7 @@ function findRecentRun(
   }
 }
 
-function watchWorkflowRun(
+export function watchWorkflowRun(
   repoRoot: string,
   runId: string | undefined,
 ): { ok: boolean; reason?: string } {
@@ -560,7 +621,7 @@ function promptForProdConfirmPrefix(fullSha: string, expected: string): Promise<
   });
 }
 
-async function probeHealthcheck(url: string): Promise<DeployVerification> {
+export async function probeHealthcheck(url: string): Promise<DeployVerification> {
   if (process.env.PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS) {
     const statusCode = Number(process.env.PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS);
     return {

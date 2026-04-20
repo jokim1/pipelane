@@ -59,7 +59,8 @@ mirrors it.
 | 9.1 | v0.6 `/status` cockpit V0 + v1.3 `TaskLock.nextAction` breadcrumb | ✅ merged | pipelane #31 |
 | 9.2 | v1.5 WIP soft warn (`/new` at ≥3 active) + `--override --reason` auditability | ✅ merged | pipelane #32 |
 | 9.3 | v1.2 `doctor.*` (diagnose + `--probe` + `--fix` wizard) + probe-state release gate + first `docs/WORKFLOW_API.md` | ✅ merged | pipelane #33 |
-| 9.4 | v1.4 `/status --week / --stuck / --blast` + `surfacePathMap` config + v1.3 `/resume` nextAction fold-in | 🟡 in PR | pipelane next-1 |
+| 9.4 | v1.4 `/status --week / --stuck / --blast` + `surfacePathMap` config + v1.3 `/resume` nextAction fold-in | ✅ merged | pipelane #35 |
+| 9.5 | v1.1 `rollback.*` actions + `--revert-pr` flag + WORKFLOW_COMMANDS `rollback` | 🟡 in PR | pipelane next-2 |
 
 Ship items in this exact order. Each is its own PR in Pipelane unless
 noted. Catalog IDs reference the detailed sections below.
@@ -544,7 +545,7 @@ Current state:
 
 ## Phase v1 — Trust + recovery (following sprint)
 
-### v1.1 — `rollback.*` actions
+### v1.1 — `rollback.*` actions 🟡 IN PR (pipelane next-2)
 
 **Goal.** One command to recover from a bad deploy. Pipelane adds two
 new action IDs to the contract: `rollback.staging` and `rollback.prod`.

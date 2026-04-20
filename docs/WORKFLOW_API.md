@@ -81,8 +81,9 @@ Every mutating workflow step is exposed as a stable action ID. Callers
 whether a confirm token is required); `action <id> --execute` with the
 returned token to actually run it.
 
-Risky actions (`merge`, `deploy.prod`, `clean.apply`) always require a
-fresh confirmation token. Non-risky actions complete in one call.
+Risky actions (`merge`, `deploy.prod`, `clean.apply`, `rollback.prod`)
+always require a fresh confirmation token. Non-risky actions complete
+in one call.
 
 | Action ID | Risky? | Purpose |
 |-----------|--------|---------|
@@ -99,11 +100,24 @@ fresh confirmation token. Non-risky actions complete in one call.
 | `clean.apply` | **yes** | Apply workspace cleanup (delete branches/worktrees). |
 | `doctor.diagnose` | no | Read CLAUDE.md, detect platform, list missing config + probe status. |
 | `doctor.probe` | no | Hit every configured staging healthcheck URL and persist the result to `probe-state.json`. |
+| `rollback.staging` | no | Redeploy the last verified-good SHA to staging (Pipelane-only). |
+| `rollback.prod` | **yes** | Redeploy the last verified-good SHA to production (Pipelane-only). |
 
 `doctor.fix` is intentionally **not** exposed as an API action — it is
 interactive (TTY prompts for platform + URLs) and lives behind
 `npm run workflow:doctor -- --fix`. Scripted config goes through
 `pipelane configure --json=...` instead.
+
+`rollback.*` are **Pipelane-only** extensions above the shared
+Rocketboard-compatible baseline — a Rocketboard-only client won't
+recognize them. Both actions take `{ task, surfaces }` as
+`normalizedInputs`. Target SHA resolves server-side from the deploy
+state: the most recent `status=succeeded, verification.statusCode<300`
+record for the (environment, surfaces) pair, excluding the currently
+failing SHA. `--revert-pr` (CLI-only, release mode only) is an
+orthogonal path that opens a `git revert <mergeCommit>` PR via gh —
+it's not exposed as an API action because PR-open from a long-lived
+board/CI shell needs conflict handling that lives behind the TTY today.
 
 ## `probe-state.json` (v1.2)
 

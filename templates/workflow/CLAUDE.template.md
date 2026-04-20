@@ -35,6 +35,7 @@ Key routing rules:
 - Cleanup or stale workspace inspection -> `{{ALIAS_CLEAN}}`
 - One-screen cockpit of task + lane state -> `{{ALIAS_STATUS}}`
 - Diagnose deploy config or refresh staging probes -> `{{ALIAS_DOCTOR}}`
+- Roll back the last deploy to the last-good SHA -> `{{ALIAS_ROLLBACK}}`
 - Architecture review -> `plan-eng-review`
 - QA, test the site, find bugs -> `qa`
 - Code review, check my diff -> `review`

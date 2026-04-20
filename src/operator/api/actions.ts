@@ -4,7 +4,16 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 import type { ParsedOperatorArgs } from '../state.ts';
-import { nowIso, resolveWorkflowContext } from '../state.ts';
+import { loadDeployState, nowIso, resolveWorkflowContext, type DeployRecord } from '../state.ts';
+import {
+  computeDeployConfigFingerprint,
+  emptyDeployConfig,
+  loadDeployConfig,
+  normalizeDeployEnvironment,
+  resolveDeployStateKey,
+  verifyDeployRecord,
+} from '../release-gate.ts';
+import { findLastGoodDeploy, inferActiveTaskLock, resolveCommandSurfaces } from '../commands/helpers.ts';
 import {
   buildApiEnvelope,
   buildFreshness,
@@ -38,6 +47,15 @@ export const STABLE_ACTION_IDS = [
   // duplicates `pipelane configure`) or a long-lived stdin proxy.
   'doctor.diagnose',
   'doctor.probe',
+  // v1.1: rollback.* — one-command deploy recovery. Pipelane-only
+  // extension above Rocketboard's shared baseline. rollback.staging is
+  // low-risk (staging is allowed to break); rollback.prod joins the
+  // risky set alongside deploy.prod and requires a confirm-token.
+  // --revert-pr is NOT exposed as an API action — opening a PR from a
+  // long-lived board/CI shell needs branch-rename + conflict handling
+  // that live behind the TTY path today.
+  'rollback.staging',
+  'rollback.prod',
 ] as const;
 
 export type StableActionId = (typeof STABLE_ACTION_IDS)[number];
@@ -48,6 +66,7 @@ export const API_RISKY_ACTION_IDS: ReadonlySet<StableActionId> = new Set<StableA
   'clean.apply',
   'merge',
   'deploy.prod',
+  'rollback.prod',
 ]);
 
 const ACTION_LABELS: Record<StableActionId, string> = {
@@ -64,6 +83,8 @@ const ACTION_LABELS: Record<StableActionId, string> = {
   'clean.apply': 'Apply cleanup',
   'doctor.diagnose': 'Diagnose deploy configuration',
   'doctor.probe': 'Run live healthcheck probe',
+  'rollback.staging': 'Rollback staging to last-good deploy',
+  'rollback.prod': 'Rollback production to last-good deploy',
 };
 
 export interface ActionPreflightData {
@@ -95,7 +116,7 @@ export function isStableActionId(value: string): value is StableActionId {
 
 export function buildActionPreflightEnvelope(cwd: string, actionId: StableActionId, parsed: ParsedOperatorArgs): ApiEnvelope<ActionPreflightData> {
   const context = resolveWorkflowContext(cwd);
-  const normalizedInputs = normalizeInputs(actionId, parsed);
+  const normalizedInputs = normalizeInputs(actionId, parsed, cwd);
   const risky = API_RISKY_ACTION_IDS.has(actionId);
   const checkedAt = nowIso();
 
@@ -188,7 +209,7 @@ function evaluatePreflightGate(actionId: StableActionId, inputs: Record<string, 
 
 export async function runActionExecute(cwd: string, actionId: StableActionId, parsed: ParsedOperatorArgs, confirmToken: string): Promise<ApiEnvelope<ActionExecutionData | ActionPreflightData>> {
   const context = resolveWorkflowContext(cwd);
-  const normalizedInputs = normalizeInputs(actionId, parsed);
+  const normalizedInputs = normalizeInputs(actionId, parsed, cwd);
   const risky = API_RISKY_ACTION_IDS.has(actionId);
   const checkedAt = nowIso();
 
@@ -253,7 +274,7 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
   });
 }
 
-function normalizeInputs(actionId: StableActionId, parsed: ParsedOperatorArgs): Record<string, unknown> {
+function normalizeInputs(actionId: StableActionId, parsed: ParsedOperatorArgs, cwd?: string): Record<string, unknown> {
   const { flags } = parsed;
   switch (actionId) {
     case 'new':
@@ -282,6 +303,120 @@ function normalizeInputs(actionId: StableActionId, parsed: ParsedOperatorArgs): 
       return {};
     case 'doctor.probe':
       return {};
+    case 'rollback.staging': {
+      const resolved = resolveRollbackInputs(cwd, 'staging', flags.surfaces, flags.task);
+      return { task: flags.task, surfaces: flags.surfaces, resolvedSurfaces: resolved?.surfaces, targetSha: resolved?.targetSha };
+    }
+    case 'rollback.prod': {
+      const resolved = resolveRollbackInputs(cwd, 'prod', flags.surfaces, flags.task);
+      return { task: flags.task, surfaces: flags.surfaces, resolvedSurfaces: resolved?.surfaces, targetSha: resolved?.targetSha };
+    }
+  }
+}
+
+// v1.1 R7 fix: bind the rollback target sha to the confirm-token
+// fingerprint. Preflight resolves the target against the current deploy
+// state; execute re-resolves. If the state shifted (another deploy
+// succeeded or failed between preflight and execute), the target sha
+// will be different, the fingerprint won't match, and the token
+// consume rejects. This closes the TOCTOU window where a human-
+// approved "roll back to X" could become "roll back to Y" invisibly.
+//
+// The surface fallback chain MUST mirror handleRollback's exactly
+// (flags → lock.surfaces → config.surfaces) or preflight and execute
+// compute different targetSha values on the same repo state. Codex
+// caught an earlier version that used config.surfaces directly when
+// flags were empty, diverging from execute's lock-first fallback.
+//
+// Returns undefined (not null) when resolution fails so the resulting
+// fingerprint value is stable across failed-resolution calls. Failed
+// resolution still lets preflight hand out a token, but the subsequent
+// handleRollback invocation will throw a clear error anyway.
+function resolveRollbackInputs(
+  cwd: string | undefined,
+  environment: 'staging' | 'prod',
+  surfaceFlags: string[],
+  taskFlag: string,
+): { surfaces: string[]; targetSha: string } | undefined {
+  if (!cwd) return undefined;
+  try {
+    const context = resolveWorkflowContext(cwd);
+    const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
+    const deployState = loadDeployState(context.commonDir, context.config);
+    const stateKey = resolveDeployStateKey();
+    const trustedRecords = stateKey
+      ? deployState.records.filter((record) => verifyDeployRecord(record, stateKey))
+      : deployState.records;
+    // Use the same resolveCommandSurfaces helper handleRollback uses at
+    // execute time. Codex caught an earlier manual reconstruction that
+    // missed modeState.requestedSurfaces + the parseSurfaceList
+    // validation step — those differences could make preflight and
+    // execute compute different targetSha values for the same inputs.
+    // Task-lock lookup is best-effort (operator may preflight without
+    // an active lock, e.g. from a dashboard UI).
+    let lockSurfaces: string[] = [];
+    try {
+      const { lock } = inferActiveTaskLock(context, taskFlag);
+      lockSurfaces = lock.surfaces ?? [];
+    } catch {
+      // No active task lock — resolveCommandSurfaces will fall through
+      // to modeState.requestedSurfaces and then config.surfaces.
+    }
+    const surfaces = [...resolveCommandSurfaces(context, surfaceFlags, lockSurfaces)].sort();
+    // Current record = latest record for this (env, surfaces). We need
+    // the whole record (not just sha) so we can mirror handleRollback's
+    // excludeSha logic: prefer rollbackOfSha (the original broken sha)
+    // when the latest record is itself a failed/pending rollback. Codex
+    // round 4 P1: preflight used record.sha unconditionally, which
+    // drifted from execute on retry scenarios.
+    let currentRecord: DeployRecord | null = null;
+    const sortedKey = surfaces.join(',');
+    for (let i = trustedRecords.length - 1; i >= 0; i -= 1) {
+      const record = trustedRecords[i];
+      if (record.environment !== environment) continue;
+      if (!record.sha) continue;
+      const recordKey = [...(record.surfaces ?? [])].sort().join(',');
+      if (recordKey !== sortedKey) continue;
+      currentRecord = record;
+      break;
+    }
+    if (!currentRecord) return undefined;
+    // Mirror handleRollback's cascade guard + in-flight guard +
+    // excludeSha selection. Both guards return undefined so the
+    // preflight token is still issued (handleRollback will throw the
+    // clear error at execute time), but the fingerprint targetSha is
+    // blank so the token doesn't lock in a stale/duplicate target.
+    if (currentRecord.status === 'succeeded' && currentRecord.rollbackOfSha) {
+      return undefined;
+    }
+    if (currentRecord.status === 'requested') {
+      // Mirror handleRollback's widened in-flight guard (Codex r8 P1):
+      // block on any 'requested' record, not just rollback ones. An
+      // async deploy in flight also disqualifies preflight from
+      // minting a valid target. Staleness threshold matches execute
+      // so preflight and execute agree on when a stale record
+      // bypasses the guard.
+      const requestedMs = Date.parse(currentRecord.requestedAt);
+      const timeoutMs = Number.parseInt(process.env.PIPELANE_ROLLBACK_INFLIGHT_TIMEOUT_MS ?? '', 10);
+      const threshold = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 30 * 60 * 1000;
+      const age = Number.isFinite(requestedMs) ? Date.now() - requestedMs : 0;
+      if (age < threshold) {
+        return undefined;
+      }
+      // Stale → fall through.
+    }
+    const excludeSha = currentRecord.rollbackOfSha ?? currentRecord.sha;
+    const target = findLastGoodDeploy({
+      records: trustedRecords,
+      environment,
+      surfaces,
+      excludeSha,
+      configFingerprint: computeDeployConfigFingerprint(deployConfig, environment),
+    });
+    if (!target?.sha) return undefined;
+    return { surfaces, targetSha: target.sha };
+  } catch {
+    return undefined;
   }
 }
 
@@ -355,6 +490,16 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
     case 'doctor.probe':
       args.push('doctor', 'probe');
       break;
+    case 'rollback.staging':
+      args.push('rollback', 'staging');
+      pushOpt('--task', flags.task);
+      pushSurfaces();
+      break;
+    case 'rollback.prod':
+      args.push('rollback', 'prod');
+      pushOpt('--task', flags.task);
+      pushSurfaces();
+      break;
   }
 
   args.push('--json');
@@ -386,10 +531,11 @@ function buildChildEnv(actionId: StableActionId): NodeJS.ProcessEnv {
   for (const key of TEST_HOOK_ENV_KEYS) {
     delete env[key];
   }
-  if (actionId === 'deploy.prod') {
-    // deploy.prod's CLI shim also requires human confirmation. The API path
-    // has already proved humanness via the HMAC confirm-token consume above,
-    // so tell the child CLI it can skip the typed-SHA TTY prompt. The child
+  if (actionId === 'deploy.prod' || actionId === 'rollback.prod') {
+    // Both deploy.prod and rollback.prod's CLI shims require human
+    // confirmation via requireProdConfirmation. The API path has already
+    // proved humanness via the HMAC confirm-token consume above, so tell
+    // the child CLI it can skip the typed-SHA TTY prompt. The child
     // scrubs this flag the moment it reads it so grandchild subprocesses
     // don't inherit an open prod-confirm bit.
     env.PIPELANE_DEPLOY_PROD_API_CONFIRMED = '1';

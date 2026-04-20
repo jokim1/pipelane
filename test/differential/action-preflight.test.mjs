@@ -23,11 +23,22 @@ const PREFLIGHT_EXTRA_ARGS = {
   'clean.apply': ['--all-stale'],
 };
 
-test('action preflight differential: risky flag and label match across all 11 stable IDs', { skip: !hasRocketboard && 'Rocketboard operator not available' }, () => {
+// Pipelane-only extensions above the shared Rocketboard baseline. The
+// differential harness skips these against Rocketboard (which doesn't
+// implement them) and just asserts Pipelane's envelope is well-formed.
+const PIPELANE_ONLY_ACTION_IDS = new Set([
+  'doctor.diagnose',
+  'doctor.probe',
+  'rollback.staging',
+  'rollback.prod',
+]);
+
+test('action preflight differential: risky flag and label match across all shared stable IDs', { skip: !hasRocketboard && 'Rocketboard operator not available' }, () => {
   const repoRoot = setupMinimalFixture();
   try {
     const divergences = [];
-    for (const actionId of STABLE_ACTION_IDS) {
+    const sharedIds = STABLE_ACTION_IDS.filter((id) => !PIPELANE_ONLY_ACTION_IDS.has(id));
+    for (const actionId of sharedIds) {
       const extra = PREFLIGHT_EXTRA_ARGS[actionId] ?? [];
       const pipelaneResult = runPipelane(repoRoot, ['api', 'action', actionId, ...extra]);
       const rocketboardResult = runRocketboard(repoRoot, ['api', 'action', actionId, ...extra]);
@@ -60,7 +71,7 @@ test('action preflight differential: risky flag and label match across all 11 st
       console.log('\n[differential] action preflight divergences:');
       for (const entry of divergences) console.log(`  - ${entry}`);
     } else {
-      console.log('\n[differential] action preflight: all 11 IDs match on action.id + risky + requiresConfirmation.');
+      console.log(`\n[differential] action preflight: ${sharedIds.length}/${STABLE_ACTION_IDS.length} shared IDs match (${PIPELANE_ONLY_ACTION_IDS.size} Pipelane-only IDs skipped).`);
     }
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });

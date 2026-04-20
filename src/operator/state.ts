@@ -5,7 +5,7 @@ import path from 'node:path';
 
 export type Mode = 'build' | 'release';
 export type KnownSurface = 'frontend' | 'edge' | 'sql';
-export const WORKFLOW_COMMANDS = ['devmode', 'new', 'resume', 'pr', 'merge', 'deploy', 'clean', 'status', 'doctor'] as const;
+export const WORKFLOW_COMMANDS = ['devmode', 'new', 'resume', 'pr', 'merge', 'deploy', 'clean', 'status', 'doctor', 'rollback'] as const;
 export type WorkflowCommand = (typeof WORKFLOW_COMMANDS)[number];
 export const DEFAULT_WORKFLOW_ALIASES: Record<WorkflowCommand, string> = {
   devmode: '/devmode',
@@ -17,6 +17,7 @@ export const DEFAULT_WORKFLOW_ALIASES: Record<WorkflowCommand, string> = {
   clean: '/clean',
   status: '/status',
   doctor: '/doctor',
+  rollback: '/rollback',
 };
 
 // Managed Claude command files that aren't workflow operator actions. These
@@ -257,6 +258,10 @@ export interface OperatorFlags {
   week: boolean;
   stuck: boolean;
   blastSha: string;
+  // v1.1: `/rollback <env> --revert-pr` alternate recovery path — opens a
+  // `git revert <mergeCommit>` PR via gh instead of dispatching a deploy.
+  // Mutually exclusive with the default redeploy flow. Release-mode only.
+  revertPr: boolean;
 }
 
 export interface ParsedOperatorArgs {
@@ -892,6 +897,7 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     week: false,
     stuck: false,
     blastSha: '',
+    revertPr: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -1010,6 +1016,11 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       }
       flags.blastSha = next;
       index += 1;
+      continue;
+    }
+
+    if (token === '--revert-pr') {
+      flags.revertPr = true;
       continue;
     }
 

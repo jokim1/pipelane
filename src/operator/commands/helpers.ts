@@ -16,6 +16,7 @@ import {
   runGit,
   saveTaskLock,
   slugifyTaskName,
+  type DeployRecord,
   type PrRecord,
   type TaskLock,
 } from '../state.ts';
@@ -458,4 +459,72 @@ export function resolveDeployTargetForTask(options: {
   }
 
   throw new Error(`Could not resolve a deploy target from ${options.baseBranch}.`);
+}
+
+// v1.1: pick the most recent succeeded + verified (2xx) DeployRecord for
+// the given environment + surfaces, excluding any sha matching the
+// caller's `excludeSha` (the failing current deploy we're rolling back
+// from). Matches surfaces by sorted-set equality so a rollback targeting
+// [frontend, edge] cannot pick up a [frontend]-only record.
+//
+// When `configFingerprint` is provided, candidates whose own
+// configFingerprint differs are rejected. Without this filter a
+// rollback could target a sha that was verified-good under a DIFFERENT
+// config (stale staging URL, rotated healthcheck path) — the
+// healthcheck that certified the sha may no longer exist. Legacy
+// records without a configFingerprint are accepted when the filter is
+// set, matching the fail-open posture elsewhere in the release gate.
+//
+// Returns null when no qualifying earlier record exists. Callers treat
+// null as "nothing to roll back to" and abort with a clear error.
+export function findLastGoodDeploy(options: {
+  records: DeployRecord[];
+  environment: 'staging' | 'prod';
+  surfaces: string[];
+  excludeSha: string;
+  configFingerprint?: string;
+}): DeployRecord | null {
+  const key = [...options.surfaces].sort().join(',');
+  // Walk newest-first so we can short-circuit on the first qualifying hit.
+  // A DeployRecord appended later in the array is always newer than one
+  // earlier in the array — persistRecord preserves write order.
+  for (let i = options.records.length - 1; i >= 0; i -= 1) {
+    const record = options.records[i];
+    if (record.environment !== options.environment) continue;
+    if (record.status !== 'succeeded') continue;
+    if (!record.sha) continue;
+    if (record.sha === options.excludeSha) continue;
+    const recordKey = [...(record.surfaces ?? [])].sort().join(',');
+    if (recordKey !== key) continue;
+    if (options.configFingerprint
+      && record.configFingerprint
+      && record.configFingerprint !== options.configFingerprint) {
+      continue;
+    }
+    // Require verified (2xx) liveness. v1.2 per-surface verification is
+    // preferred. Legacy aggregate `verification.statusCode` is accepted
+    // as a fallback ONLY for single-surface rollbacks — a pre-v1.2
+    // record has one probe (historically frontend), which can't
+    // legitimately verify [frontend, edge] together. Rejecting legacy
+    // aggregates on multi-surface rollbacks is the right safety call:
+    // operators get a clear "no earlier verified deploy for these
+    // surfaces" error and re-run the target deploy with per-surface
+    // verification. Codex r6 P2.
+    const perSurface = record.verificationBySurface;
+    if (perSurface && typeof perSurface === 'object') {
+      const allOk = options.surfaces.every((surface) => {
+        const code = perSurface[surface]?.statusCode;
+        return typeof code === 'number' && code >= 200 && code < 300;
+      });
+      if (!allOk) continue;
+    } else if (options.surfaces.length === 1) {
+      const code = record.verification?.statusCode;
+      if (typeof code !== 'number' || code < 200 || code >= 300) continue;
+    } else {
+      // Multi-surface rollback + only aggregate verification → reject.
+      continue;
+    }
+    return record;
+  }
+  return null;
 }

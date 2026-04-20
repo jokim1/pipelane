@@ -12,6 +12,7 @@ import { handlePr } from './commands/pr.ts';
 import { handleReleaseCheck } from './commands/release-check.ts';
 import { handleRepoGuard } from './commands/repo-guard.ts';
 import { handleResume } from './commands/resume.ts';
+import { handleRollback } from './commands/rollback.ts';
 import { handleStatus } from './commands/status.ts';
 import { handleTaskLock } from './commands/task-lock.ts';
 import { loadDeployConfig } from './release-gate.ts';
@@ -106,6 +107,11 @@ export async function runOperator(cwd: string, argv: string[]): Promise<void> {
     return;
   }
 
+  if (command === 'rollback') {
+    await handleRollback(cwd, parsed);
+    return;
+  }
+
   if (command === 'api') {
     await handleApi(cwd, parsed);
     return;
@@ -136,6 +142,7 @@ Workflow commands:
   clean
   status
   doctor [--probe | --fix]
+  rollback <staging|prod> [--surfaces ...] [--revert-pr]
   api snapshot
 `);
 }
