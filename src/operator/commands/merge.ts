@@ -1,5 +1,6 @@
 import { printResult, resolveWorkflowContext, runGh, runGit, savePrRecord, type ParsedOperatorArgs } from '../state.ts';
 import { ensureTaskLockMatchesCurrent, inferActiveTaskLock, loadPrForBranch, pollForMergedSha, setNextAction, watchPrChecks } from './helpers.ts';
+import { dispatchDeploy } from './deploy.ts';
 
 export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const context = resolveWorkflowContext(cwd);
@@ -13,7 +14,7 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
   }
 
   watchPrChecks(context.repoRoot, pr.number);
-  runGh(context.repoRoot, ['pr', 'merge', String(pr.number), '--squash', '--delete-branch']);
+  runGh(context.repoRoot, ['pr', 'merge', String(pr.number), '--squash']);
 
   // Poll gh until the PR reports state === "MERGED" AND mergeCommit.oid
   // is present. Fail closed on timeout. Never fall back to
@@ -32,21 +33,34 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
   });
 
   const shortSha = mergedSha.slice(0, 7);
-  const nextActionText = context.modeState.mode === 'build'
-    ? `merged at ${shortSha}, awaiting auto-deploy`
-    : `merged at ${shortSha}, deploy to staging`;
-  setNextAction(context.commonDir, context.config, taskSlug, nextActionText);
-
   const lines = [
     'Pull request merged.',
     `Task: ${taskSlug}`,
     `Merged SHA: ${mergedSha}`,
   ];
 
-  if (context.modeState.mode === 'build') {
-    lines.push(`Build mode expects production deploy to happen via ${context.config.deployWorkflowName}.`);
+  const autoDeployOnMerge = context.modeState.mode === 'build' && context.config.buildMode.autoDeployOnMerge;
+
+  if (autoDeployOnMerge) {
+    const deploy = await dispatchDeploy(cwd, parsed, {
+      environment: 'prod',
+      explicitTask: taskSlug,
+      explicitSurfaces: lock.surfaces,
+      async: true,
+    });
+    lines.push(`Production deploy dispatched via ${deploy.workflowName}.`);
+    if (deploy.workflowRunUrl) {
+      lines.push(`Workflow run: ${deploy.workflowRunUrl}`);
+    } else if (deploy.workflowRunId) {
+      lines.push(`Workflow run: ${deploy.workflowRunId}`);
+    }
     lines.push('Next: verify production, then run workflow:clean.');
+  } else if (context.modeState.mode === 'build') {
+    setNextAction(context.commonDir, context.config, taskSlug, `merged at ${shortSha}, deploy to prod`);
+    lines.push('Build mode auto-deploy is disabled for this repo.');
+    lines.push('Next: run workflow:deploy -- prod.');
   } else {
+    setNextAction(context.commonDir, context.config, taskSlug, `merged at ${shortSha}, deploy to staging`);
     lines.push('Next: run workflow:deploy -- staging.');
   }
 

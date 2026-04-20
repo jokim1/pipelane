@@ -76,7 +76,7 @@ function writeFakeGh(binDir, stateFile) {
 const fs = require('node:fs');
 const path = require('node:path');
 const statePath = process.env.GH_STATE_FILE;
-const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, 'utf8')) : { prs: {}, workflows: [] };
+const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, 'utf8')) : { prs: {}, workflows: [], prMergeCalls: [] };
 const args = process.argv.slice(2);
 const writeState = () => fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + '\\n', 'utf8');
 const findFlag = (flag) => {
@@ -112,6 +112,12 @@ if (args[0] === 'pr' && args[1] === 'checks') {
   process.exit(0);
 }
 if (args[0] === 'pr' && args[1] === 'merge') {
+  state.prMergeCalls = state.prMergeCalls || [];
+  state.prMergeCalls.push(args.slice(2));
+  if (process.env.GH_FAIL_ON_DELETE_BRANCH === '1' && args.includes('--delete-branch')) {
+    process.stderr.write('fatal: local branch deletion is not worktree-safe\\n');
+    process.exit(1);
+  }
   const number = Number(args[2]);
   const pr = Object.values(state.prs).find((entry) => entry.number === number);
   if (pr) {
@@ -3269,6 +3275,7 @@ test('pr, merge, deploy, and task-lock work with a fake gh adapter', () => {
   const env = {
     PATH: `${ghBin}:${process.env.PATH}`,
     GH_STATE_FILE: ghStateFile,
+    GH_FAIL_ON_DELETE_BRANCH: '1',
   };
 
   try {
@@ -3285,6 +3292,7 @@ test('pr, merge, deploy, and task-lock work with a fake gh adapter', () => {
 
     const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
     assert.equal(merged.mergedSha, 'deadbeefcafebabe');
+    assert.match(merged.message, /Production deploy dispatched via Deploy Hosted/);
 
     const deployed = JSON.parse(runCli(['run', 'deploy', 'prod', '--async', '--json'], created.worktreePath, env).stdout);
     assert.equal(deployed.environment, 'prod');
@@ -3294,8 +3302,52 @@ test('pr, merge, deploy, and task-lock work with a fake gh adapter', () => {
     assert.ok(deployed.idempotencyKey, 'record carries an idempotencyKey');
 
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
-    assert.equal(ghState.workflows.length, 1);
+    assert.equal(ghState.prMergeCalls.length, 1);
+    assert.ok(!ghState.prMergeCalls[0].includes('--delete-branch'));
+    assert.equal(ghState.workflows.length, 2);
     assert.equal(ghState.workflows[0].name, 'Deploy Hosted');
+    assert.ok(ghState.workflows[0].args.includes('environment=production'));
+    assert.ok(ghState.workflows[0].args.includes('sha=deadbeefcafebabe'));
+    assert.ok(ghState.workflows[0].args.includes('surfaces=frontend,edge,sql'));
+    assert.ok(ghState.workflows[0].args.includes('bypass_staging_guard=true'));
+    assert.ok(ghState.workflows[1].args.includes('bypass_staging_guard=true'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('merge skips auto-deploy in build mode when autoDeployOnMerge is disabled', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_FAIL_ON_DELETE_BRANCH: '1',
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Manual Deploy', '--json'], repoRoot).stdout);
+    const configPath = path.join(created.worktreePath, '.project-workflow.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.buildMode.autoDeployOnMerge = false;
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Manual Deploy', '--json'], created.worktreePath, env);
+
+    const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
+    assert.equal(merged.mergedSha, 'deadbeefcafebabe');
+    assert.match(merged.message, /auto-deploy is disabled/);
+
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.prMergeCalls.length, 1);
+    assert.equal(ghState.workflows.length, 0);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
