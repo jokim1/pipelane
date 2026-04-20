@@ -262,7 +262,13 @@ export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Pro
   };
 
   // Persist the 'requested' record immediately so an interrupted run
-  // still leaves a breadcrumb in deploy-state.json.
+  // still leaves a breadcrumb in deploy-state.json. Sign it if signing
+  // is enabled — otherwise an async deploy's initial record would be
+  // invisible to verifyDeployRecord filters and rollback would miss
+  // in-flight deploys on signed repos (Codex r6 P2).
+  if (stateKey) {
+    record = { ...record, signature: signDeployRecord(record, stateKey) };
+  }
   persistRecord(context.commonDir, context.config, deployState.records, record);
 
   if (parsed.flags.async) {
@@ -479,16 +485,21 @@ export function findRecentRun(
       createdAt: string;
       url?: string;
     }>;
-    // strict=true requires the run to have been created AFTER our
-    // dispatch moment. Rollback always re-dispatches a known sha, so
-    // the default "match on sha OR recency" filter can attach to an
-    // older successful run of the same sha (Codex r5 P1). Deploy keeps
-    // the permissive default because it has the idempotency
-    // short-circuit to prevent same-sha re-dispatch in the first place.
+    // strict=true requires BOTH sha match AND recency-after-dispatch.
+    // Rollback always re-dispatches a known sha, so the default
+    // "match on sha OR recency" filter can attach to an older
+    // successful run of the same sha (Codex r5 P1). Dropping the sha
+    // clause entirely goes the other way — an unrelated run of the
+    // same workflow dispatched in the same 5s window would match
+    // (Codex r6 P1). Both clauses required keeps the match unique
+    // to our dispatch. Deploy keeps the permissive default because
+    // its idempotency short-circuit prevents same-sha re-dispatch.
     const minCreated = dispatchedAfter - 5_000;
     const candidate = runs
       .filter((run) => {
-        if (options.strict) return Date.parse(run.createdAt) >= minCreated;
+        if (options.strict) {
+          return run.headSha === sha && Date.parse(run.createdAt) >= minCreated;
+        }
         return run.headSha === sha || Date.parse(run.createdAt) >= minCreated;
       })
       .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];

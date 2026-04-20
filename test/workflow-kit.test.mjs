@@ -6756,10 +6756,15 @@ test('v1.1 codex fixup: /rollback prod requires typed-SHA confirmation in build 
     // Seed deploy state with a good prod + a failed prod to roll back FROM.
     const stateDir = path.join(repoRoot, '.git', 'workflow-kit-state');
     const okProbe = { statusCode: 200, latencyMs: 10, probes: 2 };
+    // verificationBySurface is required for multi-surface rollbacks
+    // per r6 P2 fix (legacy aggregate probes only qualify for
+    // single-surface rollbacks now).
+    const perSurfaceOk = { frontend: okProbe, edge: okProbe, sql: okProbe };
     writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({ records: [
       { environment: 'prod', sha: goodSha, surfaces: ['frontend', 'edge', 'sql'],
         workflowName: 'Deploy Hosted', requestedAt: '2026-04-10T00:00:00Z',
-        status: 'succeeded', verifiedAt: '2026-04-10T00:01:00Z', verification: okProbe },
+        status: 'succeeded', verifiedAt: '2026-04-10T00:01:00Z',
+        verification: okProbe, verificationBySurface: perSurfaceOk },
       { environment: 'prod', sha: '1'.repeat(40), surfaces: ['frontend', 'edge', 'sql'],
         workflowName: 'Deploy Hosted', requestedAt: '2026-04-11T00:00:00Z',
         status: 'failed', verification: { statusCode: 503 } },

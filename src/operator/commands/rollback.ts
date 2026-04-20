@@ -237,6 +237,14 @@ export async function handleRollback(cwd: string, parsed: ParsedOperatorArgs): P
     rollbackOfSha: originalFailingSha,
   };
 
+  // Sign the 'requested' record so signed repos' trustedRecords filter
+  // keeps it visible during async dispatch. Without this, --async
+  // rollback's breadcrumb is filtered out and a subsequent /rollback
+  // can't see the in-flight attempt (Codex r6 P2). Matches the
+  // deploy.ts pattern at the same step.
+  if (stateKey) {
+    record = { ...record, signature: signDeployRecord(record, stateKey) };
+  }
   persistRecord(context.commonDir, context.config, deployState.records, record);
 
   if (parsed.flags.async) {
