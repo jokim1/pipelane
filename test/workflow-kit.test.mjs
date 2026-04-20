@@ -3388,9 +3388,12 @@ test('deploy verifies via gh run watch + healthcheck stubs and records status=su
     assert.equal(redeployed.status, 'succeeded');
     assert.equal(redeployed.idempotencyKey, deployed.idempotencyKey);
 
-    // Only ONE gh workflow run dispatch should be recorded (idempotent).
+    // Build mode auto-deploy dispatches prod on merge; the explicit staging deploy
+    // should still stay idempotent across reruns.
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
-    assert.equal(ghState.workflows.length, 1);
+    assert.equal(ghState.workflows.length, 2);
+    assert.ok(ghState.workflows[0].args.includes('environment=production'));
+    assert.ok(ghState.workflows[1].args.includes('environment=staging'));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
