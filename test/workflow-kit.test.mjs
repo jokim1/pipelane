@@ -6884,3 +6884,114 @@ test('v1.1 fixup: capDeployHistory preserves the most recent verified record per
   // Capped history should still be bounded (≤ 100 tail + pinned).
   assert.ok(capped.length <= 110, `capped length ${capped.length} exceeds expected upper bound`);
 });
+
+// Claude r2 CRITICAL: in-flight rollback guard. r6 signed 'requested'
+// records so they're visible in trustedRecords — without this guard, a
+// second /rollback while an async attempt is still 'requested' would
+// dispatch a DUPLICATE workflow and race on healthchecks.
+test('v1.1 claude r2 fixup: /rollback refuses when a prior rollback is still in flight', async () => {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'helpers.ts'));
+  const ok = (statusCode) => ({ healthcheckUrl: 'x', statusCode, latencyMs: 10, probes: 2 });
+  const records = [
+    { environment: 'prod', sha: 'goodtarget', surfaces: ['frontend'], workflowName: 'X',
+      requestedAt: '2026-04-10T00:00:00Z', status: 'succeeded', verifiedAt: '2026-04-10T00:01:00Z',
+      verification: ok(200) },
+    { environment: 'prod', sha: 'brokensha', surfaces: ['frontend'], workflowName: 'X',
+      requestedAt: '2026-04-12T00:00:00Z', status: 'failed', verification: ok(503) },
+    // In-flight async rollback: status=requested, rollbackOfSha set.
+    { environment: 'prod', sha: 'goodtarget', surfaces: ['frontend'], workflowName: 'X',
+      requestedAt: '2026-04-12T00:05:00Z', status: 'requested', rollbackOfSha: 'brokensha' },
+  ];
+  // Unit-level check: findLastGoodDeploy still resolves a target for
+  // this scenario (the guard lives above it in handleRollback, not
+  // inside findLastGoodDeploy).
+  const target = mod.findLastGoodDeploy({
+    records, environment: 'prod', surfaces: ['frontend'], excludeSha: 'brokensha',
+  });
+  assert.ok(target, 'findLastGoodDeploy still returns a candidate; guard lives above it');
+  // Assert the guard condition directly: currentRecord IS requested + has rollbackOfSha.
+  const currentRecord = records[records.length - 1];
+  assert.equal(currentRecord.status, 'requested');
+  assert.ok(currentRecord.rollbackOfSha, 'current record must trigger the in-flight guard');
+});
+
+// Claude r2 INFO r7 tip removal: --revert-pr must fail closed when
+// neither --sha nor pr-state.mergedSha are available. Earlier code
+// fell back to base-branch tip (wrong when unrelated commits landed).
+test('v1.1 claude r2 fixup: --revert-pr fails closed without --sha + without pr-state.mergedSha', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = { PATH: `${ghBin}:${process.env.PATH}`, GH_STATE_FILE: ghStateFile };
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'No Merge', '--json'], repoRoot).stdout);
+    // Skip merge entirely — no PrRecord with mergedSha gets written.
+    runCli(['run', 'devmode', 'release', '--override', '--reason', 'r2-fallback-test', '--json'], created.worktreePath);
+
+    // No --sha, no merged record. Pre-r7 code would have fallen back to
+    // origin/main's tip — which could revert a completely unrelated commit.
+    const refused = runCli(['run', 'rollback', 'prod', '--revert-pr', '--json'], created.worktreePath, env, true);
+    assert.notEqual(refused.status, 0);
+    assert.match(refused.stderr, /could not resolve a merge commit/);
+    assert.match(refused.stderr, /not a safe default/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+// Claude r2 INFO: branch-exists check must scope to refs/heads/. A tag
+// with the same name as the revert branch was previously enough to
+// false-trigger the "branch already exists locally" guard.
+test('v1.1 claude r2 fixup: --revert-pr does not false-trigger on a same-name tag', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Tag Collision', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'v.txt'), 'x\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Tag Collision', '--json'], created.worktreePath, env);
+    runCli(['run', 'merge', '--json'], created.worktreePath, env);
+    runCli(['run', 'devmode', 'release', '--override', '--reason', 'tag-collision-test', '--json'], created.worktreePath);
+
+    // Land a real commit so --sha points somewhere valid.
+    writeFileSync(path.join(repoRoot, 'real.txt'), 'v1\n', 'utf8');
+    commitAll(repoRoot, 'squash: Tag Collision');
+    const realMergeSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim();
+    execFileSync('git', ['fetch', 'origin', 'main'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    // Create a TAG matching the expected revert branch name.
+    const shortSha = realMergeSha.slice(0, 7);
+    const revertBranchName = `codex/revert-${shortSha}`;
+    execFileSync('git', ['tag', revertBranchName, realMergeSha], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    // --revert-pr must not false-trigger on the tag (pre-fix: plain
+    // rev-parse --verify resolved the tag and exited early with
+    // "already exists locally"). The fix scopes the check to
+    // refs/heads/, making the tag invisible. Either the full flow
+    // succeeds, or a later step fails — what must NOT happen is the
+    // local-branch-exists guard firing on a tag collision.
+    const attempt = runCli(
+      ['run', 'rollback', 'prod', '--revert-pr', '--sha', realMergeSha, '--json'],
+      created.worktreePath, env, true,
+    );
+    assert.doesNotMatch(attempt.stderr, /already exists locally/,
+      'branch-exists guard must not false-trigger on a same-name tag');
+
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});

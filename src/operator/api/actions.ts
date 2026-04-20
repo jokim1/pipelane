@@ -381,9 +381,15 @@ function resolveRollbackInputs(
       break;
     }
     if (!currentRecord) return undefined;
-    // Mirror handleRollback's cascade guard + excludeSha selection.
+    // Mirror handleRollback's cascade guard + in-flight guard +
+    // excludeSha selection. Both guards return undefined so the
+    // preflight token is still issued (handleRollback will throw the
+    // clear error at execute time), but the fingerprint targetSha is
+    // blank so the token doesn't lock in a stale/duplicate target.
     if (currentRecord.status === 'succeeded' && currentRecord.rollbackOfSha) {
-      // No rollback target when already at a prior rollback result.
+      return undefined;
+    }
+    if (currentRecord.status === 'requested' && currentRecord.rollbackOfSha) {
       return undefined;
     }
     const excludeSha = currentRecord.rollbackOfSha ?? currentRecord.sha;

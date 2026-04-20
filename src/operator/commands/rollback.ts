@@ -138,6 +138,23 @@ export async function handleRollback(cwd: string, parsed: ParsedOperatorArgs): P
     ].join('\n'));
   }
 
+  // Block a duplicate dispatch while an async rollback is still in
+  // flight. r6 made 'requested' records visible in trustedRecords
+  // (signed on persist) — without this guard, a second /rollback sees
+  // the in-flight attempt, treats it as a retry, and dispatches a
+  // COMPETING gh workflow run to the same environment. Two workflows
+  // race on healthchecks and the second overwrites the first's
+  // breadcrumb via idempotencyKey dedup. Operators running --async
+  // then re-running /rollback hit this. Second-review catch from
+  // Claude after 7 codex rounds.
+  if (currentRecord.status === 'requested' && currentRecord.rollbackOfSha) {
+    throw new Error([
+      `rollback ${environment} blocked: a prior rollback is still in flight`,
+      `(requested at ${currentRecord.requestedAt}, rolling ${currentRecord.rollbackOfSha.slice(0, 7)} → ${currentRecord.sha.slice(0, 7)}).`,
+      'Wait for the prior dispatch to finalize (watch `gh run list`), or clear the record manually if the workflow is known-dead.',
+    ].join('\n'));
+  }
+
   // When the current record is a failed/pending rollback (rollbackOfSha
   // set + status != succeeded), the environment is still at the
   // originally-failing sha, not at currentRecord.sha. Use rollbackOfSha
@@ -489,13 +506,29 @@ async function handleRevertPr(
   // Refuse to reuse an existing branch — operators re-running /rollback
   // --revert-pr need deterministic behavior, not a silent append to a
   // pre-existing revert branch. Check both local and remote.
-  if (runGit(context.repoRoot, ['rev-parse', '--verify', revertBranch], true)) {
+  // Scope the branch-exists check to refs/heads/ so a tag with the
+  // same name (codex/revert-abc1234 as a tag, for instance) doesn't
+  // false-trigger. Plain rev-parse --verify walks git's DWIM order
+  // (tags, branches, remote-tracking, ...) and would match a tag here.
+  if (runGit(context.repoRoot, ['rev-parse', '--verify', `refs/heads/${revertBranch}`], true)) {
     throw new Error(`--revert-pr blocked: branch ${revertBranch} already exists locally. Delete it or pass a different --sha.`);
   }
-  if (runGit(context.repoRoot, ['ls-remote', '--exit-code', '--heads', 'origin', revertBranch], true) !== null) {
+  // ls-remote --exit-code returns 0 when found, 2 when not-found, 128
+  // on network/auth failure. runGit allowFailure=true collapses the
+  // last two into null, so a naive `!== null` check fail-opens on
+  // origin-unreachable and lets the subsequent push surface a
+  // confusing error. Use runCommandCapture to distinguish exit codes.
+  const lsRemote = runCommandCapture('git', ['ls-remote', '--exit-code', '--heads', 'origin', revertBranch], { cwd: context.repoRoot });
+  if (lsRemote.exitCode === 0) {
     throw new Error([
       `--revert-pr blocked: branch ${revertBranch} already exists on origin.`,
       `Delete it (\`git push origin --delete ${revertBranch}\`) before retrying.`,
+    ].join('\n'));
+  }
+  if (lsRemote.exitCode !== 2) {
+    throw new Error([
+      `--revert-pr blocked: could not verify remote branch state (git ls-remote exit ${lsRemote.exitCode}).`,
+      lsRemote.stderr.trim() || 'Origin may be unreachable; fix auth/network and retry.',
     ].join('\n'));
   }
 
@@ -525,7 +558,22 @@ async function handleRevertPr(
       ].join('\n'));
     }
 
-    runGit(context.repoRoot, ['push', '-u', 'origin', revertBranch]);
+    // Explicit allowFailure on push so a transient failure (non-fast-
+    // forward after concurrent push, auth rotation, network blip)
+    // doesn't escape the try-block with the local revertBranch still
+    // around — next retry would fail on the "branch already exists"
+    // guard with a misleading error. Cleanup mirrors the gh-pr-create
+    // failure path below.
+    const pushOutput = runGit(context.repoRoot, ['push', '-u', 'origin', revertBranch], true);
+    if (pushOutput === null) {
+      restoreOriginalRef();
+      runGit(context.repoRoot, ['branch', '-D', revertBranch], true);
+      throw new Error([
+        '--revert-pr blocked: `git push -u origin <revertBranch>` failed.',
+        'Likely causes: origin rejected the push (branch already on remote? auth expired?), or the network is down.',
+        'Cleaned up the local branch. Re-run the command once the cause is cleared.',
+      ].join('\n'));
+    }
     const prUrl = runGh(context.repoRoot, [
       'pr',
       'create',
