@@ -74,8 +74,31 @@ export async function handleRollback(cwd: string, parsed: ParsedOperatorArgs): P
     return;
   }
 
-  const { taskSlug, lock } = inferActiveTaskLock(context, parsed.flags.task);
-  const surfaces = resolveCommandSurfaces(context, explicitSurfaces, lock.surfaces);
+  // Redeploy-rollback path: lock lookup is also best-effort here so
+  // the command stays usable after /clean --apply has pruned the lock.
+  // In that state the operator can still invoke with --task <slug>
+  // --surfaces <csv> and we fall through to config.surfaces when
+  // neither lock nor flags are present. Codex r7 P2. taskSlug is
+  // required for the idempotency key + DeployRecord, so if no lock +
+  // no --task, we fail with a clear message.
+  let taskSlug = '';
+  let lockSurfaces: string[] = [];
+  try {
+    const result = inferActiveTaskLock(context, parsed.flags.task);
+    taskSlug = result.taskSlug;
+    lockSurfaces = result.lock.surfaces ?? [];
+  } catch (error) {
+    if (parsed.flags.task.trim()) {
+      taskSlug = slugifyTaskName(parsed.flags.task);
+    } else {
+      throw new Error([
+        'rollback blocked: no active task lock and no --task passed.',
+        'Run with --task <slug> (e.g. after /clean --apply pruned the lock), or resume the task workspace first.',
+        `underlying: ${error instanceof Error ? error.message : String(error)}`,
+      ].join('\n'));
+    }
+  }
+  const surfaces = resolveCommandSurfaces(context, explicitSurfaces, lockSurfaces);
 
   const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
   const deployState = loadDeployState(context.commonDir, context.config);
@@ -212,9 +235,18 @@ export async function handleRollback(cwd: string, parsed: ParsedOperatorArgs): P
   // strict=true: rollback redeploys a known sha, so any prior
   // successful run of target.sha is a stale match that would make
   // watchWorkflowRun attach to the old succeeded run and mark the new
-  // rollback succeeded without waiting for the fresh dispatch.
-  // Require createdAt >= dispatchStart - 5s window.
-  const run = findRecentRun(context.repoRoot, workflowName, target.sha, dispatchStart, { strict: true });
+  // rollback succeeded without waiting for the fresh dispatch. Retry
+  // a few times with a short delay to absorb `gh run list` propagation
+  // lag — one-shot lookup races against GitHub's run-list index and
+  // can return null even for a just-dispatched run (Codex r7 P2).
+  let run: { id: string; url?: string } | null = null;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    run = findRecentRun(context.repoRoot, workflowName, target.sha, dispatchStart, { strict: true });
+    if (run) break;
+    // 500ms, 1s, 2s, 4s, 8s — total ~15.5s of propagation tolerance.
+    const delayMs = 500 * 2 ** attempt;
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
 
   // originalFailingSha already computed above for the idempotency key.
   // Preserve it as the new record's rollbackOfSha — without this, a
@@ -391,28 +423,23 @@ async function handleRevertPr(
 
   // Resolution order: operator-supplied --sha (highest precedence,
   // covers the "pr-state.json is stale or wrong" incident case) →
-  // recorded mergedSha on the task's PR record → tip of the base
-  // branch (last-resort fallback). The error message below advertises
-  // --sha explicitly, so the code MUST honor it — earlier revisions
-  // silently ignored parsed.flags.sha, which Codex caught as P1.
-  //
-  // Refresh origin/<base> BEFORE resolving the tip fallback. A stale
-  // local remote-tracking ref (e.g. operator hasn't fetched in a
-  // while) would otherwise make resolveBaseBranchTip select the wrong
-  // commit, and the later ancestry check still passes — silent
-  // failure. Codex r5 P2.
+  // recorded mergedSha on the task's PR record. NO tip fallback:
+  // Codex r7 P1 caught that reverting the base-branch tip when newer
+  // unrelated commits have landed opens a PR reverting the WRONG
+  // commit. The ancestry check still passes because the tip is on
+  // the base branch. Fail closed instead — the operator can pass
+  // --sha explicitly if pr-state is missing.
   runGit(context.repoRoot, ['fetch', 'origin', context.config.baseBranch], true);
   const explicitSha = parsed.flags.sha.trim();
   const prRecord = options.taskSlug
     ? loadPrRecord(context.commonDir, context.config, options.taskSlug)
     : null;
-  const rawSha = explicitSha
-    || prRecord?.mergedSha
-    || resolveBaseBranchTip(context.repoRoot, context.config.baseBranch);
+  const rawSha = explicitSha || prRecord?.mergedSha;
   if (!rawSha) {
     throw new Error([
       '--revert-pr blocked: could not resolve a merge commit to revert.',
       'Pass --sha <mergeCommit> explicitly, or ensure pr-state.json has a recorded mergedSha for this task.',
+      'Reverting the base-branch tip is not a safe default — newer unrelated commits may have landed.',
     ].join('\n'));
   }
 
@@ -567,16 +594,3 @@ function findLatestRecord(options: {
   return null;
 }
 
-// Returns the tip of origin/<baseBranch> (or local <baseBranch> as a
-// fallback). Callers use this when pr-state.json lacks a mergedSha; the
-// tip is a reasonable revert candidate because a normal squash-merge
-// lands on that tip. No merge-commit subject filter — the callers
-// validate shape + ancestry before passing the sha to git revert.
-function resolveBaseBranchTip(repoRoot: string, baseBranch: string): string | null {
-  const last = runGit(
-    repoRoot,
-    ['log', '-n', '1', '--format=%H', `origin/${baseBranch}`],
-    true,
-  ) ?? runGit(repoRoot, ['log', '-n', '1', '--format=%H', baseBranch], true);
-  return last ? last.trim() : null;
-}
