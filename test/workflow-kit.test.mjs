@@ -7256,6 +7256,10 @@ test('v1.1 claude r2 fixup: --revert-pr does not false-trigger on a same-name ta
   };
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.project-workflow.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.buildMode.autoDeployOnMerge = false;
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     commitAll(repoRoot, 'Adopt workflow-kit');
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Tag Collision', '--json'], repoRoot).stdout);
     writeFileSync(path.join(created.worktreePath, 'v.txt'), 'x\n', 'utf8');
@@ -7371,6 +7375,10 @@ test('v1.1 codex r8 fixup: --revert-pr reverts a real merge commit with -m 1', (
   const env = { PATH: `${ghBin}:${process.env.PATH}`, GH_STATE_FILE: ghStateFile };
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.project-workflow.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.buildMode.autoDeployOnMerge = false;
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     commitAll(repoRoot, 'Adopt workflow-kit');
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Merge Commit Revert', '--json'], repoRoot).stdout);
     writeFileSync(path.join(created.worktreePath, 'v.txt'), 'x\n', 'utf8');
