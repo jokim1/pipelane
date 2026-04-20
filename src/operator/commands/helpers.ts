@@ -368,7 +368,7 @@ export function setNextAction(
 // terminals render them correctly (macOS Terminal, iTerm2, modern Linux
 // terminals, Windows Terminal). Code-page 437/850 cmd.exe will mangle them;
 // consumers stuck on legacy Windows should set NO_COLOR and expect `?`-like
-// boxes. Mapping mirrors docs/PIPELANE_BOARD.md color language for symmetry
+// boxes. Mapping mirrors docs/public/PIPELANE_BOARD.md color language for symmetry
 // with the web dashboard.
 export function renderStateGlyph(state: LaneState): string {
   switch (state) {

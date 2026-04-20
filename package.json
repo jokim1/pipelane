@@ -10,9 +10,9 @@
     "bin",
     "dist",
     "templates",
-    "docs/RELEASE_WORKFLOW.md",
-    "docs/PIPELANE_BOARD.md",
-    "docs/PIPELANE_API.md",
+    "docs/public/RELEASE_WORKFLOW.md",
+    "docs/public/PIPELANE_BOARD.md",
+    "docs/public/PIPELANE_API.md",
     "README.md"
   ],
   "scripts": {

@@ -106,7 +106,7 @@ Use the board's Settings button to customize:
 
 Docs:
 
-- [Pipelane Board reference design](docs/PIPELANE_BOARD.md)
+- [Pipelane Board reference design](docs/public/PIPELANE_BOARD.md)
 - [Dashboard implementation guide](src/dashboard/README.md)
 
 ## Alias configuration
@@ -354,6 +354,6 @@ contract needs to exist there first.
 
 ## Repo layout
 
-See [docs/RELEASE_WORKFLOW.md](./docs/RELEASE_WORKFLOW.md) for the full operator contract,
+See [docs/public/RELEASE_WORKFLOW.md](./docs/public/RELEASE_WORKFLOW.md) for the full operator contract,
 build vs. release user journeys, required tracked files, local-only state, gstack guidance,
 troubleshooting, and the exact task workspace flow.
