@@ -290,6 +290,7 @@ export interface WorkflowContext {
 export const DEFAULT_MODE: Mode = 'build';
 export const DEFAULT_SURFACES = ['frontend', 'edge', 'sql'];
 export const CONFIG_FILENAME = '.pipelane.json';
+export const LEGACY_CONFIG_FILENAME = '.project-workflow.json';
 const MODE_STATE_FILENAME = 'mode-state.json';
 const PR_STATE_FILENAME = 'pr-state.json';
 const DEPLOY_STATE_FILENAME = 'deploy-state.json';
@@ -489,11 +490,25 @@ export function resolveConfigPath(repoRoot: string): string {
   return path.join(repoRoot, CONFIG_FILENAME);
 }
 
-export function loadWorkflowConfig(repoRoot: string): WorkflowConfig {
+export function resolveReadableConfigPath(repoRoot: string): string | null {
   const configPath = resolveConfigPath(repoRoot);
+  if (existsSync(configPath)) {
+    return configPath;
+  }
 
-  if (!existsSync(configPath)) {
-    throw new Error(`No ${CONFIG_FILENAME} found in ${repoRoot}. Run pipelane bootstrap first.`);
+  const legacyConfigPath = path.join(repoRoot, LEGACY_CONFIG_FILENAME);
+  if (existsSync(legacyConfigPath)) {
+    return legacyConfigPath;
+  }
+
+  return null;
+}
+
+export function loadWorkflowConfig(repoRoot: string): WorkflowConfig {
+  const configPath = resolveReadableConfigPath(repoRoot);
+
+  if (!configPath) {
+    throw new Error(`No ${CONFIG_FILENAME} or ${LEGACY_CONFIG_FILENAME} found in ${repoRoot}. Run pipelane bootstrap first.`);
   }
 
   const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as Partial<WorkflowConfig>;

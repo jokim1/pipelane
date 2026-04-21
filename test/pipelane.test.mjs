@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cpSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer as createNetServer } from 'node:net';
@@ -112,6 +112,12 @@ function commitAll(repoRoot, message) {
   execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
   execFileSync('git', ['commit', '-m', message], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
   execFileSync('git', ['push'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+}
+
+function switchToLegacyProjectWorkflowConfig(repoRoot) {
+  const configPath = path.join(repoRoot, '.pipelane.json');
+  const legacyConfigPath = path.join(repoRoot, '.project-workflow.json');
+  renameSync(configPath, legacyConfigPath);
 }
 
 function writeFakeGh(binDir, stateFile) {
@@ -2361,6 +2367,41 @@ test('loadWorkflowConfig falls back to the default branchPrefix and drops invali
     assert.deepEqual(loaded.legacyBranchPrefixes, ['task/']);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('loadWorkflowConfig falls back to .project-workflow.json when .pipelane.json is missing', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    switchToLegacyProjectWorkflowConfig(repoRoot);
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const loaded = stateMod.loadWorkflowConfig(repoRoot);
+    assert.equal(loaded.displayName, 'Demo App');
+    assert.equal(loaded.baseBranch, 'main');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('new and repo-guard work from repos that track only .project-workflow.json', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    switchToLegacyProjectWorkflowConfig(repoRoot);
+    commitAll(repoRoot, 'Adopt legacy workflow config');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Legacy Config', '--json'], repoRoot).stdout);
+    assert.equal(existsSync(path.join(created.worktreePath, '.pipelane.json')), false);
+    assert.equal(existsSync(path.join(created.worktreePath, '.project-workflow.json')), true);
+
+    const guarded = JSON.parse(runCli(['run', 'repo-guard', '--task', 'legacy-config', '--json'], created.worktreePath).stdout);
+    assert.equal(guarded.createdWorktree, false);
+    assert.equal(guarded.lock.branchName, created.branch);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
   }
 });
 
