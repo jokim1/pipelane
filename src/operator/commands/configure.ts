@@ -12,8 +12,10 @@ import {
 } from '../release-gate.ts';
 import {
   CONFIG_FILENAME,
+  LEGACY_CONFIG_FILENAME,
+  loadWorkflowConfig,
+  resolveReadableConfigPath,
   resolveRepoRoot,
-  resolveWorkflowAliases,
   type WorkflowConfig,
 } from '../state.ts';
 
@@ -201,12 +203,11 @@ export async function handleConfigure(cwd: string, argv: string[]): Promise<Conf
 // (DISPLAY_NAME, ALIAS_*, DEPLOY_WORKFLOW_NAME) against. An operator who hits
 // this error ran configure before init; the fix is to run `pipelane init` first.
 function loadWorkflowConfigOrThrow(repoRoot: string): WorkflowConfig {
-  const configPath = path.join(repoRoot, CONFIG_FILENAME);
-  if (!existsSync(configPath)) {
-    throw new Error(`No ${CONFIG_FILENAME} found in ${repoRoot}. Run \`pipelane init\` first to seed CLAUDE.md.`);
+  const configPath = resolveReadableConfigPath(repoRoot);
+  if (!configPath) {
+    throw new Error(`No ${CONFIG_FILENAME} or ${LEGACY_CONFIG_FILENAME} found in ${repoRoot}. Run \`pipelane init\` first to seed CLAUDE.md.`);
   }
-  const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as WorkflowConfig;
-  return { ...parsed, aliases: resolveWorkflowAliases(parsed.aliases) };
+  return loadWorkflowConfig(repoRoot);
 }
 
 function applyFlagOverrides(base: DeployConfig, options: ConfigureOptions): DeployConfig {

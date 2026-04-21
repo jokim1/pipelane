@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { CONFIG_FILENAME, resolveRepoRoot, runCommandCapture } from './state.ts';
+import { resolveReadableConfigPath, resolveRepoRoot, runCommandCapture } from './state.ts';
 import { resolvePipelaneInstallSpec } from './install-source.ts';
 
 export interface BootstrapOptions {
@@ -76,8 +76,8 @@ function parseSetupOutput(stdout: string): { createdClaude: boolean; codexSkills
 }
 
 function readDisplayName(repoRoot: string): string {
-  const configPath = path.join(repoRoot, CONFIG_FILENAME);
-  if (!existsSync(configPath)) {
+  const configPath = resolveReadableConfigPath(repoRoot);
+  if (!configPath) {
     return path.basename(repoRoot);
   }
 
@@ -90,8 +90,8 @@ function readDisplayName(repoRoot: string): string {
 }
 
 function readBaseBranch(repoRoot: string): string {
-  const configPath = path.join(repoRoot, CONFIG_FILENAME);
-  if (!existsSync(configPath)) {
+  const configPath = resolveReadableConfigPath(repoRoot);
+  if (!configPath) {
     return 'main';
   }
 
@@ -152,8 +152,7 @@ export function parseBootstrapArgs(argv: string[]): BootstrapOptions {
 
 export function runBootstrap(cwd: string, options: BootstrapOptions): BootstrapResult {
   const repoRoot = resolveRepoRoot(cwd, true);
-  const configPath = path.join(repoRoot, CONFIG_FILENAME);
-  const initializedRepo = !existsSync(configPath);
+  const initializedRepo = !resolveReadableConfigPath(repoRoot);
   const projectName = inferProjectName(repoRoot, options.projectName);
 
   let installedPackage = false;

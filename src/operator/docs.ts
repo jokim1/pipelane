@@ -8,6 +8,7 @@ import {
   CONFIG_FILENAME,
   defaultWorkflowConfig,
   inferProjectKey,
+  loadWorkflowConfig,
   MANAGED_COMMANDS,
   MANAGED_EXTRA_COMMANDS,
   type ManagedCommand,
@@ -546,17 +547,7 @@ export function setupConsumerRepo(cwd: string): {
   removedLegacyCodexSkills: string[];
 } {
   const repoRoot = resolveRepoRoot(cwd, true);
-  const configPath = path.join(repoRoot, CONFIG_FILENAME);
-
-  if (!existsSync(configPath)) {
-    throw new Error(`No ${CONFIG_FILENAME} found in ${repoRoot}. Run pipelane bootstrap first.`);
-  }
-
-  const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as WorkflowConfig;
-  const config = {
-    ...parsed,
-    aliases: resolveWorkflowAliases(parsed.aliases),
-  };
+  const config = loadWorkflowConfig(repoRoot);
   const syncDocs = resolveSyncDocs(config.syncDocs);
   syncConsumerDocs(repoRoot, config);
 
@@ -584,11 +575,7 @@ export function setupConsumerRepo(cwd: string): {
 
 export function syncDocsOnly(cwd: string): { repoRoot: string } {
   const repoRoot = resolveRepoRoot(cwd, true);
-  const configPath = path.join(repoRoot, CONFIG_FILENAME);
-  if (!existsSync(configPath)) {
-    throw new Error(`No ${CONFIG_FILENAME} found in ${repoRoot}.`);
-  }
-  const config = JSON.parse(readFileSync(configPath, 'utf8')) as WorkflowConfig;
+  const config = loadWorkflowConfig(repoRoot);
   syncConsumerDocs(repoRoot, config);
   return { repoRoot };
 }
