@@ -216,6 +216,9 @@ Release mode is the protected lane.
 The gate reads local `CLAUDE.md` and validates the configured surfaces:
 
 - `{{SURFACES_CSV}}`
+- the latest `/doctor --probe` result for each configured surface must be green and fresh
+- cached probe results are tied to the exact configured `healthcheckUrl`, so any staging URL or healthcheck-path change requires rerunning `npm run pipelane:doctor -- --probe`
+- if `PIPELANE_PROBE_STATE_KEY` is set, only signed probe records count toward release readiness
 
 ## Environment and Surface Names
 
@@ -358,3 +361,5 @@ workflow contract needs to exist there first.
   - use `pipelane:resume -- --task "<task-name>"`
 - release mode blocked
   - complete local `CLAUDE.md`
+  - rerun `npm run pipelane:doctor -- --probe` after any staging URL or healthcheck-path change because cached probe results are URL-bound
+  - if probe-state signing is enabled, make sure `PIPELANE_PROBE_STATE_KEY` is set on the machine running the probe and then rerun it

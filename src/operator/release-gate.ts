@@ -1,4 +1,4 @@
-import crypto from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
@@ -11,15 +11,16 @@ import {
   resolveGitCommonDir,
   writeJsonFile,
 } from './state.ts';
+import {
+  DEPLOY_STATE_KEY_ENV,
+  canonicalize,
+  computeUrlFingerprint,
+  resolveDeployStateKey,
+  signSignedPayload,
+  verifySignedPayload,
+} from './integrity.ts';
 
-// v1.2 env var: opaque HMAC-SHA256 signing key. Accepts any non-empty string;
-// we recommend ≥32 bytes of cryptographic-random (e.g. `openssl rand -hex 32`)
-// but don't enforce a format — that's the operator's call. When set,
-// handleDeploy signs every new DeployRecord and the observed-success gate
-// drops any record that fails signature verification (it becomes invisible
-// to the gate, not authoritative). When unset, records ship unsigned and the
-// signature step is skipped for backwards compat.
-export const DEPLOY_STATE_KEY_ENV = 'PIPELANE_DEPLOY_STATE_KEY';
+export { DEPLOY_STATE_KEY_ENV, resolveDeployStateKey } from './integrity.ts';
 
 export interface DeployConfig {
   platform: string;
@@ -300,65 +301,15 @@ export function computeDeployConfigFingerprint(
       sql: deployConfig.sql.production,
       supabase: deployConfig.supabase.production,
     };
-  return crypto.createHash('sha256').update(canonicalize(scoped)).digest('hex');
-}
-
-function canonicalize(value: unknown): string {
-  if (value === undefined) {
-    // JSON.stringify drops undefined properties when writing to disk; the
-    // canonical form must match so sign-time and verify-time produce the
-    // same string after an on-disk round-trip.
-    return 'undefined';
-  }
-  if (value === null || typeof value !== 'object') {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    // Arrays: JSON.stringify turns undefined entries into null, keeping the
-    // slot. Mirror that so the canonical form survives JSON round-trip.
-    return `[${value.map((entry) => (entry === undefined ? 'null' : canonicalize(entry))).join(',')}]`;
-  }
-  // Object: skip keys whose value is undefined, same as JSON.stringify. Sort
-  // remaining keys for determinism.
-  const entries: string[] = [];
-  for (const key of Object.keys(value as Record<string, unknown>).sort()) {
-    const v = (value as Record<string, unknown>)[key];
-    if (v === undefined) continue;
-    entries.push(`${JSON.stringify(key)}:${canonicalize(v)}`);
-  }
-  return `{${entries.join(',')}}`;
-}
-
-// Sign every field of the record except `signature` itself. Using the
-// compiler-enforced destructure (instead of a hand-maintained allowlist)
-// means any future DeployRecord field is signed by default; forgetting to
-// update an allowlist can't silently leave a field unsigned.
-function canonicalRecordPayload(record: DeployRecord): string {
-  const { signature: _signature, ...rest } = record;
-  return canonicalize(rest);
+  return createHash('sha256').update(canonicalize(scoped)).digest('hex');
 }
 
 export function signDeployRecord(record: DeployRecord, key: string): string {
-  return crypto.createHmac('sha256', key).update(canonicalRecordPayload(record)).digest('hex');
+  return signSignedPayload(record, key);
 }
 
 export function verifyDeployRecord(record: DeployRecord, key: string): boolean {
-  if (typeof record.signature !== 'string' || record.signature.length !== 64) return false;
-  const expected = signDeployRecord(record, key);
-  // Length-aware compare. Not strictly constant-time — the length check
-  // above leaks whether the hex was 64 chars — but signatures are a fixed
-  // size so length is public anyway. timingSafeEqual guards the byte-wise
-  // compare once both buffers are 32 bytes.
-  const a = Buffer.from(record.signature, 'hex');
-  const b = Buffer.from(expected, 'hex');
-  if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(a, b);
-}
-
-export function resolveDeployStateKey(): string | undefined {
-  const raw = process.env[DEPLOY_STATE_KEY_ENV];
-  if (!raw || raw.trim().length === 0) return undefined;
-  return raw.trim();
+  return verifySignedPayload(record, key);
 }
 
 function resolveSurfaceVerification(record: DeployRecord, surface: string): DeployVerificationResult {
@@ -461,6 +412,30 @@ export interface ProbeSurfaceFreshness {
   ageMs: number | null;
 }
 
+export function resolveSurfaceProbeUrl(
+  deployConfig: DeployConfig,
+  environment: ProbeEnvironment,
+  surface: string,
+): string {
+  if (surface === 'frontend') {
+    const frontend = environment === 'staging'
+      ? deployConfig.frontend.staging
+      : deployConfig.frontend.production;
+    return frontend.healthcheckUrl || frontend.url;
+  }
+  if (surface === 'edge') {
+    return environment === 'staging'
+      ? deployConfig.edge.staging.healthcheckUrl
+      : deployConfig.edge.production.healthcheckUrl;
+  }
+  if (surface === 'sql') {
+    return environment === 'staging'
+      ? deployConfig.sql.staging.healthcheckUrl
+      : deployConfig.sql.production.healthcheckUrl;
+  }
+  return '';
+}
+
 // v1.2: reconciles a probeState snapshot against the current clock + staling
 // threshold. Returns a per-surface classification the release gate, /status
 // cockpit, and dashboard share. Called from one place so the vocabulary is
@@ -471,6 +446,7 @@ export function explainSurfaceProbe(options: {
   probeState: ProbeState;
   surface: string;
   environment: ProbeEnvironment;
+  expectedUrl?: string;
   now?: number;
   staleMs?: number;
 }): ProbeSurfaceFreshness {
@@ -482,6 +458,17 @@ export function explainSurfaceProbe(options: {
 
   if (!match) {
     return { state: 'unknown', reason: 'no probe recorded yet', probe: null, ageMs: null };
+  }
+
+  const storedFingerprint = match.urlFingerprint ?? computeUrlFingerprint(match.url);
+  if (match.urlFingerprint && storedFingerprint !== computeUrlFingerprint(match.url)) {
+    return { state: 'stale', reason: 'probe record URL fingerprint does not match the stored URL', probe: match, ageMs: null };
+  }
+  if (options.expectedUrl) {
+    const expectedFingerprint = computeUrlFingerprint(options.expectedUrl);
+    if (storedFingerprint !== expectedFingerprint) {
+      return { state: 'stale', reason: 'probe target drifted since the last successful probe', probe: match, ageMs: null };
+    }
   }
 
   const probedAt = Date.parse(match.probedAt);
@@ -533,7 +520,8 @@ export function evaluateReleaseReadiness(options: {
   };
   const probeState = options.probeState ?? { records: [], updatedAt: '' };
   const probeFreshness = (surface: string): string | null => {
-    const probe = explainSurfaceProbe({ probeState, surface, environment: 'staging' });
+    const expectedUrl = resolveSurfaceProbeUrl(options.deployConfig, 'staging', surface) || undefined;
+    const probe = explainSurfaceProbe({ probeState, surface, environment: 'staging', expectedUrl });
     if (probe.state === 'healthy') return null;
     if (probe.state === 'unknown') {
       return `${surface} staging: no probe recorded. Run \`pipelane:doctor --probe\`.`;

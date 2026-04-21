@@ -15,6 +15,7 @@ import {
   emptyDeployConfig,
   explainSurfaceProbe,
   loadDeployConfig,
+  resolveSurfaceProbeUrl,
   type DeployConfig,
   type ProbeFreshnessState,
   type ProbeSurfaceFreshness,
@@ -252,11 +253,35 @@ function collectSurfaceProbes(options: {
   const entries: SurfaceProbeEntry[] = [];
   for (const surface of surfaces) {
     if (surface === 'frontend') {
-      entries.push({ surface, result: explainSurfaceProbe({ probeState, surface, environment: 'staging' }) });
+      entries.push({
+        surface,
+        result: explainSurfaceProbe({
+          probeState,
+          surface,
+          environment: 'staging',
+          expectedUrl: resolveSurfaceProbeUrl(deployConfig, 'staging', surface),
+        }),
+      });
     } else if (surface === 'edge' && deployConfig.edge.staging.healthcheckUrl) {
-      entries.push({ surface, result: explainSurfaceProbe({ probeState, surface, environment: 'staging' }) });
+      entries.push({
+        surface,
+        result: explainSurfaceProbe({
+          probeState,
+          surface,
+          environment: 'staging',
+          expectedUrl: resolveSurfaceProbeUrl(deployConfig, 'staging', surface),
+        }),
+      });
     } else if (surface === 'sql' && deployConfig.sql.staging.healthcheckUrl) {
-      entries.push({ surface, result: explainSurfaceProbe({ probeState, surface, environment: 'staging' }) });
+      entries.push({
+        surface,
+        result: explainSurfaceProbe({
+          probeState,
+          surface,
+          environment: 'staging',
+          expectedUrl: resolveSurfaceProbeUrl(deployConfig, 'staging', surface),
+        }),
+      });
     }
   }
   return entries;

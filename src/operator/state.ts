@@ -1,7 +1,9 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+
+import { computeUrlFingerprint, resolveProbeStateKey, verifySignedPayload } from './integrity.ts';
 
 export type Mode = 'build' | 'release';
 export type KnownSurface = 'frontend' | 'edge' | 'sql';
@@ -309,11 +311,13 @@ export interface ProbeRecord {
   environment: ProbeEnvironment;
   surface: string;
   url: string;
+  urlFingerprint?: string;
   ok: boolean;
   statusCode: number | null;
   latencyMs: number | null;
   error?: string;
   probedAt: string;
+  signature?: string;
 }
 
 export interface ProbeState {
@@ -497,10 +501,13 @@ export function loadWorkflowConfig(repoRoot: string): WorkflowConfig {
 }
 
 export function normalizeWorkflowConfig(raw: Partial<WorkflowConfig>): WorkflowConfig {
+  const branchPrefix = normalizeBranchPrefix(raw.branchPrefix);
+  const legacyBranchPrefixes = normalizeLegacyBranchPrefixes(raw.legacyBranchPrefixes)
+    .filter((prefix, index, all) => prefix !== branchPrefix && all.indexOf(prefix) === index);
   return {
     ...(raw as WorkflowConfig),
-    branchPrefix: normalizeBranchPrefix(raw.branchPrefix ?? DEFAULT_BRANCH_PREFIX),
-    legacyBranchPrefixes: (raw.legacyBranchPrefixes ?? []).map(normalizeBranchPrefix),
+    branchPrefix,
+    legacyBranchPrefixes,
     prPathDenyList: raw.prPathDenyList ?? [...DEFAULT_PR_PATH_DENY_LIST],
     aliases: resolveWorkflowAliases(raw.aliases),
     checks: normalizeChecksConfig(raw.checks),
@@ -574,10 +581,32 @@ function normalizeChecksConfig(raw: ChecksConfig | undefined): ChecksConfig | un
   };
 }
 
-function normalizeBranchPrefix(prefix: string): string {
+function normalizeLegacyBranchPrefixes(prefixes: unknown): string[] {
+  if (!Array.isArray(prefixes)) return [];
+  const normalized: string[] = [];
+  for (const entry of prefixes) {
+    const prefix = normalizeOptionalBranchPrefix(entry);
+    if (prefix) normalized.push(prefix);
+  }
+  return normalized;
+}
+
+function normalizeBranchPrefix(prefix: unknown): string {
+  return normalizeOptionalBranchPrefix(prefix) ?? DEFAULT_BRANCH_PREFIX;
+}
+
+function normalizeOptionalBranchPrefix(prefix: unknown): string | null {
+  if (typeof prefix !== 'string') return null;
   const trimmed = prefix.trim();
-  if (!trimmed) return DEFAULT_BRANCH_PREFIX;
-  return trimmed.endsWith('/') ? trimmed : `${trimmed}/`;
+  if (!trimmed) return null;
+  const normalized = trimmed.endsWith('/') ? trimmed : `${trimmed}/`;
+  if (!isValidBranchPrefix(normalized)) return null;
+  return normalized;
+}
+
+function isValidBranchPrefix(prefix: string): boolean {
+  const candidate = `${prefix}branch-prefix-validation`;
+  return runCommandCapture('git', ['check-ref-format', '--branch', candidate]).ok;
 }
 
 export function writeWorkflowConfig(repoRoot: string, config: WorkflowConfig): void {
@@ -619,7 +648,21 @@ export function probeStatePath(commonDir: string, config: WorkflowConfig): strin
 
 export function loadProbeState(commonDir: string, config: WorkflowConfig): ProbeState {
   const raw = readJsonFile<ProbeState>(probeStatePath(commonDir, config), { records: [] as ProbeRecord[], updatedAt: '' });
-  return normalizeProbeState(raw);
+  const normalized = normalizeProbeState(raw);
+  const structurallyValid = normalized.records.filter((record) =>
+    !record.urlFingerprint || record.urlFingerprint === computeUrlFingerprint(record.url)
+  );
+  const key = resolveProbeStateKey();
+  if (!key) {
+    return { ...normalized, records: structurallyValid };
+  }
+  return {
+    ...normalized,
+    records: structurallyValid.filter((record) =>
+      typeof record.urlFingerprint === 'string'
+      && verifySignedPayload(record, key)
+    ),
+  };
 }
 
 // v1.2: mirror `normalizeModeState` — a malformed probe-state.json (valid
@@ -648,11 +691,13 @@ function normalizeProbeState(raw: ProbeState): ProbeState {
       environment: record.environment,
       surface: record.surface,
       url: record.url,
+      urlFingerprint: typeof record.urlFingerprint === 'string' ? record.urlFingerprint : undefined,
       ok: record.ok,
       statusCode,
       latencyMs,
       error: typeof record.error === 'string' ? record.error : undefined,
       probedAt: record.probedAt,
+      signature: typeof record.signature === 'string' ? record.signature : undefined,
     });
   }
   return { records: valid, updatedAt };
@@ -672,12 +717,37 @@ export function readJsonFile<T>(targetPath: string, fallback: T): T {
     return fallback;
   }
 
-  return JSON.parse(readFileSync(targetPath, 'utf8')) as T;
+  try {
+    return JSON.parse(readFileSync(targetPath, 'utf8')) as T;
+  } catch (error) {
+    // Half-written state files from an interrupted write surface as
+    // SyntaxError (truncated JSON). Fail closed to the caller's fallback
+    // instead of bricking every state consumer until a human deletes the
+    // file. Non-parse failures still bubble — permissions and I/O errors
+    // are real operator problems, not schema drift.
+    if (error instanceof SyntaxError) {
+      return fallback;
+    }
+    throw error;
+  }
 }
 
 export function writeJsonFile(targetPath: string, value: unknown): void {
-  mkdirSync(path.dirname(targetPath), { recursive: true });
-  writeFileSync(targetPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  const dir = path.dirname(targetPath);
+  const basename = path.basename(targetPath);
+  const tmpPath = path.join(
+    dir,
+    `.${basename}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+  );
+  mkdirSync(dir, { recursive: true });
+  try {
+    writeFileSync(tmpPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+    renameSync(tmpPath, targetPath);
+  } finally {
+    if (existsSync(tmpPath)) {
+      rmSync(tmpPath, { force: true });
+    }
+  }
 }
 
 export function loadModeState(commonDir: string, config: WorkflowConfig): ModeState {

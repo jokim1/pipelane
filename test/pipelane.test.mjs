@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cpSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer as createNetServer } from 'node:net';
@@ -2345,6 +2345,25 @@ test('new honors a custom branchPrefix from .pipelane.json', () => {
   }
 });
 
+test('loadWorkflowConfig falls back to the default branchPrefix and drops invalid legacy prefixes', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.branchPrefix = '../bad-prefix';
+    config.legacyBranchPrefixes = ['task/', '../nope', 42, 'task/'];
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const loaded = stateMod.loadWorkflowConfig(repoRoot);
+    assert.equal(loaded.branchPrefix, stateMod.DEFAULT_BRANCH_PREFIX);
+    assert.deepEqual(loaded.legacyBranchPrefixes, ['task/']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('new generates a task-<hex> slug when --task is omitted', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
 
@@ -2578,7 +2597,7 @@ function writeHealthyProbeState(repoRoot, surfaces) {
   const records = surfaces.map((surface) => ({
     environment: 'staging',
     surface,
-    url: `https://staging.example.test/${surface}-health`,
+    url: probeUrlForSurface(surface),
     ok: true,
     statusCode: 200,
     latencyMs: 25,
@@ -2589,6 +2608,23 @@ function writeHealthyProbeState(repoRoot, surfaces) {
     JSON.stringify({ records, updatedAt: probedAt }, null, 2),
     'utf8',
   );
+}
+
+function writeProbeState(repoRoot, records, updatedAt = records.at(-1)?.probedAt ?? '') {
+  const stateDir = path.join(repoRoot, '.git', 'pipelane-state');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(
+    path.join(stateDir, 'probe-state.json'),
+    JSON.stringify({ records, updatedAt }, null, 2),
+    'utf8',
+  );
+}
+
+function probeUrlForSurface(surface) {
+  if (surface === 'frontend') return 'https://staging.example.test/health';
+  if (surface === 'edge') return 'https://staging.example.test/edge-health';
+  if (surface === 'sql') return 'https://staging.example.test/db-health';
+  throw new Error(`Unknown probe surface fixture: ${surface}`);
 }
 
 test('release-check blocks when CLAUDE config is full but no staging deploy record exists', () => {
@@ -5845,6 +5881,43 @@ test('loadModeState drops a malformed lastOverride entry instead of crashing ren
   }
 });
 
+test('loadModeState falls back to defaults when mode-state.json contains malformed JSON', async () => {
+  const { repoRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['run', 'devmode', 'build'], repoRoot);
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+    const modeStateFile = stateMod.modeStatePath(context.commonDir, context.config);
+    writeFileSync(modeStateFile, '{"mode":', 'utf8');
+
+    const loaded = stateMod.loadModeState(context.commonDir, context.config);
+    assert.equal(loaded.mode, stateMod.DEFAULT_MODE);
+    assert.deepEqual(loaded.requestedSurfaces, context.config.surfaces);
+    assert.equal(loaded.override, null);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('writeJsonFile leaves only the target file after a successful atomic write', async () => {
+  const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-json-write-'));
+  try {
+    const target = path.join(dir, 'state.json');
+    stateMod.writeJsonFile(target, { mode: 'build', requestedSurfaces: ['frontend'] });
+
+    assert.deepEqual(readdirSync(dir), ['state.json']);
+    assert.equal(
+      readFileSync(target, 'utf8'),
+      `${JSON.stringify({ mode: 'build', requestedSurfaces: ['frontend'] }, null, 2)}\n`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('renderCockpit shows RELEASE GATE PREVIOUSLY BYPASSED banner when override cleared but lastOverride persists', async () => {
   // The audit trail must outlive the active-override flag. After
   // /devmode build, effectiveOverride is null but lastOverride persists
@@ -5944,7 +6017,7 @@ function writeStaleProbeState(repoRoot, surfaces, { ageMs = 25 * 60 * 60 * 1000,
   const records = surfaces.map((surface) => ({
     environment: 'staging',
     surface,
-    url: `https://staging.example.test/${surface}-health`,
+    url: probeUrlForSurface(surface),
     ok,
     statusCode: ok ? 200 : 503,
     latencyMs: 25,
@@ -6009,6 +6082,24 @@ test('doctor.mergeProbeRecords keeps previously-probed surfaces across a partial
   assert.equal(byKey['staging:sql'].probedAt, '2026-04-18T00:00:00.000Z', 'sql untouched');
 });
 
+test('loadProbeState falls back to an empty probe set when probe-state.json contains malformed JSON', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+    mkdirSync(path.dirname(stateMod.probeStatePath(context.commonDir, context.config)), { recursive: true });
+    writeFileSync(stateMod.probeStatePath(context.commonDir, context.config), '{"records":[', 'utf8');
+
+    const loaded = stateMod.loadProbeState(context.commonDir, context.config);
+    assert.deepEqual(loaded, { records: [], updatedAt: '' });
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('doctor.detectPlatform honors fly.toml / vercel.json / netlify.toml / gh-actions signals', async () => {
   const doctor = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'doctor.ts'));
   const releaseGate = await import(path.join(KIT_ROOT, 'src', 'operator', 'release-gate.ts'));
@@ -6049,6 +6140,51 @@ test('doctor.detectPlatform honors fly.toml / vercel.json / netlify.toml / gh-ac
     '.github/workflows/ci.yml': 'name: CI\n',
   });
   assert.equal(flyWithActions.detected, 'fly.io');
+});
+
+test('doctor.resolveProbeTimeoutMs clamps tiny and huge env overrides', async () => {
+  const doctor = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'doctor.ts'));
+  const previous = process.env.PIPELANE_DOCTOR_PROBE_TIMEOUT_MS;
+  try {
+    process.env.PIPELANE_DOCTOR_PROBE_TIMEOUT_MS = '1';
+    assert.equal(doctor.resolveProbeTimeoutMs(), doctor.MIN_PROBE_TIMEOUT_MS);
+
+    process.env.PIPELANE_DOCTOR_PROBE_TIMEOUT_MS = '999999';
+    assert.equal(doctor.resolveProbeTimeoutMs(), doctor.MAX_PROBE_TIMEOUT_MS);
+
+    process.env.PIPELANE_DOCTOR_PROBE_TIMEOUT_MS = 'not-a-number';
+    assert.equal(doctor.resolveProbeTimeoutMs(), 5000);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.PIPELANE_DOCTOR_PROBE_TIMEOUT_MS;
+    } else {
+      process.env.PIPELANE_DOCTOR_PROBE_TIMEOUT_MS = previous;
+    }
+  }
+});
+
+test('doctor --probe blocks while another doctor state mutation lock is held', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+    const stateDir = stateMod.ensureStateDir(context.commonDir, context.config);
+    writeFileSync(
+      path.join(stateDir, 'doctor.lock.json'),
+      JSON.stringify({ pid: process.pid, createdAt: '2026-04-20T00:00:00.000Z', mode: 'fix' }, null, 2),
+      'utf8',
+    );
+
+    const result = runCli(['run', 'doctor', '--probe'], repoRoot, {}, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Doctor state is locked/);
+    assert.match(result.stderr, /fix already running in pid/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
 });
 
 test('doctor --fix via PIPELANE_DOCTOR_FIX_STUB writes the Deploy Configuration block and runs a probe', () => {
@@ -6109,6 +6245,33 @@ test('release-check blocks when staging probe is stale (>24h old)', async () => 
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
+});
+
+test('explainSurfaceProbe marks a fresh probe stale when the expected URL drifts', async () => {
+  const releaseGate = await import(path.join(KIT_ROOT, 'src', 'operator', 'release-gate.ts'));
+  const integrity = await import(path.join(KIT_ROOT, 'src', 'operator', 'integrity.ts'));
+  const probedAt = new Date().toISOString();
+  const result = releaseGate.explainSurfaceProbe({
+    probeState: {
+      records: [{
+        environment: 'staging',
+        surface: 'frontend',
+        url: 'https://staging.example.test/health',
+        urlFingerprint: integrity.computeUrlFingerprint('https://staging.example.test/health'),
+        ok: true,
+        statusCode: 200,
+        latencyMs: 10,
+        probedAt,
+      }],
+      updatedAt: probedAt,
+    },
+    surface: 'frontend',
+    environment: 'staging',
+    expectedUrl: 'https://staging-v2.example.test/health',
+  });
+
+  assert.equal(result.state, 'stale');
+  assert.match(result.reason, /target drifted/);
 });
 
 test('doctor.listMissingFields reports platform + frontend staging + production gaps on an empty config', async () => {
@@ -6174,6 +6337,54 @@ test('release-check blocks when staging probe is degraded (non-2xx)', async () =
     assert.equal(output.ready, false);
     assert.match(output.message, /probe is degraded/);
     assert.match(output.message, /HTTP 503|probe failed/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check ignores unsigned planted failed probe records when PIPELANE_PROBE_STATE_KEY is configured', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    await writeStagingSucceededRecord(repoRoot, ['frontend'], { skipProbeState: true });
+
+    const integrity = await import(path.join(KIT_ROOT, 'src', 'operator', 'integrity.ts'));
+    const key = 'cafe'.repeat(8);
+    const probedAt = new Date().toISOString();
+    const signedHealthy = {
+      environment: 'staging',
+      surface: 'frontend',
+      url: 'https://staging.example.test/health',
+      urlFingerprint: integrity.computeUrlFingerprint('https://staging.example.test/health'),
+      ok: true,
+      statusCode: 200,
+      latencyMs: 10,
+      probedAt,
+    };
+    const plantedFailure = {
+      environment: 'staging',
+      surface: 'frontend',
+      url: 'https://staging.example.test/health',
+      urlFingerprint: integrity.computeUrlFingerprint('https://staging.example.test/health'),
+      ok: false,
+      statusCode: 503,
+      latencyMs: 5,
+      error: 'HTTP 503',
+      probedAt: new Date(Date.now() + 1000).toISOString(),
+    };
+    writeProbeState(repoRoot, [
+      { ...signedHealthy, signature: integrity.signSignedPayload(signedHealthy, key) },
+      plantedFailure,
+    ], plantedFailure.probedAt);
+
+    const result = runCli(['run', 'release-check', '--surfaces', 'frontend', '--json'], repoRoot, {
+      PIPELANE_PROBE_STATE_KEY: key,
+    });
+    const output = JSON.parse(result.stdout);
+    assert.equal(result.status, 0, output.message);
+    assert.equal(output.ready, true);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }

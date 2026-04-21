@@ -1,7 +1,8 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 
+import { computeUrlFingerprint, resolveProbeStateKey, signSignedPayload } from '../integrity.ts';
 import {
   emptyDeployConfig,
   loadDeployConfig,
@@ -11,6 +12,7 @@ import {
 } from '../release-gate.ts';
 import { sanitizeForTerminal } from './helpers.ts';
 import {
+  ensureStateDir,
   loadProbeState,
   printResult,
   resolveWorkflowContext,
@@ -42,11 +44,15 @@ export async function handleDoctor(cwd: string, parsed: ParsedOperatorArgs): Pro
 
   const mode = resolveDoctorMode(parsed);
   if (mode === 'probe') {
-    await runProbe(context, parsed);
+    await withDoctorStateLock(context, 'probe', async () => {
+      await runProbe(context, parsed);
+    });
     return;
   }
   if (mode === 'fix') {
-    await runFix(context, parsed);
+    await withDoctorStateLock(context, 'fix', async () => {
+      await runFix(context, parsed);
+    });
     return;
   }
   runDiagnose(context, parsed);
@@ -210,7 +216,9 @@ export async function executeProbe(context: WorkflowContext, nowFn: () => Date =
   // probeUrl always resolves (catches its own errors into the record), so
   // Promise.all can't short-circuit on a single bad target. Parallelizing
   // cuts end-to-end probe latency from sum-of-targets to max-of-targets.
-  const records = await Promise.all(targets.map((target) => probeUrl(target, nowFn)));
+  const key = resolveProbeStateKey();
+  const records = (await Promise.all(targets.map((target) => probeUrl(target, nowFn))))
+    .map((record) => finalizeProbeRecord(record, key));
 
   // Merge new records on top of the existing snapshot so a partial
   // re-probe (single surface) doesn't wipe out previously-probed surfaces.
@@ -264,12 +272,16 @@ export function collectProbeTargets(config: DeployConfig): ProbeTarget[] {
 // PIPELANE_DOCTOR_PROBE_TIMEOUT_MS for slow staging environments.
 // Default matches what a human expects from an "interactive CLI healthcheck."
 const DEFAULT_PROBE_TIMEOUT_MS = 5000;
+export const MIN_PROBE_TIMEOUT_MS = 100;
+export const MAX_PROBE_TIMEOUT_MS = 30000;
 
-function resolveProbeTimeoutMs(): number {
+export function resolveProbeTimeoutMs(): number {
   const raw = process.env.PIPELANE_DOCTOR_PROBE_TIMEOUT_MS;
   if (!raw) return DEFAULT_PROBE_TIMEOUT_MS;
   const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_PROBE_TIMEOUT_MS;
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_PROBE_TIMEOUT_MS;
+  const clamped = Math.trunc(parsed);
+  return Math.min(MAX_PROBE_TIMEOUT_MS, Math.max(MIN_PROBE_TIMEOUT_MS, clamped));
 }
 
 async function probeUrl(target: ProbeTarget, nowFn: () => Date): Promise<ProbeRecord> {
@@ -335,6 +347,18 @@ async function probeUrl(target: ProbeTarget, nowFn: () => Date): Promise<ProbeRe
   }
 }
 
+function finalizeProbeRecord(record: ProbeRecord, key: string | undefined): ProbeRecord {
+  const finalized: ProbeRecord = {
+    ...record,
+    urlFingerprint: computeUrlFingerprint(record.url),
+  };
+  if (!key) return finalized;
+  return {
+    ...finalized,
+    signature: signSignedPayload(finalized, key),
+  };
+}
+
 export function mergeProbeRecords(previous: ProbeRecord[], incoming: ProbeRecord[]): ProbeRecord[] {
   const keyed = new Map<string, ProbeRecord>();
   for (const record of previous) {
@@ -346,6 +370,110 @@ export function mergeProbeRecords(previous: ProbeRecord[], incoming: ProbeRecord
   return [...keyed.values()].sort((a, b) =>
     `${a.environment}:${a.surface}`.localeCompare(`${b.environment}:${b.surface}`),
   );
+}
+
+const DOCTOR_LOCK_FILENAME = 'doctor.lock.json';
+
+interface DoctorLockMetadata {
+  pid: number;
+  createdAt: string;
+  mode: 'probe' | 'fix';
+}
+
+async function withDoctorStateLock<T>(
+  context: WorkflowContext,
+  mode: 'probe' | 'fix',
+  work: () => Promise<T>,
+): Promise<T> {
+  const lockPath = path.join(ensureStateDir(context.commonDir, context.config), DOCTOR_LOCK_FILENAME);
+  acquireDoctorStateLock(lockPath, mode);
+  try {
+    return await work();
+  } finally {
+    releaseDoctorStateLock(lockPath);
+  }
+}
+
+function acquireDoctorStateLock(lockPath: string, mode: 'probe' | 'fix'): void {
+  const metadata: DoctorLockMetadata = {
+    pid: process.pid,
+    createdAt: new Date().toISOString(),
+    mode,
+  };
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const fd = openSync(lockPath, 'wx');
+      try {
+        writeFileSync(fd, `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
+      } finally {
+        closeSync(fd);
+      }
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'EEXIST') throw error;
+      if (pruneStaleDoctorStateLock(lockPath)) continue;
+      const existing = readDoctorStateLock(lockPath);
+      const detail = existing
+        ? `${existing.mode} already running in pid ${existing.pid} since ${existing.createdAt}`
+        : 'another doctor state mutation is already running';
+      throw new Error(`Doctor state is locked: ${detail}. Wait for it to finish and retry.`);
+    }
+  }
+}
+
+function pruneStaleDoctorStateLock(lockPath: string): boolean {
+  const existing = readDoctorStateLock(lockPath);
+  if (!existing) {
+    unlinkIfExists(lockPath);
+    return true;
+  }
+  try {
+    process.kill(existing.pid, 0);
+    return false;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ESRCH') {
+      unlinkIfExists(lockPath);
+      return true;
+    }
+    return false;
+  }
+}
+
+function readDoctorStateLock(lockPath: string): DoctorLockMetadata | null {
+  if (!existsSync(lockPath)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(lockPath, 'utf8')) as Partial<DoctorLockMetadata>;
+    if ((parsed.mode === 'probe' || parsed.mode === 'fix')
+      && typeof parsed.pid === 'number'
+      && Number.isInteger(parsed.pid)
+      && typeof parsed.createdAt === 'string'
+      && parsed.createdAt.length > 0) {
+      return {
+        pid: parsed.pid,
+        createdAt: parsed.createdAt,
+        mode: parsed.mode,
+      };
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function releaseDoctorStateLock(lockPath: string): void {
+  unlinkIfExists(lockPath);
+}
+
+function unlinkIfExists(targetPath: string): void {
+  try {
+    unlinkSync(targetPath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT') throw error;
+  }
 }
 
 // ---------------------------------------------------------------------------

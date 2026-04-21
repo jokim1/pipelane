@@ -336,6 +336,14 @@ The same-SHA gate is now based on **verified outcomes**, not requests.
 - **Prod deploy succeeded but healthcheck failed.** Hard fail. Record
   marks `status='failed'` with `failureReason='healthcheck 500'`.
   `/rollback` is the next action.
+- **Release mode suddenly blocks after a staging URL or healthcheck-path
+  change.** The cached probe result is tied to the old `healthcheckUrl`.
+  Rerun `/doctor --probe` to record a fresh green result for the new
+  target.
+- **Release mode blocks after enabling probe-state signing.** Make sure
+  `PIPELANE_PROBE_STATE_KEY` is set consistently on the machine that
+  runs `/doctor --probe`, then rerun the probe so readiness is backed by
+  signed records instead of legacy unsigned cache entries.
 - **You need a hotfix that skips staging.** Use `/devmode build
   --override --reason "hotfix: <incident>"`. One-shot; the override is
   recorded and the next command resets to release.
@@ -387,6 +395,15 @@ URL, deploy workflow name, healthcheck path), writes the
 `/doctor --probe` hits each configured `healthcheckUrl` and reports
 HTTP status + latency. Release lane consults the most recent probe
 result (cached 24h) as the freshness check.
+
+Probe cache entries are bound to the exact configured `healthcheckUrl`.
+If a staging URL, prod URL, or healthcheck path changes, the previous
+green probe result is ignored until `/doctor --probe` is rerun against
+the new target.
+
+If `PIPELANE_PROBE_STATE_KEY` is set, probe cache entries are HMAC-signed
+before they are written to local state. In that mode, unsigned or
+tampered probe records do not count toward release readiness.
 
 ## State model
 

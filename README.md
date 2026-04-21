@@ -169,6 +169,7 @@ Why:
 - each release operator must have a local `CLAUDE.md`
 - that local `CLAUDE.md` must include valid staging and production deploy config
 - `npm run pipelane:release-check` must pass before release mode is considered ready
+- if `healthcheckUrl` changes, rerun `npm run pipelane:doctor -- --probe` because cached probe results are URL-bound
 
 ### What "Works Out Of The Box" Means In Practice
 
@@ -453,6 +454,10 @@ npm run pipelane:release-check
 ```
 
 Until this is configured correctly, release mode stays fail-closed.
+If the staging URL or healthcheck path changes later, rerun
+`npm run pipelane:doctor -- --probe` so the cached probe result matches
+the new target. If you enable `PIPELANE_PROBE_STATE_KEY`, rerun the
+probe after setting it so readiness is backed by signed probe records.
 
 ### Step 1: Confirm Or Switch To Release Mode
 
