@@ -4130,6 +4130,60 @@ test('merge fails closed when gh never reports mergeCommit.oid', () => {
   }
 });
 
+test('merge fails closed when non-required PR checks fail', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const ghPath = path.join(ghBin, 'gh');
+  const original = readFileSync(ghPath, 'utf8');
+  writeFileSync(
+    ghPath,
+    original.replace(
+      "if (args[0] === 'pr' && args[1] === 'checks') {\n  process.exit(0);\n}",
+      `if (args[0] === 'pr' && args[1] === 'checks') {
+  if (args.includes('--required') && !args.includes('--watch')) {
+    process.stderr.write("no required checks reported on the 'test-branch' branch\\n");
+    process.exit(1);
+  }
+  if (args.includes('--watch')) {
+    process.stderr.write('validate failed\\n');
+    process.exit(1);
+  }
+  process.exit(0);
+}`,
+    ),
+    { mode: 0o755, encoding: 'utf8' },
+  );
+
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Check Fail', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Check Fail', '--json'], created.worktreePath, env);
+
+    const failed = runCli(['run', 'merge', '--json'], created.worktreePath, env, true);
+    assert.equal(failed.status, 1);
+    assert.match(failed.stderr, /validate failed/);
+
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.prMergeCalls?.length ?? 0, 0, 'merge command never reaches `gh pr merge`');
+
+    const prState = readFileSync(path.join(repoRoot, '.git', 'pipelane-state', 'pr-state.json'), 'utf8');
+    assert.doesNotMatch(prState, /mergedSha/, 'no mergedSha recorded on failed checks');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
 test('pr blocks denied paths and --force-include overrides per-path', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));

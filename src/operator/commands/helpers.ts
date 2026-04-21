@@ -318,15 +318,11 @@ export function watchPrChecks(repoRoot: string, prNumber: number): void {
   });
 
   if (!probe.ok && /no required checks reported/i.test(probe.stderr)) {
-    runCommandCapture('gh', ['pr', 'checks', String(prNumber), '--watch', '--fail-fast'], {
-      cwd: repoRoot,
-    });
+    runGh(repoRoot, ['pr', 'checks', String(prNumber), '--watch', '--fail-fast']);
     return;
   }
 
-  runCommandCapture('gh', ['pr', 'checks', String(prNumber), '--required', '--watch', '--fail-fast'], {
-    cwd: repoRoot,
-  });
+  runGh(repoRoot, ['pr', 'checks', String(prNumber), '--required', '--watch', '--fail-fast']);
 }
 
 // v1.5: strip terminal control characters before embedding untrusted
