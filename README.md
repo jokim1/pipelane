@@ -60,7 +60,8 @@ and local setup instructions that are hard to reuse safely.
 
 Bootstrapping Pipelane into a repo adds or manages:
 
-- `.pipelane.json` for tracked workflow config
+- tracked workflow config in `.pipelane.json`, or `.project-workflow.json` if you
+  want a tool-neutral filename
 - `.claude/commands/*` for repo-tracked Claude commands
 - `.agents/skills/*` for repo-tracked Codex skills
 - `pipelane/CLAUDE.template.md` for machine-local operator config
@@ -245,12 +246,25 @@ After bootstrap, you should expect to see:
 - `pipelane:*` scripts in `package.json`
 - local `CLAUDE.md`
 
+If you want the repo to stay tool-neutral, rename `.pipelane.json` to
+`.project-workflow.json` before committing. Pipelane `main` reads either
+filename as of April 21, 2026 (merge commit `4111230`, PR #44). No shim is
+required on that build.
+
 ### Step 4: Commit The Tracked Pipelane Files
 
 Do this before using `/new` in a normal remote-backed repo:
 
 ```bash
 git add .pipelane.json .claude/commands .agents/skills README.md CONTRIBUTING.md docs/RELEASE_WORKFLOW.md pipelane/CLAUDE.template.md package.json package-lock.json
+git commit -m "Add pipelane workflow"
+git push
+```
+
+If you renamed the config to `.project-workflow.json`, add that file instead:
+
+```bash
+git add .project-workflow.json .claude/commands .agents/skills README.md CONTRIBUTING.md docs/RELEASE_WORKFLOW.md pipelane/CLAUDE.template.md package.json package-lock.json
 git commit -m "Add pipelane workflow"
 git push
 ```
@@ -276,6 +290,17 @@ Why this matters:
 3. if this machine previously used pipelane's machine-local Codex wrappers, run `npm run pipelane:setup` once to prune them
 4. open the repo in Codex
 5. reopen Codex if it was already open before the repo gained tracked skills or aliases changed
+
+### Do users need a shim?
+
+Usually, no.
+
+- If the repo tracks `.pipelane.json`, no shim is needed.
+- If the repo tracks `.project-workflow.json` and your local pipelane build includes
+  PR #44 / merge commit `4111230` on `main` from April 21, 2026, no shim is needed.
+- If someone is on an older local pipelane install from before that change, they
+  must upgrade pipelane or temporarily create a local `.pipelane.json` shim that
+  points at `.project-workflow.json`.
 
 ## Detailed User Journey: Build Mode
 
