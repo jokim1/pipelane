@@ -525,7 +525,10 @@ in `AGENTS.md` where enforcement is social.
 
 ### Tracked in git (repo policy)
 
-- `.pipelane.json` — baseBranch, surfaces, aliases, prePrChecks, deploy workflow names
+- `.pipelane.json` or `.project-workflow.json` — baseBranch, surfaces, aliases,
+  prePrChecks, deploy workflow names. `bootstrap` writes `.pipelane.json` by
+  default; rename it to `.project-workflow.json` before commit if you want a
+  tool-neutral filename.
 - `AGENTS.md` — policy for AI operators
 - `.claude/commands/*` — thin slash adapters
 - `.agents/skills/*` — tracked Codex skills
@@ -596,7 +599,12 @@ spec fixes. The change manifest tracks which PR closes each one.
 
 ## Troubleshooting
 
-- **Missing ****`.pipelane.json`** → `pipelane bootstrap --project "<name>"` or `npx pipelane init`
+- **Missing tracked workflow config** → `pipelane bootstrap --project "<name>"` or
+  `npx pipelane init`. A repo may track either `.pipelane.json` or
+  `.project-workflow.json`.
+- **Repo tracks `.project-workflow.json` but local pipelane still errors on missing `.pipelane.json`** →
+  upgrade to a pipelane build that includes PR #44 / merge commit `4111230`
+  from April 21, 2026. Older local installs need a temporary local shim.
 - **Task already active** → `/resume --task "<slug>"`
 - **Release lane blocked** → `/doctor` (diagnose), `/doctor --fix`
   (configure), `/doctor --probe` (verify)
