@@ -666,3 +666,124 @@ If you want the deeper operator contract, read:
 - [Full release workflow reference](docs/public/RELEASE_WORKFLOW.md)
 - [Pipelane Board reference design](docs/public/PIPELANE_BOARD.md)
 - [Pipelane API contract](docs/public/PIPELANE_API.md)
+
+<!-- pipelane:readme:start -->
+## Workflow
+
+This repo uses `pipelane`, the repo-specific workflow layer for AI-first builders.
+
+It is designed to work well with Claude, Codex, and similar tools by keeping the release flow
+deterministic:
+
+- repo-native commands are the source of truth
+- slash commands are thin adapters
+- `/new` creates explicit isolated task workspaces
+- `/resume` recovers them later when needed
+
+The default alias set can be changed in `.pipelane.json`. If aliases change, rerun
+`npm run pipelane:setup` and reopen Claude/Codex so the new names are picked up.
+Aliases must be unique, and setup fails closed if an alias would overwrite an unrelated command.
+Codex resolves aliases per repo at runtime, so the same alias can mean different workflow commands in different pipelane repos on one machine.
+
+### Two dev modes
+
+`pipelane` gives this repo two lanes:
+
+- `build`: the fast lane, where merge is expected to hand off production deploy
+- `release`: the protected lane, where staging happens before prod for the same merged SHA
+
+### Build mode user journey
+
+User-facing:
+
+1. `/devmode build`
+2. `/new <task-name>`
+3. `/pr`
+4. `/merge`
+5. `/clean`
+
+Repo-native:
+
+```bash
+npm run pipelane:devmode -- build
+npm run pipelane:new -- --task "example-task"
+npm run pipelane:pr -- --title "Example PR title"
+npm run pipelane:merge
+npm run pipelane:clean
+```
+
+### Release mode user journey
+
+User-facing:
+
+1. `/devmode release`
+2. `/new <task-name>`
+3. `/pr`
+4. `/merge`
+5. `/deploy staging`
+6. `/smoke staging`
+7. `/deploy prod`
+7. `/clean`
+
+Repo-native:
+
+```bash
+npm run pipelane:devmode -- release
+npm run pipelane:new -- --task "example-task"
+npm run pipelane:pr -- --title "Example PR title"
+npm run pipelane:merge
+npm run pipelane:deploy -- staging
+npm run pipelane:smoke -- staging
+npm run pipelane:deploy -- prod
+npm run pipelane:clean
+```
+
+### Command surface
+
+- `/devmode`
+- `/new`
+- `/resume`
+- `/pr`
+- `/merge`
+- `/deploy`
+- `/smoke`
+- `/clean`
+- `/status`
+- `/doctor`
+- `/rollback`
+
+Canonical repo-native commands:
+
+- `npm run pipelane:setup`
+- `npm run pipelane:devmode -- ...`
+- `npm run pipelane:new -- --task "<task-name>"` (the `--task` flag is optional; omitting it generates a `task-<hex>` slug)
+- `npm run pipelane:resume -- --task "<task-name>"`
+- `npm run pipelane:pr -- ...`
+- `npm run pipelane:merge`
+- `npm run pipelane:release-check`
+- `npm run pipelane:task-lock -- verify --task "<task-name>"`
+- `npm run pipelane:deploy -- staging|prod ...`
+- `npm run pipelane:smoke -- plan|staging|prod`
+- `npm run pipelane:clean`
+- `npm run pipelane:status`
+- `npm run pipelane:doctor` (add `-- --probe` for live healthchecks, `-- --fix` for the guided wizard)
+
+### pipelane + gstack
+
+Use both.
+
+- use `pipelane` for task workspaces, PR prep, merge, and deploy flow
+- use gstack for review, QA, architecture review, deploy bootstrap, docs, and investigation
+
+If this repo is adopting pipelane for the first time, commit the tracked Pipelane files
+before using `pipelane:new` in a remote-backed repo.
+
+### What each user still needs to do
+
+- One repo maintainer runs `pipelane bootstrap --project "<name>"`, reviews `.pipelane.json`, and commits the tracked Pipelane files.
+- Each Claude user can run `pipelane install-claude` once per machine for the global `/init-pipelane` bootstrap command, then pulls the repo and reopens Claude if command files or aliases changed.
+- Each Codex user can optionally run `pipelane install-codex` once per machine for the global `/init-pipelane` bootstrap command, then pulls the repo. If that machine previously used pipelane's machine-local Codex wrappers, rerun `npm run pipelane:setup` once to prune them before reopening Codex.
+- Each release operator fills local deploy config in `CLAUDE.md` and verifies with `npm run pipelane:release-check`.
+
+Use [docs/RELEASE_WORKFLOW.md](./docs/RELEASE_WORKFLOW.md) for the full operator workflow.
+<!-- pipelane:readme:end -->

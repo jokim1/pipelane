@@ -1,5 +1,6 @@
 import readline from 'node:readline';
 
+import { acquireSmokeEnvironmentLock, evaluateSmokeCoverage, findLatestSmokeRun, findQualifyingSmokeRun, isSmokeSuccessStatus, releaseSmokeEnvironmentLock, resolveSmokeConfig } from '../smoke-gate.ts';
 import {
   buildReleaseCheckMessage,
   computeDeployConfigFingerprint,
@@ -13,6 +14,7 @@ import {
 } from '../release-gate.ts';
 import {
   loadDeployState,
+  loadSmokeRegistry,
   loadPrRecord,
   loadProbeState,
   nowIso,
@@ -30,11 +32,12 @@ import {
 import {
   inferActiveTaskLock,
   makeIdempotencyKey,
+  resolveSurfaceHealthcheckUrl,
   resolveCommandSurfaces,
   resolveDeployTargetForTask,
-  resolveSurfaceHealthcheckUrl,
   setNextAction,
 } from './helpers.ts';
+import { observeFrontendRuntime, toDeployRuntimeObservation } from '../runtime-observation.ts';
 
 function surfacesKey(surfaces: string[]): string {
   return [...surfaces].sort().join(',');
@@ -204,6 +207,16 @@ export async function dispatchDeploy(
     mode: context.modeState.mode,
   });
   const asyncRequested = options.async ?? parsed.flags.async;
+  const smokeConfig = resolveSmokeConfig(context.config);
+  const requestedSmokeCoverageOverrideReason = parsed.flags.skipSmokeCoverage
+    ? parsed.flags.reason.trim()
+    : '';
+  if (parsed.flags.skipSmokeCoverage && !requestedSmokeCoverageOverrideReason) {
+    throw new Error([
+      'Smoke coverage override requires --reason.',
+      'Example: pipelane:deploy -- prod --skip-smoke-coverage --reason "critical hotfix while smoke coverage catches up"',
+    ].join('\n'));
+  }
 
   const deployState = loadDeployState(context.commonDir, context.config);
   // v1.2: when signing is configured, attacker-planted records (unsigned or
@@ -214,6 +227,7 @@ export async function dispatchDeploy(
   const trustedRecords = stateKey
     ? deployState.records.filter((record) => verifyDeployRecord(record, stateKey))
     : deployState.records;
+  let smokeCoverageOverrideReason: string | undefined;
 
   if (context.modeState.mode === 'release') {
     // v1.2 readiness is now observed, not asserted. Callers to prod are also
@@ -266,124 +280,187 @@ export async function dispatchDeploy(
         'Re-run pipelane:deploy -- staging and let it verify before promoting.',
       ].join('\n'));
     }
+
+    if (smokeConfig.requireStagingSmoke) {
+      const qualifyingSmoke = findQualifyingSmokeRun({
+        commonDir: context.commonDir,
+        config: context.config,
+        environment: 'staging',
+        sha: target.sha,
+      });
+      if (!qualifyingSmoke) {
+        const latestSmoke = findLatestSmokeRun({
+          commonDir: context.commonDir,
+          config: context.config,
+          environment: 'staging',
+          sha: target.sha,
+        });
+        if (latestSmoke && !isSmokeSuccessStatus(latestSmoke.status)) {
+          throw new Error([
+            `deploy prod blocked: staging smoke failed for SHA ${target.sha.slice(0, 7)}.`,
+            'Run pipelane:smoke -- staging after fixing the failing smoke checks.',
+          ].join('\n'));
+        }
+        throw new Error([
+          `deploy prod blocked: no qualifying staging smoke found for SHA ${target.sha.slice(0, 7)}.`,
+          'Run pipelane:smoke -- staging.',
+        ].join('\n'));
+      }
+
+      const coverage = evaluateSmokeCoverage({
+        registry: loadSmokeRegistry(context.repoRoot, context.config),
+        environment: 'staging',
+        config: context.config,
+      });
+      if (coverage.uncoveredCriticalPaths.length > 0) {
+        const coverageMessage = `critical-path smoke gaps: ${coverage.uncoveredCriticalPaths.join(', ')}`;
+        if (coverage.mode === 'block') {
+          if (!requestedSmokeCoverageOverrideReason) {
+            throw new Error([
+              `deploy prod blocked: ${coverageMessage}.`,
+              'Run pipelane:smoke -- plan or add smoke coverage before promoting.',
+              'If you must ship anyway, re-run with `--skip-smoke-coverage --reason "<why>"`.',
+            ].join('\n'));
+          }
+          smokeCoverageOverrideReason = requestedSmokeCoverageOverrideReason;
+          process.stderr.write(`[pipelane] WARNING: bypassing smoke coverage block: ${coverageMessage}\n`);
+          process.stderr.write(`[pipelane] WARNING: smoke coverage override reason: ${smokeCoverageOverrideReason}\n`);
+        } else {
+          process.stderr.write(`[pipelane] WARNING: ${coverageMessage}\n`);
+        }
+      }
+    }
   }
 
-  const idempotencyKey = makeIdempotencyKey({
+  const deployRunId = `deploy-${environment}-${target.sha.slice(0, 7)}-${Date.now()}`;
+  acquireSmokeEnvironmentLock({
+    commonDir: context.commonDir,
+    repoRoot: context.repoRoot,
     environment,
+    operation: 'deploy',
+    runId: deployRunId,
     sha: target.sha,
-    surfaces,
-    taskSlug,
-    configFingerprint: computeDeployConfigFingerprint(deployConfig, environment),
   });
 
-  // Short-circuit: if we already have a succeeded deploy with this key,
-  // don't re-dispatch. Return the existing record. Uses trusted records so
-  // an attacker can't plant a sig-invalid success to DoS legitimate deploys.
-  const existingSucceeded = findMatchingSucceededDeploy({
-    records: trustedRecords,
-    environment,
-    sha: target.sha,
-    surfaces,
-    taskSlug,
-  });
-  if (existingSucceeded && existingSucceeded.idempotencyKey === idempotencyKey) {
-    return {
-      ...existingSucceeded,
+  try {
+    const idempotencyKey = makeIdempotencyKey({
       environment,
       sha: target.sha,
       surfaces,
-      workflowName: existingSucceeded.workflowName,
       taskSlug,
-      message: [
-        `Deploy already succeeded: ${environment}`,
-        `Task: ${taskSlug}`,
-        `SHA: ${target.sha}`,
-        `Workflow run: ${existingSucceeded.workflowRunId ?? 'unknown'}`,
-        'Idempotent short-circuit — no new dispatch.',
-      ].join('\n'),
-    };
-  }
+      configFingerprint: computeDeployConfigFingerprint(deployConfig, environment),
+    });
 
-  // v0.5: prod deploys require typed-SHA confirmation so an AI can't one-char
-  // approve production. Runs AFTER the staging + idempotency gates so a human
-  // isn't asked to confirm a deploy that would be rejected or short-circuited.
-  // The API path bypasses via PIPELANE_DEPLOY_PROD_API_CONFIRMED — it's already
-  // consumed an HMAC confirm token. --override bypasses the release-readiness
-  // gate but NOT this check: an AI can set --override too.
-  if (environment === 'prod' && context.modeState.mode === 'release') {
-    await requireProdConfirmation(target.sha);
-  }
-
-  const workflowName = environment === 'staging'
-    ? (deployConfig.frontend.staging.deployWorkflow || context.config.deployWorkflowName)
-    : (deployConfig.frontend.production.deployWorkflow || context.config.deployWorkflowName);
-
-  const requestedAt = nowIso();
-  const triggeredBy = resolveTriggeredBy();
-  const dispatchStart = Date.now();
-
-  const dispatchArgs = [
-    'workflow',
-    'run',
-    workflowName,
-    '-f',
-    `environment=${environment === 'prod' ? 'production' : 'staging'}`,
-    '-f',
-    `sha=${target.sha}`,
-    '-f',
-    `surfaces=${surfaces.join(',')}`,
-  ];
-  if (environment === 'prod' && context.modeState.mode === 'build') {
-    dispatchArgs.push('-f', 'bypass_staging_guard=true');
-  }
-  runGh(context.repoRoot, dispatchArgs);
-
-  const run = findRecentRun(context.repoRoot, workflowName, target.sha, dispatchStart);
-
-  let record: DeployRecord = {
-    environment,
-    sha: target.sha,
-    surfaces,
-    workflowName,
-    requestedAt,
-    taskSlug,
-    status: 'requested',
-    workflowRunId: run?.id,
-    workflowRunUrl: run?.url,
-    idempotencyKey,
-    triggeredBy,
-  };
-
-  // Persist the 'requested' record immediately so an interrupted run
-  // still leaves a breadcrumb in deploy-state.json. Sign it if signing
-  // is enabled — otherwise an async deploy's initial record would be
-  // invisible to verifyDeployRecord filters and rollback would miss
-  // in-flight deploys on signed repos (Codex r6 P2).
-  if (stateKey) {
-    record = { ...record, signature: signDeployRecord(record, stateKey) };
-  }
-  persistRecord(context.commonDir, context.config, deployState.records, record);
-
-  if (asyncRequested) {
-    const shortSha = target.sha.slice(0, 7);
-    const nextStage = environment === 'staging'
-      ? `staging deploy requested at ${shortSha}, wait for verification`
-      : `prod deploy requested at ${shortSha}, verify production`;
-    setNextAction(context.commonDir, context.config, taskSlug, nextStage);
-    return {
-      ...record,
+    // Short-circuit: if we already have a succeeded deploy with this key,
+    // don't re-dispatch. Return the existing record. Uses trusted records so
+    // an attacker can't plant a sig-invalid success to DoS legitimate deploys.
+    const existingSucceeded = findMatchingSucceededDeploy({
+      records: trustedRecords,
+      environment,
+      sha: target.sha,
+      surfaces,
       taskSlug,
-      message: [
-        `Deploy dispatched (async): ${environment}`,
-        `Task: ${taskSlug}`,
-        `SHA: ${target.sha}`,
-        `Surfaces: ${surfaces.join(', ')}`,
-        `Workflow: ${workflowName}`,
-        run?.id ? `Workflow run: ${run.url ?? run.id}` : 'Workflow run: not yet resolvable',
-        'Exit without watching per --async.',
-      ].join('\n'),
+    });
+    if (existingSucceeded && existingSucceeded.idempotencyKey === idempotencyKey) {
+      return {
+        ...existingSucceeded,
+        environment,
+        sha: target.sha,
+        surfaces,
+        workflowName: existingSucceeded.workflowName,
+        taskSlug,
+        message: [
+          `Deploy already succeeded: ${environment}`,
+          `Task: ${taskSlug}`,
+          `SHA: ${target.sha}`,
+          `Workflow run: ${existingSucceeded.workflowRunId ?? 'unknown'}`,
+          'Idempotent short-circuit — no new dispatch.',
+        ].join('\n'),
+      };
+    }
+
+    // v0.5: prod deploys require typed-SHA confirmation so an AI can't one-char
+    // approve production. Runs AFTER the staging + idempotency gates so a human
+    // isn't asked to confirm a deploy that would be rejected or short-circuited.
+    // The API path bypasses via PIPELANE_DEPLOY_PROD_API_CONFIRMED — it's already
+    // consumed an HMAC confirm token. --override bypasses the release-readiness
+    // gate but NOT this check: an AI can set --override too.
+    if (environment === 'prod' && context.modeState.mode === 'release') {
+      await requireProdConfirmation(target.sha);
+    }
+
+    const workflowName = environment === 'staging'
+      ? (deployConfig.frontend.staging.deployWorkflow || context.config.deployWorkflowName)
+      : (deployConfig.frontend.production.deployWorkflow || context.config.deployWorkflowName);
+
+    const requestedAt = nowIso();
+    const triggeredBy = resolveTriggeredBy();
+    const dispatchStart = Date.now();
+
+    const dispatchArgs = [
+      'workflow',
+      'run',
+      workflowName,
+      '-f',
+      `environment=${environment === 'prod' ? 'production' : 'staging'}`,
+      '-f',
+      `sha=${target.sha}`,
+      '-f',
+      `surfaces=${surfaces.join(',')}`,
+    ];
+    if (environment === 'prod' && context.modeState.mode === 'build') {
+      dispatchArgs.push('-f', 'bypass_staging_guard=true');
+    }
+    runGh(context.repoRoot, dispatchArgs);
+
+    const run = findRecentRun(context.repoRoot, workflowName, target.sha, dispatchStart);
+
+    let record: DeployRecord = {
+      environment,
+      sha: target.sha,
+      surfaces,
+      workflowName,
+      requestedAt,
+      taskSlug,
+      status: 'requested',
+      workflowRunId: run?.id,
+      workflowRunUrl: run?.url,
+      idempotencyKey,
+      triggeredBy,
+      smokeCoverageOverrideReason,
     };
-  }
+
+    // Persist the 'requested' record immediately so an interrupted run
+    // still leaves a breadcrumb in deploy-state.json. Sign it if signing
+    // is enabled — otherwise an async deploy's initial record would be
+    // invisible to verifyDeployRecord filters and rollback would miss
+    // in-flight deploys on signed repos (Codex r6 P2).
+    if (stateKey) {
+      record = { ...record, signature: signDeployRecord(record, stateKey) };
+    }
+    persistRecord(context.commonDir, context.config, deployState.records, record);
+
+    if (asyncRequested) {
+      const shortSha = target.sha.slice(0, 7);
+      const nextStage = environment === 'staging'
+        ? `staging deploy requested at ${shortSha}, wait for verification`
+        : `prod deploy requested at ${shortSha}, verify production`;
+      setNextAction(context.commonDir, context.config, taskSlug, nextStage);
+      return {
+        ...record,
+        taskSlug,
+        message: [
+          `Deploy dispatched (async): ${environment}`,
+          `Task: ${taskSlug}`,
+          `SHA: ${target.sha}`,
+          `Surfaces: ${surfaces.join(', ')}`,
+          record.smokeCoverageOverrideReason ? `Smoke coverage override: ${record.smokeCoverageOverrideReason}` : '',
+          `Workflow: ${workflowName}`,
+          run?.id ? `Workflow run: ${run.url ?? run.id}` : 'Workflow run: not yet resolvable',
+          'Exit without watching per --async.',
+        ].join('\n'),
+      };
+    }
 
   // Watch the run and stamp the final outcome.
   const watched = watchWorkflowRun(context.repoRoot, run?.id);
@@ -394,6 +471,7 @@ export async function dispatchDeploy(
 
   let verification: DeployVerification | undefined;
   let verificationBySurface: Record<string, DeployVerification> | undefined;
+  let runtimeObservation: DeployRecord['runtimeObservation'];
   if (watched.ok) {
     // v1.2: per-surface probing. A multi-surface deploy produces one probe
     // entry per surface so a frontend healthcheck can't credit edge or sql.
@@ -435,6 +513,13 @@ export async function dispatchDeploy(
       status = 'failed';
       failureReason = perSurfaceFailures.join('; ');
     }
+
+    if (surfaces.includes('frontend')) {
+      runtimeObservation = toDeployRuntimeObservation(await observeFrontendRuntime({
+        deployConfig,
+        environment,
+      }));
+    }
   }
 
   const verifiedAt = status === 'succeeded' ? nowIso() : undefined;
@@ -447,6 +532,7 @@ export async function dispatchDeploy(
     durationMs,
     verification,
     verificationBySurface,
+    runtimeObservation,
     verifiedAt,
     configFingerprint,
     failureReason,
@@ -477,24 +563,28 @@ export async function dispatchDeploy(
     : `prod verified at ${shortSha}, run pipelane:clean`;
   setNextAction(context.commonDir, context.config, taskSlug, nextStage);
 
-  return {
-    ...record,
-    taskSlug,
-    message: [
-      `Deploy verified: ${environment}`,
-      `Task: ${taskSlug}`,
-      `SHA: ${target.sha}`,
-      `Surfaces: ${surfaces.join(', ')}`,
-      `Workflow: ${workflowName}`,
-      run?.url ? `Workflow run: ${run.url}` : '',
-      verification?.healthcheckUrl
-        ? `Healthcheck: ${verification.healthcheckUrl} → HTTP ${verification.statusCode} in ${verification.latencyMs}ms (${verification.probes} probe(s))`
-        : 'Healthcheck: skipped (no URL configured)',
-      environment === 'staging'
-        ? 'Next: run pipelane:deploy -- prod.'
-        : 'Next: run pipelane:clean.',
-    ].filter(Boolean).join('\n'),
-  };
+    return {
+      ...record,
+      taskSlug,
+      message: [
+        `Deploy verified: ${environment}`,
+        `Task: ${taskSlug}`,
+        `SHA: ${target.sha}`,
+        `Surfaces: ${surfaces.join(', ')}`,
+        record.smokeCoverageOverrideReason ? `Smoke coverage override: ${record.smokeCoverageOverrideReason}` : '',
+        `Workflow: ${workflowName}`,
+        run?.url ? `Workflow run: ${run.url}` : '',
+        verification?.healthcheckUrl
+          ? `Healthcheck: ${verification.healthcheckUrl} → HTTP ${verification.statusCode} in ${verification.latencyMs}ms (${verification.probes} probe(s))`
+          : 'Healthcheck: skipped (no URL configured)',
+        environment === 'staging'
+          ? 'Next: run pipelane:deploy -- prod.'
+          : 'Next: run pipelane:clean.',
+      ].filter(Boolean).join('\n'),
+    };
+  } finally {
+    releaseSmokeEnvironmentLock(context.commonDir, environment);
+  }
 }
 
 export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {

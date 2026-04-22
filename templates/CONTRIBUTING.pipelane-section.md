@@ -4,7 +4,7 @@ This repo uses `pipelane` for task workspaces and release flow.
 
 It pairs well with gstack:
 
-- use `pipelane` for `{{ALIAS_NEW}}`, `{{ALIAS_RESUME}}`, `{{ALIAS_PR}}`, `{{ALIAS_MERGE}}`, `{{ALIAS_DEPLOY}}`, and `{{ALIAS_ROLLBACK}}`
+- use `pipelane` for `{{ALIAS_NEW}}`, `{{ALIAS_RESUME}}`, `{{ALIAS_PR}}`, `{{ALIAS_MERGE}}`, `{{ALIAS_DEPLOY}}`, `{{ALIAS_SMOKE}}`, and `{{ALIAS_ROLLBACK}}`
 - use gstack for review, QA, planning, docs, and investigation
 
 Before work that may lead to a commit:

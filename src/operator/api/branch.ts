@@ -1,8 +1,8 @@
 import { existsSync } from 'node:fs';
 
-import { nowIso, resolveWorkflowContext, runGit } from '../state.ts';
+import { loadAllTaskLocks, loadDeployState, loadPrState, nowIso, resolveWorkflowContext, runGit } from '../state.ts';
 import { buildApiEnvelope, buildFreshness, type ApiEnvelope } from './envelope.ts';
-import { buildWorkflowApiSnapshot, type BranchRow } from './snapshot.ts';
+import { buildBranchRows, type BranchRow } from './snapshot.ts';
 
 export type BranchFileScope = 'branch' | 'workspace';
 
@@ -103,8 +103,22 @@ export function buildBranchPatchEnvelope(
 }
 
 function resolveBranchRow(cwd: string, branchName: string): BranchRow {
-  const snapshot = buildWorkflowApiSnapshot(cwd);
-  const branch = snapshot.data.branches.find((entry) => entry.name === branchName);
+  const context = resolveWorkflowContext(cwd);
+  const currentBranch = runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
+  const baseBranchSha = runGit(context.repoRoot, ['rev-parse', '--verify', `origin/${context.config.baseBranch}`], true)?.trim() ?? '';
+  const checkedAt = nowIso();
+  const rows = buildBranchRows({
+    locks: loadAllTaskLocks(context.commonDir, context.config),
+    config: context.config,
+    currentBranch,
+    baseBranch: context.config.baseBranch,
+    baseBranchSha,
+    prRecords: loadPrState(context.commonDir, context.config).records,
+    deployRecords: loadDeployState(context.commonDir, context.config).records,
+    mode: context.modeState.mode,
+    checkedAt,
+  });
+  const branch = rows.find((entry) => entry.name === branchName);
   if (!branch) {
     throw new Error(`No active pipelane branch named "${branchName}" found.`);
   }

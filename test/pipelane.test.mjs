@@ -126,6 +126,7 @@ function writeFakeGh(binDir, stateFile) {
   writeFileSync(targetPath, `#!/usr/bin/env node
 const fs = require('node:fs');
 const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 const statePath = process.env.GH_STATE_FILE;
 const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, 'utf8')) : { prs: {}, workflows: [], prMergeCalls: [] };
 const args = process.argv.slice(2);
@@ -172,8 +173,21 @@ if (args[0] === 'pr' && args[1] === 'merge') {
   const number = Number(args[2]);
   const pr = Object.values(state.prs).find((entry) => entry.number === number);
   if (pr) {
+    let mergeSha = 'deadbeefcafebabe';
+    if (process.env.GH_PR_MERGE_PUSH_HEAD === '1') {
+      mergeSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }).trim();
+      const baseBranch = process.env.GH_PR_MERGE_BASE || 'main';
+      execFileSync('git', ['push', 'origin', 'HEAD:refs/heads/' + baseBranch], {
+        cwd: process.cwd(),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    }
     pr.state = 'MERGED';
-    pr.mergeCommit = { oid: 'deadbeefcafebabe' };
+    pr.mergeCommit = { oid: mergeSha };
     pr.mergedAt = '2026-04-13T00:00:00Z';
     writeState();
   }
@@ -275,6 +289,27 @@ async function getFreePort() {
   server.close();
   await once(server, 'close');
   return port;
+}
+
+async function startRuntimeMarkerServer(handler) {
+  const hits = [];
+  const server = createHttpServer((req, res) => {
+    hits.push(req.url ?? '');
+    handler(req, res, hits);
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+  return {
+    server,
+    hits,
+    baseUrl: `http://127.0.0.1:${port}`,
+    async close() {
+      server.close();
+      await once(server, 'close').catch(() => undefined);
+    },
+  };
 }
 
 async function startDashboardServer(repoRoot, env = {}) {
@@ -711,8 +746,10 @@ test('init writes tracked Pipelane files and setup seeds CLAUDE plus tracked Cod
     assert.equal(packageJson.scripts['pipelane:new'], 'pipelane run new');
     assert.equal(packageJson.scripts['pipelane:resume'], 'pipelane run resume');
     assert.equal(packageJson.scripts['pipelane:repo-guard'], 'pipelane run repo-guard');
+    assert.equal(packageJson.scripts['pipelane:smoke'], 'pipelane run smoke');
     assert.equal(packageJson.scripts['pipelane:board'], 'pipelane board');
     assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'repo-guard.md')));
+    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'smoke.md')));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -749,6 +786,7 @@ test('bootstrap installs pipelane, initializes the repo, and seeds the global bo
     const packageJson = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
     assert.equal(typeof packageJson.devDependencies.pipelane, 'string');
     assert.equal(packageJson.scripts['pipelane:new'], 'pipelane run new');
+    assert.equal(packageJson.scripts['pipelane:smoke'], 'pipelane run smoke');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -774,6 +812,512 @@ test('bootstrap in a non-git directory warns that workflow commands still need g
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('smoke plan scaffolds .pipelane/smoke-checks.json from discovered smoke tags', () => {
+  const repoRoot = createRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
+    writeFileSync(
+      path.join(repoRoot, 'e2e', 'auth.spec.ts'),
+      [
+        "test('@smoke-auth sign in', async () => {});",
+        "test('@smoke-app-shell boots', async () => {});",
+      ].join('\n'),
+      'utf8',
+    );
+
+    const result = runCli(['run', 'smoke', 'plan', '--json'], repoRoot);
+    const output = JSON.parse(result.stdout);
+    const registry = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane', 'smoke-checks.json'), 'utf8'));
+
+    assert.equal(output.createdRegistry, true);
+    assert.ok(output.findings.length <= 5);
+    assert.ok(registry.checks['@smoke-auth']);
+    assert.equal(registry.checks['@smoke-auth'].blocking, false);
+    assert.equal(registry.checks['@smoke-auth'].quarantine, true);
+    assert.deepEqual(registry.checks['@smoke-auth'].sourceTests, ['e2e/auth.spec.ts']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke staging runs the configured command, injects env vars, and surfaces state in /status', async () => {
+  const repoRoot = createRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.smoke = {
+        generatedSummaryPath: 'docs/smoke/README.md',
+        staging: {
+          command: 'node -e "console.log([process.env.PIPELANE_SMOKE_ENV, process.env.PIPELANE_COHORT, process.env.PIPELANE_SMOKE_SHA, process.env.PIPELANE_SMOKE_BASE_URL].join(\'|\'))"',
+          preflight: [
+            {
+              name: 'env-parity',
+              command: 'node -e "console.log(process.env.PIPELANE_SMOKE_ENV)"',
+              critical: true,
+            },
+          ],
+        },
+      };
+    });
+    await writeSucceededDeployRecord(repoRoot, 'staging', '1111111111111111111111111111111111111111', ['frontend']);
+
+    runCli(['run', 'smoke', 'plan'], repoRoot);
+    const result = runCli(['run', 'smoke', 'staging', '--json'], repoRoot);
+    const output = JSON.parse(result.stdout);
+    const latest = JSON.parse(readFileSync(path.join(resolveSharedSmokeStateRoot(repoRoot), 'latest.json'), 'utf8'));
+    const logDir = path.join(resolveSharedSmokeStateRoot(repoRoot), 'logs');
+    const logFiles = readdirSync(logDir).filter((entry) => entry.includes('default'));
+    const logText = readFileSync(path.join(logDir, logFiles[0]), 'utf8');
+    const statusOutput = JSON.parse(runCli(['run', 'status', '--json'], repoRoot).stdout);
+
+    assert.equal(output.status, 'passed');
+    assert.equal(latest.staging.status, 'passed');
+    assert.equal(latest.staging.sha, '1111111111111111111111111111111111111111');
+    assert.match(logText, /staging\|default\|1111111/);
+    assert.match(logText, /https:\/\/staging\.example\.test/);
+    assert.match(readFileSync(path.join(repoRoot, 'docs', 'smoke', 'README.md'), 'utf8'), /@smoke-auth/);
+    assert.equal(statusOutput.data.smoke.staging.status, 'passed');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release deploy prod does not require smoke unless the repo opts in', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(fakeBin, 'gh-state.json');
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    const headSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+    writeTaskLock(repoRoot, 'bootstrap', { mode: 'release', surfaces: ['frontend'] });
+    writePrRecord(repoRoot, 'bootstrap', headSha);
+    await writeSucceededDeployRecord(repoRoot, 'staging', headSha, ['frontend']);
+    writeHealthyProbeState(repoRoot, ['frontend']);
+    runCli(['run', 'devmode', 'release', '--surfaces', 'frontend'], repoRoot);
+
+    writeFakeGh(fakeBin, ghStateFile);
+    const result = runCli(
+      ['run', 'deploy', 'prod', '--task', 'bootstrap', '--json'],
+      repoRoot,
+      {
+        PATH: `${fakeBin}:${process.env.PATH}`,
+        GH_STATE_FILE: ghStateFile,
+        PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+        PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+        PIPELANE_DEPLOY_PROD_CONFIRM_STUB: headSha.slice(0, 4),
+      },
+    );
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(output.environment, 'prod');
+    assert.equal(output.sha, headSha);
+    assert.match(output.message, /Deploy verified: prod/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
+test('release deploy prod blocks when staging smoke for the same SHA is missing', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.smoke = {
+        requireStagingSmoke: true,
+        staging: { command: 'node -e "process.exit(0)"' },
+        prod: { command: 'node -e "process.exit(0)"' },
+      };
+    });
+    const headSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+    writeTaskLock(repoRoot, 'bootstrap', { mode: 'release', surfaces: ['frontend'] });
+    writePrRecord(repoRoot, 'bootstrap', headSha);
+    await writeSucceededDeployRecord(repoRoot, 'staging', headSha, ['frontend']);
+    writeHealthyProbeState(repoRoot, ['frontend']);
+    runCli(['run', 'devmode', 'release', '--surfaces', 'frontend'], repoRoot);
+
+    const result = runCli(
+      ['run', 'deploy', 'prod', '--task', 'bootstrap'],
+      repoRoot,
+      { PIPELANE_DEPLOY_PROD_CONFIRM_STUB: headSha.slice(0, 4) },
+      true,
+    );
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /no qualifying staging smoke found/i);
+    assert.match(result.stderr, /Run pipelane:smoke -- staging/i);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('release deploy prod accepts a qualifying staging smoke run for the same SHA', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(fakeBin, 'gh-state.json');
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.smoke = {
+        requireStagingSmoke: true,
+        staging: { command: smokeResultCommand([{ tag: '@smoke-auth', status: 'passed' }]) },
+        prod: { command: smokeResultCommand([{ tag: '@smoke-auth', status: 'passed' }]) },
+      };
+    });
+    const headSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+    writeTaskLock(repoRoot, 'bootstrap', { mode: 'release', surfaces: ['frontend'] });
+    writePrRecord(repoRoot, 'bootstrap', headSha);
+    await writeSucceededDeployRecord(repoRoot, 'staging', headSha, ['frontend']);
+    writeHealthyProbeState(repoRoot, ['frontend']);
+    runCli(['run', 'devmode', 'release', '--surfaces', 'frontend'], repoRoot);
+    runCli(['run', 'smoke', 'plan'], repoRoot);
+    updateSmokeRegistry(repoRoot, (registry) => {
+      registry.checks['@smoke-auth'].blocking = true;
+      registry.checks['@smoke-auth'].quarantine = false;
+    });
+    runCli(['run', 'smoke', 'staging'], repoRoot);
+
+    writeFakeGh(fakeBin, ghStateFile);
+    const result = runCli(
+      ['run', 'deploy', 'prod', '--task', 'bootstrap', '--json'],
+      repoRoot,
+      {
+        PATH: `${fakeBin}:${process.env.PATH}`,
+        GH_STATE_FILE: ghStateFile,
+        PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+        PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+        PIPELANE_DEPLOY_PROD_CONFIRM_STUB: headSha.slice(0, 4),
+      },
+    );
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(output.environment, 'prod');
+    assert.equal(output.sha, headSha);
+    assert.match(output.message, /Deploy verified: prod/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
+test('latest staging smoke failure for a SHA overrides an older pass', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.smoke = {
+        requireStagingSmoke: true,
+        staging: { command: smokeResultCommand([{ tag: '@smoke-auth', status: 'passed' }]) },
+        prod: { command: smokeResultCommand([{ tag: '@smoke-auth', status: 'passed' }]) },
+      };
+    });
+    const headSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+    writeTaskLock(repoRoot, 'bootstrap', { mode: 'release', surfaces: ['frontend'] });
+    writePrRecord(repoRoot, 'bootstrap', headSha);
+    await writeSucceededDeployRecord(repoRoot, 'staging', headSha, ['frontend']);
+    writeHealthyProbeState(repoRoot, ['frontend']);
+    runCli(['run', 'devmode', 'release', '--surfaces', 'frontend'], repoRoot);
+    runCli(['run', 'smoke', 'plan'], repoRoot);
+    updateSmokeRegistry(repoRoot, (registry) => {
+      registry.checks['@smoke-auth'].blocking = true;
+      registry.checks['@smoke-auth'].quarantine = false;
+    });
+    runCli(['run', 'smoke', 'staging'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.smoke.staging.command = smokeResultCommand([{ tag: '@smoke-auth', status: 'failed' }], { exitCode: 1 });
+    });
+    runCli(['run', 'smoke', 'staging'], repoRoot, {}, true);
+
+    const result = runCli(
+      ['run', 'deploy', 'prod', '--task', 'bootstrap'],
+      repoRoot,
+      { PIPELANE_DEPLOY_PROD_CONFIRM_STUB: headSha.slice(0, 4) },
+      true,
+    );
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /staging smoke failed for SHA/i);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('release override does not bypass smoke coverage gaps; deploy prod needs an explicit smoke coverage override', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(fakeBin, 'gh-state.json');
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.smoke = {
+        requireStagingSmoke: true,
+        criticalPathCoverage: 'block',
+        criticalPaths: ['billing'],
+        staging: { command: smokeResultCommand([{ tag: '@smoke-auth', status: 'passed' }]) },
+        prod: { command: smokeResultCommand([{ tag: '@smoke-auth', status: 'passed' }]) },
+      };
+    });
+    const headSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+    writeTaskLock(repoRoot, 'bootstrap', { mode: 'release', surfaces: ['frontend'] });
+    writePrRecord(repoRoot, 'bootstrap', headSha);
+    await writeSucceededDeployRecord(repoRoot, 'staging', headSha, ['frontend']);
+    writeHealthyProbeState(repoRoot, ['frontend']);
+    runCli(['run', 'devmode', 'release', '--surfaces', 'frontend', '--override', '--reason', 'release gate bypass'], repoRoot);
+    runCli(['run', 'smoke', 'plan'], repoRoot);
+    updateSmokeRegistry(repoRoot, (registry) => {
+      registry.checks['@smoke-auth'].blocking = true;
+      registry.checks['@smoke-auth'].quarantine = false;
+    });
+    runCli(['run', 'smoke', 'staging'], repoRoot);
+
+    const blocked = runCli(
+      ['run', 'deploy', 'prod', '--task', 'bootstrap'],
+      repoRoot,
+      { PIPELANE_DEPLOY_PROD_CONFIRM_STUB: headSha.slice(0, 4) },
+      true,
+    );
+
+    assert.notEqual(blocked.status, 0);
+    assert.match(blocked.stderr, /critical-path smoke gaps: billing/i);
+    assert.match(blocked.stderr, /--skip-smoke-coverage --reason/);
+
+    writeFakeGh(fakeBin, ghStateFile);
+    const result = runCli(
+      ['run', 'deploy', 'prod', '--task', 'bootstrap', '--skip-smoke-coverage', '--reason', 'billing smoke follow-up', '--json'],
+      repoRoot,
+      {
+        PATH: `${fakeBin}:${process.env.PATH}`,
+        GH_STATE_FILE: ghStateFile,
+        PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+        PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+        PIPELANE_DEPLOY_PROD_CONFIRM_STUB: headSha.slice(0, 4),
+      },
+    );
+    const output = JSON.parse(result.stdout);
+    const deployState = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'deploy-state.json'), 'utf8'));
+    const latestRecord = deployState.records.at(-1);
+
+    assert.equal(output.environment, 'prod');
+    assert.match(output.message, /Smoke coverage override: billing smoke follow-up/);
+    assert.equal(latestRecord.smokeCoverageOverrideReason, 'billing smoke follow-up');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
+test('smoke waivers turn a failing blocking check into a non-blocking warning when check results are reported', async () => {
+  const repoRoot = createRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.smoke = {
+        requireStagingSmoke: true,
+        staging: {
+          command: smokeResultCommand([{ tag: '@smoke-auth', status: 'failed' }], { exitCode: 1 }),
+        },
+      };
+    });
+    await writeSucceededDeployRecord(repoRoot, 'staging', '1111111111111111111111111111111111111111', ['frontend']);
+    runCli(['run', 'smoke', 'plan'], repoRoot);
+    updateSmokeRegistry(repoRoot, (registry) => {
+      registry.checks['@smoke-auth'].blocking = true;
+      registry.checks['@smoke-auth'].quarantine = false;
+    });
+    runCli(['run', 'smoke', 'waiver', 'create', '@smoke-auth', 'staging', '--reason', 'known flake'], repoRoot);
+
+    const result = runCli(['run', 'smoke', 'staging', '--json'], repoRoot);
+    const output = JSON.parse(result.stdout);
+    const latest = JSON.parse(readFileSync(path.join(resolveSharedSmokeStateRoot(repoRoot), 'latest.json'), 'utf8'));
+
+    assert.equal(output.status, 'passed');
+    assert.equal(latest.staging.status, 'passed');
+    assert.equal(latest.staging.waiversApplied.length, 1);
+    assert.equal(latest.staging.checks[0].waived, true);
+    assert.equal(latest.staging.checks[0].effectiveBlocking, false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('quarantined blocking smoke checks no longer fail the run when other blocking checks pass', async () => {
+  const repoRoot = createRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
+    writeFileSync(
+      path.join(repoRoot, 'e2e', 'auth.spec.ts'),
+      [
+        "test('@smoke-auth sign in', async () => {});",
+        "test('@smoke-app-shell boots', async () => {});",
+      ].join('\n'),
+      'utf8',
+    );
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.smoke = {
+        requireStagingSmoke: true,
+        staging: {
+          command: smokeResultCommand([
+            { tag: '@smoke-auth', status: 'failed' },
+            { tag: '@smoke-app-shell', status: 'passed' },
+          ], { exitCode: 1 }),
+        },
+      };
+    });
+    await writeSucceededDeployRecord(repoRoot, 'staging', '1111111111111111111111111111111111111111', ['frontend']);
+    runCli(['run', 'smoke', 'plan'], repoRoot);
+    updateSmokeRegistry(repoRoot, (registry) => {
+      registry.checks['@smoke-auth'].blocking = true;
+      registry.checks['@smoke-auth'].quarantine = true;
+      registry.checks['@smoke-app-shell'].blocking = true;
+      registry.checks['@smoke-app-shell'].quarantine = false;
+    });
+
+    const result = runCli(['run', 'smoke', 'staging', '--json'], repoRoot);
+    const output = JSON.parse(result.stdout);
+    const latest = JSON.parse(readFileSync(path.join(resolveSharedSmokeStateRoot(repoRoot), 'latest.json'), 'utf8'));
+    const authCheck = latest.staging.checks.find((check) => check.tag === '@smoke-auth');
+    const appShellCheck = latest.staging.checks.find((check) => check.tag === '@smoke-app-shell');
+
+    assert.equal(output.status, 'passed');
+    assert.equal(latest.staging.status, 'passed');
+    assert.equal(authCheck.status, 'failed');
+    assert.equal(authCheck.quarantine, true);
+    assert.equal(authCheck.effectiveBlocking, false);
+    assert.equal(appShellCheck.status, 'passed');
+    assert.equal(appShellCheck.effectiveBlocking, true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('non-blocking cohort failures stay visible without failing the smoke run', async () => {
+  const repoRoot = createRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.smoke = {
+        requireStagingSmoke: true,
+        staging: {
+          command: cohortSmokeResultCommand({
+            default: {
+              checks: [{ tag: '@smoke-auth', status: 'passed' }],
+              exitCode: 0,
+            },
+            beta: {
+              checks: [{ tag: '@smoke-auth', status: 'failed' }],
+              exitCode: 1,
+            },
+          }),
+          cohorts: [
+            { name: 'default', blocking: true },
+            { name: 'beta', blocking: false },
+          ],
+        },
+      };
+    });
+    await writeSucceededDeployRecord(repoRoot, 'staging', '1111111111111111111111111111111111111111', ['frontend']);
+    runCli(['run', 'smoke', 'plan'], repoRoot);
+    updateSmokeRegistry(repoRoot, (registry) => {
+      registry.checks['@smoke-auth'].blocking = true;
+      registry.checks['@smoke-auth'].quarantine = false;
+    });
+
+    const result = runCli(['run', 'smoke', 'staging', '--json'], repoRoot);
+    const output = JSON.parse(result.stdout);
+    const latest = JSON.parse(readFileSync(path.join(resolveSharedSmokeStateRoot(repoRoot), 'latest.json'), 'utf8'));
+    const authCheck = latest.staging.checks.find((check) => check.tag === '@smoke-auth');
+    const betaCohort = latest.staging.cohortResults.find((cohort) => cohort.name === 'beta');
+
+    assert.equal(output.status, 'passed');
+    assert.equal(latest.staging.status, 'passed');
+    assert.equal(authCheck.status, 'passed');
+    assert.equal(authCheck.effectiveBlocking, true);
+    assert.equal(betaCohort.status, 'failed');
+    assert.match(output.message, /Non-blocking cohort failures:/);
+    assert.match(output.message, /beta/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke waiver create rejects unknown or out-of-environment tags', async () => {
+  const repoRoot = createRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
+    runCli(['run', 'smoke', 'plan'], repoRoot);
+
+    const missingTag = runCli(
+      ['run', 'smoke', 'waiver', 'create', '@smoke-typo', 'staging', '--reason', 'known flake'],
+      repoRoot,
+      {},
+      true,
+    );
+    assert.notEqual(missingTag.status, 0);
+    assert.match(missingTag.stderr, /No smoke registry entry found for @smoke-typo/i);
+
+    const wrongEnvironment = runCli(
+      ['run', 'smoke', 'waiver', 'create', '@smoke-auth', 'prod', '--reason', 'known flake'],
+      repoRoot,
+      {},
+      true,
+    );
+    assert.notEqual(wrongEnvironment.status, 0);
+    assert.match(wrongEnvironment.stderr, /@smoke-auth is not configured for prod/i);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
   }
 });
 
@@ -1155,7 +1699,7 @@ test('every managed command template renders with an empty consumer-extension ma
     // the next re-sync. This test catches that at kit-time. pipelane is
     // in the list even though it's an "extra" (fixed filename, not
     // aliased) — same marker contract applies.
-    for (const cmd of ['clean', 'deploy', 'devmode', 'merge', 'new', 'pr', 'resume', 'pipelane']) {
+    for (const cmd of ['clean', 'deploy', 'devmode', 'merge', 'new', 'pr', 'resume', 'smoke', 'pipelane']) {
       const contents = readFileSync(path.join(repoRoot, '.claude', 'commands', `${cmd}.md`), 'utf8');
       assert.match(
         contents,
@@ -1182,7 +1726,7 @@ test('consumer-extension preservation works for every managed command', () => {
     runCli(['init', '--project', 'Demo App'], repoRoot);
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
-    const commands = ['clean', 'deploy', 'devmode', 'merge', 'new', 'pr', 'resume', 'pipelane'];
+    const commands = ['clean', 'deploy', 'devmode', 'merge', 'new', 'pr', 'resume', 'smoke', 'pipelane'];
     for (const cmd of commands) {
       const p = path.join(repoRoot, '.claude', 'commands', `${cmd}.md`);
       const seeded = readFileSync(p, 'utf8').replace(
@@ -1814,6 +2358,7 @@ test('syncDocs.packageScripts: false preserves consumer-customized workflow scri
       'pipelane:pr': 'my-wrapper pr',
       'pipelane:merge': 'my-wrapper merge',
       'pipelane:deploy': 'my-wrapper deploy',
+      'pipelane:smoke': 'my-wrapper smoke',
       'pipelane:clean': 'my-wrapper clean',
       'pipelane:devmode': 'my-wrapper devmode',
       'pipelane:status': 'my-wrapper status',
@@ -2518,11 +3063,19 @@ function buildFullDeployConfig(_options = {}) {
         deployWorkflow: 'Deploy Hosted',
         autoDeployOnMain: false,
         healthcheckUrl: 'https://app.example.test/health',
+        runtimeMarker: {
+          enabled: false,
+          path: '',
+        },
       },
       staging: {
         url: 'https://staging.example.test',
         deployWorkflow: 'Deploy Hosted',
         healthcheckUrl: 'https://staging.example.test/health',
+        runtimeMarker: {
+          enabled: false,
+          path: '',
+        },
       },
     },
     edge: {
@@ -2591,7 +3144,137 @@ function writeSharedDeployConfig(repoRoot, config = buildFullDeployConfig()) {
 
 async function fingerprintForFullConfig(options = {}, environment = 'staging') {
   const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'release-gate.ts'));
-  return mod.computeDeployConfigFingerprint(buildFullDeployConfig(options), environment);
+  const normalized = mod.parseDeployConfigMarkdown(mod.renderDeployConfigSection(buildFullDeployConfig(options)));
+  if (!normalized) {
+    throw new Error('Failed to normalize full deploy config for fingerprinting.');
+  }
+  return mod.computeDeployConfigFingerprint(normalized, environment);
+}
+
+function updateWorkflowConfig(repoRoot, updater) {
+  const configPath = path.join(repoRoot, '.pipelane.json');
+  const config = JSON.parse(readFileSync(configPath, 'utf8'));
+  updater(config);
+  writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+  return config;
+}
+
+function updateSmokeRegistry(repoRoot, updater) {
+  const registryPath = path.join(repoRoot, '.pipelane', 'smoke-checks.json');
+  const registry = JSON.parse(readFileSync(registryPath, 'utf8'));
+  updater(registry);
+  writeFileSync(registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
+  return registry;
+}
+
+function smokeResultCommand(checks, options = {}) {
+  const payload = {
+    schemaVersion: 1,
+    checks,
+  };
+  const payloadLiteral = JSON.stringify(JSON.stringify(payload));
+  const exitCode = Number.isFinite(options.exitCode) ? Number(options.exitCode) : inferSmokeExitCode(checks);
+  return `node -e 'require(\"node:fs\").writeFileSync(process.env.PIPELANE_SMOKE_RESULTS_PATH, ${payloadLiteral}); process.exit(${exitCode})'`;
+}
+
+function cohortSmokeResultCommand(resultsByCohort) {
+  const payloadLiteral = JSON.stringify(JSON.stringify(resultsByCohort));
+  return [
+    'node -e',
+    `'const fs = require("node:fs");`,
+    `const results = JSON.parse(${payloadLiteral});`,
+    'const cohort = process.env.PIPELANE_COHORT || "default";',
+    'const response = results[cohort] || results.default;',
+    'if (!response) process.exit(2);',
+    'const payload = { schemaVersion: 1, checks: response.checks || [] };',
+    'fs.writeFileSync(process.env.PIPELANE_SMOKE_RESULTS_PATH, JSON.stringify(payload));',
+    'process.exit(Number.isFinite(response.exitCode) ? response.exitCode : ((response.checks || []).some((check) => check.status === "failed") ? 1 : 0));',
+    `'`,
+  ].join(' ');
+}
+
+function inferSmokeExitCode(checks) {
+  return checks.some((check) => check.status === 'failed') ? 1 : 0;
+}
+
+function resolveCommonDir(repoRoot) {
+  return path.resolve(repoRoot, run('git', ['rev-parse', '--git-common-dir'], repoRoot));
+}
+
+function resolveSharedSmokeStateRoot(repoRoot) {
+  return path.join(path.dirname(resolveCommonDir(repoRoot)), '.pipelane', 'state', 'smoke');
+}
+
+function writeTaskLock(repoRoot, taskSlug = 'bootstrap', options = {}) {
+  const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(
+    path.join(stateDir, `${taskSlug}.json`),
+    `${JSON.stringify({
+      taskSlug,
+      branchName: run('git', ['branch', '--show-current'], repoRoot),
+      worktreePath: repoRoot,
+      mode: options.mode || 'release',
+      surfaces: options.surfaces || ['frontend'],
+      updatedAt: '2026-04-22T00:00:00Z',
+    }, null, 2)}\n`,
+    'utf8',
+  );
+}
+
+function writePrRecord(repoRoot, taskSlug, mergedSha) {
+  const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(
+    path.join(stateDir, 'pr-state.json'),
+    `${JSON.stringify({
+      records: {
+        [taskSlug]: {
+          taskSlug,
+          branchName: run('git', ['branch', '--show-current'], repoRoot),
+          title: 'Smoke gate test',
+          mergedSha,
+          mergedAt: '2026-04-22T00:00:00Z',
+          updatedAt: '2026-04-22T00:00:00Z',
+        },
+      },
+    }, null, 2)}\n`,
+    'utf8',
+  );
+}
+
+async function writeSucceededDeployRecord(repoRoot, environment, sha, surfaces = ['frontend'], options = {}) {
+  const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+  mkdirSync(stateDir, { recursive: true });
+  const existingPath = path.join(stateDir, 'deploy-state.json');
+  const existing = existsSync(existingPath)
+    ? JSON.parse(readFileSync(existingPath, 'utf8'))
+    : { records: [] };
+  const fingerprint = await fingerprintForFullConfig({}, environment === 'prod' ? 'prod' : 'staging');
+  const host = environment === 'prod' ? 'https://app.example.test' : 'https://staging.example.test';
+  const verificationBySurface = Object.fromEntries(surfaces.map((surface) => [
+    surface,
+    { healthcheckUrl: `${host}/${surface}-health`, statusCode: 200, latencyMs: 50, probes: 2 },
+  ]));
+  existing.records.push({
+    environment,
+    sha,
+    surfaces,
+    workflowName: 'Deploy Hosted',
+    requestedAt: '2026-04-22T00:00:00Z',
+    finishedAt: '2026-04-22T00:01:00Z',
+    durationMs: 60000,
+    taskSlug: options.taskSlug || 'bootstrap',
+    status: 'succeeded',
+    workflowRunId: `${environment}-run-1`,
+    verifiedAt: '2026-04-22T00:01:30Z',
+    verification: verificationBySurface.frontend ?? verificationBySurface[surfaces[0]],
+    verificationBySurface,
+    configFingerprint: fingerprint,
+    idempotencyKey: `${environment}-${sha.slice(0, 8)}`,
+    triggeredBy: 'test',
+  });
+  writeFileSync(existingPath, `${JSON.stringify(existing, null, 2)}\n`, 'utf8');
 }
 
 async function writeStagingSucceededRecord(repoRoot, surfaces, options = {}) {
@@ -3770,6 +4453,50 @@ test('merge skips auto-deploy in build mode when autoDeployOnMerge is disabled',
   }
 });
 
+test('merge refreshes origin/base and leaves local main untouched', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_PR_MERGE_PUSH_HEAD: '1',
+    GH_PR_MERGE_BASE: 'main',
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    runCli(['run', 'devmode', 'release', '--override', '--reason', 'test merge receipt'], repoRoot);
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Merge Receipt', '--json'], repoRoot).stdout);
+    const branchName = run('git', ['branch', '--show-current'], created.worktreePath);
+    const localMainBefore = run('git', ['rev-parse', 'main'], repoRoot);
+
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Merge Receipt', '--json'], created.worktreePath, env);
+
+    const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
+    const originMainAfter = run('git', ['rev-parse', 'origin/main'], created.worktreePath);
+    const localMainAfter = run('git', ['rev-parse', 'main'], repoRoot);
+
+    assert.equal(originMainAfter, merged.mergedSha);
+    assert.equal(localMainAfter, localMainBefore, 'local main should remain untouched');
+    assert.notEqual(localMainAfter, merged.mergedSha, 'merge must not fast-forward the local main branch');
+    assert.equal(run('git', ['branch', '--show-current'], created.worktreePath), branchName);
+    assert.match(merged.message, /Refreshed origin\/main:/);
+    assert.match(merged.message, /Remote base matches the merged SHA/);
+    assert.match(merged.message, /Current worktree branch remains/);
+    assert.match(merged.message, /Local base checkouts were not changed/);
+    assert.match(merged.message, /Stay in this task worktree and deploy staging from here/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
 test('deploy verifies via gh run watch + healthcheck stubs and records status=succeeded', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
@@ -4145,7 +4872,7 @@ test('merge fails closed when gh never reports mergeCommit.oid', () => {
   writeFileSync(
     ghPath,
     original.replace(
-      "pr.mergeCommit = { oid: 'deadbeefcafebabe' };",
+      "pr.mergeCommit = { oid: mergeSha };",
       "pr.state = 'MERGED'; pr.mergeCommit = null;",
     ),
     { mode: 0o755, encoding: 'utf8' },
@@ -4658,7 +5385,7 @@ test('dashboard proxies pipelane:api routes and persists local board settings', 
 async function runCliAsync(args, cwd, env = {}) {
   const child = spawn('node', [CLI_PATH, ...args], {
     cwd,
-    env: { ...process.env, ...env },
+    env: { ...process.env, CODEX_HOME: DEFAULT_CODEX_HOME, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';
@@ -4863,7 +5590,7 @@ test('api snapshot emits a wire-compatible envelope', () => {
     const result = runCli(['run', 'api', 'snapshot'], repoRoot);
     const envelope = JSON.parse(result.stdout);
 
-    assert.equal(envelope.schemaVersion, '2026-04-18');
+    assert.equal(envelope.schemaVersion, '2026-04-22');
     assert.equal(envelope.command, 'pipelane.api.snapshot');
     assert.equal(envelope.ok, true);
     assert.ok(Array.isArray(envelope.warnings));
@@ -4898,7 +5625,128 @@ test('api snapshot emits a wire-compatible envelope', () => {
   }
 });
 
-test('api snapshot marks staging as bypassed in build mode', () => {
+test('api snapshot computes release readiness from observed deploys and probes', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    await writeStagingSucceededRecord(repoRoot, ['frontend', 'edge', 'sql']);
+    runCli(['run', 'devmode', 'release'], repoRoot);
+
+    const result = runCli(['run', 'api', 'snapshot'], repoRoot);
+    const envelope = JSON.parse(result.stdout);
+    const release = envelope.data.boardContext.releaseReadiness;
+
+    assert.equal(release.state, 'healthy');
+    assert.equal(release.reason, 'requested surfaces passed observed staging + probe checks');
+    assert.deepEqual(release.blockedSurfaces, []);
+    assert.equal(release.localReady, true);
+    assert.equal(release.hostedReady, true);
+    assert.match(release.message, /Release mode is active and requested surfaces passed observed staging \+ probe checks\./);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('api snapshot distinguishes config readiness from hosted readiness when staging evidence is missing', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    runCli(['run', 'devmode', 'release', '--override', '--reason', 'snapshot readiness fixture'], repoRoot);
+
+    const result = runCli(['run', 'api', 'snapshot'], repoRoot);
+    const envelope = JSON.parse(result.stdout);
+    const release = envelope.data.boardContext.releaseReadiness;
+
+    assert.equal(release.state, 'blocked');
+    assert.equal(release.localReady, true);
+    assert.equal(release.hostedReady, false);
+    assert.deepEqual([...release.blockedSurfaces].sort(), ['edge', 'frontend', 'sql']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('api snapshot only marks missing staging smoke as blocking when the repo opts into the smoke gate', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    runCli(['run', 'devmode', 'release', '--surfaces', 'frontend', '--override', '--reason', 'snapshot smoke fixture'], repoRoot);
+
+    const advisoryEnvelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    const advisoryIssue = advisoryEnvelope.data.attention.find((issue) => issue.code === 'smoke.staging.missing');
+    const advisorySource = advisoryEnvelope.data.sourceHealth.find((entry) => entry.name === 'smoke.staging');
+    assert.equal(advisoryIssue.severity, 'warning');
+    assert.equal(advisoryIssue.blocking, false);
+    assert.equal(advisorySource.blocking, false);
+
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.smoke = {
+        requireStagingSmoke: true,
+        staging: { command: 'node -e "process.exit(0)"' },
+      };
+    });
+
+    const blockingEnvelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    const blockingIssue = blockingEnvelope.data.attention.find((issue) => issue.code === 'smoke.staging.missing');
+    const blockingSource = blockingEnvelope.data.sourceHealth.find((entry) => entry.name === 'smoke.staging');
+    assert.equal(blockingIssue.severity, 'error');
+    assert.equal(blockingIssue.blocking, true);
+    assert.equal(blockingSource.blocking, true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('api snapshot surfaces blocking smoke coverage gaps that would stop prod promotion', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.smoke = {
+        requireStagingSmoke: true,
+        criticalPathCoverage: 'block',
+        criticalPaths: ['billing'],
+        staging: { command: smokeResultCommand([{ tag: '@smoke-auth', status: 'passed' }]) },
+      };
+    });
+    await writeSucceededDeployRecord(repoRoot, 'staging', '1111111111111111111111111111111111111111', ['frontend']);
+    writeHealthyProbeState(repoRoot, ['frontend']);
+    runCli(['run', 'smoke', 'plan'], repoRoot);
+    updateSmokeRegistry(repoRoot, (registry) => {
+      registry.checks['@smoke-auth'].blocking = true;
+      registry.checks['@smoke-auth'].quarantine = false;
+    });
+    runCli(['run', 'smoke', 'staging'], repoRoot);
+    runCli(['run', 'devmode', 'release', '--surfaces', 'frontend', '--override', '--reason', 'coverage snapshot fixture'], repoRoot);
+
+    const result = await runCliAsync(['run', 'api', 'snapshot'], repoRoot);
+    assert.equal(result.status, 0);
+    const envelope = JSON.parse(result.stdout);
+    const coverageIssue = envelope.data.attention.find((issue) => issue.code === 'smoke.coverage.missing');
+    const coverageSource = envelope.data.sourceHealth.find((entry) => entry.name === 'smoke.coverage');
+
+    assert.equal(coverageIssue.severity, 'error');
+    assert.equal(coverageIssue.blocking, true);
+    assert.match(coverageIssue.message, /billing/);
+    assert.equal(coverageSource.state, 'blocked');
+    assert.equal(coverageSource.blocking, true);
+    assert.match(coverageSource.reason, /billing/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('api snapshot marks staging as bypassed in build mode', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
@@ -4923,13 +5771,50 @@ test('api snapshot marks staging as bypassed in build mode', () => {
       },
     }, null, 2), 'utf8');
 
-    const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    const result = await runCliAsync(['run', 'api', 'snapshot'], repoRoot);
+    assert.equal(result.status, 0);
+    const envelope = JSON.parse(result.stdout);
     const [branch] = envelope.data.branches;
     assert.equal(branch.lanes.staging.state, 'bypassed', 'build mode bypasses staging');
     assert.equal(branch.lanes.production.state, 'awaiting_preflight', 'no prod deploy recorded');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('deploy releases the shared smoke environment lock when the workflow fails after lock acquisition', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(fakeBin, 'gh-state.json');
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    writeTaskLock(repoRoot, 'bootstrap', { mode: 'build', surfaces: ['frontend'] });
+    writeFakeGh(fakeBin, ghStateFile);
+
+    const result = runCli(
+      ['run', 'deploy', 'staging', '--task', 'bootstrap'],
+      repoRoot,
+      {
+        PATH: `${fakeBin}:${process.env.PATH}`,
+        GH_STATE_FILE: ghStateFile,
+        PIPELANE_DEPLOY_WATCH_STUB: 'failed',
+      },
+      true,
+    );
+
+    assert.notEqual(result.status, 0);
+    assert.ok(
+      !existsSync(path.join(resolveSharedSmokeStateRoot(repoRoot), 'locks', 'staging.json')),
+      'staging smoke/deploy lock should be removed on failure',
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
   }
 });
 
@@ -5014,7 +5899,7 @@ test('api action preflight: non-risky action returns no confirmation', () => {
     commitAll(repoRoot, 'Adopt pipelane');
 
     const envelope = JSON.parse(runCli(['run', 'api', 'action', 'resume'], repoRoot).stdout);
-    assert.equal(envelope.schemaVersion, '2026-04-18');
+    assert.equal(envelope.schemaVersion, '2026-04-22');
     assert.equal(envelope.command, 'pipelane.api.action');
     assert.equal(envelope.data.action.id, 'resume');
     assert.equal(envelope.data.action.risky, false);
@@ -5772,7 +6657,7 @@ test('buildWorkflowApiSnapshot surfaces TaskLock.nextAction through the envelope
       nextAction: 'PR #42 open, awaiting CI',
     });
 
-    const envelope = snapshotMod.buildWorkflowApiSnapshot(repoRoot);
+    const envelope = await snapshotMod.buildWorkflowApiSnapshot(repoRoot);
     assert.ok(envelope.ok, 'snapshot should be ok');
     const demoBranch = envelope.data.branches.find((b) => b.task?.taskSlug === 'demo-task');
     assert.ok(demoBranch, 'expected demo-task branch in envelope');
@@ -6503,6 +7388,16 @@ test('pipelane:api snapshot surfaces probeState rollup + deployProbe.* sourceHea
       'stale',
       'probeState rollup surfaces staleness',
     );
+    assert.equal(
+      envelope.data.boardContext.releaseReadiness.state,
+      'degraded',
+      'releaseReadiness state reflects stale probe failures instead of a placeholder value',
+    );
+    assert.deepEqual(
+      [...envelope.data.boardContext.releaseReadiness.blockedSurfaces].sort(),
+      ['edge', 'frontend', 'sql'],
+      'stale probes block the requested release surfaces',
+    );
     assert.ok(
       envelope.data.sourceHealth.some((entry) => entry.name === 'deployProbe.frontend'),
       'deployProbe.frontend in sourceHealth',
@@ -6542,6 +7437,232 @@ test('pipelane:api snapshot surfaces unsupported configured probes explicitly', 
     assert.match(issue.message, /worker/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('pipelane:api snapshot reports runtime unavailable when runtime-marker capability is off', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    const result = await runCliAsync(['run', 'api', 'snapshot'], repoRoot);
+    assert.equal(result.status, 0);
+    const envelope = JSON.parse(result.stdout);
+    assert.equal(envelope.data.boardContext.currentCheckout.layers.runtime.health, 'unavailable');
+    assert.equal(envelope.data.boardContext.currentCheckout.relationships.runtimeToDeploy.state, 'not-comparable');
+    assert.equal(
+      envelope.data.attention.some((issue) => issue.code === 'runtime.provenance.drift'),
+      false,
+      'no runtime drift warning when capability is disabled',
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('pipelane:api snapshot reports runtime unknown when runtime marker is enabled but missing', async () => {
+  const repoRoot = createRepo();
+  const markerServer = await startRuntimeMarkerServer((req, res) => {
+    res.writeHead(404);
+    res.end();
+  });
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const config = buildFullDeployConfig();
+    config.frontend.production.url = markerServer.baseUrl;
+    config.frontend.production.runtimeMarker = { enabled: true, path: '/.well-known/pipelane-release.json' };
+    writeSharedDeployConfig(repoRoot, config);
+
+    const result = await runCliAsync(['run', 'api', 'snapshot'], repoRoot);
+    assert.equal(result.status, 0);
+    const envelope = JSON.parse(result.stdout);
+    assert.equal(envelope.data.boardContext.currentCheckout.layers.runtime.health, 'unknown');
+    assert.equal(envelope.data.boardContext.currentCheckout.relationships.runtimeToDeploy.state, 'not-comparable');
+    const runtimeSource = envelope.data.sourceHealth.find((entry) => entry.name === 'runtime.frontend.production');
+    assert.ok(runtimeSource, 'runtime source health row should exist');
+    assert.equal(runtimeSource.blocking, false);
+    assert.equal(
+      markerServer.hits.filter((entry) => entry === '/.well-known/pipelane-release.json').length,
+      1,
+      'snapshot should attempt one live runtime read',
+    );
+  } finally {
+    await markerServer.close();
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('pipelane:api snapshot treats runtime marker without a production URL as advisory unknown state', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const config = buildFullDeployConfig();
+    config.frontend.production.url = '';
+    config.frontend.production.runtimeMarker = { enabled: true, path: '/.well-known/pipelane-release.json' };
+    writeSharedDeployConfig(repoRoot, config);
+
+    const result = await runCliAsync(['run', 'api', 'snapshot'], repoRoot);
+    assert.equal(result.status, 0);
+    const envelope = JSON.parse(result.stdout);
+    const runtimeLayer = envelope.data.boardContext.currentCheckout.layers.runtime;
+    const runtimeSource = envelope.data.sourceHealth.find((entry) => entry.name === 'runtime.frontend.production');
+
+    assert.equal(runtimeLayer.health, 'unknown');
+    assert.match(runtimeLayer.reason, /frontend URL is not configured/);
+    assert.ok(runtimeSource, 'runtime source health row should exist');
+    assert.equal(runtimeSource.state, 'unknown');
+    assert.equal(runtimeSource.blocking, false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('observeFrontendRuntime times out quickly and reports request failures as unknown', async () => {
+  const markerServer = await startRuntimeMarkerServer(() => {
+    // Intentionally never respond; the observation timeout should abort first.
+  });
+  try {
+    const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'runtime-observation.ts'));
+    const config = buildFullDeployConfig();
+    config.frontend.production.url = markerServer.baseUrl;
+    config.frontend.production.runtimeMarker = { enabled: true, path: '/.well-known/pipelane-release.json' };
+    const startedAt = Date.now();
+    const observation = await mod.observeFrontendRuntime({
+      deployConfig: config,
+      environment: 'prod',
+      timeoutMs: 25,
+    });
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.equal(observation.health, 'unknown');
+    assert.match(observation.reason, /timed out/i);
+    assert.ok(elapsedMs < 1000, `runtime observation should fail fast, got ${elapsedMs}ms`);
+  } finally {
+    await markerServer.close();
+  }
+});
+
+test('pipelane:api snapshot surfaces runtime drift when live production differs from recorded deploy history', async () => {
+  const repoRoot = createRepo();
+  const markerServer = await startRuntimeMarkerServer((req, res) => {
+    if (req.url === '/.well-known/pipelane-release.json') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        surface: 'frontend',
+        environment: 'production',
+        sha: '2222222222222222222222222222222222222222',
+        deployedAt: '2026-04-22T19:12:32.284Z',
+        source: 'test',
+      }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const config = buildFullDeployConfig();
+    config.frontend.production.url = markerServer.baseUrl;
+    config.frontend.production.autoDeployOnMain = false;
+    config.frontend.production.runtimeMarker = { enabled: true, path: '/.well-known/pipelane-release.json' };
+    writeSharedDeployConfig(repoRoot, config);
+    await writeSucceededDeployRecord(
+      repoRoot,
+      'prod',
+      '1111111111111111111111111111111111111111',
+      ['frontend'],
+    );
+
+    const result = await runCliAsync(['run', 'api', 'snapshot'], repoRoot);
+    assert.equal(result.status, 0);
+    const envelope = JSON.parse(result.stdout);
+    assert.equal(envelope.data.boardContext.currentCheckout.layers.runtime.health, 'healthy');
+    assert.equal(envelope.data.boardContext.currentCheckout.relationships.runtimeToDeploy.state, 'drift');
+    const drift = envelope.data.attention.find((issue) => issue.code === 'runtime.provenance.drift');
+    assert.ok(drift, 'expected explicit runtime provenance drift warning');
+    assert.match(drift.message, /live SHA differs from the latest recorded Pipelane deploy/);
+  } finally {
+    await markerServer.close();
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('branch detail does not trigger a second runtime marker fetch', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const markerServer = await startRuntimeMarkerServer((req, res) => {
+    if (req.url === '/.well-known/pipelane-release.json') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        surface: 'frontend',
+        environment: 'production',
+        sha: '3333333333333333333333333333333333333333',
+        deployedAt: '2026-04-22T19:12:32.284Z',
+        source: 'test',
+      }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const config = buildFullDeployConfig();
+    config.frontend.production.url = markerServer.baseUrl;
+    config.frontend.production.runtimeMarker = { enabled: true, path: '/.well-known/pipelane-release.json' };
+    writeSharedDeployConfig(repoRoot, config);
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Branch Fetch Guard', '--json'], repoRoot).stdout);
+    const branchName = run('git', ['branch', '--show-current'], created.worktreePath);
+
+    const snapshot = await runCliAsync(['run', 'api', 'snapshot'], created.worktreePath);
+    assert.equal(snapshot.status, 0);
+    assert.equal(markerServer.hits.length, 1, 'snapshot should fetch runtime marker once');
+
+    const branchDetails = await runCliAsync(['run', 'api', 'branch', '--branch', branchName], created.worktreePath);
+    assert.equal(branchDetails.status, 0);
+    assert.equal(markerServer.hits.length, 1, 'branch detail must not rebuild the runtime shell');
+  } finally {
+    await markerServer.close();
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('stale-base warning only appears when the current checkout itself is on the base branch', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const updaterRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-updater-'));
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    execFileSync('git', ['clone', remoteRoot, updaterRoot], { stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['config', 'user.email', 'codex@example.com'], { cwd: updaterRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['config', 'user.name', 'Codex'], { cwd: updaterRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    writeFileSync(path.join(updaterRoot, 'remote.txt'), 'advance main\n', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: updaterRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Advance remote main'], { cwd: updaterRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['push', 'origin', 'main'], { cwd: updaterRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    execFileSync('git', ['fetch', 'origin', 'main'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const baseSnapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    assert.ok(
+      baseSnapshot.data.attention.some((issue) => issue.code === 'git.base.stale'),
+      'expected stale-base warning on the base checkout itself',
+    );
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'No Base Warning', '--json'], repoRoot).stdout);
+    const taskSnapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], created.worktreePath).stdout);
+    assert.equal(
+      taskSnapshot.data.attention.some((issue) => issue.code === 'git.base.stale'),
+      false,
+      'task worktrees should not inherit stale-base warnings for someone else’s main checkout',
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(updaterRoot, { recursive: true, force: true });
   }
 });
 

@@ -13,6 +13,7 @@ import { handleReleaseCheck } from './commands/release-check.ts';
 import { handleRepoGuard } from './commands/repo-guard.ts';
 import { handleResume } from './commands/resume.ts';
 import { handleRollback } from './commands/rollback.ts';
+import { handleSmoke } from './commands/smoke.ts';
 import { handleStatus } from './commands/status.ts';
 import { handleTaskLock } from './commands/task-lock.ts';
 import { loadDeployConfig } from './release-gate.ts';
@@ -99,6 +100,11 @@ export async function runOperator(cwd: string, argv: string[]): Promise<void> {
     return;
   }
 
+  if (command === 'smoke') {
+    await handleSmoke(cwd, parsed);
+    return;
+  }
+
   if (command === 'status') {
     await handleStatus(cwd, parsed);
     return;
@@ -145,6 +151,7 @@ Pipelane commands:
   task-lock
   deploy
   clean
+  smoke
   status
   doctor [--probe | --fix]
   rollback <staging|prod> [--surfaces ...] [--revert-pr]

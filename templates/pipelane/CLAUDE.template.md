@@ -13,8 +13,9 @@ This file is local-only operator state. Keep it git-ignored.
   3. `npm run pipelane:pr -- --title "<pr title>"`
   4. `npm run pipelane:merge`
   5. `npm run pipelane:deploy -- staging`
-  6. `npm run pipelane:deploy -- prod`
-  7. `npm run pipelane:clean`
+  6. `npm run pipelane:smoke -- staging`
+  7. `npm run pipelane:deploy -- prod`
+  8. `npm run pipelane:clean`
 - Use `npm run pipelane:resume -- --task "<task-name>"` only when returning to an existing task workspace.
 - Use `npm run pipelane:status` (or `{{ALIAS_STATUS}}`) to see the cockpit before acting.
 - Use `npm run pipelane:doctor` (or `{{ALIAS_DOCTOR}}`) to diagnose deploy config and probe staging health. Run `npm run pipelane:doctor -- --probe` after a staging deploy to refresh the release gate's freshness check.
@@ -32,6 +33,7 @@ Key routing rules:
 - Prepare or update a PR -> `{{ALIAS_PR}}`
 - Merge the current PR -> `{{ALIAS_MERGE}}`
 - Deploy the merged SHA -> `{{ALIAS_DEPLOY}}`
+- Plan smoke coverage or run smoke -> `{{ALIAS_SMOKE}}`
 - Cleanup or stale workspace inspection -> `{{ALIAS_CLEAN}}`
 - One-screen cockpit of task + lane state -> `{{ALIAS_STATUS}}`
 - Diagnose deploy config or refresh staging probes -> `{{ALIAS_DOCTOR}}`

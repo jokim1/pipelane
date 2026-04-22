@@ -1,10 +1,13 @@
 import { existsSync } from 'node:fs';
 
-import type { DeployRecord, PrRecord, ProbeState, TaskLock, WorkflowConfig } from '../state.ts';
+import type { DeployRecord, PrRecord, ProbeState, SmokeEnvironmentLock, SmokeRunRecord, TaskLock, WorkflowConfig } from '../state.ts';
 import {
   DEFAULT_MODE,
   loadAllTaskLocks,
   loadDeployState,
+  loadSmokeEnvironmentLock,
+  loadSmokeLatestState,
+  loadSmokeRegistry,
   loadPrState,
   loadProbeState,
   nowIso,
@@ -13,15 +16,22 @@ import {
 } from '../state.ts';
 import {
   emptyDeployConfig,
+  evaluateReleaseReadiness,
   explainSurfaceProbe,
   isReleaseManagedSurface,
   loadDeployConfig,
   resolveSurfaceProbeUrl,
   unsupportedSurfaceReason,
   type DeployConfig,
+  type ReleaseReadinessBlocker,
   type ProbeFreshnessState,
   type ProbeSurfaceFreshness,
 } from '../release-gate.ts';
+import { evaluateSmokeCoverage, resolveSmokeConfig } from '../smoke-gate.ts';
+import {
+  observeFrontendRuntime,
+  type FrontendRuntimeObservation,
+} from '../runtime-observation.ts';
 import {
   buildApiActionState,
   buildApiEnvelope,
@@ -34,6 +44,8 @@ import {
   type ApiIssue,
   type ApiStatusCell,
   type LaneState,
+  type ShellLayerHealth,
+  type ShellRelationshipState,
   type SourceHealthEntry,
 } from './envelope.ts';
 
@@ -74,6 +86,40 @@ export interface BranchRow {
   availableActions: ApiActionState[];
 }
 
+export interface CheckoutTruthLayer {
+  label: string;
+  health: ShellLayerHealth;
+  sha: string | null;
+  reason: string;
+  detail: string;
+  freshness: ReturnType<typeof buildFreshness>;
+}
+
+export interface CheckoutTruthRelationship {
+  state: ShellRelationshipState;
+  reason: string;
+}
+
+export interface CurrentCheckoutTruth {
+  branchName: string;
+  baseBranch: string;
+  taskSlug: string | null;
+  nextAction: string | null;
+  summary: string;
+  layers: {
+    worktree: CheckoutTruthLayer;
+    origin: CheckoutTruthLayer;
+    deploy: CheckoutTruthLayer;
+    runtime: CheckoutTruthLayer;
+  };
+  relationships: {
+    worktreeToOrigin: CheckoutTruthRelationship;
+    deployToOrigin: CheckoutTruthRelationship;
+    runtimeToDeploy: CheckoutTruthRelationship;
+    runtimeToOrigin: CheckoutTruthRelationship;
+  };
+}
+
 export interface SnapshotData {
   boardContext: {
     mode: string;
@@ -111,7 +157,13 @@ export interface SnapshotData {
       surfaces: string[];
       updatedAt: string | null;
     };
+    currentCheckout: CurrentCheckoutTruth;
     overallFreshness: ReturnType<typeof buildFreshness>;
+  };
+  smoke: {
+    staging: SmokeRunRecord | null;
+    prod: SmokeRunRecord | null;
+    locks: SmokeEnvironmentLock[];
   };
   sourceHealth: SourceHealthEntry[];
   attention: unknown[];
@@ -119,41 +171,72 @@ export interface SnapshotData {
   branches: BranchRow[];
 }
 
-export function buildWorkflowApiSnapshot(cwd: string): ApiEnvelope<SnapshotData> {
+export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope<SnapshotData>> {
   const context = resolveWorkflowContext(cwd);
   const baseBranch = context.config.baseBranch;
   const currentBranch = runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
+  const currentHeadSha = runGit(context.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '';
   const mode = context.modeState.mode ?? DEFAULT_MODE;
   const checkedAt = nowIso();
 
   const locks = loadAllTaskLocks(context.commonDir, context.config);
   const prState = loadPrState(context.commonDir, context.config);
   const deployState = loadDeployState(context.commonDir, context.config);
+  const smokeLatest = loadSmokeLatestState(context.commonDir, context.config);
+  const smokeConfig = resolveSmokeConfig(context.config);
+  const smokeRegistry = loadSmokeRegistry(context.repoRoot, context.config);
+  const smokeLocks = (['staging', 'prod'] as const)
+    .map((environment) => loadSmokeEnvironmentLock(context.commonDir, environment))
+    .filter((entry): entry is SmokeEnvironmentLock => entry !== null);
   const probeState = loadProbeState(context.commonDir, context.config);
   const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
+  const requestedSurfaces = context.modeState.requestedSurfaces ?? context.config.surfaces;
+  const smokeCoverage = evaluateSmokeCoverage({
+    registry: smokeRegistry,
+    environment: 'staging',
+    config: context.config,
+  });
+  const smokeCoverageBlocking = mode === 'release'
+    && smokeConfig.requireStagingSmoke
+    && smokeCoverage.mode === 'block'
+    && smokeCoverage.uncoveredCriticalPaths.length > 0;
   const surfaceProbes = collectSurfaceProbes({
     deployConfig,
     probeState,
-    surfaces: context.config.surfaces,
+    surfaces: requestedSurfaces,
   });
   const probeRollup = rollupProbeState(surfaceProbes);
   const baseBranchSha = runGit(context.repoRoot, ['rev-parse', '--verify', `origin/${baseBranch}`], true)?.trim() ?? '';
+  const runtimeObservation = await observeFrontendRuntime({
+    deployConfig,
+    environment: 'prod',
+  });
 
-  const branches: BranchRow[] = locks.map((lock) =>
-    buildBranchRow({
-      lock,
-      config: context.config,
-      currentBranch,
-      baseBranch,
-      baseBranchSha,
-      prRecord: prState.records[lock.taskSlug] ?? null,
-      deployRecords: deployState.records,
-      mode,
-      checkedAt,
-    }),
-  );
+  const branches = buildBranchRows({
+    locks,
+    config: context.config,
+    currentBranch,
+    baseBranch,
+    baseBranchSha,
+    prRecords: prState.records,
+    deployRecords: deployState.records,
+    mode,
+    checkedAt,
+  });
 
   const activeLock = locks.find((lock) => lock.branchName === currentBranch) ?? null;
+  const currentCheckout = buildCurrentCheckoutTruth({
+    checkedAt,
+    currentBranch,
+    currentHeadSha,
+    baseBranch,
+    baseBranchSha,
+    activeLock,
+    currentPrRecord: activeLock ? prState.records[activeLock.taskSlug] ?? null : null,
+    deployRecords: deployState.records,
+    deployConfig,
+    runtimeObservation,
+  });
 
   const sourceHealth: SourceHealthEntry[] = [
     buildSourceHealthEntry({
@@ -178,6 +261,49 @@ export function buildWorkflowApiSnapshot(cwd: string): ApiEnvelope<SnapshotData>
       observedAt: entry.result.probe?.probedAt,
       stale: entry.result.state === 'stale',
     })),
+    buildSourceHealthEntry({
+      name: 'smoke.staging',
+      state: smokeLaneState(smokeLatest.staging),
+      blocking: context.modeState.mode === 'release' && smokeConfig.requireStagingSmoke,
+      reason: describeSmokeSummary(smokeLatest.staging, 'staging'),
+      checkedAt,
+      observedAt: smokeLatest.staging?.finishedAt,
+    }),
+    buildSourceHealthEntry({
+      name: 'smoke.prod',
+      state: smokeLaneState(smokeLatest.prod),
+      blocking: false,
+      reason: describeSmokeSummary(smokeLatest.prod, 'prod'),
+      checkedAt,
+      observedAt: smokeLatest.prod?.finishedAt,
+    }),
+    ...(smokeConfig.criticalPaths.length > 0
+      ? [
+          buildSourceHealthEntry({
+            name: 'smoke.coverage',
+            state: smokeCoverage.uncoveredCriticalPaths.length === 0
+              ? 'healthy'
+              : smokeCoverageBlocking
+                ? 'blocked'
+                : 'degraded',
+            blocking: smokeCoverageBlocking,
+            reason: smokeCoverage.uncoveredCriticalPaths.length === 0
+              ? 'critical paths covered by the smoke registry'
+              : `critical path smoke gaps: ${smokeCoverage.uncoveredCriticalPaths.join(', ')}`,
+            checkedAt,
+          }),
+        ]
+      : []),
+    buildSourceHealthEntry({
+      name: 'runtime.frontend.production',
+      state: mapShellHealthToLaneState(runtimeObservation.health),
+      // Runtime provenance is advisory: it helps explain what is live in
+      // production, but it is not itself a promotion gate.
+      blocking: false,
+      reason: runtimeObservation.reason,
+      checkedAt,
+      observedAt: runtimeObservation.observedAt,
+    }),
   ];
 
   const attention: ApiIssue[] = [];
@@ -205,6 +331,75 @@ export function buildWorkflowApiSnapshot(cwd: string): ApiEnvelope<SnapshotData>
       action: 'doctor.probe',
     }));
   }
+  for (const lock of smokeLocks) {
+    attention.push(buildApiIssue({
+      code: 'smoke.locked',
+      severity: 'warning',
+      message: `${lock.environment} ${lock.operation} in progress: ${lock.runId}.`,
+      source: 'smokeLock',
+      blocking: false,
+      lane: lock.environment,
+    }));
+  }
+  if (!smokeLatest.staging) {
+    attention.push(buildApiIssue({
+      code: 'smoke.staging.missing',
+      severity: context.modeState.mode === 'release' && smokeConfig.requireStagingSmoke ? 'error' : 'warning',
+      message: 'No staging smoke history yet. Run `pipelane:smoke -- staging` before promoting.',
+      source: 'smokeLatest',
+      blocking: context.modeState.mode === 'release' && smokeConfig.requireStagingSmoke,
+      lane: 'staging',
+      action: 'smoke.staging',
+    }));
+  } else if (smokeLatest.staging?.status === 'failed') {
+    attention.push(buildApiIssue({
+      code: 'smoke.staging.failed',
+      severity: context.modeState.mode === 'release' && smokeConfig.requireStagingSmoke ? 'error' : 'warning',
+      message: `Latest staging smoke failed for ${smokeLatest.staging.sha.slice(0, 7)}.`,
+      source: 'smokeLatest',
+      blocking: context.modeState.mode === 'release' && smokeConfig.requireStagingSmoke,
+      lane: 'staging',
+      action: 'smoke.staging',
+    }));
+  }
+  if (smokeLatest.prod?.status === 'failed') {
+    attention.push(buildApiIssue({
+      code: 'smoke.prod.failed',
+      severity: 'warning',
+      message: `Latest prod smoke failed for ${smokeLatest.prod.sha.slice(0, 7)}.`,
+      source: 'smokeLatest',
+      blocking: false,
+      lane: 'production',
+      action: 'smoke.prod',
+    }));
+  }
+  if (smokeCoverage.uncoveredCriticalPaths.length > 0) {
+    attention.push(buildApiIssue({
+      code: 'smoke.coverage.missing',
+      severity: smokeCoverageBlocking ? 'error' : 'warning',
+      message: `Staging smoke coverage gaps: ${smokeCoverage.uncoveredCriticalPaths.join(', ')}. Run \`pipelane:smoke -- plan\`.`,
+      source: 'smokeRegistry',
+      blocking: smokeCoverageBlocking,
+      lane: 'staging',
+      action: 'smoke.plan',
+    }));
+  }
+  const staleBaseIssue = buildStaleBaseIssue({
+    currentBranch,
+    baseBranch,
+    currentHeadSha,
+    baseBranchSha,
+  });
+  if (staleBaseIssue) {
+    attention.push(staleBaseIssue);
+  }
+  const runtimeDriftIssue = buildRuntimeDriftIssue({
+    deployConfig,
+    currentCheckout,
+  });
+  if (runtimeDriftIssue) {
+    attention.push(runtimeDriftIssue);
+  }
 
   const boardMessage = mode === 'release'
     ? 'Release mode: promote merged SHA through staging before prod.'
@@ -219,19 +414,19 @@ export function buildWorkflowApiSnapshot(cwd: string): ApiEnvelope<SnapshotData>
         mode,
         baseBranch,
         laneOrder: ['Local', 'PR', `Base: ${baseBranch}`, 'Staging', 'Production'],
-        releaseReadiness: {
-          state: 'unknown',
-          reason: 'release readiness not yet computed in pipelane snapshot',
-          requestedSurfaces: context.modeState.requestedSurfaces ?? [],
-          blockedSurfaces: [],
+        releaseReadiness: buildBoardReleaseReadiness({
+          checkedAt,
+          mode,
+          config: context.config,
+          deployConfig,
+          deployRecords: deployState.records,
+          probeState,
+          requestedSurfaces,
+          probeRollup,
+          boardMessage,
           effectiveOverride: context.modeState.override ?? null,
           lastOverride: context.modeState.lastOverride ?? null,
-          probeState: probeRollup,
-          localReady: false,
-          hostedReady: false,
-          freshness: buildFreshness({ checkedAt }),
-          message: boardMessage,
-        },
+        }),
         activeTask: activeLock
           ? {
             taskSlug: activeLock.taskSlug,
@@ -242,7 +437,13 @@ export function buildWorkflowApiSnapshot(cwd: string): ApiEnvelope<SnapshotData>
             updatedAt: activeLock.updatedAt ?? null,
           }
           : null,
+        currentCheckout,
         overallFreshness: buildFreshness({ checkedAt }),
+      },
+      smoke: {
+        staging: smokeLatest.staging,
+        prod: smokeLatest.prod,
+        locks: smokeLocks,
       },
       sourceHealth,
       attention,
@@ -250,6 +451,19 @@ export function buildWorkflowApiSnapshot(cwd: string): ApiEnvelope<SnapshotData>
       branches,
     },
   });
+}
+
+function smokeLaneState(record: SmokeRunRecord | null): LaneState {
+  if (!record) return 'unknown';
+  if (record.status === 'passed' || record.status === 'passed_with_retries') return 'healthy';
+  return 'degraded';
+}
+
+function describeSmokeSummary(record: SmokeRunRecord | null, environment: 'staging' | 'prod'): string {
+  if (!record) {
+    return `no ${environment} smoke history`;
+  }
+  return `${record.status} @ ${record.sha.slice(0, 7)} (${record.finishedAt})`;
 }
 
 interface SurfaceProbeEntry {
@@ -342,6 +556,526 @@ function describeSurfaceProbe(entry: SurfaceProbeEntry): string {
   if (result.reason) return `staging ${surface}: ${result.reason}`;
   if (result.state === 'healthy') return `staging ${surface} probe healthy`;
   return `staging ${surface} probe ${result.state}`;
+}
+
+function buildBoardReleaseReadiness(options: {
+  checkedAt: string;
+  mode: string;
+  config: WorkflowConfig;
+  deployConfig: DeployConfig;
+  deployRecords: DeployRecord[];
+  probeState: ProbeState;
+  requestedSurfaces: string[];
+  probeRollup: ProbeFreshnessState;
+  boardMessage: string;
+  effectiveOverride: SnapshotData['boardContext']['releaseReadiness']['effectiveOverride'];
+  lastOverride: SnapshotData['boardContext']['releaseReadiness']['lastOverride'];
+}): SnapshotData['boardContext']['releaseReadiness'] {
+  const readiness = evaluateReleaseReadiness({
+    config: options.config,
+    deployConfig: options.deployConfig,
+    deployRecords: options.deployRecords,
+    probeState: options.probeState,
+    surfaces: options.requestedSurfaces,
+  });
+  const blockers = options.requestedSurfaces.flatMap((surface) => readiness.results[surface]?.blockers ?? []);
+  const hasHostedBlocker = blockers.some(isHostedReadinessBlocker);
+  const hasConfigBlocker = blockers.some((blocker) => !isHostedReadinessBlocker(blocker));
+  const state: LaneState = readiness.ready
+    ? 'healthy'
+    : !hasConfigBlocker && (options.probeRollup === 'degraded' || options.probeRollup === 'stale')
+      ? 'degraded'
+      : 'blocked';
+
+  const detail = summarizeReleaseBlockers(readiness);
+  const modeLead = readiness.ready
+    ? options.mode === 'release'
+      ? 'Release mode is active and requested surfaces passed observed staging + probe checks.'
+      : 'Requested surfaces passed observed staging + probe checks and are ready for release mode.'
+    : options.mode === 'release'
+      ? 'Release mode is active, but the release gate is failing.'
+      : 'Requested surfaces are not ready for release mode.';
+  const overrideNote = options.effectiveOverride
+    ? ` Release override active: ${options.effectiveOverride.reason}.`
+    : '';
+
+  return {
+    state,
+    reason: readiness.ready ? 'requested surfaces passed observed staging + probe checks' : detail,
+    requestedSurfaces: options.requestedSurfaces,
+    blockedSurfaces: readiness.blockedSurfaces,
+    effectiveOverride: options.effectiveOverride,
+    lastOverride: options.lastOverride,
+    probeState: options.probeRollup,
+    localReady: !hasConfigBlocker,
+    hostedReady: !hasHostedBlocker,
+    freshness: buildFreshness({
+      checkedAt: options.checkedAt,
+      observedAt: options.probeState.updatedAt || options.checkedAt,
+      stale: options.probeRollup === 'stale',
+    }),
+    message: readiness.ready
+      ? `${modeLead}${overrideNote}`
+      : `${modeLead} ${detail} ${options.boardMessage}${overrideNote}`.trim(),
+  };
+}
+
+function isHostedReadinessBlocker(blocker: ReleaseReadinessBlocker): boolean {
+  return blocker.kind === 'observed' || blocker.kind === 'probe';
+}
+
+function summarizeReleaseBlockers(
+  readiness: ReturnType<typeof evaluateReleaseReadiness>,
+): string {
+  if (readiness.blockedSurfaces.length === 0) {
+    return 'requested surfaces passed release checks';
+  }
+
+  const surfaceDetails = readiness.blockedSurfaces.map((surface) => {
+    const firstMissing = readiness.results[surface]?.missing?.[0];
+    return firstMissing ? `${surface}: ${firstMissing}` : surface;
+  });
+  const preview = surfaceDetails.slice(0, 2).join(' ');
+  const remaining = surfaceDetails.length - 2;
+  const extra = remaining > 0 ? ` (+${remaining} more surface${remaining === 1 ? '' : 's'}.)` : '';
+  return `Blocked surfaces: ${readiness.blockedSurfaces.join(', ')}. ${preview}${extra}`;
+}
+
+const RUNTIME_PROPAGATION_WINDOW_MS = 5 * 60 * 1000;
+
+export function buildBranchRows(options: {
+  locks: TaskLock[];
+  config: WorkflowConfig;
+  currentBranch: string;
+  baseBranch: string;
+  baseBranchSha: string;
+  prRecords: Record<string, PrRecord>;
+  deployRecords: DeployRecord[];
+  mode: string;
+  checkedAt: string;
+}): BranchRow[] {
+  return options.locks.map((lock) =>
+    buildBranchRow({
+      lock,
+      config: options.config,
+      currentBranch: options.currentBranch,
+      baseBranch: options.baseBranch,
+      baseBranchSha: options.baseBranchSha,
+      prRecord: options.prRecords[lock.taskSlug] ?? null,
+      deployRecords: options.deployRecords,
+      mode: options.mode,
+      checkedAt: options.checkedAt,
+    }),
+  );
+}
+
+function buildCurrentCheckoutTruth(options: {
+  checkedAt: string;
+  currentBranch: string;
+  currentHeadSha: string;
+  baseBranch: string;
+  baseBranchSha: string;
+  activeLock: TaskLock | null;
+  currentPrRecord: PrRecord | null;
+  deployRecords: DeployRecord[];
+  deployConfig: DeployConfig;
+  runtimeObservation: FrontendRuntimeObservation;
+}): CurrentCheckoutTruth {
+  const latestProdFrontendDeploy = findLatestFrontendDeployRecord(options.deployRecords, 'prod');
+  const latestSuccessfulProdFrontendDeploy = latestProdFrontendDeploy?.status === 'succeeded'
+    ? latestProdFrontendDeploy
+    : findLatestFrontendDeployRecord(
+      options.deployRecords.filter((record) => record.status === 'succeeded'),
+      'prod',
+    );
+  const worktreeLayer = buildCheckoutTruthLayer({
+    label: 'Worktree',
+    health: options.currentHeadSha ? 'healthy' : 'unknown',
+    sha: options.currentHeadSha || null,
+    reason: options.currentHeadSha
+      ? `current checkout is on ${options.currentBranch}`
+      : 'current checkout SHA could not be resolved',
+    detail: options.currentBranch || '(detached)',
+    checkedAt: options.checkedAt,
+  });
+  const originLayer = buildCheckoutTruthLayer({
+    label: 'Origin',
+    health: options.baseBranchSha ? 'healthy' : 'unknown',
+    sha: options.baseBranchSha || null,
+    reason: options.baseBranchSha
+      ? `remote base tip is origin/${options.baseBranch}`
+      : `origin/${options.baseBranch} is not available locally`,
+    detail: `origin/${options.baseBranch}`,
+    checkedAt: options.checkedAt,
+  });
+  const deployLayer = buildDeployTruthLayer({
+    checkedAt: options.checkedAt,
+    deploy: latestProdFrontendDeploy,
+  });
+  const runtimeLayer = buildRuntimeTruthLayer({
+    checkedAt: options.checkedAt,
+    observation: options.runtimeObservation,
+  });
+
+  const worktreeToOrigin = compareWorktreeToOrigin({
+    currentBranch: options.currentBranch,
+    baseBranch: options.baseBranch,
+    worktreeSha: worktreeLayer.sha,
+    originSha: originLayer.sha,
+  });
+  const deployToOrigin = compareLayerShas({
+    leftLabel: 'recorded production deploy',
+    leftSha: latestSuccessfulProdFrontendDeploy?.sha ?? null,
+    rightLabel: `origin/${options.baseBranch}`,
+    rightSha: options.baseBranchSha || null,
+    matchReason: `latest recorded production deploy matches origin/${options.baseBranch}`,
+    driftReason: latestSuccessfulProdFrontendDeploy?.sha
+      ? `latest recorded production deploy is ${shortSha(latestSuccessfulProdFrontendDeploy.sha)}, but origin/${options.baseBranch} is ${shortSha(options.baseBranchSha)}`
+      : `no comparable production deploy record exists for origin/${options.baseBranch}`,
+  });
+  const runtimeToDeploy = compareRuntimeToDeploy({
+    runtimeObservation: options.runtimeObservation,
+    deploy: latestSuccessfulProdFrontendDeploy,
+    checkedAt: options.checkedAt,
+  });
+  const runtimeToOrigin = compareRuntimeToOrigin({
+    runtimeObservation: options.runtimeObservation,
+    originSha: options.baseBranchSha || null,
+    baseBranch: options.baseBranch,
+  });
+
+  return {
+    branchName: options.currentBranch,
+    baseBranch: options.baseBranch,
+    taskSlug: options.activeLock?.taskSlug ?? null,
+    nextAction: options.activeLock?.nextAction?.trim() || null,
+    summary: summarizeCurrentCheckoutTruth({
+      currentBranch: options.currentBranch,
+      baseBranch: options.baseBranch,
+      currentPrRecord: options.currentPrRecord,
+      worktreeToOrigin,
+      runtimeToDeploy,
+      runtimeLayer,
+    }),
+    layers: {
+      worktree: worktreeLayer,
+      origin: originLayer,
+      deploy: deployLayer,
+      runtime: runtimeLayer,
+    },
+    relationships: {
+      worktreeToOrigin,
+      deployToOrigin,
+      runtimeToDeploy,
+      runtimeToOrigin,
+    },
+  };
+}
+
+function buildCheckoutTruthLayer(options: {
+  label: string;
+  health: ShellLayerHealth;
+  sha: string | null;
+  reason: string;
+  detail: string;
+  checkedAt: string;
+  observedAt?: string | null;
+}): CheckoutTruthLayer {
+  return {
+    label: options.label,
+    health: options.health,
+    sha: options.sha,
+    reason: options.reason,
+    detail: options.detail,
+    freshness: buildFreshness({
+      checkedAt: options.checkedAt,
+      observedAt: options.observedAt ?? options.checkedAt,
+    }),
+  };
+}
+
+function buildDeployTruthLayer(options: {
+  checkedAt: string;
+  deploy: DeployRecord | null;
+}): CheckoutTruthLayer {
+  const deploy = options.deploy;
+  if (!deploy) {
+    return buildCheckoutTruthLayer({
+      label: 'Deploy',
+      health: 'unknown',
+      sha: null,
+      reason: 'no production frontend deploy recorded by Pipelane',
+      detail: 'production/frontend',
+      checkedAt: options.checkedAt,
+    });
+  }
+
+  if (deploy.status === 'succeeded') {
+    return buildCheckoutTruthLayer({
+      label: 'Deploy',
+      health: 'healthy',
+      sha: deploy.sha,
+      reason: `latest recorded production frontend deploy verified at ${deploy.verifiedAt ?? deploy.finishedAt ?? deploy.requestedAt}`,
+      detail: deploy.workflowRunUrl ?? deploy.workflowRunId ?? deploy.workflowName,
+      checkedAt: options.checkedAt,
+      observedAt: deploy.verifiedAt ?? deploy.finishedAt ?? deploy.requestedAt,
+    });
+  }
+
+  if (deploy.status === 'failed') {
+    return buildCheckoutTruthLayer({
+      label: 'Deploy',
+      health: 'degraded',
+      sha: deploy.sha,
+      reason: `latest recorded production frontend deploy failed: ${deploy.failureReason ?? 'see deploy-state.json'}`,
+      detail: deploy.workflowRunUrl ?? deploy.workflowRunId ?? deploy.workflowName,
+      checkedAt: options.checkedAt,
+      observedAt: deploy.finishedAt ?? deploy.requestedAt,
+    });
+  }
+
+  return buildCheckoutTruthLayer({
+    label: 'Deploy',
+    health: 'unknown',
+    sha: deploy.sha,
+    reason: deploy.status === 'requested'
+      ? 'latest recorded production frontend deploy is still in flight'
+      : 'latest recorded production frontend deploy is legacy or unverifiable',
+    detail: deploy.workflowRunUrl ?? deploy.workflowRunId ?? deploy.workflowName,
+    checkedAt: options.checkedAt,
+    observedAt: deploy.requestedAt,
+  });
+}
+
+function buildRuntimeTruthLayer(options: {
+  checkedAt: string;
+  observation: FrontendRuntimeObservation;
+}): CheckoutTruthLayer {
+  return buildCheckoutTruthLayer({
+    label: 'Runtime',
+    health: options.observation.health,
+    sha: options.observation.observedSha,
+    reason: options.observation.reason,
+    detail: options.observation.markerUrl ?? options.observation.frontendUrl ?? 'runtime marker unavailable',
+    checkedAt: options.checkedAt,
+    observedAt: options.observation.observedAt,
+  });
+}
+
+function compareWorktreeToOrigin(options: {
+  currentBranch: string;
+  baseBranch: string;
+  worktreeSha: string | null;
+  originSha: string | null;
+}): CheckoutTruthRelationship {
+  if (!options.worktreeSha || !options.originSha) {
+    return {
+      state: 'not-comparable',
+      reason: 'worktree or remote base SHA is unavailable',
+    };
+  }
+  if (options.worktreeSha === options.originSha) {
+    return {
+      state: 'match',
+      reason: `this checkout matches origin/${options.baseBranch}`,
+    };
+  }
+  if (options.currentBranch === options.baseBranch) {
+    return {
+      state: 'drift',
+      reason: `this checkout's ${options.baseBranch} is behind origin/${options.baseBranch}`,
+    };
+  }
+  return {
+    state: 'drift',
+    reason: `current worktree remains on ${options.currentBranch}; origin/${options.baseBranch} moved independently`,
+  };
+}
+
+function compareRuntimeToDeploy(options: {
+  runtimeObservation: FrontendRuntimeObservation;
+  deploy: DeployRecord | null;
+  checkedAt: string;
+}): CheckoutTruthRelationship {
+  if (options.runtimeObservation.health !== 'healthy' || !options.runtimeObservation.observedSha) {
+    return {
+      state: 'not-comparable',
+      reason: options.runtimeObservation.reason,
+    };
+  }
+  if (!options.deploy || options.deploy.status !== 'succeeded') {
+    return {
+      state: 'not-comparable',
+      reason: 'no verified production deploy record exists for comparison',
+    };
+  }
+  if (isWithinRuntimePropagationWindow(options.deploy, options.checkedAt)
+    && options.runtimeObservation.observedSha !== options.deploy.sha) {
+    return {
+      state: 'not-comparable',
+      reason: 'waiting for the runtime marker to converge after the latest production deploy',
+    };
+  }
+  if (options.runtimeObservation.observedSha === options.deploy.sha) {
+    return {
+      state: 'match',
+      reason: `runtime marker matches the recorded production deploy ${shortSha(options.deploy.sha)}`,
+    };
+  }
+  return {
+    state: 'drift',
+    reason: `runtime marker reports ${shortSha(options.runtimeObservation.observedSha)}, but the latest recorded production deploy is ${shortSha(options.deploy.sha)}`,
+  };
+}
+
+function compareRuntimeToOrigin(options: {
+  runtimeObservation: FrontendRuntimeObservation;
+  originSha: string | null;
+  baseBranch: string;
+}): CheckoutTruthRelationship {
+  return compareLayerShas({
+    leftLabel: 'runtime marker',
+    leftSha: options.runtimeObservation.health === 'healthy'
+      ? options.runtimeObservation.observedSha
+      : null,
+    rightLabel: `origin/${options.baseBranch}`,
+    rightSha: options.originSha,
+    matchReason: `runtime marker matches origin/${options.baseBranch}`,
+    driftReason: options.runtimeObservation.observedSha && options.originSha
+      ? `runtime marker reports ${shortSha(options.runtimeObservation.observedSha)}, but origin/${options.baseBranch} is ${shortSha(options.originSha)}`
+      : `runtime marker cannot yet be compared to origin/${options.baseBranch}`,
+    unavailableReason: options.runtimeObservation.reason,
+  });
+}
+
+function compareLayerShas(options: {
+  leftLabel: string;
+  leftSha: string | null;
+  rightLabel: string;
+  rightSha: string | null;
+  matchReason: string;
+  driftReason: string;
+  unavailableReason?: string;
+}): CheckoutTruthRelationship {
+  if (!options.leftSha || !options.rightSha) {
+    return {
+      state: 'not-comparable',
+      reason: options.unavailableReason ?? `${options.leftLabel} or ${options.rightLabel} is unavailable`,
+    };
+  }
+  if (options.leftSha === options.rightSha) {
+    return {
+      state: 'match',
+      reason: options.matchReason,
+    };
+  }
+  return {
+    state: 'drift',
+    reason: options.driftReason,
+  };
+}
+
+function summarizeCurrentCheckoutTruth(options: {
+  currentBranch: string;
+  baseBranch: string;
+  currentPrRecord: PrRecord | null;
+  worktreeToOrigin: CheckoutTruthRelationship;
+  runtimeToDeploy: CheckoutTruthRelationship;
+  runtimeLayer: CheckoutTruthLayer;
+}): string {
+  if (options.runtimeToDeploy.state === 'drift') {
+    return 'production frontend live SHA differs from recorded deploy history';
+  }
+  if (options.worktreeToOrigin.state === 'drift' && options.currentBranch === options.baseBranch) {
+    return `this checkout's ${options.baseBranch} is behind origin/${options.baseBranch}`;
+  }
+  if (options.worktreeToOrigin.state === 'drift') {
+    return options.currentPrRecord?.mergedAt
+      ? 'merged on GitHub, current worktree unchanged'
+      : `current worktree differs from origin/${options.baseBranch}`;
+  }
+  if (options.runtimeLayer.health === 'unknown' || options.runtimeLayer.health === 'degraded') {
+    return options.runtimeLayer.reason;
+  }
+  return 'current checkout truth loaded';
+}
+
+function buildStaleBaseIssue(options: {
+  currentBranch: string;
+  baseBranch: string;
+  currentHeadSha: string;
+  baseBranchSha: string;
+}): ApiIssue | null {
+  if (!options.currentHeadSha || !options.baseBranchSha) return null;
+  if (options.currentBranch !== options.baseBranch) return null;
+  if (options.currentHeadSha === options.baseBranchSha) return null;
+  return buildApiIssue({
+    code: 'git.base.stale',
+    severity: 'warning',
+    message: `local ${options.baseBranch} in this checkout is behind origin/${options.baseBranch}. Refresh this checkout if you want merged code locally.`,
+    source: 'git',
+    blocking: false,
+    lane: 'base',
+  });
+}
+
+function buildRuntimeDriftIssue(options: {
+  deployConfig: DeployConfig;
+  currentCheckout: CurrentCheckoutTruth;
+}): ApiIssue | null {
+  if (options.deployConfig.frontend.production.autoDeployOnMain !== false) {
+    return null;
+  }
+  if (options.currentCheckout.layers.runtime.health !== 'healthy') {
+    return null;
+  }
+  if (options.currentCheckout.relationships.runtimeToDeploy.state !== 'drift') {
+    return null;
+  }
+  return buildApiIssue({
+    code: 'runtime.provenance.drift',
+    severity: 'warning',
+    message: `production frontend live SHA differs from the latest recorded Pipelane deploy: ${options.currentCheckout.relationships.runtimeToDeploy.reason}.`,
+    source: 'runtimeMarker',
+    blocking: false,
+    lane: 'production',
+  });
+}
+
+function findLatestFrontendDeployRecord(
+  records: DeployRecord[],
+  environment: 'staging' | 'prod',
+): DeployRecord | null {
+  return [...records]
+    .filter((record) => record.environment === environment && record.surfaces.includes('frontend'))
+    .sort((left, right) => latestDeploySortKey(right).localeCompare(latestDeploySortKey(left)))[0] ?? null;
+}
+
+function latestDeploySortKey(record: DeployRecord): string {
+  return record.verifiedAt ?? record.finishedAt ?? record.requestedAt ?? '';
+}
+
+function isWithinRuntimePropagationWindow(record: DeployRecord, checkedAt: string): boolean {
+  const observedAt = Date.parse(record.finishedAt ?? record.requestedAt ?? '');
+  const checkedAtMs = Date.parse(checkedAt);
+  if (!Number.isFinite(observedAt) || !Number.isFinite(checkedAtMs)) {
+    return false;
+  }
+  return checkedAtMs - observedAt < RUNTIME_PROPAGATION_WINDOW_MS;
+}
+
+function mapShellHealthToLaneState(health: ShellLayerHealth): LaneState {
+  switch (health) {
+    case 'healthy':
+      return 'healthy';
+    case 'degraded':
+      return 'degraded';
+    case 'unavailable':
+      return 'bypassed';
+    case 'unknown':
+    default:
+      return 'unknown';
+  }
 }
 
 function buildBranchRow(options: {

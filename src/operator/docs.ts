@@ -53,6 +53,10 @@ export const LEGACY_CLAUDE_SIGNATURES: Record<ManagedCommand, string[]> = {
     'Deploy the merged SHA for this repo.',
     'npm run pipelane:deploy',
   ],
+  smoke: [
+    'Plan smoke coverage or run deterministic smoke against staging or prod.',
+    'npm run pipelane:smoke',
+  ],
   devmode: [
     "Switch or check the repo's development mode (build or release).",
     'npm run pipelane:devmode',
@@ -137,6 +141,7 @@ function renderTemplate(template: string, config: WorkflowConfig): string {
     ALIAS_PR: aliases.pr,
     ALIAS_MERGE: aliases.merge,
     ALIAS_DEPLOY: aliases.deploy,
+    ALIAS_SMOKE: aliases.smoke,
     ALIAS_CLEAN: aliases.clean,
     ALIAS_STATUS: aliases.status,
     ALIAS_DOCTOR: aliases.doctor,
@@ -362,6 +367,7 @@ export function ensurePackageScripts(repoRoot: string): void {
     'pipelane:release-check': 'pipelane run release-check',
     'pipelane:task-lock': 'pipelane run task-lock',
     'pipelane:deploy': 'pipelane run deploy',
+    'pipelane:smoke': 'pipelane run smoke',
     'pipelane:clean': 'pipelane run clean',
     'pipelane:status': 'pipelane run status',
     'pipelane:doctor': 'pipelane run doctor',

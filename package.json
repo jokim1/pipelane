@@ -22,7 +22,26 @@
     "board": "node ./src/cli.ts board",
     "build": "tsc -p tsconfig.build.json && node -e \"import('node:fs').then(m=>m.cpSync('src/dashboard/public','dist/dashboard/public',{recursive:true}))\"",
     "prepare": "npm run build",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "pipelane:setup": "pipelane setup",
+    "pipelane:configure": "pipelane configure",
+    "pipelane:devmode": "pipelane run devmode",
+    "pipelane:new": "pipelane run new",
+    "pipelane:resume": "pipelane run resume",
+    "pipelane:repo-guard": "pipelane run repo-guard",
+    "pipelane:pr": "pipelane run pr",
+    "pipelane:merge": "pipelane run merge",
+    "pipelane:release-check": "pipelane run release-check",
+    "pipelane:task-lock": "pipelane run task-lock",
+    "pipelane:deploy": "pipelane run deploy",
+    "pipelane:smoke": "pipelane run smoke",
+    "pipelane:clean": "pipelane run clean",
+    "pipelane:status": "pipelane run status",
+    "pipelane:doctor": "pipelane run doctor",
+    "pipelane:rollback": "pipelane run rollback",
+    "pipelane:board": "pipelane board",
+    "pipelane:update": "pipelane update",
+    "pipelane:api": "pipelane run api"
   },
   "engines": {
     "node": ">=22.0.0"

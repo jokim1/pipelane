@@ -28,6 +28,8 @@
       --executing: #8ea3b0;
       --accent: #6cb4ee;
       --accent-soft: rgba(108, 180, 238, 0.12);
+      --build-soft: rgba(108, 180, 238, 0.14);
+      --release-soft: rgba(255, 179, 71, 0.16);
       --danger-soft: rgba(255, 107, 107, 0.12);
       --warning-soft: rgba(245, 176, 65, 0.12);
       --healthy-soft: rgba(88, 214, 141, 0.12);
@@ -130,6 +132,50 @@
       flex-direction: column;
       align-items: flex-end;
       gap: 10px;
+    }
+
+    .hero-mode-card {
+      min-width: min(320px, 100%);
+      max-width: 340px;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.03);
+      padding: 10px 12px;
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .hero-mode-copy {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .hero-mode-label {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--subtle);
+    }
+
+    .hero-mode-value {
+      font-family: var(--mono);
+      font-size: 18px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--text);
+      line-height: 1;
+    }
+
+    .hero-mode-note {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      word-break: break-word;
     }
 
     .button-row {
@@ -248,6 +294,34 @@
       margin-top: 10px;
     }
 
+    .hero-mode-card.mode-build {
+      border-color: rgba(108, 180, 238, 0.34);
+      background: linear-gradient(180deg, var(--build-soft), rgba(255, 255, 255, 0.025));
+    }
+
+    .hero-mode-card.mode-build .hero-mode-value {
+      color: #8fd2ff;
+    }
+
+    .hero-mode-card.mode-build .menu-button {
+      border-color: rgba(108, 180, 238, 0.32);
+      background: rgba(108, 180, 238, 0.08);
+    }
+
+    .hero-mode-card.mode-release {
+      border-color: rgba(255, 179, 71, 0.34);
+      background: linear-gradient(180deg, var(--release-soft), rgba(255, 255, 255, 0.025));
+    }
+
+    .hero-mode-card.mode-release .hero-mode-value {
+      color: #ffd38c;
+    }
+
+    .hero-mode-card.mode-release .menu-button {
+      border-color: rgba(255, 179, 71, 0.32);
+      background: rgba(255, 179, 71, 0.08);
+    }
+
     .menu-shell {
       position: relative;
       display: inline-flex;
@@ -358,6 +432,30 @@
       gap: 12px;
     }
 
+    .attention-context {
+      margin-bottom: 12px;
+    }
+
+    .attention-context:empty {
+      display: none;
+    }
+
+    .attention-context-list {
+      margin: 0;
+      padding-left: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .attention-context-item strong {
+      color: var(--text);
+      font-weight: 600;
+    }
+
     .attention-card {
       border-radius: 16px;
       border: 1px solid var(--line);
@@ -373,9 +471,19 @@
       background: rgba(255, 107, 107, 0.08);
     }
 
+    .attention-card.error {
+      border-color: rgba(255, 107, 107, 0.36);
+      background: rgba(255, 107, 107, 0.08);
+    }
+
     .attention-card.warning {
       border-color: rgba(245, 176, 65, 0.36);
       background: rgba(245, 176, 65, 0.08);
+    }
+
+    .attention-card.info {
+      border-color: rgba(108, 180, 238, 0.34);
+      background: rgba(108, 180, 238, 0.08);
     }
 
     .attention-head {
@@ -396,7 +504,15 @@
       color: var(--blocked);
     }
 
+    .attention-severity.error {
+      color: var(--blocked);
+    }
+
     .attention-severity.warning {
+      color: var(--stale);
+    }
+
+    .attention-severity.info {
       color: var(--running);
     }
 
@@ -1338,6 +1454,7 @@
               <button class="button" id="settings-button" type="button" data-settings-open="true">Settings</button>
               <button class="button primary" id="refresh-button" type="button">Refresh snapshot</button>
             </div>
+            <div id="hero-mode"></div>
             <div class="footer-note" id="health-note">Checking local dashboard health…</div>
           </div>
         </div>
@@ -1349,17 +1466,17 @@
           <div class="footer-note" id="attention-summary">Waiting for snapshot…</div>
         </div>
         <div class="panel-body">
+          <div class="attention-context" id="attention-context"></div>
           <div class="cards" id="attention-list"></div>
         </div>
       </section>
 
-      <section class="panel">
+      <section class="panel" id="board-actions-panel">
         <div class="panel-header">
-          <div class="panel-title">Board Context</div>
-          <div class="footer-note" id="task-meta"></div>
+          <div class="panel-title">Board Actions</div>
+          <div class="footer-note">Repository cleanup and recent action feedback.</div>
         </div>
         <div class="panel-body">
-          <div class="meta-grid" id="active-task-grid"></div>
           <div id="board-actions-wrap">
             <div class="panel-title" style="margin-top:18px">Repository Cleanup</div>
             <p class="section-copy">Cleanup is the remaining board-wide maintenance action. Branch-specific actions live on the branch card, in the detail drawer, and in the card context menu.</p>
@@ -1849,45 +1966,72 @@
       };
     }
 
-    function releaseReadinessHeadline(mode, release) {
-      if (mode === 'release') {
-        if (release.state === 'healthy') {
-          return 'Release mode ready';
-        }
-        if (release.state === 'degraded') {
-          return 'Release mode needs setup';
-        }
-        if (release.state === 'blocked') {
-          return 'Release mode blocked';
-        }
-        return 'Release mode status unknown';
-      }
-
-      return mode === 'build' ? 'Build mode active' : `${mode || 'Unknown'} mode`;
+    function modeCardTone(mode) {
+      if (mode === 'build') return 'mode-build';
+      if (mode === 'release') return 'mode-release';
+      return 'mode-unknown';
     }
 
-    function releaseReadinessCaption(mode, release) {
-      const requestedSurfaces = (release.requestedSurfaces || []).join(', ') || 'frontend';
-      const blockedSurfaces = release.blockedSurfaces || [];
-      const baseBlockedNote = blockedSurfaces.length ? ` Blocked surfaces: ${blockedSurfaces.join(', ')}.` : '';
+    function heroModeNote(mode, release) {
+      const blocked = release.blockedSurfaces || [];
+      const requested = (release.requestedSurfaces || []).join(', ') || '—';
+      if (blocked.length) {
+        return `Blocked: ${blocked.join(', ')}`;
+      }
+      return mode === 'release' ? `Release scope: ${requested}` : `Build scope: ${requested}`;
+    }
 
-      if (mode === 'release') {
-        if (release.state === 'healthy') {
-          return `Release mode is active and ${requestedSurfaces} is ready for the protected staging and production lane.${baseBlockedNote}`;
-        }
+    function buildAttentionContextItems(boardContext) {
+      const items = [];
+      const activeTask = boardContext?.activeTask;
+      const release = boardContext?.releaseReadiness || {};
+      const mode = boardContext?.mode || 'unknown';
 
-        if ((release.reason || '').includes('hosted bootstrap pending')) {
-          return `Release mode is active, but hosted bootstrap / external checks are incomplete.${baseBlockedNote}`;
-        }
-
-        if (release.reason) {
-          return `Release mode is active, but ${release.reason}.${baseBlockedNote}`;
-        }
-
-        return `Release mode is active, but readiness details are incomplete.${baseBlockedNote}`;
+      if (activeTask) {
+        items.push(`Current worktree: ${activeTask.taskSlug} on ${activeTask.branchName}.`);
+      } else {
+        items.push('Current checkout is not an active pipelane task worktree.');
       }
 
-      return `Build mode is active. Requested release surfaces: ${requestedSurfaces}.${baseBlockedNote}`;
+      if (mode === 'release' && release.effectiveOverride?.reason) {
+        items.push(`Release override active: ${release.effectiveOverride.reason}.`);
+      } else if (
+        mode === 'release'
+        && release.state
+        && release.state !== 'healthy'
+        && (release.reason || (release.blockedSurfaces || []).length)
+      ) {
+        items.push(release.reason || `Release gate is ${release.state}.`);
+      }
+
+      return items;
+    }
+
+    function normalizeAttentionSeverity(severity) {
+      if (severity === 'blocker' || severity === 'error') return 'error';
+      if (severity === 'warning') return 'warning';
+      return 'info';
+    }
+
+    function attentionSeverityLabel(severity) {
+      if (severity === 'error') return 'blocker';
+      if (severity === 'warning') return 'warning';
+      return 'update';
+    }
+
+    function attentionReason(item) {
+      return item.reason || item.message || 'No reason provided.';
+    }
+
+    function attentionScope(item) {
+      return item.branch || item.lane || item.scope || 'board';
+    }
+
+    function attentionNext(item) {
+      if (item.next) return item.next;
+      if (item.safeNextAction) return item.safeNextAction;
+      if (item.action) return `Suggested action: ${item.action}`;
+      return 'No suggested action.';
     }
 
     function cleanupCardPresentation(branch, activeLane) {
@@ -1946,93 +2090,37 @@
     function renderHero() {
       const settings = currentSettings();
       const boardContext = state.snapshot?.data?.boardContext;
+      const modeActions = devModeActions();
+      const heroMode = document.getElementById('hero-mode');
       document.getElementById('hero-title').textContent = settings.boardTitle || DEFAULT_BOARD_TITLE;
       document.getElementById('hero-copy').textContent = settings.boardSubtitle || DEFAULT_BOARD_SUBTITLE;
       document.title = settings.boardTitle || DEFAULT_BOARD_TITLE;
       const pills = [];
       if (boardContext) {
-        pills.push(`<div class="pill"><span>Mode</span><strong>${escapeHtml(boardContext.mode || 'unknown')}</strong></div>`);
         pills.push(`<div class="pill"><span>Base</span><strong>${escapeHtml(boardContext.baseBranch || 'main')}</strong></div>`);
         pills.push(`<div class="pill"><span>Freshness</span><strong>${escapeHtml(boardContext.overallFreshness?.state || 'unknown')}</strong></div>`);
         pills.push(`<div class="pill"><span>Last Checked</span><strong>${escapeHtml(relativeTime(boardContext.overallFreshness?.checkedAt))}</strong></div>`);
       }
       document.getElementById('hero-pills').innerHTML = pills.join('') || '<div class="pill"><span>Snapshot</span><strong>Loading…</strong></div>';
-
-      const health = state.health;
-      const healthNote = document.getElementById('health-note');
-      if (!health) {
-        healthNote.textContent = 'Checking local dashboard health…';
-        return;
-      }
-      if (!health.pipelaneApiConfigured) {
-        healthNote.textContent = `Repo ${health.repoRoot} is reachable, but pipelane:api is not configured there.`;
-        return;
-      }
-      healthNote.textContent = `Serving ${health.repoRoot} · pipelane:api ready · refreshed ${relativeTime(state.snapshot?.data?.boardContext?.overallFreshness?.checkedAt)}`;
-    }
-
-    function renderAttention() {
-      const attention = state.snapshot?.data?.attention || [];
-      const list = document.getElementById('attention-list');
-      const summary = document.getElementById('attention-summary');
-
-      if (!attention.length) {
-        summary.textContent = 'No blockers or warnings surfaced by the snapshot.';
-        list.innerHTML = '<div class="empty-state">No attention items. The board is quiet right now.</div>';
-        return;
-      }
-
-      const blockers = attention.filter((item) => item.severity === 'blocker').length;
-      summary.textContent = `${blockers} blocker${blockers === 1 ? '' : 's'} · ${attention.length} total items`;
-
-      list.innerHTML = attention.map((item) => `
-        <article class="attention-card ${escapeHtml(item.severity || 'warning')}">
-          <div class="attention-head">
-            <div class="attention-severity ${escapeHtml(item.severity || 'warning')}">${escapeHtml(item.severity || 'warning')}</div>
-            <div class="footer-note">${escapeHtml(item.branch || item.lane || 'board')}</div>
+      if (!boardContext) {
+        heroMode.innerHTML = `
+          <div class="hero-mode-card">
+            <div class="hero-mode-copy">
+              <div class="hero-mode-label">Dev Mode</div>
+              <div class="hero-mode-value">Loading</div>
+              <div class="hero-mode-note">Waiting for snapshot…</div>
+            </div>
           </div>
-          <div class="attention-reason">${escapeHtml(item.reason || 'No reason provided.')}</div>
-          <div class="attention-next">${item.safeNextAction ? `Safe next action: ${escapeHtml(item.safeNextAction)}` : 'No safe next action suggested.'}</div>
-        </article>
-      `).join('');
-    }
-
-    function renderActiveTask() {
-      const boardContext = state.snapshot?.data?.boardContext || {};
-      const activeTask = boardContext.activeTask;
-      const release = boardContext.releaseReadiness || {};
-      const mode = boardContext.mode || 'unknown';
-      const taskMeta = document.getElementById('task-meta');
-      taskMeta.textContent = activeTask ? `Task lock updated ${relativeTime(activeTask.updatedAt)}` : 'No active task lock in this checkout.';
-
-      const cards = [];
-      const modeActions = devModeActions();
-      const cleanupActions = cleanupBoardActions();
-
-      cards.push(`
-        <article class="meta-card">
-          <div class="eyebrow">Current Checkout</div>
-          <div class="headline">${escapeHtml(activeTask?.taskSlug || 'No active task')}</div>
-          <div class="caption">${escapeHtml(activeTask?.branchName || 'No task lock is active in the checkout this dashboard is pointed at.')}</div>
-          <div class="footer-note">${escapeHtml(activeTask?.worktreePath ? `Worktree: ${activeTask.worktreePath}` : 'The branch board still works even when the current checkout is not inside a task worktree.')}</div>
-        </article>
-      `);
-
-      cards.push(`
-        <article class="meta-card">
-          <div class="eyebrow">Release Readiness</div>
-          <div class="headline">${escapeHtml(releaseReadinessHeadline(mode, release))}</div>
-          <div class="caption">${escapeHtml(releaseReadinessCaption(mode, release))}</div>
-          <div class="footer-note">${escapeHtml(`Requested surfaces: ${(release.requestedSurfaces || []).join(', ') || '—'}`)}</div>
-        </article>
-      `);
-
-      cards.push(`
-        <article class="meta-card">
-          <div class="meta-card-head">
-            <div>
-              <div class="eyebrow">Dev Mode</div>
-              <div class="headline">${escapeHtml(mode)}</div>
+        `;
+      } else {
+        const release = boardContext.releaseReadiness || {};
+        const mode = boardContext.mode || 'unknown';
+        heroMode.innerHTML = `
+          <div class="hero-mode-card ${escapeHtml(modeCardTone(mode))}">
+            <div class="hero-mode-copy">
+              <div class="hero-mode-label">Dev Mode</div>
+              <div class="hero-mode-value">${escapeHtml(mode.toUpperCase())}</div>
+              <div class="hero-mode-note">${escapeHtml(heroModeNote(mode, release))}</div>
             </div>
             <div class="menu-shell">
               <button
@@ -2057,12 +2145,74 @@
               </div>
             </div>
           </div>
-          <div class="caption">${escapeHtml(mode === 'release' ? 'Protected lane is active. Use the menu to switch between build and release modes.' : 'Fast build lane is active. Use the menu to switch between build and release modes.')}</div>
-          <div class="footer-note">${escapeHtml((release.blockedSurfaces || []).length ? `Blocked surfaces: ${(release.blockedSurfaces || []).join(', ')}` : `Requested release surfaces: ${(release.requestedSurfaces || []).join(', ') || '—'}`)}</div>
-        </article>
-      `);
+        `;
+      }
 
-      document.getElementById('active-task-grid').innerHTML = cards.join('');
+      const health = state.health;
+      const healthNote = document.getElementById('health-note');
+      if (!health) {
+        healthNote.textContent = 'Checking local dashboard health…';
+        return;
+      }
+      if (!health.pipelaneApiConfigured) {
+        healthNote.textContent = `Repo ${health.repoRoot} is reachable, but pipelane:api is not configured there.`;
+        return;
+      }
+      healthNote.textContent = `Serving ${health.repoRoot} · pipelane:api ready · refreshed ${relativeTime(state.snapshot?.data?.boardContext?.overallFreshness?.checkedAt)}`;
+    }
+
+    function renderAttention() {
+      const boardContext = state.snapshot?.data?.boardContext || {};
+      const contextItems = buildAttentionContextItems(boardContext);
+      const attention = state.snapshot?.data?.attention || [];
+      const list = document.getElementById('attention-list');
+      const context = document.getElementById('attention-context');
+      const summary = document.getElementById('attention-summary');
+      const normalizedAttention = attention.map((item) => ({
+        severity: normalizeAttentionSeverity(item.severity),
+        scope: attentionScope(item),
+        reason: attentionReason(item),
+        next: attentionNext(item),
+      }));
+
+      context.innerHTML = contextItems.length
+        ? `<ul class="attention-context-list">${contextItems.map((item) => `<li class="attention-context-item">${escapeHtml(item)}</li>`).join('')}</ul>`
+        : '';
+
+      const blockers = normalizedAttention.filter((item) => item.severity === 'error').length;
+      const warnings = normalizedAttention.filter((item) => item.severity === 'warning').length;
+      const summaryParts = [];
+      if (blockers > 0) summaryParts.push(`${blockers} blocker${blockers === 1 ? '' : 's'}`);
+      if (warnings > 0) summaryParts.push(`${warnings} warning${warnings === 1 ? '' : 's'}`);
+      if (contextItems.length > 0) summaryParts.push(`${contextItems.length} context note${contextItems.length === 1 ? '' : 's'}`);
+
+      if (!normalizedAttention.length) {
+        summary.textContent = summaryParts.join(' · ') || 'No blockers or warnings surfaced by the snapshot.';
+        if (contextItems.length) {
+          list.innerHTML = '';
+          return;
+        }
+        list.innerHTML = '<div class="empty-state">No attention items. The board is quiet right now.</div>';
+        return;
+      }
+
+      summary.textContent = [...summaryParts, `${normalizedAttention.length} alert${normalizedAttention.length === 1 ? '' : 's'}`].join(' · ');
+
+      list.innerHTML = normalizedAttention.map((item) => `
+        <article class="attention-card ${escapeHtml(item.severity)}">
+          <div class="attention-head">
+            <div class="attention-severity ${escapeHtml(item.severity)}">${escapeHtml(attentionSeverityLabel(item.severity))}</div>
+            <div class="footer-note">${escapeHtml(item.scope)}</div>
+          </div>
+          <div class="attention-reason">${escapeHtml(item.reason)}</div>
+          <div class="attention-next">${escapeHtml(item.next)}</div>
+        </article>
+      `).join('');
+    }
+
+    function renderActiveTask() {
+      const panel = document.getElementById('board-actions-panel');
+      const cleanupActions = cleanupBoardActions();
 
       const boardActions = document.getElementById('board-actions');
       const boardActionsWrap = document.getElementById('board-actions-wrap');
@@ -2074,7 +2224,8 @@
         boardActions.innerHTML = cleanupActions.map((action) => actionButtonMarkup(action, 'board')).join('');
       }
 
-      renderActionFeedback();
+      const hasFeedback = renderActionFeedback();
+      panel.style.display = cleanupActions.length || hasFeedback ? '' : 'none';
     }
 
     function renderBranchContextMenu() {
@@ -2123,7 +2274,7 @@
       if (!feedback) {
         wrap.style.display = 'none';
         container.innerHTML = '';
-        return;
+        return false;
       }
 
       wrap.style.display = '';
@@ -2137,6 +2288,7 @@
           <div class="footer-note" style="margin-top:10px">${escapeHtml(feedback.detail || `Updated ${relativeTime(feedback.at)}`)}</div>
         </article>
       `;
+      return true;
     }
 
     function actionButtonMarkup(action, scope, branchName = '') {

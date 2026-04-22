@@ -34,6 +34,7 @@ follow safely without improvising repo behavior.
 - `npm run pipelane:release-check`
 - `npm run pipelane:task-lock -- verify --task "<task-name>"`
 - `npm run pipelane:deploy -- staging|prod ...`
+- `npm run pipelane:smoke -- plan|staging|prod`
 - `npm run pipelane:clean`
 - `npm run pipelane:status`
 - `npm run pipelane:doctor` (add `-- --probe` for staging healthchecks, `-- --fix` for the guided wizard)
@@ -48,6 +49,7 @@ This repo exposes the following user-facing slash commands through Claude/Codex 
 - `{{ALIAS_PR}}`
 - `{{ALIAS_MERGE}}`
 - `{{ALIAS_DEPLOY}}`
+- `{{ALIAS_SMOKE}}`
 - `{{ALIAS_CLEAN}}`
 - `{{ALIAS_STATUS}}`
 - `{{ALIAS_DOCTOR}}`
@@ -69,6 +71,7 @@ Use both.
 - `{{ALIAS_PR}}`
 - `{{ALIAS_MERGE}}`
 - `{{ALIAS_DEPLOY}}`
+- `{{ALIAS_SMOKE}}`
 - `{{ALIAS_CLEAN}}`
 - `{{ALIAS_STATUS}}`
 - `{{ALIAS_DOCTOR}}`

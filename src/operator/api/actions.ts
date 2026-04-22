@@ -294,7 +294,13 @@ function normalizeInputs(actionId: StableActionId, parsed: ParsedOperatorArgs, c
     case 'deploy.staging':
       return { task: flags.task, sha: flags.sha, surfaces: flags.surfaces };
     case 'deploy.prod':
-      return { task: flags.task, sha: flags.sha, surfaces: flags.surfaces };
+      return {
+        task: flags.task,
+        sha: flags.sha,
+        surfaces: flags.surfaces,
+        skipSmokeCoverage: flags.skipSmokeCoverage,
+        reason: flags.reason,
+      };
     case 'clean.plan':
       return {};
     case 'clean.apply':
@@ -475,6 +481,8 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
       pushOpt('--task', flags.task);
       pushOpt('--sha', flags.sha);
       pushSurfaces();
+      if (flags.skipSmokeCoverage) args.push('--skip-smoke-coverage');
+      pushOpt('--reason', flags.reason);
       break;
     case 'clean.plan':
       args.push('clean');

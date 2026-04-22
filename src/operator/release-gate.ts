@@ -41,11 +41,19 @@ export interface DeployConfig {
       deployWorkflow: string;
       autoDeployOnMain: boolean;
       healthcheckUrl: string;
+      runtimeMarker?: {
+        enabled: boolean;
+        path: string;
+      };
     };
     staging: {
       url: string;
       deployWorkflow: string;
       healthcheckUrl: string;
+      runtimeMarker?: {
+        enabled: boolean;
+        path: string;
+      };
     };
   };
   edge: {
@@ -91,11 +99,19 @@ export function emptyDeployConfig(): DeployConfig {
         deployWorkflow: '',
         autoDeployOnMain: false,
         healthcheckUrl: '',
+        runtimeMarker: {
+          enabled: false,
+          path: '',
+        },
       },
       staging: {
         url: '',
         deployWorkflow: '',
         healthcheckUrl: '',
+        runtimeMarker: {
+          enabled: false,
+          path: '',
+        },
       },
     },
     edge: {
@@ -169,9 +185,17 @@ function hydrateDeployConfig(parsed: Partial<DeployConfig> | null | undefined): 
   config.frontend.production.deployWorkflow = parsed.frontend?.production?.deployWorkflow ?? '';
   config.frontend.production.autoDeployOnMain = Boolean(parsed.frontend?.production?.autoDeployOnMain);
   config.frontend.production.healthcheckUrl = parsed.frontend?.production?.healthcheckUrl ?? '';
+  config.frontend.production.runtimeMarker = {
+    enabled: Boolean(parsed.frontend?.production?.runtimeMarker?.enabled),
+    path: parsed.frontend?.production?.runtimeMarker?.path ?? '',
+  };
   config.frontend.staging.url = parsed.frontend?.staging?.url ?? '';
   config.frontend.staging.deployWorkflow = parsed.frontend?.staging?.deployWorkflow ?? '';
   config.frontend.staging.healthcheckUrl = parsed.frontend?.staging?.healthcheckUrl ?? '';
+  config.frontend.staging.runtimeMarker = {
+    enabled: Boolean(parsed.frontend?.staging?.runtimeMarker?.enabled),
+    path: parsed.frontend?.staging?.runtimeMarker?.path ?? '',
+  };
 
   config.edge.staging.deployCommand = parsed.edge?.staging?.deployCommand ?? '';
   config.edge.staging.verificationCommand = parsed.edge?.staging?.verificationCommand ?? '';
@@ -378,6 +402,13 @@ export type ObservedStagingResult =
   | { ok: true; reason?: undefined }
   | { ok: false; reason: string };
 
+export type ReleaseReadinessBlockerKind = 'config' | 'observed' | 'probe' | 'unsupported';
+
+export interface ReleaseReadinessBlocker {
+  kind: ReleaseReadinessBlockerKind;
+  message: string;
+}
+
 // v1.2: readiness is observed, not asserted. Walks records newest-first and
 // the *most recent* VALID staging deploy touching the surface is
 // authoritative. When a signing key is configured, unsigned/invalid-sig
@@ -544,9 +575,9 @@ export function evaluateReleaseReadiness(options: {
 }): {
   ready: boolean;
   blockedSurfaces: string[];
-  results: Record<string, { ready: boolean; missing: string[] }>;
+  results: Record<string, { ready: boolean; missing: string[]; blockers: ReleaseReadinessBlocker[] }>;
 } {
-  const results: Record<string, { ready: boolean; missing: string[] }> = {};
+  const results: Record<string, { ready: boolean; missing: string[]; blockers: ReleaseReadinessBlocker[] }> = {};
   const gateOptions = { deployConfig: options.deployConfig, key: resolveDeployStateKey() };
   const observedStagingSuccess = (surface: string): string | null => {
     const result = explainObservedStagingSuccess(options.deployRecords, surface, gateOptions);
@@ -566,12 +597,18 @@ export function evaluateReleaseReadiness(options: {
 
   for (const surface of options.surfaces) {
     const missing: string[] = [];
+    const blockers: ReleaseReadinessBlocker[] = [];
+    const addBlocker = (kind: ReleaseReadinessBlockerKind, message: string) => {
+      blockers.push({ kind, message });
+      missing.push(message);
+    };
 
     if (!isReleaseManagedSurface(surface)) {
-      missing.push(unsupportedSurfaceReason(surface));
+      addBlocker('unsupported', unsupportedSurfaceReason(surface));
       results[surface] = {
         ready: false,
         missing,
+        blockers,
       };
       continue;
     }
@@ -585,70 +622,71 @@ export function evaluateReleaseReadiness(options: {
       const stagingHealthcheck = options.deployConfig.frontend.staging.healthcheckUrl || stagingUrl;
 
       if (!productionUrl && !productionWorkflow) {
-        missing.push('frontend production URL or workflow');
+        addBlocker('config', 'frontend production URL or workflow');
       }
       if (!productionHealthcheck) {
-        missing.push('frontend production health check');
+        addBlocker('config', 'frontend production health check');
       }
       if (!stagingUrl && !stagingWorkflow) {
-        missing.push('frontend staging URL or workflow');
+        addBlocker('config', 'frontend staging URL or workflow');
       }
       if (!stagingHealthcheck) {
-        missing.push('frontend staging health check');
+        addBlocker('config', 'frontend staging health check');
       }
       if (productionUrl && stagingUrl && productionUrl === stagingUrl) {
-        missing.push('frontend staging URL must differ from production URL');
+        addBlocker('config', 'frontend staging URL must differ from production URL');
       }
       if (stagingUrl && isLocalUrl(stagingUrl)) {
-        missing.push('frontend staging URL must not be localhost');
+        addBlocker('config', 'frontend staging URL must not be localhost');
       }
       if (stagingHealthcheck && isLocalUrl(stagingHealthcheck)) {
-        missing.push('frontend staging health check must not be localhost');
+        addBlocker('config', 'frontend staging health check must not be localhost');
       }
       const observed = observedStagingSuccess('frontend');
-      if (observed) missing.push(observed);
+      if (observed) addBlocker('observed', observed);
       const probe = probeFreshness('frontend');
-      if (probe) missing.push(probe);
+      if (probe) addBlocker('probe', probe);
     } else if (surface === 'edge') {
       if (!options.deployConfig.edge.staging.deployCommand) {
-        missing.push('edge staging deploy command');
+        addBlocker('config', 'edge staging deploy command');
       }
       if (!options.deployConfig.edge.production.deployCommand) {
-        missing.push('edge production deploy command');
+        addBlocker('config', 'edge production deploy command');
       }
       if (!options.deployConfig.edge.staging.verificationCommand && !options.deployConfig.edge.production.verificationCommand && !options.deployConfig.edge.staging.healthcheckUrl && !options.deployConfig.edge.production.healthcheckUrl) {
-        missing.push('edge verification command or health check');
+        addBlocker('config', 'edge verification command or health check');
       }
       const observed = observedStagingSuccess('edge');
-      if (observed) missing.push(observed);
+      if (observed) addBlocker('observed', observed);
       // Edge + sql probes only run when an explicit healthcheckUrl is
       // configured for them — many consumers don't have one. When unset,
       // fall back to the observed-staging-success gate alone.
       if (options.deployConfig.edge.staging.healthcheckUrl) {
         const probe = probeFreshness('edge');
-        if (probe) missing.push(probe);
+        if (probe) addBlocker('probe', probe);
       }
     } else if (surface === 'sql') {
       if (!options.deployConfig.sql.staging.applyCommand) {
-        missing.push('sql staging apply/reset path');
+        addBlocker('config', 'sql staging apply/reset path');
       }
       if (!options.deployConfig.sql.production.applyCommand) {
-        missing.push('sql production apply path');
+        addBlocker('config', 'sql production apply path');
       }
       if (!options.deployConfig.sql.staging.verificationCommand && !options.deployConfig.sql.production.verificationCommand && !options.deployConfig.sql.staging.healthcheckUrl && !options.deployConfig.sql.production.healthcheckUrl) {
-        missing.push('sql verification step');
+        addBlocker('config', 'sql verification step');
       }
       const observed = observedStagingSuccess('sql');
-      if (observed) missing.push(observed);
+      if (observed) addBlocker('observed', observed);
       if (options.deployConfig.sql.staging.healthcheckUrl) {
         const probe = probeFreshness('sql');
-        if (probe) missing.push(probe);
+        if (probe) addBlocker('probe', probe);
       }
     }
 
     results[surface] = {
       ready: missing.length === 0,
       missing,
+      blockers,
     };
   }
 

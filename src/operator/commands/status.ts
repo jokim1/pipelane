@@ -77,7 +77,7 @@ export async function handleStatus(cwd: string, parsed: ParsedOperatorArgs): Pro
 
   let envelope: ApiEnvelope<SnapshotData>;
   try {
-    envelope = buildWorkflowApiSnapshot(cwd);
+    envelope = await buildWorkflowApiSnapshot(cwd);
   } catch (error) {
     // Fail loud. Never silently read raw state files.
     const message = error instanceof Error ? error.message : String(error);
@@ -113,7 +113,7 @@ export function renderCockpit(
   options: RenderCockpitOptions = {},
 ): string {
   const color = options.color === true;
-  const { boardContext, branches, sourceHealth, attention } = envelope.data;
+  const { boardContext, branches, smoke, sourceHealth, attention } = envelope.data;
   const baseBranch = boardContext.baseBranch;
 
   const lines: string[] = [];
@@ -156,7 +156,13 @@ export function renderCockpit(
     lines.push('');
   }
 
+  lines.push(...renderCurrentCheckout(boardContext.currentCheckout, color));
+  lines.push('');
+
   lines.push(...renderAttention(attention as ApiIssue[], color));
+  lines.push('');
+
+  lines.push(...renderSmoke(smoke, color));
   lines.push('');
 
   const grouped = groupBranches(branches);
@@ -211,6 +217,41 @@ function renderHeader(envelope: ApiEnvelope<SnapshotData>, color: boolean): stri
   ].join('  ');
 }
 
+function renderCurrentCheckout(
+  checkout: SnapshotData['boardContext']['currentCheckout'] | undefined,
+  color: boolean,
+): string[] {
+  if (!checkout) {
+    return [];
+  }
+  const lines = [colorize('CHECKOUT', color, 'bold')];
+  lines.push(`  ${sanitizeForTerminal(checkout.summary)}`);
+
+  const renderLayer = (label: string, layer: SnapshotData['boardContext']['currentCheckout']['layers']['worktree']) => {
+    const health = colorize(layer.health, color, toneForShellHealth(layer.health));
+    const sha = layer.sha ? layer.sha.slice(0, 7) : 'n/a';
+    const detail = layer.detail ? ` ${sanitizeForTerminal(layer.detail)}` : '';
+    lines.push(`  ${label}: ${health} sha=${sanitizeForTerminal(sha)}${detail}`);
+    lines.push(`    ${sanitizeForTerminal(layer.reason)}`);
+  };
+
+  renderLayer('worktree', checkout.layers.worktree);
+  renderLayer('origin', checkout.layers.origin);
+  renderLayer('deploy', checkout.layers.deploy);
+  renderLayer('runtime', checkout.layers.runtime);
+
+  lines.push(`  compare worktree→origin: ${sanitizeForTerminal(checkout.relationships.worktreeToOrigin.state)} (${sanitizeForTerminal(checkout.relationships.worktreeToOrigin.reason)})`);
+  lines.push(`  compare deploy→origin: ${sanitizeForTerminal(checkout.relationships.deployToOrigin.state)} (${sanitizeForTerminal(checkout.relationships.deployToOrigin.reason)})`);
+  lines.push(`  compare runtime→deploy: ${sanitizeForTerminal(checkout.relationships.runtimeToDeploy.state)} (${sanitizeForTerminal(checkout.relationships.runtimeToDeploy.reason)})`);
+  lines.push(`  compare runtime→origin: ${sanitizeForTerminal(checkout.relationships.runtimeToOrigin.state)} (${sanitizeForTerminal(checkout.relationships.runtimeToOrigin.reason)})`);
+
+  if (checkout.nextAction) {
+    lines.push(`  next: ${sanitizeForTerminal(checkout.nextAction)}`);
+  }
+
+  return lines;
+}
+
 function renderAttention(attention: ApiIssue[], color: boolean): string[] {
   const lines = [colorize('ATTENTION', color, 'bold')];
   if (!Array.isArray(attention) || attention.length === 0) {
@@ -221,6 +262,31 @@ function renderAttention(attention: ApiIssue[], color: boolean): string[] {
     const sev = colorize(issue.severity ?? 'warning', color, severityTone(issue.severity));
     const where = issue.branch ? ` ${sanitizeForTerminal(issue.branch)}` : '';
     lines.push(`  [${sev}]${where} ${sanitizeForTerminal(issue.message)}`);
+  }
+  return lines;
+}
+
+function renderSmoke(
+  smoke: SnapshotData['smoke'],
+  color: boolean,
+): string[] {
+  const lines = [colorize('SMOKE', color, 'bold')];
+  const renderLine = (label: string, record: SnapshotData['smoke']['staging']) => {
+    if (!record) {
+      lines.push(`  ${label}: none`);
+      return;
+    }
+    const statusTone = record.status === 'failed' ? 'red' : 'green';
+    lines.push(
+      `  ${label}: ${colorize(record.status, color, statusTone)} sha=${sanitizeForTerminal(record.sha.slice(0, 7))} finished=${sanitizeForTerminal(record.finishedAt)}`,
+    );
+  };
+  renderLine('staging', smoke?.staging ?? null);
+  renderLine('prod', smoke?.prod ?? null);
+  if (Array.isArray(smoke?.locks)) {
+    for (const lock of smoke.locks) {
+      lines.push(`  active: ${sanitizeForTerminal(lock.environment)} ${sanitizeForTerminal(lock.operation)} runId=${sanitizeForTerminal(lock.runId)}`);
+    }
   }
   return lines;
 }
@@ -334,6 +400,20 @@ function toneForState(state: LaneState): Tone {
     case 'unknown':
     case 'bypassed':
     default: return 'gray';
+  }
+}
+
+function toneForShellHealth(state: SnapshotData['boardContext']['currentCheckout']['layers']['worktree']['health']): Tone {
+  switch (state) {
+    case 'healthy':
+      return 'green';
+    case 'degraded':
+      return 'yellow';
+    case 'unavailable':
+      return 'gray';
+    case 'unknown':
+    default:
+      return 'cyan';
   }
 }
 

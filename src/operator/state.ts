@@ -7,7 +7,7 @@ import { computeUrlFingerprint, resolveProbeStateKey, verifySignedPayload } from
 
 export type Mode = 'build' | 'release';
 export type KnownSurface = 'frontend' | 'edge' | 'sql';
-export const WORKFLOW_COMMANDS = ['devmode', 'new', 'resume', 'repo-guard', 'pr', 'merge', 'deploy', 'clean', 'status', 'doctor', 'rollback'] as const;
+export const WORKFLOW_COMMANDS = ['devmode', 'new', 'resume', 'repo-guard', 'pr', 'merge', 'deploy', 'smoke', 'clean', 'status', 'doctor', 'rollback'] as const;
 export type WorkflowCommand = (typeof WORKFLOW_COMMANDS)[number];
 export const DEFAULT_WORKFLOW_ALIASES: Record<WorkflowCommand, string> = {
   devmode: '/devmode',
@@ -17,6 +17,7 @@ export const DEFAULT_WORKFLOW_ALIASES: Record<WorkflowCommand, string> = {
   pr: '/pr',
   merge: '/merge',
   deploy: '/deploy',
+  smoke: '/smoke',
   clean: '/clean',
   status: '/status',
   doctor: '/doctor',
@@ -48,6 +49,52 @@ export interface ChecksConfig {
   // GitHub environment-level secrets (staging + production) that must exist.
   // Checked via `gh secret list --env <name>` for each environment.
   requiredEnvironmentSecrets?: string[];
+}
+
+export interface SmokePreflightStepConfig {
+  name: string;
+  command: string;
+  critical?: boolean;
+}
+
+export interface SmokeCohortConfig {
+  name: string;
+  blocking?: boolean;
+}
+
+export interface SmokeEnvironmentConfig {
+  command: string;
+  preflight?: SmokePreflightStepConfig[];
+  cohorts?: SmokeCohortConfig[];
+}
+
+export interface SmokeWaiverConfig {
+  path?: string;
+  maxExtensions?: number;
+}
+
+export interface SmokeHistoryConfig {
+  dir?: string;
+  latestPath?: string;
+  retentionDays?: number;
+  maxEntries?: number;
+}
+
+export interface SmokeConcurrencyConfig {
+  mode?: 'single-flight';
+}
+
+export interface SmokeConfig {
+  registryPath?: string;
+  generatedSummaryPath?: string;
+  criticalPathCoverage?: 'warn' | 'block';
+  criticalPaths?: string[];
+  requireStagingSmoke?: boolean;
+  staging?: SmokeEnvironmentConfig;
+  prod?: SmokeEnvironmentConfig;
+  waivers?: SmokeWaiverConfig;
+  history?: SmokeHistoryConfig;
+  concurrency?: SmokeConcurrencyConfig;
 }
 
 export interface WorkflowConfig {
@@ -83,6 +130,7 @@ export interface WorkflowConfig {
   // against `git diff --name-only` output. Empty / absent = all changes
   // land in the "other" bucket with a hint to configure the map.
   surfacePathMap?: Record<string, string[]>;
+  smoke?: SmokeConfig;
 }
 
 // Per-surface opt-out flags for `pipelane setup` / `pipelane sync-docs`.
@@ -207,6 +255,14 @@ export interface DeployVerification {
   error?: string;
 }
 
+export interface DeployRuntimeObservation {
+  observedSha?: string;
+  observedAt?: string;
+  releaseMarkerUrl?: string;
+  releaseMarkerState?: 'healthy' | 'unknown' | 'degraded' | 'unavailable';
+  reason?: string;
+}
+
 export interface DeployRecord {
   environment: 'staging' | 'prod';
   sha: string;
@@ -229,6 +285,7 @@ export interface DeployRecord {
   // gate re-blocks when the current config has drifted (staging URL rotated,
   // healthcheck path changed, etc.). Computed by computeDeployConfigFingerprint.
   configFingerprint?: string;
+  runtimeObservation?: DeployRuntimeObservation;
   // v1.2 (optional): HMAC-SHA256 over canonical record fields using the key
   // at env PIPELANE_DEPLOY_STATE_KEY. Unsigned records are accepted when no
   // key is configured; when a key IS configured, unsigned + invalid-sig
@@ -238,6 +295,125 @@ export interface DeployRecord {
   idempotencyKey?: string;
   triggeredBy?: string;
   failureReason?: string;
+  smokeCoverageOverrideReason?: string;
+}
+
+export type SmokeEnvironment = 'staging' | 'prod';
+export type SmokeRunStatus = 'passed' | 'failed' | 'passed_with_retries';
+
+export interface SmokeRegistryEntry {
+  description?: string;
+  blocking?: boolean;
+  quarantine?: boolean;
+  owner?: string;
+  escalation?: string;
+  runbook?: string;
+  environments?: SmokeEnvironment[];
+  surfaces?: string[];
+  sourceTests?: string[];
+  reviewBy?: string;
+  reason?: string;
+}
+
+export interface SmokeRegistryState {
+  checks: Record<string, SmokeRegistryEntry>;
+}
+
+export interface SmokeWaiverRecord {
+  tag: string;
+  environment: SmokeEnvironment;
+  reason: string;
+  createdAt: string;
+  expiresAt: string;
+  extensions?: number;
+}
+
+export interface SmokeWaiverState {
+  waivers: SmokeWaiverRecord[];
+}
+
+export interface SmokePreflightResult {
+  name: string;
+  critical: boolean;
+  status: 'passed' | 'failed' | 'skipped';
+  logPath: string;
+}
+
+export interface SmokeArtifacts {
+  firstFailureTrace?: string;
+  htmlReport?: string;
+  screenshotDir?: string;
+  logPath?: string;
+}
+
+export interface SmokeRunnerCheckResult {
+  tag: string;
+  status: SmokeRunStatus;
+  attempts?: Array<{ attempt: number; status: SmokeRunStatus }>;
+  artifacts?: SmokeArtifacts;
+}
+
+export interface SmokeRunnerResultContract {
+  schemaVersion?: number;
+  checks: SmokeRunnerCheckResult[];
+}
+
+export interface SmokeCohortResult {
+  name: string;
+  blocking: boolean;
+  status: SmokeRunStatus;
+  exitCode: number;
+  artifacts?: SmokeArtifacts;
+  checks?: SmokeRunnerCheckResult[];
+  resultsPath?: string;
+  contractError?: string;
+}
+
+export interface SmokeCheckResult {
+  tag: string;
+  status: SmokeRunStatus;
+  quarantine: boolean;
+  blocking: boolean;
+  effectiveBlocking: boolean;
+  waived?: boolean;
+  waiverReason?: string;
+  owner?: string;
+  attempts: Array<{ attempt: number; status: SmokeRunStatus }>;
+  artifacts?: SmokeArtifacts;
+  cohorts?: string[];
+}
+
+export interface SmokeRunRecord {
+  runId: string;
+  environment: SmokeEnvironment;
+  sha: string;
+  baseUrl: string;
+  status: SmokeRunStatus;
+  startedAt: string;
+  finishedAt: string;
+  preflight: SmokePreflightResult[];
+  cohortResults: SmokeCohortResult[];
+  checks: SmokeCheckResult[];
+  waiversApplied: SmokeWaiverRecord[];
+  lastKnownGoodSha: string | null;
+  drifted?: boolean;
+  retryCount?: number;
+}
+
+export interface SmokeLatestState {
+  staging: SmokeRunRecord | null;
+  prod: SmokeRunRecord | null;
+  updatedAt: string;
+}
+
+export interface SmokeEnvironmentLock {
+  environment: SmokeEnvironment;
+  operation: 'smoke' | 'deploy';
+  runId: string;
+  sha: string;
+  createdAt: string;
+  pid: number;
+  repoRoot: string;
 }
 
 export interface OperatorFlags {
@@ -246,6 +422,7 @@ export interface OperatorFlags {
   json: boolean;
   offline: boolean;
   override: boolean;
+  skipSmokeCoverage: boolean;
   patch: boolean;
   reason: string;
   sha: string;
@@ -353,6 +530,7 @@ export function defaultWorkflowConfig(projectKey: string, displayName: string): 
       description: 'Protected lane. Promote the same merged SHA through staging before prod.',
       requireStagingPromotion: true,
     },
+    smoke: undefined,
   };
 }
 
@@ -528,7 +706,85 @@ export function normalizeWorkflowConfig(raw: Partial<WorkflowConfig>): WorkflowC
     checks: normalizeChecksConfig(raw.checks),
     syncDocs: normalizeSyncDocsConfig(raw.syncDocs),
     surfacePathMap: normalizeSurfacePathMap(raw.surfacePathMap),
+    smoke: normalizeSmokeConfig(raw.smoke),
   };
+}
+
+function normalizeSmokeConfig(raw: SmokeConfig | undefined): SmokeConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const normalizeEnvironment = (value: SmokeEnvironmentConfig | undefined): SmokeEnvironmentConfig | undefined => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+    const command = typeof value.command === 'string' ? value.command.trim() : '';
+    if (!command) return undefined;
+    const preflight = Array.isArray(value.preflight)
+      ? value.preflight
+          .filter((step): step is SmokePreflightStepConfig =>
+            Boolean(step)
+            && typeof step.name === 'string'
+            && step.name.trim().length > 0
+            && typeof step.command === 'string'
+            && step.command.trim().length > 0,
+          )
+          .map((step) => ({
+            name: step.name.trim(),
+            command: step.command.trim(),
+            critical: step.critical === true,
+          }))
+      : undefined;
+    const cohorts = Array.isArray(value.cohorts)
+      ? value.cohorts
+          .filter((cohort): cohort is SmokeCohortConfig =>
+            Boolean(cohort)
+            && typeof cohort.name === 'string'
+            && cohort.name.trim().length > 0,
+          )
+          .map((cohort) => ({
+            name: cohort.name.trim(),
+            blocking: cohort.blocking !== false,
+          }))
+      : undefined;
+    return {
+      command,
+      preflight,
+      cohorts,
+    };
+  };
+  const criticalPaths = Array.isArray(raw.criticalPaths)
+    ? raw.criticalPaths.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+    : undefined;
+  const normalized: SmokeConfig = {
+    registryPath: typeof raw.registryPath === 'string' && raw.registryPath.trim().length > 0 ? raw.registryPath.trim() : undefined,
+    generatedSummaryPath: typeof raw.generatedSummaryPath === 'string' && raw.generatedSummaryPath.trim().length > 0 ? raw.generatedSummaryPath.trim() : undefined,
+    criticalPathCoverage: raw.criticalPathCoverage === 'block' ? 'block' : (raw.criticalPathCoverage === 'warn' ? 'warn' : undefined),
+    criticalPaths,
+    requireStagingSmoke: raw.requireStagingSmoke === true,
+    staging: normalizeEnvironment(raw.staging),
+    prod: normalizeEnvironment(raw.prod),
+    waivers: raw.waivers && typeof raw.waivers === 'object'
+      ? {
+          path: typeof raw.waivers.path === 'string' && raw.waivers.path.trim().length > 0 ? raw.waivers.path.trim() : undefined,
+          maxExtensions: typeof raw.waivers.maxExtensions === 'number' && Number.isFinite(raw.waivers.maxExtensions)
+            ? Math.max(0, Math.trunc(raw.waivers.maxExtensions))
+            : undefined,
+        }
+      : undefined,
+    history: raw.history && typeof raw.history === 'object'
+      ? {
+          dir: typeof raw.history.dir === 'string' && raw.history.dir.trim().length > 0 ? raw.history.dir.trim() : undefined,
+          latestPath: typeof raw.history.latestPath === 'string' && raw.history.latestPath.trim().length > 0 ? raw.history.latestPath.trim() : undefined,
+          retentionDays: typeof raw.history.retentionDays === 'number' && Number.isFinite(raw.history.retentionDays)
+            ? Math.max(1, Math.trunc(raw.history.retentionDays))
+            : undefined,
+          maxEntries: typeof raw.history.maxEntries === 'number' && Number.isFinite(raw.history.maxEntries)
+            ? Math.max(1, Math.trunc(raw.history.maxEntries))
+            : undefined,
+        }
+      : undefined,
+    concurrency: raw.concurrency && raw.concurrency.mode === 'single-flight'
+      ? { mode: 'single-flight' }
+      : undefined,
+  };
+  return Object.values(normalized).some((value) => value !== undefined) ? normalized : undefined;
 }
 
 // Accept a surface→path-list map only when both shape and value types
@@ -635,6 +891,10 @@ export function resolveStateDir(commonDir: string, config: WorkflowConfig): stri
   return path.join(commonDir, config.stateDir);
 }
 
+export function resolveSharedRepoRoot(commonDir: string): string {
+  return path.dirname(normalizePath(commonDir));
+}
+
 export function ensureStateDir(commonDir: string, config: WorkflowConfig): string {
   const stateDir = resolveStateDir(commonDir, config);
   mkdirSync(path.join(stateDir, TASK_LOCKS_DIRNAME), { recursive: true });
@@ -661,6 +921,50 @@ export function probeStatePath(commonDir: string, config: WorkflowConfig): strin
   return path.join(resolveStateDir(commonDir, config), PROBE_STATE_FILENAME);
 }
 
+export function resolveSmokeTrackedDir(repoRoot: string): string {
+  return path.join(repoRoot, '.pipelane');
+}
+
+export function resolveSmokeRegistryPath(repoRoot: string, config: WorkflowConfig): string {
+  return path.join(repoRoot, config.smoke?.registryPath ?? '.pipelane/smoke-checks.json');
+}
+
+export function resolveSmokeWaiversPath(repoRoot: string, config: WorkflowConfig): string {
+  return path.join(repoRoot, config.smoke?.waivers?.path ?? '.pipelane/waivers.json');
+}
+
+export function resolveSmokeRuntimeRoot(commonDir: string): string {
+  return path.join(resolveSharedRepoRoot(commonDir), '.pipelane', 'state', 'smoke');
+}
+
+export function resolveSmokeHistoryDir(commonDir: string, config: WorkflowConfig): string {
+  const relative = config.smoke?.history?.dir?.trim();
+  if (relative) {
+    return path.join(resolveSharedRepoRoot(commonDir), relative);
+  }
+  return path.join(resolveSmokeRuntimeRoot(commonDir), 'history');
+}
+
+export function resolveSmokeLatestPath(commonDir: string, config: WorkflowConfig): string {
+  const relative = config.smoke?.history?.latestPath?.trim();
+  if (relative) {
+    return path.join(resolveSharedRepoRoot(commonDir), relative);
+  }
+  return path.join(resolveSmokeRuntimeRoot(commonDir), 'latest.json');
+}
+
+export function resolveSmokeHistoryRecordPath(commonDir: string, config: WorkflowConfig, runId: string): string {
+  return path.join(resolveSmokeHistoryDir(commonDir, config), `${runId}.json`);
+}
+
+export function resolveSmokeLogsDir(commonDir: string): string {
+  return path.join(resolveSmokeRuntimeRoot(commonDir), 'logs');
+}
+
+export function resolveSmokeLockPath(commonDir: string, environment: SmokeEnvironment): string {
+  return path.join(resolveSmokeRuntimeRoot(commonDir), 'locks', `${environment}.json`);
+}
+
 export function loadProbeState(commonDir: string, config: WorkflowConfig): ProbeState {
   const raw = readJsonFile<ProbeState>(probeStatePath(commonDir, config), { records: [] as ProbeRecord[], updatedAt: '' });
   const normalized = normalizeProbeState(raw);
@@ -678,6 +982,76 @@ export function loadProbeState(commonDir: string, config: WorkflowConfig): Probe
       && verifySignedPayload(record, key)
     ),
   };
+}
+
+export function loadSmokeRegistry(repoRoot: string, config: WorkflowConfig): SmokeRegistryState {
+  const raw = readJsonFile<SmokeRegistryState>(resolveSmokeRegistryPath(repoRoot, config), { checks: {} });
+  const source = raw && typeof raw === 'object' ? raw : { checks: {} };
+  const checks = source.checks && typeof source.checks === 'object' ? source.checks : {};
+  return { checks: checks as Record<string, SmokeRegistryEntry> };
+}
+
+export function saveSmokeRegistry(repoRoot: string, config: WorkflowConfig, value: SmokeRegistryState): void {
+  mkdirSync(resolveSmokeTrackedDir(repoRoot), { recursive: true });
+  writeJsonFile(resolveSmokeRegistryPath(repoRoot, config), value);
+}
+
+export function loadSmokeWaivers(repoRoot: string, config: WorkflowConfig): SmokeWaiverState {
+  const raw = readJsonFile<SmokeWaiverState>(resolveSmokeWaiversPath(repoRoot, config), { waivers: [] });
+  const waivers = Array.isArray(raw?.waivers) ? raw.waivers : [];
+  return { waivers: waivers as SmokeWaiverRecord[] };
+}
+
+export function saveSmokeWaivers(repoRoot: string, config: WorkflowConfig, value: SmokeWaiverState): void {
+  mkdirSync(resolveSmokeTrackedDir(repoRoot), { recursive: true });
+  writeJsonFile(resolveSmokeWaiversPath(repoRoot, config), value);
+}
+
+export function loadSmokeLatestState(commonDir: string, config: WorkflowConfig): SmokeLatestState {
+  return readJsonFile<SmokeLatestState>(resolveSmokeLatestPath(commonDir, config), {
+    staging: null,
+    prod: null,
+    updatedAt: '',
+  });
+}
+
+export function saveSmokeLatestState(commonDir: string, config: WorkflowConfig, value: SmokeLatestState): void {
+  writeJsonFile(resolveSmokeLatestPath(commonDir, config), value);
+}
+
+export function saveSmokeRunRecord(commonDir: string, config: WorkflowConfig, value: SmokeRunRecord): void {
+  writeJsonFile(resolveSmokeHistoryRecordPath(commonDir, config, value.runId), value);
+}
+
+export function loadSmokeRunRecord(commonDir: string, config: WorkflowConfig, runId: string): SmokeRunRecord | null {
+  return readJsonFile<SmokeRunRecord | null>(resolveSmokeHistoryRecordPath(commonDir, config, runId), null);
+}
+
+export function listSmokeRunRecords(commonDir: string, config: WorkflowConfig): SmokeRunRecord[] {
+  const historyDir = resolveSmokeHistoryDir(commonDir, config);
+  if (!existsSync(historyDir)) {
+    return [];
+  }
+  return readdirSync(historyDir)
+    .filter((entry) => entry.endsWith('.json'))
+    .map((entry) => readJsonFile<SmokeRunRecord | null>(path.join(historyDir, entry), null))
+    .filter((entry): entry is SmokeRunRecord => entry !== null)
+    .sort((left, right) => left.startedAt.localeCompare(right.startedAt));
+}
+
+export function loadSmokeEnvironmentLock(commonDir: string, environment: SmokeEnvironment): SmokeEnvironmentLock | null {
+  return readJsonFile<SmokeEnvironmentLock | null>(resolveSmokeLockPath(commonDir, environment), null);
+}
+
+export function saveSmokeEnvironmentLock(commonDir: string, value: SmokeEnvironmentLock): void {
+  writeJsonFile(resolveSmokeLockPath(commonDir, value.environment), value);
+}
+
+export function removeSmokeEnvironmentLock(commonDir: string, environment: SmokeEnvironment): void {
+  const targetPath = resolveSmokeLockPath(commonDir, environment);
+  if (existsSync(targetPath)) {
+    unlinkSync(targetPath);
+  }
 }
 
 // v1.2: mirror `normalizeModeState` — a malformed probe-state.json (valid
@@ -981,6 +1355,7 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     json: false,
     offline: false,
     override: false,
+    skipSmokeCoverage: false,
     patch: false,
     reason: '',
     sha: '',
@@ -1027,6 +1402,11 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
 
     if (token === '--override') {
       flags.override = true;
+      continue;
+    }
+
+    if (token === '--skip-smoke-coverage') {
+      flags.skipSmokeCoverage = true;
       continue;
     }
 

@@ -51,7 +51,8 @@ User-facing:
 3. `{{ALIAS_PR}}`
 4. `{{ALIAS_MERGE}}`
 5. `{{ALIAS_DEPLOY}} staging`
-6. `{{ALIAS_DEPLOY}} prod`
+6. `{{ALIAS_SMOKE}} staging`
+7. `{{ALIAS_DEPLOY}} prod`
 7. `{{ALIAS_CLEAN}}`
 
 Repo-native:
@@ -62,6 +63,7 @@ npm run pipelane:new -- --task "example-task"
 npm run pipelane:pr -- --title "Example PR title"
 npm run pipelane:merge
 npm run pipelane:deploy -- staging
+npm run pipelane:smoke -- staging
 npm run pipelane:deploy -- prod
 npm run pipelane:clean
 ```
@@ -74,6 +76,7 @@ npm run pipelane:clean
 - `{{ALIAS_PR}}`
 - `{{ALIAS_MERGE}}`
 - `{{ALIAS_DEPLOY}}`
+- `{{ALIAS_SMOKE}}`
 - `{{ALIAS_CLEAN}}`
 - `{{ALIAS_STATUS}}`
 - `{{ALIAS_DOCTOR}}`
@@ -90,6 +93,7 @@ Canonical repo-native commands:
 - `npm run pipelane:release-check`
 - `npm run pipelane:task-lock -- verify --task "<task-name>"`
 - `npm run pipelane:deploy -- staging|prod ...`
+- `npm run pipelane:smoke -- plan|staging|prod`
 - `npm run pipelane:clean`
 - `npm run pipelane:status`
 - `npm run pipelane:doctor` (add `-- --probe` for live healthchecks, `-- --fix` for the guided wizard)

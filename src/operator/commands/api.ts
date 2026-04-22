@@ -12,7 +12,7 @@ export async function handleApi(cwd: string, parsed: ParsedOperatorArgs): Promis
   const [subcommand, actionId] = parsed.positional;
 
   if (!subcommand || subcommand === 'snapshot') {
-    const envelope = buildWorkflowApiSnapshot(cwd);
+    const envelope = await buildWorkflowApiSnapshot(cwd);
     process.stdout.write(`${JSON.stringify(envelope, null, 2)}\n`);
     return;
   }
@@ -30,8 +30,8 @@ export async function handleApi(cwd: string, parsed: ParsedOperatorArgs): Promis
 
     const scope = parsed.flags.scope === 'workspace' ? 'workspace' : 'branch';
     const envelope = parsed.flags.patch
-      ? buildBranchPatchEnvelope(cwd, parsed.flags.branch, parsed.flags.file, scope)
-      : buildBranchDetailsEnvelope(cwd, parsed.flags.branch);
+      ? await buildBranchPatchEnvelope(cwd, parsed.flags.branch, parsed.flags.file, scope)
+      : await buildBranchDetailsEnvelope(cwd, parsed.flags.branch);
 
     process.stdout.write(`${JSON.stringify(envelope, null, 2)}\n`);
     return;
