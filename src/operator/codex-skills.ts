@@ -4,6 +4,8 @@ import path from 'node:path';
 import { aliasCommandName, readJsonFile, resolveWorkflowAliases, type WorkflowCommand, WORKFLOW_COMMANDS, type WorkflowConfig, writeJsonFile } from './state.ts';
 
 const MANAGED_CODEX_SKILLS_FILENAME = '.pipelane-managed.json';
+const MANAGED_CODEX_RUNTIME_DIR = '.pipelane';
+const MANAGED_CODEX_RUNNER = path.join(MANAGED_CODEX_RUNTIME_DIR, 'bin', 'run-pipelane.sh');
 const INIT_PIPELANE_SKILL_NAME = 'init-pipelane';
 const PIPELANE_CODEX_SKILL_MARKER = '<!-- pipelane:codex-skill:';
 
@@ -23,8 +25,48 @@ Run the repo-native pipelane command currently mapped to ${slashAlias}.
 1. Parse any arguments that appear after the requested command invocation.
 2. Preserve quoted substrings when building the shell command.
 3. Run:
-   \`npm run pipelane:${command} -- <parsed arguments>\`
+   \`"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.agents/skills/${MANAGED_CODEX_RUNNER}" ${command} <parsed arguments>\`
 4. Stream the command output directly.
+`;
+}
+
+function managedCodexRunnerPath(skillsRoot: string): string {
+  return path.join(skillsRoot, MANAGED_CODEX_RUNNER);
+}
+
+function buildManagedCodexRunner(): string {
+  return `#!/bin/sh
+set -eu
+
+command="\${1:-}"
+if [ -z "$command" ]; then
+  echo "usage: run-pipelane.sh <command> [args...]" >&2
+  exit 64
+fi
+shift
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+local_bin="$repo_root/node_modules/.bin/pipelane"
+if [ -x "$local_bin" ]; then
+  cd "$repo_root"
+  exec "$local_bin" run "$command" "$@"
+fi
+
+codex_home="\${CODEX_HOME:-\${HOME:-}/.codex}"
+global_bin="$codex_home/skills/.pipelane/bin/pipelane"
+if [ -x "$global_bin" ]; then
+  cd "$repo_root"
+  exec "$global_bin" run "$command" "$@"
+fi
+
+echo "pipelane is unavailable for this repo." >&2
+echo "Checked:" >&2
+echo "  - $local_bin" >&2
+echo "  - $global_bin" >&2
+echo "Restore one of these runtimes and retry:" >&2
+echo "  - run npm install in the repo to restore node_modules/.bin/pipelane" >&2
+echo "  - run pipelane install-codex (or reinstall Codex skills) to restore the managed Codex runtime" >&2
+exit 1
 `;
 }
 
@@ -128,6 +170,8 @@ export function syncCodexSkills(
   const managedSkills = loadManagedCodexSkills(skillsRoot);
   assertNoCodexSkillCollisions(skillsRoot, desiredSkills, managedSkills);
   pruneManagedCodexSkills(skillsRoot, desiredSkills, managedSkills);
+  mkdirSync(path.dirname(managedCodexRunnerPath(skillsRoot)), { recursive: true });
+  writeFileSync(managedCodexRunnerPath(skillsRoot), buildManagedCodexRunner(), { mode: 0o755, encoding: 'utf8' });
 
   for (const [skillName, mapping] of desiredMappings.entries()) {
     const skillDir = path.join(skillsRoot, skillName);

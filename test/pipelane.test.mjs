@@ -1518,10 +1518,11 @@ test('custom aliases drive generated Claude commands, docs, and tracked Codex sk
     assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'branch', 'SKILL.md')));
     assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'back', 'SKILL.md')));
     assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'draft-pr', 'SKILL.md')));
+    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', '.pipelane', 'bin', 'run-pipelane.sh')));
     assert.equal(existsSync(path.join(repoRoot, '.agents', 'skills', 'new', 'SKILL.md')), false);
     assert.equal(existsSync(path.join(repoRoot, '.agents', 'skills', 'resume', 'SKILL.md')), false);
     assert.equal(existsSync(path.join(repoRoot, '.agents', 'skills', 'pr', 'SKILL.md')), false);
-    assert.match(readFileSync(path.join(repoRoot, '.agents', 'skills', 'branch', 'SKILL.md'), 'utf8'), /npm run pipelane:new --/);
+    assert.match(readFileSync(path.join(repoRoot, '.agents', 'skills', 'branch', 'SKILL.md'), 'utf8'), /run-pipelane\.sh" new/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -2512,7 +2513,7 @@ test('syncDocs.packageScripts: false without required pipelane:* scripts throws 
     // Error message must list the three escape hatches so the consumer
     // can recover without digging into the codebase.
     assert.match(result.stderr, /set syncDocs\.packageScripts to true/);
-    assert.match(result.stderr, /set syncDocs\.claudeCommands and syncDocs\.codexSkills to false/);
+    assert.match(result.stderr, /set syncDocs\.claudeCommands to false/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -2547,6 +2548,34 @@ test('syncDocs.packageScripts: false is allowed when claudeCommands is also fals
 
     const after = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
     assert.deepEqual(after.scripts, { build: 'my-build' });
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('syncDocs.packageScripts: false still allows tracked Codex skills when Claude commands are disabled', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    const packageJsonPath = path.join(repoRoot, 'package.json');
+    const consumerPackage = { name: 'consumer-app', private: true, type: 'module', scripts: { build: 'my-build' } };
+    writeFileSync(packageJsonPath, `${JSON.stringify(consumerPackage, null, 2)}\n`, 'utf8');
+
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.syncDocs = { packageScripts: false, claudeCommands: false };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    const after = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+    assert.deepEqual(after.scripts, { build: 'my-build' });
+    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'new', 'SKILL.md')));
+    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', '.pipelane', 'bin', 'run-pipelane.sh')));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -2820,13 +2849,86 @@ test('tracked Codex skills stay repo-local when different repos map the same ali
 
     const repoOneBranchSkill = readFileSync(path.join(repoOne, '.agents', 'skills', 'branch', 'SKILL.md'), 'utf8');
     const repoTwoBranchSkill = readFileSync(path.join(repoTwo, '.agents', 'skills', 'branch', 'SKILL.md'), 'utf8');
-    assert.match(repoOneBranchSkill, /npm run pipelane:new --/);
-    assert.match(repoTwoBranchSkill, /npm run pipelane:resume --/);
+    assert.match(repoOneBranchSkill, /run-pipelane\.sh" new/);
+    assert.match(repoTwoBranchSkill, /run-pipelane\.sh" resume/);
     assert.ok(existsSync(path.join(repoOne, '.agents', 'skills', 'back', 'SKILL.md')));
     assert.equal(existsSync(path.join(repoTwo, '.agents', 'skills', 'back', 'SKILL.md')), false);
   } finally {
     rmSync(repoOne, { recursive: true, force: true });
     rmSync(repoTwo, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('tracked Codex wrapper prefers the repo-local pipelane install', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    mkdirSync(path.join(repoRoot, 'node_modules', '.bin'), { recursive: true });
+    writeFileSync(
+      path.join(repoRoot, 'node_modules', '.bin', 'pipelane'),
+      '#!/bin/sh\necho "LOCAL:$*"\n',
+      { mode: 0o755, encoding: 'utf8' },
+    );
+
+    mkdirSync(path.join(codexHome, 'skills', '.pipelane', 'bin'), { recursive: true });
+    writeFileSync(
+      path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane'),
+      '#!/bin/sh\necho "GLOBAL:$*"\n',
+      { mode: 0o755, encoding: 'utf8' },
+    );
+
+    const output = execFileSync(
+      path.join(repoRoot, '.agents', 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      ['status', '--json'],
+      {
+        cwd: repoRoot,
+        env: { ...process.env, CODEX_HOME: codexHome },
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+
+    assert.equal(output.trim(), 'LOCAL:run status --json');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('tracked Codex wrapper falls back to the managed Codex runtime when node_modules is missing', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    mkdirSync(path.join(codexHome, 'skills', '.pipelane', 'bin'), { recursive: true });
+    writeFileSync(
+      path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane'),
+      '#!/bin/sh\necho "GLOBAL:$*"\n',
+      { mode: 0o755, encoding: 'utf8' },
+    );
+
+    const output = execFileSync(
+      path.join(repoRoot, '.agents', 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      ['status', '--json'],
+      {
+        cwd: repoRoot,
+        env: { ...process.env, CODEX_HOME: codexHome },
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+
+    assert.equal(output.trim(), 'GLOBAL:run status --json');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
   }
 });

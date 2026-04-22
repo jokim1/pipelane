@@ -385,12 +385,11 @@ export function ensurePackageScripts(repoRoot: string): void {
   writeFileSync(targetPath, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
 }
 
-// Generated slash-command templates and tracked Codex skills invoke
-// `npm run pipelane:<cmd>`. If a consumer opts out of packageScripts but
-// keeps either surface, the generated files would point at scripts that do
-// not exist. Catch that mismatch here instead of leaving a broken setup.
+// Generated Claude slash-command templates invoke `npm run pipelane:<cmd>`.
+// Tracked Codex skills use a repo-managed wrapper instead, so packageScripts
+// are only a hard requirement when Claude commands are being generated.
 function assertPackageScriptConsistency(repoRoot: string, syncDocs: Required<SyncDocsConfig>): void {
-  if (syncDocs.packageScripts || (!syncDocs.claudeCommands && !syncDocs.codexSkills)) {
+  if (syncDocs.packageScripts || !syncDocs.claudeCommands) {
     return;
   }
 
@@ -409,11 +408,11 @@ function assertPackageScriptConsistency(repoRoot: string, syncDocs: Required<Syn
 
   throw new Error(
     `syncDocs.packageScripts is false but package.json is missing required npm scripts: ${missing.join(', ')}. ` +
-      `The generated .claude/commands/*.md templates and tracked Codex skills invoke these via \`npm run pipelane:<cmd>\`. ` +
+      `The generated .claude/commands/*.md templates invoke these via \`npm run pipelane:<cmd>\`. ` +
       `Fix it one of three ways: ` +
       `(a) add the missing scripts to package.json yourself, ` +
       `(b) set syncDocs.packageScripts to true (or drop the flag), or ` +
-      `(c) also set syncDocs.claudeCommands and syncDocs.codexSkills to false so the command files aren't generated.`,
+      `(c) set syncDocs.claudeCommands to false so the command files aren't generated.`,
   );
 }
 
