@@ -6430,6 +6430,62 @@ test('doctor.listMissingFields reports platform + frontend staging + production 
   assert.deepEqual(doctor.listMissingFields(full), [], 'full config reports no gaps');
 });
 
+test('doctor diagnose labels stale staging probes explicitly', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    writeStaleProbeState(repoRoot, ['frontend'], { ageMs: 25 * 60 * 60 * 1000, ok: true });
+
+    const result = runCli(['run', 'doctor'], repoRoot);
+    assert.match(result.stdout, /frontend: STALE/);
+    assert.match(result.stdout, /25h old/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('doctor diagnose reports only the newest staging probe per surface', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    const now = Date.now();
+    const olderProbedAt = new Date(now - 10 * 60 * 1000).toISOString();
+    const newerProbedAt = new Date(now - 60 * 1000).toISOString();
+    writeProbeState(repoRoot, [
+      {
+        environment: 'staging',
+        surface: 'frontend',
+        url: probeUrlForSurface('frontend'),
+        ok: false,
+        statusCode: 500,
+        latencyMs: 30,
+        error: 'HTTP 500',
+        probedAt: olderProbedAt,
+      },
+      {
+        environment: 'staging',
+        surface: 'frontend',
+        url: probeUrlForSurface('frontend'),
+        ok: true,
+        statusCode: 200,
+        latencyMs: 20,
+        probedAt: newerProbedAt,
+      },
+    ], newerProbedAt);
+
+    const result = runCli(['run', 'doctor'], repoRoot);
+    assert.match(result.stdout, /Probe state: 1 staging surface probe\(s\) recorded\./);
+    assert.match(result.stdout, new RegExp(`frontend: OK \\(HTTP 200\\) at ${newerProbedAt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.doesNotMatch(result.stdout, /HTTP 500/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('pipelane:api snapshot surfaces probeState rollup + deployProbe.* sourceHealth + probe attention', async () => {
   const repoRoot = createRepo();
   try {
@@ -6465,6 +6521,30 @@ test('pipelane:api snapshot surfaces probeState rollup + deployProbe.* sourceHea
   }
 });
 
+test('pipelane:api snapshot surfaces unsupported configured probes explicitly', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.surfaces = [...config.surfaces, 'worker'];
+    writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
+
+    const result = runCli(['run', 'api', 'snapshot'], repoRoot);
+    const envelope = JSON.parse(result.stdout);
+    const workerProbe = envelope.data.sourceHealth.find((entry) => entry.name === 'deployProbe.worker');
+    assert.ok(workerProbe, 'unsupported surface still gets a probe/sourceHealth row');
+    assert.equal(workerProbe.state, 'unknown');
+    assert.match(workerProbe.reason, /unsupported surface "worker"/);
+    const issue = envelope.data.attention.find((entry) => entry.code === 'surface.unsupported');
+    assert.ok(issue, 'attention[] carries an unsupported surface issue');
+    assert.match(issue.message, /worker/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('release-check blocks when staging probe is degraded (non-2xx)', async () => {
   const repoRoot = createRepo();
   try {
@@ -6481,6 +6561,32 @@ test('release-check blocks when staging probe is degraded (non-2xx)', async () =
     assert.equal(output.ready, false);
     assert.match(output.message, /probe is degraded/);
     assert.match(output.message, /HTTP 503|probe failed/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check blocks unsupported configured surfaces with a clear error', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.surfaces = [...config.surfaces, 'worker'];
+    writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
+    writeFullDeployConfigClaude(repoRoot);
+    await writeStagingSucceededRecord(repoRoot, ['frontend', 'edge', 'sql']);
+
+    const result = runCli(['run', 'release-check', '--surfaces', 'worker', '--json'], repoRoot, {}, true);
+    const output = JSON.parse(result.stdout);
+    assert.equal(result.status, 1);
+    assert.equal(output.ready, false);
+    assert.deepEqual(output.blockedSurfaces, ['worker']);
+    assert.match(output.message, /unsupported surface "worker"/);
+    assert.match(output.message, /release gate only knows frontend, edge, sql/);
+    assert.match(output.message, /update the tracked workflow config/);
+    assert.doesNotMatch(output.message, /npm run pipelane:configure/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -6838,6 +6944,74 @@ test('v1.4 /status --week --json end-to-end renders from a real init\'d repo', (
     assert.equal(parsed.view, 'week');
     assert.equal(parsed.days.length, 7);
     assert.equal(parsed.totals.succeeded, 1);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('v1.4 /status --stuck --json end-to-end renders from a real init\'d repo', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const commonDir = path.join(repoRoot, '.git');
+    const updatedAt = new Date(Date.now() - 90 * 3600 * 1000).toISOString();
+    v14SeedState(commonDir, {
+      taskLocks: [{
+        taskSlug: 'stuck-task',
+        taskName: 'Stuck Task',
+        branchName: 'codex/stuck-task-1111',
+        worktreePath: '/tmp/stuck',
+        mode: 'release',
+        surfaces: ['frontend'],
+        updatedAt,
+        nextAction: 'PR #42 open, awaiting CI',
+      }],
+    });
+
+    const result = runCli(['run', 'status', '--stuck', '--json'], repoRoot);
+    assert.equal(result.status, 0);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.view, 'stuck');
+    assert.equal(parsed.idleTasks.length, 1);
+    assert.equal(parsed.idleTasks[0].taskSlug, 'stuck-task');
+    assert.equal(parsed.idleTasks[0].nextAction, 'PR #42 open, awaiting CI');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('v1.4 /status --blast --json end-to-end renders from a real init\'d repo', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.surfacePathMap = { frontend: ['src/frontend/'], sql: ['supabase/'] };
+    writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
+
+    mkdirSync(path.join(repoRoot, 'src', 'frontend', 'components'), { recursive: true });
+    mkdirSync(path.join(repoRoot, 'supabase', 'migrations'), { recursive: true });
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'src', 'frontend', 'App.tsx'), 'v1', 'utf8');
+    writeFileSync(path.join(repoRoot, 'docs', 'README.md'), 'old', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'blast-base'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['switch', '-c', 'feature'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    writeFileSync(path.join(repoRoot, 'src', 'frontend', 'App.tsx'), 'v2', 'utf8');
+    writeFileSync(path.join(repoRoot, 'src', 'frontend', 'components', 'Button.tsx'), 'new', 'utf8');
+    writeFileSync(path.join(repoRoot, 'supabase', 'migrations', '001.sql'), 'create', 'utf8');
+    writeFileSync(path.join(repoRoot, 'docs', 'README.md'), 'changed', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'blast-target'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const result = runCli(['run', 'status', '--blast', 'HEAD', '--json'], repoRoot);
+    assert.equal(result.status, 0);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.view, 'blast');
+    assert.equal(parsed.base.kind, 'base-branch');
+    assert.deepEqual(parsed.surfaces.frontend.sort(), ['src/frontend/App.tsx', 'src/frontend/components/Button.tsx']);
+    assert.deepEqual(parsed.surfaces.sql, ['supabase/migrations/001.sql']);
+    assert.deepEqual(parsed.other, ['docs/README.md']);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -7732,6 +7906,82 @@ test('v1.1 fixup: capDeployHistory preserves the most recent verified record per
   assert.ok(preserved, 'verified prod record must survive the cap as a pinned checkpoint');
   // Capped history should still be bounded (≤ 100 tail + pinned).
   assert.ok(capped.length <= 110, `capped length ${capped.length} exceeds expected upper bound`);
+});
+
+test('v1.1 fixup: capDeployHistory preserves multiple verified checkpoints per (env, surfaces)', async () => {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'deploy.ts'));
+  const ok = (statusCode) => ({ healthcheckUrl: 'x', statusCode, latencyMs: 10, probes: 2 });
+  const records = [
+    { environment: 'prod', sha: 'good-1', surfaces: ['frontend'], workflowName: 'X',
+      requestedAt: '2026-01-01T00:00:00Z', status: 'succeeded', verifiedAt: '2026-01-01T00:01:00Z',
+      verification: ok(200) },
+    { environment: 'prod', sha: 'good-2', surfaces: ['frontend'], workflowName: 'X',
+      requestedAt: '2026-01-02T00:00:00Z', status: 'succeeded', verifiedAt: '2026-01-02T00:01:00Z',
+      verification: ok(200) },
+    { environment: 'prod', sha: 'good-3', surfaces: ['frontend'], workflowName: 'X',
+      requestedAt: '2026-01-03T00:00:00Z', status: 'succeeded', verifiedAt: '2026-01-03T00:01:00Z',
+      verification: ok(200) },
+  ];
+  for (let i = 0; i < 150; i += 1) {
+    records.push({ environment: 'staging', sha: `filler-${i}`, surfaces: ['frontend'],
+      workflowName: 'X', requestedAt: '2026-01-04T00:00:00Z', status: 'requested' });
+  }
+  const capped = mod.capDeployHistory(records);
+  const preserved = capped
+    .filter((record) => ['good-1', 'good-2', 'good-3'].includes(record.sha))
+    .map((record) => record.sha);
+  assert.deepEqual(preserved, ['good-1', 'good-2', 'good-3']);
+  assert.ok(capped.length <= 110, `capped length ${capped.length} exceeds expected upper bound`);
+});
+
+test('v1.1 fixup: findRecentRun scans far enough for busy repos', async () => {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'deploy.ts'));
+  const repoRoot = createRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-find-run-'));
+  const ghPath = path.join(ghBin, 'gh');
+  writeFileSync(ghPath, `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === 'run' && args[1] === 'list') {
+  const limitIndex = args.indexOf('--limit');
+  const limit = limitIndex === -1 ? 0 : Number(args[limitIndex + 1] || '0');
+  const runs = [];
+  for (let i = 0; i < Math.min(limit, 14); i += 1) {
+    runs.push({
+      databaseId: i + 1,
+      headSha: 'other-' + i,
+      createdAt: new Date(Date.now() + i * 1000).toISOString(),
+      url: 'https://example.test/run/' + (i + 1),
+      status: 'completed',
+      conclusion: 'success',
+    });
+  }
+  if (limit >= 15) {
+    runs.push({
+      databaseId: 999,
+      headSha: 'targetsha',
+      createdAt: new Date(Date.now() + 15000).toISOString(),
+      url: 'https://example.test/run/999',
+      status: 'completed',
+      conclusion: 'success',
+    });
+  }
+  process.stdout.write(JSON.stringify(runs));
+  process.exit(0);
+}
+process.exit(0);
+`, { mode: 0o755, encoding: 'utf8' });
+
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${ghBin}:${originalPath}`;
+  try {
+    const hit = mod.findRecentRun(repoRoot, 'Deploy Hosted', 'targetsha', Date.now(), { strict: true });
+    assert.equal(hit?.id, '999');
+    assert.equal(hit?.url, 'https://example.test/run/999');
+  } finally {
+    process.env.PATH = originalPath;
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
 });
 
 // Claude r3 P1: in-flight guard must expire when the async workflow dies.

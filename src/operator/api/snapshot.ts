@@ -14,8 +14,10 @@ import {
 import {
   emptyDeployConfig,
   explainSurfaceProbe,
+  isReleaseManagedSurface,
   loadDeployConfig,
   resolveSurfaceProbeUrl,
+  unsupportedSurfaceReason,
   type DeployConfig,
   type ProbeFreshnessState,
   type ProbeSurfaceFreshness,
@@ -167,7 +169,10 @@ export function buildWorkflowApiSnapshot(cwd: string): ApiEnvelope<SnapshotData>
     ...surfaceProbes.map((entry) => buildSourceHealthEntry({
       name: `deployProbe.${entry.surface}`,
       state: mapProbeStateToLaneState(entry.result.state),
-      blocking: entry.result.state === 'stale' || entry.result.state === 'degraded',
+      blocking:
+        entry.result.state === 'stale'
+        || entry.result.state === 'degraded'
+        || isUnsupportedSurfaceProbe(entry),
       reason: describeSurfaceProbe(entry),
       checkedAt,
       observedAt: entry.result.probe?.probedAt,
@@ -177,6 +182,18 @@ export function buildWorkflowApiSnapshot(cwd: string): ApiEnvelope<SnapshotData>
 
   const attention: ApiIssue[] = [];
   for (const entry of surfaceProbes) {
+    if (isUnsupportedSurfaceProbe(entry)) {
+      attention.push(buildApiIssue({
+        code: 'surface.unsupported',
+        severity: 'error',
+        message: `staging ${entry.surface}: ${entry.result.reason}`,
+        source: 'deployConfig',
+        blocking: true,
+        lane: 'staging',
+        action: 'doctor.diagnose',
+      }));
+      continue;
+    }
     if (entry.result.state !== 'stale' && entry.result.state !== 'degraded') continue;
     attention.push(buildApiIssue({
       code: entry.result.state === 'degraded' ? 'probe.degraded' : 'probe.stale',
@@ -240,6 +257,10 @@ interface SurfaceProbeEntry {
   result: ProbeSurfaceFreshness;
 }
 
+function isUnsupportedSurfaceProbe(entry: SurfaceProbeEntry): boolean {
+  return entry.result.state === 'unknown' && entry.result.reason.startsWith('unsupported surface "');
+}
+
 // Only the surfaces the release-gate would probe end up here. `frontend`
 // is always probed (the URL or healthcheckUrl is the target); `edge`/`sql`
 // probe only when an explicit healthcheckUrl is wired — many consumers
@@ -252,7 +273,17 @@ function collectSurfaceProbes(options: {
   const { deployConfig, probeState, surfaces } = options;
   const entries: SurfaceProbeEntry[] = [];
   for (const surface of surfaces) {
-    if (surface === 'frontend') {
+    if (!isReleaseManagedSurface(surface)) {
+      entries.push({
+        surface,
+        result: {
+          state: 'unknown',
+          reason: unsupportedSurfaceReason(surface),
+          probe: null,
+          ageMs: null,
+        },
+      });
+    } else if (surface === 'frontend') {
       entries.push({
         surface,
         result: explainSurfaceProbe({

@@ -22,6 +22,17 @@ import {
 
 export { DEPLOY_STATE_KEY_ENV, resolveDeployStateKey } from './integrity.ts';
 
+export const RELEASE_MANAGED_SURFACES = ['frontend', 'edge', 'sql'] as const;
+export type ReleaseManagedSurface = (typeof RELEASE_MANAGED_SURFACES)[number];
+
+export function isReleaseManagedSurface(surface: string): surface is ReleaseManagedSurface {
+  return RELEASE_MANAGED_SURFACES.includes(surface as ReleaseManagedSurface);
+}
+
+export function unsupportedSurfaceReason(surface: string): string {
+  return `unsupported surface "${surface}"; release gate only knows ${RELEASE_MANAGED_SURFACES.join(', ')}.`;
+}
+
 export interface DeployConfig {
   platform: string;
   frontend: {
@@ -556,6 +567,15 @@ export function evaluateReleaseReadiness(options: {
   for (const surface of options.surfaces) {
     const missing: string[] = [];
 
+    if (!isReleaseManagedSurface(surface)) {
+      missing.push(unsupportedSurfaceReason(surface));
+      results[surface] = {
+        ready: false,
+        missing,
+      };
+      continue;
+    }
+
     if (surface === 'frontend') {
       const productionUrl = options.deployConfig.frontend.production.url;
       const productionWorkflow = options.deployConfig.frontend.production.deployWorkflow;
@@ -662,9 +682,15 @@ export function buildReleaseCheckMessage(readiness: ReturnType<typeof evaluateRe
       readiness.results[surface].missing.length > 0
       && readiness.results[surface].missing.every((reason) => reason.includes('no succeeded deploy observed')),
     );
+    const hasUnsupportedSurfaceBlocker = readiness.blockedSurfaces.some((surface) =>
+      readiness.results[surface].missing.some((reason) => reason.startsWith('unsupported surface "')),
+    );
     if (allObserveBlockers) {
       lines.push('Next: run `npm run pipelane:devmode -- build`, then `npm run pipelane:deploy -- staging` once per surface,');
       lines.push('then `npm run pipelane:devmode -- release`. The readiness gate is observed, not asserted.');
+    } else if (hasUnsupportedSurfaceBlocker) {
+      lines.push('Next: update the tracked workflow config (`.pipelane.json`, or `.project-workflow.json` in legacy repos) so');
+      lines.push('it only lists release-managed surfaces (frontend, edge, sql), or extend the release gate before retrying.');
     } else {
       lines.push('Next: run `npm run pipelane:configure` to fill in the Deploy Configuration block in CLAUDE.md, then');
       lines.push('`npm run pipelane:devmode -- build` and `npm run pipelane:deploy -- staging` to register a staging success.');

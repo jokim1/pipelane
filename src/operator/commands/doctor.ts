@@ -5,8 +5,10 @@ import readline from 'node:readline';
 import { computeUrlFingerprint, resolveProbeStateKey, signSignedPayload } from '../integrity.ts';
 import {
   emptyDeployConfig,
+  explainSurfaceProbe,
   loadDeployConfig,
   replaceDeployConfigSection,
+  resolveSurfaceProbeUrl,
   saveSharedDeployConfig,
   type DeployConfig,
 } from '../release-gate.ts';
@@ -121,13 +123,26 @@ export function buildDiagnoseReport(context: WorkflowContext): DiagnoseReport {
     }
     lines.push('  Fix: `npm run pipelane:doctor -- --fix`');
   }
-  const freshStaging = probeState.records.filter((r) => r.environment === 'staging');
-  if (freshStaging.length === 0) {
+  const latestStaging = latestProbeRecordsBySurface(probeState.records, 'staging');
+  if (latestStaging.length === 0) {
     lines.push('  Probe state: no probes recorded. Run `npm run pipelane:doctor -- --probe`.');
   } else {
-    lines.push(`  Probe state: ${freshStaging.length} staging probe(s) recorded.`);
-    for (const record of freshStaging) {
-      lines.push(`    - ${record.surface}: ${record.ok ? 'OK' : 'FAILED'} (${record.statusCode ?? 'no status'}) at ${record.probedAt}`);
+    lines.push(`  Probe state: ${latestStaging.length} staging surface probe(s) recorded.`);
+    for (const record of latestStaging) {
+      const freshness = explainSurfaceProbe({
+        probeState,
+        surface: record.surface,
+        environment: 'staging',
+        expectedUrl: resolveSurfaceProbeUrl(deployConfig, 'staging', record.surface) || undefined,
+      });
+      let label = 'UNKNOWN';
+      if (freshness.state === 'healthy') label = 'OK';
+      if (freshness.state === 'degraded') label = 'FAILED';
+      if (freshness.state === 'stale') label = 'STALE';
+      const detail = freshness.state === 'healthy'
+        ? `HTTP ${record.statusCode ?? '?'}`
+        : freshness.reason;
+      lines.push(`    - ${record.surface}: ${label} (${detail}) at ${record.probedAt}`);
     }
   }
   return {
@@ -136,6 +151,15 @@ export function buildDiagnoseReport(context: WorkflowContext): DiagnoseReport {
     probeState: { present: probeState.records.length > 0, records: probeState.records },
     message: lines.join('\n'),
   };
+}
+
+function latestProbeRecordsBySurface(records: ProbeRecord[], environment: ProbeEnvironment): ProbeRecord[] {
+  const latest = new Map<string, ProbeRecord>();
+  for (const record of records) {
+    if (record.environment !== environment) continue;
+    latest.set(record.surface, record);
+  }
+  return [...latest.values()];
 }
 
 export interface PlatformDetection {

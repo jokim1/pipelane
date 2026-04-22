@@ -524,34 +524,51 @@ export function persistRecord(
 // recency cap. Keep the tail-100 window for everything else so state
 // files still stay bounded.
 const DEPLOY_HISTORY_TAIL = 100;
+const DEPLOY_HISTORY_PINNED_PER_TARGET = 3;
 export function capDeployHistory(records: DeployRecord[]): DeployRecord[] {
   if (records.length <= DEPLOY_HISTORY_TAIL) return records;
   const tail = records.slice(-DEPLOY_HISTORY_TAIL);
   const tailSet = new Set(tail);
-  // Walk the full history and pick the most recent verified checkpoint
-  // per (environment, sorted-surfaces) that isn't already in the tail.
-  const pinned = new Map<string, DeployRecord>();
-  for (const record of records) {
-    if (tailSet.has(record)) continue;
-    if (record.status !== 'succeeded') continue;
-    if (!record.verifiedAt) continue;
-    if (!record.sha) continue;
-    const key = `${record.environment}:${[...(record.surfaces ?? [])].sort().join(',')}`;
-    const prev = pinned.get(key);
-    const prevTime = prev?.verifiedAt ? Date.parse(prev.verifiedAt) : 0;
-    const curTime = Date.parse(record.verifiedAt);
-    if (!prev || (Number.isFinite(curTime) && curTime > prevTime)) {
-      pinned.set(key, record);
-    }
+  const isPinnedCandidate = (record: DeployRecord): boolean =>
+    record.status === 'succeeded' && Boolean(record.verifiedAt) && Boolean(record.sha);
+  const keyFor = (record: DeployRecord): string =>
+    `${record.environment}:${[...(record.surfaces ?? [])].sort().join(',')}`;
+
+  // Preserve a few verified checkpoints per (environment, surfaces), not just
+  // one. That keeps rollback viable for more than a single step-back on a
+  // busy long-lived repo where multiple good deploys can age out of the tail.
+  // Only pin what the tail window does NOT already retain, so the total
+  // history stays bounded while still carrying a small rollback ladder.
+  const tailPinnedCounts = new Map<string, number>();
+  for (const record of tail) {
+    if (!isPinnedCandidate(record)) continue;
+    const key = keyFor(record);
+    tailPinnedCounts.set(key, (tailPinnedCounts.get(key) ?? 0) + 1);
   }
-  if (pinned.size === 0) return tail;
+
+  const pinned = new Map<string, DeployRecord[]>();
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    const record = records[index];
+    if (tailSet.has(record)) continue;
+    if (!isPinnedCandidate(record)) continue;
+    const key = keyFor(record);
+    const needed = Math.max(0, DEPLOY_HISTORY_PINNED_PER_TARGET - (tailPinnedCounts.get(key) ?? 0));
+    if (needed === 0) continue;
+    const bucket = pinned.get(key) ?? [];
+    if (bucket.length >= needed) continue;
+    bucket.push(record);
+    pinned.set(key, bucket);
+  }
+
+  const pinnedSet = new Set<DeployRecord>();
+  for (const bucket of pinned.values()) {
+    for (const record of bucket) pinnedSet.add(record);
+  }
+  if (pinnedSet.size === 0) return tail;
   // Preserve the original insertion order across pinned + tail so the
   // newest-last invariant that findLastGoodDeploy relies on still
   // holds. Pinned records come first (they're older than the tail).
-  const pinnedOrdered = records.filter((record) => {
-    for (const value of pinned.values()) if (value === record) return true;
-    return false;
-  });
+  const pinnedOrdered = records.filter((record) => pinnedSet.has(record));
   return [...pinnedOrdered, ...tail];
 }
 
@@ -571,13 +588,14 @@ export function findRecentRun(
   dispatchedAfter: number,
   options: { strict?: boolean } = {},
 ): { id: string; url?: string } | null {
+  const recentRunLimit = 50;
   const output = runCommandCapture('gh', [
     'run',
     'list',
     '--workflow',
     workflowName,
     '--limit',
-    '10',
+    String(recentRunLimit),
     '--json',
     'databaseId,headSha,createdAt,url,status,conclusion',
   ], { cwd: repoRoot });
