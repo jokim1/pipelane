@@ -2921,6 +2921,41 @@ test('loadDeployConfig falls back to shared deploy-config.json when local CLAUDE
   }
 });
 
+test('setup output mentions shared deploy configuration when the empty local CLAUDE.md falls back to shared state', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    writeSharedDeployConfig(repoRoot);
+
+    const result = runCli(['setup'], repoRoot);
+    assert.match(
+      result.stdout,
+      /Release mode can use shared deploy configuration when available\./,
+    );
+    assert.doesNotMatch(
+      result.stdout,
+      /Release mode still requires local deploy configuration in CLAUDE\.md\./,
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup output points the operator at doctor or configure when no deploy config exists yet', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    const result = runCli(['setup'], repoRoot);
+    assert.match(
+      result.stdout,
+      /Release mode still requires deploy configuration\. Run `pipelane doctor --fix` or `pipelane configure`\./,
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('release-check re-blocks when the deploy config fingerprint drifts', async () => {
   const repoRoot = createRepo();
   try {

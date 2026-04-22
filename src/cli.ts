@@ -8,6 +8,7 @@ import { installCodexBootstrapSkill } from './operator/codex-install.ts';
 import { handleConfigure } from './operator/commands/configure.ts';
 import { initConsumerRepo, setupConsumerRepo, syncDocsOnly } from './operator/docs.ts';
 import { runOperator } from './operator/index.ts';
+import { loadDeployConfig } from './operator/release-gate.ts';
 import { parseUpdateArgs, runUpdate } from './operator/update.ts';
 
 function valueAfter(args: string[], flag: string): string {
@@ -40,6 +41,14 @@ Examples:
   pipelane dashboard --repo /absolute/path/to/repo
   pipelane run new --task "My Task"
 `);
+}
+
+function setupDeployConfigMessage(repoRoot: string): string {
+  if (loadDeployConfig(repoRoot)) {
+    return 'Release mode can use shared deploy configuration when available. Edit local CLAUDE.md only for worktree-local overrides.';
+  }
+
+  return 'Release mode still requires deploy configuration. Run `pipelane doctor --fix` or `pipelane configure`.';
 }
 
 async function main(): Promise<void> {
@@ -100,7 +109,7 @@ async function main(): Promise<void> {
     process.stdout.write([
       `Pipelane setup complete in ${result.repoRoot}`,
       result.createdClaude ? 'Created local CLAUDE.md from the Pipelane template.' : 'Preserved existing local CLAUDE.md.',
-      'Release mode still requires local deploy configuration in CLAUDE.md.',
+      setupDeployConfigMessage(result.repoRoot),
     ].concat(
       result.installedCodexSkills.length > 0
         ? [
