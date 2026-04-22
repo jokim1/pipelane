@@ -27,7 +27,13 @@ import {
   type ProbeFreshnessState,
   type ProbeSurfaceFreshness,
 } from '../release-gate.ts';
-import { evaluateSmokeCoverage, resolveSmokeConfig } from '../smoke-gate.ts';
+import {
+  evaluateSmokeCoverage,
+  findLatestSmokeRun,
+  findQualifyingSmokeRun,
+  isSmokeSuccessStatus,
+  resolveSmokeConfig,
+} from '../smoke-gate.ts';
 import {
   observeFrontendRuntime,
   type FrontendRuntimeObservation,
@@ -211,6 +217,16 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
     deployConfig,
     environment: 'prod',
   });
+  const activeLock = locks.find((lock) => lock.branchName === currentBranch) ?? null;
+  const currentPrRecord = activeLock ? prState.records[activeLock.taskSlug] ?? null : null;
+  const stagingSmokeStatus = resolveStagingSmokeStatus({
+    commonDir: context.commonDir,
+    config: context.config,
+    mode,
+    smokeConfig,
+    latestRecord: smokeLatest.staging,
+    currentPrRecord,
+  });
 
   const branches = buildBranchRows({
     locks,
@@ -224,7 +240,13 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
     checkedAt,
   });
 
-  const activeLock = locks.find((lock) => lock.branchName === currentBranch) ?? null;
+  const worktreeToOriginAnalysis = analyzeWorktreeToOrigin({
+    repoRoot: context.repoRoot,
+    currentBranch,
+    baseBranch,
+    worktreeSha: currentHeadSha || null,
+    originSha: baseBranchSha || null,
+  });
   const currentCheckout = buildCurrentCheckoutTruth({
     checkedAt,
     currentBranch,
@@ -232,10 +254,11 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
     baseBranch,
     baseBranchSha,
     activeLock,
-    currentPrRecord: activeLock ? prState.records[activeLock.taskSlug] ?? null : null,
+    currentPrRecord,
     deployRecords: deployState.records,
     deployConfig,
     runtimeObservation,
+    worktreeToOrigin: worktreeToOriginAnalysis.relationship,
   });
 
   const sourceHealth: SourceHealthEntry[] = [
@@ -263,11 +286,11 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
     })),
     buildSourceHealthEntry({
       name: 'smoke.staging',
-      state: smokeLaneState(smokeLatest.staging),
-      blocking: context.modeState.mode === 'release' && smokeConfig.requireStagingSmoke,
-      reason: describeSmokeSummary(smokeLatest.staging, 'staging'),
+      state: stagingSmokeStatus.state,
+      blocking: stagingSmokeStatus.blocking,
+      reason: stagingSmokeStatus.reason,
       checkedAt,
-      observedAt: smokeLatest.staging?.finishedAt,
+      observedAt: stagingSmokeStatus.observedAt,
     }),
     buildSourceHealthEntry({
       name: 'smoke.prod',
@@ -341,26 +364,8 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
       lane: lock.environment,
     }));
   }
-  if (!smokeLatest.staging) {
-    attention.push(buildApiIssue({
-      code: 'smoke.staging.missing',
-      severity: context.modeState.mode === 'release' && smokeConfig.requireStagingSmoke ? 'error' : 'warning',
-      message: 'No staging smoke history yet. Run `pipelane:smoke -- staging` before promoting.',
-      source: 'smokeLatest',
-      blocking: context.modeState.mode === 'release' && smokeConfig.requireStagingSmoke,
-      lane: 'staging',
-      action: 'smoke.staging',
-    }));
-  } else if (smokeLatest.staging?.status === 'failed') {
-    attention.push(buildApiIssue({
-      code: 'smoke.staging.failed',
-      severity: context.modeState.mode === 'release' && smokeConfig.requireStagingSmoke ? 'error' : 'warning',
-      message: `Latest staging smoke failed for ${smokeLatest.staging.sha.slice(0, 7)}.`,
-      source: 'smokeLatest',
-      blocking: context.modeState.mode === 'release' && smokeConfig.requireStagingSmoke,
-      lane: 'staging',
-      action: 'smoke.staging',
-    }));
+  if (stagingSmokeStatus.issue) {
+    attention.push(stagingSmokeStatus.issue);
   }
   if (smokeLatest.prod?.status === 'failed') {
     attention.push(buildApiIssue({
@@ -385,10 +390,8 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
     }));
   }
   const staleBaseIssue = buildStaleBaseIssue({
-    currentBranch,
     baseBranch,
-    currentHeadSha,
-    baseBranchSha,
+    analysis: worktreeToOriginAnalysis,
   });
   if (staleBaseIssue) {
     attention.push(staleBaseIssue);
@@ -464,6 +467,160 @@ function describeSmokeSummary(record: SmokeRunRecord | null, environment: 'stagi
     return `no ${environment} smoke history`;
   }
   return `${record.status} @ ${record.sha.slice(0, 7)} (${record.finishedAt})`;
+}
+
+interface StagingSmokeStatus {
+  state: LaneState;
+  blocking: boolean;
+  reason: string;
+  observedAt?: string;
+  issue: ApiIssue | null;
+}
+
+function resolveStagingSmokeStatus(options: {
+  commonDir: string;
+  config: WorkflowConfig;
+  mode: string;
+  smokeConfig: ReturnType<typeof resolveSmokeConfig>;
+  latestRecord: SmokeRunRecord | null;
+  currentPrRecord: PrRecord | null;
+}): StagingSmokeStatus {
+  const gateBlocking = options.mode === 'release' && options.smokeConfig.requireStagingSmoke;
+  const latestSummary = describeSmokeSummary(options.latestRecord, 'staging');
+  const latestIssue = buildLatestStagingSmokeIssue({
+    latestRecord: options.latestRecord,
+    gateBlocking,
+  });
+
+  if (!gateBlocking || !options.currentPrRecord?.mergedSha) {
+    return {
+      state: smokeLaneState(options.latestRecord),
+      blocking: gateBlocking,
+      reason: latestSummary,
+      observedAt: options.latestRecord?.finishedAt,
+      issue: latestIssue,
+    };
+  }
+
+  const targetSha = options.currentPrRecord.mergedSha.trim();
+  const qualifyingRecord = findQualifyingSmokeRun({
+    commonDir: options.commonDir,
+    config: options.config,
+    environment: 'staging',
+    sha: targetSha,
+  });
+  if (qualifyingRecord) {
+    return {
+      state: 'healthy',
+      blocking: true,
+      reason: `qualifying staging smoke passed for current promotion SHA ${shortSha(targetSha)} (${qualifyingRecord.finishedAt})`,
+      observedAt: qualifyingRecord.finishedAt,
+      issue: null,
+    };
+  }
+
+  const latestForTarget = findLatestSmokeRun({
+    commonDir: options.commonDir,
+    config: options.config,
+    environment: 'staging',
+    sha: targetSha,
+  });
+
+  if (!latestForTarget) {
+    const latestContext = options.latestRecord
+      ? ` Latest staging smoke is ${options.latestRecord.status} @ ${shortSha(options.latestRecord.sha)} (${options.latestRecord.finishedAt}).`
+      : '';
+    return {
+      state: 'blocked',
+      blocking: true,
+      reason: `no qualifying staging smoke for current promotion SHA ${shortSha(targetSha)}.${latestContext}`,
+      observedAt: options.latestRecord?.finishedAt,
+      issue: buildApiIssue({
+        code: 'smoke.staging.target_missing',
+        severity: 'error',
+        message: `No qualifying staging smoke found for current promotion SHA ${shortSha(targetSha)}. Run \`pipelane:smoke -- staging\`.`,
+        source: 'smokeLatest',
+        blocking: true,
+        lane: 'staging',
+        action: 'smoke.staging',
+      }),
+    };
+  }
+
+  if (latestForTarget.drifted) {
+    return {
+      state: 'blocked',
+      blocking: true,
+      reason: `latest staging smoke for current promotion SHA ${shortSha(targetSha)} drifted during execution (${latestForTarget.finishedAt})`,
+      observedAt: latestForTarget.finishedAt,
+      issue: buildApiIssue({
+        code: 'smoke.staging.target_drifted',
+        severity: 'error',
+        message: `Latest staging smoke for current promotion SHA ${shortSha(targetSha)} drifted during execution. Re-run \`pipelane:smoke -- staging\`.`,
+        source: 'smokeLatest',
+        blocking: true,
+        lane: 'staging',
+        action: 'smoke.staging',
+      }),
+    };
+  }
+
+  if (!isSmokeSuccessStatus(latestForTarget.status)) {
+    return {
+      state: 'blocked',
+      blocking: true,
+      reason: `latest staging smoke failed for current promotion SHA ${shortSha(targetSha)} (${latestForTarget.finishedAt})`,
+      observedAt: latestForTarget.finishedAt,
+      issue: buildApiIssue({
+        code: 'smoke.staging.target_failed',
+        severity: 'error',
+        message: `Latest staging smoke failed for current promotion SHA ${shortSha(targetSha)}. Run \`pipelane:smoke -- staging\` after fixing the failing checks.`,
+        source: 'smokeLatest',
+        blocking: true,
+        lane: 'staging',
+        action: 'smoke.staging',
+      }),
+    };
+  }
+
+  return {
+    state: smokeLaneState(options.latestRecord),
+    blocking: gateBlocking,
+    reason: latestSummary,
+    observedAt: options.latestRecord?.finishedAt,
+    issue: latestIssue,
+  };
+}
+
+function buildLatestStagingSmokeIssue(options: {
+  latestRecord: SmokeRunRecord | null;
+  gateBlocking: boolean;
+}): ApiIssue | null {
+  if (!options.latestRecord) {
+    return buildApiIssue({
+      code: 'smoke.staging.missing',
+      severity: options.gateBlocking ? 'error' : 'warning',
+      message: 'No staging smoke history yet. Run `pipelane:smoke -- staging` before promoting.',
+      source: 'smokeLatest',
+      blocking: options.gateBlocking,
+      lane: 'staging',
+      action: 'smoke.staging',
+    });
+  }
+
+  if (options.latestRecord.status === 'failed') {
+    return buildApiIssue({
+      code: 'smoke.staging.failed',
+      severity: options.gateBlocking ? 'error' : 'warning',
+      message: `Latest staging smoke failed for ${options.latestRecord.sha.slice(0, 7)}.`,
+      source: 'smokeLatest',
+      blocking: options.gateBlocking,
+      lane: 'staging',
+      action: 'smoke.staging',
+    });
+  }
+
+  return null;
 }
 
 interface SurfaceProbeEntry {
@@ -643,6 +800,11 @@ function summarizeReleaseBlockers(
 
 const RUNTIME_PROPAGATION_WINDOW_MS = 5 * 60 * 1000;
 
+interface WorktreeOriginAnalysis {
+  kind: 'unavailable' | 'match' | 'behind' | 'ahead' | 'diverged' | 'independent' | 'drift';
+  relationship: CheckoutTruthRelationship;
+}
+
 export function buildBranchRows(options: {
   locks: TaskLock[];
   config: WorkflowConfig;
@@ -680,6 +842,7 @@ function buildCurrentCheckoutTruth(options: {
   deployRecords: DeployRecord[];
   deployConfig: DeployConfig;
   runtimeObservation: FrontendRuntimeObservation;
+  worktreeToOrigin: CheckoutTruthRelationship;
 }): CurrentCheckoutTruth {
   const latestProdFrontendDeploy = findLatestFrontendDeployRecord(options.deployRecords, 'prod');
   const latestSuccessfulProdFrontendDeploy = latestProdFrontendDeploy?.status === 'succeeded'
@@ -717,12 +880,7 @@ function buildCurrentCheckoutTruth(options: {
     observation: options.runtimeObservation,
   });
 
-  const worktreeToOrigin = compareWorktreeToOrigin({
-    currentBranch: options.currentBranch,
-    baseBranch: options.baseBranch,
-    worktreeSha: worktreeLayer.sha,
-    originSha: originLayer.sha,
-  });
+  const worktreeToOrigin = options.worktreeToOrigin;
   const deployToOrigin = compareLayerShas({
     leftLabel: 'recorded production deploy',
     leftSha: latestSuccessfulProdFrontendDeploy?.sha ?? null,
@@ -863,32 +1021,85 @@ function buildRuntimeTruthLayer(options: {
 }
 
 function compareWorktreeToOrigin(options: {
+  repoRoot: string;
   currentBranch: string;
   baseBranch: string;
   worktreeSha: string | null;
   originSha: string | null;
 }): CheckoutTruthRelationship {
+  return analyzeWorktreeToOrigin(options).relationship;
+}
+
+function analyzeWorktreeToOrigin(options: {
+  repoRoot: string;
+  currentBranch: string;
+  baseBranch: string;
+  worktreeSha: string | null;
+  originSha: string | null;
+}): WorktreeOriginAnalysis {
   if (!options.worktreeSha || !options.originSha) {
     return {
-      state: 'not-comparable',
-      reason: 'worktree or remote base SHA is unavailable',
+      kind: 'unavailable',
+      relationship: {
+        state: 'not-comparable',
+        reason: 'worktree or remote base SHA is unavailable',
+      },
     };
   }
   if (options.worktreeSha === options.originSha) {
     return {
-      state: 'match',
-      reason: `this checkout matches origin/${options.baseBranch}`,
+      kind: 'match',
+      relationship: {
+        state: 'match',
+        reason: `this checkout matches origin/${options.baseBranch}`,
+      },
     };
   }
   if (options.currentBranch === options.baseBranch) {
+    const distance = readRevisionDistance(options.repoRoot, options.worktreeSha, options.originSha);
+    if (distance) {
+      if (distance.ahead === 0 && distance.behind > 0) {
+        return {
+          kind: 'behind',
+          relationship: {
+            state: 'drift',
+            reason: `this checkout's ${options.baseBranch} is behind origin/${options.baseBranch} by ${formatCommitDistance(distance.behind)}`,
+          },
+        };
+      }
+      if (distance.ahead > 0 && distance.behind === 0) {
+        return {
+          kind: 'ahead',
+          relationship: {
+            state: 'drift',
+            reason: `this checkout's ${options.baseBranch} is ahead of origin/${options.baseBranch} by ${formatCommitDistance(distance.ahead)}`,
+          },
+        };
+      }
+      if (distance.ahead > 0 && distance.behind > 0) {
+        return {
+          kind: 'diverged',
+          relationship: {
+            state: 'drift',
+            reason: `this checkout's ${options.baseBranch} has diverged from origin/${options.baseBranch} (${formatAheadBehind(distance.ahead, distance.behind)})`,
+          },
+        };
+      }
+    }
     return {
-      state: 'drift',
-      reason: `this checkout's ${options.baseBranch} is behind origin/${options.baseBranch}`,
+      kind: 'drift',
+      relationship: {
+        state: 'drift',
+        reason: `this checkout's ${options.baseBranch} differs from origin/${options.baseBranch}`,
+      },
     };
   }
   return {
-    state: 'drift',
-    reason: `current worktree remains on ${options.currentBranch}; origin/${options.baseBranch} moved independently`,
+    kind: 'independent',
+    relationship: {
+      state: 'drift',
+      reason: `current worktree remains on ${options.currentBranch}; origin/${options.baseBranch} moved independently`,
+    },
   };
 }
 
@@ -987,7 +1198,7 @@ function summarizeCurrentCheckoutTruth(options: {
     return 'production frontend live SHA differs from recorded deploy history';
   }
   if (options.worktreeToOrigin.state === 'drift' && options.currentBranch === options.baseBranch) {
-    return `this checkout's ${options.baseBranch} is behind origin/${options.baseBranch}`;
+    return options.worktreeToOrigin.reason;
   }
   if (options.worktreeToOrigin.state === 'drift') {
     return options.currentPrRecord?.mergedAt
@@ -1001,18 +1212,14 @@ function summarizeCurrentCheckoutTruth(options: {
 }
 
 function buildStaleBaseIssue(options: {
-  currentBranch: string;
   baseBranch: string;
-  currentHeadSha: string;
-  baseBranchSha: string;
+  analysis: WorktreeOriginAnalysis;
 }): ApiIssue | null {
-  if (!options.currentHeadSha || !options.baseBranchSha) return null;
-  if (options.currentBranch !== options.baseBranch) return null;
-  if (options.currentHeadSha === options.baseBranchSha) return null;
+  if (options.analysis.kind !== 'behind') return null;
   return buildApiIssue({
     code: 'git.base.stale',
     severity: 'warning',
-    message: `local ${options.baseBranch} in this checkout is behind origin/${options.baseBranch}. Refresh this checkout if you want merged code locally.`,
+    message: `${options.analysis.relationship.reason}. Refresh this checkout if you want merged code locally.`,
     source: 'git',
     blocking: false,
     lane: 'base',
@@ -1076,6 +1283,32 @@ function mapShellHealthToLaneState(health: ShellLayerHealth): LaneState {
     default:
       return 'unknown';
   }
+}
+
+function readRevisionDistance(
+  repoRoot: string,
+  worktreeSha: string,
+  originSha: string,
+): { ahead: number; behind: number } | null {
+  const raw = runGit(repoRoot, ['rev-list', '--left-right', '--count', `${worktreeSha}...${originSha}`], true)?.trim();
+  if (!raw) {
+    return null;
+  }
+  const [aheadRaw, behindRaw] = raw.split(/\s+/);
+  const ahead = Number.parseInt(aheadRaw ?? '', 10);
+  const behind = Number.parseInt(behindRaw ?? '', 10);
+  if (!Number.isFinite(ahead) || !Number.isFinite(behind)) {
+    return null;
+  }
+  return { ahead, behind };
+}
+
+function formatCommitDistance(count: number): string {
+  return `${count} commit${count === 1 ? '' : 's'}`;
+}
+
+function formatAheadBehind(ahead: number, behind: number): string {
+  return `ahead ${formatCommitDistance(ahead)}, behind ${formatCommitDistance(behind)}`;
 }
 
 function buildBranchRow(options: {

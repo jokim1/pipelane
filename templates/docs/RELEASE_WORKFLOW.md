@@ -294,7 +294,7 @@ adding a `syncDocs` block. Every flag defaults to `true`; absent or
 | `agentsSection` | Marker-wrapped `AGENTS.md` section. |
 | `docsReleaseWorkflow` | `docs/RELEASE_WORKFLOW.md` file write. |
 | `pipelaneClaudeTemplate` | `pipelane/CLAUDE.template.md` file write. |
-| `packageScripts` | `pipelane:*` script entries in `package.json`. Setting this to `false` while `claudeCommands` or `codexSkills` is `true` requires the consumer's `package.json` to already define every tracked workflow script (`devmode`, `new`, `resume`, `repo-guard`, `pr`, `merge`, `deploy`, `clean`, `status`, `doctor`, `rollback`) plus `pipelane:configure`. Setup fails fast with guidance if any are missing. |
+| `packageScripts` | `pipelane:*` script entries in `package.json`. Setting this to `false` while `claudeCommands` or `codexSkills` is `true` requires the consumer's `package.json` to already define the full managed `pipelane:*` workflow script set for that Pipelane version, plus `pipelane:configure`. Setup fails fast with guidance if any are missing. |
 
 Opting out never removes content that a previous sync already wrote; it
 just stops future syncs from touching the surface.

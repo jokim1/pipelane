@@ -7,7 +7,6 @@ import {
   loadSmokeEnvironmentLock,
   loadSmokeLatestState,
   loadSmokeRegistry,
-  loadSmokeWaivers,
   listSmokeRunRecords,
   nowIso,
   removeSmokeEnvironmentLock,
@@ -127,6 +126,22 @@ export function resolveSmokeConfig(config: WorkflowConfig): ResolvedSmokeConfig 
       mode: 'single-flight',
     },
   };
+}
+
+export function isSmokeWaiverExpired(waiver: SmokeWaiverRecord, nowMs = Date.now()): boolean {
+  return Date.parse(waiver.expiresAt) < nowMs;
+}
+
+export function isSmokeWaiverOverExtended(waiver: SmokeWaiverRecord, maxExtensions: number): boolean {
+  return (waiver.extensions ?? 0) > maxExtensions;
+}
+
+export function isSmokeWaiverUsable(
+  waiver: SmokeWaiverRecord,
+  maxExtensions: number,
+  nowMs = Date.now(),
+): boolean {
+  return !isSmokeWaiverExpired(waiver, nowMs) && !isSmokeWaiverOverExtended(waiver, maxExtensions);
 }
 
 export function isSmokeSuccessStatus(status: SmokeRunStatus): boolean {
@@ -273,6 +288,7 @@ export function lintSmokeSetup(options: {
   waivers: SmokeWaiverRecord[];
 }): SmokeLintReport {
   const smokeConfig = resolveSmokeConfig(options.config);
+  const nowMs = Date.now();
   const registryTags = new Set(Object.keys(options.registry.checks));
   const discoveredTags = new Set(options.discoveredTags.map((entry) => entry.tag));
   const missingRegistryEntries = [...discoveredTags].filter((tag) => !registryTags.has(tag)).sort();
@@ -282,11 +298,11 @@ export function lintSmokeSetup(options: {
     .map(([tag]) => tag)
     .sort();
   const expiredWaivers = options.waivers
-    .filter((waiver) => Date.parse(waiver.expiresAt) < Date.now())
+    .filter((waiver) => isSmokeWaiverExpired(waiver, nowMs))
     .map((waiver) => `${waiver.tag}:${waiver.environment}`)
     .sort();
   const excessiveWaivers = options.waivers
-    .filter((waiver) => (waiver.extensions ?? 0) > smokeConfig.waivers.maxExtensions)
+    .filter((waiver) => isSmokeWaiverOverExtended(waiver, smokeConfig.waivers.maxExtensions))
     .map((waiver) => `${waiver.tag}:${waiver.environment}`)
     .sort();
   let generatedSummaryDrift = false;
@@ -740,6 +756,7 @@ export function buildLegacySmokeCheckResults(options: {
 export function evaluateSmokeChecks(options: {
   registry: SmokeRegistryState;
   environment: SmokeEnvironment;
+  config: WorkflowConfig;
   cohortResults: Array<{
     name: string;
     blocking: boolean;
@@ -749,12 +766,17 @@ export function evaluateSmokeChecks(options: {
   waivers: SmokeWaiverRecord[];
   requireCheckResults: boolean;
 }): { checks: SmokeCheckResult[]; contractErrors: string[] } {
+  const smokeConfig = resolveSmokeConfig(options.config);
+  const nowMs = Date.now();
   const contractErrors = options.cohortResults
     .filter((cohort) => cohort.blocking && cohort.contractError)
     .map((cohort) => `${cohort.name}: ${cohort.contractError}`);
   const activeWaivers = new Map(
     options.waivers
-      .filter((waiver) => waiver.environment === options.environment && Date.parse(waiver.expiresAt) >= Date.now())
+      .filter((waiver) =>
+        waiver.environment === options.environment
+        && isSmokeWaiverUsable(waiver, smokeConfig.waivers.maxExtensions, nowMs),
+      )
       .map((waiver) => [`${waiver.tag}:${waiver.environment}`, waiver] as const),
   );
 

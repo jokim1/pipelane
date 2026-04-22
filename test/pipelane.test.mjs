@@ -815,6 +815,22 @@ test('bootstrap in a non-git directory warns that workflow commands still need g
   }
 });
 
+test('smoke and runtime source files are tracked in git so the branch stays self-contained', () => {
+  for (const relativePath of [
+    'src/operator/commands/smoke.ts',
+    'src/operator/runtime-observation.ts',
+    'src/operator/smoke-gate.ts',
+    'templates/.claude/commands/smoke.md',
+  ]) {
+    const trackedPath = execFileSync('git', ['ls-files', '--error-unmatch', relativePath], {
+      cwd: KIT_ROOT,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    assert.equal(trackedPath, relativePath);
+  }
+});
+
 test('smoke plan scaffolds .pipelane/smoke-checks.json from discovered smoke tags', () => {
   const repoRoot = createRepo();
 
@@ -840,6 +856,25 @@ test('smoke plan scaffolds .pipelane/smoke-checks.json from discovered smoke tag
     assert.equal(registry.checks['@smoke-auth'].blocking, false);
     assert.equal(registry.checks['@smoke-auth'].quarantine, true);
     assert.deepEqual(registry.checks['@smoke-auth'].sourceTests, ['e2e/auth.spec.ts']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke plan scaffolds an empty smoke registry before any smoke tags exist', () => {
+  const repoRoot = createRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    const result = runCli(['run', 'smoke', 'plan', '--json'], repoRoot);
+    const output = JSON.parse(result.stdout);
+    const registryPath = path.join(repoRoot, '.pipelane', 'smoke-checks.json');
+    const registry = JSON.parse(readFileSync(registryPath, 'utf8'));
+
+    assert.equal(output.createdRegistry, true);
+    assert.ok(existsSync(registryPath));
+    assert.deepEqual(registry.checks, {});
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -1316,6 +1351,60 @@ test('smoke waiver create rejects unknown or out-of-environment tags', async () 
     );
     assert.notEqual(wrongEnvironment.status, 0);
     assert.match(wrongEnvironment.stderr, /@smoke-auth is not configured for prod/i);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke waiver extend enforces maxExtensions and overextended waivers no longer bypass smoke failures', async () => {
+  const repoRoot = createRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.smoke = {
+        waivers: { maxExtensions: 0 },
+        requireStagingSmoke: true,
+        staging: { command: smokeResultCommand([{ tag: '@smoke-auth', status: 'failed' }], { exitCode: 1 }) },
+      };
+    });
+    await writeSucceededDeployRecord(repoRoot, 'staging', '1111111111111111111111111111111111111111', ['frontend']);
+    runCli(['run', 'smoke', 'plan'], repoRoot);
+    updateSmokeRegistry(repoRoot, (registry) => {
+      registry.checks['@smoke-auth'].blocking = true;
+      registry.checks['@smoke-auth'].quarantine = false;
+    });
+    runCli(['run', 'smoke', 'waiver', 'create', '@smoke-auth', 'staging', '--reason', 'known flake'], repoRoot);
+
+    const extendResult = runCli(
+      ['run', 'smoke', 'waiver', 'extend', '@smoke-auth', 'staging', '--reason', 'still flaky'],
+      repoRoot,
+      {},
+      true,
+    );
+    assert.notEqual(extendResult.status, 0);
+    assert.match(extendResult.stderr, /maxExtensions=0/i);
+
+    const waiversPath = path.join(repoRoot, '.pipelane', 'waivers.json');
+    writeFileSync(waiversPath, `${JSON.stringify({
+      waivers: [{
+        tag: '@smoke-auth',
+        environment: 'staging',
+        reason: 'manually overextended',
+        createdAt: '2026-04-22T00:00:00Z',
+        expiresAt: '2099-04-22T00:00:00Z',
+        extensions: 1,
+      }],
+    }, null, 2)}\n`, 'utf8');
+
+    const smokeResult = runCli(['run', 'smoke', 'staging'], repoRoot, {}, true);
+    assert.notEqual(smokeResult.status, 0);
+    assert.match(smokeResult.stderr, /Blocking failures:/);
+    assert.doesNotMatch(smokeResult.stderr, /Waived failures:/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -2428,6 +2517,12 @@ test('syncDocs.packageScripts: false without required pipelane:* scripts throws 
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
   }
+});
+
+test('RELEASE_WORKFLOW packageScripts docs describe the managed script contract generically', () => {
+  const template = readFileSync(path.join(KIT_ROOT, 'templates', 'docs', 'RELEASE_WORKFLOW.md'), 'utf8');
+  assert.match(template, /full managed `pipelane:\*` workflow script set/i);
+  assert.match(template, /`pipelane:configure`/);
 });
 
 test('syncDocs.packageScripts: false is allowed when claudeCommands is also false', () => {
@@ -5746,6 +5841,49 @@ test('api snapshot surfaces blocking smoke coverage gaps that would stop prod pr
   }
 });
 
+test('api snapshot keys staging smoke health to the current promotion SHA, not just the latest smoke run', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.smoke = {
+        requireStagingSmoke: true,
+        staging: { command: smokeResultCommand([{ tag: '@smoke-auth', status: 'passed' }]) },
+      };
+    });
+    const smokedSha = '1111111111111111111111111111111111111111';
+    const targetSha = '2222222222222222222222222222222222222222';
+    await writeSucceededDeployRecord(repoRoot, 'staging', smokedSha, ['frontend']);
+    runCli(['run', 'smoke', 'plan'], repoRoot);
+    updateSmokeRegistry(repoRoot, (registry) => {
+      registry.checks['@smoke-auth'].blocking = true;
+      registry.checks['@smoke-auth'].quarantine = false;
+    });
+    runCli(['run', 'smoke', 'staging'], repoRoot);
+    writeTaskLock(repoRoot, 'bootstrap', { mode: 'release', surfaces: ['frontend'] });
+    writePrRecord(repoRoot, 'bootstrap', targetSha);
+    runCli(['run', 'devmode', 'release', '--surfaces', 'frontend', '--override', '--reason', 'target smoke fixture'], repoRoot);
+
+    const envelope = JSON.parse((await runCliAsync(['run', 'api', 'snapshot'], repoRoot)).stdout);
+    const smokeSource = envelope.data.sourceHealth.find((entry) => entry.name === 'smoke.staging');
+    const smokeIssue = envelope.data.attention.find((issue) => issue.code === 'smoke.staging.target_missing');
+
+    assert.equal(envelope.data.smoke.staging.sha, smokedSha);
+    assert.equal(smokeSource.state, 'blocked');
+    assert.equal(smokeSource.blocking, true);
+    assert.match(smokeSource.reason, /current promotion SHA 2222222/i);
+    assert.match(smokeSource.reason, /latest staging smoke is passed @ 1111111/i);
+    assert.equal(smokeIssue.blocking, true);
+    assert.match(smokeIssue.message, /current promotion SHA 2222222/i);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('api snapshot marks staging as bypassed in build mode', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
@@ -7663,6 +7801,36 @@ test('stale-base warning only appears when the current checkout itself is on the
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
     rmSync(updaterRoot, { recursive: true, force: true });
+  }
+});
+
+test('base checkout ahead of origin is described accurately and does not trigger stale-base warning', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    writeFileSync(path.join(repoRoot, 'ahead.txt'), 'local ahead\n', 'utf8');
+    execFileSync('git', ['add', 'ahead.txt'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Local ahead'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    assert.equal(
+      envelope.data.attention.some((issue) => issue.code === 'git.base.stale'),
+      false,
+      'ahead local main should not be labeled stale',
+    );
+    assert.match(
+      envelope.data.boardContext.currentCheckout.summary,
+      /ahead of origin\/main by 1 commit/,
+    );
+    assert.match(
+      envelope.data.boardContext.currentCheckout.relationships.worktreeToOrigin.reason,
+      /ahead of origin\/main by 1 commit/,
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
   }
 });
 

@@ -11,6 +11,7 @@ import {
   findQualifyingSmokeRun,
   formatSmokePlanReport,
   isSmokeSuccessStatus,
+  isSmokeWaiverUsable,
   lintSmokeSetup,
   pruneSmokeHistory,
   releaseSmokeEnvironmentLock,
@@ -80,7 +81,7 @@ async function handleSmokePlan(cwd: string, parsed: ParsedOperatorArgs): Promise
   let registry = loadSmokeRegistry(context.repoRoot, context.config);
   let createdRegistry = false;
 
-  if (Object.keys(registry.checks).length === 0 && discoveredTags.length > 0) {
+  if (Object.keys(registry.checks).length === 0) {
     registry = scaffoldSmokeRegistry({
       repoRoot: context.repoRoot,
       config: context.config,
@@ -155,6 +156,7 @@ async function handleSmokeRun(
   const waivers = listActiveWaivers({
     waivers: loadSmokeWaivers(context.repoRoot, context.config).waivers,
     environment,
+    maxExtensions: smokeConfig.waivers.maxExtensions,
     tags: environmentChecks.map(([tag]) => tag),
   });
   const requireCheckResults = shouldRequireCheckResults({
@@ -234,6 +236,7 @@ async function handleSmokeRun(
       const evaluated = evaluateSmokeChecks({
         registry,
         environment,
+        config: context.config,
         cohortResults,
         waivers,
         requireCheckResults,
@@ -389,13 +392,15 @@ function runSmokeCohort(options: {
 function listActiveWaivers(options: {
   waivers: SmokeWaiverRecord[];
   environment: SmokeEnvironment;
+  maxExtensions: number;
   tags?: string[];
 }): SmokeWaiverRecord[] {
   const activeTags = options.tags ? new Set(options.tags) : null;
+  const nowMs = Date.now();
   return options.waivers.filter((waiver) =>
     waiver.environment === options.environment
     && (activeTags ? activeTags.has(waiver.tag) : true)
-    && Date.parse(waiver.expiresAt) >= Date.now(),
+    && isSmokeWaiverUsable(waiver, options.maxExtensions, nowMs),
   );
 }
 
@@ -560,11 +565,19 @@ function handleSmokeWaiver(cwd: string, parsed: ParsedOperatorArgs): void {
     environment,
     action: 'waiver',
   });
+  const smokeConfig = resolveSmokeConfig(context.config);
   const waivers = loadSmokeWaivers(context.repoRoot, context.config);
   const existing = waivers.waivers.find((waiver) => waiver.tag === tag && waiver.environment === environment);
   const now = Date.now();
   if (action === 'extend' && !existing) {
     throw new Error(`No existing smoke waiver found for ${tag}:${environment}.`);
+  }
+  const nextExtensions = action === 'extend' ? (existing?.extensions ?? 0) + 1 : 0;
+  if (nextExtensions > smokeConfig.waivers.maxExtensions) {
+    throw new Error(
+      `Smoke waiver for ${tag}:${environment} already reached maxExtensions=${smokeConfig.waivers.maxExtensions}. ` +
+      'Remove the waiver or raise the configured cap before extending again.',
+    );
   }
   const next = {
     tag,
@@ -572,7 +585,7 @@ function handleSmokeWaiver(cwd: string, parsed: ParsedOperatorArgs): void {
     reason: parsed.flags.reason.trim(),
     createdAt: existing?.createdAt ?? nowIso(),
     expiresAt: new Date(now + 7 * 24 * 60 * 60 * 1000).toISOString(),
-    extensions: action === 'extend' ? (existing?.extensions ?? 0) + 1 : 0,
+    extensions: nextExtensions,
   };
   waivers.waivers = waivers.waivers.filter((waiver) => !(waiver.tag === tag && waiver.environment === environment));
   waivers.waivers.push(next);
