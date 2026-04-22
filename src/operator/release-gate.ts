@@ -211,10 +211,33 @@ function loadDeployConfigFromClaude(targetPath: string): DeployConfig | null {
   return parseDeployConfigMarkdown(readFileSync(targetPath, 'utf8'));
 }
 
+function deployConfigHasMeaningfulValue(value: unknown): boolean {
+  if (typeof value === 'string') {
+    return value.trim().length > 0;
+  }
+
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+
+  return Object.values(value).some((entry) => deployConfigHasMeaningfulValue(entry));
+}
+
+function isConfiguredDeployConfig(config: DeployConfig | null): config is DeployConfig {
+  return Boolean(config) && deployConfigHasMeaningfulValue(config);
+}
+
 export function loadDeployConfig(repoRoot: string): DeployConfig | null {
   const claudePath = path.join(repoRoot, 'CLAUDE.md');
   const localConfig = loadDeployConfigFromClaude(claudePath);
-  if (localConfig) {
+  // `setup` seeds a template CLAUDE.md containing an empty Deploy Configuration
+  // block. Treat that default block as "unset" so a worktree-local CLAUDE.md
+  // does not shadow the shared deploy-config.json or shared-root CLAUDE.md.
+  if (isConfiguredDeployConfig(localConfig)) {
     return localConfig;
   }
 
@@ -225,14 +248,15 @@ export function loadDeployConfig(repoRoot: string): DeployConfig | null {
 
     if (path.resolve(sharedClaudePath) !== path.resolve(claudePath)) {
       const sharedRootConfig = loadDeployConfigFromClaude(sharedClaudePath);
-      if (sharedRootConfig) {
+      if (isConfiguredDeployConfig(sharedRootConfig)) {
         return sharedRootConfig;
       }
     }
 
     const config = loadWorkflowConfig(repoRoot);
     const sharedState = readJsonFile<Partial<DeployConfig> | null>(deployConfigPath(commonDir, config), null);
-    return sharedState ? hydrateDeployConfig(sharedState) : null;
+    const hydratedSharedState = sharedState ? hydrateDeployConfig(sharedState) : null;
+    return isConfiguredDeployConfig(hydratedSharedState) ? hydratedSharedState : null;
   } catch {
     return null;
   }

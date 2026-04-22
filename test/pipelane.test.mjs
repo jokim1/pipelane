@@ -2907,6 +2907,20 @@ test('loadDeployConfig falls back to shared deploy-config.json when CLAUDE.md is
   }
 });
 
+test('loadDeployConfig falls back to shared deploy-config.json when local CLAUDE.md only has the empty template block', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const expected = writeSharedDeployConfig(repoRoot);
+
+    const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'release-gate.ts'));
+    const loaded = mod.loadDeployConfig(repoRoot);
+    assert.deepEqual(loaded, expected);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('release-check re-blocks when the deploy config fingerprint drifts', async () => {
   const repoRoot = createRepo();
   try {
