@@ -13,7 +13,6 @@ import {
   resolveSmokeHistoryDir,
   resolveSmokeLatestPath,
   resolveSmokeRuntimeRoot,
-  runCommandCapture,
   saveSmokeEnvironmentLock,
   saveSmokeLatestState,
   saveSmokeRegistry,
@@ -173,32 +172,62 @@ function resolveSmokeEnvironmentConfig(value: SmokeEnvironmentConfig | undefined
   };
 }
 
-export function discoverSmokeTags(repoRoot: string): SmokeTagDiscovery[] {
-  const result = runCommandCapture('rg', [
-    '-n',
-    '-o',
-    '--hidden',
-    '--glob',
-    '!.git',
-    '--glob',
-    '!node_modules',
-    '@smoke-[a-z0-9-]+',
-    repoRoot,
-  ]);
-  if (!result.ok || !result.stdout.trim()) {
-    return [];
+// Tag/file discovery runs during `pipelane smoke plan` on consumer repos and
+// inside tests. Shelling out to ripgrep was faster on huge repos but failed
+// closed when `rg` was shadowed (Claude Code's shell wrapper) or missing on
+// the host: discoverSmokeTags returned [] and every downstream smoke test
+// silently scaffolded an empty registry. Pure-Node walk is fast enough for
+// the sizes pipelane actually sees and has no external dependency.
+const SMOKE_TAG_PATTERN = /@smoke-[a-z0-9-]+/g;
+const WALK_DIRS_EXCLUDED = new Set(['.git', 'node_modules']);
+const MAX_SMOKE_SCAN_BYTES = 5 * 1024 * 1024;
+
+function* walkRepoFiles(root: string): Generator<string> {
+  const stack: string[] = [root];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    let entries;
+    try {
+      entries = readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (WALK_DIRS_EXCLUDED.has(entry.name)) continue;
+      const entryPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(entryPath);
+      } else if (entry.isFile()) {
+        yield entryPath;
+      }
+    }
   }
+}
+
+export function discoverSmokeTags(repoRoot: string): SmokeTagDiscovery[] {
   const discovered = new Map<string, Set<string>>();
-  for (const line of result.stdout.split('\n')) {
-    const first = line.indexOf(':');
-    const second = first === -1 ? -1 : line.indexOf(':', first + 1);
-    if (first === -1 || second === -1) continue;
-    const filePath = line.slice(0, first);
-    const tag = line.slice(second + 1).trim();
-    if (!tag) continue;
-    const bucket = discovered.get(tag) ?? new Set<string>();
-    bucket.add(path.relative(repoRoot, filePath) || filePath);
-    discovered.set(tag, bucket);
+  for (const filePath of walkRepoFiles(repoRoot)) {
+    let size = 0;
+    try {
+      size = statSync(filePath).size;
+    } catch {
+      continue;
+    }
+    if (size === 0 || size > MAX_SMOKE_SCAN_BYTES) continue;
+    let contents: string;
+    try {
+      contents = readFileSync(filePath, 'utf8');
+    } catch {
+      continue;
+    }
+    const matches = contents.match(SMOKE_TAG_PATTERN);
+    if (!matches) continue;
+    const relative = path.relative(repoRoot, filePath) || filePath;
+    for (const tag of matches) {
+      const bucket = discovered.get(tag) ?? new Set<string>();
+      bucket.add(relative);
+      discovered.set(tag, bucket);
+    }
   }
   return [...discovered.entries()]
     .map(([tag, files]) => ({ tag, files: [...files].sort() }))
@@ -206,22 +235,18 @@ export function discoverSmokeTags(repoRoot: string): SmokeTagDiscovery[] {
 }
 
 export function discoverCandidateSmokeTests(repoRoot: string): string[] {
-  const result = runCommandCapture('rg', [
-    '--files',
-    repoRoot,
-    '--glob',
-    '**/*playwright*',
-    '--glob',
-    '**/*e2e*',
-    '--glob',
-    '**/*.spec.*',
-  ]);
-  if (!result.ok || !result.stdout.trim()) {
-    return [];
+  const results = new Set<string>();
+  for (const filePath of walkRepoFiles(repoRoot)) {
+    const relative = path.relative(repoRoot, filePath) || filePath;
+    if (
+      /playwright/i.test(relative)
+      || /e2e/i.test(relative)
+      || /\.spec\./i.test(relative)
+    ) {
+      results.add(relative);
+    }
   }
-  return [...new Set(result.stdout.split('\n').map((entry) => path.relative(repoRoot, entry) || entry))]
-    .filter((entry) => !entry.includes('node_modules'))
-    .sort();
+  return [...results].sort();
 }
 
 export function scaffoldSmokeRegistry(options: {

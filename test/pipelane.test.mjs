@@ -102,7 +102,11 @@ Run the generic pipelane wrapper for this repo.
 function createRemoteBackedRepo() {
   const repoRoot = createRepo();
   const remoteRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-remote-'));
-  execFileSync('git', ['init', '--bare', remoteRoot], { stdio: ['ignore', 'pipe', 'pipe'] });
+  // `-b main` so the bare remote's HEAD points at main. Without it, git
+  // 2.53+ defaults bare HEAD to `master`; subsequent clones then check out
+  // `master` (empty) and `git push origin main` from the clone fails with
+  // "src refspec main does not match any".
+  execFileSync('git', ['init', '--bare', '-b', 'main', remoteRoot], { stdio: ['ignore', 'pipe', 'pipe'] });
   execFileSync('git', ['remote', 'add', 'origin', remoteRoot], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
   execFileSync('git', ['push', '-u', 'origin', 'main'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
   return { repoRoot, remoteRoot };
