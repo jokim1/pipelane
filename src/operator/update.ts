@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 
+import { detectSetupDrift, formatSetupResult, type SetupDrift, setupConsumerRepo } from './docs.ts';
 import { PIPELANE_GITHUB_URL, PIPELANE_REPO_SLUG, resolvePipelaneInstallSpec } from './install-source.ts';
 import { resolveRepoRoot, runCommandCapture } from './state.ts';
 
@@ -27,6 +28,13 @@ export interface UpdateResult {
   status: UpdateStatus;
   action: 'up-to-date' | 'checked' | 'skipped' | 'installed';
   message: string;
+  // Context-aware follow-up: what pipelane:setup would still change on this
+  // consumer's disk after the npm install (or right now, for --check). Null
+  // when detection couldn't run (missing .pipelane.json, etc.).
+  followUpSteps: SetupDrift | null;
+  // True iff runUpdate actually invoked setupConsumerRepo before returning
+  // (inline setup accepted via prompt or --yes).
+  ranSetup: boolean;
 }
 
 export function parseUpdateArgs(argv: string[]): UpdateOptions {
@@ -49,34 +57,49 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
   const repoRoot = resolveRepoRoot(cwd, true);
   const status = collectUpdateStatus(repoRoot);
 
-  if (options.json && (options.check || status.upToDate)) {
-    const result: UpdateResult = {
+  // --check path (pre-install) and upToDate path: run drift detection so the
+  // operator sees whether the consumer's working tree is in sync with the
+  // currently-installed pipelane, even when no upstream update exists.
+  if (options.check || status.upToDate) {
+    const driftResult = tryDetectDrift(repoRoot);
+    const summary = status.upToDate
+      ? `pipelane is up to date (${status.installedShaShort}).`
+      : buildStatusMessage(status);
+    if (options.json) {
+      // JSON mode: no ambient text. Drift hint (if any) travels in the
+      // result object's followUpSteps field. If detection failed, the
+      // caller sees followUpSteps=null and can act accordingly.
+      const result: UpdateResult = {
+        status,
+        action: status.upToDate ? 'up-to-date' : 'checked',
+        message: summary,
+        followUpSteps: driftResult.drift,
+        ranSetup: false,
+      };
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      return result;
+    }
+    process.stdout.write(`${summary}\n`);
+    emitDriftHint(driftResult);
+    return {
       status,
       action: status.upToDate ? 'up-to-date' : 'checked',
-      message: buildStatusMessage(status),
+      message: summary,
+      followUpSteps: driftResult.drift,
+      ranSetup: false,
     };
-    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-    return result;
   }
 
-  if (status.upToDate) {
-    const message = `pipelane is up to date (${status.installedShaShort}).`;
-    if (!options.json) process.stdout.write(`${message}\n`);
-    return { status, action: 'up-to-date', message };
-  }
-
+  // Behind main path: print the commit delta, confirm upgrade, install,
+  // detect drift, optionally run setup inline.
   const summary = buildStatusMessage(status);
   if (!options.json) process.stdout.write(`${summary}\n`);
-
-  if (options.check) {
-    return { status, action: 'checked', message: summary };
-  }
 
   const confirmed = options.yes || (await promptYesNo('Upgrade now? [y/N] '));
   if (!confirmed) {
     const message = 'Upgrade skipped.';
     process.stdout.write(`${message}\n`);
-    return { status, action: 'skipped', message };
+    return { status, action: 'skipped', message, followUpSteps: null, ranSetup: false };
   }
 
   installLatest(repoRoot);
@@ -86,13 +109,138 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
     ? `Installed ${after.installedShaShort} (up to date).`
     : `Installed pipelane; now at ${after.installedShaShort} (remote main: ${after.latestShaShort}).`;
   const message = `Upgrade complete.\n${tail}`;
+
+  const driftResult = tryDetectDrift(repoRoot);
+
   if (options.json) {
-    const result: UpdateResult = { status: after, action: 'installed', message };
+    const result: UpdateResult = {
+      status: after,
+      action: 'installed',
+      message,
+      followUpSteps: driftResult.drift,
+      ranSetup: false,
+    };
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     return result;
   }
+
   process.stdout.write(`${message}\n`);
-  return { status: after, action: 'installed', message };
+  emitDriftHint(driftResult);
+
+  let ranSetup = false;
+  const drift = driftResult.drift;
+  if (drift?.needsSetup && drift.claude.collisions.length === 0) {
+    const shouldRun = options.yes || (process.stdin.isTTY && (await promptYesNoDefaultYes('Run `npm run pipelane:setup` now? [Y/n] ')));
+    if (shouldRun) {
+      const setupResult = setupConsumerRepo(repoRoot);
+      process.stdout.write('\n' + formatSetupResult(setupResult).join('\n') + '\n');
+      emitReopenHints(drift);
+      ranSetup = true;
+    }
+  }
+
+  return {
+    status: after,
+    action: 'installed',
+    message,
+    followUpSteps: drift,
+    ranSetup,
+  };
+}
+
+interface DriftResult {
+  drift: SetupDrift | null;
+  // Set when detection couldn't run (no .pipelane.json, etc.). Non-JSON
+  // callers surface it; JSON mode keeps the channel clean and carries the
+  // null via followUpSteps instead.
+  error: string | null;
+}
+
+function tryDetectDrift(repoRoot: string): DriftResult {
+  try {
+    return { drift: detectSetupDrift(repoRoot), error: null };
+  } catch (error) {
+    return { drift: null, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function emitDriftHint(result: DriftResult): void {
+  if (result.error) {
+    process.stdout.write(`\n[pipelane] Skipped drift detection: ${result.error}\n`);
+    process.stdout.write('Run `pipelane init` or `pipelane bootstrap` to enable setup follow-up.\n');
+    return;
+  }
+  const drift = result.drift;
+  if (!drift) return;
+  if (!drift.needsSetup) {
+    process.stdout.write('\nNo additional steps required — templates are in sync.\n');
+    return;
+  }
+  process.stdout.write('\n' + formatFollowUpSummary(drift) + '\n');
+}
+
+function emitReopenHints(drift: SetupDrift): void {
+  if (drift.needsReopenClaude) {
+    process.stdout.write('Reopen Claude so the new or renamed slash commands appear.\n');
+  }
+  if (drift.needsReopenCodex) {
+    process.stdout.write('Reopen Codex to pick up .agents/skills changes.\n');
+  }
+}
+
+export function formatFollowUpSummary(drift: SetupDrift): string {
+  const lines: string[] = ['Follow-up needed:'];
+  const changes: string[] = [];
+  if (drift.claude.enabled) {
+    const added = truncateList(drift.claude.addedCommands);
+    const updated = truncateList(drift.claude.updatedCommands);
+    const removed = truncateList(drift.claude.removedLegacyCommands);
+    if (added) changes.push(`New slash commands: ${added}`);
+    if (updated) changes.push(`Updated commands: ${updated}`);
+    if (removed) changes.push(`Legacy commands to prune: ${removed}`);
+  }
+  if (drift.repoGuidance.willScaffold) {
+    changes.push('REPO_GUIDANCE.md scaffold available');
+  }
+  if (drift.codex.enabled) {
+    const added = truncateList(drift.codex.addedSkills);
+    const updated = truncateList(drift.codex.updatedSkills);
+    const removed = truncateList(drift.codex.removedLegacySkills);
+    if (added) changes.push(`New Codex skills: ${added}`);
+    if (updated) changes.push(`Updated Codex skills: ${updated}`);
+    if (removed) changes.push(`Legacy Codex skills to prune: ${removed}`);
+    if (drift.codex.runnerDrift) changes.push('Codex runner script updated');
+  }
+  if (drift.otherSurfaces.length > 0) {
+    changes.push(`Other surfaces to re-render: ${drift.otherSurfaces.join(', ')}`);
+  }
+  if (drift.claude.collisions.length > 0) {
+    // Collisions block setup. Surface them prominently; no "run setup"
+    // step, no reopen hint.
+    return [
+      'Setup cannot run — collision with existing non-pipelane files:',
+      ...drift.claude.collisions.map((file) => `  - .claude/commands/${file}`),
+      'Resolve these manually (rename, remove, or change the alias in .pipelane.json), then rerun `pipelane update`.',
+    ].join('\n');
+  }
+  lines.push('  1. Run `npm run pipelane:setup` to apply template changes:');
+  for (const change of changes) {
+    lines.push(`     - ${change}`);
+  }
+  let step = 2;
+  if (drift.needsReopenClaude) {
+    lines.push(`  ${step++}. Reopen Claude so the new or renamed slash commands appear.`);
+  }
+  if (drift.needsReopenCodex) {
+    lines.push(`  ${step++}. Reopen Codex to pick up .agents/skills changes.`);
+  }
+  return lines.join('\n');
+}
+
+function truncateList(entries: string[], cap = 8): string {
+  if (entries.length === 0) return '';
+  if (entries.length <= cap) return entries.join(', ');
+  return `${entries.slice(0, cap).join(', ')}, +${entries.length - cap} more`;
 }
 
 export function collectUpdateStatus(repoRoot: string): UpdateStatus {
@@ -258,6 +406,22 @@ async function promptYesNo(prompt: string): Promise<boolean> {
   try {
     const answer = await new Promise<string>((resolve) => rl.question(prompt, resolve));
     return /^y(es)?$/i.test(answer.trim());
+  } finally {
+    rl.close();
+  }
+}
+
+// Default-yes variant — used for the "run setup now?" prompt where accepting
+// is the expected common path after a successful upgrade. Empty answer
+// (just pressing Enter) is treated as confirmation; only explicit "n"/"no"
+// declines.
+async function promptYesNoDefaultYes(prompt: string): Promise<boolean> {
+  if (!process.stdin.isTTY) return true;
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await new Promise<string>((resolve) => rl.question(prompt, resolve));
+    const trimmed = answer.trim();
+    return !/^n(o)?$/i.test(trimmed);
   } finally {
     rl.close();
   }

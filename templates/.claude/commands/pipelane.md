@@ -24,10 +24,10 @@ to open the Pipelane Board — the visual release-pipeline dashboard for this re
 Common forms:
 
 ```bash
-npm run pipelane:update              # check, prompt, install if newer
-npm run pipelane:update -- --check   # report status without mutating
-npm run pipelane:update -- --yes     # skip the prompt (CI / non-TTY)
-npm run pipelane:update -- --json    # emit JSON
+npm run pipelane:update              # check, prompt, install, run setup inline
+npm run pipelane:update -- --check   # report upstream + local drift; no mutation
+npm run pipelane:update -- --yes     # skip all prompts (CI / non-TTY); auto-runs setup
+npm run pipelane:update -- --json    # structured output; never prompts
 ```
 
 This command:
@@ -36,9 +36,11 @@ This command:
 2. Fetches the latest `main` commit from `github:jokim1/pipelane` via `git ls-remote`.
 3. If behind, summarizes the commits between (via `gh api repos/jokim1/pipelane/compare`, best effort) and prompts to upgrade.
 4. On confirm, runs `npm install pipelane@github:jokim1/pipelane#main` in the consumer repo.
-5. Reports the new installed commit.
+5. Runs template-drift detection against the consumer repo. Surfaces the minimum follow-up needed — new/renamed slash commands, scaffold writes, Codex skill changes, other template re-renders — and offers to run `npm run pipelane:setup` inline. Prints reopen-Claude / reopen-Codex hints only when the affected surface actually changed. In `--check` mode this same detection runs without installing, so you can answer "is this consumer in sync?" any time.
 
-After an upgrade, remember that `.pipelane.json` alias changes require rerunning `npm run pipelane:setup` so Claude/Codex pick up renamed commands.
+Use `--yes` in CI / non-TTY contexts to accept both the upgrade and the inline setup without prompts. Use `--json` for structured output; JSON mode never prompts and includes a `followUpSteps` field describing exactly which surfaces would change.
+
+Collisions (existing non-pipelane files where managed files would land) are reported but NOT auto-resolved — setup is skipped and the operator must rename, remove, or adjust aliases before retrying.
 
 ## Pipelane Board (default)
 

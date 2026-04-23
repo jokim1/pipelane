@@ -9680,3 +9680,248 @@ test('v1.1 codex r8 fixup: --revert-pr reverts a real merge commit with -m 1', (
     rmSync(ghBin, { recursive: true, force: true });
   }
 });
+
+// detectSetupDrift — the read-only dry-run that /pipelane update uses to
+// decide which follow-up steps to surface. These tests exercise the
+// detection function directly (not via the CLI) so they don't need to mock
+// `git ls-remote` or `npm install`.
+
+test('detectSetupDrift on a freshly-setup repo reports no drift', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
+    const drift = docs.detectSetupDrift(repoRoot);
+    assert.equal(drift.needsSetup, false, 'fresh setup must report no drift');
+    assert.equal(drift.needsReopenClaude, false);
+    assert.equal(drift.needsReopenCodex, false);
+    assert.deepEqual(drift.claude.addedCommands, []);
+    assert.deepEqual(drift.claude.updatedCommands, []);
+    assert.deepEqual(drift.claude.removedLegacyCommands, []);
+    assert.deepEqual(drift.claude.collisions, []);
+    assert.deepEqual(drift.codex.addedSkills, []);
+    assert.deepEqual(drift.codex.updatedSkills, []);
+    assert.equal(drift.codex.runnerDrift, false);
+    assert.equal(drift.repoGuidance.willScaffold, false);
+    assert.deepEqual(drift.otherSurfaces, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('detectSetupDrift flags a deleted managed command as addedCommands', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    // Simulate what happens after `/pipelane update` ships a new command
+    // (or the consumer never ran setup): the template is present in
+    // node_modules but the consumer's working tree has no matching file.
+    rmSync(path.join(repoRoot, '.claude', 'commands', 'fix.md'), { force: true });
+    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
+    const drift = docs.detectSetupDrift(repoRoot);
+    assert.ok(drift.claude.addedCommands.includes('fix.md'), `expected fix.md in addedCommands, got ${drift.claude.addedCommands.join(',')}`);
+    assert.equal(drift.needsSetup, true);
+    assert.equal(drift.needsReopenClaude, true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('detectSetupDrift flags edits OUTSIDE consumer-extension markers as updatedCommands', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const targetPath = path.join(repoRoot, '.claude', 'commands', 'fix.md');
+    // Tamper outside the marker pair — prepend a line to the top of the
+    // file. Setup would overwrite this.
+    const original = readFileSync(targetPath, 'utf8');
+    writeFileSync(targetPath, `CONSUMER_TAMPERED_LINE\n${original}`, 'utf8');
+    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
+    const drift = docs.detectSetupDrift(repoRoot);
+    assert.ok(drift.claude.updatedCommands.includes('fix.md'));
+    assert.equal(drift.needsSetup, true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('detectSetupDrift preserves edits INSIDE consumer-extension markers (no drift reported)', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const targetPath = path.join(repoRoot, '.claude', 'commands', 'fix.md');
+    const original = readFileSync(targetPath, 'utf8');
+    // Inject content between the marker pair — re-sync would preserve it.
+    const withExtension = original.replace(
+      '<!-- pipelane:consumer-extension:start -->\n<!-- pipelane:consumer-extension:end -->',
+      '<!-- pipelane:consumer-extension:start -->\nCONSUMER_HAND_EDIT_OK\n<!-- pipelane:consumer-extension:end -->',
+    );
+    writeFileSync(targetPath, withExtension, 'utf8');
+    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
+    const drift = docs.detectSetupDrift(repoRoot);
+    assert.ok(
+      !drift.claude.updatedCommands.includes('fix.md'),
+      `fix.md should not be flagged when only consumer-extension content changed; got updatedCommands=${drift.claude.updatedCommands.join(',')}`,
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('detectSetupDrift reports willScaffold=true when REPO_GUIDANCE.md is absent', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    rmSync(path.join(repoRoot, 'REPO_GUIDANCE.md'), { force: true });
+    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
+    const drift = docs.detectSetupDrift(repoRoot);
+    assert.equal(drift.repoGuidance.willScaffold, true);
+    assert.equal(drift.needsSetup, true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('detectSetupDrift respects syncDocs.claudeCommands opt-out', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    // Opt out of Claude command sync BEFORE setup, and provide the npm
+    // scripts the generated templates would otherwise rely on (the consistency
+    // check only runs when claudeCommands is still on).
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.syncDocs = { claudeCommands: false };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+    runCli(['setup'], repoRoot);
+    // Even if a stale managed command file sits in the commands dir, the
+    // drift report should treat the Claude surface as disabled.
+    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
+    const drift = docs.detectSetupDrift(repoRoot);
+    assert.equal(drift.claude.enabled, false);
+    assert.deepEqual(drift.claude.addedCommands, []);
+    assert.deepEqual(drift.claude.updatedCommands, []);
+    assert.equal(drift.needsReopenClaude, false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('detectSetupDrift surfaces Codex skill drift when SKILL.md is stale', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    // Tamper with a Codex skill wrapper.
+    const skillPath = path.join(repoRoot, '.agents', 'skills', 'pr', 'SKILL.md');
+    writeFileSync(skillPath, `${readFileSync(skillPath, 'utf8')}\nTAMPERED\n`, 'utf8');
+    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
+    const drift = docs.detectSetupDrift(repoRoot);
+    assert.ok(drift.codex.updatedSkills.includes('pr'), `expected 'pr' in updatedSkills, got ${drift.codex.updatedSkills.join(',')}`);
+    assert.equal(drift.needsSetup, true);
+    assert.equal(drift.needsReopenCodex, true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('detectSetupDrift reports a collision when a non-pipelane fix.md is present', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    // Run setup first so the managed manifest exists with the expected
+    // pipelane fix.md, then swap the file with a non-marker, non-signature
+    // consumer-authored version so detection sees it as a collision.
+    runCli(['setup'], repoRoot);
+    const commandsDir = path.join(repoRoot, '.claude', 'commands');
+    // Drop the file from the managed manifest so it looks unmanaged.
+    const manifestPath = path.join(commandsDir, '.pipelane-managed.json');
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    manifest.files = manifest.files.filter((f) => f !== 'fix.md');
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    // Replace the file content with something that carries no pipelane
+    // marker and no legacy signature — a consumer-authored /fix.
+    writeFileSync(path.join(commandsDir, 'fix.md'), '# Consumer-authored fix\n', 'utf8');
+    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
+    const drift = docs.detectSetupDrift(repoRoot);
+    assert.ok(drift.claude.collisions.includes('fix.md'), `expected fix.md collision, got ${drift.claude.collisions.join(',')}`);
+    assert.equal(drift.needsSetup, true);
+    // Collisions must NOT auto-trigger a reopen hint; setup won't run.
+    assert.equal(drift.needsReopenClaude, false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('formatFollowUpSummary lists new/updated commands and step-numbered reopen hints', async () => {
+  const update = await import(path.join(KIT_ROOT, 'src', 'operator', 'update.ts'));
+  const drift = {
+    repoRoot: '/tmp/fake',
+    needsSetup: true,
+    needsReopenClaude: true,
+    needsReopenCodex: true,
+    claude: {
+      enabled: true,
+      addedCommands: ['fix.md'],
+      updatedCommands: ['pr.md', 'merge.md'],
+      removedLegacyCommands: [],
+      collisions: [],
+    },
+    codex: {
+      enabled: true,
+      skillsDir: '/tmp/fake/.agents/skills',
+      addedSkills: [],
+      updatedSkills: ['pr'],
+      removedLegacySkills: [],
+      runnerDrift: true,
+    },
+    repoGuidance: { willScaffold: false },
+    otherSurfaces: [],
+  };
+  const summary = update.formatFollowUpSummary(drift);
+  assert.match(summary, /Follow-up needed:/);
+  assert.match(summary, /Run `npm run pipelane:setup`/);
+  assert.match(summary, /New slash commands: fix\.md/);
+  assert.match(summary, /Updated commands: pr\.md, merge\.md/);
+  assert.match(summary, /Updated Codex skills: pr/);
+  assert.match(summary, /Codex runner script updated/);
+  assert.match(summary, /2\. Reopen Claude/);
+  assert.match(summary, /3\. Reopen Codex/);
+});
+
+test('formatFollowUpSummary on collisions replaces the run-setup step with a resolve-manually message', async () => {
+  const update = await import(path.join(KIT_ROOT, 'src', 'operator', 'update.ts'));
+  const drift = {
+    repoRoot: '/tmp/fake',
+    needsSetup: true,
+    needsReopenClaude: false,
+    needsReopenCodex: false,
+    claude: {
+      enabled: true,
+      addedCommands: [],
+      updatedCommands: [],
+      removedLegacyCommands: [],
+      collisions: ['fix.md'],
+    },
+    codex: {
+      enabled: true,
+      skillsDir: '/tmp/fake/.agents/skills',
+      addedSkills: [],
+      updatedSkills: [],
+      removedLegacySkills: [],
+      runnerDrift: false,
+    },
+    repoGuidance: { willScaffold: false },
+    otherSurfaces: [],
+  };
+  const summary = update.formatFollowUpSummary(drift);
+  assert.match(summary, /Setup cannot run — collision/);
+  assert.match(summary, /\.claude\/commands\/fix\.md/);
+  assert.match(summary, /Resolve these manually/);
+  assert.doesNotMatch(summary, /Run `npm run pipelane:setup`/);
+});

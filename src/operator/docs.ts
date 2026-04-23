@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFile
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import type { SyncDocsConfig, WorkflowConfig } from './state.ts';
+import type { SyncDocsConfig, WorkflowCommand, WorkflowConfig } from './state.ts';
 import {
   aliasCommandName,
   CONFIG_FILENAME,
@@ -21,9 +21,9 @@ import {
   writeJsonFile,
   writeWorkflowConfig,
 } from './state.ts';
-import { emptyDeployConfig, renderDeployConfigSection } from './release-gate.ts';
+import { emptyDeployConfig, loadDeployConfig, renderDeployConfigSection } from './release-gate.ts';
 import { pruneLegacyCodexWrapperSkills } from './codex-install.ts';
-import { syncCodexSkills } from './codex-skills.ts';
+import { type CodexSkillDrift, detectCodexSkillDrift, syncCodexSkills } from './codex-skills.ts';
 
 const README_MARKER_START = '<!-- pipelane:readme:start -->';
 const README_MARKER_END = '<!-- pipelane:readme:end -->';
@@ -341,56 +341,101 @@ function captureManagedExtensionsByCommand(
   return extensions;
 }
 
-function replaceMarkedSection(targetPath: string, startMarker: string, endMarker: string, rendered: string, defaultHeading = ''): void {
-  const existing = existsSync(targetPath) ? readFileSync(targetPath, 'utf8') : '';
-  const section = `${startMarker}\n${rendered.trimEnd()}\n${endMarker}`;
-
-  if (existing.includes(startMarker) && existing.includes(endMarker)) {
-    const updated = existing.replace(new RegExp(`${startMarker}[\\s\\S]*?${endMarker}`), section);
-    writeFileSync(targetPath, updated, 'utf8');
-    return;
+// Compute the on-disk filename pipelane:setup will write for a managed command.
+// Extras (pipelane.md, fix.md) keep fixed filenames; workflow commands follow
+// the consumer's alias map. Shared by the sync loop and by detectSetupDrift so
+// both agree on which file represents each command.
+function managedClaudeCommandFilename(
+  name: ManagedCommand,
+  aliases: Record<WorkflowCommand, string>,
+): string {
+  if ((MANAGED_EXTRA_COMMANDS as readonly string[]).includes(name)) {
+    return `${name}.md`;
   }
+  return `${aliasCommandName(aliases[name as WorkflowCommand])}.md`;
+}
 
+// Render the final content pipelane:setup will write for a managed command,
+// including any preserved consumer-extension block. Used by the sync loop to
+// emit bytes and by detectSetupDrift to compare against what's already on
+// disk — one render path, one answer.
+function renderManagedClaudeCommand(
+  name: ManagedCommand,
+  config: WorkflowConfig,
+  capturedExtension: string | null,
+): string {
+  const rendered = renderTemplate(readTemplate(`.claude/commands/${name}.md`), config);
+  return injectConsumerExtension(rendered, capturedExtension);
+}
+
+// Pure computation of what replaceMarkedSection would write. Shared by the
+// writer below and by detectSetupDrift so both agree on the resulting bytes.
+function computeReplaceMarkedSection(
+  existing: string,
+  startMarker: string,
+  endMarker: string,
+  rendered: string,
+  defaultHeading: string,
+): string {
+  const section = `${startMarker}\n${rendered.trimEnd()}\n${endMarker}`;
+  if (existing.includes(startMarker) && existing.includes(endMarker)) {
+    return existing.replace(new RegExp(`${startMarker}[\\s\\S]*?${endMarker}`), section);
+  }
   const prefix = existing.trimEnd();
   const heading = prefix ? '\n\n' : defaultHeading;
-  writeFileSync(targetPath, `${prefix}${heading}${section}\n`, 'utf8');
+  return `${prefix}${heading}${section}\n`;
+}
+
+function replaceMarkedSection(targetPath: string, startMarker: string, endMarker: string, rendered: string, defaultHeading = ''): void {
+  const existing = existsSync(targetPath) ? readFileSync(targetPath, 'utf8') : '';
+  const next = computeReplaceMarkedSection(existing, startMarker, endMarker, rendered, defaultHeading);
+  writeFileSync(targetPath, next, 'utf8');
+}
+
+const REQUIRED_PACKAGE_SCRIPTS: Record<string, string> = {
+  'pipelane:setup': 'pipelane setup',
+  'pipelane:configure': 'pipelane configure',
+  'pipelane:devmode': 'pipelane run devmode',
+  'pipelane:new': 'pipelane run new',
+  'pipelane:resume': 'pipelane run resume',
+  'pipelane:repo-guard': 'pipelane run repo-guard',
+  'pipelane:pr': 'pipelane run pr',
+  'pipelane:merge': 'pipelane run merge',
+  'pipelane:release-check': 'pipelane run release-check',
+  'pipelane:task-lock': 'pipelane run task-lock',
+  'pipelane:deploy': 'pipelane run deploy',
+  'pipelane:smoke': 'pipelane run smoke',
+  'pipelane:clean': 'pipelane run clean',
+  'pipelane:status': 'pipelane run status',
+  'pipelane:doctor': 'pipelane run doctor',
+  'pipelane:rollback': 'pipelane run rollback',
+  'pipelane:board': 'pipelane board',
+  'pipelane:update': 'pipelane update',
+  'pipelane:api': 'pipelane run api',
+};
+
+// Shared builder: returns the exact bytes pipelane would write to package.json
+// along with the current on-disk bytes. Used by ensurePackageScripts (to
+// write) and by detectSetupDrift (to compare without writing).
+function buildEnsuredPackageJson(repoRoot: string): { targetPath: string; currentRaw: string; nextRaw: string } {
+  const targetPath = path.join(repoRoot, 'package.json');
+  const existed = existsSync(targetPath);
+  const currentRaw = existed ? readFileSync(targetPath, 'utf8') : '';
+  const current: Record<string, unknown> = existed
+    ? JSON.parse(currentRaw) as Record<string, unknown>
+    : { name: path.basename(repoRoot), private: true, type: 'module', scripts: {} };
+  const scripts = {
+    ...(typeof current.scripts === 'object' && current.scripts ? current.scripts as Record<string, string> : {}),
+    ...REQUIRED_PACKAGE_SCRIPTS,
+  };
+  const next = { ...current, scripts };
+  const nextRaw = `${JSON.stringify(next, null, 2)}\n`;
+  return { targetPath, currentRaw, nextRaw };
 }
 
 export function ensurePackageScripts(repoRoot: string): void {
-  const targetPath = path.join(repoRoot, 'package.json');
-  const current = existsSync(targetPath)
-    ? JSON.parse(readFileSync(targetPath, 'utf8')) as Record<string, unknown>
-    : { name: path.basename(repoRoot), private: true, type: 'module', scripts: {} as Record<string, string> };
-
-  const scripts = {
-    ...(typeof current.scripts === 'object' && current.scripts ? current.scripts as Record<string, string> : {}),
-    'pipelane:setup': 'pipelane setup',
-    'pipelane:configure': 'pipelane configure',
-    'pipelane:devmode': 'pipelane run devmode',
-    'pipelane:new': 'pipelane run new',
-    'pipelane:resume': 'pipelane run resume',
-    'pipelane:repo-guard': 'pipelane run repo-guard',
-    'pipelane:pr': 'pipelane run pr',
-    'pipelane:merge': 'pipelane run merge',
-    'pipelane:release-check': 'pipelane run release-check',
-    'pipelane:task-lock': 'pipelane run task-lock',
-    'pipelane:deploy': 'pipelane run deploy',
-    'pipelane:smoke': 'pipelane run smoke',
-    'pipelane:clean': 'pipelane run clean',
-    'pipelane:status': 'pipelane run status',
-    'pipelane:doctor': 'pipelane run doctor',
-    'pipelane:rollback': 'pipelane run rollback',
-    'pipelane:board': 'pipelane board',
-    'pipelane:update': 'pipelane update',
-    'pipelane:api': 'pipelane run api',
-  };
-
-  const next = {
-    ...current,
-    scripts,
-  };
-
-  writeFileSync(targetPath, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+  const { targetPath, nextRaw } = buildEnsuredPackageJson(repoRoot);
+  writeFileSync(targetPath, nextRaw, 'utf8');
 }
 
 // Generated Claude slash-command templates invoke `npm run pipelane:<cmd>`.
@@ -452,30 +497,15 @@ export function syncConsumerDocs(repoRoot: string, config: WorkflowConfig): void
     // alias renames (old filename gets pruned but its content survives).
     const capturedExtensions = captureManagedExtensionsByCommand(commandsDir, managedCommandFiles);
     const desiredCommandFiles = new Set<string>();
-    for (const name of WORKFLOW_COMMANDS) {
-      const commandFilename = `${aliasCommandName(aliases[name])}.md`;
-      desiredCommandFiles.add(commandFilename);
-    }
-    // Extras (pipelane.md) use fixed filenames — not aliased — but they
-    // still participate in collision detection, prune, and extension
-    // preservation so consumer hand-edits inside the marker pair survive.
-    for (const name of MANAGED_EXTRA_COMMANDS) {
-      desiredCommandFiles.add(`${name}.md`);
+    for (const name of MANAGED_COMMANDS) {
+      desiredCommandFiles.add(managedClaudeCommandFilename(name, aliases));
     }
     assertNoClaudeCollisions(commandsDir, desiredCommandFiles, managedCommandFiles);
     pruneManagedClaudeCommands(commandsDir, desiredCommandFiles, managedCommandFiles);
-    for (const name of WORKFLOW_COMMANDS) {
-      const rendered = renderTemplate(readTemplate(`.claude/commands/${name}.md`), config);
-      const commandFilename = `${aliasCommandName(aliases[name])}.md`;
-      const targetPath = path.join(commandsDir, commandFilename);
-      const output = injectConsumerExtension(rendered, capturedExtensions.get(name) ?? null);
-      writeFileSync(targetPath, output, 'utf8');
-    }
-    for (const name of MANAGED_EXTRA_COMMANDS) {
-      const rendered = renderTemplate(readTemplate(`.claude/commands/${name}.md`), config);
-      const targetPath = path.join(commandsDir, `${name}.md`);
-      const output = injectConsumerExtension(rendered, capturedExtensions.get(name) ?? null);
-      writeFileSync(targetPath, output, 'utf8');
+    for (const name of MANAGED_COMMANDS) {
+      const filename = managedClaudeCommandFilename(name, aliases);
+      const content = renderManagedClaudeCommand(name, config, capturedExtensions.get(name) ?? null);
+      writeFileSync(path.join(commandsDir, filename), content, 'utf8');
     }
     saveManagedClaudeCommands(commandsDir, desiredCommandFiles);
   }
@@ -552,14 +582,16 @@ export function initConsumerRepo(cwd: string, projectName: string): { repoRoot: 
   };
 }
 
-export function setupConsumerRepo(cwd: string): {
+export interface SetupConsumerRepoResult {
   repoRoot: string;
   createdClaude: boolean;
   createdRepoGuidance: boolean;
   codexSkillsDir: string;
   installedCodexSkills: string[];
   removedLegacyCodexSkills: string[];
-} {
+}
+
+export function setupConsumerRepo(cwd: string): SetupConsumerRepoResult {
   const repoRoot = resolveRepoRoot(cwd, true);
   const config = loadWorkflowConfig(repoRoot);
   const syncDocs = resolveSyncDocs(config.syncDocs);
@@ -603,6 +635,245 @@ export function syncDocsOnly(cwd: string): { repoRoot: string } {
   const config = loadWorkflowConfig(repoRoot);
   syncConsumerDocs(repoRoot, config);
   return { repoRoot };
+}
+
+export interface ClaudeCommandDrift {
+  enabled: boolean;
+  addedCommands: string[];
+  updatedCommands: string[];
+  removedLegacyCommands: string[];
+  collisions: string[]; // existing non-pipelane files that setup would refuse to overwrite
+}
+
+export interface SetupDrift {
+  repoRoot: string;
+  needsSetup: boolean;
+  needsReopenClaude: boolean;
+  needsReopenCodex: boolean;
+  claude: ClaudeCommandDrift;
+  codex: CodexSkillDrift & { enabled: boolean };
+  repoGuidance: { willScaffold: boolean };
+  // Names of other syncConsumerDocs surfaces setup would re-render. Values
+  // come from the SyncDocsConfig keys enabled for this consumer.
+  otherSurfaces: string[];
+}
+
+// Pure-detection mirror of syncConsumerDocs + setupConsumerRepo's file writes.
+// Answers "what would pipelane:setup change right now?" without touching disk.
+// Used by /pipelane update to surface the minimum follow-up steps when
+// templates drift between installed node_modules and the consumer's working
+// tree.
+export function detectSetupDrift(cwd: string): SetupDrift {
+  const repoRoot = resolveRepoRoot(cwd, true);
+  const config = loadWorkflowConfig(repoRoot);
+  const syncDocs = resolveSyncDocs(config.syncDocs);
+  const aliases = resolveWorkflowAliases(config.aliases);
+
+  // Claude surface
+  const claude: ClaudeCommandDrift = {
+    enabled: syncDocs.claudeCommands,
+    addedCommands: [],
+    updatedCommands: [],
+    removedLegacyCommands: [],
+    collisions: [],
+  };
+  if (syncDocs.claudeCommands) {
+    const commandsDir = path.join(repoRoot, '.claude', 'commands');
+    const managedFiles = existsSync(commandsDir) ? loadManagedClaudeCommands(commandsDir) : new Set<string>();
+    const capturedExtensions = existsSync(commandsDir)
+      ? captureManagedExtensionsByCommand(commandsDir, managedFiles)
+      : new Map<ManagedCommand, string>();
+    const desiredFiles = new Set<string>();
+    for (const name of MANAGED_COMMANDS) {
+      desiredFiles.add(managedClaudeCommandFilename(name, aliases));
+    }
+    for (const entry of desiredFiles) {
+      const targetPath = path.join(commandsDir, entry);
+      if (existsSync(targetPath) && !managedFiles.has(entry)) {
+        claude.collisions.push(entry);
+      }
+    }
+    for (const name of MANAGED_COMMANDS) {
+      const filename = managedClaudeCommandFilename(name, aliases);
+      const targetPath = path.join(commandsDir, filename);
+      const desiredContent = renderManagedClaudeCommand(name, config, capturedExtensions.get(name) ?? null);
+      if (!existsSync(targetPath)) {
+        claude.addedCommands.push(filename);
+        continue;
+      }
+      // Skip update-classification for collisions — the file exists but
+      // isn't ours to rewrite.
+      if (claude.collisions.includes(filename)) {
+        continue;
+      }
+      const onDisk = readFileSync(targetPath, 'utf8');
+      if (onDisk !== desiredContent) {
+        claude.updatedCommands.push(filename);
+      }
+    }
+    for (const filename of managedFiles) {
+      if (!desiredFiles.has(filename)) {
+        claude.removedLegacyCommands.push(filename);
+      }
+    }
+    claude.addedCommands.sort();
+    claude.updatedCommands.sort();
+    claude.removedLegacyCommands.sort();
+    claude.collisions.sort();
+  }
+
+  // Codex surface
+  const codexDrift = syncDocs.codexSkills
+    ? detectCodexSkillDrift(repoRoot, config)
+    : {
+        skillsDir: path.join(repoRoot, '.agents', 'skills'),
+        addedSkills: [],
+        updatedSkills: [],
+        removedLegacySkills: [],
+        runnerDrift: false,
+      };
+  const codex = { ...codexDrift, enabled: syncDocs.codexSkills };
+
+  // REPO_GUIDANCE.md scaffold — write-once, never re-sync.
+  const repoGuidance = {
+    willScaffold: !existsSync(path.join(repoRoot, 'REPO_GUIDANCE.md')),
+  };
+
+  // Other re-rendered surfaces — each conditional block in syncConsumerDocs.
+  const otherSurfaces: string[] = [];
+  if (syncDocs.pipelaneClaudeTemplate) {
+    const target = path.join(repoRoot, 'pipelane', 'CLAUDE.template.md');
+    const rendered = renderTemplate(readTemplate('pipelane/CLAUDE.template.md'), config);
+    if (!existsSync(target) || readFileSync(target, 'utf8') !== rendered) {
+      otherSurfaces.push('pipelaneClaudeTemplate');
+    }
+  }
+  if (syncDocs.docsReleaseWorkflow) {
+    const target = path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md');
+    const rendered = renderTemplate(readTemplate('docs/RELEASE_WORKFLOW.md'), config);
+    if (!existsSync(target) || readFileSync(target, 'utf8') !== rendered) {
+      otherSurfaces.push('docsReleaseWorkflow');
+    }
+  }
+  if (syncDocs.readmeSection && markerSectionWouldDrift(
+    path.join(repoRoot, 'README.md'),
+    README_MARKER_START,
+    README_MARKER_END,
+    renderTemplate(readTemplate('README.pipelane-section.md'), config),
+    `# ${config.displayName}\n\n`,
+  )) {
+    otherSurfaces.push('readmeSection');
+  }
+  if (syncDocs.contributingSection && markerSectionWouldDrift(
+    path.join(repoRoot, 'CONTRIBUTING.md'),
+    CONTRIBUTING_MARKER_START,
+    CONTRIBUTING_MARKER_END,
+    renderTemplate(readTemplate('CONTRIBUTING.pipelane-section.md'), config),
+    '# Contributing\n\n',
+  )) {
+    otherSurfaces.push('contributingSection');
+  }
+  if (syncDocs.agentsSection && markerSectionWouldDrift(
+    path.join(repoRoot, 'AGENTS.md'),
+    AGENTS_MARKER_START,
+    AGENTS_MARKER_END,
+    renderTemplate(readTemplate('AGENTS.md'), config),
+    `# ${config.displayName} Repo Context\n\n`,
+  )) {
+    otherSurfaces.push('agentsSection');
+  }
+  if (syncDocs.packageScripts) {
+    const { currentRaw, nextRaw } = buildEnsuredPackageJson(repoRoot);
+    if (currentRaw !== nextRaw) {
+      otherSurfaces.push('packageScripts');
+    }
+  }
+
+  const claudeDirty =
+    claude.addedCommands.length > 0 ||
+    claude.updatedCommands.length > 0 ||
+    claude.removedLegacyCommands.length > 0 ||
+    claude.collisions.length > 0;
+  const codexDirty =
+    codex.enabled &&
+    (codex.addedSkills.length > 0 ||
+      codex.updatedSkills.length > 0 ||
+      codex.removedLegacySkills.length > 0 ||
+      codex.runnerDrift);
+
+  return {
+    repoRoot,
+    needsSetup:
+      claudeDirty ||
+      codexDirty ||
+      repoGuidance.willScaffold ||
+      otherSurfaces.length > 0,
+    // Reopen is only relevant when command files actually change — collisions
+    // alone block setup but don't add/change Claude-visible slash commands.
+    needsReopenClaude:
+      claude.enabled &&
+      (claude.addedCommands.length > 0 ||
+        claude.updatedCommands.length > 0 ||
+        claude.removedLegacyCommands.length > 0),
+    needsReopenCodex: codexDirty,
+    claude,
+    codex,
+    repoGuidance,
+    otherSurfaces,
+  };
+}
+
+function markerSectionWouldDrift(
+  targetPath: string,
+  startMarker: string,
+  endMarker: string,
+  rendered: string,
+  defaultHeading: string,
+): boolean {
+  const existing = existsSync(targetPath) ? readFileSync(targetPath, 'utf8') : '';
+  const next = computeReplaceMarkedSection(existing, startMarker, endMarker, rendered, defaultHeading);
+  return existing !== next;
+}
+
+// Human-readable line describing whether the repo has a usable deploy config
+// for release mode. Formerly lived in cli.ts; pulled here so the same
+// phrasing flows through both the setup CLI handler and update's inline-setup
+// path without divergence.
+export function setupDeployConfigMessage(repoRoot: string): string {
+  if (loadDeployConfig(repoRoot)) {
+    return 'Release mode can use shared deploy configuration when available. Edit local CLAUDE.md only for worktree-local overrides.';
+  }
+  return 'Release mode still requires deploy configuration. Run `pipelane doctor --fix` or `pipelane configure`.';
+}
+
+// Canonical setup-complete output. Used by `pipelane setup` (cli.ts) and by
+// `pipelane update`'s inline-setup path (update.ts) so both entry points
+// emit the same lines in the same order.
+export function formatSetupResult(result: SetupConsumerRepoResult): string[] {
+  const lines: string[] = [
+    `Pipelane setup complete in ${result.repoRoot}`,
+    result.createdClaude
+      ? 'Created local CLAUDE.md from the Pipelane template.'
+      : 'Preserved existing local CLAUDE.md.',
+    result.createdRepoGuidance
+      ? 'Created REPO_GUIDANCE.md from the scaffold — run `/fix refresh-guidance` to fill it in.'
+      : 'Preserved existing REPO_GUIDANCE.md.',
+    setupDeployConfigMessage(result.repoRoot),
+  ];
+  if (result.installedCodexSkills.length > 0) {
+    lines.push(
+      `Synced Codex skills in ${result.codexSkillsDir}`,
+      `Slash commands: ${result.installedCodexSkills.join(', ')}`,
+      'Codex picks up the tracked .agents/skills files from the repo.',
+    );
+  } else {
+    lines.push('Skipped tracked Codex skill sync because syncDocs.codexSkills is false.');
+  }
+  if (result.removedLegacyCodexSkills.length > 0) {
+    lines.push(`Removed legacy machine-local wrapper skills: ${result.removedLegacyCodexSkills.join(', ')}`);
+  }
+  lines.push('If Claude or Codex was already open, reopen the repo or restart the client to refresh commands and skills.');
+  return lines;
 }
 
 export function maybeInitGitRepo(repoRoot: string): void {

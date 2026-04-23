@@ -144,6 +144,80 @@ function saveManagedCodexSkills(skillsRoot: string, desiredSkills: Set<string>):
   });
 }
 
+export interface CodexSkillDrift {
+  skillsDir: string;
+  addedSkills: string[];        // desired skills whose SKILL.md is not on disk
+  updatedSkills: string[];      // desired skills whose on-disk SKILL.md differs from what buildSkill would emit
+  removedLegacySkills: string[];// managed skills no longer desired (setup would prune)
+  runnerDrift: boolean;         // .pipelane/bin/run-pipelane.sh missing or stale
+}
+
+// Read-only mirror of syncCodexSkills: computes the same desired skill map
+// and compares to disk without writing anything. `detectSetupDrift` uses this
+// to answer "would pipelane:setup change anything on the Codex side?" so
+// /pipelane update can surface the minimum follow-up steps.
+export function detectCodexSkillDrift(
+  repoRoot: string,
+  config: WorkflowConfig,
+): CodexSkillDrift {
+  const skillsRoot = path.join(repoRoot, '.agents', 'skills');
+  const aliases = resolveWorkflowAliases(config.aliases);
+  const desiredSkills = new Set<string>();
+  const desiredMappings = new Map<string, { command: WorkflowCommand; slashAlias: string }>();
+
+  for (const command of WORKFLOW_COMMANDS) {
+    const slashAlias = aliases[command];
+    const skillName = aliasCommandName(slashAlias);
+    if (skillName === INIT_PIPELANE_SKILL_NAME) {
+      // syncCodexSkills throws here. Surface as a no-drift answer — the
+      // collision becomes the caller's problem at sync time, not detection.
+      return {
+        skillsDir: skillsRoot,
+        addedSkills: [],
+        updatedSkills: [],
+        removedLegacySkills: [],
+        runnerDrift: false,
+      };
+    }
+    desiredSkills.add(skillName);
+    desiredMappings.set(skillName, { command, slashAlias });
+  }
+
+  const managedSkills = existsSync(skillsRoot) ? loadManagedCodexSkills(skillsRoot) : new Set<string>();
+  const addedSkills: string[] = [];
+  const updatedSkills: string[] = [];
+
+  for (const [skillName, mapping] of desiredMappings.entries()) {
+    const targetPath = skillDocPath(skillsRoot, skillName);
+    if (!existsSync(targetPath)) {
+      addedSkills.push(skillName);
+      continue;
+    }
+    const onDisk = readFileSync(targetPath, 'utf8');
+    if (onDisk !== buildSkill(mapping.command, mapping.slashAlias)) {
+      updatedSkills.push(skillName);
+    }
+  }
+
+  const removedLegacySkills: string[] = [];
+  for (const skillName of managedSkills) {
+    if (!desiredSkills.has(skillName)) {
+      removedLegacySkills.push(skillName);
+    }
+  }
+
+  const runnerPath = managedCodexRunnerPath(skillsRoot);
+  const runnerDrift = !existsSync(runnerPath) || readFileSync(runnerPath, 'utf8') !== buildManagedCodexRunner();
+
+  return {
+    skillsDir: skillsRoot,
+    addedSkills: addedSkills.sort(),
+    updatedSkills: updatedSkills.sort(),
+    removedLegacySkills: removedLegacySkills.sort(),
+    runnerDrift,
+  };
+}
+
 export function syncCodexSkills(
   repoRoot: string,
   config: WorkflowConfig,

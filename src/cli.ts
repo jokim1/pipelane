@@ -6,9 +6,8 @@ import { parseBootstrapArgs, runBootstrap } from './operator/bootstrap.ts';
 import { installClaudeBootstrapSkill } from './operator/claude-install.ts';
 import { installCodexBootstrapSkill } from './operator/codex-install.ts';
 import { handleConfigure } from './operator/commands/configure.ts';
-import { initConsumerRepo, setupConsumerRepo, syncDocsOnly } from './operator/docs.ts';
+import { formatSetupResult, initConsumerRepo, setupConsumerRepo, syncDocsOnly } from './operator/docs.ts';
 import { runOperator } from './operator/index.ts';
-import { loadDeployConfig } from './operator/release-gate.ts';
 import { parseUpdateArgs, runUpdate } from './operator/update.ts';
 
 function valueAfter(args: string[], flag: string): string {
@@ -41,14 +40,6 @@ Examples:
   pipelane dashboard --repo /absolute/path/to/repo
   pipelane run new --task "My Task"
 `);
-}
-
-function setupDeployConfigMessage(repoRoot: string): string {
-  if (loadDeployConfig(repoRoot)) {
-    return 'Release mode can use shared deploy configuration when available. Edit local CLAUDE.md only for worktree-local overrides.';
-  }
-
-  return 'Release mode still requires deploy configuration. Run `pipelane doctor --fix` or `pipelane configure`.';
 }
 
 async function main(): Promise<void> {
@@ -106,30 +97,7 @@ async function main(): Promise<void> {
 
   if (command === 'setup') {
     const result = setupConsumerRepo(process.cwd());
-    process.stdout.write([
-      `Pipelane setup complete in ${result.repoRoot}`,
-      result.createdClaude ? 'Created local CLAUDE.md from the Pipelane template.' : 'Preserved existing local CLAUDE.md.',
-      result.createdRepoGuidance ? 'Created REPO_GUIDANCE.md from the scaffold — run `/fix refresh-guidance` to fill it in.' : 'Preserved existing REPO_GUIDANCE.md.',
-      setupDeployConfigMessage(result.repoRoot),
-    ].concat(
-      result.installedCodexSkills.length > 0
-        ? [
-            `Synced Codex skills in ${result.codexSkillsDir}`,
-            `Slash commands: ${result.installedCodexSkills.join(', ')}`,
-            'Codex picks up the tracked .agents/skills files from the repo.',
-          ]
-        : [
-            'Skipped tracked Codex skill sync because syncDocs.codexSkills is false.',
-          ],
-      result.removedLegacyCodexSkills.length > 0
-        ? [
-            `Removed legacy machine-local wrapper skills: ${result.removedLegacyCodexSkills.join(', ')}`,
-          ]
-        : [],
-      [
-        'If Claude or Codex was already open, reopen the repo or restart the client to refresh commands and skills.',
-      ],
-    ).join('\n') + '\n');
+    process.stdout.write(formatSetupResult(result).join('\n') + '\n');
     return;
   }
 
