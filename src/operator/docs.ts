@@ -105,6 +105,14 @@ export const LEGACY_CLAUDE_SIGNATURES: Record<ManagedCommand, string[]> = {
     'npm run pipelane:board',
     '## Pipelane Board (default)',
   ],
+  // `fix.md` ships marker-first, so legacy detection is mostly a formality —
+  // no pre-marker consumer files exist. Two distinctive body strings satisfy
+  // the structural >= 2 invariant and keep detection robust if a future
+  // non-marker variant ever ships.
+  fix: [
+    'Produce durable, root-cause fixes. Not shims, not speculative refactors.',
+    '### Refuse these shims unconditionally',
+  ],
 };
 
 function kitRoot(): string {
@@ -547,6 +555,7 @@ export function initConsumerRepo(cwd: string, projectName: string): { repoRoot: 
 export function setupConsumerRepo(cwd: string): {
   repoRoot: string;
   createdClaude: boolean;
+  createdRepoGuidance: boolean;
   codexSkillsDir: string;
   installedCodexSkills: string[];
   removedLegacyCodexSkills: string[];
@@ -563,6 +572,16 @@ export function setupConsumerRepo(cwd: string): {
     createdClaude = true;
   }
 
+  // REPO_GUIDANCE.md is consumer-owned forever: pipelane writes the scaffold
+  // once on setup, never re-syncs. Idempotent — skip if the file already
+  // exists, preserving whatever the consumer has customized.
+  const repoGuidancePath = path.join(repoRoot, 'REPO_GUIDANCE.md');
+  let createdRepoGuidance = false;
+  if (!existsSync(repoGuidancePath)) {
+    writeFileSync(repoGuidancePath, readTemplate('REPO_GUIDANCE.template.md'), 'utf8');
+    createdRepoGuidance = true;
+  }
+
   const removedLegacyCodexSkills = syncDocs.codexSkills
     ? pruneLegacyCodexWrapperSkills()
     : [];
@@ -570,6 +589,7 @@ export function setupConsumerRepo(cwd: string): {
   return {
     repoRoot,
     createdClaude,
+    createdRepoGuidance,
     codexSkillsDir: path.join(repoRoot, '.agents', 'skills'),
     installedCodexSkills: syncDocs.codexSkills
       ? WORKFLOW_COMMANDS.map((command) => config.aliases[command])

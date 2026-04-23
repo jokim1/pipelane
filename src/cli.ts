@@ -109,6 +109,7 @@ async function main(): Promise<void> {
     process.stdout.write([
       `Pipelane setup complete in ${result.repoRoot}`,
       result.createdClaude ? 'Created local CLAUDE.md from the Pipelane template.' : 'Preserved existing local CLAUDE.md.',
+      result.createdRepoGuidance ? 'Created REPO_GUIDANCE.md from the scaffold — run `/fix refresh-guidance` to fill it in.' : 'Preserved existing REPO_GUIDANCE.md.',
       setupDeployConfigMessage(result.repoRoot),
     ].concat(
       result.installedCodexSkills.length > 0
