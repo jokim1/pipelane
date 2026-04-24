@@ -9968,6 +9968,66 @@ test('detectSetupDrift surfaces Codex skill drift when SKILL.md is stale', async
   }
 });
 
+test('setup writes .agents/skills/fix/SKILL.md with Codex frontmatter and shared prompt body', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const fixSkillPath = path.join(repoRoot, '.agents', 'skills', 'fix', 'SKILL.md');
+    assert.ok(existsSync(fixSkillPath), 'fix Codex skill must be written by setup');
+    const content = readFileSync(fixSkillPath, 'utf8');
+
+    // Frontmatter: must declare name, version, and the extra allowed-tools
+    // /fix needs beyond the workflow wrapper skills' Bash-only list.
+    assert.match(content, /^---\nname: fix\n/);
+    assert.match(content, /\nversion: 1\.0\.0\n/);
+    assert.match(content, /\nallowed-tools:\n(?:[\s\S]*?  - Read\n)/);
+    assert.match(content, /  - Edit\n/);
+    assert.match(content, /  - Grep\n/);
+    assert.match(content, /  - Bash\n/);
+    // Marker for managed detection (survives alias rename / prune / drift).
+    assert.match(content, /<!-- pipelane:codex-skill:fix -->/);
+    // Shared body with the Claude-side template — a few anchor phrases the
+    // /fix prompt is built around.
+    assert.match(content, /Produce durable, root-cause fixes\./);
+    assert.match(content, /## Mode routing/);
+    assert.match(content, /### Refuse these shims unconditionally/);
+    // Claude-specific markers must NOT appear — those live only on the Claude
+    // template so re-sync doesn't strip hand-edits there.
+    assert.doesNotMatch(content, /<!-- pipelane:command:fix -->/);
+    assert.doesNotMatch(content, /<!-- pipelane:consumer-extension:/);
+
+    // Managed manifest lists fix alongside the workflow skills.
+    const manifest = JSON.parse(
+      readFileSync(path.join(repoRoot, '.agents', 'skills', '.pipelane-managed.json'), 'utf8'),
+    );
+    assert.ok(manifest.skills.includes('fix'), `manifest.skills missing "fix": ${manifest.skills.join(',')}`);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('detectSetupDrift flags a deleted fix Codex skill as addedSkills', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    // Simulate a consumer that upgraded pipelane before the fix Codex skill
+    // shipped, or that pruned the skill dir.
+    rmSync(path.join(repoRoot, '.agents', 'skills', 'fix'), { recursive: true, force: true });
+    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
+    const drift = docs.detectSetupDrift(repoRoot);
+    assert.ok(
+      drift.codex.addedSkills.includes('fix'),
+      `expected 'fix' in addedSkills, got ${drift.codex.addedSkills.join(',')}`,
+    );
+    assert.equal(drift.needsSetup, true);
+    assert.equal(drift.needsReopenCodex, true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('detectSetupDrift reports a collision when a non-pipelane fix.md is present', async () => {
   const repoRoot = createRepo();
   try {

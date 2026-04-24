@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { aliasCommandName, readJsonFile, resolveWorkflowAliases, type WorkflowCommand, WORKFLOW_COMMANDS, type WorkflowConfig, writeJsonFile } from './state.ts';
 
@@ -8,6 +9,60 @@ const MANAGED_CODEX_RUNTIME_DIR = '.pipelane';
 const MANAGED_CODEX_RUNNER = path.join(MANAGED_CODEX_RUNTIME_DIR, 'bin', 'run-pipelane.sh');
 const INIT_PIPELANE_SKILL_NAME = 'init-pipelane';
 const PIPELANE_CODEX_SKILL_MARKER = '<!-- pipelane:codex-skill:';
+
+// Fixed-name Codex skills that are NOT workflow-command wrappers. `fix` is a
+// behavioral-discipline prompt, not a shell passthrough — its body is the
+// shared /fix prompt from templates/.claude/commands/fix.md, wrapped with
+// Codex frontmatter so the same /fix discipline fires in Codex too.
+const FIX_CODEX_SKILL_NAME = 'fix';
+const MANAGED_EXTRA_CODEX_SKILLS = [FIX_CODEX_SKILL_NAME] as const;
+
+function codexSkillsKitRoot(): string {
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+}
+
+function readFixCommandTemplate(): string {
+  return readFileSync(path.join(codexSkillsKitRoot(), 'templates', '.claude', 'commands', 'fix.md'), 'utf8');
+}
+
+// Generate the Codex-side /fix skill from the shared Claude-side prompt body.
+// Single source of truth for the /fix prompt lives in
+// templates/.claude/commands/fix.md; Codex gets the same prose with its own
+// frontmatter + marker and without the Claude-specific command /
+// consumer-extension markers (setup re-generates this file every run, so
+// consumer hand-edits here would be lost — direct the consumer at the Claude
+// template's extension markers instead).
+function buildFixCodexSkill(): string {
+  const raw = readFixCommandTemplate();
+  const body = raw
+    .replace(/^<!-- pipelane:command:fix -->\n/, '')
+    .replace(/\n<!-- pipelane:consumer-extension:start -->\n<!-- pipelane:consumer-extension:end -->\n?$/, '\n');
+  return `---
+name: ${FIX_CODEX_SKILL_NAME}
+version: 1.0.0
+description: Produce durable, root-cause fixes. Three modes — FINDINGS (default), rethink, refresh-guidance. See body for routing.
+allowed-tools:
+  - Read
+  - Edit
+  - Write
+  - Grep
+  - Glob
+  - Bash
+---
+${PIPELANE_CODEX_SKILL_MARKER}${FIX_CODEX_SKILL_NAME} -->
+
+${body}`;
+}
+
+// Map from desired-skill-name to the body builder. Workflow skills (populated
+// inline in syncCodexSkills) and extras (fix) share the same desired / managed
+// / prune / collision machinery; only the builder differs.
+function buildManagedExtraCodexSkill(name: (typeof MANAGED_EXTRA_CODEX_SKILLS)[number]): string {
+  switch (name) {
+    case FIX_CODEX_SKILL_NAME:
+      return buildFixCodexSkill();
+  }
+}
 
 function buildSkill(command: WorkflowCommand, slashAlias: string): string {
   const skillName = aliasCommandName(slashAlias);
@@ -163,7 +218,7 @@ export function detectCodexSkillDrift(
   const skillsRoot = path.join(repoRoot, '.agents', 'skills');
   const aliases = resolveWorkflowAliases(config.aliases);
   const desiredSkills = new Set<string>();
-  const desiredMappings = new Map<string, { command: WorkflowCommand; slashAlias: string }>();
+  const desiredBodies = new Map<string, string>();
 
   for (const command of WORKFLOW_COMMANDS) {
     const slashAlias = aliases[command];
@@ -180,21 +235,25 @@ export function detectCodexSkillDrift(
       };
     }
     desiredSkills.add(skillName);
-    desiredMappings.set(skillName, { command, slashAlias });
+    desiredBodies.set(skillName, buildSkill(command, slashAlias));
+  }
+  for (const name of MANAGED_EXTRA_CODEX_SKILLS) {
+    desiredSkills.add(name);
+    desiredBodies.set(name, buildManagedExtraCodexSkill(name));
   }
 
   const managedSkills = existsSync(skillsRoot) ? loadManagedCodexSkills(skillsRoot) : new Set<string>();
   const addedSkills: string[] = [];
   const updatedSkills: string[] = [];
 
-  for (const [skillName, mapping] of desiredMappings.entries()) {
+  for (const [skillName, desiredBody] of desiredBodies.entries()) {
     const targetPath = skillDocPath(skillsRoot, skillName);
     if (!existsSync(targetPath)) {
       addedSkills.push(skillName);
       continue;
     }
     const onDisk = readFileSync(targetPath, 'utf8');
-    if (onDisk !== buildSkill(mapping.command, mapping.slashAlias)) {
+    if (onDisk !== desiredBody) {
       updatedSkills.push(skillName);
     }
   }
@@ -227,7 +286,7 @@ export function syncCodexSkills(
 
   const aliases = resolveWorkflowAliases(config.aliases);
   const desiredSkills = new Set<string>();
-  const desiredMappings = new Map<string, { command: WorkflowCommand; slashAlias: string }>();
+  const desiredBodies = new Map<string, string>();
 
   for (const command of WORKFLOW_COMMANDS) {
     const slashAlias = aliases[command];
@@ -238,7 +297,19 @@ export function syncCodexSkills(
       );
     }
     desiredSkills.add(skillName);
-    desiredMappings.set(skillName, { command, slashAlias });
+    desiredBodies.set(skillName, buildSkill(command, slashAlias));
+  }
+  // Extras (fix) — fixed-name skills with full prompt bodies rather than
+  // shell wrappers. Participate in the same collision / prune / manifest
+  // machinery as workflow skills.
+  for (const name of MANAGED_EXTRA_CODEX_SKILLS) {
+    if (desiredSkills.has(name)) {
+      throw new Error(
+        `Codex skill alias collision: a workflow alias resolves to the reserved extra skill name "${name}". Rename the alias in .pipelane.json.`,
+      );
+    }
+    desiredSkills.add(name);
+    desiredBodies.set(name, buildManagedExtraCodexSkill(name));
   }
 
   const managedSkills = loadManagedCodexSkills(skillsRoot);
@@ -247,10 +318,10 @@ export function syncCodexSkills(
   mkdirSync(path.dirname(managedCodexRunnerPath(skillsRoot)), { recursive: true });
   writeFileSync(managedCodexRunnerPath(skillsRoot), buildManagedCodexRunner(), { mode: 0o755, encoding: 'utf8' });
 
-  for (const [skillName, mapping] of desiredMappings.entries()) {
+  for (const [skillName, body] of desiredBodies.entries()) {
     const skillDir = path.join(skillsRoot, skillName);
     mkdirSync(skillDir, { recursive: true });
-    writeFileSync(skillDocPath(skillsRoot, skillName), buildSkill(mapping.command, mapping.slashAlias), 'utf8');
+    writeFileSync(skillDocPath(skillsRoot, skillName), body, 'utf8');
   }
 
   saveManagedCodexSkills(skillsRoot, desiredSkills);
