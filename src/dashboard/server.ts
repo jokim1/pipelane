@@ -75,7 +75,7 @@ interface DashboardHelp {
   warning: string;
 }
 
-const DEFAULT_BOARD_SUBTITLE = 'Pipelane — the release cockpit for AI vibe coders. Branch pipeline triage, action preflight, execution follow-through, and cleanup discipline.';
+const DEFAULT_BOARD_SUBTITLE = 'Pipelane - release pipeline management and safety for AI vibe coders. Branch pipeline triage, action preflight, execution follow-through, smoke gates, and cleanup discipline.';
 const DEFAULT_AUTO_REFRESH_SECONDS = 30;
 
 function valueAfter(args: string[], flag: string): string {

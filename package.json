@@ -2,7 +2,7 @@
   "name": "pipelane",
   "version": "0.2.0",
   "type": "module",
-  "description": "Pipelane — release cockpit for AI vibe coders.",
+  "description": "Pipelane - release pipeline management and safety for AI vibe coders.",
   "bin": {
     "pipelane": "./bin/pipelane"
   },
@@ -13,6 +13,7 @@
     "docs/public/RELEASE_WORKFLOW.md",
     "docs/public/PIPELANE_BOARD.md",
     "docs/public/PIPELANE_API.md",
+    "docs/public/pipelane-board-example.png",
     "README.md"
   ],
   "scripts": {

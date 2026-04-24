@@ -1,626 +1,250 @@
 # Pipelane
 
-> **Pipelane** is the repo-native release cockpit for AI-first builders.
+> Release pipeline management and safety for AI vibe coders.
 
-`pipelane` is a standalone npm package for deterministic task workspaces, PR handoff,
-merge discipline, deploy flow, and cleanup. It is meant for repos where Claude, Codex,
-or both are doing a meaningful amount of the day-to-day operating.
+AI coding makes it easy to create five branches, three worktrees, two half-open PRs,
+and one deployment that nobody is fully sure about.
 
-The short version:
+Pipelane gives a repo a visible release pipeline and a small set of safe actions for
+moving work through it. It is built for solo builders and small teams using Claude,
+Codex, or both to ship real product code quickly.
 
-- product repos keep a small tracked workflow contract
-- humans and AI both use the same repo-native commands
-- task work happens in explicit git worktrees
-- build mode and release mode are separate, deliberate lanes
-- release state stays legible instead of living in tribal knowledge
+Use it when you want:
 
-## What Pipelane Actually Is
+- every active branch and worktree to be easy to find again
+- a clear difference between fast build flow and protected release flow
+- staging and production deploys tied to the same merged SHA when safety matters
+- smoke checks, release gates, rollback, and cleanup built into the workflow
+- a durable `/fix` loop for bugs, review findings, and code-quality repairs
+
+![Pipelane Board showing branch pipeline state, attention items, and release actions](docs/public/pipelane-board-example.png)
+
+## What Pipelane Is
+
+Pipelane is a local, repo-native release workflow layer.
+
+It installs a small workflow contract into your repo, adds slash commands for Claude
+and Codex, and ships a local web board for seeing branch, PR, smoke, deploy, and
+cleanup state in one place.
 
 Pipelane is not:
 
 - an AI model
-- a hosted SaaS control plane
+- a hosted SaaS dashboard
 - a project management board
-- a replacement for your editor, CI provider, or deployment platform
+- a replacement for git, GitHub, CI, or your deploy platform
 
-Pipelane is:
+Pipelane is closer to a release cockpit:
 
-- a shared workflow engine that lives outside any one product repo
-- a repo-local contract that gets installed into product repos
-- a thin command layer that Claude and Codex can follow without improvising
-- a release workflow that is stricter than "just merge and hope"
+- **Pipeline management:** see what is in flight, recover worktrees, open PRs,
+  merge, deploy, and clean up finished work.
+- **Release safety:** choose build mode for speed or release mode for staging-first
+  promotion of the same merged SHA.
+- **Repair discipline:** use `/fix` to turn bugs, CI failures, review comments,
+  and code-quality findings into root-cause fixes.
 
-In a pipelane-enabled repo, the normal source of truth is the repo-native command surface:
+## Start With `/pipelane`
 
-```bash
-npm run pipelane:devmode -- ...
-npm run pipelane:new -- --task "task name"
-npm run pipelane:pr -- --title "PR title"
-npm run pipelane:merge
-npm run pipelane:deploy -- staging
-npm run pipelane:deploy -- prod
-npm run pipelane:clean
+In a Pipelane-enabled repo, run:
+
+```text
+/pipelane
 ```
 
-Claude command files and Codex skills exist to make those commands easier to invoke, not to replace them.
+That prints the workflow guide. The important part is choosing the right lane.
 
-## Why It Lives Outside Product Repos
+### Build Journey
 
-Pipelane is intentionally its own repo.
+Build mode is the fast path. Use it when you want the shortest route from branch
+to production and do not need required staging validation for the same SHA.
 
-That split keeps the boundary clean:
+```text
+/status                 See what is already in flight.
+/devmode build          Use the fast lane.
+/new "task name"        Create a clean task worktree and branch.
+/pr                     Run pre-PR checks, commit, push, and open or update the PR.
+/merge                  Merge the PR and record the merged SHA.
+/smoke prod             Optional: run production-safe smoke checks if configured.
+/clean                  Clean up finished task state after production is verified.
+```
 
-- product repos own product code, repo defaults, and deploy specifics
-- Pipelane owns the reusable workflow engine, templates, and docs
+Build mode is for normal product iteration, small fixes, and repos where production
+deploys already happen safely after merge.
 
-Without that separation, product repos accumulate half-generic workflow logic, stale prompts,
-and local setup instructions that are hard to reuse safely.
+### Release Journey
 
-## What You Get In A Pipelane-Enabled Repo
+Release mode is the protected path. Use it when staging must prove the exact same
+merged SHA before production can move.
+
+```text
+/status                 See active tasks, deploy state, and release gates.
+/devmode release        Use the protected lane.
+/new "task name"        Create a clean task worktree and branch.
+/pr                     Run pre-PR checks, commit, push, and open or update the PR.
+/merge                  Merge the PR and record the merged SHA.
+/deploy staging         Deploy the merged SHA to staging.
+/smoke staging          Run or verify staging smoke checks.
+/deploy prod            Promote that same SHA to production.
+/smoke prod             Optional: run production-safe smoke checks.
+/clean                  Clean up finished task state after production is verified.
+```
+
+Release mode is for risky changes, multi-surface deploys, customer-facing launches,
+database or edge changes, or any moment where "I think prod has the right thing"
+is not good enough.
+
+### Helpful Anytime
+
+```text
+/pipelane web           Open the local Pipelane Board.
+/status                 Render a terminal cockpit from the same API as the board.
+/resume                 Reopen or recover an existing task workspace.
+/doctor                 Diagnose deploy config, probes, and release readiness.
+/rollback prod          Roll production back to the last verified-good deploy.
+/fix                    Fix bugs, review findings, CI failures, and code-quality issues.
+/fix rethink            Plan a bigger codebase restructure before changing code.
+```
+
+## The Pipelane Board
+
+`/pipelane web` opens a local web board for the current repo.
+
+The board is useful when AI-generated work is happening in parallel and the state
+is hard to hold in your head. It shows:
+
+- attention items first
+- current dev mode and release gate status
+- staging and production smoke state
+- one active pipeline card per branch
+- branch files, workspace files, and patch previews on demand
+- preflighted actions for deploy, cleanup, and other workflow steps
+
+The board is local-first. It reads the repo's public `pipelane:api` contract and
+does not become the source of truth. Git, GitHub, CI, and Pipelane state remain the
+source of truth.
+
+## Why Build Mode And Release Mode Both Exist
+
+Fast development and safe release are different jobs.
+
+Build mode keeps the loop short:
+
+- make a branch
+- open a PR
+- merge
+- let the normal production path take over
+- clean up
+
+Release mode adds a gate:
+
+- merge once
+- deploy that merged SHA to staging
+- run smoke checks
+- promote that same SHA to production
+- verify production
+
+The point is not ceremony. The point is knowing exactly which code is in which
+environment, especially when AI operators are producing many branches at once.
+
+## Where `/fix` Fits
+
+Pipelane also installs `/fix`, because release safety is not only deploy order.
+It is also bug quality and code quality.
+
+`/fix` is for findings from:
+
+- human review
+- PR comments
+- CI failures
+- `/smoke`
+- `/qa` or other test runs
+- pasted errors
+- code-quality reviews
+
+The command is deliberately strict. It asks for the root cause, checks
+`REPO_GUIDANCE.md` for repo-specific invariants, scans for sibling bugs, and refuses
+cheap shims like swallowing errors or adding one-off special cases without explaining
+the caller that produced the bad state.
+
+Use `/fix` when you want the codebase to get healthier, not just quieter.
+
+## What Gets Installed
 
 Bootstrapping Pipelane into a repo adds or manages:
 
-- tracked workflow config in `.pipelane.json`, or `.project-workflow.json` if you
-  want a tool-neutral filename
-- `.claude/commands/*` for repo-tracked Claude commands
+- `.pipelane.json`, or `.project-workflow.json` if you want a tool-neutral name
+- `.claude/commands/*` for repo-tracked Claude slash commands
 - `.agents/skills/*` for repo-tracked Codex skills
 - `pipelane/CLAUDE.template.md` for machine-local operator config
 - `docs/RELEASE_WORKFLOW.md` for the repo's operator guide
-- a Pipelane section in `README.md`
-- a Pipelane section in `CONTRIBUTING.md`
+- Pipelane sections in `README.md`, `CONTRIBUTING.md`, and `AGENTS.md`
 - canonical `npm run pipelane:*` scripts in `package.json`
-- machine-local `CLAUDE.md` when the local operator runs setup
+- local `CLAUDE.md` for each release operator's private deploy config
+- `REPO_GUIDANCE.md`, used by `/fix` to preserve repo-specific rules
 
-## The Pipelane Website / Board
+## Install
 
-Pipelane ships a local web UI called the **Pipelane Board**.
-
-This is the "Pipelane website" most users will interact with. It is not a hosted control panel.
-It is a local operator cockpit that reads the repo's `pipelane:api` snapshot and gives you a
-visual view of the workflow state.
-
-Use it for:
-
-- seeing repo-wide attention items first
-- scanning the current branch pipeline at a glance
-- inspecting a branch's lane, history, and changed files
-- running preflighted workflow actions from a visual interface
-- keeping a local branch/release cockpit open while you work
-
-It is not:
-
-- the workflow source of truth
-- a replacement for git or GitHub
-- a planning board for product tasks
-- a hosted dashboard for your whole team
-
-In a pipelane-enabled consumer repo, the normal entry point is:
-
-```bash
-npm run pipelane:board
-```
-
-When working on the Pipelane package itself, you can point the dashboard at another repo:
-
-```bash
-npm run dashboard -- --repo /absolute/path/to/your/repo
-```
-
-The board shows:
-
-- `Attention` and repo-wide release context first
-- a `?` help guide for the build and release slash-command journeys
-- one active pipeline card per branch
-- lane reasons and status history
-- row actions and board-level actions
-- lazy patch previews and execution feedback
-
-Local board settings live at:
-
-```text
-~/.pipelane/dashboard/<repo>-<hash>.json
-```
-
-More detail:
-
-- [Pipelane Board reference design](docs/public/PIPELANE_BOARD.md)
-- [Dashboard implementation guide](src/dashboard/README.md)
-- [Pipelane API contract](docs/public/PIPELANE_API.md)
-
-## Requirements
-
-Pipelane does not require a giant platform dependency stack, but it is not literally zero-dependency.
-If you want the full workflow to work end to end, you need to understand the prerequisites clearly.
-
-### Hard requirements for installation
-
-- Node.js `>=22.0.0`
-- npm
-- filesystem access to the target repo
-
-### Hard requirements for normal day-to-day workflow
-
-- git installed
-- a target repo on disk
-- a real base branch, usually `main`
-- at least one commit on that base branch before you start creating task worktrees
-- an `origin` remote with the base branch pushed if you want the default safe `/new` flow
-
-Why the remote matters:
-
-- `/new` branches from `origin/<base-branch>` by default, not from a guessed local state
-- if `origin/main` cannot be refreshed, `/new` fails closed and tells you to rerun with `--offline`
-
-### Hard requirements for PR, merge, and deploy flow
-
-- GitHub CLI (`gh`) installed and authenticated for the target repo
-
-Why:
-
-- `pipelane:pr` pushes to `origin` and creates or edits a PR through `gh`
-- `pipelane:merge` merges the PR through `gh`
-- `pipelane:deploy` dispatches and tracks deploy workflow activity through `gh`
-
-### Optional environment integrations
-
-- Claude Code if you want repo-tracked `.claude/commands/*`
-- Codex if you want repo-tracked Codex skills
-
-### Release-mode-only requirements
-
-- each release operator must have a local `CLAUDE.md`
-- that local `CLAUDE.md` must include valid staging and production deploy config
-- `npm run pipelane:release-check` must pass before release mode is considered ready
-- if `healthcheckUrl` changes, rerun `npm run pipelane:doctor -- --probe` because cached probe results are URL-bound
-
-### What "Works Out Of The Box" Means In Practice
-
-`bootstrap` can scaffold an empty directory and install the repo-local dependency. That part works.
-
-What does **not** work automatically unless the repo is actually ready:
-
-- `/new` in a non-git directory
-- `/new` in a git repo with no commits
-- `/new` in a repo with no `origin` remote unless you intentionally use `--offline`
-- `/pr`, `/merge`, or `/deploy` without a working GitHub CLI setup
-- release mode without local deploy configuration
-
-That fail-closed behavior is intentional. Pipelane favors explicit requirements over silent guesses.
-
-## Detailed Install Journey
-
-This section is the exact user journey for adopting Pipelane in a repo.
-
-### Step 1: Start From A Repo That Is Actually Ready
-
-If you already have a remote-backed git repo with a base branch and at least one commit, use that.
-
-If you are starting from scratch, do this first:
-
-```bash
-mkdir my-app
-cd my-app
-git init -b main
-npm init -y
-git add package.json
-git commit -m "Initial commit"
-git remote add origin git@github.com:you/my-app.git
-git push -u origin main
-```
-
-Pipelane can scaffold before this point, but the normal task workflow starts making sense only after
-the repo has a real git base to branch from.
-
-### Step 2: Bootstrap Pipelane Into The Repo
-
-Inside the target repo:
+Start from a repo that already has git, a base branch, and at least one commit.
+The default safe `/new` flow branches from `origin/<base>`, so a pushed `origin`
+remote is recommended.
 
 ```bash
 npx -y pipelane@github:jokim1/pipelane#main bootstrap --project "My App"
 ```
 
-If `pipelane` is already on your `PATH`, the equivalent is:
+If `pipelane` is already on your `PATH`, use:
 
 ```bash
 pipelane bootstrap --project "My App"
 ```
 
-What `bootstrap` does:
-
-1. installs the repo-local `pipelane` dependency if needed
-2. runs `pipelane init`
-3. runs `pipelane setup`
-4. creates local `CLAUDE.md` if it does not exist yet
-5. writes tracked Codex skills under `.agents/skills/*`
-6. prints readiness warnings if the repo is not actually ready for `/new`
-
-### Step 3: Review What Bootstrap Added
-
-After bootstrap, you should expect to see:
-
-- `.pipelane.json`
-- `.claude/commands/*`
-- `.agents/skills/*`
-- `pipelane/CLAUDE.template.md`
-- `docs/RELEASE_WORKFLOW.md`
-- Pipelane sections in `README.md` and `CONTRIBUTING.md`
-- `pipelane:*` scripts in `package.json`
-- local `CLAUDE.md`
-
-If you want the repo to stay tool-neutral, rename `.pipelane.json` to
-`.project-workflow.json` before committing. Pipelane `main` reads either
-filename as of April 21, 2026 (merge commit `4111230`, PR #44). No shim is
-required on that build.
-
-### Step 4: Commit The Tracked Pipelane Files
-
-Do this before using `/new` in a normal remote-backed repo:
+Then review and commit the tracked files:
 
 ```bash
-git add .pipelane.json .claude/commands .agents/skills README.md CONTRIBUTING.md docs/RELEASE_WORKFLOW.md pipelane/CLAUDE.template.md package.json package-lock.json
+git add .pipelane.json .claude/commands .agents/skills README.md CONTRIBUTING.md AGENTS.md docs/RELEASE_WORKFLOW.md pipelane/CLAUDE.template.md REPO_GUIDANCE.md package.json package-lock.json
 git commit -m "Add pipelane workflow"
 git push
 ```
 
-If you renamed the config to `.project-workflow.json`, add that file instead:
+Why commit before using `/new`?
 
-```bash
-git add .project-workflow.json .claude/commands .agents/skills README.md CONTRIBUTING.md docs/RELEASE_WORKFLOW.md pipelane/CLAUDE.template.md package.json package-lock.json
-git commit -m "Add pipelane workflow"
-git push
-```
+`/new` creates task worktrees from the repo's base branch. If the base branch does
+not contain the Pipelane files yet, new worktrees will not inherit the workflow.
 
-Why this matters:
+## Requirements
 
-- `/new` creates task worktrees from the repo's base branch
-- if the base branch does not contain the tracked Pipelane files yet, new task worktrees will not inherit the workflow contract
+Hard requirements:
 
-### Step 5: Each User Finishes Their Local Setup
+- Node.js `>=22.0.0`
+- npm
+- git
+- a target repo on disk
+- a real base branch, usually `main`
 
-#### Every Claude user
+For PR, merge, deploy, and release flow:
 
-1. pull the repo after the tracked files are committed
-2. optionally run `pipelane install-claude` once per machine if they want the global `/init-pipelane` bootstrap command
-3. open the repo in Claude Code
-4. reopen Claude if it was already open before the repo gained Pipelane files or aliases changed
+- GitHub CLI (`gh`) installed and authenticated
+- an `origin` remote with the base branch pushed
+- deploy workflow config for staging and production
+- `npm run pipelane:release-check` passing before release mode is considered ready
 
-#### Every Codex user
+Optional:
 
-1. pull the repo after the tracked files are committed
-2. optionally run `pipelane install-codex` once per machine if they want the global `/init-pipelane` bootstrap command
-3. if this machine previously used pipelane's machine-local Codex wrappers, run `npm run pipelane:setup` once to prune them
-4. open the repo in Codex
-5. reopen Codex if it was already open before the repo gained tracked skills or aliases changed
+- Claude Code, if you want `.claude/commands/*`
+- Codex, if you want `.agents/skills/*`
 
-### Do users need a shim?
-
-Usually, no.
-
-- If the repo tracks `.pipelane.json`, no shim is needed.
-- If the repo tracks `.project-workflow.json` and your local pipelane build includes
-  PR #44 / merge commit `4111230` on `main` from April 21, 2026, no shim is needed.
-- If someone is on an older local pipelane install from before that change, they
-  must upgrade pipelane or temporarily create a local `.pipelane.json` shim that
-  points at `.project-workflow.json`.
-
-## Detailed User Journey: Build Mode
-
-Build mode is the fast lane. Use it when you want the shortest path from merge to production and you
-do not need a required staging promotion step for the same SHA.
-
-### Build mode requirements
-
-Before starting a build-mode task, make sure:
-
-- the repo is already bootstrapped with Pipelane
-- the tracked Pipelane files are committed on the base branch
-- your local machine has already run `npm run pipelane:setup`
-- the repo has a working `origin` remote unless you intentionally plan to use `--offline`
-- `gh` is installed and authenticated if you plan to use `/pr` and `/merge`
-
-### Step 1: Confirm Or Switch To Build Mode
-
-Slash command:
-
-```text
-/devmode build
-```
-
-Repo-native equivalent:
-
-```bash
-npm run pipelane:devmode -- build
-```
-
-What this does:
-
-- records that the repo is currently operating in the fast lane
-- tells later commands that production deploy is the normal post-merge path
-- removes the release-lane staging requirement for this task flow
-
-### Step 2: Create A Task Workspace
-
-Slash command:
-
-```text
-/new my-task
-```
-
-Repo-native equivalent:
-
-```bash
-npm run pipelane:new -- --task "my-task"
-```
-
-What this does:
-
-- refreshes `origin/<base-branch>` by default
-- creates a new `codex/<task>-<hex>` branch
-- creates a separate git worktree for the task
-- records the task lock so the repo can recover it later with `/resume`
-
-Important:
-
-- if the repo has no `origin` remote, this step fails closed by default
-- if you knowingly want to branch from local `main`, rerun with `--offline`
-
-### Step 3: Implement And Verify
-
-Do the actual work inside the task worktree.
-
-Before opening the PR, make sure the repo's configured pre-PR checks are healthy. By default those are:
-
-- `npm run test`
-- `npm run typecheck`
-- `npm run build`
-
-The exact checks come from `.pipelane.json`.
-
-### Step 4: Open Or Update The PR
-
-Slash command:
-
-```text
-/pr
-```
-
-Repo-native equivalent:
-
-```bash
-npm run pipelane:pr -- --title "Add feature X"
-```
-
-What this does:
-
-- runs the configured pre-PR checks
-- stages and commits dirty changes if needed
-- pushes the branch to `origin`
-- creates or updates the pull request through `gh`
-- records the PR state for later merge and deploy flow
-
-If the worktree is dirty and this is a brand-new PR, pass `--title`.
-
-### Step 5: Merge The PR
-
-Slash command:
-
-```text
-/merge
-```
-
-Repo-native equivalent:
-
-```bash
-npm run pipelane:merge
-```
-
-What this does:
-
-- waits for PR checks
-- merges through `gh`
-- records the merged SHA
-- in build mode, may dispatch production deploy immediately if the repo config has auto-deploy-on-merge enabled
-
-### Step 6: Verify Production
-
-Two cases exist in build mode:
-
-- if the repo auto-deploys on merge, verify that production is healthy
-- if the repo does not auto-deploy on merge, deploy manually:
-
-```bash
-npm run pipelane:deploy -- prod
-```
-
-Then verify the production result.
-
-### Step 7: Clean Up
-
-Slash command:
-
-```text
-/clean
-```
-
-Repo-native equivalent:
-
-```bash
-npm run pipelane:clean
-```
-
-Use this after production is verified and the task is truly done.
-
-## Detailed User Journey: Release Mode
-
-Release mode is the protected lane. Use it when you want the merged SHA promoted through staging and
-then production in order, with a fail-closed gate around release readiness.
-
-### Release mode requirements
-
-Before starting a release-mode task, make sure:
-
-- everything in the build-mode requirements is already true
-- local `CLAUDE.md` has valid staging and production deploy configuration
-- `npm run pipelane:release-check` passes
-
-Release mode is intentionally stricter than build mode.
-
-### Step 0: Prepare Release Operator Configuration
-
-If you have not done it on this machine yet:
-
-```bash
-npm run pipelane:setup
-```
-
-Then open local `CLAUDE.md`, fill in the deploy configuration block, and verify readiness:
-
-```bash
-npm run pipelane:release-check
-```
-
-Until this is configured correctly, release mode stays fail-closed.
-If the staging URL or healthcheck path changes later, rerun
-`npm run pipelane:doctor -- --probe` so the cached probe result matches
-the new target. If you enable `PIPELANE_PROBE_STATE_KEY`, rerun the
-probe after setting it so readiness is backed by signed probe records.
-
-### Step 1: Confirm Or Switch To Release Mode
-
-Slash command:
-
-```text
-/devmode release
-```
-
-Repo-native equivalent:
-
-```bash
-npm run pipelane:devmode -- release
-```
-
-What this does:
-
-- records that the repo is now using the protected lane
-- enforces release readiness instead of assuming it
-- makes staging promotion part of the normal path
-
-### Step 2: Create A Task Workspace
-
-Use the same task-start flow as build mode:
-
-```bash
-npm run pipelane:new -- --task "my-task"
-```
-
-This still expects a valid git base and usually an `origin` remote.
-
-### Step 3: Implement And Verify
-
-Do the work in the task worktree and make sure the configured checks pass before PR creation.
-
-### Step 4: Open Or Update The PR
-
-```bash
-npm run pipelane:pr -- --title "Add feature X"
-```
-
-In release mode, PR creation also checks that release readiness is satisfied unless an explicit
-override has been recorded.
-
-### Step 5: Merge The PR
-
-```bash
-npm run pipelane:merge
-```
-
-After merge, Pipelane records the merged SHA and expects the next step to be staging promotion.
-
-### Step 6: Deploy That Merged SHA To Staging
-
-Slash command:
-
-```text
-/deploy staging
-```
-
-Repo-native equivalent:
-
-```bash
-npm run pipelane:deploy -- staging
-```
-
-What this does:
-
-- resolves the merged SHA for the task
-- dispatches the deploy workflow
-- records staging deploy state
-- expects the staging verification to succeed before prod is allowed
-
-### Step 7: Verify Staging
-
-Do not skip this. In release mode, the entire point is that staging validates the same merged SHA
-before production.
-
-### Step 8: Promote The Same SHA To Production
-
-Slash command:
-
-```text
-/deploy prod
-```
-
-Repo-native equivalent:
-
-```bash
-npm run pipelane:deploy -- prod
-```
-
-Prod deploy is blocked unless Pipelane can prove there is a qualifying staging success for the same
-task, same SHA, and same surfaces.
-
-### Step 9: Verify Production
-
-Confirm that the production deployment is healthy and complete.
-
-### Step 10: Clean Up
-
-```bash
-npm run pipelane:clean
-```
-
-Run cleanup only after the release is truly complete.
-
-## Alias Configuration
-
-The default slash aliases are:
-
-- `/devmode`
-- `/new`
-- `/resume`
-- `/pr`
-- `/merge`
-- `/deploy`
-- `/clean`
-- `/status`
-- `/doctor`
-- `/rollback`
-
-Those names come from `.pipelane.json` under `aliases`.
-
-If you change aliases:
-
-- rerun `npm run pipelane:setup`
-- commit the regenerated `.claude/commands/*` and `.agents/skills/*`
-- reopen Claude or Codex if it was already open
-- keep aliases unique
-
-Pipelane fails closed if an alias would overwrite an unrelated Claude command or Codex skill.
+Pipelane fails closed when the repo is not ready. For example, `/new` fails in a
+repo with no commits or no usable remote unless you intentionally choose offline
+mode. `/deploy prod` in release mode is blocked until staging evidence exists for
+the same SHA and surface set.
 
 ## Command Reference
 
+User-facing slash commands:
+
 - `/pipelane`: show the build/release journey overview
 - `/pipelane web`: open the local Pipelane Board
+- `/status`: show branch, PR, deploy, smoke, and release-gate state
 - `/devmode`: inspect or switch between `build` and `release`
 - `/new`: create a fresh isolated task workspace
 - `/resume`: recover an existing task workspace
@@ -628,170 +252,52 @@ Pipelane fails closed if an alias would overwrite an unrelated Claude command or
 - `/pr`: run checks, push, and create or update a PR
 - `/merge`: merge the PR and record the merged SHA
 - `/deploy`: deploy the merged SHA to `staging` or `prod`
+- `/smoke`: plan smoke coverage or run smoke against `staging` or `prod`
+- `/fix`: apply durable root-cause fixes from findings
 - `/clean`: inspect cleanup status and prune stale task locks
-- `/status`: render a terminal cockpit of repo workflow state
 - `/doctor`: inspect deploy configuration and live probes
 - `/rollback`: roll back the most recent verified-good deploy
 
-Canonical repo-native commands:
+Repo-native scripts behind those commands:
 
-- `npm run pipelane:setup`
-- `npm run pipelane:configure`
-- `npm run pipelane:devmode -- ...`
-- `npm run pipelane:new -- --task "<task-name>"`
-- `npm run pipelane:resume -- --task "<task-name>"`
-- `npm run pipelane:repo-guard`
-- `npm run pipelane:pr -- ...`
-- `npm run pipelane:merge`
-- `npm run pipelane:release-check`
-- `npm run pipelane:deploy -- staging|prod`
-- `npm run pipelane:clean`
-- `npm run pipelane:status`
-- `npm run pipelane:doctor`
-- `npm run pipelane:rollback`
-- `npm run pipelane:board`
-- `npm run pipelane:update`
+```bash
+npm run pipelane:setup
+npm run pipelane:configure
+npm run pipelane:devmode -- build|release
+npm run pipelane:new -- --task "<task-name>"
+npm run pipelane:resume -- --task "<task-name>"
+npm run pipelane:repo-guard
+npm run pipelane:pr -- --title "PR title"
+npm run pipelane:merge
+npm run pipelane:release-check
+npm run pipelane:deploy -- staging|prod
+npm run pipelane:smoke -- plan|staging|prod
+npm run pipelane:clean
+npm run pipelane:status
+npm run pipelane:doctor -- --probe
+npm run pipelane:rollback -- prod
+npm run pipelane:board
+npm run pipelane:update
+```
+
+Slash commands are the normal human/AI interface. The `npm run pipelane:*` scripts
+are the stable repo-native layer underneath them.
 
 ## Use Pipelane With Gstack
 
-You should generally use both.
+Use both when a repo has both.
 
-The boundary is:
+- Pipelane owns task workspaces, PR prep, merge, deploy flow, smoke gates,
+  rollback, cleanup, and release discipline.
+- gstack remains useful for broader planning, review, QA, investigation,
+  documentation, design review, and other AI-builder workflows.
 
-- `pipelane` owns repo-specific task workspaces, PR/merge/deploy flow, and release discipline
-- gstack remains useful for generic planning, review, QA, investigation, documentation, and broader AI workflows
-
-If a repo uses Pipelane, prefer the Pipelane release flow over generic gstack `/ship`.
+If a repo uses Pipelane, prefer the Pipelane release flow over a generic `/ship`
+flow for branch, merge, deploy, and cleanup work.
 
 ## More Detail
-
-If you want the deeper operator contract, read:
 
 - [Full release workflow reference](docs/public/RELEASE_WORKFLOW.md)
 - [Pipelane Board reference design](docs/public/PIPELANE_BOARD.md)
 - [Pipelane API contract](docs/public/PIPELANE_API.md)
-
-<!-- pipelane:readme:start -->
-## Workflow
-
-This repo uses `pipelane`, the repo-specific workflow layer for AI-first builders.
-
-It is designed to work well with Claude, Codex, and similar tools by keeping the release flow
-deterministic:
-
-- repo-native commands are the source of truth
-- slash commands are thin adapters
-- `/new` creates explicit isolated task workspaces
-- `/resume` recovers them later when needed
-
-The default alias set can be changed in `.pipelane.json`. If aliases change, rerun
-`npm run pipelane:setup` and reopen Claude/Codex so the new names are picked up.
-Aliases must be unique, and setup fails closed if an alias would overwrite an unrelated command.
-Codex resolves aliases per repo at runtime, so the same alias can mean different workflow commands in different pipelane repos on one machine.
-
-### Two dev modes
-
-`pipelane` gives this repo two lanes:
-
-- `build`: the fast lane, where merge is expected to hand off production deploy
-- `release`: the protected lane, where staging happens before prod for the same merged SHA
-
-### Build mode user journey
-
-User-facing:
-
-1. `/devmode build`
-2. `/new <task-name>`
-3. `/pr`
-4. `/merge`
-5. `/clean`
-
-Repo-native:
-
-```bash
-npm run pipelane:devmode -- build
-npm run pipelane:new -- --task "example-task"
-npm run pipelane:pr -- --title "Example PR title"
-npm run pipelane:merge
-npm run pipelane:clean
-```
-
-### Release mode user journey
-
-User-facing:
-
-1. `/devmode release`
-2. `/new <task-name>`
-3. `/pr`
-4. `/merge`
-5. `/deploy staging`
-6. `/smoke staging`
-7. `/deploy prod`
-7. `/clean`
-
-Repo-native:
-
-```bash
-npm run pipelane:devmode -- release
-npm run pipelane:new -- --task "example-task"
-npm run pipelane:pr -- --title "Example PR title"
-npm run pipelane:merge
-npm run pipelane:deploy -- staging
-npm run pipelane:smoke -- staging
-npm run pipelane:deploy -- prod
-npm run pipelane:clean
-```
-
-### Command surface
-
-- `/pipelane` (journey overview)
-- `/pipelane web` (local web board)
-- `/devmode`
-- `/new`
-- `/resume`
-- `/pr`
-- `/merge`
-- `/deploy`
-- `/smoke`
-- `/clean`
-- `/status`
-- `/doctor`
-- `/rollback`
-
-Canonical repo-native commands:
-
-- `npm run pipelane:setup`
-- `npm run pipelane:devmode -- ...`
-- `npm run pipelane:new -- --task "<task-name>"` (the `--task` flag is optional; omitting it generates a `task-<hex>` slug)
-- `npm run pipelane:resume -- --task "<task-name>"`
-- `npm run pipelane:pr -- ...`
-- `npm run pipelane:merge`
-- `npm run pipelane:release-check`
-- `npm run pipelane:task-lock -- verify --task "<task-name>"`
-- `npm run pipelane:deploy -- staging|prod ...`
-- `npm run pipelane:smoke -- plan|staging|prod`
-- `npm run pipelane:clean`
-- `npm run pipelane:status`
-- `npm run pipelane:doctor` (add `-- --probe` for live healthchecks, `-- --fix` for the guided wizard)
-- `npm run pipelane:board`
-- `npm run pipelane:update`
-
-### pipelane + gstack
-
-Use both.
-
-- use `pipelane` for task workspaces, PR prep, merge, and deploy flow
-- use gstack for review, QA, architecture review, deploy bootstrap, docs, and investigation
-
-If this repo is adopting pipelane for the first time, commit the tracked Pipelane files
-before using `pipelane:new` in a remote-backed repo.
-
-### What each user still needs to do
-
-- One repo maintainer runs `pipelane bootstrap --project "<name>"`, reviews `.pipelane.json`, and commits the tracked Pipelane files.
-- Each Claude user can run `pipelane install-claude` once per machine for the global `/init-pipelane` bootstrap command, then pulls the repo and reopens Claude if command files or aliases changed.
-- Each Codex user can optionally run `pipelane install-codex` once per machine for the global `/init-pipelane` bootstrap command, then pulls the repo. If that machine previously used pipelane's machine-local Codex wrappers, rerun `npm run pipelane:setup` once to prune them before reopening Codex.
-- Each release operator fills local deploy config in `CLAUDE.md` and verifies with `npm run pipelane:release-check`.
-
-Use [docs/RELEASE_WORKFLOW.md](./docs/RELEASE_WORKFLOW.md) for the full operator workflow.
-<!-- pipelane:readme:end -->
+- [Dashboard implementation guide](src/dashboard/README.md)

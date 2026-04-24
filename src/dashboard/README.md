@@ -82,7 +82,7 @@ Current settings schema:
 ```json
 {
   "boardTitle": "Pipelane Board",
-  "boardSubtitle": "Pipelane — the release cockpit for AI vibe coders. Branch pipeline triage, action preflight, execution follow-through, and cleanup discipline.",
+  "boardSubtitle": "Pipelane - release pipeline management and safety for AI vibe coders. Branch pipeline triage, action preflight, execution follow-through, smoke gates, and cleanup discipline.",
   "preferredPort": 3033,
   "autoRefreshSeconds": 30
 }

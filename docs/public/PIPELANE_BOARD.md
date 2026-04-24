@@ -1,8 +1,8 @@
 # Pipelane Board
 
-The Pipelane Board is the web cockpit of **Pipelane** — the release
-workflow system for AI vibe coders. It is an opinionated reference design
-for a local workflow dashboard.
+The Pipelane Board is the web cockpit of **Pipelane**, the release pipeline
+management and safety system for AI vibe coders. It is an opinionated reference
+design for a local workflow dashboard.
 
 It is meant to make AI-first developers more effective at running a branch-based release workflow
 without forcing product repos to ship a first-party dashboard.
@@ -52,8 +52,8 @@ This reference design deliberately optimizes for operator clarity over generic d
    only when the operator clicks into a branch.
 
 7. Contextual help
-   The `?` guide should stay close to the board and mirror the `/pipelane` overview: build
-   journey, release journey, helpful anytime commands, and web commands.
+The `?` guide should stay close to the board and mirror the `/pipelane` overview: build
+journey, release journey, helpful anytime commands, `/fix`, and web commands.
 
 ## Current information architecture
 
@@ -78,6 +78,7 @@ Shows the quick Pipelane guide:
 - build journey slash commands
 - release journey slash commands
 - helpful anytime commands
+- `/fix` and `/fix rethink`
 - `/pipelane web`, `/pipelane status`, and `/pipelane update --check`
 
 The drawer renders configured aliases from the repo when available, falling back to the default

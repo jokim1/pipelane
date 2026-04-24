@@ -11,7 +11,7 @@ import { runOperator } from './operator/index.ts';
 import { parseUpdateArgs, runUpdate } from './operator/update.ts';
 
 function printTopLevelHelp(): void {
-  process.stdout.write(`Pipelane — release cockpit for AI vibe coders
+  process.stdout.write(`Pipelane - release pipeline management and safety for AI vibe coders
 
 Commands:
   bootstrap [--project "Project Name"]

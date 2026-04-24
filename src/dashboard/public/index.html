@@ -1954,13 +1954,16 @@
       }
 
       const buildRows = [
+        { command: aliases.status, description: 'See what is already in flight.' },
         { command: `${aliases.devmode} build`, description: 'Set the repo to build mode. Usually set once, until you switch lanes.' },
         { command: `${aliases.new} "task name"`, description: 'Create a clean task worktree and branch. The task name is optional.' },
         { command: aliases.pr, description: 'Run pre-PR checks, commit, push, and open or update the PR.' },
         { command: aliases.merge, description: 'Merge the PR. In build mode, this hands off to the prod deploy path.' },
+        { command: `${aliases.smoke} prod`, description: 'Optional: run production-safe smoke checks if configured.' },
         { command: aliases.clean, description: 'Clean up finished task state after the release is complete.' },
       ];
       const releaseRows = [
+        { command: aliases.status, description: 'See active tasks, deploy state, and release gates.' },
         { command: `${aliases.devmode} release`, description: 'Set the repo to release mode. Usually set once, until you switch lanes.' },
         { command: `${aliases.new} "task name"`, description: 'Create a clean task worktree and branch. The task name is optional.' },
         { command: aliases.pr, description: 'Run pre-PR checks, commit, push, and open or update the PR.' },
@@ -1968,6 +1971,7 @@
         { command: `${aliases.deploy} staging`, description: 'Deploy the merged SHA to staging.' },
         { command: `${aliases.smoke} staging`, description: 'Run or verify staging smoke checks.' },
         { command: `${aliases.deploy} prod`, description: 'Promote the same merged SHA to production.' },
+        { command: `${aliases.smoke} prod`, description: 'Optional: run production-safe smoke checks.' },
         { command: aliases.clean, description: 'Clean up finished task state after production is verified.' },
       ];
       const helpfulRows = [
@@ -1975,6 +1979,8 @@
         { command: aliases.resume, description: 'Reopen or recover an existing task workspace.' },
         { command: aliases.doctor, description: 'Diagnose deploy config, probes, and release readiness.' },
         { command: `${aliases.rollback} prod`, description: 'Roll back production to the last verified-good deploy.' },
+        { command: '/fix', description: 'Fix bugs, review findings, CI failures, and code-quality issues.' },
+        { command: '/fix rethink', description: 'Plan a larger codebase restructure before changing code.' },
         { command: '/pipelane', description: 'Show the same build and release journey overview in chat.' },
       ];
       const webRows = [

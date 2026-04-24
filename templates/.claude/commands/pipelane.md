@@ -28,15 +28,18 @@ Pick a lane:
 1. Build journey
 Fast path. Merge hands off to production deploy.
 
+  {{ALIAS_STATUS}}               See what is already in flight.
   {{ALIAS_DEVMODE}} build        Set the repo to build mode. Usually set once, until you switch lanes.
   {{ALIAS_NEW}} "task name"      Create a clean task worktree and branch. The task name is optional.
   {{ALIAS_PR}}                   Run pre-PR checks, commit, push, and open or update the PR.
   {{ALIAS_MERGE}}                Merge the PR. In build mode, this hands off to the prod deploy path.
+  {{ALIAS_SMOKE}} prod           Optional: run production-safe smoke checks if configured.
   {{ALIAS_CLEAN}}                Clean up finished task state after the release is complete.
 
 2. Release journey
 Protected path. Promote the same merged SHA through staging, smoke, then prod.
 
+  {{ALIAS_STATUS}}               See active tasks, deploy state, and release gates.
   {{ALIAS_DEVMODE}} release      Set the repo to release mode. Usually set once, until you switch lanes.
   {{ALIAS_NEW}} "task name"      Create a clean task worktree and branch. The task name is optional.
   {{ALIAS_PR}}                   Run pre-PR checks, commit, push, and open or update the PR.
@@ -44,6 +47,7 @@ Protected path. Promote the same merged SHA through staging, smoke, then prod.
   {{ALIAS_DEPLOY}} staging       Deploy the merged SHA to staging.
   {{ALIAS_SMOKE}} staging        Run or verify staging smoke checks.
   {{ALIAS_DEPLOY}} prod          Promote the same merged SHA to production.
+  {{ALIAS_SMOKE}} prod           Optional: run production-safe smoke checks.
   {{ALIAS_CLEAN}}                Clean up finished task state after production is verified.
 
 Helpful anytime:
@@ -51,6 +55,8 @@ Helpful anytime:
   {{ALIAS_RESUME}}               Reopen or recover an existing task workspace.
   {{ALIAS_DOCTOR}}               Diagnose deploy config, probes, and release readiness.
   {{ALIAS_ROLLBACK}} prod        Roll back production to the last verified-good deploy.
+  /fix                           Fix bugs, review findings, CI failures, and code-quality issues.
+  /fix rethink                   Plan a larger codebase restructure before changing code.
   /pipelane web                  Open the local Pipelane Board.
   /pipelane update --check       Check whether Pipelane itself has updates.
 ```
