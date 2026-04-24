@@ -126,21 +126,20 @@ where `$REST` is `$ARGUMENTS` with the leading `update` token stripped. Use this
 Common forms:
 
 ```bash
-npm run pipelane:update              # check, prompt, install, run setup inline
+npm run pipelane:update              # check, install if behind, auto-run setup
 npm run pipelane:update -- --check   # report upstream + local drift; no mutation
-npm run pipelane:update -- --yes     # skip all prompts (CI / non-TTY); auto-runs setup
-npm run pipelane:update -- --json    # structured output; never prompts
+npm run pipelane:update -- --json    # structured output; installs but never auto-runs setup
+npm run pipelane:update -- --yes     # backward-compat no-op (update no longer prompts)
 ```
 
 This command:
 
 1. Reads the installed Pipelane version from `node_modules/pipelane/package.json` and the resolved commit from `package-lock.json`.
 2. Fetches the latest `main` commit from `github:jokim1/pipelane` via `git ls-remote`.
-3. If behind, summarizes the commits between (via `gh api repos/jokim1/pipelane/compare`, best effort) and prompts to upgrade.
-4. On confirm, runs `npm install pipelane@github:jokim1/pipelane#main` in the consumer repo.
-5. Runs template-drift detection against the consumer repo. Surfaces the minimum follow-up needed — new/renamed slash commands, scaffold writes, Codex skill changes, other template re-renders — and offers to run setup inline. Prints reopen-Claude / reopen-Codex hints only when the affected surface actually changed. In `--check` mode this same detection runs without installing, so you can answer "is this consumer in sync?" any time.
+3. If behind, summarizes the commits between (via `gh api repos/jokim1/pipelane/compare`, best effort) and runs `npm install pipelane@github:jokim1/pipelane#main` in the consumer repo. The user invoked `update` — that is the consent; no confirmation prompt.
+4. Runs template-drift detection against the consumer repo. Surfaces the minimum follow-up needed — new/renamed slash commands, scaffold writes, Codex skill changes, other template re-renders — and runs setup inline automatically when there are no collisions. Prints reopen-Claude / reopen-Codex hints only when the affected surface actually changed. In `--check` mode this same detection runs without installing, so you can answer "is this consumer in sync?" any time.
 
-Use `--yes` in CI / non-TTY contexts to accept both the upgrade and the inline setup without prompts. Use `--json` for structured output; JSON mode never prompts and includes a `followUpSteps` field describing exactly which surfaces would change.
+Use `--check` to inspect without mutating. Use `--json` for structured output; JSON mode installs but does not auto-run setup — the caller decides via the `followUpSteps` field, which describes exactly which surfaces would change.
 
 Collisions (existing non-pipelane files where managed files would land) are reported but NOT auto-resolved — setup is skipped and the operator must rename, remove, or adjust aliases before retrying.
 

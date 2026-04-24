@@ -1,6 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import readline from 'node:readline';
 
 import { detectSetupDrift, formatSetupResult, type SetupDrift, setupConsumerRepo } from './docs.ts';
 import { PIPELANE_GITHUB_URL, PIPELANE_REPO_SLUG, resolvePipelaneInstallSpec } from './install-source.ts';
@@ -90,30 +89,11 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
     };
   }
 
-  // Behind main path: print the commit delta, confirm upgrade, install,
-  // detect drift, optionally run setup inline.
+  // Behind main path: print the commit delta, install, detect drift, run
+  // setup inline if needed. The user invoked `pipelane update` — that is
+  // the consent. For read-only inspection, use `--check`.
   const summary = buildStatusMessage(status);
   if (!options.json) process.stdout.write(`${summary}\n`);
-
-  const confirmed = options.yes || (await promptYesNo('Upgrade now? [y/N] '));
-  if (!confirmed) {
-    const message = 'Upgrade skipped.';
-    const driftResult = tryDetectDrift(repoRoot);
-    const result: UpdateResult = {
-      status,
-      action: 'skipped',
-      message,
-      followUpSteps: driftResult.drift,
-      ranSetup: false,
-    };
-    if (options.json) {
-      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-    } else {
-      process.stdout.write(`${message}\n`);
-      emitDriftHint(driftResult);
-    }
-    return result;
-  }
 
   installLatest(repoRoot);
 
@@ -143,13 +123,10 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
   let ranSetup = false;
   const drift = driftResult.drift;
   if (drift?.needsSetup && drift.claude.collisions.length === 0) {
-    const shouldRun = options.yes || (process.stdin.isTTY && (await promptYesNoDefaultYes('Run setup now? [Y/n] ')));
-    if (shouldRun) {
-      const setupResult = setupConsumerRepo(repoRoot);
-      process.stdout.write('\n' + formatSetupResult(setupResult).join('\n') + '\n');
-      emitReopenHints(drift);
-      ranSetup = true;
-    }
+    const setupResult = setupConsumerRepo(repoRoot);
+    process.stdout.write('\n' + formatSetupResult(setupResult).join('\n') + '\n');
+    emitReopenHints(drift);
+    ranSetup = true;
   }
 
   return {
@@ -413,40 +390,13 @@ function shortSha(sha: string): string {
   return sha ? sha.slice(0, 7) : '';
 }
 
-async function promptYesNo(prompt: string): Promise<boolean> {
-  if (!process.stdin.isTTY) return false;
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    const answer = await new Promise<string>((resolve) => rl.question(prompt, resolve));
-    return /^y(es)?$/i.test(answer.trim());
-  } finally {
-    rl.close();
-  }
-}
-
-// Default-yes variant — used for the "run setup now?" prompt where accepting
-// is the expected common path after a successful upgrade. Empty answer
-// (just pressing Enter) is treated as confirmation; only explicit "n"/"no"
-// declines.
-async function promptYesNoDefaultYes(prompt: string): Promise<boolean> {
-  if (!process.stdin.isTTY) return true;
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    const answer = await new Promise<string>((resolve) => rl.question(prompt, resolve));
-    const trimmed = answer.trim();
-    return !/^n(o)?$/i.test(trimmed);
-  } finally {
-    rl.close();
-  }
-}
-
 function printUsage(): void {
   process.stdout.write(`pipelane update — check for and install the latest pipelane from jokim1/pipelane#main
 
 Usage:
-  pipelane update           Check, prompt, and upgrade
+  pipelane update           Check and install if behind; auto-run setup if needed
   pipelane update --check   Report status without mutating
-  pipelane update --yes     Skip the prompt (for CI / non-TTY)
-  pipelane update --json    Emit JSON status/result
+  pipelane update --json    Emit JSON status/result; never auto-runs setup
+  pipelane update --yes     Backward-compat no-op (update no longer prompts)
 `);
 }
