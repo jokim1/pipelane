@@ -30,6 +30,7 @@ import {
   loadSmokeWaivers,
   listSmokeRunRecords,
   nowIso,
+  patchReadableWorkflowConfig,
   printResult,
   resolveSmokeLogsDir,
   resolveWorkflowContext,
@@ -56,6 +57,10 @@ export async function handleSmoke(cwd: string, parsed: ParsedOperatorArgs): Prom
     await handleSmokePlan(cwd, parsed);
     return;
   }
+  if (subcommand === 'setup') {
+    await handleSmokeSetup(cwd, parsed);
+    return;
+  }
   if (subcommand === 'waiver') {
     handleSmokeWaiver(cwd, parsed);
     return;
@@ -72,11 +77,22 @@ export async function handleSmoke(cwd: string, parsed: ParsedOperatorArgs): Prom
     await handleSmokeRun(cwd, parsed, subcommand);
     return;
   }
-  throw new Error('smoke requires one of: plan, staging, prod, waiver, quarantine, unquarantine.');
+  throw new Error('smoke requires one of: plan, setup, staging, prod, waiver, quarantine, unquarantine.');
 }
 
-async function handleSmokePlan(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
-  const context = resolveWorkflowContext(cwd);
+// Pure helper: compute the plan result without printing. Shared by
+// `handleSmokePlan` (prints) and `handleSmokeSetup` (prints its own
+// envelope once, avoiding double JSON output on --json).
+interface SmokePlanResult {
+  createdRegistry: boolean;
+  smokeTags: ReturnType<typeof buildSmokePlanReport>['smokeTags'];
+  candidateTests: ReturnType<typeof buildSmokePlanReport>['candidateTests'];
+  findings: ReturnType<typeof buildSmokePlanReport>['findings'];
+  summaryPath?: string;
+  message: string;
+}
+
+function buildSmokePlanResult(context: ReturnType<typeof resolveWorkflowContext>): SmokePlanResult {
   const discoveredTags = discoverSmokeTags(context.repoRoot);
   const candidateTests = discoverCandidateSmokeTests(context.repoRoot);
   let registry = loadSmokeRegistry(context.repoRoot, context.config);
@@ -112,12 +128,423 @@ async function handleSmokePlan(cwd: string, parsed: ParsedOperatorArgs): Promise
   if (summaryPath) {
     report.summaryPath = path.relative(context.repoRoot, summaryPath) || summaryPath;
   }
-  printResult(parsed.flags, {
+  return {
     createdRegistry,
     smokeTags: report.smokeTags,
     candidateTests: report.candidateTests,
     findings: report.findings,
+    summaryPath: report.summaryPath,
     message: formatSmokePlanReport(report),
+  };
+}
+
+async function handleSmokePlan(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
+  const context = resolveWorkflowContext(cwd);
+  const planResult = buildSmokePlanResult(context);
+  printResult(parsed.flags, {
+    createdRegistry: planResult.createdRegistry,
+    smokeTags: planResult.smokeTags,
+    candidateTests: planResult.candidateTests,
+    findings: planResult.findings,
+    message: planResult.message,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// /smoke setup
+// ---------------------------------------------------------------------------
+//
+// Two-mode contract:
+//   auto-wired: exactly one strong candidate OR explicit --staging-command.
+//               Setup writes the config, scaffolds the registry, prints the
+//               configured summary.
+//   needs input: anything else — multiple strong candidates, only weak
+//                candidates, no candidates. Setup writes nothing and prints
+//                exactly what flag the operator must supply.
+//
+// Misconfigured:
+//   --require-staging-smoke=true with no resolved staging command → throw
+//   (exit 1). Setup refuses to silently promote an unreachable release gate.
+
+type CandidateStrength = 'strong' | 'medium' | 'weak';
+
+interface SmokeSetupCandidate {
+  name: string;       // package-script name
+  command: string;    // the shell command the script runs
+  strength: CandidateStrength;
+  reason: string;     // why we scored it this strength (for user-facing output)
+}
+
+// Score a single package.json script against the /smoke setup heuristic
+// table. Returns null if the script is not smoke-adjacent at all.
+function scorePackageScript(scriptName: string, scriptCommand: string): SmokeSetupCandidate | null {
+  const name = scriptName.toLowerCase();
+  const command = scriptCommand.toLowerCase();
+  const invokesBrowserE2e = /\b(playwright|cypress|webdriver|puppeteer)\b/.test(command);
+  const hasSmokeFilter = /(@smoke\b|--grep[^\n]*smoke)/i.test(scriptCommand);
+  const looksLikeCliOnly = (() => {
+    // "smoke": "node ./src/cli.ts --help" — the pipelane repo itself — is
+    // the canonical weak case. Treat scripts that only run node/CLI help,
+    // build, lint, or type-check as weak.
+    const weakPatterns = [
+      /\bnode\b.*(--help|-h)\b/,
+      /\b(npm run )?build\b/,
+      /\beslint\b/,
+      /\btypecheck\b/,
+      /\btsc\b/,
+      /\bprettier\b/,
+    ];
+    return weakPatterns.some((pattern) => pattern.test(command))
+      && !invokesBrowserE2e
+      && !hasSmokeFilter;
+  })();
+
+  if (name.includes('smoke') && invokesBrowserE2e) {
+    return {
+      name: scriptName,
+      command: scriptCommand,
+      strength: 'strong',
+      reason: 'script name contains "smoke" and runs a browser e2e framework',
+    };
+  }
+  if (name.includes('e2e') && name.includes('smoke')) {
+    return {
+      name: scriptName,
+      command: scriptCommand,
+      strength: 'strong',
+      reason: 'script name contains both "e2e" and "smoke"',
+    };
+  }
+  if (hasSmokeFilter) {
+    return {
+      name: scriptName,
+      command: scriptCommand,
+      strength: 'strong',
+      reason: 'command filters to smoke tests via @smoke tag or --grep',
+    };
+  }
+  if (name === 'smoke' && looksLikeCliOnly) {
+    return {
+      name: scriptName,
+      command: scriptCommand,
+      strength: 'weak',
+      reason: 'script named "smoke" but runs only CLI help / build / lint — not a release smoke test',
+    };
+  }
+  if (name.startsWith('test:e2e') && !name.includes('smoke') && !command.includes('smoke')) {
+    return {
+      name: scriptName,
+      command: scriptCommand,
+      strength: 'medium',
+      reason: 'runs e2e suite but does not filter to smoke checks',
+    };
+  }
+  return null;
+}
+
+interface ScoredCandidates {
+  strong: SmokeSetupCandidate[];
+  medium: SmokeSetupCandidate[];
+  weak: SmokeSetupCandidate[];
+}
+
+// Read package.json from repoRoot (if present) and score every script. A
+// repo without package.json produces empty arrays; handleSmokeSetup treats
+// that case as "no-candidate" and falls through to explicit-flag or
+// needs-input.
+function detectSmokeCandidates(repoRoot: string): ScoredCandidates {
+  const packagePath = path.join(repoRoot, 'package.json');
+  if (!existsSync(packagePath)) {
+    return { strong: [], medium: [], weak: [] };
+  }
+  let parsed: { scripts?: Record<string, unknown> };
+  try {
+    parsed = JSON.parse(readFileSync(packagePath, 'utf8')) as { scripts?: Record<string, unknown> };
+  } catch {
+    return { strong: [], medium: [], weak: [] };
+  }
+  const scripts = typeof parsed.scripts === 'object' && parsed.scripts ? parsed.scripts : {};
+  const result: ScoredCandidates = { strong: [], medium: [], weak: [] };
+  for (const [name, command] of Object.entries(scripts)) {
+    if (typeof command !== 'string') continue;
+    const candidate = scorePackageScript(name, command);
+    if (!candidate) continue;
+    result[candidate.strength].push(candidate);
+  }
+  return result;
+}
+
+type SmokeSetupMode = 'configured' | 'already configured' | 'needs input';
+
+interface SmokeSetupOutcome {
+  mode: SmokeSetupMode;
+  repoSignal: string;
+  stagingCommand: string | null;
+  prodCommand: string | null;
+  coverageRegistry: 'created' | 'updated' | 'unchanged';
+  releaseGate: 'required' | 'optional' | 'misconfigured';
+  nextAction: string;
+  warnings: string[];
+  candidates: ScoredCandidates;
+  configPath: string;
+  configPathIsLegacy: boolean;
+  planMessage: string;
+}
+
+async function handleSmokeSetup(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
+  const context = resolveWorkflowContext(cwd);
+  const smokeBefore = context.config.smoke;
+  const stagingConfiguredBefore = typeof smokeBefore?.staging?.command === 'string' && smokeBefore.staging.command.trim().length > 0;
+  const prodConfiguredBefore = typeof smokeBefore?.prod?.command === 'string' && smokeBefore.prod.command.trim().length > 0;
+
+  const explicitStagingCommand = parsed.flags.stagingCommand.trim();
+  const explicitProdCommand = parsed.flags.prodCommand.trim();
+  const explicitRequireStaging = parsed.flags.requireStagingSmoke;
+  const explicitGeneratedSummary = parsed.flags.generatedSummaryPath.trim();
+  const explicitCriticalCoverage = parsed.flags.criticalPathCoverage;
+  const explicitCriticalPaths = parsed.flags.criticalPaths;
+
+  const candidates = detectSmokeCandidates(context.repoRoot);
+  const warnings: string[] = [];
+
+  // Decide the staging command. Explicit flag wins. Otherwise auto-wire only
+  // on exactly one strong candidate. Multiple strong / only weak / none →
+  // needs input.
+  let resolvedStagingCommand = stagingConfiguredBefore ? smokeBefore!.staging!.command : '';
+  let stagingAutoSource: 'flag' | 'candidate' | 'preserved' | 'none' = stagingConfiguredBefore ? 'preserved' : 'none';
+  if (explicitStagingCommand) {
+    resolvedStagingCommand = explicitStagingCommand;
+    stagingAutoSource = 'flag';
+  } else if (!stagingConfiguredBefore && candidates.strong.length === 1) {
+    resolvedStagingCommand = `npm run ${candidates.strong[0].name}`;
+    stagingAutoSource = 'candidate';
+  }
+
+  // Resolve needs-input cases. Precedence: explicit flag > existing config >
+  // auto-wire from strong candidate. If none of those produce a command,
+  // explain exactly what input is missing.
+  const needsInput = !resolvedStagingCommand;
+
+  if (needsInput) {
+    // We write nothing. Build a needs-input outcome with repo signal + exact
+    // next action.
+    const repoSignal = describeRepoSignal(candidates);
+    const nextAction = buildNeedsInputNextAction(candidates, context.config);
+    const outcome: SmokeSetupOutcome = {
+      mode: 'needs input',
+      repoSignal,
+      stagingCommand: null,
+      prodCommand: explicitProdCommand || (prodConfiguredBefore ? smokeBefore!.prod!.command : null),
+      coverageRegistry: 'unchanged',
+      releaseGate: explicitRequireStaging === 'true' ? 'misconfigured' : (smokeBefore?.requireStagingSmoke ? 'misconfigured' : 'optional'),
+      nextAction,
+      warnings,
+      candidates,
+      configPath: '',
+      configPathIsLegacy: false,
+      planMessage: '',
+    };
+    if (outcome.releaseGate === 'misconfigured') {
+      // require-staging-smoke=true + no command resolved is a release-gate
+      // misconfig — throw (exit 1) per the plan's release gate spec.
+      throw new Error(
+        `smoke setup blocked: --require-staging-smoke=true but no staging command is available. ` +
+        `Pass --staging-command="<command>" or pick one from the candidates above.`,
+      );
+    }
+    emitSetupOutcome(parsed, outcome);
+    return;
+  }
+
+  // Auto-wired path. Deep-merge the smoke subtree, write the config, then
+  // rebuild the smoke plan so the registry scaffolds.
+  const resolvedProdCommand = explicitProdCommand || (prodConfiguredBefore ? smokeBefore!.prod!.command : '');
+  const resolvedRequireStaging = (() => {
+    if (explicitRequireStaging === 'true') return true;
+    if (explicitRequireStaging === 'false') return false;
+    return smokeBefore?.requireStagingSmoke === true;
+  })();
+
+  // Release-gate misconfig check BEFORE writing — require-staging-smoke=true
+  // without a staging command should never be persisted.
+  if (resolvedRequireStaging && !resolvedStagingCommand) {
+    throw new Error('smoke setup blocked: --require-staging-smoke=true but no staging command is available. Pass --staging-command="<command>".');
+  }
+
+  const { configPath, isLegacy } = patchReadableWorkflowConfig(context.repoRoot, (raw) => {
+    const existingSmoke = (raw.smoke && typeof raw.smoke === 'object' && !Array.isArray(raw.smoke)
+      ? raw.smoke as Record<string, unknown>
+      : {});
+    const existingStaging = (existingSmoke.staging && typeof existingSmoke.staging === 'object' && !Array.isArray(existingSmoke.staging)
+      ? existingSmoke.staging as Record<string, unknown>
+      : {});
+    const existingProd = (existingSmoke.prod && typeof existingSmoke.prod === 'object' && !Array.isArray(existingSmoke.prod)
+      ? existingSmoke.prod as Record<string, unknown>
+      : {});
+    const nextStaging = { ...existingStaging, command: resolvedStagingCommand };
+    const nextProd = resolvedProdCommand
+      ? { ...existingProd, command: resolvedProdCommand }
+      : (Object.keys(existingProd).length > 0 ? existingProd : undefined);
+    const mergedSmoke: Record<string, unknown> = {
+      ...existingSmoke,
+      staging: nextStaging,
+    };
+    if (nextProd) {
+      mergedSmoke.prod = nextProd;
+    } else if ('prod' in mergedSmoke) {
+      delete mergedSmoke.prod;
+    }
+    if (explicitRequireStaging === 'true') {
+      mergedSmoke.requireStagingSmoke = true;
+    } else if (explicitRequireStaging === 'false') {
+      mergedSmoke.requireStagingSmoke = false;
+    }
+    if (explicitGeneratedSummary) {
+      mergedSmoke.generatedSummaryPath = explicitGeneratedSummary;
+    }
+    if (explicitCriticalCoverage) {
+      mergedSmoke.criticalPathCoverage = explicitCriticalCoverage;
+    }
+    if (explicitCriticalPaths.length > 0) {
+      mergedSmoke.criticalPaths = explicitCriticalPaths;
+    }
+    return { ...raw, smoke: mergedSmoke };
+  });
+
+  // Reload context so buildSmokePlanResult sees the newly-written config.
+  const refreshedContext = resolveWorkflowContext(cwd);
+  const planResult = buildSmokePlanResult(refreshedContext);
+
+  const sameAsBefore =
+    stagingConfiguredBefore
+    && smokeBefore!.staging!.command === resolvedStagingCommand
+    && ((resolvedProdCommand && prodConfiguredBefore && smokeBefore!.prod!.command === resolvedProdCommand)
+        || (!resolvedProdCommand && !prodConfiguredBefore))
+    && (smokeBefore?.requireStagingSmoke === true) === resolvedRequireStaging;
+  const mode: SmokeSetupMode = sameAsBefore ? 'already configured' : 'configured';
+
+  const repoSignal = (() => {
+    if (explicitStagingCommand) return `explicit --staging-command="${explicitStagingCommand}"`;
+    if (stagingAutoSource === 'candidate') {
+      const candidate = candidates.strong[0];
+      return `package script ${candidate.name} (strong: ${candidate.reason})`;
+    }
+    if (stagingAutoSource === 'preserved') return 'existing .pipelane.json smoke.staging.command';
+    return 'unknown';
+  })();
+
+  const coverageRegistry: SmokeSetupOutcome['coverageRegistry'] = planResult.createdRegistry
+    ? 'created'
+    : (sameAsBefore ? 'unchanged' : 'updated');
+
+  const releaseGate: SmokeSetupOutcome['releaseGate'] = resolvedRequireStaging
+    ? (resolvedStagingCommand ? 'required' : 'misconfigured')
+    : 'optional';
+
+  const nextAction = buildConfiguredNextAction({
+    config: refreshedContext.config,
+    releaseGate,
+    mode,
+  });
+
+  emitSetupOutcome(parsed, {
+    mode,
+    repoSignal,
+    stagingCommand: resolvedStagingCommand,
+    prodCommand: resolvedProdCommand || null,
+    coverageRegistry,
+    releaseGate,
+    nextAction,
+    warnings,
+    candidates,
+    configPath,
+    configPathIsLegacy: isLegacy,
+    planMessage: planResult.message,
+  });
+}
+
+function describeRepoSignal(candidates: ScoredCandidates): string {
+  if (candidates.strong.length > 1) {
+    return `found multiple strong candidate scripts: ${candidates.strong.map((c) => c.name).join(', ')}`;
+  }
+  if (candidates.strong.length === 1 && candidates.weak.length === 0 && candidates.medium.length === 0) {
+    // Should not reach here — single strong is the auto-wired case.
+    return `found one strong candidate: ${candidates.strong[0].name}`;
+  }
+  if (candidates.medium.length > 0 && candidates.strong.length === 0) {
+    return `found medium candidate scripts (not auto-selected — no smoke filter): ${candidates.medium.map((c) => c.name).join(', ')}`;
+  }
+  if (candidates.weak.length > 0 && candidates.strong.length === 0 && candidates.medium.length === 0) {
+    const first = candidates.weak[0];
+    return `found one weak candidate "${first.name}" — ${first.reason}`;
+  }
+  return 'no smoke / e2e package scripts detected';
+}
+
+function buildNeedsInputNextAction(candidates: ScoredCandidates, config: Parameters<typeof formatWorkflowCommand>[0]): string {
+  const setupCommand = formatWorkflowCommand(config, 'smoke', 'setup');
+  if (candidates.strong.length > 1) {
+    const options = candidates.strong.map((c) => `npm run ${c.name}`).join(' | ');
+    return `rerun ${setupCommand} --staging-command="<one of: ${options}>"`;
+  }
+  if (candidates.strong.length === 0 && candidates.medium.length > 0) {
+    const options = candidates.medium.map((c) => `npm run ${c.name}`).join(' | ');
+    return `rerun ${setupCommand} --staging-command="<${options}, filtered to @smoke tests>"`;
+  }
+  if (candidates.strong.length === 0 && candidates.medium.length === 0 && candidates.weak.length > 0) {
+    return `rerun ${setupCommand} --staging-command="<your real smoke command>" (the weak candidate is not a release smoke test)`;
+  }
+  return `rerun ${setupCommand} --staging-command="<your smoke command>" — add a package script like "test:e2e:smoke" first if none exists`;
+}
+
+function buildConfiguredNextAction(options: {
+  config: Parameters<typeof formatWorkflowCommand>[0];
+  releaseGate: SmokeSetupOutcome['releaseGate'];
+  mode: SmokeSetupMode;
+}): string {
+  const planCommand = formatWorkflowCommand(options.config, 'smoke', 'plan');
+  const stagingCommand = formatWorkflowCommand(options.config, 'smoke', 'staging');
+  if (options.mode === 'already configured') {
+    return `run ${planCommand} to audit coverage, or ${stagingCommand} after the next verified staging deploy`;
+  }
+  return `run ${stagingCommand} after the next verified staging deploy`;
+}
+
+function emitSetupOutcome(parsed: ParsedOperatorArgs, outcome: SmokeSetupOutcome): void {
+  const lines = [
+    `Smoke setup: ${outcome.mode}`,
+    `Repo signal: ${outcome.repoSignal}`,
+    `Staging command: ${outcome.stagingCommand ?? 'missing'}`,
+    `Production command: ${outcome.prodCommand ?? 'not configured'}`,
+    `Coverage registry: ${outcome.coverageRegistry}${outcome.configPath ? ` (via ${path.basename(outcome.configPath)})` : ''}`,
+    `Release gate: ${outcome.releaseGate}`,
+    `Next: ${outcome.nextAction}`,
+  ];
+  if (outcome.configPathIsLegacy) {
+    lines.push(`Note: wrote updates to legacy .project-workflow.json — consider migrating to .pipelane.json.`);
+  }
+  for (const warning of outcome.warnings) {
+    lines.push(`Warning: ${warning}`);
+  }
+  printResult(parsed.flags, {
+    setupMode: outcome.mode,
+    smokeConfigured: Boolean(outcome.stagingCommand),
+    smokeRequired: outcome.releaseGate === 'required',
+    stagingCommand: outcome.stagingCommand,
+    prodCommand: outcome.prodCommand,
+    coverageRegistry: outcome.coverageRegistry,
+    releaseGate: outcome.releaseGate,
+    repoSignal: outcome.repoSignal,
+    candidates: {
+      strong: outcome.candidates.strong.map((c) => ({ name: c.name, command: c.command, reason: c.reason })),
+      medium: outcome.candidates.medium.map((c) => ({ name: c.name, command: c.command, reason: c.reason })),
+      weak: outcome.candidates.weak.map((c) => ({ name: c.name, command: c.command, reason: c.reason })),
+    },
+    warnings: outcome.warnings,
+    suggestedNextAction: outcome.nextAction,
+    configPath: outcome.configPath || null,
+    configPathIsLegacy: outcome.configPathIsLegacy,
+    message: lines.join('\n'),
   });
 }
 

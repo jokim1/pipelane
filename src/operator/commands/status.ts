@@ -305,6 +305,9 @@ function renderBranch(branch: BranchRow, baseBranch: string, color: boolean): st
   if (lockNextAction) {
     detail.push(`    next: ${sanitizeForTerminal(lockNextAction)}`);
   }
+  if (branch.task?.promotedWithoutStagingSmoke) {
+    detail.push(`    smoke: promoted without staging smoke — add coverage via /smoke setup`);
+  }
   return [header, laneLine, ...detail];
 }
 

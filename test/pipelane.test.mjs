@@ -10122,3 +10122,401 @@ test('formatFollowUpSummary on collisions replaces the run-setup step with a res
   assert.match(summary, /Resolve these manually/);
   assert.doesNotMatch(summary, /Run setup/);
 });
+
+// ---------------------------------------------------------------------------
+// /smoke setup — configuration + handoff coverage
+// ---------------------------------------------------------------------------
+
+function createSmokeSetupRepo(options = {}) {
+  const repoRoot = createRepo();
+  const extraScripts = options.scripts ?? {};
+  writeFileSync(
+    path.join(repoRoot, 'package.json'),
+    JSON.stringify({
+      name: 'smoke-setup-test',
+      version: '0.0.0',
+      type: 'module',
+      scripts: { ...extraScripts },
+    }, null, 2) + '\n',
+    'utf8',
+  );
+  execFileSync('git', ['add', '-A'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+  execFileSync('git', ['commit', '-m', 'add package.json'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+  runCli(['init', '--project', 'Smoke Setup Test'], repoRoot);
+  return repoRoot;
+}
+
+function readSmokeConfig(repoRoot) {
+  const config = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+  return config.smoke ?? null;
+}
+
+test('smoke setup auto-wires from a single strong Playwright candidate', () => {
+  const repoRoot = createSmokeSetupRepo({
+    scripts: { 'test:e2e:smoke': 'npx playwright test --project=smoke' },
+  });
+  try {
+    const result = runCli(['run', 'smoke', 'setup', '--json'], repoRoot);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.setupMode, 'configured');
+    assert.equal(parsed.stagingCommand, 'npm run test:e2e:smoke');
+    assert.equal(parsed.smokeConfigured, true);
+    assert.equal(parsed.releaseGate, 'optional');
+    const smoke = readSmokeConfig(repoRoot);
+    assert.equal(smoke.staging.command, 'npm run test:e2e:smoke');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke setup scores grep-filtered command as strong (plan: @smoke / --grep.*smoke)', () => {
+  const repoRoot = createSmokeSetupRepo({
+    scripts: { 'test:browser': 'vitest run --grep smoke' },
+  });
+  try {
+    const result = runCli(['run', 'smoke', 'setup', '--json'], repoRoot);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.setupMode, 'configured');
+    assert.equal(parsed.stagingCommand, 'npm run test:browser');
+    assert.equal(parsed.candidates.strong.length, 1);
+    assert.match(parsed.candidates.strong[0].reason, /@smoke tag or --grep/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke setup returns needs-input on a medium-only test:e2e candidate (plan: test:e2e without smoke filtering)', () => {
+  const repoRoot = createSmokeSetupRepo({
+    scripts: { 'test:e2e': 'playwright test' },
+  });
+  try {
+    const result = runCli(['run', 'smoke', 'setup', '--json'], repoRoot);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.setupMode, 'needs input');
+    assert.equal(parsed.stagingCommand, null);
+    assert.equal(parsed.smokeConfigured, false);
+    assert.ok(parsed.candidates.medium.some((c) => c.name === 'test:e2e'));
+    assert.equal(readSmokeConfig(repoRoot), null);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke setup refuses weak-only "smoke": "node ./src/cli.ts --help"', () => {
+  const repoRoot = createSmokeSetupRepo({
+    scripts: { 'smoke': 'node ./src/cli.ts --help' },
+  });
+  try {
+    const result = runCli(['run', 'smoke', 'setup', '--json'], repoRoot);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.setupMode, 'needs input');
+    assert.ok(parsed.candidates.weak.some((c) => c.name === 'smoke'));
+    assert.equal(parsed.candidates.strong.length, 0);
+    assert.equal(readSmokeConfig(repoRoot), null);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke setup with multiple strong candidates returns needs-input', () => {
+  const repoRoot = createSmokeSetupRepo({
+    scripts: {
+      'test:e2e:smoke': 'playwright test --project=smoke',
+      'test:smoke': 'cypress run --spec "cypress/e2e/smoke/**/*"',
+    },
+  });
+  try {
+    const result = runCli(['run', 'smoke', 'setup', '--json'], repoRoot);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.setupMode, 'needs input');
+    assert.ok(parsed.candidates.strong.length >= 2);
+    assert.equal(readSmokeConfig(repoRoot), null);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke setup accepts explicit --staging-command without package.json candidate', () => {
+  const repoRoot = createSmokeSetupRepo();
+  try {
+    const result = runCli(['run', 'smoke', 'setup', '--staging-command=npm run e2e', '--json'], repoRoot);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.setupMode, 'configured');
+    assert.equal(parsed.stagingCommand, 'npm run e2e');
+    assert.equal(readSmokeConfig(repoRoot).staging.command, 'npm run e2e');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke setup --staging-command value with shell metacharacters roundtrips intact', () => {
+  const repoRoot = createSmokeSetupRepo();
+  const rawValue = 'npm run test:smoke -- --grep "auth|signup" --workers=2';
+  try {
+    runCli(['run', 'smoke', 'setup', `--staging-command=${rawValue}`], repoRoot);
+    const smoke = readSmokeConfig(repoRoot);
+    assert.equal(smoke.staging.command, rawValue);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke setup preserves unrelated smoke fields on deep merge', () => {
+  const repoRoot = createSmokeSetupRepo();
+  const configPath = path.join(repoRoot, '.pipelane.json');
+  try {
+    const existing = JSON.parse(readFileSync(configPath, 'utf8'));
+    existing.smoke = {
+      staging: { command: 'npm run old:smoke' },
+      waivers: { path: '.pipelane/waivers.json', maxExtensions: 3 },
+      history: { retentionDays: 14, maxEntries: 50 },
+      criticalPathCoverage: 'warn',
+    };
+    writeFileSync(configPath, JSON.stringify(existing, null, 2) + '\n', 'utf8');
+
+    runCli(['run', 'smoke', 'setup', '--staging-command=npm run new:smoke'], repoRoot);
+
+    const smoke = readSmokeConfig(repoRoot);
+    assert.equal(smoke.staging.command, 'npm run new:smoke');           // overwritten
+    assert.equal(smoke.waivers.maxExtensions, 3);                       // preserved
+    assert.equal(smoke.history.retentionDays, 14);                      // preserved
+    assert.equal(smoke.history.maxEntries, 50);                         // preserved
+    assert.equal(smoke.criticalPathCoverage, 'warn');                   // preserved
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke setup --require-staging-smoke=true with no staging command is misconfigured and exits 1', () => {
+  const repoRoot = createSmokeSetupRepo();
+  try {
+    const result = runCli(['run', 'smoke', 'setup', '--require-staging-smoke=true'], repoRoot, {}, true);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /--require-staging-smoke=true but no staging command/);
+    assert.equal(readSmokeConfig(repoRoot), null);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke setup --require-staging-smoke=true with --staging-command writes required gate', () => {
+  const repoRoot = createSmokeSetupRepo();
+  try {
+    const result = runCli([
+      'run', 'smoke', 'setup',
+      '--staging-command=npm run smoke',
+      '--require-staging-smoke=true',
+      '--json',
+    ], repoRoot);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.releaseGate, 'required');
+    const smoke = readSmokeConfig(repoRoot);
+    assert.equal(smoke.requireStagingSmoke, true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke setup --json emits exactly one parseable JSON document', () => {
+  const repoRoot = createSmokeSetupRepo({
+    scripts: { 'test:e2e:smoke': 'playwright test --project=smoke' },
+  });
+  try {
+    const result = runCli(['run', 'smoke', 'setup', '--json'], repoRoot);
+    const trimmed = result.stdout.trim();
+    // Must be a single JSON document — not two concatenated (the double-print
+    // risk identified in the plan).
+    const parsed = JSON.parse(trimmed);
+    assert.ok(parsed.setupMode);
+    assert.equal(trimmed.lastIndexOf('}') + 1, trimmed.length);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke setup fails clearly when .pipelane.json is malformed JSON', () => {
+  const repoRoot = createSmokeSetupRepo();
+  const configPath = path.join(repoRoot, '.pipelane.json');
+  try {
+    writeFileSync(configPath, '{"broken":', 'utf8');
+    const result = runCli(['run', 'smoke', 'setup', '--staging-command=npm run x'], repoRoot, {}, true);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Malformed \.pipelane\.json/);
+    // The broken content must survive — setup refuses to overwrite.
+    assert.equal(readFileSync(configPath, 'utf8'), '{"broken":');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke setup --critical-path repeat dedupes while preserving first-seen order', () => {
+  const repoRoot = createSmokeSetupRepo();
+  try {
+    runCli([
+      'run', 'smoke', 'setup',
+      '--staging-command=npm run smoke',
+      '--critical-path=auth',
+      '--critical-path=checkout',
+      '--critical-path=auth',
+    ], repoRoot);
+    const smoke = readSmokeConfig(repoRoot);
+    assert.deepEqual(smoke.criticalPaths, ['auth', 'checkout']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke setup rejects --yes flag (cut from v1)', () => {
+  const repoRoot = createSmokeSetupRepo();
+  try {
+    const result = runCli(['run', 'smoke', 'setup', '--yes'], repoRoot, {}, true);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Unknown flag/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke plan rejects setup-only --staging-command flag', () => {
+  const repoRoot = createSmokeSetupRepo();
+  try {
+    const result = runCli(['run', 'smoke', 'plan', '--staging-command=foo'], repoRoot, {}, true);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /--staging-command/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke setup rejects malformed --require-staging-smoke value', () => {
+  const repoRoot = createSmokeSetupRepo();
+  try {
+    const result = runCli(['run', 'smoke', 'setup', '--staging-command=x', '--require-staging-smoke=yes'], repoRoot, {}, true);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /--require-staging-smoke must be "true" or "false"/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// buildSmokeHandoffMessage — pure unit tests across all 3 stages × 3 states
+// ---------------------------------------------------------------------------
+
+async function loadBuildSmokeHandoffMessage() {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'helpers.ts'));
+  return mod.buildSmokeHandoffMessage;
+}
+
+function makeSmokeHandoffConfig({ stagingCommand, requireStagingSmoke }) {
+  return {
+    aliases: {
+      devmode: '/devmode',
+      new: '/new',
+      resume: '/resume',
+      'repo-guard': '/repo-guard',
+      pr: '/pr',
+      merge: '/merge',
+      deploy: '/deploy',
+      smoke: '/smoke',
+      clean: '/clean',
+      status: '/status',
+      doctor: '/doctor',
+      rollback: '/rollback',
+    },
+    smoke: stagingCommand
+      ? {
+          staging: { command: stagingCommand },
+          requireStagingSmoke: requireStagingSmoke === true,
+        }
+      : (requireStagingSmoke === true ? { requireStagingSmoke: true } : undefined),
+  };
+}
+
+test('buildSmokeHandoffMessage after-merge-release: configured path recommends staging + smoke + prod', async () => {
+  const build = await loadBuildSmokeHandoffMessage();
+  const msg = build({
+    config: makeSmokeHandoffConfig({ stagingCommand: 'npm run smoke', requireStagingSmoke: false }),
+    stage: 'after-merge-release',
+    shortSha: 'abc1234',
+  });
+  assert.equal(msg.status, 'configured');
+  assert.equal(msg.blocks, false);
+  assert.match(msg.nextAction, /merged at abc1234/);
+  assert.match(msg.nextAction, /run \/deploy staging/);
+  assert.match(msg.nextAction, /\/smoke staging/);
+  assert.match(msg.nextAction, /\/deploy prod/);
+});
+
+test('buildSmokeHandoffMessage after-merge-release: optional+unconfigured offers setup OR promote without smoke', async () => {
+  const build = await loadBuildSmokeHandoffMessage();
+  const msg = build({
+    config: makeSmokeHandoffConfig({ stagingCommand: '', requireStagingSmoke: false }),
+    stage: 'after-merge-release',
+    shortSha: 'abc1234',
+  });
+  assert.equal(msg.status, 'optional-unconfigured');
+  assert.equal(msg.blocks, false);
+  assert.match(msg.nextAction, /\/smoke setup/);
+  assert.match(msg.nextAction, /healthcheck-only evidence/);
+});
+
+test('buildSmokeHandoffMessage after-merge-release: required+unconfigured mandates setup', async () => {
+  const build = await loadBuildSmokeHandoffMessage();
+  const msg = build({
+    config: makeSmokeHandoffConfig({ stagingCommand: '', requireStagingSmoke: true }),
+    stage: 'after-merge-release',
+    shortSha: 'abc1234',
+  });
+  assert.equal(msg.status, 'required-unconfigured');
+  assert.match(msg.nextAction, /Smoke is required but not configured/);
+  assert.match(msg.nextAction, /\/smoke setup/);
+});
+
+test('buildSmokeHandoffMessage after-deploy-staging: configured branch tells operator to run smoke then prod', async () => {
+  const build = await loadBuildSmokeHandoffMessage();
+  const msg = build({
+    config: makeSmokeHandoffConfig({ stagingCommand: 'npm run smoke', requireStagingSmoke: false }),
+    stage: 'after-deploy-staging',
+    shortSha: 'def5678',
+  });
+  assert.equal(msg.status, 'configured');
+  assert.match(msg.nextAction, /staging verified at def5678/);
+  assert.match(msg.nextAction, /run \/smoke staging/);
+  assert.match(msg.nextAction, /\/deploy prod/);
+});
+
+test('buildSmokeHandoffMessage after-deploy-staging: required+unconfigured points at setup (original-bug codepath)', async () => {
+  const build = await loadBuildSmokeHandoffMessage();
+  const msg = build({
+    config: makeSmokeHandoffConfig({ stagingCommand: '', requireStagingSmoke: true }),
+    stage: 'after-deploy-staging',
+    shortSha: 'def5678',
+  });
+  // This is the exact branch that used to tell users "run /smoke staging"
+  // when smoke.staging.command was missing — now it points at /smoke setup.
+  assert.equal(msg.status, 'required-unconfigured');
+  assert.match(msg.nextAction, /blocked until smoke is configured/);
+  assert.match(msg.nextAction, /\/smoke setup/);
+  assert.doesNotMatch(msg.nextAction, /run \/smoke staging\b/);
+});
+
+test('buildSmokeHandoffMessage before-deploy-prod: required+unconfigured blocks', async () => {
+  const build = await loadBuildSmokeHandoffMessage();
+  const msg = build({
+    config: makeSmokeHandoffConfig({ stagingCommand: '', requireStagingSmoke: true }),
+    stage: 'before-deploy-prod',
+  });
+  assert.equal(msg.blocks, true);
+  assert.match(msg.nextAction, /deploy prod blocked/);
+  assert.match(msg.nextAction, /\/smoke setup/);
+});
+
+test('buildSmokeHandoffMessage before-deploy-prod: optional+unconfigured does not block', async () => {
+  const build = await loadBuildSmokeHandoffMessage();
+  const msg = build({
+    config: makeSmokeHandoffConfig({ stagingCommand: '', requireStagingSmoke: false }),
+    stage: 'before-deploy-prod',
+  });
+  assert.equal(msg.blocks, false);
+});

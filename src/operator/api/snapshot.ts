@@ -78,6 +78,11 @@ export interface BranchRow {
     // by state-mutating commands (pr/merge/deploy). Null when the lock
     // hasn't been touched by a state mutation yet.
     nextAction: string | null;
+    // Skip-smoke observability (from TaskLock.promotedWithoutStagingSmoke).
+    // True iff the latest `/deploy prod` on this task promoted without
+    // staging smoke being configured. Cleared on next `/deploy prod` that
+    // ran with smoke wired up.
+    promotedWithoutStagingSmoke: boolean;
   } | null;
   surfaces: string[];
   cleanup: { available: boolean; eligible: boolean; reason: string };
@@ -1402,6 +1407,7 @@ function buildBranchRow(options: {
       worktreePath: lock.worktreePath,
       updatedAt: lock.updatedAt ?? null,
       nextAction: lock.nextAction ?? null,
+      promotedWithoutStagingSmoke: lock.promotedWithoutStagingSmoke === true,
     },
     surfaces: lock.surfaces ?? [],
     cleanup: {

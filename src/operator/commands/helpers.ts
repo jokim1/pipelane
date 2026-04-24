@@ -361,6 +361,143 @@ export function setNextAction(
   });
 }
 
+// Skip-smoke observability flag. Called after a successful `/deploy prod`
+// promotion. Sets the TaskLock flag to true iff the promotion occurred
+// without staging smoke being configured (operator intentionally skipped);
+// otherwise clears the flag so repeat promotions with smoke wired in don't
+// carry forward a stale "skipped" label.
+export function updatePromotedWithoutStagingSmoke(
+  commonDir: string,
+  config: WorkflowConfig,
+  taskSlug: string,
+  skipped: boolean,
+): TaskLock | null {
+  const lock = loadTaskLock(commonDir, config, taskSlug);
+  if (!lock) return null;
+  return saveTaskLock(commonDir, config, taskSlug, {
+    ...lock,
+    promotedWithoutStagingSmoke: skipped ? true : undefined,
+    updatedAt: nowIso(),
+  });
+}
+
+// -------------------------------------------------------------------------
+// Smoke readiness + shared handoff helper
+// -------------------------------------------------------------------------
+//
+// `/merge` and `/deploy staging` handoff messages must reflect the smoke
+// configuration. Without this, a release-mode repo that has not configured
+// smoke gets told "run /smoke staging next" — which immediately blocks with
+// a confusing "no smoke command configured" error. The plan's product rule:
+// never recommend a command we know cannot run.
+//
+// The helper returns a plain-text string. Call sites that print wrap it in
+// ANSI at print time (or not); `TaskLock.nextAction` stores the bare string
+// so `/status` and `/resume` surface the same text. One source of truth.
+
+export function isStagingSmokeConfigured(config: WorkflowConfig): boolean {
+  const cmd = config.smoke?.staging?.command;
+  return typeof cmd === 'string' && cmd.trim().length > 0;
+}
+
+export function isStagingSmokeRequired(config: WorkflowConfig): boolean {
+  return config.smoke?.requireStagingSmoke === true;
+}
+
+export type SmokeHandoffStage =
+  | 'after-merge-release'       // release-mode merge completed; setting up next-action
+  | 'after-deploy-staging'      // staging deploy verified; setting up next-action
+  | 'before-deploy-prod';       // prod precheck; blocks if required+unconfigured
+
+export interface SmokeHandoffInput {
+  config: WorkflowConfig;
+  stage: SmokeHandoffStage;
+  shortSha?: string;             // used in breadcrumb text after merge / deploy
+}
+
+export interface SmokeHandoffMessage {
+  nextAction: string;            // bare plain-text (goes to TaskLock.nextAction)
+  status: 'configured' | 'optional-unconfigured' | 'required-unconfigured';
+  blocks: boolean;               // true iff prod deploy must be refused
+}
+
+export function buildSmokeHandoffMessage(input: SmokeHandoffInput): SmokeHandoffMessage {
+  const configured = isStagingSmokeConfigured(input.config);
+  const required = isStagingSmokeRequired(input.config);
+  const setupCmd = formatWorkflowCommand(input.config, 'smoke', 'setup');
+  const stagingCmd = formatWorkflowCommand(input.config, 'smoke', 'staging');
+  const deployStagingCmd = formatWorkflowCommand(input.config, 'deploy', 'staging');
+  const deployProdCmd = formatWorkflowCommand(input.config, 'deploy', 'prod');
+
+  const status: SmokeHandoffMessage['status'] = configured
+    ? 'configured'
+    : (required ? 'required-unconfigured' : 'optional-unconfigured');
+
+  if (input.stage === 'after-merge-release') {
+    const sha = input.shortSha ?? '';
+    const merged = sha ? `merged at ${sha}, ` : '';
+    if (status === 'configured') {
+      return {
+        nextAction: `${merged}run ${deployStagingCmd}. After staging verifies, run ${stagingCmd} before ${deployProdCmd}.`,
+        status,
+        blocks: false,
+      };
+    }
+    if (status === 'required-unconfigured') {
+      return {
+        nextAction: `${merged}run ${deployStagingCmd}. Smoke is required but not configured — run ${setupCmd} before ${deployProdCmd}.`,
+        status,
+        blocks: false,
+      };
+    }
+    return {
+      nextAction: `${merged}run ${deployStagingCmd}. After staging verifies, run ${setupCmd} to add smoke coverage or ${deployProdCmd} to promote with healthcheck-only evidence.`,
+      status,
+      blocks: false,
+    };
+  }
+
+  if (input.stage === 'after-deploy-staging') {
+    const sha = input.shortSha ?? '';
+    const verified = sha ? `staging verified at ${sha}, ` : '';
+    if (status === 'configured') {
+      return {
+        nextAction: `${verified}run ${stagingCmd}, then ${deployProdCmd}.`,
+        status,
+        blocks: false,
+      };
+    }
+    if (status === 'required-unconfigured') {
+      return {
+        nextAction: `${verified}${deployProdCmd} is blocked until smoke is configured and passing. Run ${setupCmd}.`,
+        status,
+        blocks: false,
+      };
+    }
+    return {
+      nextAction: `${verified}run ${setupCmd} to add smoke coverage, or ${deployProdCmd} to promote with healthcheck-only evidence.`,
+      status,
+      blocks: false,
+    };
+  }
+
+  // before-deploy-prod — the release-gate precheck. Only blocks on
+  // required-unconfigured.
+  if (status === 'required-unconfigured') {
+    return {
+      nextAction: `deploy prod blocked: staging smoke is required but smoke.staging.command is not configured. Run ${setupCmd} --staging-command="<command>" or edit .pipelane.json.`,
+      status,
+      blocks: true,
+    };
+  }
+  // Configured or optional-unconfigured → caller handles its own gating.
+  return {
+    nextAction: '',
+    status,
+    blocks: false,
+  };
+}
+
 // v0.6: 1-char glyph per canonical lane state. Uses UTF-8 symbols — tested
 // terminals render them correctly (macOS Terminal, iTerm2, modern Linux
 // terminals, Windows Terminal). Code-page 437/850 cmd.exe will mangle them;

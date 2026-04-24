@@ -232,6 +232,13 @@ export interface TaskLock {
   // today; /resume render integration is queued for the next slice. Absent
   // on fresh locks until the first mutation writes it.
   nextAction?: string;
+  // Skip-smoke observability. Set to true when `/deploy prod` succeeds with
+  // `smoke.staging.command` unconfigured AND `requireStagingSmoke` is not
+  // true (i.e. the promotion was allowed but without smoke evidence). `/status`
+  // surfaces it so the skip decision is visible instead of silent. A later
+  // `/deploy prod` that DID run with staging smoke clears the flag on next
+  // write.
+  promotedWithoutStagingSmoke?: boolean;
 }
 
 export interface PrRecord {
@@ -449,6 +456,19 @@ export interface OperatorFlags {
   // `git revert <mergeCommit>` PR via gh instead of dispatching a deploy.
   // Mutually exclusive with the default redeploy flow. Release-mode only.
   revertPr: boolean;
+  // `pipelane run smoke setup` flags. Values are stored exactly as provided
+  // (trimmed of outer whitespace) so shell command strings with embedded
+  // spaces / quotes / metacharacters roundtrip into .pipelane.json faithfully.
+  // `requireStagingSmoke` uses an explicit tri-state empty / 'true' / 'false'
+  // rather than a boolean so absence is distinguishable from explicit false —
+  // presence means "operator opted in", absence means "leave the existing
+  // value alone in the deep merge."
+  stagingCommand: string;
+  prodCommand: string;
+  requireStagingSmoke: string;
+  generatedSummaryPath: string;
+  criticalPaths: string[];
+  criticalPathCoverage: string;
 }
 
 export interface ParsedOperatorArgs {
@@ -702,7 +722,13 @@ export function loadWorkflowConfig(repoRoot: string): WorkflowConfig {
     throw new Error(`No ${CONFIG_FILENAME} or ${LEGACY_CONFIG_FILENAME} found in ${repoRoot}. Run pipelane bootstrap first.`);
   }
 
-  const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as Partial<WorkflowConfig>;
+  let parsed: Partial<WorkflowConfig>;
+  try {
+    parsed = JSON.parse(readFileSync(configPath, 'utf8')) as Partial<WorkflowConfig>;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Malformed ${path.basename(configPath)} at ${configPath}: ${detail}. Fix the JSON by hand before rerunning.`);
+  }
   return normalizeWorkflowConfig(parsed);
 }
 
@@ -898,6 +924,41 @@ export function writeWorkflowConfig(repoRoot: string, config: WorkflowConfig): v
     ...config,
     aliases: resolveWorkflowAliases(config.aliases),
   });
+}
+
+// Read the readable workflow config file, run the patcher, atomically write
+// the result back to the same path. Used by `pipelane run smoke setup` to
+// update only the smoke subtree without disturbing unrelated keys.
+//
+// - If no config file exists, throws with the same init-guidance message
+//   `loadWorkflowConfig` uses so the operator sees a consistent hint.
+// - If the existing file is malformed JSON, throws with the parse error
+//   (including line/column when the runtime reports it). Never auto-repairs.
+// - Writes to the same path the config was read from — if the repo is still
+//   on legacy `.project-workflow.json`, the legacy file is updated in place
+//   rather than silently creating a second `.pipelane.json`.
+export function patchReadableWorkflowConfig(
+  repoRoot: string,
+  patcher: (raw: Record<string, unknown>) => Record<string, unknown>,
+): { configPath: string; isLegacy: boolean } {
+  const configPath = resolveReadableConfigPath(repoRoot);
+  if (!configPath) {
+    throw new Error(`No ${CONFIG_FILENAME} or ${LEGACY_CONFIG_FILENAME} found in ${repoRoot}. Run pipelane bootstrap first.`);
+  }
+  const raw = readFileSync(configPath, 'utf8');
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(raw) as Record<string, unknown>;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Malformed ${path.basename(configPath)} at ${configPath}: ${detail}. Fix the JSON by hand before rerunning.`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`Malformed ${path.basename(configPath)} at ${configPath}: expected a JSON object. Fix the JSON by hand before rerunning.`);
+  }
+  const next = patcher(parsed);
+  writeJsonFile(configPath, next);
+  return { configPath, isLegacy: configPath.endsWith(LEGACY_CONFIG_FILENAME) };
 }
 
 export function resolveStateDir(commonDir: string, config: WorkflowConfig): string {
@@ -1412,6 +1473,12 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     stuck: false,
     blastSha: '',
     revertPr: false,
+    stagingCommand: '',
+    prodCommand: '',
+    requireStagingSmoke: '',
+    generatedSummaryPath: '',
+    criticalPaths: [],
+    criticalPathCoverage: '',
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -1598,6 +1665,48 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       continue;
     }
 
+    // smoke setup flags. Shell command values (staging / prod command) and
+    // path values pass through readFlagValue which preserves embedded
+    // spaces, quotes, and metacharacters intact — parser test covers this.
+    if (flagName === '--staging-command') {
+      flags.stagingCommand = readFlagValue('--staging-command');
+      continue;
+    }
+    if (flagName === '--prod-command') {
+      flags.prodCommand = readFlagValue('--prod-command');
+      continue;
+    }
+    if (flagName === '--require-staging-smoke') {
+      const raw = readFlagValue('--require-staging-smoke').trim();
+      if (raw !== 'true' && raw !== 'false') {
+        throw new Error(`--require-staging-smoke must be "true" or "false", got "${raw}".`);
+      }
+      flags.requireStagingSmoke = raw;
+      continue;
+    }
+    if (flagName === '--generated-summary-path') {
+      flags.generatedSummaryPath = readFlagValue('--generated-summary-path');
+      continue;
+    }
+    if (flagName === '--critical-path') {
+      // Repeatable. Preserve first-seen order while deduping so operators
+      // listing "--critical-path=auth --critical-path=checkout --critical-path=auth"
+      // get ['auth', 'checkout'].
+      const value = readFlagValue('--critical-path').trim();
+      if (value.length > 0 && !flags.criticalPaths.includes(value)) {
+        flags.criticalPaths.push(value);
+      }
+      continue;
+    }
+    if (flagName === '--critical-path-coverage') {
+      const raw = readFlagValue('--critical-path-coverage').trim();
+      if (raw !== 'warn' && raw !== 'block') {
+        throw new Error(`--critical-path-coverage must be "warn" or "block", got "${raw}".`);
+      }
+      flags.criticalPathCoverage = raw;
+      continue;
+    }
+
     if (token.startsWith('--')) {
       throw new Error(`Unknown flag "${flagName}" for pipelane run. Run "pipelane run --help" for supported commands and flags.`);
     }
@@ -1691,9 +1800,27 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       }
       return;
     case 'smoke': {
-      assertOnlyFlags(parsed, ['reason']);
       const [subcommand] = parsed.positional;
-      if (!subcommand) return;
+      if (!subcommand) {
+        assertOnlyFlags(parsed, []);
+        return;
+      }
+      if (subcommand === 'setup') {
+        // Only setup accepts the setup flags. Other subcommands below still
+        // fall into assertOnlyFlags with their own allowlist so a stray
+        // --staging-command on `smoke plan` raises "Unexpected flag".
+        assertOnlyFlags(parsed, [
+          'stagingCommand',
+          'prodCommand',
+          'requireStagingSmoke',
+          'generatedSummaryPath',
+          'criticalPaths',
+          'criticalPathCoverage',
+        ]);
+        if (parsed.positional.length > 1) failUnexpected('pipelane run smoke setup [--staging-command <cmd>] [--prod-command <cmd>] [--require-staging-smoke <true|false>] [--generated-summary-path <path>] [--critical-path <path>]... [--critical-path-coverage <warn|block>]');
+        return;
+      }
+      assertOnlyFlags(parsed, ['reason']);
       if (subcommand === 'plan' || subcommand === 'staging' || subcommand === 'prod') {
         if (parsed.flags.reason) {
           throw new Error(`smoke ${subcommand} does not accept --reason.`);
@@ -1716,7 +1843,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         }
         return;
       }
-      throw new Error('smoke requires one of: plan, staging, prod, waiver, quarantine, unquarantine.');
+      throw new Error('smoke requires one of: plan, setup, staging, prod, waiver, quarantine, unquarantine.');
     }
     case 'clean':
       assertOnlyFlags(parsed, ['apply', 'allStale', 'task']);
@@ -1826,6 +1953,12 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'stuck', label: '--stuck', active: (flags) => flags.stuck },
   { key: 'blastSha', label: '--blast', active: (flags) => flags.blastSha.trim().length > 0 },
   { key: 'revertPr', label: '--revert-pr', active: (flags) => flags.revertPr },
+  { key: 'stagingCommand', label: '--staging-command', active: (flags) => flags.stagingCommand.trim().length > 0 },
+  { key: 'prodCommand', label: '--prod-command', active: (flags) => flags.prodCommand.trim().length > 0 },
+  { key: 'requireStagingSmoke', label: '--require-staging-smoke', active: (flags) => flags.requireStagingSmoke.length > 0 },
+  { key: 'generatedSummaryPath', label: '--generated-summary-path', active: (flags) => flags.generatedSummaryPath.trim().length > 0 },
+  { key: 'criticalPaths', label: '--critical-path', active: (flags) => flags.criticalPaths.length > 0 },
+  { key: 'criticalPathCoverage', label: '--critical-path-coverage', active: (flags) => flags.criticalPathCoverage.length > 0 },
 ];
 
 function assertOnlyFlags(parsed: ParsedOperatorArgs, allowed: OperatorFlagKey[]): void {

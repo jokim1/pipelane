@@ -31,12 +31,15 @@ import {
   type WorkflowConfig,
 } from '../state.ts';
 import {
+  buildSmokeHandoffMessage,
   inferActiveTaskLock,
+  isStagingSmokeConfigured,
   makeIdempotencyKey,
   resolveSurfaceHealthcheckUrl,
   resolveCommandSurfaces,
   resolveDeployTargetForTask,
   setNextAction,
+  updatePromotedWithoutStagingSmoke,
 } from './helpers.ts';
 import { observeFrontendRuntime, toDeployRuntimeObservation } from '../runtime-observation.ts';
 
@@ -290,6 +293,17 @@ export async function dispatchDeploy(
     }
 
     if (smokeConfig.requireStagingSmoke) {
+      // Misconfigured release gate — requireStagingSmoke=true but no staging
+      // command is configured. The old "run /smoke staging" message was the
+      // original bug: /smoke staging would immediately reject because smoke
+      // is not wired up. Route the operator to /smoke setup instead.
+      const prodHandoff = buildSmokeHandoffMessage({
+        config: context.config,
+        stage: 'before-deploy-prod',
+      });
+      if (prodHandoff.blocks) {
+        throw new Error(prodHandoff.nextAction);
+      }
       const qualifyingSmoke = findQualifyingSmokeRun({
         commonDir: context.commonDir,
         config: context.config,
@@ -566,10 +580,28 @@ export async function dispatchDeploy(
   }
 
   const shortSha = target.sha.slice(0, 7);
+  // Build the next-action breadcrumb. Staging: smoke-aware handoff. Prod:
+  // the existing flow is unchanged here (cleanup guidance).
+  const stagingHandoff = environment === 'staging'
+    ? buildSmokeHandoffMessage({
+        config: context.config,
+        stage: 'after-deploy-staging',
+        shortSha,
+      })
+    : null;
   const nextStage = environment === 'staging'
-    ? `staging verified at ${shortSha}, run ${formatWorkflowCommand(context.config, 'smoke', 'staging')}, then ${formatWorkflowCommand(context.config, 'deploy', 'prod')}`
+    ? stagingHandoff!.nextAction
     : `prod verified at ${shortSha}, run ${formatWorkflowCommand(context.config, 'clean')}`;
   setNextAction(context.commonDir, context.config, taskSlug, nextStage);
+
+  // Skip-smoke observability. On successful prod promotion, record whether
+  // the promotion happened without staging smoke configured so `/status` can
+  // surface the skip decision. If smoke is now configured, clear any
+  // previously-set flag from an earlier skipped promotion.
+  if (environment === 'prod' && context.modeState.mode === 'release') {
+    const skipped = !isStagingSmokeConfigured(context.config);
+    updatePromotedWithoutStagingSmoke(context.commonDir, context.config, taskSlug, skipped);
+  }
 
     return {
       ...record,
@@ -586,7 +618,7 @@ export async function dispatchDeploy(
           ? `Healthcheck: ${verification.healthcheckUrl} → HTTP ${verification.statusCode} in ${verification.latencyMs}ms (${verification.probes} probe(s))`
           : 'Healthcheck: skipped (no URL configured)',
         environment === 'staging'
-          ? `You should \`${formatWorkflowCommand(context.config, 'smoke', 'staging')}\` next; once you finish testing staging, run \`${formatWorkflowCommand(context.config, 'deploy', 'prod')}\`.`
+          ? `Next: ${stagingHandoff!.nextAction}`
           : `Next: run ${formatWorkflowCommand(context.config, 'clean')}.`,
       ].filter(Boolean).join('\n'),
     };

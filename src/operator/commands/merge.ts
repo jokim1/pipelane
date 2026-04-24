@@ -1,5 +1,5 @@
 import { formatWorkflowCommand, printResult, resolveWorkflowContext, runCommandCapture, runGh, runGit, savePrRecord, type ParsedOperatorArgs } from '../state.ts';
-import { ensureTaskLockMatchesCurrent, inferActiveTaskLock, loadPrForBranch, pollForMergedSha, setNextAction, watchPrChecks } from './helpers.ts';
+import { buildSmokeHandoffMessage, ensureTaskLockMatchesCurrent, inferActiveTaskLock, loadPrForBranch, pollForMergedSha, setNextAction, watchPrChecks } from './helpers.ts';
 import { dispatchDeploy } from './deploy.ts';
 
 export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
@@ -82,9 +82,17 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
     lines.push('Stay in this task worktree and dispatch production from here.');
     lines.push(`Next: run ${formatWorkflowCommand(context.config, 'deploy', 'prod')}.`);
   } else {
-    setNextAction(context.commonDir, context.config, taskSlug, `merged at ${shortSha}, run ${formatWorkflowCommand(context.config, 'deploy', 'staging')}`);
+    // Release-mode merge. Smoke-aware handoff: tell the operator to deploy
+    // staging next and, based on whether smoke is configured/required/
+    // optional, add the right follow-up line. See buildSmokeHandoffMessage.
+    const handoff = buildSmokeHandoffMessage({
+      config: context.config,
+      stage: 'after-merge-release',
+      shortSha,
+    });
+    setNextAction(context.commonDir, context.config, taskSlug, handoff.nextAction);
     lines.push('Stay in this task worktree and deploy staging from here.');
-    lines.push(`Next: run ${formatWorkflowCommand(context.config, 'deploy', 'staging')}.`);
+    lines.push(`Next: ${handoff.nextAction}`);
   }
 
   printResult(parsed.flags, {
