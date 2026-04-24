@@ -98,8 +98,21 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
   const confirmed = options.yes || (await promptYesNo('Upgrade now? [y/N] '));
   if (!confirmed) {
     const message = 'Upgrade skipped.';
-    process.stdout.write(`${message}\n`);
-    return { status, action: 'skipped', message, followUpSteps: null, ranSetup: false };
+    const driftResult = tryDetectDrift(repoRoot);
+    const result: UpdateResult = {
+      status,
+      action: 'skipped',
+      message,
+      followUpSteps: driftResult.drift,
+      ranSetup: false,
+    };
+    if (options.json) {
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    } else {
+      process.stdout.write(`${message}\n`);
+      emitDriftHint(driftResult);
+    }
+    return result;
   }
 
   installLatest(repoRoot);

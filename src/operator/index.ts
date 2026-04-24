@@ -20,6 +20,7 @@ import { loadDeployConfig } from './release-gate.ts';
 import {
   parseOperatorArgs,
   resolveWorkflowContext,
+  validateOperatorArgs,
   type ParsedOperatorArgs,
   type WorkflowContext,
 } from './state.ts';
@@ -45,10 +46,12 @@ export async function runOperator(cwd: string, argv: string[]): Promise<void> {
   const parsed = parseOperatorArgs(argv);
   const command = parsed.command;
 
-  if (!command || command === '--help' || command === '-h') {
+  if (!command || command === '--help' || command === '-h' || parsed.flags.help) {
     printUsage();
     return;
   }
+
+  validateOperatorArgs(parsed);
 
   if (command === 'devmode') {
     await handleDevmode(cwd, parsed);
@@ -125,7 +128,7 @@ export async function runOperator(cwd: string, argv: string[]): Promise<void> {
     return;
   }
 
-  throw new Error(`Unknown Pipelane command "${command}".`);
+  throw new Error(`Unknown Pipelane command "${command}". Run "pipelane run --help" to see supported commands.`);
 }
 
 function printUsage(): void {

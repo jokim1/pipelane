@@ -11,13 +11,25 @@ npm run pipelane:update -- $REST
 
 where `$REST` is `$ARGUMENTS` with the leading `update` token stripped. Use this path to check for and install the latest Pipelane from `jokim1/pipelane#main`. See the "pipelane update" section below.
 
-**Otherwise** (the default, including bare `/pipelane`), run:
+**If `$ARGUMENTS` is empty**, run:
 
 ```bash
-npm run pipelane:board -- $ARGUMENTS
+npm run pipelane:board
 ```
 
 to open the Pipelane Board — the visual release-pipeline dashboard for this repo.
+
+**If `$ARGUMENTS` starts with `board`, `start`, `stop`, or `status`**, route to the board:
+
+```bash
+npm run pipelane:board -- $BOARD_ARGS
+```
+
+where `$BOARD_ARGS` is `$ARGUMENTS` with the leading `board` stripped when present.
+
+**If `$ARGUMENTS` starts with `fix`**, do not route through `/pipelane`; tell the user to run the managed `/fix` command instead so findings and root-cause checks are applied.
+
+For any other leading token, stop and report the supported `/pipelane` subcommands (`update`, `board`, `start`, `stop`, `status`). Do not silently open the board for an unknown subcommand.
 
 ## `pipelane update`
 
@@ -48,6 +60,7 @@ Common forms:
 
 ```bash
 npm run pipelane:board            # start (if not already running) and open the browser
+npm run pipelane:board -- start   # explicit start
 npm run pipelane:board -- stop    # stop the Pipelane Board for this repo
 npm run pipelane:board -- status  # show URL, port, PID, log path
 ```

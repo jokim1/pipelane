@@ -2,18 +2,13 @@
 
 import { handlePipelane } from './dashboard/launcher.ts';
 import { getDashboardOptions, startDashboardServer } from './dashboard/server.ts';
-import { parseBootstrapArgs, runBootstrap } from './operator/bootstrap.ts';
+import { collectBootstrapWarnings, parseBootstrapArgs, runBootstrap } from './operator/bootstrap.ts';
 import { installClaudeBootstrapSkill } from './operator/claude-install.ts';
 import { installCodexBootstrapSkill } from './operator/codex-install.ts';
 import { handleConfigure } from './operator/commands/configure.ts';
 import { formatSetupResult, initConsumerRepo, setupConsumerRepo, syncDocsOnly } from './operator/docs.ts';
 import { runOperator } from './operator/index.ts';
 import { parseUpdateArgs, runUpdate } from './operator/update.ts';
-
-function valueAfter(args: string[], flag: string): string {
-  const index = args.indexOf(flag);
-  return index === -1 ? '' : args[index + 1] ?? '';
-}
 
 function printTopLevelHelp(): void {
   process.stdout.write(`Pipelane — release cockpit for AI vibe coders
@@ -42,6 +37,34 @@ Examples:
 `);
 }
 
+function parseProjectArg(args: string[], command: string): string {
+  let projectName = '';
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index];
+    if (token === '--help' || token === '-h') {
+      process.stdout.write(`pipelane ${command} --project "Project Name"\n`);
+      process.exit(0);
+    }
+    if (token === '--project' || token.startsWith('--project=')) {
+      const value = token === '--project' ? args[index + 1] ?? '' : token.slice('--project='.length);
+      if (token === '--project') index += 1;
+      if (!value.trim()) {
+        throw new Error(`pipelane ${command} requires --project "Project Name".`);
+      }
+      projectName = value;
+      continue;
+    }
+    throw new Error(`Unknown flag for pipelane ${command}: ${token}`);
+  }
+  return projectName;
+}
+
+function assertNoArgs(args: string[], command: string): void {
+  if (args.length > 0) {
+    throw new Error(`pipelane ${command} does not accept arguments: ${args.join(' ')}`);
+  }
+}
+
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
 
@@ -51,19 +74,25 @@ async function main(): Promise<void> {
   }
 
   if (command === 'init') {
-    const projectName = valueAfter(rest, '--project');
+    const projectName = parseProjectArg(rest, 'init');
     if (!projectName.trim()) {
       throw new Error('pipelane init requires --project "Project Name".');
     }
 
     const result = initConsumerRepo(process.cwd(), projectName);
-    process.stdout.write([
+    const lines = [
       `Initialized pipelane in ${result.repoRoot}`,
       `Config: ${result.configPath}`,
       'Commit the tracked Pipelane files before using pipelane:new from a remote-backed repo.',
       'Next: run npm run pipelane:setup',
       'Tracked Codex skills will be written into .agents/skills for the repo.',
-    ].join('\n') + '\n');
+    ];
+    const warnings = collectBootstrapWarnings(result.repoRoot);
+    if (warnings.length > 0) {
+      lines.push('Readiness warnings:');
+      lines.push(...warnings.map((warning) => `- ${warning}`));
+    }
+    process.stdout.write(lines.join('\n') + '\n');
     return;
   }
 
@@ -96,14 +125,19 @@ async function main(): Promise<void> {
   }
 
   if (command === 'setup') {
+    assertNoArgs(rest, 'setup');
     const result = setupConsumerRepo(process.cwd());
     process.stdout.write(formatSetupResult(result).join('\n') + '\n');
     return;
   }
 
   if (command === 'sync-docs') {
+    assertNoArgs(rest, 'sync-docs');
     const result = syncDocsOnly(process.cwd());
-    process.stdout.write(`Synced Pipelane docs for ${result.repoRoot}\n`);
+    process.stdout.write([
+      `Synced Pipelane docs for ${result.repoRoot}`,
+      'If command files or Codex skills changed, reopen Claude/Codex so the refreshed commands are visible.',
+    ].join('\n') + '\n');
     return;
   }
 
@@ -119,6 +153,7 @@ async function main(): Promise<void> {
   }
 
   if (command === 'install-codex') {
+    assertNoArgs(rest, 'install-codex');
     const result = installCodexBootstrapSkill();
     const lines = [
       `Installed Codex bootstrap skill in ${result.codexHome}: ${result.installed.join(', ')}`,
@@ -132,12 +167,17 @@ async function main(): Promise<void> {
   }
 
   if (command === 'install-claude') {
+    assertNoArgs(rest, 'install-claude');
     const result = installClaudeBootstrapSkill();
     process.stdout.write(`Installed Claude skills in ${result.claudeHome}: ${result.installed.join(', ')}\n`);
     return;
   }
 
   if (command === 'dashboard') {
+    if (rest.includes('--help') || rest.includes('-h')) {
+      process.stdout.write('pipelane dashboard [--repo <repo-root>] [--host <host>] [--port <port>]\n');
+      return;
+    }
     const options = getDashboardOptions(rest, process.cwd());
     await startDashboardServer(options);
     return;

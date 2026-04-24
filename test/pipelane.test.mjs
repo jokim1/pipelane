@@ -6275,6 +6275,51 @@ test('board help prints subcommand list', () => {
   assert.match(result.stdout, /--no-open/);
 });
 
+test('board rejects unknown subcommands instead of opening the dashboard silently', () => {
+  const result = runCli(['board', 'fix'], process.cwd(), {}, true);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Unknown Pipelane Board subcommand "fix"/);
+  assert.match(result.stderr, /managed `\/fix` command/);
+});
+
+test('operator parser rejects unknown flags, missing values, unused flags, and unused positionals', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    const unknown = runCli(['run', 'pr', '--titel', 'Typo'], repoRoot, {}, true);
+    assert.notEqual(unknown.status, 0);
+    assert.match(unknown.stderr, /Unknown flag "--titel"/);
+
+    const missingValue = runCli(['run', 'new', '--task', '--json'], repoRoot, {}, true);
+    assert.notEqual(missingValue.status, 0);
+    assert.match(missingValue.stderr, /--task requires a value/);
+
+    const wrongFlagForCommand = runCli(['run', 'new', '--title', 'Ignored before'], repoRoot, {}, true);
+    assert.notEqual(wrongFlagForCommand.status, 0);
+    assert.match(wrongFlagForCommand.stderr, /new does not accept flag\(s\): --title/);
+
+    const wrongPositionalForCommand = runCli(['run', 'status', 'ignored-before'], repoRoot, {}, true);
+    assert.notEqual(wrongPositionalForCommand.status, 0);
+    assert.match(wrongPositionalForCommand.stderr, /status does not accept positional argument/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('init refuses to overwrite an existing pipelane config', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const second = runCli(['init', '--project', 'Demo App'], repoRoot, {}, true);
+    assert.notEqual(second.status, 0);
+    assert.match(second.stderr, /already initialized/);
+    assert.match(second.stderr, /pipelane setup/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('configure --json writes a Deploy Configuration block byte-identical to renderDeployConfigSection', async () => {
   const repoRoot = createRepo();
   try {

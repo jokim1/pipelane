@@ -419,6 +419,7 @@ export interface SmokeEnvironmentLock {
 export interface OperatorFlags {
   apply: boolean;
   allStale: boolean;
+  help: boolean;
   json: boolean;
   offline: boolean;
   override: boolean;
@@ -634,10 +635,22 @@ export function runGh(cwd: string, args: string[], allowFailure = false): string
 }
 
 export function runShell(cwd: string, command: string, quiet = false): void {
-  execFileSync('sh', ['-lc', command], {
-    cwd,
-    stdio: quiet ? ['ignore', 'pipe', 'pipe'] : 'inherit',
-  });
+  try {
+    execFileSync('sh', ['-lc', command], {
+      cwd,
+      stdio: quiet ? ['ignore', 'pipe', 'pipe'] : 'inherit',
+    });
+  } catch (error) {
+    const err = error as { stderr?: Buffer | string; stdout?: Buffer | string; message: string; status?: number };
+    const stderr = typeof err.stderr === 'string' ? err.stderr.trim() : err.stderr?.toString().trim();
+    const stdout = typeof err.stdout === 'string' ? err.stdout.trim() : err.stdout?.toString().trim();
+    throw new Error([
+      `Command failed in ${cwd}: ${command}`,
+      typeof err.status === 'number' ? `Exit code: ${err.status}` : '',
+      stderr || stdout || err.message,
+      'Fix the command output above, then rerun the Pipelane command.',
+    ].filter(Boolean).join('\n'));
+  }
 }
 
 export function resolveRepoRoot(cwd: string, allowNoGit = false): string {
@@ -1115,10 +1128,21 @@ export function readJsonFile<T>(targetPath: string, fallback: T): T {
     // file. Non-parse failures still bubble — permissions and I/O errors
     // are real operator problems, not schema drift.
     if (error instanceof SyntaxError) {
+      warnMalformedJson(targetPath);
       return fallback;
     }
     throw error;
   }
+}
+
+const malformedJsonWarnings = new Set<string>();
+
+function warnMalformedJson(targetPath: string): void {
+  if (malformedJsonWarnings.has(targetPath)) return;
+  malformedJsonWarnings.add(targetPath);
+  process.stderr.write(
+    `[pipelane] WARNING: ${targetPath} contains malformed JSON; using fallback state for this run. Fix or remove the file so future commands read the intended state.\n`,
+  );
 }
 
 export function writeJsonFile(targetPath: string, value: unknown): void {
@@ -1352,6 +1376,7 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
   const flags: OperatorFlags = {
     apply: false,
     allStale: false,
+    help: false,
     json: false,
     offline: false,
     override: false,
@@ -1379,154 +1404,190 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
 
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
+    const equalsIndex = token.startsWith('--') ? token.indexOf('=') : -1;
+    const flagName = equalsIndex > 0 ? token.slice(0, equalsIndex) : token;
+    const inlineValue = equalsIndex > 0 ? token.slice(equalsIndex + 1) : null;
 
-    if (token === '--apply') {
+    const readFlagValue = (flag: string): string => {
+      if (inlineValue !== null) {
+        if (!inlineValue.trim()) {
+          throw new Error(`${flag} requires a non-empty value.`);
+        }
+        return inlineValue;
+      }
+      const next = argv[index + 1];
+      if (next === undefined || next.startsWith('--')) {
+        throw new Error(`${flag} requires a value.`);
+      }
+      index += 1;
+      return next;
+    };
+
+    const rejectInlineValue = (flag: string): void => {
+      if (inlineValue !== null) {
+        throw new Error(`${flag} does not take a value.`);
+      }
+    };
+
+    if (token === '--help' || token === '-h') {
+      flags.help = true;
+      continue;
+    }
+
+    // Doctor supports these historical flag-shaped mode selectors. Keep them
+    // as positional mode tokens so handleDoctor can preserve both
+    // `doctor probe` and `doctor --probe`; validation below makes them legal
+    // only for the doctor command instead of silently leaking into others.
+    if (token === '--probe' || token === '--fix' || token === '--diagnose') {
+      positional.push(token);
+      continue;
+    }
+
+    if (flagName === '--apply') {
+      rejectInlineValue('--apply');
       flags.apply = true;
       continue;
     }
 
-    if (token === '--all-stale') {
+    if (flagName === '--all-stale') {
+      rejectInlineValue('--all-stale');
       flags.allStale = true;
       continue;
     }
 
-    if (token === '--json') {
+    if (flagName === '--json') {
+      rejectInlineValue('--json');
       flags.json = true;
       continue;
     }
 
-    if (token === '--offline') {
+    if (flagName === '--offline') {
+      rejectInlineValue('--offline');
       flags.offline = true;
       continue;
     }
 
-    if (token === '--override') {
+    if (flagName === '--override') {
+      rejectInlineValue('--override');
       flags.override = true;
       continue;
     }
 
-    if (token === '--skip-smoke-coverage') {
+    if (flagName === '--skip-smoke-coverage') {
+      rejectInlineValue('--skip-smoke-coverage');
       flags.skipSmokeCoverage = true;
       continue;
     }
 
-    if (token === '--patch') {
+    if (flagName === '--patch') {
+      rejectInlineValue('--patch');
       flags.patch = true;
       continue;
     }
 
-    if (token === '--reason') {
-      flags.reason = argv[index + 1] ?? '';
-      index += 1;
+    if (flagName === '--reason') {
+      flags.reason = readFlagValue('--reason');
       continue;
     }
 
-    if (token === '--task') {
-      flags.task = argv[index + 1] ?? '';
-      index += 1;
+    if (flagName === '--task') {
+      flags.task = readFlagValue('--task');
       continue;
     }
 
-    if (token === '--branch') {
-      flags.branch = argv[index + 1] ?? '';
-      index += 1;
+    if (flagName === '--branch') {
+      flags.branch = readFlagValue('--branch');
       continue;
     }
 
-    if (token === '--file') {
-      flags.file = argv[index + 1] ?? '';
-      index += 1;
+    if (flagName === '--file') {
+      flags.file = readFlagValue('--file');
       continue;
     }
 
-    if (token === '--title') {
-      flags.title = argv[index + 1] ?? '';
-      index += 1;
+    if (flagName === '--title') {
+      flags.title = readFlagValue('--title');
       continue;
     }
 
-    if (token === '--message') {
-      flags.message = argv[index + 1] ?? '';
-      index += 1;
+    if (flagName === '--message') {
+      flags.message = readFlagValue('--message');
       continue;
     }
 
-    if (token === '--sha') {
-      flags.sha = argv[index + 1] ?? '';
-      index += 1;
+    if (flagName === '--sha') {
+      flags.sha = readFlagValue('--sha');
       continue;
     }
 
-    if (token === '--mode') {
-      flags.mode = argv[index + 1] ?? '';
-      index += 1;
+    if (flagName === '--mode') {
+      flags.mode = readFlagValue('--mode');
       continue;
     }
 
-    if (token === '--scope') {
-      flags.scope = argv[index + 1] ?? '';
-      index += 1;
+    if (flagName === '--scope') {
+      flags.scope = readFlagValue('--scope');
       continue;
     }
 
-    if (token === '--execute') {
+    if (flagName === '--execute') {
+      rejectInlineValue('--execute');
       flags.execute = true;
       continue;
     }
 
-    if (token === '--confirm-token') {
-      flags.confirmToken = argv[index + 1] ?? '';
-      index += 1;
+    if (flagName === '--confirm-token') {
+      flags.confirmToken = readFlagValue('--confirm-token');
       continue;
     }
 
-    if (token === '--force-include') {
-      const raw = argv[index + 1] ?? '';
+    if (flagName === '--force-include') {
+      const raw = readFlagValue('--force-include');
       flags.forceInclude.push(...raw.split(',').map((item) => item.trim()).filter(Boolean));
-      index += 1;
       continue;
     }
 
-    if (token === '--async') {
+    if (flagName === '--async') {
+      rejectInlineValue('--async');
       flags.async = true;
       continue;
     }
 
-    if (token === '--surfaces') {
-      const raw = argv[index + 1] ?? '';
+    if (flagName === '--surfaces') {
+      const raw = readFlagValue('--surfaces');
       flags.surfaces.push(...raw.split(',').map((item) => item.trim()).filter(Boolean));
-      index += 1;
       continue;
     }
 
-    if (token === '--week') {
+    if (flagName === '--week') {
+      rejectInlineValue('--week');
       flags.week = true;
       continue;
     }
 
-    if (token === '--stuck') {
+    if (flagName === '--stuck') {
+      rejectInlineValue('--stuck');
       flags.stuck = true;
       continue;
     }
 
-    if (token === '--blast') {
-      const next = argv[index + 1];
-      // Reject a flag-shaped next token so `/status --blast --json`
-      // doesn't silently swallow `--json` as the sha and fall through to
-      // rev-parse. Value-taking flags elsewhere in this parser are
-      // looser for historical reasons; scoping this guard to --blast
-      // avoids regressing existing call sites.
-      if (next === undefined || next.startsWith('--')) {
+    if (flagName === '--blast') {
+      try {
+        flags.blastSha = readFlagValue('--blast');
+      } catch {
         throw new Error('--blast requires a commit sha or rev-parseable ref as the next argument.');
       }
-      flags.blastSha = next;
-      index += 1;
       continue;
     }
 
-    if (token === '--revert-pr') {
+    if (flagName === '--revert-pr') {
+      rejectInlineValue('--revert-pr');
       flags.revertPr = true;
       continue;
+    }
+
+    if (token.startsWith('--')) {
+      throw new Error(`Unknown flag "${flagName}" for pipelane run. Run "pipelane run --help" for supported commands and flags.`);
     }
 
     positional.push(token);
@@ -1537,6 +1598,231 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     positional: positional.slice(1),
     flags,
   };
+}
+
+export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
+  if (!parsed.command || parsed.command === '--help' || parsed.command === '-h' || parsed.flags.help) {
+    return;
+  }
+
+  const failUnexpected = (usage: string): never => {
+    const rendered = parsed.positional.length > 0 ? ` "${parsed.positional.join(' ')}"` : '';
+    throw new Error(`${parsed.command} does not accept positional argument(s)${rendered}.\nUsage: ${usage}`);
+  };
+
+  const requireNoPositional = (usage: string): void => {
+    if (parsed.positional.length > 0) failUnexpected(usage);
+  };
+
+  switch (parsed.command) {
+    case 'devmode': {
+      if (parsed.positional.length > 1) failUnexpected('pipelane run devmode [status|build|release] [--surfaces <csv>] [--override --reason <text>]');
+      const action = parsed.positional[0] ?? 'status';
+      if (action && action !== 'status' && action !== 'build' && action !== 'release') {
+        throw new Error(`Unknown devmode action "${action}". Supported actions: status, build, release.`);
+      }
+      if (action === 'status') {
+        assertOnlyFlags(parsed, []);
+      } else if (action === 'build') {
+        assertOnlyFlags(parsed, ['surfaces']);
+      } else {
+        assertOnlyFlags(parsed, ['surfaces', 'override', 'reason']);
+      }
+      if (parsed.flags.reason && !parsed.flags.override) {
+        throw new Error('devmode only accepts --reason together with --override.');
+      }
+      return;
+    }
+    case 'new':
+      assertOnlyFlags(parsed, ['task', 'surfaces', 'offline']);
+      requireNoPositional('pipelane run new [--task <task-name>] [--surfaces <csv>] [--offline]');
+      return;
+    case 'resume':
+      assertOnlyFlags(parsed, ['task']);
+      requireNoPositional('pipelane run resume [--task <task-name>]');
+      return;
+    case 'repo-guard':
+      assertOnlyFlags(parsed, ['task', 'mode', 'surfaces', 'offline']);
+      requireNoPositional('pipelane run repo-guard --task <task-name> [--mode build|release] [--surfaces <csv>] [--offline]');
+      return;
+    case 'pr':
+      assertOnlyFlags(parsed, ['task', 'title', 'message', 'forceInclude']);
+      requireNoPositional('pipelane run pr [--task <task-name>] [--title <title>] [--message <message>] [--force-include <path>]');
+      return;
+    case 'merge':
+      assertOnlyFlags(parsed, ['task']);
+      requireNoPositional('pipelane run merge [--task <task-name>]');
+      return;
+    case 'release-check':
+      assertOnlyFlags(parsed, ['surfaces']);
+      requireNoPositional('pipelane run release-check [--surfaces <csv>]');
+      return;
+    case 'task-lock':
+      assertOnlyFlags(parsed, ['task', 'mode']);
+      if (parsed.positional.length !== 1 || parsed.positional[0] !== 'verify') {
+        throw new Error('task-lock requires exactly: pipelane run task-lock verify --task <task-name> [--mode build|release]');
+      }
+      return;
+    case 'deploy':
+      assertOnlyFlags(parsed, ['task', 'sha', 'surfaces', 'async', 'skipSmokeCoverage', 'reason']);
+      if (parsed.positional.length === 0) {
+        throw new Error('deploy requires an environment: staging or prod.');
+      }
+      if (parsed.positional[0] !== 'staging' && parsed.positional[0] !== 'prod' && parsed.positional[0] !== 'production') {
+        throw new Error('deploy requires an environment: staging or prod.');
+      }
+      if (parsed.flags.reason && !parsed.flags.skipSmokeCoverage) {
+        throw new Error('deploy only accepts --reason together with --skip-smoke-coverage.');
+      }
+      if (parsed.flags.skipSmokeCoverage && parsed.positional[0] === 'staging') {
+        throw new Error('--skip-smoke-coverage only applies to production deploys.');
+      }
+      return;
+    case 'smoke': {
+      assertOnlyFlags(parsed, ['reason']);
+      const [subcommand] = parsed.positional;
+      if (!subcommand) return;
+      if (subcommand === 'plan' || subcommand === 'staging' || subcommand === 'prod') {
+        if (parsed.flags.reason) {
+          throw new Error(`smoke ${subcommand} does not accept --reason.`);
+        }
+        if (parsed.positional.length > 1) failUnexpected('pipelane run smoke <plan|staging|prod>');
+        return;
+      }
+      if (subcommand === 'waiver') {
+        if (parsed.positional.length !== 4) {
+          throw new Error('Usage: pipelane run smoke waiver <create|extend> <@smoke-tag> <staging|prod> --reason <text>');
+        }
+        return;
+      }
+      if (subcommand === 'quarantine' || subcommand === 'unquarantine') {
+        if (subcommand === 'unquarantine' && parsed.flags.reason) {
+          throw new Error('smoke unquarantine does not accept --reason.');
+        }
+        if (parsed.positional.length !== 2) {
+          throw new Error(`Usage: pipelane run smoke ${subcommand} <@smoke-tag> [--reason <text>]`);
+        }
+        return;
+      }
+      throw new Error('smoke requires one of: plan, staging, prod, waiver, quarantine, unquarantine.');
+    }
+    case 'clean':
+      assertOnlyFlags(parsed, ['apply', 'allStale', 'task']);
+      if (!parsed.flags.apply && (parsed.flags.allStale || parsed.flags.task.trim())) {
+        throw new Error('clean only accepts --task or --all-stale when --apply is also passed.');
+      }
+      requireNoPositional('pipelane run clean [--apply (--task <task-name>|--all-stale)]');
+      return;
+    case 'status':
+      assertOnlyFlags(parsed, ['week', 'stuck', 'blastSha']);
+      requireNoPositional('pipelane run status [--week|--stuck|--blast <sha>] [--json]');
+      return;
+    case 'doctor': {
+      assertOnlyFlags(parsed, ['apply']);
+      if (parsed.positional.length > 1) failUnexpected('pipelane run doctor [diagnose|probe|fix|--diagnose|--probe|--fix]');
+      const mode = parsed.positional[0];
+      if (mode && mode !== 'diagnose' && mode !== 'probe' && mode !== 'fix' && mode !== '--diagnose' && mode !== '--probe' && mode !== '--fix') {
+        throw new Error(`Unknown doctor mode "${mode}". Supported modes: diagnose, probe, fix.`);
+      }
+      return;
+    }
+    case 'rollback':
+      assertOnlyFlags(parsed, ['task', 'surfaces', 'async', 'revertPr', 'sha']);
+      if (parsed.positional.length === 0) {
+        throw new Error('rollback requires an environment: staging or prod.');
+      }
+      if (parsed.positional[0] !== 'staging' && parsed.positional[0] !== 'prod' && parsed.positional[0] !== 'production') {
+        throw new Error('rollback requires an environment: staging or prod.');
+      }
+      if (parsed.flags.revertPr && parsed.positional.length > 1) {
+        throw new Error('--revert-pr does not accept surface positional arguments; it opens a revert PR for the resolved merge commit.');
+      }
+      if (parsed.flags.revertPr && parsed.flags.surfaces.length > 0) {
+        throw new Error('--revert-pr does not accept --surfaces; it opens a revert PR for the resolved merge commit.');
+      }
+      if (parsed.flags.revertPr && parsed.flags.async) {
+        throw new Error('--revert-pr cannot be combined with --async; it opens a PR and does not dispatch a deploy.');
+      }
+      if (parsed.flags.sha && !parsed.flags.revertPr) {
+        throw new Error('/rollback only accepts --sha with --revert-pr. The redeploy rollback path selects the last verified-good DeployRecord automatically.');
+      }
+      return;
+    case 'api': {
+      const [subcommand] = parsed.positional;
+      if (!subcommand || subcommand === 'snapshot') {
+        assertOnlyFlags(parsed, []);
+        if (parsed.positional.length > 1) failUnexpected('pipelane run api snapshot');
+        return;
+      }
+      if (subcommand === 'branch') {
+        assertOnlyFlags(parsed, ['branch', 'file', 'patch', 'scope']);
+        if (parsed.positional.length > 1) failUnexpected('pipelane run api branch --branch <branch> [--patch --file <path>]');
+        return;
+      }
+      if (subcommand === 'action') {
+        assertOnlyFlags(parsed, [
+          'task',
+          'offline',
+          'surfaces',
+          'override',
+          'reason',
+          'mode',
+          'title',
+          'message',
+          'sha',
+          'skipSmokeCoverage',
+          'allStale',
+          'execute',
+          'confirmToken',
+        ]);
+        if (parsed.positional.length !== 2) {
+          throw new Error('api action requires exactly: pipelane run api action <action-id> [--execute] [--confirm-token <token>]');
+        }
+        return;
+      }
+      throw new Error('Unknown api subcommand. Supported: snapshot, branch, action.');
+    }
+    default:
+      return;
+  }
+}
+
+type OperatorFlagKey = keyof OperatorFlags;
+
+const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flags: OperatorFlags) => boolean }> = [
+  { key: 'apply', label: '--apply', active: (flags) => flags.apply },
+  { key: 'allStale', label: '--all-stale', active: (flags) => flags.allStale },
+  { key: 'offline', label: '--offline', active: (flags) => flags.offline },
+  { key: 'override', label: '--override', active: (flags) => flags.override },
+  { key: 'skipSmokeCoverage', label: '--skip-smoke-coverage', active: (flags) => flags.skipSmokeCoverage },
+  { key: 'patch', label: '--patch', active: (flags) => flags.patch },
+  { key: 'reason', label: '--reason', active: (flags) => flags.reason.trim().length > 0 },
+  { key: 'sha', label: '--sha', active: (flags) => flags.sha.trim().length > 0 },
+  { key: 'task', label: '--task', active: (flags) => flags.task.trim().length > 0 },
+  { key: 'branch', label: '--branch', active: (flags) => flags.branch.trim().length > 0 },
+  { key: 'file', label: '--file', active: (flags) => flags.file.trim().length > 0 },
+  { key: 'title', label: '--title', active: (flags) => flags.title.trim().length > 0 },
+  { key: 'message', label: '--message', active: (flags) => flags.message.trim().length > 0 },
+  { key: 'mode', label: '--mode', active: (flags) => flags.mode.trim().length > 0 },
+  { key: 'scope', label: '--scope', active: (flags) => flags.scope.trim().length > 0 },
+  { key: 'surfaces', label: '--surfaces', active: (flags) => flags.surfaces.length > 0 },
+  { key: 'execute', label: '--execute', active: (flags) => flags.execute },
+  { key: 'confirmToken', label: '--confirm-token', active: (flags) => flags.confirmToken.trim().length > 0 },
+  { key: 'forceInclude', label: '--force-include', active: (flags) => flags.forceInclude.length > 0 },
+  { key: 'async', label: '--async', active: (flags) => flags.async },
+  { key: 'week', label: '--week', active: (flags) => flags.week },
+  { key: 'stuck', label: '--stuck', active: (flags) => flags.stuck },
+  { key: 'blastSha', label: '--blast', active: (flags) => flags.blastSha.trim().length > 0 },
+  { key: 'revertPr', label: '--revert-pr', active: (flags) => flags.revertPr },
+];
+
+function assertOnlyFlags(parsed: ParsedOperatorArgs, allowed: OperatorFlagKey[]): void {
+  const allowedSet = new Set<OperatorFlagKey>(['json', 'help', ...allowed]);
+  const unexpected = FLAG_RENDERERS
+    .filter((entry) => !allowedSet.has(entry.key) && entry.active(parsed.flags))
+    .map((entry) => entry.label);
+  if (unexpected.length === 0) return;
+  throw new Error(`${parsed.command} does not accept flag(s): ${unexpected.join(', ')}.`);
 }
 
 export function parseSurfaceList(config: WorkflowConfig, values: string[]): string[] {

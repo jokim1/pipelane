@@ -13,6 +13,7 @@ import {
   MANAGED_EXTRA_COMMANDS,
   type ManagedCommand,
   readJsonFile,
+  resolveReadableConfigPath,
   resolveRepoRoot,
   resolveSyncDocs,
   resolveWorkflowAliases,
@@ -569,6 +570,14 @@ export function syncConsumerDocs(repoRoot: string, config: WorkflowConfig): void
 
 export function initConsumerRepo(cwd: string, projectName: string): { repoRoot: string; configPath: string } {
   const repoRoot = resolveRepoRoot(cwd, true);
+  const existingConfig = resolveReadableConfigPath(repoRoot);
+  if (existingConfig) {
+    throw new Error([
+      `Pipelane is already initialized in ${repoRoot}.`,
+      `Existing config: ${existingConfig}`,
+      'Run `pipelane setup` to refresh generated files, or edit the existing config intentionally.',
+    ].join('\n'));
+  }
   const inferredName = projectName.trim() || path.basename(repoRoot);
   const projectKey = inferProjectKey(inferredName);
   const config = defaultWorkflowConfig(projectKey, inferredName);

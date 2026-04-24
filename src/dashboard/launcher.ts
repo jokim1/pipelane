@@ -165,7 +165,7 @@ function hasFlag(args: string[], flag: string): boolean {
 }
 
 async function runStart(argv: string[], cwd: string): Promise<void> {
-  const options = getDashboardOptions(argv, cwd);
+  const options = getDashboardOptions(argv, cwd, { allowNoOpen: true });
   const url = `http://${options.host}:${options.port}`;
   const noOpen = hasFlag(argv, '--no-open');
 
@@ -241,7 +241,7 @@ async function runStart(argv: string[], cwd: string): Promise<void> {
 }
 
 async function runStop(argv: string[], cwd: string): Promise<void> {
-  const options = getDashboardOptions(argv, cwd);
+  const options = getDashboardOptions(argv, cwd, { allowNoOpen: true });
   const storedPid = readPidFile(options.repoRoot);
 
   if (!storedPid) {
@@ -277,7 +277,7 @@ async function runStop(argv: string[], cwd: string): Promise<void> {
 }
 
 async function runStatus(argv: string[], cwd: string): Promise<void> {
-  const options = getDashboardOptions(argv, cwd);
+  const options = getDashboardOptions(argv, cwd, { allowNoOpen: true });
   const url = `http://${options.host}:${options.port}`;
   const health = await probeHealth(options.host, options.port, 500);
   const storedPid = readPidFile(options.repoRoot);
@@ -297,14 +297,6 @@ async function runStatus(argv: string[], cwd: string): Promise<void> {
 
 export async function handlePipelane(argv: string[], cwd: string): Promise<void> {
   const [sub, ...rest] = argv;
-  if (sub === 'stop') {
-    await runStop(rest, cwd);
-    return;
-  }
-  if (sub === 'status') {
-    await runStatus(rest, cwd);
-    return;
-  }
   if (sub === 'help' || sub === '--help' || sub === '-h') {
     process.stdout.write(
       [
@@ -324,6 +316,26 @@ export async function handlePipelane(argv: string[], cwd: string): Promise<void>
     );
     return;
   }
+  if (!sub || sub.startsWith('--')) {
+    await runStart(argv, cwd);
+    return;
+  }
+  if (sub === 'start') {
+    await runStart(rest, cwd);
+    return;
+  }
+  if (sub === 'stop') {
+    await runStop(rest, cwd);
+    return;
+  }
+  if (sub === 'status') {
+    await runStatus(rest, cwd);
+    return;
+  }
 
-  await runStart(argv, cwd);
+  throw new Error([
+    `Unknown Pipelane Board subcommand "${sub}".`,
+    sub === 'fix' ? 'Did you mean the managed `/fix` command? `/pipelane fix` opens the board router, not the fix workflow.' : '',
+    'Supported board subcommands: start, stop, status.',
+  ].filter(Boolean).join('\n'));
 }

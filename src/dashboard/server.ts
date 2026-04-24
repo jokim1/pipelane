@@ -49,6 +49,10 @@ interface DashboardServerOptions {
   settings: DashboardSettings;
 }
 
+interface DashboardOptionParseOptions {
+  allowNoOpen?: boolean;
+}
+
 interface BranchAuthor {
   name: string;
   email: string;
@@ -868,7 +872,12 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
   });
 }
 
-export function getDashboardOptions(argv: string[], cwd: string): DashboardServerOptions {
+export function getDashboardOptions(
+  argv: string[],
+  cwd: string,
+  parseOptions: DashboardOptionParseOptions = {},
+): DashboardServerOptions {
+  validateDashboardOptions(argv, parseOptions);
   const repoRoot = path.resolve(valueAfter(argv, '--repo') || process.env.ROCKETBOARD_ROOT || cwd);
   const settingsPath = dashboardSettingsPath(repoRoot);
   const settings = readDashboardSettings(repoRoot, settingsPath);
@@ -879,4 +888,28 @@ export function getDashboardOptions(argv: string[], cwd: string): DashboardServe
     settingsPath,
     settings,
   };
+}
+
+function validateDashboardOptions(argv: string[], parseOptions: DashboardOptionParseOptions): void {
+  const valueFlags = new Set(['--repo', '--host', '--port']);
+  const booleanFlags = new Set(parseOptions.allowNoOpen ? ['--no-open'] : []);
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (booleanFlags.has(token)) {
+      continue;
+    }
+    if (valueFlags.has(token)) {
+      const next = argv[index + 1];
+      if (next === undefined || next.startsWith('--')) {
+        throw new Error(`${token} requires a value.`);
+      }
+      index += 1;
+      continue;
+    }
+    if (token.startsWith('--')) {
+      throw new Error(`Unknown dashboard option "${token}". Supported options: --repo <path>, --host <host>, --port <port>${parseOptions.allowNoOpen ? ', --no-open' : ''}.`);
+    }
+    throw new Error(`Unexpected dashboard argument "${token}".`);
+  }
 }

@@ -103,7 +103,7 @@ function readBaseBranch(repoRoot: string): string {
   }
 }
 
-function collectBootstrapWarnings(repoRoot: string): string[] {
+export function collectBootstrapWarnings(repoRoot: string): string[] {
   const baseBranch = readBaseBranch(repoRoot);
   const warnings: string[] = [];
   const gitRepo = runCommandCapture('git', ['rev-parse', '--show-toplevel'], { cwd: repoRoot });
@@ -136,9 +136,13 @@ export function parseBootstrapArgs(argv: string[]): BootstrapOptions {
   const options: BootstrapOptions = {};
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
-    if (token === '--project') {
-      options.projectName = argv[index + 1] ?? '';
-      index += 1;
+    if (token === '--project' || token.startsWith('--project=')) {
+      const value = token === '--project' ? argv[index + 1] ?? '' : token.slice('--project='.length);
+      if (token === '--project') index += 1;
+      if (!value.trim()) {
+        throw new Error('pipelane bootstrap --project requires a non-empty value.');
+      }
+      options.projectName = value;
       continue;
     }
     if (token === '--help' || token === '-h') {
