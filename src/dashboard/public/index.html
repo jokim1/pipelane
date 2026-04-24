@@ -268,6 +268,8 @@
     }
 
     .hero-panel {
+      position: relative;
+      z-index: 40;
       overflow: visible;
     }
 
@@ -718,6 +720,26 @@
       line-height: 1.5;
       white-space: pre-wrap;
       word-break: break-word;
+    }
+
+    .attention-detail {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .attention-detail-list {
+      margin: 0;
+      padding-left: 16px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .attention-detail-list li + li {
+      margin-top: 4px;
     }
 
     .attention-next {
@@ -2514,19 +2536,19 @@
       const aliases = currentHelpAliases();
       switch (issue?.action) {
         case 'doctor.probe':
-          return `run ${aliases.doctor} probe`;
+          return `Run ${aliases.doctor} --probe`;
         case 'doctor.diagnose':
-          return `run ${aliases.doctor}`;
+          return `Run ${aliases.doctor}`;
         case 'smoke.plan':
-          return `run ${aliases.smoke} -- plan`;
+          return `Run ${aliases.smoke} -- plan`;
         case 'smoke.staging':
-          return `run ${aliases.smoke} staging`;
+          return `Run ${aliases.smoke} staging`;
         case 'deploy.staging':
-          return `run ${aliases.deploy} staging`;
+          return `Run ${aliases.deploy} staging`;
         case 'deploy.prod':
-          return `run ${aliases.deploy} prod`;
+          return `Run ${aliases.deploy} prod`;
         default:
-          return issue?.action ? `run ${issue.action}` : '';
+          return issue?.action ? `Run ${issue.action}` : '';
       }
     }
 
@@ -2958,14 +2980,18 @@
       const mode = boardContext?.mode || 'unknown';
       const smoke = state.snapshot?.data?.smoke;
       const health = state.health;
+      const checkout = boardContext?.currentCheckout || {};
+      const aliases = currentHelpAliases();
 
       if (activeTask) {
         items.push(`Current worktree: ${activeTask.taskSlug} on ${activeTask.branchName}.`);
       } else {
-        items.push('Current checkout is not an active pipelane task worktree.');
-        if (health?.repoRoot) {
-          items.push(`Serving ${health.repoRoot}.`);
-        }
+        const branch = checkout.branchName || '(detached)';
+        const label = branch === (checkout.baseBranch || boardContext?.baseBranch)
+          ? `Viewing base checkout: ${branch}`
+          : `Viewing checkout: ${branch}`;
+        items.push(`${label}. Serving ${health?.repoRoot || 'this repo'}.`);
+        items.push(`Task-specific actions need a task workspace: use ${aliases.new} to start work or ${aliases.resume} to continue an existing task.`);
       }
 
       if (mode === 'release' && release.effectiveOverride?.reason) {
@@ -3013,8 +3039,147 @@
     function attentionNext(item) {
       if (item.next) return item.next;
       if (item.safeNextAction) return item.safeNextAction;
-      if (item.action) return `Suggested action: ${item.action}`;
+      const action = issueActionHint(item);
+      if (action) return action;
       return 'No suggested action.';
+    }
+
+    function stripProbePrefix(reason, surface) {
+      return String(reason || '')
+        .replace(new RegExp(`^staging\\s+${escapeRegExp(surface)}\\s*:?\\s*`, 'i'), '')
+        .replace(new RegExp(`^staging\\s+${escapeRegExp(surface)}\\s+probe\\s+`, 'i'), 'probe ')
+        .trim();
+    }
+
+    function escapeRegExp(value) {
+      return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+
+    function probeSurfaceFromIssue(issue) {
+      const message = String(issue?.message || '');
+      const match = message.match(/^staging\s+([^\s:]+)\s+probe\b/i);
+      if (match) return match[1];
+      return '';
+    }
+
+    function surfaceListLabel(surfaces) {
+      const values = uniqueLines(surfaces);
+      if (values.length === 0) return 'the configured staging surfaces';
+      if (values.length === 1) return values[0];
+      if (values.length === 2) return `${values[0]} and ${values[1]}`;
+      return `${values.slice(0, -1).join(', ')}, and ${values[values.length - 1]}`;
+    }
+
+    function buildProbeAttentionCard(issues, code) {
+      const aliases = currentHelpAliases();
+      const sourceHealth = state.snapshot?.data?.sourceHealth || [];
+      const severity = code === 'probe.degraded' ? 'error' : 'warning';
+      const stateLabel = code === 'probe.degraded' ? 'failing' : 'stale';
+      const surfaces = uniqueLines(issues.map(probeSurfaceFromIssue));
+      const details = surfaces.map((surface) => {
+        const health = sourceHealth.find((entry) => entry.name === `deployProbe.${surface}`);
+        const reason = stripProbePrefix(health?.reason || issues.find((issue) => probeSurfaceFromIssue(issue) === surface)?.message || '', surface);
+        const observed = health?.freshness?.observedAt ? ` · last checked ${formatDateWithRelative(health.freshness.observedAt)}` : '';
+        return `${surface}: ${reason || stateLabel}${observed}`;
+      });
+      const surfaceLabel = surfaceListLabel(surfaces);
+      const reason = code === 'probe.degraded'
+        ? 'Staging health checks are failing.'
+        : 'Staging health checks are stale.';
+      const detail = code === 'probe.degraded'
+        ? `Pipelane could not get a clean health check for ${surfaceLabel}. Refresh the probes to see whether staging is healthy now.`
+        : `Pipelane no longer trusts the latest recorded health check for ${surfaceLabel}. It wants a fresh staging health check before trusting staging for release.`;
+
+      return {
+        severity,
+        scope: 'staging',
+        reason,
+        detail,
+        details,
+        next: `Run ${aliases.doctor} --probe`,
+        tooltip: `A probe pings the configured staging health URLs. It is narrower than a smoke test: if it passes, this warning clears; if it fails, staging may be down or misconfigured.`,
+      };
+    }
+
+    function normalizeAttentionItem(item) {
+      const aliases = currentHelpAliases();
+      const code = item?.code || '';
+      if (code === 'smoke.staging.missing') {
+        return {
+          severity: normalizeAttentionSeverity(item.severity),
+          scope: 'staging',
+          reason: 'No staging smoke test has run.',
+          detail: 'Smoke tests exercise the deployed staging app before production promotion. This is broader than a health probe.',
+          details: [
+            `Use ${aliases.smoke} staging after a staging deploy to record the result.`,
+            `If smoke checks are not planned yet, start with ${aliases.smoke} -- plan.`,
+          ],
+          next: `Run ${aliases.smoke} staging`,
+          tooltip: `You can smoke test staging using ${aliases.smoke} staging. Pipelane stores the latest result and uses it as release context.`,
+        };
+      }
+      if (code === 'git.base.stale') {
+        return {
+          severity: normalizeAttentionSeverity(item.severity),
+          scope: attentionScope(item),
+          reason: 'Local main is behind the remote.',
+          detail: attentionReason(item),
+          details: ['Refresh this checkout when you want local files to include the latest merged code. Task worktrees stay independent.'],
+          next: 'Refresh this checkout before relying on local main.',
+          tooltip: 'This warning is about the base checkout serving the board, not every task branch.',
+        };
+      }
+      return {
+        severity: normalizeAttentionSeverity(item.severity),
+        scope: attentionScope(item),
+        reason: attentionReason(item),
+        detail: '',
+        details: [],
+        next: attentionNext(item),
+        tooltip: '',
+      };
+    }
+
+    function buildAttentionCards(attention) {
+      const cards = [];
+      const probeStale = attention.filter((item) => item?.code === 'probe.stale');
+      const probeDegraded = attention.filter((item) => item?.code === 'probe.degraded');
+      if (probeDegraded.length) cards.push(buildProbeAttentionCard(probeDegraded, 'probe.degraded'));
+      if (probeStale.length) cards.push(buildProbeAttentionCard(probeStale, 'probe.stale'));
+      for (const item of attention) {
+        if (item?.code === 'probe.stale' || item?.code === 'probe.degraded') continue;
+        cards.push(normalizeAttentionItem(item));
+      }
+      return cards;
+    }
+
+    function attentionCardTitle(item) {
+      return uniqueLines([
+        item.reason,
+        item.detail,
+        ...(item.details || []),
+        item.next ? `Next: ${item.next}` : '',
+        item.tooltip,
+      ]).join(' ');
+    }
+
+    function renderAttentionCard(item) {
+      const detail = item.detail ? `<div class="attention-detail">${escapeHtml(item.detail)}</div>` : '';
+      const details = item.details?.length
+        ? `<ul class="attention-detail-list">${item.details.map((entry) => `<li>${escapeHtml(entry)}</li>`).join('')}</ul>`
+        : '';
+      return `
+        <article class="attention-card ${escapeHtml(item.severity)}"${titleAttr(attentionCardTitle(item))}>
+          <div class="attention-head">
+            <div class="attention-severity ${escapeHtml(item.severity)}">${escapeHtml(attentionSeverityLabel(item.severity))}</div>
+            <div class="footer-note">${escapeHtml(item.scope)}</div>
+          </div>
+          <div class="attention-reason">${escapeHtml(item.reason)}</div>
+          ${detail}
+          ${details}
+          <div class="attention-next">${escapeHtml(item.next)}</div>
+        </article>
+      `;
     }
 
     function cleanupCardPresentation(branch, activeLane) {
@@ -3137,12 +3302,7 @@
       const list = document.getElementById('attention-list');
       const context = document.getElementById('attention-context');
       const summary = document.getElementById('attention-summary');
-      const normalizedAttention = attention.map((item) => ({
-        severity: normalizeAttentionSeverity(item.severity),
-        scope: attentionScope(item),
-        reason: attentionReason(item),
-        next: attentionNext(item),
-      }));
+      const normalizedAttention = buildAttentionCards(attention);
 
       context.innerHTML = contextItems.length
         ? `<ul class="attention-context-list">${contextItems.map((item) => `<li class="attention-context-item">${escapeHtml(item)}</li>`).join('')}</ul>`
@@ -3167,16 +3327,7 @@
 
       summary.textContent = [...summaryParts, `${normalizedAttention.length} alert${normalizedAttention.length === 1 ? '' : 's'}`].join(' · ');
 
-      list.innerHTML = normalizedAttention.map((item) => `
-        <article class="attention-card ${escapeHtml(item.severity)}">
-          <div class="attention-head">
-            <div class="attention-severity ${escapeHtml(item.severity)}">${escapeHtml(attentionSeverityLabel(item.severity))}</div>
-            <div class="footer-note">${escapeHtml(item.scope)}</div>
-          </div>
-          <div class="attention-reason">${escapeHtml(item.reason)}</div>
-          <div class="attention-next">${escapeHtml(item.next)}</div>
-        </article>
-      `).join('');
+      list.innerHTML = normalizedAttention.map(renderAttentionCard).join('');
     }
 
     function renderActiveTask() {

@@ -87,6 +87,9 @@ slash command names only when alias config cannot be loaded.
 ### Attention
 
 Shows the highest-signal blockers and warnings from `snapshot.data.attention`.
+The board keeps the API payload intact, but renders related probe alerts as one
+plain-language card with a single next command. Attention cards should answer:
+what is wrong, why it matters, and what command to run next.
 
 ### Board Context
 
