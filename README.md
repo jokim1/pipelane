@@ -285,15 +285,203 @@ are the stable repo-native layer underneath them.
 
 ## Use Pipelane With Gstack
 
-Use both when a repo has both.
+Pipelane and gstack are complementary. Use gstack as the review stack. Use Pipelane
+as the release stack.
 
-- Pipelane owns task workspaces, PR prep, merge, deploy flow, smoke gates,
-  rollback, cleanup, and release discipline.
-- gstack remains useful for broader planning, review, QA, investigation,
-  documentation, design review, and other AI-builder workflows.
+That split keeps the workflow easy to reason about:
 
-If a repo uses Pipelane, prefer the Pipelane release flow over a generic `/ship`
-flow for branch, merge, deploy, and cleanup work.
+- **gstack reviews the work:** planning, architecture, implementation risk, code
+  review, QA, investigation, design review, and documentation review.
+- **Pipelane moves the work:** task branches, worktrees, PR prep, merge, deploy
+  flow, smoke checks, rollback, cleanup, and release gates.
+
+In other words, gstack helps you answer "is this the right change, and is it good
+enough?" Pipelane helps you answer "where is this change, what environment has it,
+and what action is safe next?"
+
+If a repo uses Pipelane, prefer Pipelane for branch, PR, merge, deploy, smoke,
+rollback, and cleanup flow. Use gstack around that flow to make the plan and code
+better before Pipelane moves it forward.
+
+### Full Build Journey With Gstack Reviews
+
+This is the normal fast path for a solo builder or small team using AI to ship
+product changes quickly. The important idea is that the user, the AI agent,
+gstack, and Pipelane each have a clear job.
+
+```text
+User: Add checkout recovery emails for abandoned carts.
+```
+
+The user starts with a task description in plain English. It does not need to be
+a perfect spec. The AI agent can turn it into an implementation plan.
+
+```text
+/status
+/devmode build
+/new "add checkout recovery emails"
+```
+
+Pipelane creates the task workspace. `/status` shows what is already in flight,
+`/devmode build` selects the fast lane, and `/new` creates a clean task branch and
+worktree so the AI agent is not mixing unrelated work.
+
+```text
+AI: Proposed plan:
+- add recovery-email settings
+- create abandoned-cart query
+- add email copy and unsubscribe handling
+- add tests for timing, opt-out, and duplicate-send prevention
+```
+
+The AI returns a plan before implementation. That is where gstack starts helping.
+For user-facing changes, review the UX and product shape first:
+
+```text
+/plan-design-review
+```
+
+gstack's design plan review checks whether the user experience, copy, hierarchy,
+states, and interaction model make sense before code exists. If you think of this
+as "design-plan-review", the actual command name is `/plan-design-review`.
+
+Then review the engineering plan:
+
+```text
+/plan-eng-review
+```
+
+gstack's engineering plan review checks architecture, data flow, edge cases, test
+coverage, performance, and operational risk before the AI agent starts coding.
+This catches bad structure while it is still cheap to change.
+
+```text
+User: Looks good. Implement the revised plan.
+```
+
+Now the AI builds inside the Pipelane task worktree.
+
+```text
+AI: Implementation complete.
+Changed:
+- checkout recovery settings
+- abandoned-cart detection
+- email scheduling
+- tests
+
+Checks:
+- unit tests pass
+- typecheck passes
+
+Open risk:
+- email provider sandbox credentials need staging verification
+```
+
+After the AI implementation returns, use Pipelane's repair loop for any failures,
+bugs, review findings, or code-quality issues:
+
+```text
+/fix
+```
+
+`/fix` is part of Pipelane because release safety includes code health. It turns
+failures and findings into root-cause fixes instead of hiding symptoms.
+
+When the branch is ready for a PR, let Pipelane prepare it:
+
+```text
+/pr
+```
+
+`/pr` runs the repo's configured pre-PR checks, commits, pushes, and opens or
+updates the PR. Then use the review stack again:
+
+```text
+/review
+```
+
+gstack `/review` is the pre-landing review pass. It looks at the diff before merge
+and tries to catch structural issues, safety problems, and code-quality regressions.
+If it finds something real, keep the loop simple:
+
+```text
+/fix
+/pr
+/review
+```
+
+Fix the finding, update the PR, and review again until the code is clean enough to
+land.
+
+For Codex users who want a Claude review pass from inside Codex, you can also add
+the standalone [`/claude review` skill](https://github.com/jokim1/codexskill-claude-review):
+
+```text
+git clone https://github.com/jokim1/codexskill-claude-review.git ~/.codex/skills/claude
+chmod +x ~/.codex/skills/claude/scripts/*.sh
+```
+
+After restarting Codex, use:
+
+```text
+/claude review
+/claude review code
+/claude review plan
+/claude review iterate
+/claude review pr <number>
+```
+
+This is useful when `/review` is not available or is blocked in your current
+Codex/gstack setup, or when you want a second model to review the plan or code.
+The recommended role split is simple: Claude reviews, Codex fixes, and Pipelane
+moves the release forward.
+
+Once review is clean, return to Pipelane:
+
+```text
+/merge
+/smoke prod
+/clean
+```
+
+In build mode, `/merge` lands the PR and records the merged SHA. If production
+deploys automatically from the base branch, `/smoke prod` verifies the live app
+after deploy. `/clean` removes finished task state so the next AI session starts
+from a clean cockpit.
+
+The full build journey looks long when written out, but the responsibilities are
+simple: the user describes the work, gstack improves the plan and reviews the
+diff, the AI implements and fixes, and Pipelane moves the change through branch,
+PR, merge, smoke, and cleanup.
+
+### Release Journey With Gstack Reviews
+
+Use the same review stack in release mode, but let Pipelane enforce the staging
+gate before production:
+
+```text
+User: Replace the billing webhook handler.
+/status
+/devmode release
+/new "replace billing webhook handler"
+/plan-design-review
+/plan-eng-review
+AI: Implementation returns.
+/pr
+/review
+/fix
+/pr
+/merge
+/deploy staging
+/smoke staging
+/deploy prod
+/smoke prod
+/clean
+```
+
+The review stack still asks whether the plan and code are good. The release stack
+now adds the operational guarantee: staging and production are tied to the same
+merged SHA, with smoke evidence before promotion.
 
 ## More Detail
 
