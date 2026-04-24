@@ -141,9 +141,11 @@ hints on files listed here.
 
 ## Ask-first additions
 
-Beyond the universal `/fix` ask-first list. Changes to any of these
-surfaces affect every downstream consumer on the next `pipelane:setup`
-and need explicit confirmation before coding.
+Beyond the universal `/fix` sensitive-area list. Changes to any of these
+surfaces affect every downstream consumer on the next `pipelane:setup`, so
+`/fix` emits `[fix] Proposed action — <category>: <line>` before mutating
+and proceeds. The heads-up ensures the intended change is visible in the
+transcript; no consent gate (section name is legacy).
 
 - **`MANAGED_EXTRA_COMMANDS` or `WORKFLOW_COMMANDS` arrays** in
   `src/operator/state.ts`. Adds/removes/renames ripple through

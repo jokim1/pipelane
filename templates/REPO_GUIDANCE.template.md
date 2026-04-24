@@ -52,11 +52,14 @@ fix-application.
 
 ## Ask-first additions
 
-Anything beyond the universal ask-first list in the `/fix` prompt. These
-additions are repo-specific "stop and surface" triggers. You cannot remove
-items from the universal list; this section only adds to it.
+Repo-specific sensitive-area additions beyond the universal list in the
+`/fix` prompt. The section name is legacy — functionally these are
+**heads-up triggers**, not consent gates. `/fix` emits
+`[fix] Proposed action — <category>: <line>` before mutating code in these
+areas and proceeds; no yes/no approval. You can only add to the universal
+list here; you cannot remove items from it.
 
-- <Surface or pattern the agent should stop at>
+- <Surface or pattern worth flagging with a heads-up before changes>
 
 ## Drift-hint ignore
 
