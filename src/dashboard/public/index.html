@@ -2021,6 +2021,14 @@
         x: 0,
         y: 0,
       },
+      attentionContextMenu: {
+        open: false,
+        actionId: '',
+        label: '',
+        reason: '',
+        x: 0,
+        y: 0,
+      },
       branchColumnWidth: readBranchColumnWidth(),
       branchColumnResize: null,
       branchDetails: null,
@@ -3221,6 +3229,9 @@
         detail,
         details,
         next: `Run ${aliases.doctor} --probe`,
+        actionId: 'doctor.probe',
+        actionLabel: 'Update health checks',
+        actionReason: 'Run a fresh live probe for the configured staging health URLs.',
         tooltip: `A probe pings the configured staging health URLs. It is narrower than a smoke test: if it passes, this warning clears; if it fails, staging may be down or misconfigured.`,
       };
     }
@@ -3243,13 +3254,17 @@
         };
       }
       if (code === 'git.base.stale') {
+        const baseBranch = state.snapshot?.data?.boardContext?.baseBranch || 'main';
         return {
           severity: normalizeAttentionSeverity(item.severity),
           scope: attentionScope(item),
-          reason: 'Local main is behind the remote.',
+          reason: `Local ${baseBranch} is behind the remote.`,
           detail: attentionReason(item),
           details: ['Refresh this checkout when you want local files to include the latest merged code. Task worktrees stay independent.'],
-          next: 'Refresh this checkout before relying on local main.',
+          next: `Refresh this checkout before relying on local ${baseBranch}.`,
+          actionId: 'git.catchupBase',
+          actionLabel: `Catch up local ${baseBranch}`,
+          actionReason: `Fetch origin/${baseBranch} and fast-forward this checkout if it is still behind.`,
           tooltip: 'This warning is about the base checkout serving the board, not every task branch.',
         };
       }
@@ -3292,8 +3307,11 @@
       const details = item.details?.length
         ? `<ul class="attention-detail-list">${item.details.map((entry) => `<li>${escapeHtml(entry)}</li>`).join('')}</ul>`
         : '';
+      const actionAttrs = item.actionId
+        ? ` data-attention-action="${escapeHtml(item.actionId)}" data-attention-label="${escapeHtml(item.actionLabel || item.next || item.actionId)}" data-attention-reason="${escapeHtml(item.actionReason || item.next || '')}"`
+        : '';
       return `
-        <article class="attention-card ${escapeHtml(item.severity)}"${titleAttr(attentionCardTitle(item))}>
+        <article class="attention-card ${escapeHtml(item.severity)}"${actionAttrs}${titleAttr(attentionCardTitle(item))}>
           <div class="attention-head">
             <div class="attention-severity ${escapeHtml(item.severity)}">${escapeHtml(attentionSeverityLabel(item.severity))}</div>
             <div class="footer-note">${escapeHtml(item.scope)}</div>
@@ -3347,9 +3365,17 @@
       state.branchContextMenu.branchName = '';
     }
 
+    function closeAttentionContextMenu() {
+      state.attentionContextMenu.open = false;
+      state.attentionContextMenu.actionId = '';
+      state.attentionContextMenu.label = '';
+      state.attentionContextMenu.reason = '';
+    }
+
     function closeMenus() {
       state.devModeMenuOpen = false;
       closeBranchContextMenu();
+      closeAttentionContextMenu();
     }
 
     function setActionFeedback(feedback) {
@@ -3474,6 +3500,11 @@
 
     function renderBranchContextMenu() {
       const menu = document.getElementById('branch-context-menu');
+      if (state.attentionContextMenu.open) {
+        renderAttentionContextMenu(menu);
+        return;
+      }
+
       const { open, branchName, x, y } = state.branchContextMenu;
 
       if (!open || !branchName) {
@@ -3508,6 +3539,30 @@
       menu.style.left = `${Math.max(12, Math.min(x, window.innerWidth - 332))}px`;
       menu.style.top = `${Math.max(12, Math.min(y, window.innerHeight - 260))}px`;
       menu.innerHTML = `${detailButton}${actionButtons}`;
+    }
+
+    function renderAttentionContextMenu(menu) {
+      const { open, actionId, label, reason, x, y } = state.attentionContextMenu;
+
+      if (!open || !actionId) {
+        menu.className = 'context-menu';
+        menu.setAttribute('aria-hidden', 'true');
+        menu.innerHTML = '';
+        menu.style.left = '0px';
+        menu.style.top = '0px';
+        return;
+      }
+
+      menu.className = 'context-menu open';
+      menu.setAttribute('aria-hidden', 'false');
+      menu.style.left = `${Math.max(12, Math.min(x, window.innerWidth - 332))}px`;
+      menu.style.top = `${Math.max(12, Math.min(y, window.innerHeight - 180))}px`;
+      menu.innerHTML = `
+        <button class="context-menu-item" type="button" data-attention-context-action="${escapeHtml(actionId)}" ${actionControlDisabled('board') ? 'disabled' : ''}>
+          <span class="action-label">${escapeHtml(label || actionId)}</span>
+          <span class="action-reason">${escapeHtml(reason || 'Run the suggested board action.')}</span>
+        </button>
+      `;
     }
 
     function renderActionFeedback() {
@@ -4238,11 +4293,24 @@
       return collectActionInputs(action, params);
     }
 
+    function attentionActionSource(actionId) {
+      for (const item of buildAttentionCards(state.snapshot?.data?.attention || [])) {
+        if (item.actionId === actionId) {
+          return {
+            id: actionId,
+            label: item.actionLabel || item.next || actionId,
+            reason: item.actionReason || item.next || 'Run the suggested board action.',
+          };
+        }
+      }
+      return null;
+    }
+
     async function runAction(actionId, scope) {
       const snapshotBranch = getSelectedBranch();
       const branchName = scope === 'branch' ? (state.selectedBranchName || snapshotBranch?.name || '') : '';
       const actionSource = scope === 'board'
-        ? boardActions().find((entry) => entry.id === actionId)
+        ? boardActions().find((entry) => entry.id === actionId) || attentionActionSource(actionId)
         : (state.branchDetails?.data?.branch?.availableActions || snapshotBranch?.availableActions || []).find((entry) => entry.id === actionId);
 
       if (!actionSource) {
@@ -4485,9 +4553,9 @@
     document.body.addEventListener('pointercancel', finishBranchColumnResize);
 
     document.body.addEventListener('click', async (event) => {
-      const target = event.target.closest('[data-branch-open], [data-file-select], [data-action-trigger], [data-confirm-action], [data-detail-close], [data-devmode-toggle], [data-devmode-action], [data-context-action], [data-context-open], [data-help-open], [data-help-close], [data-settings-open], [data-settings-close], [data-settings-save], [data-settings-revert]');
+      const target = event.target.closest('[data-branch-open], [data-file-select], [data-action-trigger], [data-confirm-action], [data-detail-close], [data-devmode-toggle], [data-devmode-action], [data-context-action], [data-context-open], [data-attention-context-action], [data-help-open], [data-help-close], [data-settings-open], [data-settings-close], [data-settings-save], [data-settings-revert]');
       if (!target) {
-        if (state.devModeMenuOpen || state.branchContextMenu.open) {
+        if (state.devModeMenuOpen || state.branchContextMenu.open || state.attentionContextMenu.open) {
           closeMenus();
           render();
         }
@@ -4500,6 +4568,10 @@
 
       if (!target.closest('.context-menu') && !target.closest('[data-branch-card]') && state.branchContextMenu.open) {
         closeBranchContextMenu();
+      }
+
+      if (!target.closest('.context-menu') && !target.closest('[data-attention-action]') && state.attentionContextMenu.open) {
+        closeAttentionContextMenu();
       }
 
       if (target.dataset.devmodeToggle) {
@@ -4564,6 +4636,14 @@
         return;
       }
 
+      if (target.dataset.attentionContextAction) {
+        const actionId = target.dataset.attentionContextAction;
+        closeAttentionContextMenu();
+        render();
+        await runAction(actionId, 'board');
+        return;
+      }
+
       if (target.dataset.branchOpen) {
         closeBranchContextMenu();
         await loadBranch(decodeURIComponent(target.dataset.branchOpen), true);
@@ -4614,10 +4694,27 @@
     });
 
     document.body.addEventListener('contextmenu', (event) => {
+      const attentionCard = event.target.closest('[data-attention-action]');
+      if (attentionCard) {
+        event.preventDefault();
+        state.attentionContextMenu = {
+          open: true,
+          actionId: attentionCard.dataset.attentionAction || '',
+          label: attentionCard.dataset.attentionLabel || '',
+          reason: attentionCard.dataset.attentionReason || '',
+          x: event.clientX,
+          y: event.clientY,
+        };
+        state.branchContextMenu.open = false;
+        state.devModeMenuOpen = false;
+        render();
+        return;
+      }
+
       const card = event.target.closest('[data-branch-card]');
       if (!card) {
-        if (state.branchContextMenu.open) {
-          closeBranchContextMenu();
+        if (state.branchContextMenu.open || state.attentionContextMenu.open) {
+          closeMenus();
           render();
         }
         return;
@@ -4632,6 +4729,7 @@
         y: event.clientY,
       };
       state.devModeMenuOpen = false;
+      closeAttentionContextMenu();
       render();
     });
 
@@ -4651,7 +4749,7 @@
         return;
       }
 
-      if (event.key === 'Escape' && (state.devModeMenuOpen || state.branchContextMenu.open)) {
+      if (event.key === 'Escape' && (state.devModeMenuOpen || state.branchContextMenu.open || state.attentionContextMenu.open)) {
         closeMenus();
         render();
         return;

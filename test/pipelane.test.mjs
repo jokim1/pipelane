@@ -8435,6 +8435,47 @@ test('stale-base warning only appears when the current checkout itself is on the
   }
 });
 
+test('git.catchupBase action fast-forwards a stale base checkout', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const updaterRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-updater-'));
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    execFileSync('git', ['clone', remoteRoot, updaterRoot], { stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['config', 'user.email', 'codex@example.com'], { cwd: updaterRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['config', 'user.name', 'Codex'], { cwd: updaterRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    writeFileSync(path.join(updaterRoot, 'remote.txt'), 'advance main\n', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: updaterRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Advance remote main'], { cwd: updaterRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['push', 'origin', 'main'], { cwd: updaterRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    execFileSync('git', ['fetch', 'origin', 'main'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    const staleSnapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    const staleIssue = staleSnapshot.data.attention.find((issue) => issue.code === 'git.base.stale');
+    assert.equal(staleIssue?.action, 'git.catchupBase');
+
+    const executed = JSON.parse(runCli(['run', 'api', 'action', 'git.catchupBase', '--execute'], repoRoot).stdout);
+    assert.equal(executed.ok, true);
+    assert.equal(executed.data.execution.exitCode, 0);
+
+    const localHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim();
+    const remoteHead = execFileSync('git', ['rev-parse', 'origin/main'], { cwd: repoRoot, encoding: 'utf8' }).trim();
+    assert.equal(localHead, remoteHead);
+
+    const freshSnapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    assert.equal(
+      freshSnapshot.data.attention.some((issue) => issue.code === 'git.base.stale'),
+      false,
+      'catching up local main should clear the stale-base warning',
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(updaterRoot, { recursive: true, force: true });
+  }
+});
+
 test('base checkout ahead of origin is described accurately and does not trigger stale-base warning', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {

@@ -49,6 +49,7 @@ export const STABLE_ACTION_IDS = [
   // duplicates `pipelane configure`) or a long-lived stdin proxy.
   'doctor.diagnose',
   'doctor.probe',
+  'git.catchupBase',
   // v1.1: rollback.* — one-command deploy recovery. Pipelane-only
   // extension above the base action set. rollback.staging is
   // low-risk (staging is allowed to break); rollback.prod joins the
@@ -85,6 +86,7 @@ const ACTION_LABELS: Record<StableActionId, string> = {
   'clean.apply': 'Apply cleanup',
   'doctor.diagnose': 'Diagnose deploy configuration',
   'doctor.probe': 'Run live healthcheck probe',
+  'git.catchupBase': 'Catch up local base branch',
   'rollback.staging': 'Rollback staging to last-good deploy',
   'rollback.prod': 'Rollback production to last-good deploy',
 };
@@ -345,9 +347,9 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
     }
   }
 
-  const underlyingArgs = buildUnderlyingArgs(actionId, parsed);
-  const childEnv = buildChildEnv(actionId);
-  const result = runCliWithJson(cwd, underlyingArgs, childEnv);
+  const result = actionId === 'git.catchupBase'
+    ? runCatchupBase(cwd)
+    : runCliWithJson(cwd, buildUnderlyingArgs(actionId, parsed), buildChildEnv(actionId));
   const failureReason = result.ok ? '' : describeExecutionFailure(actionId, result);
 
   const data: ActionExecutionData = {
@@ -435,6 +437,8 @@ function normalizeInputs(actionId: StableActionId, parsed: ParsedOperatorArgs, c
     case 'doctor.diagnose':
       return {};
     case 'doctor.probe':
+      return {};
+    case 'git.catchupBase':
       return {};
     case 'rollback.staging': {
       const resolved = resolveRollbackInputs(cwd, 'staging', flags.surfaces, flags.task);
@@ -625,6 +629,8 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
     case 'doctor.probe':
       args.push('doctor', 'probe');
       break;
+    case 'git.catchupBase':
+      throw new Error('git.catchupBase is handled directly by the API action executor.');
     case 'rollback.staging':
       args.push('rollback', 'staging');
       pushOpt('--task', flags.task);
@@ -706,6 +712,67 @@ function runCliWithJson(cwd: string, args: string[], env: NodeJS.ProcessEnv = pr
     stderr,
     parsed,
   };
+}
+
+function runCatchupBase(cwd: string): { ok: boolean; exitCode: number; stdout: string; stderr: string; parsed: unknown } {
+  const context = resolveWorkflowContext(cwd);
+  const baseBranch = context.config.baseBranch;
+  const currentBranch = spawnSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const current = currentBranch.stdout?.trim() ?? '';
+  if (currentBranch.status !== 0) {
+    return gitActionResult(false, currentBranch.status ?? 1, '', currentBranch.stderr?.trim() || 'Could not read the current branch.', null);
+  }
+  if (current !== baseBranch) {
+    return gitActionResult(
+      false,
+      1,
+      '',
+      `Refusing to catch up ${baseBranch} while this checkout is on ${current || 'an unknown branch'}.`,
+      { baseBranch, currentBranch: current },
+    );
+  }
+
+  const fetch = spawnSync('git', ['fetch', 'origin', baseBranch], {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (fetch.status !== 0) {
+    return gitActionResult(false, fetch.status ?? 1, fetch.stdout?.trim() ?? '', fetch.stderr?.trim() || `git fetch origin ${baseBranch} failed.`, null);
+  }
+
+  const merge = spawnSync('git', ['merge', '--ff-only', `origin/${baseBranch}`], {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const head = spawnSync('git', ['rev-parse', 'HEAD'], {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const parsed = {
+    baseBranch,
+    currentBranch: current,
+    head: head.status === 0 ? head.stdout.trim() : '',
+    fetch: fetch.stdout.trim(),
+    merge: merge.stdout.trim(),
+  };
+  return gitActionResult(
+    merge.status === 0,
+    merge.status ?? 1,
+    JSON.stringify(parsed),
+    merge.stderr?.trim() ?? '',
+    parsed,
+  );
+}
+
+function gitActionResult(ok: boolean, exitCode: number, stdout: string, stderr: string, parsed: unknown): { ok: boolean; exitCode: number; stdout: string; stderr: string; parsed: unknown } {
+  return { ok, exitCode, stdout, stderr, parsed };
 }
 
 function resolveCliEntry(): string {
