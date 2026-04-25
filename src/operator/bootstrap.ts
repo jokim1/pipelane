@@ -6,6 +6,7 @@ import { resolvePipelaneInstallSpec } from './install-source.ts';
 
 export interface BootstrapOptions {
   projectName?: string;
+  yes?: boolean;
 }
 
 export interface BootstrapResult {
@@ -152,8 +153,12 @@ export function parseBootstrapArgs(argv: string[]): BootstrapOptions {
       continue;
     }
     if (token === '--help' || token === '-h') {
-      process.stdout.write('pipelane bootstrap [--project "Project Name"]\n');
+      process.stdout.write('pipelane bootstrap [--yes] [--project "Project Name"]\n');
       process.exit(0);
+    }
+    if (token === '--yes' || token === '-y') {
+      options.yes = true;
+      continue;
     }
     throw new Error(`Unknown flag for pipelane bootstrap: ${token}`);
   }

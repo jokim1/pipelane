@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cpSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer as createNetServer } from 'node:net';
@@ -14,6 +14,7 @@ const KIT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const CLI_PATH = path.join(KIT_ROOT, 'src', 'cli.ts');
 const FIXTURE_ROOT = path.join(KIT_ROOT, 'test', 'fixtures', 'sample-repo');
 const DEFAULT_CODEX_HOME = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-global-'));
+const DEFAULT_PIPELANE_HOME = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-global-'));
 const LOCAL_PIPELANE_INSTALL_SPEC = `file:${KIT_ROOT}`;
 
 // Mark this process + every child spawn as a test run. Production-gated test
@@ -34,7 +35,7 @@ function run(command, args, cwd, env = {}) {
 function runCli(args, cwd, env = {}, allowFailure = false) {
   const result = spawnSync('node', [CLI_PATH, ...args], {
     cwd,
-    env: { ...process.env, CODEX_HOME: DEFAULT_CODEX_HOME, ...env },
+    env: { ...process.env, CODEX_HOME: DEFAULT_CODEX_HOME, PIPELANE_HOME: DEFAULT_PIPELANE_HOME, ...env },
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -818,7 +819,7 @@ test('bootstrap installs pipelane, initializes the repo, and seeds the global bo
     execFileSync('git', ['init', '-b', 'main'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
 
     const result = runCli(
-      ['bootstrap', '--project', 'Demo App'],
+      ['bootstrap', '--yes', '--project', 'Demo App'],
       repoRoot,
       { CODEX_HOME: codexHome, PIPELANE_INSTALL_SPEC: LOCAL_PIPELANE_INSTALL_SPEC },
     );
@@ -853,7 +854,7 @@ test('bootstrap in a non-git directory warns that workflow commands still need g
 
   try {
     const result = runCli(
-      ['bootstrap', '--project', 'Demo App'],
+      ['bootstrap', '--yes', '--project', 'Demo App'],
       repoRoot,
       { CODEX_HOME: codexHome, PIPELANE_INSTALL_SPEC: LOCAL_PIPELANE_INSTALL_SPEC },
     );
@@ -866,6 +867,25 @@ test('bootstrap in a non-git directory warns that workflow commands still need g
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('bootstrap without --yes fails before repo writes in non-TTY mode', () => {
+  const repoRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-bootstrap-confirm-'));
+
+  try {
+    const result = runCli(
+      ['bootstrap', '--project', 'Demo App'],
+      repoRoot,
+      { PIPELANE_INSTALL_SPEC: LOCAL_PIPELANE_INSTALL_SPEC },
+      true,
+    );
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Re-run with --yes/);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'package.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
   }
 });
 
@@ -883,6 +903,12 @@ test('smoke and runtime source files are tracked in git so the branch stays self
     }).trim();
     assert.equal(trackedPath, relativePath);
   }
+});
+
+test('skill-rendering module stays pure and placement-free', () => {
+  const content = readFileSync(path.join(KIT_ROOT, 'src', 'operator', 'skill-rendering.ts'), 'utf8');
+  assert.doesNotMatch(content, /from 'node:(fs|path|os)'/);
+  assert.doesNotMatch(content, /from "node:(fs|path|os)"/);
 });
 
 test('smoke plan scaffolds .pipelane/smoke-checks.json from discovered smoke tags', () => {
@@ -1576,16 +1602,19 @@ test('smoke waiver extend enforces maxExtensions and overextended waivers no lon
   }
 });
 
-test('install-codex outside a pipelane repo installs only the global init-pipelane skill', () => {
+test('install-codex outside a pipelane repo installs durable global default skills', () => {
   const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-install-codex-'));
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
   try {
     const result = runCli(['install-codex'], workspaceRoot, { CODEX_HOME: codexHome });
-    assert.match(result.stdout, /\/init-pipelane/);
+    assert.match(result.stdout, /Installed \d+ durable Pipelane Codex commands/);
     assert.ok(existsSync(path.join(codexHome, 'skills', 'init-pipelane', 'SKILL.md')));
-    assert.equal(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')), false);
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')));
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md')));
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane-fix', 'SKILL.md')));
     assert.ok(existsSync(path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane')));
+    assert.ok(existsSync(path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh')));
     assert.match(
       readFileSync(path.join(codexHome, 'skills', '.pipelane', 'bin', 'bootstrap-pipelane.sh'), 'utf8'),
       new RegExp(path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane').replaceAll('\\', '\\\\')),
@@ -1596,20 +1625,19 @@ test('install-codex outside a pipelane repo installs only the global init-pipela
   }
 });
 
-test('install-claude outside a pipelane repo installs the global init-pipelane skill and managed runtime', () => {
+test('install-claude outside a pipelane repo installs durable personal skills and managed runtime', () => {
   const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-install-claude-'));
   const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
 
   try {
     const result = runCli(['install-claude'], workspaceRoot, { CLAUDE_HOME: claudeHome });
-    assert.match(result.stdout, /\/init-pipelane/);
+    assert.match(result.stdout, /Installed \d+ durable Pipelane Claude commands/);
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane', 'bin', 'pipelane')));
-    assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane', 'init-pipelane', 'SKILL.md')));
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'init-pipelane', 'SKILL.md')));
-    assert.equal(
-      realpathSync(path.join(claudeHome, 'skills', 'init-pipelane', 'SKILL.md')),
-      realpathSync(path.join(claudeHome, 'skills', 'pipelane', 'init-pipelane', 'SKILL.md')),
-    );
+    assert.ok(existsSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md')));
+    assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane', 'SKILL.md')));
+    assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane-fix', 'SKILL.md')));
+    assert.match(readFileSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md'), 'utf8'), /disable-model-invocation: true/);
     assert.match(
       readFileSync(path.join(claudeHome, 'skills', 'pipelane', 'bin', 'bootstrap-pipelane.sh'), 'utf8'),
       new RegExp(path.join(claudeHome, 'skills', 'pipelane', 'bin', 'pipelane').replaceAll('\\', '\\\\')),
@@ -1617,6 +1645,104 @@ test('install-claude outside a pipelane repo installs the global init-pipelane s
   } finally {
     rmSync(workspaceRoot, { recursive: true, force: true });
     rmSync(claudeHome, { recursive: true, force: true });
+  }
+});
+
+test('verify treats absent npm guard as optional after durable command installs', () => {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-verify-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+
+  try {
+    runCli(['install-codex'], workspaceRoot, { CODEX_HOME: codexHome, PIPELANE_HOME: pipelaneHome });
+    runCli(['install-claude'], workspaceRoot, { CLAUDE_HOME: claudeHome, PIPELANE_HOME: pipelaneHome });
+
+    const result = runCli(
+      ['verify'],
+      workspaceRoot,
+      { CODEX_HOME: codexHome, CLAUDE_HOME: claudeHome, PIPELANE_HOME: pipelaneHome },
+    );
+
+    assert.match(result.stdout, /SKIP npm guard: not installed \(optional;/);
+    assert.doesNotMatch(result.stdout, /FAIL npm guard/);
+    assert.match(result.stdout, /OK codex optional skill \/fix/);
+    assert.match(result.stdout, /OK claude optional skill \/fix/);
+    assert.match(result.stdout, /OK codex temporary runner self-test/);
+    assert.match(result.stdout, /OK claude temporary runner self-test/);
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('verify fails when a managed skill body drifts even if its marker remains', () => {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-verify-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+
+  try {
+    runCli(['install-codex'], workspaceRoot, { CODEX_HOME: codexHome, PIPELANE_HOME: pipelaneHome });
+    runCli(['install-claude'], workspaceRoot, { CLAUDE_HOME: claudeHome, PIPELANE_HOME: pipelaneHome });
+
+    const codexNewSkill = path.join(codexHome, 'skills', 'new', 'SKILL.md');
+    writeFileSync(
+      codexNewSkill,
+      readFileSync(codexNewSkill, 'utf8').replace('run-pipelane.sh" new', 'run-pipelane.sh" status'),
+      'utf8',
+    );
+
+    const result = runCli(
+      ['verify'],
+      workspaceRoot,
+      { CODEX_HOME: codexHome, CLAUDE_HOME: claudeHome, PIPELANE_HOME: pipelaneHome },
+      true,
+    );
+
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /FAIL codex skill \/new: content drift/);
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('verify executes the Claude durable runner self-test', () => {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-verify-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+
+  try {
+    runCli(['install-codex'], workspaceRoot, { CODEX_HOME: codexHome, PIPELANE_HOME: pipelaneHome });
+    runCli(['install-claude'], workspaceRoot, { CLAUDE_HOME: claudeHome, PIPELANE_HOME: pipelaneHome });
+    writeFileSync(
+      path.join(claudeHome, 'skills', 'pipelane', 'bin', 'pipelane'),
+      '#!/bin/sh\necho claude runner broken >&2\nexit 7\n',
+      { mode: 0o755, encoding: 'utf8' },
+    );
+
+    const result = runCli(
+      ['verify'],
+      workspaceRoot,
+      { CODEX_HOME: codexHome, CLAUDE_HOME: claudeHome, PIPELANE_HOME: pipelaneHome },
+      true,
+    );
+
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /OK codex temporary runner self-test/);
+    assert.match(result.stdout, /FAIL claude temporary runner self-test/);
+    assert.match(result.stdout, /claude runner broken/);
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
   }
 });
 
@@ -3149,7 +3275,124 @@ test('tracked Codex wrapper falls back to the managed Codex runtime when node_mo
   }
 });
 
-test('install-codex prunes legacy machine-local wrapper skills while keeping init-pipelane', () => {
+test('durable Codex runner marks managed fallback and dispatches /pipelane status', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    runCli(['install-codex'], repoRoot, { CODEX_HOME: codexHome });
+    const managedBin = path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane');
+    writeFileSync(
+      managedBin,
+      '#!/bin/sh\necho "MANAGED:$PIPELANE_MANAGED_RUNTIME:$PIPELANE_MANAGED_RUNTIME_ROOT:$*"\n',
+      { mode: 0o755, encoding: 'utf8' },
+    );
+
+    const output = execFileSync(
+      path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      ['pipelane', 'status', '--json'],
+      {
+        cwd: repoRoot,
+        env: { ...process.env, CODEX_HOME: codexHome },
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    ).trim();
+
+    assert.equal(output, `MANAGED:1:${path.join(codexHome, 'skills', '.pipelane')}:run status --json`);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('managed CLI re-exec removes managed runtime markers before launching repo-local pipelane', () => {
+  const repoRoot = createRepo();
+
+  try {
+    mkdirSync(path.join(repoRoot, 'node_modules', '.bin'), { recursive: true });
+    writeFileSync(
+      path.join(repoRoot, 'node_modules', '.bin', 'pipelane'),
+      `#!/bin/sh
+if env | grep '^PIPELANE_MANAGED_RUNTIME=' >/dev/null; then
+  echo managed-runtime-present
+else
+  echo managed-runtime-absent
+fi
+if env | grep '^PIPELANE_MANAGED_RUNTIME_ROOT=' >/dev/null; then
+  echo managed-root-present
+else
+  echo managed-root-absent
+fi
+echo "args:$*"
+`,
+      { mode: 0o755, encoding: 'utf8' },
+    );
+
+    const result = spawnSync('node', [CLI_PATH, 'run', 'status'], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        PIPELANE_MANAGED_RUNTIME: '1',
+        PIPELANE_MANAGED_RUNTIME_ROOT: '/tmp/pipelane-managed-runtime',
+      },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /managed-runtime-absent/);
+    assert.match(result.stdout, /managed-root-absent/);
+    assert.match(result.stdout, /args:run status/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('durable default command path does not write repo-local adapters in a Rocketboard-shaped repo', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+
+  try {
+    writeFileSync(
+      path.join(repoRoot, '.gitignore'),
+      '.claude/\n.agents/\n.pipelane/\n.pipelane.json\nnode_modules/\n',
+      'utf8',
+    );
+    const packageBefore = readFileSync(path.join(repoRoot, 'package.json'), 'utf8');
+    runCli(['install-codex'], repoRoot, { CODEX_HOME: codexHome });
+    writeFileSync(
+      path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane'),
+      `#!/bin/sh\nexec node "${CLI_PATH}" "$@"\n`,
+      { mode: 0o755, encoding: 'utf8' },
+    );
+
+    const output = execFileSync(
+      path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      ['status', '--json'],
+      {
+        cwd: repoRoot,
+        env: { ...process.env, CODEX_HOME: codexHome, PIPELANE_HOME: pipelaneHome },
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+
+    assert.match(output, /"ok": true/);
+    assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
+    assert.equal(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'), packageBefore);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('install-codex upgrades legacy machine-local wrapper skills in place', () => {
   const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-install-codex-'));
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
@@ -3159,12 +3402,38 @@ test('install-codex prunes legacy machine-local wrapper skills while keeping ini
     const result = runCli(['install-codex'], workspaceRoot, { CODEX_HOME: codexHome });
     assert.match(result.stdout, /Removed legacy machine-local wrapper skills: new, pr, resume/);
 
-    assert.equal(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')), false);
-    assert.equal(existsSync(path.join(codexHome, 'skills', 'resume', 'SKILL.md')), false);
-    assert.equal(existsSync(path.join(codexHome, 'skills', 'pr', 'SKILL.md')), false);
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')));
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'resume', 'SKILL.md')));
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'pr', 'SKILL.md')));
+    assert.match(readFileSync(path.join(codexHome, 'skills', 'new', 'SKILL.md'), 'utf8'), /pipelane:codex-global-skill:new/);
     assert.ok(existsSync(path.join(codexHome, 'skills', 'init-pipelane', 'SKILL.md')));
-    assert.equal(existsSync(path.join(codexHome, 'skills', '.pipelane', 'managed-skills.json')), false);
-    assert.equal(existsSync(path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh')), false);
+    assert.ok(existsSync(path.join(codexHome, 'skills', '.pipelane', 'managed-skills.json')));
+    assert.ok(existsSync(path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh')));
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('install-codex fails closed when a user skill only contains legacy prose', () => {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-install-codex-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    mkdirSync(path.join(codexHome, 'skills', 'new'), { recursive: true });
+    writeFileSync(
+      path.join(codexHome, 'skills', 'new', 'SKILL.md'),
+      'custom user skill\nRun the generic pipelane wrapper for this repo.\n',
+      'utf8',
+    );
+
+    const result = runCli(['install-codex'], workspaceRoot, { CODEX_HOME: codexHome }, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Codex skill alias collision/);
+    assert.equal(
+      readFileSync(path.join(codexHome, 'skills', 'new', 'SKILL.md'), 'utf8'),
+      'custom user skill\nRun the generic pipelane wrapper for this repo.\n',
+    );
   } finally {
     rmSync(workspaceRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -3179,12 +3448,62 @@ test('install-codex upgrades a legacy managed init-pipelane skill in place', () 
     seedLegacyCodexBootstrapSkill(codexHome);
 
     const result = runCli(['install-codex'], workspaceRoot, { CODEX_HOME: codexHome });
-    assert.match(result.stdout, /\/init-pipelane/);
+    assert.match(result.stdout, /Installed \d+ durable Pipelane Codex commands/);
 
     const skillPath = path.join(codexHome, 'skills', 'init-pipelane', 'SKILL.md');
     const skill = readFileSync(skillPath, 'utf8');
-    assert.match(skill, /pipelane:codex-bootstrap:init-pipelane/);
+    assert.match(skill, /pipelane:codex-global-skill:init-pipelane/);
     assert.match(skill, /Run the global pipelane bootstrap for this machine\./);
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('install-codex skips unmanaged /fix without blocking /pipelane-fix', () => {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-install-codex-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    mkdirSync(path.join(codexHome, 'skills', 'fix'), { recursive: true });
+    writeFileSync(path.join(codexHome, 'skills', 'fix', 'SKILL.md'), 'custom fix skill\n', 'utf8');
+
+    const result = runCli(['install-codex'], workspaceRoot, { CODEX_HOME: codexHome });
+    assert.match(result.stdout, /Skipped unmanaged optional skills: \/fix/);
+    assert.equal(readFileSync(path.join(codexHome, 'skills', 'fix', 'SKILL.md'), 'utf8'), 'custom fix skill\n');
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane-fix', 'SKILL.md')));
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')));
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('install-codex ignores unsafe managed manifest skill names instead of deleting outside skills root', () => {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-install-codex-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const outsideDir = path.join(codexHome, 'outside-skill');
+  const outsideSkill = path.join(outsideDir, 'SKILL.md');
+
+  try {
+    mkdirSync(path.join(codexHome, 'skills', '.pipelane'), { recursive: true });
+    mkdirSync(outsideDir, { recursive: true });
+    writeFileSync(
+      path.join(codexHome, 'skills', '.pipelane', 'managed-skills.json'),
+      `${JSON.stringify({ skills: ['../outside-skill'] }, null, 2)}\n`,
+      'utf8',
+    );
+    writeFileSync(
+      outsideSkill,
+      '<!-- pipelane:codex-global-skill:new -->\nshould never be deleted\n',
+      'utf8',
+    );
+
+    runCli(['install-codex'], workspaceRoot, { CODEX_HOME: codexHome });
+    assert.equal(
+      readFileSync(outsideSkill, 'utf8'),
+      '<!-- pipelane:codex-global-skill:new -->\nshould never be deleted\n',
+    );
   } finally {
     rmSync(workspaceRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -11623,6 +11942,162 @@ test('buildSmokeHandoffMessage before-deploy-prod: optional+unconfigured does no
     stage: 'before-deploy-prod',
   });
   assert.equal(msg.blocks, false);
+});
+
+test('npm guard blocks install-like commands when node_modules is a symlink and delegates safe commands', async () => {
+  const guard = await import(path.join(KIT_ROOT, 'src', 'operator', 'npm-guard-install.ts'));
+  const homeDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-npm-guard-home-'));
+  const root = mkdtempSync(path.join(os.tmpdir(), 'pipelane-npm-guard-test-'));
+
+  try {
+    const fakeBin = path.join(root, 'fake-bin');
+    const stateFile = path.join(root, 'npm-state.json');
+    mkdirSync(fakeBin, { recursive: true });
+    writeFileSync(
+      path.join(fakeBin, 'npm'),
+      `#!/usr/bin/env node
+const fs = require('node:fs');
+fs.writeFileSync(process.env.NPM_GUARD_STATE, JSON.stringify(process.argv.slice(2)) + '\\n', 'utf8');
+process.exit(0);
+`,
+      { mode: 0o755, encoding: 'utf8' },
+    );
+
+    const nodeBinDir = path.dirname(process.execPath);
+    const install = guard.installNpmGuard({ homeDir, envPath: `${path.join(homeDir, 'bin')}${path.delimiter}${fakeBin}${path.delimiter}${nodeBinDir}` });
+    const shared = path.join(root, 'shared');
+    const worktree = path.join(root, 'worktree');
+    mkdirSync(path.join(shared, 'node_modules'), { recursive: true });
+    mkdirSync(worktree, { recursive: true });
+    symlinkSync(path.join(shared, 'node_modules'), path.join(worktree, 'node_modules'), 'dir');
+
+    const baseEnv = {
+      ...process.env,
+      PATH: `${install.binDir}${path.delimiter}${fakeBin}${path.delimiter}${nodeBinDir}`,
+      NPM_GUARD_STATE: stateFile,
+    };
+    const blocked = spawnSync(install.shimPath, ['install'], {
+      cwd: worktree,
+      env: baseEnv,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /Refusing npm install/);
+    assert.equal(existsSync(stateFile), false, 'real npm should not run when guard blocks');
+
+    const blockedAbsolutePrefix = spawnSync(install.shimPath, ['--prefix', worktree, 'install'], {
+      cwd: worktree,
+      env: baseEnv,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(blockedAbsolutePrefix.status, 1);
+    assert.match(blockedAbsolutePrefix.stderr, /Refusing npm install/);
+    assert.equal(existsSync(stateFile), false, 'real npm should not run for an absolute --prefix that targets this worktree');
+
+    const blockedTrailingPrefix = spawnSync(install.shimPath, ['install', '--prefix', worktree], {
+      cwd: worktree,
+      env: baseEnv,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(blockedTrailingPrefix.status, 1);
+    assert.match(blockedTrailingPrefix.stderr, /Refusing npm install/);
+    assert.equal(existsSync(stateFile), false, 'real npm should not run when --prefix appears after the command');
+
+    const delegatedGlobal = spawnSync(install.shimPath, ['install', '-g', 'left-pad'], {
+      cwd: worktree,
+      env: baseEnv,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(delegatedGlobal.status, 0, delegatedGlobal.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')), ['install', '-g', 'left-pad']);
+    rmSync(stateFile, { force: true });
+
+    const delegated = spawnSync(install.shimPath, ['run', 'test'], {
+      cwd: worktree,
+      env: baseEnv,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(delegated.status, 0, delegated.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')), ['run', 'test']);
+  } finally {
+    rmSync(homeDir, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('npm guard bypass delegates install-like commands and prints a warning', async () => {
+  const guard = await import(path.join(KIT_ROOT, 'src', 'operator', 'npm-guard-install.ts'));
+  const homeDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-npm-guard-home-'));
+  const root = mkdtempSync(path.join(os.tmpdir(), 'pipelane-npm-guard-test-'));
+
+  try {
+    const fakeBin = path.join(root, 'fake-bin');
+    const stateFile = path.join(root, 'npm-state.json');
+    mkdirSync(fakeBin, { recursive: true });
+    writeFileSync(
+      path.join(fakeBin, 'npm'),
+      `#!/usr/bin/env node
+const fs = require('node:fs');
+fs.writeFileSync(process.env.NPM_GUARD_STATE, JSON.stringify(process.argv.slice(2)) + '\\n', 'utf8');
+process.exit(0);
+`,
+      { mode: 0o755, encoding: 'utf8' },
+    );
+
+    const nodeBinDir = path.dirname(process.execPath);
+    const install = guard.installNpmGuard({ homeDir, envPath: `${path.join(homeDir, 'bin')}${path.delimiter}${fakeBin}${path.delimiter}${nodeBinDir}` });
+    const shared = path.join(root, 'shared');
+    const worktree = path.join(root, 'worktree');
+    mkdirSync(path.join(shared, 'node_modules'), { recursive: true });
+    mkdirSync(worktree, { recursive: true });
+    symlinkSync(path.join(shared, 'node_modules'), path.join(worktree, 'node_modules'), 'dir');
+
+    const delegated = spawnSync(install.shimPath, ['install'], {
+      cwd: worktree,
+      env: {
+        ...process.env,
+        PATH: `${install.binDir}${path.delimiter}${fakeBin}${path.delimiter}${nodeBinDir}`,
+        NPM_GUARD_STATE: stateFile,
+        PIPELANE_NPM_GUARD_BYPASS: '1',
+      },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(delegated.status, 0, delegated.stderr);
+    assert.match(delegated.stderr, /PIPELANE_NPM_GUARD_BYPASS=1/);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')), ['install']);
+  } finally {
+    rmSync(homeDir, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('doctor --check-guard verifies the installed npm guard in the active PATH', () => {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-doctor-guard-'));
+  const homeDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+
+  try {
+    const install = runCli(['install-npm-guard'], workspaceRoot, { PIPELANE_HOME: homeDir });
+    assert.match(install.stdout, /Installed npm guard/);
+    const result = runCli(
+      ['run', 'doctor', '--check-guard'],
+      workspaceRoot,
+      {
+        PIPELANE_HOME: homeDir,
+        PATH: `${path.join(homeDir, 'bin')}${path.delimiter}${process.env.PATH}`,
+      },
+    );
+    assert.match(result.stdout, /Doctor npm guard/);
+    assert.match(result.stdout, /symlinked node_modules block: pass/);
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(homeDir, { recursive: true, force: true });
+  }
 });
 
 const PREINSTALL_GUARD_PATH = path.join(KIT_ROOT, 'scripts', 'preinstall-guard.cjs');

@@ -297,25 +297,33 @@ This repo tracks `AGENTS.md` as the repo policy surface for pipelane.
 
 ### One repo maintainer
 
-1. run `pipelane bootstrap --project "{{DISPLAY_NAME}}"` or `npx -y pipelane@github:jokim1/pipelane#main bootstrap --project "{{DISPLAY_NAME}}"`
+1. run `pipelane bootstrap --yes --project "{{DISPLAY_NAME}}"` or `npx -y pipelane@github:jokim1/pipelane#main bootstrap --project "{{DISPLAY_NAME}}"`
 2. review `.pipelane.json`, especially `aliases` (or the `pipelane` block in
    `package.json` if using the gitignored-config flow)
 3. commit the tracked Pipelane files
 
 ### Each Claude user
 
-1. optional once per machine: run `pipelane install-claude` for the global `/init-pipelane` bootstrap command
+1. optional once per machine: run `pipelane install-claude` for durable default personal skills under `~/.claude/skills`
 2. pull the committed workflow files
 3. open the repo in Claude
 4. reopen or restart Claude if aliases changed or the command files were added while it was already open
 
 ### Each Codex user
 
-1. optional once per machine: run `pipelane install-codex` for the global `/init-pipelane` bootstrap command
+1. optional once per machine: run `pipelane install-codex` for durable default skills under `~/.codex/skills`
 2. pull the committed workflow files
 3. if this machine previously used pipelane's machine-local Codex wrappers, rerun setup once to prune them
 4. open the repo in Codex
 5. reopen or restart Codex if tracked skills or aliases changed while it was already open
+
+### Repos that do not commit Pipelane adapters
+
+Use the machine-local commands from `pipelane install-claude` and
+`pipelane install-codex` only. Do not run `bootstrap` or `/init-pipelane` unless
+you intentionally want generated repo config/adapters/docs. To protect raw npm
+in symlinked worktrees, run `pipelane install-npm-guard`, put `~/.pipelane/bin`
+first in `PATH`, and verify with `pipelane run doctor --check-guard`.
 
 ### Each release operator
 

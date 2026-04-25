@@ -1,14 +1,15 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
+import { readFixPromptBody } from './fix-prompt.ts';
 import { aliasCommandName, readJsonFile, resolveWorkflowAliases, type WorkflowCommand, WORKFLOW_COMMANDS, type WorkflowConfig, writeJsonFile } from './state.ts';
+import { REPO_CODEX_SKILL_MARKER_PREFIX } from './skill-rendering.ts';
 
 const MANAGED_CODEX_SKILLS_FILENAME = '.pipelane-managed.json';
 const MANAGED_CODEX_RUNTIME_DIR = '.pipelane';
 const MANAGED_CODEX_RUNNER = path.join(MANAGED_CODEX_RUNTIME_DIR, 'bin', 'run-pipelane.sh');
 const INIT_PIPELANE_SKILL_NAME = 'init-pipelane';
-const PIPELANE_CODEX_SKILL_MARKER = '<!-- pipelane:codex-skill:';
+const PIPELANE_CODEX_SKILL_MARKER = REPO_CODEX_SKILL_MARKER_PREFIX;
 
 // Fixed-name Codex skills that are NOT workflow-command wrappers. `fix` is a
 // behavioral-discipline prompt, not a shell passthrough — its body is the
@@ -16,14 +17,6 @@ const PIPELANE_CODEX_SKILL_MARKER = '<!-- pipelane:codex-skill:';
 // Codex frontmatter so the same /fix discipline fires in Codex too.
 const FIX_CODEX_SKILL_NAME = 'fix';
 const MANAGED_EXTRA_CODEX_SKILLS = [FIX_CODEX_SKILL_NAME] as const;
-
-function codexSkillsKitRoot(): string {
-  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-}
-
-function readFixCommandTemplate(): string {
-  return readFileSync(path.join(codexSkillsKitRoot(), 'templates', '.claude', 'commands', 'fix.md'), 'utf8');
-}
 
 // Generate the Codex-side /fix skill from the shared Claude-side prompt body.
 // Single source of truth for the /fix prompt lives in
@@ -33,10 +26,7 @@ function readFixCommandTemplate(): string {
 // consumer hand-edits here would be lost — direct the consumer at the Claude
 // template's extension markers instead).
 function buildFixCodexSkill(): string {
-  const raw = readFixCommandTemplate();
-  const body = raw
-    .replace(/^<!-- pipelane:command:fix -->\n/, '')
-    .replace(/\n<!-- pipelane:consumer-extension:start -->\n<!-- pipelane:consumer-extension:end -->\n?$/, '\n');
+  const body = readFixPromptBody();
   return `---
 name: ${FIX_CODEX_SKILL_NAME}
 version: 1.0.0
@@ -111,6 +101,8 @@ codex_home="\${CODEX_HOME:-\${HOME:-}/.codex}"
 global_bin="$codex_home/skills/.pipelane/bin/pipelane"
 if [ -x "$global_bin" ]; then
   cd "$repo_root"
+  export PIPELANE_MANAGED_RUNTIME=1
+  export PIPELANE_MANAGED_RUNTIME_ROOT="$codex_home/skills/.pipelane"
   exec "$global_bin" run "$command" "$@"
 fi
 

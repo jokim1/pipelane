@@ -205,7 +205,7 @@ sense for the repo.
 ```
 npx -y pipelane@github:jokim1/pipelane#main bootstrap --project "My App"  # one-shot bootstrap
 # or, if pipelane is already on PATH:
-pipelane bootstrap --project "My App"
+pipelane bootstrap --yes --project "My App"
 /doctor --fix                            # interactive config wizard (v1)
 /doctor --probe                          # verify healthcheck URLs respond (v1)
 ```
@@ -515,11 +515,12 @@ in `AGENTS.md` where enforcement is social.
 
 | Command | Purpose | Status |
 | --- | --- | --- |
-| `pipelane bootstrap --project "<name>"` | Install pipelane into the repo, scaffold tracked files, and run setup | shipped |
+| `pipelane bootstrap --yes --project "<name>"` | Install pipelane into the repo, scaffold tracked files, and run setup after explicit confirmation | shipped |
 | `npx pipelane init --project "<name>"` | Scaffold tracked files in a repo that already has pipelane installed locally | rename-pending |
 | setup | Install templates, Claude commands, and tracked Codex skills | rename-pending |
-| `pipelane install-claude` | Install the global Claude `/init-pipelane` bootstrap command on this machine | shipped |
-| `pipelane install-codex` | Install the global Codex `/init-pipelane` bootstrap command on this machine | shipped |
+| `pipelane install-claude` | Install durable default Claude personal skills under `~/.claude/skills` | shipped |
+| `pipelane install-codex` | Install durable default Codex skills under `~/.codex/skills` | shipped |
+| `pipelane install-npm-guard` | Install the opt-in `~/.pipelane/bin/npm` guard for symlinked worktree `node_modules` | shipped |
 
 ## Configuration
 
