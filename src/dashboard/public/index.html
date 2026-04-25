@@ -973,6 +973,24 @@
       color: #f1bbbb;
     }
 
+    .mini-pill.cleanup-pending {
+      border-color: rgba(135, 206, 250, 0.42);
+      background: rgba(135, 206, 250, 0.1);
+      color: #b9dcf2;
+    }
+
+    .mini-pill.cleanup-ready {
+      border-color: rgba(88, 214, 141, 0.42);
+      background: rgba(88, 214, 141, 0.1);
+      color: #a7e8bf;
+    }
+
+    .mini-pill.cleanup-blocked {
+      border-color: rgba(255, 107, 107, 0.42);
+      background: rgba(255, 107, 107, 0.1);
+      color: #f1bbbb;
+    }
+
     .ledger-lane-cell {
       min-width: 220px;
       padding-top: 12px;
@@ -2552,7 +2570,11 @@
       return hasActionLock() && state.lastActionContext?.scope === 'board';
     }
 
-    function actionControlDisabled(scope, branchName = '') {
+    function actionControlDisabled(scope, branchName = '', action = null) {
+      if (action && ['blocked', 'running'].includes(action.state)) {
+        return true;
+      }
+
       if (!hasActionLock()) {
         return false;
       }
@@ -3371,10 +3393,10 @@
     }
 
     function cleanupCardPresentation(branch, activeLane) {
-      if (branch.cleanup?.eligible) {
+      if (branch.cleanup?.available) {
         return {
           tone: 'cleanup',
-          stateLabel: 'Stale',
+          stateLabel: branch.cleanup.eligible ? 'Cleanup' : 'Pending',
           reason: branch.cleanup.reason || activeLane.lane.reason || 'This branch is live and ready for cleanup.',
         };
       }
@@ -3467,7 +3489,7 @@
                 data-action-trigger="${escapeHtml(cleanAction.id)}"
                 data-action-scope="board"
                 ${titleAttr(cleanAction.reason)}
-                ${actionControlDisabled('board') ? 'disabled' : ''}
+                ${actionControlDisabled('board', '', cleanAction) ? 'disabled' : ''}
               >
                 ${escapeHtml(cleanAction.label || 'Clean')}
               </button>
@@ -3492,7 +3514,7 @@
                 <div class="menu-popover ${state.devModeMenuOpen ? 'open' : ''}">
                   ${modeActions.length
                     ? modeActions.map((action) => `
-                      <button class="menu-item" type="button" data-devmode-action="${escapeHtml(action.id)}" ${actionControlDisabled('board') ? 'disabled' : ''}>
+                      <button class="menu-item" type="button" data-devmode-action="${escapeHtml(action.id)}" ${actionControlDisabled('board', '', action) ? 'disabled' : ''}>
                         <span class="action-label">${escapeHtml(action.label || action.id)}</span>
                         <span class="action-reason">${escapeHtml(action.reason || 'No reason provided.')}</span>
                       </button>
@@ -3590,7 +3612,7 @@
 
       const actionButtons = actions.length
         ? actions.map((action) => `
-            <button class="context-menu-item" type="button" data-context-action="${escapeHtml(action.id)}" data-context-branch="${encodeURIComponent(branchName)}" ${actionControlDisabled('branch', branchName) ? 'disabled' : ''}>
+            <button class="context-menu-item" type="button" data-context-action="${escapeHtml(action.id)}" data-context-branch="${encodeURIComponent(branchName)}" ${actionControlDisabled('branch', branchName, action) ? 'disabled' : ''}>
               <span class="action-label">${escapeHtml(action.label || action.id)}</span>
               <span class="action-reason">${escapeHtml(action.reason || 'No reason provided.')}</span>
             </button>
@@ -3660,7 +3682,7 @@
           type="button"
           data-action-trigger="${escapeHtml(action.id)}"
           data-action-scope="${escapeHtml(scope)}"
-          ${actionControlDisabled(scope, branchName) ? 'disabled' : ''}
+          ${actionControlDisabled(scope, branchName, action) ? 'disabled' : ''}
           ${titleAttr(action.reason)}
         >
           <span class="action-label">${escapeHtml(action.label || action.id)}</span>
@@ -4106,9 +4128,9 @@
 
         <div>
           <div class="panel-title">Cleanup</div>
-          <article class="lane-card ${detailBranch.cleanup?.eligible ? 'state-degraded' : 'state-unknown'}">
+          <article class="lane-card ${detailBranch.cleanup?.available ? (detailBranch.cleanup?.eligible ? 'state-degraded' : 'state-awaiting_preflight') : 'state-unknown'}">
             <div class="lane-head">
-              <strong>${escapeHtml(detailBranch.cleanup?.eligible ? 'Stale cleanup candidate' : 'Hold')}</strong>
+              <strong>${escapeHtml(detailBranch.cleanup?.available ? (detailBranch.cleanup?.eligible ? 'Cleanup available' : 'Cleanup pending') : 'Hold')}</strong>
               <span class="mini-pill ${detailBranch.cleanup?.tag ? `cleanup-${escapeHtml(detailBranch.cleanup.tag)}` : ''}">${escapeHtml(detailBranch.cleanup?.tag || 'unknown')}</span>
             </div>
             <div class="reason-block">${escapeHtml(detailBranch.cleanup?.reason || 'No cleanup guidance provided.')}</div>

@@ -5745,6 +5745,71 @@ test('api snapshot tags stale cleanup candidates and exposes apply-all-stale act
   }
 });
 
+test('api snapshot exposes scoped cleanup after production verification and explains prune floor', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Verified Cleanup', '--json'], repoRoot).stdout);
+    const mergedSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(path.join(stateDir, 'pr-state.json'), JSON.stringify({
+      records: {
+        'verified-cleanup': {
+          taskSlug: 'verified-cleanup',
+          branchName: created.branch,
+          title: 'Verified cleanup',
+          number: 42,
+          url: 'https://example.test/pr/42',
+          mergedSha,
+          mergedAt: '2026-04-17T00:00:00Z',
+          updatedAt: '2026-04-17T00:00:00Z',
+        },
+      },
+    }, null, 2), 'utf8');
+    await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, ['frontend'], { taskSlug: 'verified-cleanup' });
+
+    const pendingEnvelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    const pendingBranch = pendingEnvelope.data.branches.find((entry) => entry.task?.taskSlug === 'verified-cleanup');
+    assert.ok(pendingBranch, 'verified branch row is present');
+    assert.equal(pendingBranch.cleanup.available, true);
+    assert.equal(pendingBranch.cleanup.eligible, false);
+    assert.equal(pendingBranch.cleanup.stale, false);
+    assert.equal(pendingBranch.cleanup.tag, 'pending');
+    assert.match(pendingBranch.cleanup.reason, /5-minute prune floor/);
+    const pendingClean = pendingBranch.availableActions.find((action) => action.id === 'clean.apply');
+    assert.ok(pendingClean, 'branch exposes cleanup action during prune-floor wait');
+    assert.equal(pendingClean.state, 'blocked');
+    assert.deepEqual(pendingClean.defaultParams, { task: 'verified-cleanup' });
+    assert.equal(
+      pendingEnvelope.data.availableActions.some((action) => action.id === 'clean.apply'),
+      false,
+      'repo-wide all-stale cleanup stays hidden for non-stale completed tasks',
+    );
+
+    const lockPath = path.join(stateDir, 'task-locks', 'verified-cleanup.json');
+    const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+    lock.updatedAt = '2026-04-17T00:00:00Z';
+    writeFileSync(lockPath, JSON.stringify(lock, null, 2), 'utf8');
+
+    const readyEnvelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    const readyBranch = readyEnvelope.data.branches.find((entry) => entry.task?.taskSlug === 'verified-cleanup');
+    assert.equal(readyBranch.cleanup.available, true);
+    assert.equal(readyBranch.cleanup.eligible, true);
+    assert.equal(readyBranch.cleanup.stale, false);
+    assert.equal(readyBranch.cleanup.tag, 'ready');
+    assert.match(readyBranch.cleanup.reason, /prod is verified/);
+    const readyClean = readyBranch.availableActions.find((action) => action.id === 'clean.apply');
+    assert.equal(readyClean.state, 'awaiting_preflight');
+    assert.deepEqual(readyClean.defaultParams, { task: 'verified-cleanup' });
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('clean --apply without scope refuses to run', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {

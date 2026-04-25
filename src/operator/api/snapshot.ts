@@ -39,6 +39,7 @@ import {
   observeFrontendRuntime,
   type FrontendRuntimeObservation,
 } from '../runtime-observation.ts';
+import { TASK_LOCK_MIN_PRUNE_AGE_MS } from '../task-workspaces.ts';
 import {
   buildApiActionState,
   buildApiEnvelope,
@@ -479,7 +480,7 @@ function buildBoardActions(options: {
   branches: BranchRow[];
   checkedAt: string;
 }): ApiActionState[] {
-  const staleCount = options.branches.filter((branch) => branch.cleanup?.eligible).length;
+  const staleCount = options.branches.filter((branch) => branch.cleanup?.stale && branch.cleanup?.eligible).length;
   const cleanupActions = [
     buildApiActionState({
       id: 'clean.plan',
@@ -1423,21 +1424,6 @@ function buildBranchRow(options: {
   const dirty = worktreeExists ? isWorktreeDirty(lock.worktreePath) : false;
   const branchExists = Boolean(runGit(options.repoRoot, ['rev-parse', '--verify', lock.branchName], true));
   const isMerged = Boolean(prRecord?.mergedSha);
-  const cleanupEvidence = [
-    ...(!worktreeExists ? [`saved worktree ${lock.worktreePath} no longer exists`] : []),
-    ...(!branchExists ? [`saved branch ${lock.branchName} no longer exists`] : []),
-  ];
-  const cleanupEligible = cleanupEvidence.length > 0;
-  const cleanupTag = cleanupEligible
-    ? 'stale'
-    : dirty
-      ? 'dirty'
-      : 'active';
-  const cleanupReason = cleanupEligible
-    ? cleanupEvidence.join('; ')
-    : dirty
-      ? 'dirty worktree'
-      : 'workspace still active';
 
   const localCell: ApiStatusCell = !worktreeExists
     ? buildApiStatusCell({ state: 'unknown', reason: 'worktree no longer exists', detail: lock.worktreePath, checkedAt, stale: true })
@@ -1477,6 +1463,14 @@ function buildBranchRow(options: {
     deployRecords,
     checkedAt,
   });
+  const cleanup = buildBranchCleanup({
+    lock,
+    worktreeExists,
+    branchExists,
+    dirty,
+    prodVerified: Boolean(prRecord?.mergedSha) && productionCell.state === 'healthy',
+    checkedAt,
+  });
 
   const note = !worktreeExists
     ? `worktree missing at ${lock.worktreePath}`
@@ -1513,12 +1507,12 @@ function buildBranchRow(options: {
     },
     surfaces: lock.surfaces ?? [],
     cleanup: {
-      available: cleanupEligible,
-      eligible: cleanupEligible,
-      reason: cleanupReason,
-      stale: cleanupEligible,
-      tag: cleanupTag,
-      evidence: cleanupEvidence,
+      available: cleanup.available,
+      eligible: cleanup.eligible,
+      reason: cleanup.reason,
+      stale: cleanup.stale,
+      tag: cleanup.tag,
+      evidence: cleanup.evidence,
     },
     pr: prRecord
       ? {
@@ -1546,9 +1540,99 @@ function buildBranchRow(options: {
       prCell,
       stagingCell,
       productionCell,
+      cleanup,
+      taskSlug: lock.taskSlug,
       checkedAt,
     }),
   };
+}
+
+function buildBranchCleanup(options: {
+  lock: TaskLock;
+  worktreeExists: boolean;
+  branchExists: boolean;
+  dirty: boolean;
+  prodVerified: boolean;
+  checkedAt: string;
+}): BranchRow['cleanup'] {
+  const { lock, worktreeExists, branchExists, dirty, prodVerified, checkedAt } = options;
+  const evidence = [
+    ...(!worktreeExists ? [`saved worktree ${lock.worktreePath} no longer exists`] : []),
+    ...(!branchExists ? [`saved branch ${lock.branchName} no longer exists`] : []),
+  ];
+
+  if (evidence.length > 0) {
+    return {
+      available: true,
+      eligible: true,
+      reason: evidence.join('; '),
+      stale: true,
+      tag: 'stale',
+      evidence,
+    };
+  }
+
+  if (dirty) {
+    return {
+      available: false,
+      eligible: false,
+      reason: 'dirty worktree',
+      stale: false,
+      tag: 'dirty',
+      evidence: [],
+    };
+  }
+
+  if (!prodVerified) {
+    return {
+      available: false,
+      eligible: false,
+      reason: 'workspace still active',
+      stale: false,
+      tag: 'active',
+      evidence: [],
+    };
+  }
+
+  const ageMs = lockAgeMs(lock.updatedAt, Date.parse(checkedAt));
+  if (ageMs === null) {
+    return {
+      available: true,
+      eligible: false,
+      reason: `prod is verified, but cleanup is blocked because updatedAt is missing or unparseable ("${lock.updatedAt ?? ''}")`,
+      stale: false,
+      tag: 'blocked',
+      evidence: [],
+    };
+  }
+
+  if (ageMs < TASK_LOCK_MIN_PRUNE_AGE_MS) {
+    const waitSeconds = Math.ceil((TASK_LOCK_MIN_PRUNE_AGE_MS - ageMs) / 1000);
+    return {
+      available: true,
+      eligible: false,
+      reason: `prod is verified; cleanup unlocks after the 5-minute prune floor in about ${waitSeconds}s`,
+      stale: false,
+      tag: 'pending',
+      evidence: [],
+    };
+  }
+
+  return {
+    available: true,
+    eligible: true,
+    reason: 'prod is verified; this task lock can be cleaned with /clean --apply --task',
+    stale: false,
+    tag: 'ready',
+    evidence: [],
+  };
+}
+
+function lockAgeMs(updatedAt: string | undefined, now: number): number | null {
+  if (!updatedAt || !Number.isFinite(now)) return null;
+  const parsed = Date.parse(updatedAt);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.max(0, now - parsed);
 }
 
 function buildBranchActions(options: {
@@ -1560,10 +1644,12 @@ function buildBranchActions(options: {
   prCell: ApiStatusCell;
   stagingCell: ApiStatusCell;
   productionCell: ApiStatusCell;
+  cleanup: BranchRow['cleanup'];
+  taskSlug: string;
   checkedAt: string;
 }): ApiActionState[] {
   const actions: ApiActionState[] = [];
-  const { worktreeExists, dirty, prRecord, mode, localCell, prCell, stagingCell, productionCell, checkedAt } = options;
+  const { worktreeExists, dirty, prRecord, mode, localCell, prCell, stagingCell, productionCell, cleanup, taskSlug, checkedAt } = options;
 
   if (!prRecord) {
     actions.push(buildApiActionState({
@@ -1621,14 +1707,15 @@ function buildBranchActions(options: {
     }
   }
 
-  if (!worktreeExists) {
+  if (cleanup.available) {
     actions.push(buildApiActionState({
       id: 'clean.apply',
-      label: 'Clean task record',
-      state: 'awaiting_preflight',
-      reason: 'prune the stale Pipelane task lock for this branch',
+      label: cleanup.eligible ? 'Clean task record' : 'Clean task record pending',
+      state: cleanup.eligible ? 'awaiting_preflight' : 'blocked',
+      reason: cleanup.reason || 'prune the Pipelane task lock for this branch',
       risky: true,
       requiresConfirmation: true,
+      defaultParams: { task: taskSlug },
       checkedAt,
     }));
   }
