@@ -5544,6 +5544,45 @@ test('clean --apply --all-stale prunes stale task locks', () => {
   }
 });
 
+test('api snapshot tags stale cleanup candidates and exposes apply-all-stale action', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Stale Candidate', '--json'], repoRoot).stdout);
+
+    execFileSync('git', ['worktree', 'remove', '--force', created.worktreePath], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    execFileSync('git', ['branch', '-D', created.branch], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    const branch = envelope.data.branches.find((entry) => entry.task?.taskSlug === 'stale-candidate');
+    assert.ok(branch, 'stale candidate branch row is present');
+    assert.equal(branch.cleanup.tag, 'stale');
+    assert.equal(branch.cleanup.stale, true);
+    assert.equal(branch.cleanup.eligible, true);
+    assert.match(branch.cleanup.reason, /worktree/);
+    assert.match(branch.cleanup.reason, /branch/);
+    assert.ok(branch.cleanup.evidence.some((entry) => entry.includes('worktree')));
+    assert.ok(branch.cleanup.evidence.some((entry) => entry.includes('branch')));
+
+    const applyStale = envelope.data.availableActions.find((action) => action.id === 'clean.apply');
+    assert.ok(applyStale, 'blanket stale cleanup action is exposed when stale candidates exist');
+    assert.deepEqual(applyStale.defaultParams, { allStale: true });
+    assert.equal(applyStale.risky, true);
+    assert.equal(applyStale.requiresConfirmation, true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('clean --apply without scope refuses to run', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
@@ -6205,20 +6244,33 @@ test('api snapshot emits a wire-compatible envelope', () => {
     assert.ok(Array.isArray(availableActions));
     assert.deepEqual(
       availableActions.map((action) => action.id),
-      ['devmode.release'],
-      'snapshot should expose the repo-level mode switch for the board',
+      ['clean.plan', 'devmode.release'],
+      'snapshot should expose repo-level cleanup and mode switch actions for the board',
     );
-    assert.equal(availableActions[0].label, 'Switch to release mode');
-    assert.equal(availableActions[0].risky, false);
-    assert.equal(availableActions[0].requiresConfirmation, false);
-    assert.deepEqual(availableActions[0].defaultParams, { override: true });
-    assert.equal(availableActions[0].inputs[0].name, 'reason');
-    assert.equal(availableActions[0].inputs[0].required, true);
+    const cleanPlan = availableActions.find((action) => action.id === 'clean.plan');
+    assert.equal(cleanPlan.label, 'Clean');
+    assert.equal(cleanPlan.risky, false);
+    assert.equal(cleanPlan.requiresConfirmation, false);
+    const devmodeRelease = availableActions.find((action) => action.id === 'devmode.release');
+    assert.equal(devmodeRelease.label, 'Switch to release mode');
+    assert.equal(devmodeRelease.risky, false);
+    assert.equal(devmodeRelease.requiresConfirmation, false);
+    assert.deepEqual(devmodeRelease.defaultParams, { override: true });
+    assert.equal(devmodeRelease.inputs[0].name, 'reason');
+    assert.equal(devmodeRelease.inputs[0].required, true);
 
     assert.ok(Array.isArray(branches) && branches.length === 1);
     const [branch] = branches;
     assert.match(branch.name, /^codex\/snapshot-task-[a-f0-9]{4}$/);
     assert.equal(branch.task.taskSlug, 'snapshot-task');
+    assert.deepEqual(branch.cleanup, {
+      available: false,
+      eligible: false,
+      reason: 'workspace still active',
+      stale: false,
+      tag: 'active',
+      evidence: [],
+    });
     for (const laneKey of ['local', 'pr', 'base', 'staging', 'production']) {
       assert.ok(branch.lanes[laneKey], `lane ${laneKey} present`);
       assert.ok(typeof branch.lanes[laneKey].state === 'string');
@@ -6735,8 +6787,8 @@ test('api action execute: devmode actions switch the repo mode', () => {
     assert.equal(releaseSnapshot.data.boardContext.mode, 'release');
     assert.deepEqual(
       releaseSnapshot.data.availableActions.map((action) => action.id),
-      ['devmode.build'],
-      'release mode should expose the switch back to build mode',
+      ['clean.plan', 'devmode.build'],
+      'release mode should expose cleanup and the switch back to build mode',
     );
 
     const buildResult = runCli(['run', 'api', 'action', 'devmode.build', '--execute'], repoRoot);
@@ -6748,8 +6800,8 @@ test('api action execute: devmode actions switch the repo mode', () => {
     assert.equal(buildSnapshot.data.boardContext.mode, 'build');
     assert.deepEqual(
       buildSnapshot.data.availableActions.map((action) => action.id),
-      ['devmode.release'],
-      'build mode should expose the switch to release mode',
+      ['clean.plan', 'devmode.release'],
+      'build mode should expose cleanup and the switch to release mode',
     );
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });

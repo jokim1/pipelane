@@ -85,7 +85,14 @@ export interface BranchRow {
     promotedWithoutStagingSmoke: boolean;
   } | null;
   surfaces: string[];
-  cleanup: { available: boolean; eligible: boolean; reason: string };
+  cleanup: {
+    available: boolean;
+    eligible: boolean;
+    reason: string;
+    stale: boolean;
+    tag: string;
+    evidence: string[];
+  };
   pr: {
     number: number | null;
     state: 'OPEN' | 'MERGED' | 'CLOSED' | null;
@@ -238,6 +245,7 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
   const branches = buildBranchRows({
     locks,
     config: context.config,
+    repoRoot: context.repoRoot,
     currentBranch,
     baseBranch,
     baseBranchSha,
@@ -459,7 +467,7 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
       },
       sourceHealth,
       attention,
-      availableActions: buildBoardActions({ mode, releaseReadiness, checkedAt }),
+      availableActions: buildBoardActions({ mode, releaseReadiness, branches, checkedAt }),
       branches,
     },
   });
@@ -468,10 +476,39 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
 function buildBoardActions(options: {
   mode: string;
   releaseReadiness: SnapshotData['boardContext']['releaseReadiness'];
+  branches: BranchRow[];
   checkedAt: string;
 }): ApiActionState[] {
+  const staleCount = options.branches.filter((branch) => branch.cleanup?.eligible).length;
+  const cleanupActions = [
+    buildApiActionState({
+      id: 'clean.plan',
+      label: 'Clean',
+      state: 'awaiting_preflight',
+      reason: staleCount > 0
+        ? `preview cleanup status; ${staleCount} stale task lock${staleCount === 1 ? '' : 's'} can be pruned`
+        : 'preview cleanup status and stale task lock assessment',
+      checkedAt: options.checkedAt,
+    }),
+    ...(staleCount > 0
+      ? [
+          buildApiActionState({
+            id: 'clean.apply',
+            label: 'Apply stale cleanup',
+            state: 'awaiting_preflight',
+            reason: `prune ${staleCount} stale task lock${staleCount === 1 ? '' : 's'} with /clean --apply --all-stale`,
+            risky: true,
+            requiresConfirmation: true,
+            defaultParams: { allStale: true },
+            checkedAt: options.checkedAt,
+          }),
+        ]
+      : []),
+  ];
+
   if (options.mode === 'release') {
     return [
+      ...cleanupActions,
       buildApiActionState({
         id: 'devmode.build',
         label: 'Switch to build mode',
@@ -484,6 +521,7 @@ function buildBoardActions(options: {
 
   const releaseReady = options.releaseReadiness.state === 'healthy';
   return [
+    ...cleanupActions,
     buildApiActionState({
       id: 'devmode.release',
       label: 'Switch to release mode',
@@ -862,6 +900,7 @@ interface WorktreeOriginAnalysis {
 export function buildBranchRows(options: {
   locks: TaskLock[];
   config: WorkflowConfig;
+  repoRoot: string;
   currentBranch: string;
   baseBranch: string;
   baseBranchSha: string;
@@ -874,6 +913,7 @@ export function buildBranchRows(options: {
     buildBranchRow({
       lock,
       config: options.config,
+      repoRoot: options.repoRoot,
       currentBranch: options.currentBranch,
       baseBranch: options.baseBranch,
       baseBranchSha: options.baseBranchSha,
@@ -1369,6 +1409,7 @@ function formatAheadBehind(ahead: number, behind: number): string {
 function buildBranchRow(options: {
   lock: TaskLock;
   config: WorkflowConfig;
+  repoRoot: string;
   currentBranch: string;
   baseBranch: string;
   baseBranchSha: string;
@@ -1380,7 +1421,23 @@ function buildBranchRow(options: {
   const { lock, currentBranch, baseBranch, baseBranchSha, prRecord, deployRecords, mode, checkedAt } = options;
   const worktreeExists = existsSync(lock.worktreePath);
   const dirty = worktreeExists ? isWorktreeDirty(lock.worktreePath) : false;
+  const branchExists = Boolean(runGit(options.repoRoot, ['rev-parse', '--verify', lock.branchName], true));
   const isMerged = Boolean(prRecord?.mergedSha);
+  const cleanupEvidence = [
+    ...(!worktreeExists ? [`saved worktree ${lock.worktreePath} no longer exists`] : []),
+    ...(!branchExists ? [`saved branch ${lock.branchName} no longer exists`] : []),
+  ];
+  const cleanupEligible = cleanupEvidence.length > 0;
+  const cleanupTag = cleanupEligible
+    ? 'stale'
+    : dirty
+      ? 'dirty'
+      : 'active';
+  const cleanupReason = cleanupEligible
+    ? cleanupEvidence.join('; ')
+    : dirty
+      ? 'dirty worktree'
+      : 'workspace still active';
 
   const localCell: ApiStatusCell = !worktreeExists
     ? buildApiStatusCell({ state: 'unknown', reason: 'worktree no longer exists', detail: lock.worktreePath, checkedAt, stale: true })
@@ -1456,9 +1513,12 @@ function buildBranchRow(options: {
     },
     surfaces: lock.surfaces ?? [],
     cleanup: {
-      available: !worktreeExists,
-      eligible: !worktreeExists && !dirty,
-      reason: !worktreeExists ? 'worktree already gone' : dirty ? 'dirty worktree' : 'workspace still active',
+      available: cleanupEligible,
+      eligible: cleanupEligible,
+      reason: cleanupReason,
+      stale: cleanupEligible,
+      tag: cleanupTag,
+      evidence: cleanupEvidence,
     },
     pr: prRecord
       ? {

@@ -147,6 +147,27 @@
       gap: 12px;
     }
 
+    .hero-primary-actions {
+      display: flex;
+      align-items: stretch;
+      justify-content: flex-end;
+      gap: 10px;
+      width: 100%;
+    }
+
+    .hero-clean-button {
+      align-self: stretch;
+      min-width: 96px;
+      border-color: rgba(227, 179, 65, 0.42);
+      background: rgba(227, 179, 65, 0.08);
+      color: #f1d892;
+    }
+
+    .hero-clean-button:hover:not(:disabled) {
+      border-color: rgba(227, 179, 65, 0.7);
+      background: rgba(227, 179, 65, 0.14);
+    }
+
     .hero-mode-copy {
       min-width: 0;
       display: flex;
@@ -938,6 +959,18 @@
       color: var(--muted);
       font-size: 11px;
       font-family: var(--mono);
+    }
+
+    .mini-pill.cleanup-stale {
+      border-color: rgba(227, 179, 65, 0.48);
+      background: rgba(227, 179, 65, 0.12);
+      color: #f1d892;
+    }
+
+    .mini-pill.cleanup-dirty {
+      border-color: rgba(255, 107, 107, 0.42);
+      background: rgba(255, 107, 107, 0.1);
+      color: #f1bbbb;
     }
 
     .ledger-lane-cell {
@@ -1817,6 +1850,15 @@
         align-items: flex-start;
       }
 
+      .hero-primary-actions {
+        justify-content: flex-start;
+        flex-wrap: wrap;
+      }
+
+      .hero-clean-button {
+        min-height: 44px;
+      }
+
       .panel-header,
       .panel-body,
       .hero {
@@ -2474,8 +2516,12 @@
       return boardActions().filter((action) => action.id.startsWith('devmode.'));
     }
 
+    function cleanPlanAction() {
+      return boardActions().find((action) => action.id === 'clean.plan') || null;
+    }
+
     function cleanupBoardActions() {
-      return boardActions().filter((action) => !action.id.startsWith('devmode.'));
+      return boardActions().filter((action) => !action.id.startsWith('devmode.') && action.id !== 'clean.plan');
     }
 
     function currentActionPhase() {
@@ -3325,10 +3371,10 @@
     }
 
     function cleanupCardPresentation(branch, activeLane) {
-      if (activeLane.key === 'production' && branch.cleanup?.eligible) {
+      if (branch.cleanup?.eligible) {
         return {
           tone: 'cleanup',
-          stateLabel: 'Ready to Clean',
+          stateLabel: 'Stale',
           reason: branch.cleanup.reason || activeLane.lane.reason || 'This branch is live and ready for cleanup.',
         };
       }
@@ -3389,6 +3435,7 @@
       const settings = currentSettings();
       const boardContext = state.snapshot?.data?.boardContext;
       const modeActions = devModeActions();
+      const cleanAction = cleanPlanAction();
       const heroMode = document.getElementById('hero-mode');
       document.getElementById('hero-title').textContent = settings.boardTitle || DEFAULT_BOARD_TITLE;
       document.getElementById('hero-copy').textContent = settings.boardSubtitle || DEFAULT_BOARD_SUBTITLE;
@@ -3398,11 +3445,13 @@
       document.getElementById('hero-pills').innerHTML = pills.join('') || '<div class="pill"><span>Snapshot</span><strong>Loading…</strong></div>';
       if (!boardContext) {
         heroMode.innerHTML = `
-          <div class="hero-mode-card">
-            <div class="hero-mode-copy">
-              <div class="hero-mode-label">Dev Mode</div>
-              <div class="hero-mode-value">Loading</div>
-              <div class="hero-mode-note">Waiting for snapshot…</div>
+          <div class="hero-primary-actions">
+            <div class="hero-mode-card">
+              <div class="hero-mode-copy">
+                <div class="hero-mode-label">Dev Mode</div>
+                <div class="hero-mode-value">Loading</div>
+                <div class="hero-mode-note">Waiting for snapshot…</div>
+              </div>
             </div>
           </div>
         `;
@@ -3410,32 +3459,46 @@
         const release = boardContext.releaseReadiness || {};
         const mode = boardContext.mode || 'unknown';
         heroMode.innerHTML = `
-          <div class="hero-mode-card ${escapeHtml(modeCardTone(mode))}">
-            <div class="hero-mode-copy">
-              <div class="hero-mode-label">Dev Mode</div>
-              <div class="hero-mode-value">${escapeHtml(mode.toUpperCase())}</div>
-              <div class="hero-mode-note">${escapeHtml(heroModeNote(mode, release))}</div>
-            </div>
-            <div class="menu-shell">
+          <div class="hero-primary-actions">
+            ${cleanAction ? `
               <button
-                class="menu-button"
+                class="button hero-clean-button"
                 type="button"
-                data-devmode-toggle="true"
-                aria-label="Open dev mode menu"
-                aria-expanded="${state.devModeMenuOpen ? 'true' : 'false'}"
+                data-action-trigger="${escapeHtml(cleanAction.id)}"
+                data-action-scope="board"
+                ${titleAttr(cleanAction.reason)}
                 ${actionControlDisabled('board') ? 'disabled' : ''}
               >
-                <span class="chevron">⌄</span>
+                ${escapeHtml(cleanAction.label || 'Clean')}
               </button>
-              <div class="menu-popover ${state.devModeMenuOpen ? 'open' : ''}">
-                ${modeActions.length
-                  ? modeActions.map((action) => `
-                    <button class="menu-item" type="button" data-devmode-action="${escapeHtml(action.id)}" ${actionControlDisabled('board') ? 'disabled' : ''}>
-                      <span class="action-label">${escapeHtml(action.label || action.id)}</span>
-                      <span class="action-reason">${escapeHtml(action.reason || 'No reason provided.')}</span>
-                    </button>
-                  `).join('')
-                  : '<div class="context-menu-empty">No mode-switch actions are available right now.</div>'}
+            ` : ''}
+            <div class="hero-mode-card ${escapeHtml(modeCardTone(mode))}">
+              <div class="hero-mode-copy">
+                <div class="hero-mode-label">Dev Mode</div>
+                <div class="hero-mode-value">${escapeHtml(mode.toUpperCase())}</div>
+                <div class="hero-mode-note">${escapeHtml(heroModeNote(mode, release))}</div>
+              </div>
+              <div class="menu-shell">
+                <button
+                  class="menu-button"
+                  type="button"
+                  data-devmode-toggle="true"
+                  aria-label="Open dev mode menu"
+                  aria-expanded="${state.devModeMenuOpen ? 'true' : 'false'}"
+                  ${actionControlDisabled('board') ? 'disabled' : ''}
+                >
+                  <span class="chevron">⌄</span>
+                </button>
+                <div class="menu-popover ${state.devModeMenuOpen ? 'open' : ''}">
+                  ${modeActions.length
+                    ? modeActions.map((action) => `
+                      <button class="menu-item" type="button" data-devmode-action="${escapeHtml(action.id)}" ${actionControlDisabled('board') ? 'disabled' : ''}>
+                        <span class="action-label">${escapeHtml(action.label || action.id)}</span>
+                        <span class="action-reason">${escapeHtml(action.reason || 'No reason provided.')}</span>
+                      </button>
+                    `).join('')
+                    : '<div class="context-menu-empty">No mode-switch actions are available right now.</div>'}
+                </div>
               </div>
             </div>
           </div>
@@ -3683,6 +3746,7 @@
                 <div class="branch-note">${escapeHtml(branch.note || (branch.task?.taskSlug ? `Task ${branch.task.taskSlug}` : 'No branch note.'))}</div>
                 <div class="mini-pills" style="margin-top:8px">
                   ${(branch.surfaces || []).map((surface) => `<span class="mini-pill">${escapeHtml(surface)}</span>`).join('') || '<span class="mini-pill">none</span>'}
+                  ${branch.cleanup?.tag && branch.cleanup.tag !== 'active' ? `<span class="mini-pill cleanup-${escapeHtml(branch.cleanup.tag)}">${escapeHtml(branch.cleanup.tag)}</span>` : ''}
                 </div>
               </div>
             </td>
@@ -4044,10 +4108,13 @@
           <div class="panel-title">Cleanup</div>
           <article class="lane-card ${detailBranch.cleanup?.eligible ? 'state-degraded' : 'state-unknown'}">
             <div class="lane-head">
-              <strong>${escapeHtml(detailBranch.cleanup?.eligible ? 'Ready to Clean' : 'Hold')}</strong>
-              <span class="mini-pill">${escapeHtml(detailBranch.cleanup?.available ? 'available' : 'not available')}</span>
+              <strong>${escapeHtml(detailBranch.cleanup?.eligible ? 'Stale cleanup candidate' : 'Hold')}</strong>
+              <span class="mini-pill ${detailBranch.cleanup?.tag ? `cleanup-${escapeHtml(detailBranch.cleanup.tag)}` : ''}">${escapeHtml(detailBranch.cleanup?.tag || 'unknown')}</span>
             </div>
             <div class="reason-block">${escapeHtml(detailBranch.cleanup?.reason || 'No cleanup guidance provided.')}</div>
+            ${(detailBranch.cleanup?.evidence || []).length
+              ? `<div class="reason-block" style="margin-top:8px">${(detailBranch.cleanup.evidence || []).map((entry) => escapeHtml(entry)).join('<br>')}</div>`
+              : ''}
           </article>
         </div>
 

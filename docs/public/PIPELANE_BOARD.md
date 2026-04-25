@@ -68,8 +68,8 @@ The reference board is structured in this order:
 
 ### Hero
 
-Shows the board identity, repo health, mode, base branch, freshness, Settings, Refresh, and the
-`?` guide.
+Shows the board identity, repo health, mode, base branch, freshness, Clean, Settings, Refresh,
+and the `?` guide. Clean runs the non-destructive cleanup plan action from the header.
 
 ### Help drawer
 
@@ -137,6 +137,8 @@ The board uses workflow states directly, with an opinionated visual language:
 - `blocked` / `failed`: red
 - `unknown` / `bypassed`: slate
 - `ready to clean`: gold
+- cleanup `stale` tag: gold, derived from the same missing-worktree or missing-branch evidence
+  that `/clean --apply --all-stale` uses
 - active action lock: steel/slate with `Executing`
 
 The important rule is consistency:

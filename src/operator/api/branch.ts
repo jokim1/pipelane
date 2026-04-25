@@ -124,6 +124,7 @@ function resolveBranchRow(cwd: string, branchName: string): BranchRow {
   const rows = buildBranchRows({
     locks: loadAllTaskLocks(context.commonDir, context.config),
     config: context.config,
+    repoRoot: context.repoRoot,
     currentBranch,
     baseBranch: context.config.baseBranch,
     baseBranchSha,
