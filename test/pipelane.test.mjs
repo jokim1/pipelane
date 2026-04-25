@@ -931,6 +931,118 @@ test('smoke staging runs the configured command, injects env vars, and surfaces 
   }
 });
 
+test('smoke staging summary names every registered check with its registry description', async () => {
+  const repoRoot = createRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.smoke = {
+        staging: {
+          command: smokeResultCommand([{ tag: '@smoke-auth', status: 'passed' }]),
+        },
+      };
+    });
+    await writeSucceededDeployRecord(repoRoot, 'staging', '1111111111111111111111111111111111111111', ['frontend']);
+    runCli(['run', 'smoke', 'plan'], repoRoot);
+    updateSmokeRegistry(repoRoot, (registry) => {
+      registry.checks['@smoke-auth'].description = 'Auth login';
+      registry.checks['@smoke-auth'].quarantine = false;
+    });
+
+    const result = runCli(['run', 'smoke', 'staging', '--json'], repoRoot);
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(output.status, 'passed');
+    assert.match(output.message, /Tested:/);
+    assert.match(output.message, /- Auth login \(passed\)/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke staging summary prints per-test counts when the runner contract supplies tests', async () => {
+  const repoRoot = createRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.smoke = {
+        staging: {
+          command: smokeResultCommand([
+            { tag: '@smoke-auth', status: 'passed', tests: { passed: 3, total: 10 } },
+          ]),
+        },
+      };
+    });
+    await writeSucceededDeployRecord(repoRoot, 'staging', '1111111111111111111111111111111111111111', ['frontend']);
+    runCli(['run', 'smoke', 'plan'], repoRoot);
+    updateSmokeRegistry(repoRoot, (registry) => {
+      registry.checks['@smoke-auth'].description = 'Auth login';
+      registry.checks['@smoke-auth'].quarantine = false;
+    });
+
+    const result = runCli(['run', 'smoke', 'staging', '--json'], repoRoot);
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(output.status, 'passed');
+    assert.match(output.message, /- Auth login \(3\/10 tests passed\)/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('bare /smoke lists registered checks, unregistered tags, candidate tests, and the configured runner', () => {
+  const repoRoot = createRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
+    writeFileSync(path.join(repoRoot, 'e2e', 'checkout.spec.ts'), "test('@smoke-checkout pays', async () => {});\n", 'utf8');
+    writeFileSync(path.join(repoRoot, 'e2e', 'landing.spec.ts'), "test('landing renders', async () => {});\n", 'utf8');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.smoke = {
+        staging: { command: 'npm run test:e2e:smoke' },
+      };
+    });
+    runCli(['run', 'smoke', 'plan'], repoRoot);
+    updateSmokeRegistry(repoRoot, (registry) => {
+      registry.checks['@smoke-auth'].description = 'Auth login';
+      delete registry.checks['@smoke-checkout'];
+    });
+
+    const result = runCli(['run', 'smoke', '--json'], repoRoot);
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0);
+    assert.match(output.message, /Registered smoke checks/);
+    assert.match(output.message, /@smoke-auth — Auth login/);
+    assert.match(output.message, /Discovered @smoke-\* tags not yet registered:/);
+    assert.match(output.message, /- @smoke-checkout/);
+    assert.match(output.message, /Candidate test files without @smoke tags:/);
+    assert.match(output.message, /- e2e\/landing\.spec\.ts/);
+    assert.match(output.message, /To add a new smoke check:/);
+    assert.match(output.message, /Runner: npm run test:e2e:smoke/);
+    assert.equal(output.stagingCommand, 'npm run test:e2e:smoke');
+    assert.ok(Array.isArray(output.registered));
+    assert.ok(output.registered.some((entry) => entry.tag === '@smoke-auth'));
+    assert.ok(output.unregisteredTags.some((entry) => entry.tag === '@smoke-checkout'));
+    assert.ok(output.orphanCandidates.includes('e2e/landing.spec.ts'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('release deploy prod does not require smoke unless the repo opts in', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));

@@ -9,6 +9,7 @@ npm run pipelane:smoke -- $ARGUMENTS
 
 Expected subcommands:
 
+- _no subcommand_ — lists registered smoke checks (from `.pipelane/smoke-checks.json`), discovered `@smoke-*` tags not yet registered, candidate test files without `@smoke` tags, and the currently configured runner command. Prints add-a-check hints at the end.
 - `plan` — scaffolds or audits `.pipelane/smoke-checks.json` and prints the top actions.
 - `setup` — wires a smoke runner command into `.pipelane.json`. See "Setup quoting" below for passing commands with spaces / metacharacters.
 - `staging` — runs smoke for the currently deployed staging SHA.
@@ -49,6 +50,33 @@ Setup flags (accepted only on `smoke setup`):
 - `--critical-path-coverage=warn|block` — how /deploy prod treats uncovered critical paths.
 
 Display the output directly and keep the environment explicit.
+
+## Runner results contract
+
+A smoke runner communicates per-tag results by writing JSON to `$PIPELANE_SMOKE_RESULTS_PATH`:
+
+```json
+{
+  "schemaVersion": 1,
+  "checks": [
+    {
+      "tag": "@smoke-<name>",
+      "status": "passed",
+      "tests": { "passed": 3, "total": 10 }
+    }
+  ]
+}
+```
+
+Fields per check:
+
+- `tag` — required; must match a registered smoke tag.
+- `status` — required; `passed`, `failed`, or `passed_with_retries`.
+- `attempts` — optional; array of per-retry `{ attempt, status }` entries.
+- `artifacts` — optional; `{ firstFailureTrace, htmlReport, screenshotDir }`.
+- `tests` — optional; `{ passed, total }` individual test case counts within the tag. When present, post-run summaries print `(N/M tests passed)` instead of a bare `(passed)`. Invalid shapes (non-number, `total === 0`, `passed > total`) are silently dropped.
+
+Consumer runners (e.g. a Playwright reporter adapter) can opt in to `tests` at any time — older runners without the field continue to work unchanged.
 
 <!-- pipelane:consumer-extension:start -->
 <!-- pipelane:consumer-extension:end -->

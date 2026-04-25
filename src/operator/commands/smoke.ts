@@ -53,6 +53,10 @@ import {
 
 export async function handleSmoke(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const subcommand = parsed.positional[0] ?? '';
+  if (subcommand === '') {
+    handleSmokeList(cwd, parsed);
+    return;
+  }
   if (subcommand === 'plan') {
     await handleSmokePlan(cwd, parsed);
     return;
@@ -77,7 +81,7 @@ export async function handleSmoke(cwd: string, parsed: ParsedOperatorArgs): Prom
     await handleSmokeRun(cwd, parsed, subcommand);
     return;
   }
-  throw new Error('smoke requires one of: plan, setup, staging, prod, waiver, quarantine, unquarantine.');
+  throw new Error('smoke requires one of: plan, setup, staging, prod, waiver, quarantine, unquarantine (or no subcommand to list).');
 }
 
 // Pure helper: compute the plan result without printing. Shared by
@@ -147,6 +151,99 @@ async function handleSmokePlan(cwd: string, parsed: ParsedOperatorArgs): Promise
     candidateTests: planResult.candidateTests,
     findings: planResult.findings,
     message: planResult.message,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// /smoke (no subcommand) — list registered checks, discovered tags, candidates
+// ---------------------------------------------------------------------------
+
+function handleSmokeList(cwd: string, parsed: ParsedOperatorArgs): void {
+  const context = resolveWorkflowContext(cwd);
+  const registry = loadSmokeRegistry(context.repoRoot, context.config);
+  const discoveredTags = discoverSmokeTags(context.repoRoot);
+  const candidateTests = discoverCandidateSmokeTests(context.repoRoot);
+  const smokeConfig = resolveSmokeConfig(context.config);
+
+  const registeredTagSet = new Set(Object.keys(registry.checks));
+  const sourceTestSet = new Set<string>();
+  for (const entry of Object.values(registry.checks)) {
+    for (const file of entry.sourceTests ?? []) sourceTestSet.add(file);
+  }
+
+  const registered = Object.entries(registry.checks).sort(([left], [right]) =>
+    left.localeCompare(right),
+  );
+  const unregisteredTags = discoveredTags.filter((entry) => !registeredTagSet.has(entry.tag));
+  const orphanCandidates = candidateTests.filter((file) => !sourceTestSet.has(file));
+
+  const planCommand = formatWorkflowCommand(context.config, 'smoke', 'plan');
+  const setupCommand = formatWorkflowCommand(context.config, 'smoke', 'setup');
+
+  const lines: string[] = [];
+  lines.push(`Registered smoke checks (${smokeConfig.registryPath}):`);
+  if (registered.length === 0) {
+    lines.push('  (none)');
+  } else {
+    registered.forEach(([tag, entry], index) => {
+      const label = entry.description?.trim() || tag;
+      lines.push(`  ${index + 1}. ${tag} — ${label}`);
+      const environments = (entry.environments ?? ['staging']).join(', ');
+      lines.push(`     Environments: ${environments}`);
+      if (entry.sourceTests && entry.sourceTests.length > 0) {
+        lines.push(`     Source: ${entry.sourceTests.join(', ')}`);
+      }
+      const flags: string[] = [];
+      if (entry.blocking === true) flags.push('blocking');
+      if (entry.quarantine === true) flags.push('quarantined');
+      if (flags.length > 0) lines.push(`     Flags: ${flags.join(', ')}`);
+    });
+  }
+
+  lines.push('');
+  lines.push('Discovered @smoke-* tags not yet registered:');
+  if (unregisteredTags.length === 0) {
+    lines.push('  (none)');
+  } else {
+    for (const entry of unregisteredTags) {
+      lines.push(`  - ${entry.tag} (${entry.files.join(', ')})`);
+    }
+  }
+
+  lines.push('');
+  lines.push('Candidate test files without @smoke tags:');
+  if (orphanCandidates.length === 0) {
+    lines.push('  (none)');
+  } else {
+    for (const file of orphanCandidates) {
+      lines.push(`  - ${file}`);
+    }
+  }
+
+  lines.push('');
+  lines.push('To add a new smoke check:');
+  lines.push('  1. Tag a test with @smoke-<name> in your test code');
+  lines.push(`  2. Run ${planCommand} to scaffold ${smokeConfig.registryPath}`);
+  lines.push(`  3. Run ${setupCommand} --staging-script=<script> if no runner is wired`);
+
+  lines.push('');
+  const stagingCommand = smokeConfig.staging?.command ?? 'not configured';
+  lines.push(`Runner: ${stagingCommand}`);
+
+  printResult(parsed.flags, {
+    registered: registered.map(([tag, entry]) => ({
+      tag,
+      description: entry.description?.trim() || '',
+      environments: entry.environments ?? ['staging'],
+      sourceTests: entry.sourceTests ?? [],
+      blocking: entry.blocking === true,
+      quarantine: entry.quarantine === true,
+    })),
+    unregisteredTags: unregisteredTags.map((entry) => ({ tag: entry.tag, files: entry.files })),
+    orphanCandidates,
+    stagingCommand,
+    registryPath: smokeConfig.registryPath,
+    message: lines.join('\n'),
   });
 }
 
@@ -770,7 +867,7 @@ async function handleSmokeRun(
     writeGeneratedSmokeSummary(context.repoRoot, context.config, registry);
 
     if (!isSmokeSuccessStatus(status)) {
-      throw new Error(summarizeSmokeRun(record));
+      throw new Error(summarizeSmokeRun(record, registry));
     }
 
     printResult(parsed.flags, {
@@ -778,7 +875,7 @@ async function handleSmokeRun(
       environment,
       sha: target.sha,
       status,
-      message: summarizeSmokeRun(record),
+      message: summarizeSmokeRun(record, registry),
     });
   } finally {
     releaseSmokeEnvironmentLock(context.commonDir, environment);
@@ -989,12 +1086,33 @@ function normalizeRunnerCheckResult(value: unknown, cwd: string): SmokeRunnerChe
         }))
     : undefined;
   const artifacts = normalizeSmokeArtifacts(entry.artifacts, cwd);
+  const tests = normalizeRunnerTests(entry.tests);
   return {
     tag: entry.tag.trim(),
     status: entry.status,
     attempts: attempts && attempts.length > 0 ? attempts : undefined,
     artifacts,
+    tests,
   };
+}
+
+function normalizeRunnerTests(value: unknown): { passed: number; total: number } | undefined {
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+  const entry = value as Partial<{ passed: number; total: number }>;
+  if (typeof entry.passed !== 'number' || typeof entry.total !== 'number') {
+    return undefined;
+  }
+  if (!Number.isFinite(entry.passed) || !Number.isFinite(entry.total)) {
+    return undefined;
+  }
+  const passed = Math.max(0, Math.trunc(entry.passed));
+  const total = Math.max(0, Math.trunc(entry.total));
+  if (total === 0 || passed > total) {
+    return undefined;
+  }
+  return { passed, total };
 }
 
 function normalizeSmokeArtifacts(value: unknown, cwd: string): SmokeArtifacts | undefined {

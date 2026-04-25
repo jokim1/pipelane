@@ -665,7 +665,7 @@ export function findLatestSmokeRun(options: {
     ) ?? null;
 }
 
-export function summarizeSmokeRun(record: SmokeRunRecord): string {
+export function summarizeSmokeRun(record: SmokeRunRecord, registry?: SmokeRegistryState): string {
   const primaryFailure = record.checks.find((check) => check.status === 'failed' && check.effectiveBlocking)
     ?? record.checks.find((check) => check.status === 'failed');
   const trace = primaryFailure?.artifacts?.firstFailureTrace
@@ -675,10 +675,20 @@ export function summarizeSmokeRun(record: SmokeRunRecord): string {
     isSmokeSuccessStatus(record.status)
       ? `${successLabel}: ${record.environment}`
       : `Smoke FAILED: ${trace ? `trace=${trace}` : record.preflight.find((step) => step.status === 'failed')?.logPath ?? 'see logs'}`,
+  ];
+  if (record.checks.length > 0) {
+    lines.push('', 'Tested:');
+    for (const check of record.checks) {
+      const label = registry?.checks[check.tag]?.description?.trim() || check.tag;
+      lines.push(`- ${label} (${formatCheckOutcome(check)})`);
+    }
+    lines.push('');
+  }
+  lines.push(
     `Environment: ${record.environment}`,
     `SHA: ${record.sha}`,
     `Result: ${record.status}`,
-  ];
+  );
   if (record.lastKnownGoodSha) {
     lines.push(`Last known good: ${record.lastKnownGoodSha}`);
   }
@@ -840,6 +850,7 @@ export function evaluateSmokeChecks(options: {
       const waiver = activeWaivers.get(`${tag}:${options.environment}`);
       const effectiveBlocking = entry.blocking === true && entry.quarantine !== true && !waiver;
       const artifacts = chooseCheckArtifacts(statusMatches.map(({ check }) => check));
+      const tests = aggregateRunnerCheckTests(statusMatches.map(({ check }) => check));
       return {
         tag,
         status,
@@ -852,6 +863,7 @@ export function evaluateSmokeChecks(options: {
         attempts: attempts.length > 0 ? attempts : [{ attempt: 1, status }],
         artifacts,
         cohorts: cohorts.length > 0 ? [...new Set(cohorts)].sort() : undefined,
+        tests,
       } satisfies SmokeCheckResult;
     })
     .sort((left, right) => left.tag.localeCompare(right.tag));
@@ -874,6 +886,38 @@ function chooseCheckArtifacts(results: SmokeRunnerCheckResult[]): SmokeArtifacts
     ?? results.find((result) => result.artifacts)?.artifacts;
 }
 
+function aggregateRunnerCheckTests(
+  results: SmokeRunnerCheckResult[],
+): { passed: number; total: number } | undefined {
+  let passed = 0;
+  let total = 0;
+  let seen = false;
+  for (const result of results) {
+    if (result.tests) {
+      passed += result.tests.passed;
+      total += result.tests.total;
+      seen = true;
+    }
+  }
+  return seen ? { passed, total } : undefined;
+}
+
 function capitalize(value: string): string {
   return value.slice(0, 1).toUpperCase() + value.slice(1);
+}
+
+function formatCheckOutcome(check: SmokeCheckResult): string {
+  const base = check.tests
+    ? `${check.tests.passed}/${check.tests.total} tests passed`
+    : formatCheckStatus(check.status);
+  const modifiers: string[] = [];
+  if (check.waived) modifiers.push('waived');
+  if (check.quarantine && !check.waived) modifiers.push('quarantined');
+  return modifiers.length > 0 ? `${base}, ${modifiers.join(', ')}` : base;
+}
+
+function formatCheckStatus(status: SmokeRunStatus): string {
+  if (status === 'passed') return 'passed';
+  if (status === 'failed') return 'failed';
+  return 'passed with retries';
 }
