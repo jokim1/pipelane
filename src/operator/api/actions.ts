@@ -4,10 +4,11 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 import type { ParsedOperatorArgs } from '../state.ts';
-import { loadDeployState, nowIso, resolveWorkflowContext, type DeployRecord } from '../state.ts';
+import { loadDeployState, loadProbeState, nowIso, resolveWorkflowContext, type DeployRecord, type WorkflowContext } from '../state.ts';
 import {
   computeDeployConfigFingerprint,
   emptyDeployConfig,
+  evaluateReleaseReadiness,
   loadDeployConfig,
   normalizeDeployEnvironment,
   resolveDeployStateKey,
@@ -18,6 +19,7 @@ import {
   buildApiEnvelope,
   buildFreshness,
   type ApiEnvelope,
+  type ApiActionInput,
   type LaneState,
 } from './envelope.ts';
 import {
@@ -93,6 +95,10 @@ export interface ActionPreflightData {
     allowed: boolean;
     state: LaneState;
     reason: string;
+    needsInput: boolean;
+    missingInputs: string[];
+    inputs: ApiActionInput[];
+    defaultParams: Record<string, unknown>;
     warnings: string[];
     issues: unknown[];
     normalizedInputs: Record<string, unknown>;
@@ -120,14 +126,18 @@ export function buildActionPreflightEnvelope(cwd: string, actionId: StableAction
   const risky = API_RISKY_ACTION_IDS.has(actionId);
   const checkedAt = nowIso();
 
-  const gate = evaluatePreflightGate(actionId, normalizedInputs);
-  if (!gate.allowed) {
+  const gate = evaluatePreflightGate(context, actionId, normalizedInputs);
+  if (gate.allowed === false) {
     const data: ActionPreflightData = {
       action: { id: actionId, label: ACTION_LABELS[actionId], risky },
       preflight: {
         allowed: false,
         state: 'blocked',
         reason: gate.reason,
+        needsInput: gate.needsInput ?? false,
+        missingInputs: gate.missingInputs ?? [],
+        inputs: gate.inputs ?? [],
+        defaultParams: gate.defaultParams ?? {},
         warnings: [],
         issues: [],
         normalizedInputs,
@@ -161,6 +171,10 @@ export function buildActionPreflightEnvelope(cwd: string, actionId: StableAction
       allowed: true,
       state: 'healthy',
       reason: '',
+      needsInput: false,
+      missingInputs: [],
+      inputs: [],
+      defaultParams: {},
       warnings: [],
       issues: [],
       normalizedInputs,
@@ -184,9 +198,18 @@ export function buildActionPreflightEnvelope(cwd: string, actionId: StableAction
 // The CLI still enforces the same rule at execute time.
 type PreflightGateResult =
   | { allowed: true; reason?: undefined }
-  | { allowed: false; reason: string };
+  | PreflightGateBlocked;
 
-function evaluatePreflightGate(actionId: StableActionId, inputs: Record<string, unknown>): PreflightGateResult {
+interface PreflightGateBlocked {
+  allowed: false;
+  reason: string;
+  needsInput?: boolean;
+  missingInputs?: string[];
+  inputs?: ApiActionInput[];
+  defaultParams?: Record<string, unknown>;
+}
+
+function evaluatePreflightGate(context: WorkflowContext, actionId: StableActionId, inputs: Record<string, unknown>): PreflightGateResult {
   if (actionId === 'clean.apply') {
     const taskRaw = inputs.task;
     const task = typeof taskRaw === 'string' ? taskRaw.trim() : '';
@@ -204,7 +227,56 @@ function evaluatePreflightGate(actionId: StableActionId, inputs: Record<string, 
       };
     }
   }
+  if (actionId === 'devmode.release') {
+    const override = inputs.override === true;
+    const reason = typeof inputs.reason === 'string' ? inputs.reason.trim() : '';
+    const surfaces = Array.isArray(inputs.surfaces)
+      ? inputs.surfaces.filter((entry): entry is string => typeof entry === 'string')
+      : [];
+
+    if (override && !reason) {
+      return buildReleaseOverrideInputGate('Release override requires a reason.');
+    }
+
+    const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
+    const deployState = loadDeployState(context.commonDir, context.config);
+    const probeState = loadProbeState(context.commonDir, context.config);
+    const requestedSurfaces = resolveCommandSurfaces(context, surfaces);
+    const readiness = evaluateReleaseReadiness({
+      config: context.config,
+      deployConfig,
+      deployRecords: deployState.records,
+      probeState,
+      surfaces: requestedSurfaces,
+    });
+
+    if (!override && !readiness.ready) {
+      const blocked = readiness.blockedSurfaces.join(', ') || requestedSurfaces.join(', ');
+      return buildReleaseOverrideInputGate(
+        `Release readiness is blocked for ${blocked}. Provide an override reason, or run /doctor --probe and retry.`,
+      );
+    }
+  }
   return { allowed: true };
+}
+
+function buildReleaseOverrideInputGate(reason: string): PreflightGateResult {
+  return {
+    allowed: false,
+    reason,
+    needsInput: true,
+    missingInputs: ['reason'],
+    inputs: [
+      {
+        name: 'reason',
+        label: 'Release override reason',
+        type: 'text',
+        required: true,
+        placeholder: 'Why are you overriding release readiness?',
+      },
+    ],
+    defaultParams: { override: true },
+  };
 }
 
 export async function runActionExecute(cwd: string, actionId: StableActionId, parsed: ParsedOperatorArgs, confirmToken: string): Promise<ApiEnvelope<ActionExecutionData | ActionPreflightData>> {
@@ -212,6 +284,33 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
   const normalizedInputs = normalizeInputs(actionId, parsed, cwd);
   const risky = API_RISKY_ACTION_IDS.has(actionId);
   const checkedAt = nowIso();
+  const gate = evaluatePreflightGate(context, actionId, normalizedInputs);
+  if (gate.allowed === false) {
+    const preflight: ActionPreflightData = {
+      action: { id: actionId, label: ACTION_LABELS[actionId], risky },
+      preflight: {
+        allowed: false,
+        state: 'blocked',
+        reason: gate.reason,
+        needsInput: gate.needsInput ?? false,
+        missingInputs: gate.missingInputs ?? [],
+        inputs: gate.inputs ?? [],
+        defaultParams: gate.defaultParams ?? {},
+        warnings: [],
+        issues: [],
+        normalizedInputs,
+        requiresConfirmation: false,
+        confirmation: null,
+        freshness: buildFreshness({ checkedAt, stale: true }),
+      },
+    };
+    return buildApiEnvelope<ActionPreflightData>({
+      command: 'pipelane.api.action',
+      ok: false,
+      message: gate.reason,
+      data: preflight,
+    });
+  }
 
   if (risky) {
     const fingerprint = buildActionFingerprint(actionId, normalizedInputs);
@@ -225,6 +324,10 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
           allowed: false,
           state: 'blocked',
           reason: message,
+          needsInput: false,
+          missingInputs: [],
+          inputs: [],
+          defaultParams: {},
           warnings: [],
           issues: [],
           normalizedInputs,
@@ -253,6 +356,10 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
       allowed: true,
       state: result.ok ? 'healthy' : 'blocked',
       reason: failureReason,
+      needsInput: false,
+      missingInputs: [],
+      inputs: [],
+      defaultParams: {},
       warnings: [],
       issues: [],
       normalizedInputs,

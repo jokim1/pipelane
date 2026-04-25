@@ -5961,12 +5961,14 @@ test('board detects a running dashboard and skips spawning a second one', async 
   const repoRoot = createRepo();
   const port = await getFreePort();
   const probeHits = [];
+  const dashboardMod = await import(path.join(KIT_ROOT, 'src', 'dashboard', 'server.ts'));
+  const runtime = dashboardMod.buildDashboardRuntimeMetadata();
 
   const fakeServer = createHttpServer((req, res) => {
     probeHits.push(req.url ?? '');
     if (req.url === '/api/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, repoRoot }));
+      res.end(JSON.stringify({ ok: true, repoRoot, runtime }));
       return;
     }
     res.writeHead(404);
@@ -5985,6 +5987,39 @@ test('board detects a running dashboard and skips spawning a second one', async 
     assert.equal(result.status, 0, `unexpected exit.\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}\nprobeHits: ${JSON.stringify(probeHits)}`);
     assert.match(result.stdout, new RegExp(`already running at http://127\\.0\\.0\\.1:${port}`));
     assert.ok(probeHits.includes('/api/health'), 'expected /api/health to be probed');
+  } finally {
+    fakeServer.close();
+    await once(fakeServer, 'close').catch(() => undefined);
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('board refuses to reuse a stale dashboard runtime without a stoppable pid', async () => {
+  const repoRoot = createRepo();
+  const port = await getFreePort();
+
+  const fakeServer = createHttpServer((req, res) => {
+    if (req.url === '/api/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, repoRoot }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  fakeServer.listen(port, '127.0.0.1');
+  await once(fakeServer, 'listening');
+
+  try {
+    const result = await runCliAsync(
+      ['board', '--repo', repoRoot, '--port', String(port)],
+      repoRoot,
+      { PIPELANE_OPEN_COMMAND: 'skip' },
+    );
+
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /different runtime/);
+    assert.match(result.stdout, /could not be stopped automatically/);
   } finally {
     fakeServer.close();
     await once(fakeServer, 'close').catch(() => undefined);
@@ -6176,6 +6211,9 @@ test('api snapshot emits a wire-compatible envelope', () => {
     assert.equal(availableActions[0].label, 'Switch to release mode');
     assert.equal(availableActions[0].risky, false);
     assert.equal(availableActions[0].requiresConfirmation, false);
+    assert.deepEqual(availableActions[0].defaultParams, { override: true });
+    assert.equal(availableActions[0].inputs[0].name, 'reason');
+    assert.equal(availableActions[0].inputs[0].required, true);
 
     assert.ok(Array.isArray(branches) && branches.length === 1);
     const [branch] = branches;
@@ -6680,7 +6718,7 @@ test('api action execute: devmode actions switch the repo mode', () => {
   }
 });
 
-test('api action execute: devmode release failure surfaces the CLI result message', () => {
+test('api action execute: devmode release without override returns needs-input preflight', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
@@ -6690,10 +6728,13 @@ test('api action execute: devmode release failure surfaces the CLI result messag
     assert.equal(result.status, 1);
     const envelope = JSON.parse(result.stdout);
     assert.equal(envelope.ok, false);
-    assert.match(envelope.message, /Release readiness: FAIL/);
+    assert.match(envelope.message, /Release readiness is blocked/);
     assert.doesNotMatch(envelope.message, /see execution\.stderr/);
-    assert.match(envelope.data.preflight.reason, /Release readiness: FAIL/);
-    assert.equal(envelope.data.execution.stderr, '');
+    assert.equal(envelope.data.preflight.needsInput, true);
+    assert.deepEqual(envelope.data.preflight.missingInputs, ['reason']);
+    assert.deepEqual(envelope.data.preflight.defaultParams, { override: true });
+    assert.equal(envelope.data.preflight.inputs[0].name, 'reason');
+    assert.equal(envelope.data.execution, undefined);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });

@@ -75,6 +75,15 @@ interface DashboardHelp {
   warning: string;
 }
 
+export interface DashboardRuntimeMetadata {
+  packageVersion: string;
+  entrypoint: string;
+  uiFilePath: string;
+  sourceRoot: string;
+  gitSha: string;
+  assetVersion: string;
+}
+
 const DEFAULT_BOARD_SUBTITLE = 'Pipelane - release pipeline management and safety for AI vibe coders. Branch pipeline triage, action preflight, execution follow-through, smoke gates, and cleanup discipline.';
 const DEFAULT_AUTO_REFRESH_SECONDS = 30;
 
@@ -171,6 +180,69 @@ function readDashboardHelp(repoRoot: string): DashboardHelp {
       warning: message,
     };
   }
+}
+
+function findPackageRoot(startDir: string): string {
+  let current = path.resolve(startDir);
+  while (current !== path.dirname(current)) {
+    if (existsSync(path.join(current, 'package.json'))) {
+      return current;
+    }
+    current = path.dirname(current);
+  }
+  return path.resolve(startDir);
+}
+
+function readPackageVersion(packageRoot: string): string {
+  try {
+    const parsed = JSON.parse(readFileSync(path.join(packageRoot, 'package.json'), 'utf8')) as { version?: unknown };
+    return typeof parsed.version === 'string' ? parsed.version : '';
+  } catch {
+    return '';
+  }
+}
+
+function readGitSha(packageRoot: string): string {
+  try {
+    return execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: packageRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return '';
+  }
+}
+
+function readFileForHash(filePath: string): string {
+  try {
+    return readFileSync(filePath, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+export function buildDashboardRuntimeMetadata(): DashboardRuntimeMetadata {
+  const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+  const sourceRoot = findPackageRoot(moduleDir);
+  const uiFilePath = getUiFilePath();
+  const jsEntrypoint = path.resolve(moduleDir, '..', 'cli.js');
+  const entrypoint = existsSync(jsEntrypoint)
+    ? jsEntrypoint
+    : path.resolve(moduleDir, '..', 'cli.ts');
+  const packageVersion = readPackageVersion(sourceRoot);
+  const gitSha = readGitSha(sourceRoot);
+  return {
+    packageVersion,
+    entrypoint,
+    uiFilePath,
+    sourceRoot,
+    gitSha,
+    assetVersion: createHash('sha1')
+      .update(`${packageVersion}\0${gitSha}\0${entrypoint}\0${uiFilePath}\0${readFileForHash(uiFilePath)}`)
+      .digest('hex')
+      .slice(0, 12),
+  };
 }
 
 function readJsonBody(req: IncomingMessage): Promise<JsonObject> {
@@ -688,10 +760,12 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
         sendJson(res, 200, {
           ok: true,
           repoRoot: options.repoRoot,
+          pid: process.pid,
           repoExists: existsSync(options.repoRoot),
           pipelaneApiConfigured: pipelaneApiConfigured(options.repoRoot),
           uiFileExists: existsSync(uiFilePath),
           settingsPath: options.settingsPath,
+          runtime: buildDashboardRuntimeMetadata(),
           checkedAt: new Date().toISOString(),
         });
         return;

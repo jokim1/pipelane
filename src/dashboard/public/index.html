@@ -4191,10 +4191,33 @@
     }
 
     function defaultActionParams(action, scope) {
-      const params = {};
+      const params = { ...(action.defaultParams || {}) };
       const detailBranch = state.branchDetails?.data?.branch || getSelectedBranch();
       if (scope === 'branch' && detailBranch?.task?.taskSlug && !action.id.startsWith('clean.') && !action.id.startsWith('devmode.') && action.id !== 'new' && action.id !== 'resume') {
         params.task = detailBranch.task.taskSlug;
+      }
+      return params;
+    }
+
+    async function collectActionInputs(action, params) {
+      const inputs = action.inputs || [];
+      for (const input of inputs) {
+        if (!input?.name) {
+          continue;
+        }
+        if (input.type === 'boolean') {
+          params[input.name] = window.confirm(input.label || input.name);
+          continue;
+        }
+        const currentValue = typeof params[input.name] === 'string' ? params[input.name] : '';
+        const value = window.prompt(input.label || input.name, currentValue || input.placeholder || '');
+        if (value === null) {
+          return null;
+        }
+        if (input.required && !value.trim()) {
+          return null;
+        }
+        params[input.name] = value.trim();
       }
       return params;
     }
@@ -4212,19 +4235,7 @@
         params.title = title;
       }
 
-      if (action.id === 'devmode.release') {
-        const release = state.snapshot?.data?.boardContext?.releaseReadiness || {};
-        if (release.state && release.state !== 'healthy') {
-          const reason = window.prompt('Release override reason', release.reason || 'Release readiness is not green.');
-          if (!reason || !reason.trim()) {
-            return null;
-          }
-          params.override = true;
-          params.reason = reason.trim();
-        }
-      }
-
-      return params;
+      return collectActionInputs(action, params);
     }
 
     async function runAction(actionId, scope) {
@@ -4238,7 +4249,7 @@
         return;
       }
 
-      const params = await gatherActionParams(actionSource, scope);
+      let params = await gatherActionParams(actionSource, scope);
       if (params === null) {
         return;
       }
@@ -4262,12 +4273,39 @@
       closeMenus();
       render();
       try {
-        const envelope = await fetchJson(`/api/action/${encodeURIComponent(actionId)}/preflight`, {
-          method: 'POST',
-          body: JSON.stringify({ params }),
-        });
+        let envelope = null;
+        let preflight = null;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          envelope = await fetchJson(`/api/action/${encodeURIComponent(actionId)}/preflight`, {
+            method: 'POST',
+            body: JSON.stringify({ params }),
+          });
+          preflight = envelope?.data?.preflight;
+          if (!preflight?.needsInput) {
+            break;
+          }
+          const nextParams = await collectActionInputs(
+            {
+              ...actionSource,
+              inputs: preflight.inputs || [],
+              defaultParams: { ...(preflight.defaultParams || {}), ...params },
+            },
+            { ...(preflight.defaultParams || {}), ...params },
+          );
+          if (nextParams === null) {
+            setActionFeedback({
+              label: actionSource.label || actionSource.id || actionId,
+              state: preflight.state || 'blocked',
+              reason: 'Action cancelled before required inputs were provided.',
+              detail: branchName
+                ? `Branch action for ${branchName}.`
+                : 'Repository action.',
+            });
+            return;
+          }
+          params = nextParams;
+        }
         state.lastPreflight = envelope;
-        const preflight = envelope?.data?.preflight;
         if (preflight?.requiresConfirmation) {
           setActionFeedback({
             label: actionSource.label || actionSource.id || actionId,

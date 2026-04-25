@@ -491,6 +491,18 @@ function buildBoardActions(options: {
       reason: releaseReady
         ? 'enter the protected release lane'
         : options.releaseReadiness.reason || 'release readiness must pass, or the switch needs an override reason',
+      inputs: releaseReady
+        ? []
+        : [
+            {
+              name: 'reason',
+              label: 'Release override reason',
+              type: 'text',
+              required: true,
+              placeholder: options.releaseReadiness.reason || 'Why are you overriding release readiness?',
+            },
+          ],
+      defaultParams: releaseReady ? {} : { override: true },
       checkedAt: options.checkedAt,
     }),
   ];

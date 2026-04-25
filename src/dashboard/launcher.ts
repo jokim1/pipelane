@@ -5,11 +5,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { getDashboardOptions } from './server.ts';
+import { buildDashboardRuntimeMetadata, getDashboardOptions } from './server.ts';
 
 interface HealthResult {
   ok: boolean;
   status?: number;
+  payload?: Record<string, unknown>;
 }
 
 function pidDir(): string {
@@ -58,9 +59,26 @@ function probeHealth(host: string, port: number, timeoutMs: number): Promise<Hea
         method: 'GET',
       },
       (res) => {
+        let body = '';
+        res.on('data', (chunk: Buffer) => {
+          body += chunk.toString('utf8');
+        });
+        res.on('end', () => {
+          const status = res.statusCode ?? 0;
+          let payload: Record<string, unknown> | undefined;
+          if (body.trim()) {
+            try {
+              const parsed = JSON.parse(body) as unknown;
+              if (parsed && typeof parsed === 'object') {
+                payload = parsed as Record<string, unknown>;
+              }
+            } catch {
+              payload = undefined;
+            }
+          }
+          finish({ ok: status >= 200 && status < 300, status, payload });
+        });
         res.resume();
-        const status = res.statusCode ?? 0;
-        finish({ ok: status >= 200 && status < 300, status });
       },
     );
     req.setTimeout(timeoutMs, () => {
@@ -164,6 +182,43 @@ function hasFlag(args: string[], flag: string): boolean {
   return args.includes(flag);
 }
 
+function runtimeMatches(health: HealthResult): boolean {
+  const runtime = health.payload?.runtime;
+  if (!runtime || typeof runtime !== 'object') {
+    return false;
+  }
+  const expected = buildDashboardRuntimeMetadata();
+  const actual = runtime as Record<string, unknown>;
+  return actual.entrypoint === expected.entrypoint
+    && actual.uiFilePath === expected.uiFilePath
+    && actual.gitSha === expected.gitSha
+    && actual.assetVersion === expected.assetVersion;
+}
+
+function healthRepoRoot(health: HealthResult): string {
+  const raw = health.payload?.repoRoot;
+  return typeof raw === 'string' ? path.resolve(raw) : '';
+}
+
+function healthPid(health: HealthResult): number | null {
+  const raw = health.payload?.pid;
+  const parsed = Number.parseInt(String(raw ?? ''), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function stopExistingDashboard(pid: number | null, repoRoot: string): boolean {
+  if (!pid || !isProcessAlive(pid)) {
+    return false;
+  }
+  try {
+    process.kill(pid);
+    clearPidFile(repoRoot);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function runStart(argv: string[], cwd: string): Promise<void> {
   const options = getDashboardOptions(argv, cwd, { allowNoOpen: true });
   const url = `http://${options.host}:${options.port}`;
@@ -171,12 +226,38 @@ async function runStart(argv: string[], cwd: string): Promise<void> {
 
   const existingHealth = await probeHealth(options.host, options.port, 500);
   if (existingHealth.ok) {
-    process.stdout.write(`Pipelane Board already running at ${url}\n`);
-    if (!noOpen) {
-      openBrowser(url);
-      process.stdout.write(`Opened ${url} in browser.\n`);
+    const runningRepoRoot = healthRepoRoot(existingHealth);
+    if (runningRepoRoot && runningRepoRoot !== path.resolve(options.repoRoot)) {
+      process.stdout.write(
+        `Port ${options.port} is already serving a Pipelane Board for ${runningRepoRoot}.\n`
+          + `Requested repo: ${path.resolve(options.repoRoot)}\n`
+          + 'Use --port <n> or stop the other board first.\n',
+      );
+      process.exitCode = 1;
+      return;
     }
-    return;
+
+    if (runtimeMatches(existingHealth)) {
+      process.stdout.write(`Pipelane Board already running at ${url}\n`);
+      if (!noOpen) {
+        openBrowser(url);
+        process.stdout.write(`Opened ${url} in browser.\n`);
+      }
+      return;
+    }
+
+    const stopped = stopExistingDashboard(healthPid(existingHealth) ?? readPidFile(options.repoRoot), options.repoRoot);
+    if (stopped) {
+      process.stdout.write(`Restarting stale Pipelane Board at ${url}; launcher/runtime changed.\n`);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    } else {
+      process.stdout.write(
+        `Pipelane Board at ${url} is running with a different runtime and could not be stopped automatically.\n`
+          + 'Stop it manually or choose another --port.\n',
+      );
+      process.exitCode = 1;
+      return;
+    }
   }
 
   const storedPid = readPidFile(options.repoRoot);

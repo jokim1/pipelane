@@ -73,7 +73,17 @@ export interface ApiActionState {
   reason: string;
   risky: boolean;
   requiresConfirmation: boolean;
+  inputs: ApiActionInput[];
+  defaultParams: Record<string, unknown>;
   freshness: Freshness;
+}
+
+export interface ApiActionInput {
+  name: string;
+  label: string;
+  type: 'text' | 'boolean';
+  required: boolean;
+  placeholder: string;
 }
 
 export interface ApiEnvelope<TData = unknown> {
@@ -189,6 +199,8 @@ export function buildApiActionState(options: {
   reason?: string;
   risky?: boolean;
   requiresConfirmation?: boolean;
+  inputs?: ApiActionInput[];
+  defaultParams?: Record<string, unknown>;
   checkedAt?: string;
 }): ApiActionState {
   return {
@@ -198,6 +210,8 @@ export function buildApiActionState(options: {
     reason: options.reason ?? '',
     risky: options.risky ?? false,
     requiresConfirmation: options.requiresConfirmation ?? false,
+    inputs: options.inputs ?? [],
+    defaultParams: options.defaultParams ?? {},
     freshness: buildFreshness({ checkedAt: options.checkedAt }),
   };
 }
