@@ -117,6 +117,55 @@ export function ensureSharedNodeModulesLink(
   }
 }
 
+export interface WorktreeBootstrapResult {
+  kind: 'symlinked' | 'noop' | 'error';
+  message: string | null;
+}
+
+/**
+ * Auto-bootstrap missing node_modules in an externally-created worktree by
+ * symlinking the shared repo's node_modules. `pipelane:new` / `pipelane:resume`
+ * / `pipelane:repo-guard` already do this for pipelane-managed worktrees;
+ * this function covers the case where a worktree was created by some other
+ * tool (Claude Code's worktrees feature, manual `git worktree add`, etc.)
+ * and the user runs a pipelane command in it before any pipelane setup.
+ *
+ * Conservative trigger: only fires when the worktree has no `node_modules`
+ * directory at all. If the user installed deps manually, leave it alone.
+ */
+export function bootstrapWorktreeNodeModulesIfNeeded(cwd: string): WorktreeBootstrapResult {
+  const worktreePathRaw = runGit(cwd, ['rev-parse', '--show-toplevel'], true);
+  const commonDirRaw = runGit(cwd, ['rev-parse', '--git-common-dir'], true);
+  if (!worktreePathRaw || !commonDirRaw) {
+    return { kind: 'noop', message: null };
+  }
+  const worktreePath = worktreePathRaw.trim();
+  const commonDirRel = commonDirRaw.trim();
+  const commonDir = path.isAbsolute(commonDirRel) ? commonDirRel : path.resolve(worktreePath, commonDirRel);
+
+  const sharedRepoRoot = resolveSharedRepoRoot(commonDir);
+  if (normalizePath(sharedRepoRoot) === normalizePath(worktreePath)) {
+    return { kind: 'noop', message: null };
+  }
+
+  const targetNodeModules = path.join(worktreePath, 'node_modules');
+  if (existsSync(targetNodeModules)) {
+    return { kind: 'noop', message: null };
+  }
+
+  const result = ensureSharedNodeModulesLink(commonDir, worktreePath);
+  if (result === null) {
+    return { kind: 'noop', message: null };
+  }
+  if (result === SHARED_NODE_MODULES_NPMCI_WARNING) {
+    return {
+      kind: 'symlinked',
+      message: `[pipelane] Linked node_modules into worktree from shared repo at ${sharedRepoRoot}.`,
+    };
+  }
+  return { kind: 'error', message: result };
+}
+
 export function generateHex(): string {
   return crypto.randomBytes(2).toString('hex');
 }

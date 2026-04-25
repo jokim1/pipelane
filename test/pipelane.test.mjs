@@ -3393,6 +3393,142 @@ test('repo-guard links shared node_modules when it creates a new isolated worktr
   }
 });
 
+test('bootstrapWorktreeNodeModulesIfNeeded is a no-op in the shared repo', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    mkdirSync(path.join(repoRoot, 'node_modules', 'pipelane'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'node_modules', 'pipelane', 'package.json'), '{"name":"pipelane"}\n', 'utf8');
+    commitAll(repoRoot, 'Adopt');
+
+    const taskWorkspaces = await import(path.join(KIT_ROOT, 'src', 'operator', 'task-workspaces.ts'));
+    const result = taskWorkspaces.bootstrapWorktreeNodeModulesIfNeeded(repoRoot);
+    assert.equal(result.kind, 'noop');
+    assert.equal(result.message, null);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('bootstrapWorktreeNodeModulesIfNeeded symlinks an externally-created worktree without node_modules', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt');
+
+    // Externally-created worktree (Claude Code worktrees, manual git
+    // worktree add) checked out from a branch that has no node_modules
+    // committed.
+    const worktreePath = path.join(repoRoot, '.claude', 'worktrees', 'external-task');
+    execFileSync('git', ['worktree', 'add', worktreePath, '-b', 'external-task'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    // Shared repo has node_modules installed (npm install) AFTER the
+    // worktree was created — this is the modal user case we want to
+    // bootstrap from.
+    mkdirSync(path.join(repoRoot, 'node_modules', 'pipelane'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'node_modules', 'pipelane', 'package.json'), '{"name":"pipelane"}\n', 'utf8');
+
+    assert.equal(existsSync(path.join(worktreePath, 'node_modules')), false);
+
+    const taskWorkspaces = await import(path.join(KIT_ROOT, 'src', 'operator', 'task-workspaces.ts'));
+    const result = taskWorkspaces.bootstrapWorktreeNodeModulesIfNeeded(worktreePath);
+    assert.equal(result.kind, 'symlinked');
+    assert.match(result.message, /Linked node_modules/);
+
+    const linkedNodeModules = path.join(worktreePath, 'node_modules');
+    assert.ok(lstatSync(linkedNodeModules).isSymbolicLink());
+    assert.equal(realpathSync(linkedNodeModules), realpathSync(path.join(repoRoot, 'node_modules')));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('bootstrapWorktreeNodeModulesIfNeeded leaves an existing node_modules directory alone', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    mkdirSync(path.join(repoRoot, 'node_modules', 'pipelane'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'node_modules', 'pipelane', 'package.json'), '{"name":"pipelane"}\n', 'utf8');
+    commitAll(repoRoot, 'Adopt');
+
+    const worktreePath = path.join(repoRoot, '.claude', 'worktrees', 'has-modules');
+    execFileSync('git', ['worktree', 'add', worktreePath, '-b', 'has-modules'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    mkdirSync(path.join(worktreePath, 'node_modules', 'foo'), { recursive: true });
+    writeFileSync(path.join(worktreePath, 'node_modules', 'foo', 'index.js'), '// own content\n', 'utf8');
+
+    const taskWorkspaces = await import(path.join(KIT_ROOT, 'src', 'operator', 'task-workspaces.ts'));
+    const result = taskWorkspaces.bootstrapWorktreeNodeModulesIfNeeded(worktreePath);
+    assert.equal(result.kind, 'noop');
+    assert.equal(lstatSync(path.join(worktreePath, 'node_modules')).isSymbolicLink(), false);
+    assert.equal(existsSync(path.join(worktreePath, 'node_modules', 'foo', 'index.js')), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('bootstrapWorktreeNodeModulesIfNeeded is a graceful no-op when shared node_modules is missing', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt');
+
+    const worktreePath = path.join(repoRoot, '.claude', 'worktrees', 'no-shared');
+    execFileSync('git', ['worktree', 'add', worktreePath, '-b', 'no-shared'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const taskWorkspaces = await import(path.join(KIT_ROOT, 'src', 'operator', 'task-workspaces.ts'));
+    const result = taskWorkspaces.bootstrapWorktreeNodeModulesIfNeeded(worktreePath);
+    assert.equal(result.kind, 'noop');
+    assert.equal(result.message, null);
+    assert.equal(existsSync(path.join(worktreePath, 'node_modules')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('CLI auto-bootstraps node_modules in an externally-created worktree before command dispatch', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt');
+
+    const worktreePath = path.join(repoRoot, '.claude', 'worktrees', 'cli-bootstrap');
+    execFileSync('git', ['worktree', 'add', worktreePath, '-b', 'cli-bootstrap'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    mkdirSync(path.join(repoRoot, 'node_modules', 'pipelane'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'node_modules', 'pipelane', 'package.json'), '{"name":"pipelane"}\n', 'utf8');
+    assert.equal(existsSync(path.join(worktreePath, 'node_modules')), false);
+
+    // Any non-setup command exercises the bootstrap path. `run status --json`
+    // is read-only and exits cleanly enough for this check; we don't care
+    // about the status payload, only that the symlink got created before
+    // dispatch.
+    const result = runCli(['run', 'status', '--json'], worktreePath, {}, true);
+
+    const linkedNodeModules = path.join(worktreePath, 'node_modules');
+    assert.ok(lstatSync(linkedNodeModules).isSymbolicLink());
+    assert.equal(realpathSync(linkedNodeModules), realpathSync(path.join(repoRoot, 'node_modules')));
+    assert.match(result.stderr, /\[pipelane\] Linked node_modules/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('release-check fails closed before local CLAUDE is configured', () => {
   const repoRoot = createRepo();
 

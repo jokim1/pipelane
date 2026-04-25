@@ -8,6 +8,7 @@ import { installCodexBootstrapSkill } from './operator/codex-install.ts';
 import { handleConfigure } from './operator/commands/configure.ts';
 import { formatSetupResult, initConsumerRepo, setupConsumerRepo, syncDocsOnly } from './operator/docs.ts';
 import { runOperator } from './operator/index.ts';
+import { bootstrapWorktreeNodeModulesIfNeeded } from './operator/task-workspaces.ts';
 import { parseUpdateArgs, runUpdate } from './operator/update.ts';
 
 function printTopLevelHelp(): void {
@@ -65,12 +66,31 @@ function assertNoArgs(args: string[], command: string): void {
   }
 }
 
+// Commands that own pipelane setup themselves; auto-bootstrap is irrelevant
+// (init/bootstrap) or operates outside the worktree (install-claude/codex
+// write to ~/.claude or ~/.codex). Skip the worktree symlink for these so
+// we don't surprise users running them in unusual locations.
+const SETUP_COMMANDS = new Set(['init', 'bootstrap', 'install-claude', 'install-codex']);
+
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
 
   if (!command || command === '--help' || command === '-h') {
     printTopLevelHelp();
     return;
+  }
+
+  // Auto-link shared node_modules into externally-created worktrees (Claude
+  // Code worktrees, manual `git worktree add`) so any pipelane command
+  // works without a manual symlink step. Same mechanism pipelane:new
+  // already uses internally; this just covers worktrees pipelane didn't
+  // create. Conservative trigger — only fires when the worktree has no
+  // node_modules at all.
+  if (!SETUP_COMMANDS.has(command)) {
+    const bootstrap = bootstrapWorktreeNodeModulesIfNeeded(process.cwd());
+    if (bootstrap.message) {
+      process.stderr.write(`${bootstrap.message}\n`);
+    }
   }
 
   if (command === 'init') {
