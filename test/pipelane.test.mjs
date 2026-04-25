@@ -6680,6 +6680,26 @@ test('api action execute: devmode actions switch the repo mode', () => {
   }
 });
 
+test('api action execute: devmode release failure surfaces the CLI result message', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const result = runCli(['run', 'api', 'action', 'devmode.release', '--execute'], repoRoot, {}, true);
+    assert.equal(result.status, 1);
+    const envelope = JSON.parse(result.stdout);
+    assert.equal(envelope.ok, false);
+    assert.match(envelope.message, /Release readiness: FAIL/);
+    assert.doesNotMatch(envelope.message, /see execution\.stderr/);
+    assert.match(envelope.data.preflight.reason, /Release readiness: FAIL/);
+    assert.equal(envelope.data.execution.stderr, '');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('board help prints subcommand list', () => {
   const result = runCli(['board', '--help'], process.cwd());
   assert.equal(result.status, 0);

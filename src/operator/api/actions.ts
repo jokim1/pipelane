@@ -245,13 +245,14 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
   const underlyingArgs = buildUnderlyingArgs(actionId, parsed);
   const childEnv = buildChildEnv(actionId);
   const result = runCliWithJson(cwd, underlyingArgs, childEnv);
+  const failureReason = result.ok ? '' : describeExecutionFailure(actionId, result);
 
   const data: ActionExecutionData = {
     action: { id: actionId, label: ACTION_LABELS[actionId], risky },
     preflight: {
       allowed: true,
       state: result.ok ? 'healthy' : 'blocked',
-      reason: result.ok ? '' : result.stderr || `${actionId} exited ${result.exitCode}`,
+      reason: failureReason,
       warnings: [],
       issues: [],
       normalizedInputs,
@@ -269,9 +270,28 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
   return buildApiEnvelope<ActionExecutionData>({
     command: 'pipelane.api.action',
     ok: result.ok,
-    message: result.ok ? `${actionId} executed` : `${actionId} failed: ${result.stderr || 'see execution.stderr'}`,
+    message: result.ok ? `${actionId} executed` : `${actionId} failed: ${failureReason}`,
     data,
   });
+}
+
+function describeExecutionFailure(
+  actionId: StableActionId,
+  result: ReturnType<typeof runCliWithJson>,
+): string {
+  if (result.stderr) {
+    return result.stderr;
+  }
+  if (result.parsed && typeof result.parsed === 'object') {
+    const message = (result.parsed as { message?: unknown }).message;
+    if (typeof message === 'string' && message.trim()) {
+      return message.trim();
+    }
+  }
+  if (typeof result.parsed === 'string' && result.parsed.trim()) {
+    return result.parsed.trim();
+  }
+  return `${actionId} exited ${result.exitCode}`;
 }
 
 function normalizeInputs(actionId: StableActionId, parsed: ParsedOperatorArgs, cwd?: string): Record<string, unknown> {
