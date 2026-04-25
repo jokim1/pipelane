@@ -3510,6 +3510,37 @@ test('install-codex ignores unsafe managed manifest skill names instead of delet
   }
 });
 
+test('install-codex replaces legacy pipelane runtime directory that blocks the /pipelane skill', () => {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-install-codex-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    mkdirSync(path.join(codexHome, 'skills', 'pipelane', 'bin'), { recursive: true });
+    writeFileSync(
+      path.join(codexHome, 'skills', 'pipelane', 'bin', 'run-pipelane.sh'),
+      [
+        '#!/bin/sh',
+        'ensure_local_pipelane_config() {',
+        '  true',
+        '}',
+        'echo "This repo is not pipelane enabled. Run pipelane init first." >&2',
+        '',
+      ].join('\n'),
+      { mode: 0o755, encoding: 'utf8' },
+    );
+
+    const result = runCli(['install-codex'], workspaceRoot, { CODEX_HOME: codexHome });
+
+    assert.match(result.stdout, /Removed legacy machine-local wrapper skills: pipelane/);
+    const skill = readFileSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
+    assert.match(skill, /pipelane:codex-global-skill:pipelane/);
+    assert.equal(existsSync(path.join(codexHome, 'skills', 'pipelane', 'bin', 'run-pipelane.sh')), false);
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
 test('setup upgrades pre-marker alias-generated Claude commands and prunes them on rename', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));

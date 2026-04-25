@@ -116,6 +116,21 @@ function hasLegacyWorkflowKitSignature(body: string, skillName: string): boolean
     );
 }
 
+function isLegacyPipelaneRuntimeDir(skillsRoot: string, skillName: string): boolean {
+  if (skillName !== PIPELANE_DISPATCH_SKILL_NAME) {
+    return false;
+  }
+  const targetDir = skillDirPath(skillsRoot, skillName);
+  const skillPath = path.join(targetDir, 'SKILL.md');
+  const legacyRunnerPath = path.join(targetDir, 'bin', 'run-pipelane.sh');
+  if (existsSync(skillPath) || !existsSync(legacyRunnerPath)) {
+    return false;
+  }
+  const body = readFileSync(legacyRunnerPath, 'utf8');
+  return body.includes('ensure_local_pipelane_config')
+    && body.includes('This repo is not pipelane enabled. Run pipelane init first.');
+}
+
 function isManagedCodexSkillBody(body: string, skillName: string): boolean {
   return (
     body.includes(`${MACHINE_CODEX_SKILL_MARKER_PREFIX}${skillName} -->`)
@@ -166,6 +181,11 @@ function pruneLegacyCodexWrappers(skillsRoot: string, desired: DesiredInstallEnt
   const removed: string[] = [];
   for (const skillName of candidates) {
     if (!isSafeSkillName(skillName)) {
+      continue;
+    }
+    if (isLegacyPipelaneRuntimeDir(skillsRoot, skillName)) {
+      rmSync(skillDirPath(skillsRoot, skillName), { recursive: true, force: true });
+      removed.push(skillName);
       continue;
     }
     if (!isManagedCodexSkill(skillsRoot, skillName)) {
