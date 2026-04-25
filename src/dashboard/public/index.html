@@ -751,7 +751,7 @@
     .table-wrap {
       --branch-column-width: 320px;
       --ledger-lanes-width: 1100px;
-      overflow: auto;
+      overflow: visible;
       border-top: 1px solid var(--line);
     }
 
@@ -788,6 +788,32 @@
       position: sticky;
       top: 0;
       z-index: 1;
+    }
+
+    .branch-ledger-panel {
+      overflow: visible;
+    }
+
+    .branch-ledger-panel-header {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      min-height: var(--branch-ledger-header-height, 52px);
+      border-radius: var(--radius) var(--radius) 0 0;
+      border-bottom: 1px solid var(--line);
+      background: rgba(8, 18, 24, 0.96);
+      backdrop-filter: blur(18px);
+    }
+
+    .branch-ledger-panel thead th {
+      top: var(--branch-ledger-header-height, 52px);
+      z-index: 18;
+      background: rgba(9, 22, 28, 0.98);
+      backdrop-filter: blur(14px);
+    }
+
+    .branch-ledger-panel .branch-sticky-head {
+      z-index: 22;
     }
 
     tbody tr {
@@ -1887,8 +1913,8 @@
         </div>
       </section>
 
-      <section class="panel">
-        <div class="panel-header">
+      <section class="panel branch-ledger-panel" id="branch-ledger-panel">
+        <div class="panel-header branch-ledger-panel-header" id="branch-ledger-header">
           <div class="panel-title">Branch Ledger</div>
           <div class="footer-note" id="branch-summary"></div>
         </div>
@@ -4330,6 +4356,20 @@
       render();
     }
 
+    function syncBranchLedgerHeaderHeight() {
+      const header = document.getElementById('branch-ledger-header');
+      const panel = document.getElementById('branch-ledger-panel');
+      if (!header || !panel) return;
+      panel.style.setProperty('--branch-ledger-header-height', `${Math.ceil(header.getBoundingClientRect().height)}px`);
+    }
+
+    function observeBranchLedgerHeader() {
+      syncBranchLedgerHeaderHeight();
+      const header = document.getElementById('branch-ledger-header');
+      if (!header || typeof ResizeObserver === 'undefined') return;
+      new ResizeObserver(syncBranchLedgerHeaderHeight).observe(header);
+    }
+
     function scheduleAutoRefresh() {
       clearTimeout(state.refreshTimer);
       state.refreshTimer = setTimeout(async () => {
@@ -4350,6 +4390,7 @@
       renderBranchTable();
       renderBranchContextMenu();
       renderDetail();
+      syncBranchLedgerHeaderHeight();
       document.getElementById('help-button').disabled = state.loading.help;
       document.getElementById('refresh-button').disabled = state.loading.snapshot;
     }
@@ -4576,6 +4617,7 @@
       await loadHealth();
       await loadSnapshot(true);
       render();
+      observeBranchLedgerHeader();
       scheduleAutoRefresh();
     })().catch((error) => {
       document.getElementById('detail-content').innerHTML = `<div class="detail-empty">${escapeHtml(error.message || String(error))}</div>`;

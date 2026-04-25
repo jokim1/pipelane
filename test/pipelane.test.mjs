@@ -5932,6 +5932,17 @@ test('dashboard UI ships a Pipelane help drawer', () => {
   assert.match(html, /\/pipelane update --check/);
 });
 
+test('dashboard branch ledger keeps its headers sticky while rows scroll', () => {
+  const html = readFileSync(path.join(KIT_ROOT, 'src', 'dashboard', 'public', 'index.html'), 'utf8');
+
+  assert.match(html, /class="panel branch-ledger-panel"/);
+  assert.match(html, /class="panel-header branch-ledger-panel-header"/);
+  assert.match(html, /\.branch-ledger-panel-header\s*\{[^}]*position: sticky;/s);
+  assert.match(html, /\.branch-ledger-panel thead th\s*\{[^}]*top: var\(--branch-ledger-header-height/s);
+  assert.match(html, /function syncBranchLedgerHeaderHeight\(\)/);
+  assert.match(html, /\.table-wrap\s*\{[^}]*overflow: visible;/s);
+});
+
 async function runCliAsync(args, cwd, env = {}) {
   const child = spawn('node', [CLI_PATH, ...args], {
     cwd,
