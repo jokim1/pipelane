@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 
+import { accessSync, constants, existsSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import readline from 'node:readline/promises';
+
 import { handlePipelane } from './dashboard/launcher.ts';
 import { getDashboardOptions, startDashboardServer } from './dashboard/server.ts';
 import { collectBootstrapWarnings, parseBootstrapArgs, runBootstrap } from './operator/bootstrap.ts';
@@ -8,20 +12,25 @@ import { installCodexBootstrapSkill } from './operator/codex-install.ts';
 import { handleConfigure } from './operator/commands/configure.ts';
 import { formatSetupResult, initConsumerRepo, setupConsumerRepo, syncDocsOnly } from './operator/docs.ts';
 import { runOperator } from './operator/index.ts';
+import { installNpmGuard } from './operator/npm-guard-install.ts';
+import { resolveRepoRoot } from './operator/state.ts';
 import { bootstrapWorktreeNodeModulesIfNeeded } from './operator/task-workspaces.ts';
 import { parseUpdateArgs, runUpdate } from './operator/update.ts';
+import { runVerify } from './operator/verify.ts';
 
 function printTopLevelHelp(): void {
   process.stdout.write(`Pipelane - release pipeline management and safety for AI vibe coders
 
 Commands:
-  bootstrap [--project "Project Name"]
+  bootstrap [--yes] [--project "Project Name"]
   init --project "Project Name"
   setup
   sync-docs
   configure [--json] [surface flags...]
-  install-claude
-  install-codex
+  install-claude [--verbose]
+  install-codex [--verbose]
+  install-npm-guard
+  verify
   update [--check] [--yes] [--json]
   dashboard [--repo <repo-root>] [--host <host>] [--port <port>]
   board [stop|status] [--repo <repo-root>] [--port <port>] [--no-open]
@@ -30,6 +39,7 @@ Commands:
 Examples:
   pipelane bootstrap --project "My Project"
   pipelane install-claude
+  pipelane install-npm-guard
   pipelane board
   pipelane board stop
   pipelane update --check
@@ -66,11 +76,85 @@ function assertNoArgs(args: string[], command: string): void {
   }
 }
 
+function parseVerboseArg(args: string[], command: string): boolean {
+  let verbose = false;
+  for (const token of args) {
+    if (token === '--verbose') {
+      verbose = true;
+      continue;
+    }
+    if (token === '--help' || token === '-h') {
+      process.stdout.write(`pipelane ${command} [--verbose]\n`);
+      process.exit(0);
+    }
+    throw new Error(`Unknown flag for pipelane ${command}: ${token}`);
+  }
+  return verbose;
+}
+
 // Commands that own pipelane setup themselves; auto-bootstrap is irrelevant
 // (init/bootstrap) or operates outside the worktree (install-claude/codex
 // write to ~/.claude or ~/.codex). Skip the worktree symlink for these so
 // we don't surprise users running them in unusual locations.
-const SETUP_COMMANDS = new Set(['init', 'bootstrap', 'install-claude', 'install-codex']);
+const SETUP_COMMANDS = new Set(['init', 'bootstrap', 'install-claude', 'install-codex', 'install-npm-guard', 'verify']);
+
+function isExecutablePath(targetPath: string): boolean {
+  try {
+    accessSync(targetPath, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function maybeReexecRepoLocalPipelane(cwd: string): void {
+  if (process.env.PIPELANE_MANAGED_RUNTIME !== '1' || process.env.PIPELANE_RUNNER_REEXECED === '1') {
+    return;
+  }
+
+  const repoRoot = resolveRepoRoot(cwd, true);
+  const localBin = `${repoRoot}/node_modules/.bin/pipelane`;
+  if (!existsSync(localBin) || !isExecutablePath(localBin)) {
+    return;
+  }
+
+  const reexecEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    PIPELANE_RUNNER_REEXECED: '1',
+  };
+  delete reexecEnv.PIPELANE_MANAGED_RUNTIME;
+  delete reexecEnv.PIPELANE_MANAGED_RUNTIME_ROOT;
+
+  const result = spawnSync(localBin, process.argv.slice(2), {
+    cwd: repoRoot,
+    env: reexecEnv,
+    stdio: 'inherit',
+  });
+  if (result.error) {
+    throw result.error;
+  }
+  process.exit(result.status === null ? 1 : result.status);
+}
+
+async function confirmBootstrapWrites(yes: boolean | undefined): Promise<void> {
+  if (yes) {
+    return;
+  }
+
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error('pipelane bootstrap can write .pipelane.json, .claude/, .agents/, package.json scripts, docs, and other generated repo files. Re-run with --yes after confirming those changes are intended.');
+  }
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (await rl.question('pipelane bootstrap can write .pipelane.json, .claude/, .agents/, package.json scripts, docs, and other generated repo files. Continue? [y/N] ')).trim().toLowerCase();
+    if (answer !== 'y' && answer !== 'yes') {
+      throw new Error('pipelane bootstrap cancelled.');
+    }
+  } finally {
+    rl.close();
+  }
+}
 
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
@@ -91,6 +175,7 @@ async function main(): Promise<void> {
     if (bootstrap.message) {
       process.stderr.write(`${bootstrap.message}\n`);
     }
+    maybeReexecRepoLocalPipelane(process.cwd());
   }
 
   if (command === 'init') {
@@ -118,6 +203,7 @@ async function main(): Promise<void> {
 
   if (command === 'bootstrap') {
     const options = parseBootstrapArgs(rest);
+    await confirmBootstrapWrites(options.yes);
     const result = runBootstrap(process.cwd(), options);
     const lines = [
       `Bootstrapped pipelane in ${result.repoRoot}`,
@@ -173,23 +259,62 @@ async function main(): Promise<void> {
   }
 
   if (command === 'install-codex') {
-    assertNoArgs(rest, 'install-codex');
+    const verbose = parseVerboseArg(rest, 'install-codex');
     const result = installCodexBootstrapSkill();
     const lines = [
-      `Installed Codex bootstrap skill in ${result.codexHome}: ${result.installed.join(', ')}`,
+      `Installed ${result.installed.length} durable Pipelane Codex commands in ${result.codexHome}.`,
     ];
     if (result.removedLegacySkills.length > 0) {
       lines.push(`Removed legacy machine-local wrapper skills: ${result.removedLegacySkills.join(', ')}`);
     }
-    lines.push('Repo-tracked Codex skills now live under .agents/skills after pipelane bootstrap/setup.');
+    if (result.skipped.length > 0) {
+      lines.push(`Skipped unmanaged optional skills: ${result.skipped.join(', ')}. Use /pipelane-fix.`);
+    }
+    if (verbose) {
+      lines.push(`Commands: ${result.installed.join(', ')}`);
+      lines.push(`Runtime: ${result.runtimeRoot}`);
+    }
+    lines.push('Restart Codex if newly installed commands do not appear in this session.');
     process.stdout.write(lines.join('\n') + '\n');
     return;
   }
 
   if (command === 'install-claude') {
-    assertNoArgs(rest, 'install-claude');
+    const verbose = parseVerboseArg(rest, 'install-claude');
     const result = installClaudeBootstrapSkill();
-    process.stdout.write(`Installed Claude skills in ${result.claudeHome}: ${result.installed.join(', ')}\n`);
+    const lines = [`Installed ${result.installed.length} durable Pipelane Claude commands in ${result.claudeHome}.`];
+    if (result.skipped.length > 0) {
+      lines.push(`Skipped unmanaged optional skills: ${result.skipped.join(', ')}. Use /pipelane-fix.`);
+    }
+    if (verbose) {
+      lines.push(`Commands: ${result.installed.join(', ')}`);
+      lines.push(`Runtime: ${result.runtimeRoot}`);
+    }
+    lines.push('Restart Claude if newly installed skills do not appear in this session.');
+    process.stdout.write(lines.join('\n') + '\n');
+    return;
+  }
+
+  if (command === 'install-npm-guard') {
+    assertNoArgs(rest, 'install-npm-guard');
+    const result = installNpmGuard();
+    const lines = [`Installed npm guard at ${result.shimPath}`];
+    if (result.warnings.length > 0) {
+      lines.push('PATH warnings:');
+      lines.push(...result.warnings.map((warning) => `- ${warning}`));
+      lines.push(`Add this before your Node version manager in shell startup: export PATH="${result.binDir}:$PATH"`);
+    }
+    process.stdout.write(lines.join('\n') + '\n');
+    return;
+  }
+
+  if (command === 'verify') {
+    assertNoArgs(rest, 'verify');
+    const result = runVerify();
+    process.stdout.write(`${result.message}\n`);
+    if (!result.ok) {
+      process.exitCode = 1;
+    }
     return;
   }
 

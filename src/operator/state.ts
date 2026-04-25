@@ -1700,7 +1700,7 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     // as positional mode tokens so handleDoctor can preserve both
     // `doctor probe` and `doctor --probe`; validation below makes them legal
     // only for the doctor command instead of silently leaking into others.
-    if (token === '--probe' || token === '--fix' || token === '--diagnose') {
+    if (token === '--probe' || token === '--fix' || token === '--diagnose' || token === '--check-guard') {
       positional.push(token);
       continue;
     }
@@ -2069,10 +2069,20 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       return;
     case 'doctor': {
       assertOnlyFlags(parsed, ['apply']);
-      if (parsed.positional.length > 1) failUnexpected('pipelane run doctor [diagnose|probe|fix|--diagnose|--probe|--fix]');
+      if (parsed.positional.length > 1) failUnexpected('pipelane run doctor [diagnose|probe|fix|check-guard|--diagnose|--probe|--fix|--check-guard]');
       const mode = parsed.positional[0];
-      if (mode && mode !== 'diagnose' && mode !== 'probe' && mode !== 'fix' && mode !== '--diagnose' && mode !== '--probe' && mode !== '--fix') {
-        throw new Error(`Unknown doctor mode "${mode}". Supported modes: diagnose, probe, fix.`);
+      if (
+        mode
+        && mode !== 'diagnose'
+        && mode !== 'probe'
+        && mode !== 'fix'
+        && mode !== 'check-guard'
+        && mode !== '--diagnose'
+        && mode !== '--probe'
+        && mode !== '--fix'
+        && mode !== '--check-guard'
+      ) {
+        throw new Error(`Unknown doctor mode "${mode}". Supported modes: diagnose, probe, fix, check-guard.`);
       }
       return;
     }

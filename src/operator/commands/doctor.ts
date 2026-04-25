@@ -1,4 +1,4 @@
-import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, lstatSync, openSync, readFileSync, readlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 
@@ -12,6 +12,7 @@ import {
   saveSharedDeployConfig,
   type DeployConfig,
 } from '../release-gate.ts';
+import { runNpmGuardSelfCheck } from '../npm-guard-install.ts';
 import { sanitizeForTerminal } from './helpers.ts';
 import {
   ensureStateDir,
@@ -37,8 +38,6 @@ import {
 //
 // All three write JSON output under `--json` and human text otherwise.
 export async function handleDoctor(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
-  const context = resolveWorkflowContext(cwd);
-
   if (parsed.flags.apply) {
     // `--apply` is the scoped-prune flag on /clean; repurpose `--probe`
     // for clarity. This branch catches an operator who typed --apply here.
@@ -46,6 +45,11 @@ export async function handleDoctor(cwd: string, parsed: ParsedOperatorArgs): Pro
   }
 
   const mode = resolveDoctorMode(parsed);
+  if (mode === 'check-guard') {
+    runCheckGuard(parsed);
+    return;
+  }
+  const context = resolveWorkflowContext(cwd);
   if (mode === 'probe') {
     await withDoctorStateLock(context, 'probe', async () => {
       await runProbe(context, parsed);
@@ -61,7 +65,7 @@ export async function handleDoctor(cwd: string, parsed: ParsedOperatorArgs): Pro
   runDiagnose(context, parsed);
 }
 
-type DoctorMode = 'diagnose' | 'probe' | 'fix';
+type DoctorMode = 'diagnose' | 'probe' | 'fix' | 'check-guard';
 
 function resolveDoctorMode(parsed: ParsedOperatorArgs): DoctorMode {
   // Modes arrive as positional args since /doctor doesn't take --probe /
@@ -71,6 +75,7 @@ function resolveDoctorMode(parsed: ParsedOperatorArgs): DoctorMode {
   const flagsToken = findFlag(parsed);
   if (positional === 'probe' || flagsToken === '--probe') return 'probe';
   if (positional === 'fix' || flagsToken === '--fix') return 'fix';
+  if (positional === 'check-guard' || flagsToken === '--check-guard') return 'check-guard';
   if (positional === 'diagnose' || flagsToken === '--diagnose') return 'diagnose';
   return 'diagnose';
 }
@@ -80,9 +85,20 @@ function findFlag(parsed: ParsedOperatorArgs): string | null {
   // fell through parseOperatorArgs into positional. Scan positional for
   // them; the explicit form is slightly more discoverable than positional.
   for (const entry of parsed.positional) {
-    if (entry === '--probe' || entry === '--fix' || entry === '--diagnose') return entry;
+    if (entry === '--probe' || entry === '--fix' || entry === '--diagnose' || entry === '--check-guard') return entry;
   }
   return null;
+}
+
+function runCheckGuard(parsed: ParsedOperatorArgs): void {
+  const result = runNpmGuardSelfCheck();
+  printResult(parsed.flags, {
+    ok: result.ok,
+    message: ['Doctor npm guard:', ...result.lines.map((line) => `  ${line}`)].join('\n'),
+  });
+  if (!result.ok) {
+    process.exitCode = 1;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +140,16 @@ export function buildDiagnoseReport(context: WorkflowContext): DiagnoseReport {
     }
     lines.push(`  Fix: \`${formatWorkflowCommand(context.config, 'doctor', '--fix')}\``);
   }
+  const staleNodeModules = detectStaleNodeModulesLink(context.repoRoot);
+  if (staleNodeModules) {
+    lines.push(`  node_modules link: stale (${staleNodeModules.target})`);
+    lines.push('  Fix: remove only the node_modules symlink, then rerun the Pipelane command or reinstall dependencies in the shared checkout.');
+  }
+  const versionSkew = detectManagedLocalVersionSkew(context.repoRoot);
+  if (versionSkew) {
+    lines.push(`  Runtime versions: managed ${versionSkew.managedVersion}, repo-local ${versionSkew.localVersion}`);
+    lines.push('  Warning: this command started from a managed runtime but a different repo-local pipelane version is available; renamed flags can fail after re-exec.');
+  }
   const latestStaging = latestProbeRecordsBySurface(probeState.records, 'staging');
   if (latestStaging.length === 0) {
     lines.push(`  Probe state: no probes recorded. Run \`${formatWorkflowCommand(context.config, 'doctor', '--probe')}\`.`);
@@ -152,6 +178,44 @@ export function buildDiagnoseReport(context: WorkflowContext): DiagnoseReport {
     probeState: { present: probeState.records.length > 0, records: probeState.records },
     message: lines.join('\n'),
   };
+}
+
+function detectStaleNodeModulesLink(repoRoot: string): { target: string } | null {
+  const nodeModulesPath = path.join(repoRoot, 'node_modules');
+  try {
+    const stat = lstatSync(nodeModulesPath);
+    if (!stat.isSymbolicLink()) {
+      return null;
+    }
+    const rawTarget = readlinkSync(nodeModulesPath);
+    const target = path.isAbsolute(rawTarget) ? rawTarget : path.resolve(repoRoot, rawTarget);
+    return existsSync(target) ? null : { target };
+  } catch {
+    return null;
+  }
+}
+
+function readJsonVersion(targetPath: string): string {
+  try {
+    const parsed = JSON.parse(readFileSync(targetPath, 'utf8')) as { version?: string; packageVersion?: string };
+    return parsed.version || parsed.packageVersion || '';
+  } catch {
+    return '';
+  }
+}
+
+function detectManagedLocalVersionSkew(repoRoot: string): { managedVersion: string; localVersion: string } | null {
+  const managedRoot = process.env.PIPELANE_MANAGED_RUNTIME_ROOT;
+  if (!managedRoot) {
+    return null;
+  }
+  const managedVersion = readJsonVersion(path.join(managedRoot, '.pipelane-runtime.json'))
+    || readJsonVersion(path.join(managedRoot, 'package.json'));
+  const localVersion = readJsonVersion(path.join(repoRoot, 'node_modules', 'pipelane', 'package.json'));
+  if (!managedVersion || !localVersion || managedVersion === localVersion) {
+    return null;
+  }
+  return { managedVersion, localVersion };
 }
 
 function latestProbeRecordsBySurface(records: ProbeRecord[], environment: ProbeEnvironment): ProbeRecord[] {

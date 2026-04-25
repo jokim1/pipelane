@@ -48,6 +48,15 @@ export function resolveSharedRepoRoot(commonDir: string): string {
   return normalizePath(path.dirname(commonDir));
 }
 
+function resolveLinkableSharedRepoRoot(commonDir: string): string | null {
+  const normalizedCommonDir = normalizePath(commonDir);
+  const modulesSegment = `${path.sep}.git${path.sep}modules${path.sep}`;
+  if (normalizedCommonDir.includes(modulesSegment)) {
+    return null;
+  }
+  return resolveSharedRepoRoot(commonDir);
+}
+
 export function resolveTaskWorktreeRoot(commonDir: string, config: WorkflowConfig): string {
   const sharedRepoRoot = resolveSharedRepoRoot(commonDir);
   return path.join(path.dirname(sharedRepoRoot), config.taskWorktreeDirName);
@@ -75,7 +84,10 @@ export function ensureSharedNodeModulesLink(
   worktreePath: string,
   options: { replaceExistingDirectory?: boolean } = {},
 ): string | null {
-  const sharedRepoRoot = resolveSharedRepoRoot(commonDir);
+  const sharedRepoRoot = resolveLinkableSharedRepoRoot(commonDir);
+  if (!sharedRepoRoot) {
+    return null;
+  }
   const normalizedSharedRepoRoot = normalizePath(sharedRepoRoot);
   const normalizedWorktreePath = normalizePath(worktreePath);
 
@@ -143,7 +155,10 @@ export function bootstrapWorktreeNodeModulesIfNeeded(cwd: string): WorktreeBoots
   const commonDirRel = commonDirRaw.trim();
   const commonDir = path.isAbsolute(commonDirRel) ? commonDirRel : path.resolve(worktreePath, commonDirRel);
 
-  const sharedRepoRoot = resolveSharedRepoRoot(commonDir);
+  const sharedRepoRoot = resolveLinkableSharedRepoRoot(commonDir);
+  if (!sharedRepoRoot) {
+    return { kind: 'noop', message: null };
+  }
   if (normalizePath(sharedRepoRoot) === normalizePath(worktreePath)) {
     return { kind: 'noop', message: null };
   }

@@ -176,6 +176,18 @@ Use `/fix` when you want the codebase to get healthier, not just quieter.
 
 ## What Gets Installed
 
+Pipelane has two command surfaces:
+
+- machine-local durable defaults installed by `pipelane install-codex` and
+  `pipelane install-claude`
+- repo-local generated adapters from `pipelane bootstrap`/`pipelane setup` for
+  custom aliases and rich per-repo command text
+
+The machine-local surface installs default `/new`, `/status`, `/pipelane`,
+`/pipelane-fix`, and related commands under `~/.codex/skills` and
+`~/.claude/skills`. It is the no-commit path for repos that intentionally ignore
+generated Pipelane adapters.
+
 Bootstrapping Pipelane into a repo adds or manages:
 
 - `.pipelane.json`, or `.project-workflow.json` if you want a tool-neutral name
@@ -201,7 +213,7 @@ npx -y pipelane@github:jokim1/pipelane#main bootstrap --project "My App"
 If `pipelane` is already on your `PATH`, use:
 
 ```bash
-pipelane bootstrap --project "My App"
+pipelane bootstrap --yes --project "My App"
 ```
 
 Then review and commit the tracked files:
@@ -216,6 +228,30 @@ Why commit before using `/new`?
 
 `/new` creates task worktrees from the repo's base branch. If the base branch does
 not contain the Pipelane files yet, new worktrees will not inherit the workflow.
+
+For a repo that must not commit Pipelane adapters or config, do not run
+`bootstrap`/`init-pipelane`. Install the machine-local defaults instead:
+
+```bash
+pipelane install-codex
+pipelane install-claude
+```
+
+Those commands install durable default slash commands without writing to the
+current repo. `/init-pipelane` is still available when you intentionally want to
+attach a repo; it prompts before writing `.pipelane.json`, `.claude/`,
+`.agents/`, package scripts, docs, or other generated files.
+
+To guard raw npm installs in worktrees whose `node_modules` is a symlink:
+
+```bash
+pipelane install-npm-guard
+export PATH="$HOME/.pipelane/bin:$PATH"
+pipelane run doctor --check-guard
+```
+
+The npm guard is opt-in, does not edit shell profiles, and only protects shells
+where `npm` resolves through `~/.pipelane/bin/npm`.
 
 ## Requirements
 

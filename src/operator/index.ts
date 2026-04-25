@@ -142,6 +142,8 @@ Usage:
   pipelane sync-docs
   pipelane install-claude
   pipelane install-codex
+  pipelane install-npm-guard
+  pipelane verify
 
 Pipelane commands:
   devmode
@@ -156,7 +158,7 @@ Pipelane commands:
   clean
   smoke
   status
-  doctor [--probe | --fix]
+  doctor [--probe | --fix | --check-guard]
   rollback <staging|prod> [--surfaces ...] [--revert-pr]
   api snapshot
   api branch --branch <branch>
