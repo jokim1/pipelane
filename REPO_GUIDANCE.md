@@ -61,6 +61,13 @@ cleaner approach failed.
 - **Symlinked `node_modules` warns on every setup.** Prevents `npm ci`
   wipe when working in a worktree that symlinks back to the main repo's
   `node_modules`. Added in 9d71d66; do not weaken the warning.
+- **Preinstall guard hard-blocks `npm ci`/`install` in symlinked
+  worktrees.** `scripts/preinstall-guard.cjs` runs from the consumer's
+  `package.json:scripts.preinstall` (wired by `pipelane setup`). Aborts
+  before npm's reify step touches the symlink. The standalone CJS file
+  must stay zero-import so it works when pipelane itself isn't yet
+  loadable; the consumer-side wiring uses `existsSync` so it self-no-ops
+  on first install. Do not weaken either side.
 - **`renderTemplate` substitutes `{{PLACEHOLDER}}` only from a closed
   replacements map.** Every new template variable must land in the
   replacements object in `docs.ts:135`. Missing substitutions ship to

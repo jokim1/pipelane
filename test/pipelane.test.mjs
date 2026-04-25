@@ -11444,3 +11444,180 @@ test('buildSmokeHandoffMessage before-deploy-prod: optional+unconfigured does no
   });
   assert.equal(msg.blocks, false);
 });
+
+const PREINSTALL_GUARD_PATH = path.join(KIT_ROOT, 'scripts', 'preinstall-guard.cjs');
+
+function spawnPreinstallGuard(cwd) {
+  return spawnSync('node', [PREINSTALL_GUARD_PATH], {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
+test('preinstall-guard exits 0 silently when node_modules is missing', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-guard-empty-'));
+  try {
+    const result = spawnPreinstallGuard(dir);
+    assert.equal(result.status, 0, `guard should pass; stderr=${result.stderr}`);
+    assert.equal(result.stderr, '');
+    assert.equal(result.stdout, '');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('preinstall-guard exits 0 silently when node_modules is a real directory', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-guard-realdir-'));
+  try {
+    mkdirSync(path.join(dir, 'node_modules'));
+    const result = spawnPreinstallGuard(dir);
+    assert.equal(result.status, 0, `guard should pass; stderr=${result.stderr}`);
+    assert.equal(result.stderr, '');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('preinstall-guard exits 1 with warning when node_modules is a symlink', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-guard-symlink-'));
+  const sharedDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-guard-shared-'));
+  try {
+    mkdirSync(path.join(sharedDir, 'node_modules'));
+    const { symlinkSync } = await import('node:fs');
+    symlinkSync(path.join(sharedDir, 'node_modules'), path.join(dir, 'node_modules'), 'dir');
+    const result = spawnPreinstallGuard(dir);
+    assert.equal(result.status, 1, `guard should refuse; stderr=${result.stderr}`);
+    assert.match(result.stderr, /preinstall-guard/);
+    assert.match(result.stderr, /symlink/);
+    assert.match(result.stderr, /npm ci/);
+    // Symlink target must remain intact — the whole point of the guard.
+    assert.ok(existsSync(path.join(sharedDir, 'node_modules')));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(sharedDir, { recursive: true, force: true });
+  }
+});
+
+test('preinstall-guard warning text matches SHARED_NODE_MODULES_NPMCI_WARNING from task-workspaces.ts', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-guard-textmatch-'));
+  const sharedDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-guard-textmatch-shared-'));
+  try {
+    mkdirSync(path.join(sharedDir, 'node_modules'));
+    const { symlinkSync } = await import('node:fs');
+    symlinkSync(path.join(sharedDir, 'node_modules'), path.join(dir, 'node_modules'), 'dir');
+    const result = spawnPreinstallGuard(dir);
+    const taskWorkspaces = await import(path.join(KIT_ROOT, 'src', 'operator', 'task-workspaces.ts'));
+    assert.ok(
+      result.stderr.includes(taskWorkspaces.SHARED_NODE_MODULES_NPMCI_WARNING),
+      `guard stderr must contain SHARED_NODE_MODULES_NPMCI_WARNING verbatim. stderr=${result.stderr}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(sharedDir, { recursive: true, force: true });
+  }
+});
+
+test('mergePreinstallScript writes pipelane guard when no existing preinstall', async () => {
+  const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
+  assert.equal(docs.mergePreinstallScript(undefined), docs.PIPELANE_PREINSTALL_GUARD);
+  assert.equal(docs.mergePreinstallScript(''), docs.PIPELANE_PREINSTALL_GUARD);
+  assert.equal(docs.mergePreinstallScript('   '), docs.PIPELANE_PREINSTALL_GUARD);
+});
+
+test('mergePreinstallScript chains pipelane guard before existing preinstall', async () => {
+  const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
+  const merged = docs.mergePreinstallScript('echo hello');
+  assert.equal(merged, `${docs.PIPELANE_PREINSTALL_GUARD} && echo hello`);
+  assert.ok(merged.startsWith(docs.PIPELANE_PREINSTALL_GUARD), 'guard must run first');
+});
+
+test('mergePreinstallScript is idempotent when guard fingerprint is already present', async () => {
+  const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
+  // Already-chained: leave alone.
+  const chained = `${docs.PIPELANE_PREINSTALL_GUARD} && echo hello`;
+  assert.equal(docs.mergePreinstallScript(chained), chained);
+  // User put the guard inline some other way (e.g., wrapped in their own script).
+  const wrapped = `bash -c "${docs.PIPELANE_PREINSTALL_GUARD}"`;
+  assert.equal(docs.mergePreinstallScript(wrapped), wrapped);
+});
+
+test('setup writes preinstall guard into a fresh consumer package.json', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    assert.ok(pkg.scripts.preinstall, 'preinstall script must be present');
+    assert.match(pkg.scripts.preinstall, /pipelane\/scripts\/preinstall-guard\.cjs/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup chains existing preinstall instead of clobbering it', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const packageJsonPath = path.join(repoRoot, 'package.json');
+    const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+    pkg.scripts = { ...(pkg.scripts ?? {}), preinstall: 'echo consumer-hook' };
+    writeFileSync(packageJsonPath, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
+
+    runCli(['setup'], repoRoot);
+
+    const next = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+    assert.match(next.scripts.preinstall, /pipelane\/scripts\/preinstall-guard\.cjs/);
+    assert.match(next.scripts.preinstall, /echo consumer-hook/);
+    assert.ok(
+      next.scripts.preinstall.indexOf('preinstall-guard.cjs') < next.scripts.preinstall.indexOf('echo consumer-hook'),
+      'pipelane guard must run before the consumer hook',
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup is idempotent when preinstall guard is already present', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const packageJsonPath = path.join(repoRoot, 'package.json');
+    const firstPass = readFileSync(packageJsonPath, 'utf8');
+    runCli(['setup'], repoRoot);
+    const secondPass = readFileSync(packageJsonPath, 'utf8');
+    assert.equal(firstPass, secondPass, 'second setup must not change package.json');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('detectSetupDrift reports drift when preinstall guard is missing and no drift after setup', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    // Wipe the preinstall that init may have written, to simulate an
+    // older consumer who set up before the guard existed.
+    const packageJsonPath = path.join(repoRoot, 'package.json');
+    const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+    if (pkg.scripts) delete pkg.scripts.preinstall;
+    writeFileSync(packageJsonPath, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
+
+    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
+    const drift = docs.detectSetupDrift(repoRoot);
+    assert.ok(
+      drift.otherSurfaces.includes('packageScripts'),
+      `expected packageScripts drift; got otherSurfaces=${drift.otherSurfaces.join(',')}`,
+    );
+
+    runCli(['setup'], repoRoot);
+    const after = docs.detectSetupDrift(repoRoot);
+    assert.ok(
+      !after.otherSurfaces.includes('packageScripts'),
+      `setup should clear packageScripts drift; got otherSurfaces=${after.otherSurfaces.join(',')}`,
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});

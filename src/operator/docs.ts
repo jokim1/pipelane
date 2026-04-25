@@ -432,6 +432,30 @@ const REQUIRED_PACKAGE_SCRIPTS: Record<string, string> = {
   'pipelane:api': 'pipelane run api',
 };
 
+// Hard block against the npm-wipes-shared-deps footgun. Loads the standalone
+// CJS guard from pipelane's own published `scripts/` folder if present.
+// Self-no-ops when pipelane isn't installed yet (first-bootstrap), and there
+// can't be a worktree symlink to wipe at that point either. The substring
+// PREINSTALL_GUARD_FINGERPRINT is what mergePreinstallScript looks for to
+// stay idempotent and to recognize an already-chained existing preinstall.
+export const PREINSTALL_GUARD_FINGERPRINT = 'pipelane/scripts/preinstall-guard.cjs';
+export const PIPELANE_PREINSTALL_GUARD =
+  `node -e "const p='./node_modules/${PREINSTALL_GUARD_FINGERPRINT}';require('fs').existsSync(p)&&require(p)"`;
+
+// Special-case merge for the `preinstall` script slot. The default
+// REQUIRED_PACKAGE_SCRIPTS merge is last-write-wins; clobbering a consumer's
+// existing preinstall would silently break their CI hooks. Instead:
+// - no existing preinstall → write ours
+// - existing already contains the guard fingerprint → leave alone (idempotent)
+// - existing is something else → chain ours first so the worktree-symlink
+//   case fails fast before the consumer's hook runs
+export function mergePreinstallScript(existing: string | undefined): string {
+  const trimmed = (existing ?? '').trim();
+  if (!trimmed) return PIPELANE_PREINSTALL_GUARD;
+  if (trimmed.includes(PREINSTALL_GUARD_FINGERPRINT)) return existing as string;
+  return `${PIPELANE_PREINSTALL_GUARD} && ${existing}`;
+}
+
 // Shared builder: returns the exact bytes pipelane would write to package.json
 // along with the current on-disk bytes. Used by ensurePackageScripts (to
 // write) and by detectSetupDrift (to compare without writing).
@@ -442,9 +466,13 @@ function buildEnsuredPackageJson(repoRoot: string): { targetPath: string; curren
   const current: Record<string, unknown> = existed
     ? JSON.parse(currentRaw) as Record<string, unknown>
     : { name: path.basename(repoRoot), private: true, type: 'module', scripts: {} };
-  const scripts = {
-    ...(typeof current.scripts === 'object' && current.scripts ? current.scripts as Record<string, string> : {}),
+  const existingScripts = typeof current.scripts === 'object' && current.scripts
+    ? current.scripts as Record<string, string>
+    : {};
+  const scripts: Record<string, string> = {
+    ...existingScripts,
     ...REQUIRED_PACKAGE_SCRIPTS,
+    preinstall: mergePreinstallScript(existingScripts.preinstall),
   };
   const next = { ...current, scripts };
   const nextRaw = `${JSON.stringify(next, null, 2)}\n`;

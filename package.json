@@ -9,6 +9,7 @@
   "files": [
     "bin",
     "dist",
+    "scripts",
     "templates",
     "docs/public/RELEASE_WORKFLOW.md",
     "docs/public/PIPELANE_BOARD.md",
@@ -18,6 +19,7 @@
   ],
   "scripts": {
     "test": "node --test test/pipelane.test.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.build.json",
     "smoke": "node ./src/cli.ts --help",
     "dashboard": "node ./src/cli.ts dashboard",
     "board": "node ./src/cli.ts board",
