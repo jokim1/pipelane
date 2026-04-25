@@ -3783,6 +3783,7 @@
       const availableActions = detailBranch.availableActions || [];
       const branchFiles = branchData?.branchFiles || [];
       const workspaceFiles = branchData?.workspaceFiles || [];
+      const actionHistory = branchData?.actionHistory || [];
       const patchData = state.patchEnvelope?.data;
       const selectedFileReason = patchData?.reason || '';
       const preflightData = state.lastPreflight?.data?.preflight || null;
@@ -3889,6 +3890,30 @@
         </div>
       ` : '';
 
+      const persistedActionMarkup = `
+        <div>
+          <div class="panel-title">Action Feedback</div>
+          ${actionHistory.length ? `
+            <div class="log-list">
+              ${actionHistory.map((entry) => `
+                <article class="preflight-card ${entry.status === 'succeeded' ? 'state-healthy' : 'state-blocked'}">
+                  <div class="lane-head">
+                    <strong>${escapeHtml(entry.label || entry.actionId || 'Action')}</strong>
+                    <span class="mini-pill">${escapeHtml(entry.status || 'unknown')}</span>
+                  </div>
+                  <div class="reason-block">${escapeHtml(entry.reason || 'No action output recorded.')}</div>
+                  ${entry.stderr ? `<div class="log-text" style="margin-top:10px">${escapeHtml(entry.stderr)}</div>` : ''}
+                  ${entry.stdout ? `<div class="log-text" style="margin-top:10px">${escapeHtml(entry.stdout)}</div>` : ''}
+                  <div class="footer-note" style="margin-top:10px">
+                    Exit ${escapeHtml(entry.exitCode)} · ${escapeHtml(formatDateWithRelative(entry.finishedAt || entry.startedAt))}
+                  </div>
+                </article>
+              `).join('')}
+            </div>
+          ` : '<div class="empty-state">No persisted action feedback for this task yet.</div>'}
+        </div>
+      `;
+
       const historyMarkup = `
         <div>
           <div class="panel-title">History</div>
@@ -3948,6 +3973,7 @@
         ${preflightMarkup}
         ${confirmationMarkup}
         ${executionMarkup}
+        ${persistedActionMarkup}
 
         <div>
           <div class="panel-title">Branch Files</div>
@@ -4193,7 +4219,7 @@
     function defaultActionParams(action, scope) {
       const params = {};
       const detailBranch = state.branchDetails?.data?.branch || getSelectedBranch();
-      if (scope === 'branch' && detailBranch?.task?.taskSlug && !action.id.startsWith('clean.') && !action.id.startsWith('devmode.') && action.id !== 'new' && action.id !== 'resume') {
+      if (scope === 'branch' && detailBranch?.task?.taskSlug && !action.id.startsWith('devmode.') && action.id !== 'new' && action.id !== 'resume' && action.id !== 'clean.plan') {
         params.task = detailBranch.task.taskSlug;
       }
       return params;

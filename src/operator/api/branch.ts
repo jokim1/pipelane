@@ -1,6 +1,15 @@
 import { existsSync } from 'node:fs';
 
-import { loadAllTaskLocks, loadDeployState, loadPrState, nowIso, resolveWorkflowContext, runGit } from '../state.ts';
+import {
+  loadActionState,
+  loadAllTaskLocks,
+  loadDeployState,
+  loadPrState,
+  nowIso,
+  resolveWorkflowContext,
+  runGit,
+  type ActionRunRecord,
+} from '../state.ts';
 import { buildApiEnvelope, buildFreshness, type ApiEnvelope } from './envelope.ts';
 import { buildBranchRows, type BranchRow } from './snapshot.ts';
 
@@ -19,6 +28,7 @@ export interface BranchDetailsData {
   branch: BranchRow;
   branchFiles: BranchFileEntry[];
   workspaceFiles: BranchFileEntry[];
+  actionHistory: ActionRunRecord[];
   counts: {
     branchFiles: number;
     workspaceFiles: number;
@@ -49,6 +59,9 @@ export function buildBranchDetailsEnvelope(cwd: string, branchName: string): Api
   const workspaceFiles = worktreePath && existsSync(worktreePath)
     ? listWorkspaceFiles(worktreePath)
     : [];
+  const actionHistory = branch.task?.taskSlug
+    ? loadActionState(context.commonDir, context.config).records[branch.task.taskSlug] ?? []
+    : [];
 
   return buildApiEnvelope<BranchDetailsData>({
     command: 'pipelane.api.branch',
@@ -58,6 +71,7 @@ export function buildBranchDetailsEnvelope(cwd: string, branchName: string): Api
       branch,
       branchFiles,
       workspaceFiles,
+      actionHistory,
       counts: {
         branchFiles: branchFiles.length,
         workspaceFiles: workspaceFiles.length,

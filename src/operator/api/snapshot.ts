@@ -1464,8 +1464,103 @@ function buildBranchRow(options: {
       staging: stagingCell,
       production: productionCell,
     },
-    availableActions: [],
+    availableActions: buildBranchActions({
+      worktreeExists,
+      dirty,
+      prRecord,
+      mode,
+      localCell,
+      prCell,
+      stagingCell,
+      productionCell,
+      checkedAt,
+    }),
   };
+}
+
+function buildBranchActions(options: {
+  worktreeExists: boolean;
+  dirty: boolean;
+  prRecord: PrRecord | null;
+  mode: string;
+  localCell: ApiStatusCell;
+  prCell: ApiStatusCell;
+  stagingCell: ApiStatusCell;
+  productionCell: ApiStatusCell;
+  checkedAt: string;
+}): ApiActionState[] {
+  const actions: ApiActionState[] = [];
+  const { worktreeExists, dirty, prRecord, mode, localCell, prCell, stagingCell, productionCell, checkedAt } = options;
+
+  if (!prRecord) {
+    actions.push(buildApiActionState({
+      id: 'pr',
+      label: 'Open PR',
+      state: worktreeExists ? 'awaiting_preflight' : 'blocked',
+      reason: worktreeExists
+        ? dirty
+          ? 'commit local work, push the branch, and open a PR'
+          : 'push the branch and open a PR'
+        : localCell.reason,
+      checkedAt,
+    }));
+  } else if (!prRecord.mergedAt) {
+    if (dirty && worktreeExists) {
+      actions.push(buildApiActionState({
+        id: 'pr',
+        label: 'Update PR',
+        state: 'awaiting_preflight',
+        reason: 'commit local work, push the branch, and update the PR',
+        checkedAt,
+      }));
+    }
+    actions.push(buildApiActionState({
+      id: 'merge',
+      label: 'Merge PR',
+      state: prCell.state === 'running' ? 'awaiting_preflight' : prCell.state,
+      reason: prCell.reason || 'merge this branch PR',
+      risky: true,
+      requiresConfirmation: true,
+      checkedAt,
+    }));
+  }
+
+  if (prRecord?.mergedSha) {
+    if (mode === 'release' && stagingCell.state !== 'healthy' && stagingCell.state !== 'running') {
+      actions.push(buildApiActionState({
+        id: 'deploy.staging',
+        label: 'Deploy staging',
+        state: stagingCell.state,
+        reason: stagingCell.reason || 'deploy the merged SHA to staging',
+        checkedAt,
+      }));
+    }
+    if (productionCell.state !== 'healthy' && productionCell.state !== 'running') {
+      actions.push(buildApiActionState({
+        id: 'deploy.prod',
+        label: 'Deploy production',
+        state: productionCell.state,
+        reason: productionCell.reason || 'deploy the merged SHA to production',
+        risky: true,
+        requiresConfirmation: true,
+        checkedAt,
+      }));
+    }
+  }
+
+  if (!worktreeExists) {
+    actions.push(buildApiActionState({
+      id: 'clean.apply',
+      label: 'Clean task record',
+      state: 'awaiting_preflight',
+      reason: 'prune the stale Pipelane task lock for this branch',
+      risky: true,
+      requiresConfirmation: true,
+      checkedAt,
+    }));
+  }
+
+  return actions;
 }
 
 function buildDeployCell(options: {

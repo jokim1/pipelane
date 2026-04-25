@@ -4,7 +4,16 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 import type { ParsedOperatorArgs } from '../state.ts';
-import { loadDeployState, nowIso, resolveWorkflowContext, type DeployRecord } from '../state.ts';
+import {
+  appendActionRunRecord,
+  loadDeployState,
+  loadTaskLock,
+  nowIso,
+  resolveWorkflowContext,
+  runGit,
+  slugifyTaskName,
+  type DeployRecord,
+} from '../state.ts';
 import {
   computeDeployConfigFingerprint,
   emptyDeployConfig,
@@ -68,6 +77,8 @@ export const API_RISKY_ACTION_IDS: ReadonlySet<StableActionId> = new Set<StableA
   'deploy.prod',
   'rollback.prod',
 ]);
+
+const ACTION_FEEDBACK_MAX_OUTPUT_CHARS = 20_000;
 
 const ACTION_LABELS: Record<StableActionId, string> = {
   new: 'Create task workspace',
@@ -244,7 +255,9 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
 
   const underlyingArgs = buildUnderlyingArgs(actionId, parsed);
   const childEnv = buildChildEnv(actionId);
+  const startedAt = nowIso();
   const result = runCliWithJson(cwd, underlyingArgs, childEnv);
+  const finishedAt = nowIso();
   const failureReason = result.ok ? '' : describeExecutionFailure(actionId, result);
 
   const data: ActionExecutionData = {
@@ -267,12 +280,61 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
     },
   };
 
+  persistActionRunIfTaskScoped({
+    context,
+    actionId,
+    label: ACTION_LABELS[actionId],
+    normalizedInputs,
+    startedAt,
+    finishedAt,
+    result,
+    reason: result.ok ? `${actionId} executed` : failureReason,
+  });
+
   return buildApiEnvelope<ActionExecutionData>({
     command: 'pipelane.api.action',
     ok: result.ok,
     message: result.ok ? `${actionId} executed` : `${actionId} failed: ${failureReason}`,
     data,
   });
+}
+
+function persistActionRunIfTaskScoped(options: {
+  context: ReturnType<typeof resolveWorkflowContext>;
+  actionId: StableActionId;
+  label: string;
+  normalizedInputs: Record<string, unknown>;
+  startedAt: string;
+  finishedAt: string;
+  result: ReturnType<typeof runCliWithJson>;
+  reason: string;
+}): void {
+  const task = typeof options.normalizedInputs.task === 'string'
+    ? options.normalizedInputs.task.trim()
+    : '';
+  if (!task) return;
+  const taskSlug = slugifyTaskName(task);
+  const lock = loadTaskLock(options.context.commonDir, options.context.config, taskSlug);
+  const branchName = lock?.branchName || runGit(options.context.repoRoot, ['branch', '--show-current'], true)?.trim() || taskSlug;
+  appendActionRunRecord(options.context.commonDir, options.context.config, {
+    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    taskSlug,
+    branchName,
+    actionId: options.actionId,
+    label: options.label,
+    status: options.result.ok ? 'succeeded' : 'failed',
+    exitCode: options.result.exitCode,
+    startedAt: options.startedAt,
+    finishedAt: options.finishedAt,
+    reason: options.reason,
+    stdout: truncateActionOutput(options.result.stdout),
+    stderr: truncateActionOutput(options.result.stderr),
+  });
+}
+
+function truncateActionOutput(value: string): string {
+  if (value.length <= ACTION_FEEDBACK_MAX_OUTPUT_CHARS) return value;
+  return `${value.slice(0, ACTION_FEEDBACK_MAX_OUTPUT_CHARS)}\n[truncated by Pipelane action feedback]`;
 }
 
 function describeExecutionFailure(

@@ -6,7 +6,15 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { DEFAULT_WORKFLOW_ALIASES, loadWorkflowConfig, resolveReadableConfigPath, type WorkflowCommand } from '../operator/state.ts';
+import {
+  DEFAULT_WORKFLOW_ALIASES,
+  loadTaskLock,
+  loadWorkflowConfig,
+  resolveReadableConfigPath,
+  resolveWorkflowContext,
+  slugifyTaskName,
+  type WorkflowCommand,
+} from '../operator/state.ts';
 
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = 3033;
@@ -414,6 +422,20 @@ async function runWorkflowJson(repoRoot: string, args: string[]): Promise<{ stat
   }
 }
 
+function resolveActionCwd(repoRoot: string, params: JsonObject): string {
+  const taskRaw = typeof params.task === 'string' ? params.task.trim() : '';
+  if (!taskRaw) {
+    return repoRoot;
+  }
+  const taskSlug = slugifyTaskName(taskRaw);
+  const context = resolveWorkflowContext(repoRoot);
+  const lock = loadTaskLock(context.commonDir, context.config, taskSlug);
+  if (lock?.worktreePath && existsSync(lock.worktreePath)) {
+    return lock.worktreePath;
+  }
+  return repoRoot;
+}
+
 function encodeSseEvent(event: ExecutionEvent): string {
   return `event: ${event.type}\ndata: ${JSON.stringify({ at: event.at, payload: event.payload })}\n\n`;
 }
@@ -520,7 +542,8 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
   }
 
   async function postActionPreflight(actionId: string, params: JsonObject): Promise<{ status: number; envelope: JsonObject }> {
-    const { status, envelope } = await runWorkflowJson(options.repoRoot, [
+    const actionCwd = resolveActionCwd(options.repoRoot, params);
+    const { status, envelope } = await runWorkflowJson(actionCwd, [
       'action',
       actionId,
       ...buildWorkflowArgsFromParams(params),
@@ -531,10 +554,11 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
 
   function startExecution(actionId: string, params: JsonObject, confirmToken: string): ExecutionRecord {
     const id = randomUUID();
+    const actionCwd = resolveActionCwd(options.repoRoot, params);
     const record: ExecutionRecord = {
       id,
       actionId,
-      repoRoot: options.repoRoot,
+      repoRoot: actionCwd,
       params,
       confirmToken,
       startedAt: new Date().toISOString(),
@@ -576,7 +600,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
     args.push('--json');
 
     const child = spawn('npm', args, {
-      cwd: options.repoRoot,
+      cwd: actionCwd,
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });

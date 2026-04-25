@@ -6188,6 +6188,45 @@ test('api snapshot emits a wire-compatible envelope', () => {
     }
     assert.equal(branch.lanes.pr.state, 'awaiting_preflight', 'no PR opened yet');
     assert.equal(branch.lanes.base.state, 'awaiting_preflight', 'branch has not landed');
+    assert.deepEqual(branch.availableActions.map((action) => action.id), ['pr']);
+    assert.equal(branch.availableActions[0].label, 'Open PR');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('api action execute persists task-scoped failure feedback for branch detail', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    runCli(['run', 'new', '--task', 'Action Feedback Task', '--json'], repoRoot);
+
+    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', 'action-feedback-task.json');
+    const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+    writeFileSync(path.join(lock.worktreePath, 'dirty.txt'), 'dirty\n', 'utf8');
+
+    const executed = runCli(
+      ['run', 'api', 'action', 'pr', '--task', 'action-feedback-task', '--execute'],
+      lock.worktreePath,
+      {},
+      true,
+    );
+    assert.notEqual(executed.status, 0);
+    const envelope = JSON.parse(executed.stdout);
+    assert.equal(envelope.ok, false);
+    assert.match(envelope.data.preflight.reason, /requires --title/);
+
+    const actionStatePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'action-state.json');
+    const actionState = JSON.parse(readFileSync(actionStatePath, 'utf8'));
+    assert.equal(actionState.records['action-feedback-task'][0].actionId, 'pr');
+    assert.equal(actionState.records['action-feedback-task'][0].status, 'failed');
+    assert.match(actionState.records['action-feedback-task'][0].reason, /requires --title/);
+
+    const detail = JSON.parse(runCli(['run', 'api', 'branch', '--branch', lock.branchName], repoRoot).stdout);
+    assert.equal(detail.data.actionHistory[0].actionId, 'pr');
+    assert.equal(detail.data.actionHistory[0].status, 'failed');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });

@@ -252,6 +252,25 @@ export interface PrRecord {
   updatedAt: string;
 }
 
+export interface ActionRunRecord {
+  id: string;
+  taskSlug: string;
+  branchName: string;
+  actionId: string;
+  label: string;
+  status: 'succeeded' | 'failed';
+  exitCode: number;
+  startedAt: string;
+  finishedAt: string;
+  reason: string;
+  stdout: string;
+  stderr: string;
+}
+
+export interface ActionState {
+  records: Record<string, ActionRunRecord[]>;
+}
+
 export type DeployStatus = 'requested' | 'succeeded' | 'failed' | 'unknown';
 
 export interface DeployVerification {
@@ -498,6 +517,7 @@ export const LEGACY_CONFIG_FILENAME = '.project-workflow.json';
 const MODE_STATE_FILENAME = 'mode-state.json';
 const PR_STATE_FILENAME = 'pr-state.json';
 const DEPLOY_STATE_FILENAME = 'deploy-state.json';
+const ACTION_STATE_FILENAME = 'action-state.json';
 const DEPLOY_CONFIG_FILENAME = 'deploy-config.json';
 const PROBE_STATE_FILENAME = 'probe-state.json';
 const TASK_LOCKS_DIRNAME = 'task-locks';
@@ -1092,6 +1112,10 @@ export function deployStatePath(commonDir: string, config: WorkflowConfig): stri
   return path.join(resolveStateDir(commonDir, config), DEPLOY_STATE_FILENAME);
 }
 
+export function actionStatePath(commonDir: string, config: WorkflowConfig): string {
+  return path.join(resolveStateDir(commonDir, config), ACTION_STATE_FILENAME);
+}
+
 export function deployConfigPath(commonDir: string, config: WorkflowConfig): string {
   return path.join(resolveStateDir(commonDir, config), DEPLOY_CONFIG_FILENAME);
 }
@@ -1392,6 +1416,50 @@ export function loadPrState(commonDir: string, config: WorkflowConfig): { record
 export function savePrState(commonDir: string, config: WorkflowConfig, value: { records: Record<string, PrRecord> }): void {
   ensureStateDir(commonDir, config);
   writeJsonFile(prStatePath(commonDir, config), value);
+}
+
+export function loadActionState(commonDir: string, config: WorkflowConfig): ActionState {
+  const raw = readJsonFile<ActionState>(actionStatePath(commonDir, config), { records: {} });
+  const records: Record<string, ActionRunRecord[]> = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || !raw.records || typeof raw.records !== 'object' || Array.isArray(raw.records)) {
+    return { records };
+  }
+
+  for (const [taskSlug, entries] of Object.entries(raw.records)) {
+    if (!Array.isArray(entries)) continue;
+    records[taskSlug] = entries
+      .filter((entry): entry is ActionRunRecord => {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+        const item = entry as unknown as Record<string, unknown>;
+        return typeof item.id === 'string'
+          && typeof item.taskSlug === 'string'
+          && typeof item.branchName === 'string'
+          && typeof item.actionId === 'string'
+          && typeof item.label === 'string'
+          && (item.status === 'succeeded' || item.status === 'failed')
+          && typeof item.exitCode === 'number'
+          && typeof item.startedAt === 'string'
+          && typeof item.finishedAt === 'string'
+          && typeof item.reason === 'string'
+          && typeof item.stdout === 'string'
+          && typeof item.stderr === 'string';
+      })
+      .slice(0, 20);
+  }
+  return { records };
+}
+
+export function saveActionState(commonDir: string, config: WorkflowConfig, value: ActionState): void {
+  ensureStateDir(commonDir, config);
+  writeJsonFile(actionStatePath(commonDir, config), value);
+}
+
+export function appendActionRunRecord(commonDir: string, config: WorkflowConfig, record: ActionRunRecord): ActionRunRecord {
+  const state = loadActionState(commonDir, config);
+  const existing = state.records[record.taskSlug] ?? [];
+  state.records[record.taskSlug] = [record, ...existing].slice(0, 20);
+  saveActionState(commonDir, config, state);
+  return record;
 }
 
 export function loadPrRecord(commonDir: string, config: WorkflowConfig, taskSlug: string): PrRecord | null {
