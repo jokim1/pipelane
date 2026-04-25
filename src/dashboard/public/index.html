@@ -749,6 +749,8 @@
     }
 
     .table-wrap {
+      --branch-column-width: 320px;
+      --ledger-lanes-width: 1100px;
       overflow: auto;
       border-top: 1px solid var(--line);
     }
@@ -757,6 +759,15 @@
       width: 100%;
       border-collapse: collapse;
       min-width: 1240px;
+    }
+
+    .branch-ledger-table {
+      table-layout: fixed;
+      min-width: calc(var(--branch-column-width) + var(--ledger-lanes-width));
+    }
+
+    .branch-col {
+      width: var(--branch-column-width);
     }
 
     th,
@@ -796,8 +807,9 @@
     .branch-sticky-cell {
       position: sticky;
       left: 0;
-      min-width: 280px;
-      max-width: 280px;
+      width: var(--branch-column-width);
+      min-width: var(--branch-column-width);
+      max-width: var(--branch-column-width);
       z-index: 4;
       background: var(--bg-panel-strong);
       box-shadow: 12px 0 20px -20px rgba(0, 0, 0, 0.9);
@@ -812,6 +824,52 @@
     .branch-sticky-cell {
       z-index: 3;
       background: rgba(13, 27, 34, 0.96);
+    }
+
+    .branch-header-content {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .branch-column-resizer {
+      position: absolute;
+      top: 0;
+      right: -5px;
+      width: 10px;
+      height: 100%;
+      border: 0;
+      padding: 0;
+      background: transparent;
+      cursor: col-resize;
+      touch-action: none;
+      z-index: 8;
+    }
+
+    .branch-column-resizer::after {
+      content: "";
+      position: absolute;
+      top: 12px;
+      bottom: 12px;
+      left: 4px;
+      width: 2px;
+      border-radius: 999px;
+      background: transparent;
+      transition: background 120ms ease;
+    }
+
+    .branch-column-resizer:hover::after,
+    .branch-column-resizer:focus-visible::after,
+    body.is-resizing-branch .branch-column-resizer::after {
+      background: rgba(132, 169, 189, 0.55);
+    }
+
+    body.is-resizing-branch,
+    body.is-resizing-branch * {
+      cursor: col-resize !important;
+      user-select: none;
     }
 
     tbody tr.selected .branch-sticky-cell {
@@ -834,7 +892,7 @@
     .branch-note {
       color: var(--muted);
       font-size: 12px;
-      max-width: 280px;
+      max-width: calc(var(--branch-column-width) - 32px);
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -858,7 +916,6 @@
 
     .ledger-lane-cell {
       min-width: 220px;
-      width: 220px;
       padding-top: 12px;
       padding-bottom: 12px;
     }
@@ -1753,13 +1810,13 @@
 
       .branch-sticky-head,
       .branch-sticky-cell {
-        min-width: 220px;
-        max-width: 220px;
+        width: var(--branch-column-width);
+        min-width: var(--branch-column-width);
+        max-width: var(--branch-column-width);
       }
 
       .ledger-lane-cell {
         min-width: 220px;
-        width: 220px;
       }
 
       .detail-panel {
@@ -1835,8 +1892,9 @@
           <div class="panel-title">Branch Ledger</div>
           <div class="footer-note" id="branch-summary"></div>
         </div>
-        <div class="table-wrap">
-          <table>
+        <div class="table-wrap" id="branch-ledger-wrap">
+          <table class="branch-ledger-table">
+            <colgroup id="branch-colgroup"></colgroup>
             <thead id="branch-head"></thead>
             <tbody id="branch-body"></tbody>
           </table>
@@ -1898,6 +1956,10 @@
   <script>
     const DEFAULT_BOARD_TITLE = 'Pipelane';
     const DEFAULT_BOARD_SUBTITLE = 'Pipelane — the release cockpit for AI vibe coders. Branch pipeline triage, action preflight, execution follow-through, and cleanup discipline.';
+    const BRANCH_COLUMN_STORAGE_KEY = 'pipelane.branchLedger.branchColumnWidth';
+    const BRANCH_COLUMN_MIN = 220;
+    const BRANCH_COLUMN_MAX = 720;
+    const BRANCH_COLUMN_DEFAULT = window.matchMedia?.('(max-width: 760px)').matches ? 260 : 320;
     const DEFAULT_HELP_ALIASES = {
       devmode: '/devmode',
       new: '/new',
@@ -1933,6 +1995,8 @@
         x: 0,
         y: 0,
       },
+      branchColumnWidth: readBranchColumnWidth(),
+      branchColumnResize: null,
       branchDetails: null,
       selectedFileKey: '',
       patchEnvelope: null,
@@ -1970,6 +2034,40 @@
 
     function titleAttr(value) {
       return value ? ` title="${escapeHtml(value)}"` : '';
+    }
+
+    function clampBranchColumnWidth(value) {
+      const numericValue = Number(value);
+      if (!Number.isFinite(numericValue)) {
+        return BRANCH_COLUMN_DEFAULT;
+      }
+      return Math.min(BRANCH_COLUMN_MAX, Math.max(BRANCH_COLUMN_MIN, Math.round(numericValue)));
+    }
+
+    function readBranchColumnWidth() {
+      try {
+        const storedWidth = window.localStorage?.getItem(BRANCH_COLUMN_STORAGE_KEY);
+        return storedWidth ? clampBranchColumnWidth(storedWidth) : BRANCH_COLUMN_DEFAULT;
+      } catch {
+        return BRANCH_COLUMN_DEFAULT;
+      }
+    }
+
+    function persistBranchColumnWidth() {
+      try {
+        window.localStorage?.setItem(BRANCH_COLUMN_STORAGE_KEY, String(state.branchColumnWidth));
+      } catch {
+        // Browser storage can be unavailable in private or restricted contexts.
+      }
+    }
+
+    function applyBranchColumnWidth() {
+      const ledgerWrap = document.getElementById('branch-ledger-wrap');
+      if (!ledgerWrap) {
+        return;
+      }
+      ledgerWrap.style.setProperty('--branch-column-width', `${state.branchColumnWidth}px`);
+      ledgerWrap.style.setProperty('--ledger-lanes-width', `${laneOrder().length * 220}px`);
     }
 
     function currentSettings() {
@@ -3430,24 +3528,35 @@
     function renderBranchTable() {
       const branches = state.snapshot?.data?.branches || [];
       const selectedBranchName = state.selectedBranchName;
+      const lanes = laneOrder();
+      applyBranchColumnWidth();
       document.getElementById('branch-summary').textContent = `${branches.length} branches · one active release card per branch`;
+      document.getElementById('branch-colgroup').innerHTML = `
+        <col class="branch-col">
+        ${lanes.map(() => '<col>').join('')}
+      `;
 
       document.getElementById('branch-head').innerHTML = `
         <tr>
-          <th class="branch-sticky-head">Branch</th>
-          ${laneOrder().map((label) => `<th>${escapeHtml(label)}</th>`).join('')}
+          <th class="branch-sticky-head">
+            <div class="branch-header-content">
+              <span>Branch</span>
+              <button class="branch-column-resizer" type="button" data-branch-resize aria-label="Resize branch column"></button>
+            </div>
+          </th>
+          ${lanes.map((label) => `<th>${escapeHtml(label)}</th>`).join('')}
         </tr>
       `;
 
       if (!branches.length) {
-        document.getElementById('branch-body').innerHTML = `<tr><td colspan="${laneOrder().length + 1}"><div class="empty-state">No branches were returned by the snapshot.</div></td></tr>`;
+        document.getElementById('branch-body').innerHTML = `<tr><td colspan="${lanes.length + 1}"><div class="empty-state">No branches were returned by the snapshot.</div></td></tr>`;
         return;
       }
 
       document.getElementById('branch-body').innerHTML = branches.map((branch) => {
         const activeLane = resolveActiveLane(branch);
         const cardPresentation = lockCardPresentation(branch, cleanupCardPresentation(branch, activeLane));
-        const laneCells = laneOrder().map((label) => {
+        const laneCells = lanes.map((label) => {
           const lane = branch.lanes?.[mapLaneKey(label)] || {};
           if (label === activeLane.label) {
             return `
@@ -4244,6 +4353,45 @@
       document.getElementById('help-button').disabled = state.loading.help;
       document.getElementById('refresh-button').disabled = state.loading.snapshot;
     }
+
+    document.body.addEventListener('pointerdown', (event) => {
+      const target = event.target.closest('[data-branch-resize]');
+      if (!target) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      state.branchColumnResize = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startWidth: state.branchColumnWidth,
+      };
+      target.setPointerCapture?.(event.pointerId);
+      document.body.classList.add('is-resizing-branch');
+    });
+
+    document.body.addEventListener('pointermove', (event) => {
+      const resize = state.branchColumnResize;
+      if (!resize || resize.pointerId !== event.pointerId) {
+        return;
+      }
+      event.preventDefault();
+      state.branchColumnWidth = clampBranchColumnWidth(resize.startWidth + event.clientX - resize.startX);
+      applyBranchColumnWidth();
+    });
+
+    function finishBranchColumnResize(event) {
+      const resize = state.branchColumnResize;
+      if (!resize || resize.pointerId !== event.pointerId) {
+        return;
+      }
+      state.branchColumnResize = null;
+      document.body.classList.remove('is-resizing-branch');
+      persistBranchColumnWidth();
+    }
+
+    document.body.addEventListener('pointerup', finishBranchColumnResize);
+    document.body.addEventListener('pointercancel', finishBranchColumnResize);
 
     document.body.addEventListener('click', async (event) => {
       const target = event.target.closest('[data-branch-open], [data-file-select], [data-action-trigger], [data-confirm-action], [data-detail-close], [data-devmode-toggle], [data-devmode-action], [data-context-action], [data-context-open], [data-help-open], [data-help-close], [data-settings-open], [data-settings-close], [data-settings-save], [data-settings-revert]');
