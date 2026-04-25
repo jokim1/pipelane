@@ -9,3 +9,4 @@ CLAUDE.md
 # Internal docs (specs, strategy, interim notes). Public docs live under docs/public/.
 docs/*
 !docs/public/
+.gstack/
