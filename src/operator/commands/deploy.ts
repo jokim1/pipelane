@@ -591,7 +591,7 @@ export async function dispatchDeploy(
     : null;
   const nextStage = environment === 'staging'
     ? stagingHandoff!.nextAction
-    : `prod verified at ${shortSha}, run ${formatWorkflowCommand(context.config, 'clean')}`;
+    : `prod verified at ${shortSha}, run ${formatWorkflowCommand(context.config, 'clean', `--apply --task ${taskSlug}`)} to close out the workspace`;
   setNextAction(context.commonDir, context.config, taskSlug, nextStage);
 
   // Skip-smoke observability. On successful prod promotion, record whether
@@ -619,7 +619,7 @@ export async function dispatchDeploy(
           : 'Healthcheck: skipped (no URL configured)',
         environment === 'staging'
           ? `Next: ${stagingHandoff!.nextAction}`
-          : `Next: run ${formatWorkflowCommand(context.config, 'clean')}.`,
+          : `Next: run ${formatWorkflowCommand(context.config, 'clean', `--apply --task ${taskSlug}`)} to close out this workspace (removes lock + worktree + local branch).`,
       ].filter(Boolean).join('\n'),
     };
   } finally {

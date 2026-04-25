@@ -447,6 +447,7 @@ export interface SmokeEnvironmentLock {
 export interface OperatorFlags {
   apply: boolean;
   allStale: boolean;
+  force: boolean;
   help: boolean;
   json: boolean;
   offline: boolean;
@@ -1628,6 +1629,7 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
   const flags: OperatorFlags = {
     apply: false,
     allStale: false,
+    force: false,
     help: false,
     json: false,
     offline: false,
@@ -1712,6 +1714,12 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     if (flagName === '--all-stale') {
       rejectInlineValue('--all-stale');
       flags.allStale = true;
+      continue;
+    }
+
+    if (flagName === '--force') {
+      rejectInlineValue('--force');
+      flags.force = true;
       continue;
     }
 
@@ -2046,11 +2054,14 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       throw new Error('smoke requires one of: plan, setup, staging, prod, waiver, quarantine, unquarantine.');
     }
     case 'clean':
-      assertOnlyFlags(parsed, ['apply', 'allStale', 'task']);
-      if (!parsed.flags.apply && (parsed.flags.allStale || parsed.flags.task.trim())) {
-        throw new Error('clean only accepts --task or --all-stale when --apply is also passed.');
+      assertOnlyFlags(parsed, ['apply', 'allStale', 'task', 'force']);
+      if (!parsed.flags.apply && (parsed.flags.allStale || parsed.flags.task.trim() || parsed.flags.force)) {
+        throw new Error('clean only accepts --task, --all-stale, or --force when --apply is also passed.');
       }
-      requireNoPositional('pipelane run clean [--apply (--task <task-name>|--all-stale)]');
+      if (parsed.flags.force && !parsed.flags.task.trim()) {
+        throw new Error('clean --force is only valid with --task <task-name>; --all-stale is metadata-only.');
+      }
+      requireNoPositional('pipelane run clean [--apply (--task <task-name> [--force]|--all-stale)]');
       return;
     case 'status':
       assertOnlyFlags(parsed, ['week', 'stuck', 'blastSha']);
@@ -2131,6 +2142,7 @@ type OperatorFlagKey = keyof OperatorFlags;
 const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flags: OperatorFlags) => boolean }> = [
   { key: 'apply', label: '--apply', active: (flags) => flags.apply },
   { key: 'allStale', label: '--all-stale', active: (flags) => flags.allStale },
+  { key: 'force', label: '--force', active: (flags) => flags.force },
   { key: 'offline', label: '--offline', active: (flags) => flags.offline },
   { key: 'override', label: '--override', active: (flags) => flags.override },
   { key: 'skipSmokeCoverage', label: '--skip-smoke-coverage', active: (flags) => flags.skipSmokeCoverage },

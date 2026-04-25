@@ -5874,34 +5874,214 @@ test('clean --apply --task prunes just the named lock', () => {
   }
 });
 
-test('clean --apply --task prunes a lock whose worktree + branch are still intact (operator override)', () => {
+test('clean --apply --task closes out the workspace: lock + worktree + merged branch all removed', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     const drop = JSON.parse(runCli(['run', 'new', '--task', 'Drop Live', '--json'], repoRoot).stdout);
 
-    // Intentionally DO NOT delete the worktree or branch. --task should
-    // honor the operator's explicit scope even when the lock would
-    // otherwise be considered "active" by --all-stale's rules.
+    // Intentionally DO NOT delete the worktree or branch. The new branch was
+    // forked from origin/main with no commits of its own, so it's "merged"
+    // by `git branch -d`'s definition (tip is reachable from main). The
+    // worktree is fresh-checked-out with no edits. Both safety checks pass,
+    // and the closer should remove all three artifacts.
     const result = runCli(['run', 'clean', '--apply', '--task', 'Drop Live', '--json'], repoRoot, {
       PIPELANE_CLEAN_MIN_AGE_MS: '0',
     });
     const envelope = JSON.parse(result.stdout);
     assert.deepEqual(envelope.removed, ['drop-live']);
-    assert.match(envelope.message, /Pruned task locks/);
+    assert.match(envelope.message, /Closed out task workspaces/);
 
     // Lock file is gone.
     const dropLockPath = path.join(repoRoot, '.git', 'pipelane-state', 'task-locks', 'drop-live.json');
-    assert.ok(!existsSync(dropLockPath), 'targeted prune did not delete the lock file');
+    assert.ok(!existsSync(dropLockPath), 'closer must remove the lock file');
 
-    // Worktree and branch are untouched — prune is metadata-only.
-    assert.ok(existsSync(drop.worktreePath), 'targeted prune must not delete the worktree');
-    const branchStillThere = execFileSync('git', ['rev-parse', '--verify', drop.branch], {
+    // Worktree directory is gone.
+    assert.ok(!existsSync(drop.worktreePath), 'closer must remove the worktree directory');
+
+    // Local branch is gone.
+    const branchProbe = spawnSync('git', ['rev-parse', '--verify', `refs/heads/${drop.branch}`], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.notEqual(branchProbe.status, 0, 'closer must remove the local branch');
+
+    // Per-artifact summary in the JSON envelope.
+    assert.equal(envelope.artifacts.length, 1);
+    assert.equal(envelope.artifacts[0].taskSlug, 'drop-live');
+    assert.equal(envelope.artifacts[0].worktreeRemoved, true);
+    assert.equal(envelope.artifacts[0].branchRemoved, true);
+    assert.deepEqual(envelope.artifacts[0].errors, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean --apply --task refuses to remove a worktree with uncommitted changes without --force', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Dirty WIP', '--json'], repoRoot).stdout);
+    // Dirty the worktree with a tracked-file edit. .gitignored content
+    // (e.g. node_modules) is excluded by `git status --porcelain` so this
+    // edit is the smallest signal the safety check should latch on to.
+    writeFileSync(path.join(created.worktreePath, 'CHANGELOG.md'), 'Dirty edit\n', 'utf8');
+
+    const result = runCli(['run', 'clean', '--apply', '--task', 'Dirty WIP', '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    });
+    const envelope = JSON.parse(result.stdout);
+
+    // Lock pruning still happens — that's pure metadata. Artifact teardown
+    // is what stalls.
+    assert.deepEqual(envelope.removed, ['dirty-wip']);
+    assert.equal(envelope.artifacts[0].worktreeRemoved, false);
+    assert.match(envelope.artifacts[0].errors.join('\n'), /uncommitted or untracked changes/);
+
+    // Worktree + branch must still exist after the safety refusal.
+    assert.ok(existsSync(created.worktreePath), 'dirty worktree must survive without --force');
+    const branchProbe = spawnSync('git', ['rev-parse', '--verify', `refs/heads/${created.branch}`], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(branchProbe.status, 0, 'branch should not be deleted when worktree removal stalls');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean --apply --task --force removes a worktree with uncommitted changes', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Force Dirty', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'CHANGELOG.md'), 'Dirty edit\n', 'utf8');
+
+    const result = runCli(['run', 'clean', '--apply', '--task', 'Force Dirty', '--force', '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    });
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.removed, ['force-dirty']);
+    assert.equal(envelope.artifacts[0].worktreeRemoved, true);
+    assert.equal(envelope.artifacts[0].branchRemoved, true);
+    assert.ok(!existsSync(created.worktreePath), '--force must remove dirty worktree');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean --apply --task refuses to delete an unmerged branch without --force', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Unmerged Work', '--json'], repoRoot).stdout);
+
+    // Land a commit on the new branch but don't merge it back. After this
+    // the branch tip is no longer reachable from main → `git branch -d` will
+    // refuse, and our wrapper should surface that as a non-fatal error
+    // pointing at --force. Then commit it and revert the worktree to keep
+    // the worktree-clean check passing so we isolate the unmerged-branch
+    // refusal from the dirty-worktree refusal.
+    writeFileSync(path.join(created.worktreePath, 'NEW_FILE.txt'), 'unmerged change\n', 'utf8');
+    execFileSync('git', ['add', 'NEW_FILE.txt'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'unmerged commit'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const result = runCli(['run', 'clean', '--apply', '--task', 'Unmerged Work', '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    });
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.removed, ['unmerged-work']);
+    assert.equal(envelope.artifacts[0].worktreeRemoved, true, 'clean worktree should still be removed');
+    assert.equal(envelope.artifacts[0].branchRemoved, false, 'unmerged branch must survive without --force');
+    assert.match(envelope.artifacts[0].errors.join('\n'), /not fully merged/);
+
+    // Branch must still exist after the safety refusal.
+    const branchProbe = spawnSync('git', ['rev-parse', '--verify', `refs/heads/${created.branch}`], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(branchProbe.status, 0, 'unmerged branch must survive without --force');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean --apply --task refuses when invoked from inside the target worktree', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Self Removal', '--json'], repoRoot).stdout);
+
+    // Run /clean from inside the worktree it's trying to remove. git would
+    // refuse anyway, but the wrapper turns that into an actionable hint.
+    const result = runCli(['run', 'clean', '--apply', '--task', 'Self Removal', '--json'], created.worktreePath, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    });
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.removed, ['self-removal']);
+    assert.equal(envelope.artifacts[0].worktreeRemoved, false);
+    assert.match(envelope.artifacts[0].errors.join('\n'), /Cannot remove worktree .* while inside it/);
+    assert.ok(existsSync(created.worktreePath), 'worktree must survive the self-removal refusal');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean (no --apply) lists orphan worktrees that have no matching task lock', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    // pipelane-managed orphan: lock removed but worktree + branch left.
+    const tracked = JSON.parse(runCli(['run', 'new', '--task', 'Tracked Orphan', '--json'], repoRoot).stdout);
+    rmSync(path.join(repoRoot, '.git', 'pipelane-state', 'task-locks', 'tracked-orphan.json'));
+
+    // External orphan: created with raw `git worktree add`, never seen by
+    // pipelane. Path is OUTSIDE the configured pipelane-worktrees/ dir so
+    // the `source` tag should report it as 'external'. realpath the dir
+    // because macOS's TMPDIR is a symlink (/var/folders -> /private/var/...)
+    // and `git worktree list` reports the resolved path; without this the
+    // path the test holds and the path git stores diverge.
+    const externalDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'external-worktree-')));
+    const externalWorktree = path.join(externalDir, 'wt');
+    execFileSync('git', ['worktree', 'add', '-b', 'external/manual-branch', externalWorktree, 'main'], {
       cwd: repoRoot,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    assert.ok(branchStillThere.toString().trim().length > 0, 'targeted prune must not delete the branch');
+
+    try {
+      const result = runCli(['run', 'clean', '--json'], repoRoot);
+      const envelope = JSON.parse(result.stdout);
+      assert.match(envelope.message, /Orphan worktrees/);
+      const orphanPaths = envelope.orphanWorktrees.map((entry) => entry.path);
+      assert.ok(orphanPaths.includes(tracked.worktreePath), 'pipelane-managed orphan should be listed');
+      assert.ok(orphanPaths.includes(externalWorktree), 'external orphan should be listed');
+      const trackedEntry = envelope.orphanWorktrees.find((entry) => entry.path === tracked.worktreePath);
+      assert.equal(trackedEntry.source, 'pipelane-managed');
+      const externalEntry = envelope.orphanWorktrees.find((entry) => entry.path === externalWorktree);
+      assert.equal(externalEntry.source, 'external');
+      // Main worktree (where main is checked out) must NOT be flagged as orphan.
+      assert.ok(!orphanPaths.includes(repoRoot), 'main worktree must not be reported as orphan');
+    } finally {
+      execFileSync('git', ['worktree', 'remove', '--force', externalWorktree], {
+        cwd: repoRoot,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      rmSync(externalDir, { recursive: true, force: true });
+    }
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });

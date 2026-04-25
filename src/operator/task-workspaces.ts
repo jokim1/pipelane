@@ -508,3 +508,188 @@ export function saveNewTaskLock(options: {
     updatedAt: nowIso(),
   });
 }
+
+export interface RemoveTaskArtifactsResult {
+  // What was actually removed. False entries are either "already gone" or
+  // "skipped because the safety check fired without --force"; the `errors`
+  // list explains which.
+  worktreeRemoved: boolean;
+  branchRemoved: boolean;
+  // Non-fatal notes (e.g. "worktree directory was already missing").
+  warnings: string[];
+  // Fatal blockers that prevented removal. Empty when both removals
+  // succeeded (or were no-ops because the target was already gone).
+  errors: string[];
+}
+
+/**
+ * Tear down a task's worktree + local branch as the end-of-task close-out.
+ * The lock file is the caller's responsibility — typically pruned just
+ * before by `/clean --apply --task` so the operator's mental model is
+ * "metadata lock, then the artifacts it pointed at."
+ *
+ * Safety floor (skipped when `force === true`):
+ * - Worktree must have no uncommitted or untracked content. The check uses
+ *   `git status --porcelain` inside the worktree, so .gitignored files
+ *   (node_modules symlink, build outputs) are tolerated.
+ * - Branch must be merged into baseBranch (or absent locally). Enforced by
+ *   git itself via `git branch -d`; we surface the failure with a hint to
+ *   re-run with --force.
+ *
+ * Refuses when the worktree being removed is the caller's current
+ * directory — git rejects that and the operator should `cd` out first.
+ */
+export function removeTaskArtifacts(options: {
+  sharedRepoRoot: string;
+  worktreePath: string;
+  branchName: string;
+  callerCwd: string;
+  force: boolean;
+}): RemoveTaskArtifactsResult {
+  const warnings: string[] = [];
+  const errors: string[] = [];
+  let worktreeRemoved = false;
+  let branchRemoved = false;
+
+  const callerInsideTarget = normalizePath(options.callerCwd).startsWith(normalizePath(options.worktreePath));
+  if (callerInsideTarget && existsSync(options.worktreePath)) {
+    errors.push(
+      `Cannot remove worktree ${options.worktreePath} while inside it. ` +
+      `cd to a different directory (e.g. ${options.sharedRepoRoot}) and retry.`,
+    );
+    return { worktreeRemoved, branchRemoved, warnings, errors };
+  }
+
+  // Step 1: worktree removal.
+  if (!existsSync(options.worktreePath)) {
+    warnings.push(`Worktree ${options.worktreePath} was already missing.`);
+    // Still try `git worktree prune` so git's bookkeeping catches up. Cheap
+    // and idempotent; failures are non-fatal.
+    runCommandCapture('git', ['worktree', 'prune'], { cwd: options.sharedRepoRoot });
+    worktreeRemoved = true;
+  } else {
+    if (!options.force) {
+      const status = runCommandCapture('git', ['status', '--porcelain'], { cwd: options.worktreePath });
+      if (status.ok && status.stdout.trim().length > 0) {
+        errors.push(
+          `Worktree ${options.worktreePath} has uncommitted or untracked changes. ` +
+          `Re-run with --force to remove anyway, or commit/stash first.`,
+        );
+      }
+    }
+    if (errors.length === 0) {
+      const removeArgs = ['worktree', 'remove'];
+      if (options.force) removeArgs.push('--force');
+      removeArgs.push(options.worktreePath);
+      const result = runCommandCapture('git', removeArgs, { cwd: options.sharedRepoRoot });
+      if (result.ok) {
+        worktreeRemoved = true;
+      } else {
+        errors.push(`git worktree remove failed: ${result.stderr || result.stdout || 'unknown error'}`);
+      }
+    }
+  }
+
+  // Step 2: local branch removal. Always attempt, even if worktree removal
+  // failed — the two artifacts are independent, and the caller can decide
+  // what to surface.
+  const branchExists = runGit(options.sharedRepoRoot, ['rev-parse', '--verify', `refs/heads/${options.branchName}`], true);
+  if (!branchExists) {
+    warnings.push(`Local branch ${options.branchName} was already missing.`);
+    branchRemoved = true;
+  } else {
+    const deleteFlag = options.force ? '-D' : '-d';
+    const result = runCommandCapture('git', ['branch', deleteFlag, options.branchName], { cwd: options.sharedRepoRoot });
+    if (result.ok) {
+      branchRemoved = true;
+    } else {
+      const stderr = result.stderr || result.stdout || 'unknown error';
+      const isUnmerged = /not fully merged/i.test(stderr);
+      errors.push(
+        isUnmerged
+          ? `Branch ${options.branchName} is not fully merged into the current HEAD. ` +
+            `Re-run with --force to delete it anyway, or merge/rebase first.`
+          : `git branch ${deleteFlag} ${options.branchName} failed: ${stderr}`,
+      );
+    }
+  }
+
+  return { worktreeRemoved, branchRemoved, warnings, errors };
+}
+
+export interface OrphanWorktree {
+  path: string;
+  branchName: string | null;
+  isDetached: boolean;
+  // When the worktree path lives inside the configured worktree dir
+  // (`pipelane-worktrees/`), pipelane created it but its lock has gone
+  // away. Otherwise it's an externally-created worktree pipelane never
+  // tracked (Codex, Claude Code's /new, manual `git worktree add`).
+  source: 'pipelane-managed' | 'external';
+}
+
+/**
+ * Worktrees that show up in `git worktree list` but have no matching
+ * active task lock. The shared repo's main worktree is excluded — that
+ * one is structural, not orphaned. Surfaced by `/clean` (no args) so the
+ * operator has a UX cue to clean them up; pipelane never auto-removes
+ * orphans because the blast radius (potentially destroying external
+ * agents' WIP) is too high.
+ */
+export function listOrphanWorktrees(commonDir: string, config: WorkflowConfig): OrphanWorktree[] {
+  const sharedRepoRoot = resolveSharedRepoRoot(commonDir);
+  const result = runCommandCapture('git', ['worktree', 'list', '--porcelain'], { cwd: sharedRepoRoot });
+  if (!result.ok) return [];
+
+  const knownLocks = loadAllTaskLocks(commonDir, config);
+  const knownByPath = new Set(knownLocks.map((lock) => normalizePath(lock.worktreePath)));
+  const knownByBranch = new Set(knownLocks.map((lock) => lock.branchName));
+
+  const taskWorktreeRoot = normalizePath(resolveTaskWorktreeRoot(commonDir, config));
+  const orphans: OrphanWorktree[] = [];
+  let current: { path?: string; branch?: string; detached?: boolean } = {};
+
+  const flush = (): void => {
+    if (!current.path) {
+      current = {};
+      return;
+    }
+    const normalizedPath = normalizePath(current.path);
+    const isMainWorktree = normalizedPath === normalizePath(sharedRepoRoot);
+    if (isMainWorktree) {
+      current = {};
+      return;
+    }
+    const branchName = current.branch ?? null;
+    const isTracked = knownByPath.has(normalizedPath) || (branchName !== null && knownByBranch.has(branchName));
+    if (!isTracked) {
+      orphans.push({
+        path: current.path,
+        branchName,
+        isDetached: current.detached === true,
+        source: normalizedPath.startsWith(taskWorktreeRoot + '/') || normalizedPath === taskWorktreeRoot
+          ? 'pipelane-managed'
+          : 'external',
+      });
+    }
+    current = {};
+  };
+
+  for (const line of result.stdout.split('\n')) {
+    if (line === '') {
+      flush();
+      continue;
+    }
+    if (line.startsWith('worktree ')) {
+      current.path = line.slice('worktree '.length);
+    } else if (line.startsWith('branch ')) {
+      const ref = line.slice('branch '.length);
+      current.branch = ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : ref;
+    } else if (line === 'detached') {
+      current.detached = true;
+    }
+  }
+  flush();
+
+  return orphans;
+}
