@@ -75,6 +75,9 @@ that ignore unknown fields parse every revision transparently. See
   `doctor.probe` when a staging surface is stale or degraded).
 - `availableActions[]` — unblocked actions for the active branch.
 - `branches[]` — per-branch rows with `lanes.{local,pr,base,staging,production}`.
+- `branches[].cleanup` — cleanup assessment for the branch task lock. `tag:
+  "stale"` means `/clean --apply --all-stale` has objective evidence to prune
+  the lock, such as a missing worktree or missing branch.
 
 ## `branch` data
 
@@ -118,7 +121,7 @@ in one call.
 | `deploy.staging` | no | Deploy the merged SHA to staging. |
 | `deploy.prod` | **yes** | Deploy the merged SHA to production. |
 | `clean.plan` | no | Preview workspace cleanup. |
-| `clean.apply` | **yes** | Apply workspace cleanup (delete branches/worktrees). |
+| `clean.apply` | **yes** | Apply stale workspace cleanup with an explicit scope such as `allStale`. |
 | `doctor.diagnose` | no | Read CLAUDE.md, detect platform, list missing config + probe status. |
 | `doctor.probe` | no | Hit every configured staging healthcheck URL and persist the result to `probe-state.json`. |
 | `rollback.staging` | no | Redeploy the last verified-good SHA to staging (Pipelane-only). |
