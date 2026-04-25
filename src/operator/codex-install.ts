@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { readFixPromptBody } from './fix-prompt.ts';
@@ -197,11 +197,6 @@ function pruneLegacyCodexWrappers(skillsRoot: string, desired: DesiredInstallEnt
       rmSync(skillDirPath(skillsRoot, skillName), { recursive: true, force: true });
       removed.push(skillName);
     }
-  }
-
-  const legacyRunScriptPath = path.join(skillsRoot, MANAGED_PIPELANE_DIR, 'bin', 'run-pipelane.sh');
-  if (existsSync(legacyRunScriptPath)) {
-    unlinkSync(legacyRunScriptPath);
   }
 
   return removed.sort();

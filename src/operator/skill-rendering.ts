@@ -165,6 +165,10 @@ shift
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 local_bin="$repo_root/node_modules/.bin/pipelane"
+managed_bin="${options.managedPipelaneBin}"
+if [ ! -x "$managed_bin" ]; then
+  managed_bin="${globalBinFallback}"
+fi
 
 run_pipelane() {
   bin="$1"
@@ -205,13 +209,19 @@ run_pipelane() {
 }
 
 cd "$repo_root"
-if [ -x "$local_bin" ]; then
-  run_pipelane "$local_bin" "$command" "$@"
+
+# Updates must run from the managed runtime when invoked through a durable
+# machine-local skill. A stale repo-local install is exactly what update is
+# meant to repair, so letting node_modules own this path can leave Codex/Claude
+# command surfaces permanently stale.
+if [ "$command" = "pipelane" ] && [ "$#" -gt 0 ] && [ "$1" = "update" ] && [ -x "$managed_bin" ]; then
+  export PIPELANE_MANAGED_RUNTIME=1
+  export PIPELANE_MANAGED_RUNTIME_ROOT="${options.managedRuntimeRoot}"
+  run_pipelane "$managed_bin" "$command" "$@"
 fi
 
-managed_bin="${options.managedPipelaneBin}"
-if [ ! -x "$managed_bin" ]; then
-  managed_bin="${globalBinFallback}"
+if [ -x "$local_bin" ]; then
+  run_pipelane "$local_bin" "$command" "$@"
 fi
 
 if [ -x "$managed_bin" ]; then

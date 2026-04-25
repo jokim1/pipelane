@@ -96,7 +96,12 @@ function parseVerboseArg(args: string[], command: string): boolean {
 // (init/bootstrap) or operates outside the worktree (install-claude/codex
 // write to ~/.claude or ~/.codex). Skip the worktree symlink for these so
 // we don't surprise users running them in unusual locations.
-const SETUP_COMMANDS = new Set(['init', 'bootstrap', 'install-claude', 'install-codex', 'install-npm-guard', 'verify']);
+const SKIP_WORKTREE_BOOTSTRAP_COMMANDS = new Set(['init', 'bootstrap', 'install-claude', 'install-codex', 'install-npm-guard', 'verify']);
+
+// `update` must not re-exec into the repo-local pipelane binary when invoked
+// from a managed runtime: a stale repo-local install is the thing update is
+// repairing. It still participates in worktree node_modules bootstrap above.
+const SKIP_MANAGED_REEXEC_COMMANDS = new Set([...SKIP_WORKTREE_BOOTSTRAP_COMMANDS, 'update']);
 
 function isExecutablePath(targetPath: string): boolean {
   try {
@@ -170,11 +175,13 @@ async function main(): Promise<void> {
   // already uses internally; this just covers worktrees pipelane didn't
   // create. Conservative trigger — only fires when the worktree has no
   // node_modules at all.
-  if (!SETUP_COMMANDS.has(command)) {
+  if (!SKIP_WORKTREE_BOOTSTRAP_COMMANDS.has(command)) {
     const bootstrap = bootstrapWorktreeNodeModulesIfNeeded(process.cwd());
     if (bootstrap.message) {
       process.stderr.write(`${bootstrap.message}\n`);
     }
+  }
+  if (!SKIP_MANAGED_REEXEC_COMMANDS.has(command)) {
     maybeReexecRepoLocalPipelane(process.cwd());
   }
 

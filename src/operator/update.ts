@@ -1,10 +1,12 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { accessSync, constants, existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 
 import { stopDashboardForRepo } from '../dashboard/launcher.ts';
+import { installClaudeBootstrapSkill } from './claude-install.ts';
+import { installCodexBootstrapSkill } from './codex-install.ts';
 import { detectSetupDrift, formatSetupResult, type SetupDrift, setupConsumerRepo } from './docs.ts';
 import { PIPELANE_GITHUB_URL, PIPELANE_REPO_SLUG, resolvePipelaneInstallSpec } from './install-source.ts';
-import { resolveRepoRoot, runCommandCapture } from './state.ts';
+import { homeClaudeDir, homeCodexDir, resolveRepoRoot, runCommandCapture } from './state.ts';
 
 export interface UpdateOptions {
   check: boolean;
@@ -35,6 +37,19 @@ export interface UpdateResult {
   // True iff runUpdate actually invoked setupConsumerRepo before returning
   // (inline setup accepted via prompt or --yes).
   ranSetup: boolean;
+  globalSurfaces: GlobalSurfaceRefresh;
+}
+
+type GlobalSurfaceRefreshStatus = 'refreshed' | 'skipped' | 'failed';
+
+export interface GlobalSurfaceRefreshCheck {
+  status: GlobalSurfaceRefreshStatus;
+  detail: string;
+}
+
+export interface GlobalSurfaceRefresh {
+  codex: GlobalSurfaceRefreshCheck;
+  claude: GlobalSurfaceRefreshCheck;
 }
 
 export function parseUpdateArgs(argv: string[]): UpdateOptions {
@@ -62,6 +77,9 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
   // currently-installed pipelane, even when no upstream update exists.
   if (options.check || status.upToDate) {
     const driftResult = tryDetectDrift(repoRoot);
+    const globalSurfaces = options.check
+      ? skippedGlobalSurfaces('read-only --check')
+      : refreshInstalledGlobalSurfaces(repoRoot);
     const summary = status.upToDate
       ? `pipelane is up to date (${status.installedShaShort}).`
       : buildStatusMessage(status);
@@ -75,11 +93,13 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
         message: summary,
         followUpSteps: driftResult.drift,
         ranSetup: false,
+        globalSurfaces,
       };
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
       return result;
     }
     process.stdout.write(`${summary}\n`);
+    emitGlobalSurfaceRefreshHint(globalSurfaces);
     emitDriftHint(driftResult);
     return {
       status,
@@ -87,6 +107,7 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
       message: summary,
       followUpSteps: driftResult.drift,
       ranSetup: false,
+      globalSurfaces,
     };
   }
 
@@ -96,7 +117,8 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
   const summary = buildStatusMessage(status);
   if (!options.json) process.stdout.write(`${summary}\n`);
 
-  installLatest(repoRoot);
+  assertSafeNpmInstallTarget(repoRoot);
+  installLatest(repoRoot, { quiet: options.json });
   const boardStop = await stopDashboardForRepo(repoRoot);
 
   const after = collectUpdateStatus(repoRoot);
@@ -106,6 +128,7 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
   const message = `Upgrade complete.\n${tail}`;
 
   const driftResult = tryDetectDrift(repoRoot);
+  const globalSurfaces = refreshInstalledGlobalSurfaces(repoRoot);
 
   if (options.json) {
     const result: UpdateResult = {
@@ -114,6 +137,7 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
       message,
       followUpSteps: driftResult.drift,
       ranSetup: false,
+      globalSurfaces,
     };
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     return result;
@@ -123,6 +147,7 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
   if (boardStop.stopped) {
     process.stdout.write(`Stopped existing Pipelane Board (PID ${boardStop.pid}) so the next board start uses the updated package.\n`);
   }
+  emitGlobalSurfaceRefreshHint(globalSurfaces);
   emitDriftHint(driftResult);
 
   let ranSetup = false;
@@ -140,6 +165,7 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
     message,
     followUpSteps: drift,
     ranSetup,
+    globalSurfaces,
   };
 }
 
@@ -156,6 +182,146 @@ function tryDetectDrift(repoRoot: string): DriftResult {
     return { drift: detectSetupDrift(repoRoot), error: null };
   } catch (error) {
     return { drift: null, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function skippedGlobalSurfaces(reason: string): GlobalSurfaceRefresh {
+  return {
+    codex: { status: 'skipped', detail: reason },
+    claude: { status: 'skipped', detail: reason },
+  };
+}
+
+function isExecutable(targetPath: string): boolean {
+  try {
+    accessSync(targetPath, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function installedCodexSurfaceSignals(): string[] {
+  const skillsRoot = path.join(homeCodexDir(), 'skills');
+  return [
+    path.join(skillsRoot, '.pipelane', 'bin', 'pipelane'),
+    path.join(skillsRoot, '.pipelane', 'bin', 'run-pipelane.sh'),
+    path.join(skillsRoot, '.pipelane', 'managed-skills.json'),
+    path.join(skillsRoot, 'pipelane', 'SKILL.md'),
+    path.join(skillsRoot, 'init-pipelane', 'SKILL.md'),
+    path.join(skillsRoot, 'new', 'SKILL.md'),
+    // Legacy pre-durable installs used this path as a runtime directory. Its
+    // presence should still trigger a refresh so update can repair it.
+    path.join(skillsRoot, 'pipelane', 'bin', 'run-pipelane.sh'),
+  ];
+}
+
+function installedClaudeSurfaceSignals(): string[] {
+  const skillsRoot = path.join(homeClaudeDir(), 'skills');
+  return [
+    path.join(skillsRoot, 'pipelane', 'bin', 'pipelane'),
+    path.join(skillsRoot, 'pipelane', 'bin', 'run-pipelane.sh'),
+    path.join(skillsRoot, 'pipelane', 'managed-skills.json'),
+    path.join(skillsRoot, 'pipelane', 'SKILL.md'),
+    path.join(skillsRoot, 'init-pipelane', 'SKILL.md'),
+    path.join(skillsRoot, 'new', 'SKILL.md'),
+  ];
+}
+
+function refreshInstalledGlobalSurfaces(repoRoot: string): GlobalSurfaceRefresh {
+  return {
+    codex: refreshGlobalSurface(repoRoot, 'codex', installedCodexSurfaceSignals()),
+    claude: refreshGlobalSurface(repoRoot, 'claude', installedClaudeSurfaceSignals()),
+  };
+}
+
+function refreshGlobalSurface(repoRoot: string, host: 'codex' | 'claude', signals: string[]): GlobalSurfaceRefreshCheck {
+  if (!signals.some((targetPath) => existsSync(targetPath))) {
+    return { status: 'skipped', detail: `not installed (run pipelane install-${host} to add it)` };
+  }
+
+  const installCommand = host === 'codex' ? 'install-codex' : 'install-claude';
+  const localBin = path.join(repoRoot, 'node_modules', '.bin', 'pipelane');
+  if (isExecutable(localBin)) {
+    const result = runCommandCapture(localBin, [installCommand], {
+      cwd: repoRoot,
+      env: process.env,
+    });
+    if (result.ok) {
+      return { status: 'refreshed', detail: `refreshed via ${localBin}` };
+    }
+    return {
+      status: 'failed',
+      detail: result.stderr || result.stdout || `${localBin} ${installCommand} exited ${result.exitCode}`,
+    };
+  }
+
+  try {
+    if (host === 'codex') {
+      installCodexBootstrapSkill();
+    } else {
+      installClaudeBootstrapSkill();
+    }
+    return { status: 'refreshed', detail: 'refreshed via current runtime' };
+  } catch (error) {
+    return {
+      status: 'failed',
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function symlinkedNodeModulesTarget(repoRoot: string): string | null {
+  const nodeModulesPath = path.join(repoRoot, 'node_modules');
+  try {
+    const stat = lstatSync(nodeModulesPath);
+    if (!stat.isSymbolicLink()) {
+      return null;
+    }
+    try {
+      return realpathSync(nodeModulesPath);
+    } catch {
+      return nodeModulesPath;
+    }
+  } catch {
+    return null;
+  }
+}
+
+function assertSafeNpmInstallTarget(repoRoot: string): void {
+  const target = symlinkedNodeModulesTarget(repoRoot);
+  if (!target) {
+    return;
+  }
+  const sharedRepoHint = path.basename(target) === 'node_modules'
+    ? path.dirname(target)
+    : null;
+  const rerun = sharedRepoHint
+    ? `Run \`pipelane update\` from the shared checkout instead: cd ${sharedRepoHint} && pipelane update`
+    : 'Run `pipelane update` from a checkout whose node_modules is a real directory, not a symlink.';
+  throw new Error([
+    `Refusing to run npm install for pipelane update in ${repoRoot} because node_modules is a symlink to ${target}.`,
+    'Running npm install/update through a symlinked node_modules can remove or corrupt the shared dependency tree.',
+    rerun,
+  ].join('\n'));
+}
+
+function emitGlobalSurfaceRefreshHint(result: GlobalSurfaceRefresh): void {
+  const lines: string[] = [];
+  if (result.codex.status === 'refreshed') {
+    lines.push('Refreshed machine-local Codex commands. Restart Codex if command discovery is already loaded.');
+  } else if (result.codex.status === 'failed') {
+    lines.push(`Machine-local Codex refresh failed: ${result.codex.detail}`);
+  }
+
+  if (result.claude.status === 'refreshed') {
+    lines.push('Refreshed machine-local Claude commands. Restart Claude if skill discovery is already loaded.');
+  } else if (result.claude.status === 'failed') {
+    lines.push(`Machine-local Claude refresh failed: ${result.claude.detail}`);
+  }
+
+  if (lines.length > 0) {
+    process.stdout.write(`\n${lines.join('\n')}\n`);
   }
 }
 
@@ -355,14 +521,14 @@ function fetchCompare(
   }
 }
 
-function installLatest(repoRoot: string): void {
+function installLatest(repoRoot: string, options: { quiet?: boolean } = {}): void {
   const result = runCommandCapture('npm', ['install', resolvePipelaneInstallSpec()], { cwd: repoRoot });
   if (!result.ok) {
     const detail = result.stderr || result.stdout;
     throw new Error(`npm install failed:\n${detail}`);
   }
-  if (result.stdout) process.stdout.write(`${result.stdout}\n`);
-  if (result.stderr) process.stderr.write(`${result.stderr}\n`);
+  if (!options.quiet && result.stdout) process.stdout.write(`${result.stdout}\n`);
+  if (!options.quiet && result.stderr) process.stderr.write(`${result.stderr}\n`);
 }
 
 function buildStatusMessage(status: UpdateStatus): string {

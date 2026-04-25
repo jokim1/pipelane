@@ -86,11 +86,34 @@ function desiredMachineInstall(host: HostInstall, home: string): DesiredInstall 
   });
 }
 
-function checkHostInstall(checks: VerifyCheck[], host: HostInstall, home: string): string {
+function hostInstallSignals(host: HostInstall, home: string, install: DesiredInstall): string[] {
+  const skillsRoot = path.join(home, 'skills');
+  const root = runtimeRoot(host, home);
+  const signals = [
+    path.join(root, 'bin', 'pipelane'),
+    path.join(root, 'bin', 'run-pipelane.sh'),
+    path.join(root, 'managed-skills.json'),
+    ...install.entries.filter((entry) => entry.required).map((entry) => path.join(skillsRoot, entry.name, 'SKILL.md')),
+  ];
+  if (host === 'codex') {
+    signals.push(path.join(skillsRoot, 'pipelane', 'bin', 'run-pipelane.sh'));
+  }
+  return signals;
+}
+
+function checkHostInstall(checks: VerifyCheck[], host: HostInstall, home: string): string | null {
   const install = desiredMachineInstall(host, home);
   const skillsRoot = path.join(home, 'skills');
   const root = runtimeRoot(host, home);
   const markerPrefix = host === 'codex' ? 'pipelane:codex-global-skill:' : 'pipelane:claude-global-skill:';
+  if (!hostInstallSignals(host, home, install).some((targetPath) => existsSync(targetPath))) {
+    checks.push({
+      name: `${host} durable commands`,
+      status: 'skip',
+      detail: `not installed (optional host; run pipelane install-${host})`,
+    });
+    return null;
+  }
 
   for (const entry of install.entries) {
     const targetPath = path.join(skillsRoot, entry.name, 'SKILL.md');
@@ -120,8 +143,23 @@ export function runVerify(): VerifyResult {
   const claudeRunnerPath = checkHostInstall(checks, 'claude', homeClaudeDir());
 
   addNpmGuardCheck(checks);
-  checks.push(runTemporaryRunnerCheck('codex temporary runner self-test', codexRunnerPath));
-  checks.push(runTemporaryRunnerCheck('claude temporary runner self-test', claudeRunnerPath));
+  const runnerChecks: Array<{ name: string; path: string }> = [];
+  if (codexRunnerPath) {
+    runnerChecks.push({ name: 'codex temporary runner self-test', path: codexRunnerPath });
+  }
+  if (claudeRunnerPath) {
+    runnerChecks.push({ name: 'claude temporary runner self-test', path: claudeRunnerPath });
+  }
+  if (runnerChecks.length === 0) {
+    checks.push({
+      name: 'durable command host',
+      status: 'fail',
+      detail: 'no Codex or Claude durable commands are installed; run pipelane install-codex or pipelane install-claude',
+    });
+  }
+  for (const runner of runnerChecks) {
+    checks.push(runTemporaryRunnerCheck(runner.name, runner.path));
+  }
 
   const ok = checks.every((check) => check.status !== 'fail');
   const lines = ['Pipelane durable install verify:'];

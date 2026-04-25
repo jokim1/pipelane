@@ -1678,6 +1678,57 @@ test('verify treats absent npm guard as optional after durable command installs'
   }
 });
 
+test('verify passes with only Codex durable commands installed and skips Claude', () => {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-verify-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+
+  try {
+    runCli(['install-codex'], workspaceRoot, { CODEX_HOME: codexHome, PIPELANE_HOME: pipelaneHome });
+
+    const result = runCli(
+      ['verify'],
+      workspaceRoot,
+      { CODEX_HOME: codexHome, CLAUDE_HOME: claudeHome, PIPELANE_HOME: pipelaneHome },
+    );
+
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /OK codex temporary runner self-test/);
+    assert.match(result.stdout, /SKIP claude durable commands: not installed \(optional host;/);
+    assert.doesNotMatch(result.stdout, /claude temporary runner self-test/);
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('verify fails clearly when no durable command host is installed', () => {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-verify-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+
+  try {
+    const result = runCli(
+      ['verify'],
+      workspaceRoot,
+      { CODEX_HOME: codexHome, CLAUDE_HOME: claudeHome, PIPELANE_HOME: pipelaneHome },
+      true,
+    );
+
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /FAIL durable command host: no Codex or Claude durable commands are installed/);
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
 test('verify fails when a managed skill body drifts even if its marker remains', () => {
   const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-verify-'));
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
@@ -3242,6 +3293,45 @@ test('tracked Codex wrapper prefers the repo-local pipelane install', () => {
   }
 });
 
+test('durable Codex runner routes /pipelane update through the managed runtime', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    runCli(['install-codex'], repoRoot, { CODEX_HOME: codexHome });
+
+    mkdirSync(path.join(repoRoot, 'node_modules', '.bin'), { recursive: true });
+    writeFileSync(
+      path.join(repoRoot, 'node_modules', '.bin', 'pipelane'),
+      '#!/bin/sh\necho "LOCAL:$*"\n',
+      { mode: 0o755, encoding: 'utf8' },
+    );
+
+    const managedBin = path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane');
+    writeFileSync(
+      managedBin,
+      '#!/bin/sh\necho "GLOBAL:$*"\n',
+      { mode: 0o755, encoding: 'utf8' },
+    );
+
+    const output = execFileSync(
+      path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      ['pipelane', 'update', '--check'],
+      {
+        cwd: repoRoot,
+        env: { ...process.env, CODEX_HOME: codexHome },
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+
+    assert.equal(output.trim(), 'GLOBAL:update --check');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
 test('tracked Codex wrapper falls back to the managed Codex runtime when node_modules is missing', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
@@ -3411,6 +3501,26 @@ test('install-codex upgrades legacy machine-local wrapper skills in place', () =
     assert.ok(existsSync(path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh')));
   } finally {
     rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('setup preserves the durable machine-local Codex runtime runner', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    runCli(['install-codex'], repoRoot, { CODEX_HOME: codexHome });
+    const runnerPath = path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh');
+    assert.ok(existsSync(runnerPath));
+
+    runCli(['init', '--project', 'Demo App'], repoRoot, { CODEX_HOME: codexHome });
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    assert.ok(existsSync(runnerPath));
+    assert.match(readFileSync(path.join(codexHome, 'skills', 'pr', 'SKILL.md'), 'utf8'), new RegExp(runnerPath.replaceAll('\\', '\\\\')));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
   }
 });
@@ -4047,6 +4157,132 @@ test('CLI auto-bootstraps node_modules in an externally-created worktree before 
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('managed update bootstraps worktree node_modules without re-execing stale local pipelane', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-bin-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  const sha = '0123456789abcdef0123456789abcdef01234567';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    writeFakeConsumer(repoRoot, { installedVersion: '0.2.0', installedSha: sha });
+    execFileSync('git', ['add', 'package.json', 'package-lock.json', '.pipelane.json'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    execFileSync('git', ['commit', '-m', 'Adopt fake pipelane install'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    execFileSync('git', ['push'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    mkdirSync(path.join(repoRoot, 'node_modules', '.bin'), { recursive: true });
+    writeFileSync(
+      path.join(repoRoot, 'node_modules', '.bin', 'pipelane'),
+      '#!/bin/sh\necho "LOCAL REEXEC:$*"\n',
+      { mode: 0o755, encoding: 'utf8' },
+    );
+
+    const worktreePath = path.join(repoRoot, '.claude', 'worktrees', 'managed-update');
+    execFileSync('git', ['worktree', 'add', worktreePath, '-b', 'managed-update'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(existsSync(path.join(worktreePath, 'node_modules')), false);
+    makeFakeUpdateBin(binDir, { latestSha: sha });
+
+    const result = spawnSync('node', [CLI_PATH, 'update', '--check'], {
+      cwd: worktreePath,
+      env: {
+        ...process.env,
+        CODEX_HOME: codexHome,
+        CLAUDE_HOME: claudeHome,
+        PIPELANE_HOME: pipelaneHome,
+        PIPELANE_MANAGED_RUNTIME: '1',
+        PIPELANE_MANAGED_RUNTIME_ROOT: '/tmp/pipelane-managed-runtime',
+        PATH: `${binDir}:${process.env.PATH}`,
+      },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /\[pipelane\] Linked node_modules/);
+    assert.match(result.stdout, /pipelane is up to date/);
+    assert.doesNotMatch(result.stdout, /LOCAL REEXEC/);
+    const linkedNodeModules = path.join(worktreePath, 'node_modules');
+    assert.ok(lstatSync(linkedNodeModules).isSymbolicLink());
+    assert.equal(realpathSync(linkedNodeModules), realpathSync(path.join(repoRoot, 'node_modules')));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('update refuses to npm install through symlinked worktree node_modules', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-bin-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  const oldSha = '1111111111111111111111111111111111111111';
+  const newSha = '2222222222222222222222222222222222222222';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    writeFakeConsumer(repoRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    execFileSync('git', ['add', 'package.json', 'package-lock.json', '.pipelane.json'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    execFileSync('git', ['commit', '-m', 'Adopt fake pipelane install'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    execFileSync('git', ['push'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const worktreePath = path.join(repoRoot, '.claude', 'worktrees', 'update-refuses-symlink');
+    execFileSync('git', ['worktree', 'add', worktreePath, '-b', 'update-refuses-symlink'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    makeFakeUpdateBin(binDir, { latestSha: newSha });
+
+    const result = spawnSync('node', [CLI_PATH, 'update'], {
+      cwd: worktreePath,
+      env: {
+        ...process.env,
+        CODEX_HOME: codexHome,
+        CLAUDE_HOME: claudeHome,
+        PIPELANE_HOME: pipelaneHome,
+        PIPELANE_MANAGED_RUNTIME: '1',
+        PIPELANE_MANAGED_RUNTIME_ROOT: '/tmp/pipelane-managed-runtime',
+        PATH: `${binDir}:${process.env.PATH}`,
+      },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Refusing to run npm install for pipelane update/);
+    assert.match(result.stderr, /node_modules is a symlink/);
+    assert.match(result.stderr, /Run `pipelane update` from the shared checkout instead/);
+    const worktreeLock = JSON.parse(readFileSync(path.join(worktreePath, 'package-lock.json'), 'utf8'));
+    assert.equal(worktreeLock.packages['node_modules/pipelane'].resolved.endsWith(`#${oldSha}`), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
   }
 });
 
@@ -6948,6 +7184,110 @@ test('update reports up-to-date when installed sha matches remote main', () => {
   }
 });
 
+test('update refreshes installed machine-local Codex commands when already up to date', () => {
+  const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-consumer-'));
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-bin-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  const refreshLog = path.join(consumerRoot, 'refresh.log');
+  const sha = '0123456789abcdef0123456789abcdef01234567';
+  try {
+    writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: sha });
+    makeFakeUpdateBin(binDir, { latestSha: sha });
+    mkdirSync(path.join(consumerRoot, 'node_modules', '.bin'), { recursive: true });
+    writeFileSync(
+      path.join(consumerRoot, 'node_modules', '.bin', 'pipelane'),
+      `#!/usr/bin/env node
+const fs = require('node:fs');
+fs.appendFileSync(process.env.PIPELANE_REFRESH_LOG, process.argv.slice(2).join(' ') + '\\n', 'utf8');
+`,
+      { mode: 0o755, encoding: 'utf8' },
+    );
+    mkdirSync(path.join(codexHome, 'skills', '.pipelane', 'bin'), { recursive: true });
+    writeFileSync(path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane'), '#!/bin/sh\nexit 0\n', {
+      mode: 0o755,
+      encoding: 'utf8',
+    });
+
+    const result = spawnSync('node', [CLI_PATH, 'update'], {
+      cwd: consumerRoot,
+      env: {
+        ...process.env,
+        CODEX_HOME: codexHome,
+        CLAUDE_HOME: claudeHome,
+        PIPELANE_HOME: pipelaneHome,
+        PIPELANE_REFRESH_LOG: refreshLog,
+        PATH: `${binDir}:${process.env.PATH}`,
+      },
+      encoding: 'utf8',
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /pipelane is up to date/);
+    assert.match(result.stdout, /Refreshed machine-local Codex commands/);
+    assert.doesNotMatch(result.stdout, /Refreshed machine-local Claude commands/);
+    assert.equal(readFileSync(refreshLog, 'utf8'), 'install-codex\n');
+  } finally {
+    rmSync(consumerRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('update --check does not refresh installed machine-local commands', () => {
+  const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-consumer-'));
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-bin-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  const refreshLog = path.join(consumerRoot, 'refresh.log');
+  const sha = '0123456789abcdef0123456789abcdef01234567';
+  try {
+    writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: sha });
+    makeFakeUpdateBin(binDir, { latestSha: sha });
+    mkdirSync(path.join(consumerRoot, 'node_modules', '.bin'), { recursive: true });
+    writeFileSync(
+      path.join(consumerRoot, 'node_modules', '.bin', 'pipelane'),
+      `#!/usr/bin/env node
+const fs = require('node:fs');
+fs.appendFileSync(process.env.PIPELANE_REFRESH_LOG, process.argv.slice(2).join(' ') + '\\n', 'utf8');
+`,
+      { mode: 0o755, encoding: 'utf8' },
+    );
+    mkdirSync(path.join(codexHome, 'skills', '.pipelane', 'bin'), { recursive: true });
+    writeFileSync(path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane'), '#!/bin/sh\nexit 0\n', {
+      mode: 0o755,
+      encoding: 'utf8',
+    });
+
+    const result = spawnSync('node', [CLI_PATH, 'update', '--check'], {
+      cwd: consumerRoot,
+      env: {
+        ...process.env,
+        CODEX_HOME: codexHome,
+        CLAUDE_HOME: claudeHome,
+        PIPELANE_HOME: pipelaneHome,
+        PIPELANE_REFRESH_LOG: refreshLog,
+        PATH: `${binDir}:${process.env.PATH}`,
+      },
+      encoding: 'utf8',
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(existsSync(refreshLog), false);
+    assert.doesNotMatch(result.stdout, /Refreshed machine-local Codex commands/);
+  } finally {
+    rmSync(consumerRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
 test('update --check reports the commit list when behind', () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-bin-'));
@@ -6976,6 +7316,44 @@ test('update --check reports the commit list when behind', () => {
   } finally {
     rmSync(consumerRoot, { recursive: true, force: true });
     rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('update --json remains parseable after installing an update', () => {
+  const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-consumer-'));
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-bin-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  const oldSha = '1111111111111111111111111111111111111111';
+  const newSha = '2222222222222222222222222222222222222222';
+  try {
+    writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    makeFakeUpdateBin(binDir, { latestSha: newSha });
+
+    const result = spawnSync('node', [CLI_PATH, 'update', '--json'], {
+      cwd: consumerRoot,
+      env: {
+        ...process.env,
+        CODEX_HOME: codexHome,
+        CLAUDE_HOME: claudeHome,
+        PIPELANE_HOME: pipelaneHome,
+        PATH: `${binDir}:${process.env.PATH}`,
+      },
+      encoding: 'utf8',
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.action, 'installed');
+    assert.equal(parsed.status.installedSha, newSha);
+    assert.equal(parsed.globalSurfaces.codex.status, 'skipped');
+  } finally {
+    rmSync(consumerRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
   }
 });
 
