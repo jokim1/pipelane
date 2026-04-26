@@ -796,9 +796,19 @@ test('init writes tracked Pipelane files and setup seeds CLAUDE plus tracked Cod
     assert.match(setupResult.stdout, /Removed legacy machine-local wrapper skills: new, pr, resume/);
     assert.ok(existsSync(path.join(repoRoot, 'CLAUDE.md')));
     assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'new', 'SKILL.md')));
+    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'smoke', 'SKILL.md')));
     assert.equal(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')), false);
     assert.equal(existsSync(path.join(codexHome, 'skills', 'resume', 'SKILL.md')), false);
     assert.equal(existsSync(path.join(codexHome, 'skills', 'pr', 'SKILL.md')), false);
+
+    const smokeSkill = readFileSync(path.join(repoRoot, '.agents', 'skills', 'smoke', 'SKILL.md'), 'utf8');
+    assert.match(smokeSkill, /Guided empty state behavior/);
+    assert.match(smokeSkill, /Offer the exact choices from `emptyState\.options`/);
+    assert.match(smokeSkill, /intent: "start_smoke_interview"/);
+    assert.match(
+      smokeSkill,
+      /What are the 1-3 user journeys that must work before this app is considered alive\?/,
+    );
 
     const packageJson = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
     // Canonical pipelane:* script names
@@ -809,6 +819,10 @@ test('init writes tracked Pipelane files and setup seeds CLAUDE plus tracked Cod
     assert.equal(packageJson.scripts['pipelane:board'], 'pipelane board');
     assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'repo-guard.md')));
     assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'smoke.md')));
+    const smokeCommand = readFileSync(path.join(repoRoot, '.claude', 'commands', 'smoke.md'), 'utf8');
+    assert.match(smokeCommand, /Guided empty states/);
+    assert.match(smokeCommand, /Offer the exact choices from `emptyState\.options`/);
+    assert.match(smokeCommand, /intent: "start_smoke_interview"/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -898,6 +912,8 @@ test('smoke and runtime source files are tracked in git so the branch stays self
     'src/operator/commands/smoke.ts',
     'src/operator/runtime-observation.ts',
     'src/operator/smoke-gate.ts',
+    'src/operator/smoke-hot-paths.ts',
+    'src/operator/text-output.ts',
     'templates/.claude/commands/smoke.md',
   ]) {
     const trackedPath = execFileSync('git', ['ls-files', '--error-unmatch', relativePath], {
@@ -1118,6 +1134,126 @@ test('bare /smoke lists registered checks, unregistered tags, candidate tests, a
     assert.ok(output.registered.some((entry) => entry.tag === '@smoke-auth'));
     assert.ok(output.unregisteredTags.some((entry) => entry.tag === '@smoke-checkout'));
     assert.ok(output.orphanCandidates.includes('e2e/landing.spec.ts'));
+    assert.equal(output.emptyState, undefined);
+    assert.doesNotMatch(output.message, /Reply with Y, 1, 2, or 3/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('bare /smoke shows guided empty state when runner is configured but no checks exist', () => {
+  const repoRoot = createRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'e2e', 'vip-billing.spec.ts'), "test('billing works', async () => {});\n", 'utf8');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.smoke = {
+        staging: { command: 'npm run test:e2e:vip' },
+      };
+    });
+
+    const result = runCli(['run', 'smoke', '--json'], repoRoot);
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0);
+    assert.equal(output.emptyState.kind, 'runner_configured_no_checks');
+    assert.equal(
+      output.emptyState.summary,
+      'Smoke runner is configured, but no hot-path checks are registered yet.',
+    );
+    assert.equal(output.emptyState.recommendedAction, 'start_smoke_interview');
+    assert.match(output.message, /Smoke runner is configured, but no hot-path checks are registered yet\./);
+    assert.match(output.message, /Current state:/);
+    assert.match(output.message, /- Runner: npm run test:e2e:vip/);
+    assert.match(output.message, /- Registered checks: none/);
+    assert.match(output.message, /- Discovered @smoke-\* tags: none/);
+    assert.match(output.message, /- Candidate files:\n  - e2e\/vip-billing\.spec\.ts/);
+    assert.match(output.message, /Y or 1\. Start smoke interview \(recommended\)/);
+    assert.match(output.message, /2\. Generate baseline hot paths/);
+    assert.match(output.message, /3\. Manually tag existing tests/);
+    assert.match(output.message, /Reply with Y, 1, 2, or 3\./);
+    assert.equal(output.emptyState.options[0].key, '1');
+    assert.ok(output.emptyState.options[0].aliases.includes('Y'));
+    assert.equal(output.emptyState.options[0].intent, 'start_smoke_interview');
+    assert.match(output.emptyState.options[1].command, /smoke setup/);
+    assert.match(output.emptyState.options[2].command, /smoke plan/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('bare /smoke recommends setup when no runner and no checks exist', () => {
+  const repoRoot = createRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const result = runCli(['run', 'smoke', '--json'], repoRoot);
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0);
+    assert.equal(output.emptyState.kind, 'no_runner_no_checks');
+    assert.equal(output.emptyState.recommendedAction, 'run_smoke_setup');
+    assert.match(output.message, /Smoke is not configured yet\. No runner or hot-path checks were found\./);
+    assert.match(output.message, /Y or 1\. Configure smoke setup \(recommended\)/);
+    assert.deepEqual(output.emptyState.options.map((option) => option.key), ['1', '2', '3']);
+    assert.match(output.emptyState.options[0].command, /smoke setup/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('bare /smoke classifies candidate tests when no runner is configured', () => {
+  const repoRoot = createRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'e2e', 'landing.spec.ts'), "test('landing renders', async () => {});\n", 'utf8');
+
+    const result = runCli(['run', 'smoke', '--json'], repoRoot);
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0);
+    assert.equal(output.emptyState.kind, 'candidate_tests_no_checks');
+    assert.equal(output.emptyState.recommendedAction, 'run_smoke_setup');
+    assert.match(output.message, /Smoke candidate tests were found, but no hot-path checks are registered yet\./);
+    assert.match(output.message, /- Runner: not configured/);
+    assert.match(output.message, /- Candidate files:\n  - e2e\/landing\.spec\.ts/);
+    assert.match(output.message, /Y or 1\. Configure smoke setup \(recommended\)/);
+    assert.deepEqual(output.emptyState.options.map((option) => option.key), ['1', '2', '3']);
+    assert.match(output.emptyState.options[0].command, /smoke setup/);
+    assert.equal(output.emptyState.options[1].intent, 'start_smoke_interview');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('bare /smoke recommends plan when smoke tags exist without registry checks', () => {
+  const repoRoot = createRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
+
+    const result = runCli(['run', 'smoke', '--json'], repoRoot);
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0);
+    assert.equal(output.emptyState.kind, 'tags_discovered_no_registry');
+    assert.equal(output.emptyState.recommendedAction, 'run_smoke_plan');
+    assert.match(output.message, /Smoke tags were found, but the smoke registry has no checks yet\./);
+    assert.match(output.message, /Y or 1\. Register discovered smoke tags \(recommended\)/);
+    assert.match(output.message, /- @smoke-auth \(e2e\/auth\.spec\.ts\)/);
+    assert.deepEqual(output.emptyState.options.map((option) => option.key), ['1', '2', '3']);
+    assert.match(output.emptyState.options[0].command, /smoke plan/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }

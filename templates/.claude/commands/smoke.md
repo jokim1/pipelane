@@ -9,7 +9,7 @@ npm run pipelane:smoke -- $ARGUMENTS
 
 Expected subcommands:
 
-- _no subcommand_ — lists registered smoke checks (from `.pipelane/smoke-checks.json`), discovered `@smoke-*` tags not yet registered, candidate test files without `@smoke` tags, and the currently configured runner command. Prints add-a-check hints at the end.
+- _no subcommand_ — lists registered smoke checks (from `.pipelane/smoke-checks.json`), discovered `@smoke-*` tags not yet registered, candidate test files without `@smoke` tags, and the currently configured runner command. If no checks are registered, it prints a guided empty state with `Y`/`1`/`2`/`3` options and JSON `emptyState` metadata.
 - `plan` — scaffolds or audits `.pipelane/smoke-checks.json` and prints the top actions.
 - `setup` — wires a smoke runner command into `.pipelane.json`. See "Setup quoting" below for passing commands with spaces / metacharacters.
 - `staging` — runs smoke for the currently deployed staging SHA.
@@ -50,6 +50,41 @@ Setup flags (accepted only on `smoke setup`):
 - `--critical-path-coverage=warn|block` — how /deploy prod treats uncovered critical paths.
 
 Display the output directly and keep the environment explicit.
+
+## Guided empty states
+
+Bare `/smoke` is intentionally read-only. When it returns an `emptyState`,
+continue the conversation in chat instead of asking the user to memorize
+commands.
+
+Offer the exact choices from `emptyState.options`. Follow each option's
+`intent` or `command`; do not assume the same number always means the same
+action for every empty-state kind.
+
+- If an option has `intent: "start_smoke_interview"`, start the interview.
+- If an option has `command`, run or offer that command.
+- If the selected option is manual tagging, explain how to tag existing tests,
+  then run `/smoke plan` after tags are added.
+
+For the smoke interview, ask one question at a time. The first question must be:
+
+```text
+What are the 1-3 user journeys that must work before this app is considered alive?
+```
+
+After the user answers, convert the answer into the deterministic setup path,
+primarily:
+
+```bash
+/smoke setup --feedback "<answer>"
+```
+
+When the selected option runs setup, use `/smoke setup` so repo analysis can
+generate baseline hot paths where supported.
+
+When the selected option is manual tagging, explain that the user can add
+`@smoke-<name>` tags to existing tests and then run `/smoke plan` to register
+them.
 
 ## Runner results contract
 

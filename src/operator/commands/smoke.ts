@@ -60,6 +60,7 @@ import {
   type SmokeRunStatus,
   type SmokeWaiverRecord,
 } from '../state.ts';
+import { renderTextEmptyState, type TextEmptyState, type TextEmptyStateOption } from '../text-output.ts';
 
 export async function handleSmoke(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const subcommand = parsed.positional[0] ?? '';
@@ -211,6 +212,145 @@ async function handleSmokePlan(cwd: string, parsed: ParsedOperatorArgs): Promise
 // /smoke (no subcommand) — list registered checks, discovered tags, candidates
 // ---------------------------------------------------------------------------
 
+type SmokeListEmptyStateKind =
+  | 'runner_configured_no_checks'
+  | 'candidate_tests_no_checks'
+  | 'tags_discovered_no_registry'
+  | 'no_runner_no_checks';
+
+interface SmokeListEmptyState extends TextEmptyState {
+  kind: SmokeListEmptyStateKind;
+}
+
+interface SmokeListEmptyStateInput {
+  registeredCount: number;
+  unregisteredTags: Array<{ tag: string; files: string[] }>;
+  orphanCandidates: string[];
+  stagingCommand: string;
+  hasRunner: boolean;
+  planCommand: string;
+  setupCommand: string;
+}
+
+function smokeInterviewOption(recommended = true, key = '1'): TextEmptyStateOption {
+  return {
+    key,
+    aliases: key === '1' ? ['Y', 'y'] : [],
+    label: recommended ? 'Start smoke interview (recommended)' : 'Start smoke interview',
+    description: 'Answer one question about the 1-3 journeys that must work.',
+    intent: 'start_smoke_interview',
+  };
+}
+
+function baselineHotPathsOption(setupCommand: string, key = '2', recommended = false): TextEmptyStateOption {
+  return {
+    key,
+    label: recommended ? 'Generate baseline hot paths (recommended)' : 'Generate baseline hot paths',
+    description: 'Use repo analysis to propose and generate supported hot-path checks.',
+    command: setupCommand,
+  };
+}
+
+function manualTaggingOption(planCommand: string, key = '3', recommended = false): TextEmptyStateOption {
+  return {
+    key,
+    label: recommended ? 'Manually tag existing tests (recommended)' : 'Manually tag existing tests',
+    description: `Add @smoke-* tags to tests, then run ${planCommand}.`,
+    command: planCommand,
+  };
+}
+
+function smokeSetupOption(setupCommand: string, key = '1', recommended = true): TextEmptyStateOption {
+  return {
+    key,
+    aliases: key === '1' ? ['Y', 'y'] : [],
+    label: recommended ? 'Configure smoke setup (recommended)' : 'Configure smoke setup',
+    description: 'Choose a runner and let setup create the first smoke plan.',
+    command: setupCommand,
+  };
+}
+
+function smokePlanOption(planCommand: string, key = '1', recommended = true): TextEmptyStateOption {
+  return {
+    key,
+    aliases: key === '1' ? ['Y', 'y'] : [],
+    label: recommended ? 'Register discovered smoke tags (recommended)' : 'Register discovered smoke tags',
+    description: 'Scaffold the smoke registry from the tags already in tests.',
+    command: planCommand,
+  };
+}
+
+function buildSmokeListEmptyState(input: SmokeListEmptyStateInput): SmokeListEmptyState | null {
+  if (input.registeredCount > 0) {
+    return null;
+  }
+
+  let kind: SmokeListEmptyStateKind;
+  let summary: string;
+  let recommendedAction: string;
+  let options: TextEmptyStateOption[];
+
+  if (input.unregisteredTags.length > 0) {
+    kind = 'tags_discovered_no_registry';
+    summary = 'Smoke tags were found, but the smoke registry has no checks yet.';
+    recommendedAction = 'run_smoke_plan';
+    options = [
+      smokePlanOption(input.planCommand),
+      smokeInterviewOption(false, '2'),
+      baselineHotPathsOption(input.setupCommand, '3'),
+    ];
+  } else if (input.hasRunner) {
+    kind = 'runner_configured_no_checks';
+    summary = 'Smoke runner is configured, but no hot-path checks are registered yet.';
+    recommendedAction = 'start_smoke_interview';
+    options = [
+      smokeInterviewOption(),
+      baselineHotPathsOption(input.setupCommand),
+      manualTaggingOption(input.planCommand),
+    ];
+  } else if (input.orphanCandidates.length > 0) {
+    kind = 'candidate_tests_no_checks';
+    summary = 'Smoke candidate tests were found, but no hot-path checks are registered yet.';
+    recommendedAction = 'run_smoke_setup';
+    options = [
+      smokeSetupOption(input.setupCommand),
+      smokeInterviewOption(false, '2'),
+      manualTaggingOption(input.planCommand),
+    ];
+  } else {
+    kind = 'no_runner_no_checks';
+    summary = 'Smoke is not configured yet. No runner or hot-path checks were found.';
+    recommendedAction = 'run_smoke_setup';
+    options = [
+      smokeSetupOption(input.setupCommand),
+      smokeInterviewOption(false, '2'),
+      manualTaggingOption(input.planCommand),
+    ];
+  }
+
+  return {
+    kind,
+    summary,
+    recommendedAction,
+    evidence: [
+      { label: 'Runner', value: input.stagingCommand },
+      { label: 'Registered checks', value: 'none' },
+      {
+        label: 'Discovered @smoke-* tags',
+        items: input.unregisteredTags.map((entry) => `${entry.tag} (${entry.files.join(', ')})`),
+        value: input.unregisteredTags.length === 0 ? 'none' : undefined,
+      },
+      {
+        label: 'Candidate files',
+        items: input.orphanCandidates,
+        value: input.orphanCandidates.length === 0 ? 'none' : undefined,
+      },
+    ],
+    options,
+    replyPrompt: 'Reply with Y, 1, 2, or 3.',
+  };
+}
+
 function handleSmokeList(cwd: string, parsed: ParsedOperatorArgs): void {
   const context = resolveWorkflowContext(cwd);
   const registry = loadSmokeRegistry(context.repoRoot, context.config);
@@ -232,12 +372,23 @@ function handleSmokeList(cwd: string, parsed: ParsedOperatorArgs): void {
 
   const planCommand = formatWorkflowCommand(context.config, 'smoke', 'plan');
   const setupCommand = formatWorkflowCommand(context.config, 'smoke', 'setup');
+  const configuredStagingCommand = smokeConfig.staging?.command?.trim() ?? '';
+  const stagingCommand = configuredStagingCommand || 'not configured';
+  const emptyState = buildSmokeListEmptyState({
+    registeredCount: registered.length,
+    unregisteredTags: unregisteredTags.map((entry) => ({ tag: entry.tag, files: entry.files })),
+    orphanCandidates,
+    stagingCommand,
+    hasRunner: configuredStagingCommand.length > 0,
+    planCommand,
+    setupCommand,
+  });
 
   const lines: string[] = [];
-  lines.push(`Registered smoke checks (${smokeConfig.registryPath}):`);
-  if (registered.length === 0) {
-    lines.push('  (none)');
+  if (emptyState) {
+    lines.push(renderTextEmptyState(emptyState));
   } else {
+    lines.push(`Registered smoke checks (${smokeConfig.registryPath}):`);
     registered.forEach(([tag, entry], index) => {
       const label = entry.description?.trim() || tag;
       lines.push(`  ${index + 1}. ${tag} — ${label}`);
@@ -255,37 +406,36 @@ function handleSmokeList(cwd: string, parsed: ParsedOperatorArgs): void {
         lines.push(`     Required env: ${entry.requiredEnv.join(', ')}`);
       }
     });
-  }
 
-  lines.push('');
-  lines.push('Discovered @smoke-* tags not yet registered:');
-  if (unregisteredTags.length === 0) {
-    lines.push('  (none)');
-  } else {
-    for (const entry of unregisteredTags) {
-      lines.push(`  - ${entry.tag} (${entry.files.join(', ')})`);
+    lines.push('');
+    lines.push('Discovered @smoke-* tags not yet registered:');
+    if (unregisteredTags.length === 0) {
+      lines.push('  (none)');
+    } else {
+      for (const entry of unregisteredTags) {
+        lines.push(`  - ${entry.tag} (${entry.files.join(', ')})`);
+      }
     }
-  }
 
-  lines.push('');
-  lines.push('Candidate test files without @smoke tags:');
-  if (orphanCandidates.length === 0) {
-    lines.push('  (none)');
-  } else {
-    for (const file of orphanCandidates) {
-      lines.push(`  - ${file}`);
+    lines.push('');
+    lines.push('Candidate test files without @smoke tags:');
+    if (orphanCandidates.length === 0) {
+      lines.push('  (none)');
+    } else {
+      for (const file of orphanCandidates) {
+        lines.push(`  - ${file}`);
+      }
     }
+
+    lines.push('');
+    lines.push('To add a new smoke check:');
+    lines.push('  1. Tag a test with @smoke-<name> in your test code');
+    lines.push(`  2. Run ${planCommand} to scaffold ${smokeConfig.registryPath}`);
+    lines.push(`  3. Run ${setupCommand} --staging-script=<script> if no runner is wired`);
+
+    lines.push('');
+    lines.push(`Runner: ${stagingCommand}`);
   }
-
-  lines.push('');
-  lines.push('To add a new smoke check:');
-  lines.push('  1. Tag a test with @smoke-<name> in your test code');
-  lines.push(`  2. Run ${planCommand} to scaffold ${smokeConfig.registryPath}`);
-  lines.push(`  3. Run ${setupCommand} --staging-script=<script> if no runner is wired`);
-
-  lines.push('');
-  const stagingCommand = smokeConfig.staging?.command ?? 'not configured';
-  lines.push(`Runner: ${stagingCommand}`);
 
   printResult(parsed.flags, {
     registered: registered.map(([tag, entry]) => ({
@@ -302,6 +452,7 @@ function handleSmokeList(cwd: string, parsed: ParsedOperatorArgs): void {
     orphanCandidates,
     stagingCommand,
     registryPath: smokeConfig.registryPath,
+    ...(emptyState ? { emptyState } : {}),
     message: lines.join('\n'),
   });
 }

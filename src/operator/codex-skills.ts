@@ -54,6 +54,42 @@ function buildManagedExtraCodexSkill(name: (typeof MANAGED_EXTRA_CODEX_SKILLS)[n
   }
 }
 
+function buildWorkflowSkillGuidance(command: WorkflowCommand, slashAlias: string): string {
+  if (command !== 'smoke') {
+    return '';
+  }
+
+  return `
+## Guided empty state behavior
+
+When bare ${slashAlias} returns an \`emptyState\`, do not stop at the raw
+warning. Offer the exact choices from \`emptyState.options\` in chat. Follow each
+option's \`intent\` or \`command\`; do not assume the same number always means
+the same action for every empty-state kind.
+
+- If an option has \`intent: "start_smoke_interview"\`, start the interview.
+- If an option has \`command\`, run or offer that command.
+- If the selected option is manual tagging, explain how to tag existing tests,
+  then run ${slashAlias} plan after tags are added.
+
+For the smoke interview, ask one question at a time. The first question must be:
+
+\`\`\`text
+What are the 1-3 user journeys that must work before this app is considered alive?
+\`\`\`
+
+After the user answers, convert the answer into the deterministic setup path,
+primarily:
+
+\`\`\`bash
+${slashAlias} setup --feedback "<answer>"
+\`\`\`
+
+Keep command execution deterministic; the interview is agent-side guidance over
+existing ${slashAlias} setup and plan commands.
+`;
+}
+
 function buildSkill(command: WorkflowCommand, slashAlias: string): string {
   const skillName = aliasCommandName(slashAlias);
   return `---
@@ -72,6 +108,7 @@ Run the repo-native pipelane command currently mapped to ${slashAlias}.
 3. Run:
    \`"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.agents/skills/${MANAGED_CODEX_RUNNER}" ${command} <parsed arguments>\`
 4. Stream the command output directly.
+${buildWorkflowSkillGuidance(command, slashAlias)}
 `;
 }
 
