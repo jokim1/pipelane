@@ -9,6 +9,7 @@ import {
   runGit,
   saveTaskLock,
   type ParsedOperatorArgs,
+  type TaskLock,
 } from '../state.ts';
 import {
   ensureSharedNodeModulesLink,
@@ -45,6 +46,7 @@ export async function handleRepoGuard(cwd: string, parsed: ParsedOperatorArgs): 
 
   if (reasons.length === 0) {
     const lock = saveTaskLock(context.commonDir, context.config, taskSlug, {
+      ...(existingLock ?? {}),
       taskSlug,
       taskName,
       branchName,
@@ -75,6 +77,7 @@ export async function handleRepoGuard(cwd: string, parsed: ParsedOperatorArgs): 
   });
 
   const lock = saveTaskLock(context.commonDir, context.config, taskSlug, {
+    ...preserveTaskLockAuditTrail(existingLock),
     taskSlug,
     taskName,
     branchName: workspace.branchName,
@@ -100,4 +103,10 @@ export async function handleRepoGuard(cwd: string, parsed: ParsedOperatorArgs): 
       ...reasons.map((reason) => `- ${reason}`),
     ].join('\n'),
   });
+}
+
+function preserveTaskLockAuditTrail(lock: TaskLock | null): Pick<TaskLock, 'bindingHistory'> {
+  return Array.isArray(lock?.bindingHistory) && lock.bindingHistory.length > 0
+    ? { bindingHistory: lock.bindingHistory }
+    : {};
 }

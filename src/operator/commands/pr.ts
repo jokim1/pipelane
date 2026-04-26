@@ -11,6 +11,11 @@ import {
 } from './helpers.ts';
 import { emptyDeployConfig, evaluateReleaseReadiness, loadDeployConfig } from '../release-gate.ts';
 import {
+  applyTaskBindingRecovery,
+  diagnoseTaskBinding,
+  formatTaskBindingRecoveryMessage,
+} from '../task-binding.ts';
+import {
   loadDeployState,
   formatWorkflowCommand,
   loadPrRecord,
@@ -22,12 +27,46 @@ import {
   runShell,
   savePrRecord,
   type ParsedOperatorArgs,
+  type TaskLock,
 } from '../state.ts';
-import { inferActiveTaskLock } from './helpers.ts';
 
 export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const context = resolveWorkflowContext(cwd);
-  const { taskSlug, lock } = inferActiveTaskLock(context, parsed.flags.task);
+  let taskSlug = '';
+  let lock: TaskLock | null = null;
+
+  const binding = resolvePrTaskBinding(context, parsed);
+  if (binding.status === 'handoff') {
+    printResult(parsed.flags, {
+      taskSlug: binding.taskSlug,
+      branchName: binding.lock.branchName,
+      worktreePath: binding.lock.worktreePath,
+      handoff: true,
+      message: binding.message,
+    });
+    return;
+  }
+  if (binding.status === 'needs-recovery') {
+    const message = formatTaskBindingRecoveryMessage(binding.diagnosis);
+    if (parsed.flags.json) {
+      printResult(parsed.flags, {
+        taskSlug: binding.diagnosis.taskSlug,
+        branchName: binding.diagnosis.current.branchName,
+        needsRecoveryChoice: true,
+        options: binding.diagnosis.options,
+        message,
+      });
+      process.exitCode = 1;
+      return;
+    }
+    throw new Error(message);
+  }
+  if (binding.status === 'blocked') {
+    throw new Error(binding.reason);
+  }
+
+  taskSlug = binding.taskSlug;
+  lock = binding.lock;
   ensureTaskLockMatchesCurrent(context, lock);
 
   const surfaces = resolveCommandSurfaces(context, parsed.flags.surfaces, lock.surfaces);
@@ -148,4 +187,48 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
       `Next: run ${formatWorkflowCommand(context.config, 'merge')}.`,
     ].join('\n'),
   });
+}
+
+function resolvePrTaskBinding(
+  context: ReturnType<typeof resolveWorkflowContext>,
+  parsed: ParsedOperatorArgs,
+):
+  | { status: 'resolved'; taskSlug: string; lock: TaskLock }
+  | { status: 'handoff'; taskSlug: string; lock: TaskLock; message: string }
+  | { status: 'needs-recovery'; diagnosis: Extract<ReturnType<typeof diagnoseTaskBinding>, { status: 'needs-recovery' }> }
+  | { status: 'blocked'; reason: string } {
+  if (parsed.flags.recover.trim()) {
+    const recovered = applyTaskBindingRecovery(
+      context,
+      parsed.flags.task,
+      parsed.flags.recover,
+      parsed.flags.bindingFingerprint,
+    );
+    if ('message' in recovered) {
+      return {
+        status: 'handoff',
+        taskSlug: recovered.taskSlug,
+        lock: recovered.lock,
+        message: recovered.message,
+      };
+    }
+    return {
+      status: 'resolved',
+      taskSlug: recovered.taskSlug,
+      lock: recovered.lock,
+    };
+  }
+
+  const diagnosis = diagnoseTaskBinding(context, parsed.flags.task);
+  if (diagnosis.status === 'resolved') {
+    return {
+      status: 'resolved',
+      taskSlug: diagnosis.taskSlug,
+      lock: diagnosis.lock,
+    };
+  }
+  if (diagnosis.status === 'needs-recovery') {
+    return { status: 'needs-recovery', diagnosis };
+  }
+  return { status: 'blocked', reason: diagnosis.reason };
 }

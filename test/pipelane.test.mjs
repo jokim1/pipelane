@@ -415,14 +415,18 @@ async function startDashboardServer(repoRoot, env = {}) {
   };
 }
 
-function setWorkflowApiScript(repoRoot) {
+function setWorkflowApiScriptCommand(repoRoot, command) {
   const packageJsonPath = path.join(repoRoot, 'package.json');
   const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
   packageJson.scripts = {
     ...(packageJson.scripts || {}),
-    'pipelane:api': 'node fake-workflow-api.js',
+    'pipelane:api': command,
   };
   writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 2) + '\n', 'utf8');
+}
+
+function setWorkflowApiScript(repoRoot) {
+  setWorkflowApiScriptCommand(repoRoot, 'node fake-workflow-api.js');
 }
 
 function makeDashboardFixture() {
@@ -4015,6 +4019,47 @@ test('repo-guard links shared node_modules when it creates a new isolated worktr
   }
 });
 
+test('repo-guard replacement lock clears checkout-local transient state', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt workflow-kit');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Guarded Rebind', '--json'], repoRoot).stdout);
+    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`);
+    const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+    const bindingHistory = [{
+      reboundAt: '2026-04-25T00:00:00.000Z',
+      reason: 'fixture',
+      fromBranchName: 'codex/old-1111',
+      fromWorktreePath: '/tmp/old',
+      toBranchName: lock.branchName,
+      toWorktreePath: lock.worktreePath,
+      fingerprint: 'abc123',
+    }];
+    writeFileSync(lockPath, `${JSON.stringify({
+      ...lock,
+      nextAction: 'stale next action from the old checkout',
+      promotedWithoutStagingSmoke: true,
+      bindingHistory,
+    }, null, 2)}\n`, 'utf8');
+
+    const guarded = JSON.parse(runCli(['run', 'repo-guard', '--task', 'Guarded Rebind', '--json'], repoRoot).stdout);
+    assert.equal(guarded.createdWorktree, true);
+
+    const updated = JSON.parse(readFileSync(lockPath, 'utf8'));
+    assert.notEqual(updated.branchName, created.branch);
+    assert.equal(updated.branchName, guarded.lock.branchName);
+    assert.equal(updated.worktreePath, guarded.lock.worktreePath);
+    assert.equal(updated.nextAction, undefined);
+    assert.equal(updated.promotedWithoutStagingSmoke, undefined);
+    assert.deepEqual(updated.bindingHistory, bindingHistory);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('bootstrapWorktreeNodeModulesIfNeeded is a no-op in the shared repo', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
@@ -6263,6 +6308,886 @@ test('pr blocks denied paths and --force-include overrides per-path', () => {
   }
 });
 
+test('pr in an external task-like checkout returns recovery choices instead of /new guidance', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const externalParent = mkdtempSync(path.join(os.tmpdir(), 'pipelane-external-'));
+  const externalWorktree = path.join(externalParent, 'canvas-palette-options-4f2a');
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Canvas Palette Options', '--json'], repoRoot).stdout);
+
+    execFileSync('git', ['worktree', 'add', externalWorktree, '-b', 'codex/canvas-palette-options-4f2a', 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(externalWorktree, 'palette.txt'), 'external change\n', 'utf8');
+
+    const result = runCli(['run', 'pr', '--json'], externalWorktree, {}, true);
+    assert.equal(result.status, 1);
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(output.needsRecoveryChoice, true);
+    assert.equal(output.taskSlug, 'canvas-palette-options');
+    assert.deepEqual(
+      output.options.map((option) => option.value),
+      ['use-current-checkout', 'continue-attached-workspace'],
+    );
+    assert.match(output.message, /You have 2 options:/);
+    assert.match(output.message, /Type which option you would like to proceed with/);
+    assert.doesNotMatch(output.message, /\/new|--task/);
+
+    const lock = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`), 'utf8'));
+    assert.equal(lock.worktreePath, created.worktreePath, 'first preflight must not mutate the existing task lock');
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', externalWorktree], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      // best-effort cleanup
+    }
+    rmSync(externalParent, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('pr recovery use-current-checkout rebinds the task lock with history and continues the PR', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  const externalParent = mkdtempSync(path.join(os.tmpdir(), 'pipelane-external-'));
+  const externalWorktree = path.join(externalParent, 'canvas-palette-options-4f2a');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Canvas Palette Options', '--json'], repoRoot).stdout);
+    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`);
+    const originalLock = JSON.parse(readFileSync(lockPath, 'utf8'));
+    const previousHistory = {
+      reboundAt: '2026-04-25T00:00:00.000Z',
+      reason: 'fixture',
+      fromBranchName: 'codex/old-1111',
+      fromWorktreePath: '/tmp/old',
+      toBranchName: originalLock.branchName,
+      toWorktreePath: originalLock.worktreePath,
+      fingerprint: 'old-fingerprint',
+    };
+    writeFileSync(lockPath, `${JSON.stringify({
+      ...originalLock,
+      nextAction: 'stale next action from the attached workspace',
+      promotedWithoutStagingSmoke: true,
+      bindingHistory: [previousHistory],
+    }, null, 2)}\n`, 'utf8');
+
+    execFileSync('git', ['worktree', 'add', externalWorktree, '-b', 'codex/canvas-palette-options-4f2a', 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(externalWorktree, 'palette.txt'), 'external change\n', 'utf8');
+
+    const recoveryPrompt = JSON.parse(runCli(['run', 'pr', '--json'], externalWorktree, env, true).stdout);
+    const option = recoveryPrompt.options.find((entry) => entry.value === 'use-current-checkout');
+    assert.ok(option?.fingerprint);
+
+    const pr = JSON.parse(runCli([
+      'run', 'pr',
+      '--recover', 'use-current-checkout',
+      '--binding-fingerprint', option.fingerprint,
+      '--title', 'Canvas Palette Options',
+      '--json',
+    ], externalWorktree, env).stdout);
+
+    assert.match(pr.url, /example\.test\/pr/);
+    const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+    assert.equal(lock.branchName, 'codex/canvas-palette-options-4f2a');
+    assert.equal(lock.worktreePath, realpathSync(externalWorktree));
+    assert.notEqual(lock.nextAction, 'stale next action from the attached workspace');
+    assert.match(lock.nextAction, /PR #1 open, awaiting CI/);
+    assert.equal(lock.promotedWithoutStagingSmoke, undefined);
+    assert.equal(lock.bindingHistory.length, 2);
+    assert.deepEqual(lock.bindingHistory[0], previousHistory);
+    assert.equal(lock.bindingHistory[1].fromBranchName, created.branch);
+    assert.equal(lock.bindingHistory[1].fromWorktreePath, created.worktreePath);
+    assert.equal(lock.bindingHistory[1].toBranchName, 'codex/canvas-palette-options-4f2a');
+    assert.equal(lock.bindingHistory[1].toWorktreePath, realpathSync(externalWorktree));
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', externalWorktree], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      // best-effort cleanup
+    }
+    rmSync(externalParent, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('pr recovery continue-attached-workspace returns a handoff and mutates nothing', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  const externalParent = mkdtempSync(path.join(os.tmpdir(), 'pipelane-external-'));
+  const externalWorktree = path.join(externalParent, 'canvas-palette-options-4f2a');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Canvas Palette Options', '--json'], repoRoot).stdout);
+
+    execFileSync('git', ['worktree', 'add', externalWorktree, '-b', 'codex/canvas-palette-options-4f2a', 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(externalWorktree, 'palette.txt'), 'external change\n', 'utf8');
+
+    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`);
+    const beforeLock = readFileSync(lockPath, 'utf8');
+    const recoveryPrompt = JSON.parse(runCli(['run', 'pr', '--json'], externalWorktree, env, true).stdout);
+    const option = recoveryPrompt.options.find((entry) => entry.value === 'continue-attached-workspace');
+    assert.ok(option?.fingerprint);
+
+    const handoff = JSON.parse(runCli([
+      'run', 'pr',
+      '--recover', 'continue-attached-workspace',
+      '--binding-fingerprint', option.fingerprint,
+      '--json',
+    ], externalWorktree, env).stdout);
+
+    assert.equal(handoff.handoff, true);
+    assert.match(handoff.message, /Continue in the attached task workspace/);
+    assert.equal(readFileSync(lockPath, 'utf8'), beforeLock);
+    assert.match(run('git', ['status', '--short'], externalWorktree), /palette\.txt/);
+    assert.equal(existsSync(ghStateFile), false, 'continue-attached-workspace must not call gh');
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', externalWorktree], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      // best-effort cleanup
+    }
+    rmSync(externalParent, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('api action pr recovery confirmation executes and rebinds when fingerprint is fresh', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  const externalParent = mkdtempSync(path.join(os.tmpdir(), 'pipelane-external-'));
+  const externalWorktree = path.join(externalParent, 'canvas-palette-options-4f2a');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Canvas Palette Options', '--json'], repoRoot).stdout);
+
+    execFileSync('git', ['worktree', 'add', externalWorktree, '-b', 'codex/canvas-palette-options-4f2a', 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(externalWorktree, 'palette.txt'), 'external change\n', 'utf8');
+
+    const first = runCli(['run', 'api', 'action', 'pr', '--task', 'Canvas Palette Options', '--json'], externalWorktree, env, true);
+    assert.equal(first.status, 1);
+    const firstEnvelope = JSON.parse(first.stdout);
+    const choiceInput = firstEnvelope.data.preflight.inputs.find((input) => input.name === 'recover');
+    const option = choiceInput.options.find((entry) => entry.value === 'use-current-checkout');
+    assert.ok(option.params.bindingFingerprint);
+
+    const second = JSON.parse(runCli([
+      'run', 'api', 'action', 'pr',
+      '--task', 'Canvas Palette Options',
+      '--recover', 'use-current-checkout',
+      '--binding-fingerprint', option.params.bindingFingerprint,
+      '--title', 'Canvas Palette Options',
+      '--json',
+    ], externalWorktree, env).stdout);
+    assert.equal(second.data.preflight.requiresConfirmation, true);
+    const token = second.data.preflight.confirmation.token;
+    assert.ok(token);
+
+    const executed = JSON.parse(runCli([
+      'run', 'api', 'action', 'pr',
+      '--task', 'Canvas Palette Options',
+      '--recover', 'use-current-checkout',
+      '--binding-fingerprint', option.params.bindingFingerprint,
+      '--title', 'Canvas Palette Options',
+      '--execute',
+      '--confirm-token', token,
+      '--json',
+    ], externalWorktree, env).stdout);
+
+    assert.equal(executed.ok, true);
+    assert.match(executed.data.execution.result.url, /example\.test\/pr/);
+    const lock = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`), 'utf8'));
+    assert.equal(lock.branchName, 'codex/canvas-palette-options-4f2a');
+    assert.equal(lock.worktreePath, realpathSync(externalWorktree));
+    assert.equal(lock.bindingHistory.length, 1);
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', externalWorktree], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      // best-effort cleanup
+    }
+    rmSync(externalParent, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('api action pr recovery choice uses a confirmation token and rejects stale binding fingerprints', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const externalParent = mkdtempSync(path.join(os.tmpdir(), 'pipelane-external-'));
+  const externalWorktree = path.join(externalParent, 'canvas-palette-options-4f2a');
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Canvas Palette Options', '--json'], repoRoot).stdout);
+
+    execFileSync('git', ['worktree', 'add', externalWorktree, '-b', 'codex/canvas-palette-options-4f2a', 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(externalWorktree, 'palette.txt'), 'external change\n', 'utf8');
+
+    const first = runCli(['run', 'api', 'action', 'pr', '--task', 'Canvas Palette Options', '--json'], externalWorktree, {}, true);
+    assert.equal(first.status, 1);
+    const firstEnvelope = JSON.parse(first.stdout);
+    const choiceInput = firstEnvelope.data.preflight.inputs.find((input) => input.name === 'recover');
+    const titleInput = firstEnvelope.data.preflight.inputs.find((input) => input.name === 'title');
+    assert.equal(choiceInput.type, 'choice');
+    assert.equal(titleInput, undefined, 'recovery preflight should collect the recovery choice before path-specific inputs');
+    const option = choiceInput.options.find((entry) => entry.value === 'use-current-checkout');
+    assert.ok(option.params.bindingFingerprint);
+
+    const titlePrompt = runCli([
+      'run', 'api', 'action', 'pr',
+      '--task', 'Canvas Palette Options',
+      '--recover', 'use-current-checkout',
+      '--binding-fingerprint', option.params.bindingFingerprint,
+      '--json',
+    ], externalWorktree, {}, true);
+    assert.equal(titlePrompt.status, 1);
+    const titlePromptEnvelope = JSON.parse(titlePrompt.stdout);
+    assert.equal(titlePromptEnvelope.data.preflight.needsInput, true);
+    assert.deepEqual(titlePromptEnvelope.data.preflight.inputs.map((input) => input.name), ['title']);
+
+    const second = JSON.parse(runCli([
+      'run', 'api', 'action', 'pr',
+      '--task', 'Canvas Palette Options',
+      '--recover', 'use-current-checkout',
+      '--binding-fingerprint', option.params.bindingFingerprint,
+      '--title', 'Canvas Palette Options',
+      '--json',
+    ], externalWorktree).stdout);
+    assert.equal(second.data.preflight.requiresConfirmation, true);
+    const token = second.data.preflight.confirmation.token;
+    assert.ok(token);
+
+    writeFileSync(path.join(externalWorktree, 'palette.txt'), 'external change after preflight\n', 'utf8');
+    const executed = runCli([
+      'run', 'api', 'action', 'pr',
+      '--task', 'Canvas Palette Options',
+      '--recover', 'use-current-checkout',
+      '--binding-fingerprint', option.params.bindingFingerprint,
+      '--title', 'Canvas Palette Options',
+      '--execute',
+      '--confirm-token', token,
+      '--json',
+    ], externalWorktree, {}, true);
+    const executedEnvelope = JSON.parse(executed.stdout);
+    assert.equal(executed.status, 1);
+    assert.equal(executedEnvelope.ok, false);
+    assert.match(executedEnvelope.message, /stale|preflight/i);
+
+    const lock = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`), 'utf8'));
+    assert.equal(lock.worktreePath, created.worktreePath, 'stale recovery must not mutate the lock');
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', externalWorktree], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      // best-effort cleanup
+    }
+    rmSync(externalParent, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('api action pr recovery continue-attached-workspace does not require a PR title', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const externalParent = mkdtempSync(path.join(os.tmpdir(), 'pipelane-external-'));
+  const externalWorktree = path.join(externalParent, 'canvas-palette-options-4f2a');
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Canvas Palette Options', '--json'], repoRoot).stdout);
+
+    execFileSync('git', ['worktree', 'add', externalWorktree, '-b', 'codex/canvas-palette-options-4f2a', 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(externalWorktree, 'palette.txt'), 'external change\n', 'utf8');
+
+    const first = runCli(['run', 'api', 'action', 'pr', '--task', 'Canvas Palette Options', '--json'], externalWorktree, {}, true);
+    assert.equal(first.status, 1);
+    const firstEnvelope = JSON.parse(first.stdout);
+    const choiceInput = firstEnvelope.data.preflight.inputs.find((input) => input.name === 'recover');
+    const option = choiceInput.options.find((entry) => entry.value === 'continue-attached-workspace');
+    assert.ok(option.params.bindingFingerprint);
+
+    const second = JSON.parse(runCli([
+      'run', 'api', 'action', 'pr',
+      '--task', 'Canvas Palette Options',
+      '--recover', 'continue-attached-workspace',
+      '--binding-fingerprint', option.params.bindingFingerprint,
+      '--json',
+    ], externalWorktree).stdout);
+    assert.equal(second.data.preflight.requiresConfirmation, true);
+    assert.equal(second.data.preflight.needsInput, false);
+    assert.deepEqual(second.data.preflight.inputs, []);
+    const token = second.data.preflight.confirmation.token;
+
+    const executed = JSON.parse(runCli([
+      'run', 'api', 'action', 'pr',
+      '--task', 'Canvas Palette Options',
+      '--recover', 'continue-attached-workspace',
+      '--binding-fingerprint', option.params.bindingFingerprint,
+      '--execute',
+      '--confirm-token', token,
+      '--json',
+    ], externalWorktree).stdout);
+    assert.equal(executed.ok, true);
+    assert.equal(executed.data.execution.result.handoff, true);
+    assert.match(executed.data.execution.result.message, /Continue in the attached task workspace/);
+
+    const lock = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`), 'utf8'));
+    assert.equal(lock.worktreePath, created.worktreePath);
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', externalWorktree], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      // best-effort cleanup
+    }
+    rmSync(externalParent, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('task binding diagnosis hashes dirty status only when recovery choices are needed', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const externalParent = mkdtempSync(path.join(os.tmpdir(), 'pipelane-external-'));
+  const externalWorktree = path.join(externalParent, 'canvas-palette-options-4f2a');
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Canvas Palette Options', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'attached.txt'), 'attached dirty state\n', 'utf8');
+
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const binding = await import(path.join(KIT_ROOT, 'src', 'operator', 'task-binding.ts'));
+    const resolved = binding.diagnoseTaskBinding(state.resolveWorkflowContext(created.worktreePath), 'Canvas Palette Options');
+    assert.equal(resolved.status, 'resolved');
+    assert.equal(resolved.current.dirty, true);
+    assert.equal(resolved.current.statusDigest, '', 'resolved binding checks should not compute recovery-only status digests');
+
+    execFileSync('git', ['worktree', 'add', externalWorktree, '-b', 'codex/canvas-palette-options-4f2a', 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(externalWorktree, 'palette.txt'), 'external dirty state\n', 'utf8');
+
+    const recovery = binding.diagnoseTaskBinding(state.resolveWorkflowContext(externalWorktree), 'Canvas Palette Options');
+    assert.equal(recovery.status, 'needs-recovery');
+    assert.notEqual(recovery.current.statusDigest, '', 'recovery fingerprints need the current checkout digest');
+    assert.notEqual(recovery.attached.statusDigest, '', 'recovery fingerprints need the attached workspace digest');
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', externalWorktree], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      // best-effort cleanup
+    }
+    rmSync(externalParent, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('api action pr preflight checks live PR before trusting local pr-state title', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Canvas Palette Options', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'initial change\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Canvas Palette Options', '--json'], created.worktreePath, env);
+
+    writeFileSync(path.join(created.worktreePath, 'followup.txt'), 'follow-up change\n', 'utf8');
+    const livePreflight = JSON.parse(runCli([
+      'run', 'api', 'action', 'pr',
+      '--task', 'Canvas Palette Options',
+      '--json',
+    ], created.worktreePath, env).stdout);
+    assert.equal(livePreflight.data.preflight.allowed, true);
+    assert.equal(livePreflight.data.preflight.requiresConfirmation, false);
+    assert.equal(livePreflight.data.preflight.needsInput, false);
+
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    delete ghState.prs[created.branch];
+    writeFileSync(ghStateFile, JSON.stringify(ghState, null, 2) + '\n', 'utf8');
+
+    const stalePreflight = runCli([
+      'run', 'api', 'action', 'pr',
+      '--task', 'Canvas Palette Options',
+      '--json',
+    ], created.worktreePath, env, true);
+    assert.equal(stalePreflight.status, 1);
+    const envelope = JSON.parse(stalePreflight.stdout);
+    assert.equal(envelope.data.preflight.needsInput, true);
+    assert.deepEqual(envelope.data.preflight.inputs.map((input) => input.name), ['title']);
+    assert.equal(envelope.data.preflight.defaultParams.title, 'Canvas Palette Options');
+    assert.match(envelope.data.preflight.reason, /no live PR/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('pr recovery blocks before mutation when task has non-binding mismatches', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const externalParent = mkdtempSync(path.join(os.tmpdir(), 'pipelane-external-'));
+  const externalWorktree = path.join(externalParent, 'canvas-palette-options-4f2a');
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Canvas Palette Options', '--json'], repoRoot).stdout);
+    runCli(['run', 'devmode', 'release', '--override', '--reason', 'mode mismatch fixture'], repoRoot);
+
+    execFileSync('git', ['worktree', 'add', externalWorktree, '-b', 'codex/canvas-palette-options-4f2a', 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`);
+    const beforeLock = readFileSync(lockPath, 'utf8');
+
+    const result = runCli(['run', 'pr', '--json'], externalWorktree, {}, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /rebinding cannot fix/);
+    assert.match(result.stderr, /mode/);
+    assert.equal(readFileSync(lockPath, 'utf8'), beforeLock, 'mode mismatch recovery must not mutate the lock');
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', externalWorktree], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      // best-effort cleanup
+    }
+    rmSync(externalParent, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('pr recovery blocks when current checkout is already locked by another task', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const externalParent = mkdtempSync(path.join(os.tmpdir(), 'pipelane-external-'));
+  const externalWorktree = path.join(externalParent, 'canvas-palette-options-4f2a');
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Canvas Palette Options', '--json'], repoRoot).stdout);
+
+    execFileSync('git', ['worktree', 'add', externalWorktree, '-b', 'codex/canvas-palette-options-4f2a', 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const lockDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks');
+    writeFileSync(path.join(lockDir, 'other-task.json'), `${JSON.stringify({
+      taskSlug: 'other-task',
+      taskName: 'Other Task',
+      branchName: 'codex/canvas-palette-options-4f2a',
+      worktreePath: realpathSync(externalWorktree),
+      mode: 'build',
+      surfaces: ['app'],
+      updatedAt: '2026-04-25T00:00:00.000Z',
+    }, null, 2)}\n`, 'utf8');
+    const lockPath = path.join(lockDir, `${created.taskSlug}.json`);
+    const beforeLock = readFileSync(lockPath, 'utf8');
+
+    const result = runCli(['run', 'pr', '--task', 'Canvas Palette Options', '--json'], externalWorktree, {}, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /already locked by another task/);
+    assert.match(result.stderr, /other-task/);
+    assert.equal(readFileSync(lockPath, 'utf8'), beforeLock, 'cross-lock collision recovery must not mutate the target lock');
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', externalWorktree], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      // best-effort cleanup
+    }
+    rmSync(externalParent, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('pr recovery blocks detached HEAD before rebinding the task lock', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const externalParent = mkdtempSync(path.join(os.tmpdir(), 'pipelane-external-'));
+  const externalWorktree = path.join(externalParent, 'canvas-palette-options-4f2a');
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Canvas Palette Options', '--json'], repoRoot).stdout);
+
+    execFileSync('git', ['worktree', 'add', externalWorktree, '-b', 'codex/detached-fixture', 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    execFileSync('git', ['checkout', '--detach'], {
+      cwd: externalWorktree,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`);
+    const beforeLock = readFileSync(lockPath, 'utf8');
+
+    const result = runCli(['run', 'pr', '--task', 'Canvas Palette Options', '--json'], externalWorktree, {}, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /detached HEAD/);
+    assert.equal(readFileSync(lockPath, 'utf8'), beforeLock, 'detached recovery must not mutate the lock');
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', externalWorktree], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      // best-effort cleanup
+    }
+    rmSync(externalParent, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('pr recovery from base checkout only offers attached workspace and never rebinds base', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Canvas Palette Options', '--json'], repoRoot).stdout);
+    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`);
+    const beforeLock = readFileSync(lockPath, 'utf8');
+
+    const result = runCli(['run', 'pr', '--task', 'Canvas Palette Options', '--json'], repoRoot, {}, true);
+    assert.equal(result.status, 1);
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(output.needsRecoveryChoice, true);
+    assert.deepEqual(output.options.map((option) => option.value), ['continue-attached-workspace']);
+    assert.doesNotMatch(JSON.stringify(output.options), /use-current-checkout/);
+    assert.match(output.message, /You have 1 option:/);
+    assert.equal(readFileSync(lockPath, 'utf8'), beforeLock, 'base checkout preflight must not mutate the lock');
+
+    const blocked = runCli([
+      'run', 'pr',
+      '--task', 'Canvas Palette Options',
+      '--recover', 'use-current-checkout',
+      '--binding-fingerprint', 'stale-fingerprint',
+      '--json',
+    ], repoRoot, {}, true);
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /stale|preflight|no longer/i);
+    assert.equal(readFileSync(lockPath, 'utf8'), beforeLock, 'base checkout recovery must not mutate the lock');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('pr recovery omits attached-workspace handoff when the attached workspace is missing', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const externalParent = mkdtempSync(path.join(os.tmpdir(), 'pipelane-external-'));
+  const externalWorktree = path.join(externalParent, 'canvas-palette-options-4f2a');
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Canvas Palette Options', '--json'], repoRoot).stdout);
+    execFileSync('git', ['worktree', 'remove', '--force', created.worktreePath], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    execFileSync('git', ['worktree', 'add', externalWorktree, '-b', 'codex/canvas-palette-options-4f2a', 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const result = runCli(['run', 'pr', '--json'], externalWorktree, {}, true);
+    assert.equal(result.status, 1);
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(output.needsRecoveryChoice, true);
+    assert.deepEqual(output.options.map((option) => option.value), ['use-current-checkout']);
+    assert.match(output.message, /You have 1 option:/);
+    assert.match(output.message, /Attached task workspace: .*\(missing\)/);
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', externalWorktree], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      // best-effort cleanup
+    }
+    rmSync(externalParent, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('pr recovery surfaces dirty attached workspace state in both recovery options', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const externalParent = mkdtempSync(path.join(os.tmpdir(), 'pipelane-external-'));
+  const externalWorktree = path.join(externalParent, 'canvas-palette-options-4f2a');
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Canvas Palette Options', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'attached-dirty.txt'), 'dirty attached workspace\n', 'utf8');
+
+    execFileSync('git', ['worktree', 'add', externalWorktree, '-b', 'codex/canvas-palette-options-4f2a', 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const result = runCli(['run', 'pr', '--json'], externalWorktree, {}, true);
+    assert.equal(result.status, 1);
+    const output = JSON.parse(result.stdout);
+    const currentOption = output.options.find((option) => option.value === 'use-current-checkout');
+    const attachedOption = output.options.find((option) => option.value === 'continue-attached-workspace');
+
+    assert.match(currentOption.description, /attached workspace currently has \d+ uncommitted status entr/);
+    assert.match(attachedOption.description, /It has \d+ uncommitted status entr/);
+    assert.match(output.message, /Attached task workspace: .*uncommitted status entr/);
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', externalWorktree], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      // best-effort cleanup
+    }
+    rmSync(externalParent, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('api action pr recovery stale fingerprint detects sampled large untracked file changes', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const externalParent = mkdtempSync(path.join(os.tmpdir(), 'pipelane-external-'));
+  const externalWorktree = path.join(externalParent, 'canvas-palette-options-4f2a');
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Canvas Palette Options', '--json'], repoRoot).stdout);
+
+    execFileSync('git', ['worktree', 'add', externalWorktree, '-b', 'codex/canvas-palette-options-4f2a', 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(externalWorktree, 'large.bin'), `${'a'.repeat(2 * 1024 * 1024)}\n`, 'utf8');
+
+    const first = runCli(['run', 'api', 'action', 'pr', '--task', 'Canvas Palette Options', '--json'], externalWorktree, {}, true);
+    assert.equal(first.status, 1);
+    const firstEnvelope = JSON.parse(first.stdout);
+    const choiceInput = firstEnvelope.data.preflight.inputs.find((input) => input.name === 'recover');
+    const option = choiceInput.options.find((entry) => entry.value === 'use-current-checkout');
+
+    const second = JSON.parse(runCli([
+      'run', 'api', 'action', 'pr',
+      '--task', 'Canvas Palette Options',
+      '--recover', 'use-current-checkout',
+      '--binding-fingerprint', option.params.bindingFingerprint,
+      '--title', 'Canvas Palette Options',
+      '--json',
+    ], externalWorktree).stdout);
+    const token = second.data.preflight.confirmation.token;
+
+    writeFileSync(path.join(externalWorktree, 'large.bin'), `${'b'.repeat(2 * 1024 * 1024)}\n`, 'utf8');
+    const executed = runCli([
+      'run', 'api', 'action', 'pr',
+      '--task', 'Canvas Palette Options',
+      '--recover', 'use-current-checkout',
+      '--binding-fingerprint', option.params.bindingFingerprint,
+      '--title', 'Canvas Palette Options',
+      '--execute',
+      '--confirm-token', token,
+      '--json',
+    ], externalWorktree, {}, true);
+    const executedEnvelope = JSON.parse(executed.stdout);
+    assert.equal(executed.status, 1);
+    assert.match(executedEnvelope.message, /stale|preflight/i);
+
+    const lock = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`), 'utf8'));
+    assert.equal(lock.worktreePath, created.worktreePath, 'large-file stale recovery must not mutate the lock');
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', externalWorktree], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      // best-effort cleanup
+    }
+    rmSync(externalParent, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('api action pr recovery fingerprint tracks metadata beyond content sampling cap', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const externalParent = mkdtempSync(path.join(os.tmpdir(), 'pipelane-external-'));
+  const externalWorktree = path.join(externalParent, 'canvas-palette-options-4f2a');
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Canvas Palette Options', '--json'], repoRoot).stdout);
+
+    execFileSync('git', ['worktree', 'add', externalWorktree, '-b', 'codex/canvas-palette-options-4f2a', 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    for (let index = 0; index <= 512; index += 1) {
+      writeFileSync(path.join(externalWorktree, `bulk-${String(index).padStart(3, '0')}.txt`), 'a\n', 'utf8');
+    }
+
+    const first = runCli(['run', 'api', 'action', 'pr', '--task', 'Canvas Palette Options', '--json'], externalWorktree, {}, true);
+    assert.equal(first.status, 1);
+    const firstEnvelope = JSON.parse(first.stdout);
+    const choiceInput = firstEnvelope.data.preflight.inputs.find((input) => input.name === 'recover');
+    const option = choiceInput.options.find((entry) => entry.value === 'use-current-checkout');
+    assert.ok(option.params.bindingFingerprint);
+
+    const second = JSON.parse(runCli([
+      'run', 'api', 'action', 'pr',
+      '--task', 'Canvas Palette Options',
+      '--recover', 'use-current-checkout',
+      '--binding-fingerprint', option.params.bindingFingerprint,
+      '--title', 'Canvas Palette Options',
+      '--json',
+    ], externalWorktree).stdout);
+    const token = second.data.preflight.confirmation.token;
+
+    writeFileSync(path.join(externalWorktree, 'bulk-512.txt'), 'changed beyond the content sampling cutoff\n', 'utf8');
+    const executed = runCli([
+      'run', 'api', 'action', 'pr',
+      '--task', 'Canvas Palette Options',
+      '--recover', 'use-current-checkout',
+      '--binding-fingerprint', option.params.bindingFingerprint,
+      '--title', 'Canvas Palette Options',
+      '--execute',
+      '--confirm-token', token,
+      '--json',
+    ], externalWorktree, {}, true);
+    const executedEnvelope = JSON.parse(executed.stdout);
+    assert.equal(executed.status, 1);
+    assert.match(executedEnvelope.message, /stale|preflight/i);
+
+    const lock = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`), 'utf8'));
+    assert.equal(lock.worktreePath, created.worktreePath, 'overflow-path stale recovery must not mutate the lock');
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', externalWorktree], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      // best-effort cleanup
+    }
+    rmSync(externalParent, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('clean --apply --all-stale prunes stale task locks', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
 
@@ -6921,6 +7846,49 @@ test('dashboard proxies pipelane:api routes and persists local board settings', 
   }
 });
 
+test('dashboard pr preflight resolves the task lock before same-slug current branch fallback', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  let server;
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    runCli(['run', 'new', '--task', 'Dashboard Cwd Routing', '--json'], repoRoot);
+
+    const lock = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', 'dashboard-cwd-routing.json'), 'utf8'));
+    setWorkflowApiScriptCommand(repoRoot, `node ${CLI_PATH} run api`);
+    setWorkflowApiScriptCommand(lock.worktreePath, `node ${CLI_PATH} run api`);
+    writeFileSync(path.join(lock.worktreePath, 'dirty.txt'), 'dirty\n', 'utf8');
+    execFileSync('git', ['checkout', '-b', 'codex/dashboard-cwd-routing-d00d'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    server = await startDashboardServer(repoRoot);
+    const preflightResponse = await fetch(`${server.baseUrl}/api/action/${encodeURIComponent('pr')}/preflight`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ params: { task: 'Dashboard Cwd Routing' } }),
+    });
+    const envelope = await preflightResponse.json();
+    assert.equal(preflightResponse.status, 200, JSON.stringify(envelope));
+    assert.equal(envelope.ok, false);
+    assert.equal(envelope.data.preflight.needsInput, true);
+    assert.deepEqual(envelope.data.preflight.inputs.map((input) => input.name), ['title']);
+    assert.match(envelope.data.preflight.reason, /Provide a PR title/);
+  } finally {
+    if (server?.processHandle) {
+      server.processHandle.kill('SIGTERM');
+      await once(server.processHandle, 'exit').catch(() => undefined);
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('dashboard help endpoint exposes configured slash aliases', async () => {
   const repoRoot = createRepo();
   let server;
@@ -6962,6 +7930,20 @@ test('dashboard UI ships a Pipelane help drawer', () => {
   assert.match(html, /Release Journey/);
   assert.match(html, /Web Commands/);
   assert.match(html, /\/pipelane update --check/);
+});
+
+test('dashboard action input modal renders visible required-field errors', () => {
+  const html = readFileSync(path.join(KIT_ROOT, 'src', 'dashboard', 'public', 'index.html'), 'utf8');
+
+  assert.match(html, /data-input-error/);
+  assert.match(html, /Choose an option to continue\./);
+  assert.match(html, /is required\./);
+});
+
+test('dashboard action runner allows sequential recovery inputs', () => {
+  const html = readFileSync(path.join(KIT_ROOT, 'src', 'dashboard', 'public', 'index.html'), 'utf8');
+
+  assert.match(html, /attempt < 4/);
 });
 
 test('dashboard branch ledger keeps its headers sticky while rows scroll', () => {
@@ -7437,7 +8419,7 @@ test('api snapshot emits a wire-compatible envelope', () => {
     const result = runCli(['run', 'api', 'snapshot'], repoRoot);
     const envelope = JSON.parse(result.stdout);
 
-    assert.equal(envelope.schemaVersion, '2026-04-22');
+    assert.equal(envelope.schemaVersion, '2026-04-25');
     assert.equal(envelope.command, 'pipelane.api.snapshot');
     assert.equal(envelope.ok, true);
     assert.ok(Array.isArray(envelope.warnings));
@@ -7518,13 +8500,13 @@ test('api action execute persists task-scoped failure feedback for branch detail
     assert.notEqual(executed.status, 0);
     const envelope = JSON.parse(executed.stdout);
     assert.equal(envelope.ok, false);
-    assert.match(envelope.data.preflight.reason, /requires --title/);
+    assert.match(envelope.data.preflight.reason, /Provide a PR title/);
 
     const actionStatePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'action-state.json');
     const actionState = JSON.parse(readFileSync(actionStatePath, 'utf8'));
     assert.equal(actionState.records['action-feedback-task'][0].actionId, 'pr');
     assert.equal(actionState.records['action-feedback-task'][0].status, 'failed');
-    assert.match(actionState.records['action-feedback-task'][0].reason, /requires --title/);
+    assert.match(actionState.records['action-feedback-task'][0].reason, /Provide a PR title/);
 
     const detail = JSON.parse(runCli(['run', 'api', 'branch', '--branch', lock.branchName], repoRoot).stdout);
     assert.equal(detail.data.actionHistory[0].actionId, 'pr');
@@ -7852,7 +8834,7 @@ test('api action preflight: non-risky action returns no confirmation', () => {
     commitAll(repoRoot, 'Adopt pipelane');
 
     const envelope = JSON.parse(runCli(['run', 'api', 'action', 'resume'], repoRoot).stdout);
-    assert.equal(envelope.schemaVersion, '2026-04-22');
+    assert.equal(envelope.schemaVersion, '2026-04-25');
     assert.equal(envelope.command, 'pipelane.api.action');
     assert.equal(envelope.data.action.id, 'resume');
     assert.equal(envelope.data.action.risky, false);

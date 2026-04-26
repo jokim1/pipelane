@@ -1560,6 +1560,97 @@
       padding: 14px 16px;
     }
 
+    .input-modal-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 80;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 18px;
+      background: rgba(5, 12, 18, 0.74);
+      backdrop-filter: blur(10px);
+    }
+
+    .input-modal {
+      width: min(520px, 100%);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: #101a22;
+      box-shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
+      padding: 18px;
+    }
+
+    .input-modal h3 {
+      margin: 0 0 12px;
+      font-size: 16px;
+      letter-spacing: 0;
+    }
+
+    .input-field {
+      width: 100%;
+      min-height: 40px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+    }
+
+    .input-field.invalid {
+      border-color: rgba(255, 107, 107, 0.72);
+      box-shadow: 0 0 0 3px rgba(255, 107, 107, 0.12);
+    }
+
+    .input-error {
+      margin: 10px 0 0;
+      min-height: 18px;
+      color: #f1bbbb;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .input-error[hidden] {
+      display: none;
+    }
+
+    .input-choice-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-top: 4px;
+    }
+
+    .input-choice {
+      display: grid;
+      grid-template-columns: 18px 1fr;
+      gap: 10px;
+      align-items: flex-start;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+      cursor: pointer;
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .input-choice-list.invalid .input-choice {
+      border-color: rgba(255, 107, 107, 0.72);
+    }
+
+    .input-choice strong {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 14px;
+    }
+
+    .input-choice span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
     .lane-card.state-blocked,
     .preflight-card.state-blocked,
     .confirmation-card.danger,
@@ -4370,42 +4461,148 @@
       return params;
     }
 
+    function promptActionInput(input, currentValue) {
+      return new Promise((resolve) => {
+        const options = Array.isArray(input.options) ? input.options : [];
+        const initialChoice = typeof currentValue === 'string' && currentValue
+          ? currentValue
+          : (options[0]?.value || '');
+        const backdrop = document.createElement('div');
+        backdrop.className = 'input-modal-backdrop';
+        const bodyMarkup = input.type === 'choice'
+          ? `
+            <div class="input-choice-list">
+              ${options.map((option, index) => `
+                <label class="input-choice">
+                  <input type="radio" name="action-input-choice" value="${escapeHtml(option.value || '')}" ${String(option.value || '') === String(initialChoice) || (!initialChoice && index === 0) ? 'checked' : ''}>
+                  <span>
+                    <strong>${escapeHtml(option.label || option.value || '')}</strong>
+                    <span>${escapeHtml(option.description || '')}</span>
+                  </span>
+                </label>
+              `).join('')}
+            </div>
+          `
+          : input.type === 'boolean'
+            ? `
+              <label class="input-choice">
+                <input type="checkbox" name="action-input-boolean" ${currentValue === true ? 'checked' : ''}>
+                <span>
+                  <strong>${escapeHtml(input.label || input.name)}</strong>
+                  <span>${escapeHtml(input.placeholder || '')}</span>
+                </span>
+              </label>
+            `
+            : `<input class="input-field" name="action-input-text" type="text" value="${escapeHtml(typeof currentValue === 'string' ? currentValue : '')}" placeholder="${escapeHtml(input.placeholder || '')}" autocomplete="off">`;
+
+        backdrop.innerHTML = `
+          <form class="input-modal">
+            <h3>${escapeHtml(input.label || input.name)}</h3>
+            ${bodyMarkup}
+            <div class="input-error" data-input-error role="alert" hidden></div>
+            <div class="button-row" style="margin-top:14px">
+              <button class="button primary" type="submit">Continue</button>
+              <button class="button subtle" type="button" data-input-cancel>Cancel</button>
+            </div>
+          </form>
+        `;
+        document.body.appendChild(backdrop);
+
+        const cleanup = (value) => {
+          backdrop.remove();
+          document.removeEventListener('keydown', handleKeydown);
+          resolve(value);
+        };
+        const handleKeydown = (event) => {
+          if (event.key === 'Escape') {
+            cleanup(null);
+          }
+        };
+        document.addEventListener('keydown', handleKeydown);
+        const textInput = backdrop.querySelector('[name="action-input-text"]');
+        const choiceList = backdrop.querySelector('.input-choice-list');
+        const errorElement = backdrop.querySelector('[data-input-error]');
+        const clearInputError = () => {
+          if (errorElement) {
+            errorElement.textContent = '';
+            errorElement.hidden = true;
+          }
+          textInput?.classList.remove('invalid');
+          choiceList?.classList.remove('invalid');
+        };
+        const setInputError = (message) => {
+          if (errorElement) {
+            errorElement.textContent = message;
+            errorElement.hidden = false;
+          }
+          if (input.type === 'choice') {
+            choiceList?.classList.add('invalid');
+          } else {
+            textInput?.classList.add('invalid');
+          }
+        };
+        if (textInput) {
+          textInput.focus();
+          textInput.select();
+          textInput.addEventListener('input', clearInputError);
+        } else {
+          backdrop.querySelector('button[type="submit"]')?.focus();
+        }
+        backdrop.querySelectorAll('input[name="action-input-choice"]').forEach((element) => {
+          element.addEventListener('change', clearInputError);
+        });
+
+        backdrop.querySelector('[data-input-cancel]')?.addEventListener('click', () => cleanup(null));
+        backdrop.querySelector('form')?.addEventListener('submit', (event) => {
+          event.preventDefault();
+          if (input.type === 'choice') {
+            const selected = backdrop.querySelector('input[name="action-input-choice"]:checked')?.value || '';
+            const option = options.find((entry) => String(entry.value || '') === selected) || null;
+            if (input.required && !selected) {
+              setInputError('Choose an option to continue.');
+              return;
+            }
+            cleanup({ value: selected, params: option?.params || {} });
+            return;
+          }
+          if (input.type === 'boolean') {
+            cleanup({ value: backdrop.querySelector('[name="action-input-boolean"]')?.checked === true, params: {} });
+            return;
+          }
+          const value = String(backdrop.querySelector('[name="action-input-text"]')?.value || '').trim();
+          if (input.required && !value) {
+            setInputError(`${input.label || input.name} is required.`);
+            return;
+          }
+          cleanup({ value, params: {} });
+        });
+      });
+    }
+
     async function collectActionInputs(action, params) {
       const inputs = action.inputs || [];
       for (const input of inputs) {
         if (!input?.name) {
           continue;
         }
-        if (input.type === 'boolean') {
-          params[input.name] = window.confirm(input.label || input.name);
-          continue;
-        }
         const currentValue = typeof params[input.name] === 'string' ? params[input.name] : '';
-        const value = window.prompt(input.label || input.name, currentValue || input.placeholder || '');
-        if (value === null) {
+        const result = await promptActionInput(input, input.type === 'boolean' ? params[input.name] === true : currentValue);
+        if (result === null) {
           return null;
         }
-        if (input.required && !value.trim()) {
+        if (input.required && typeof result.value === 'string' && !result.value.trim()) {
           return null;
         }
-        params[input.name] = value.trim();
+        params[input.name] = typeof result.value === 'string' ? result.value.trim() : result.value;
+        if (result.params && typeof result.params === 'object' && !Array.isArray(result.params)) {
+          params = { ...params, ...result.params };
+        }
       }
       return params;
     }
 
     async function gatherActionParams(action, scope) {
       const params = defaultActionParams(action, scope);
-
-      if (action.id === 'pr') {
-        const detailBranch = state.branchDetails?.data?.branch || getSelectedBranch();
-        const suggestedTitle = detailBranch?.pr?.title || detailBranch?.task?.taskSlug || detailBranch?.name || 'Update branch';
-        const title = window.prompt('PR title', suggestedTitle);
-        if (!title) {
-          return null;
-        }
-        params.title = title;
-      }
-
       return collectActionInputs(action, params);
     }
 
@@ -4459,7 +4656,7 @@
       try {
         let envelope = null;
         let preflight = null;
-        for (let attempt = 0; attempt < 2; attempt += 1) {
+        for (let attempt = 0; attempt < 4; attempt += 1) {
           envelope = await fetchJson(`/api/action/${encodeURIComponent(actionId)}/preflight`, {
             method: 'POST',
             body: JSON.stringify({ params }),

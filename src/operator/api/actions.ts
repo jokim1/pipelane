@@ -27,6 +27,12 @@ import {
 } from '../release-gate.ts';
 import { findLastGoodDeploy, inferActiveTaskLock, resolveCommandSurfaces } from '../commands/helpers.ts';
 import {
+  diagnoseTaskBinding,
+  isTaskBindingRecovery,
+  resolveLocalPrTitleRequirement,
+  validateTaskBindingRecoverySelection,
+} from '../task-binding.ts';
+import {
   buildApiEnvelope,
   buildFreshness,
   type ApiEnvelope,
@@ -139,6 +145,7 @@ export function buildActionPreflightEnvelope(cwd: string, actionId: StableAction
   const context = resolveWorkflowContext(cwd);
   const normalizedInputs = normalizeInputs(actionId, parsed, cwd);
   const risky = API_RISKY_ACTION_IDS.has(actionId);
+  const requiresConfirmation = actionRequiresConfirmation(actionId, normalizedInputs);
   const checkedAt = nowIso();
 
   const gate = evaluatePreflightGate(context, actionId, normalizedInputs);
@@ -170,7 +177,7 @@ export function buildActionPreflightEnvelope(cwd: string, actionId: StableAction
   }
 
   let confirmation: { token: string; expiresAt: string } | null = null;
-  if (risky) {
+  if (requiresConfirmation) {
     const fingerprint = buildActionFingerprint(actionId, normalizedInputs);
     const record = createActionConfirmation(context.commonDir, context.config, {
       actionId,
@@ -193,7 +200,7 @@ export function buildActionPreflightEnvelope(cwd: string, actionId: StableAction
       warnings: [],
       issues: [],
       normalizedInputs,
-      requiresConfirmation: risky,
+      requiresConfirmation,
       confirmation,
       freshness: buildFreshness({ checkedAt }),
     },
@@ -225,6 +232,9 @@ interface PreflightGateBlocked {
 }
 
 function evaluatePreflightGate(context: WorkflowContext, actionId: StableActionId, inputs: Record<string, unknown>): PreflightGateResult {
+  if (actionId === 'pr') {
+    return evaluatePrPreflightGate(context, inputs);
+  }
   if (actionId === 'clean.apply') {
     const taskRaw = inputs.task;
     const task = typeof taskRaw === 'string' ? taskRaw.trim() : '';
@@ -275,6 +285,117 @@ function evaluatePreflightGate(context: WorkflowContext, actionId: StableActionI
   return { allowed: true };
 }
 
+function evaluatePrPreflightGate(context: WorkflowContext, inputs: Record<string, unknown>): PreflightGateResult {
+  const task = typeof inputs.task === 'string' ? inputs.task : '';
+  const title = typeof inputs.title === 'string' ? inputs.title : '';
+  const recover = typeof inputs.recover === 'string' ? inputs.recover.trim() : '';
+  const bindingFingerprint = typeof inputs.bindingFingerprint === 'string' ? inputs.bindingFingerprint.trim() : '';
+
+  if (recover) {
+    if (!isTaskBindingRecovery(recover)) {
+      return {
+        allowed: false,
+        reason: `Unknown task recovery option "${recover}". Run the preflight again.`,
+      };
+    }
+    let diagnosis: ReturnType<typeof validateTaskBindingRecoverySelection>;
+    try {
+      diagnosis = validateTaskBindingRecoverySelection(context, task, recover, bindingFingerprint);
+    } catch (error) {
+      return {
+        allowed: false,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+    const titleRequirement = recover === 'use-current-checkout'
+      ? resolveLocalPrTitleRequirement(context, diagnosis.taskSlug, diagnosis.current.branchName, title)
+      : { required: false, defaultTitle: '' };
+    if (titleRequirement.required) {
+      return buildPrTitleInputGate(
+        'This checkout has local changes and no live PR yet. Provide a PR title before using the current checkout.',
+        {
+          task: diagnosis.taskSlug,
+          recover,
+          bindingFingerprint,
+          ...(titleRequirement.defaultTitle ? { title: titleRequirement.defaultTitle } : {}),
+        },
+      );
+    }
+    return { allowed: true };
+  }
+
+  const diagnosis = diagnoseTaskBinding(context, task);
+  if (diagnosis.status === 'resolved') {
+    const titleRequirement = resolveLocalPrTitleRequirement(
+      context,
+      diagnosis.taskSlug,
+      diagnosis.current.branchName,
+      title,
+    );
+    if (titleRequirement.required) {
+      return buildPrTitleInputGate(
+        'This checkout has local changes and no live PR yet. Provide a PR title before opening the PR.',
+        {
+          task: diagnosis.taskSlug,
+          ...(titleRequirement.defaultTitle ? { title: titleRequirement.defaultTitle } : {}),
+        },
+      );
+    }
+    return { allowed: true };
+  }
+  if (diagnosis.status === 'blocked') {
+    return {
+      allowed: false,
+      reason: diagnosis.reason,
+    };
+  }
+
+  const inputsToCollect: ApiActionInput[] = [
+    {
+      name: 'recover',
+      label: 'Task workspace',
+      type: 'choice',
+      required: true,
+      placeholder: '',
+      options: diagnosis.options.map((option) => ({
+        value: option.value,
+        label: option.label,
+        description: option.description,
+        params: option.params,
+      })),
+    },
+  ];
+  return {
+    allowed: false,
+    reason: diagnosis.reason,
+    needsInput: true,
+    missingInputs: ['recover'],
+    inputs: inputsToCollect,
+    defaultParams: { task: diagnosis.taskSlug },
+  };
+}
+
+function buildPrTitleInputGate(reason: string, defaultParams: Record<string, unknown>): PreflightGateResult {
+  return {
+    allowed: false,
+    reason,
+    needsInput: true,
+    missingInputs: ['title'],
+    inputs: [prTitleInput()],
+    defaultParams,
+  };
+}
+
+function prTitleInput(): ApiActionInput {
+  return {
+    name: 'title',
+    label: 'PR title',
+    type: 'text',
+    required: true,
+    placeholder: 'Short PR title',
+  };
+}
+
 function buildReleaseOverrideInputGate(reason: string): PreflightGateResult {
   return {
     allowed: false,
@@ -298,9 +419,18 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
   const context = resolveWorkflowContext(cwd);
   const normalizedInputs = normalizeInputs(actionId, parsed, cwd);
   const risky = API_RISKY_ACTION_IDS.has(actionId);
+  const requiresConfirmation = actionRequiresConfirmation(actionId, normalizedInputs);
   const checkedAt = nowIso();
   const gate = evaluatePreflightGate(context, actionId, normalizedInputs);
   if (gate.allowed === false) {
+    persistActionPreflightBlockIfTaskScoped({
+      context,
+      actionId,
+      label: ACTION_LABELS[actionId],
+      normalizedInputs,
+      checkedAt,
+      reason: gate.reason,
+    });
     const preflight: ActionPreflightData = {
       action: { id: actionId, label: ACTION_LABELS[actionId], risky },
       preflight: {
@@ -327,14 +457,14 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
     });
   }
 
-  if (risky) {
+  if (requiresConfirmation) {
     const fingerprint = buildActionFingerprint(actionId, normalizedInputs);
     try {
       consumeActionConfirmation(context.commonDir, context.config, confirmToken, fingerprint);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const preflight: ActionPreflightData = {
-        action: { id: actionId, label: ACTION_LABELS[actionId], risky: true },
+        action: { id: actionId, label: ACTION_LABELS[actionId], risky },
         preflight: {
           allowed: false,
           state: 'blocked',
@@ -346,7 +476,7 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
           warnings: [],
           issues: [],
           normalizedInputs,
-          requiresConfirmation: true,
+          requiresConfirmation,
           confirmation: null,
           freshness: buildFreshness({ checkedAt, stale: true }),
         },
@@ -380,7 +510,7 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
       warnings: [],
       issues: [],
       normalizedInputs,
-      requiresConfirmation: risky,
+      requiresConfirmation,
       confirmation: null,
       freshness: buildFreshness({ checkedAt, stale: !result.ok }),
     },
@@ -407,6 +537,37 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
     ok: result.ok,
     message: result.ok ? `${actionId} executed` : `${actionId} failed: ${failureReason}`,
     data,
+  });
+}
+
+function persistActionPreflightBlockIfTaskScoped(options: {
+  context: ReturnType<typeof resolveWorkflowContext>;
+  actionId: StableActionId;
+  label: string;
+  normalizedInputs: Record<string, unknown>;
+  checkedAt: string;
+  reason: string;
+}): void {
+  const task = typeof options.normalizedInputs.task === 'string'
+    ? options.normalizedInputs.task.trim()
+    : '';
+  if (!task) return;
+  const taskSlug = slugifyTaskName(task);
+  const lock = loadTaskLock(options.context.commonDir, options.context.config, taskSlug);
+  const branchName = lock?.branchName || runGit(options.context.repoRoot, ['branch', '--show-current'], true)?.trim() || taskSlug;
+  appendActionRunRecord(options.context.commonDir, options.context.config, {
+    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    taskSlug,
+    branchName,
+    actionId: options.actionId,
+    label: options.label,
+    status: 'failed',
+    exitCode: 1,
+    startedAt: options.checkedAt,
+    finishedAt: nowIso(),
+    reason: options.reason,
+    stdout: '',
+    stderr: '',
   });
 }
 
@@ -467,6 +628,15 @@ function describeExecutionFailure(
   return `${actionId} exited ${result.exitCode}`;
 }
 
+function actionRequiresConfirmation(actionId: StableActionId, normalizedInputs: Record<string, unknown>): boolean {
+  if (API_RISKY_ACTION_IDS.has(actionId)) {
+    return true;
+  }
+  return actionId === 'pr'
+    && typeof normalizedInputs.recover === 'string'
+    && normalizedInputs.recover.trim().length > 0;
+}
+
 function normalizeInputs(actionId: StableActionId, parsed: ParsedOperatorArgs, cwd?: string): Record<string, unknown> {
   const { flags } = parsed;
   switch (actionId) {
@@ -481,7 +651,13 @@ function normalizeInputs(actionId: StableActionId, parsed: ParsedOperatorArgs, c
     case 'taskLock.verify':
       return { task: flags.task, mode: flags.mode };
     case 'pr':
-      return { task: flags.task, title: flags.title, message: flags.message };
+      return {
+        task: flags.task,
+        title: flags.title,
+        message: flags.message,
+        recover: flags.recover,
+        bindingFingerprint: flags.bindingFingerprint,
+      };
     case 'merge':
       return { task: flags.task };
     case 'deploy.staging':
@@ -660,6 +836,8 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
       pushOpt('--task', flags.task);
       pushOpt('--title', flags.title);
       pushOpt('--message', flags.message);
+      pushOpt('--recover', flags.recover);
+      pushOpt('--binding-fingerprint', flags.bindingFingerprint);
       break;
     case 'merge':
       args.push('merge');

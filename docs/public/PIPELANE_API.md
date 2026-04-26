@@ -21,7 +21,7 @@ accept `--text`. Every response is an `ApiEnvelope` (see below).
 
 ```jsonc
 {
-  "schemaVersion": "2026-04-18",
+  "schemaVersion": "2026-04-25",
   // command is "pipelane.api.snapshot" or "pipelane.api.action"
   "command": "pipelane.api.snapshot",
   "ok": true,
@@ -106,8 +106,10 @@ whether a confirm token is required); `action <id> --execute` with the
 returned token to actually run it.
 
 Risky actions (`merge`, `deploy.prod`, `clean.apply`, `rollback.prod`)
-always require a fresh confirmation token. Non-risky actions complete
-in one call.
+always require a fresh confirmation token. `pr` remains non-risky in the
+normal path, but a task-binding recovery choice returns a confirmation token
+so the selected checkout and fingerprint are consumed atomically. Other
+non-risky actions complete in one call.
 
 | Action ID | Risky? | Purpose |
 |-----------|--------|---------|
@@ -126,6 +128,14 @@ in one call.
 | `doctor.probe` | no | Hit every configured staging healthcheck URL and persist the result to `probe-state.json`. |
 | `rollback.staging` | no | Redeploy the last verified-good SHA to staging (Pipelane-only). |
 | `rollback.prod` | **yes** | Redeploy the last verified-good SHA to production (Pipelane-only). |
+
+Preflight may return `needsInput: true` with `inputs[]`. Inputs have
+`type: "text" | "boolean" | "choice"`. Choice inputs include `options[]`
+with `{ value, label, description, params? }`; clients should merge `params`
+into the next preflight request after the user selects that option. This is
+how `/pr` presents safe task-binding recovery choices such as "use current
+checkout" (only from a task-owned branch) or "continue the attached task
+workspace" without showing hidden recovery flags.
 
 `doctor.fix` is intentionally **not** exposed as an API action — it is
 interactive (TTY prompts for platform + URLs) and lives behind

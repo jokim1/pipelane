@@ -239,6 +239,17 @@ export interface TaskLock {
   // `/deploy prod` that DID run with staging smoke clears the flag on next
   // write.
   promotedWithoutStagingSmoke?: boolean;
+  // Audit trail for task/worktree rebinding recoveries. The current lock
+  // branch/path remain authoritative; history explains how they changed.
+  bindingHistory?: Array<{
+    reboundAt: string;
+    reason: string;
+    fromBranchName: string;
+    fromWorktreePath: string;
+    toBranchName: string;
+    toWorktreePath: string;
+    fingerprint: string;
+  }>;
 }
 
 export interface PrRecord {
@@ -461,6 +472,8 @@ export interface OperatorFlags {
   file: string;
   title: string;
   message: string;
+  recover: string;
+  bindingFingerprint: string;
   mode: string;
   scope: string;
   surfaces: string[];
@@ -1643,6 +1656,8 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     file: '',
     title: '',
     message: '',
+    recover: '',
+    bindingFingerprint: '',
     mode: '',
     scope: '',
     surfaces: [],
@@ -1780,6 +1795,16 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
 
     if (flagName === '--message') {
       flags.message = readFlagValue('--message');
+      continue;
+    }
+
+    if (flagName === '--recover') {
+      flags.recover = readFlagValue('--recover');
+      continue;
+    }
+
+    if (flagName === '--binding-fingerprint') {
+      flags.bindingFingerprint = readFlagValue('--binding-fingerprint');
       continue;
     }
 
@@ -1964,7 +1989,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       requireNoPositional('pipelane run repo-guard --task <task-name> [--mode build|release] [--surfaces <csv>] [--offline]');
       return;
     case 'pr':
-      assertOnlyFlags(parsed, ['task', 'title', 'message', 'forceInclude']);
+      assertOnlyFlags(parsed, ['task', 'title', 'message', 'forceInclude', 'recover', 'bindingFingerprint']);
       requireNoPositional('pipelane run pr [--task <task-name>] [--title <title>] [--message <message>] [--force-include <path>]');
       return;
     case 'merge':
@@ -2129,6 +2154,8 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
           'mode',
           'title',
           'message',
+          'recover',
+          'bindingFingerprint',
           'sha',
           'skipSmokeCoverage',
           'allStale',
@@ -2164,6 +2191,8 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'file', label: '--file', active: (flags) => flags.file.trim().length > 0 },
   { key: 'title', label: '--title', active: (flags) => flags.title.trim().length > 0 },
   { key: 'message', label: '--message', active: (flags) => flags.message.trim().length > 0 },
+  { key: 'recover', label: '--recover', active: (flags) => flags.recover.trim().length > 0 },
+  { key: 'bindingFingerprint', label: '--binding-fingerprint', active: (flags) => flags.bindingFingerprint.trim().length > 0 },
   { key: 'mode', label: '--mode', active: (flags) => flags.mode.trim().length > 0 },
   { key: 'scope', label: '--scope', active: (flags) => flags.scope.trim().length > 0 },
   { key: 'surfaces', label: '--surfaces', active: (flags) => flags.surfaces.length > 0 },

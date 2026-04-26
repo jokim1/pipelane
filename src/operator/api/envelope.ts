@@ -1,9 +1,9 @@
 import { nowIso } from '../state.ts';
 
-// Bumped 2026-04-22: snapshot payload now includes deterministic smoke state.
+// Bumped 2026-04-25: action inputs can expose structured choice options.
 // Readers that ignore the new fields still parse correctly because the
 // extension is additive-only.
-export const WORKFLOW_API_SCHEMA_VERSION = '2026-04-22';
+export const WORKFLOW_API_SCHEMA_VERSION = '2026-04-25';
 
 export const CANONICAL_LANE_STATES = [
   'healthy',
@@ -81,9 +81,17 @@ export interface ApiActionState {
 export interface ApiActionInput {
   name: string;
   label: string;
-  type: 'text' | 'boolean';
+  type: 'text' | 'boolean' | 'choice';
   required: boolean;
   placeholder: string;
+  options?: ApiActionInputOption[];
+}
+
+export interface ApiActionInputOption {
+  value: string;
+  label: string;
+  description: string;
+  params?: Record<string, unknown>;
 }
 
 export interface ApiEnvelope<TData = unknown> {

@@ -498,13 +498,20 @@ async function runWorkflowJson(repoRoot: string, args: string[]): Promise<{ stat
   }
 }
 
-function resolveActionCwd(repoRoot: string, params: JsonObject): string {
+function resolveActionCwd(repoRoot: string, params: JsonObject, actionId = ''): string {
   const taskRaw = typeof params.task === 'string' ? params.task.trim() : '';
   if (!taskRaw) {
     return repoRoot;
   }
   const taskSlug = slugifyTaskName(taskRaw);
   const context = resolveWorkflowContext(repoRoot);
+  if (actionId === 'pr') {
+    const recover = typeof params.recover === 'string' ? params.recover.trim() : '';
+    const bindingFingerprint = typeof params.bindingFingerprint === 'string' ? params.bindingFingerprint.trim() : '';
+    if (recover || bindingFingerprint) {
+      return repoRoot;
+    }
+  }
   const lock = loadTaskLock(context.commonDir, context.config, taskSlug);
   if (lock?.worktreePath && existsSync(lock.worktreePath)) {
     return lock.worktreePath;
@@ -618,7 +625,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
   }
 
   async function postActionPreflight(actionId: string, params: JsonObject): Promise<{ status: number; envelope: JsonObject }> {
-    const actionCwd = resolveActionCwd(options.repoRoot, params);
+    const actionCwd = resolveActionCwd(options.repoRoot, params, actionId);
     const { status, envelope } = await runWorkflowJson(actionCwd, [
       'action',
       actionId,
@@ -630,7 +637,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
 
   function startExecution(actionId: string, params: JsonObject, confirmToken: string): ExecutionRecord {
     const id = randomUUID();
-    const actionCwd = resolveActionCwd(options.repoRoot, params);
+    const actionCwd = resolveActionCwd(options.repoRoot, params, actionId);
     const record: ExecutionRecord = {
       id,
       actionId,

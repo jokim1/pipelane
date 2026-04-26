@@ -1661,6 +1661,15 @@ function buildBranchActions(options: {
           ? 'commit local work, push the branch, and open a PR'
           : 'push the branch and open a PR'
         : localCell.reason,
+      inputs: dirty
+        ? [{
+          name: 'title',
+          label: 'PR title',
+          type: 'text',
+          required: true,
+          placeholder: 'Short PR title',
+        }]
+        : [],
       checkedAt,
     }));
   } else if (!prRecord.mergedAt) {
