@@ -1754,6 +1754,10 @@ test('install-codex outside a pipelane repo installs durable global default skil
     assert.ok(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')));
     assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md')));
     assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane-fix', 'SKILL.md')));
+    const fixSkill = readFileSync(path.join(codexHome, 'skills', 'fix', 'SKILL.md'), 'utf8');
+    assert.match(fixSkill, /Pipelane-enabled repo detection/);
+    assert.match(fixSkill, /standalone `REPO_GUIDANCE\.md` does not count/);
+    assert.match(fixSkill, /Only emit these in Pipelane-enabled repos/);
     assert.ok(existsSync(path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane')));
     assert.ok(existsSync(path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh')));
     assert.match(

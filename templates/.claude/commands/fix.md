@@ -23,15 +23,29 @@ Parse `$ARGUMENTS` by whitespace. Evaluate the first token:
 
 Flow: parse → list numbered with sensitive-area tags → confirm → pre-check → apply (emit heads-up before any sensitive-area change) → post-fix hints.
 
+### Pipelane-enabled repo detection
+
+At the start of FINDINGS MODE, determine whether the repo is Pipelane-enabled:
+
+- **Enabled.** The repo root contains `.pipelane.json` or `.project-workflow.json`, or `package.json` has a top-level `pipelane` object.
+- **Not enabled.** Anything else. A source checkout with only `pipelane:*` package scripts or a standalone `REPO_GUIDANCE.md` does not count.
+
+When the repo is not Pipelane-enabled, `/fix` still fixes the finding, but
+`REPO_GUIDANCE.md` is advisory only:
+
+- If present and real, read it for project invariants.
+- Do not run guidance staleness checks, ask to refresh guidance, or queue/emit post-fix hints.
+- If absent or scaffold-only, proceed silently.
+
 ### Pre-check
 
 **Severity gate:** if the confirmed batch is one finding AND it touches no sensitive area, skip the staleness check — overhead without payoff.
 
 Resolve `REPO_GUIDANCE.md` at the repo root:
 
-- **Missing.** Proceed; queue missing-file hint. Do not ask, do not block.
-- **Scaffold-only** (template-shape detection: majority of sections still contain `<placeholder>` angle-bracket content). Treat as no repo-specific guidance; proceed; queue scaffold-only hint.
-- **Real content.** Parse frontmatter (see Parser grammar). Read `Last reviewed` and `Refresh cadence`. If either axis exceeded, ask: "REPO_GUIDANCE.md last reviewed &lt;N&gt; days ago, &lt;M&gt; commits since. Refresh first?" If yes, run REFRESH GUIDANCE MODE inline, then continue. If no, proceed.
+- **Missing.** In Pipelane-enabled repos, proceed and queue the missing-file hint; otherwise proceed silently. Do not ask, do not block.
+- **Scaffold-only** (template-shape detection: majority of sections still contain `<placeholder>` angle-bracket content). Treat as no repo-specific guidance. In Pipelane-enabled repos, queue the scaffold-only hint; otherwise proceed silently.
+- **Real content.** Read it for project invariants. In Pipelane-enabled repos only, parse frontmatter (see Parser grammar), read `Last reviewed` and `Refresh cadence`, and if either axis exceeded, ask: "REPO_GUIDANCE.md last reviewed &lt;N&gt; days ago, &lt;M&gt; commits since. Refresh first?" If yes, run REFRESH GUIDANCE MODE inline, then continue. If no, proceed.
 
 ### Before writing code, for each finding
 
@@ -98,7 +112,7 @@ Prefix each load-bearing decision in the diff explanation. Emit at least `[fix] 
 
 ### Post-fix hints
 
-Informational. No confirm, no block. Rate-limit: one per category per session. **Emit the hint string verbatim** — do not paraphrase, shorten, or summarize. The wording is load-bearing because it explains what happened and what to do next.
+Informational. No confirm, no block. Only emit these in Pipelane-enabled repos. Rate-limit: one per category per session. **Emit the hint string verbatim** — do not paraphrase, shorten, or summarize. The wording is load-bearing because it explains what happened and what to do next.
 
 - **Drift.** For each modified file, run `git log --since="30 days ago" --oneline -- <file>` and count. Read `Drift-hint threshold` from `REPO_GUIDANCE.md` (default: `20 commits / 30 days`). If any touched file exceeds, is not in `Drift-hint ignore`, and is not in `Deferred / don't-touch`, emit: "&lt;file&gt; has &lt;N&gt; commits in 30 days. Consider `/fix rethink`." Skip if `REPO_GUIDANCE.md` is missing entirely; scaffold-only still allows it.
 - **Missing-file** (no REPO_GUIDANCE.md): "No REPO_GUIDANCE.md at the repo root. Run `/fix refresh-guidance` to start building invariants."
