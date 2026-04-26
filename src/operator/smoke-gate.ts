@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, wri
 import path from 'node:path';
 
 import { loadDeployConfig } from './release-gate.ts';
+import { buildSmokeFailureFixPrompt } from './smoke-hot-paths.ts';
 import {
   loadDeployState,
   loadSmokeEnvironmentLock,
@@ -179,7 +180,7 @@ function resolveSmokeEnvironmentConfig(value: SmokeEnvironmentConfig | undefined
 // silently scaffolded an empty registry. Pure-Node walk is fast enough for
 // the sizes pipelane actually sees and has no external dependency.
 const SMOKE_TAG_PATTERN = /@smoke-[a-z0-9-]+/g;
-const WALK_DIRS_EXCLUDED = new Set(['.git', 'node_modules']);
+const WALK_DIRS_EXCLUDED = new Set(['.agents', '.claude', '.codex', '.git', '.pipelane', 'node_modules']);
 const MAX_SMOKE_SCAN_BYTES = 5 * 1024 * 1024;
 
 function* walkRepoFiles(root: string): Generator<string> {
@@ -266,6 +267,15 @@ export function scaffoldSmokeRegistry(options: {
       environments: ['staging'],
       surfaces: inferRegistrySurfaces(entry.tag),
       sourceTests: entry.files,
+      lifecycle: 'accepted',
+      safetyFlags: ['readonly'],
+      requiredEnv: [],
+      provenance: {
+        source: 'discovered-tag',
+        confidence: 'high',
+        evidence: entry.files,
+        updatedAt: nowIso(),
+      },
     };
   }
   const registry = { checks };
@@ -300,6 +310,8 @@ export function generateSmokeSummary(registry: SmokeRegistryState): string {
     if (entry.owner) lines.push(`  Owner: \`${entry.owner}\``);
     if (entry.runbook) lines.push(`  Runbook: \`${entry.runbook}\``);
     if (entry.sourceTests?.length) lines.push(`  Source tests: ${entry.sourceTests.map((file) => `\`${file}\``).join(', ')}`);
+    if (entry.lifecycle) lines.push(`  Lifecycle: \`${entry.lifecycle}\``);
+    if (entry.requiredEnv?.length) lines.push(`  Required env: ${entry.requiredEnv.map((name) => `\`${name}\``).join(', ')}`);
     if (entry.quarantine) lines.push('  Status: quarantined');
   }
   return `${lines.join('\n')}\n`;
@@ -750,6 +762,17 @@ export function summarizeSmokeRun(record: SmokeRunRecord, registry?: SmokeRegist
     lines.push('', 'Artifacts:');
     if (artifacts.htmlReport) lines.push(`- HTML report: ${artifacts.htmlReport}`);
     if (artifacts.screenshotDir) lines.push(`- Screenshot dir: ${artifacts.screenshotDir}`);
+  }
+  if (!isSmokeSuccessStatus(record.status)) {
+    lines.push('', buildSmokeFailureFixPrompt({
+      scenario: primaryFailure?.tag ?? 'smoke run',
+      command: `${record.environment} smoke runner`,
+      baseUrl: record.baseUrl,
+      logPath: primaryFailure?.artifacts?.logPath
+        ?? record.cohortResults.find((cohort) => cohort.artifacts?.logPath)?.artifacts?.logPath,
+      resultsPath: record.cohortResults.find((cohort) => cohort.resultsPath)?.resultsPath,
+      checks: record.checks.map((check) => ({ tag: check.tag, status: check.status })),
+    }));
   }
   return lines.join('\n');
 }

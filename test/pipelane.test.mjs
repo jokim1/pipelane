@@ -12231,6 +12231,318 @@ test('smoke setup needs-input output recommends --staging-script= form (not --st
   }
 });
 
+test('smoke setup stores repo-specific hot paths and plain-language AI feedback', () => {
+  const repoRoot = createSmokeSetupRepo({
+    scripts: { 'test:e2e:smoke': 'playwright test --project=smoke' },
+  });
+  try {
+    mkdirSync(path.join(repoRoot, 'src', 'app', 'projects', '[id]'), { recursive: true });
+    writeFileSync(
+      path.join(repoRoot, 'src', 'app', 'projects', '[id]', 'page.tsx'),
+      [
+        'export default function ProjectBoard() {',
+        '  return <main>Project board wiki AI assistant OpenAI login credentials</main>;',
+        '}',
+      ].join('\n'),
+      'utf8',
+    );
+
+    const result = runCli([
+      'run', 'smoke', 'setup',
+      '--staging-script=test:e2e:smoke',
+      '--feedback=also test AI in project boards and wiki pages, credentials properly auth',
+      '--json',
+    ], repoRoot);
+    const parsed = JSON.parse(result.stdout);
+    const registry = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane', 'smoke-checks.json'), 'utf8'));
+
+    assert.equal(parsed.setupVerification.status, 'skipped_missing_base_url');
+    assert.ok(parsed.hotPathScenarios.some((scenario) => scenario.id === '@smoke-ai-project-board'));
+    assert.ok(parsed.hotPathScenarios.some((scenario) => scenario.id === '@smoke-ai-wiki-page'));
+    assert.equal(registry.checks['@smoke-ai-project-board'].lifecycle, 'accepted');
+    assert.equal(registry.checks['@smoke-ai-project-board'].blocking, false);
+    assert.equal(registry.checks['@smoke-ai-project-board'].quarantine, true);
+    assert.deepEqual(registry.checks['@smoke-ai-project-board'].provenance.evidence, ['user feedback supplied during smoke setup']);
+    assert.deepEqual(registry.checks['@smoke-ai-project-board'].requiredEnv, ['OPENAI_API_KEY']);
+    assert.ok(registry.checks['@smoke-auth-credentials'].requiredEnv.includes('PIPELANE_SMOKE_USER_EMAIL'));
+    assert.equal(registry.checks['@smoke-wiki-page-crud'].safetyFlags.includes('requiresSyntheticData'), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke setup feedback promotes existing suggested hot paths to accepted', () => {
+  const repoRoot = createSmokeSetupRepo({
+    scripts: { 'test:e2e:smoke': 'playwright test --project=smoke' },
+  });
+  try {
+    mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'src', 'wiki.ts'), 'export const wiki = "wiki docs page markdown editor";\n', 'utf8');
+
+    runCli(['run', 'smoke', 'setup', '--staging-script=test:e2e:smoke'], repoRoot);
+    let registry = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane', 'smoke-checks.json'), 'utf8'));
+    assert.equal(registry.checks['@smoke-wiki-page-crud'].lifecycle, 'suggested');
+
+    runCli([
+      'run', 'smoke', 'setup',
+      '--staging-script=test:e2e:smoke',
+      '--feedback=create rename and delete wiki pages',
+    ], repoRoot);
+    registry = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane', 'smoke-checks.json'), 'utf8'));
+    assert.equal(registry.checks['@smoke-wiki-page-crud'].lifecycle, 'accepted');
+    assert.equal(registry.checks['@smoke-wiki-page-crud'].provenance.source, 'user-feedback');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke setup generates marker-owned Playwright app-shell test for supported runner', () => {
+  const repoRoot = createSmokeSetupRepo({
+    scripts: { 'test:e2e:smoke': 'playwright test --project=smoke --grep @smoke' },
+  });
+  try {
+    mkdirSync(path.join(repoRoot, 'app'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'app', 'page.tsx'), 'export default function Home() { return <main>Hello</main>; }\n', 'utf8');
+
+    runCli(['run', 'smoke', 'setup', '--staging-script=test:e2e:smoke'], repoRoot);
+
+    const generatedPath = path.join(repoRoot, 'tests', 'pipelane-smoke.generated.spec.ts');
+    const generated = readFileSync(generatedPath, 'utf8');
+    const registry = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane', 'smoke-checks.json'), 'utf8'));
+
+    assert.match(generated, /pipelane:smoke:start support/);
+    assert.match(generated, /pipelane:smoke:start app-shell/);
+    assert.match(generated, /@smoke-app-shell Open the app shell/);
+    assert.equal(registry.checks['@smoke-app-shell'].lifecycle, 'generated');
+    assert.equal(registry.checks['@smoke-app-shell'].generated.adapter, 'playwright');
+    assert.equal(registry.checks['@smoke-app-shell'].generated.status, 'unverified');
+    assert.ok(registry.checks['@smoke-app-shell'].sourceTests.includes('tests/pipelane-smoke.generated.spec.ts'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke setup generates Cypress app-shell test when Cypress is the detected runner', () => {
+  const repoRoot = createSmokeSetupRepo({
+    scripts: { 'test:e2e:smoke': 'cypress run --spec "cypress/e2e/**/*.cy.ts" --env grepTags=@smoke' },
+  });
+  try {
+    mkdirSync(path.join(repoRoot, 'pages'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'pages', 'index.tsx'), 'export default function Home() { return <main>Hello</main>; }\n', 'utf8');
+
+    runCli(['run', 'smoke', 'setup', '--staging-script=test:e2e:smoke'], repoRoot);
+
+    const generatedPath = path.join(repoRoot, 'cypress', 'e2e', 'pipelane-smoke.generated.cy.js');
+    const generated = readFileSync(generatedPath, 'utf8');
+    const registry = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane', 'smoke-checks.json'), 'utf8'));
+
+    assert.match(generated, /pipelane:smoke:start support/);
+    assert.match(generated, /pipelane:smoke:start app-shell/);
+    assert.match(generated, /Cypress\.env\('PIPELANE_SMOKE_RESULTS_PATH'\)/);
+    assert.equal(registry.checks['@smoke-app-shell'].generated.adapter, 'cypress');
+    assert.ok(registry.checks['@smoke-app-shell'].sourceTests.includes('cypress/e2e/pipelane-smoke.generated.cy.js'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke setup saves generated metadata even when generated file is unchanged', () => {
+  const repoRoot = createSmokeSetupRepo({
+    scripts: { 'test:e2e:smoke': 'playwright test --project=smoke --grep @smoke' },
+  });
+  try {
+    mkdirSync(path.join(repoRoot, 'app'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'app', 'page.tsx'), 'export default function Home() { return <main>Hello</main>; }\n', 'utf8');
+
+    runCli(['run', 'smoke', 'setup', '--staging-script=test:e2e:smoke'], repoRoot);
+
+    const registryPath = path.join(repoRoot, '.pipelane', 'smoke-checks.json');
+    const registry = JSON.parse(readFileSync(registryPath, 'utf8'));
+    registry.checks['@smoke-app-shell'].lifecycle = 'accepted';
+    registry.checks['@smoke-app-shell'].sourceTests = [];
+    delete registry.checks['@smoke-app-shell'].generated;
+    writeFileSync(registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
+
+    runCli(['run', 'smoke', 'setup', '--staging-script=test:e2e:smoke'], repoRoot);
+
+    const latest = JSON.parse(readFileSync(registryPath, 'utf8'));
+    assert.equal(latest.checks['@smoke-app-shell'].lifecycle, 'generated');
+    assert.equal(latest.checks['@smoke-app-shell'].generated.adapter, 'playwright');
+    assert.ok(latest.checks['@smoke-app-shell'].sourceTests.includes('tests/pipelane-smoke.generated.spec.ts'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke setup does not generate app-shell test when tagged source test already exists', () => {
+  const repoRoot = createSmokeSetupRepo({
+    scripts: { 'test:e2e:smoke': 'playwright test --project=smoke --grep @smoke' },
+  });
+  try {
+    mkdirSync(path.join(repoRoot, 'app'), { recursive: true });
+    mkdirSync(path.join(repoRoot, 'tests'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'app', 'page.tsx'), 'export default function Home() { return <main>Hello</main>; }\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'tests', 'existing.spec.ts'), "test('@smoke-app-shell boots', async () => {});\n", 'utf8');
+
+    runCli(['run', 'smoke', 'setup', '--staging-script=test:e2e:smoke'], repoRoot);
+
+    const generatedPath = path.join(repoRoot, 'tests', 'pipelane-smoke.generated.spec.ts');
+    const registry = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane', 'smoke-checks.json'), 'utf8'));
+
+    assert.equal(existsSync(generatedPath), false);
+    assert.equal(registry.checks['@smoke-app-shell'].lifecycle, 'accepted');
+    assert.equal(registry.checks['@smoke-app-shell'].provenance.source, 'discovered-tag');
+    assert.deepEqual(registry.checks['@smoke-app-shell'].sourceTests, ['tests/existing.spec.ts']);
+    assert.equal(registry.checks['@smoke-app-shell'].generated, undefined);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke plan --refresh reports proposed hot paths without writing registry files', () => {
+  const repoRoot = createSmokeSetupRepo({
+    scripts: { 'test:e2e:smoke': 'playwright test --project=smoke' },
+  });
+  try {
+    mkdirSync(path.join(repoRoot, 'app'), { recursive: true });
+    mkdirSync(path.join(repoRoot, '.claude'), { recursive: true });
+    mkdirSync(path.join(repoRoot, 'src', 'app', 'projects', '[id]'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'app', 'page.tsx'), 'export default function Home() { return <a href="/pricing">Pricing</a>; }\n', 'utf8');
+    writeFileSync(path.join(repoRoot, '.claude', 'notes.md'), 'login password openai @smoke-auth-credentials\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'src', 'app', 'projects', '[id]', 'page.tsx'), 'export default function ProjectPage() { return <main />; }\n', 'utf8');
+
+    const registryPath = path.join(repoRoot, '.pipelane', 'smoke-checks.json');
+    assert.equal(existsSync(registryPath), false);
+    const result = runCli(['run', 'smoke', 'plan', '--refresh', '--json'], repoRoot);
+    const parsed = JSON.parse(result.stdout);
+
+    assert.equal(parsed.refresh, true);
+    assert.equal(parsed.changedFiles, 0);
+    assert.equal(parsed.createdRegistry, false);
+    assert.equal(existsSync(registryPath), false);
+    assert.ok(parsed.proposedAdds.includes('@smoke-app-shell'));
+    assert.equal(parsed.proposedAdds.includes('@smoke-auth-credentials'), false);
+    assert.equal(parsed.proposedAdds.includes('@smoke-ai-primary-feature'), false);
+    assert.ok(parsed.analysis.routes.includes('/projects/:id'));
+    assert.match(parsed.message, /files changed: 0/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke plan --refresh refuses scenario files outside the repo', () => {
+  const repoRoot = createSmokeSetupRepo({
+    scripts: { 'test:e2e:smoke': 'playwright test --project=smoke' },
+  });
+  const outsidePath = path.join(path.dirname(repoRoot), `outside-scenarios-${Date.now()}.json`);
+  try {
+    writeFileSync(outsidePath, JSON.stringify({ scenarios: [{ id: '@smoke-outside', title: 'Outside file' }] }), 'utf8');
+
+    const result = runCli(['run', 'smoke', 'plan', '--refresh', `--scenario-file=${outsidePath}`, '--json'], repoRoot);
+    const parsed = JSON.parse(result.stdout);
+
+    assert.ok(parsed.warnings.some((warning) => /must live inside the repo/.test(warning)));
+    assert.equal(parsed.proposedAdds.includes('@smoke-outside'), false);
+  } finally {
+    rmSync(outsidePath, { force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke setup verification can make clean check-level results blocking', () => {
+  const repoRoot = createSmokeSetupRepo();
+  try {
+    mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'src', 'auth.ts'), 'export const login = "auth session password";\n', 'utf8');
+    const command = smokeResultCommand([{ tag: '@smoke-auth-credentials', status: 'passed' }]);
+
+    const result = runCli([
+      'run', 'smoke', 'setup',
+      `--staging-command=${command}`,
+      '--base-url=http://127.0.0.1:4173',
+      '--make-blocking',
+      '--json',
+    ], repoRoot);
+    const parsed = JSON.parse(result.stdout);
+    const registry = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane', 'smoke-checks.json'), 'utf8'));
+
+    assert.equal(parsed.setupVerification.status, 'passed');
+    assert.deepEqual(parsed.setupVerification.verifiedTags, ['@smoke-auth-credentials']);
+    assert.deepEqual(parsed.setupVerification.blockingTags, ['@smoke-auth-credentials']);
+    assert.equal(registry.checks['@smoke-auth-credentials'].lifecycle, 'blocking');
+    assert.equal(registry.checks['@smoke-auth-credentials'].blocking, true);
+    assert.equal(registry.checks['@smoke-auth-credentials'].quarantine, false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('smoke setup does not promote passed-with-retries verification to blocking', () => {
+  const repoRoot = createSmokeSetupRepo();
+  try {
+    mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'src', 'auth.ts'), 'export const login = "auth session password";\n', 'utf8');
+    const command = smokeResultCommand([{ tag: '@smoke-auth-credentials', status: 'passed_with_retries' }]);
+
+    const result = runCli([
+      'run', 'smoke', 'setup',
+      `--staging-command=${command}`,
+      '--base-url=http://127.0.0.1:4173',
+      '--make-blocking',
+      '--json',
+    ], repoRoot);
+    const parsed = JSON.parse(result.stdout);
+    const registry = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane', 'smoke-checks.json'), 'utf8'));
+
+    assert.equal(parsed.setupVerification.status, 'passed_with_retries');
+    assert.deepEqual(parsed.setupVerification.verifiedTags, []);
+    assert.equal(registry.checks['@smoke-auth-credentials'].blocking, false);
+    assert.equal(registry.checks['@smoke-auth-credentials'].quarantine, true);
+    assert.notEqual(registry.checks['@smoke-auth-credentials'].lifecycle, 'blocking');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('generated smoke marker helper preserves user edits and rejects malformed regions', async () => {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'smoke-hot-paths.ts'));
+  const created = mod.upsertGeneratedSmokeRegion('const userEdit = true;\n', 'auth', 'test("auth", async () => {});');
+  assert.equal(created.action, 'created');
+  assert.match(created.contents, /const userEdit = true;/);
+  assert.match(created.contents, /pipelane:smoke:start auth/);
+
+  const updated = mod.upsertGeneratedSmokeRegion(created.contents, 'auth', 'test("auth v2", async () => {});');
+  assert.equal(updated.action, 'updated');
+  assert.match(updated.contents, /const userEdit = true;/);
+  assert.match(updated.contents, /auth v2/);
+  assert.doesNotMatch(updated.contents, /test\("auth", async/);
+
+  assert.throws(
+    () => mod.upsertGeneratedSmokeRegion('/* pipelane:smoke:start auth */\nbody\n', 'auth', 'next'),
+    /malformed markers/,
+  );
+});
+
+test('smoke failure AI fix prompt redacts credential material', async () => {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'smoke-hot-paths.ts'));
+  const prompt = mod.buildSmokeFailureFixPrompt({
+    scenario: 'auth flow',
+    command: 'OPENAI_API_KEY=sk-secret npm run smoke -- --password=hunter2',
+    baseUrl: 'https://example.test/app?token=abc123&ok=1',
+    logPath: '/tmp/smoke.log',
+    resultsPath: '/tmp/results.json',
+    checks: [{ tag: '@smoke-auth', status: 'failed' }],
+  });
+
+  assert.match(prompt, /AI fix prompt:/);
+  assert.doesNotMatch(prompt, /sk-secret/);
+  assert.doesNotMatch(prompt, /abc123/);
+  assert.doesNotMatch(prompt, /hunter2/);
+  assert.match(prompt, /OPENAI_API_KEY=\[REDACTED\]/);
+  assert.match(prompt, /--password=\[REDACTED\]/);
+  assert.match(prompt, /token=\[REDACTED\]/);
+});
+
 // ---------------------------------------------------------------------------
 // buildSmokeHandoffMessage — pure unit tests across all 3 stages × 3 states
 // ---------------------------------------------------------------------------

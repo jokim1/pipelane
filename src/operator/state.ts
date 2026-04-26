@@ -326,6 +326,15 @@ export interface DeployRecord {
 
 export type SmokeEnvironment = 'staging' | 'prod';
 export type SmokeRunStatus = 'passed' | 'failed' | 'passed_with_retries';
+export type SmokeScenarioLifecycle = 'suggested' | 'accepted' | 'generated' | 'verified' | 'blocking' | 'quarantined';
+export type SmokeSafetyFlag = 'readonly' | 'stagingOnly' | 'requiresSyntheticData' | 'externalDependency' | 'unsafeForAutomation';
+
+export interface SmokeScenarioProvenance {
+  source: 'discovered-tag' | 'internal-template' | 'user-feedback' | 'scenario-file';
+  confidence: 'high' | 'medium' | 'low';
+  evidence: string[];
+  updatedAt?: string;
+}
 
 export interface SmokeRegistryEntry {
   description?: string;
@@ -339,6 +348,17 @@ export interface SmokeRegistryEntry {
   sourceTests?: string[];
   reviewBy?: string;
   reason?: string;
+  lifecycle?: SmokeScenarioLifecycle;
+  safetyFlags?: SmokeSafetyFlag[];
+  requiredEnv?: string[];
+  provenance?: SmokeScenarioProvenance;
+  generated?: {
+    path?: string;
+    marker?: string;
+    adapter?: string;
+    status?: 'unverified' | 'passed' | 'failed' | 'passed_with_retries';
+    verifiedAt?: string;
+  };
 }
 
 export interface SmokeRegistryState {
@@ -497,6 +517,11 @@ export interface OperatorFlags {
   generatedSummaryPath: string;
   criticalPaths: string[];
   criticalPathCoverage: string;
+  refresh: boolean;
+  baseUrl: string;
+  smokeFeedback: string[];
+  scenarioFile: string;
+  makeBlocking: boolean;
 }
 
 export interface ParsedOperatorArgs {
@@ -1662,6 +1687,11 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     generatedSummaryPath: '',
     criticalPaths: [],
     criticalPathCoverage: '',
+    refresh: false,
+    baseUrl: '',
+    smokeFeedback: [],
+    scenarioFile: '',
+    makeBlocking: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -1903,6 +1933,29 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       flags.criticalPathCoverage = raw;
       continue;
     }
+    if (flagName === '--refresh') {
+      rejectInlineValue('--refresh');
+      flags.refresh = true;
+      continue;
+    }
+    if (flagName === '--base-url') {
+      flags.baseUrl = readFlagValue('--base-url').trim();
+      continue;
+    }
+    if (flagName === '--feedback') {
+      const value = readFlagValue('--feedback').trim();
+      if (value.length > 0) flags.smokeFeedback.push(value);
+      continue;
+    }
+    if (flagName === '--scenario-file') {
+      flags.scenarioFile = readFlagValue('--scenario-file').trim();
+      continue;
+    }
+    if (flagName === '--make-blocking') {
+      rejectInlineValue('--make-blocking');
+      flags.makeBlocking = true;
+      continue;
+    }
 
     if (token.startsWith('--')) {
       throw new Error(`Unknown flag "${flagName}" for pipelane run. Run "pipelane run --help" for supported commands and flags.`);
@@ -2015,6 +2068,10 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
           'generatedSummaryPath',
           'criticalPaths',
           'criticalPathCoverage',
+          'baseUrl',
+          'smokeFeedback',
+          'scenarioFile',
+          'makeBlocking',
         ]);
         // Script and full-command forms are mutually exclusive — passing
         // both leaves the operator's intent ambiguous. Reject with both
@@ -2025,15 +2082,26 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         if (parsed.flags.prodScript.trim() && parsed.flags.prodCommand.trim()) {
           throw new Error('smoke setup: --prod-script and --prod-command are mutually exclusive — pass one.');
         }
-        if (parsed.positional.length > 1) failUnexpected('pipelane run smoke setup [--staging-script <name> | --staging-command <cmd>] [--prod-script <name> | --prod-command <cmd>] [--require-staging-smoke <true|false>] [--generated-summary-path <path>] [--critical-path <path>]... [--critical-path-coverage <warn|block>]');
+        if (parsed.positional.length > 1) failUnexpected('pipelane run smoke setup [--staging-script <name> | --staging-command <cmd>] [--prod-script <name> | --prod-command <cmd>] [--require-staging-smoke <true|false>] [--generated-summary-path <path>] [--critical-path <path>]... [--critical-path-coverage <warn|block>] [--feedback <text>] [--scenario-file <path>] [--base-url <url>] [--make-blocking]');
+        return;
+      }
+      if (subcommand === 'plan') {
+        assertOnlyFlags(parsed, ['refresh', 'smokeFeedback', 'scenarioFile']);
+        if (parsed.flags.reason) {
+          throw new Error('smoke plan does not accept --reason.');
+        }
+        if (!parsed.flags.refresh && (parsed.flags.smokeFeedback.length > 0 || parsed.flags.scenarioFile.trim().length > 0)) {
+          throw new Error('smoke plan only accepts --feedback or --scenario-file together with --refresh.');
+        }
+        if (parsed.positional.length > 1) failUnexpected('pipelane run smoke plan [--refresh] [--feedback <text>] [--scenario-file <path>]');
         return;
       }
       assertOnlyFlags(parsed, ['reason']);
-      if (subcommand === 'plan' || subcommand === 'staging' || subcommand === 'prod') {
+      if (subcommand === 'staging' || subcommand === 'prod') {
         if (parsed.flags.reason) {
           throw new Error(`smoke ${subcommand} does not accept --reason.`);
         }
-        if (parsed.positional.length > 1) failUnexpected('pipelane run smoke <plan|staging|prod>');
+        if (parsed.positional.length > 1) failUnexpected('pipelane run smoke <staging|prod>');
         return;
       }
       if (subcommand === 'waiver') {
@@ -2183,6 +2251,11 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'generatedSummaryPath', label: '--generated-summary-path', active: (flags) => flags.generatedSummaryPath.trim().length > 0 },
   { key: 'criticalPaths', label: '--critical-path', active: (flags) => flags.criticalPaths.length > 0 },
   { key: 'criticalPathCoverage', label: '--critical-path-coverage', active: (flags) => flags.criticalPathCoverage.length > 0 },
+  { key: 'refresh', label: '--refresh', active: (flags) => flags.refresh },
+  { key: 'baseUrl', label: '--base-url', active: (flags) => flags.baseUrl.trim().length > 0 },
+  { key: 'smokeFeedback', label: '--feedback', active: (flags) => flags.smokeFeedback.length > 0 },
+  { key: 'scenarioFile', label: '--scenario-file', active: (flags) => flags.scenarioFile.trim().length > 0 },
+  { key: 'makeBlocking', label: '--make-blocking', active: (flags) => flags.makeBlocking },
 ];
 
 function assertOnlyFlags(parsed: ParsedOperatorArgs, allowed: OperatorFlagKey[]): void {

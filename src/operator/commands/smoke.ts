@@ -1,6 +1,16 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { loadDeployConfig } from '../release-gate.ts';
+import {
+  applySmokeHotPathScenarios,
+  generateSmokeHotPathTests,
+  planSmokeHotPaths,
+  summarizeHotPathPlan,
+  verifySmokeSetupCommand,
+  type PlannedSmokeScenario,
+  type SmokeSetupVerificationResult,
+} from '../smoke-hot-paths.ts';
 import {
   buildLegacySmokeCheckResults,
   buildSmokePlanReport,
@@ -144,6 +154,49 @@ function buildSmokePlanResult(context: ReturnType<typeof resolveWorkflowContext>
 
 async function handleSmokePlan(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const context = resolveWorkflowContext(cwd);
+  if (parsed.flags.refresh) {
+    const discoveredTags = discoverSmokeTags(context.repoRoot);
+    const candidateTests = discoverCandidateSmokeTests(context.repoRoot);
+    const registry = loadSmokeRegistry(context.repoRoot, context.config);
+    const hotPathPlan = planSmokeHotPaths({
+      repoRoot: context.repoRoot,
+      discoveredTags,
+      candidateTests,
+      feedback: parsed.flags.smokeFeedback,
+      scenarioFile: parsed.flags.scenarioFile || undefined,
+    });
+    const proposedAdds = hotPathPlan.scenarios
+      .filter((scenario) => !registry.checks[scenario.id])
+      .map((scenario) => scenario.id);
+    const proposedMetadataUpdates = hotPathPlan.scenarios
+      .filter((scenario) => {
+        const entry = registry.checks[scenario.id];
+        return Boolean(entry) && (!entry!.lifecycle || !entry!.provenance || !entry!.safetyFlags);
+      })
+      .map((scenario) => scenario.id);
+    const lines = [
+      'Smoke refresh (report only):',
+      `- app type: ${hotPathPlan.analysis.appTypes.join(', ')}`,
+      `- scanned files: ${hotPathPlan.analysis.scan.scannedFiles}`,
+      `- supported runners: ${hotPathPlan.analysis.supportedRunners.join(', ') || 'none detected'}`,
+      `- proposed registry additions: ${proposedAdds.length}`,
+      `- proposed metadata updates: ${proposedMetadataUpdates.length}`,
+      '- files changed: 0',
+      ...summarizeHotPathPlan(hotPathPlan),
+    ];
+    printResult(parsed.flags, {
+      refresh: true,
+      createdRegistry: false,
+      changedFiles: 0,
+      proposedAdds,
+      proposedMetadataUpdates,
+      hotPathScenarios: hotPathPlan.scenarios,
+      analysis: hotPathPlan.analysis,
+      warnings: hotPathPlan.warnings,
+      message: lines.join('\n'),
+    });
+    return;
+  }
   const planResult = buildSmokePlanResult(context);
   printResult(parsed.flags, {
     createdRegistry: planResult.createdRegistry,
@@ -196,7 +249,11 @@ function handleSmokeList(cwd: string, parsed: ParsedOperatorArgs): void {
       const flags: string[] = [];
       if (entry.blocking === true) flags.push('blocking');
       if (entry.quarantine === true) flags.push('quarantined');
+      if (entry.lifecycle) flags.push(`lifecycle=${entry.lifecycle}`);
       if (flags.length > 0) lines.push(`     Flags: ${flags.join(', ')}`);
+      if (entry.requiredEnv && entry.requiredEnv.length > 0) {
+        lines.push(`     Required env: ${entry.requiredEnv.join(', ')}`);
+      }
     });
   }
 
@@ -238,6 +295,8 @@ function handleSmokeList(cwd: string, parsed: ParsedOperatorArgs): void {
       sourceTests: entry.sourceTests ?? [],
       blocking: entry.blocking === true,
       quarantine: entry.quarantine === true,
+      lifecycle: entry.lifecycle ?? null,
+      requiredEnv: entry.requiredEnv ?? [],
     })),
     unregisteredTags: unregisteredTags.map((entry) => ({ tag: entry.tag, files: entry.files })),
     orphanCandidates,
@@ -371,6 +430,26 @@ function detectSmokeCandidates(repoRoot: string): ScoredCandidates {
   return result;
 }
 
+function skippedSetupVerification(status: SmokeSetupVerificationResult['status'], message: string): SmokeSetupVerificationResult {
+  return {
+    status,
+    checks: [],
+    verifiedTags: [],
+    blockingTags: [],
+    message,
+  };
+}
+
+function resolveSetupBaseUrl(repoRoot: string, parsed: ParsedOperatorArgs): string {
+  if (parsed.flags.baseUrl.trim()) {
+    return parsed.flags.baseUrl.trim();
+  }
+  const deployConfig = loadDeployConfig(repoRoot);
+  return deployConfig?.frontend.staging.url?.trim()
+    || deployConfig?.frontend.staging.healthcheckUrl?.trim()
+    || '';
+}
+
 type SmokeSetupMode = 'configured' | 'already configured' | 'needs input';
 
 interface SmokeSetupOutcome {
@@ -383,6 +462,8 @@ interface SmokeSetupOutcome {
   nextAction: string;
   warnings: string[];
   candidates: ScoredCandidates;
+  hotPathScenarios: PlannedSmokeScenario[];
+  setupVerification: SmokeSetupVerificationResult;
   configPath: string;
   configPathIsLegacy: boolean;
   planMessage: string;
@@ -413,6 +494,16 @@ async function handleSmokeSetup(cwd: string, parsed: ParsedOperatorArgs): Promis
 
   const candidates = detectSmokeCandidates(context.repoRoot);
   const warnings: string[] = [];
+  const discoveredTags = discoverSmokeTags(context.repoRoot);
+  const candidateTests = discoverCandidateSmokeTests(context.repoRoot);
+  const hotPathPlan = planSmokeHotPaths({
+    repoRoot: context.repoRoot,
+    discoveredTags,
+    candidateTests,
+    feedback: parsed.flags.smokeFeedback,
+    scenarioFile: parsed.flags.scenarioFile || undefined,
+  });
+  warnings.push(...hotPathPlan.warnings);
 
   // Decide the staging command. Explicit flag wins. Otherwise auto-wire when
   // there is exactly one non-weak candidate (strong or medium). Weak-only is
@@ -463,6 +554,11 @@ async function handleSmokeSetup(cwd: string, parsed: ParsedOperatorArgs): Promis
       nextAction,
       warnings,
       candidates,
+      hotPathScenarios: hotPathPlan.scenarios,
+      setupVerification: skippedSetupVerification(
+        'skipped_no_command',
+        'Verification skipped: choose a staging smoke command before making hot paths blocking.',
+      ),
       configPath: '',
       configPathIsLegacy: false,
       planMessage: '',
@@ -537,6 +633,33 @@ async function handleSmokeSetup(cwd: string, parsed: ParsedOperatorArgs): Promis
   // Reload context so buildSmokePlanResult sees the newly-written config.
   const refreshedContext = resolveWorkflowContext(cwd);
   const planResult = buildSmokePlanResult(refreshedContext);
+  const registry = loadSmokeRegistry(refreshedContext.repoRoot, refreshedContext.config);
+  const hotPathApply = applySmokeHotPathScenarios(registry, hotPathPlan.scenarios);
+  const hotPathGeneration = generateSmokeHotPathTests({
+    repoRoot: refreshedContext.repoRoot,
+    analysis: hotPathPlan.analysis,
+    scenarios: hotPathPlan.scenarios,
+    registry,
+  });
+  warnings.push(...hotPathGeneration.warnings);
+  const setupBaseUrl = resolveSetupBaseUrl(refreshedContext.repoRoot, parsed);
+  const setupVerification = setupBaseUrl
+    ? verifySmokeSetupCommand({
+        repoRoot: refreshedContext.repoRoot,
+        logsDir: resolveSmokeLogsDir(refreshedContext.commonDir),
+        command: resolvedStagingCommand,
+        baseUrl: setupBaseUrl,
+        makeBlocking: parsed.flags.makeBlocking,
+        registry,
+      })
+    : skippedSetupVerification(
+        'skipped_missing_base_url',
+        'Verification skipped: pass --base-url or configure a staging URL before making hot paths blocking.',
+      );
+  if (hotPathApply.changed || hotPathGeneration.changed || setupVerification.verifiedTags.length > 0) {
+    saveSmokeRegistry(refreshedContext.repoRoot, refreshedContext.config, registry);
+    writeGeneratedSmokeSummary(refreshedContext.repoRoot, refreshedContext.config, registry);
+  }
 
   const sameAsBefore =
     stagingConfiguredBefore
@@ -561,7 +684,7 @@ async function handleSmokeSetup(cwd: string, parsed: ParsedOperatorArgs): Promis
 
   const coverageRegistry: SmokeSetupOutcome['coverageRegistry'] = planResult.createdRegistry
     ? 'created'
-    : (sameAsBefore ? 'unchanged' : 'updated');
+    : (hotPathApply.changed || hotPathGeneration.changed || !sameAsBefore ? 'updated' : 'unchanged');
 
   const releaseGate: SmokeSetupOutcome['releaseGate'] = resolvedRequireStaging
     ? (resolvedStagingCommand ? 'required' : 'misconfigured')
@@ -583,6 +706,8 @@ async function handleSmokeSetup(cwd: string, parsed: ParsedOperatorArgs): Promis
     nextAction,
     warnings,
     candidates,
+    hotPathScenarios: hotPathPlan.scenarios,
+    setupVerification,
     configPath,
     configPathIsLegacy: isLegacy,
     planMessage: planResult.message,
@@ -665,6 +790,26 @@ function emitSetupOutcome(parsed: ParsedOperatorArgs, outcome: SmokeSetupOutcome
     }
   }
   lines.push(`Next: ${outcome.nextAction}`);
+  lines.push(...summarizeHotPathPlan({
+    analysis: {
+      appTypes: [],
+      scripts: [],
+      dependencies: [],
+      devDependencies: [],
+      envNames: [],
+      routes: [],
+      featureSignals: [],
+      testFiles: [],
+      supportedRunners: [],
+      scan: { scannedFiles: 0, skippedLargeFiles: [], skippedDirs: [], maxFileBytes: 0 },
+    },
+    scenarios: outcome.hotPathScenarios,
+    warnings: [],
+  }));
+  lines.push(`Verification: ${outcome.setupVerification.message}`);
+  if (outcome.setupVerification.aiFixPrompt) {
+    lines.push('', outcome.setupVerification.aiFixPrompt);
+  }
   if (outcome.configPathIsLegacy) {
     lines.push(`Note: wrote updates to legacy .project-workflow.json — consider migrating to .pipelane.json.`);
   }
@@ -686,6 +831,8 @@ function emitSetupOutcome(parsed: ParsedOperatorArgs, outcome: SmokeSetupOutcome
       weak: outcome.candidates.weak.map((c) => ({ name: c.name, command: c.command, reason: c.reason })),
     },
     warnings: outcome.warnings,
+    hotPathScenarios: outcome.hotPathScenarios,
+    setupVerification: outcome.setupVerification,
     suggestedNextAction: outcome.nextAction,
     configPath: outcome.configPath || null,
     configPathIsLegacy: outcome.configPathIsLegacy,
@@ -765,6 +912,10 @@ async function handleSmokeRun(
       PIPELANE_SMOKE_BASE_URL: target.baseUrl,
       PIPELANE_SMOKE_SHA: target.sha,
       PIPELANE_SMOKE_RUN_ID: runId,
+      CYPRESS_PIPELANE_SMOKE_ENV: environment,
+      CYPRESS_PIPELANE_SMOKE_BASE_URL: target.baseUrl,
+      CYPRESS_PIPELANE_SMOKE_SHA: target.sha,
+      CYPRESS_PIPELANE_SMOKE_RUN_ID: runId,
     };
 
     const preflight = runPreflightSteps({
@@ -787,6 +938,7 @@ async function handleSmokeRun(
           env: {
             ...baseEnv,
             PIPELANE_COHORT: cohort.name,
+            CYPRESS_PIPELANE_COHORT: cohort.name,
           },
           requireCheckResults,
         }));
@@ -938,6 +1090,7 @@ function runSmokeCohort(options: {
     env: {
       ...options.env,
       PIPELANE_SMOKE_RESULTS_PATH: resultsPath,
+      CYPRESS_PIPELANE_SMOKE_RESULTS_PATH: resultsPath,
     },
   });
   writeFileSync(logPath, `${result.stdout}\n${result.stderr}`.trim() + '\n', 'utf8');
@@ -1207,6 +1360,7 @@ function handleSmokeQuarantine(cwd: string, parsed: ParsedOperatorArgs, quaranti
   registry.checks[tag] = {
     ...entry,
     quarantine,
+    lifecycle: quarantine ? 'quarantined' : (entry.blocking === true ? 'blocking' : entry.lifecycle === 'quarantined' ? 'accepted' : entry.lifecycle),
     reason: quarantine ? parsed.flags.reason.trim() : '',
   };
   saveSmokeRegistry(context.repoRoot, context.config, registry);
