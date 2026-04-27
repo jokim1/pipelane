@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
+import { createConnection } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -112,6 +113,41 @@ async function waitForHealthy(host: string, port: number, maxMs: number): Promis
   return false;
 }
 
+function connectionProbeHost(host: string): string {
+  return host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
+}
+
+function portIsOccupied(host: string, port: number, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const socket = createConnection({ host: connectionProbeHost(host), port });
+    const finish = (occupied: boolean): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.destroy();
+      resolve(occupied);
+    };
+
+    socket.setTimeout(timeoutMs, () => finish(true));
+    socket.on('connect', () => finish(true));
+    socket.on('error', (error: NodeJS.ErrnoException) => {
+      finish(error.code !== 'ECONNREFUSED' && error.code !== 'EHOSTUNREACH' && error.code !== 'ENETUNREACH');
+    });
+  });
+}
+
+async function findNextOpenPort(host: string, port: number): Promise<number> {
+  const lastCandidate = Math.min(65535, port + 100);
+  for (let candidate = port + 1; candidate <= lastCandidate; candidate += 1) {
+    if (!(await portIsOccupied(host, candidate, 250))) {
+      return candidate;
+    }
+  }
+  throw new Error(`Could not find an available dashboard port after ${port}. Try --port <n>.`);
+}
+
 function openBrowser(url: string): void {
   const override = process.env.PIPELANE_OPEN_COMMAND;
   if (override === 'skip') {
@@ -205,6 +241,18 @@ function runtimeMatches(health: HealthResult): boolean {
     && actual.assetVersion === expected.assetVersion;
 }
 
+function hasDashboardRuntimeMetadata(health: HealthResult): boolean {
+  const runtime = health.payload?.runtime;
+  if (!runtime || typeof runtime !== 'object') {
+    return false;
+  }
+  const actual = runtime as Record<string, unknown>;
+  return typeof actual.entrypoint === 'string'
+    && typeof actual.uiFilePath === 'string'
+    && typeof actual.sourceRoot === 'string'
+    && typeof actual.assetVersion === 'string';
+}
+
 function healthRepoRoot(health: HealthResult): string {
   const raw = health.payload?.repoRoot;
   return typeof raw === 'string' ? path.resolve(raw) : '';
@@ -266,48 +314,56 @@ export async function stopDashboardForRepo(repoRoot: string): Promise<DashboardS
 
 async function runStart(argv: string[], cwd: string): Promise<void> {
   const options = getDashboardOptions(argv, cwd, { allowNoOpen: true });
-  const url = `http://${options.host}:${options.port}`;
+  let port = options.port;
+  let url = `http://${options.host}:${port}`;
   const noOpen = hasFlag(argv, '--no-open');
+  const useNextOpenPort = async (): Promise<void> => {
+    port = await findNextOpenPort(options.host, port);
+    url = `http://${options.host}:${port}`;
+  };
 
-  const existingHealth = await probeHealth(options.host, options.port, 500);
+  const existingHealth = await probeHealth(options.host, port, 500);
   if (existingHealth.ok) {
     const runningRepoRoot = healthRepoRoot(existingHealth);
     if (runningRepoRoot && runningRepoRoot !== path.resolve(options.repoRoot)) {
-      process.stdout.write(
-        `Port ${options.port} is already serving a Pipelane Board for ${runningRepoRoot}.\n`
-          + `Requested repo: ${path.resolve(options.repoRoot)}\n`
-          + 'Use --port <n> or stop the other board first.\n',
-      );
-      process.exitCode = 1;
-      return;
-    }
-
-    if (runtimeMatches(existingHealth)) {
+      const reportedPid = healthPid(existingHealth);
+      const storedPid = readPidFile(runningRepoRoot);
+      const runningPid = reportedPid ?? storedPid;
+      const ownedByPipelane = hasDashboardRuntimeMetadata(existingHealth) || (Boolean(storedPid) && storedPid === runningPid);
+      const stopped = ownedByPipelane ? stopExistingDashboard(runningPid, runningRepoRoot) : false;
+      if (stopped) {
+        process.stdout.write(`Stopped existing Pipelane Board for ${runningRepoRoot} so ${path.resolve(options.repoRoot)} can use ${url}.\n`);
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      } else {
+        await useNextOpenPort();
+      }
+    } else if (runtimeMatches(existingHealth)) {
       process.stdout.write(`Pipelane Board already running at ${url}\n`);
       if (!noOpen) {
         openBrowser(url);
         process.stdout.write(`Opened ${url} in browser.\n`);
       }
       return;
-    }
-
-    const stopped = stopExistingDashboard(healthPid(existingHealth) ?? readPidFile(options.repoRoot), options.repoRoot);
-    if (stopped) {
-      process.stdout.write(`Restarting stale Pipelane Board at ${url}; launcher/runtime changed.\n`);
-      await new Promise((resolve) => setTimeout(resolve, 250));
     } else {
-      process.stdout.write(
-        `Pipelane Board at ${url} is running with a different runtime and could not be stopped automatically.\n`
-          + 'Stop it manually or choose another --port.\n',
-      );
-      process.exitCode = 1;
-      return;
+      const reportedPid = healthPid(existingHealth);
+      const storedPid = readPidFile(options.repoRoot);
+      const runningPid = reportedPid ?? storedPid;
+      const ownedByPipelane = hasDashboardRuntimeMetadata(existingHealth) || (Boolean(storedPid) && storedPid === runningPid);
+      const stopped = ownedByPipelane ? stopExistingDashboard(runningPid, options.repoRoot) : false;
+      if (stopped) {
+        process.stdout.write(`Restarting stale Pipelane Board at ${url}; launcher/runtime changed.\n`);
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      } else {
+        await useNextOpenPort();
+      }
     }
+  } else if (await portIsOccupied(options.host, port, 500)) {
+    await useNextOpenPort();
   }
 
   const storedPid = readPidFile(options.repoRoot);
   if (storedPid && isProcessAlive(storedPid)) {
-    process.stdout.write(`PID ${storedPid} is alive but port ${options.port} is not responding; starting a fresh server.\n`);
+    process.stdout.write(`PID ${storedPid} is alive but port ${port} is not responding; starting a fresh server.\n`);
     try {
       process.kill(storedPid);
     } catch {
@@ -333,7 +389,7 @@ async function runStart(argv: string[], cwd: string): Promise<void> {
     '--host',
     options.host,
     '--port',
-    String(options.port),
+    String(port),
   ];
 
   const child = spawn(process.execPath, spawnArgs, {
@@ -348,7 +404,7 @@ async function runStart(argv: string[], cwd: string): Promise<void> {
     writePidFile(options.repoRoot, child.pid);
   }
 
-  const healthy = await waitForHealthy(options.host, options.port, 8000);
+  const healthy = await waitForHealthy(options.host, port, 8000);
   if (!healthy) {
     process.stdout.write(
       `Dashboard did not become healthy within 8s. See logs: ${logPath}\n`
