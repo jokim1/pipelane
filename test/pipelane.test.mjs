@@ -8262,9 +8262,155 @@ test('board detects a running dashboard and skips spawning a second one', async 
   }
 });
 
-test('board refuses to reuse a stale dashboard runtime without a stoppable pid', async () => {
+test('board replaces another running Pipelane Board on the requested port', async () => {
+  const existingRepoRoot = createRepo();
+  const requestedRepoRoot = createRepo();
+  const port = await getFreePort();
+  const homeDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-board-home-'));
+  const dashboardMod = await import(path.join(KIT_ROOT, 'src', 'dashboard', 'server.ts'));
+  const runtime = dashboardMod.buildDashboardRuntimeMetadata();
+  const fakeBoardScript = `
+const { createServer } = require('node:http');
+const repoRoot = process.env.FAKE_REPO_ROOT;
+const port = Number(process.env.FAKE_PORT);
+const runtime = JSON.parse(process.env.FAKE_RUNTIME || '{}');
+const server = createServer((req, res) => {
+  if (req.url === '/api/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, repoRoot, pid: process.pid, runtime }));
+    return;
+  }
+  res.writeHead(404);
+  res.end();
+});
+server.listen(port, '127.0.0.1', () => process.stdout.write('ready\\n'));
+process.on('SIGTERM', () => {
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 500).unref();
+});
+`;
+  const existingBoard = spawn(process.execPath, ['-e', fakeBoardScript], {
+    env: {
+      ...process.env,
+      FAKE_REPO_ROOT: existingRepoRoot,
+      FAKE_PORT: String(port),
+      FAKE_RUNTIME: JSON.stringify(runtime),
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let fakeStdout = '';
+  let fakeStderr = '';
+  existingBoard.stdout.on('data', (chunk) => {
+    fakeStdout += chunk.toString('utf8');
+  });
+  existingBoard.stderr.on('data', (chunk) => {
+    fakeStderr += chunk.toString('utf8');
+  });
+
+  try {
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error(`Fake board did not start.\nstdout:\n${fakeStdout}\nstderr:\n${fakeStderr}`));
+      }, 4000);
+      const handleExit = (code) => {
+        clearTimeout(timeout);
+        reject(new Error(`Fake board exited early with ${code}.\nstdout:\n${fakeStdout}\nstderr:\n${fakeStderr}`));
+      };
+      const handleStdout = () => {
+        if (!fakeStdout.includes('ready')) {
+          return;
+        }
+        clearTimeout(timeout);
+        existingBoard.stdout.off('data', handleStdout);
+        existingBoard.off('exit', handleExit);
+        resolve();
+      };
+      existingBoard.stdout.on('data', handleStdout);
+      existingBoard.once('exit', handleExit);
+      handleStdout();
+    });
+
+    const result = await runCliAsync(
+      ['board', '--repo', requestedRepoRoot, '--port', String(port), '--no-open'],
+      requestedRepoRoot,
+      { PIPELANE_DASHBOARD_HOME: homeDir, PIPELANE_OPEN_COMMAND: 'skip' },
+    );
+
+    assert.equal(result.status, 0, `unexpected exit.\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+    assert.ok(result.stdout.includes(`Stopped existing Pipelane Board for ${existingRepoRoot}`));
+    assert.match(result.stdout, new RegExp(`Pipelane Board ready at http://127\\.0\\.0\\.1:${port}`));
+    await waitForChildExit(existingBoard);
+    assert.equal(isPidAlive(existingBoard.pid), false, 'expected the existing board process to be stopped');
+
+    const health = await fetch(`http://127.0.0.1:${port}/api/health`).then((response) => response.json());
+    assert.equal(path.resolve(health.repoRoot), path.resolve(requestedRepoRoot));
+  } finally {
+    await runCliAsync(
+      ['board', 'stop', '--repo', requestedRepoRoot, '--port', String(port)],
+      requestedRepoRoot,
+      { PIPELANE_DASHBOARD_HOME: homeDir },
+    ).catch(() => undefined);
+    if (isPidAlive(existingBoard.pid)) {
+      existingBoard.kill();
+      await waitForChildExit(existingBoard);
+    }
+    rmSync(existingRepoRoot, { recursive: true, force: true });
+    rmSync(requestedRepoRoot, { recursive: true, force: true });
+    rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('board starts on the next open port when another site owns the requested port', async () => {
   const repoRoot = createRepo();
   const port = await getFreePort();
+  const homeDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-board-home-'));
+  let boardPort = 0;
+
+  const fakeSite = createHttpServer((_req, res) => {
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('not a pipelane board');
+  });
+  fakeSite.listen(port, '127.0.0.1');
+  await once(fakeSite, 'listening');
+
+  try {
+    const result = await runCliAsync(
+      ['board', '--repo', repoRoot, '--port', String(port), '--no-open'],
+      repoRoot,
+      { PIPELANE_DASHBOARD_HOME: homeDir, PIPELANE_OPEN_COMMAND: 'skip' },
+    );
+
+    assert.equal(result.status, 0, `unexpected exit.\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+    assert.doesNotMatch(result.stdout, /Use --port|different runtime|could not be stopped automatically/);
+    const match = result.stdout.match(/Pipelane Board ready at http:\/\/127\.0\.0\.1:(\d+)/);
+    assert.ok(match, `missing ready URL in stdout:\n${result.stdout}`);
+    boardPort = Number(match[1]);
+    assert.notEqual(boardPort, port);
+
+    const health = await fetch(`http://127.0.0.1:${boardPort}/api/health`).then((response) => response.json());
+    assert.equal(path.resolve(health.repoRoot), path.resolve(repoRoot));
+    const fakeSiteResponse = await fetch(`http://127.0.0.1:${port}/`).then((response) => response.text());
+    assert.equal(fakeSiteResponse, 'not a pipelane board');
+  } finally {
+    if (boardPort) {
+      await runCliAsync(
+        ['board', 'stop', '--repo', repoRoot, '--port', String(boardPort)],
+        repoRoot,
+        { PIPELANE_DASHBOARD_HOME: homeDir },
+      ).catch(() => undefined);
+    }
+    fakeSite.close();
+    await once(fakeSite, 'close').catch(() => undefined);
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('board starts on the next open port when a health endpoint is not Pipelane-owned', async () => {
+  const repoRoot = createRepo();
+  const port = await getFreePort();
+  const homeDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-board-home-'));
+  let boardPort = 0;
 
   const fakeServer = createHttpServer((req, res) => {
     if (req.url === '/api/health') {
@@ -8280,18 +8426,32 @@ test('board refuses to reuse a stale dashboard runtime without a stoppable pid',
 
   try {
     const result = await runCliAsync(
-      ['board', '--repo', repoRoot, '--port', String(port)],
+      ['board', '--repo', repoRoot, '--port', String(port), '--no-open'],
       repoRoot,
-      { PIPELANE_OPEN_COMMAND: 'skip' },
+      { PIPELANE_DASHBOARD_HOME: homeDir, PIPELANE_OPEN_COMMAND: 'skip' },
     );
 
-    assert.equal(result.status, 1);
-    assert.match(result.stdout, /different runtime/);
-    assert.match(result.stdout, /could not be stopped automatically/);
+    assert.equal(result.status, 0, `unexpected exit.\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+    assert.doesNotMatch(result.stdout, /Use --port|different runtime|could not be stopped automatically/);
+    const match = result.stdout.match(/Pipelane Board ready at http:\/\/127\.0\.0\.1:(\d+)/);
+    assert.ok(match, `missing ready URL in stdout:\n${result.stdout}`);
+    boardPort = Number(match[1]);
+    assert.notEqual(boardPort, port);
+
+    const health = await fetch(`http://127.0.0.1:${boardPort}/api/health`).then((response) => response.json());
+    assert.equal(path.resolve(health.repoRoot), path.resolve(repoRoot));
   } finally {
+    if (boardPort) {
+      await runCliAsync(
+        ['board', 'stop', '--repo', repoRoot, '--port', String(boardPort)],
+        repoRoot,
+        { PIPELANE_DASHBOARD_HOME: homeDir },
+      ).catch(() => undefined);
+    }
     fakeServer.close();
     await once(fakeServer, 'close').catch(() => undefined);
     rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(homeDir, { recursive: true, force: true });
   }
 });
 
