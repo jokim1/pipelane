@@ -10,7 +10,14 @@ import { collectBootstrapWarnings, parseBootstrapArgs, runBootstrap } from './op
 import { installClaudeBootstrapSkill } from './operator/claude-install.ts';
 import { installCodexBootstrapSkill } from './operator/codex-install.ts';
 import { handleConfigure } from './operator/commands/configure.ts';
-import { formatSetupResult, initConsumerRepo, setupConsumerRepo, syncDocsOnly } from './operator/docs.ts';
+import {
+  applyAgentsGuidanceMigrationsWithApproval,
+  formatSetupResult,
+  initConsumerRepo,
+  setupConsumerRepo,
+  syncDocsOnly,
+  type SetupConsumerRepoResult,
+} from './operator/docs.ts';
 import { runOperator } from './operator/index.ts';
 import { installNpmGuard } from './operator/npm-guard-install.ts';
 import { resolveRepoRoot } from './operator/state.ts';
@@ -24,7 +31,7 @@ function printTopLevelHelp(): void {
 Commands:
   bootstrap [--yes] [--project "Project Name"]
   init --project "Project Name"
-  setup
+  setup [--yes]
   sync-docs
   configure [--json] [surface flags...]
   install-claude [--verbose]
@@ -74,6 +81,22 @@ function assertNoArgs(args: string[], command: string): void {
   if (args.length > 0) {
     throw new Error(`pipelane ${command} does not accept arguments: ${args.join(' ')}`);
   }
+}
+
+function parseSetupArgs(args: string[]): { yes: boolean } {
+  let yes = false;
+  for (const token of args) {
+    if (token === '--yes' || token === '-y') {
+      yes = true;
+      continue;
+    }
+    if (token === '--help' || token === '-h') {
+      process.stdout.write('pipelane setup [--yes]\n');
+      process.exit(0);
+    }
+    throw new Error(`Unknown flag for pipelane setup: ${token}`);
+  }
+  return { yes };
 }
 
 function parseVerboseArg(args: string[], command: string): boolean {
@@ -161,6 +184,24 @@ async function confirmBootstrapWrites(yes: boolean | undefined): Promise<void> {
   }
 }
 
+async function maybeApplyAgentsGuidanceMigrationsAfterPrompt(
+  result: SetupConsumerRepoResult,
+  yes: boolean,
+): Promise<SetupConsumerRepoResult> {
+  const applied = await applyAgentsGuidanceMigrationsWithApproval(result.agentsGuidanceMigrations, { yes });
+  if (applied.length === 0) {
+    return result;
+  }
+  return {
+    ...result,
+    agentsGuidanceMigrations: [],
+    appliedAgentsGuidanceMigrations: [
+      ...result.appliedAgentsGuidanceMigrations,
+      ...applied,
+    ],
+  };
+}
+
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
 
@@ -238,8 +279,9 @@ async function main(): Promise<void> {
   }
 
   if (command === 'setup') {
-    assertNoArgs(rest, 'setup');
-    const result = setupConsumerRepo(process.cwd());
+    const options = parseSetupArgs(rest);
+    let result = setupConsumerRepo(process.cwd());
+    result = await maybeApplyAgentsGuidanceMigrationsAfterPrompt(result, options.yes);
     process.stdout.write(formatSetupResult(result).join('\n') + '\n');
     return;
   }

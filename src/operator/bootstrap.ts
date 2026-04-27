@@ -189,7 +189,7 @@ export function runBootstrap(cwd: string, options: BootstrapOptions): BootstrapR
     runLocalPipelane(repoRoot, ['init', '--project', projectName]);
   }
 
-  const setupOutput = runLocalPipelane(repoRoot, ['setup']);
+  const setupOutput = runLocalPipelane(repoRoot, ['setup', ...(options.yes ? ['--yes'] : [])]);
   const parsedSetup = parseSetupOutput(setupOutput);
 
   return {

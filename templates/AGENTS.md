@@ -5,6 +5,7 @@ This repo uses `pipelane` for task workspaces, PR prep, merge handoff, and deplo
 ### Command surface
 
 - Default slash aliases are `{{ALIAS_DEVMODE}}`, `{{ALIAS_NEW}}`, `{{ALIAS_RESUME}}`, `{{ALIAS_PR}}`, `{{ALIAS_MERGE}}`, `{{ALIAS_DEPLOY}}`, `{{ALIAS_SMOKE}}`, `{{ALIAS_CLEAN}}`, `{{ALIAS_STATUS}}`, `{{ALIAS_DOCTOR}}`, and `{{ALIAS_ROLLBACK}}`.
+- Prefer the slash aliases above. Repo-local `npm run pipelane:*` scripts are a fallback path and require `node_modules/.bin/pipelane` to exist.
 - Use `{{ALIAS_NEW}} --task "<task-name>"` to start new work.
 - Use `{{ALIAS_RESUME}} --task "<task-name>"` to return to an existing task workspace.
 - Use `{{ALIAS_DEVMODE}} status|build|release` to inspect or switch lanes.

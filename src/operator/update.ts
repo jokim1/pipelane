@@ -4,7 +4,15 @@ import path from 'node:path';
 import { stopDashboardForRepo } from '../dashboard/launcher.ts';
 import { installClaudeBootstrapSkill } from './claude-install.ts';
 import { installCodexBootstrapSkill } from './codex-install.ts';
-import { detectSetupDrift, formatSetupResult, type SetupDrift, setupConsumerRepo } from './docs.ts';
+import {
+  applyAgentsGuidanceMigrationsWithApproval,
+  detectSetupDrift,
+  formatAgentsGuidanceMigrations,
+  formatSetupResult,
+  type SetupConsumerRepoResult,
+  type SetupDrift,
+  setupConsumerRepo,
+} from './docs.ts';
 import { PIPELANE_GITHUB_URL, PIPELANE_REPO_SLUG, resolvePipelaneInstallSpec } from './install-source.ts';
 import { homeClaudeDir, homeCodexDir, resolveRepoRoot, runCommandCapture } from './state.ts';
 
@@ -76,7 +84,7 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
   // operator sees whether the consumer's working tree is in sync with the
   // currently-installed pipelane, even when no upstream update exists.
   if (options.check || status.upToDate) {
-    const driftResult = tryDetectDrift(repoRoot);
+    let driftResult = tryDetectDrift(repoRoot);
     const globalSurfaces = options.check
       ? skippedGlobalSurfaces('read-only --check')
       : refreshInstalledGlobalSurfaces(repoRoot);
@@ -100,6 +108,12 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
     }
     process.stdout.write(`${summary}\n`);
     emitGlobalSurfaceRefreshHint(globalSurfaces);
+    if (!options.check) {
+      const appliedAgentsMigration = await maybeApplyAgentsGuidanceMigrationsFromDrift(driftResult.drift, options.yes);
+      if (appliedAgentsMigration) {
+        driftResult = tryDetectDrift(repoRoot);
+      }
+    }
     emitDriftHint(driftResult);
     return {
       status,
@@ -127,7 +141,7 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
     : `Installed pipelane; now at ${after.installedShaShort} (remote main: ${after.latestShaShort}).`;
   const message = `Upgrade complete.\n${tail}`;
 
-  const driftResult = tryDetectDrift(repoRoot);
+  let driftResult = tryDetectDrift(repoRoot);
   const globalSurfaces = refreshInstalledGlobalSurfaces(repoRoot);
 
   if (options.json) {
@@ -148,12 +162,21 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
     process.stdout.write(`Stopped existing Pipelane Board (PID ${boardStop.pid}) so the next board start uses the updated package.\n`);
   }
   emitGlobalSurfaceRefreshHint(globalSurfaces);
+  if (!driftResult.drift?.needsSetup) {
+    const appliedAgentsMigration = await maybeApplyAgentsGuidanceMigrationsFromDrift(driftResult.drift, options.yes);
+    if (appliedAgentsMigration) {
+      driftResult = tryDetectDrift(repoRoot);
+    }
+  }
   emitDriftHint(driftResult);
 
   let ranSetup = false;
   const drift = driftResult.drift;
   if (drift?.needsSetup && drift.claude.collisions.length === 0) {
-    const setupResult = setupConsumerRepo(repoRoot);
+    const setupResult = await maybeApplyAgentsGuidanceMigrationsFromSetupResult(
+      setupConsumerRepo(repoRoot),
+      options.yes,
+    );
     process.stdout.write('\n' + formatSetupResult(setupResult).join('\n') + '\n');
     emitReopenHints(drift);
     ranSetup = true;
@@ -183,6 +206,33 @@ function tryDetectDrift(repoRoot: string): DriftResult {
   } catch (error) {
     return { drift: null, error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+async function maybeApplyAgentsGuidanceMigrationsFromDrift(
+  drift: SetupDrift | null,
+  yes: boolean,
+): Promise<boolean> {
+  const migrations = drift?.agentsGuidanceMigrations ?? [];
+  const applied = await applyAgentsGuidanceMigrationsWithApproval(migrations, { yes });
+  return applied.length > 0;
+}
+
+async function maybeApplyAgentsGuidanceMigrationsFromSetupResult(
+  result: SetupConsumerRepoResult,
+  yes: boolean,
+): Promise<SetupConsumerRepoResult> {
+  const applied = await applyAgentsGuidanceMigrationsWithApproval(result.agentsGuidanceMigrations, { yes });
+  if (applied.length === 0) {
+    return result;
+  }
+  return {
+    ...result,
+    agentsGuidanceMigrations: [],
+    appliedAgentsGuidanceMigrations: [
+      ...result.appliedAgentsGuidanceMigrations,
+      ...applied,
+    ],
+  };
 }
 
 function skippedGlobalSurfaces(reason: string): GlobalSurfaceRefresh {
@@ -333,7 +383,20 @@ function emitDriftHint(result: DriftResult): void {
   }
   const drift = result.drift;
   if (!drift) return;
+  const warnings = drift.warnings ?? [];
+  const agentsGuidanceMigrations = drift.agentsGuidanceMigrations ?? [];
   if (!drift.needsSetup) {
+    if (agentsGuidanceMigrations.length > 0) {
+      process.stdout.write('\nAGENTS.md guidance migration requires approval:\n');
+      process.stdout.write(formatAgentsGuidanceMigrations(agentsGuidanceMigrations).join('\n') + '\n');
+      process.stdout.write('Run `pipelane setup --yes` to apply these AGENTS.md changes non-interactively, or run `pipelane setup` in a TTY and approve the prompt.\n');
+      return;
+    }
+    if (warnings.length > 0) {
+      process.stdout.write('\nReadiness warnings:\n');
+      process.stdout.write(warnings.map((warning) => `- ${warning}`).join('\n') + '\n');
+      return;
+    }
     process.stdout.write('\nNo additional steps required — templates are in sync.\n');
     return;
   }
@@ -352,6 +415,8 @@ function emitReopenHints(drift: SetupDrift): void {
 export function formatFollowUpSummary(drift: SetupDrift): string {
   const lines: string[] = ['Follow-up needed:'];
   const changes: string[] = [];
+  const warnings = drift.warnings ?? [];
+  const agentsGuidanceMigrations = drift.agentsGuidanceMigrations ?? [];
   if (drift.claude.enabled) {
     const added = truncateList(drift.claude.addedCommands);
     const updated = truncateList(drift.claude.updatedCommands);
@@ -374,6 +439,13 @@ export function formatFollowUpSummary(drift: SetupDrift): string {
   }
   if (drift.otherSurfaces.length > 0) {
     changes.push(`Other surfaces to re-render: ${drift.otherSurfaces.join(', ')}`);
+  }
+  if (agentsGuidanceMigrations.length > 0) {
+    const count = agentsGuidanceMigrations.reduce((sum, migration) => sum + migration.replacements.length, 0);
+    changes.push(`AGENTS.md guidance migration requires approval (${count} line${count === 1 ? '' : 's'})`);
+  }
+  if (warnings.length > 0) {
+    changes.push(`Readiness warnings: ${warnings.join(' ')}`);
   }
   if (drift.claude.collisions.length > 0) {
     // Collisions block setup. Surface them prominently; no "run setup"
@@ -568,6 +640,6 @@ Usage:
   pipelane update           Check and install if behind; auto-run setup if needed
   pipelane update --check   Report status without mutating
   pipelane update --json    Emit JSON status/result; never auto-runs setup
-  pipelane update --yes     Backward-compat no-op (update no longer prompts)
+  pipelane update --yes     Apply setup guidance migrations without prompting
 `);
 }

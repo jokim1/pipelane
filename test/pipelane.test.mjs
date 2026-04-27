@@ -12861,6 +12861,102 @@ test('detectSetupDrift on a freshly-setup repo reports no drift', async () => {
     assert.equal(drift.codex.runnerDrift, false);
     assert.equal(drift.repoGuidance.willScaffold, false);
     assert.deepEqual(drift.otherSurfaces, []);
+    assert.deepEqual(drift.agentsGuidanceMigrations, []);
+    assert.deepEqual(drift.warnings, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('detectSetupDrift proposes an AGENTS.md migration when stale workflow guidance uses npm scripts', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const agentsPath = path.join(repoRoot, 'AGENTS.md');
+    const current = readFileSync(agentsPath, 'utf8');
+    writeFileSync(
+      agentsPath,
+      [
+        '# Demo App Repo Context',
+        '',
+        '- Before starting work, run `npm run workflow:new -- --task "task name"`.',
+        '',
+        current,
+      ].join('\n'),
+      'utf8',
+    );
+
+    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
+    const drift = docs.detectSetupDrift(repoRoot);
+    assert.equal(drift.needsSetup, false, 'AGENTS guidance migrations require approval, not automatic setup');
+    assert.deepEqual(drift.warnings, []);
+    assert.equal(drift.agentsGuidanceMigrations.length, 1);
+    assert.equal(drift.agentsGuidanceMigrations[0].file, 'AGENTS.md');
+    assert.deepEqual(drift.agentsGuidanceMigrations[0].replacements, [{
+      line: 3,
+      before: '- Before starting work, run `npm run workflow:new -- --task "task name"`.',
+      after: '- Before starting work, run `/new --task "task name"`.',
+    }]);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup without --yes prints the AGENTS.md migration proposal without rewriting consumer text in non-TTY mode', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const agentsPath = path.join(repoRoot, 'AGENTS.md');
+    const current = readFileSync(agentsPath, 'utf8');
+    writeFileSync(
+      agentsPath,
+      [
+        '# Demo App Repo Context',
+        '',
+        '- Agent default workflow: `npm run workflow:new -- --task "task name"`.',
+        '',
+        current,
+      ].join('\n'),
+      'utf8',
+    );
+
+    const result = runCli(['setup'], repoRoot);
+    assert.match(result.stdout, /AGENTS\.md guidance migration requires approval:/);
+    assert.match(result.stdout, /current: - Agent default workflow: `npm run workflow:new -- --task "task name"`\./);
+    assert.match(result.stdout, /proposed: - Agent default workflow: `\/new --task "task name"`\./);
+    assert.match(result.stdout, /AGENTS\.md:3/);
+    assert.match(result.stdout, /node_modules\/\.bin\/pipelane/);
+    assert.match(result.stdout, /pipelane setup --yes/);
+    assert.match(readFileSync(agentsPath, 'utf8'), /npm run workflow:new/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup --yes applies the AGENTS.md stale workflow guidance migration', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const agentsPath = path.join(repoRoot, 'AGENTS.md');
+    const current = readFileSync(agentsPath, 'utf8');
+    writeFileSync(
+      agentsPath,
+      [
+        '# Demo App Repo Context',
+        '',
+        '- Agent default workflow: `npm run workflow:new -- --task "task name"`.',
+        '',
+        current,
+      ].join('\n'),
+      'utf8',
+    );
+
+    const result = runCli(['setup', '--yes'], repoRoot);
+    const agents = readFileSync(agentsPath, 'utf8');
+    assert.match(result.stdout, /Updated AGENTS\.md stale workflow guidance \(1 line\)\./);
+    assert.match(agents, /\/new --task "task name"/);
+    assert.doesNotMatch(agents, /npm run workflow:new/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }

@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import readline from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 
 import type { SyncDocsConfig, WorkflowCommand, WorkflowConfig } from './state.ts';
@@ -643,9 +644,160 @@ export interface SetupConsumerRepoResult {
   codexSkillsDir: string;
   installedCodexSkills: string[];
   removedLegacyCodexSkills: string[];
+  agentsGuidanceMigrations: AgentsGuidanceMigration[];
+  appliedAgentsGuidanceMigrations: AgentsGuidanceMigration[];
+  warnings: string[];
 }
 
-export function setupConsumerRepo(cwd: string): SetupConsumerRepoResult {
+export interface SetupConsumerRepoOptions {
+  applyAgentsGuidanceMigrations?: boolean;
+}
+
+export interface AgentsGuidanceReplacement {
+  line: number;
+  before: string;
+  after: string;
+}
+
+export interface AgentsGuidanceMigration {
+  file: 'AGENTS.md';
+  path: string;
+  replacements: AgentsGuidanceReplacement[];
+}
+
+const AGENTS_GUIDANCE_EXTRA_COMMANDS: Record<string, string> = {
+  board: '/pipelane web',
+  update: '/pipelane update',
+};
+
+function replacementForAgentsWorkflowCommand(command: string, aliases: Record<WorkflowCommand, string>): string | null {
+  if ((WORKFLOW_COMMANDS as readonly string[]).includes(command)) {
+    return aliases[command as WorkflowCommand];
+  }
+  return AGENTS_GUIDANCE_EXTRA_COMMANDS[command] ?? null;
+}
+
+function migrateAgentsGuidanceLine(line: string, aliases: Record<WorkflowCommand, string>): string {
+  const staleScriptPattern = /\bnpm\s+run\s+(?:workflow|pipelane):([a-z0-9-]+)(?:\s+--(?=\s|$))?/gi;
+  return line.replace(staleScriptPattern, (match, rawCommand: string) => {
+    const replacement = replacementForAgentsWorkflowCommand(rawCommand.toLowerCase(), aliases);
+    return replacement ?? match;
+  });
+}
+
+function detectAgentsGuidanceMigrationsForConfig(repoRoot: string, config: WorkflowConfig): AgentsGuidanceMigration[] {
+  const agentsPath = path.join(repoRoot, 'AGENTS.md');
+  if (!existsSync(agentsPath)) {
+    return [];
+  }
+
+  const aliases = resolveWorkflowAliases(config.aliases);
+  const replacements: AgentsGuidanceReplacement[] = [];
+  let insideManagedSection = false;
+  const lines = readFileSync(agentsPath, 'utf8').split('\n');
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line.includes(AGENTS_MARKER_START)) {
+      insideManagedSection = true;
+      continue;
+    }
+    if (line.includes(AGENTS_MARKER_END)) {
+      insideManagedSection = false;
+      continue;
+    }
+    if (insideManagedSection) {
+      continue;
+    }
+
+    const migrated = migrateAgentsGuidanceLine(line, aliases);
+    if (migrated === line) {
+      continue;
+    }
+    replacements.push({
+      line: index + 1,
+      before: line,
+      after: migrated,
+    });
+  }
+
+  if (replacements.length === 0) {
+    return [];
+  }
+
+  return [{ file: 'AGENTS.md', path: agentsPath, replacements }];
+}
+
+export function detectAgentsGuidanceMigrations(cwd: string): AgentsGuidanceMigration[] {
+  const repoRoot = resolveRepoRoot(cwd, true);
+  const config = loadWorkflowConfig(repoRoot);
+  return detectAgentsGuidanceMigrationsForConfig(repoRoot, config);
+}
+
+export function applyAgentsGuidanceMigrations(migrations: AgentsGuidanceMigration[]): AgentsGuidanceMigration[] {
+  const applied: AgentsGuidanceMigration[] = [];
+  for (const migration of migrations) {
+    const content = readFileSync(migration.path, 'utf8');
+    const lines = content.split('\n');
+    for (const replacement of migration.replacements) {
+      const current = lines[replacement.line - 1];
+      if (current !== replacement.before) {
+        throw new Error(
+          `${migration.file}:${replacement.line} changed while preparing the AGENTS.md guidance migration. Re-run setup to recompute the proposed edits.`,
+        );
+      }
+      lines[replacement.line - 1] = replacement.after;
+    }
+    writeFileSync(migration.path, lines.join('\n'), 'utf8');
+    applied.push(migration);
+  }
+  return applied;
+}
+
+export async function applyAgentsGuidanceMigrationsWithApproval(
+  migrations: AgentsGuidanceMigration[],
+  options: { yes?: boolean } = {},
+): Promise<AgentsGuidanceMigration[]> {
+  if (migrations.length === 0) {
+    return [];
+  }
+  if (options.yes) {
+    return applyAgentsGuidanceMigrations(migrations);
+  }
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    return [];
+  }
+
+  process.stdout.write(`${formatAgentsGuidanceMigrations(migrations).join('\n')}\n`);
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (await rl.question('Apply these AGENTS.md changes? Enter Y to proceed. [Y/n] ')).trim().toLowerCase();
+    if (answer !== '' && answer !== 'y' && answer !== 'yes') {
+      return [];
+    }
+  } finally {
+    rl.close();
+  }
+  return applyAgentsGuidanceMigrations(migrations);
+}
+
+export function formatAgentsGuidanceMigrations(migrations: AgentsGuidanceMigration[]): string[] {
+  const lines: string[] = [];
+  for (const migration of migrations) {
+    lines.push(`${migration.file} contains stale Pipelane guidance that should be migrated:`);
+    for (const replacement of migration.replacements) {
+      lines.push(`- ${migration.file}:${replacement.line}`);
+      lines.push(`  current: ${replacement.before}`);
+      lines.push(`  proposed: ${replacement.after}`);
+    }
+  }
+  return [
+    ...lines,
+    'These npm script paths require repo-local node_modules/.bin/pipelane and can fail in fresh AI worktrees.',
+  ];
+}
+
+export function setupConsumerRepo(cwd: string, options: SetupConsumerRepoOptions = {}): SetupConsumerRepoResult {
   const repoRoot = resolveRepoRoot(cwd, true);
   const config = loadWorkflowConfig(repoRoot);
   const syncDocs = resolveSyncDocs(config.syncDocs);
@@ -671,6 +823,13 @@ export function setupConsumerRepo(cwd: string): SetupConsumerRepoResult {
   const removedLegacyCodexSkills = syncDocs.codexSkills
     ? pruneLegacyCodexWrapperSkills()
     : [];
+  let agentsGuidanceMigrations = detectAgentsGuidanceMigrationsForConfig(repoRoot, config);
+  const appliedAgentsGuidanceMigrations = options.applyAgentsGuidanceMigrations
+    ? applyAgentsGuidanceMigrations(agentsGuidanceMigrations)
+    : [];
+  if (appliedAgentsGuidanceMigrations.length > 0) {
+    agentsGuidanceMigrations = detectAgentsGuidanceMigrationsForConfig(repoRoot, config);
+  }
 
   return {
     repoRoot,
@@ -681,6 +840,9 @@ export function setupConsumerRepo(cwd: string): SetupConsumerRepoResult {
       ? WORKFLOW_COMMANDS.map((command) => config.aliases[command])
       : [],
     removedLegacyCodexSkills,
+    agentsGuidanceMigrations,
+    appliedAgentsGuidanceMigrations,
+    warnings: [],
   };
 }
 
@@ -710,6 +872,8 @@ export interface SetupDrift {
   // Names of other syncConsumerDocs surfaces setup would re-render. Values
   // come from the SyncDocsConfig keys enabled for this consumer.
   otherSurfaces: string[];
+  agentsGuidanceMigrations: AgentsGuidanceMigration[];
+  warnings: string[];
 }
 
 // Pure-detection mirror of syncConsumerDocs + setupConsumerRepo's file writes.
@@ -842,6 +1006,7 @@ export function detectSetupDrift(cwd: string): SetupDrift {
       otherSurfaces.push('packageScripts');
     }
   }
+  const agentsGuidanceMigrations = detectAgentsGuidanceMigrationsForConfig(repoRoot, config);
 
   const claudeDirty =
     claude.addedCommands.length > 0 ||
@@ -874,6 +1039,8 @@ export function detectSetupDrift(cwd: string): SetupDrift {
     codex,
     repoGuidance,
     otherSurfaces,
+    agentsGuidanceMigrations,
+    warnings: [],
   };
 }
 
@@ -925,6 +1092,20 @@ export function formatSetupResult(result: SetupConsumerRepoResult): string[] {
   }
   if (result.removedLegacyCodexSkills.length > 0) {
     lines.push(`Removed legacy machine-local wrapper skills: ${result.removedLegacyCodexSkills.join(', ')}`);
+  }
+  if (result.appliedAgentsGuidanceMigrations.length > 0) {
+    const count = result.appliedAgentsGuidanceMigrations
+      .reduce((sum, migration) => sum + migration.replacements.length, 0);
+    lines.push(`Updated AGENTS.md stale workflow guidance (${count} line${count === 1 ? '' : 's'}).`);
+  }
+  if (result.agentsGuidanceMigrations.length > 0) {
+    lines.push('AGENTS.md guidance migration requires approval:');
+    lines.push(...formatAgentsGuidanceMigrations(result.agentsGuidanceMigrations));
+    lines.push('Run `pipelane setup --yes` to apply these AGENTS.md changes non-interactively, or run `pipelane setup` in a TTY and approve the prompt.');
+  }
+  if (result.warnings.length > 0) {
+    lines.push('Readiness warnings:');
+    lines.push(...result.warnings.map((warning) => `- ${warning}`));
   }
   lines.push('If Claude or Codex was already open, reopen the repo or restart the client to refresh commands and skills.');
   return lines;

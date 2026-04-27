@@ -129,7 +129,7 @@ Common forms:
 npm run pipelane:update              # check, install if behind, auto-run setup
 npm run pipelane:update -- --check   # report upstream + local drift; no mutation
 npm run pipelane:update -- --json    # structured output; installs but never auto-runs setup
-npm run pipelane:update -- --yes     # backward-compat no-op (update no longer prompts)
+npm run pipelane:update -- --yes     # apply setup guidance migrations without prompting
 ```
 
 This command:
