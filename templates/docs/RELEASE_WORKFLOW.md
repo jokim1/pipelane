@@ -204,7 +204,7 @@ Surfaces:
 
 ## Cleanup
 
-`{{ALIAS_CLEAN}}` is report-first. Use `--apply` only when you want to prune stale task locks.
+`{{ALIAS_CLEAN}}` closes completed, prod-verified task workspaces automatically when the local safety checks pass, then reports anything left. Use `--status-only` for a non-mutating preview, `--apply --all-stale` to prune stale task locks in bulk, or `--apply --task <slug>` to close a specific task explicitly.
 
 ## Supporting Files
 

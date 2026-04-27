@@ -4684,6 +4684,14 @@ function writePrRecord(repoRoot, taskSlug, mergedSha) {
   );
 }
 
+function localBranchExists(repoRoot, branchName) {
+  return spawnSync('git', ['rev-parse', '--verify', `refs/heads/${branchName}`], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).status === 0;
+}
+
 async function writeSucceededDeployRecord(repoRoot, environment, sha, surfaces = ['frontend'], options = {}) {
   const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
   mkdirSync(stateDir, { recursive: true });
@@ -4716,6 +4724,30 @@ async function writeSucceededDeployRecord(repoRoot, environment, sha, surfaces =
     triggeredBy: 'test',
   });
   writeFileSync(existingPath, `${JSON.stringify(existing, null, 2)}\n`, 'utf8');
+}
+
+async function createVerifiedAutoCleanCandidate(repoRoot, taskName, taskSlug, options = {}) {
+  const created = JSON.parse(runCli(['run', 'new', '--task', taskName, '--json'], repoRoot).stdout);
+  const mergedSha = options.mergedSha || run('git', ['rev-parse', 'HEAD'], repoRoot);
+  writePrRecord(repoRoot, taskSlug, mergedSha);
+
+  const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+  const lockPath = path.join(stateDir, 'task-locks', `${taskSlug}.json`);
+  const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+  await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, options.deploySurfaces || lock.surfaces, { taskSlug });
+  if (Object.prototype.hasOwnProperty.call(options, 'updatedAt')) {
+    if (options.updatedAt === undefined) {
+      delete lock.updatedAt;
+    } else {
+      lock.updatedAt = options.updatedAt;
+    }
+  } else {
+    lock.updatedAt = '2026-04-17T00:00:00Z';
+  }
+  if (options.branchName) lock.branchName = options.branchName;
+  writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`, 'utf8');
+
+  return { created, lockPath, stateDir, mergedSha };
 }
 
 async function writeStagingSucceededRecord(repoRoot, surfaces, options = {}) {
@@ -7878,7 +7910,9 @@ test('api snapshot exposes scoped cleanup after production verification and expl
         },
       },
     }, null, 2), 'utf8');
-    await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, ['frontend'], { taskSlug: 'verified-cleanup' });
+    const lockPath = path.join(stateDir, 'task-locks', 'verified-cleanup.json');
+    const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+    await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, lock.surfaces, { taskSlug: 'verified-cleanup' });
 
     const pendingEnvelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
     const pendingBranch = pendingEnvelope.data.branches.find((entry) => entry.task?.taskSlug === 'verified-cleanup');
@@ -7898,8 +7932,6 @@ test('api snapshot exposes scoped cleanup after production verification and expl
       'repo-wide all-stale cleanup stays hidden for non-stale completed tasks',
     );
 
-    const lockPath = path.join(stateDir, 'task-locks', 'verified-cleanup.json');
-    const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
     lock.updatedAt = '2026-04-17T00:00:00Z';
     writeFileSync(lockPath, JSON.stringify(lock, null, 2), 'utf8');
 
@@ -7943,6 +7975,32 @@ test('clean --apply cannot combine --task and --all-stale', () => {
     const failed = runCli(['run', 'clean', '--apply', '--task', 'Anything', '--all-stale'], repoRoot, {}, true);
     assert.equal(failed.status, 1);
     assert.match(failed.stderr, /cannot combine --task and --all-stale/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean --status-only rejects mutating cleanup flags without touching cleanup state', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const { created, lockPath } = await createVerifiedAutoCleanCandidate(repoRoot, 'Status Only Guard', 'status-only-guard');
+
+    for (const args of [
+      ['run', 'clean', '--status-only', '--apply'],
+      ['run', 'clean', '--status-only', '--task', 'Status Only Guard'],
+      ['run', 'clean', '--status-only', '--all-stale'],
+      ['run', 'clean', '--status-only', '--force'],
+    ]) {
+      const failed = runCli(args, repoRoot, { PIPELANE_CLEAN_MIN_AGE_MS: '0' }, true);
+      assert.equal(failed.status, 1, `${args.join(' ')} should fail validation`);
+      assert.match(failed.stderr, /--status-only cannot be combined/);
+      assert.ok(existsSync(lockPath), `${args.join(' ')} must not prune the lock`);
+      assert.ok(existsSync(created.worktreePath), `${args.join(' ')} must not remove the worktree`);
+      assert.equal(localBranchExists(repoRoot, created.branch), true, `${args.join(' ')} must not delete the branch`);
+    }
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -8023,6 +8081,414 @@ test('clean --apply --task closes out the workspace: lock + worktree + merged br
     assert.equal(envelope.artifacts[0].worktreeRemoved, true);
     assert.equal(envelope.artifacts[0].branchRemoved, true);
     assert.deepEqual(envelope.artifacts[0].errors, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean auto-closes a prod-verified task when the branch tree matches the deployed squash SHA', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Auto Safe', '--json'], repoRoot).stdout);
+
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'auto cleanup\n', 'utf8');
+    execFileSync('git', ['add', 'feature.txt'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'task branch work'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    // Simulate GitHub's squash merge: base gets an equivalent tree but a
+    // different commit, so `git branch -d` would reject the task branch even
+    // though its content is already represented by the deployed SHA.
+    writeFileSync(path.join(repoRoot, 'feature.txt'), 'auto cleanup\n', 'utf8');
+    execFileSync('git', ['add', 'feature.txt'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'squash merge task'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    const mergedSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+    writePrRecord(repoRoot, 'auto-safe', mergedSha);
+
+    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', 'auto-safe.json');
+    const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+    await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, lock.surfaces, { taskSlug: 'auto-safe' });
+    lock.updatedAt = '2026-04-17T00:00:00Z';
+    writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`, 'utf8');
+
+    const result = runCli(['run', 'clean', '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    });
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.autoCleaned, ['auto-safe']);
+    assert.match(envelope.message, /Closed out safe completed task workspaces/);
+    assert.equal(existsSync(lockPath), false, 'auto clean removes the lock');
+    assert.equal(existsSync(created.worktreePath), false, 'auto clean removes the worktree');
+
+    const branchProbe = spawnSync('git', ['rev-parse', '--verify', `refs/heads/${created.branch}`], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.notEqual(branchProbe.status, 0, 'auto clean removes the squash-merged branch');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean keeps a completed task when prod verification does not cover every requested surface', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const { created, lockPath } = await createVerifiedAutoCleanCandidate(
+      repoRoot,
+      'Partial Surface Deploy',
+      'partial-surface-deploy',
+      { deploySurfaces: ['frontend'] },
+    );
+
+    const result = runCli(['run', 'clean', '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    });
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.autoCleaned, []);
+    assert.ok(existsSync(lockPath), 'frontend-only prod verification must not clean a multi-surface task lock');
+    assert.ok(existsSync(created.worktreePath), 'partial-surface prod verification keeps the worktree');
+    assert.equal(localBranchExists(repoRoot, created.branch), true, 'partial-surface prod verification keeps the branch');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean ignores malformed deploy record entries while finding a verified prod cleanup ref', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Malformed Deploy History', '--json'], repoRoot).stdout);
+    const mergedSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+    writePrRecord(repoRoot, 'malformed-deploy-history', mergedSha);
+
+    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    const lockPath = path.join(stateDir, 'task-locks', 'malformed-deploy-history.json');
+    const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+    await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, lock.surfaces, { taskSlug: 'malformed-deploy-history' });
+    const deployStatePath = path.join(stateDir, 'deploy-state.json');
+    const deployState = JSON.parse(readFileSync(deployStatePath, 'utf8'));
+    deployState.records.unshift(null);
+    deployState.records.push({ environment: 'prod', sha: 123, status: 'succeeded', verifiedAt: '2026-04-22T00:02:00Z' });
+    writeFileSync(deployStatePath, `${JSON.stringify(deployState, null, 2)}\n`, 'utf8');
+
+    lock.updatedAt = '2026-04-17T00:00:00Z';
+    writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`, 'utf8');
+
+    const result = runCli(['run', 'clean', '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    });
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.autoCleaned, ['malformed-deploy-history']);
+    assert.equal(existsSync(lockPath), false, 'auto clean removes the lock despite malformed history entries');
+    assert.equal(existsSync(created.worktreePath), false, 'auto clean removes the worktree despite malformed history entries');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean requires a trusted signed prod deploy record when deploy-state signing is enabled', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const { created, lockPath } = await createVerifiedAutoCleanCandidate(repoRoot, 'Unsigned Deploy State', 'unsigned-deploy-state');
+    const key = 'feedface'.repeat(8);
+
+    const unsigned = runCli(['run', 'clean', '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+      PIPELANE_DEPLOY_STATE_KEY: key,
+    });
+    const unsignedEnvelope = JSON.parse(unsigned.stdout);
+    assert.deepEqual(unsignedEnvelope.autoCleaned, []);
+    assert.deepEqual(unsignedEnvelope.autoCleanSkipped, []);
+    assert.ok(existsSync(lockPath), 'unsigned deploy record must not authorize auto-clean');
+    assert.ok(existsSync(created.worktreePath), 'unsigned deploy record keeps the worktree');
+
+    const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'release-gate.ts'));
+    const deployStatePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'deploy-state.json');
+    const deployState = JSON.parse(readFileSync(deployStatePath, 'utf8'));
+    deployState.records = deployState.records.map((record) => ({ ...record, signature: mod.signDeployRecord(record, key) }));
+    writeFileSync(deployStatePath, `${JSON.stringify(deployState, null, 2)}\n`, 'utf8');
+
+    const signed = runCli(['run', 'clean', '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+      PIPELANE_DEPLOY_STATE_KEY: key,
+    });
+    const signedEnvelope = JSON.parse(signed.stdout);
+    assert.deepEqual(signedEnvelope.autoCleaned, ['unsigned-deploy-state']);
+    assert.equal(existsSync(lockPath), false, 'signed deploy record authorizes auto-clean');
+    assert.equal(existsSync(created.worktreePath), false, 'signed deploy record removes the worktree');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean keeps a prod-verified task when the worktree is dirty', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Dirty Verified', '--json'], repoRoot).stdout);
+    const mergedSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+    writePrRecord(repoRoot, 'dirty-verified', mergedSha);
+
+    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', 'dirty-verified.json');
+    const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+    await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, lock.surfaces, { taskSlug: 'dirty-verified' });
+    lock.updatedAt = '2026-04-17T00:00:00Z';
+    writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`, 'utf8');
+    writeFileSync(path.join(created.worktreePath, 'CHANGELOG.md'), 'dirty edit\n', 'utf8');
+
+    const result = runCli(['run', 'clean', '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    });
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.autoCleaned, []);
+    assert.equal(envelope.autoCleanSkipped[0].taskSlug, 'dirty-verified');
+    assert.match(envelope.autoCleanSkipped[0].reason, /uncommitted or untracked changes/);
+    assert.ok(existsSync(lockPath), 'dirty completed lock is kept');
+    assert.ok(existsSync(created.worktreePath), 'dirty completed worktree is kept');
+    assert.equal(localBranchExists(repoRoot, created.branch), true, 'dirty completed branch is kept');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean keeps a prod-verified task when ignored local files are present', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    writeFileSync(path.join(repoRoot, '.gitignore'), '.env.local\nnode_modules/\n', 'utf8');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const { created, lockPath } = await createVerifiedAutoCleanCandidate(repoRoot, 'Ignored Local Data', 'ignored-local-data');
+    writeFileSync(path.join(created.worktreePath, '.env.local'), 'SECRET=do-not-delete\n', 'utf8');
+
+    const result = runCli(['run', 'clean', '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    });
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.autoCleaned, []);
+    assert.equal(envelope.autoCleanSkipped[0].taskSlug, 'ignored-local-data');
+    assert.match(envelope.autoCleanSkipped[0].reason, /ignored local files/);
+    assert.ok(existsSync(lockPath), 'ignored-file lock is kept');
+    assert.ok(existsSync(path.join(created.worktreePath, '.env.local')), 'ignored local data is kept');
+    assert.equal(localBranchExists(repoRoot, created.branch), true, 'ignored-file branch is kept');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean keeps a prod-verified task when the lock timestamp is malformed', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const { created, lockPath } = await createVerifiedAutoCleanCandidate(repoRoot, 'Malformed Lock Time', 'malformed-lock-time', {
+      updatedAt: undefined,
+    });
+
+    const result = runCli(['run', 'clean', '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    });
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.autoCleaned, []);
+    assert.equal(envelope.autoCleanSkipped[0].taskSlug, 'malformed-lock-time');
+    assert.match(envelope.autoCleanSkipped[0].reason, /updatedAt is missing or unparseable/);
+    assert.ok(existsSync(lockPath), 'malformed timestamp lock is kept');
+    assert.ok(existsSync(created.worktreePath), 'malformed timestamp worktree is kept');
+    assert.equal(localBranchExists(repoRoot, created.branch), true, 'malformed timestamp branch is kept');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean keeps a prod-verified task that is still inside the prune floor', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const { created, lockPath } = await createVerifiedAutoCleanCandidate(repoRoot, 'Fresh Verified', 'fresh-verified', {
+      updatedAt: new Date().toISOString(),
+    });
+
+    const result = runCli(['run', 'clean', '--json'], repoRoot);
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.autoCleaned, []);
+    assert.equal(envelope.autoCleanSkipped[0].taskSlug, 'fresh-verified');
+    assert.match(envelope.autoCleanSkipped[0].reason, /below the 300s prune floor/);
+    assert.ok(existsSync(lockPath), 'fresh verified lock is kept');
+    assert.ok(existsSync(created.worktreePath), 'fresh verified worktree is kept');
+    assert.equal(localBranchExists(repoRoot, created.branch), true, 'fresh verified branch is kept');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean keeps a prod-verified lock whose saved worktree is missing', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const { created, lockPath } = await createVerifiedAutoCleanCandidate(repoRoot, 'Missing Worktree Verified', 'missing-worktree-verified');
+    execFileSync('git', ['worktree', 'remove', '--force', created.worktreePath], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const result = runCli(['run', 'clean', '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    });
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.autoCleaned, []);
+    assert.equal(envelope.autoCleanSkipped[0].taskSlug, 'missing-worktree-verified');
+    assert.match(envelope.autoCleanSkipped[0].reason, /saved worktree is missing/);
+    assert.ok(existsSync(lockPath), 'missing-worktree lock is kept for explicit stale pruning');
+    assert.equal(existsSync(created.worktreePath), false, 'worktree was already missing before clean ran');
+    assert.equal(localBranchExists(repoRoot, created.branch), true, 'missing-worktree branch is kept');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean keeps a prod-verified task when the saved branch is missing', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const { created, lockPath } = await createVerifiedAutoCleanCandidate(repoRoot, 'Missing Branch Verified', 'missing-branch-verified', {
+      branchName: 'codex/missing-branch-verified-dead',
+    });
+
+    const result = runCli(['run', 'clean', '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    });
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.autoCleaned, []);
+    assert.equal(envelope.autoCleanSkipped[0].taskSlug, 'missing-branch-verified');
+    assert.match(envelope.autoCleanSkipped[0].reason, /saved branch is missing/);
+    assert.ok(existsSync(lockPath), 'missing-branch lock is kept');
+    assert.ok(existsSync(created.worktreePath), 'missing-branch worktree is kept');
+    assert.equal(localBranchExists(repoRoot, created.branch), true, 'actual task branch is kept');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean keeps a prod-verified task when the saved worktree is checked out on another branch', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const primary = await createVerifiedAutoCleanCandidate(repoRoot, 'Branch Mismatch Primary', 'branch-mismatch-primary');
+    const other = JSON.parse(runCli(['run', 'new', '--task', 'Branch Mismatch Other', '--json'], repoRoot).stdout);
+
+    const lock = JSON.parse(readFileSync(primary.lockPath, 'utf8'));
+    lock.worktreePath = other.worktreePath;
+    writeFileSync(primary.lockPath, `${JSON.stringify(lock, null, 2)}\n`, 'utf8');
+
+    const result = runCli(['run', 'clean', '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    });
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.autoCleaned, []);
+    assert.equal(envelope.autoCleanSkipped[0].taskSlug, 'branch-mismatch-primary');
+    assert.match(envelope.autoCleanSkipped[0].reason, /does not match saved branch/);
+    assert.ok(existsSync(primary.lockPath), 'branch-mismatch lock is kept');
+    assert.ok(existsSync(primary.created.worktreePath), 'original worktree is kept');
+    assert.ok(existsSync(other.worktreePath), 'unrelated worktree is kept');
+    assert.equal(localBranchExists(repoRoot, primary.created.branch), true, 'original branch is kept');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean keeps a prod-verified task when invoked from inside the target worktree', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const { created, lockPath } = await createVerifiedAutoCleanCandidate(repoRoot, 'Inside Auto Clean', 'inside-auto-clean');
+
+    const result = runCli(['run', 'clean', '--json'], created.worktreePath, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    });
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.autoCleaned, []);
+    assert.equal(envelope.autoCleanSkipped[0].taskSlug, 'inside-auto-clean');
+    assert.match(envelope.autoCleanSkipped[0].reason, /while running inside it/);
+    assert.ok(existsSync(lockPath), 'inside-target lock is kept');
+    assert.ok(existsSync(created.worktreePath), 'inside-target worktree is kept');
+    assert.equal(localBranchExists(repoRoot, created.branch), true, 'inside-target branch is kept');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean keeps a prod-verified task when the prod deploy record lacks health verification', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const { created, lockPath } = await createVerifiedAutoCleanCandidate(repoRoot, 'Unverified Prod Record', 'unverified-prod-record');
+    const deployStatePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'deploy-state.json');
+    const deployState = JSON.parse(readFileSync(deployStatePath, 'utf8'));
+    delete deployState.records[0].verification;
+    delete deployState.records[0].verificationBySurface;
+    writeFileSync(deployStatePath, `${JSON.stringify(deployState, null, 2)}\n`, 'utf8');
+
+    const result = runCli(['run', 'clean', '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    });
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.autoCleaned, []);
+    assert.deepEqual(envelope.autoCleanSkipped, []);
+    assert.ok(existsSync(lockPath), 'unverified prod record does not authorize auto-clean');
+    assert.ok(existsSync(created.worktreePath), 'unverified prod record keeps worktree');
+    assert.equal(localBranchExists(repoRoot, created.branch), true, 'unverified prod record keeps branch');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean keeps a prod-verified task when the branch tree differs from deployed prod', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const { created, lockPath, mergedSha } = await createVerifiedAutoCleanCandidate(repoRoot, 'Diverged Verified', 'diverged-verified');
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'local branch diverged\n', 'utf8');
+    execFileSync('git', ['add', 'feature.txt'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'diverge from deployed tree'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const result = runCli(['run', 'clean', '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    });
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.autoCleaned, []);
+    assert.equal(envelope.autoCleanSkipped[0].taskSlug, 'diverged-verified');
+    assert.match(envelope.autoCleanSkipped[0].reason, new RegExp(`branch tree differs from verified prod SHA ${mergedSha.slice(0, 7)}`));
+    assert.ok(existsSync(lockPath), 'diverged lock is kept');
+    assert.ok(existsSync(created.worktreePath), 'diverged worktree is kept');
+    assert.equal(localBranchExists(repoRoot, created.branch), true, 'diverged branch is kept');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -9718,17 +10184,31 @@ test('api action preflight: clean.apply without scope returns allowed:false stat
   }
 });
 
-test('api action execute: non-risky action runs without a token', () => {
+test('api action execute: non-risky clean.plan runs without a token and does not mutate cleanup state', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Plan Only', '--json'], repoRoot).stdout);
+    const mergedSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+    writePrRecord(repoRoot, 'plan-only', mergedSha);
+
+    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', 'plan-only.json');
+    const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+    await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, lock.surfaces, { taskSlug: 'plan-only' });
+    lock.updatedAt = '2026-04-17T00:00:00Z';
+    writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`, 'utf8');
 
     const executed = runCli(['run', 'api', 'action', 'clean.plan', '--execute'], repoRoot);
     const envelope = JSON.parse(executed.stdout);
     assert.equal(envelope.ok, true);
     assert.equal(envelope.data.action.risky, false);
     assert.equal(envelope.data.execution.exitCode, 0);
+    assert.deepEqual(envelope.data.execution.result.autoCleaned, []);
+    assert.deepEqual(envelope.data.execution.result.autoCleanCandidates, ['plan-only']);
+    assert.match(envelope.data.execution.result.message, /Would close safe completed task workspaces/);
+    assert.ok(existsSync(lockPath), 'clean.plan must preview without pruning the lock');
+    assert.ok(existsSync(created.worktreePath), 'clean.plan must preview without removing the worktree');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });

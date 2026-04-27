@@ -167,9 +167,12 @@ Refuses to start the same task slug twice and points you at `/resume`.
 succeeded and healthcheck passed. You watch the cockpit, not the GH
 Actions tab.
 
-**`/clean`** — [shipped + hardened v0] Report-first. `--apply` requires
-`--task <slug>` or `--all-stale`; refuses to prune any lock newer
-than 5 minutes.
+**`/clean`** — [shipped + hardened v0] Auto-closes completed task
+workspaces when prod is verified, the prune floor has passed, the
+worktree is clean, and the branch tree matches the deployed SHA. It
+then reports anything left. `--apply` still requires `--task <slug>` or
+`--all-stale`; cleanup refuses to prune any lock newer than 5 minutes.
+Use `--status-only` when a caller needs a non-mutating preview.
 
 The two scope flags have different authority models:
 - `--all-stale` is evidence-based: it only prunes locks whose worktree
@@ -486,6 +489,7 @@ the weight of a prod deploy the way a human does.
 - Call `git commit --amend` on a merged commit
 - Call `git push --force` to any tracked branch
 - Call `/clean --apply` without `--task <slug>` or `--all-stale`
+- Auto-remove dirty, external, too-young, or branch-diverged workspaces
 - Flip `/devmode build` in the middle of a release-lane task without
   `--override --reason`
 - Run `/deploy prod` with `--sha <other>` (hard-blocked in release lane;
@@ -509,7 +513,7 @@ in `AGENTS.md` where enforcement is social.
 | `/deploy` | Deploy + watch + verify | v0-hardened |
 | `/rollback` | Redeploy last-known-good | v1 |
 | `/doctor` | Diagnose / configure / probe | v1 |
-| `/clean` | Prune stale task locks | shipped + v0-hardened |
+| `/clean` | Clean verified task workspaces and prune stale task locks | shipped + v0-hardened |
 
 ### Setup commands
 
@@ -596,7 +600,8 @@ spec fixes. The change manifest tracks which PR closes each one.
   from existing + v0 data.
 - [v1] **No rollback.** `/rollback` ships.
 - [v0] **`/clean --apply`**** too aggressive.** Requires `--task` or
-  `--all-stale`; refuses recent locks.
+  `--all-stale`; refuses recent locks. Default `/clean` only removes
+  completed task workspaces after the safe-close checks pass.
 
 ## Troubleshooting
 

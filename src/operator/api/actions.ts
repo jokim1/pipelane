@@ -862,7 +862,7 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
       pushOpt('--reason', flags.reason);
       break;
     case 'clean.plan':
-      args.push('clean');
+      args.push('clean', '--status-only');
       break;
     case 'clean.apply':
       args.push('clean', '--apply');

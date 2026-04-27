@@ -296,7 +296,7 @@ User-facing slash commands:
 - `/deploy`: deploy the merged SHA to `staging` or `prod`
 - `/smoke`: plan smoke coverage or run smoke against `staging` or `prod`
 - `/fix`: apply durable root-cause fixes from findings
-- `/clean`: inspect cleanup status and prune stale task locks
+- `/clean`: close verified task workspaces when safe and prune stale task locks
 - `/doctor`: inspect deploy configuration and live probes
 - `/rollback`: roll back the most recent verified-good deploy
 

@@ -19,6 +19,7 @@ export interface RemovedTaskLock {
   taskSlug: string;
   branchName: string;
   worktreePath: string;
+  surfaces: string[];
   reasons: string[];
 }
 
@@ -481,6 +482,7 @@ export function pruneDeadTaskLocks(
       taskSlug: lock.taskSlug,
       branchName: lock.branchName,
       worktreePath: lock.worktreePath,
+      surfaces: lock.surfaces,
       reasons,
     });
   }
@@ -547,9 +549,11 @@ export interface RemoveTaskArtifactsResult {
  * - Worktree must have no uncommitted or untracked content. The check uses
  *   `git status --porcelain` inside the worktree, so .gitignored files
  *   (node_modules symlink, build outputs) are tolerated.
- * - Branch must be merged into baseBranch (or absent locally). Enforced by
- *   git itself via `git branch -d`; we surface the failure with a hint to
- *   re-run with --force.
+ * - Branch must be merged by git's local ancestry rules, or its tree must
+ *   match a caller-provided verified ref. The tree-match path covers
+ *   squash-merged PR branches after production verification: the commits are
+ *   not ancestors, but the branch content is already represented by the
+ *   deployed merge SHA.
  *
  * Refuses when the worktree being removed is the caller's current
  * directory — git rejects that and the operator should `cd` out first.
@@ -560,6 +564,7 @@ export function removeTaskArtifacts(options: {
   branchName: string;
   callerCwd: string;
   force: boolean;
+  safeDeleteBranchRef?: string;
 }): RemoveTaskArtifactsResult {
   const warnings: string[] = [];
   const errors: string[] = [];
@@ -613,10 +618,18 @@ export function removeTaskArtifacts(options: {
     warnings.push(`Local branch ${options.branchName} was already missing.`);
     branchRemoved = true;
   } else {
-    const deleteFlag = options.force ? '-D' : '-d';
+    const safeTreeMatch = !options.force && options.safeDeleteBranchRef
+      ? branchTreeMatchesRef(options.sharedRepoRoot, options.branchName, options.safeDeleteBranchRef)
+      : false;
+    const deleteFlag = options.force || safeTreeMatch ? '-D' : '-d';
     const result = runCommandCapture('git', ['branch', deleteFlag, options.branchName], { cwd: options.sharedRepoRoot });
     if (result.ok) {
       branchRemoved = true;
+      if (safeTreeMatch) {
+        warnings.push(
+          `Local branch ${options.branchName} was deleted because its tree matches verified ref ${shortRef(options.safeDeleteBranchRef ?? '')}.`,
+        );
+      }
     } else {
       const stderr = result.stderr || result.stdout || 'unknown error';
       const isUnmerged = /not fully merged/i.test(stderr);
@@ -630,6 +643,16 @@ export function removeTaskArtifacts(options: {
   }
 
   return { worktreeRemoved, branchRemoved, warnings, errors };
+}
+
+export function branchTreeMatchesRef(repoRoot: string, branchName: string, targetRef: string): boolean {
+  const branchTree = runGit(repoRoot, ['rev-parse', '--verify', `refs/heads/${branchName}^{tree}`], true)?.trim() ?? '';
+  const targetTree = runGit(repoRoot, ['rev-parse', '--verify', `${targetRef}^{tree}`], true)?.trim() ?? '';
+  return branchTree.length > 0 && branchTree === targetTree;
+}
+
+function shortRef(ref: string): string {
+  return /^[a-f0-9]{7,40}$/i.test(ref) ? ref.slice(0, 7) : ref;
 }
 
 export interface OrphanWorktree {

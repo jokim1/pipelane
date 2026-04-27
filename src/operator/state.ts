@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -479,6 +479,7 @@ export interface OperatorFlags {
   apply: boolean;
   allStale: boolean;
   force: boolean;
+  statusOnly: boolean;
   help: boolean;
   json: boolean;
   offline: boolean;
@@ -563,6 +564,8 @@ const ACTION_STATE_FILENAME = 'action-state.json';
 const DEPLOY_CONFIG_FILENAME = 'deploy-config.json';
 const PROBE_STATE_FILENAME = 'probe-state.json';
 const TASK_LOCKS_DIRNAME = 'task-locks';
+const TASK_CLEANUP_LOCKS_DIRNAME = 'task-cleanup-locks';
+const TASK_CLEANUP_LOCK_STALE_MS = 10 * 60 * 1000;
 const INSTALL_MARKER_FILENAME = 'installed.json';
 const LEGACY_MIGRATION_FILENAME = 'legacy-migration.json';
 
@@ -1418,6 +1421,54 @@ export function taskLockPath(commonDir: string, config: WorkflowConfig, taskSlug
   return path.join(resolveStateDir(commonDir, config), TASK_LOCKS_DIRNAME, `${taskSlug}.json`);
 }
 
+function taskCleanupLockPath(commonDir: string, config: WorkflowConfig, taskSlug: string): string {
+  return path.join(resolveStateDir(commonDir, config), TASK_CLEANUP_LOCKS_DIRNAME, `${taskSlug}.lock`);
+}
+
+function clearStaleTaskCleanupLock(lockPath: string): boolean {
+  if (!existsSync(lockPath)) return false;
+  try {
+    const ageMs = Date.now() - statSync(lockPath).mtimeMs;
+    if (ageMs <= TASK_CLEANUP_LOCK_STALE_MS) return false;
+    rmSync(lockPath, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function acquireTaskCleanupLock(commonDir: string, config: WorkflowConfig, taskSlug: string): { acquired: true; release: () => void } | { acquired: false; reason: string } {
+  const lockPath = taskCleanupLockPath(commonDir, config, taskSlug);
+  mkdirSync(path.dirname(lockPath), { recursive: true });
+  clearStaleTaskCleanupLock(lockPath);
+  let created = false;
+  try {
+    mkdirSync(lockPath);
+    created = true;
+    writeFileSync(
+      path.join(lockPath, 'owner.json'),
+      `${JSON.stringify({ taskSlug, pid: process.pid, acquiredAt: nowIso() }, null, 2)}\n`,
+      'utf8',
+    );
+    return { acquired: true, release: () => rmSync(lockPath, { recursive: true, force: true }) };
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === 'EEXIST') {
+      return { acquired: false, reason: 'another cleanup already owns this task lock' };
+    }
+    if (created) rmSync(lockPath, { recursive: true, force: true });
+    return { acquired: false, reason: `could not acquire cleanup lock: ${err.message}` };
+  }
+}
+
+function assertTaskCleanupUnlocked(commonDir: string, config: WorkflowConfig, taskSlug: string): void {
+  const lockPath = taskCleanupLockPath(commonDir, config, taskSlug);
+  clearStaleTaskCleanupLock(lockPath);
+  if (existsSync(lockPath)) {
+    throw new Error(`Task ${taskSlug} is being cleaned by another Pipelane process; retry after cleanup finishes.`);
+  }
+}
+
 export function readJsonFile<T>(targetPath: string, fallback: T): T {
   if (!existsSync(targetPath)) {
     return fallback;
@@ -1773,6 +1824,7 @@ export function loadTaskLock(commonDir: string, config: WorkflowConfig, taskSlug
 }
 
 export function saveTaskLock(commonDir: string, config: WorkflowConfig, taskSlug: string, value: TaskLock): TaskLock {
+  assertTaskCleanupUnlocked(commonDir, config, taskSlug);
   ensureStateDir(commonDir, config);
   writeVersionedJsonFile('taskLock', taskLockPath(commonDir, config, taskSlug), value);
   return value;
@@ -1921,6 +1973,7 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     apply: false,
     allStale: false,
     force: false,
+    statusOnly: false,
     help: false,
     json: false,
     offline: false,
@@ -2019,6 +2072,12 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     if (flagName === '--force') {
       rejectInlineValue('--force');
       flags.force = true;
+      continue;
+    }
+
+    if (flagName === '--status-only') {
+      rejectInlineValue('--status-only');
+      flags.statusOnly = true;
       continue;
     }
 
@@ -2428,14 +2487,20 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       throw new Error('smoke requires one of: plan, setup, staging, prod, waiver, quarantine, unquarantine.');
     }
     case 'clean':
-      assertOnlyFlags(parsed, ['apply', 'allStale', 'task', 'force']);
+      assertOnlyFlags(parsed, ['apply', 'allStale', 'task', 'force', 'statusOnly']);
+      if (parsed.flags.statusOnly && parsed.flags.apply) {
+        throw new Error('clean --status-only cannot be combined with --apply.');
+      }
+      if (parsed.flags.statusOnly && (parsed.flags.allStale || parsed.flags.task.trim() || parsed.flags.force)) {
+        throw new Error('clean --status-only cannot be combined with --task, --all-stale, or --force.');
+      }
       if (!parsed.flags.apply && (parsed.flags.allStale || parsed.flags.task.trim() || parsed.flags.force)) {
         throw new Error('clean only accepts --task, --all-stale, or --force when --apply is also passed.');
       }
       if (parsed.flags.force && !parsed.flags.task.trim()) {
         throw new Error('clean --force is only valid with --task <task-name>; --all-stale is metadata-only.');
       }
-      requireNoPositional('pipelane run clean [--apply (--task <task-name> [--force]|--all-stale)]');
+      requireNoPositional('pipelane run clean [--status-only | --apply (--task <task-name> [--force]|--all-stale)]');
       return;
     case 'status':
       assertOnlyFlags(parsed, ['week', 'stuck', 'blastSha']);
@@ -2546,6 +2611,7 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'apply', label: '--apply', active: (flags) => flags.apply },
   { key: 'allStale', label: '--all-stale', active: (flags) => flags.allStale },
   { key: 'force', label: '--force', active: (flags) => flags.force },
+  { key: 'statusOnly', label: '--status-only', active: (flags) => flags.statusOnly },
   { key: 'offline', label: '--offline', active: (flags) => flags.offline },
   { key: 'override', label: '--override', active: (flags) => flags.override },
   { key: 'skipSmokeCoverage', label: '--skip-smoke-coverage', active: (flags) => flags.skipSmokeCoverage },
