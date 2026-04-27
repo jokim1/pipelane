@@ -412,6 +412,34 @@ export interface ReleaseReadinessBlocker {
   message: string;
 }
 
+const RELEASE_GATE_DETAIL_MAX = 300;
+const RELEASE_GATE_INFLIGHT_STAGING_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+const RELEASE_GATE_INFLIGHT_STAGING_TIMEOUT_ENV = 'PIPELANE_RELEASE_GATE_INFLIGHT_TIMEOUT_MS';
+
+function sanitizeReleaseGateDetail(raw: unknown): string {
+  if (!raw) return '';
+  const text = String(raw);
+  // Deploy records are local JSON, not source code. Strip terminal controls
+  // before embedding record details in release-check and /pr errors.
+  // eslint-disable-next-line no-control-regex
+  return text
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|[\x00-\x1F\x7F\x80-\x9F]/g, '')
+    .slice(0, RELEASE_GATE_DETAIL_MAX);
+}
+
+function resolveReleaseGateInflightStagingTimeoutMs(): number {
+  const parsed = Number.parseInt(process.env[RELEASE_GATE_INFLIGHT_STAGING_TIMEOUT_ENV] ?? '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : RELEASE_GATE_INFLIGHT_STAGING_TIMEOUT_MS;
+}
+
+function formatReleaseGateDuration(ms: number): string {
+  const minutes = Math.max(1, Math.round(ms / 60000));
+  if (minutes >= 120 && minutes % 60 === 0) {
+    return `${minutes / 60}h`;
+  }
+  return `${minutes} min`;
+}
+
 // v1.2: readiness is observed, not asserted. Walks records newest-first and
 // the *most recent* VALID staging deploy touching the surface is
 // authoritative. When a signing key is configured, unsigned/invalid-sig
@@ -427,11 +455,13 @@ export function explainObservedStagingSuccess(
   surface: string,
   options: { deployConfig?: DeployConfig; key?: string } = {},
 ): ObservedStagingResult {
+  const safeRecords = Array.isArray(records) ? records : [];
   const expectedFingerprint = options.deployConfig
     ? computeDeployConfigFingerprint(options.deployConfig, 'staging')
     : undefined;
-  for (let i = records.length - 1; i >= 0; i -= 1) {
-    const record = records[i];
+  for (let i = safeRecords.length - 1; i >= 0; i -= 1) {
+    const record = safeRecords[i];
+    if (!record || typeof record !== 'object') continue;
     if (record.environment !== 'staging') continue;
     if (!Array.isArray(record.surfaces) || !record.surfaces.includes(surface)) continue;
     // Signing gate: invalid records don't participate at all, so they can't
@@ -439,7 +469,35 @@ export function explainObservedStagingSuccess(
     if (options.key && !verifyDeployRecord(record, options.key)) continue;
 
     if (record.status !== 'succeeded') {
-      return { ok: false, reason: `latest record has status "${record.status ?? 'unknown'}"` };
+      if (record.status === 'requested') {
+        const safeRequestedAt = sanitizeReleaseGateDetail(record.requestedAt);
+        if (!safeRequestedAt) {
+          return { ok: false, reason: 'latest staging deploy request has no requestedAt; re-run staging' };
+        }
+        const requestedMs = typeof record.requestedAt === 'string' ? Date.parse(record.requestedAt) : NaN;
+        if (!Number.isFinite(requestedMs)) {
+          return { ok: false, reason: `latest staging deploy request has invalid requestedAt "${safeRequestedAt}"; re-run staging` };
+        }
+        const nowMs = Date.now();
+        if (requestedMs > nowMs + FUTURE_SKEW_MS) {
+          return { ok: false, reason: `latest staging deploy request has future requestedAt "${safeRequestedAt}"; re-run staging` };
+        }
+        const ageMs = Math.max(0, nowMs - requestedMs);
+        const timeoutMs = resolveReleaseGateInflightStagingTimeoutMs();
+        if (ageMs > timeoutMs) {
+          return {
+            ok: false,
+            reason: `latest staging deploy request is stale since ${safeRequestedAt} (${formatReleaseGateDuration(ageMs)} old); re-run staging`,
+          };
+        }
+        const workflow = record.workflowRunUrl
+          ? ` (${sanitizeReleaseGateDetail(record.workflowRunUrl)})`
+          : record.workflowRunId
+            ? ` (workflow run ${sanitizeReleaseGateDetail(record.workflowRunId)})`
+            : '';
+        return { ok: false, reason: `latest staging deploy is still in flight since ${safeRequestedAt}${workflow}` };
+      }
+      return { ok: false, reason: `latest record has status "${sanitizeReleaseGateDetail(record.status ?? 'unknown')}"` };
     }
     if (!record.verifiedAt) {
       return { ok: false, reason: 'latest record lacks verifiedAt (unverified deploy)' };
@@ -452,7 +510,7 @@ export function explainObservedStagingSuccess(
       return { ok: false, reason: 'no per-surface verification recorded for this surface' };
     }
     if (!verificationPassed(probe.verification)) {
-      return { ok: false, reason: `healthcheck did not return 2xx (HTTP ${probe.verification.statusCode ?? 'none'})` };
+      return { ok: false, reason: `healthcheck did not return 2xx (HTTP ${sanitizeReleaseGateDetail(probe.verification.statusCode ?? 'none')})` };
     }
     return { ok: true };
   }
@@ -585,6 +643,9 @@ export function evaluateReleaseReadiness(options: {
   const observedStagingSuccess = (surface: string): string | null => {
     const result = explainObservedStagingSuccess(options.deployRecords, surface, gateOptions);
     if (result.ok) return null;
+    if (result.reason.includes('still in flight')) {
+      return `${surface} staging: ${result.reason}. Retry after staging verification finishes, or run \`${formatWorkflowCommand(options.config, 'status')}\` to watch progress.`;
+    }
     return `${surface} staging: ${result.reason}. Run \`${formatWorkflowCommand(options.config, 'deploy', ['staging', surface])}\` first.`;
   };
   const probeState = options.probeState ?? { records: [], updatedAt: '' };
@@ -730,12 +791,48 @@ export function buildReleaseCheckMessage(
     const hasUnsupportedSurfaceBlocker = readiness.blockedSurfaces.some((surface) =>
       readiness.results[surface].missing.some((reason) => reason.startsWith('unsupported surface "')),
     );
+    const hasPendingStagingBlocker = readiness.blockedSurfaces.some((surface) =>
+      readiness.results[surface].missing.some((reason) => reason.includes('latest staging deploy is still in flight')),
+    );
+    const hasDeployActionObservedBlocker = readiness.blockedSurfaces.some((surface) =>
+      readiness.results[surface].blockers.some((blocker) =>
+        blocker.kind === 'observed'
+        && !blocker.message.includes('latest staging deploy is still in flight'),
+      ),
+    );
+    const allPendingStagingBlockers = readiness.blockedSurfaces.every((surface) =>
+      readiness.results[surface].missing.length > 0
+      && readiness.results[surface].missing.every((reason) => reason.includes('latest staging deploy is still in flight')),
+    );
+    const onlyObservedOrProbeBlockers = readiness.blockedSurfaces.every((surface) =>
+      readiness.results[surface].blockers.length > 0
+      && readiness.results[surface].blockers.every((blocker) => blocker.kind === 'observed' || blocker.kind === 'probe'),
+    );
+    const onlyPendingStagingOrProbeBlockers = hasPendingStagingBlocker
+      && readiness.blockedSurfaces.every((surface) =>
+        readiness.results[surface].blockers.length > 0
+        && readiness.results[surface].blockers.every((blocker) =>
+          blocker.kind === 'probe'
+          || (blocker.kind === 'observed' && blocker.message.includes('latest staging deploy is still in flight')),
+        ),
+      );
     if (allObserveBlockers) {
       lines.push(`Next: run \`${formatWorkflowCommand(config, 'devmode', 'build')}\`, then \`${formatWorkflowCommand(config, 'deploy', 'staging')}\` once per surface,`);
       lines.push(`then \`${formatWorkflowCommand(config, 'devmode', 'release')}\`. The readiness gate is observed, not asserted.`);
+    } else if (allPendingStagingBlockers) {
+      lines.push(`Next: wait for the staging deploy verification to finish, then retry this command.`);
+      lines.push(`Use \`${formatWorkflowCommand(config, 'status')}\` if you need the current staging state.`);
     } else if (hasUnsupportedSurfaceBlocker) {
       lines.push('Next: update the tracked workflow config (`.pipelane.json`, or `.project-workflow.json` in legacy repos) so');
       lines.push('it only lists release-managed surfaces (frontend, edge, sql), or extend the release gate before retrying.');
+    } else if (onlyPendingStagingOrProbeBlockers) {
+      lines.push(`Next: wait for the staging deploy verification to finish, then retry this command.`);
+      lines.push(`Use \`${formatWorkflowCommand(config, 'status')}\` if you need the current staging state.`);
+    } else if (onlyObservedOrProbeBlockers && hasPendingStagingBlocker && hasDeployActionObservedBlocker) {
+      lines.push(`Next: wait for any in-flight staging deploy verification to finish, then re-run \`${formatWorkflowCommand(config, 'deploy', 'staging')}\` for any surface still blocked.`);
+      lines.push(`Use \`${formatWorkflowCommand(config, 'status')}\` if you need the current staging state.`);
+    } else if (onlyObservedOrProbeBlockers && hasDeployActionObservedBlocker) {
+      lines.push(`Next: re-run \`${formatWorkflowCommand(config, 'deploy', 'staging')}\` for the blocked surface(s), then retry this command.`);
     } else {
       lines.push(`Next: run \`${formatWorkflowCommand(config, 'doctor', '--fix')}\` to fill in the Deploy Configuration block in CLAUDE.md, then`);
       lines.push(`\`${formatWorkflowCommand(config, 'devmode', 'build')}\` and \`${formatWorkflowCommand(config, 'deploy', 'staging')}\` to register a staging success.`);

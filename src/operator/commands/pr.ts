@@ -12,7 +12,7 @@ import {
   deriveTaskSlugFromPr,
   type LivePr,
 } from './helpers.ts';
-import { emptyDeployConfig, evaluateReleaseReadiness, loadDeployConfig } from '../release-gate.ts';
+import { buildReleaseCheckMessage, emptyDeployConfig, evaluateReleaseReadiness, loadDeployConfig } from '../release-gate.ts';
 import {
   applyTaskBindingRecovery,
   diagnoseTaskBinding,
@@ -87,7 +87,10 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
       surfaces,
     });
     if (!readiness.ready && !context.modeState.override) {
-      throw new Error(`Release mode is not ready. Run ${formatWorkflowCommand(context.config, 'status')} for blockers, then ${formatWorkflowCommand(context.config, 'devmode', 'release')} after fixing readiness.`);
+      throw new Error([
+        `${formatWorkflowCommand(context.config, 'pr')} blocked before staging or committing because release mode is not ready.`,
+        buildReleaseCheckMessage(readiness, surfaces, context.config),
+      ].join('\n\n'));
     }
   }
 

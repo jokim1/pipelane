@@ -4755,6 +4755,26 @@ async function writeStagingSucceededRecord(repoRoot, surfaces, options = {}) {
   }
 }
 
+function writeStagingRequestedRecord(repoRoot, surfaces, options = {}) {
+  const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({
+    records: [{
+      environment: 'staging',
+      sha: options.sha || '2222222222222222222222222222222222222222',
+      surfaces,
+      workflowName: 'Deploy Hosted',
+      requestedAt: options.requestedAt || '2026-04-27T13:16:30Z',
+      taskSlug: options.taskSlug || 'bootstrap',
+      status: 'requested',
+      workflowRunId: options.workflowRunId || 'deploy-staging-2222222-1',
+      workflowRunUrl: options.workflowRunUrl || 'https://example.test/actions/runs/1',
+      idempotencyKey: options.idempotencyKey || 'staging-requested-1',
+      triggeredBy: 'test',
+    }],
+  }, null, 2), 'utf8');
+}
+
 function writeHealthyProbeState(repoRoot, surfaces) {
   const stateDir = path.join(repoRoot, '.git', 'pipelane-state');
   mkdirSync(stateDir, { recursive: true });
@@ -4843,6 +4863,269 @@ test('release-check passes when a staging-succeeded DeployRecord covers every re
     assert.equal(result.status, 0);
     assert.equal(output.ready, true);
     assert.deepEqual(output.blockedSurfaces, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check tells the operator to wait when staging deploy is still in flight', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    const requestedAt = new Date().toISOString();
+    writeStagingRequestedRecord(repoRoot, ['frontend', 'edge', 'sql'], {
+      requestedAt,
+      workflowRunUrl: 'https://example.test/actions/runs/882\u001b[31m',
+    });
+    writeHealthyProbeState(repoRoot, ['frontend', 'edge', 'sql']);
+
+    const result = runCli(['run', 'release-check', '--json'], repoRoot, {}, true);
+    const output = JSON.parse(result.stdout);
+    assert.equal(result.status, 1);
+    assert.equal(output.ready, false);
+    assert.deepEqual(output.blockedSurfaces.sort(), ['edge', 'frontend', 'sql']);
+    assert.ok(output.message.includes(`latest staging deploy is still in flight since ${requestedAt}`));
+    assert.doesNotMatch(output.message, /\u001b/);
+    assert.match(output.message, /Retry after staging verification finishes/);
+    assert.match(output.message, /Next: wait for the staging deploy verification to finish/);
+    assert.doesNotMatch(output.message, /\/doctor --fix/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check keeps wait guidance when in-flight staging also lacks probe records', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    const requestedAt = new Date().toISOString();
+    writeStagingRequestedRecord(repoRoot, ['frontend', 'edge', 'sql'], {
+      requestedAt,
+      workflowRunUrl: 'https://example.test/actions/runs/882',
+    });
+
+    const result = runCli(['run', 'release-check', '--json'], repoRoot, {}, true);
+    const output = JSON.parse(result.stdout);
+    assert.equal(result.status, 1);
+    assert.ok(output.message.includes(`latest staging deploy is still in flight since ${requestedAt}`));
+    assert.match(output.message, /no probe recorded/);
+    assert.match(output.message, /Next: wait for the staging deploy verification to finish/);
+    assert.doesNotMatch(output.message, /\/doctor --fix/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check keeps config remediation when staging is pending but deploy config is incomplete', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const requestedAt = new Date().toISOString();
+    writeStagingRequestedRecord(repoRoot, ['frontend'], {
+      requestedAt,
+    });
+
+    const result = runCli(['run', 'release-check', '--surfaces', 'frontend', '--json'], repoRoot, {}, true);
+    const output = JSON.parse(result.stdout);
+    assert.equal(result.status, 1);
+    assert.ok(output.message.includes(`latest staging deploy is still in flight since ${requestedAt}`));
+    assert.match(output.message, /frontend production URL or workflow/);
+    assert.match(output.message, /\/doctor --fix/);
+    assert.doesNotMatch(output.message, /Next: wait for the staging deploy verification to finish/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check tells the operator to re-run staging when a requested deploy record is stale', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    writeStagingRequestedRecord(repoRoot, ['frontend'], {
+      requestedAt: '2000-01-01T00:00:00Z',
+      workflowRunUrl: 'https://example.test/actions/runs/stale',
+    });
+    writeHealthyProbeState(repoRoot, ['frontend']);
+
+    const result = runCli(['run', 'release-check', '--surfaces', 'frontend', '--json'], repoRoot, {}, true);
+    const output = JSON.parse(result.stdout);
+    assert.equal(result.status, 1);
+    assert.match(output.message, /latest staging deploy request is stale since 2000-01-01T00:00:00Z/);
+    assert.match(output.message, /re-run staging/);
+    assert.match(output.message, /Next: re-run `\/deploy staging`/);
+    assert.doesNotMatch(output.message, /Next: wait for the staging deploy verification to finish/);
+    assert.doesNotMatch(output.message, /\/doctor --fix/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check tells the operator to re-run staging when requestedAt is far in the future', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    writeStagingRequestedRecord(repoRoot, ['frontend'], {
+      requestedAt: '2100-01-01T00:00:00Z',
+      workflowRunUrl: 'https://example.test/actions/runs/future',
+    });
+    writeHealthyProbeState(repoRoot, ['frontend']);
+
+    const result = runCli(['run', 'release-check', '--surfaces', 'frontend', '--json'], repoRoot, {}, true);
+    const output = JSON.parse(result.stdout);
+    assert.equal(result.status, 1);
+    assert.match(output.message, /latest staging deploy request has future requestedAt "2100-01-01T00:00:00Z"/);
+    assert.match(output.message, /Next: re-run `\/deploy staging`/);
+    assert.doesNotMatch(output.message, /Next: wait for the staging deploy verification to finish/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check gives mixed wait-and-rerun guidance for pending plus retryable staging blockers', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    mkdirSync(stateDir, { recursive: true });
+    const requestedAt = new Date().toISOString();
+    writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({
+      records: [
+        {
+          environment: 'staging',
+          sha: '4444444444444444444444444444444444444444',
+          surfaces: ['frontend'],
+          workflowName: 'Deploy Hosted',
+          requestedAt: '2000-01-01T00:00:00Z',
+          taskSlug: 'bootstrap',
+          status: 'requested',
+          workflowRunUrl: 'https://example.test/actions/runs/stale',
+          idempotencyKey: 'stale-frontend',
+          triggeredBy: 'test',
+        },
+        {
+          environment: 'staging',
+          sha: '5555555555555555555555555555555555555555',
+          surfaces: ['edge'],
+          workflowName: 'Deploy Hosted',
+          requestedAt,
+          taskSlug: 'bootstrap',
+          status: 'requested',
+          workflowRunUrl: 'https://example.test/actions/runs/fresh',
+          idempotencyKey: 'fresh-edge',
+          triggeredBy: 'test',
+        },
+      ],
+    }, null, 2), 'utf8');
+    writeHealthyProbeState(repoRoot, ['frontend', 'edge']);
+
+    const result = runCli(['run', 'release-check', '--surfaces', 'frontend,edge', '--json'], repoRoot, {}, true);
+    const output = JSON.parse(result.stdout);
+    assert.equal(result.status, 1);
+    assert.match(output.message, /frontend staging: latest staging deploy request is stale since 2000-01-01T00:00:00Z/);
+    assert.ok(output.message.includes(`edge staging: latest staging deploy is still in flight since ${requestedAt}`));
+    assert.match(output.message, /Next: wait for any in-flight staging deploy verification to finish, then re-run `\/deploy staging`/);
+    assert.doesNotMatch(output.message, /\/doctor --fix/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check does not crash when an in-flight deploy record has malformed detail fields', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    writeStagingRequestedRecord(repoRoot, ['frontend'], {
+      requestedAt: { bad: true },
+      workflowRunUrl: ['https://example.test/actions/runs/882'],
+    });
+    writeHealthyProbeState(repoRoot, ['frontend']);
+
+    const result = runCli(['run', 'release-check', '--surfaces', 'frontend', '--json'], repoRoot, {}, true);
+    const output = JSON.parse(result.stdout);
+    assert.equal(result.status, 1);
+    assert.match(output.message, /latest staging deploy request has invalid requestedAt/);
+    assert.match(output.message, /Next: re-run `\/deploy staging`/);
+    assert.doesNotMatch(result.stderr, /TypeError/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check treats malformed deploy-state shapes as empty history instead of crashing', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    mkdirSync(stateDir, { recursive: true });
+    writeHealthyProbeState(repoRoot, ['frontend']);
+
+    for (const payload of [null, { records: null }]) {
+      writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify(payload, null, 2), 'utf8');
+      const result = runCli(['run', 'release-check', '--surfaces', 'frontend', '--json'], repoRoot, {}, true);
+      const output = JSON.parse(result.stdout);
+      assert.equal(result.status, 1);
+      assert.match(output.message, /no succeeded deploy observed/);
+      assert.doesNotMatch(result.stderr, /TypeError/);
+    }
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check skips malformed deploy record entries and sanitizes malformed verification details', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    const fingerprint = await fingerprintForFullConfig();
+    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({
+      records: [
+        null,
+        {
+          environment: 'staging',
+          sha: '3333333333333333333333333333333333333333',
+          surfaces: ['frontend'],
+          workflowName: 'Deploy Hosted',
+          requestedAt: '2026-04-27T13:16:30Z',
+          finishedAt: '2026-04-27T13:17:30Z',
+          taskSlug: 'bootstrap',
+          status: 'succeeded',
+          verifiedAt: '2026-04-27T13:18:00Z',
+          verificationBySurface: {
+            frontend: { healthcheckUrl: 'https://staging.example.test/health', statusCode: '503\u001b[31m', latencyMs: 50, probes: 2 },
+          },
+          configFingerprint: fingerprint,
+          idempotencyKey: 'malformed-verification',
+          triggeredBy: 'test',
+        },
+      ],
+    }, null, 2), 'utf8');
+    writeHealthyProbeState(repoRoot, ['frontend']);
+
+    const result = runCli(['run', 'release-check', '--surfaces', 'frontend', '--json'], repoRoot, {}, true);
+    const output = JSON.parse(result.stdout);
+    assert.equal(result.status, 1);
+    assert.match(output.message, /healthcheck did not return 2xx \(HTTP 503\)/);
+    assert.doesNotMatch(output.message, /\u001b/);
+    assert.doesNotMatch(result.stderr, /TypeError/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -5850,6 +6133,67 @@ test('pr, merge, deploy, and task-lock work with a fake gh adapter', () => {
     assert.ok(ghState.workflows[0].args.includes('surfaces=frontend,edge,sql'));
     assert.ok(ghState.workflows[0].args.includes('bypass_staging_guard=true'));
     assert.ok(ghState.workflows[1].args.includes('bypass_staging_guard=true'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('pr blocked by release mode reports in-flight staging deploy details before committing', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(path.join(stateDir, 'mode-state.json'), JSON.stringify({
+      mode: 'release',
+      requestedSurfaces: ['frontend', 'edge', 'sql'],
+      override: null,
+      updatedAt: '2026-04-27T13:16:00Z',
+    }, null, 2), 'utf8');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Canvas Picker', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+    const requestedAt = new Date().toISOString();
+    writeStagingRequestedRecord(repoRoot, ['frontend', 'edge', 'sql'], {
+      requestedAt,
+      workflowRunUrl: 'https://example.test/actions/runs/882',
+    });
+    writeHealthyProbeState(repoRoot, ['frontend', 'edge', 'sql']);
+
+    const result = runCli(['run', 'pr', '--title', 'Canvas Picker', '--json'], created.worktreePath, env, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /\/pr blocked before staging or committing because release mode is not ready/);
+    assert.match(result.stderr, /Blocked surfaces: frontend, edge, sql/);
+    assert.ok(result.stderr.includes(`latest staging deploy is still in flight since ${requestedAt}`));
+    assert.match(result.stderr, /Retry after staging verification finishes/);
+    assert.match(result.stderr, /Next: wait for the staging deploy verification to finish/);
+    assert.doesNotMatch(result.stderr, /\/doctor --fix/);
+
+    const branchLog = run('git', ['log', '--oneline', '-1'], created.worktreePath);
+    assert.match(branchLog, /Adopt pipelane/);
+    assert.match(run('git', ['status', '--short'], created.worktreePath), /feature\.txt/);
+
+    if (existsSync(ghStateFile)) {
+      const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+      assert.deepEqual(ghState.prs, {});
+    }
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });

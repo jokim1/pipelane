@@ -1680,7 +1680,12 @@ export function saveModeState(commonDir: string, config: WorkflowConfig, value: 
 }
 
 export function loadDeployState(commonDir: string, config: WorkflowConfig): { records: DeployRecord[] } {
-  return readVersionedJsonFile('deployState', commonDir, config, deployStatePath(commonDir, config), { records: [] as DeployRecord[] });
+  const loaded = readVersionedJsonFile<unknown>('deployState', commonDir, config, deployStatePath(commonDir, config), { records: [] as DeployRecord[] });
+  if (!loaded || typeof loaded !== 'object' || Array.isArray(loaded)) {
+    return { records: [] };
+  }
+  const records = (loaded as { records?: unknown }).records;
+  return { records: Array.isArray(records) ? records as DeployRecord[] : [] };
 }
 
 export function saveDeployState(commonDir: string, config: WorkflowConfig, value: { records: DeployRecord[] }): void {
