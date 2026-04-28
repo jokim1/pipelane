@@ -2380,7 +2380,7 @@
       const buildRows = [
         { command: aliases.status, description: 'See what is already in flight.' },
         { command: `${aliases.devmode} build`, description: 'Set the repo to build mode. Usually set once, until you switch lanes.' },
-        { command: `${aliases.new} "task name"`, description: 'Create a clean task worktree and branch. The task name is optional.' },
+        { command: aliases.new, description: 'Create a named task worktree from the described task.' },
         { command: aliases.pr, description: 'Run pre-PR checks, commit, push, and open or update the PR.' },
         { command: aliases.merge, description: 'Merge the PR. In build mode, this hands off to the prod deploy path.' },
         { command: `${aliases.smoke} prod`, description: 'Optional: run production-safe smoke checks if configured.' },
@@ -2389,7 +2389,7 @@
       const releaseRows = [
         { command: aliases.status, description: 'See active tasks, deploy state, and release gates.' },
         { command: `${aliases.devmode} release`, description: 'Set the repo to release mode. Usually set once, until you switch lanes.' },
-        { command: `${aliases.new} "task name"`, description: 'Create a clean task worktree and branch. The task name is optional.' },
+        { command: aliases.new, description: 'Create a named task worktree from the described task.' },
         { command: aliases.pr, description: 'Run pre-PR checks, commit, push, and open or update the PR.' },
         { command: aliases.merge, description: 'Merge the PR and record the merged SHA.' },
         { command: `${aliases.deploy} staging`, description: 'Deploy the merged SHA to staging.' },

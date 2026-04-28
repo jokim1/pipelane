@@ -55,6 +55,24 @@ function buildManagedExtraCodexSkill(name: (typeof MANAGED_EXTRA_CODEX_SKILLS)[n
 }
 
 function buildWorkflowSkillGuidance(command: WorkflowCommand, slashAlias: string): string {
+  if (command === 'new') {
+    return `
+## Bare invocation behavior
+
+When the user invokes bare ${slashAlias} after describing an unstarted coding
+task, infer a concise task label from the recent request and pass it as
+\`--task "<task label>"\`. Do not make the user repeat a task name that is
+already clear.
+
+If recent context says the task was already implemented, do not create another
+workspace. Continue in the reported worktree and use the PR flow there.
+
+If no task context is available, ask one short question for the task
+description. Only use \`--unnamed\` when the operator explicitly wants a
+generated task slug.
+`;
+  }
+
   if (command !== 'smoke') {
     return '';
   }

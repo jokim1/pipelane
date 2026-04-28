@@ -1,11 +1,14 @@
 import { mkdirSync } from 'node:fs';
+import path from 'node:path';
 
 import {
   formatWorkflowCommand,
+  normalizePath,
   loadTaskLock,
   printResult,
   resolveWorkflowContext,
   type ParsedOperatorArgs,
+  type WorkflowConfig,
 } from '../state.ts';
 import {
   buildCurrentWorkspaceReasons,
@@ -14,15 +17,18 @@ import {
   findPrunedTaskLock,
   generateHex,
   generateUniqueTaskWorkspace,
+  listOrphanWorktrees,
   listActiveTaskLocks,
+  readWorktreeStatus,
   pruneDeadTaskLocks,
   resolveTaskBaseRef,
   resolveTaskCommandIdentity,
   resolveTaskWorktreeRoot,
   saveNewTaskLock,
+  type OrphanWorktree,
 } from '../task-workspaces.ts';
 import { runGit } from '../state.ts';
-import { resolveCommandSurfaces } from './helpers.ts';
+import { inferTaskSlugsFromBranchName, resolveCommandSurfaces } from './helpers.ts';
 
 // v1.5: soft-warn when the operator has 3+ active tasks. Never blocks —
 // small teams legitimately juggle several lanes, but 24 half-alive
@@ -32,9 +38,13 @@ export const WIP_SOFT_WARN_THRESHOLD = 3;
 
 export async function handleNew(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const rawTask = parsed.flags.task.trim();
-  const effectiveTask = rawTask || `task-${generateHex()}`;
-
   const context = resolveWorkflowContext(cwd);
+
+  if (!rawTask && !parsed.flags.unnamed) {
+    throw new Error(formatMissingTaskError(context.config, listOrphanWorktrees(context.commonDir, context.config)));
+  }
+
+  const effectiveTask = rawTask || `task-${generateHex()}`;
   const { taskName, taskSlug } = resolveTaskCommandIdentity(effectiveTask);
   const mode = context.modeState.mode;
   const surfaces = resolveCommandSurfaces(context, parsed.flags.surfaces);
@@ -51,6 +61,15 @@ export async function handleNew(cwd: string, parsed: ParsedOperatorArgs): Promis
   // the operator sees "about to hit N+1" rather than the pre-save N
   // (undercount by one).
   const activeLocks = listActiveTaskLocks(context.commonDir, context.config);
+  assertNewTaskStartIsSafe({
+    config: context.config,
+    repoRoot: context.repoRoot,
+    activeLocks,
+    taskSlug,
+    force: parsed.flags.force,
+    matchingOrphans: matchingOrphanWorktrees(context.commonDir, context.config, taskSlug),
+  });
+
   if (activeLocks.length >= WIP_SOFT_WARN_THRESHOLD && !parsed.flags.json) {
     const oldestAgeHours = computeOldestLockAgeHours(activeLocks);
     const ageNote = oldestAgeHours !== null ? `, oldest updated ${oldestAgeHours}h ago` : '';
@@ -110,6 +129,116 @@ export async function handleNew(cwd: string, parsed: ParsedOperatorArgs): Promis
     warnings: [...baseRef.warnings, ...warnings, ...(nodeModulesWarning ? [nodeModulesWarning] : [])],
     reasons,
   }));
+}
+
+function formatMissingTaskError(config: WorkflowConfig, orphans: OrphanWorktree[]): string {
+  const lines = [
+    `${formatWorkflowCommand(config, 'new')} needs a task name before it creates a workspace.`,
+    `Describe the task, then run ${formatWorkflowCommand(config, 'new')} so the agent can infer the task name.`,
+    `Or pass ${formatWorkflowCommand(config, 'new', '--task "<task-name>"')} directly.`,
+    `To intentionally create a generated task slug, run ${formatWorkflowCommand(config, 'new', '--unnamed')}.`,
+  ];
+
+  if (orphans.length > 0) {
+    lines.push(
+      '',
+      'Existing worktrees without task locks were found. If one is your task, continue there instead of starting another workspace:',
+      ...orphans.slice(0, 5).map((orphan) => `- ${formatOrphanWorktree(orphan)}`),
+    );
+    if (orphans.length > 5) {
+      lines.push(`- ... ${orphans.length - 5} more`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+function assertNewTaskStartIsSafe(options: {
+  config: WorkflowConfig;
+  repoRoot: string;
+  activeLocks: Array<{ taskSlug: string; taskName?: string; branchName: string; worktreePath: string }>;
+  taskSlug: string;
+  force: boolean;
+  matchingOrphans: OrphanWorktree[];
+}): void {
+  if (options.force) {
+    return;
+  }
+
+  const status = readWorktreeStatus(options.repoRoot);
+  const repoPath = normalizePath(options.repoRoot);
+  const currentLock = options.activeLocks.find((lock) =>
+    lock.branchName === status.branchName || normalizePath(lock.worktreePath) === repoPath
+  );
+
+  if (currentLock) {
+    throw new Error([
+      `${formatWorkflowCommand(options.config, 'new')} blocked because this checkout is already bound to an active task.`,
+      `Task: ${currentLock.taskName || currentLock.taskSlug}`,
+      `Branch: ${currentLock.branchName}`,
+      `Worktree: ${currentLock.worktreePath}`,
+      `Next: continue in that worktree, or run ${formatWorkflowCommand(options.config, 'resume', `--task "${currentLock.taskName || currentLock.taskSlug}"`)}.`,
+      `If you intentionally want another workspace anyway, rerun ${formatWorkflowCommand(options.config, 'new', `--task "${options.taskSlug}" --force`)}.`,
+    ].join('\n'));
+  }
+
+  if (status.statusLines.length > 0) {
+    throw new Error([
+      `${formatWorkflowCommand(options.config, 'new')} blocked because the current checkout has uncommitted changes.`,
+      ...status.statusLines.slice(0, 10).map((line) => `- ${line}`),
+      status.statusLines.length > 10 ? `- ... ${status.statusLines.length - 10} more` : '',
+      'Commit, stash, or move this work into a task before starting another workspace.',
+      `If this is intentional, rerun ${formatWorkflowCommand(options.config, 'new', `--task "${options.taskSlug}" --force`)}.`,
+    ].filter(Boolean).join('\n'));
+  }
+
+  if (options.matchingOrphans.length > 0) {
+    throw new Error([
+      `${formatWorkflowCommand(options.config, 'new')} blocked because an existing worktree looks like this task but has no task lock.`,
+      ...options.matchingOrphans.map((orphan) => `- ${formatOrphanWorktree(orphan)}`),
+      'Continue in that worktree, or inspect with git status before starting a replacement.',
+      `If this is unrelated, rerun ${formatWorkflowCommand(options.config, 'new', `--task "${options.taskSlug}" --force`)}.`,
+    ].join('\n'));
+  }
+}
+
+function matchingOrphanWorktrees(commonDir: string, config: WorkflowConfig, taskSlug: string): OrphanWorktree[] {
+  const orphans = listOrphanWorktrees(commonDir, config);
+  return orphans.filter((orphan) => orphanMatchesTaskSlug(orphan, config, taskSlug));
+}
+
+function orphanMatchesTaskSlug(orphan: OrphanWorktree, config: WorkflowConfig, taskSlug: string): boolean {
+  if (orphan.branchName) {
+    const branchSlugs = inferTaskSlugsFromBranchName(config, orphan.branchName);
+    if (branchSlugs.includes(taskSlug) || basenameMatchesTaskSlug(path.basename(orphan.branchName), taskSlug)) {
+      return true;
+    }
+  }
+
+  return basenameMatchesTaskSlug(path.basename(orphan.path), taskSlug);
+}
+
+function basenameMatchesTaskSlug(basename: string, taskSlug: string): boolean {
+  const candidates = new Set([basename, basename.replace(/-[a-f0-9]{4}$/i, '')]);
+  for (const candidate of candidates) {
+    if (normalizeTaskNameCandidate(candidate) === taskSlug) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function normalizeTaskNameCandidate(candidate: string): string {
+  return candidate
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function formatOrphanWorktree(orphan: OrphanWorktree): string {
+  const branch = orphan.branchName ?? (orphan.isDetached ? '(detached)' : '(unknown branch)');
+  return `${branch} @ ${orphan.path} (${orphan.source})`;
 }
 
 function ordinal(n: number): string {

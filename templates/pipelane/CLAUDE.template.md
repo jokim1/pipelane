@@ -7,9 +7,11 @@ This file is local-only operator state. Keep it git-ignored.
 - Treat `release` as the standard shipping mode.
 - Use `build` only for fallback, recovery, or an explicit user request.
 - Use `{{ALIAS_NEW}}`, not manual branch creation, for normal task starts.
+- When the user describes a task and then invokes `{{ALIAS_NEW}}`, infer a concise task label and pass it as `--task`.
+- If recent context says the task is already implemented in a worktree, do not run `{{ALIAS_NEW}}`; continue there and use `{{ALIAS_PR}}`.
 - Preferred operator path:
   1. `{{ALIAS_DEVMODE}} release`
-  2. `{{ALIAS_NEW}} --task "<task-name>"`
+  2. `{{ALIAS_NEW}}`
   3. `{{ALIAS_PR}} --title "<pr title>"`
   4. `{{ALIAS_MERGE}}`
   5. `{{ALIAS_DEPLOY}} staging`
@@ -28,7 +30,7 @@ When the user's request matches an available skill, invoke it first.
 
 Key routing rules:
 
-- Start a new task workspace -> `{{ALIAS_NEW}}`
+- Start a new task workspace -> `{{ALIAS_NEW}}` with an inferred `--task` label when recent context names unstarted work
 - Resume an existing task workspace -> `{{ALIAS_RESUME}}`
 - Prepare or update a PR -> `{{ALIAS_PR}}`
 - Merge the current PR -> `{{ALIAS_MERGE}}`

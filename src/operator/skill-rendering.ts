@@ -73,6 +73,28 @@ export function buildSkillMarker(prefix: string, name: string): string {
   return `${prefix}${name} -->`;
 }
 
+function renderWorkflowSkillGuidance(command: WorkflowCommand | 'pipelane', slashAlias: string): string {
+  if (command !== 'new') {
+    return '';
+  }
+
+  return `
+## Bare invocation behavior
+
+When the user invokes bare ${slashAlias} after describing an unstarted coding
+task, infer a concise task label from the recent request and pass it as
+\`--task "<task label>"\`. Do not make the user repeat a task name that is
+already clear.
+
+If recent context says the task was already implemented, do not create another
+workspace. Continue in the reported worktree and use the PR flow there.
+
+If no task context is available, ask one short question for the task
+description. Only use \`--unnamed\` when the operator explicitly wants a
+generated task slug.
+`;
+}
+
 export function renderWorkflowSkillBody(options: WorkflowSkillBodyOptions): string {
   const skillName = aliasCommandName(options.slashAlias);
   const commandLabel = options.command === 'pipelane'
@@ -98,6 +120,7 @@ Run ${commandLabel}.
 3. Run:
    \`${runnerCommand}\`
 4. Stream the command output directly.
+${renderWorkflowSkillGuidance(options.command, options.slashAlias)}
 `;
 }
 

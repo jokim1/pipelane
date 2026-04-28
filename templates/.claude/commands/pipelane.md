@@ -30,7 +30,7 @@ Fast path. Merge hands off to production deploy.
 
   {{ALIAS_STATUS}}               See what is already in flight.
   {{ALIAS_DEVMODE}} build        Set the repo to build mode. Usually set once, until you switch lanes.
-  {{ALIAS_NEW}} --task "task name" Create a clean task worktree and branch. The task name is optional.
+  {{ALIAS_NEW}}                  Create a named task worktree from the described task.
   {{ALIAS_PR}} --title "PR title"  Run pre-PR checks, commit, push, and open or update the PR.
   {{ALIAS_MERGE}}                Merge the PR. In build mode, this hands off to the prod deploy path.
   {{ALIAS_SMOKE}} prod           Optional: run production-safe smoke checks if configured.
@@ -41,7 +41,7 @@ Protected path. Promote the same merged SHA through staging, smoke, then prod.
 
   {{ALIAS_STATUS}}               See active tasks, deploy state, and release gates.
   {{ALIAS_DEVMODE}} release      Set the repo to release mode. Usually set once, until you switch lanes.
-  {{ALIAS_NEW}} --task "task name" Create a clean task worktree and branch. The task name is optional.
+  {{ALIAS_NEW}}                  Create a named task worktree from the described task.
   {{ALIAS_PR}} --title "PR title"  Run pre-PR checks, commit, push, and open or update the PR.
   {{ALIAS_MERGE}}                Merge the PR and record the merged SHA.
   {{ALIAS_DEPLOY}} staging       Deploy the merged SHA to staging.

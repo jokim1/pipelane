@@ -490,6 +490,7 @@ export interface OperatorFlags {
   help: boolean;
   json: boolean;
   offline: boolean;
+  unnamed: boolean;
   override: boolean;
   plan: boolean;
   yes: boolean;
@@ -2084,6 +2085,7 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     help: false,
     json: false,
     offline: false,
+    unnamed: false,
     override: false,
     plan: false,
     yes: false,
@@ -2199,6 +2201,12 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     if (flagName === '--offline') {
       rejectInlineValue('--offline');
       flags.offline = true;
+      continue;
+    }
+
+    if (flagName === '--unnamed') {
+      rejectInlineValue('--unnamed');
+      flags.unnamed = true;
       continue;
     }
 
@@ -2485,8 +2493,11 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       return;
     }
     case 'new':
-      assertOnlyFlags(parsed, ['task', 'surfaces', 'offline']);
-      requireNoPositional('pipelane run new [--task <task-name>] [--surfaces <csv>] [--offline]');
+      assertOnlyFlags(parsed, ['task', 'surfaces', 'offline', 'unnamed', 'force']);
+      requireNoPositional('pipelane run new (--task <task-name> | --unnamed) [--surfaces <csv>] [--offline] [--force]');
+      if (parsed.flags.task.trim() && parsed.flags.unnamed) {
+        throw new Error('new cannot combine --task and --unnamed; provide a task name or explicitly request a generated slug.');
+      }
       return;
     case 'resume':
       assertOnlyFlags(parsed, ['task']);
@@ -2763,6 +2774,7 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'force', label: '--force', active: (flags) => flags.force },
   { key: 'statusOnly', label: '--status-only', active: (flags) => flags.statusOnly },
   { key: 'offline', label: '--offline', active: (flags) => flags.offline },
+  { key: 'unnamed', label: '--unnamed', active: (flags) => flags.unnamed },
   { key: 'override', label: '--override', active: (flags) => flags.override },
   { key: 'plan', label: '--plan', active: (flags) => flags.plan },
   { key: 'yes', label: '--yes', active: (flags) => flags.yes },

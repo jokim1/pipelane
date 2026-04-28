@@ -818,6 +818,10 @@ test('init writes tracked Pipelane files and setup seeds CLAUDE plus tracked Cod
     assert.equal(existsSync(path.join(codexHome, 'skills', 'resume', 'SKILL.md')), false);
     assert.equal(existsSync(path.join(codexHome, 'skills', 'pr', 'SKILL.md')), false);
 
+    const newSkill = readFileSync(path.join(repoRoot, '.agents', 'skills', 'new', 'SKILL.md'), 'utf8');
+    assert.match(newSkill, /Bare invocation behavior/);
+    assert.match(newSkill, /infer a\s+concise task label/);
+
     const smokeSkill = readFileSync(path.join(repoRoot, '.agents', 'skills', 'smoke', 'SKILL.md'), 'utf8');
     assert.match(smokeSkill, /Guided empty state behavior/);
     assert.match(smokeSkill, /Offer the exact choices from `emptyState\.options`/);
@@ -836,6 +840,8 @@ test('init writes tracked Pipelane files and setup seeds CLAUDE plus tracked Cod
     assert.equal(packageJson.scripts['pipelane:board'], 'pipelane board');
     assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'repo-guard.md')));
     assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'smoke.md')));
+    const newCommand = readFileSync(path.join(repoRoot, '.claude', 'commands', 'new.md'), 'utf8');
+    assert.match(newCommand, /infer a concise task label/);
     const smokeCommand = readFileSync(path.join(repoRoot, '.claude', 'commands', 'smoke.md'), 'utf8');
     assert.match(smokeCommand, /Guided empty states/);
     assert.match(smokeCommand, /Offer the exact choices from `emptyState\.options`/);
@@ -1809,6 +1815,7 @@ test('install-codex outside a pipelane repo installs durable global default skil
     assert.ok(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')));
     assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md')));
     assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane-fix', 'SKILL.md')));
+    assert.match(readFileSync(path.join(codexHome, 'skills', 'new', 'SKILL.md'), 'utf8'), /Bare invocation behavior/);
     const fixSkill = readFileSync(path.join(codexHome, 'skills', 'fix', 'SKILL.md'), 'utf8');
     assert.match(fixSkill, /Pipelane-enabled repo detection/);
     assert.match(fixSkill, /Resolve `<base>` from the Pipelane config first/);
@@ -1845,6 +1852,7 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane', 'SKILL.md')));
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane-fix', 'SKILL.md')));
     assert.match(readFileSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md'), 'utf8'), /disable-model-invocation: true/);
+    assert.match(readFileSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md'), 'utf8'), /Bare invocation behavior/);
     assert.match(
       readFileSync(path.join(claudeHome, 'skills', 'pipelane', 'bin', 'bootstrap-pipelane.sh'), 'utf8'),
       new RegExp(path.join(claudeHome, 'skills', 'pipelane', 'bin', 'pipelane').replaceAll('\\', '\\\\')),
@@ -2461,7 +2469,7 @@ test('pipelane.md renders a journey-first overview with real slash aliases', () 
     assert.match(pipelane, /Pick a lane:/);
     assert.match(pipelane, /1\. Build journey/);
     assert.match(pipelane, /\/devmode build\s+Set the repo to build mode\./);
-    assert.match(pipelane, /\/start --task "task name"\s+Create a clean task worktree and branch\./);
+    assert.match(pipelane, /\/start\s+Create a named task worktree from the described task\./);
     assert.match(pipelane, /\/pr --title "PR title"\s+Run pre-PR checks, commit, push, and open or update the PR\./);
     assert.match(pipelane, /\/merge\s+Merge the PR\. In build mode, this hands off to the prod deploy path\./);
     assert.match(pipelane, /\/tidy\s+Clean up finished task state after the release is complete\./);
@@ -4191,19 +4199,109 @@ test('new and repo-guard work from repos that track only .project-workflow.json'
   }
 });
 
-test('new generates a task-<hex> slug when --task is omitted', () => {
+test('new requires a task name unless --unnamed is explicit', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
 
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
 
-    const created = JSON.parse(runCli(['run', 'new', '--json'], repoRoot).stdout);
+    const missingTask = runCli(['run', 'new', '--json'], repoRoot, {}, true);
+    assert.notEqual(missingTask.status, 0);
+    assert.match(missingTask.stderr, /needs a task name/);
+    assert.match(missingTask.stderr, /--unnamed/);
+
+    const created = JSON.parse(runCli(['run', 'new', '--unnamed', '--json'], repoRoot).stdout);
     assert.match(created.taskSlug, /^task-[0-9a-f]{4}$/);
     assert.equal(created.createdWorktree, true);
     assert.ok(created.worktreePath.includes(created.taskSlug));
     assert.equal(run('git', ['branch', '--show-current'], created.worktreePath), created.branch);
   } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('new blocks current dirty worktree and matching orphan worktrees unless forced', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const externalWorktree = path.join(os.tmpdir(), `pipelane-external-${Date.now()}`);
+  let forcedWorktree = '';
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    writeFileSync(path.join(repoRoot, 'dirty.txt'), 'local work\n', 'utf8');
+    const dirty = runCli(['run', 'new', '--task', 'Dirty Start'], repoRoot, {}, true);
+    assert.notEqual(dirty.status, 0);
+    assert.match(dirty.stderr, /uncommitted changes/);
+    assert.match(dirty.stderr, /--force/);
+    rmSync(path.join(repoRoot, 'dirty.txt'), { force: true });
+
+    execFileSync('git', ['worktree', 'add', externalWorktree, '-b', 'task/ai-dialog-text-formatting-5d3a', 'origin/main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const orphan = runCli(['run', 'new', '--task', 'AI dialog text formatting'], repoRoot, {}, true);
+    assert.notEqual(orphan.status, 0);
+    assert.match(orphan.stderr, /existing worktree looks like this task/);
+    assert.match(orphan.stderr, /task\/ai-dialog-text-formatting-5d3a/);
+
+    const forced = JSON.parse(runCli(['run', 'new', '--task', 'AI dialog text formatting', '--force', '--json'], repoRoot).stdout);
+    forcedWorktree = forced.worktreePath;
+    assert.equal(forced.taskSlug, 'ai-dialog-text-formatting');
+    assert.equal(forced.createdWorktree, true);
+  } finally {
+    if (forcedWorktree) {
+      try {
+        execFileSync('git', ['worktree', 'remove', '--force', forcedWorktree], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+      } catch {
+        rmSync(forcedWorktree, { recursive: true, force: true });
+      }
+    }
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', externalWorktree], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      rmSync(externalWorktree, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('new ignores unrelated orphan worktrees that only contain the requested slug', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const externalWorktree = path.join(os.tmpdir(), `pipelane-external-build-ui-${Date.now()}`);
+  let createdWorktree = '';
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    execFileSync('git', ['worktree', 'add', externalWorktree, '-b', 'task/build-ui-menu-5d3a', 'origin/main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'UI', '--json'], repoRoot).stdout);
+    createdWorktree = created.worktreePath;
+    assert.equal(created.taskSlug, 'ui');
+    assert.equal(created.createdWorktree, true);
+    assert.equal(run('git', ['branch', '--show-current'], created.worktreePath), created.branch);
+  } finally {
+    if (createdWorktree) {
+      try {
+        execFileSync('git', ['worktree', 'remove', '--force', createdWorktree], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+      } catch {
+        rmSync(createdWorktree, { recursive: true, force: true });
+      }
+    }
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', externalWorktree], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      rmSync(externalWorktree, { recursive: true, force: true });
+    }
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
   }
@@ -11103,6 +11201,10 @@ test('operator parser rejects unknown flags, missing values, unused flags, and u
     assert.notEqual(missingValue.status, 0);
     assert.match(missingValue.stderr, /--task requires a value/);
 
+    const taskAndUnnamed = runCli(['run', 'new', '--task', 'Named', '--unnamed'], repoRoot, {}, true);
+    assert.notEqual(taskAndUnnamed.status, 0);
+    assert.match(taskAndUnnamed.stderr, /cannot combine --task and --unnamed/);
+
     const wrongFlagForCommand = runCli(['run', 'new', '--title', 'Ignored before'], repoRoot, {}, true);
     assert.notEqual(wrongFlagForCommand.status, 0);
     assert.match(wrongFlagForCommand.stderr, /new does not accept flag\(s\): --title/);
@@ -14670,7 +14772,39 @@ test('detectSetupDrift proposes an AGENTS.md migration when stale workflow guida
     assert.deepEqual(drift.agentsGuidanceMigrations[0].replacements, [{
       line: 3,
       before: '- Before starting work, run `npm run workflow:new -- --task "task name"`.',
-      after: '- Before starting work, run `/new --task "task name"`.',
+      after: '- Before starting work, run `/new`.',
+    }]);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('detectSetupDrift proposes an AGENTS.md migration for placeholder /new --task guidance', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const agentsPath = path.join(repoRoot, 'AGENTS.md');
+    const current = readFileSync(agentsPath, 'utf8');
+    writeFileSync(
+      agentsPath,
+      [
+        '# Demo App Repo Context',
+        '',
+        '- Before starting work, run `/new --task "<task-name>"`.',
+        '',
+        current,
+      ].join('\n'),
+      'utf8',
+    );
+
+    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
+    const drift = docs.detectSetupDrift(repoRoot);
+    assert.equal(drift.agentsGuidanceMigrations.length, 1);
+    assert.deepEqual(drift.agentsGuidanceMigrations[0].replacements, [{
+      line: 3,
+      before: '- Before starting work, run `/new --task "<task-name>"`.',
+      after: '- Before starting work, run `/new`.',
     }]);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -14698,9 +14832,9 @@ test('setup without --yes prints the AGENTS.md migration proposal without rewrit
     const result = runCli(['setup'], repoRoot);
     assert.match(result.stdout, /AGENTS\.md guidance migration requires approval:/);
     assert.match(result.stdout, /current: - Agent default workflow: `npm run workflow:new -- --task "task name"`\./);
-    assert.match(result.stdout, /proposed: - Agent default workflow: `\/new --task "task name"`\./);
+    assert.match(result.stdout, /proposed: - Agent default workflow: `\/new`\./);
     assert.match(result.stdout, /AGENTS\.md:3/);
-    assert.match(result.stdout, /node_modules\/\.bin\/pipelane/);
+    assert.match(result.stdout, /prevent placeholder task names from creating stray worktrees/);
     assert.match(result.stdout, /pipelane setup --yes/);
     assert.match(readFileSync(agentsPath, 'utf8'), /npm run workflow:new/);
   } finally {
@@ -14729,7 +14863,8 @@ test('setup --yes applies the AGENTS.md stale workflow guidance migration', () =
     const result = runCli(['setup', '--yes'], repoRoot);
     const agents = readFileSync(agentsPath, 'utf8');
     assert.match(result.stdout, /Updated AGENTS\.md stale workflow guidance \(1 line\)\./);
-    assert.match(agents, /\/new --task "task name"/);
+    assert.match(agents, /Agent default workflow: `\/new`/);
+    assert.doesNotMatch(agents, /\/new --task "task name"/);
     assert.doesNotMatch(agents, /npm run workflow:new/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });

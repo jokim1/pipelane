@@ -84,7 +84,10 @@ Properties:
 - refreshes `origin/{{BASE_BRANCH}}` first
 - inherits the current dev mode
 - fails closed if the task already exists and points to `{{ALIAS_RESUME}}`
-- `--task "<task-name>"` is optional; when omitted, `{{ALIAS_NEW}}` generates a `task-<hex>` slug automatically
+- fails closed if the current checkout has uncommitted changes or is already bound to a task, unless `--force` is explicit
+- fails closed when a matching orphan worktree exists without a task lock, so finished manual work is not accidentally abandoned
+- agents should infer `--task "<task-name>"` from the described work when the user invokes bare `{{ALIAS_NEW}}`
+- a generated `task-<hex>` slug requires explicit `--unnamed`
 
 `{{ALIAS_RESUME}}` is the recovery path, not the normal happy path.
 
@@ -140,7 +143,7 @@ Use it when:
 User-facing journey:
 
 1. `{{ALIAS_DEVMODE}} build`
-2. `{{ALIAS_NEW}} --task "<task-name>"`
+2. `{{ALIAS_NEW}}`
 3. `{{ALIAS_PR}} --title "<pr title>"`
 4. `{{ALIAS_MERGE}}`
 5. `{{ALIAS_CLEAN}}`
@@ -158,7 +161,7 @@ Use it when:
 User-facing journey:
 
 1. `{{ALIAS_DEVMODE}} release`
-2. `{{ALIAS_NEW}} --task "<task-name>"`
+2. `{{ALIAS_NEW}}`
 3. `{{ALIAS_PR}} --title "<pr title>"`
 4. `{{ALIAS_MERGE}}`
 5. `{{ALIAS_DEPLOY}} staging`
@@ -348,7 +351,7 @@ workflow contract needs to exist there first.
 
 1. Run setup
 2. `{{ALIAS_DEVMODE}} status`
-3. `{{ALIAS_NEW}} --task "<task-name>"`
+3. describe the task, then run `{{ALIAS_NEW}}`
 4. implement and verify
 5. `{{ALIAS_PR}} --title "<pr title>"`
 

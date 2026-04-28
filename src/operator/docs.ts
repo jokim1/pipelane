@@ -679,10 +679,18 @@ function replacementForAgentsWorkflowCommand(command: string, aliases: Record<Wo
 
 function migrateAgentsGuidanceLine(line: string, aliases: Record<WorkflowCommand, string>): string {
   const staleScriptPattern = /\bnpm\s+run\s+(?:workflow|pipelane):([a-z0-9-]+)(?:\s+--(?=\s|$))?/gi;
-  return line.replace(staleScriptPattern, (match, rawCommand: string) => {
+  const migrated = line.replace(staleScriptPattern, (match, rawCommand: string) => {
     const replacement = replacementForAgentsWorkflowCommand(rawCommand.toLowerCase(), aliases);
     return replacement ?? match;
   });
+
+  return [
+    `${aliases.new} --task "task name"`,
+    `${aliases.new} --task 'task name'`,
+    `${aliases.new} --task "<task-name>"`,
+    `${aliases.new} --task '<task-name>'`,
+    `${aliases.new} --task <task-name>`,
+  ].reduce((next, placeholder) => next.replaceAll(placeholder, aliases.new), migrated);
 }
 
 function detectAgentsGuidanceMigrationsForConfig(repoRoot: string, config: WorkflowConfig): AgentsGuidanceMigration[] {
@@ -793,7 +801,7 @@ export function formatAgentsGuidanceMigrations(migrations: AgentsGuidanceMigrati
   }
   return [
     ...lines,
-    'These npm script paths require repo-local node_modules/.bin/pipelane and can fail in fresh AI worktrees.',
+    'These updates keep task starts on the slash-command path and prevent placeholder task names from creating stray worktrees.',
   ];
 }
 

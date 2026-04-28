@@ -61,7 +61,7 @@ to production and do not need required staging validation for the same SHA.
 ```text
 /status                 See what is already in flight.
 /devmode build          Use the fast lane.
-/new --task "task name" Create a clean task worktree and branch.
+/new                    Create a named task worktree from the described task.
 /pr --title "PR title"  Run pre-PR checks, commit, push, and open or update the PR.
 /merge                  Merge the PR and record the merged SHA.
 /smoke prod             Optional: run production-safe smoke checks if configured.
@@ -79,7 +79,7 @@ merged SHA before production can move.
 ```text
 /status                 See active tasks, deploy state, and release gates.
 /devmode release        Use the protected lane.
-/new --task "task name" Create a clean task worktree and branch.
+/new                    Create a named task worktree from the described task.
 /pr --title "PR title"  Run pre-PR checks, commit, push, and open or update the PR.
 /merge                  Merge the PR and record the merged SHA.
 /deploy staging         Deploy the merged SHA to staging.
@@ -342,17 +342,20 @@ User: Add checkout recovery emails for abandoned carts.
 ```
 
 The user starts with a task description in plain English. It does not need to be
-a perfect spec. The AI agent can turn it into an implementation plan.
+a perfect spec. The AI agent can turn it into an implementation plan and infer
+the task name for `/new`.
 
 ```text
 /status
 /devmode build
-/new --task "add checkout recovery emails"
+/new
 ```
 
 Pipelane creates the task workspace. `/status` shows what is already in flight,
-`/devmode build` selects the fast lane, and `/new` creates a clean task branch and
-worktree so the AI agent is not mixing unrelated work.
+`/devmode build` selects the fast lane, and `/new` lets the AI infer a concise
+task name from the user's request before creating a clean task branch and
+worktree. If work was already implemented in another worktree, do not run
+`/new` again; continue there and use `/pr`.
 
 ```text
 AI: Proposed plan:
@@ -493,7 +496,7 @@ gate before production:
 User: Replace the billing webhook handler.
 /status
 /devmode release
-/new --task "replace billing webhook handler"
+/new
 /plan-design-review
 /plan-eng-review
 AI: Implementation returns.

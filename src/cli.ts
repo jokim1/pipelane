@@ -53,6 +53,7 @@ Examples:
   pipelane update --check
   pipelane dashboard --repo /absolute/path/to/repo
   pipelane run new --task "My Task"
+  pipelane run new --unnamed
 `);
 }
 

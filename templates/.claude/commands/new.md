@@ -7,14 +7,22 @@ Run:
 npm run pipelane:new -- $ARGUMENTS
 ```
 
-Expected form (with a task label):
+If recent conversation says the task was already implemented, do not create a
+new workspace. Point the user at the reported task worktree and run `{{ALIAS_PR}}`
+there instead.
 
-```text
-{{ALIAS_NEW}} --task "task name"
+If `$ARGUMENTS` is empty and the recent conversation clearly describes an
+unstarted coding task, infer a concise task label and append it to the shell
+command:
+
+```bash
+npm run pipelane:new -- --task "task name"
 ```
 
-The task label is optional. You can also run `/new` with no arguments and a
-`task-<hex>` slug will be generated automatically.
+Do not ask the user to repeat a task name when the request is already clear. If
+there is no clear task context, ask one short question for the task description.
+Only use `--unnamed` when the operator intentionally wants a generated
+`task-<hex>` slug.
 
 This command:
 
@@ -22,7 +30,7 @@ This command:
 2. Creates a new `codex/<task>-<4hex>` branch.
 3. Inherits the current dev mode.
 4. Refuses to start the same task twice, and points to `{{ALIAS_RESUME}}`.
-5. Generates a `task-<hex>` slug when `--task` is omitted.
+5. Refuses no-context task starts unless `--unnamed` is explicit.
 
 Display the output directly. Call out that the chat/workspace has not moved automatically yet.
 

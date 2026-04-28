@@ -23,7 +23,7 @@ to production and do not need required staging validation for the same SHA.
 ```text
 {{ALIAS_STATUS}}                 See what is already in flight.
 {{ALIAS_DEVMODE}} build          Use the fast lane.
-{{ALIAS_NEW}} --task "task name" Create a clean task worktree and branch.
+{{ALIAS_NEW}}                    Create a named task worktree from the described task.
 {{ALIAS_PR}} --title "PR title"  Run pre-PR checks, commit, push, and open or update the PR.
 {{ALIAS_MERGE}}                  Merge the PR and record the merged SHA.
 {{ALIAS_SMOKE}} prod             Optional: run production-safe smoke checks if configured.
@@ -38,7 +38,7 @@ same merged SHA before production can move.
 ```text
 {{ALIAS_STATUS}}                 See active tasks, deploy state, and release gates.
 {{ALIAS_DEVMODE}} release        Use the protected lane.
-{{ALIAS_NEW}} --task "task name" Create a clean task worktree and branch.
+{{ALIAS_NEW}}                    Create a named task worktree from the described task.
 {{ALIAS_PR}} --title "PR title"  Run pre-PR checks, commit, push, and open or update the PR.
 {{ALIAS_MERGE}}                  Merge the PR and record the merged SHA.
 {{ALIAS_DEPLOY}} staging         Deploy the merged SHA to staging.

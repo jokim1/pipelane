@@ -10,7 +10,7 @@ It pairs well with gstack:
 Before work that may lead to a commit:
 
 1. Check mode with `{{ALIAS_DEVMODE}} status`
-2. Start a task workspace with `{{ALIAS_NEW}} --task "<task-name>"`
+2. Start a task workspace with `{{ALIAS_NEW}}`; infer a concise task label from the described work
 3. Move into the reported worktree before editing
 4. Use `{{ALIAS_RESUME}} --task "<task-name>"` only when returning to existing work
 5. Prepare the PR with `{{ALIAS_PR}} --title "<pr title>"`
