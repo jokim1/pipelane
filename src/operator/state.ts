@@ -487,6 +487,19 @@ export interface OperatorFlags {
   allStale: boolean;
   force: boolean;
   statusOnly: boolean;
+  // Scoped bulk-apply variants for /clean. Each names a category that
+  // pipelane is willing to remove without per-task confirmation. They are
+  // mutually exclusive with --task and --all-stale.
+  // - completedWithIgnored: prod-verified task locks blocked only on
+  //   ignored content (dist/, .turbo/, etc.) — the underlying PR is merged
+  //   and prod-verified, so the ignored files are recoverable build output.
+  // - safeOrphans: orphan worktrees with no tracked changes, regardless of
+  //   PR state.
+  // - mergedOrphans: orphan worktrees whose branches have a merged PR
+  //   (work is on main; remaining tree differences are stale follow-ups).
+  completedWithIgnored: boolean;
+  safeOrphans: boolean;
+  mergedOrphans: boolean;
   help: boolean;
   json: boolean;
   offline: boolean;
@@ -2082,6 +2095,9 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     allStale: false,
     force: false,
     statusOnly: false,
+    completedWithIgnored: false,
+    safeOrphans: false,
+    mergedOrphans: false,
     help: false,
     json: false,
     offline: false,
@@ -2177,6 +2193,24 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     if (flagName === '--all-stale') {
       rejectInlineValue('--all-stale');
       flags.allStale = true;
+      continue;
+    }
+
+    if (flagName === '--completed-with-ignored') {
+      rejectInlineValue('--completed-with-ignored');
+      flags.completedWithIgnored = true;
+      continue;
+    }
+
+    if (flagName === '--safe-orphans') {
+      rejectInlineValue('--safe-orphans');
+      flags.safeOrphans = true;
+      continue;
+    }
+
+    if (flagName === '--merged-orphans') {
+      rejectInlineValue('--merged-orphans');
+      flags.mergedOrphans = true;
       continue;
     }
 
@@ -2632,22 +2666,65 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       }
       throw new Error('smoke requires one of: plan, setup, staging, prod, waiver, quarantine, unquarantine.');
     }
-    case 'clean':
-      assertOnlyFlags(parsed, ['apply', 'allStale', 'task', 'force', 'statusOnly']);
+    case 'clean': {
+      assertOnlyFlags(parsed, [
+        'apply',
+        'allStale',
+        'task',
+        'force',
+        'statusOnly',
+        'completedWithIgnored',
+        'safeOrphans',
+        'mergedOrphans',
+      ]);
+      const bulkScopes: Array<'completedWithIgnored' | 'safeOrphans' | 'mergedOrphans'> = [];
+      if (parsed.flags.completedWithIgnored) bulkScopes.push('completedWithIgnored');
+      if (parsed.flags.safeOrphans) bulkScopes.push('safeOrphans');
+      if (parsed.flags.mergedOrphans) bulkScopes.push('mergedOrphans');
+      const taskGiven = parsed.flags.task.trim().length > 0;
+      const scopeFlagsGiven = parsed.flags.allStale || taskGiven || bulkScopes.length > 0;
       if (parsed.flags.statusOnly && parsed.flags.apply) {
         throw new Error('clean --status-only cannot be combined with --apply.');
       }
-      if (parsed.flags.statusOnly && (parsed.flags.allStale || parsed.flags.task.trim() || parsed.flags.force)) {
-        throw new Error('clean --status-only cannot be combined with --task, --all-stale, or --force.');
+      if (parsed.flags.statusOnly && (scopeFlagsGiven || parsed.flags.force)) {
+        throw new Error(
+          'clean --status-only cannot be combined with --task, --all-stale, --completed-with-ignored, --safe-orphans, --merged-orphans, or --force.',
+        );
       }
-      if (!parsed.flags.apply && (parsed.flags.allStale || parsed.flags.task.trim() || parsed.flags.force)) {
-        throw new Error('clean only accepts --task, --all-stale, or --force when --apply is also passed.');
+      if (!parsed.flags.apply && (scopeFlagsGiven || parsed.flags.force)) {
+        throw new Error(
+          'clean only accepts --task, --all-stale, --completed-with-ignored, --safe-orphans, --merged-orphans, or --force when --apply is also passed.',
+        );
       }
-      if (parsed.flags.force && !parsed.flags.task.trim()) {
-        throw new Error('clean --force is only valid with --task <task-name>; --all-stale is metadata-only.');
+      // Bulk scopes are mutually exclusive with each other and with
+      // --task/--all-stale. Each names a different category, and combining
+      // them would obscure which removals an operator authorized.
+      const totalScopes = bulkScopes.length + (parsed.flags.allStale ? 1 : 0) + (taskGiven ? 1 : 0);
+      if (totalScopes > 1) {
+        // Preserve the original "cannot combine --task and --all-stale"
+        // wording for the most-common collision so existing tooling /
+        // tests that grep for that phrase continue to match. Other
+        // collisions get a more general explanation.
+        if (taskGiven && parsed.flags.allStale && bulkScopes.length === 0) {
+          throw new Error([
+            '/clean --apply cannot combine --task and --all-stale.',
+            'Pick one scope so the operator knows what to prune.',
+          ].join('\n'));
+        }
+        throw new Error(
+          'clean --apply accepts exactly one scope: --task <slug>, --all-stale, --completed-with-ignored, --safe-orphans, or --merged-orphans.',
+        );
       }
-      requireNoPositional('pipelane run clean [--status-only | --apply (--task <task-name> [--force]|--all-stale)]');
+      if (parsed.flags.force && !taskGiven) {
+        throw new Error(
+          'clean --force is only valid with --task <task-name>; the bulk scopes apply per-category safety rules instead.',
+        );
+      }
+      requireNoPositional(
+        'pipelane run clean [--status-only | --apply (--task <task-name> [--force]|--all-stale|--completed-with-ignored|--safe-orphans|--merged-orphans)]',
+      );
       return;
+    }
     case 'status':
       assertOnlyFlags(parsed, ['week', 'stuck', 'blastSha']);
       requireNoPositional('pipelane run status [--week|--stuck|--blast <sha>] [--json]');
@@ -2773,6 +2850,9 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'allStale', label: '--all-stale', active: (flags) => flags.allStale },
   { key: 'force', label: '--force', active: (flags) => flags.force },
   { key: 'statusOnly', label: '--status-only', active: (flags) => flags.statusOnly },
+  { key: 'completedWithIgnored', label: '--completed-with-ignored', active: (flags) => flags.completedWithIgnored },
+  { key: 'safeOrphans', label: '--safe-orphans', active: (flags) => flags.safeOrphans },
+  { key: 'mergedOrphans', label: '--merged-orphans', active: (flags) => flags.mergedOrphans },
   { key: 'offline', label: '--offline', active: (flags) => flags.offline },
   { key: 'unnamed', label: '--unnamed', active: (flags) => flags.unnamed },
   { key: 'override', label: '--override', active: (flags) => flags.override },

@@ -666,6 +666,139 @@ function shortRef(ref: string): string {
   return /^[a-f0-9]{7,40}$/i.test(ref) ? ref.slice(0, 7) : ref;
 }
 
+/**
+ * Tear down an orphan worktree + its (optional) local branch. Used by
+ * `/clean --apply --safe-orphans` and `--merged-orphans`. Same safety
+ * shape as removeTaskArtifacts, but the orphan has no task lock and may
+ * have a detached HEAD with no branch to delete. No safeDeleteBranchRef
+ * path — orphans aren't tracked by the deploy state chain.
+ */
+export function removeOrphanWorktree(options: {
+  sharedRepoRoot: string;
+  worktreePath: string;
+  branchName: string | null;
+  callerCwd: string;
+  force: boolean;
+}): RemoveTaskArtifactsResult {
+  const branchName = options.branchName?.trim() ?? '';
+  if (branchName.length > 0) {
+    return removeTaskArtifacts({
+      sharedRepoRoot: options.sharedRepoRoot,
+      worktreePath: options.worktreePath,
+      branchName,
+      callerCwd: options.callerCwd,
+      force: options.force,
+    });
+  }
+
+  // Detached HEAD: only the worktree to remove. Mirror the worktree-removal
+  // half of removeTaskArtifacts so error/warning shapes match. Report
+  // branchRemoved: true so the caller's "fully torn down" check passes.
+  const warnings: string[] = [];
+  const errors: string[] = [];
+  let worktreeRemoved = false;
+
+  const callerInsideTarget = normalizePath(options.callerCwd).startsWith(normalizePath(options.worktreePath));
+  if (callerInsideTarget && existsSync(options.worktreePath)) {
+    errors.push(
+      `Cannot remove worktree ${options.worktreePath} while inside it. ` +
+      `cd to a different directory (e.g. ${options.sharedRepoRoot}) and retry.`,
+    );
+    return { worktreeRemoved, branchRemoved: true, warnings, errors };
+  }
+
+  if (!existsSync(options.worktreePath)) {
+    warnings.push(`Worktree ${options.worktreePath} was already missing.`);
+    runCommandCapture('git', ['worktree', 'prune'], { cwd: options.sharedRepoRoot });
+    worktreeRemoved = true;
+  } else {
+    if (!options.force) {
+      const status = runCommandCapture('git', ['status', '--porcelain'], { cwd: options.worktreePath });
+      if (status.ok && status.stdout.trim().length > 0) {
+        errors.push(
+          `Worktree ${options.worktreePath} has uncommitted or untracked changes. ` +
+          `Re-run with --force to remove anyway, or commit/stash first.`,
+        );
+      }
+    }
+    if (errors.length === 0) {
+      const removeArgs = ['worktree', 'remove'];
+      if (options.force) removeArgs.push('--force');
+      removeArgs.push(options.worktreePath);
+      const result = runCommandCapture('git', removeArgs, { cwd: options.sharedRepoRoot });
+      if (result.ok) {
+        worktreeRemoved = true;
+      } else {
+        errors.push(`git worktree remove failed: ${result.stderr || result.stdout || 'unknown error'}`);
+      }
+    }
+  }
+
+  return { worktreeRemoved, branchRemoved: true, warnings, errors };
+}
+
+export interface OrphanClassification {
+  // Tracked file changes (modifications, additions, deletions, renames).
+  // 0 means the worktree's tracked files all match HEAD.
+  trackedChanges: number;
+  // Untracked files (status code "??"). Often intentional — operator
+  // created files but never staged.
+  untrackedFiles: number;
+  // Risky ignored files matching .gitignore. Allow-listed paths
+  // (node_modules symlinks back to shared deps) are filtered out.
+  ignoredEntries: string[];
+  // Overall classification, used by /clean to bucket orphans:
+  //   - 'clean'         — nothing to lose; safe to delete without --force
+  //   - 'ignored-only'  — only ignored content (build outputs, dist/)
+  //   - 'untracked'     — untracked files not yet added to git
+  //   - 'dirty-source'  — tracked source modifications
+  //   - 'unknown'       — git status failed (e.g. broken worktree)
+  treeState: 'clean' | 'ignored-only' | 'untracked' | 'dirty-source' | 'unknown';
+}
+
+export function classifyOrphan(worktreePath: string): OrphanClassification {
+  if (!existsSync(worktreePath)) {
+    return { trackedChanges: 0, untrackedFiles: 0, ignoredEntries: [], treeState: 'unknown' };
+  }
+  const status = runCommandCapture('git', ['status', '--porcelain', '--ignored=matching'], { cwd: worktreePath });
+  if (!status.ok) {
+    return { trackedChanges: 0, untrackedFiles: 0, ignoredEntries: [], treeState: 'unknown' };
+  }
+  let tracked = 0;
+  let untracked = 0;
+  const ignored: string[] = [];
+  for (const rawLine of status.stdout.split('\n')) {
+    const line = rawLine.trimEnd();
+    if (!line) continue;
+    if (line.startsWith('!! ')) {
+      const candidate = line.slice(3).trim();
+      if (candidate.length > 0 && !isAllowedAutoCleanIgnoredPath(worktreePath, candidate)) {
+        ignored.push(candidate);
+      }
+    } else if (line.startsWith('?? ')) {
+      untracked += 1;
+    } else {
+      tracked += 1;
+    }
+  }
+  let treeState: OrphanClassification['treeState'];
+  if (tracked > 0) treeState = 'dirty-source';
+  else if (untracked > 0) treeState = 'untracked';
+  else if (ignored.length > 0) treeState = 'ignored-only';
+  else treeState = 'clean';
+  return { trackedChanges: tracked, untrackedFiles: untracked, ignoredEntries: ignored, treeState };
+}
+
+function isAllowedAutoCleanIgnoredPath(worktreePath: string, ignoredPath: string): boolean {
+  const normalized = ignoredPath.replace(/\\/g, '/').replace(/\/+$/, '');
+  if (normalized !== 'node_modules') return false;
+  try {
+    return lstatSync(path.join(worktreePath, ignoredPath)).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 export interface OrphanWorktree {
   path: string;
   branchName: string | null;
