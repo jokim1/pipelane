@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 
 import {
+  acquireOrphanCleanupLock,
   acquireTaskCleanupLock,
   formatWorkflowCommand,
   loadDeployState,
@@ -220,21 +221,41 @@ async function handleApplySafeOrphans(
   }> = [];
 
   for (const candidate of candidates) {
-    const result = removeOrphanWorktree({
-      sharedRepoRoot,
-      worktreePath: candidate.orphan.path,
-      branchName: candidate.orphan.branchName,
-      callerCwd: cwd,
-      force: false,
-    });
-    removedSummaries.push({
-      path: candidate.orphan.path,
-      branchName: candidate.orphan.branchName,
-      worktreeRemoved: result.worktreeRemoved,
-      branchRemoved: result.branchRemoved,
-      warnings: result.warnings,
-      errors: result.errors,
-    });
+    // Per-orphan cleanup lock: prevents two concurrent /clean --apply
+    // --safe-orphans runs from racing on the same `git worktree remove`.
+    // Loser of the race surfaces a clean "busy" message instead of a
+    // confusing git error.
+    const lock = acquireOrphanCleanupLock(commonDir, config, candidate.orphan.path);
+    if (lock.acquired === false) {
+      removedSummaries.push({
+        path: candidate.orphan.path,
+        branchName: candidate.orphan.branchName,
+        worktreeRemoved: false,
+        branchRemoved: false,
+        warnings: [],
+        errors: [`skipped: ${lock.reason}`],
+      });
+      continue;
+    }
+    try {
+      const result = removeOrphanWorktree({
+        sharedRepoRoot,
+        worktreePath: candidate.orphan.path,
+        branchName: candidate.orphan.branchName,
+        callerCwd: cwd,
+        force: false,
+      });
+      removedSummaries.push({
+        path: candidate.orphan.path,
+        branchName: candidate.orphan.branchName,
+        worktreeRemoved: result.worktreeRemoved,
+        branchRemoved: result.branchRemoved,
+        warnings: result.warnings,
+        errors: result.errors,
+      });
+    } finally {
+      lock.release();
+    }
   }
 
   const lines: string[] = [];
@@ -283,26 +304,45 @@ async function handleApplyMergedOrphans(
   }> = [];
 
   for (const candidate of candidates) {
-    // Force-remove: the branch's PR is merged on main, so any tracked changes
-    // here are stale follow-ups. The worktree's tree differs from the
-    // squash-merge SHA, so safeDeleteBranchRef won't recognize it; --force
-    // is the correct escape.
-    const result = removeOrphanWorktree({
-      sharedRepoRoot,
-      worktreePath: candidate.orphan.path,
-      branchName: candidate.orphan.branchName,
-      callerCwd: cwd,
-      force: true,
-    });
-    removedSummaries.push({
-      path: candidate.orphan.path,
-      branchName: candidate.orphan.branchName,
-      prNumber: candidate.mergedPr?.number ?? null,
-      worktreeRemoved: result.worktreeRemoved,
-      branchRemoved: result.branchRemoved,
-      warnings: result.warnings,
-      errors: result.errors,
-    });
+    // Per-orphan cleanup lock: prevents two concurrent /clean --apply
+    // --merged-orphans runs from racing on the same `git worktree remove`.
+    const lock = acquireOrphanCleanupLock(commonDir, config, candidate.orphan.path);
+    if (lock.acquired === false) {
+      removedSummaries.push({
+        path: candidate.orphan.path,
+        branchName: candidate.orphan.branchName,
+        prNumber: candidate.mergedPr?.number ?? null,
+        worktreeRemoved: false,
+        branchRemoved: false,
+        warnings: [],
+        errors: [`skipped: ${lock.reason}`],
+      });
+      continue;
+    }
+    try {
+      // Force-remove: the branch's PR is merged on main, so any tracked changes
+      // here are stale follow-ups. The worktree's tree differs from the
+      // squash-merge SHA, so safeDeleteBranchRef won't recognize it; --force
+      // is the correct escape.
+      const result = removeOrphanWorktree({
+        sharedRepoRoot,
+        worktreePath: candidate.orphan.path,
+        branchName: candidate.orphan.branchName,
+        callerCwd: cwd,
+        force: true,
+      });
+      removedSummaries.push({
+        path: candidate.orphan.path,
+        branchName: candidate.orphan.branchName,
+        prNumber: candidate.mergedPr?.number ?? null,
+        worktreeRemoved: result.worktreeRemoved,
+        branchRemoved: result.branchRemoved,
+        warnings: result.warnings,
+        errors: result.errors,
+      });
+    } finally {
+      lock.release();
+    }
   }
 
   const lines: string[] = [];
@@ -638,12 +678,58 @@ function lookupMergedPrsByBranch(repoRoot: string, branchNames: string[]): Merge
     });
   }
   const warnings: string[] = [];
-  if (parsed.length >= 500 && branchNames.some((name) => !byBranch.has(name))) {
-    warnings.push(
-      'gh pr list capped at 500 merged PRs; some older orphans may have merged PRs that were not checked.',
-    );
+  if (parsed.length >= 500) {
+    // Batch hit the cap. Fall back to per-branch search for branches that
+    // weren't matched in the batch, capped at PER_BRANCH_FALLBACK_CAP queries
+    // to bound latency (~1s each on a healthy gh setup). Without this,
+    // long-history repos silently misclassify merged orphans as suspicious.
+    const PER_BRANCH_FALLBACK_CAP = 30;
+    const missing = branchNames.filter((name) => !byBranch.has(name));
+    const lookupTargets = missing.slice(0, PER_BRANCH_FALLBACK_CAP);
+    let recovered = 0;
+    for (const name of lookupTargets) {
+      const single = lookupSingleBranchMergedPr(repoRoot, name);
+      if (single) {
+        byBranch.set(name, single);
+        recovered += 1;
+      }
+    }
+    const stillMissingAfterFallback = missing.length - recovered;
+    if (missing.length > PER_BRANCH_FALLBACK_CAP) {
+      warnings.push(
+        `gh pr list capped at 500 merged PRs and ${missing.length} branches needed fallback (only ${PER_BRANCH_FALLBACK_CAP} checked individually); some older orphans may still be misclassified.`,
+      );
+    } else if (stillMissingAfterFallback > 0 && recovered > 0) {
+      // Partial recovery — surface the assist so operators understand the
+      // count when comparing /clean output across runs.
+      warnings.push(
+        `gh pr list batch was capped; recovered ${recovered} of ${missing.length} missing branches via per-branch fallback.`,
+      );
+    }
   }
   return { byBranch, warnings, available: true };
+}
+
+function lookupSingleBranchMergedPr(repoRoot: string, branchName: string): MergedPrInfo | null {
+  const result = runCommandCapture(
+    'gh',
+    ['pr', 'list', '--state', 'merged', '--head', branchName, '--limit', '1', '--json', 'number,headRefName,mergedAt,title'],
+    { cwd: repoRoot, timeoutMs: 15_000 },
+  );
+  if (!result.ok) return null;
+  let parsed: Array<{ number: number; headRefName: string; mergedAt: string; title: string }>;
+  try {
+    parsed = JSON.parse(result.stdout);
+  } catch {
+    return null;
+  }
+  const entry = parsed[0];
+  if (!entry || typeof entry.headRefName !== 'string' || entry.headRefName !== branchName) return null;
+  return {
+    number: typeof entry.number === 'number' ? entry.number : 0,
+    mergedAt: typeof entry.mergedAt === 'string' ? entry.mergedAt : '',
+    title: typeof entry.title === 'string' ? entry.title : '',
+  };
 }
 
 // -----------------------------------------------------------------------------

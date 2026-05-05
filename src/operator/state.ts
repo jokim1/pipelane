@@ -1,4 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -589,6 +590,7 @@ const PROBE_STATE_FILENAME = 'probe-state.json';
 const TASK_LOCKS_DIRNAME = 'task-locks';
 const TASK_CLEANUP_LOCKS_DIRNAME = 'task-cleanup-locks';
 const TASK_CLEANUP_LOCK_STALE_MS = 10 * 60 * 1000;
+const ORPHAN_CLEANUP_LOCKS_DIRNAME = 'orphan-cleanup-locks';
 const INSTALL_MARKER_FILENAME = 'installed.json';
 const LEGACY_MIGRATION_FILENAME = 'legacy-migration.json';
 
@@ -1490,6 +1492,46 @@ function assertTaskCleanupUnlocked(commonDir: string, config: WorkflowConfig, ta
   clearStaleTaskCleanupLock(lockPath);
   if (existsSync(lockPath)) {
     throw new Error(`Task ${taskSlug} is being cleaned by another Pipelane process; retry after cleanup finishes.`);
+  }
+}
+
+function orphanCleanupLockPath(commonDir: string, config: WorkflowConfig, worktreePath: string): string {
+  // Hash the absolute worktree path so the lockfile name is stable across
+  // operators (independent of working dir) and filesystem-safe (no slashes).
+  // Truncate to 16 chars — enough to make collisions vanishingly unlikely
+  // for the small set of orphans pipelane sees in practice.
+  const key = crypto.createHash('sha256').update(normalizePath(worktreePath)).digest('hex').slice(0, 16);
+  return path.join(resolveStateDir(commonDir, config), ORPHAN_CLEANUP_LOCKS_DIRNAME, `${key}.lock`);
+}
+
+/**
+ * Same shape as acquireTaskCleanupLock, keyed on the orphan worktree's
+ * absolute path. Used by `/clean --apply --safe-orphans` and
+ * `--merged-orphans` so two concurrent invocations don't both attempt the
+ * same `git worktree remove` (which would surface a confusing per-orphan
+ * git error on the loser instead of a clean "busy" message).
+ */
+export function acquireOrphanCleanupLock(commonDir: string, config: WorkflowConfig, worktreePath: string): { acquired: true; release: () => void } | { acquired: false; reason: string } {
+  const lockPath = orphanCleanupLockPath(commonDir, config, worktreePath);
+  mkdirSync(path.dirname(lockPath), { recursive: true });
+  clearStaleTaskCleanupLock(lockPath);
+  let created = false;
+  try {
+    mkdirSync(lockPath);
+    created = true;
+    writeFileSync(
+      path.join(lockPath, 'owner.json'),
+      `${JSON.stringify({ worktreePath: normalizePath(worktreePath), pid: process.pid, acquiredAt: nowIso() }, null, 2)}\n`,
+      'utf8',
+    );
+    return { acquired: true, release: () => rmSync(lockPath, { recursive: true, force: true }) };
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === 'EEXIST') {
+      return { acquired: false, reason: 'another /clean run already owns this orphan worktree' };
+    }
+    if (created) rmSync(lockPath, { recursive: true, force: true });
+    return { acquired: false, reason: `could not acquire orphan cleanup lock: ${err.message}` };
   }
 }
 

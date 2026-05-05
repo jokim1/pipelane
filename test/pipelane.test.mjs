@@ -9486,6 +9486,116 @@ test('clean --apply rejects mutually-exclusive bulk scope flags', () => {
   }
 });
 
+test('clean --apply --safe-orphans honors per-orphan cleanup lock', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const externalDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'safe-orphans-locked-')));
+  const cleanWt = path.join(externalDir, 'clean');
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    execFileSync('git', ['worktree', 'add', '-b', 'codex/locked-orphan-1234', cleanWt, 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    // Pre-create the orphan cleanup lock to simulate a concurrent /clean run
+    // owning this orphan path. The hash matches the function in state.ts:
+    // sha256(normalizedPath).slice(0, 16).
+    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    const orphanLockDir = path.join(stateDir, 'orphan-cleanup-locks');
+    mkdirSync(orphanLockDir, { recursive: true });
+    const hash = createHash('sha256').update(cleanWt).digest('hex').slice(0, 16);
+    const lockPath = path.join(orphanLockDir, `${hash}.lock`);
+    mkdirSync(lockPath);
+    writeFileSync(path.join(lockPath, 'owner.json'), JSON.stringify({ pid: 999999, acquiredAt: '2026-05-04T20:00:00Z' }), 'utf8');
+
+    const result = runCli(['run', 'clean', '--apply', '--safe-orphans', '--json'], repoRoot, {
+      PIPELANE_CLEAN_SKIP_PR_LOOKUP: '1',
+    });
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.removed, [], 'locked orphan must NOT be removed');
+    assert.equal(envelope.artifacts.length, 1);
+    assert.match(envelope.artifacts[0].errors[0], /another \/clean run already owns this orphan worktree/);
+    assert.ok(existsSync(cleanWt), 'orphan worktree kept while lock held');
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', cleanWt], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      // best-effort
+    }
+    rmSync(externalDir, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean --apply --merged-orphans uses per-branch fallback when batch is truncated', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const externalDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'merged-fallback-')));
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-fallback-'));
+  const wt = path.join(externalDir, 'old-merge');
+  // Fake gh that returns a 500-PR batch NOT containing our branch, but
+  // resolves the branch via the per-branch --head fallback. This forces
+  // the truncation path in lookupMergedPrsByBranch.
+  mkdirSync(ghBin, { recursive: true });
+  const filler = Array.from({ length: 500 }, (_, i) => ({
+    number: 1000 + i,
+    headRefName: `codex/filler-${i}`,
+    mergedAt: '2026-01-01T00:00:00Z',
+    title: `Filler ${i}`,
+  }));
+  const fillerPath = path.join(ghBin, 'filler.json');
+  writeFileSync(fillerPath, JSON.stringify(filler), 'utf8');
+  writeFileSync(path.join(ghBin, 'gh'), `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+if (args[0] === '--version') { process.stdout.write('gh fake 1.0.0\\n'); process.exit(0); }
+if (args[0] === 'pr' && args[1] === 'list' && args.includes('--state') && args[args.indexOf('--state') + 1] === 'merged') {
+  // Batched query (no --head): return the filler 500.
+  if (!args.includes('--head')) {
+    process.stdout.write(fs.readFileSync(${JSON.stringify(fillerPath)}, 'utf8'));
+    process.exit(0);
+  }
+  // Per-branch query: return a single matching record only for our orphan.
+  const headIdx = args.indexOf('--head');
+  const head = args[headIdx + 1];
+  if (head === 'codex/old-merged-1234') {
+    process.stdout.write(JSON.stringify([{ number: 7, headRefName: 'codex/old-merged-1234', mergedAt: '2025-01-01T00:00:00Z', title: 'Old merge' }]));
+    process.exit(0);
+  }
+  process.stdout.write('[]');
+  process.exit(0);
+}
+process.exit(0);
+`, { mode: 0o755, encoding: 'utf8' });
+  const env = { PATH: `${ghBin}:${process.env.PATH}` };
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    execFileSync('git', ['worktree', 'add', '-b', 'codex/old-merged-1234', wt, 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(wt, 'README.md'), 'stale follow-up\n', 'utf8');
+
+    const result = runCli(['run', 'clean', '--apply', '--merged-orphans', '--json'], repoRoot, env);
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.removed, [wt], 'fallback should resolve the truncated branch and force-remove it');
+    assert.equal(envelope.prLookupAvailable, true);
+    assert.equal(existsSync(wt), false, 'worktree removed after fallback resolved the merge');
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', wt], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      // best-effort
+    }
+    rmSync(externalDir, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
 test('dashboard proxies pipelane:api routes and persists local board settings', async () => {
   const repoRoot = createRepo();
   const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-dashboard-bin-'));
