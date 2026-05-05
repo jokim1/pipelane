@@ -9145,6 +9145,347 @@ test('clean --apply refuses to prune locks younger than 5 minutes', () => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Actionable /clean: status surfaces categorized actions, plus three new
+// bulk-apply scopes (--completed-with-ignored, --safe-orphans,
+// --merged-orphans) so an operator can clear common categories without
+// per-task confirmation.
+// ---------------------------------------------------------------------------
+
+function writeMergedPrFakeGh(binDir, prsByBranch) {
+  mkdirSync(binDir, { recursive: true });
+  const stateFile = path.join(binDir, 'gh-merged-prs.json');
+  writeFileSync(stateFile, JSON.stringify(prsByBranch), 'utf8');
+  // Minimal fake gh: handles `gh --version` (probe) and
+  // `gh pr list --state merged --limit ... --json ...`. Returns the
+  // configured PR list as JSON.
+  const targetPath = path.join(binDir, 'gh');
+  writeFileSync(targetPath, `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+if (args[0] === '--version') {
+  process.stdout.write('gh fake 1.0.0\\n');
+  process.exit(0);
+}
+if (args[0] === 'pr' && args[1] === 'list' && args.includes('--state') && args[args.indexOf('--state') + 1] === 'merged') {
+  const data = JSON.parse(fs.readFileSync(${JSON.stringify(stateFile)}, 'utf8'));
+  process.stdout.write(JSON.stringify(data));
+  process.exit(0);
+}
+process.exit(0);
+`, { mode: 0o755, encoding: 'utf8' });
+  return stateFile;
+}
+
+test('clean (no --apply) classifies orphan worktrees and surfaces a numbered action menu', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-clean-status-'));
+  // One merged PR registered under the dirty orphan's branch — the action
+  // menu should pick it up as a "merged orphan" candidate.
+  writeMergedPrFakeGh(ghBin, [
+    { number: 99, headRefName: 'codex/dirty-with-pr-aaaa', mergedAt: '2026-04-30T00:00:00Z', title: 'Dirty with merged PR' },
+  ]);
+  const env = { PATH: `${ghBin}:${process.env.PATH}` };
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    // Clean orphan: pipelane-managed worktree whose lock was deleted.
+    const cleanWt = JSON.parse(runCli(['run', 'new', '--task', 'Clean Orphan', '--json'], repoRoot).stdout);
+    rmSync(path.join(repoRoot, '.git', 'pipelane-state', 'task-locks', 'clean-orphan.json'));
+
+    // Dirty orphan with a merged PR: external worktree on a branch that
+    // appears in the fake gh's merged-PR list, with an extra modified file.
+    const externalDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'external-orphan-')));
+    const dirtyWt = path.join(externalDir, 'dirty');
+    execFileSync('git', ['worktree', 'add', '-b', 'codex/dirty-with-pr-aaaa', dirtyWt, 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(dirtyWt, 'README.md'), 'modified content\n', 'utf8');
+
+    // Suspicious orphan: external worktree with dirty source and no merged PR.
+    const suspiciousWt = path.join(externalDir, 'suspicious');
+    execFileSync('git', ['worktree', 'add', '-b', 'codex/suspicious-no-pr-bbbb', suspiciousWt, 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(suspiciousWt, 'README.md'), 'no pr edits\n', 'utf8');
+
+    try {
+      const result = runCli(['run', 'clean', '--json'], repoRoot, env);
+      const envelope = JSON.parse(result.stdout);
+
+      const orphanByPath = Object.fromEntries(envelope.orphanWorktrees.map((entry) => [entry.path, entry]));
+      assert.equal(orphanByPath[cleanWt.worktreePath].classification.treeState, 'clean');
+      assert.equal(orphanByPath[cleanWt.worktreePath].mergedPr, null);
+      assert.equal(orphanByPath[dirtyWt].classification.treeState, 'dirty-source');
+      assert.equal(orphanByPath[dirtyWt].mergedPr.number, 99);
+      assert.equal(orphanByPath[suspiciousWt].classification.treeState, 'dirty-source');
+      assert.equal(orphanByPath[suspiciousWt].mergedPr, null);
+
+      const actions = envelope.suggestedActions;
+      const cleanAction = actions.find((entry) => entry.command.endsWith('--safe-orphans'));
+      const mergedAction = actions.find((entry) => entry.command.endsWith('--merged-orphans'));
+      assert.equal(cleanAction.count, 1, 'one clean orphan should be offered for --safe-orphans');
+      assert.equal(mergedAction.count, 1, 'one dirty-with-merged-PR orphan should be offered for --merged-orphans');
+      assert.match(envelope.message, /Suggested actions/);
+      assert.match(envelope.message, /--apply --safe-orphans/);
+      assert.match(envelope.message, /--apply --merged-orphans/);
+      assert.match(envelope.message, /Inspect manually/);
+      assert.match(envelope.message, new RegExp(suspiciousWt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    } finally {
+      execFileSync('git', ['worktree', 'remove', '--force', dirtyWt], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+      execFileSync('git', ['worktree', 'remove', '--force', suspiciousWt], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+      rmSync(externalDir, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('clean (no --apply) reports an action for prod-verified locks blocked only on ignored content', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    writeFileSync(path.join(repoRoot, '.gitignore'), 'dist/\n', 'utf8');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const { created } = await createVerifiedAutoCleanCandidate(repoRoot, 'Built Output', 'built-output');
+    mkdirSync(path.join(created.worktreePath, 'dist'), { recursive: true });
+    writeFileSync(path.join(created.worktreePath, 'dist', 'bundle.js'), 'console.log(1)\n', 'utf8');
+
+    const result = runCli(['run', 'clean', '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+      PIPELANE_CLEAN_SKIP_PR_LOOKUP: '1',
+    });
+    const envelope = JSON.parse(result.stdout);
+    const ignoredAction = envelope.suggestedActions.find((entry) => entry.command.endsWith('--completed-with-ignored'));
+    assert.equal(ignoredAction.count, 1);
+    assert.match(envelope.message, /Suggested actions/);
+    assert.match(envelope.message, /--apply --completed-with-ignored/);
+    assert.equal(envelope.autoCleanSkipped[0].code, 'ignored-content');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean --apply --completed-with-ignored bulk-removes prod-verified workspaces blocked on ignored output', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    writeFileSync(path.join(repoRoot, '.gitignore'), 'dist/\n', 'utf8');
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    // Two prod-verified candidates with ignored build output. The shared
+    // helper writePrRecord overwrites pr-state.json each call, so write
+    // PR records manually to keep both tasks in pipelane's prod-verified
+    // chain.
+    const first = await createVerifiedAutoCleanCandidate(repoRoot, 'Built One', 'built-one');
+    const second = await createVerifiedAutoCleanCandidate(repoRoot, 'Built Two', 'built-two');
+    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    const prStatePath = path.join(stateDir, 'pr-state.json');
+    writeFileSync(prStatePath, `${JSON.stringify({
+      records: {
+        'built-one': {
+          taskSlug: 'built-one',
+          branchName: first.created.branch,
+          title: 'Built One',
+          mergedSha: first.mergedSha,
+          mergedAt: '2026-04-22T00:00:00Z',
+          updatedAt: '2026-04-22T00:00:00Z',
+        },
+        'built-two': {
+          taskSlug: 'built-two',
+          branchName: second.created.branch,
+          title: 'Built Two',
+          mergedSha: second.mergedSha,
+          mergedAt: '2026-04-22T00:00:00Z',
+          updatedAt: '2026-04-22T00:00:00Z',
+        },
+      },
+    }, null, 2)}\n`, 'utf8');
+    for (const candidate of [first, second]) {
+      mkdirSync(path.join(candidate.created.worktreePath, 'dist'), { recursive: true });
+      writeFileSync(path.join(candidate.created.worktreePath, 'dist', 'bundle.js'), 'console.log(1)\n', 'utf8');
+    }
+
+    const result = runCli(['run', 'clean', '--apply', '--completed-with-ignored', '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    });
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.closed.sort(), ['built-one', 'built-two']);
+    for (const candidate of [first, second]) {
+      assert.equal(existsSync(candidate.lockPath), false, `${candidate.created.taskSlug} lock removed`);
+      assert.equal(existsSync(candidate.created.worktreePath), false, `${candidate.created.taskSlug} worktree removed`);
+      assert.equal(localBranchExists(repoRoot, candidate.created.branch), false, `${candidate.created.taskSlug} branch removed`);
+    }
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean --apply --completed-with-ignored leaves uncommitted source alone', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const dirty = await createVerifiedAutoCleanCandidate(repoRoot, 'Dirty Source', 'dirty-source');
+    writeFileSync(path.join(dirty.created.worktreePath, 'CHANGELOG.md'), 'pending edit\n', 'utf8');
+
+    const result = runCli(['run', 'clean', '--apply', '--completed-with-ignored', '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    });
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.closed, []);
+    assert.equal(envelope.skipped[0].taskSlug, 'dirty-source');
+    assert.match(envelope.skipped[0].reason, /uncommitted or untracked changes/);
+    assert.ok(existsSync(dirty.lockPath));
+    assert.ok(existsSync(dirty.created.worktreePath));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean --apply --safe-orphans removes orphans with clean trees and leaves dirty ones alone', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const externalDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'safe-orphans-')));
+  const cleanWt = path.join(externalDir, 'clean');
+  const dirtyWt = path.join(externalDir, 'dirty');
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    execFileSync('git', ['worktree', 'add', '-b', 'codex/clean-orphan-cccc', cleanWt, 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    execFileSync('git', ['worktree', 'add', '-b', 'codex/dirty-orphan-dddd', dirtyWt, 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(dirtyWt, 'README.md'), 'real edit\n', 'utf8');
+
+    const result = runCli(['run', 'clean', '--apply', '--safe-orphans', '--json'], repoRoot, {
+      PIPELANE_CLEAN_SKIP_PR_LOOKUP: '1',
+    });
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.removed, [cleanWt]);
+    assert.equal(existsSync(cleanWt), false, 'clean orphan worktree was removed');
+    assert.equal(localBranchExists(repoRoot, 'codex/clean-orphan-cccc'), false, 'clean orphan branch was removed');
+    assert.ok(existsSync(dirtyWt), 'dirty orphan kept');
+    assert.equal(localBranchExists(repoRoot, 'codex/dirty-orphan-dddd'), true, 'dirty orphan branch kept');
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', dirtyWt], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      // best-effort
+    }
+    rmSync(externalDir, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean --apply --merged-orphans force-removes orphans whose branches have merged PRs and leaves the rest alone', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const externalDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'merged-orphans-')));
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-merged-orphans-'));
+  const mergedWt = path.join(externalDir, 'merged');
+  const unmergedWt = path.join(externalDir, 'unmerged');
+  // Only the first branch is in the fake's merged-PR list.
+  writeMergedPrFakeGh(ghBin, [
+    { number: 42, headRefName: 'codex/merged-with-changes-eeee', mergedAt: '2026-04-30T00:00:00Z', title: 'Merged with stale follow-ups' },
+  ]);
+  const env = { PATH: `${ghBin}:${process.env.PATH}` };
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    execFileSync('git', ['worktree', 'add', '-b', 'codex/merged-with-changes-eeee', mergedWt, 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(mergedWt, 'README.md'), 'stale follow-up edit\n', 'utf8');
+    execFileSync('git', ['worktree', 'add', '-b', 'codex/unmerged-followup-ffff', unmergedWt, 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(unmergedWt, 'README.md'), 'no pr edit\n', 'utf8');
+
+    const result = runCli(['run', 'clean', '--apply', '--merged-orphans', '--json'], repoRoot, env);
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.removed, [mergedWt]);
+    assert.equal(existsSync(mergedWt), false, 'merged-PR orphan worktree force-removed');
+    assert.equal(localBranchExists(repoRoot, 'codex/merged-with-changes-eeee'), false, 'merged-PR branch removed');
+    assert.ok(existsSync(unmergedWt), 'unmerged orphan kept');
+    assert.equal(localBranchExists(repoRoot, 'codex/unmerged-followup-ffff'), true, 'unmerged branch kept');
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', unmergedWt], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      // best-effort
+    }
+    rmSync(externalDir, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('clean --apply --merged-orphans gracefully reports when gh is unavailable', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const externalDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'merged-orphans-no-gh-')));
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-fail-'));
+  // Fake gh that fails the probe by exit-1 on every invocation. Keeps the
+  // rest of PATH intact so node/git/etc. still resolve.
+  writeFileSync(path.join(ghBin, 'gh'), '#!/bin/sh\nexit 1\n', { mode: 0o755, encoding: 'utf8' });
+  const env = { PATH: `${ghBin}:${process.env.PATH}` };
+  const wt = path.join(externalDir, 'orphan');
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    execFileSync('git', ['worktree', 'add', '-b', 'codex/no-gh-orphan-gggg', wt, 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(wt, 'README.md'), 'edit\n', 'utf8');
+
+    const result = runCli(['run', 'clean', '--apply', '--merged-orphans', '--json'], repoRoot, env);
+    const envelope = JSON.parse(result.stdout);
+    assert.deepEqual(envelope.removed, []);
+    assert.equal(envelope.prLookupAvailable, false);
+    assert.match(envelope.message, /PR-merge lookup unavailable/);
+    assert.ok(existsSync(wt), 'orphan kept when PR-merge lookup is unavailable');
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', wt], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      // best-effort
+    }
+    rmSync(externalDir, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('clean --apply rejects mutually-exclusive bulk scope flags', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const failed = runCli(['run', 'clean', '--apply', '--safe-orphans', '--merged-orphans'], repoRoot, {}, true);
+    assert.equal(failed.status, 1);
+    assert.match(failed.stderr, /accepts exactly one scope/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('dashboard proxies pipelane:api routes and persists local board settings', async () => {
   const repoRoot = createRepo();
   const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-dashboard-bin-'));
