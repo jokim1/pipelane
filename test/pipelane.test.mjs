@@ -831,6 +831,10 @@ test('init writes tracked Pipelane files and setup seeds CLAUDE plus tracked Cod
       /What are the 1-3 user journeys that must work before this app is considered alive\?/,
     );
 
+    const deploySkill = readFileSync(path.join(repoRoot, '.agents', 'skills', 'deploy', 'SKILL.md'), 'utf8');
+    assert.match(deploySkill, /Blocked deploy follow-up behavior/);
+    assert.match(deploySkill, /Reply 1 or Y to execute/);
+
     const packageJson = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
     // Canonical pipelane:* script names
     assert.equal(packageJson.scripts['pipelane:new'], 'pipelane run new');
@@ -1816,6 +1820,9 @@ test('install-codex outside a pipelane repo installs durable global default skil
     assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md')));
     assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane-fix', 'SKILL.md')));
     assert.match(readFileSync(path.join(codexHome, 'skills', 'new', 'SKILL.md'), 'utf8'), /Bare invocation behavior/);
+    const deploySkill = readFileSync(path.join(codexHome, 'skills', 'deploy', 'SKILL.md'), 'utf8');
+    assert.match(deploySkill, /Blocked deploy follow-up behavior/);
+    assert.match(deploySkill, /Reply 1 or Y to execute/);
     const fixSkill = readFileSync(path.join(codexHome, 'skills', 'fix', 'SKILL.md'), 'utf8');
     assert.match(fixSkill, /Pipelane-enabled repo detection/);
     assert.match(fixSkill, /Resolve `<base>` from the Pipelane config first/);

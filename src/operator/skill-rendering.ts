@@ -74,6 +74,28 @@ export function buildSkillMarker(prefix: string, name: string): string {
 }
 
 function renderWorkflowSkillGuidance(command: WorkflowCommand | 'pipelane', slashAlias: string): string {
+  if (command === 'deploy') {
+    return `
+## Blocked deploy follow-up behavior
+
+When ${slashAlias} staging or ${slashAlias} prod exits blocked before starting a
+deploy and the recent output or context names an exact deploy-safe path, do not
+end with only a summary. If you write "The deploy-safe path is ...", make that
+path actionable by presenting explicit choices and asking for confirmation:
+
+\`\`\`text
+1. Execute deploy-safe path: <exact commands>
+2. Cancel
+\`\`\`
+
+Ask "Reply 1 or Y to execute, or 2 to cancel." If the user confirms, run the
+listed commands in order from the required worktree(s). Do not bypass Pipelane
+gates; use the normal ${slashAlias}, PR, merge, smoke, and clean commands the
+path calls for. If any step is not deterministic, state the missing input and
+stop before side effects.
+`;
+  }
+
   if (command !== 'new') {
     return '';
   }
