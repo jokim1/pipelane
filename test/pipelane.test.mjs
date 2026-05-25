@@ -17308,3 +17308,69 @@ test('api route actions forward approved PR title and message into the PR child'
     rmSync(fakeBin, { recursive: true, force: true });
   }
 });
+
+test("parseSurfaceList accepts 'mcp' as a known surface even when config.surfaces omits it", async () => {
+  const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+  assert.ok(stateMod.KNOWN_SURFACES.includes('mcp'), 'KNOWN_SURFACES should include mcp');
+
+  const config = { surfaces: ['frontend', 'edge', 'sql'] };
+  // Bare mcp via --surfaces should be accepted without the consumer first
+  // editing their (gitignored) .pipelane.json surfaces array.
+  assert.deepEqual(stateMod.parseSurfaceList(config, ['mcp']), ['mcp']);
+  // Mixed list (the rocketboard use case: `--surfaces sql,edge,frontend,mcp`).
+  assert.deepEqual(
+    stateMod.parseSurfaceList(config, ['sql,edge,frontend,mcp']),
+    ['sql', 'edge', 'frontend', 'mcp'],
+  );
+  // Truly unsupported surface still throws — only KNOWN_SURFACES values
+  // are auto-allowed.
+  assert.throws(
+    () => stateMod.parseSurfaceList(config, ['quantum']),
+    /Unsupported surface "quantum"/,
+  );
+  // No --surfaces flag still falls back to config.surfaces; mcp is not
+  // added to DEFAULT_SURFACES so the implicit default is unchanged.
+  assert.deepEqual(stateMod.parseSurfaceList(config, []), ['frontend', 'edge', 'sql']);
+  assert.deepEqual(stateMod.DEFAULT_SURFACES, ['frontend', 'edge', 'sql']);
+});
+
+test("release gate manages mcp surface and resolves its healthcheck URL", async () => {
+  const gateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'release-gate.ts'));
+  assert.ok(
+    gateMod.RELEASE_MANAGED_SURFACES.includes('mcp'),
+    'RELEASE_MANAGED_SURFACES should include mcp so the release gate accepts --surfaces mcp',
+  );
+  assert.equal(gateMod.isReleaseManagedSurface('mcp'), true);
+
+  // Hydrating a DeployConfig that includes an mcp block must round-trip.
+  const parsed = {
+    platform: 'cloudflare',
+    mcp: {
+      staging: {
+        deployCommand: 'wrangler deploy --env staging',
+        verificationCommand: '',
+        healthcheckUrl: 'https://mcp.staging.example.test',
+      },
+      production: {
+        deployCommand: 'wrangler deploy --env production',
+        verificationCommand: '',
+        healthcheckUrl: 'https://mcp.example.test',
+      },
+    },
+  };
+  const markdown = ['## Deploy Configuration', '', '```json', JSON.stringify(parsed, null, 2), '```', ''].join('\n');
+  const hydrated = gateMod.parseDeployConfigMarkdown(markdown);
+  assert.ok(hydrated, 'parseDeployConfigMarkdown should return a config when mcp block is present');
+  assert.equal(hydrated.mcp?.staging.healthcheckUrl, 'https://mcp.staging.example.test');
+  assert.equal(hydrated.mcp?.production.deployCommand, 'wrangler deploy --env production');
+
+  // resolveSurfaceProbeUrl picks the right URL per environment for mcp.
+  assert.equal(
+    gateMod.resolveSurfaceProbeUrl(hydrated, 'staging', 'mcp'),
+    'https://mcp.staging.example.test',
+  );
+  assert.equal(
+    gateMod.resolveSurfaceProbeUrl(hydrated, 'production', 'mcp'),
+    'https://mcp.example.test',
+  );
+});

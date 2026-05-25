@@ -24,7 +24,7 @@ import {
 
 export { DEPLOY_STATE_KEY_ENV, resolveDeployStateKey } from './integrity.ts';
 
-export const RELEASE_MANAGED_SURFACES = ['frontend', 'edge', 'sql'] as const;
+export const RELEASE_MANAGED_SURFACES = ['frontend', 'edge', 'sql', 'mcp'] as const;
 export type ReleaseManagedSurface = (typeof RELEASE_MANAGED_SURFACES)[number];
 
 export function isReleaseManagedSurface(surface: string): surface is ReleaseManagedSurface {
@@ -78,6 +78,24 @@ export interface DeployConfig {
     };
     production: {
       applyCommand: string;
+      verificationCommand: string;
+      healthcheckUrl: string;
+    };
+  };
+  // v1.6: optional `mcp` surface for hosted MCP servers (e.g. Cloudflare
+  // Workers exposing an MCP endpoint). Mirrors edge's shape: a deploy
+  // command + optional verification step + a healthcheck URL probed at
+  // the end of each deploy. Consumers that don't ship an MCP server can
+  // leave these blank — the release gate skips mcp until a healthcheck
+  // URL or deploy command is configured.
+  mcp?: {
+    staging: {
+      deployCommand: string;
+      verificationCommand: string;
+      healthcheckUrl: string;
+    };
+    production: {
+      deployCommand: string;
       verificationCommand: string;
       healthcheckUrl: string;
     };
@@ -212,6 +230,33 @@ function hydrateDeployConfig(parsed: Partial<DeployConfig> | null | undefined): 
   config.sql.production.applyCommand = parsed.sql?.production?.applyCommand ?? '';
   config.sql.production.verificationCommand = parsed.sql?.production?.verificationCommand ?? '';
   config.sql.production.healthcheckUrl = parsed.sql?.production?.healthcheckUrl ?? '';
+
+  // Only materialize the mcp block when at least one mcp field is set in
+  // the parsed payload. Leaving it undefined keeps the serialized config
+  // minimal for consumers that don't ship an MCP server.
+  const parsedMcp = parsed.mcp;
+  const mcpHasContent = Boolean(
+    parsedMcp?.staging?.deployCommand
+    || parsedMcp?.staging?.verificationCommand
+    || parsedMcp?.staging?.healthcheckUrl
+    || parsedMcp?.production?.deployCommand
+    || parsedMcp?.production?.verificationCommand
+    || parsedMcp?.production?.healthcheckUrl,
+  );
+  if (mcpHasContent) {
+    config.mcp = {
+      staging: {
+        deployCommand: parsedMcp?.staging?.deployCommand ?? '',
+        verificationCommand: parsedMcp?.staging?.verificationCommand ?? '',
+        healthcheckUrl: parsedMcp?.staging?.healthcheckUrl ?? '',
+      },
+      production: {
+        deployCommand: parsedMcp?.production?.deployCommand ?? '',
+        verificationCommand: parsedMcp?.production?.verificationCommand ?? '',
+        healthcheckUrl: parsedMcp?.production?.healthcheckUrl ?? '',
+      },
+    };
+  }
 
   config.supabase.staging.projectRef = parsed.supabase?.staging?.projectRef ?? '';
   config.supabase.production.projectRef = parsed.supabase?.production?.projectRef ?? '';
@@ -615,6 +660,11 @@ export function resolveSurfaceProbeUrl(
       ? deployConfig.sql.staging.healthcheckUrl
       : deployConfig.sql.production.healthcheckUrl;
   }
+  if (surface === 'mcp') {
+    return environment === 'staging'
+      ? deployConfig.mcp?.staging.healthcheckUrl ?? ''
+      : deployConfig.mcp?.production.healthcheckUrl ?? '';
+  }
   return '';
 }
 
@@ -800,6 +850,28 @@ export function evaluateReleaseReadiness(options: {
         const probe = probeFreshness('sql');
         if (probe) addBlocker('probe', probe);
       }
+    } else if (surface === 'mcp') {
+      // mcp is optional in DeployConfig — consumers that don't ship an MCP
+      // server leave the block undefined. Treat the missing block as "no
+      // mcp configured": one config blocker so the operator knows to
+      // configure it before passing `--surfaces mcp` in release mode.
+      const mcp = options.deployConfig.mcp;
+      if (!mcp) {
+        addBlocker('config', 'mcp configuration (deploy command or healthcheck URL)');
+      } else {
+        if (!mcp.staging.deployCommand && !mcp.staging.healthcheckUrl) {
+          addBlocker('config', 'mcp staging deploy command or healthcheck URL');
+        }
+        if (!mcp.production.deployCommand && !mcp.production.healthcheckUrl) {
+          addBlocker('config', 'mcp production deploy command or healthcheck URL');
+        }
+        const observed = observedStagingSuccess('mcp');
+        if (observed) addBlocker('observed', observed);
+        if (mcp.staging.healthcheckUrl) {
+          const probe = probeFreshness('mcp');
+          if (probe) addBlocker('probe', probe);
+        }
+      }
     }
 
     results[surface] = {
@@ -879,7 +951,7 @@ export function buildReleaseCheckMessage(
       lines.push(`Use \`${formatWorkflowCommand(config, 'status')}\` if you need the current staging state.`);
     } else if (hasUnsupportedSurfaceBlocker) {
       lines.push('Next: update the tracked workflow config (`.pipelane.json`, or `.project-workflow.json` in legacy repos) so');
-      lines.push('it only lists release-managed surfaces (frontend, edge, sql), or extend the release gate before retrying.');
+      lines.push(`it only lists release-managed surfaces (${RELEASE_MANAGED_SURFACES.join(', ')}), or extend the release gate before retrying.`);
     } else if (onlyPendingStagingOrProbeBlockers) {
       lines.push(`Next: wait for the staging deploy verification to finish, then retry this command.`);
       lines.push(`Use \`${formatWorkflowCommand(config, 'status')}\` if you need the current staging state.`);
