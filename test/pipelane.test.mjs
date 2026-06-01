@@ -10266,6 +10266,60 @@ test('CLI auto-updates workflow commands and re-execs the updated local bin with
   }
 });
 
+test('CLI notifies about updates by default without installing or re-pinning', async () => {
+  const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-notify-consumer-'));
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-notify-bin-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  const npmInstallLog = path.join(consumerRoot, 'npm-install.log');
+  const oldSha = '1111111111111111111111111111111111111111';
+  const newSha = '2222222222222222222222222222222222222222';
+  const port = await getFreePort();
+  try {
+    writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    mkdirSync(path.join(consumerRoot, 'node_modules', '.bin'), { recursive: true });
+    writeFileSync(
+      path.join(consumerRoot, 'node_modules', '.bin', 'pipelane'),
+      '#!/bin/sh\necho "REEXEC:$*"\n',
+      { mode: 0o755, encoding: 'utf8' },
+    );
+    makeFakeUpdateBin(binDir, { latestSha: newSha, npmMarkerPath: npmInstallLog });
+
+    // Default behavior: PIPELANE_AUTO_UPDATE unset -> notify-only. The global
+    // test setup pins it to '0'; clear it here to exercise the real default.
+    const env = {
+      ...process.env,
+      PIPELANE_HOME: pipelaneHome,
+      PIPELANE_AUTO_UPDATE_TTL_MS: '0',
+      PORT: String(port),
+      PATH: `${binDir}:${process.env.PATH}`,
+    };
+    delete env.PIPELANE_AUTO_UPDATE;
+
+    const result = spawnSync('node', [CLI_PATH, 'board', 'status'], {
+      cwd: consumerRoot,
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    // Notice fired: names the available update and how to apply it.
+    assert.match(result.stderr, /Update available: 1111111 -> 2222222/);
+    assert.match(result.stderr, /pipelane update/);
+    // Did NOT self-update: no auto-update banner, no npm install, no re-exec.
+    assert.doesNotMatch(result.stderr, /Auto-updating pipelane/);
+    assert.doesNotMatch(result.stdout, /REEXEC/);
+    assert.equal(existsSync(npmInstallLog), false, 'notify-only must not run npm install');
+    // package.json pin untouched: lock still resolves to the old sha.
+    const lock = JSON.parse(readFileSync(path.join(consumerRoot, 'package-lock.json'), 'utf8'));
+    assert.equal(lock.packages['node_modules/pipelane'].resolved.endsWith(`#${oldSha}`), true);
+  } finally {
+    rmSync(consumerRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
 test('CLI auto-update does not stop a running board during implicit command updates', async () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-bin-'));
