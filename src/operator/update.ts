@@ -161,6 +161,20 @@ export async function maybeAutoUpdate(cwd: string): Promise<AutoUpdateResult> {
     return { checked: true, updated: false, skippedReason: null, status };
   }
 
+  // Notify-only (default): an update exists, but pipelane no longer self-installs
+  // it — auto-installing rewrote the consumer's package.json pin on every run.
+  // Surface the update + the command to apply it, cache the check so we neither
+  // nag nor re-hit the network within the TTL, and continue on the current
+  // version. Auto-install is opt-in via PIPELANE_AUTO_UPDATE=1.
+  if (!autoInstallEnabled()) {
+    writeAutoUpdateCache(updateRoot, status);
+    process.stderr.write(
+      `[pipelane] Update available: ${status.installedShaShort || '(unknown)'} -> ${status.latestShaShort}. ` +
+      'Run `npm run pipelane:update` (or `pipelane update`) to update.\n',
+    );
+    return { checked: true, updated: false, skippedReason: 'notify-only', status };
+  }
+
   try {
     process.stderr.write(`[pipelane] Auto-updating pipelane ${status.installedShaShort || '(unknown)'} -> ${status.latestShaShort} before continuing.\n`);
     const result = await runUpdate(updateRoot, {
@@ -380,6 +394,16 @@ function autoUpdateDisabled(): boolean {
   }
   const raw = process.env.PIPELANE_AUTO_UPDATE?.trim().toLowerCase();
   return raw === '0' || raw === 'false' || raw === 'off' || raw === 'no';
+}
+
+// Self-update (auto-installing the newer main on `run`) is OPT-IN. The default
+// is notify-only: pipelane reports that an update exists and how to apply it,
+// but does not install — auto-installing rewrote the consumer's package.json
+// pipelane pin (github:…#main -> #<sha>) on every run. Opt back into automatic
+// upgrades with PIPELANE_AUTO_UPDATE=1 (or true/on/yes/auto/install).
+function autoInstallEnabled(): boolean {
+  const raw = process.env.PIPELANE_AUTO_UPDATE?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on' || raw === 'yes' || raw === 'auto' || raw === 'install';
 }
 
 function autoUpdateTtlMs(): number {
