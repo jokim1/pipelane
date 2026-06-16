@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { computeUrlFingerprint, resolveProbeStateKey, verifySignedPayload } from './integrity.ts';
+import { buildDefaultReviewGatesConfig, buildReviewGatesConfigForPreset } from './review-gates.ts';
 
 export type Mode = 'build' | 'release';
 export type KnownSurface = 'frontend' | 'edge' | 'sql';
@@ -98,6 +99,43 @@ export interface SmokeConfig {
   concurrency?: SmokeConcurrencyConfig;
 }
 
+export type ReviewGatePreset = 'lean' | 'standard' | 'strict-production';
+export type ReviewPlanGatePhase = 'plan';
+export type ReviewGatePhase = 'static' | 'behavioral' | 'ai-diff' | 'instruction' | 'runtime' | 'human';
+export type ReviewGateType = 'command' | 'skill' | 'agent' | 'approval' | 'pipelane';
+
+export interface ReviewPlanGateConfig {
+  id: string;
+  phase: ReviewPlanGatePhase;
+  type: Exclude<ReviewGateType, 'command' | 'pipelane'>;
+  blocking?: boolean;
+  skill?: string;
+  role?: string;
+  when?: string;
+}
+
+export interface ReviewGateConfig {
+  id: string;
+  phase: ReviewGatePhase;
+  type: ReviewGateType;
+  blocking?: boolean;
+  command?: string;
+  skill?: string;
+  role?: string;
+  when?: string;
+  whenChanged?: string[];
+  timeoutMs?: number;
+  userCommands?: string[];
+}
+
+export interface ReviewGatesConfig {
+  preset?: ReviewGatePreset;
+  planReview?: {
+    gates?: ReviewPlanGateConfig[];
+  };
+  gates?: ReviewGateConfig[];
+}
+
 export interface WorkflowConfig {
   version: number;
   projectKey: string;
@@ -131,6 +169,7 @@ export interface WorkflowConfig {
   // against `git diff --name-only` output. Empty / absent = all changes
   // land in the "other" bucket with a hint to configure the map.
   surfacePathMap?: Record<string, string[]>;
+  reviewGates?: ReviewGatesConfig;
   smoke?: SmokeConfig;
 }
 
@@ -682,7 +721,18 @@ export interface ProbeState {
   updatedAt: string;
 }
 
-export function defaultWorkflowConfig(projectKey: string, displayName: string): WorkflowConfig {
+export function defaultReviewGatesConfig(options: {
+  repoRoot?: string;
+  scripts?: Record<string, string>;
+} = {}): ReviewGatesConfig {
+  return buildDefaultReviewGatesConfig(options);
+}
+
+export function defaultWorkflowConfig(
+  projectKey: string,
+  displayName: string,
+  options: { repoRoot?: string } = {},
+): WorkflowConfig {
   return {
     version: 1,
     projectKey,
@@ -709,6 +759,7 @@ export function defaultWorkflowConfig(projectKey: string, displayName: string): 
       description: 'Protected lane. Promote the same merged SHA through staging before prod.',
       requireStagingPromotion: true,
     },
+    reviewGates: defaultReviewGatesConfig({ repoRoot: options.repoRoot }),
     smoke: undefined,
   };
 }
@@ -927,6 +978,18 @@ function mergeWorkflowLayers(
     if (overlay.checks) next.checks = { ...current.checks, ...overlay.checks };
     if (overlay.smoke) next.smoke = { ...current.smoke, ...overlay.smoke };
     if (overlay.surfacePathMap) next.surfacePathMap = { ...current.surfacePathMap, ...overlay.surfacePathMap };
+    if (overlay.reviewGates) {
+      const presetOverlay = hasOwn(overlay.reviewGates, 'preset');
+      next.reviewGates = presetOverlay
+        ? { ...overlay.reviewGates }
+        : {
+            ...current.reviewGates,
+            ...overlay.reviewGates,
+            planReview: overlay.reviewGates.planReview
+              ? { ...current.reviewGates?.planReview, ...overlay.reviewGates.planReview }
+              : current.reviewGates?.planReview,
+          };
+    }
     if (overlay.buildMode) next.buildMode = { ...current.buildMode, ...overlay.buildMode } as WorkflowConfig['buildMode'];
     if (overlay.releaseMode) next.releaseMode = { ...current.releaseMode, ...overlay.releaseMode } as WorkflowConfig['releaseMode'];
     current = next;
@@ -945,9 +1008,9 @@ export function synthesizeWorkflowConfig(repoRoot: string): WorkflowConfig {
   const inferredName = overlayName || readPackageJsonName(repoRoot) || path.basename(repoRoot);
   const overlayKey = typeof overlay?.projectKey === 'string' ? overlay.projectKey.trim() : '';
   const projectKey = overlayKey || inferProjectKey(inferredName);
-  const base = defaultWorkflowConfig(projectKey, inferredName);
+  const base = defaultWorkflowConfig(projectKey, inferredName, { repoRoot });
   const merged = mergeWorkflowLayers(base, overlay);
-  return normalizeWorkflowConfig(merged);
+  return normalizeWorkflowConfig(merged, { repoRoot });
 }
 
 export function loadWorkflowConfig(repoRoot: string): WorkflowConfig {
@@ -981,12 +1044,15 @@ export function loadWorkflowConfig(repoRoot: string): WorkflowConfig {
   const overlayKey = typeof overlay?.projectKey === 'string' ? overlay.projectKey.trim() : '';
   const fileKey = typeof parsed.projectKey === 'string' ? parsed.projectKey.trim() : '';
   const projectKey = fileKey || overlayKey || inferProjectKey(inferredName);
-  const base = defaultWorkflowConfig(projectKey, inferredName);
+  const base = defaultWorkflowConfig(projectKey, inferredName, { repoRoot });
   const merged = mergeWorkflowLayers(base, overlay, parsed);
-  return normalizeWorkflowConfig(merged);
+  return normalizeWorkflowConfig(merged, { repoRoot });
 }
 
-export function normalizeWorkflowConfig(raw: Partial<WorkflowConfig>): WorkflowConfig {
+export function normalizeWorkflowConfig(
+  raw: Partial<WorkflowConfig>,
+  options: { repoRoot?: string } = {},
+): WorkflowConfig {
   const branchPrefix = normalizeBranchPrefix(raw.branchPrefix);
   const legacyBranchPrefixes = normalizeLegacyBranchPrefixes(raw.legacyBranchPrefixes)
     .filter((prefix, index, all) => prefix !== branchPrefix && all.indexOf(prefix) === index);
@@ -999,8 +1065,139 @@ export function normalizeWorkflowConfig(raw: Partial<WorkflowConfig>): WorkflowC
     checks: normalizeChecksConfig(raw.checks),
     syncDocs: normalizeSyncDocsConfig(raw.syncDocs),
     surfacePathMap: normalizeSurfacePathMap(raw.surfacePathMap),
+    reviewGates: normalizeReviewGatesConfig(raw.reviewGates, { repoRoot: options.repoRoot }),
     smoke: normalizeSmokeConfig(raw.smoke),
   };
+}
+
+const REVIEW_GATE_PRESETS: readonly ReviewGatePreset[] = ['lean', 'standard', 'strict-production'];
+const REVIEW_GATE_PHASES: readonly ReviewGatePhase[] = ['static', 'behavioral', 'ai-diff', 'instruction', 'runtime', 'human'];
+const REVIEW_GATE_TYPES: readonly ReviewGateType[] = ['command', 'skill', 'agent', 'approval', 'pipelane'];
+const REVIEW_PLAN_GATE_TYPES: readonly ReviewPlanGateConfig['type'][] = ['skill', 'agent', 'approval'];
+
+export function normalizeReviewGatesConfig(
+  raw: ReviewGatesConfig | undefined,
+  options: { repoRoot?: string } = {},
+): ReviewGatesConfig {
+  const defaults = defaultReviewGatesConfig({ repoRoot: options.repoRoot });
+  if (!isRecord(raw)) return defaults;
+
+  const preset = includesString(REVIEW_GATE_PRESETS, raw.preset) ? raw.preset : defaults.preset;
+  const presetDefaults = preset === defaults.preset
+    ? defaults
+    : buildReviewGatesConfigForPreset(preset, { repoRoot: options.repoRoot });
+  const planReview = isRecord(raw.planReview) ? raw.planReview : undefined;
+  const planGates = Array.isArray(planReview?.gates)
+    ? normalizeReviewPlanGateList(planReview.gates)
+    : presetDefaults.planReview?.gates;
+  const gates = Array.isArray(raw.gates)
+    ? normalizeReviewGateList(raw.gates)
+    : presetDefaults.gates;
+
+  return {
+    preset,
+    planReview: {
+      gates: planGates ?? [],
+    },
+    gates: gates ?? [],
+  };
+}
+
+function normalizeReviewPlanGateList(raw: unknown[]): ReviewPlanGateConfig[] {
+  const seen = new Set<string>();
+  const out: ReviewPlanGateConfig[] = [];
+  for (const entry of raw) {
+    if (!isRecord(entry)) continue;
+    const id = cleanString(entry.id);
+    if (!id || seen.has(id)) continue;
+    const type = includesString(REVIEW_PLAN_GATE_TYPES, entry.type) ? entry.type : undefined;
+    if (!type) continue;
+
+    const skill = cleanString(entry.skill);
+    const role = cleanString(entry.role);
+    if (type === 'skill' && !skill) continue;
+    if (type === 'agent' && !role) continue;
+
+    seen.add(id);
+    out.push({
+      id,
+      phase: 'plan',
+      type,
+      blocking: entry.blocking !== false,
+      skill: type === 'skill' ? skill : undefined,
+      role: type === 'agent' ? role : undefined,
+      when: cleanString(entry.when),
+    });
+  }
+  return out;
+}
+
+function normalizeReviewGateList(raw: unknown[]): ReviewGateConfig[] {
+  const seen = new Set<string>();
+  const out: ReviewGateConfig[] = [];
+  for (const entry of raw) {
+    if (!isRecord(entry)) continue;
+    const id = cleanString(entry.id);
+    if (!id || seen.has(id)) continue;
+    const phase = includesString(REVIEW_GATE_PHASES, entry.phase) ? entry.phase : undefined;
+    const type = includesString(REVIEW_GATE_TYPES, entry.type) ? entry.type : undefined;
+    if (!phase || !type) continue;
+
+    const command = cleanString(entry.command);
+    const skill = cleanString(entry.skill);
+    const role = cleanString(entry.role);
+    if ((type === 'command' || type === 'pipelane') && !command) continue;
+    if (type === 'skill' && !skill) continue;
+    if (type === 'agent' && !role) continue;
+
+    const timeoutMs = typeof entry.timeoutMs === 'number' && Number.isFinite(entry.timeoutMs) && entry.timeoutMs > 0
+      ? Math.trunc(entry.timeoutMs)
+      : undefined;
+
+    seen.add(id);
+    out.push({
+      id,
+      phase,
+      type,
+      blocking: entry.blocking !== false,
+      command: type === 'command' || type === 'pipelane' ? command : undefined,
+      skill: type === 'skill' ? skill : undefined,
+      role: type === 'agent' ? role : undefined,
+      when: cleanString(entry.when),
+      whenChanged: cleanStringList(entry.whenChanged),
+      timeoutMs,
+      userCommands: cleanStringList(entry.userCommands),
+    });
+  }
+  return out;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function includesString<const T extends string>(allowed: readonly T[], value: unknown): value is T {
+  return typeof value === 'string' && (allowed as readonly string[]).includes(value);
+}
+
+function hasOwn(value: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function cleanString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function cleanStringList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: string[] = [];
+  for (const entry of value) {
+    const cleaned = cleanString(entry);
+    if (cleaned && !out.includes(cleaned)) out.push(cleaned);
+  }
+  return out.length > 0 ? out : undefined;
 }
 
 function normalizeSmokeConfig(raw: SmokeConfig | undefined): SmokeConfig | undefined {

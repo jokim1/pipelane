@@ -57,7 +57,7 @@ export const LEGACY_CLAUDE_SIGNATURES: Record<ManagedCommand, string[]> = {
     'npm run pipelane:deploy',
   ],
   smoke: [
-    'Plan smoke coverage or run deterministic smoke against staging or prod.',
+    'Plan smoke coverage or run deterministic staging smoke.',
     'npm run pipelane:smoke',
   ],
   devmode: [
@@ -116,6 +116,10 @@ export const LEGACY_CLAUDE_SIGNATURES: Record<ManagedCommand, string[]> = {
 };
 
 const ADDITIONAL_LEGACY_CLAUDE_SIGNATURES: Partial<Record<ManagedCommand, string[][]>> = {
+  smoke: [[
+    'Plan smoke coverage or run deterministic smoke against staging or prod.',
+    'npm run pipelane:smoke',
+  ]],
   // Pre-overview `/pipelane` opened the board by default and shipped without
   // the command marker. Keep recognizing that exact old shape without forcing
   // stale "Board (default)" copy to remain in the current template forever.

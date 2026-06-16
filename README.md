@@ -14,8 +14,10 @@ Use it when you want:
 - every active branch and worktree to be easy to find again
 - a clear difference between fast build flow and protected release flow
 - staging and production deploys tied to the same merged SHA when safety matters
-- smoke checks, release gates, rollback, and cleanup built into the workflow
+- release gates, rollback, and cleanup built into the workflow
 - a durable `/fix` loop for bugs, review findings, and code-quality repairs
+- a planned path toward auditable AI orchestration: static gates first, then
+  tests, traceability review, AI review, runtime QA, and human gates
 
 ![Pipelane Board showing branch pipeline state, attention items, and release actions](docs/public/pipelane-board-example.png)
 
@@ -24,8 +26,8 @@ Use it when you want:
 Pipelane is a local, repo-native release workflow layer.
 
 It installs a small workflow contract into your repo, adds slash commands for Claude
-and Codex, and ships a local web board for seeing branch, PR, smoke, deploy, and
-cleanup state in one place.
+and Codex, and ships a local web board for seeing branch, PR, deploy, and cleanup
+state in one place.
 
 Pipelane is not:
 
@@ -43,6 +45,11 @@ Pipelane is closer to a release cockpit:
 - **Repair discipline:** use `/fix` to turn bugs, CI failures, review comments,
   and code-quality findings into root-cause fixes.
 
+The next planned layer is `/orchestrate`: a configurable execution system that
+turns implementation plans into isolated slices, runs deterministic checks before
+AI review, records evidence, and hands safe work back to the existing Pipelane
+release flow. See [Orchestration Roadmap](docs/public/ORCHESTRATION.md).
+
 ## Start With `/pipelane`
 
 In a Pipelane-enabled repo, run:
@@ -59,12 +66,10 @@ Build mode is the fast path. Use it when you want the shortest route from branch
 to production and do not need required staging validation for the same SHA.
 
 ```text
-/status                 See what is already in flight.
 /devmode build          Use the fast lane.
-/new                    Create a named task worktree from the described task.
+/new                    Let the AI infer the task name, or provide one if you want.
 /pr --title "PR title"  Run pre-PR checks, commit, push, and open or update the PR.
 /merge                  Merge the PR and record the merged SHA.
-/smoke prod             Optional: run production-safe smoke checks if configured.
 /clean                  Clean up finished task state after production is verified.
 ```
 
@@ -77,15 +82,12 @@ Release mode is the protected path. Use it when staging must prove the exact sam
 merged SHA before production can move.
 
 ```text
-/status                 See active tasks, deploy state, and release gates.
 /devmode release        Use the protected lane.
-/new                    Create a named task worktree from the described task.
+/new                    Let the AI infer the task name, or provide one if you want.
 /pr --title "PR title"  Run pre-PR checks, commit, push, and open or update the PR.
 /merge                  Merge the PR and record the merged SHA.
 /deploy staging         Deploy the merged SHA to staging.
-/smoke staging          Run or verify staging smoke checks.
 /deploy prod            Promote that same SHA to production.
-/smoke prod             Optional: run production-safe smoke checks.
 /clean                  Clean up finished task state after production is verified.
 ```
 
@@ -114,7 +116,7 @@ is hard to hold in your head. It shows:
 
 - attention items first
 - current dev mode and release gate status
-- staging and production smoke state
+- staging and production deploy state
 - one active pipeline card per branch
 - branch files, workspace files, and patch previews on demand
 - preflighted actions for deploy, cleanup, and other workflow steps
@@ -139,7 +141,7 @@ Release mode adds a gate:
 
 - merge once
 - deploy that merged SHA to staging
-- run smoke checks
+- prove the staging deploy
 - promote that same SHA to production
 - verify production
 
@@ -156,7 +158,6 @@ It is also bug quality and code quality.
 - human review
 - PR comments
 - CI failures
-- `/smoke`
 - `/qa` or other test runs
 - pasted errors
 - code-quality reviews
@@ -292,7 +293,7 @@ User-facing slash commands:
 
 - `/pipelane`: show the build/release journey overview
 - `/pipelane web`: open the local Pipelane Board
-- `/status`: show branch, PR, deploy, smoke, and release-gate state
+- `/status`: show branch, PR, deploy, and release-gate state
 - `/devmode`: inspect or switch between `build` and `release`
 - `/new`: create a fresh isolated task workspace
 - `/resume`: recover an existing task workspace
@@ -300,7 +301,6 @@ User-facing slash commands:
 - `/pr`: run checks, push, and create or update a PR
 - `/merge`: merge the PR and record the merged SHA
 - `/deploy`: deploy the merged SHA to `staging` or `prod`
-- `/smoke`: plan smoke coverage or run smoke against `staging` or `prod`
 - `/fix`: apply durable root-cause fixes from findings
 - `/clean`: close verified task workspaces when safe and prune stale task locks
 - `/doctor`: inspect deploy configuration and live probes
@@ -308,7 +308,7 @@ User-facing slash commands:
 
 Slash commands are the normal human/AI interface. Repo-native scripts are the
 stable implementation layer underneath them, but workflow guidance should point
-operators at `/status`, `/new`, `/pr`, `/merge`, `/deploy`, `/smoke`, and the
+operators at `/status`, `/new`, `/pr`, `/merge`, `/deploy`, and the
 other slash commands above.
 
 ## Use Pipelane With Gstack
@@ -321,13 +321,13 @@ That split keeps the workflow easy to reason about:
 - **gstack reviews the work:** planning, architecture, implementation risk, code
   review, QA, investigation, design review, and documentation review.
 - **Pipelane moves the work:** task branches, worktrees, PR prep, merge, deploy
-  flow, smoke checks, rollback, cleanup, and release gates.
+  flow, rollback, cleanup, and release gates.
 
 In other words, gstack helps you answer "is this the right change, and is it good
 enough?" Pipelane helps you answer "where is this change, what environment has it,
 and what action is safe next?"
 
-If a repo uses Pipelane, prefer Pipelane for branch, PR, merge, deploy, smoke,
+If a repo uses Pipelane, prefer Pipelane for branch, PR, merge, deploy,
 rollback, and cleanup flow. Use gstack around that flow to make the plan and code
 better before Pipelane moves it forward.
 
@@ -346,16 +346,14 @@ a perfect spec. The AI agent can turn it into an implementation plan and infer
 the task name for `/new`.
 
 ```text
-/status
 /devmode build
 /new
 ```
 
-Pipelane creates the task workspace. `/status` shows what is already in flight,
-`/devmode build` selects the fast lane, and `/new` lets the AI infer a concise
-task name from the user's request before creating a clean task branch and
-worktree. If work was already implemented in another worktree, do not run
-`/new` again; continue there and use `/pr`.
+Pipelane creates the task workspace. `/devmode build` selects the fast lane, and
+`/new` lets the AI infer a concise task name from the user's request before
+creating a clean task branch and worktree. If work was already implemented in
+another worktree, do not run `/new` again; continue there and use `/pr`.
 
 ```text
 AI: Proposed plan:
@@ -469,23 +467,52 @@ Codex/gstack setup, or when you want a second model to review the plan or code.
 The recommended role split is simple: Claude reviews, Codex fixes, and Pipelane
 moves the release forward.
 
+### Planned `/orchestrate` Layer
+
+The planned `/orchestrate` command sits above the current Pipelane flow. It should
+compile an implementation plan into isolated slices, configure plan-review gates,
+run static and behavioral checks before AI review, and record gate evidence for
+each slice.
+
+Use `/pipelane review setup` to configure the review gate stack. Then
+`/pipelane review` runs the configured gates, and `/pr` can enforce the
+blocking gates before PR handoff.
+
+Future orchestration slices should use a provider-neutral `GoalSpec`: Pipelane
+drafts the finish line, proof to print, handoff summary, blocked policy, and
+budget; the user approves or edits the compact goal before Codex or Claude gets
+a native `/goal` prompt.
+
+The intended review order is:
+
+1. **Plan review:** product, design, engineering, security, or docs review before code.
+2. **Static gates:** lint, typecheck, format check, secret scan, and dependency audit when configured.
+3. **Behavioral gates:** tests, integration checks, and build.
+4. **AI diff gates:** `/karpathy diff`, gstack `/review`, and adversarial review.
+5. **Instruction gates:** `/karpathy audit` when `CLAUDE.md`, `AGENTS.md`, `.cursor/rules/**`, or `.codex/skills/**` changes.
+6. **Runtime gates:** browser QA, deploy health checks, and staging evidence.
+7. **Human gates:** merge, production deploy, rollback, schema, auth, billing, secrets, and other irreversible work.
+
+Static gates belong before AI review. Pipelane should not spend review-model
+tokens on syntax, type, style, or unsafe-async issues that deterministic tools
+can reject first.
+
 Once review is clean, return to Pipelane:
 
 ```text
 /merge
-/smoke prod
 /clean
 ```
 
-In build mode, `/merge` lands the PR and records the merged SHA. If production
-deploys automatically from the base branch, `/smoke prod` verifies the live app
-after deploy. `/clean` removes finished task state so the next AI session starts
+In build mode, `/merge` lands the PR and records the merged SHA. Production
+deploy is expected to happen through the repo's existing base-branch release
+automation. `/clean` removes finished task state so the next AI session starts
 from a clean cockpit.
 
 The full build journey looks long when written out, but the responsibilities are
 simple: the user describes the work, gstack improves the plan and reviews the
 diff, the AI implements and fixes, and Pipelane moves the change through branch,
-PR, merge, smoke, and cleanup.
+PR, merge, deploy handoff, and cleanup.
 
 ### Release Journey With Gstack Reviews
 
@@ -494,7 +521,6 @@ gate before production:
 
 ```text
 User: Replace the billing webhook handler.
-/status
 /devmode release
 /new
 /plan-design-review
@@ -506,19 +532,18 @@ AI: Implementation returns.
 /pr
 /merge
 /deploy staging
-/smoke staging
 /deploy prod
-/smoke prod
 /clean
 ```
 
 The review stack still asks whether the plan and code are good. The release stack
-now adds the operational guarantee: staging and production are tied to the same
-merged SHA, with smoke evidence before promotion.
+now adds the operational guarantee: staging proves the same merged SHA before
+production promotion.
 
 ## More Detail
 
 - [Full release workflow reference](docs/public/RELEASE_WORKFLOW.md)
+- [Orchestration roadmap](docs/public/ORCHESTRATION.md)
 - [Pipelane Board reference design](docs/public/PIPELANE_BOARD.md)
 - [Pipelane API contract](docs/public/PIPELANE_API.md)
 - [Dashboard implementation guide](src/dashboard/README.md)

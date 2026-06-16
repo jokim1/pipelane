@@ -4,20 +4,21 @@ This repo uses `pipelane` for task workspaces, PR prep, merge handoff, and deplo
 
 ### Command surface
 
-- Default slash aliases are `{{ALIAS_DEVMODE}}`, `{{ALIAS_NEW}}`, `{{ALIAS_RESUME}}`, `{{ALIAS_PR}}`, `{{ALIAS_MERGE}}`, `{{ALIAS_DEPLOY}}`, `{{ALIAS_SMOKE}}`, `{{ALIAS_CLEAN}}`, `{{ALIAS_STATUS}}`, `{{ALIAS_DOCTOR}}`, and `{{ALIAS_ROLLBACK}}`.
+- Default slash aliases are `{{ALIAS_DEVMODE}}`, `{{ALIAS_NEW}}`, `{{ALIAS_RESUME}}`, `{{ALIAS_PR}}`, `{{ALIAS_MERGE}}`, `{{ALIAS_DEPLOY}}`, `{{ALIAS_CLEAN}}`, `{{ALIAS_STATUS}}`, `{{ALIAS_DOCTOR}}`, and `{{ALIAS_ROLLBACK}}`.
+- Fixed helper commands include `/fix`, `/fix rethink`, and `/fix refresh-guidance`.
 - Prefer the slash aliases above. Repo-local `npm run pipelane:*` scripts are a fallback path and require `node_modules/.bin/pipelane` to exist.
 - For code changes, ensure work is in a Pipelane task workspace before editing. If the user describes a new task from a non-task checkout, run `{{ALIAS_NEW}}` with an inferred `--task` label before implementation.
-- Use `{{ALIAS_NEW}}` to start new work after the user describes the task; infer a concise `--task` label instead of making the user repeat it.
+- Use `{{ALIAS_NEW}}` to start new work after the user describes the task; use an explicit task name if the user provided one, otherwise infer a concise `--task` label instead of making the user repeat it.
 - Use `{{ALIAS_RESUME}} --task "<task-name>"` to return to an existing task workspace.
 - Use `{{ALIAS_DEVMODE}} status|build|release` to inspect or switch lanes.
 - Use `{{ALIAS_PR}} --title "<pr title>"` to prepare or update the PR.
 - Use `{{ALIAS_MERGE}}` to merge the PR and record the merged SHA.
 - Use `{{ALIAS_DEPLOY}} staging|prod` to deploy the merged SHA.
-- Use `{{ALIAS_SMOKE}} plan|staging|prod` to audit smoke coverage or run deployed smoke.
 - Use `{{ALIAS_ROLLBACK}} staging|prod` to roll back the last deploy to the last-good SHA.
 - Use `{{ALIAS_CLEAN}}` for workflow cleanup status.
 - Use `{{ALIAS_STATUS}}` for the one-screen cockpit of task + lane state.
 - Use `{{ALIAS_DOCTOR}}` to diagnose deploy config; `{{ALIAS_DOCTOR}} --probe` to refresh staging healthcheck probes; `{{ALIAS_DOCTOR}} --fix` for the guided wizard.
+- Use `/fix` for review findings, CI failures, bugs, and code-quality repairs.
 
 ### Repo guard and task locks
 

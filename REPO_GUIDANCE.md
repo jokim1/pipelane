@@ -1,6 +1,6 @@
 # Repo Guidance
 
-Last reviewed: 2026-04-23
+Last reviewed: 2026-06-15
 Refresh cadence: 30 days or 50 commits
 Drift-hint threshold: 20 commits / 30 days
 Owners: jokim1
@@ -21,6 +21,42 @@ production repos; regressions in the kit propagate everywhere on the next
 `pipelane:setup`. Backwards compatibility for already-installed consumers
 is load-bearing. "Has real users" applies — assume downstream pain on
 every breaking change.
+
+## Current roadmap memory
+
+`/orchestrate` is the planned execution layer above the existing release
+workflow. Treat `docs/public/ORCHESTRATION.md` as the current design note.
+It is not shipped command behavior yet.
+
+Decisions captured through 2026-06-16:
+
+- Build the review-gate foundation before full multi-agent `/orchestrate`.
+  First ship top-level `reviewGates` config, `/pipelane review setup`,
+  `/pipelane review`, evidence under `<git-common-dir>/<config.stateDir>/`,
+  and `/pr` enforcement. Full slice orchestration consumes this layer later.
+- `/pipelane review setup` is the user-facing setup command for plan-review
+  gates and implementation review gates. Plain `/pipelane setup` remains
+  broader repo onboarding/setup.
+- Review gates are ordered by phase: static, behavioral, AI diff, instruction,
+  runtime, then human gates.
+- Static gates run before AI review. Lint, typecheck, format checks,
+  secret scans, dependency audits, tests, and build should reject cheap
+  deterministic failures before `/karpathy diff`, gstack `/review`, or an
+  adversarial reviewer runs.
+- `/karpathy diff` is the code-diff review gate. `/karpathy audit` is the
+  instruction/memory-file audit gate and should only run when files like
+  `CLAUDE.md`, `AGENTS.md`, `.cursor/rules/**`, or `.codex/skills/**` change.
+- Goal mode for future orchestration should use provider-neutral `GoalSpec`
+  objects. AI drafts the finish line, proof, handoff, blocked policy, and
+  budget; the user confirms, edits, splits, or runs without goal mode. Native
+  Codex or Claude `/goal` is an adapter detail, not the source of truth.
+- Setup should detect existing scripts first (`lint`, `typecheck`,
+  `format:check`, `test`, `build`) and warn about missing optional gates
+  instead of inventing a toolchain silently.
+- `/orchestrate` should hand successful work back to the existing Pipelane
+  release flow. It must not auto-merge, auto-deploy production, or bypass
+  existing `/pr`, `/merge`, `/deploy`, `/smoke`, `/rollback`, and `/clean`
+  gates.
 
 ## Project invariants
 
@@ -56,8 +92,9 @@ cleaner approach failed.
   either file.
 - **Atomic state writes.** `writeJsonFile` in `state.ts` uses tmp+rename;
   any new persisted state must use the same primitive. Non-atomic writes
-  leave consumer repos with corrupt state on crash. Open follow-up in
-  `docs/TODO.md` — Batch 2.
+  leave consumer repos with corrupt state on crash. Track any remaining
+  state-hardening follow-up in active docs or an issue, not an absent local
+  TODO file.
 - **State paths and schemas are compatibility contracts.** The default
   state dir and persisted state file shapes are public to installed
   consumers. Renaming a state dir requires a `LEGACY_STATE_DIRS` migration;
@@ -150,9 +187,10 @@ constants — touching any of them is a contract change.
 
 ## Deferred / don't-touch list
 
-Tracked in `docs/TODO.md` and various `docs/*_PLAN.md`. `/fix` should
-avoid opportunistic changes in these areas and will not surface drift
-hints on files listed here.
+Tracked here and in active docs under `docs/public/`. Historical target-state
+specs live under `docs/archive/` and are not authoritative. `/fix` should avoid
+opportunistic changes in these areas and will not surface drift hints on files
+listed here.
 
 - **v2.2 Codex dual-install re-scope.** The "just delete
   `codex-install.ts`" framing no longer maps. Needs a fresh scoping pass
@@ -164,16 +202,19 @@ hints on files listed here.
   project-wide, probe-state HMAC signing, URL fingerprint for
   config-rotation detection, concurrent `--probe` / `--fix` lock,
   `PIPELANE_DOCTOR_PROBE_TIMEOUT_MS` clamp. Unfreeze when: Batch 2
-  starts (`docs/TODO.md`).
+  gets a fresh plan in active docs or an issue.
 - **Rollback discovery / `capDeployHistory` / `findLatestRecord`
   dedup.** Deferred from PR #37 review. Unfreeze when: Batch 3 starts.
-- **Stack playbooks.** Permanently dropped per
-  `docs/FIX_COMMAND_PLAN.md`. Do not add a
-  `templates/extensions/<stack>.md` layer. Unfreeze when: copy-paste
-  pain emerges across 3+ real consumer repos (evidence bar).
+- **Stack playbooks.** Permanently dropped per prior planning. Do not
+  add a `templates/extensions/<stack>.md` layer. Unfreeze when:
+  copy-paste pain emerges across 3+ real consumer repos (evidence bar).
 - **Staleness-check extraction to `pipelane:guidance-status` script.**
   Phase 2 of `/fix` plan. Stays inline in the prompt for Phase 1.
   Unfreeze when: Phase 1 lands and metrics dashboard work begins.
+- **`/orchestrate` implementation.** Planned but not shipped. Do not add
+  partial command docs or generated adapters without the schema, setup
+  command, gate catalog, tests, and board visibility plan landing together.
+  Unfreeze when: implementation starts from `docs/public/ORCHESTRATION.md`.
 
 ## PR and review strategy
 
@@ -218,6 +259,10 @@ transcript; no consent gate (section name is legacy).
   Affects every consumer's ability to ship.
 - **CI workflow files** (`.github/workflows/*.yml`). Consumer CI
   depends on the template file shapes published through pipelane.
+- **`orchestrate` config schema, gate catalog, or command adapters.**
+  These will affect how AI agents review and move production code.
+  Changes require matching docs, tests, template updates, and explicit
+  static-gates-before-AI-review behavior.
 
 ## Drift-hint ignore
 
@@ -227,7 +272,6 @@ post-fix drift hints.
 - `package-lock.json`
 - `dist/**`
 - `.pipelane/state/**`
-- `docs/TODO.md`
 - `CHANGELOG.md`
 - `*.generated.*`
 - `test/fixtures/**`

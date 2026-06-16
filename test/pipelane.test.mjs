@@ -2455,6 +2455,42 @@ test('legacy pipelane.md (no marker) is upgraded in place on next setup', () => 
   }
 });
 
+test('legacy smoke.md staging-or-prod signature is upgraded in place on next setup', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    const smokePath = path.join(repoRoot, '.claude', 'commands', 'smoke.md');
+    writeFileSync(
+      smokePath,
+      [
+        'Plan smoke coverage or run deterministic smoke against staging or prod.',
+        '',
+        'Legacy body that predates the command marker.',
+        '',
+        '```bash',
+        'npm run pipelane:smoke -- $ARGUMENTS',
+        '```',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    const after = readFileSync(smokePath, 'utf8');
+    assert.match(after, /<!-- pipelane:command:smoke -->/);
+    assert.match(after, /Plan smoke coverage, configure the smoke runner/);
+    assert.doesNotMatch(after, /Legacy body that predates the command marker\./);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
 test('pipelane.md renders a journey-first overview with real slash aliases', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
@@ -3139,6 +3175,21 @@ test('RELEASE_WORKFLOW packageScripts docs describe the managed script contract 
   const template = readFileSync(path.join(KIT_ROOT, 'templates', 'docs', 'RELEASE_WORKFLOW.md'), 'utf8');
   assert.match(template, /full managed `pipelane:\*` workflow script set/i);
   assert.match(template, /`pipelane:configure`/);
+});
+
+test('package files include README-linked public markdown docs', () => {
+  const pkg = JSON.parse(readFileSync(path.join(KIT_ROOT, 'package.json'), 'utf8'));
+  const packageFiles = new Set(pkg.files);
+  const expectedDocs = [
+    'docs/public/RELEASE_WORKFLOW.md',
+    'docs/public/ORCHESTRATION.md',
+    'docs/public/PIPELANE_BOARD.md',
+    'docs/public/PIPELANE_API.md',
+  ];
+
+  for (const docPath of expectedDocs) {
+    assert.ok(packageFiles.has(docPath), `${docPath} must ship with the README/package docs`);
+  }
 });
 
 test('syncDocs.packageScripts: false is allowed when claudeCommands is also false', () => {
@@ -4118,6 +4169,56 @@ test('loadWorkflowConfig applies a package.json:pipelane overlay when the file i
     assert.equal(loaded.aliases.merge, stateMod.DEFAULT_WORKFLOW_ALIASES.merge);
     assert.equal(loaded.syncDocs?.readmeSection, false);
     assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('loadWorkflowConfig materializes preset-only package reviewGates overlays', async () => {
+  const repoRoot = createRepo();
+  try {
+    const packageJsonPath = path.join(repoRoot, 'package.json');
+    const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+    pkg.pipelane = {
+      reviewGates: {
+        preset: 'strict-production',
+      },
+    };
+    writeFileSync(packageJsonPath, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const loaded = stateMod.loadWorkflowConfig(repoRoot);
+    assert.equal(loaded.reviewGates.preset, 'strict-production');
+    assert.ok(loaded.reviewGates.planReview.gates.some((gate) => gate.id === 'security-data-review'));
+    assert.ok(loaded.reviewGates.gates.some((gate) => gate.id === 'adversarial-review'));
+    assert.ok(loaded.reviewGates.gates.some((gate) => gate.id === 'human-merge-approval'));
+    assert.ok(loaded.reviewGates.gates.some((gate) => gate.id === 'human-prod-deploy-approval'));
+    assert.ok(loaded.reviewGates.gates.some((gate) => gate.id === 'human-rollback-approval'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('loadWorkflowConfig detects package scripts for default review gates without inventing missing scripts', async () => {
+  const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+  const repoRoot = createRepo();
+  try {
+    const loaded = stateMod.loadWorkflowConfig(repoRoot);
+    assert.deepEqual(loaded.reviewGates.gates.slice(0, 3).map((gate) => gate.id), ['typecheck', 'test', 'build']);
+    assert.equal(loaded.reviewGates.gates.find((gate) => gate.id === 'typecheck').command, 'npm run typecheck');
+    assert.equal(loaded.reviewGates.gates.find((gate) => gate.id === 'test').command, 'npm run test');
+    assert.equal(loaded.reviewGates.gates.find((gate) => gate.id === 'build').command, 'npm run build');
+
+    const packageJsonPath = path.join(repoRoot, 'package.json');
+    const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+    pkg.scripts = {};
+    writeFileSync(packageJsonPath, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
+
+    const withoutScripts = stateMod.loadWorkflowConfig(repoRoot);
+    assert.equal(withoutScripts.reviewGates.gates.some((gate) => gate.id === 'typecheck'), false);
+    assert.equal(withoutScripts.reviewGates.gates.some((gate) => gate.id === 'test'), false);
+    assert.equal(withoutScripts.reviewGates.gates.some((gate) => gate.id === 'build'), false);
+    assert.ok(withoutScripts.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -9786,6 +9887,9 @@ test('dashboard UI ships a Pipelane help drawer', () => {
   assert.match(html, /Release Journey/);
   assert.match(html, /Web Commands/);
   assert.match(html, /\/pipelane update --check/);
+  assert.match(html, /smoke: '\/smoke'/);
+  assert.match(html, /case 'smoke\.plan':\s+return `Run \$\{aliases\.smoke\} plan`;/);
+  assert.match(html, /blocking \? `Run \$\{aliases\.smoke\} staging` : `Run \$\{aliases\.doctor\} --probe`/);
 });
 
 test('dashboard action input modal renders visible required-field errors', () => {
@@ -14008,6 +14112,259 @@ test('v1.4 normalizeSurfacePathMap filters garbage and collapses an all-invalid 
   assert.deepEqual(mixed, { frontend: ['src/frontend/'], sql: ['supabase/'] });
   const allBad = mod.normalizeWorkflowConfig({ surfacePathMap: { '': ['x'], bad: 'nope' } }).surfacePathMap;
   assert.equal(allBad, undefined);
+});
+
+test('normalizeReviewGatesConfig keeps defaults and filters malformed gate entries', async () => {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+  const defaults = mod.defaultWorkflowConfig('demo', 'Demo').reviewGates;
+  assert.equal(defaults.preset, 'standard');
+  assert.equal(defaults.gates.some((gate) => ['typecheck', 'test', 'build'].includes(gate.id)), false);
+  const karpathyDiff = defaults.gates.find((gate) => gate.id === 'karpathy-diff');
+  assert.equal(karpathyDiff.phase, 'ai-diff');
+  assert.equal(karpathyDiff.skill, 'karpathy-diff');
+  assert.ok(karpathyDiff.userCommands.includes('/karpathy diff'));
+  const karpathyAudit = defaults.gates.find((gate) => gate.id === 'karpathy-audit');
+  assert.equal(karpathyAudit.phase, 'instruction');
+  assert.equal(karpathyAudit.skill, 'karpathy-audit');
+  assert.ok(karpathyAudit.userCommands.includes('/karpathy audit'));
+  assert.ok(karpathyAudit.whenChanged.includes('CLAUDE.md'));
+
+  const normalized = mod.normalizeReviewGatesConfig({
+    preset: 'invalid',
+    planReview: {
+      gates: [
+        { id: ' plan-eng ', phase: 'nope', type: 'skill', skill: ' plan-eng-review ', blocking: false },
+        { id: 'missing-skill', phase: 'plan', type: 'skill' },
+        { id: 'human-plan', phase: 'plan', type: 'approval', when: 'release-risk' },
+      ],
+    },
+    gates: [
+      { id: ' lint ', phase: 'static', type: 'command', command: ' npm run lint ', blocking: false, timeoutMs: 1250.9 },
+      { id: 'bad-phase', phase: 'nope', type: 'command', command: 'npm run lint' },
+      { id: 'bad-command', phase: 'static', type: 'command', command: '   ' },
+      { id: 'diff', phase: 'ai-diff', type: 'skill', skill: ' karpathy-diff ', userCommands: ['/karpathy diff', '', '/karpathy diff'] },
+      { id: 'audit', phase: 'instruction', type: 'skill', skill: 'karpathy-audit', whenChanged: ['CLAUDE.md', '', 'CLAUDE.md'] },
+      { id: 'adversarial', phase: 'ai-diff', type: 'agent', role: ' adversarial-code-reviewer ' },
+      { id: 'adversarial', phase: 'ai-diff', type: 'agent', role: 'duplicate-ignored' },
+    ],
+  });
+
+  assert.equal(normalized.preset, 'standard');
+  assert.deepEqual(normalized.planReview.gates.map((gate) => gate.id), ['plan-eng', 'human-plan']);
+  assert.equal(normalized.planReview.gates[0].blocking, false);
+  assert.deepEqual(normalized.gates.map((gate) => gate.id), ['lint', 'diff', 'audit', 'adversarial']);
+  assert.deepEqual(normalized.gates[0], {
+    id: 'lint',
+    phase: 'static',
+    type: 'command',
+    blocking: false,
+    command: 'npm run lint',
+    skill: undefined,
+    role: undefined,
+    when: undefined,
+    whenChanged: undefined,
+    timeoutMs: 1250,
+    userCommands: undefined,
+  });
+  assert.deepEqual(normalized.gates[1].userCommands, ['/karpathy diff']);
+  assert.deepEqual(normalized.gates[2].whenChanged, ['CLAUDE.md']);
+  assert.equal(normalized.gates[3].role, 'adversarial-code-reviewer');
+});
+
+test('normalizeReviewGatesConfig materializes strict-production when only preset is configured', async () => {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+  const normalized = mod.normalizeReviewGatesConfig({ preset: 'strict-production' });
+
+  assert.equal(normalized.preset, 'strict-production');
+  assert.ok(normalized.planReview.gates.some((gate) => gate.id === 'security-data-review'));
+  assert.ok(normalized.gates.some((gate) => gate.id === 'adversarial-review'));
+  assert.ok(normalized.gates.some((gate) => gate.id === 'human-merge-approval'));
+  assert.ok(normalized.gates.some((gate) => gate.id === 'human-prod-deploy-approval'));
+  assert.ok(normalized.gates.some((gate) => gate.id === 'human-rollback-approval'));
+});
+
+test('review gate catalog detects package scripts and separates human aliases', async () => {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-gates.ts'));
+  const repoRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-gates-'));
+  try {
+    writeFileSync(
+      path.join(repoRoot, 'package.json'),
+      JSON.stringify({
+        name: 'review-gates-demo',
+        scripts: {
+          lint: 'eslint .',
+          'format:check': 'prettier --check .',
+          test: 42,
+          blank: '',
+        },
+      }, null, 2),
+      'utf8',
+    );
+
+    const detection = mod.detectPackageScripts(repoRoot);
+    assert.equal(detection.found, true);
+    assert.equal(detection.malformed, false);
+    assert.deepEqual(detection.scripts, {
+      lint: 'eslint .',
+      'format:check': 'prettier --check .',
+    });
+
+    assert.equal(mod.resolveReviewGateAlias('/karpathy diff'), 'karpathy-diff');
+    assert.equal(mod.resolveReviewGateAlias('/karpathy-diff'), 'karpathy-diff');
+    assert.equal(mod.resolveReviewGateAlias('/karpathy:diff'), 'karpathy-diff');
+    assert.equal(mod.resolveReviewGateAlias('/karpathy audit'), 'karpathy-audit');
+    assert.equal(mod.resolveReviewGateAlias('/karpathy-audit'), 'karpathy-audit');
+    assert.equal(mod.resolveReviewGateAlias('/karpathy:audit'), 'karpathy-audit');
+    assert.equal(mod.resolveReviewGateAlias('/gstack review'), 'gstack-review');
+    assert.equal(mod.resolveReviewGateAlias('/not-a-real-gate'), null);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review gate catalog reserves optional metadata for script-detected gates', async () => {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-gates.ts'));
+  const optionalEntries = mod.REVIEW_GATE_CATALOG.filter((entry) => entry.optional === true);
+
+  assert.deepEqual(optionalEntries.map((entry) => entry.id), [
+    'lint',
+    'format-check',
+    'secret-scan',
+    'dependency-audit',
+  ]);
+  for (const entry of optionalEntries) {
+    assert.ok(Array.isArray(entry.scriptNames) && entry.scriptNames.length > 0, `${entry.id} optional gate must be script-detected`);
+  }
+});
+
+test('review gate catalog handles missing and malformed package.json without throwing', async () => {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-gates.ts'));
+  const repoRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-gates-'));
+  try {
+    assert.deepEqual(mod.detectPackageScripts(repoRoot).scripts, {});
+    assert.equal(mod.detectPackageScripts(repoRoot).found, false);
+
+    writeFileSync(path.join(repoRoot, 'package.json'), '{ nope', 'utf8');
+    const malformed = mod.detectPackageScripts(repoRoot);
+    assert.equal(malformed.found, true);
+    assert.equal(malformed.malformed, true);
+    assert.match(malformed.parseError, /Expected property name|Unexpected token|JSON/);
+    assert.deepEqual(malformed.scripts, {});
+
+    const resolved = mod.resolveReviewGatePreset({
+      preset: 'standard',
+      repoRoot,
+    });
+    const typecheck = resolved.missing.find((entry) => entry.id === 'typecheck');
+    assert.match(typecheck.reason, /package\.json could not be parsed/);
+    assert.doesNotMatch(typecheck.reason, /script not detected/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review gate preset resolution uses detected scripts and reports unavailable gates', async () => {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-gates.ts'));
+  const standard = mod.resolveReviewGatePreset({
+    preset: 'standard',
+    scripts: {
+      typecheck: 'tsc --noEmit',
+      test: 'node --test',
+      build: 'vite build',
+      lint: 'eslint .',
+      'format:check': 'prettier --check .',
+    },
+  });
+
+  assert.deepEqual(standard.planReview.gates.map((gate) => gate.id), ['plan-eng-review', 'plan-design-review']);
+  assert.deepEqual(standard.gates.map((gate) => gate.id), [
+    'typecheck',
+    'lint',
+    'format-check',
+    'test',
+    'build',
+    'karpathy-diff',
+    'gstack-review',
+    'karpathy-audit',
+    'browser-qa',
+  ]);
+  assert.equal(standard.gates.find((gate) => gate.id === 'lint').command, 'npm run lint');
+  assert.equal(standard.gates.find((gate) => gate.id === 'format-check').command, 'npm run format:check');
+  assert.equal(standard.gates.some((gate) => gate.id === 'adversarial-review'), false);
+  assert.deepEqual(standard.missing, []);
+
+  const missingScripts = mod.resolveReviewGatePreset({
+    preset: 'standard',
+    scripts: {
+      test: 'node --test',
+    },
+  });
+  assert.deepEqual(missingScripts.gates.map((gate) => gate.id), [
+    'test',
+    'karpathy-diff',
+    'gstack-review',
+    'karpathy-audit',
+    'browser-qa',
+  ]);
+  assert.deepEqual(missingScripts.missing.map((entry) => entry.id), [
+    'typecheck',
+    'lint',
+    'format-check',
+    'build',
+  ]);
+});
+
+test('strict-production review preset adds adversarial, audit, security, and human gates', async () => {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-gates.ts'));
+  const strict = mod.resolveReviewGatePreset({
+    preset: 'strict-production',
+    scripts: {
+      typecheck: 'tsc --noEmit',
+      test: 'node --test',
+      build: 'vite build',
+      'secrets:scan': 'gitleaks detect',
+      audit: 'npm audit --audit-level=high',
+    },
+  });
+
+  assert.ok(strict.planReview.gates.some((gate) => gate.id === 'security-data-review'));
+  assert.ok(strict.gates.some((gate) => gate.id === 'adversarial-review'));
+  assert.ok(strict.gates.some((gate) => gate.id === 'karpathy-audit'));
+  assert.equal(strict.gates.find((gate) => gate.id === 'secret-scan').command, 'npm run secrets:scan');
+  assert.equal(strict.gates.find((gate) => gate.id === 'dependency-audit').command, 'npm run audit');
+  const phaseOrder = new Map([
+    ['static', 0],
+    ['behavioral', 1],
+    ['ai-diff', 2],
+    ['instruction', 3],
+    ['runtime', 4],
+    ['human', 5],
+  ]);
+  let previousPhase = -1;
+  for (const gate of strict.gates) {
+    const currentPhase = phaseOrder.get(gate.phase);
+    assert.notEqual(currentPhase, undefined, `${gate.id} has unknown review-gate phase ${gate.phase}`);
+    assert.ok(currentPhase >= previousPhase, `${gate.id} is out of canonical review-gate phase order`);
+    previousPhase = currentPhase;
+  }
+  assert.ok(strict.gates.some((gate) => gate.id === 'human-merge-approval'));
+  assert.ok(strict.gates.some((gate) => gate.id === 'human-prod-deploy-approval'));
+  assert.ok(strict.gates.some((gate) => gate.id === 'human-rollback-approval'));
+});
+
+test('default review gates are built from the canonical catalog without frontend runtime QA', async () => {
+  const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+  const defaults = stateMod.defaultReviewGatesConfig();
+  assert.deepEqual(defaults.gates.map((gate) => gate.id), [
+    'karpathy-diff',
+    'gstack-review',
+    'karpathy-audit',
+  ]);
+  assert.ok(defaults.planReview.gates.some((gate) => gate.id === 'plan-eng-review'));
+  assert.ok(defaults.planReview.gates.some((gate) => gate.id === 'plan-design-review'));
+  assert.equal(defaults.gates.some((gate) => gate.id === 'browser-qa'), false);
+  assert.ok(defaults.gates.find((gate) => gate.id === 'karpathy-diff').userCommands.includes('/karpathy:diff'));
+  assert.ok(defaults.gates.find((gate) => gate.id === 'karpathy-audit').userCommands.includes('/karpathy:audit'));
 });
 
 // Review fixup: buildBlastView throws on unresolvable sha (first user-facing error path).

@@ -7,7 +7,7 @@ This file is local-only operator state. Keep it git-ignored.
 - Treat `release` as the standard shipping mode.
 - Use `build` only for fallback, recovery, or an explicit user request.
 - Use `{{ALIAS_NEW}}`, not manual branch creation, for normal task starts.
-- When the user describes a task and then invokes `{{ALIAS_NEW}}`, infer a concise task label and pass it as `--task`.
+- When the user describes a task and then invokes `{{ALIAS_NEW}}`, infer a concise task label and pass it as `--task`; if the user provides a task name, use that.
 - If recent context says the task is already implemented in a worktree, do not run `{{ALIAS_NEW}}`; continue there and use `{{ALIAS_PR}}`.
 - Preferred operator path:
   1. `{{ALIAS_DEVMODE}} release`
@@ -15,9 +15,8 @@ This file is local-only operator state. Keep it git-ignored.
   3. `{{ALIAS_PR}} --title "<pr title>"`
   4. `{{ALIAS_MERGE}}`
   5. `{{ALIAS_DEPLOY}} staging`
-  6. `{{ALIAS_SMOKE}} staging`
-  7. `{{ALIAS_DEPLOY}} prod`
-  8. `{{ALIAS_CLEAN}}`
+  6. `{{ALIAS_DEPLOY}} prod`
+  7. `{{ALIAS_CLEAN}}`
 - Use `{{ALIAS_RESUME}} --task "<task-name>"` only when returning to an existing task workspace.
 - Use `{{ALIAS_STATUS}}` to see the cockpit before acting.
 - Use `{{ALIAS_DOCTOR}}` to diagnose deploy config and probe staging health. Run `{{ALIAS_DOCTOR}} --probe` after a staging deploy to refresh the release gate's freshness check.
@@ -35,7 +34,6 @@ Key routing rules:
 - Prepare or update a PR -> `{{ALIAS_PR}}`
 - Merge the current PR -> `{{ALIAS_MERGE}}`
 - Deploy the merged SHA -> `{{ALIAS_DEPLOY}}`
-- Plan smoke coverage or run smoke -> `{{ALIAS_SMOKE}}`
 - Cleanup or stale workspace inspection -> `{{ALIAS_CLEAN}}`
 - One-screen cockpit of task + lane state -> `{{ALIAS_STATUS}}`
 - Diagnose deploy config or refresh staging probes -> `{{ALIAS_DOCTOR}}`

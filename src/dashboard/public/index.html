@@ -2088,7 +2088,7 @@
         <div class="help-panel-header">
           <div>
             <div class="panel-title">Pipelane Guide</div>
-            <div class="footer-note" id="help-status">Loading slash command guide…</div>
+            <div class="footer-note" id="help-status">Loading Pipelane guide…</div>
           </div>
           <button class="detail-close" type="button" aria-label="Close Pipelane help" data-help-close="button">×</button>
         </div>
@@ -2273,12 +2273,12 @@
 
     function helpStatusText() {
       if (state.loading.help) {
-        return 'Loading slash command guide…';
+        return 'Loading Pipelane guide…';
       }
       if (state.helpNotice) {
         return state.helpNotice;
       }
-      return 'Slash command journeys for build and release work.';
+      return 'How Pipelane moves AI-coded work from task branch to release.';
     }
 
     function currentAutoRefreshMs() {
@@ -2378,24 +2378,19 @@
       }
 
       const buildRows = [
-        { command: aliases.status, description: 'See what is already in flight.' },
         { command: `${aliases.devmode} build`, description: 'Set the repo to build mode. Usually set once, until you switch lanes.' },
-        { command: aliases.new, description: 'Create a named task worktree from the described task.' },
+        { command: aliases.new, description: 'Let the AI infer the task name, or provide one if you want to choose it.' },
         { command: aliases.pr, description: 'Run pre-PR checks, commit, push, and open or update the PR.' },
         { command: aliases.merge, description: 'Merge the PR. In build mode, this hands off to the prod deploy path.' },
-        { command: `${aliases.smoke} prod`, description: 'Optional: run production-safe smoke checks if configured.' },
         { command: aliases.clean, description: 'Clean up finished task state after the release is complete.' },
       ];
       const releaseRows = [
-        { command: aliases.status, description: 'See active tasks, deploy state, and release gates.' },
         { command: `${aliases.devmode} release`, description: 'Set the repo to release mode. Usually set once, until you switch lanes.' },
-        { command: aliases.new, description: 'Create a named task worktree from the described task.' },
+        { command: aliases.new, description: 'Let the AI infer the task name, or provide one if you want to choose it.' },
         { command: aliases.pr, description: 'Run pre-PR checks, commit, push, and open or update the PR.' },
         { command: aliases.merge, description: 'Merge the PR and record the merged SHA.' },
         { command: `${aliases.deploy} staging`, description: 'Deploy the merged SHA to staging.' },
-        { command: `${aliases.smoke} staging`, description: 'Run or verify staging smoke checks.' },
         { command: `${aliases.deploy} prod`, description: 'Promote the same merged SHA to production.' },
-        { command: `${aliases.smoke} prod`, description: 'Optional: run production-safe smoke checks.' },
         { command: aliases.clean, description: 'Clean up finished task state after production is verified.' },
       ];
       const helpfulRows = [
@@ -2412,13 +2407,38 @@
         { command: '/pipelane status', description: 'Run the terminal status view without leaving chat.' },
         { command: '/pipelane update --check', description: 'Check whether Pipelane itself has updates.' },
       ];
+      const modelRows = [
+        { command: '1. Task workspace', description: 'Start isolated work with a task branch and worktree so parallel AI work stays legible.' },
+        { command: '2. PR handoff', description: 'Run configured local checks, commit intentionally, push, and open or update the PR.' },
+        { command: '3. Merge record', description: 'Merge the PR and store the exact merged SHA instead of guessing what reached main.' },
+        { command: '4. Release proof', description: 'In release mode, staging must prove the same merged SHA before production promotion.' },
+        { command: '5. Cleanup', description: 'Close task state only after Pipelane can prove the branch, deploy, and worktree are safe.' },
+      ];
+      const reviewRows = [
+        { command: 'Static gates', description: 'Run lint, typecheck, format checks, secret scans, and dependency audits before AI review.' },
+        { command: 'Behavioral gates', description: 'Run tests, integration checks, and build before spending reviewer attention.' },
+        { command: 'AI diff gates', description: 'Use /karpathy diff, gstack review, and adversarial review for logic, traceability, and risk.' },
+        { command: 'Instruction gates', description: 'Use /karpathy audit only when agent instruction or memory files change.' },
+        { command: 'Runtime gates', description: 'Use browser QA, deploy health checks, and staging evidence where the surface needs live proof.' },
+        { command: 'Human gates', description: 'Keep merge, production deploy, rollback, schema, auth, billing, and secrets explicitly approved.' },
+      ];
+      const orchestrationRows = [
+        { command: '/pipelane review setup', description: 'Planned: configure plan-review gates separately from implementation review gates.' },
+        { command: '/pipelane review', description: 'Planned: run the configured review gates before PR handoff.' },
+        { command: 'Slice ledger', description: 'Planned: record slices, worktrees, owners, gate results, retries, and evidence for resume.' },
+        { command: 'Board visibility', description: 'Planned: show orchestration runs and gate status without replacing the release cockpit.' },
+      ];
 
       overlay.classList.add('open');
       overlay.setAttribute('aria-hidden', 'false');
       content.innerHTML = `
-        <div class="help-callout">Start with the lane you are in. Build mode optimizes for direct merge-to-production work. Release mode keeps staging, smoke, and production promotion explicit.</div>
+        <div class="help-callout">Pipelane is the local release cockpit for AI-assisted coding. It makes task workspaces, PR handoff, merge evidence, deploy state, rollback, and cleanup visible so agents do not rely on chat memory.</div>
+        ${helpSection('How Pipelane Works', modelRows)}
+        <div class="help-callout">Start with the lane you are in. Build mode optimizes for direct merge-to-production work. Release mode keeps staging and production promotion explicit.</div>
         ${helpSection('Build Journey', buildRows)}
         ${helpSection('Release Journey', releaseRows)}
+        ${helpSection('Review Gate Order', reviewRows)}
+        ${helpSection('Planned Orchestration Layer', orchestrationRows)}
         ${helpSection('Helpful Anytime', helpfulRows)}
         ${helpSection('Web Commands', webRows)}
       `;
@@ -2831,9 +2851,11 @@
         case 'doctor.diagnose':
           return `Run ${aliases.doctor}`;
         case 'smoke.plan':
-          return `Run ${aliases.smoke} -- plan`;
+          return `Run ${aliases.smoke} plan`;
         case 'smoke.staging':
           return `Run ${aliases.smoke} staging`;
+        case 'smoke.prod':
+          return `Run ${aliases.smoke} prod`;
         case 'deploy.staging':
           return `Run ${aliases.deploy} staging`;
         case 'deploy.prod':
@@ -3006,7 +3028,7 @@
         case 'degraded':
           return 'Degraded means Pipelane has enough configuration to look at hosted release signals, but at least one observed signal is unhealthy or stale.';
         case 'blocked':
-          return 'Blocked means a required condition is missing or failing: config, staging deploy history, probes, smoke coverage, or an unsupported surface.';
+          return 'Blocked means a required condition is missing or failing: config, staging deploy history, probes, or an unsupported surface.';
         case 'stale':
           return 'Stale means the board has data, but it is outside its freshness window.';
         case 'bypassed':
@@ -3043,7 +3065,7 @@
       return {
         kicker: 'Safety rollup',
         heading: `Release Gate: ${release.state || 'unknown'}`,
-        summary: 'This is the production-readiness gate. It is a summary of config, observed staging deploys, staging probes, smoke coverage, and release-mode override state.',
+        summary: 'This is the production-readiness gate. It is a summary of config, observed staging deploys, staging probes, and release-mode override state.',
         rows: [
           ['Meaning', releaseGateMeaning(release.state)],
           ['Mode', boardContext?.mode || 'unknown'],
@@ -3084,8 +3106,8 @@
       ];
       const stagingIssues = (attention || []).filter((item) => item.lane === 'staging');
       const next = [
-        lock ? 'A staging smoke operation is already running; wait for it to finish before judging this pill.' : '',
-        !record ? `No staging smoke history is recorded yet. After staging deploy, run ${aliases.smoke} staging.` : '',
+        lock ? 'An optional staging smoke operation is already running; wait for it to finish before judging this pill.' : '',
+        !record ? 'No optional staging smoke history is recorded. The default release journey relies on staging deploy evidence and health probes.' : '',
         release.probeState !== 'healthy' ? `Probe state is ${release.probeState || 'unknown'}; run ${aliases.doctor} probe to refresh staging healthchecks.` : '',
         ...stagingIssues.map(issueLine),
         `Staging deploy actions use ${aliases.deploy} staging; this should deploy the merged SHA before production.`,
@@ -3094,7 +3116,7 @@
       return {
         kicker: 'Pre-production',
         heading: `Staging: ${textOrDash(lock ? 'running' : record?.status || 'no smoke history')}`,
-        summary: 'Staging is the environment Pipelane uses to prove the merged SHA works before production. This pill combines staging smoke history with staging probe health.',
+        summary: 'Staging is the environment Pipelane uses to prove the merged SHA works before production. This pill combines staging deploy evidence, probe health, and optional smoke history when present.',
         rows: [
           ['Smoke status', lock ? `running · ${lock.operation || 'operation'} ${lock.runId || ''}`.trim() : smokeSummary(record, 'staging')],
           ['Smoke SHA', shortSha(record?.sha)],
@@ -3129,7 +3151,7 @@
       const prodSources = sourceHealthByName(sourceHealth, ['smoke.prod', 'runtime.frontend.production']);
       const next = [
         lock ? 'A production smoke operation is already running; wait for it to finish before judging this pill.' : '',
-        !record ? `No production smoke history is recorded yet. After a production deploy, run ${aliases.smoke} prod.` : '',
+        !record ? 'No production smoke history is recorded yet. Normal journeys do not require production smoke; use it only when this repo explicitly opts in.' : '',
         `Production deploy actions use ${aliases.deploy} prod, require confirmation, and should only promote a SHA that already passed staging.`,
         checkout.relationships?.runtimeToDeploy?.reason,
         checkout.relationships?.runtimeToOrigin?.reason,
@@ -3300,7 +3322,7 @@
       if (stagingSmoke?.finishedAt && stagingSmoke.status !== 'failed') {
         const ageHours = (Date.now() - new Date(stagingSmoke.finishedAt).getTime()) / 3_600_000;
         if (Number.isFinite(ageHours) && ageHours >= 24) {
-          items.push(`Staging smoke last ran ${relativeTime(stagingSmoke.finishedAt)} — consider re-running before promote.`);
+          items.push(`Optional staging smoke last ran ${relativeTime(stagingSmoke.finishedAt)}; rely on fresh deploy and probe evidence before promoting.`);
         }
       }
 
@@ -3399,17 +3421,27 @@
       const aliases = currentHelpAliases();
       const code = item?.code || '';
       if (code === 'smoke.staging.missing') {
+        const blocking = item?.blocking === true;
         return {
           severity: normalizeAttentionSeverity(item.severity),
           scope: 'staging',
-          reason: 'No staging smoke test has run.',
-          detail: 'Smoke tests exercise the deployed staging app before production promotion. This is broader than a health probe.',
-          details: [
-            `Use ${aliases.smoke} staging after a staging deploy to record the result.`,
-            `If smoke checks are not planned yet, start with ${aliases.smoke} -- plan.`,
-          ],
-          next: `Run ${aliases.smoke} staging`,
-          tooltip: `You can smoke test staging using ${aliases.smoke} staging. Pipelane stores the latest result and uses it as release context.`,
+          reason: blocking ? 'Required staging smoke has not run.' : 'No optional staging smoke test has run.',
+          detail: blocking
+            ? 'This repo has required staging smoke enabled. A health probe is not enough to clear that gate.'
+            : 'The default release journey no longer asks operators to run smoke. Use staging deploy evidence and fresh health probes before promotion.',
+          details: blocking
+            ? [
+                `Run ${aliases.smoke} staging after the staging deploy to record the required smoke result.`,
+                `If smoke checks are not registered yet, start with ${aliases.smoke} plan.`,
+              ]
+            : [
+                `Use ${aliases.deploy} staging to deploy the merged SHA to staging.`,
+                `Use ${aliases.doctor} --probe to refresh staging health checks.`,
+              ],
+          next: blocking ? `Run ${aliases.smoke} staging` : `Run ${aliases.doctor} --probe`,
+          tooltip: blocking
+            ? 'Required smoke is a configured release gate. Run the staging smoke command for the current SHA.'
+            : 'Smoke history is optional legacy evidence. The default release journey relies on staging deploy and probe evidence.',
         };
       }
       if (code === 'git.base.stale') {
@@ -4245,7 +4277,7 @@
 
     async function loadHelp() {
       state.loading.help = true;
-      state.helpNotice = 'Loading slash command guide…';
+      state.helpNotice = 'Loading Pipelane guide…';
       renderHelpPanel();
       try {
         const response = await fetchJson('/api/help');

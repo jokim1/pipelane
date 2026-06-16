@@ -75,14 +75,34 @@ and the `?` guide. Clean runs the non-destructive cleanup plan action from the h
 
 Shows the quick Pipelane guide:
 
+- how Pipelane works
 - build journey slash commands
 - release journey slash commands
+- static, behavioral, AI, runtime, and human review gate order
+- planned orchestration layer notes
 - helpful anytime commands
 - `/fix` and `/fix rethink`
 - `/pipelane web`, `/pipelane status`, and `/pipelane update --check`
 
 The drawer renders configured aliases from the repo when available, falling back to the default
 slash command names only when alias config cannot be loaded.
+
+## Orchestration Roadmap
+
+`/orchestrate` is planned but not shipped. When it lands, the board should add
+read-only visibility for orchestration runs without changing the existing
+branch, PR, deploy, rollback, and cleanup model.
+
+The planned orchestration panel should show:
+
+- active orchestration runs
+- implementation slices and their worktrees
+- static, behavioral, AI, runtime, and human gate status
+- blocking gate failures and next actions
+- links to evidence recorded by the run ledger
+
+Static gates should appear before AI review gates. The board should make it
+obvious when lint, typecheck, tests, or build failed before any AI review ran.
 
 ### Attention
 

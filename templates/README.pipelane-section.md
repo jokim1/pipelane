@@ -4,7 +4,7 @@ This repo uses `pipelane`, the release pipeline management and safety layer for
 AI-first builders.
 
 Pipelane is here to make parallel AI-coded work legible. It tracks task
-worktrees, branches, PRs, staging deploys, production deploys, smoke checks, and
+worktrees, branches, PRs, staging deploys, production deploys, and
 cleanup state so the repo does not depend on memory or chat history.
 
 Start with:
@@ -21,12 +21,10 @@ Build mode is the fast lane. Use it when you want the shortest route from merge
 to production and do not need required staging validation for the same SHA.
 
 ```text
-{{ALIAS_STATUS}}                 See what is already in flight.
 {{ALIAS_DEVMODE}} build          Use the fast lane.
-{{ALIAS_NEW}}                    Create a named task worktree from the described task.
+{{ALIAS_NEW}}                    Let the AI infer the task name, or provide one if you want.
 {{ALIAS_PR}} --title "PR title"  Run pre-PR checks, commit, push, and open or update the PR.
 {{ALIAS_MERGE}}                  Merge the PR and record the merged SHA.
-{{ALIAS_SMOKE}} prod             Optional: run production-safe smoke checks if configured.
 {{ALIAS_CLEAN}}                  Clean up finished task state after production is verified.
 ```
 
@@ -36,15 +34,12 @@ Release mode is the protected lane. Use it when staging must prove the exact
 same merged SHA before production can move.
 
 ```text
-{{ALIAS_STATUS}}                 See active tasks, deploy state, and release gates.
 {{ALIAS_DEVMODE}} release        Use the protected lane.
-{{ALIAS_NEW}}                    Create a named task worktree from the described task.
+{{ALIAS_NEW}}                    Let the AI infer the task name, or provide one if you want.
 {{ALIAS_PR}} --title "PR title"  Run pre-PR checks, commit, push, and open or update the PR.
 {{ALIAS_MERGE}}                  Merge the PR and record the merged SHA.
 {{ALIAS_DEPLOY}} staging         Deploy the merged SHA to staging.
-{{ALIAS_SMOKE}} staging          Run or verify staging smoke checks.
 {{ALIAS_DEPLOY}} prod            Promote that same SHA to production.
-{{ALIAS_SMOKE}} prod             Optional: run production-safe smoke checks.
 {{ALIAS_CLEAN}}                  Clean up finished task state after production is verified.
 ```
 
@@ -71,7 +66,6 @@ same merged SHA before production can move.
 - `{{ALIAS_PR}}`: run checks, commit, push, and open or update a PR
 - `{{ALIAS_MERGE}}`: merge the PR and record the merged SHA
 - `{{ALIAS_DEPLOY}}`: deploy to `staging` or `prod`
-- `{{ALIAS_SMOKE}}`: plan or run smoke checks for `staging` or `prod`
 - `/fix`: make durable root-cause fixes from findings
 - `{{ALIAS_CLEAN}}`: inspect and prune finished or stale task state
 - `{{ALIAS_DOCTOR}}`: diagnose deploy config and live probes

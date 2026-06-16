@@ -12,6 +12,7 @@
     "scripts",
     "templates",
     "docs/public/RELEASE_WORKFLOW.md",
+    "docs/public/ORCHESTRATION.md",
     "docs/public/PIPELANE_BOARD.md",
     "docs/public/PIPELANE_API.md",
     "docs/public/pipelane-board-example.png",

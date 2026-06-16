@@ -1,6 +1,6 @@
 # Release Workflow
 
-Last updated: April 13, 2026
+Last updated: June 15, 2026
 Status: canonical maintainer workflow for {{DISPLAY_NAME}}
 
 This document is the full operator guide for this repo's pipelane setup.
@@ -19,6 +19,7 @@ follow safely without improvising repo behavior.
 - repo-native scripts are implementation plumbing behind those aliases
 - `{{ALIAS_NEW}}` is the canonical task-start command
 - `{{ALIAS_RESUME}}` is the recovery command
+- `/fix` is the durable repair loop for bugs, review findings, CI failures, and code-quality repairs
 - `repo-guard` is internal-only
 
 ## Supported Operator Surfaces
@@ -33,11 +34,12 @@ This repo exposes the following user-facing slash commands through Claude/Codex 
 - `{{ALIAS_PR}}`
 - `{{ALIAS_MERGE}}`
 - `{{ALIAS_DEPLOY}}`
-- `{{ALIAS_SMOKE}}`
 - `{{ALIAS_CLEAN}}`
 - `{{ALIAS_STATUS}}`
 - `{{ALIAS_DOCTOR}}`
 - `{{ALIAS_ROLLBACK}}`
+- `/fix`
+- `/fix rethink`
 
 If aliases change in `.pipelane.json`, rerun setup and reopen Claude/Codex so the new command names are picked up.
 Aliases must be unique, and setup fails closed if an alias would overwrite an unrelated command or skill.
@@ -55,11 +57,11 @@ Use both.
 - `{{ALIAS_PR}}`
 - `{{ALIAS_MERGE}}`
 - `{{ALIAS_DEPLOY}}`
-- `{{ALIAS_SMOKE}}`
 - `{{ALIAS_CLEAN}}`
 - `{{ALIAS_STATUS}}`
 - `{{ALIAS_DOCTOR}}`
 - `{{ALIAS_ROLLBACK}}`
+- `/fix`
 
 gstack is still recommended for:
 
@@ -72,6 +74,20 @@ gstack is still recommended for:
 - standalone Codex flows
 
 This repo should prefer the pipelane release flow over generic gstack `/ship`.
+
+## Review and Repair Stack
+
+Run deterministic checks before AI review whenever this repo has them:
+
+1. lint, typecheck, format check, and secret scan when configured
+2. tests and build
+3. traceability review such as `karpathy-diff`
+4. structural review such as gstack `/review`
+5. specialist review when needed: security, design, QA, docs drift
+
+Use `/fix` to repair bugs, review findings, CI failures, and code-quality
+issues. Use `/fix rethink` for planning-only architecture review before large
+refactors.
 
 ## Task Workspace Flow
 
@@ -86,7 +102,7 @@ Properties:
 - fails closed if the task already exists and points to `{{ALIAS_RESUME}}`
 - fails closed if the current checkout has uncommitted changes or is already bound to a task, unless `--force` is explicit
 - fails closed when a matching orphan worktree exists without a task lock, so finished manual work is not accidentally abandoned
-- agents should infer `--task "<task-name>"` from the described work when the user invokes bare `{{ALIAS_NEW}}`
+- agents should infer `--task "<task-name>"` from the described work when the user invokes bare `{{ALIAS_NEW}}`; if the user provides a task name, use it
 - a generated `task-<hex>` slug requires explicit `--unnamed`
 
 `{{ALIAS_RESUME}}` is the recovery path, not the normal happy path.
@@ -165,9 +181,8 @@ User-facing journey:
 3. `{{ALIAS_PR}} --title "<pr title>"`
 4. `{{ALIAS_MERGE}}`
 5. `{{ALIAS_DEPLOY}} staging`
-6. `{{ALIAS_SMOKE}} staging`
-7. `{{ALIAS_DEPLOY}} prod`
-8. `{{ALIAS_CLEAN}}`
+6. `{{ALIAS_DEPLOY}} prod`
+7. `{{ALIAS_CLEAN}}`
 
 ## Build Mode
 
@@ -215,7 +230,7 @@ Tracked (choose one shape for the workflow contract):
 
 - `.pipelane.json` — the default. Full workflow contract in one file.
 - `package.json` `"pipelane"` overlay — for consumers that gitignore
-  `.pipelane.json` and want customizations (aliases, smoke commands,
+  `.pipelane.json` and want customizations (aliases, deploy settings,
   `syncDocs`) to survive fresh checkouts without a re-bootstrap.
 
 Always tracked:
@@ -243,9 +258,9 @@ neither file nor overlay is present, `pipelane setup` self-heals by
 synthesizing a config from the repo name plus defaults — no `pipelane
 bootstrap` re-run required on fresh worktrees.
 
-Runtime mutations (`{{ALIAS_SMOKE}} setup`, `pipelane configure`) write
-to `.pipelane.json`. If it doesn't exist yet, the mutator materializes
-it from the synthesized config at write time.
+Runtime mutations from `pipelane configure` write to `.pipelane.json`. If it
+doesn't exist yet, the mutator materializes it from the synthesized config at
+write time.
 
 ### Optional `syncDocs` opt-outs
 
