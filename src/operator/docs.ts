@@ -435,6 +435,7 @@ const REQUIRED_PACKAGE_SCRIPTS: Record<string, string> = {
   'pipelane:board': 'pipelane board',
   'pipelane:update': 'pipelane update',
   'pipelane:api': 'pipelane run api',
+  'pipelane:review': 'pipelane run review',
 };
 
 // Hard block against the npm-wipes-shared-deps footgun. Loads the standalone

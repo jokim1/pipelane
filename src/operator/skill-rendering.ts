@@ -226,7 +226,7 @@ run_pipelane() {
 
   if [ "$subcommand" = "pipelane" ]; then
     if [ "$#" -eq 0 ]; then
-      echo "pipelane: use /pipelane status, /pipelane web, /pipelane board, or /pipelane update" >&2
+      echo "pipelane: use /pipelane status, /pipelane review setup, /pipelane web, /pipelane board, or /pipelane update" >&2
       exit 0
     fi
     dispatcher="$1"
@@ -238,16 +238,19 @@ run_pipelane() {
       status)
         exec "$bin" run status "$@"
         ;;
+      review)
+        exec "$bin" run review "$@"
+        ;;
       update)
         exec "$bin" update "$@"
         ;;
       help|--help|-h)
-        echo "pipelane: use /pipelane status, /pipelane web, /pipelane board, or /pipelane update" >&2
+        echo "pipelane: use /pipelane status, /pipelane review setup, /pipelane web, /pipelane board, or /pipelane update" >&2
         exit 0
         ;;
       *)
         echo "Unknown /pipelane mode: $dispatcher" >&2
-        echo "Supported modes: status, web, board, update" >&2
+        echo "Supported modes: status, review, web, board, update" >&2
         exit 64
         ;;
     esac
@@ -267,7 +270,7 @@ should_use_managed_bootloader() {
         return 1
       fi
       case "$1" in
-        status|web|board|update)
+        status|review|web|board|update)
           return 0
           ;;
       esac
