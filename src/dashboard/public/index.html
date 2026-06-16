@@ -2423,7 +2423,7 @@
         { command: 'Human gates', description: 'Keep merge, production deploy, rollback, schema, auth, billing, and secrets explicitly approved.' },
       ];
       const orchestrationRows = [
-        { command: '/pipelane review setup', description: 'Planned: configure plan-review gates separately from implementation review gates.' },
+        { command: '/pipelane review setup', description: 'Configure review gate presets, print the effective stack, and list available gates.' },
         { command: '/pipelane review', description: 'Planned: run the configured review gates before PR handoff.' },
         { command: 'Slice ledger', description: 'Planned: record slices, worktrees, owners, gate results, retries, and evidence for resume.' },
         { command: 'Board visibility', description: 'Planned: show orchestration runs and gate status without replacing the release cockpit.' },
@@ -2438,7 +2438,7 @@
         ${helpSection('Build Journey', buildRows)}
         ${helpSection('Release Journey', releaseRows)}
         ${helpSection('Review Gate Order', reviewRows)}
-        ${helpSection('Planned Orchestration Layer', orchestrationRows)}
+        ${helpSection('Review And Orchestration', orchestrationRows)}
         ${helpSection('Helpful Anytime', helpfulRows)}
         ${helpSection('Web Commands', webRows)}
       `;

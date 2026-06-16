@@ -600,6 +600,9 @@ export interface OperatorFlags {
   smokeFeedback: string[];
   scenarioFile: string;
   makeBlocking: boolean;
+  reviewPreset: string;
+  reviewPrint: boolean;
+  reviewListGates: boolean;
 }
 
 export interface ParsedOperatorArgs {
@@ -2380,6 +2383,9 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     smokeFeedback: [],
     scenarioFile: '',
     makeBlocking: false,
+    reviewPreset: '',
+    reviewPrint: false,
+    reviewListGates: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -2702,6 +2708,21 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       continue;
     }
 
+    if (flagName === '--preset') {
+      flags.reviewPreset = readFlagValue('--preset').trim();
+      continue;
+    }
+    if (flagName === '--print') {
+      rejectInlineValue('--print');
+      flags.reviewPrint = true;
+      continue;
+    }
+    if (flagName === '--list-gates') {
+      rejectInlineValue('--list-gates');
+      flags.reviewListGates = true;
+      continue;
+    }
+
     if (token.startsWith('--')) {
       throw new Error(`Unknown flag "${flagName}" for pipelane run. Run "pipelane run --help" for supported commands and flags.`);
     }
@@ -2904,6 +2925,17 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         return;
       }
       throw new Error('smoke requires one of: plan, setup, staging, prod, waiver, quarantine, unquarantine.');
+    }
+    case 'review': {
+      assertOnlyFlags(parsed, ['reviewPreset', 'reviewPrint', 'reviewListGates']);
+      if (parsed.positional.length !== 1 || parsed.positional[0] !== 'setup') {
+        throw new Error('review requires exactly: pipelane run review setup [--preset lean|standard|strict-production] [--print] [--list-gates]');
+      }
+      const preset = parsed.flags.reviewPreset.trim();
+      if (preset && !includesString(REVIEW_GATE_PRESETS, preset)) {
+        throw new Error(`--preset must be one of: ${REVIEW_GATE_PRESETS.join(', ')}.`);
+      }
+      return;
     }
     case 'clean': {
       assertOnlyFlags(parsed, [
@@ -3133,6 +3165,9 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'smokeFeedback', label: '--feedback', active: (flags) => flags.smokeFeedback.length > 0 },
   { key: 'scenarioFile', label: '--scenario-file', active: (flags) => flags.scenarioFile.trim().length > 0 },
   { key: 'makeBlocking', label: '--make-blocking', active: (flags) => flags.makeBlocking },
+  { key: 'reviewPreset', label: '--preset', active: (flags) => flags.reviewPreset.trim().length > 0 },
+  { key: 'reviewPrint', label: '--print', active: (flags) => flags.reviewPrint },
+  { key: 'reviewListGates', label: '--list-gates', active: (flags) => flags.reviewListGates },
 ];
 
 function assertOnlyFlags(parsed: ParsedOperatorArgs, allowed: OperatorFlagKey[]): void {

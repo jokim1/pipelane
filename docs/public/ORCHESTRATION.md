@@ -1,7 +1,8 @@
 # Pipelane Orchestration Roadmap
 
 Last updated: June 16, 2026
-Status: planned design, not shipped
+Status: review gate foundation and setup command shipped; full
+orchestration runner not shipped
 
 `/orchestrate` is the planned execution layer above Pipelane's current release
 workflow. Its job is to turn an implementation plan into isolated slices,
@@ -38,7 +39,7 @@ Pipelane still owns `/new`, `/pr`, `/merge`, `/deploy`, `/rollback`, and
 
 ## `/pipelane review setup`
 
-`/pipelane review setup` should configure what belongs in plan review and what
+`/pipelane review setup` configures what belongs in plan review and what
 belongs in review gates. It is the user-facing gate setup command. It should
 not be named `/pipelane setup review-gates`; that is longer than the concept.
 
@@ -46,7 +47,7 @@ Keep plain `/pipelane setup` for broader repo setup and onboarding. If
 `/orchestrate setup` exists later, it should delegate gate configuration to the
 same review-gate config rather than inventing a second setup path.
 
-Expected commands:
+Current commands:
 
 ```text
 /pipelane review setup
@@ -55,6 +56,11 @@ Expected commands:
 /pipelane review setup --preset strict-production
 /pipelane review setup --print
 /pipelane review setup --list-gates
+```
+
+Future extensions:
+
+```text
 /pipelane review setup --add-plan-gate plan-eng-review
 /pipelane review setup --add-static-gate "npm run lint"
 /pipelane review setup --add-ai-gate "/karpathy diff"
@@ -114,8 +120,10 @@ User-facing commands:
 /pr
 ```
 
-`/pipelane review setup` configures the gate stack. `/pipelane review` runs the
-configured gates against the current diff and writes evidence. `/pr` runs
+`/pipelane review setup` configures the gate stack. The first implementation
+supports preset selection, printing the effective config, and listing the gate
+catalog with detected or missing scripts. `/pipelane review` will run the
+configured gates against the current diff and write evidence. `/pr` will run
 configured blocking review gates before PR handoff.
 
 Plain `/pipelane setup` remains repo/bootstrap setup. Do not use
@@ -387,10 +395,10 @@ Do not add:
 
 ## First Implementation Slices
 
-1. Add config schema, defaults, normalization, and validation.
-2. Add canonical gate catalog and script detection.
-3. Implement `/pipelane review setup`.
-4. Implement `/pipelane review` runner and review-gate evidence ledger.
+1. Done: add config schema, defaults, normalization, and validation.
+2. Done: add canonical gate catalog and script detection.
+3. Done: implement `/pipelane review setup`.
+4. Next: implement `/pipelane review` runner and review-gate evidence ledger.
 5. Wire blocking review gates into `/pr`.
 6. Add board/API read-only visibility for review-gate runs.
 7. Add docs, tests, and generated template updates.
@@ -399,7 +407,8 @@ Do not add:
 
 ## Acceptance Criteria
 
-- `/pipelane review setup` can print and modify plan-review gates independently from review gates.
+- `/pipelane review setup` can print the effective gate config, list available gates, and persist lean/standard/strict-production presets.
+- Later setup extensions can add or remove individual plan-review gates independently from implementation review gates.
 - Static gates run before AI gates.
 - Missing optional scripts or skills produce warnings, not crashes.
 - Generated `GoalSpec` objects require checkable finish lines, visible proof,
@@ -420,4 +429,4 @@ Do not add:
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | not run | Optional; useful before shipping setup UX. |
 
 - **UNRESOLVED:** Worktree conflict model, provider adapter contract, API/human-gate exposure, and gate-runner safety semantics still need implementation-level detail before full `/orchestrate`.
-- **VERDICT:** ENG CLEARED for Slices 1 and 2. Proceed to `/pipelane review setup`.
+- **VERDICT:** ENG CLEARED for Slices 1 and 2. Next proceed to the `/pipelane review` runner.

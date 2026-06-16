@@ -12,6 +12,7 @@ import { handlePr } from './commands/pr.ts';
 import { handleReleaseCheck } from './commands/release-check.ts';
 import { handleRepoGuard } from './commands/repo-guard.ts';
 import { handleResume } from './commands/resume.ts';
+import { handleReview } from './commands/review.ts';
 import { handleRollback } from './commands/rollback.ts';
 import { handleSmoke } from './commands/smoke.ts';
 import { handleStatus } from './commands/status.ts';
@@ -108,6 +109,11 @@ export async function runOperator(cwd: string, argv: string[]): Promise<void> {
     return;
   }
 
+  if (command === 'review') {
+    await handleReview(cwd, parsed);
+    return;
+  }
+
   if (command === 'status') {
     await handleStatus(cwd, parsed);
     return;
@@ -157,6 +163,7 @@ Pipelane commands:
   deploy
   clean
   smoke
+  review setup [--preset lean|standard|strict-production] [--print] [--list-gates]
   status
   doctor [--probe | --fix | --check-guard]
   rollback <staging|prod> [--surfaces ...] [--revert-pr]
