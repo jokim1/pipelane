@@ -2424,7 +2424,7 @@
       ];
       const orchestrationRows = [
         { command: '/pipelane review setup', description: 'Configure review gate presets, print the effective stack, and list available gates.' },
-        { command: '/pipelane review', description: 'Planned: run the configured review gates before PR handoff.' },
+        { command: '/pipelane review', description: 'Run configured review gates, write evidence, and surface pending AI/manual gates.' },
         { command: 'Slice ledger', description: 'Planned: record slices, worktrees, owners, gate results, retries, and evidence for resume.' },
         { command: 'Board visibility', description: 'Planned: show orchestration runs and gate status without replacing the release cockpit.' },
       ];
@@ -2856,6 +2856,8 @@
           return `Run ${aliases.smoke} staging`;
         case 'smoke.prod':
           return `Run ${aliases.smoke} prod`;
+        case 'review':
+          return 'Run /pipelane review';
         case 'deploy.staging':
           return `Run ${aliases.deploy} staging`;
         case 'deploy.prod':

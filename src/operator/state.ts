@@ -322,6 +322,49 @@ export interface ActionState {
   records: Record<string, ActionRunRecord[]>;
 }
 
+export type ReviewGateRunStatus = 'passed' | 'failed' | 'skipped' | 'pending';
+export type ReviewRunStatus = 'passed' | 'failed' | 'pending';
+
+export interface ReviewGateRunRecord {
+  id: string;
+  gateId: string;
+  phase: ReviewGatePhase;
+  type: ReviewGateType;
+  blocking: boolean;
+  status: ReviewGateRunStatus;
+  command?: string;
+  skill?: string;
+  role?: string;
+  summary: string;
+  exitCode?: number | null;
+  durationMs: number;
+  startedAt: string;
+  finishedAt: string;
+  stdoutTail?: string;
+  stderrTail?: string;
+  skipReason?: string;
+}
+
+export interface ReviewRunRecord {
+  id: string;
+  branchName: string;
+  sha: string;
+  preset: ReviewGatePreset;
+  status: ReviewRunStatus;
+  dryRun: boolean;
+  gateFilter?: string;
+  phaseFilter?: ReviewGatePhase;
+  startedAt: string;
+  finishedAt: string;
+  durationMs: number;
+  changedFiles: string[];
+  gates: ReviewGateRunRecord[];
+}
+
+export interface ReviewState {
+  records: ReviewRunRecord[];
+}
+
 export type DeployStatus = 'requested' | 'succeeded' | 'failed' | 'unknown';
 
 export interface DeployVerification {
@@ -603,6 +646,9 @@ export interface OperatorFlags {
   reviewPreset: string;
   reviewPrint: boolean;
   reviewListGates: boolean;
+  reviewDryRun: boolean;
+  reviewGate: string;
+  reviewPhase: string;
 }
 
 export interface ParsedOperatorArgs {
@@ -627,6 +673,10 @@ const MODE_STATE_FILENAME = 'mode-state.json';
 const PR_STATE_FILENAME = 'pr-state.json';
 const DEPLOY_STATE_FILENAME = 'deploy-state.json';
 const ACTION_STATE_FILENAME = 'action-state.json';
+const REVIEW_STATE_FILENAME = 'review-state.json';
+const REVIEW_STATE_LOCK_FILENAME = 'review-state.lock';
+const REVIEW_STATE_MAX_RECORDS = 20;
+const REVIEW_STATE_LOCK_STALE_MS = 2 * 60 * 1000;
 const DEPLOY_CONFIG_FILENAME = 'deploy-config.json';
 const PROBE_STATE_FILENAME = 'probe-state.json';
 const TASK_LOCKS_DIRNAME = 'task-locks';
@@ -674,6 +724,7 @@ export const STATE_SCHEMA_VERSIONS = {
   deployState: 1,
   prState: 1,
   actionState: 1,
+  reviewState: 1,
   deployConfig: 1,
   taskLock: 1,
 } as const;
@@ -692,6 +743,7 @@ export const STATE_MIGRATIONS: Record<StateKind, Record<number, (raw: Record<str
   deployState: {},
   prState: {},
   actionState: {},
+  reviewState: {},
   deployConfig: {},
   taskLock: {},
 };
@@ -1074,7 +1126,7 @@ export function normalizeWorkflowConfig(
 }
 
 const REVIEW_GATE_PRESETS: readonly ReviewGatePreset[] = ['lean', 'standard', 'strict-production'];
-const REVIEW_GATE_PHASES: readonly ReviewGatePhase[] = ['static', 'behavioral', 'ai-diff', 'instruction', 'runtime', 'human'];
+export const REVIEW_GATE_PHASES: readonly ReviewGatePhase[] = ['static', 'behavioral', 'ai-diff', 'instruction', 'runtime', 'human'];
 const REVIEW_GATE_TYPES: readonly ReviewGateType[] = ['command', 'skill', 'agent', 'approval', 'pipelane'];
 const REVIEW_PLAN_GATE_TYPES: readonly ReviewPlanGateConfig['type'][] = ['skill', 'agent', 'approval'];
 
@@ -1453,6 +1505,14 @@ export function deployStatePath(commonDir: string, config: WorkflowConfig): stri
 
 export function actionStatePath(commonDir: string, config: WorkflowConfig): string {
   return path.join(resolveStateDir(commonDir, config), ACTION_STATE_FILENAME);
+}
+
+export function reviewStatePath(commonDir: string, config: WorkflowConfig): string {
+  return path.join(resolveStateDir(commonDir, config), REVIEW_STATE_FILENAME);
+}
+
+function reviewStateLockPath(commonDir: string, config: WorkflowConfig): string {
+  return path.join(resolveStateDir(commonDir, config), REVIEW_STATE_LOCK_FILENAME);
 }
 
 export function deployConfigPath(commonDir: string, config: WorkflowConfig): string {
@@ -2160,6 +2220,109 @@ export function appendActionRunRecord(commonDir: string, config: WorkflowConfig,
   return record;
 }
 
+export function loadReviewState(commonDir: string, config: WorkflowConfig): ReviewState {
+  const raw = readVersionedJsonFile<ReviewState>('reviewState', commonDir, config, reviewStatePath(commonDir, config), { records: [] });
+  const records = Array.isArray(raw?.records)
+    ? raw.records.filter(isReviewRunRecord).slice(0, REVIEW_STATE_MAX_RECORDS)
+    : [];
+  return { records };
+}
+
+export function saveReviewState(commonDir: string, config: WorkflowConfig, value: ReviewState): void {
+  ensureStateDir(commonDir, config);
+  writeVersionedJsonFile('reviewState', reviewStatePath(commonDir, config), {
+    records: value.records.slice(0, REVIEW_STATE_MAX_RECORDS),
+  });
+}
+
+export function appendReviewRunRecord(commonDir: string, config: WorkflowConfig, record: ReviewRunRecord): ReviewRunRecord {
+  const lock = acquireReviewStateLock(commonDir, config);
+  try {
+    const state = loadReviewState(commonDir, config);
+    state.records = [record, ...state.records].slice(0, REVIEW_STATE_MAX_RECORDS);
+    saveReviewState(commonDir, config, state);
+    return record;
+  } finally {
+    lock.release();
+  }
+}
+
+function isReviewRunRecord(value: unknown): value is ReviewRunRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  const changedFiles = raw.changedFiles;
+  const gates = raw.gates;
+  return typeof raw.id === 'string'
+    && typeof raw.branchName === 'string'
+    && typeof raw.sha === 'string'
+    && includesString(REVIEW_GATE_PRESETS, raw.preset)
+    && (raw.status === 'passed' || raw.status === 'failed' || raw.status === 'pending')
+    && typeof raw.dryRun === 'boolean'
+    && (raw.gateFilter === undefined || typeof raw.gateFilter === 'string')
+    && (raw.phaseFilter === undefined || includesString(REVIEW_GATE_PHASES, raw.phaseFilter))
+    && typeof raw.startedAt === 'string'
+    && typeof raw.finishedAt === 'string'
+    && typeof raw.durationMs === 'number'
+    && Array.isArray(changedFiles)
+    && changedFiles.every((entry) => typeof entry === 'string')
+    && Array.isArray(gates)
+    && gates.every(isReviewGateRunRecord);
+}
+
+function isReviewGateRunRecord(value: unknown): value is ReviewGateRunRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return typeof raw.id === 'string'
+    && typeof raw.gateId === 'string'
+    && includesString(REVIEW_GATE_PHASES, raw.phase)
+    && includesString(REVIEW_GATE_TYPES, raw.type)
+    && typeof raw.blocking === 'boolean'
+    && (raw.status === 'passed' || raw.status === 'failed' || raw.status === 'skipped' || raw.status === 'pending')
+    && (raw.command === undefined || typeof raw.command === 'string')
+    && (raw.skill === undefined || typeof raw.skill === 'string')
+    && (raw.role === undefined || typeof raw.role === 'string')
+    && typeof raw.summary === 'string'
+    && (raw.exitCode === undefined || raw.exitCode === null || typeof raw.exitCode === 'number')
+    && typeof raw.durationMs === 'number'
+    && typeof raw.startedAt === 'string'
+    && typeof raw.finishedAt === 'string'
+    && (raw.stdoutTail === undefined || typeof raw.stdoutTail === 'string')
+    && (raw.stderrTail === undefined || typeof raw.stderrTail === 'string')
+    && (raw.skipReason === undefined || typeof raw.skipReason === 'string');
+}
+
+function acquireReviewStateLock(commonDir: string, config: WorkflowConfig): { release: () => void } {
+  const lockPath = reviewStateLockPath(commonDir, config);
+  mkdirSync(path.dirname(lockPath), { recursive: true });
+  clearStaleReviewStateLock(lockPath);
+  try {
+    mkdirSync(lockPath);
+    writeJsonFile(
+      path.join(lockPath, 'owner.json'),
+      { pid: process.pid, acquiredAt: nowIso() },
+    );
+    return { release: () => rmSync(lockPath, { recursive: true, force: true }) };
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === 'EEXIST') {
+      throw new Error('review state is locked: another review run is writing evidence. Wait for it to finish and retry.');
+    }
+    throw new Error(`could not acquire review state lock: ${err.message}`);
+  }
+}
+
+function clearStaleReviewStateLock(lockPath: string): boolean {
+  if (!existsSync(lockPath)) return false;
+  try {
+    const ageMs = Date.now() - statSync(lockPath).mtimeMs;
+    if (ageMs <= REVIEW_STATE_LOCK_STALE_MS) return false;
+    rmSync(lockPath, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function loadPrRecord(commonDir: string, config: WorkflowConfig, taskSlug: string): PrRecord | null {
   return loadPrState(commonDir, config).records[taskSlug] ?? null;
 }
@@ -2386,6 +2549,9 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     reviewPreset: '',
     reviewPrint: false,
     reviewListGates: false,
+    reviewDryRun: false,
+    reviewGate: '',
+    reviewPhase: '',
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -2722,6 +2888,19 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       flags.reviewListGates = true;
       continue;
     }
+    if (flagName === '--dry-run') {
+      rejectInlineValue('--dry-run');
+      flags.reviewDryRun = true;
+      continue;
+    }
+    if (flagName === '--gate') {
+      flags.reviewGate = readFlagValue('--gate').trim();
+      continue;
+    }
+    if (flagName === '--phase') {
+      flags.reviewPhase = readFlagValue('--phase').trim();
+      continue;
+    }
 
     if (token.startsWith('--')) {
       throw new Error(`Unknown flag "${flagName}" for pipelane run. Run "pipelane run --help" for supported commands and flags.`);
@@ -2927,13 +3106,25 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       throw new Error('smoke requires one of: plan, setup, staging, prod, waiver, quarantine, unquarantine.');
     }
     case 'review': {
-      assertOnlyFlags(parsed, ['reviewPreset', 'reviewPrint', 'reviewListGates']);
-      if (parsed.positional.length !== 1 || parsed.positional[0] !== 'setup') {
-        throw new Error('review requires exactly: pipelane run review setup [--preset lean|standard|strict-production] [--print] [--list-gates]');
+      const subcommand = parsed.positional[0] ?? '';
+      if (subcommand === 'setup') {
+        assertOnlyFlags(parsed, ['reviewPreset', 'reviewPrint', 'reviewListGates']);
+        if (parsed.positional.length !== 1) {
+          throw new Error('review setup requires exactly: pipelane run review setup [--preset lean|standard|strict-production] [--print] [--list-gates]');
+        }
+        const preset = parsed.flags.reviewPreset.trim();
+        if (preset && !includesString(REVIEW_GATE_PRESETS, preset)) {
+          throw new Error(`--preset must be one of: ${REVIEW_GATE_PRESETS.join(', ')}.`);
+        }
+        return;
       }
-      const preset = parsed.flags.reviewPreset.trim();
-      if (preset && !includesString(REVIEW_GATE_PRESETS, preset)) {
-        throw new Error(`--preset must be one of: ${REVIEW_GATE_PRESETS.join(', ')}.`);
+      assertOnlyFlags(parsed, ['reviewDryRun', 'reviewGate', 'reviewPhase']);
+      if (parsed.positional.length > 0) {
+        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], or pipelane run review setup [--preset lean|standard|strict-production] [--print] [--list-gates]');
+      }
+      const phase = parsed.flags.reviewPhase.trim();
+      if (phase && !includesString(REVIEW_GATE_PHASES, phase)) {
+        throw new Error(`--phase must be one of: ${REVIEW_GATE_PHASES.join(', ')}.`);
       }
       return;
     }
@@ -3168,6 +3359,9 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'reviewPreset', label: '--preset', active: (flags) => flags.reviewPreset.trim().length > 0 },
   { key: 'reviewPrint', label: '--print', active: (flags) => flags.reviewPrint },
   { key: 'reviewListGates', label: '--list-gates', active: (flags) => flags.reviewListGates },
+  { key: 'reviewDryRun', label: '--dry-run', active: (flags) => flags.reviewDryRun },
+  { key: 'reviewGate', label: '--gate', active: (flags) => flags.reviewGate.trim().length > 0 },
+  { key: 'reviewPhase', label: '--phase', active: (flags) => flags.reviewPhase.trim().length > 0 },
 ];
 
 function assertOnlyFlags(parsed: ParsedOperatorArgs, allowed: OperatorFlagKey[]): void {

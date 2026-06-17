@@ -1,11 +1,12 @@
 import { existsSync } from 'node:fs';
 
-import type { DeployRecord, PrRecord, ProbeState, SmokeEnvironmentLock, SmokeRunRecord, TaskLock, WorkflowConfig } from '../state.ts';
+import type { DeployRecord, PrRecord, ProbeState, ReviewRunRecord, SmokeEnvironmentLock, SmokeRunRecord, TaskLock, WorkflowConfig } from '../state.ts';
 import {
   DEFAULT_MODE,
   formatWorkflowCommand,
   loadAllTaskLocks,
   loadDeployState,
+  loadReviewState,
   loadSmokeEnvironmentLock,
   loadSmokeLatestState,
   loadSmokeRegistry,
@@ -189,6 +190,9 @@ export interface SnapshotData {
     prod: SmokeRunRecord | null;
     locks: SmokeEnvironmentLock[];
   };
+  review: {
+    latest: ReviewRunRecord | null;
+  };
   sourceHealth: SourceHealthEntry[];
   attention: unknown[];
   availableActions: ApiActionState[];
@@ -206,6 +210,13 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
   const locks = loadAllTaskLocks(context.commonDir, context.config);
   const prState = loadPrState(context.commonDir, context.config);
   const deployState = loadDeployState(context.commonDir, context.config);
+  const reviewState = loadReviewState(context.commonDir, context.config);
+  const reviewHealth = summarizeLatestReviewHealth({
+    latestReview: reviewState.records[0] ?? null,
+    currentBranch,
+    currentHeadSha,
+    expectedGateIds: (context.config.reviewGates?.gates ?? []).map((gate) => gate.id),
+  });
   const smokeLatest = loadSmokeLatestState(context.commonDir, context.config);
   const smokeConfig = resolveSmokeConfig(context.config);
   const smokeRegistry = loadSmokeRegistry(context.repoRoot, context.config);
@@ -351,6 +362,14 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
       checkedAt,
       observedAt: runtimeObservation.observedAt,
     }),
+    buildSourceHealthEntry({
+      name: 'review.latest',
+      state: reviewHealth.state,
+      blocking: reviewHealth.blocking,
+      reason: reviewHealth.reason,
+      checkedAt,
+      observedAt: reviewHealth.observedAt,
+    }),
   ];
 
   const attention: ApiIssue[] = [];
@@ -427,6 +446,17 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
   if (runtimeDriftIssue) {
     attention.push(runtimeDriftIssue);
   }
+  const latestReview = reviewState.records[0] ?? null;
+  if (latestReview && reviewHealth.state !== 'healthy') {
+    attention.push(buildApiIssue({
+      code: reviewHealth.issueCode,
+      severity: reviewHealth.severity,
+      message: `${reviewHealth.reason}. Run /pipelane review before PR handoff.`,
+      source: 'reviewState',
+      blocking: reviewHealth.blocking,
+      action: 'review',
+    }));
+  }
 
   const boardMessage = mode === 'release'
     ? 'Release mode: promote merged SHA through staging before prod.'
@@ -474,12 +504,117 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
         prod: smokeLatest.prod,
         locks: smokeLocks,
       },
+      review: {
+        latest: reviewState.records[0] ?? null,
+      },
       sourceHealth,
       attention,
       availableActions: buildBoardActions({ mode, releaseReadiness, branches, checkedAt }),
       branches,
     },
   });
+}
+
+function summarizeLatestReviewHealth(options: {
+  latestReview: ReviewRunRecord | null;
+  currentBranch: string;
+  currentHeadSha: string;
+  expectedGateIds: string[];
+}): {
+  state: LaneState;
+  blocking: boolean;
+  reason: string;
+  observedAt?: string;
+  issueCode: string;
+  severity: ApiIssue['severity'];
+} {
+  const { latestReview, currentBranch, currentHeadSha, expectedGateIds } = options;
+  if (!latestReview) {
+    return {
+      state: 'healthy',
+      blocking: false,
+      reason: 'no review runs recorded',
+      issueCode: 'review.missing',
+      severity: 'info',
+    };
+  }
+
+  const base = {
+    observedAt: latestReview.finishedAt,
+    issueCode: 'review.incomplete',
+    severity: 'warning' as const,
+  };
+  if (latestReview.status === 'failed') {
+    return {
+      ...base,
+      state: 'blocked',
+      blocking: true,
+      issueCode: 'review.failed',
+      severity: 'error',
+      reason: `latest review failed: ${latestReview.id}`,
+    };
+  }
+  if (latestReview.status === 'pending') {
+    return {
+      ...base,
+      state: 'degraded',
+      blocking: false,
+      issueCode: 'review.pending',
+      reason: `latest review pending: ${latestReview.id}`,
+    };
+  }
+  if (latestReview.dryRun) {
+    return {
+      ...base,
+      state: 'degraded',
+      blocking: false,
+      reason: `latest review was a dry run: ${latestReview.id}`,
+    };
+  }
+  if (latestReview.gateFilter || latestReview.phaseFilter) {
+    return {
+      ...base,
+      state: 'degraded',
+      blocking: false,
+      reason: `latest review was filtered: ${latestReview.id}`,
+    };
+  }
+  if (latestReview.branchName !== currentBranch) {
+    return {
+      ...base,
+      state: 'degraded',
+      blocking: false,
+      reason: `latest review is for ${latestReview.branchName || 'unknown branch'}, not ${currentBranch || 'current branch'}: ${latestReview.id}`,
+    };
+  }
+  if (latestReview.sha !== currentHeadSha) {
+    return {
+      ...base,
+      state: 'degraded',
+      blocking: false,
+      reason: `latest review is for ${latestReview.sha.slice(0, 7)}, not ${currentHeadSha.slice(0, 7)}: ${latestReview.id}`,
+    };
+  }
+
+  const observedGateIds = new Set(latestReview.gates.map((gate) => gate.gateId));
+  const missingGateIds = expectedGateIds.filter((gateId) => !observedGateIds.has(gateId));
+  if (missingGateIds.length > 0) {
+    return {
+      ...base,
+      state: 'degraded',
+      blocking: false,
+      reason: `latest review is missing configured gates ${missingGateIds.join(', ')}: ${latestReview.id}`,
+    };
+  }
+
+  return {
+    ...base,
+    state: 'healthy',
+    blocking: false,
+    issueCode: 'review.passed',
+    severity: 'info',
+    reason: `latest review passed: ${latestReview.id}`,
+  };
 }
 
 function buildBoardActions(options: {

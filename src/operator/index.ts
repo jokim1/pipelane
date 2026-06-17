@@ -163,6 +163,7 @@ Pipelane commands:
   deploy
   clean
   smoke
+  review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human]
   review setup [--preset lean|standard|strict-production] [--print] [--list-gates]
   status
   doctor [--probe | --fix | --check-guard]

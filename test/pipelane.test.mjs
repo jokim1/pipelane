@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cpSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer as createNetServer } from 'node:net';
@@ -57,6 +57,46 @@ function createRepo() {
   execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
   execFileSync('git', ['commit', '-m', 'Initial commit'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
   return repoRoot;
+}
+
+function createNpmShimEnv() {
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-npm-shim-'));
+  const shimPath = path.join(binDir, 'npm');
+  writeFileSync(
+    shimPath,
+    `#!/usr/bin/env node
+import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+
+const args = process.argv.slice(2);
+if (args[0] !== 'run' || !args[1]) {
+  console.error('npm shim only supports npm run <script>');
+  process.exit(127);
+}
+
+const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+const script = pkg.scripts?.[args[1]];
+if (!script) {
+  console.error(\`missing package script: \${args[1]}\`);
+  process.exit(1);
+}
+
+const result = spawnSync(script, {
+  shell: true,
+  stdio: 'inherit',
+  env: process.env,
+});
+process.exit(typeof result.status === 'number' ? result.status : 1);
+`,
+    'utf8',
+  );
+  chmodSync(shimPath, 0o755);
+  return {
+    binDir,
+    env: {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+    },
+  };
 }
 
 function seedLegacyCodexWrappers(codexHome, skills = ['new', 'resume', 'pr']) {
@@ -4458,6 +4498,397 @@ test('review setup list-gates text reports resolved availability', () => {
     assert.match(result.stdout, /- test .*npm run test - available/);
     assert.match(result.stdout, /- typecheck .*missing: package\.json script not detected/);
     assert.doesNotMatch(result.stdout, /Available catalog:/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review runner executes command gates and writes evidence', () => {
+  const repoRoot = createRepo();
+  const npmShim = createNpmShimEnv();
+  try {
+    const result = runCli(['run', 'review', '--phase', 'static', '--json'], repoRoot, npmShim.env);
+    const report = JSON.parse(result.stdout);
+    const evidencePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'review-state.json');
+
+    assert.equal(report.command, 'review');
+    assert.equal(report.status, 'passed');
+    assert.equal(realpathSync(report.evidencePath), realpathSync(evidencePath));
+    assert.equal(report.phaseFilter, 'static');
+    assert.deepEqual(report.gates.map((gate) => gate.gateId), ['typecheck']);
+    assert.equal(report.gates[0].status, 'passed');
+    assert.match(report.gates[0].stdoutTail, /typecheck ok/);
+
+    const state = JSON.parse(readFileSync(evidencePath, 'utf8'));
+    assert.equal(state.schemaVersion, 1);
+    assert.equal(state.records[0].id, report.runId);
+    assert.equal(state.records[0].status, 'passed');
+    assert.equal(state.records[0].gates[0].gateId, 'typecheck');
+    assert.equal(state.records[0].gates[0].status, 'passed');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(npmShim.binDir, { recursive: true, force: true });
+  }
+});
+
+test('review runner records pending AI gates without failing the process', () => {
+  const repoRoot = createRepo();
+  const npmShim = createNpmShimEnv();
+  try {
+    const result = runCli(['run', 'review', '--json'], repoRoot, npmShim.env);
+    const report = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0);
+    assert.equal(report.status, 'pending');
+    assert.ok(report.gates.some((gate) => gate.gateId === 'typecheck' && gate.status === 'passed'));
+    assert.ok(report.gates.some((gate) => gate.gateId === 'test' && gate.status === 'passed'));
+    assert.ok(report.gates.some((gate) => gate.gateId === 'build' && gate.status === 'passed'));
+    assert.ok(report.gates.some((gate) => gate.gateId === 'karpathy-diff' && gate.status === 'pending'));
+    assert.ok(report.gates.some((gate) => gate.gateId === 'gstack-review' && gate.status === 'pending'));
+    assert.ok(report.gates.some((gate) => gate.gateId === 'karpathy-audit' && gate.status === 'skipped'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(npmShim.binDir, { recursive: true, force: true });
+  }
+});
+
+test('review runner includes staged-only files for whenChanged gates', () => {
+  const repoRoot = createRepo();
+  try {
+    writeFileSync(path.join(repoRoot, 'AGENTS.md'), 'Agent guidance\n', 'utf8');
+    execFileSync('git', ['add', 'AGENTS.md'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const result = runCli(['run', 'review', '--gate', 'karpathy-audit', '--json'], repoRoot);
+    const report = JSON.parse(result.stdout);
+
+    assert.equal(report.status, 'pending');
+    assert.ok(report.changedFiles.includes('AGENTS.md'));
+    assert.deepEqual(report.gates.map((gate) => gate.gateId), ['karpathy-audit']);
+    assert.equal(report.gates[0].status, 'pending');
+    assert.match(report.gates[0].summary, /karpathy audit/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review runner fails unknown gate filters without writing evidence', () => {
+  const repoRoot = createRepo();
+  try {
+    const result = runCli(['run', 'review', '--gate', 'does-not-exist', '--json'], repoRoot, {}, true);
+    const evidencePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'review-state.json');
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /No review gate matches --gate does-not-exist/);
+    assert.equal(existsSync(evidencePath), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review runner adds a pending config-change gate when review config inputs changed', () => {
+  const repoRoot = createRepo();
+  const markerPath = path.join(repoRoot, 'review-config-command-ran.txt');
+  try {
+    writeFileSync(
+      path.join(repoRoot, '.pipelane.json'),
+      `${JSON.stringify({
+        displayName: 'Demo App',
+        reviewGates: {
+          preset: 'standard',
+          planReview: { gates: [] },
+          gates: [{
+            id: 'typecheck',
+            phase: 'static',
+            type: 'command',
+            command: `${process.execPath} -e "require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, 'ran')"`,
+          }],
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+
+    const result = runCli(['run', 'review', '--gate', 'typecheck', '--json'], repoRoot);
+    const report = JSON.parse(result.stdout);
+
+    assert.equal(report.status, 'pending');
+    assert.ok(report.changedFiles.includes('.pipelane.json'));
+    assert.equal(report.gates[0].gateId, 'review-config-change');
+    assert.equal(report.gates[0].status, 'pending');
+    assert.match(report.gates[0].summary, /review-config-changed/);
+    assert.equal(report.gates[1].gateId, 'typecheck');
+    assert.equal(report.gates[1].status, 'skipped');
+    assert.equal(report.gates[1].skipReason, 'review-config-changed');
+    assert.equal(existsSync(markerPath), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review runner fails when a blocking command gate fails', () => {
+  const repoRoot = createRepo();
+  try {
+    writeFileSync(
+      path.join(repoRoot, '.pipelane.json'),
+      `${JSON.stringify({
+        displayName: 'Demo App',
+        reviewGates: {
+          preset: 'standard',
+          planReview: { gates: [] },
+          gates: [{
+            id: 'typecheck',
+            phase: 'static',
+            type: 'command',
+            command: `${process.execPath} -e "console.log('OPENAI_API_KEY=sk-secret'); console.error('Bearer abc.def'); process.exit(2)"`,
+          }],
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+    execFileSync('git', ['add', '.pipelane.json'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Configure review gate'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const result = runCli(['run', 'review', '--phase', 'static', '--json'], repoRoot, {}, true);
+    const report = JSON.parse(result.stdout);
+    const evidencePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'review-state.json');
+    const typecheckGate = report.gates.find((gate) => gate.gateId === 'typecheck');
+
+    assert.notEqual(result.status, 0);
+    assert.equal(report.status, 'failed');
+    assert.equal(typecheckGate.status, 'failed');
+    assert.equal(typecheckGate.exitCode, 2);
+    assert.doesNotMatch(typecheckGate.stdoutTail, /sk-secret/);
+    assert.doesNotMatch(typecheckGate.stderrTail, /abc\.def/);
+    assert.match(typecheckGate.stdoutTail, /OPENAI_API_KEY=\[REDACTED\]/);
+    assert.match(typecheckGate.stderrTail, /\[REDACTED_AUTH_HEADER\]/);
+
+    const state = JSON.parse(readFileSync(evidencePath, 'utf8'));
+    assert.equal(state.records[0].id, report.runId);
+    assert.equal(state.records[0].status, 'failed');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review runner fails timed out command gates', () => {
+  const repoRoot = createRepo();
+  try {
+    writeFileSync(
+      path.join(repoRoot, '.pipelane.json'),
+      `${JSON.stringify({
+        displayName: 'Demo App',
+        reviewGates: {
+          preset: 'standard',
+          planReview: { gates: [] },
+          gates: [{
+            id: 'slow',
+            phase: 'static',
+            type: 'command',
+            command: `${process.execPath} -e "setTimeout(() => {}, 1000)"`,
+            timeoutMs: 10,
+          }],
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+    execFileSync('git', ['add', '.pipelane.json'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Configure slow review gate'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const result = runCli(['run', 'review', '--phase', 'static', '--json'], repoRoot, {}, true);
+    const report = JSON.parse(result.stdout);
+    const slowGate = report.gates.find((gate) => gate.gateId === 'slow');
+
+    assert.notEqual(result.status, 0);
+    assert.equal(report.status, 'failed');
+    assert.equal(slowGate.status, 'failed');
+    assert.match(slowGate.summary, /timed out/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review runner supports gate dry-run filtering', () => {
+  const repoRoot = createRepo();
+  try {
+    const result = runCli(['run', 'review', '--gate', 'typecheck', '--dry-run', '--json'], repoRoot);
+    const report = JSON.parse(result.stdout);
+
+    assert.equal(report.status, 'passed');
+    assert.equal(report.dryRun, true);
+    assert.equal(report.gateFilter, 'typecheck');
+    assert.deepEqual(report.gates.map((gate) => gate.gateId), ['typecheck']);
+    assert.equal(report.gates[0].status, 'skipped');
+    assert.equal(report.gates[0].skipReason, 'dry-run');
+    assert.match(report.gates[0].summary, /would run npm run typecheck/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('api snapshot exposes the latest review run', () => {
+  const repoRoot = createRepo();
+  try {
+    writeFileSync(
+      path.join(repoRoot, '.pipelane.json'),
+      `${JSON.stringify({
+        displayName: 'Demo App',
+        reviewGates: {
+          preset: 'standard',
+          planReview: { gates: [] },
+          gates: [{
+            id: 'typecheck',
+            phase: 'static',
+            type: 'command',
+            command: `${process.execPath} -e "console.log('typecheck ok')"`,
+          }],
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+    execFileSync('git', ['add', '.pipelane.json'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Configure passing review gate'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const review = JSON.parse(runCli(['run', 'review', '--json'], repoRoot).stdout);
+    const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    const reviewHealth = envelope.data.sourceHealth.find((entry) => entry.name === 'review.latest');
+
+    assert.equal(envelope.data.review.latest.id, review.runId);
+    assert.equal(envelope.data.review.latest.status, 'passed');
+    assert.equal(reviewHealth.state, 'healthy');
+    assert.equal(reviewHealth.blocking, false);
+    assert.match(reviewHealth.reason, new RegExp(review.runId));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('api snapshot degrades pending, failed, and incomplete review evidence', () => {
+  const pendingRepoRoot = createRepo();
+  const pendingNpmShim = createNpmShimEnv();
+  try {
+    JSON.parse(runCli(['run', 'review', '--json'], pendingRepoRoot, pendingNpmShim.env).stdout);
+    const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], pendingRepoRoot).stdout);
+    const reviewHealth = envelope.data.sourceHealth.find((entry) => entry.name === 'review.latest');
+    const issue = envelope.data.attention.find((entry) => entry.code === 'review.pending');
+
+    assert.equal(envelope.data.review.latest.status, 'pending');
+    assert.equal(reviewHealth.state, 'degraded');
+    assert.equal(reviewHealth.blocking, false);
+    assert.equal(issue.blocking, false);
+  } finally {
+    rmSync(pendingRepoRoot, { recursive: true, force: true });
+    rmSync(pendingNpmShim.binDir, { recursive: true, force: true });
+  }
+
+  const failedRepoRoot = createRepo();
+  try {
+    writeFileSync(
+      path.join(failedRepoRoot, '.pipelane.json'),
+      `${JSON.stringify({
+        displayName: 'Demo App',
+        reviewGates: {
+          preset: 'standard',
+          planReview: { gates: [] },
+          gates: [{
+            id: 'typecheck',
+            phase: 'static',
+            type: 'command',
+            command: `${process.execPath} -e "process.exit(2)"`,
+          }],
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+    execFileSync('git', ['add', '.pipelane.json'], { cwd: failedRepoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Configure failing review gate'], { cwd: failedRepoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    JSON.parse(runCli(['run', 'review', '--phase', 'static', '--json'], failedRepoRoot, {}, true).stdout);
+    const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], failedRepoRoot).stdout);
+    const reviewHealth = envelope.data.sourceHealth.find((entry) => entry.name === 'review.latest');
+    const issue = envelope.data.attention.find((entry) => entry.code === 'review.failed');
+
+    assert.equal(envelope.data.review.latest.status, 'failed');
+    assert.equal(reviewHealth.state, 'blocked');
+    assert.equal(reviewHealth.blocking, true);
+    assert.equal(issue.blocking, true);
+  } finally {
+    rmSync(failedRepoRoot, { recursive: true, force: true });
+  }
+
+  const dryRunRepoRoot = createRepo();
+  try {
+    JSON.parse(runCli(['run', 'review', '--gate', 'typecheck', '--dry-run', '--json'], dryRunRepoRoot).stdout);
+    const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], dryRunRepoRoot).stdout);
+    const reviewHealth = envelope.data.sourceHealth.find((entry) => entry.name === 'review.latest');
+    const issue = envelope.data.attention.find((entry) => entry.code === 'review.incomplete');
+
+    assert.equal(envelope.data.review.latest.status, 'passed');
+    assert.equal(reviewHealth.state, 'degraded');
+    assert.equal(reviewHealth.blocking, false);
+    assert.match(reviewHealth.reason, /dry run/);
+    assert.equal(issue.blocking, false);
+  } finally {
+    rmSync(dryRunRepoRoot, { recursive: true, force: true });
+  }
+});
+
+test('loadReviewState rejects malformed nested review gate records', async () => {
+  const repoRoot = createRepo();
+  try {
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const config = stateMod.loadWorkflowConfig(repoRoot);
+    const commonDir = resolveCommonDir(repoRoot);
+    const reviewPath = stateMod.reviewStatePath(commonDir, config);
+    mkdirSync(path.dirname(reviewPath), { recursive: true });
+    writeFileSync(
+      reviewPath,
+      `${JSON.stringify({
+        schemaVersion: 1,
+        records: [
+          {
+            id: 'review-bad-run-field',
+            branchName: 'main',
+            sha: 'abc',
+            preset: 'standard',
+            status: 'passed',
+            dryRun: false,
+            gateFilter: 123,
+            startedAt: '2026-06-16T00:00:00Z',
+            finishedAt: '2026-06-16T00:00:01Z',
+            durationMs: 1,
+            changedFiles: ['src/operator/commands/review.ts'],
+            gates: [{
+              id: 'gate-ok',
+              gateId: 'typecheck',
+              phase: 'static',
+              type: 'command',
+              blocking: true,
+              status: 'passed',
+              summary: 'ok',
+              durationMs: 1,
+              startedAt: '2026-06-16T00:00:00Z',
+              finishedAt: '2026-06-16T00:00:01Z',
+            }],
+          },
+          {
+            id: 'review-bad-nested-gate',
+            branchName: 'main',
+            sha: 'abc',
+            preset: 'standard',
+            status: 'passed',
+            dryRun: false,
+            startedAt: '2026-06-16T00:00:00Z',
+            finishedAt: '2026-06-16T00:00:01Z',
+            durationMs: 1,
+            changedFiles: ['src/operator/commands/review.ts'],
+            gates: [{ gateId: 'missing-required-fields' }],
+          },
+        ],
+      }, null, 2)}\n`,
+      'utf8',
+    );
+
+    const loaded = stateMod.loadReviewState(commonDir, config);
+    assert.deepEqual(loaded.records, []);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -12085,7 +12516,7 @@ test('operator parser rejects unknown flags, missing values, unused flags, and u
 
     const invalidReviewSubcommand = runCli(['run', 'review', 'list'], repoRoot, {}, true);
     assert.notEqual(invalidReviewSubcommand.status, 0);
-    assert.match(invalidReviewSubcommand.stderr, /review requires exactly: pipelane run review setup/);
+    assert.match(invalidReviewSubcommand.stderr, /review requires: pipelane run review/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }

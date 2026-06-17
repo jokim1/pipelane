@@ -64,7 +64,6 @@ Future extensions:
 /pipelane review setup --add-plan-gate plan-eng-review
 /pipelane review setup --add-static-gate "npm run lint"
 /pipelane review setup --add-ai-gate "/karpathy diff"
-/pipelane review
 ```
 
 Setup should detect existing scripts before suggesting new gates. If a repo has
@@ -120,10 +119,10 @@ User-facing commands:
 /pr
 ```
 
-`/pipelane review setup` configures the gate stack. The first implementation
+`/pipelane review setup` configures the gate stack. The implementation
 supports preset selection, printing the effective config, and listing the gate
-catalog with detected or missing scripts. `/pipelane review` will run the
-configured gates against the current diff and write evidence. `/pr` will run
+catalog with detected or missing scripts. `/pipelane review` runs the
+configured gates against the current diff and writes evidence. `/pr` will run
 configured blocking review gates before PR handoff.
 
 Plain `/pipelane setup` remains repo/bootstrap setup. Do not use
@@ -328,17 +327,15 @@ Each gate has:
 
 ## Review Gate Evidence
 
-Every `/pipelane review` run should write evidence under existing Pipelane
-state:
+Every `/pipelane review` run writes evidence under existing Pipelane state:
 
 ```text
-<git-common-dir>/<config.stateDir>/review-gates/runs/<run-id>.json
+<git-common-dir>/<config.stateDir>/review-state.json
 ```
 
-The run record should include the gate config snapshot, changed files, gate
-order, skipped gates and skip reasons, command or skill result, timeout status,
-stdout/stderr artifact paths, redaction status, and final blocking/advisory
-verdict.
+The bounded ledger records the latest runs with branch, SHA, preset, changed
+files, gate order, skipped gates and skip reasons, command or skill result,
+timeout status, output tails, and final blocking/advisory verdict.
 
 `/pr` must run blocking configured review gates before commit, push, or PR
 handoff. A failed blocking gate stops `/pr`. A skipped or unavailable optional
@@ -398,9 +395,9 @@ Do not add:
 1. Done: add config schema, defaults, normalization, and validation.
 2. Done: add canonical gate catalog and script detection.
 3. Done: implement `/pipelane review setup`.
-4. Next: implement `/pipelane review` runner and review-gate evidence ledger.
-5. Wire blocking review gates into `/pr`.
-6. Add board/API read-only visibility for review-gate runs.
+4. Done: implement `/pipelane review` runner and review-gate evidence ledger.
+5. Done: add board/API read-only visibility for review-gate runs.
+6. Next: wire blocking review gates into `/pr`.
 7. Add docs, tests, and generated template updates.
 8. Add provider-neutral `GoalSpec` generation for future slice execution.
 9. Build full `/orchestrate` slice execution on top of this foundation later.
@@ -428,5 +425,5 @@ Do not add:
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | not run | Recommended before board UI implementation. |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | not run | Optional; useful before shipping setup UX. |
 
-- **UNRESOLVED:** Worktree conflict model, provider adapter contract, API/human-gate exposure, and gate-runner safety semantics still need implementation-level detail before full `/orchestrate`.
-- **VERDICT:** ENG CLEARED for Slices 1 and 2. Next proceed to the `/pipelane review` runner.
+- **UNRESOLVED:** Worktree conflict model, provider adapter contract, human-gate execution, `/pr` review-gate enforcement, and gate-runner trusted-baseline semantics still need implementation-level detail before full `/orchestrate`.
+- **VERDICT:** ENG CLEARED for Slices 1 and 2. Slice 3 review runner is implemented; next proceed to `/pr` enforcement on top of the review evidence ledger.
