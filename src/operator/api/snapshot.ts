@@ -60,6 +60,7 @@ import {
   type ShellRelationshipState,
   type SourceHealthEntry,
 } from './envelope.ts';
+import { evaluateReviewEvidenceForPr, type ReviewEvidenceCheckResult } from '../review-enforcement.ts';
 
 export interface BranchLanes {
   local: ApiStatusCell;
@@ -211,12 +212,8 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
   const prState = loadPrState(context.commonDir, context.config);
   const deployState = loadDeployState(context.commonDir, context.config);
   const reviewState = loadReviewState(context.commonDir, context.config);
-  const reviewHealth = summarizeLatestReviewHealth({
-    latestReview: reviewState.records[0] ?? null,
-    currentBranch,
-    currentHeadSha,
-    expectedGateIds: (context.config.reviewGates?.gates ?? []).map((gate) => gate.id),
-  });
+  const reviewEvidence = evaluateReviewEvidenceForPr(context);
+  const reviewHealth = summarizeReviewEvidenceHealth(reviewEvidence);
   const smokeLatest = loadSmokeLatestState(context.commonDir, context.config);
   const smokeConfig = resolveSmokeConfig(context.config);
   const smokeRegistry = loadSmokeRegistry(context.repoRoot, context.config);
@@ -446,8 +443,7 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
   if (runtimeDriftIssue) {
     attention.push(runtimeDriftIssue);
   }
-  const latestReview = reviewState.records[0] ?? null;
-  if (latestReview && reviewHealth.state !== 'healthy') {
+  if (reviewHealth.state !== 'healthy') {
     attention.push(buildApiIssue({
       code: reviewHealth.issueCode,
       severity: reviewHealth.severity,
@@ -505,7 +501,7 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
         locks: smokeLocks,
       },
       review: {
-        latest: reviewState.records[0] ?? null,
+        latest: reviewEvidence.latest ?? reviewState.records[0] ?? null,
       },
       sourceHealth,
       attention,
@@ -515,12 +511,7 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
   });
 }
 
-function summarizeLatestReviewHealth(options: {
-  latestReview: ReviewRunRecord | null;
-  currentBranch: string;
-  currentHeadSha: string;
-  expectedGateIds: string[];
-}): {
+function summarizeReviewEvidenceHealth(evidence: ReviewEvidenceCheckResult): {
   state: LaneState;
   blocking: boolean;
   reason: string;
@@ -528,14 +519,15 @@ function summarizeLatestReviewHealth(options: {
   issueCode: string;
   severity: ApiIssue['severity'];
 } {
-  const { latestReview, currentBranch, currentHeadSha, expectedGateIds } = options;
+  const latestReview = evidence.latest;
   if (!latestReview) {
+    const missingReason = evidence.issues[0]?.message ?? 'no review runs recorded';
     return {
-      state: 'healthy',
-      blocking: false,
-      reason: 'no review runs recorded',
+      state: evidence.allowed ? 'healthy' : 'blocked',
+      blocking: !evidence.allowed,
+      reason: missingReason,
       issueCode: 'review.missing',
-      severity: 'info',
+      severity: evidence.allowed ? 'info' : 'error',
     };
   }
 
@@ -544,66 +536,17 @@ function summarizeLatestReviewHealth(options: {
     issueCode: 'review.incomplete',
     severity: 'warning' as const,
   };
-  if (latestReview.status === 'failed') {
+  if (!evidence.allowed) {
+    const firstIssue = evidence.issues[0];
+    const failed = evidence.issues.some((issue) => issue.status === 'failed');
+    const pending = evidence.issues.some((issue) => issue.status === 'pending');
     return {
       ...base,
       state: 'blocked',
       blocking: true,
-      issueCode: 'review.failed',
+      issueCode: failed ? 'review.failed' : pending ? 'review.pending' : base.issueCode,
       severity: 'error',
-      reason: `latest review failed: ${latestReview.id}`,
-    };
-  }
-  if (latestReview.status === 'pending') {
-    return {
-      ...base,
-      state: 'degraded',
-      blocking: false,
-      issueCode: 'review.pending',
-      reason: `latest review pending: ${latestReview.id}`,
-    };
-  }
-  if (latestReview.dryRun) {
-    return {
-      ...base,
-      state: 'degraded',
-      blocking: false,
-      reason: `latest review was a dry run: ${latestReview.id}`,
-    };
-  }
-  if (latestReview.gateFilter || latestReview.phaseFilter) {
-    return {
-      ...base,
-      state: 'degraded',
-      blocking: false,
-      reason: `latest review was filtered: ${latestReview.id}`,
-    };
-  }
-  if (latestReview.branchName !== currentBranch) {
-    return {
-      ...base,
-      state: 'degraded',
-      blocking: false,
-      reason: `latest review is for ${latestReview.branchName || 'unknown branch'}, not ${currentBranch || 'current branch'}: ${latestReview.id}`,
-    };
-  }
-  if (latestReview.sha !== currentHeadSha) {
-    return {
-      ...base,
-      state: 'degraded',
-      blocking: false,
-      reason: `latest review is for ${latestReview.sha.slice(0, 7)}, not ${currentHeadSha.slice(0, 7)}: ${latestReview.id}`,
-    };
-  }
-
-  const observedGateIds = new Set(latestReview.gates.map((gate) => gate.gateId));
-  const missingGateIds = expectedGateIds.filter((gateId) => !observedGateIds.has(gateId));
-  if (missingGateIds.length > 0) {
-    return {
-      ...base,
-      state: 'degraded',
-      blocking: false,
-      reason: `latest review is missing configured gates ${missingGateIds.join(', ')}: ${latestReview.id}`,
+      reason: firstIssue?.message ? `${firstIssue.message}: ${latestReview.id}` : `latest review is not ready: ${latestReview.id}`,
     };
   }
 

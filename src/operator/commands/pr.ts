@@ -35,6 +35,7 @@ import {
   type ParsedOperatorArgs,
   type TaskLock,
 } from '../state.ts';
+import { evaluateReviewEvidenceForPr } from '../review-enforcement.ts';
 
 export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   if (await maybeHandleDestinationCommand(cwd, parsed)) return;
@@ -116,8 +117,18 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
     prTitle = existingPr?.title || latestCommitSubject(context.repoRoot);
   }
 
+  const reviewEvidence = evaluateReviewEvidenceForPr(context);
+  if (!reviewEvidence.allowed) {
+    throw new Error(reviewEvidence.message);
+  }
+
   for (const check of context.config.prePrChecks) {
     runShell(context.repoRoot, check, parsed.flags.json);
+  }
+
+  const postCheckReviewEvidence = evaluateReviewEvidenceForPr(context);
+  if (!postCheckReviewEvidence.allowed) {
+    throw new Error(postCheckReviewEvidence.message);
   }
 
   if (dirty) {

@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 
 export const DEPLOY_STATE_KEY_ENV = 'PIPELANE_DEPLOY_STATE_KEY';
 export const PROBE_STATE_KEY_ENV = 'PIPELANE_PROBE_STATE_KEY';
+export const REVIEW_STATE_KEY_ENV = 'PIPELANE_REVIEW_STATE_KEY';
 
 export function canonicalize(value: unknown): string {
   if (value === undefined) {
@@ -58,4 +59,8 @@ export function resolveDeployStateKey(): string | undefined {
 
 export function resolveProbeStateKey(): string | undefined {
   return resolveStateKey(PROBE_STATE_KEY_ENV);
+}
+
+export function resolveReviewStateKey(): string | undefined {
+  return resolveStateKey(REVIEW_STATE_KEY_ENV);
 }

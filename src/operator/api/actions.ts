@@ -53,6 +53,7 @@ import {
   DESTINATION_APPROVED_ROUTE_FINGERPRINT_ENV,
   DESTINATION_ROUTE_PROD_CONFIRMED_ENV,
 } from '../destination-executor.ts';
+import { evaluateReviewEvidenceForPr } from '../review-enforcement.ts';
 
 export const STABLE_ACTION_IDS = [
   'new',
@@ -184,7 +185,7 @@ export function buildActionPreflightEnvelope(cwd: string, actionId: StableAction
         inputs: gate.inputs ?? [],
         defaultParams: gate.defaultParams ?? {},
         warnings: [],
-        issues: [],
+        issues: gate.issues ?? [],
         normalizedInputs,
         requiresConfirmation: false,
         confirmation: null,
@@ -254,10 +255,12 @@ interface PreflightGateBlocked {
   missingInputs?: string[];
   inputs?: ApiActionInput[];
   defaultParams?: Record<string, unknown>;
+  issues?: unknown[];
 }
 
 function evaluatePreflightGate(context: WorkflowContext, actionId: StableActionId, inputs: Record<string, unknown>): PreflightGateResult {
   if (isRouteActionId(actionId)) {
+    const routeSteps = routeStepsFromInputs(inputs);
     const blockers = Array.isArray(inputs.routeBlockers)
       ? inputs.routeBlockers.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
       : [];
@@ -267,12 +270,22 @@ function evaluatePreflightGate(context: WorkflowContext, actionId: StableActionI
         reason: blockers.join('; '),
       };
     }
-    const routeBlocker = routeBaseFreshnessBlocker(context, inputs);
+    const routeBlocker = routeBaseFreshnessBlocker(context, routeSteps, inputs);
     if (routeBlocker) {
       return {
         allowed: false,
         reason: routeBlocker,
       };
+    }
+    if (routeSteps.includes('pr')) {
+      const reviewEvidence = evaluateReviewEvidenceForPr(context);
+      if (!reviewEvidence.allowed) {
+        return {
+          allowed: false,
+          reason: reviewEvidence.message,
+          issues: reviewEvidence.issues,
+        };
+      }
     }
   }
   if (actionId === 'pr') {
@@ -337,13 +350,16 @@ function evaluatePreflightGate(context: WorkflowContext, actionId: StableActionI
   return { allowed: true };
 }
 
-function routeBaseFreshnessBlocker(context: WorkflowContext, inputs: Record<string, unknown>): string {
+function routeStepsFromInputs(inputs: Record<string, unknown>): string[] {
   const route = inputs.route && typeof inputs.route === 'object'
     ? inputs.route as { routeSteps?: unknown }
     : {};
-  const routeSteps = Array.isArray(route.routeSteps)
+  return Array.isArray(route.routeSteps)
     ? route.routeSteps.filter((entry): entry is string => typeof entry === 'string')
     : [];
+}
+
+function routeBaseFreshnessBlocker(context: WorkflowContext, routeSteps: string[], inputs: Record<string, unknown>): string {
   if (routeSteps.includes('pr')) {
     return buildStaleBaseBlocker(context, 'pr');
   }
@@ -396,6 +412,16 @@ function evaluatePrPreflightGate(context: WorkflowContext, inputs: Record<string
         },
       );
     }
+    if (recover === 'use-current-checkout') {
+      const reviewEvidence = evaluateReviewEvidenceForPr(context);
+      if (!reviewEvidence.allowed) {
+        return {
+          allowed: false,
+          reason: reviewEvidence.message,
+          issues: reviewEvidence.issues,
+        };
+      }
+    }
     return { allowed: true };
   }
 
@@ -422,6 +448,14 @@ function evaluatePrPreflightGate(context: WorkflowContext, inputs: Record<string
           ...(titleRequirement.defaultTitle ? { title: titleRequirement.defaultTitle } : {}),
         },
       );
+    }
+    const reviewEvidence = evaluateReviewEvidenceForPr(context);
+    if (!reviewEvidence.allowed) {
+      return {
+        allowed: false,
+        reason: reviewEvidence.message,
+        issues: reviewEvidence.issues,
+      };
     }
     return { allowed: true };
   }
@@ -525,7 +559,7 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
         inputs: gate.inputs ?? [],
         defaultParams: gate.defaultParams ?? {},
         warnings: [],
-        issues: [],
+        issues: gate.issues ?? [],
         normalizedInputs,
         requiresConfirmation: false,
         confirmation: null,

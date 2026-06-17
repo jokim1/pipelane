@@ -7,6 +7,7 @@ import {
   resolveReviewGateCatalog,
   buildReviewGatesConfigForPreset,
 } from '../review-gates.ts';
+import { readWorktreeStatusSnapshot } from '../worktree-status.ts';
 import {
   appendReviewRunRecord,
   defaultReviewGatesConfig,
@@ -170,6 +171,7 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
   const gateFilter = parsed.flags.reviewGate.trim();
   const dryRun = parsed.flags.reviewDryRun;
   const changedFiles = collectChangedFiles(context.repoRoot, context.config.baseBranch);
+  const worktreeStatus = readWorktreeStatusSnapshot(context.repoRoot, { includeStatusDigest: true });
   const reviewConfigChanged = changedFiles.some(isReviewConfigPath);
   const activeSurfaces = context.modeState.requestedSurfaces ?? context.config.surfaces;
   const allGates = orderReviewGates(context.config.reviewGates?.gates ?? []);
@@ -211,6 +213,9 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
     finishedAt,
     durationMs: Math.max(0, Date.now() - runStartMs),
     changedFiles,
+    worktreeStatusDigest: worktreeStatus.statusDigest,
+    worktreeStatusReliable: worktreeStatus.statusDigestReliable,
+    worktreeStatusWarnings: worktreeStatus.statusDigestWarnings,
     gates: gateRecords,
   };
 

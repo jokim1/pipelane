@@ -68,7 +68,8 @@ to production and do not need required staging validation for the same SHA.
 ```text
 /devmode build          Use the fast lane.
 /new                    Let the AI infer the task name, or provide one if you want.
-/pr --title "PR title"  Run pre-PR checks, commit, push, and open or update the PR.
+/pipelane review        Run review gates and write evidence for the current diff.
+/pr --title "PR title"  Enforce review evidence, run checks, commit, push, and open or update the PR.
 /merge                  Merge the PR and record the merged SHA.
 /clean                  Clean up finished task state after production is verified.
 ```
@@ -84,7 +85,8 @@ merged SHA before production can move.
 ```text
 /devmode release        Use the protected lane.
 /new                    Let the AI infer the task name, or provide one if you want.
-/pr --title "PR title"  Run pre-PR checks, commit, push, and open or update the PR.
+/pipelane review        Run review gates and write evidence for the current diff.
+/pr --title "PR title"  Enforce review evidence, run checks, commit, push, and open or update the PR.
 /merge                  Merge the PR and record the merged SHA.
 /deploy staging         Deploy the merged SHA to staging.
 /deploy prod            Promote that same SHA to production.
@@ -422,17 +424,21 @@ When the branch is ready for a PR, let Pipelane prepare it:
 /pr
 ```
 
-`/pr` runs the repo's configured pre-PR checks, commits, pushes, and opens or
-updates the PR. It refreshes `origin/<base>` first and stops if the task branch
-is behind the configured base branch, because that stale diff can make review
-and merge include upstream reversions. Then use the review stack again:
+`/pipelane review` runs configured static, behavioral, AI, instruction, runtime,
+and human gates and records evidence for the current branch, HEAD, and worktree
+state. `/pr` enforces that evidence before it commits, pushes, or opens a PR. It
+also refreshes `origin/<base>` first and stops if the task branch is behind the
+configured base branch, because that stale diff can make review and merge include
+upstream reversions. If review evidence is missing, stale, filtered, pending, or
+failed, rerun:
 
 ```text
-/review
+/pipelane review
 ```
 
-gstack `/review` is the pre-landing review pass. It looks at the diff before merge
-and tries to catch structural issues, safety problems, and code-quality regressions.
+The review stack includes deterministic checks first, then gates such as
+`/karpathy diff`, gstack `/review`, `/karpathy audit` when instruction files
+change, and any configured approvals.
 If it finds something real, keep the loop simple:
 
 ```text
@@ -526,9 +532,10 @@ User: Replace the billing webhook handler.
 /plan-design-review
 /plan-eng-review
 AI: Implementation returns.
+/pipelane review
 /pr
-/review
 /fix
+/pipelane review
 /pr
 /merge
 /deploy staging

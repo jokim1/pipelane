@@ -34,6 +34,9 @@ function run(command, args, cwd, env = {}) {
 }
 
 function runCli(args, cwd, env = {}, allowFailure = false) {
+  if (!allowFailure && shouldSeedPassingReviewEvidence(args)) {
+    writePassingReviewEvidence(cwd);
+  }
   const result = spawnSync('node', [CLI_PATH, ...args], {
     cwd,
     env: { ...process.env, CODEX_HOME: DEFAULT_CODEX_HOME, PIPELANE_HOME: DEFAULT_PIPELANE_HOME, ...env },
@@ -46,6 +49,12 @@ function runCli(args, cwd, env = {}, allowFailure = false) {
   }
 
   return result;
+}
+
+function shouldSeedPassingReviewEvidence(args) {
+  if (args[0] !== 'run') return false;
+  if (args[1] === 'pr') return true;
+  return args[1] === 'api' && args[2] === 'action' && args[3] === 'pr';
 }
 
 function createRepo() {
@@ -2553,7 +2562,8 @@ test('pipelane.md renders a journey-first overview with real slash aliases', () 
     assert.match(pipelane, /1\. Build journey/);
     assert.match(pipelane, /\/devmode build\s+Set the repo to build mode\./);
     assert.match(pipelane, /\/start\s+Create a named task worktree from the described task\./);
-    assert.match(pipelane, /\/pr --title "PR title"\s+Run pre-PR checks, commit, push, and open or update the PR\./);
+    assert.match(pipelane, /\/pipelane review\s+Run review gates and write evidence for the current diff\./);
+    assert.match(pipelane, /\/pr --title "PR title"\s+Enforce review evidence, run checks, commit, push, and open or update the PR\./);
     assert.match(pipelane, /\/merge\s+Merge the PR\. In build mode, this hands off to the prod deploy path\./);
     assert.match(pipelane, /\/tidy\s+Clean up finished task state after the release is complete\./);
     assert.match(pipelane, /2\. Release journey/);
@@ -2576,6 +2586,8 @@ test('pipelane.md documents exact first-token routing for subcommands', () => {
 
   assert.match(template, /Exactly equals `web`/);
   assert.match(template, /Exactly equals `status`/);
+  assert.match(template, /Exactly equals `review`/);
+  assert.match(template, /npm run pipelane:review -- \$REST/);
   assert.match(template, /Exactly equals `update`/);
   assert.match(template, /No prefix matching/);
   assert.match(template, /`\/pipelane update-this-thing` routes to UNKNOWN MODE, not UPDATE MODE/);
@@ -4771,9 +4783,9 @@ test('api snapshot degrades pending, failed, and incomplete review evidence', ()
     const issue = envelope.data.attention.find((entry) => entry.code === 'review.pending');
 
     assert.equal(envelope.data.review.latest.status, 'pending');
-    assert.equal(reviewHealth.state, 'degraded');
-    assert.equal(reviewHealth.blocking, false);
-    assert.equal(issue.blocking, false);
+    assert.equal(reviewHealth.state, 'blocked');
+    assert.equal(reviewHealth.blocking, true);
+    assert.equal(issue.blocking, true);
   } finally {
     rmSync(pendingRepoRoot, { recursive: true, force: true });
     rmSync(pendingNpmShim.binDir, { recursive: true, force: true });
@@ -4822,10 +4834,10 @@ test('api snapshot degrades pending, failed, and incomplete review evidence', ()
     const issue = envelope.data.attention.find((entry) => entry.code === 'review.incomplete');
 
     assert.equal(envelope.data.review.latest.status, 'passed');
-    assert.equal(reviewHealth.state, 'degraded');
-    assert.equal(reviewHealth.blocking, false);
+    assert.equal(reviewHealth.state, 'blocked');
+    assert.equal(reviewHealth.blocking, true);
     assert.match(reviewHealth.reason, /dry run/);
-    assert.equal(issue.blocking, false);
+    assert.equal(issue.blocking, true);
   } finally {
     rmSync(dryRunRepoRoot, { recursive: true, force: true });
   }
@@ -4890,6 +4902,39 @@ test('loadReviewState rejects malformed nested review gate records', async () =>
     const loaded = stateMod.loadReviewState(commonDir, config);
     assert.deepEqual(loaded.records, []);
   } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('loadReviewState rejects unsigned review records when review state key is configured', async () => {
+  const repoRoot = createRepo();
+  const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+  const key = 'review-state-test-key';
+  const previousKey = process.env.PIPELANE_REVIEW_STATE_KEY;
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    writePassingReviewEvidence(repoRoot);
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+
+    process.env.PIPELANE_REVIEW_STATE_KEY = key;
+    assert.deepEqual(stateMod.loadReviewState(context.commonDir, context.config).records, []);
+
+    runCli(['run', 'review', '--dry-run', '--json'], repoRoot, { PIPELANE_REVIEW_STATE_KEY: key });
+    const signed = stateMod.loadReviewState(context.commonDir, context.config).records;
+    assert.equal(signed.length, 1);
+    assert.match(signed[0].signature, /^[a-f0-9]{64}$/);
+
+    const reviewPath = stateMod.reviewStatePath(context.commonDir, context.config);
+    const state = JSON.parse(readFileSync(reviewPath, 'utf8'));
+    state.records[0].status = 'passed';
+    writeFileSync(reviewPath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+    assert.deepEqual(stateMod.loadReviewState(context.commonDir, context.config).records, []);
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.PIPELANE_REVIEW_STATE_KEY;
+    } else {
+      process.env.PIPELANE_REVIEW_STATE_KEY = previousKey;
+    }
     rmSync(repoRoot, { recursive: true, force: true });
   }
 });
@@ -5676,6 +5721,52 @@ function writePrRecord(repoRoot, taskSlug, mergedSha) {
     }, null, 2)}\n`,
     'utf8',
   );
+}
+
+function writePassingReviewEvidence(repoRoot, options = {}) {
+  const review = JSON.parse(runCli(['run', 'review', '--dry-run', '--json'], repoRoot).stdout);
+  const state = JSON.parse(readFileSync(review.evidencePath, 'utf8'));
+  const record = state.records[0];
+  record.status = options.status || 'passed';
+  record.dryRun = options.dryRun === true;
+  if (Object.prototype.hasOwnProperty.call(options, 'gateFilter')) {
+    record.gateFilter = options.gateFilter;
+  } else {
+    delete record.gateFilter;
+  }
+  if (Object.prototype.hasOwnProperty.call(options, 'phaseFilter')) {
+    record.phaseFilter = options.phaseFilter;
+  } else {
+    delete record.phaseFilter;
+  }
+  if (options.sha) record.sha = options.sha;
+  if (options.branchName) record.branchName = options.branchName;
+  record.gates = record.gates.map((gate) => ({
+    ...gate,
+    status: options.gateStatuses?.[gate.gateId] || (gate.status === 'skipped' ? 'skipped' : 'passed'),
+    summary: options.gateSummaries?.[gate.gateId] || gate.summary,
+  }));
+  if (options.removeGateId) {
+    record.gates = record.gates.filter((gate) => gate.gateId !== options.removeGateId);
+  }
+  if (Object.prototype.hasOwnProperty.call(options, 'worktreeStatusDigest')) {
+    record.worktreeStatusDigest = options.worktreeStatusDigest;
+  }
+  if (options.removeWorktreeStatusDigest) {
+    delete record.worktreeStatusDigest;
+  }
+  if (Object.prototype.hasOwnProperty.call(options, 'worktreeStatusReliable')) {
+    record.worktreeStatusReliable = options.worktreeStatusReliable;
+  }
+  if (Object.prototype.hasOwnProperty.call(options, 'worktreeStatusWarnings')) {
+    record.worktreeStatusWarnings = options.worktreeStatusWarnings;
+  }
+  if (options.extraGates) {
+    record.gates = [...record.gates, ...options.extraGates];
+  }
+  state.records[0] = record;
+  writeFileSync(review.evidencePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  return record;
 }
 
 function localBranchExists(repoRoot, branchName) {
@@ -7278,6 +7369,230 @@ test('api action preflight blocks stale PR preparation before issuing actions', 
   }
 });
 
+test('pr blocks before commit or gh when review evidence is missing', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Review Missing', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+
+    const result = runCli(['run', 'pr', '--title', 'Review Missing', '--json'], created.worktreePath, env, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /\/pr blocked because review gate evidence is not ready/);
+    assert.match(result.stderr, /no review run has been recorded/);
+    assert.match(result.stderr, /Run \/pipelane review/);
+    assert.match(run('git', ['status', '--short'], created.worktreePath), /feature\.txt/);
+    assert.match(run('git', ['log', '--oneline', '-1'], created.worktreePath), /Adopt pipelane/);
+    assert.equal(existsSync(ghStateFile), false, 'missing review evidence should block before gh is called');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('pr blocks when dirty worktree changes after review evidence is recorded', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Review Drift', '--json'], repoRoot).stdout);
+    const featurePath = path.join(created.worktreePath, 'feature.txt');
+    writeFileSync(featurePath, 'reviewed\n', 'utf8');
+    writePassingReviewEvidence(created.worktreePath);
+    writeFileSync(featurePath, 'changed after review\n', 'utf8');
+
+    const result = runCli(['run', 'pr', '--title', 'Review Drift', '--json'], created.worktreePath, env, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /different worktree state/);
+    assert.match(run('git', ['status', '--short'], created.worktreePath), /feature\.txt/);
+    assert.equal(existsSync(ghStateFile), false, 'stale review evidence should block before gh is called');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('api action pr preflight blocks pending and filtered review evidence', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Review Pending', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+    writePassingReviewEvidence(created.worktreePath, {
+      status: 'pending',
+      gateStatuses: { 'karpathy-diff': 'pending' },
+      gateSummaries: { 'karpathy-diff': 'manual skill gate pending: run /karpathy diff' },
+    });
+
+    const pending = runCli(
+      ['run', 'api', 'action', 'pr', '--title', 'Review Pending'],
+      created.worktreePath,
+      {},
+      true,
+    );
+    assert.equal(pending.status, 1);
+    const pendingEnvelope = JSON.parse(pending.stdout);
+    assert.equal(pendingEnvelope.data.preflight.allowed, false);
+    assert.equal(pendingEnvelope.data.preflight.state, 'blocked');
+    assert.match(pendingEnvelope.data.preflight.reason, /blocking gate karpathy-diff is pending/);
+    assert.equal(pendingEnvelope.data.preflight.issues[0].status, 'pending');
+    assert.equal(pendingEnvelope.data.preflight.issues[0].gateId, 'karpathy-diff');
+
+    writePassingReviewEvidence(created.worktreePath, { gateFilter: 'typecheck' });
+    const filtered = runCli(
+      ['run', 'api', 'action', 'pr', '--title', 'Review Pending'],
+      created.worktreePath,
+      {},
+      true,
+    );
+    assert.equal(filtered.status, 1);
+    const filteredEnvelope = JSON.parse(filtered.stdout);
+    assert.match(filteredEnvelope.data.preflight.reason, /latest review .* was filtered by gate typecheck/);
+    assert.equal(filteredEnvelope.data.preflight.issues[0].status, 'incomplete');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('api action pr uses matching review evidence instead of the global latest run', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Review Match', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'reviewed task\n', 'utf8');
+    writePassingReviewEvidence(created.worktreePath);
+    writePassingReviewEvidence(repoRoot);
+
+    const preflight = runCli(
+      ['run', 'api', 'action', 'pr', '--title', 'Review Match'],
+      created.worktreePath,
+      {},
+      true,
+    );
+    assert.equal(preflight.status, 0, preflight.stderr);
+    const envelope = JSON.parse(preflight.stdout);
+    assert.equal(envelope.data.preflight.allowed, true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('api action pr blocks extra pending blocking gates from review evidence', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Review Extra Gate', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'extra gate\n', 'utf8');
+    writePassingReviewEvidence(created.worktreePath, {
+      extraGates: [{
+        id: 'review-config-change-test',
+        gateId: 'review-config-change',
+        phase: 'static',
+        type: 'approval',
+        blocking: true,
+        status: 'pending',
+        summary: 'approval gate pending',
+        durationMs: 0,
+        startedAt: '2026-06-17T00:00:00Z',
+        finishedAt: '2026-06-17T00:00:00Z',
+      }],
+    });
+
+    const result = runCli(
+      ['run', 'api', 'action', 'pr', '--title', 'Review Extra Gate'],
+      created.worktreePath,
+      {},
+      true,
+    );
+    assert.equal(result.status, 1);
+    const envelope = JSON.parse(result.stdout);
+    assert.equal(envelope.data.preflight.allowed, false);
+    assert.match(envelope.data.preflight.reason, /blocking gate review-config-change is pending/);
+    assert.equal(envelope.data.preflight.issues[0].gateId, 'review-config-change');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('pr blocks clean already-pushed open PRs without review evidence', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Clean Open Pr Review', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'clean open pr\n', 'utf8');
+
+    runCli(['run', 'pr', '--title', 'Clean Open Pr Review', '--json'], created.worktreePath, env);
+    const review = JSON.parse(runCli(['run', 'review', '--dry-run', '--json'], created.worktreePath).stdout);
+    writeFileSync(review.evidencePath, `${JSON.stringify({ schemaVersion: 1, records: [] }, null, 2)}\n`, 'utf8');
+
+    const result = runCli(['run', 'pr', '--json'], created.worktreePath, env, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /review gate evidence is not ready/);
+    assert.match(result.stderr, /no review run has been recorded/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
 test('destination routes surface stale base before route confirmation or child steps', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
@@ -8068,6 +8383,7 @@ test('pr blocks denied paths and --force-include overrides per-path', () => {
     writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'feature\n', 'utf8');
     writeFileSync(path.join(created.worktreePath, 'CLAUDE.md'), '# local\n', 'utf8');
     writeFileSync(path.join(created.worktreePath, '.env'), 'TOKEN=secret\n', 'utf8');
+    writePassingReviewEvidence(created.worktreePath);
 
     const blocked = runCli(['run', 'pr', '--title', 'Deny Guard', '--json'], created.worktreePath, env, true);
     assert.equal(blocked.status, 1);
@@ -18348,6 +18664,91 @@ test('api route actions reject conflicting task, pr, and sha identities', () => 
   }
 });
 
+test('api route actions block missing review evidence before route confirmation', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.buildMode = { ...config.buildMode, autoDeployOnMerge: false };
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Route Review Missing', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'route review missing\n', 'utf8');
+
+    const result = runCli(
+      [
+        'run', 'api', 'action', 'route.merge',
+        '--task', 'Route Review Missing',
+        '--title', 'Route Review Missing',
+      ],
+      created.worktreePath,
+      {},
+      true,
+    );
+    assert.equal(result.status, 1);
+    const envelope = JSON.parse(result.stdout);
+    assert.equal(envelope.data.preflight.allowed, false);
+    assert.equal(envelope.data.preflight.state, 'blocked');
+    assert.equal(envelope.data.preflight.confirmation, null);
+    assert.match(envelope.data.preflight.reason, /\/pr blocked because review gate evidence is not ready/);
+    assert.match(envelope.data.preflight.reason, /no review run has been recorded/);
+    assert.equal(envelope.data.preflight.issues[0].status, 'missing');
+    assert.match(envelope.data.preflight.issues[0].message, /no review run has been recorded/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('api route actions re-check review evidence at execute time', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(fakeBin, 'gh-state.json');
+  writeFakeGh(fakeBin, ghStateFile);
+  const env = { PATH: `${fakeBin}:${process.env.PATH}`, GH_STATE_FILE: ghStateFile };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.buildMode = { ...config.buildMode, autoDeployOnMerge: false };
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Route Review Drift', '--json'], repoRoot).stdout);
+    const featurePath = path.join(created.worktreePath, 'feature.txt');
+    writeFileSync(featurePath, 'route reviewed\n', 'utf8');
+    writePassingReviewEvidence(created.worktreePath);
+
+    const routeArgs = [
+      'run', 'api', 'action', 'route.merge',
+      '--task', 'Route Review Drift',
+      '--title', 'Route Review Drift',
+    ];
+    const preflight = JSON.parse(runCli(routeArgs, created.worktreePath, env).stdout);
+    const token = preflight.data.preflight.confirmation.token;
+    assert.ok(token);
+
+    writeFileSync(featurePath, 'changed after route preflight\n', 'utf8');
+    const executed = runCli(
+      [...routeArgs, '--execute', '--confirm-token', token],
+      created.worktreePath,
+      env,
+      true,
+    );
+    assert.equal(executed.status, 1);
+    const envelope = JSON.parse(executed.stdout);
+    assert.equal(envelope.data.preflight.allowed, false);
+    assert.match(envelope.data.preflight.reason, /different worktree state/);
+    const ghState = existsSync(ghStateFile) ? JSON.parse(readFileSync(ghStateFile, 'utf8')) : { prs: {} };
+    assert.equal(Object.keys(ghState.prs ?? {}).length, 0);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
 test('api route actions forward approved PR title and message into the PR child', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
@@ -18364,6 +18765,7 @@ test('api route actions forward approved PR title and message into the PR child'
     commitAll(repoRoot, 'Adopt pipelane');
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Route Metadata', '--json'], repoRoot).stdout);
     writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'route metadata\n', 'utf8');
+    writePassingReviewEvidence(created.worktreePath);
 
     const routeArgs = [
       'run', 'api', 'action', 'route.merge',

@@ -4,7 +4,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, r
 import os from 'node:os';
 import path from 'node:path';
 
-import { computeUrlFingerprint, resolveProbeStateKey, verifySignedPayload } from './integrity.ts';
+import { computeUrlFingerprint, resolveProbeStateKey, resolveReviewStateKey, signSignedPayload, verifySignedPayload } from './integrity.ts';
 import { buildDefaultReviewGatesConfig, buildReviewGatesConfigForPreset } from './review-gates.ts';
 
 export type Mode = 'build' | 'release';
@@ -358,7 +358,11 @@ export interface ReviewRunRecord {
   finishedAt: string;
   durationMs: number;
   changedFiles: string[];
+  worktreeStatusDigest?: string;
+  worktreeStatusReliable?: boolean;
+  worktreeStatusWarnings?: string[];
   gates: ReviewGateRunRecord[];
+  signature?: string;
 }
 
 export interface ReviewState {
@@ -2222,8 +2226,10 @@ export function appendActionRunRecord(commonDir: string, config: WorkflowConfig,
 
 export function loadReviewState(commonDir: string, config: WorkflowConfig): ReviewState {
   const raw = readVersionedJsonFile<ReviewState>('reviewState', commonDir, config, reviewStatePath(commonDir, config), { records: [] });
+  const stateKey = resolveReviewStateKey();
   const records = Array.isArray(raw?.records)
     ? raw.records.filter(isReviewRunRecord).slice(0, REVIEW_STATE_MAX_RECORDS)
+      .filter((record) => !stateKey || verifySignedPayload(record, stateKey))
     : [];
   return { records };
 }
@@ -2239,9 +2245,13 @@ export function appendReviewRunRecord(commonDir: string, config: WorkflowConfig,
   const lock = acquireReviewStateLock(commonDir, config);
   try {
     const state = loadReviewState(commonDir, config);
-    state.records = [record, ...state.records].slice(0, REVIEW_STATE_MAX_RECORDS);
+    const stateKey = resolveReviewStateKey();
+    const persisted = stateKey
+      ? { ...record, signature: signSignedPayload(record, stateKey) }
+      : record;
+    state.records = [persisted, ...state.records].slice(0, REVIEW_STATE_MAX_RECORDS);
     saveReviewState(commonDir, config, state);
-    return record;
+    return persisted;
   } finally {
     lock.release();
   }
@@ -2265,6 +2275,16 @@ function isReviewRunRecord(value: unknown): value is ReviewRunRecord {
     && typeof raw.durationMs === 'number'
     && Array.isArray(changedFiles)
     && changedFiles.every((entry) => typeof entry === 'string')
+    && (raw.worktreeStatusDigest === undefined || typeof raw.worktreeStatusDigest === 'string')
+    && (raw.worktreeStatusReliable === undefined || typeof raw.worktreeStatusReliable === 'boolean')
+    && (raw.signature === undefined || typeof raw.signature === 'string')
+    && (
+      raw.worktreeStatusWarnings === undefined
+      || (
+        Array.isArray(raw.worktreeStatusWarnings)
+        && raw.worktreeStatusWarnings.every((entry) => typeof entry === 'string')
+      )
+    )
     && Array.isArray(gates)
     && gates.every(isReviewGateRunRecord);
 }

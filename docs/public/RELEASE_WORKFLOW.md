@@ -37,7 +37,8 @@ User-facing slash commands:
 | `/new` | Create a fresh task branch and worktree. The AI can infer the task name, or you can provide one. |
 | `/resume` | Recover an existing task worktree. |
 | `/repo-guard` | Verify that the checkout is safe for task work. |
-| `/pr` | Run pre-PR checks, commit, push, and open or update a PR. |
+| `/pipelane review` | Run configured review gates and write evidence for the current diff. |
+| `/pr` | Enforce review evidence, run pre-PR checks, commit, push, and open or update a PR. |
 | `/merge` | Merge the PR and record the merged SHA. |
 | `/deploy` | Deploy the merged SHA to `staging` or `prod`. |
 | `/clean` | Inspect and prune finished or stale task state. |
@@ -56,6 +57,7 @@ safely after merge and same-SHA staging validation is not required.
 ```text
 /devmode build
 /new
+/pipelane review
 /pr --title "PR title"
 /merge
 /clean
@@ -78,6 +80,7 @@ merged SHA before production moves.
 ```text
 /devmode release
 /new
+/pipelane review
 /pr --title "PR title"
 /merge
 /deploy staging
@@ -94,16 +97,16 @@ configuration, and `/doctor --probe` refreshes live healthcheck evidence.
 For current Pipelane flows, verification happens in this order:
 
 1. local implementation checks, run by the agent or developer
-2. `/pr` pre-PR checks from `.pipelane.json`
-3. review stack outside Pipelane, commonly gstack `/review` and `karpathy-diff`
+2. `/pipelane review` static gates, behavioral gates, AI review gates, runtime gates, and human gates
+3. `/pr` review-evidence enforcement plus pre-PR checks from `.pipelane.json`
 4. CI checks on the PR
 5. `/merge` SHA recording
 6. `/deploy staging` in release mode
 7. `/deploy prod`
 8. `/clean` only after task state is safe to close
 
-The planned orchestration layer makes this ordering more explicit by separating
-static gates, behavioral gates, AI review gates, runtime gates, and human gates.
+The orchestration foundation makes this ordering explicit by separating
+deterministic gates from AI/manual gates before PR handoff.
 See [Orchestration Roadmap](./ORCHESTRATION.md).
 
 ## Safe Defaults

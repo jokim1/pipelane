@@ -9,6 +9,7 @@ Parse `$ARGUMENTS` by whitespace. Evaluate only the first token.
 - Exactly equals `web` → **WEB BOARD MODE**. Strip the leading `web` token and pass the rest to `pipelane:board`.
 - Exactly equals `board` → **WEB BOARD MODE** compatibility alias. Strip the leading `board` token and pass the rest to `pipelane:board`.
 - Exactly equals `status` → **STATUS MODE**. Strip the leading `status` token and pass the rest to `pipelane:status`.
+- Exactly equals `review` → **REVIEW MODE**. Strip the leading `review` token and pass the rest to `pipelane:review`.
 - Exactly equals `update` → **UPDATE MODE**. Strip the leading `update` token and pass the rest to `pipelane:update`.
 - Anything else → **UNKNOWN MODE**. Do not run shell commands; show the journey overview plus `Unknown /pipelane subcommand: <token>`.
 
@@ -31,7 +32,8 @@ Fast path. Merge hands off to production deploy.
   {{ALIAS_STATUS}}               See what is already in flight.
   {{ALIAS_DEVMODE}} build        Set the repo to build mode. Usually set once, until you switch lanes.
   {{ALIAS_NEW}}                  Create a named task worktree from the described task.
-  {{ALIAS_PR}} --title "PR title"  Run pre-PR checks, commit, push, and open or update the PR.
+  /pipelane review              Run review gates and write evidence for the current diff.
+  {{ALIAS_PR}} --title "PR title"  Enforce review evidence, run checks, commit, push, and open or update the PR.
   {{ALIAS_MERGE}}                Merge the PR. In build mode, this hands off to the prod deploy path.
   {{ALIAS_SMOKE}} prod           Optional: run production-safe smoke checks if configured.
   {{ALIAS_CLEAN}}                Clean up finished task state after the release is complete.
@@ -42,7 +44,8 @@ Protected path. Promote the same merged SHA through staging, smoke, then prod.
   {{ALIAS_STATUS}}               See active tasks, deploy state, and release gates.
   {{ALIAS_DEVMODE}} release      Set the repo to release mode. Usually set once, until you switch lanes.
   {{ALIAS_NEW}}                  Create a named task worktree from the described task.
-  {{ALIAS_PR}} --title "PR title"  Run pre-PR checks, commit, push, and open or update the PR.
+  /pipelane review              Run review gates and write evidence for the current diff.
+  {{ALIAS_PR}} --title "PR title"  Enforce review evidence, run checks, commit, push, and open or update the PR.
   {{ALIAS_MERGE}}                Merge the PR and record the merged SHA.
   {{ALIAS_DEPLOY}} staging       Deploy the merged SHA to staging.
   {{ALIAS_SMOKE}} staging        Run or verify staging smoke checks.
@@ -110,6 +113,20 @@ npm run pipelane:status -- $REST
 where `$REST` is `$ARGUMENTS` with the leading `status` token stripped.
 
 Use this path for `/pipelane status`, `/pipelane status --json`, `/pipelane status --week`, `/pipelane status --stuck`, and `/pipelane status --blast <sha>`. Display the output directly.
+
+---
+
+## REVIEW MODE
+
+Run:
+
+```bash
+npm run pipelane:review -- $REST
+```
+
+where `$REST` is `$ARGUMENTS` with the leading `review` token stripped.
+
+Use this path for `/pipelane review`, `/pipelane review --json`, `/pipelane review --dry-run`, `/pipelane review --gate <id>`, `/pipelane review --phase <phase>`, and `/pipelane review setup ...`. Display the output directly.
 
 ---
 

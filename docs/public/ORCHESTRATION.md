@@ -122,8 +122,9 @@ User-facing commands:
 `/pipelane review setup` configures the gate stack. The implementation
 supports preset selection, printing the effective config, and listing the gate
 catalog with detected or missing scripts. `/pipelane review` runs the
-configured gates against the current diff and writes evidence. `/pr` will run
-configured blocking review gates before PR handoff.
+configured gates against the current diff and writes evidence. `/pr` enforces
+fresh, unfiltered evidence for the current branch, HEAD, and worktree state
+before commit, push, or PR handoff.
 
 Plain `/pipelane setup` remains repo/bootstrap setup. Do not use
 `/pipelane setup review-gates`.
@@ -337,9 +338,11 @@ The bounded ledger records the latest runs with branch, SHA, preset, changed
 files, gate order, skipped gates and skip reasons, command or skill result,
 timeout status, output tails, and final blocking/advisory verdict.
 
-`/pr` must run blocking configured review gates before commit, push, or PR
-handoff. A failed blocking gate stops `/pr`. A skipped or unavailable optional
-gate records a warning, not a crash.
+`/pr` enforces blocking configured review gates before commit, push, or PR
+handoff. A failed or pending blocking gate stops `/pr`. Evidence must be for
+the current branch, HEAD, and worktree state, and cannot come from a dry-run or
+filtered review. A skipped or unavailable optional gate records a warning, not a
+crash.
 
 ## Orchestration Ledger
 
@@ -397,10 +400,9 @@ Do not add:
 3. Done: implement `/pipelane review setup`.
 4. Done: implement `/pipelane review` runner and review-gate evidence ledger.
 5. Done: add board/API read-only visibility for review-gate runs.
-6. Next: wire blocking review gates into `/pr`.
-7. Add docs, tests, and generated template updates.
-8. Add provider-neutral `GoalSpec` generation for future slice execution.
-9. Build full `/orchestrate` slice execution on top of this foundation later.
+6. Done: wire blocking review gates into `/pr`.
+7. Next: add provider-neutral `GoalSpec` generation for future slice execution.
+8. Build full `/orchestrate` slice execution on top of this foundation later.
 
 ## Acceptance Criteria
 
@@ -425,5 +427,5 @@ Do not add:
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | not run | Recommended before board UI implementation. |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | not run | Optional; useful before shipping setup UX. |
 
-- **UNRESOLVED:** Worktree conflict model, provider adapter contract, human-gate execution, `/pr` review-gate enforcement, and gate-runner trusted-baseline semantics still need implementation-level detail before full `/orchestrate`.
-- **VERDICT:** ENG CLEARED for Slices 1 and 2. Slice 3 review runner is implemented; next proceed to `/pr` enforcement on top of the review evidence ledger.
+- **UNRESOLVED:** Worktree conflict model, provider adapter contract, human-gate execution, and full gate-runner trusted-baseline semantics still need implementation-level detail before full `/orchestrate`.
+- **VERDICT:** ENG CLEARED for Slices 1 and 2. Review runner and `/pr` enforcement are implemented; next proceed to provider-neutral `GoalSpec` generation.
