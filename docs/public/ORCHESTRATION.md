@@ -230,13 +230,16 @@ Provider adapters render `GoalSpec` into native `/goal` prompts when available:
 Current implementation surface:
 
 ```text
+/pipelane orchestrate plan --plan-file docs/plan.md
 /pipelane orchestrate goal-spec --plan-file docs/plan.md
 /pipelane orchestrate goal-spec --outcome "Implement review gate enforcement"
 /pipelane orchestrate goal-spec --provider codex --json
 ```
 
-This drafts the provider-neutral `GoalSpec`, compact confirmation prompt, and
-provider prompt. It does not create worktrees or run agents yet.
+`orchestrate plan` compiles an implementation plan into a durable orchestration
+ledger with slice records, provider-neutral `GoalSpec` prompts, a review-gate
+snapshot, and the source plan fingerprint. It does not create worktrees or run
+agents yet. `goal-spec` remains the single-slice draft-only command.
 
 ## Presets
 
@@ -413,7 +416,8 @@ Do not add:
 5. Done: add board/API read-only visibility for review-gate runs.
 6. Done: wire blocking review gates into `/pr`.
 7. Done: add provider-neutral `GoalSpec` generation for future slice execution.
-8. Next: build full `/orchestrate` slice execution on top of this foundation.
+8. Done: add durable `/pipelane orchestrate plan` ledger compilation.
+9. Next: build worktree/provider execution on top of the ledger.
 
 ## Acceptance Criteria
 
@@ -439,4 +443,4 @@ Do not add:
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | not run | Optional; useful before shipping setup UX. |
 
 - **UNRESOLVED:** Worktree conflict model, provider adapter execution, human-gate execution, and full gate-runner trusted-baseline semantics still need implementation-level detail before full `/orchestrate`.
-- **VERDICT:** ENG CLEARED for earlier slices. Review runner, `/pr` enforcement, and provider-neutral `GoalSpec` generation are implemented; next proceed to full slice execution.
+- **VERDICT:** ENG CLEARED for earlier slices. Review runner, `/pr` enforcement, provider-neutral `GoalSpec` generation, and durable ledger compilation are implemented; next proceed to worktree/provider execution.

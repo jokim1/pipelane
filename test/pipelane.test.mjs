@@ -2591,6 +2591,7 @@ test('pipelane.md documents exact first-token routing for subcommands', () => {
   assert.match(template, /npm run pipelane:review -- \$REST/);
   assert.match(template, /Exactly equals `orchestrate`/);
   assert.match(template, /npm run pipelane:orchestrate -- \$REST/);
+  assert.match(template, /\/pipelane orchestrate plan --plan-file <path>/);
   assert.match(template, /Exactly equals `update`/);
   assert.match(template, /No prefix matching/);
   assert.match(template, /`\/pipelane update-this-thing` routes to UNKNOWN MODE, not UPDATE MODE/);
@@ -3887,6 +3888,19 @@ test('durable Codex runner dispatches /pipelane orchestrate goal-spec', () => {
     ).trim();
 
     assert.equal(output, 'MANAGED:1:run orchestrate goal-spec --slice-id demo-slice');
+
+    const planOutput = execFileSync(
+      path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      ['pipelane', 'orchestrate', 'plan', '--outcome', 'Demo plan'],
+      {
+        cwd: repoRoot,
+        env: { ...process.env, CODEX_HOME: codexHome },
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    ).trim();
+
+    assert.equal(planOutput, 'MANAGED:1:run orchestrate plan --outcome Demo plan');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -4719,46 +4733,411 @@ test('orchestrate goal-spec rejects invalid command forms', () => {
 
     const invalidSubcommand = runCli(['run', 'orchestrate', 'nope'], repoRoot, {}, true);
     assert.notEqual(invalidSubcommand.status, 0);
-    assert.match(invalidSubcommand.stderr, /orchestrate requires exactly: pipelane run orchestrate goal-spec/);
+    assert.match(invalidSubcommand.stderr, /orchestrate requires exactly: pipelane run orchestrate <goal-spec\|plan>/);
 
     const extraPositional = runCli(['run', 'orchestrate', 'goal-spec', 'extra'], repoRoot, {}, true);
     assert.notEqual(extraPositional.status, 0);
     assert.match(extraPositional.stderr, /orchestrate goal-spec requires exactly/);
 
+    const missingPlanInput = runCli(['run', 'orchestrate', 'plan'], repoRoot, {}, true);
+    assert.notEqual(missingPlanInput.status, 0);
+    assert.match(missingPlanInput.stderr, /orchestrate plan requires --plan-file <path> or --outcome <text>/);
+
+    const extraPlanPositional = runCli(['run', 'orchestrate', 'plan', 'extra', '--outcome', 'Demo'], repoRoot, {}, true);
+    assert.notEqual(extraPlanPositional.status, 0);
+    assert.match(extraPlanPositional.stderr, /orchestrate plan requires exactly/);
+
     const invalidProvider = runCli(['run', 'orchestrate', 'goal-spec', '--provider', 'openai'], repoRoot, {}, true);
     assert.notEqual(invalidProvider.status, 0);
     assert.match(invalidProvider.stderr, /--provider must be one of: codex, claude, generic/);
+
+    const invalidPlanProvider = runCli(['run', 'orchestrate', 'plan', '--outcome', 'Demo', '--provider', 'openai'], repoRoot, {}, true);
+    assert.notEqual(invalidPlanProvider.status, 0);
+    assert.match(invalidPlanProvider.stderr, /--provider must be one of: codex, claude, generic/);
 
     const zeroTurns = runCli(['run', 'orchestrate', 'goal-spec', '--max-turns', '0'], repoRoot, {}, true);
     assert.notEqual(zeroTurns.status, 0);
     assert.match(zeroTurns.stderr, /--max-turns requires a safe positive integer/);
 
+    const zeroPlanTurns = runCli(['run', 'orchestrate', 'plan', '--outcome', 'Demo', '--max-turns', '0'], repoRoot, {}, true);
+    assert.notEqual(zeroPlanTurns.status, 0);
+    assert.match(zeroPlanTurns.stderr, /--max-turns requires a safe positive integer/);
+
     const nonNumericMinutes = runCli(['run', 'orchestrate', 'goal-spec', '--max-minutes', 'soon'], repoRoot, {}, true);
     assert.notEqual(nonNumericMinutes.status, 0);
     assert.match(nonNumericMinutes.stderr, /--max-minutes requires a safe positive integer/);
+
+    const nonNumericPlanMinutes = runCli(['run', 'orchestrate', 'plan', '--outcome', 'Demo', '--max-minutes', 'soon'], repoRoot, {}, true);
+    assert.notEqual(nonNumericPlanMinutes.status, 0);
+    assert.match(nonNumericPlanMinutes.stderr, /--max-minutes requires a safe positive integer/);
 
     const missingPlan = runCli(['run', 'orchestrate', 'goal-spec', '--plan-file', 'docs/missing.md'], repoRoot, {}, true);
     assert.notEqual(missingPlan.status, 0);
     assert.match(missingPlan.stderr, /--plan-file not found: docs\/missing\.md/);
 
+    const missingPlanForLedger = runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/missing.md'], repoRoot, {}, true);
+    assert.notEqual(missingPlanForLedger.status, 0);
+    assert.match(missingPlanForLedger.stderr, /--plan-file not found: docs\/missing\.md/);
+
     const absoluteOutsidePlan = runCli(['run', 'orchestrate', 'goal-spec', '--plan-file', outsidePlan], repoRoot, {}, true);
     assert.notEqual(absoluteOutsidePlan.status, 0);
     assert.match(absoluteOutsidePlan.stderr, /--plan-file must stay inside the repo/);
+
+    const absoluteOutsidePlanForLedger = runCli(['run', 'orchestrate', 'plan', '--plan-file', outsidePlan], repoRoot, {}, true);
+    assert.notEqual(absoluteOutsidePlanForLedger.status, 0);
+    assert.match(absoluteOutsidePlanForLedger.stderr, /--plan-file must stay inside the repo/);
 
     const symlinkOutsidePlan = runCli(['run', 'orchestrate', 'goal-spec', '--plan-file', 'docs/outside-plan.md'], repoRoot, {}, true);
     assert.notEqual(symlinkOutsidePlan.status, 0);
     assert.match(symlinkOutsidePlan.stderr, /--plan-file must stay inside the repo/);
 
+    const symlinkOutsidePlanForLedger = runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/outside-plan.md'], repoRoot, {}, true);
+    assert.notEqual(symlinkOutsidePlanForLedger.status, 0);
+    assert.match(symlinkOutsidePlanForLedger.stderr, /--plan-file must stay inside the repo/);
+
     const directoryPlan = runCli(['run', 'orchestrate', 'goal-spec', '--plan-file', 'docs/plan-dir'], repoRoot, {}, true);
     assert.notEqual(directoryPlan.status, 0);
     assert.match(directoryPlan.stderr, /--plan-file must point to a regular file/);
 
+    const directoryPlanForLedger = runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/plan-dir'], repoRoot, {}, true);
+    assert.notEqual(directoryPlanForLedger.status, 0);
+    assert.match(directoryPlanForLedger.stderr, /--plan-file must point to a regular file/);
+
     const largePlan = runCli(['run', 'orchestrate', 'goal-spec', '--plan-file', 'docs/large-plan.md'], repoRoot, {}, true);
     assert.notEqual(largePlan.status, 0);
     assert.match(largePlan.stderr, /--plan-file is too large/);
+
+    const largePlanForLedger = runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/large-plan.md'], repoRoot, {}, true);
+    assert.notEqual(largePlanForLedger.status, 0);
+    assert.match(largePlanForLedger.stderr, /--plan-file is too large/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(outsidePlan, { force: true });
+  }
+});
+
+test('orchestrate plan writes a durable slice ledger from a plan file', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    const customPlanGates = [
+      {
+        id: 'plan-eng-review',
+        phase: 'plan',
+        type: 'skill',
+        blocking: true,
+        skill: '/plan-eng-review',
+        when: 'before:implementation',
+      },
+    ];
+    const customGates = [
+      {
+        id: 'custom-static',
+        phase: 'static',
+        type: 'command',
+        blocking: true,
+        command: 'npm run custom-static',
+        timeoutMs: 1234,
+        whenChanged: ['src/**'],
+      },
+    ];
+    config.prPathDenyList = ['secrets/**'];
+    config.orchestrate = {
+      maxConcurrentSlices: 3,
+      goalMode: {
+        default: 'auto',
+        maxTurns: 9,
+        maxMinutes: 45,
+        requireConfirmationFor: ['prod'],
+      },
+      hardStops: {
+        maxIterationsPerSlice: 2,
+        maxMinutesPerSlice: 20,
+      },
+    };
+    config.reviewGates = {
+      preset: 'standard',
+      planReview: { gates: customPlanGates },
+      gates: customGates,
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+
+    const planPath = path.join(repoRoot, 'docs', 'orchestrate-plan.md');
+    mkdirSync(path.dirname(planPath), { recursive: true });
+    const planText = [
+      '# Orchestrate Ledger Plan',
+      '',
+      '## Global Constraints',
+      '- Do not touch `secrets/prod.env`',
+      '',
+      '## Slice 1: Goal compiler',
+      '',
+      '### Acceptance Criteria',
+      '- Update `src/operator/orchestration-ledger.ts`',
+      '- Persist the ledger under `.git/pipelane-state`',
+      '',
+      '### Step 1: Parser details',
+      '- Keep nested step headings inside the parent slice',
+      '',
+      '## Slice 2: Board visibility',
+      '',
+      '### Acceptance Criteria',
+      '- Update `src/dashboard/public/index.html`',
+      '- Document the route in `templates/.claude/commands/pipelane.md`',
+      '- Ignore `https://example.com/docs` as a URL, not a repo path',
+      '',
+      '## Slice 3: Board visibility',
+      '',
+      '### Acceptance Criteria',
+      '- Update `docs/public/ORCHESTRATION.md`',
+      '- Keep `.git/pipelane-state` as state evidence, not an owned file path',
+    ].join('\n') + '\n';
+    writeFileSync(planPath, planText, 'utf8');
+    const worktreeListBefore = run('git', ['worktree', 'list', '--porcelain'], repoRoot);
+
+    const result = runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/orchestrate-plan.md',
+      '--provider',
+      'generic',
+      '--json',
+    ], repoRoot);
+    const report = JSON.parse(result.stdout);
+    const ledgerPath = report.ledgerPath;
+    const onDisk = JSON.parse(readFileSync(ledgerPath, 'utf8'));
+    const installMarker = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'installed.json'), 'utf8'));
+    const worktreeListAfter = run('git', ['worktree', 'list', '--porcelain'], repoRoot);
+
+    assert.equal(report.command, 'orchestrate plan');
+    assert.equal(report.status, 'planned');
+    assert.equal(report.sliceCount, 3);
+    assert.match(report.runId, /^orchestrate-\d{14}-[a-f0-9]{8}$/);
+    assert.equal(realpathSync(report.planPath), realpathSync(planPath));
+    assert.equal(onDisk.schemaVersion, 1);
+    assert.equal(onDisk.id, report.runId);
+    assert.equal(onDisk.status, 'planned');
+    assert.equal(onDisk.source.planPath, 'docs/orchestrate-plan.md');
+    assert.equal(onDisk.source.textSha256, createHash('sha256').update(planText).digest('hex'));
+    assert.equal(onDisk.plan.title, 'Orchestrate Ledger Plan');
+    assert.equal(onDisk.plan.outcome, null);
+    assert.equal(onDisk.plan.dependencyPolicy, 'sequential');
+    assert.equal(onDisk.gateSnapshot.preset, 'standard');
+    assert.deepEqual(onDisk.configSnapshot, {
+      maxConcurrentSlices: 3,
+      goalMode: {
+        default: 'auto',
+        maxTurns: 9,
+        maxMinutes: 45,
+        requireConfirmationFor: ['prod'],
+      },
+      hardStops: {
+        maxIterationsPerSlice: 2,
+        maxMinutesPerSlice: 20,
+      },
+    });
+    assert.deepEqual(onDisk.gateSnapshot.planReview.gates, customPlanGates);
+    assert.deepEqual(onDisk.gateSnapshot.gates, customGates);
+    assert.equal(onDisk.slices.length, 3);
+    assert.equal(onDisk.slices[0].id, 'goal-compiler');
+    assert.equal(onDisk.slices[0].provider, 'generic');
+    assert.deepEqual(onDisk.slices[0].forbiddenFiles, ['secrets/**']);
+    assert.equal(onDisk.slices[0].requestedFiles.includes('src/operator/orchestration-ledger.ts'), true);
+    assert.equal(onDisk.slices[0].goalSpec.finishLine.includes('Keep nested step headings inside the parent slice'), true);
+    assert.equal(onDisk.slices[0].goalSpec.finishLine.includes('Do not touch `secrets/prod.env`'), true);
+    assert.equal(onDisk.slices[1].id, 'board-visibility');
+    assert.deepEqual(onDisk.slices[1].dependsOn, ['goal-compiler']);
+    assert.equal(onDisk.slices[1].goalSpec.finishLine.includes('Do not touch `secrets/prod.env`'), true);
+    assert.equal(onDisk.slices[1].requestedFiles.includes('src/dashboard/public/index.html'), true);
+    assert.equal(onDisk.slices[1].requestedFiles.includes('templates/.claude/commands/pipelane.md'), true);
+    assert.equal(onDisk.slices[1].requestedFiles.includes('https:/example.com/docs'), false);
+    assert.equal(onDisk.slices[2].id, 'board-visibility-2');
+    assert.deepEqual(onDisk.slices[2].dependsOn, ['board-visibility']);
+    assert.equal(onDisk.slices[2].requestedFiles.includes('docs/public/ORCHESTRATION.md'), true);
+    assert.equal(onDisk.slices[2].requestedFiles.some((entry) => entry.startsWith('.git')), false);
+    assert.equal(onDisk.slices.every((slice) => slice.worktreePath === null && slice.branchName === null), true);
+    assert.equal(worktreeListAfter, worktreeListBefore);
+    assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks')), false);
+    assert.equal(installMarker.stateFiles.some((entry) => entry.endsWith('/orchestration.json')), true);
+    assert.match(report.message, /Next: review the generated GoalSpec prompts/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate plan supports a single outcome slice without a plan file', () => {
+  const repoRoot = createRepo();
+  try {
+    const result = runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--slice-id',
+      'docs-ledger',
+      '--outcome',
+      'Update orchestration docs',
+      '--json',
+    ], repoRoot);
+    const report = JSON.parse(result.stdout);
+    const onDisk = JSON.parse(readFileSync(report.ledgerPath, 'utf8'));
+
+    assert.equal(report.sliceCount, 1);
+    assert.equal(report.planPath, null);
+    assert.equal(onDisk.source.prompt, 'Update orchestration docs');
+    assert.equal(onDisk.source.textSha256, null);
+    assert.equal(onDisk.plan.title, 'Update orchestration docs');
+    assert.equal(onDisk.plan.outcome, 'Update orchestration docs');
+    assert.equal(onDisk.slices[0].id, 'docs-ledger');
+    assert.equal(onDisk.slices[0].goalSpec.outcome, 'Update orchestration docs');
+    assert.deepEqual(onDisk.slices[0].goalSpec.finishLine, [
+      'Update orchestration docs',
+      'Update affected tests, docs, templates, or generated surfaces',
+      'Run relevant static and behavioral verification before handoff',
+    ]);
+    assert.deepEqual(onDisk.slices[0].critique, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate plan preserves prose-only global context in slice goals', () => {
+  const repoRoot = createRepo();
+  try {
+    const planPath = path.join(repoRoot, 'docs', 'prose-plan.md');
+    mkdirSync(path.dirname(planPath), { recursive: true });
+    writeFileSync(planPath, [
+      '# Prose Plan',
+      '',
+      '## Global Constraints',
+      'Do not touch production credentials.',
+      '',
+      '## Slice 1: Prose-only slice',
+      'Implement the prose-only slice.',
+    ].join('\n') + '\n', 'utf8');
+
+    const report = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/prose-plan.md', '--json'], repoRoot).stdout);
+    const finishLine = report.run.slices[0].goalSpec.finishLine;
+
+    assert.equal(finishLine.includes('Do not touch production credentials'), true);
+    assert.equal(finishLine.includes('Implement the prose-only slice'), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate plan preserves slice prose when global context has bullets', () => {
+  const repoRoot = createRepo();
+  try {
+    const planPath = path.join(repoRoot, 'docs', 'mixed-prose-plan.md');
+    mkdirSync(path.dirname(planPath), { recursive: true });
+    writeFileSync(planPath, [
+      '# Mixed Prose Plan',
+      '',
+      '## Global Constraints',
+      '- Keep the ledger planning-only',
+      '',
+      '## Slice 1: Mixed prose slice',
+      'Implement the mixed prose slice objective.',
+    ].join('\n') + '\n', 'utf8');
+
+    const report = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/mixed-prose-plan.md', '--json'], repoRoot).stdout);
+    const finishLine = report.run.slices[0].goalSpec.finishLine;
+
+    assert.equal(finishLine.includes('Keep the ledger planning-only'), true);
+    assert.equal(finishLine.includes('Implement the mixed prose slice objective'), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate plan run records isolate config snapshots from later mutation', async () => {
+  const repoRoot = createRepo();
+  try {
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const ledgerMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'orchestration-ledger.ts'));
+    const config = stateMod.defaultWorkflowConfig('demo', 'Demo', { repoRoot });
+    config.orchestrate = {
+      maxConcurrentSlices: 2,
+      goalMode: { default: 'auto', maxTurns: 5, maxMinutes: 20, requireConfirmationFor: ['prod'] },
+      hardStops: { maxIterationsPerSlice: 2, maxMinutesPerSlice: 30 },
+    };
+    config.reviewGates = {
+      preset: 'standard',
+      planReview: {
+        gates: [{ id: 'plan-check', phase: 'plan', type: 'skill', blocking: true, skill: '/plan-eng-review' }],
+      },
+      gates: [{ id: 'static-check', phase: 'static', type: 'command', blocking: true, command: 'npm run typecheck' }],
+    };
+
+    const record = ledgerMod.buildOrchestrationRunRecord({
+      repoRoot,
+      config,
+      outcome: 'Snapshot custom review gates',
+    });
+
+    config.orchestrate.goalMode.maxTurns = 99;
+    config.orchestrate.hardStops.maxMinutesPerSlice = 99;
+    config.reviewGates.planReview.gates[0].id = 'mutated-plan-check';
+    config.reviewGates.gates[0].id = 'mutated-static-check';
+
+    assert.equal(record.configSnapshot.goalMode.maxTurns, 5);
+    assert.equal(record.configSnapshot.hardStops.maxMinutesPerSlice, 30);
+    assert.equal(record.gateSnapshot.planReview.gates[0].id, 'plan-check');
+    assert.equal(record.gateSnapshot.gates[0].id, 'static-check');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate plan keeps run and slice identifiers execution-safe', () => {
+  const repoRoot = createRepo();
+  try {
+    const longTitle = `This slice title is intentionally very long ${'repeat '.repeat(30)}`.trim();
+    const planPath = path.join(repoRoot, 'docs', 'long-plan.md');
+    mkdirSync(path.dirname(planPath), { recursive: true });
+    writeFileSync(planPath, [
+      '# Long Slice Plan',
+      '',
+      `## Slice 1: ${longTitle}`,
+      '- First duplicate slice',
+      '',
+      `## Slice 2: ${longTitle}`,
+      '- Second duplicate slice',
+      '',
+      '## Slice 3: Foo 2',
+      '- Natural suffixed slice',
+      '',
+      '## Slice 4: Foo',
+      '- Generated suffix must not collide',
+    ].join('\n') + '\n', 'utf8');
+
+    const first = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/long-plan.md',
+      '--outcome',
+      'Ship durable orchestration ledger',
+      '--json',
+    ], repoRoot).stdout);
+    const second = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/long-plan.md', '--json'], repoRoot).stdout);
+    const sliceIds = first.run.slices.map((slice) => slice.id);
+
+    assert.notEqual(first.runId, second.runId);
+    assert.equal(first.run.plan.title, 'Ship durable orchestration ledger');
+    assert.equal(first.run.plan.outcome, 'Ship durable orchestration ledger');
+    assert.equal(first.run.slices.length, 4);
+    assert.equal(new Set(sliceIds).size, sliceIds.length);
+    assert.equal(first.run.slices.every((slice) => slice.id.length <= 128), true);
+    assert.deepEqual(first.run.slices[1].dependsOn, [first.run.slices[0].id]);
+    assert.equal(first.run.slices[0].goalSpec.finishLine.includes('Ship durable orchestration ledger'), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
   }
 });
 

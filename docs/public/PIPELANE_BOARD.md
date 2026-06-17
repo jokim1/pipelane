@@ -79,7 +79,7 @@ Shows the quick Pipelane guide:
 - build journey slash commands
 - release journey slash commands
 - static, behavioral, AI, runtime, and human review gate order
-- planned orchestration layer notes
+- orchestration layer notes
 - helpful anytime commands
 - `/fix` and `/fix rethink`
 - `/pipelane web`, `/pipelane status`, and `/pipelane update --check`
@@ -89,9 +89,11 @@ slash command names only when alias config cannot be loaded.
 
 ## Orchestration Roadmap
 
-`/orchestrate` is planned but not shipped. When it lands, the board should add
-read-only visibility for orchestration runs without changing the existing
-branch, PR, deploy, rollback, and cleanup model.
+`/pipelane orchestrate goal-spec` and `/pipelane orchestrate plan` are shipped
+as planning surfaces: they draft provider-neutral goals and write durable slice
+ledgers, but they do not run workers yet. The board should add read-only
+visibility for orchestration runs without changing the existing branch, PR,
+deploy, rollback, and cleanup model.
 
 The planned orchestration panel should show:
 

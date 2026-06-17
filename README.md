@@ -492,9 +492,13 @@ a native `/goal` prompt.
 Draft a goal from a plan without starting execution:
 
 ```text
+/pipelane orchestrate plan --plan-file docs/plan.md
 /pipelane orchestrate goal-spec --plan-file docs/plan.md
 /pipelane orchestrate goal-spec --outcome "Implement review gate enforcement" --provider claude
 ```
+
+`orchestrate plan` writes a durable slice ledger under Pipelane state. It does
+not create worktrees or run agents yet.
 
 The intended review order is:
 

@@ -755,6 +755,7 @@ export const STATE_SCHEMA_VERSIONS = {
   prState: 1,
   actionState: 1,
   reviewState: 1,
+  orchestrationRun: 1,
   deployConfig: 1,
   taskLock: 1,
 } as const;
@@ -774,6 +775,7 @@ export const STATE_MIGRATIONS: Record<StateKind, Record<number, (raw: Record<str
   prState: {},
   actionState: {},
   reviewState: {},
+  orchestrationRun: {},
   deployConfig: {},
   taskLock: {},
 };
@@ -3250,8 +3252,8 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
     }
     case 'orchestrate': {
       const subcommand = parsed.positional[0] ?? '';
-      if (subcommand !== 'goal-spec') {
-        throw new Error('orchestrate requires exactly: pipelane run orchestrate goal-spec [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]');
+      if (subcommand !== 'goal-spec' && subcommand !== 'plan') {
+        throw new Error('orchestrate requires exactly: pipelane run orchestrate <goal-spec|plan> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]');
       }
       assertOnlyFlags(parsed, [
         'goalSliceId',
@@ -3262,7 +3264,10 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         'goalMaxMinutes',
       ]);
       if (parsed.positional.length !== 1) {
-        throw new Error('orchestrate goal-spec requires exactly: pipelane run orchestrate goal-spec [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]');
+        throw new Error(`orchestrate ${subcommand} requires exactly: pipelane run orchestrate ${subcommand} [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]`);
+      }
+      if (subcommand === 'plan' && !parsed.flags.goalPlanFile.trim() && !parsed.flags.goalOutcome.trim()) {
+        throw new Error('orchestrate plan requires --plan-file <path> or --outcome <text>.');
       }
       const provider = parsed.flags.goalProvider.trim();
       if (provider && !includesString(GOAL_PROVIDERS, provider)) {

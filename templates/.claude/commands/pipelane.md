@@ -61,8 +61,10 @@ Helpful anytime:
   {{ALIAS_ROLLBACK}} prod        Roll back production to the last verified-good deploy.
   /fix                           Fix bugs, review findings, CI failures, and code-quality issues.
   /fix rethink                   Plan a larger codebase restructure before changing code.
+  /pipelane orchestrate plan --plan-file <path>
+                                  Compile a plan into a durable slice ledger.
   /pipelane orchestrate goal-spec --plan-file <path>
-                                  Draft a provider-neutral GoalSpec from an implementation plan.
+                                  Draft one provider-neutral GoalSpec without writing a run ledger.
   /pipelane web                  Open the local Pipelane Board.
   /pipelane update --check       Check whether Pipelane itself has updates.
 ```
@@ -143,7 +145,7 @@ npm run pipelane:orchestrate -- $REST
 
 where `$REST` is `$ARGUMENTS` with the leading `orchestrate` token stripped.
 
-Use this path for `/pipelane orchestrate goal-spec --plan-file <path>`, `/pipelane orchestrate goal-spec --outcome "<text>"`, `/pipelane orchestrate goal-spec --provider codex`, and `/pipelane orchestrate goal-spec --json`. Display the output directly.
+Use this path for `/pipelane orchestrate plan --plan-file <path>`, `/pipelane orchestrate plan --outcome "<text>"`, `/pipelane orchestrate goal-spec --plan-file <path>`, `/pipelane orchestrate goal-spec --provider codex`, and `/pipelane orchestrate goal-spec --json`. Display the output directly.
 
 ---
 

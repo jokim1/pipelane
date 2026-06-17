@@ -6,6 +6,11 @@ import {
   type GoalSpecDraft,
 } from '../goal-spec.ts';
 import {
+  buildOrchestrationRunRecord,
+  saveOrchestrationRunRecord,
+  type OrchestrationRunRecord,
+} from '../orchestration-ledger.ts';
+import {
   DEFAULT_GOAL_PROVIDER,
   type GoalProvider,
   printResult,
@@ -30,13 +35,31 @@ interface OrchestrateGoalSpecReport {
   message: string;
 }
 
+interface OrchestratePlanReport {
+  command: 'orchestrate plan';
+  status: 'planned';
+  repoRoot: string;
+  runId: string;
+  ledgerPath: string;
+  planPath: string | null;
+  sliceCount: number;
+  confirmationRecommended: boolean;
+  run: OrchestrationRunRecord;
+  message: string;
+}
+
 export async function handleOrchestrate(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const subcommand = parsed.positional[0] ?? '';
-  if (subcommand !== 'goal-spec') {
-    throw new Error('orchestrate requires exactly: pipelane run orchestrate goal-spec [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--provider codex|claude|generic]');
+  if (subcommand === 'goal-spec') {
+    handleGoalSpec(cwd, parsed);
+    return;
+  }
+  if (subcommand === 'plan') {
+    handlePlan(cwd, parsed);
+    return;
   }
 
-  handleGoalSpec(cwd, parsed);
+  throw new Error('orchestrate requires exactly: pipelane run orchestrate <goal-spec|plan> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--provider codex|claude|generic]');
 }
 
 function handleGoalSpec(cwd: string, parsed: ParsedOperatorArgs): void {
@@ -66,6 +89,44 @@ function handleGoalSpec(cwd: string, parsed: ParsedOperatorArgs): void {
     critique: draft.critique,
     source: draft.source,
     message: renderGoalSpecReport(draft, planPath),
+  };
+
+  printResult(parsed.flags, report);
+}
+
+function handlePlan(cwd: string, parsed: ParsedOperatorArgs): void {
+  const context = resolveWorkflowContext(cwd);
+  const planPath = resolvePlanPath(context.repoRoot, parsed.flags.goalPlanFile);
+  const planText = planPath ? readPlanFile(planPath) : '';
+  const outcome = parsed.flags.goalOutcome.trim();
+  if (!planText.trim() && !outcome) {
+    throw new Error('orchestrate plan requires --plan-file <path> or --outcome <text>.');
+  }
+
+  const run = buildOrchestrationRunRecord({
+    repoRoot: context.repoRoot,
+    config: context.config,
+    planPath: planPath ?? undefined,
+    planText,
+    outcome,
+    sliceId: parsed.flags.goalSliceId,
+    provider: (parsed.flags.goalProvider.trim() as GoalProvider) || DEFAULT_GOAL_PROVIDER,
+    maxTurns: parsePositiveInteger(parsed.flags.goalMaxTurns),
+    maxMinutes: parsePositiveInteger(parsed.flags.goalMaxMinutes),
+  });
+  const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+  const confirmationRecommended = run.slices.some((slice) => slice.requiresConfirmation || slice.critique.length > 0);
+  const report: OrchestratePlanReport = {
+    command: 'orchestrate plan',
+    status: 'planned',
+    repoRoot: context.repoRoot,
+    runId: run.id,
+    ledgerPath,
+    planPath,
+    sliceCount: run.slices.length,
+    confirmationRecommended,
+    run,
+    message: renderPlanReport(run, ledgerPath, planPath, confirmationRecommended),
   };
 
   printResult(parsed.flags, report);
@@ -126,6 +187,43 @@ function renderGoalSpecReport(draft: GoalSpecDraft, planPath: string | null): st
 
   lines.push('', draft.confirmationPrompt);
   lines.push('', 'Provider prompt:', draft.providerPrompt);
+
+  return lines.join('\n');
+}
+
+function renderPlanReport(
+  run: OrchestrationRunRecord,
+  ledgerPath: string,
+  planPath: string | null,
+  confirmationRecommended: boolean,
+): string {
+  const lines = [
+    'Pipelane orchestrate plan',
+    '',
+    `Status: planned`,
+    `Run: ${run.id}`,
+    `Ledger: ${ledgerPath}`,
+    `Plan: ${planPath ?? run.source.prompt ?? '(outcome only)'}`,
+    `Slices: ${run.slices.length}`,
+  ];
+
+  if (confirmationRecommended) {
+    lines.push('Confirmation: recommended before execution');
+  }
+
+  lines.push('', 'Slice ledger:');
+  for (const slice of run.slices) {
+    const flags = [
+      slice.requiresConfirmation ? 'confirm' : '',
+      slice.critique.length > 0 ? 'critique' : '',
+    ].filter(Boolean);
+    lines.push(`- ${slice.id}: ${slice.outcome}${flags.length > 0 ? ` (${flags.join(', ')})` : ''}`);
+  }
+
+  lines.push(
+    '',
+    'Next: review the generated GoalSpec prompts, then run future slice execution from this ledger.',
+  );
 
   return lines.join('\n');
 }
