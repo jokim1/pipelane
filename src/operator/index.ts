@@ -8,6 +8,7 @@ import { handleDeploy } from './commands/deploy.ts';
 import { handleDoctor } from './commands/doctor.ts';
 import { handleMerge } from './commands/merge.ts';
 import { handleNew } from './commands/new.ts';
+import { handleOrchestrate } from './commands/orchestrate.ts';
 import { handlePr } from './commands/pr.ts';
 import { handleReleaseCheck } from './commands/release-check.ts';
 import { handleRepoGuard } from './commands/repo-guard.ts';
@@ -114,6 +115,11 @@ export async function runOperator(cwd: string, argv: string[]): Promise<void> {
     return;
   }
 
+  if (command === 'orchestrate') {
+    await handleOrchestrate(cwd, parsed);
+    return;
+  }
+
   if (command === 'status') {
     await handleStatus(cwd, parsed);
     return;
@@ -165,6 +171,7 @@ Pipelane commands:
   smoke
   review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human]
   review setup [--preset lean|standard|strict-production] [--print] [--list-gates]
+  orchestrate goal-spec [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]
   status
   doctor [--probe | --fix | --check-guard]
   rollback <staging|prod> [--surfaces ...] [--revert-pr]

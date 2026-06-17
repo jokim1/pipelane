@@ -10,6 +10,7 @@ Parse `$ARGUMENTS` by whitespace. Evaluate only the first token.
 - Exactly equals `board` → **WEB BOARD MODE** compatibility alias. Strip the leading `board` token and pass the rest to `pipelane:board`.
 - Exactly equals `status` → **STATUS MODE**. Strip the leading `status` token and pass the rest to `pipelane:status`.
 - Exactly equals `review` → **REVIEW MODE**. Strip the leading `review` token and pass the rest to `pipelane:review`.
+- Exactly equals `orchestrate` → **ORCHESTRATION MODE**. Strip the leading `orchestrate` token and pass the rest to `pipelane:orchestrate`.
 - Exactly equals `update` → **UPDATE MODE**. Strip the leading `update` token and pass the rest to `pipelane:update`.
 - Anything else → **UNKNOWN MODE**. Do not run shell commands; show the journey overview plus `Unknown /pipelane subcommand: <token>`.
 
@@ -60,6 +61,8 @@ Helpful anytime:
   {{ALIAS_ROLLBACK}} prod        Roll back production to the last verified-good deploy.
   /fix                           Fix bugs, review findings, CI failures, and code-quality issues.
   /fix rethink                   Plan a larger codebase restructure before changing code.
+  /pipelane orchestrate goal-spec --plan-file <path>
+                                  Draft a provider-neutral GoalSpec from an implementation plan.
   /pipelane web                  Open the local Pipelane Board.
   /pipelane update --check       Check whether Pipelane itself has updates.
 ```
@@ -127,6 +130,20 @@ npm run pipelane:review -- $REST
 where `$REST` is `$ARGUMENTS` with the leading `review` token stripped.
 
 Use this path for `/pipelane review`, `/pipelane review --json`, `/pipelane review --dry-run`, `/pipelane review --gate <id>`, `/pipelane review --phase <phase>`, and `/pipelane review setup ...`. Display the output directly.
+
+---
+
+## ORCHESTRATION MODE
+
+Run:
+
+```bash
+npm run pipelane:orchestrate -- $REST
+```
+
+where `$REST` is `$ARGUMENTS` with the leading `orchestrate` token stripped.
+
+Use this path for `/pipelane orchestrate goal-spec --plan-file <path>`, `/pipelane orchestrate goal-spec --outcome "<text>"`, `/pipelane orchestrate goal-spec --provider codex`, and `/pipelane orchestrate goal-spec --json`. Display the output directly.
 
 ---
 

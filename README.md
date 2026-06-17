@@ -489,6 +489,13 @@ drafts the finish line, proof to print, handoff summary, blocked policy, and
 budget; the user approves or edits the compact goal before Codex or Claude gets
 a native `/goal` prompt.
 
+Draft a goal from a plan without starting execution:
+
+```text
+/pipelane orchestrate goal-spec --plan-file docs/plan.md
+/pipelane orchestrate goal-spec --outcome "Implement review gate enforcement" --provider claude
+```
+
 The intended review order is:
 
 1. **Plan review:** product, design, engineering, security, or docs review before code.

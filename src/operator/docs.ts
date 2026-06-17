@@ -436,7 +436,17 @@ const REQUIRED_PACKAGE_SCRIPTS: Record<string, string> = {
   'pipelane:update': 'pipelane update',
   'pipelane:api': 'pipelane run api',
   'pipelane:review': 'pipelane run review',
+  'pipelane:orchestrate': 'pipelane run orchestrate',
 };
+
+const CLAUDE_COMMAND_PACKAGE_SCRIPTS = [
+  ...WORKFLOW_COMMANDS.map((cmd) => `pipelane:${cmd}`),
+  'pipelane:configure',
+  'pipelane:board',
+  'pipelane:update',
+  'pipelane:review',
+  'pipelane:orchestrate',
+];
 
 // Hard block against the npm-wipes-shared-deps footgun. Loads the standalone
 // CJS guard from pipelane's own published `scripts/` folder if present.
@@ -503,10 +513,7 @@ function assertPackageScriptConsistency(repoRoot: string, syncDocs: Required<Syn
     ? (JSON.parse(readFileSync(packageJsonPath, 'utf8')) as { scripts?: Record<string, string> })
     : {};
   const scripts = pkg.scripts ?? {};
-  // `pipelane:configure` lives outside WORKFLOW_COMMANDS, but `devmode.md`
-  // references it as the remediation path when release mode blocks.
-  const required = [...WORKFLOW_COMMANDS.map((cmd) => `pipelane:${cmd}`), 'pipelane:configure'];
-  const missing = required.filter((script) => typeof scripts[script] !== 'string');
+  const missing = CLAUDE_COMMAND_PACKAGE_SCRIPTS.filter((script) => typeof scripts[script] !== 'string');
   if (missing.length === 0) {
     return;
   }

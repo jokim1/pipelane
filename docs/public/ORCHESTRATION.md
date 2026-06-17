@@ -227,6 +227,17 @@ Provider adapters render `GoalSpec` into native `/goal` prompts when available:
 - Fallback: if native `/goal` is unavailable, use a normal prompt-loop with the
   same `GoalSpec`, but let Pipelane gates decide whether the slice is acceptable.
 
+Current implementation surface:
+
+```text
+/pipelane orchestrate goal-spec --plan-file docs/plan.md
+/pipelane orchestrate goal-spec --outcome "Implement review gate enforcement"
+/pipelane orchestrate goal-spec --provider codex --json
+```
+
+This drafts the provider-neutral `GoalSpec`, compact confirmation prompt, and
+provider prompt. It does not create worktrees or run agents yet.
+
 ## Presets
 
 `lean`:
@@ -401,8 +412,8 @@ Do not add:
 4. Done: implement `/pipelane review` runner and review-gate evidence ledger.
 5. Done: add board/API read-only visibility for review-gate runs.
 6. Done: wire blocking review gates into `/pr`.
-7. Next: add provider-neutral `GoalSpec` generation for future slice execution.
-8. Build full `/orchestrate` slice execution on top of this foundation later.
+7. Done: add provider-neutral `GoalSpec` generation for future slice execution.
+8. Next: build full `/orchestrate` slice execution on top of this foundation.
 
 ## Acceptance Criteria
 
@@ -427,5 +438,5 @@ Do not add:
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | not run | Recommended before board UI implementation. |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | not run | Optional; useful before shipping setup UX. |
 
-- **UNRESOLVED:** Worktree conflict model, provider adapter contract, human-gate execution, and full gate-runner trusted-baseline semantics still need implementation-level detail before full `/orchestrate`.
-- **VERDICT:** ENG CLEARED for Slices 1 and 2. Review runner and `/pr` enforcement are implemented; next proceed to provider-neutral `GoalSpec` generation.
+- **UNRESOLVED:** Worktree conflict model, provider adapter execution, human-gate execution, and full gate-runner trusted-baseline semantics still need implementation-level detail before full `/orchestrate`.
+- **VERDICT:** ENG CLEARED for earlier slices. Review runner, `/pr` enforcement, and provider-neutral `GoalSpec` generation are implemented; next proceed to full slice execution.

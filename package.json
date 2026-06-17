@@ -46,7 +46,8 @@
     "pipelane:board": "pipelane board",
     "pipelane:update": "pipelane update",
     "pipelane:api": "pipelane run api",
-    "pipelane:review": "pipelane run review"
+    "pipelane:review": "pipelane run review",
+    "pipelane:orchestrate": "pipelane run orchestrate"
   },
   "engines": {
     "node": ">=22.0.0"

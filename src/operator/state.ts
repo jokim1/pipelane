@@ -136,6 +136,25 @@ export interface ReviewGatesConfig {
   gates?: ReviewGateConfig[];
 }
 
+export type OrchestrateGoalConfirmationMode = 'confirm' | 'auto' | 'off';
+export const GOAL_PROVIDERS = ['codex', 'claude', 'generic'] as const;
+export type GoalProvider = (typeof GOAL_PROVIDERS)[number];
+export const DEFAULT_GOAL_PROVIDER: GoalProvider = 'codex';
+
+export interface OrchestrateConfig {
+  maxConcurrentSlices?: number;
+  goalMode?: {
+    default?: OrchestrateGoalConfirmationMode;
+    maxTurns?: number;
+    maxMinutes?: number;
+    requireConfirmationFor?: string[];
+  };
+  hardStops?: {
+    maxIterationsPerSlice?: number;
+    maxMinutesPerSlice?: number;
+  };
+}
+
 export interface WorkflowConfig {
   version: number;
   projectKey: string;
@@ -170,6 +189,7 @@ export interface WorkflowConfig {
   // land in the "other" bucket with a hint to configure the map.
   surfacePathMap?: Record<string, string[]>;
   reviewGates?: ReviewGatesConfig;
+  orchestrate?: OrchestrateConfig;
   smoke?: SmokeConfig;
 }
 
@@ -653,6 +673,12 @@ export interface OperatorFlags {
   reviewDryRun: boolean;
   reviewGate: string;
   reviewPhase: string;
+  goalSliceId: string;
+  goalOutcome: string;
+  goalPlanFile: string;
+  goalProvider: string;
+  goalMaxTurns: string;
+  goalMaxMinutes: string;
 }
 
 export interface ParsedOperatorArgs {
@@ -1037,6 +1063,18 @@ function mergeWorkflowLayers(
     if (overlay.checks) next.checks = { ...current.checks, ...overlay.checks };
     if (overlay.smoke) next.smoke = { ...current.smoke, ...overlay.smoke };
     if (overlay.surfacePathMap) next.surfacePathMap = { ...current.surfacePathMap, ...overlay.surfacePathMap };
+    if (isRecord(overlay.orchestrate)) {
+      next.orchestrate = {
+        ...current.orchestrate,
+        ...overlay.orchestrate,
+        goalMode: isRecord(overlay.orchestrate.goalMode)
+          ? { ...current.orchestrate?.goalMode, ...overlay.orchestrate.goalMode }
+          : current.orchestrate?.goalMode,
+        hardStops: isRecord(overlay.orchestrate.hardStops)
+          ? { ...current.orchestrate?.hardStops, ...overlay.orchestrate.hardStops }
+          : current.orchestrate?.hardStops,
+      };
+    }
     if (overlay.reviewGates) {
       const presetOverlay = hasOwn(overlay.reviewGates, 'preset');
       next.reviewGates = presetOverlay
@@ -1125,6 +1163,7 @@ export function normalizeWorkflowConfig(
     syncDocs: normalizeSyncDocsConfig(raw.syncDocs),
     surfacePathMap: normalizeSurfacePathMap(raw.surfacePathMap),
     reviewGates: normalizeReviewGatesConfig(raw.reviewGates, { repoRoot: options.repoRoot }),
+    orchestrate: normalizeOrchestrateConfig(raw.orchestrate),
     smoke: normalizeSmokeConfig(raw.smoke),
   };
 }
@@ -1133,6 +1172,37 @@ const REVIEW_GATE_PRESETS: readonly ReviewGatePreset[] = ['lean', 'standard', 's
 export const REVIEW_GATE_PHASES: readonly ReviewGatePhase[] = ['static', 'behavioral', 'ai-diff', 'instruction', 'runtime', 'human'];
 const REVIEW_GATE_TYPES: readonly ReviewGateType[] = ['command', 'skill', 'agent', 'approval', 'pipelane'];
 const REVIEW_PLAN_GATE_TYPES: readonly ReviewPlanGateConfig['type'][] = ['skill', 'agent', 'approval'];
+const ORCHESTRATE_GOAL_CONFIRMATION_MODES: readonly OrchestrateGoalConfirmationMode[] = ['confirm', 'auto', 'off'];
+
+function normalizeOrchestrateConfig(raw: OrchestrateConfig | undefined): OrchestrateConfig | undefined {
+  if (!isRecord(raw)) return undefined;
+
+  const goalMode = isRecord(raw.goalMode) ? raw.goalMode : undefined;
+  const hardStops = isRecord(raw.hardStops) ? raw.hardStops : undefined;
+  return {
+    maxConcurrentSlices: positiveConfigInteger(raw.maxConcurrentSlices),
+    goalMode: goalMode
+      ? {
+          default: includesString(ORCHESTRATE_GOAL_CONFIRMATION_MODES, goalMode.default)
+            ? goalMode.default
+            : undefined,
+          maxTurns: positiveConfigInteger(goalMode.maxTurns),
+          maxMinutes: positiveConfigInteger(goalMode.maxMinutes),
+          requireConfirmationFor: cleanStringList(goalMode.requireConfirmationFor),
+        }
+      : undefined,
+    hardStops: hardStops
+      ? {
+          maxIterationsPerSlice: positiveConfigInteger(hardStops.maxIterationsPerSlice),
+          maxMinutesPerSlice: positiveConfigInteger(hardStops.maxMinutesPerSlice),
+        }
+      : undefined,
+  };
+}
+
+function positiveConfigInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
 
 export function normalizeReviewGatesConfig(
   raw: ReviewGatesConfig | undefined,
@@ -2572,6 +2642,12 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     reviewDryRun: false,
     reviewGate: '',
     reviewPhase: '',
+    goalSliceId: '',
+    goalOutcome: '',
+    goalPlanFile: '',
+    goalProvider: '',
+    goalMaxTurns: '',
+    goalMaxMinutes: '',
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -2921,6 +2997,30 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       flags.reviewPhase = readFlagValue('--phase').trim();
       continue;
     }
+    if (flagName === '--slice-id') {
+      flags.goalSliceId = readFlagValue('--slice-id').trim();
+      continue;
+    }
+    if (flagName === '--outcome') {
+      flags.goalOutcome = readFlagValue('--outcome').trim();
+      continue;
+    }
+    if (flagName === '--plan-file') {
+      flags.goalPlanFile = readFlagValue('--plan-file').trim();
+      continue;
+    }
+    if (flagName === '--provider') {
+      flags.goalProvider = readFlagValue('--provider').trim();
+      continue;
+    }
+    if (flagName === '--max-turns') {
+      flags.goalMaxTurns = readFlagValue('--max-turns').trim();
+      continue;
+    }
+    if (flagName === '--max-minutes') {
+      flags.goalMaxMinutes = readFlagValue('--max-minutes').trim();
+      continue;
+    }
 
     if (token.startsWith('--')) {
       throw new Error(`Unknown flag "${flagName}" for pipelane run. Run "pipelane run --help" for supported commands and flags.`);
@@ -3145,6 +3245,36 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       const phase = parsed.flags.reviewPhase.trim();
       if (phase && !includesString(REVIEW_GATE_PHASES, phase)) {
         throw new Error(`--phase must be one of: ${REVIEW_GATE_PHASES.join(', ')}.`);
+      }
+      return;
+    }
+    case 'orchestrate': {
+      const subcommand = parsed.positional[0] ?? '';
+      if (subcommand !== 'goal-spec') {
+        throw new Error('orchestrate requires exactly: pipelane run orchestrate goal-spec [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]');
+      }
+      assertOnlyFlags(parsed, [
+        'goalSliceId',
+        'goalOutcome',
+        'goalPlanFile',
+        'goalProvider',
+        'goalMaxTurns',
+        'goalMaxMinutes',
+      ]);
+      if (parsed.positional.length !== 1) {
+        throw new Error('orchestrate goal-spec requires exactly: pipelane run orchestrate goal-spec [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]');
+      }
+      const provider = parsed.flags.goalProvider.trim();
+      if (provider && !includesString(GOAL_PROVIDERS, provider)) {
+        throw new Error(`--provider must be one of: ${GOAL_PROVIDERS.join(', ')}.`);
+      }
+      for (const [flag, value] of [
+        ['--max-turns', parsed.flags.goalMaxTurns],
+        ['--max-minutes', parsed.flags.goalMaxMinutes],
+      ] as const) {
+        if (value.trim() && (!/^[1-9]\d*$/.test(value.trim()) || !Number.isSafeInteger(Number.parseInt(value.trim(), 10)))) {
+          throw new Error(`${flag} requires a safe positive integer.`);
+        }
       }
       return;
     }
@@ -3382,6 +3512,12 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'reviewDryRun', label: '--dry-run', active: (flags) => flags.reviewDryRun },
   { key: 'reviewGate', label: '--gate', active: (flags) => flags.reviewGate.trim().length > 0 },
   { key: 'reviewPhase', label: '--phase', active: (flags) => flags.reviewPhase.trim().length > 0 },
+  { key: 'goalSliceId', label: '--slice-id', active: (flags) => flags.goalSliceId.trim().length > 0 },
+  { key: 'goalOutcome', label: '--outcome', active: (flags) => flags.goalOutcome.trim().length > 0 },
+  { key: 'goalPlanFile', label: '--plan-file', active: (flags) => flags.goalPlanFile.trim().length > 0 },
+  { key: 'goalProvider', label: '--provider', active: (flags) => flags.goalProvider.trim().length > 0 },
+  { key: 'goalMaxTurns', label: '--max-turns', active: (flags) => flags.goalMaxTurns.trim().length > 0 },
+  { key: 'goalMaxMinutes', label: '--max-minutes', active: (flags) => flags.goalMaxMinutes.trim().length > 0 },
 ];
 
 function assertOnlyFlags(parsed: ParsedOperatorArgs, allowed: OperatorFlagKey[]): void {
