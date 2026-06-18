@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync } from 'node:fs';
 import crypto from 'node:crypto';
 import path from 'node:path';
 
@@ -255,10 +255,28 @@ export function loadOrchestrationRunRecord(
   return readVersionedJsonFile<OrchestrationRunRecord | null>('orchestrationRun', commonDir, config, targetPath, null);
 }
 
+export function listOrchestrationRunRecords(commonDir: string, config: WorkflowConfig): OrchestrationRunRecord[] {
+  const runsRoot = path.join(resolveStateDir(commonDir, config), 'orchestrate', 'runs');
+  if (!existsSync(runsRoot)) return [];
+  const records: OrchestrationRunRecord[] = [];
+  for (const entry of readdirSync(runsRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !isSafeOrchestrationRunId(entry.name)) continue;
+    const targetPath = path.join(runsRoot, entry.name, 'orchestration.json');
+    if (!existsSync(targetPath)) continue;
+    const record = readVersionedJsonFile<OrchestrationRunRecord | null>('orchestrationRun', commonDir, config, targetPath, null);
+    if (record) records.push(record);
+  }
+  return records.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+}
+
 function assertSafeOrchestrationRunId(runId: string): void {
-  if (!/^orchestrate-\d{14}-[a-f0-9]{8}$/.test(runId)) {
+  if (!isSafeOrchestrationRunId(runId)) {
     throw new Error(`Invalid orchestration run id: ${runId}`);
   }
+}
+
+function isSafeOrchestrationRunId(runId: string): boolean {
+  return /^orchestrate-\d{14}-[a-f0-9]{8}$/.test(runId);
 }
 
 function resolvePlanSections(planText: string, outcome: string | undefined): { globalText: string; slices: PlanSliceSource[] } {

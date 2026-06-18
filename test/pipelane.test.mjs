@@ -4840,6 +4840,149 @@ test('review setup interactive test input exhaustion fails closed', () => {
   }
 });
 
+test('orchestrate bare command refuses non-interactive setup without an active run', () => {
+  const repoRoot = createRepo();
+  try {
+    const result = runCli(['run', 'orchestrate'], repoRoot, {}, true);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /orchestrate requires a TTY for interactive setup/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate bare command previews an explicit plan without writing state', () => {
+  const repoRoot = createRepo();
+  try {
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'project-plan.md'), [
+      '# Project Plan',
+      '',
+      '## Slice 1: Entry point',
+      '- Update `src/operator/commands/orchestrate.ts`',
+    ].join('\n') + '\n', 'utf8');
+
+    const result = runCli(['run', 'orchestrate', '--plan-file', 'docs/project-plan.md', '--preview', '--json'], repoRoot);
+    const report = JSON.parse(result.stdout);
+
+    assert.equal(report.command, 'orchestrate');
+    assert.equal(report.status, 'preview');
+    assert.equal(report.ledgerPath, null);
+    assert.equal(report.run.slices.length, 1);
+    assert.equal(report.run.slices[0].id, 'entry-point');
+    assert.ok(report.likelyPlanFiles.some((entry) => entry.path === 'docs/project-plan.md'));
+    assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'orchestrate')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate bare command --yes plans, prepares, dispatches, and starts workers', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'entry-plan.md'), [
+      '# Entry Plan',
+      '',
+      '## Slice 1: High-level orchestrate entry',
+      '- Update `src/operator/commands/orchestrate.ts`',
+    ].join('\n') + '\n', 'utf8');
+
+    const workerCommand = 'node -e "console.log(process.env.PIPELANE_ORCHESTRATE_SLICE_ID)"';
+    const result = runCli([
+      'run',
+      'orchestrate',
+      '--plan-file',
+      'docs/entry-plan.md',
+      '--provider',
+      'generic',
+      '--yes',
+      '--json',
+    ], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    });
+    const report = JSON.parse(result.stdout);
+    createdWorktrees.push(...report.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    const onDisk = JSON.parse(readFileSync(report.ledgerPath, 'utf8'));
+
+    assert.equal(report.command, 'orchestrate');
+    assert.equal(report.status, 'completed');
+    assert.match(report.runId, /^orchestrate-\d{14}-[a-f0-9]{8}$/);
+    assert.equal(report.run.status, 'completed');
+    assert.equal(onDisk.status, 'completed');
+    assert.equal(report.run.slices[0].status, 'completed');
+    assert.equal(report.run.slices[0].dispatch.status, 'ready');
+    assert.equal(report.run.slices[0].worker.status, 'succeeded');
+    assert.ok(existsSync(report.run.slices[0].worktreePath));
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate bare command opens a single active run', () => {
+  const repoRoot = createRepo();
+  try {
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Open active run', '--json'], repoRoot).stdout);
+    const result = runCli(['run', 'orchestrate', '--json'], repoRoot);
+    const report = JSON.parse(result.stdout);
+
+    assert.equal(report.command, 'orchestrate');
+    assert.equal(report.status, 'active');
+    assert.equal(report.runId, planned.runId);
+    assert.equal(report.activeRuns.length, 1);
+    assert.match(report.message, /Open active run/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate bare command reports multiple active runs', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['run', 'orchestrate', 'plan', '--outcome', 'First active run', '--json'], repoRoot);
+    runCli(['run', 'orchestrate', 'plan', '--outcome', 'Second active run', '--json'], repoRoot);
+    const result = runCli(['run', 'orchestrate', '--json'], repoRoot);
+    const report = JSON.parse(result.stdout);
+
+    assert.equal(report.command, 'orchestrate');
+    assert.equal(report.status, 'multiple-active');
+    assert.equal(report.activeRuns.length, 2);
+    assert.match(report.message, /Multiple active orchestration runs/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate interactive setup suggests likely plan files and can cancel', () => {
+  const repoRoot = createRepo();
+  try {
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'implementation-plan.md'), [
+      '# Implementation Plan',
+      '',
+      '## Slice 1: Setup',
+      '- Implement the setup flow',
+    ].join('\n') + '\n', 'utf8');
+
+    const result = runCli(['run', 'orchestrate'], repoRoot, {
+      PIPELANE_ORCHESTRATE_INPUT: 'c\n',
+    });
+
+    assert.match(result.stdout, /Orchestration setup/);
+    assert.match(result.stdout, /docs\/implementation-plan\.md/);
+    assert.match(result.stdout, /Orchestration cancelled\. No changes written\./);
+    assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'orchestrate')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('orchestrate goal-spec drafts a provider-neutral spec from a plan file', () => {
   const repoRoot = createRepo();
   try {
@@ -4953,7 +5096,7 @@ test('orchestrate goal-spec rejects invalid command forms', () => {
 
     const invalidSubcommand = runCli(['run', 'orchestrate', 'nope'], repoRoot, {}, true);
     assert.notEqual(invalidSubcommand.status, 0);
-    assert.match(invalidSubcommand.stderr, /orchestrate requires exactly: pipelane run orchestrate <goal-spec\|plan\|prepare\|dispatch\|start\|review>/);
+    assert.match(invalidSubcommand.stderr, /orchestrate requires exactly: pipelane run orchestrate .*<goal-spec\|plan\|prepare\|dispatch\|start\|review>/);
 
     const extraPositional = runCli(['run', 'orchestrate', 'goal-spec', 'extra'], repoRoot, {}, true);
     assert.notEqual(extraPositional.status, 0);

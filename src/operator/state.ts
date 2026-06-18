@@ -613,6 +613,7 @@ export interface OperatorFlags {
   unnamed: boolean;
   override: boolean;
   plan: boolean;
+  preview: boolean;
   yes: boolean;
   skipSmokeCoverage: boolean;
   patch: boolean;
@@ -2602,6 +2603,7 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     unnamed: false,
     override: false,
     plan: false,
+    preview: false,
     yes: false,
     skipSmokeCoverage: false,
     patch: false,
@@ -2764,6 +2766,12 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     if (flagName === '--plan') {
       rejectInlineValue('--plan');
       flags.plan = true;
+      continue;
+    }
+
+    if (flagName === '--preview') {
+      rejectInlineValue('--preview');
+      flags.preview = true;
       continue;
     }
 
@@ -3258,8 +3266,45 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
     }
     case 'orchestrate': {
       const subcommand = parsed.positional[0] ?? '';
+      if (subcommand === '' || subcommand === 'run') {
+        assertOnlyFlags(parsed, [
+          'goalSliceId',
+          'goalOutcome',
+          'goalPlanFile',
+          'goalProvider',
+          'goalMaxTurns',
+          'goalMaxMinutes',
+          'orchestrationRunId',
+          'offline',
+          'plan',
+          'preview',
+          'yes',
+        ]);
+        if (parsed.positional.length > (subcommand === 'run' ? 1 : 0)) {
+          throw new Error('orchestrate requires: pipelane run orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>], or pipelane run orchestrate <goal-spec|plan|prepare|dispatch|start|review> ...');
+        }
+        if (parsed.flags.yes && (parsed.flags.preview || parsed.flags.plan)) {
+          throw new Error('orchestrate cannot combine --yes with --preview or --plan.');
+        }
+        if (parsed.flags.yes && !parsed.flags.goalPlanFile.trim() && !parsed.flags.goalOutcome.trim()) {
+          throw new Error('orchestrate --yes requires --plan-file <path> or --outcome <text>.');
+        }
+        const provider = parsed.flags.goalProvider.trim();
+        if (provider && !includesString(GOAL_PROVIDERS, provider)) {
+          throw new Error(`--provider must be one of: ${GOAL_PROVIDERS.join(', ')}.`);
+        }
+        for (const [flag, value] of [
+          ['--max-turns', parsed.flags.goalMaxTurns],
+          ['--max-minutes', parsed.flags.goalMaxMinutes],
+        ] as const) {
+          if (value.trim() && (!/^[1-9]\d*$/.test(value.trim()) || !Number.isSafeInteger(Number.parseInt(value.trim(), 10)))) {
+            throw new Error(`${flag} requires a safe positive integer.`);
+          }
+        }
+        return;
+      }
       if (subcommand !== 'goal-spec' && subcommand !== 'plan' && subcommand !== 'prepare' && subcommand !== 'dispatch' && subcommand !== 'start' && subcommand !== 'review') {
-        throw new Error('orchestrate requires exactly: pipelane run orchestrate <goal-spec|plan|prepare|dispatch|start|review> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--run-id <id>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]');
+        throw new Error('orchestrate requires exactly: pipelane run orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes], or pipelane run orchestrate <goal-spec|plan|prepare|dispatch|start|review> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--run-id <id>] [--provider codex|claude|generic]');
       }
       if (subcommand === 'prepare' || subcommand === 'dispatch' || subcommand === 'start' || subcommand === 'review') {
         assertOnlyFlags(parsed, subcommand === 'start'
@@ -3501,6 +3546,7 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'unnamed', label: '--unnamed', active: (flags) => flags.unnamed },
   { key: 'override', label: '--override', active: (flags) => flags.override },
   { key: 'plan', label: '--plan', active: (flags) => flags.plan },
+  { key: 'preview', label: '--preview', active: (flags) => flags.preview },
   { key: 'yes', label: '--yes', active: (flags) => flags.yes },
   { key: 'skipSmokeCoverage', label: '--skip-smoke-coverage', active: (flags) => flags.skipSmokeCoverage },
   { key: 'patch', label: '--patch', active: (flags) => flags.patch },

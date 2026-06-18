@@ -1,6 +1,7 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import path from 'node:path';
+import readline from 'node:readline/promises';
 
 import {
   buildGoalSpecDraft,
@@ -8,6 +9,7 @@ import {
 } from '../goal-spec.ts';
 import {
   buildOrchestrationRunRecord,
+  listOrchestrationRunRecords,
   loadOrchestrationRunRecord,
   orchestrationRunPath,
   saveOrchestrationRunRecord,
@@ -42,8 +44,43 @@ import {
 } from '../task-workspaces.ts';
 
 const MAX_PLAN_FILE_BYTES = 256 * 1024;
+const MAX_LIKELY_PLAN_FILES = 5;
+const MAX_PLAN_SCAN_FILES = 200;
 const ORCHESTRATION_REVIEW_DIAGNOSTIC_MAX = 10;
 const NATIVE_COMMAND_PROBE_TIMEOUT_MS = 5000;
+
+type OrchestrateEntryStatus = 'needs-input' | 'preview' | 'active' | 'multiple-active' | 'cancelled' | OrchestrateStartReport['status'];
+
+interface OrchestrateEntryRunSummary {
+  id: string;
+  status: OrchestrationRunRecord['status'];
+  updatedAt: string;
+  title: string;
+  sliceCount: number;
+  completedSlices: number;
+  failedSlices: number;
+  pendingSlices: number;
+  planPath: string | null;
+}
+
+interface LikelyPlanFile {
+  path: string;
+  score: number;
+  reason: string;
+}
+
+interface OrchestrateEntryReport {
+  command: 'orchestrate';
+  status: OrchestrateEntryStatus;
+  repoRoot: string;
+  runId: string | null;
+  ledgerPath: string | null;
+  planPath: string | null;
+  activeRuns: OrchestrateEntryRunSummary[];
+  likelyPlanFiles: LikelyPlanFile[];
+  run?: OrchestrationRunRecord;
+  message: string;
+}
 
 interface OrchestrateGoalSpecReport {
   command: 'orchestrate goal-spec';
@@ -208,6 +245,10 @@ interface WorkerExecutionResult {
 
 export async function handleOrchestrate(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const subcommand = parsed.positional[0] ?? '';
+  if (subcommand === '' || subcommand === 'run') {
+    await handleOrchestrateEntry(cwd, parsed);
+    return;
+  }
   if (subcommand === 'goal-spec') {
     handleGoalSpec(cwd, parsed);
     return;
@@ -233,7 +274,562 @@ export async function handleOrchestrate(cwd: string, parsed: ParsedOperatorArgs)
     return;
   }
 
-  throw new Error('orchestrate requires exactly: pipelane run orchestrate <goal-spec|plan|prepare|dispatch|start|review> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--run-id <id>] [--provider codex|claude|generic]');
+  throw new Error('orchestrate requires exactly: pipelane run orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes], or pipelane run orchestrate <goal-spec|plan|prepare|dispatch|start|review> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--run-id <id>] [--provider codex|claude|generic]');
+}
+
+async function handleOrchestrateEntry(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
+  const context = resolveWorkflowContext(cwd);
+  const planPath = resolvePlanPath(context.repoRoot, parsed.flags.goalPlanFile);
+  const outcome = parsed.flags.goalOutcome.trim();
+  const explicitRunId = parsed.flags.orchestrationRunId.trim();
+  const likelyPlanFiles = collectLikelyPlanFiles(context.repoRoot);
+  const activeRuns = listActiveOrchestrationRuns(context);
+
+  if (explicitRunId) {
+    const run = loadOrchestrationRunRecord(context.commonDir, context.config, explicitRunId);
+    if (!run) throw new Error(`No orchestration run ledger found for ${explicitRunId}.`);
+    printResult(parsed.flags, buildOrchestrateEntryStatusReport(context, run, activeRuns, likelyPlanFiles));
+    return;
+  }
+
+  if (planPath || outcome) {
+    const run = buildEntryRunRecord(context, parsed, planPath, outcome);
+    if (parsed.flags.yes) {
+      const report = await runApprovedOrchestration(context, run, planPath, activeRuns, likelyPlanFiles, parsed.flags.offline);
+      printResult(parsed.flags, report);
+      if (report.status === 'failed') process.exitCode = 1;
+      return;
+    }
+    if (!parsed.flags.preview && !parsed.flags.plan && canRunInteractiveOrchestrate()) {
+      await confirmAndMaybeRunOrchestration(context, parsed, run, planPath, activeRuns, likelyPlanFiles);
+      return;
+    }
+    printResult(parsed.flags, buildOrchestratePreviewReport(context, run, planPath, activeRuns, likelyPlanFiles));
+    return;
+  }
+
+  if (activeRuns.length === 1) {
+    const run = loadOrchestrationRunRecord(context.commonDir, context.config, activeRuns[0].id);
+    if (!run) throw new Error(`No orchestration run ledger found for ${activeRuns[0].id}.`);
+    printResult(parsed.flags, buildOrchestrateEntryStatusReport(context, run, activeRuns, likelyPlanFiles));
+    return;
+  }
+
+  if (activeRuns.length > 1) {
+    if (canRunInteractiveOrchestrate() && !parsed.flags.json) {
+      await chooseActiveOrchestrationRun(context, parsed, activeRuns, likelyPlanFiles);
+      return;
+    }
+    printResult(parsed.flags, buildMultipleActiveRunsReport(context, activeRuns, likelyPlanFiles));
+    return;
+  }
+
+  if (!canRunInteractiveOrchestrate()) {
+    throw new Error('orchestrate requires a TTY for interactive setup. Use --plan-file <path> --preview to inspect, --plan-file <path> --yes to start, or --outcome <text> --preview for automation.');
+  }
+
+  await runInteractiveOrchestrateSetup(context, parsed, likelyPlanFiles);
+}
+
+function buildEntryRunRecord(
+  context: WorkflowContext,
+  parsed: ParsedOperatorArgs,
+  planPath: string | null,
+  outcome: string,
+): OrchestrationRunRecord {
+  const planText = planPath ? readPlanFile(planPath) : '';
+  if (!planText.trim() && !outcome) {
+    throw new Error('orchestrate requires --plan-file <path> or --outcome <text> to preview or start a new run.');
+  }
+  return buildOrchestrationRunRecord({
+    repoRoot: context.repoRoot,
+    config: context.config,
+    planPath: planPath ?? undefined,
+    planText,
+    outcome,
+    sliceId: parsed.flags.goalSliceId,
+    provider: (parsed.flags.goalProvider.trim() as GoalProvider) || DEFAULT_GOAL_PROVIDER,
+    maxTurns: parsePositiveInteger(parsed.flags.goalMaxTurns),
+    maxMinutes: parsePositiveInteger(parsed.flags.goalMaxMinutes),
+  });
+}
+
+async function runApprovedOrchestration(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+  planPath: string | null,
+  previousActiveRuns: OrchestrateEntryRunSummary[],
+  likelyPlanFiles: LikelyPlanFile[],
+  offline: boolean,
+): Promise<OrchestrateEntryReport> {
+  const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+  prepareSliceWorktrees(context, run, offline);
+  dispatchPreparedSlices(context, run);
+  const startResult = await startDispatchedSlices(context, run, null, false);
+  const finalLedgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+  const report: OrchestrateEntryReport = {
+    command: 'orchestrate',
+    status: startResult.status,
+    repoRoot: context.repoRoot,
+    runId: run.id,
+    ledgerPath: finalLedgerPath || ledgerPath,
+    planPath,
+    activeRuns: [summarizeEntryRun(run), ...previousActiveRuns.filter((entry) => entry.id !== run.id)],
+    likelyPlanFiles,
+    run,
+    message: renderApprovedOrchestrationReport(run, finalLedgerPath || ledgerPath, planPath, startResult),
+  };
+  return report;
+}
+
+function buildOrchestratePreviewReport(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+  planPath: string | null,
+  activeRuns: OrchestrateEntryRunSummary[],
+  likelyPlanFiles: LikelyPlanFile[],
+): OrchestrateEntryReport {
+  return {
+    command: 'orchestrate',
+    status: 'preview',
+    repoRoot: context.repoRoot,
+    runId: run.id,
+    ledgerPath: null,
+    planPath,
+    activeRuns,
+    likelyPlanFiles,
+    run,
+    message: renderOrchestrationPreview(context.repoRoot, run, planPath),
+  };
+}
+
+function buildOrchestrateEntryStatusReport(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+  activeRuns: OrchestrateEntryRunSummary[],
+  likelyPlanFiles: LikelyPlanFile[],
+): OrchestrateEntryReport {
+  return {
+    command: 'orchestrate',
+    status: 'active',
+    repoRoot: context.repoRoot,
+    runId: run.id,
+    ledgerPath: orchestrationRunPath(context.commonDir, context.config, run.id),
+    planPath: run.source.planPath ? path.join(context.repoRoot, run.source.planPath) : null,
+    activeRuns,
+    likelyPlanFiles,
+    run,
+    message: renderActiveRunReport(context, run),
+  };
+}
+
+function buildMultipleActiveRunsReport(
+  context: WorkflowContext,
+  activeRuns: OrchestrateEntryRunSummary[],
+  likelyPlanFiles: LikelyPlanFile[],
+): OrchestrateEntryReport {
+  return {
+    command: 'orchestrate',
+    status: 'multiple-active',
+    repoRoot: context.repoRoot,
+    runId: null,
+    ledgerPath: null,
+    planPath: null,
+    activeRuns,
+    likelyPlanFiles,
+    message: renderMultipleActiveRunsReport(activeRuns),
+  };
+}
+
+async function confirmAndMaybeRunOrchestration(
+  context: WorkflowContext,
+  parsed: ParsedOperatorArgs,
+  run: OrchestrationRunRecord,
+  planPath: string | null,
+  activeRuns: OrchestrateEntryRunSummary[],
+  likelyPlanFiles: LikelyPlanFile[],
+  existingPrompter?: {
+    question(prompt: string): Promise<string>;
+    close(): void;
+  },
+): Promise<void> {
+  const prompter = existingPrompter ?? createOrchestratePrompter();
+  try {
+    process.stdout.write(`${renderOrchestrationPreview(context.repoRoot, run, planPath)}\n\nStart orchestration now?\n1. Start now\n2. Cancel\n`);
+    const answer = (await prompter.question('> ')).trim().toLowerCase();
+    if (answer !== '1' && answer !== 'y' && answer !== 'yes' && answer !== 'start') {
+      printResult(parsed.flags, buildCancelledOrchestrationReport(context, likelyPlanFiles));
+      return;
+    }
+    const report = await runApprovedOrchestration(context, run, planPath, activeRuns, likelyPlanFiles, parsed.flags.offline);
+    printResult(parsed.flags, report);
+    if (report.status === 'failed') process.exitCode = 1;
+  } finally {
+    if (!existingPrompter) prompter.close();
+  }
+}
+
+async function runInteractiveOrchestrateSetup(
+  context: WorkflowContext,
+  parsed: ParsedOperatorArgs,
+  likelyPlanFiles: LikelyPlanFile[],
+): Promise<void> {
+  const prompter = createOrchestratePrompter();
+  try {
+    process.stdout.write(`${renderInteractiveOrchestrationSetup(likelyPlanFiles)}\n`);
+    const answer = (await prompter.question('> ')).trim().toLowerCase();
+    if (answer === 'c' || answer === 'cancel') {
+      printResult(parsed.flags, buildCancelledOrchestrationReport(context, likelyPlanFiles));
+      return;
+    }
+
+    let planPath: string | null = null;
+    let outcome = '';
+    const planIndex = Number.parseInt(answer, 10);
+    if (Number.isSafeInteger(planIndex) && planIndex >= 1 && planIndex <= likelyPlanFiles.length) {
+      planPath = resolvePlanPath(context.repoRoot, likelyPlanFiles[planIndex - 1].path);
+    } else if (answer === 'd' || answer === 'different') {
+      const rawPath = await prompter.question('Plan file path: ');
+      planPath = resolvePlanPath(context.repoRoot, rawPath);
+    } else if (answer === 'g' || answer === 'goal') {
+      outcome = (await prompter.question('Goal: ')).trim();
+      if (!outcome) throw new Error('orchestrate goal description cannot be empty.');
+    } else {
+      throw new Error('Choose a plan number, d for a different plan file, g to describe the goal, or c to cancel.');
+    }
+
+    const run = buildOrchestrationRunRecord({
+      repoRoot: context.repoRoot,
+      config: context.config,
+      planPath: planPath ?? undefined,
+      planText: planPath ? readPlanFile(planPath) : '',
+      outcome,
+      provider: DEFAULT_GOAL_PROVIDER,
+    });
+    await confirmAndMaybeRunOrchestration(context, parsed, run, planPath, [], likelyPlanFiles, prompter);
+  } finally {
+    prompter.close();
+  }
+}
+
+async function chooseActiveOrchestrationRun(
+  context: WorkflowContext,
+  parsed: ParsedOperatorArgs,
+  activeRuns: OrchestrateEntryRunSummary[],
+  likelyPlanFiles: LikelyPlanFile[],
+): Promise<void> {
+  const prompter = createOrchestratePrompter();
+  try {
+    process.stdout.write(`${renderMultipleActiveRunsReport(activeRuns)}\n`);
+    const answer = (await prompter.question('> ')).trim().toLowerCase();
+    if (answer === 'c' || answer === 'cancel') {
+      printResult(parsed.flags, buildCancelledOrchestrationReport(context, likelyPlanFiles));
+      return;
+    }
+    const index = Number.parseInt(answer, 10);
+    if (!Number.isSafeInteger(index) || index < 1 || index > activeRuns.length) {
+      throw new Error('Choose an active run number or c to cancel.');
+    }
+    const run = loadOrchestrationRunRecord(context.commonDir, context.config, activeRuns[index - 1].id);
+    if (!run) throw new Error(`No orchestration run ledger found for ${activeRuns[index - 1].id}.`);
+    printResult(parsed.flags, buildOrchestrateEntryStatusReport(context, run, activeRuns, likelyPlanFiles));
+  } finally {
+    prompter.close();
+  }
+}
+
+function buildCancelledOrchestrationReport(
+  context: WorkflowContext,
+  likelyPlanFiles: LikelyPlanFile[],
+): OrchestrateEntryReport {
+  return {
+    command: 'orchestrate',
+    status: 'cancelled',
+    repoRoot: context.repoRoot,
+    runId: null,
+    ledgerPath: null,
+    planPath: null,
+    activeRuns: [],
+    likelyPlanFiles,
+    message: 'Orchestration cancelled. No changes written.',
+  };
+}
+
+function canRunInteractiveOrchestrate(): boolean {
+  return (process.stdin.isTTY === true && process.stdout.isTTY === true)
+    || (process.env.NODE_ENV === 'test' && process.env.PIPELANE_ORCHESTRATE_INPUT !== undefined);
+}
+
+function createOrchestratePrompter(): {
+  question(prompt: string): Promise<string>;
+  close(): void;
+} {
+  if (process.env.NODE_ENV === 'test' && process.env.PIPELANE_ORCHESTRATE_INPUT !== undefined) {
+    const answers = process.env.PIPELANE_ORCHESTRATE_INPUT.split(/\r?\n/);
+    let index = 0;
+    return {
+      question(prompt: string): Promise<string> {
+        process.stdout.write(prompt);
+        if (index >= answers.length) {
+          throw new Error('PIPELANE_ORCHESTRATE_INPUT exhausted before orchestration setup completed.');
+        }
+        return Promise.resolve(answers[index++]);
+      },
+      close(): void {},
+    };
+  }
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return {
+    question(prompt: string): Promise<string> {
+      return rl.question(prompt);
+    },
+    close(): void {
+      rl.close();
+    },
+  };
+}
+
+function listActiveOrchestrationRuns(context: WorkflowContext): OrchestrateEntryRunSummary[] {
+  return listOrchestrationRunRecords(context.commonDir, context.config)
+    .filter((run) => run.status !== 'completed')
+    .map(summarizeEntryRun);
+}
+
+function summarizeEntryRun(run: OrchestrationRunRecord): OrchestrateEntryRunSummary {
+  const completedSlices = run.slices.filter((slice) => slice.status === 'completed' || slice.worker?.status === 'succeeded').length;
+  const failedSlices = run.slices.filter((slice) => slice.status === 'failed' || slice.worker?.status === 'failed').length;
+  return {
+    id: run.id,
+    status: run.status,
+    updatedAt: run.updatedAt,
+    title: run.plan.title,
+    sliceCount: run.slices.length,
+    completedSlices,
+    failedSlices,
+    pendingSlices: Math.max(0, run.slices.length - completedSlices - failedSlices),
+    planPath: run.source.planPath,
+  };
+}
+
+function collectLikelyPlanFiles(repoRoot: string): LikelyPlanFile[] {
+  const candidates = new Map<string, { score: number; reasons: Set<string> }>();
+  const add = (repoPath: string, score: number, reason: string): void => {
+    const normalized = normalizeRepoPath(repoPath);
+    if (!normalized.endsWith('.md')) return;
+    const absolute = path.join(repoRoot, normalized);
+    if (!existsSync(absolute)) return;
+    const stats = statSync(absolute);
+    if (!stats.isFile() || stats.size > MAX_PLAN_FILE_BYTES) return;
+    const current = candidates.get(normalized) ?? { score: 0, reasons: new Set<string>() };
+    current.score += score;
+    current.reasons.add(reason);
+    const nameScore = scorePlanFileName(normalized);
+    if (nameScore > 0) {
+      current.score += nameScore;
+      current.reasons.add('plan-like name');
+    }
+    candidates.set(normalized, current);
+  };
+
+  for (const changed of collectChangedMarkdownFiles(repoRoot)) {
+    add(changed, 100, 'changed on this branch');
+  }
+  for (const scanned of scanMarkdownFiles(repoRoot)) {
+    add(scanned, scanned.startsWith('docs/') ? 20 : 5, scanned.startsWith('docs/') ? 'docs file' : 'markdown file');
+  }
+
+  return [...candidates.entries()]
+    .map(([repoPath, entry]) => ({
+      path: repoPath,
+      score: entry.score,
+      reason: [...entry.reasons].join(', '),
+    }))
+    .sort((left, right) => right.score - left.score || left.path.localeCompare(right.path))
+    .slice(0, MAX_LIKELY_PLAN_FILES);
+}
+
+function collectChangedMarkdownFiles(repoRoot: string): string[] {
+  const compareRef = runGit(repoRoot, ['rev-parse', '--verify', 'origin/HEAD'], true)?.trim() ? 'origin/HEAD' : 'HEAD';
+  const mergeBase = runGit(repoRoot, ['merge-base', 'HEAD', compareRef], true)?.trim() ?? '';
+  const outputs = [
+    mergeBase ? runGit(repoRoot, ['diff', '--name-only', `${mergeBase}...HEAD`], true) ?? '' : '',
+    runGit(repoRoot, ['diff', '--cached', '--name-only'], true) ?? '',
+    runGit(repoRoot, ['diff', '--name-only'], true) ?? '',
+    runGit(repoRoot, ['ls-files', '--others', '--exclude-standard'], true) ?? '',
+  ];
+  return uniqueRepoPaths(outputs.flatMap((output) => output.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.endsWith('.md'))));
+}
+
+function scanMarkdownFiles(repoRoot: string): string[] {
+  const results: string[] = [];
+  const visit = (relativeDir: string): void => {
+    if (results.length >= MAX_PLAN_SCAN_FILES) return;
+    const absoluteDir = path.join(repoRoot, relativeDir);
+    if (!existsSync(absoluteDir)) return;
+    for (const entry of readdirSync(absoluteDir, { withFileTypes: true })) {
+      if (results.length >= MAX_PLAN_SCAN_FILES) return;
+      if (entry.name === '.git' || entry.name === 'node_modules' || entry.name === 'dist' || entry.name === 'coverage') continue;
+      const relativePath = relativeDir ? path.join(relativeDir, entry.name) : entry.name;
+      if (entry.isDirectory()) {
+        if (relativeDir === '' && entry.name !== 'docs') continue;
+        visit(relativePath);
+        continue;
+      }
+      if (entry.isFile() && entry.name.endsWith('.md')) results.push(normalizeRepoPath(relativePath));
+    }
+  };
+  visit('docs');
+  visit('');
+  return uniqueRepoPaths(results);
+}
+
+function uniqueRepoPaths(paths: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const entry of paths) {
+    const normalized = normalizeRepoPath(entry);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push(normalized);
+  }
+  return result;
+}
+
+function scorePlanFileName(repoPath: string): number {
+  const lower = repoPath.toLowerCase();
+  let score = 0;
+  if (/(^|[-_/])(plan|implementation|roadmap|migration)([-_.\/]|$)/.test(lower)) score += 40;
+  if (lower.includes('orchestrat')) score += 30;
+  if (lower.startsWith('docs/')) score += 10;
+  return score;
+}
+
+function renderInteractiveOrchestrationSetup(likelyPlanFiles: LikelyPlanFile[]): string {
+  const lines = [
+    'Orchestration setup',
+    '',
+    'What should I implement?',
+  ];
+  if (likelyPlanFiles.length === 0) {
+    lines.push('No likely plan files found.');
+  } else {
+    for (const [index, file] of likelyPlanFiles.entries()) {
+      lines.push(`${index + 1}. ${file.path}`);
+    }
+  }
+  lines.push(
+    'd. A different existing plan file',
+    'g. Describe the goal now',
+    'c. Cancel',
+  );
+  return lines.join('\n');
+}
+
+function renderOrchestrationPreview(repoRoot: string, run: OrchestrationRunRecord, planPath: string | null): string {
+  const lines = [
+    'Pipelane orchestrate',
+    '',
+    'Status: preview',
+    `Run: ${run.id}`,
+    `Plan: ${planPath ? displayRepoPath(repoRoot, planPath) : run.source.prompt ?? '(outcome only)'}`,
+    `Provider recommendation: ${summarizeProviders(run)}`,
+    `Review gates: ${run.gateSnapshot.gates.length}`,
+    `Slices: ${run.slices.length}`,
+    '',
+    'Slice preview:',
+  ];
+  for (const slice of run.slices) {
+    const flags = [
+      slice.requiresConfirmation ? 'human decision' : '',
+      slice.critique.length > 0 ? 'critique' : '',
+    ].filter(Boolean);
+    lines.push(`- ${slice.id}: ${slice.outcome}${flags.length > 0 ? ` (${flags.join(', ')})` : ''}`);
+  }
+  lines.push('', `Next: run /pipelane orchestrate ${planPath ? `--plan-file ${displayRepoPath(repoRoot, planPath)}` : `--outcome "${run.plan.title}"`} --yes`);
+  return lines.join('\n');
+}
+
+function renderApprovedOrchestrationReport(
+  run: OrchestrationRunRecord,
+  ledgerPath: string,
+  planPath: string | null,
+  startResult: {
+    status: OrchestrateStartReport['status'];
+    startedCount: number;
+    restartedCount: number;
+    existingCount: number;
+    failedCount: number;
+    blockedCount: number;
+    slices: StartedSliceReport[];
+  },
+): string {
+  const lines = [
+    'Pipelane orchestrate',
+    '',
+    `Status: ${startResult.status}`,
+    `Run: ${run.id}`,
+    `Ledger: ${ledgerPath}`,
+    `Plan: ${planPath ?? run.source.prompt ?? '(outcome only)'}`,
+    `Started workers: ${startResult.startedCount}`,
+    `Existing workers: ${startResult.existingCount}`,
+    `Failed workers: ${startResult.failedCount}`,
+    `Blocked slices: ${startResult.blockedCount}`,
+    '',
+    'Slices:',
+  ];
+  for (const slice of run.slices) {
+    lines.push(`- ${slice.id}: ${slice.status}${slice.worker ? ` (${slice.worker.status})` : ''}`);
+  }
+  lines.push('', 'Next: run /pipelane status to monitor progress and pending decisions.');
+  return lines.join('\n');
+}
+
+function renderActiveRunReport(context: WorkflowContext, run: OrchestrationRunRecord): string {
+  const summary = summarizeEntryRun(run);
+  const lines = [
+    'Pipelane orchestrate',
+    '',
+    `Status: ${run.status}`,
+    `Run: ${run.id}`,
+    `Ledger: ${orchestrationRunPath(context.commonDir, context.config, run.id)}`,
+    `Plan: ${run.source.planPath ?? run.source.prompt ?? '(outcome only)'}`,
+    `Slices: ${summary.completedSlices}/${summary.sliceCount} complete, ${summary.failedSlices} failed, ${summary.pendingSlices} pending`,
+    '',
+    'Slice status:',
+  ];
+  for (const slice of run.slices) {
+    lines.push(`- ${slice.id}: ${slice.status}${slice.worker ? ` worker=${slice.worker.status}` : ''}${slice.review ? ` review=${slice.review.status}` : ''}`);
+  }
+  lines.push('', 'Next: run /pipelane status for the full cockpit, or use advanced orchestrate commands for recovery.');
+  return lines.join('\n');
+}
+
+function renderMultipleActiveRunsReport(activeRuns: OrchestrateEntryRunSummary[]): string {
+  const lines = [
+    'Pipelane orchestrate',
+    '',
+    'Multiple active orchestration runs:',
+  ];
+  for (const [index, run] of activeRuns.entries()) {
+    lines.push(`${index + 1}. ${run.id} [${run.status}] ${run.title} (${run.completedSlices}/${run.sliceCount} complete)`);
+  }
+  lines.push('', 'Choose a run number, or use /pipelane orchestrate --run-id <id>.');
+  return lines.join('\n');
+}
+
+function summarizeProviders(run: OrchestrationRunRecord): string {
+  const counts = new Map<GoalProvider, number>();
+  for (const slice of run.slices) counts.set(slice.provider, (counts.get(slice.provider) ?? 0) + 1);
+  return [...counts.entries()].map(([provider, count]) => `${provider} x${count}`).join(', ');
+}
+
+function displayRepoPath(repoRoot: string, absolutePath: string): string {
+  const relative = normalizeRepoPath(path.relative(repoRoot, absolutePath));
+  return relative && !relative.startsWith('..') && !path.isAbsolute(relative) ? relative : absolutePath;
+}
+
+function normalizeRepoPath(value: string): string {
+  return value.trim().replaceAll('\\', '/').replace(/^\.\//, '');
 }
 
 function handleGoalSpec(cwd: string, parsed: ParsedOperatorArgs): void {
