@@ -151,6 +151,13 @@ Run the generic pipelane wrapper for this repo.
   );
 }
 
+function seedCodexReviewSkills(codexHome, skills = ['karpathy-diff', 'review', 'karpathy-audit', 'qa-only', 'adversarial-review']) {
+  for (const skill of skills) {
+    mkdirSync(path.join(codexHome, 'skills', skill), { recursive: true });
+    writeFileSync(path.join(codexHome, 'skills', skill, 'SKILL.md'), `${skill} review skill\n`, 'utf8');
+  }
+}
+
 function createRemoteBackedRepo() {
   const repoRoot = createRepo();
   const remoteRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-remote-'));
@@ -4658,6 +4665,176 @@ test('review setup list-gates text reports resolved availability', () => {
     assert.match(result.stdout, /- test .*npm run test - available/);
     assert.match(result.stdout, /- typecheck .*missing: package\.json script not detected/);
     assert.doesNotMatch(result.stdout, /Available catalog:/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review setup bare command refuses non-interactive execution', () => {
+  const repoRoot = createRepo();
+  try {
+    const result = runCli(['run', 'review', 'setup'], repoRoot, {}, true);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /review setup requires a TTY for interactive setup/);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review setup --yes saves compact recommended gates when detected tools match', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  try {
+    seedCodexReviewSkills(codexHome);
+
+    const result = runCli(['run', 'review', 'setup', '--yes', '--json'], repoRoot, { CODEX_HOME: codexHome });
+    const report = JSON.parse(result.stdout);
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+
+    assert.equal(report.status, 'configured');
+    assert.equal(report.preset, 'strict-production');
+    assert.deepEqual(raw.reviewGates, { preset: 'strict-production' });
+    assert.ok(report.effective.gates.some((gate) => gate.id === 'human-prod-deploy-approval'));
+    assert.ok(report.effective.gates.some((gate) => gate.id === 'adversarial-review'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup interactive save writes recommended gates', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  try {
+    seedCodexReviewSkills(codexHome);
+
+    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+      CODEX_HOME: codexHome,
+      PIPELANE_REVIEW_SETUP_INPUT: 's\n',
+    });
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+
+    assert.match(result.stdout, /Review setup/);
+    assert.match(result.stdout, /Actions:/);
+    assert.match(result.stdout, /s\. Save and continue/);
+    assert.match(result.stdout, /Review gates configured/);
+    assert.deepEqual(raw.reviewGates, { preset: 'strict-production' });
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup interactive cancel writes no config', () => {
+  const repoRoot = createRepo();
+  try {
+    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+      PIPELANE_REVIEW_SETUP_INPUT: 'c\n',
+    });
+
+    assert.match(result.stdout, /Review setup cancelled\. No changes written\./);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review setup interactive toggle of installed AI gate writes explicit gate selection', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  try {
+    seedCodexReviewSkills(codexHome);
+
+    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+      CODEX_HOME: codexHome,
+      PIPELANE_REVIEW_SETUP_INPUT: '8\ns\n',
+    });
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+
+    assert.doesNotMatch(result.stdout, /Install and enable/);
+    assert.equal(raw.reviewGates.preset, 'strict-production');
+    assert.ok(Array.isArray(raw.reviewGates.gates));
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'), false);
+    assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup interactive install decline leaves known missing AI gate disabled', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  try {
+    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+      CODEX_HOME: codexHome,
+      PIPELANE_REVIEW_SETUP_INPUT: '8\n2\ns\n',
+      PIPELANE_REVIEW_SETUP_INSTALL_SUCCESS: 'karpathy-diff',
+    });
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+
+    assert.match(result.stdout, /Karpathy diff review is not installed/);
+    assert.match(result.stdout, /2\. Leave disabled/);
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup interactive unavailable AI gate explains manual install', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  try {
+    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+      CODEX_HOME: codexHome,
+      PIPELANE_REVIEW_SETUP_INPUT: '8\ns\n',
+    });
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+
+    assert.match(result.stdout, /Karpathy diff review is unavailable/);
+    assert.match(result.stdout, /Install karpathy-diff outside Pipelane/);
+    assert.doesNotMatch(result.stdout, /Install and enable/);
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup interactive install approval can enable known missing AI gate', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  try {
+    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+      CODEX_HOME: codexHome,
+      PIPELANE_REVIEW_SETUP_INPUT: '8\n1\ns\n',
+      PIPELANE_REVIEW_SETUP_INSTALL_SUCCESS: 'karpathy-diff',
+    });
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+
+    assert.match(result.stdout, /Karpathy diff review is not installed/);
+    assert.match(result.stdout, /Install karpathy-diff now/);
+    assert.match(result.stdout, /Install and enable/);
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup interactive test input exhaustion fails closed', () => {
+  const repoRoot = createRepo();
+  try {
+    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+      PIPELANE_REVIEW_SETUP_INPUT: 'bad-choice',
+    }, true);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /PIPELANE_REVIEW_SETUP_INPUT exhausted/);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
