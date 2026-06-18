@@ -26,8 +26,18 @@ import {
   type WorkflowConfig,
 } from './state.ts';
 
-export type OrchestrationRunStatus = 'planned' | 'prepared' | 'running' | 'blocked' | 'completed' | 'failed';
-export type OrchestrationSliceStatus = 'planned' | 'prepared' | 'running' | 'blocked' | 'completed' | 'failed';
+export type OrchestrationRunStatus = 'planned' | 'prepared' | 'dispatched' | 'running' | 'blocked' | 'completed' | 'failed';
+export type OrchestrationSliceStatus = 'planned' | 'prepared' | 'dispatched' | 'running' | 'blocked' | 'completed' | 'failed';
+
+export interface OrchestrationSliceDispatchRecord {
+  status: 'ready';
+  provider: GoalProvider;
+  promptPath: string;
+  worktreePath: string;
+  branchName: string;
+  handoffCommand: string;
+  dispatchedAt: string;
+}
 
 export interface OrchestrationSliceRecord {
   id: string;
@@ -40,6 +50,7 @@ export interface OrchestrationSliceRecord {
   taskSlug: string | null;
   worktreePath: string | null;
   branchName: string | null;
+  dispatch: OrchestrationSliceDispatchRecord | null;
   goalSpec: GoalSpec;
   provider: GoalProvider;
   providerPrompt: string;
@@ -143,6 +154,7 @@ export function buildOrchestrationRunRecord(input: BuildOrchestrationRunInput): 
       taskSlug: null,
       worktreePath: null,
       branchName: null,
+      dispatch: null,
       goalSpec,
       provider: draft.provider,
       providerPrompt: renderProviderGoalPrompt(goalSpec, draft.provider),

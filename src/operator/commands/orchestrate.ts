@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import {
@@ -8,6 +8,7 @@ import {
 import {
   buildOrchestrationRunRecord,
   loadOrchestrationRunRecord,
+  orchestrationRunPath,
   saveOrchestrationRunRecord,
   type OrchestrationRunRecord,
   type OrchestrationSliceRecord,
@@ -87,6 +88,38 @@ interface OrchestratePrepareReport {
   message: string;
 }
 
+interface DispatchedSliceReport {
+  id: string;
+  status: OrchestrationSliceRecord['status'];
+  provider: GoalProvider;
+  branchName: string;
+  worktreePath: string;
+  promptPath: string;
+  handoffCommand: string;
+  action: 'written' | 'existing';
+}
+
+interface OrchestrateDispatchReport {
+  command: 'orchestrate dispatch';
+  status: 'dispatched';
+  repoRoot: string;
+  runId: string;
+  ledgerPath: string;
+  writtenCount: number;
+  existingCount: number;
+  slices: DispatchedSliceReport[];
+  run: OrchestrationRunRecord;
+  message: string;
+}
+
+interface DispatchSlicePreparation {
+  slice: OrchestrationSliceRecord;
+  taskSlug: string;
+  promptPath: string;
+  handoffCommand: string;
+  alreadyDispatched: boolean;
+}
+
 export async function handleOrchestrate(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const subcommand = parsed.positional[0] ?? '';
   if (subcommand === 'goal-spec') {
@@ -101,8 +134,12 @@ export async function handleOrchestrate(cwd: string, parsed: ParsedOperatorArgs)
     handlePrepare(cwd, parsed);
     return;
   }
+  if (subcommand === 'dispatch') {
+    handleDispatch(cwd, parsed);
+    return;
+  }
 
-  throw new Error('orchestrate requires exactly: pipelane run orchestrate <goal-spec|plan|prepare> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--run-id <id>] [--provider codex|claude|generic]');
+  throw new Error('orchestrate requires exactly: pipelane run orchestrate <goal-spec|plan|prepare|dispatch> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--run-id <id>] [--provider codex|claude|generic]');
 }
 
 function handleGoalSpec(cwd: string, parsed: ParsedOperatorArgs): void {
@@ -165,6 +202,107 @@ function handlePrepare(cwd: string, parsed: ParsedOperatorArgs): void {
   };
 
   printResult(parsed.flags, report);
+}
+
+function handleDispatch(cwd: string, parsed: ParsedOperatorArgs): void {
+  const context = resolveWorkflowContext(cwd);
+  const runId = parsed.flags.orchestrationRunId.trim();
+  const run = loadOrchestrationRunRecord(context.commonDir, context.config, runId);
+  if (!run) {
+    throw new Error(`No orchestration run ledger found for ${runId}.`);
+  }
+  if (run.status !== 'prepared' && run.status !== 'dispatched') {
+    throw new Error(`orchestrate dispatch requires a prepared run; ${runId} is ${run.status}.`);
+  }
+
+  const result = dispatchPreparedSlices(context, run);
+  const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+  const report: OrchestrateDispatchReport = {
+    command: 'orchestrate dispatch',
+    status: 'dispatched',
+    repoRoot: context.repoRoot,
+    runId: run.id,
+    ledgerPath,
+    writtenCount: result.writtenCount,
+    existingCount: result.existingCount,
+    slices: result.slices,
+    run,
+    message: renderDispatchReport(run, ledgerPath, result),
+  };
+
+  printResult(parsed.flags, report);
+}
+
+function dispatchPreparedSlices(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+): {
+  writtenCount: number;
+  existingCount: number;
+  slices: DispatchedSliceReport[];
+} {
+  const dispatchRoot = path.join(path.dirname(orchestrationRunPath(context.commonDir, context.config, run.id)), 'dispatch');
+  mkdirSync(dispatchRoot, { recursive: true });
+  const dispatchedAt = nowIso();
+  const reports: DispatchedSliceReport[] = [];
+  let writtenCount = 0;
+  let existingCount = 0;
+  const preparedSlices = run.slices.map((slice): DispatchSlicePreparation => {
+    if (slice.status !== 'prepared' && slice.status !== 'dispatched') {
+      throw new Error(`Slice ${slice.id} must be prepared before dispatch; current status is ${slice.status}.`);
+    }
+    const taskSlug = resolveOrchestrationTaskSlug(run.id, slice);
+    if (!slice.branchName || !slice.worktreePath) {
+      throw new Error(`Slice ${slice.id} is missing a prepared worktree assignment.`);
+    }
+    if (!existsSync(slice.worktreePath)) {
+      throw new Error(`Slice ${slice.id} assigned worktree is missing: ${slice.worktreePath}`);
+    }
+    assertPreparedWorktreeSafe(context, slice.id, slice.branchName, slice.worktreePath);
+
+    const promptPath = path.join(dispatchRoot, `${taskSlug}.md`);
+    return {
+      slice,
+      taskSlug,
+      promptPath,
+      handoffCommand: renderDispatchHandoffCommand(slice.worktreePath, promptPath),
+      alreadyDispatched: slice.dispatch?.promptPath === promptPath && existsSync(promptPath),
+    };
+  });
+
+  for (const { slice, taskSlug, promptPath, handoffCommand, alreadyDispatched } of preparedSlices) {
+    if (!alreadyDispatched) {
+      writeFileSync(promptPath, renderDispatchPrompt(run, slice, handoffCommand), 'utf8');
+    }
+    slice.taskSlug = taskSlug;
+    slice.dispatch = {
+      status: 'ready',
+      provider: slice.provider,
+      promptPath,
+      worktreePath: slice.worktreePath,
+      branchName: slice.branchName,
+      handoffCommand,
+      dispatchedAt: alreadyDispatched && slice.dispatch ? slice.dispatch.dispatchedAt : dispatchedAt,
+    };
+    slice.status = 'dispatched';
+    if (alreadyDispatched) existingCount += 1;
+    else writtenCount += 1;
+    reports.push({
+      id: slice.id,
+      status: slice.status,
+      provider: slice.provider,
+      branchName: slice.branchName,
+      worktreePath: slice.worktreePath,
+      promptPath,
+      handoffCommand,
+      action: alreadyDispatched ? 'existing' : 'written',
+    });
+    persistOrchestrationDispatchProgress(context, run);
+  }
+
+  run.status = 'dispatched';
+  run.updatedAt = nowIso();
+  return { writtenCount, existingCount, slices: reports };
 }
 
 function prepareSliceWorktrees(
@@ -303,6 +441,11 @@ function persistOrchestrationPrepareProgress(context: WorkflowContext, run: Orch
   saveOrchestrationRunRecord(context.commonDir, context.config, run);
 }
 
+function persistOrchestrationDispatchProgress(context: WorkflowContext, run: OrchestrationRunRecord): void {
+  run.updatedAt = nowIso();
+  saveOrchestrationRunRecord(context.commonDir, context.config, run);
+}
+
 function buildOrchestrationTaskSlug(runId: string, slice: OrchestrationSliceRecord): string {
   const runPrefix = runId.replace(/^orchestrate-/, 'orch-');
   const prefix = `${runPrefix}-s${slice.index}-`;
@@ -329,6 +472,51 @@ function assertSafeOrchestrationTaskSlug(taskSlug: string, sliceId: string): voi
 
 function buildOrchestrationTaskName(run: OrchestrationRunRecord, slice: OrchestrationSliceRecord): string {
   return `Orchestrate ${run.id} slice ${slice.index}: ${slice.outcome}`;
+}
+
+function renderDispatchHandoffCommand(worktreePath: string, promptPath: string): string {
+  return `cd ${shellQuote(worktreePath)} && cat ${shellQuote(promptPath)}`;
+}
+
+function renderDispatchPrompt(
+  run: OrchestrationRunRecord,
+  slice: OrchestrationSliceRecord,
+  handoffCommand: string,
+): string {
+  return [
+    `# Pipelane Orchestration Slice`,
+    '',
+    `Run: ${run.id}`,
+    `Slice: ${slice.id}`,
+    `Provider: ${slice.provider}`,
+    `Branch: ${slice.branchName ?? '(unassigned)'}`,
+    `Worktree: ${slice.worktreePath ?? '(unassigned)'}`,
+    '',
+    '## Handoff',
+    '',
+    'Open the provider session in the worktree above and run the GoalSpec prompt below.',
+    'Pipelane generated this handoff file only; it did not start a provider process.',
+    '',
+    'Suggested shell handoff:',
+    '',
+    '```bash',
+    handoffCommand,
+    '```',
+    '',
+    '## Provider Prompt',
+    '',
+    slice.providerPrompt,
+    '',
+    '## Required Slice Review',
+    '',
+    'After implementation, run `/pipelane review` in this worktree and record the output in the final handoff.',
+    'Do not merge, deploy, or clean this task workspace from inside the slice worker.',
+    '',
+  ].join('\n');
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\"'\"'")}'`;
 }
 
 function cleanupFailedSliceWorkspace(
@@ -536,7 +724,37 @@ function renderPrepareReport(
 
   lines.push(
     '',
-    'Provider agents were not started. Next: run the generated GoalSpec prompt in each prepared worktree, then run review gates per slice.',
+    'Provider agents were not started. Next: run /pipelane orchestrate dispatch --run-id <run-id> to write provider handoff prompts.',
+  );
+
+  return lines.join('\n');
+}
+
+function renderDispatchReport(
+  run: OrchestrationRunRecord,
+  ledgerPath: string,
+  result: { writtenCount: number; existingCount: number; slices: DispatchedSliceReport[] },
+): string {
+  const lines = [
+    'Pipelane orchestrate dispatch',
+    '',
+    `Status: dispatched`,
+    `Run: ${run.id}`,
+    `Ledger: ${ledgerPath}`,
+    `Written prompts: ${result.writtenCount}`,
+    `Existing prompts: ${result.existingCount}`,
+    '',
+    'Slice handoffs:',
+  ];
+
+  for (const slice of result.slices) {
+    lines.push(`- ${slice.id}: ${slice.provider} prompt at ${slice.promptPath} (${slice.action})`);
+  }
+
+  lines.push(
+    '',
+    'Provider agents were not started by this command.',
+    'Next: start each provider session from its prepared worktree using the handoff prompt, then run /pipelane review per slice.',
   );
 
   return lines.join('\n');

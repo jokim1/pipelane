@@ -89,10 +89,11 @@ slash command names only when alias config cannot be loaded.
 
 ## Orchestration Roadmap
 
-`/pipelane orchestrate goal-spec`, `/pipelane orchestrate plan`, and
-`/pipelane orchestrate prepare` are shipped as orchestration surfaces: they
-draft provider-neutral goals, write durable slice ledgers, and assign slice
-worktrees, but they do not run provider workers yet. The board should add
+`/pipelane orchestrate goal-spec`, `/pipelane orchestrate plan`,
+`/pipelane orchestrate prepare`, and `/pipelane orchestrate dispatch` are
+shipped as orchestration surfaces: they draft provider-neutral goals, write
+durable slice ledgers, assign slice worktrees, and write provider handoff
+prompts, but they do not run provider workers yet. The board should add
 read-only visibility for orchestration runs without changing the existing
 branch, PR, deploy, rollback, and cleanup model.
 

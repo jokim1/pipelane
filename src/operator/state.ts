@@ -3258,16 +3258,19 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
     }
     case 'orchestrate': {
       const subcommand = parsed.positional[0] ?? '';
-      if (subcommand !== 'goal-spec' && subcommand !== 'plan' && subcommand !== 'prepare') {
-        throw new Error('orchestrate requires exactly: pipelane run orchestrate <goal-spec|plan|prepare> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--run-id <id>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]');
+      if (subcommand !== 'goal-spec' && subcommand !== 'plan' && subcommand !== 'prepare' && subcommand !== 'dispatch') {
+        throw new Error('orchestrate requires exactly: pipelane run orchestrate <goal-spec|plan|prepare|dispatch> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--run-id <id>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]');
       }
-      if (subcommand === 'prepare') {
+      if (subcommand === 'prepare' || subcommand === 'dispatch') {
         assertOnlyFlags(parsed, ['orchestrationRunId', 'offline']);
         if (parsed.positional.length !== 1) {
-          throw new Error('orchestrate prepare requires exactly: pipelane run orchestrate prepare --run-id <id> [--offline]');
+          throw new Error(`orchestrate ${subcommand} requires exactly: pipelane run orchestrate ${subcommand} --run-id <id>${subcommand === 'prepare' ? ' [--offline]' : ''}`);
         }
         if (!parsed.flags.orchestrationRunId.trim()) {
-          throw new Error('orchestrate prepare requires --run-id <id>.');
+          throw new Error(`orchestrate ${subcommand} requires --run-id <id>.`);
+        }
+        if (subcommand === 'dispatch' && parsed.flags.offline) {
+          throw new Error('orchestrate dispatch does not accept --offline.');
         }
         return;
       }

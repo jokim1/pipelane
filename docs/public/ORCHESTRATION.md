@@ -232,6 +232,7 @@ Current implementation surface:
 ```text
 /pipelane orchestrate plan --plan-file docs/plan.md
 /pipelane orchestrate prepare --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
+/pipelane orchestrate dispatch --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
 /pipelane orchestrate goal-spec --plan-file docs/plan.md
 /pipelane orchestrate goal-spec --outcome "Implement review gate enforcement"
 /pipelane orchestrate goal-spec --provider codex --json
@@ -241,8 +242,11 @@ Current implementation surface:
 ledger with slice records, provider-neutral `GoalSpec` prompts, a review-gate
 snapshot, and the source plan fingerprint. `orchestrate prepare` consumes that
 ledger, creates missing slice worktrees using the same task-lock machinery as
-`/new`, and records each task slug, branch, and worktree path. It does not start
-provider agents yet. `goal-spec` remains the single-slice draft-only command.
+`/new`, and records each task slug, branch, and worktree path. `orchestrate
+dispatch` consumes prepared ledgers and writes durable provider handoff prompts
+under the run state directory. It records which prompt belongs to which prepared
+worktree, but still does not start provider agents. `goal-spec` remains the
+single-slice draft-only command.
 
 ## Presets
 
@@ -421,7 +425,8 @@ Do not add:
 7. Done: add provider-neutral `GoalSpec` generation for future slice execution.
 8. Done: add durable `/pipelane orchestrate plan` ledger compilation.
 9. Done: add `/pipelane orchestrate prepare` worktree assignment on top of the ledger.
-10. Next: build provider-agent execution on prepared slice worktrees.
+10. Done: add `/pipelane orchestrate dispatch` provider handoff prompts for prepared slice worktrees.
+11. Next: launch provider workers from dispatch records and capture completion evidence.
 
 ## Acceptance Criteria
 
@@ -446,5 +451,5 @@ Do not add:
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | not run | Recommended before board UI implementation. |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | not run | Optional; useful before shipping setup UX. |
 
-- **UNRESOLVED:** Provider adapter execution, human-gate execution, and full gate-runner trusted-baseline semantics still need implementation-level detail before full `/orchestrate`.
-- **VERDICT:** ENG CLEARED for earlier slices. Review runner, `/pr` enforcement, provider-neutral `GoalSpec` generation, durable ledger compilation, and worktree preparation are implemented; next proceed to provider-agent execution.
+- **UNRESOLVED:** Provider process launch, human-gate execution, and full gate-runner trusted-baseline semantics still need implementation-level detail before full `/orchestrate`.
+- **VERDICT:** ENG CLEARED for earlier slices. Review runner, `/pr` enforcement, provider-neutral `GoalSpec` generation, durable ledger compilation, worktree preparation, and dispatch prompt generation are implemented; next proceed to provider worker launch.

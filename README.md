@@ -494,14 +494,16 @@ Draft a goal from a plan without starting execution:
 ```text
 /pipelane orchestrate plan --plan-file docs/plan.md
 /pipelane orchestrate prepare --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
+/pipelane orchestrate dispatch --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
 /pipelane orchestrate goal-spec --plan-file docs/plan.md
 /pipelane orchestrate goal-spec --outcome "Implement review gate enforcement" --provider claude
 ```
 
 `orchestrate plan` writes a durable slice ledger under Pipelane state. It does
 not create worktrees or run agents. `orchestrate prepare` creates the slice
-worktrees from that ledger and records their task locks, branches, and paths;
-it still does not start provider agents.
+worktrees from that ledger and records their task locks, branches, and paths.
+`orchestrate dispatch` writes durable provider handoff prompts for those
+prepared worktrees; it still does not start provider agents.
 
 The intended review order is:
 
