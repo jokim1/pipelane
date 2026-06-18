@@ -3254,9 +3254,22 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         }
         return;
       }
+      if (subcommand === 'pass' || subcommand === 'attest') {
+        assertOnlyFlags(parsed, ['reviewGate', 'message']);
+        if (parsed.positional.length !== 1) {
+          throw new Error('review pass requires exactly: pipelane run review pass --gate <id> --message <what was run and why it is clean>');
+        }
+        if (!parsed.flags.reviewGate.trim()) {
+          throw new Error('review pass requires --gate <id>.');
+        }
+        if (!parsed.flags.message.trim()) {
+          throw new Error('review pass requires --message <what was run and why it is clean>.');
+        }
+        return;
+      }
       assertOnlyFlags(parsed, ['reviewDryRun', 'reviewGate', 'reviewPhase']);
       if (parsed.positional.length > 0) {
-        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], or pipelane run review setup [--yes] [--preset lean|standard|strict-production] [--print] [--list-gates]');
+        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review pass --gate <id> --message <text>, or pipelane run review setup [--yes] [--preset lean|standard|strict-production] [--print] [--list-gates]');
       }
       const phase = parsed.flags.reviewPhase.trim();
       if (phase && !includesString(REVIEW_GATE_PHASES, phase)) {

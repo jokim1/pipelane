@@ -396,6 +396,18 @@ the current branch, HEAD, and worktree state, and cannot come from a dry-run or
 filtered review. A skipped or unavailable optional gate records a warning, not a
 crash.
 
+Manual skill, agent, and approval gates are not expected to write Pipelane
+state themselves. After the operator runs the referenced command, fixes any
+findings, and determines the gate is clean, record the pass explicitly:
+
+```bash
+pipelane run review pass --gate gstack-review --message "Ran /review clean"
+```
+
+The pass command only applies to a full, non-dry-run review for the current
+branch, HEAD, and worktree state. If the worktree changes, rerun
+`/pipelane review` before recording manual passes again.
+
 ## Orchestration Ledger
 
 Every orchestration run should write an evidence ledger under Pipelane state:

@@ -15,6 +15,7 @@ import { readWorktreeStatusSnapshot } from '../worktree-status.ts';
 import {
   appendReviewRunRecord,
   defaultReviewGatesConfig,
+  loadReviewState,
   nowIso,
   patchReadableWorkflowConfig,
   printResult,
@@ -30,11 +31,13 @@ import {
   type ReviewGatePreset,
   type ReviewGatesConfig,
   type ReviewRunRecord,
+  type WorkflowConfig,
   type ReviewPlanGateConfig,
 } from '../state.ts';
 
 type ReviewSetupStatus = 'configured' | 'reported' | 'cancelled';
 type ReviewCommandStatus = ReviewRunRecord['status'];
+type ReviewAttestStatus = 'attested';
 
 const REVIEW_CONFIG_CHANGE_GATE_ID = 'review-config-change';
 const REVIEW_CONFIG_CHANGE_PATHS = ['.pipelane.json', '.project-workflow.json', 'package.json'];
@@ -97,6 +100,16 @@ interface ReviewSetupReport {
   message: string;
 }
 
+interface ReviewAttestReport {
+  command: 'review pass';
+  status: ReviewAttestStatus;
+  runId: string;
+  repoRoot: string;
+  evidencePath: string;
+  gateId: string;
+  message: string;
+}
+
 export interface BuildReviewRunRecordOptions {
   repoRoot: string;
   baseBranch: string;
@@ -112,6 +125,10 @@ export async function handleReview(cwd: string, parsed: ParsedOperatorArgs): Pro
   const subcommand = parsed.positional[0] ?? '';
   if (subcommand === 'setup') {
     await handleReviewSetup(cwd, parsed);
+    return;
+  }
+  if (subcommand === 'pass' || subcommand === 'attest') {
+    handleReviewPass(cwd, parsed);
     return;
   }
 
@@ -209,6 +226,117 @@ async function handleReviewSetup(cwd: string, parsed: ParsedOperatorArgs): Promi
   });
 
   printResult(parsed.flags, report);
+}
+
+function handleReviewPass(cwd: string, parsed: ParsedOperatorArgs): void {
+  const context = resolveWorkflowContext(cwd);
+  const gateId = parsed.flags.reviewGate.trim();
+  const message = parsed.flags.message.trim();
+  const record = buildReviewPassRecord({
+    repoRoot: context.repoRoot,
+    commonDir: context.commonDir,
+    config: context.config,
+    gateId,
+    message,
+  });
+  const persisted = appendReviewRunRecord(context.commonDir, context.config, record);
+  const report: ReviewAttestReport = {
+    command: 'review pass',
+    status: 'attested',
+    runId: persisted.id,
+    repoRoot: context.repoRoot,
+    evidencePath: reviewStatePath(context.commonDir, context.config),
+    gateId,
+    message: renderReviewPassReport(persisted, gateId, reviewStatePath(context.commonDir, context.config)),
+  };
+
+  printResult(parsed.flags, report);
+}
+
+export function buildReviewPassRecord(options: {
+  repoRoot: string;
+  commonDir: string;
+  config: WorkflowConfig;
+  gateId: string;
+  message: string;
+}): ReviewRunRecord {
+  const gateId = options.gateId.trim();
+  const message = options.message.trim();
+  if (!gateId) {
+    throw new Error('review pass requires --gate <id>.');
+  }
+  if (!message) {
+    throw new Error('review pass requires --message <what was run and why it is clean>.');
+  }
+
+  const expectedGate = options.config.reviewGates?.gates?.find((gate) => gate.id === gateId);
+  if (!expectedGate) {
+    throw new Error(`No configured review gate matches --gate ${gateId}. Run "pipelane run review setup --list-gates" to inspect configured gates.`);
+  }
+  if (!isManualReviewGate(expectedGate)) {
+    throw new Error(`review pass only accepts manual gates. Gate ${gateId} is type ${expectedGate.type}; rerun /pipelane review to execute it.`);
+  }
+
+  const currentBranch = runGit(options.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
+  const currentSha = runGit(options.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '';
+  const worktreeStatus = readWorktreeStatusSnapshot(options.repoRoot, { includeStatusDigest: true });
+  if (!worktreeStatus.statusDigestReliable) {
+    throw new Error(`review pass cannot attest an unreliable worktree digest: ${worktreeStatus.statusDigestWarnings.join('; ') || 'status digest is incomplete'}`);
+  }
+
+  const state = loadReviewState(options.commonDir, options.config);
+  const base = state.records.find((record) =>
+    !record.dryRun
+    && !record.gateFilter
+    && !record.phaseFilter
+    && record.branchName === currentBranch
+    && record.sha === currentSha
+    && record.worktreeStatusDigest === worktreeStatus.statusDigest
+  );
+  if (!base) {
+    throw new Error('review pass requires a full, non-dry-run /pipelane review for the current branch, HEAD, and worktree state.');
+  }
+
+  const gate = base.gates.find((entry) => entry.gateId === gateId);
+  if (!gate) {
+    throw new Error(`Gate ${gateId} is missing from the latest current review evidence. Rerun /pipelane review before passing it.`);
+  }
+  if (!isManualReviewGate(gate)) {
+    throw new Error(`review pass only accepts manual gates. Gate ${gateId} is type ${gate.type}; rerun /pipelane review to execute it.`);
+  }
+  if (gate.status === 'failed') {
+    throw new Error(`Gate ${gateId} is failed, not pending. Fix it and rerun /pipelane review before passing it.`);
+  }
+  if (base.gates.some((entry) => entry.blocking !== false && entry.status === 'failed')) {
+    throw new Error('review pass cannot clear evidence while a blocking gate is failed. Fix failed gates and rerun /pipelane review first.');
+  }
+
+  const startedAt = nowIso();
+  const nextGates = base.gates.map((entry) => {
+    if (entry.gateId !== gateId || entry.status !== 'pending') return entry;
+    return {
+      ...entry,
+      status: 'passed' as const,
+      summary: manualPassSummary(message),
+      startedAt,
+      finishedAt: startedAt,
+      durationMs: 0,
+    };
+  });
+
+  return {
+    ...base,
+    id: `review-pass-${new Date(startedAt).toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto.randomUUID().slice(0, 8)}`,
+    status: summarizeRunStatus(nextGates),
+    startedAt,
+    finishedAt: startedAt,
+    durationMs: 0,
+    worktreeStatusDigest: worktreeStatus.statusDigest,
+    worktreeStatusReliable: worktreeStatus.statusDigestReliable,
+    worktreeStatusWarnings: worktreeStatus.statusDigestWarnings,
+    gates: nextGates,
+    signature: undefined,
+  };
 }
 
 function canRunInteractiveReviewSetup(): boolean {
@@ -739,6 +867,14 @@ function summarizeRunStatus(gates: ReviewGateRunRecord[]): ReviewCommandStatus {
   return 'passed';
 }
 
+function isManualReviewGate(gate: Pick<ReviewGateConfig | ReviewGateRunRecord, 'type'>): boolean {
+  return gate.type === 'skill' || gate.type === 'agent' || gate.type === 'approval';
+}
+
+function manualPassSummary(message: string): string {
+  return `manual pass: ${message}`;
+}
+
 function skipReasonForGate(gate: ReviewGateConfig, changedFiles: string[], activeSurfaces: string[]): string | null {
   if (gate.whenChanged && gate.whenChanged.length > 0) {
     const matched = changedFiles.some((file) => gate.whenChanged?.some((pattern) => matchesPathPattern(file, pattern)));
@@ -909,6 +1045,38 @@ function renderReviewRunReport(record: ReviewRunRecord, evidencePath: string): s
     lines.push('', 'Next: complete pending AI/manual gates, then rerun or attach their evidence before PR enforcement.');
   } else {
     lines.push('', 'Next: continue to /pr when ready.');
+  }
+
+  return lines.join('\n');
+}
+
+function renderReviewPassReport(record: ReviewRunRecord, gateId: string, evidencePath: string): string {
+  const gate = record.gates.find((entry) => entry.gateId === gateId);
+  const lines = [
+    'Pipelane review pass',
+    `Status: ${record.status}`,
+    `Evidence: ${evidencePath}`,
+    `Run: ${record.id}`,
+    `Gate: ${gateId}`,
+    `Gate status: ${gate?.status ?? 'missing'}`,
+  ];
+
+  if (gate?.summary) {
+    lines.push(`Summary: ${gate.summary}`);
+  }
+
+  const pending = record.gates.filter((entry) => entry.status === 'pending');
+  if (pending.length > 0) {
+    lines.push('', 'Still pending:');
+    for (const entry of pending) {
+      lines.push(`- ${entry.gateId}: ${entry.summary}`);
+    }
+  }
+
+  if (record.status === 'passed') {
+    lines.push('', 'Next: continue to /pr when ready.');
+  } else {
+    lines.push('', 'Next: complete the remaining pending AI/manual gates, then record each pass.');
   }
 
   return lines.join('\n');
