@@ -175,6 +175,7 @@ Pipelane commands:
   orchestrate plan [--slice-id <id>] (--plan-file <path> | --outcome <text>) [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]
   orchestrate prepare --run-id <id> [--offline]
   orchestrate dispatch --run-id <id>
+  orchestrate start --run-id <id> [--slice-id <id>] [--force]
   status
   doctor [--probe | --fix | --check-guard]
   rollback <staging|prod> [--surfaces ...] [--revert-pr]

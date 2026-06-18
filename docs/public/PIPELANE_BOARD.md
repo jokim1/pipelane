@@ -90,10 +90,13 @@ slash command names only when alias config cannot be loaded.
 ## Orchestration Roadmap
 
 `/pipelane orchestrate goal-spec`, `/pipelane orchestrate plan`,
-`/pipelane orchestrate prepare`, and `/pipelane orchestrate dispatch` are
+`/pipelane orchestrate prepare`, `/pipelane orchestrate dispatch`, and
+`/pipelane orchestrate start` are
 shipped as orchestration surfaces: they draft provider-neutral goals, write
 durable slice ledgers, assign slice worktrees, and write provider handoff
-prompts, but they do not run provider workers yet. The board should add
+prompts. Start can run explicitly configured workers and record log/exit
+evidence, including `--force` retries for failed or stale running workers, but
+it does not run review gates, merge, deploy, or cleanup. The board should add
 read-only visibility for orchestration runs without changing the existing
 branch, PR, deploy, rollback, and cleanup model.
 

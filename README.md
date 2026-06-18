@@ -495,6 +495,7 @@ Draft a goal from a plan without starting execution:
 /pipelane orchestrate plan --plan-file docs/plan.md
 /pipelane orchestrate prepare --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
 /pipelane orchestrate dispatch --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
+/pipelane orchestrate start --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef [--slice-id <id>] [--force]
 /pipelane orchestrate goal-spec --plan-file docs/plan.md
 /pipelane orchestrate goal-spec --outcome "Implement review gate enforcement" --provider claude
 ```
@@ -503,7 +504,10 @@ Draft a goal from a plan without starting execution:
 not create worktrees or run agents. `orchestrate prepare` creates the slice
 worktrees from that ledger and records their task locks, branches, and paths.
 `orchestrate dispatch` writes durable provider handoff prompts for those
-prepared worktrees; it still does not start provider agents.
+prepared worktrees. `orchestrate start` runs a configured worker command from
+each dispatched worktree, feeds the prompt on stdin, streams redacted log/exit
+evidence, and supports `--force` to retry failed or stale running workers. It
+does not run review gates, merge, deploy, or clean up.
 
 The intended review order is:
 

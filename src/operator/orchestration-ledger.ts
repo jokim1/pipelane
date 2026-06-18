@@ -28,6 +28,7 @@ import {
 
 export type OrchestrationRunStatus = 'planned' | 'prepared' | 'dispatched' | 'running' | 'blocked' | 'completed' | 'failed';
 export type OrchestrationSliceStatus = 'planned' | 'prepared' | 'dispatched' | 'running' | 'blocked' | 'completed' | 'failed';
+export type OrchestrationSliceWorkerStatus = 'running' | 'succeeded' | 'failed';
 
 export interface OrchestrationSliceDispatchRecord {
   status: 'ready';
@@ -37,6 +38,20 @@ export interface OrchestrationSliceDispatchRecord {
   branchName: string;
   handoffCommand: string;
   dispatchedAt: string;
+}
+
+export interface OrchestrationSliceWorkerRecord {
+  status: OrchestrationSliceWorkerStatus;
+  provider: GoalProvider;
+  command: string;
+  pid: number | null;
+  promptPath: string;
+  logPath: string;
+  startedAt: string;
+  finishedAt: string | null;
+  exitCode: number | null;
+  signal: string | null;
+  error: string | null;
 }
 
 export interface OrchestrationSliceRecord {
@@ -51,6 +66,7 @@ export interface OrchestrationSliceRecord {
   worktreePath: string | null;
   branchName: string | null;
   dispatch: OrchestrationSliceDispatchRecord | null;
+  worker: OrchestrationSliceWorkerRecord | null;
   goalSpec: GoalSpec;
   provider: GoalProvider;
   providerPrompt: string;
@@ -155,6 +171,7 @@ export function buildOrchestrationRunRecord(input: BuildOrchestrationRunInput): 
       worktreePath: null,
       branchName: null,
       dispatch: null,
+      worker: null,
       goalSpec,
       provider: draft.provider,
       providerPrompt: renderProviderGoalPrompt(goalSpec, draft.provider),

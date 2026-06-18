@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import path from 'node:path';
 
 import {
@@ -12,6 +13,7 @@ import {
   saveOrchestrationRunRecord,
   type OrchestrationRunRecord,
   type OrchestrationSliceRecord,
+  type OrchestrationSliceWorkerRecord,
 } from '../orchestration-ledger.ts';
 import {
   DEFAULT_GOAL_PROVIDER,
@@ -120,6 +122,53 @@ interface DispatchSlicePreparation {
   alreadyDispatched: boolean;
 }
 
+interface StartedSliceReport {
+  id: string;
+  status: OrchestrationSliceRecord['status'];
+  provider: GoalProvider;
+  branchName: string;
+  worktreePath: string;
+  promptPath: string;
+  logPath: string | null;
+  exitCode: number | null;
+  signal: string | null;
+  action: 'started' | 'restarted' | 'existing' | 'blocked';
+  blocker: string | null;
+}
+
+interface OrchestrateStartReport {
+  command: 'orchestrate start';
+  status: 'completed' | 'running' | 'dispatched' | 'failed' | 'blocked' | 'noop';
+  repoRoot: string;
+  runId: string;
+  ledgerPath: string;
+  sliceId: string | null;
+  force: boolean;
+  startedCount: number;
+  restartedCount: number;
+  existingCount: number;
+  failedCount: number;
+  blockedCount: number;
+  slices: StartedSliceReport[];
+  run: OrchestrationRunRecord;
+  message: string;
+}
+
+interface StartSlicePreparation {
+  slice: OrchestrationSliceRecord;
+  taskSlug: string;
+  promptPath: string;
+  providerCommand: string;
+  restarting: boolean;
+}
+
+interface WorkerExecutionResult {
+  pid: number | null;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  error: string | null;
+}
+
 export async function handleOrchestrate(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const subcommand = parsed.positional[0] ?? '';
   if (subcommand === 'goal-spec') {
@@ -138,8 +187,12 @@ export async function handleOrchestrate(cwd: string, parsed: ParsedOperatorArgs)
     handleDispatch(cwd, parsed);
     return;
   }
+  if (subcommand === 'start') {
+    await handleStart(cwd, parsed);
+    return;
+  }
 
-  throw new Error('orchestrate requires exactly: pipelane run orchestrate <goal-spec|plan|prepare|dispatch> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--run-id <id>] [--provider codex|claude|generic]');
+  throw new Error('orchestrate requires exactly: pipelane run orchestrate <goal-spec|plan|prepare|dispatch|start> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--run-id <id>] [--provider codex|claude|generic]');
 }
 
 function handleGoalSpec(cwd: string, parsed: ParsedOperatorArgs): void {
@@ -233,6 +286,42 @@ function handleDispatch(cwd: string, parsed: ParsedOperatorArgs): void {
   printResult(parsed.flags, report);
 }
 
+async function handleStart(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
+  const context = resolveWorkflowContext(cwd);
+  const runId = parsed.flags.orchestrationRunId.trim();
+  const sliceId = parsed.flags.goalSliceId.trim() || null;
+  const force = parsed.flags.force;
+  const run = loadOrchestrationRunRecord(context.commonDir, context.config, runId);
+  if (!run) {
+    throw new Error(`No orchestration run ledger found for ${runId}.`);
+  }
+  if (run.status === 'planned' || run.status === 'prepared') {
+    throw new Error(`orchestrate start requires a dispatched run; ${runId} is ${run.status}.`);
+  }
+
+  const result = await startDispatchedSlices(context, run, sliceId, force);
+  const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+  const report: OrchestrateStartReport = {
+    command: 'orchestrate start',
+    status: result.status,
+    repoRoot: context.repoRoot,
+    runId: run.id,
+    ledgerPath,
+    sliceId,
+    force,
+    startedCount: result.startedCount,
+    restartedCount: result.restartedCount,
+    existingCount: result.existingCount,
+    failedCount: result.failedCount,
+    blockedCount: result.blockedCount,
+    slices: result.slices,
+    run,
+    message: renderStartReport(run, ledgerPath, sliceId, force, result),
+  };
+
+  printResult(parsed.flags, report);
+}
+
 function dispatchPreparedSlices(
   context: WorkflowContext,
   run: OrchestrationRunRecord,
@@ -303,6 +392,543 @@ function dispatchPreparedSlices(
   run.status = 'dispatched';
   run.updatedAt = nowIso();
   return { writtenCount, existingCount, slices: reports };
+}
+
+async function startDispatchedSlices(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+  sliceId: string | null,
+  force: boolean,
+): Promise<{
+  status: OrchestrateStartReport['status'];
+  startedCount: number;
+  restartedCount: number;
+  existingCount: number;
+  failedCount: number;
+  blockedCount: number;
+  slices: StartedSliceReport[];
+}> {
+  const selectedSlices = resolveStartSlices(run, sliceId);
+  const runDir = path.dirname(orchestrationRunPath(context.commonDir, context.config, run.id));
+  const workerRoot = path.join(runDir, 'workers');
+  mkdirSync(workerRoot, { recursive: true });
+  const byId = new Map(run.slices.map((slice) => [slice.id, slice]));
+  const reports: StartedSliceReport[] = [];
+  let startedCount = 0;
+  let restartedCount = 0;
+  let existingCount = 0;
+  let failedCount = 0;
+  let blockedCount = 0;
+
+  const pendingSlices = [...selectedSlices];
+  while (pendingSlices.length > 0) {
+    let progressed = false;
+    for (let index = 0; index < pendingSlices.length;) {
+      const slice = pendingSlices[index];
+      const existingWorker = slice.worker;
+      const recoverableExistingWorker = existingWorker?.status === 'running' || existingWorker?.status === 'failed';
+      if (
+        existingWorker
+        && (
+          existingWorker.status === 'succeeded'
+          || (recoverableExistingWorker && !force)
+        )
+      ) {
+        existingCount += 1;
+        reports.push(buildExistingWorkerReport(slice, existingWorker));
+        pendingSlices.splice(index, 1);
+        progressed = true;
+        continue;
+      }
+
+      const blocker = dependencyBlocker(slice, byId);
+      if (blocker && dependencyMayCompleteLater(slice, byId, pendingSlices)) {
+        index += 1;
+        continue;
+      }
+      if (blocker) {
+        blockedCount += 1;
+        slice.status = 'blocked';
+        reports.push(buildBlockedWorkerReport(slice, blocker));
+        persistOrchestrationStartProgress(context, run);
+        pendingSlices.splice(index, 1);
+        progressed = true;
+        continue;
+      }
+
+      const restarting = Boolean(existingWorker && recoverableExistingWorker && force);
+      if (restarting && existingWorker?.status === 'running') {
+        await terminateExistingRunningWorker(existingWorker);
+      }
+      const prepared = prepareSliceForStart(context, run, workerRoot, slice, restarting);
+      const worker = await runProviderWorker(context, run, prepared);
+      slice.worker = worker;
+      slice.status = worker.status === 'succeeded' ? 'completed' : 'failed';
+      if (restarting) restartedCount += 1;
+      else startedCount += 1;
+      if (worker.status === 'failed') failedCount += 1;
+      reports.push({
+        id: slice.id,
+        status: slice.status,
+        provider: slice.provider,
+        branchName: slice.branchName ?? '',
+        worktreePath: slice.worktreePath ?? '',
+        promptPath: worker.promptPath,
+        logPath: worker.logPath,
+        exitCode: worker.exitCode,
+        signal: worker.signal,
+        action: restarting ? 'restarted' : 'started',
+        blocker: null,
+      });
+      persistOrchestrationStartProgress(context, run);
+      pendingSlices.splice(index, 1);
+      progressed = true;
+    }
+
+    if (!progressed) {
+      for (const slice of pendingSlices.splice(0)) {
+        blockedCount += 1;
+        slice.status = 'blocked';
+        reports.push(buildBlockedWorkerReport(slice, dependencyBlocker(slice, byId) ?? 'dependency cycle or unsatisfied dependency order'));
+        persistOrchestrationStartProgress(context, run);
+      }
+    }
+  }
+
+  run.status = summarizeRunWorkerStatus(run);
+  run.updatedAt = nowIso();
+  return {
+    status: reportStatusForStart(run.status, startedCount, restartedCount, existingCount, failedCount, blockedCount),
+    startedCount,
+    restartedCount,
+    existingCount,
+    failedCount,
+    blockedCount,
+    slices: reports,
+  };
+}
+
+function resolveStartSlices(run: OrchestrationRunRecord, sliceId: string | null): OrchestrationSliceRecord[] {
+  if (!sliceId) return run.slices;
+  const slice = run.slices.find((candidate) => candidate.id === sliceId);
+  if (!slice) {
+    throw new Error(`No slice ${sliceId} found in orchestration run ${run.id}.`);
+  }
+  return [slice];
+}
+
+function prepareSliceForStart(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+  workerRoot: string,
+  slice: OrchestrationSliceRecord,
+  restarting: boolean,
+): StartSlicePreparation {
+  if (slice.status !== 'dispatched' && slice.status !== 'blocked' && !(restarting && (slice.status === 'running' || slice.status === 'failed'))) {
+    throw new Error(`Slice ${slice.id} must be dispatched before start; current status is ${slice.status}.`);
+  }
+  const taskSlug = resolveOrchestrationTaskSlug(run.id, slice);
+  if (!slice.branchName || !slice.worktreePath || !slice.dispatch) {
+    throw new Error(`Slice ${slice.id} is missing dispatch metadata.`);
+  }
+  if (!existsSync(slice.worktreePath)) {
+    throw new Error(`Slice ${slice.id} assigned worktree is missing: ${slice.worktreePath}`);
+  }
+  assertPreparedWorktreeSafe(context, slice.id, slice.branchName, slice.worktreePath);
+  if (slice.dispatch.branchName !== slice.branchName || slice.dispatch.worktreePath !== slice.worktreePath) {
+    throw new Error(`Slice ${slice.id} dispatch metadata does not match its prepared worktree assignment.`);
+  }
+
+  const runDir = path.dirname(orchestrationRunPath(context.commonDir, context.config, run.id));
+  const promptPath = path.join(runDir, 'dispatch', `${taskSlug}.md`);
+  if (slice.dispatch.promptPath !== promptPath) {
+    throw new Error(`Slice ${slice.id} dispatch prompt path does not match its expected location.`);
+  }
+  assertDispatchPromptSafe(runDir, slice.id, promptPath);
+  mkdirSync(workerRoot, { recursive: true });
+
+  return {
+    slice,
+    taskSlug,
+    promptPath,
+    providerCommand: resolveProviderCommand(slice.provider),
+    restarting,
+  };
+}
+
+function resolveProviderCommand(provider: GoalProvider): string {
+  const providerKey = provider.toUpperCase().replace(/[^A-Z0-9]/g, '_');
+  const providerSpecific = process.env[`PIPELANE_ORCHESTRATE_${providerKey}_COMMAND`]?.trim();
+  const fallback = process.env.PIPELANE_ORCHESTRATE_WORKER_COMMAND?.trim();
+  const command = providerSpecific || fallback || '';
+  if (!command) {
+    throw new Error(`orchestrate start requires PIPELANE_ORCHESTRATE_${providerKey}_COMMAND or PIPELANE_ORCHESTRATE_WORKER_COMMAND.`);
+  }
+  return command;
+}
+
+function assertDispatchPromptSafe(runDir: string, sliceId: string, promptPath: string): void {
+  const dispatchRoot = path.join(runDir, 'dispatch');
+  if (!existsSync(promptPath)) {
+    throw new Error(`Slice ${sliceId} dispatch prompt is missing: ${promptPath}`);
+  }
+  const rootRealpath = normalizePath(realpathSync(dispatchRoot));
+  const promptRealpath = normalizePath(realpathSync(promptPath));
+  const relative = path.relative(rootRealpath, promptRealpath);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Error(`Slice ${sliceId} dispatch prompt must stay under ${dispatchRoot}: ${promptPath}`);
+  }
+}
+
+async function runProviderWorker(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+  prepared: StartSlicePreparation,
+): Promise<OrchestrationSliceWorkerRecord> {
+  const { slice, taskSlug, promptPath, providerCommand } = prepared;
+  const startedAt = nowIso();
+  const runDir = path.dirname(orchestrationRunPath(context.commonDir, context.config, run.id));
+  const logPath = path.join(runDir, 'workers', `${taskSlug}-${Date.now()}.log`);
+  const redactedProviderCommand = redactOrchestrationWorkerText(providerCommand);
+  const prompt = readFileSync(promptPath, 'utf8');
+  const runningWorker: OrchestrationSliceWorkerRecord = {
+    status: 'running',
+    provider: slice.provider,
+    command: redactedProviderCommand,
+    pid: null,
+    promptPath,
+    logPath,
+    startedAt,
+    finishedAt: null,
+    exitCode: null,
+    signal: null,
+    error: null,
+  };
+
+  writeWorkerLog(logPath, [
+    'Pipelane orchestrate worker',
+    '',
+    `Run: ${run.id}`,
+    `Slice: ${slice.id}`,
+    `Provider: ${slice.provider}`,
+    `Command: ${redactedProviderCommand}`,
+    `Restarting: ${prepared.restarting ? 'yes' : 'no'}`,
+    `Worktree: ${slice.worktreePath ?? ''}`,
+    `Prompt: ${promptPath}`,
+    `Started: ${startedAt}`,
+    '',
+  ].join('\n'));
+
+  slice.worker = runningWorker;
+  slice.status = 'running';
+  run.status = 'running';
+  persistOrchestrationStartProgress(context, run);
+
+  const result = await executeProviderWorker({
+    command: providerCommand,
+    cwd: slice.worktreePath ?? context.repoRoot,
+    env: {
+      ...process.env,
+      PIPELANE_ORCHESTRATE_RUN_ID: run.id,
+      PIPELANE_ORCHESTRATE_SLICE_ID: slice.id,
+      PIPELANE_ORCHESTRATE_SLICE_INDEX: String(slice.index),
+      PIPELANE_ORCHESTRATE_PROVIDER: slice.provider,
+      PIPELANE_ORCHESTRATE_TASK_SLUG: taskSlug,
+      PIPELANE_ORCHESTRATE_BRANCH_NAME: slice.branchName ?? '',
+      PIPELANE_ORCHESTRATE_WORKTREE_PATH: slice.worktreePath ?? '',
+      PIPELANE_ORCHESTRATE_PROMPT_PATH: promptPath,
+      PIPELANE_ORCHESTRATE_LOG_PATH: logPath,
+      PIPELANE_ORCHESTRATE_LEDGER_PATH: orchestrationRunPath(context.commonDir, context.config, run.id),
+    },
+    prompt,
+    logPath,
+    timeoutMs: resolveWorkerTimeoutMs(slice),
+    onSpawn: (pid) => {
+      runningWorker.pid = pid;
+      slice.worker = { ...runningWorker };
+      persistOrchestrationStartProgress(context, run);
+    },
+  });
+
+  const finishedAt = nowIso();
+  const errorMessage = result.error ? redactOrchestrationWorkerText(result.error) : null;
+  appendFileSync(logPath, [
+    '',
+    '--- result ---',
+    `Finished: ${finishedAt}`,
+    `Exit code: ${result.exitCode ?? ''}`,
+    `Signal: ${result.signal ?? ''}`,
+    errorMessage ? `Error: ${errorMessage}` : '',
+    '',
+  ].filter((line) => line !== '').join('\n'), 'utf8');
+
+  return {
+    ...runningWorker,
+    status: result.exitCode === 0 && !result.error ? 'succeeded' : 'failed',
+    pid: result.pid,
+    finishedAt,
+    exitCode: result.exitCode,
+    signal: result.signal,
+    error: errorMessage,
+  };
+}
+
+function executeProviderWorker(options: {
+  command: string;
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  prompt: string;
+  logPath: string;
+  timeoutMs: number;
+  onSpawn: (pid: number | null) => void;
+}): Promise<WorkerExecutionResult> {
+  return new Promise((resolve) => {
+    const stdout = createRedactedLogAppender(options.logPath, 'stdout');
+    const stderr = createRedactedLogAppender(options.logPath, 'stderr');
+    let spawnError: Error | null = null;
+    let timedOut = false;
+    let killTimer: NodeJS.Timeout | null = null;
+    const child = spawn('/bin/sh', ['-lc', options.command], {
+      cwd: options.cwd,
+      env: options.env,
+      detached: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    options.onSpawn(child.pid ?? null);
+
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      signalWorkerProcessTree(child.pid, 'SIGTERM');
+      killTimer = setTimeout(() => {
+        signalWorkerProcessTree(child.pid, 'SIGKILL');
+      }, 5_000);
+    }, options.timeoutMs);
+
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => stdout.write(chunk));
+    child.stderr.on('data', (chunk: string) => stderr.write(chunk));
+    child.on('error', (error) => {
+      spawnError = error;
+    });
+    // Workers may read PIPELANE_ORCHESTRATE_PROMPT_PATH and close stdin early.
+    child.stdin.on('error', () => {});
+    child.on('close', (exitCode, signal) => {
+      clearTimeout(timeout);
+      if (killTimer) clearTimeout(killTimer);
+      stdout.flush();
+      stderr.flush();
+      const timeoutError = timedOut ? `Worker timed out after ${options.timeoutMs} ms.` : null;
+      resolve({
+        pid: child.pid ?? null,
+        exitCode,
+        signal,
+        error: timeoutError ?? spawnError?.message ?? null,
+      });
+    });
+    child.stdin.end(options.prompt);
+  });
+}
+
+async function terminateExistingRunningWorker(worker: OrchestrationSliceWorkerRecord): Promise<void> {
+  const pid = worker.pid ?? null;
+  if (pid === null || !isWorkerProcessGroupAlive(pid)) return;
+  signalWorkerProcessGroup(pid, 'SIGTERM');
+  await waitForWorkerProcessGroupExit(pid, 1_000);
+  if (isWorkerProcessGroupAlive(pid)) {
+    signalWorkerProcessGroup(pid, 'SIGKILL');
+    await waitForWorkerProcessGroupExit(pid, 500);
+  }
+}
+
+function signalWorkerProcessGroup(pid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    // Recovery never falls back to a bare pid because stale ledgers can outlive pid reuse.
+  }
+}
+
+function signalWorkerProcessTree(pid: number | undefined | null, signal: NodeJS.Signals): void {
+  if (pid !== undefined && pid !== null) {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch {
+      // Fall back to the direct child when the platform or process state does not expose the group.
+    }
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // The old worker may already have exited.
+    }
+  }
+}
+
+async function waitForWorkerProcessGroupExit(pid: number, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && isWorkerProcessGroupAlive(pid)) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+function isWorkerProcessGroupAlive(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function createRedactedLogAppender(logPath: string, label: string): { write: (chunk: string) => void; flush: () => void } {
+  const maxUnterminatedLineChars = 64 * 1024;
+  let pending = '';
+  let wroteHeader = false;
+  const writeSection = (text: string): void => {
+    if (!text) return;
+    const header = wroteHeader ? '' : `\n--- ${label} ---\n`;
+    appendFileSync(logPath, `${header}${redactOrchestrationWorkerText(text)}`, 'utf8');
+    wroteHeader = true;
+  };
+
+  return {
+    write(chunk: string): void {
+      pending += chunk;
+      const lastNewline = pending.lastIndexOf('\n');
+      if (lastNewline >= 0) {
+        writeSection(pending.slice(0, lastNewline + 1));
+        pending = pending.slice(lastNewline + 1);
+      }
+      if (pending.length > maxUnterminatedLineChars) {
+        const omittedCount = pending.length - maxUnterminatedLineChars;
+        writeSection(`${pending.slice(0, maxUnterminatedLineChars)}\n[... ${omittedCount} chars omitted from long unterminated line ...]\n`);
+        pending = '';
+      }
+    },
+    flush(): void {
+      writeSection(pending);
+      pending = '';
+    },
+  };
+}
+
+const CREDENTIAL_FIELD_PATTERN = '(?:token|key|secret|password|pass|auth|session|cookie|access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|api[_-]?key|access[_-]?key)';
+
+function redactOrchestrationWorkerText(value: string): string {
+  return value
+    .replace(new RegExp(`([?&]${CREDENTIAL_FIELD_PATTERN}=)[^&\\s]+`, 'gi'), '$1[REDACTED]')
+    .replace(new RegExp(`(["'])(${CREDENTIAL_FIELD_PATTERN})\\1\\s*:\\s*("[^"]*"|'[^']*'|[^\\s,}]+)`, 'gi'), '$1$2$1: [REDACTED]')
+    .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, '[REDACTED_AUTH_HEADER]')
+    .replace(/(^|\s)(--(?:token|key|secret|password|pass|auth|session|cookie|api-key|access-key)(?:[-_][a-z0-9]+)?)=("[^"]*"|'[^']*'|[^\s]+)/gi, '$1$2=[REDACTED]')
+    .replace(/(^|\s)(--(?:token|key|secret|password|pass|auth|session|cookie|api-key|access-key)(?:[-_][a-z0-9]+)?)\s+("[^"]*"|'[^']*'|[^\s]+)/gi, '$1$2 [REDACTED]')
+    .replace(new RegExp(`(^|[\\s{,])(${CREDENTIAL_FIELD_PATTERN}\\s*:\\s*)("[^"]*"|'[^']*'|[^\\s,}]+)`, 'gi'), '$1$2[REDACTED]')
+    .replace(new RegExp(`(^|\\s)(${CREDENTIAL_FIELD_PATTERN}=)("[^"]*"|'[^']*'|[^\\s]+)`, 'gi'), '$1$2[REDACTED]')
+    .replace(/\b[A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|COOKIE|SESSION|API_KEY|ACCESS_KEY)[A-Za-z0-9_]*=("[^"]*"|'[^']*'|[^\s]+)/g, (match) => {
+      const key = match.split('=')[0];
+      return `${key}=[REDACTED]`;
+    });
+}
+
+function resolveWorkerTimeoutMs(slice: OrchestrationSliceRecord): number {
+  const envValue = process.env.PIPELANE_ORCHESTRATE_WORKER_TIMEOUT_MS?.trim();
+  if (envValue) {
+    const parsed = Number.parseInt(envValue, 10);
+    if (Number.isSafeInteger(parsed) && parsed > 0) return parsed;
+  }
+  return Math.max(1, slice.goalSpec.budget.maxMinutes) * 60 * 1000;
+}
+
+function writeWorkerLog(logPath: string, body: string): void {
+  mkdirSync(path.dirname(logPath), { recursive: true });
+  writeFileSync(logPath, body, 'utf8');
+}
+
+function dependencyBlocker(slice: OrchestrationSliceRecord, byId: Map<string, OrchestrationSliceRecord>): string | null {
+  for (const dependencyId of slice.dependsOn) {
+    const dependency = byId.get(dependencyId);
+    if (!dependency) return `missing dependency ${dependencyId}`;
+    if (dependency.worker?.status === 'succeeded' || dependency.status === 'completed') continue;
+    if (dependency.worker?.status === 'failed' || dependency.status === 'failed') return `dependency ${dependencyId} failed`;
+    return `dependency ${dependencyId} has not completed`;
+  }
+  return null;
+}
+
+function dependencyMayCompleteLater(
+  slice: OrchestrationSliceRecord,
+  byId: Map<string, OrchestrationSliceRecord>,
+  pendingSlices: OrchestrationSliceRecord[],
+): boolean {
+  const pendingIds = new Set(pendingSlices.map((pendingSlice) => pendingSlice.id));
+  for (const dependencyId of slice.dependsOn) {
+    const dependency = byId.get(dependencyId);
+    if (!dependency) return false;
+    if (dependency.worker?.status === 'succeeded' || dependency.status === 'completed') continue;
+    if (dependency.worker?.status === 'failed' || dependency.status === 'failed') return false;
+    if (pendingIds.has(dependencyId)) return true;
+  }
+  return false;
+}
+
+function buildExistingWorkerReport(
+  slice: OrchestrationSliceRecord,
+  worker: OrchestrationSliceWorkerRecord,
+): StartedSliceReport {
+  return {
+    id: slice.id,
+    status: worker.status === 'succeeded' ? 'completed' : worker.status === 'failed' ? 'failed' : 'running',
+    provider: slice.provider,
+    branchName: slice.branchName ?? '',
+    worktreePath: slice.worktreePath ?? '',
+    promptPath: worker.promptPath,
+    logPath: worker.logPath,
+    exitCode: worker.exitCode,
+    signal: worker.signal,
+    action: 'existing',
+    blocker: null,
+  };
+}
+
+function buildBlockedWorkerReport(slice: OrchestrationSliceRecord, blocker: string): StartedSliceReport {
+  return {
+    id: slice.id,
+    status: 'blocked',
+    provider: slice.provider,
+    branchName: slice.branchName ?? '',
+    worktreePath: slice.worktreePath ?? '',
+    promptPath: slice.dispatch?.promptPath ?? '',
+    logPath: null,
+    exitCode: null,
+    signal: null,
+    action: 'blocked',
+    blocker,
+  };
+}
+
+function summarizeRunWorkerStatus(run: OrchestrationRunRecord): OrchestrationRunRecord['status'] {
+  if (run.slices.some((slice) => slice.worker?.status === 'failed' || slice.status === 'failed')) return 'failed';
+  if (run.slices.every((slice) => slice.worker?.status === 'succeeded' || slice.status === 'completed')) return 'completed';
+  if (run.slices.some((slice) => slice.worker?.status === 'running' || slice.status === 'running')) return 'running';
+  if (run.slices.some((slice) => slice.status === 'blocked')) return 'blocked';
+  return 'dispatched';
+}
+
+function reportStatusForStart(
+  runStatus: OrchestrationRunRecord['status'],
+  startedCount: number,
+  restartedCount: number,
+  existingCount: number,
+  failedCount: number,
+  blockedCount: number,
+): OrchestrateStartReport['status'] {
+  if (failedCount > 0 || runStatus === 'failed') return 'failed';
+  if (blockedCount > 0 && startedCount === 0 && restartedCount === 0 && existingCount === 0) return 'blocked';
+  if (runStatus === 'running') return 'running';
+  if (startedCount === 0 && restartedCount === 0 && existingCount > 0 && blockedCount === 0) return 'noop';
+  if (runStatus === 'completed') return 'completed';
+  if (runStatus === 'blocked') return 'blocked';
+  return 'dispatched';
 }
 
 function prepareSliceWorktrees(
@@ -442,6 +1068,11 @@ function persistOrchestrationPrepareProgress(context: WorkflowContext, run: Orch
 }
 
 function persistOrchestrationDispatchProgress(context: WorkflowContext, run: OrchestrationRunRecord): void {
+  run.updatedAt = nowIso();
+  saveOrchestrationRunRecord(context.commonDir, context.config, run);
+}
+
+function persistOrchestrationStartProgress(context: WorkflowContext, run: OrchestrationRunRecord): void {
   run.updatedAt = nowIso();
   saveOrchestrationRunRecord(context.commonDir, context.config, run);
 }
@@ -754,7 +1385,61 @@ function renderDispatchReport(
   lines.push(
     '',
     'Provider agents were not started by this command.',
-    'Next: start each provider session from its prepared worktree using the handoff prompt, then run /pipelane review per slice.',
+    'Next: configure PIPELANE_ORCHESTRATE_WORKER_COMMAND or PIPELANE_ORCHESTRATE_<PROVIDER>_COMMAND, then run /pipelane orchestrate start --run-id <run-id>.',
+  );
+
+  return lines.join('\n');
+}
+
+function renderStartReport(
+  run: OrchestrationRunRecord,
+  ledgerPath: string,
+  sliceId: string | null,
+  force: boolean,
+  result: {
+    status: OrchestrateStartReport['status'];
+    startedCount: number;
+    restartedCount: number;
+    existingCount: number;
+    failedCount: number;
+    blockedCount: number;
+    slices: StartedSliceReport[];
+  },
+): string {
+  const lines = [
+    'Pipelane orchestrate start',
+    '',
+    `Status: ${result.status}`,
+    `Run: ${run.id}`,
+    `Ledger: ${ledgerPath}`,
+    `Slice filter: ${sliceId ?? '(all eligible slices)'}`,
+    `Force retry: ${force ? 'yes' : 'no'}`,
+    `Started workers: ${result.startedCount}`,
+    `Restarted workers: ${result.restartedCount}`,
+    `Existing workers: ${result.existingCount}`,
+    `Failed workers: ${result.failedCount}`,
+    `Blocked slices: ${result.blockedCount}`,
+    '',
+    'Worker evidence:',
+  ];
+
+  for (const slice of result.slices) {
+    const suffix = slice.action === 'blocked'
+      ? `blocked: ${slice.blocker}`
+      : `exit=${slice.exitCode ?? ''}${slice.signal ? ` signal=${slice.signal}` : ''} log=${slice.logPath ?? ''}`;
+    lines.push(`- ${slice.id}: ${slice.action} ${suffix}`);
+  }
+
+  if (result.slices.some((slice) => slice.action === 'existing' && (slice.status === 'failed' || slice.status === 'running'))) {
+    lines.push(
+      '',
+      'Recovery: rerun /pipelane orchestrate start --run-id <run-id> [--slice-id <id>] --force to retry failed or stale running workers.',
+    );
+  }
+
+  lines.push(
+    '',
+    'Worker completion only. Review gates, merge, deploy, and cleanup were not run by this command.',
   );
 
   return lines.join('\n');

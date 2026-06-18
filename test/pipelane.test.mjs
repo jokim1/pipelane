@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, cpSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer as createNetServer } from 'node:net';
@@ -2594,6 +2594,7 @@ test('pipelane.md documents exact first-token routing for subcommands', () => {
   assert.match(template, /\/pipelane orchestrate plan --plan-file <path>/);
   assert.match(template, /\/pipelane orchestrate prepare --run-id <id>/);
   assert.match(template, /\/pipelane orchestrate dispatch --run-id <id>/);
+  assert.match(template, /\/pipelane orchestrate start --run-id <id>/);
   assert.match(template, /Exactly equals `update`/);
   assert.match(template, /No prefix matching/);
   assert.match(template, /`\/pipelane update-this-thing` routes to UNKNOWN MODE, not UPDATE MODE/);
@@ -3929,6 +3930,19 @@ test('durable Codex runner dispatches /pipelane orchestrate goal-spec', () => {
     ).trim();
 
     assert.equal(dispatchOutput, 'MANAGED:1:run orchestrate dispatch --run-id orchestrate-20260617000000-deadbeef');
+
+    const startOutput = execFileSync(
+      path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      ['pipelane', 'orchestrate', 'start', '--run-id', 'orchestrate-20260617000000-deadbeef', '--slice-id', 'demo-slice'],
+      {
+        cwd: repoRoot,
+        env: { ...process.env, CODEX_HOME: codexHome },
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    ).trim();
+
+    assert.equal(startOutput, 'MANAGED:1:run orchestrate start --run-id orchestrate-20260617000000-deadbeef --slice-id demo-slice');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -4761,7 +4775,7 @@ test('orchestrate goal-spec rejects invalid command forms', () => {
 
     const invalidSubcommand = runCli(['run', 'orchestrate', 'nope'], repoRoot, {}, true);
     assert.notEqual(invalidSubcommand.status, 0);
-    assert.match(invalidSubcommand.stderr, /orchestrate requires exactly: pipelane run orchestrate <goal-spec\|plan\|prepare\|dispatch>/);
+    assert.match(invalidSubcommand.stderr, /orchestrate requires exactly: pipelane run orchestrate <goal-spec\|plan\|prepare\|dispatch\|start>/);
 
     const extraPositional = runCli(['run', 'orchestrate', 'goal-spec', 'extra'], repoRoot, {}, true);
     assert.notEqual(extraPositional.status, 0);
@@ -4818,6 +4832,30 @@ test('orchestrate goal-spec rejects invalid command forms', () => {
     const missingDispatchLedger = runCli(['run', 'orchestrate', 'dispatch', '--run-id', 'orchestrate-20260617000000-deadbeef'], repoRoot, {}, true);
     assert.notEqual(missingDispatchLedger.status, 0);
     assert.match(missingDispatchLedger.stderr, /No orchestration run ledger found/);
+
+    const missingStartRunId = runCli(['run', 'orchestrate', 'start'], repoRoot, {}, true);
+    assert.notEqual(missingStartRunId.status, 0);
+    assert.match(missingStartRunId.stderr, /orchestrate start requires --run-id <id>/);
+
+    const extraStartPositional = runCli(['run', 'orchestrate', 'start', 'extra', '--run-id', 'orchestrate-20260617000000-deadbeef'], repoRoot, {}, true);
+    assert.notEqual(extraStartPositional.status, 0);
+    assert.match(extraStartPositional.stderr, /orchestrate start requires exactly/);
+
+    const startPlanFile = runCli(['run', 'orchestrate', 'start', '--run-id', 'orchestrate-20260617000000-deadbeef', '--plan-file', 'docs/large-plan.md'], repoRoot, {}, true);
+    assert.notEqual(startPlanFile.status, 0);
+    assert.match(startPlanFile.stderr, /orchestrate does not accept flag\(s\): --plan-file/);
+
+    const startOffline = runCli(['run', 'orchestrate', 'start', '--run-id', 'orchestrate-20260617000000-deadbeef', '--offline'], repoRoot, {}, true);
+    assert.notEqual(startOffline.status, 0);
+    assert.match(startOffline.stderr, /orchestrate does not accept flag\(s\): --offline/);
+
+    const invalidStartRunId = runCli(['run', 'orchestrate', 'start', '--run-id', '../escape'], repoRoot, {}, true);
+    assert.notEqual(invalidStartRunId.status, 0);
+    assert.match(invalidStartRunId.stderr, /Invalid orchestration run id/);
+
+    const missingStartLedger = runCli(['run', 'orchestrate', 'start', '--run-id', 'orchestrate-20260617000000-deadbeef'], repoRoot, {}, true);
+    assert.notEqual(missingStartLedger.status, 0);
+    assert.match(missingStartLedger.stderr, /No orchestration run ledger found/);
 
     const invalidProvider = runCli(['run', 'orchestrate', 'goal-spec', '--provider', 'openai'], repoRoot, {}, true);
     assert.notEqual(invalidProvider.status, 0);
@@ -5300,6 +5338,554 @@ test('orchestrate dispatch rejects ledger-assigned worktrees outside the task ro
       rmSync(worktreePath, { recursive: true, force: true });
     }
     rmSync(outsideDir, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate start runs configured workers and records completion evidence', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerCommand = [
+    'node -e "',
+    'const fs=require(\'fs\');',
+    'const input=fs.readFileSync(0,\'utf8\');',
+    'fs.writeFileSync(\'worker-\' + process.env.PIPELANE_ORCHESTRATE_SLICE_INDEX + \'.txt\', process.env.PIPELANE_ORCHESTRATE_SLICE_ID + \'\\n\' + String(input.includes(\'GoalSpec JSON\')) + \'\\n\');',
+    'console.log(\'done \' + process.env.PIPELANE_ORCHESTRATE_SLICE_ID);',
+    '"',
+  ].join('');
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'start-plan.md'), [
+      '# Start Plan',
+      '',
+      '## Slice 1: First worker',
+      '- Touch `src/operator/orchestration-ledger.ts`',
+      '',
+      '## Slice 2: Second worker',
+      '- Touch `src/operator/commands/orchestrate.ts`',
+    ].join('\n') + '\n', 'utf8');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/start-plan.md', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+
+    const started = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    }).stdout);
+    const onDisk = JSON.parse(readFileSync(started.ledgerPath, 'utf8'));
+
+    assert.equal(started.command, 'orchestrate start');
+    assert.equal(started.status, 'completed');
+    assert.equal(started.startedCount, 2);
+    assert.equal(started.existingCount, 0);
+    assert.equal(started.failedCount, 0);
+    assert.equal(started.blockedCount, 0);
+    assert.equal(onDisk.status, 'completed');
+    assert.equal(onDisk.slices.every((slice) => slice.status === 'completed'), true);
+    assert.equal(onDisk.slices.every((slice) => slice.worker?.status === 'succeeded'), true);
+    assert.equal(onDisk.slices.every((slice) => slice.worker?.exitCode === 0), true);
+    assert.equal(onDisk.slices.every((slice) => existsSync(slice.worker.logPath)), true);
+    assert.match(readFileSync(onDisk.slices[0].worker.logPath, 'utf8'), /done first-worker/);
+    assert.equal(readFileSync(path.join(onDisk.slices[0].worktreePath, 'worker-1.txt'), 'utf8'), 'first-worker\ntrue\n');
+    assert.equal(readFileSync(path.join(onDisk.slices[1].worktreePath, 'worker-2.txt'), 'utf8'), 'second-worker\ntrue\n');
+    assert.match(started.message, /Review gates, merge, deploy, and cleanup were not run/);
+
+    const firstLogPaths = onDisk.slices.map((slice) => slice.worker.logPath);
+    const rerun = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    }).stdout);
+    assert.equal(rerun.status, 'noop');
+    assert.equal(rerun.startedCount, 0);
+    assert.equal(rerun.existingCount, 2);
+    assert.deepEqual(rerun.run.slices.map((slice) => slice.worker.logPath), firstLogPaths);
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate start redacts credential material in worker evidence', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerCommand = [
+    'OPENAI_API_KEY=sk-secret',
+    JSON.stringify(process.execPath),
+    '-e',
+    JSON.stringify("console.log('OPENAI_API_KEY=sk-secret https://example.test/cb?access_token=tok-secret&next=ok'); console.log(JSON.stringify({ access_token: 'json-secret', client_secret: 'json-client-secret' })); console.error('Bearer abc.def --api-key=plainsecret client_secret: shh-secret api_key=lower-secret'); process.stdout.write('x'.repeat(70 * 1024) + 'OPENAI_API_KEY=sk-longsecret');"),
+  ].join(' ');
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Redact worker evidence', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+
+    const started = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    }).stdout);
+    const onDisk = JSON.parse(readFileSync(started.ledgerPath, 'utf8'));
+    const worker = onDisk.slices[0].worker;
+    const log = readFileSync(worker.logPath, 'utf8');
+
+    assert.equal(started.status, 'completed');
+    assert.doesNotMatch(worker.command, /sk-secret|plainsecret|sk-longsecret|tok-secret|shh-secret|lower-secret|json-secret|json-client-secret/);
+    assert.doesNotMatch(log, /sk-secret|plainsecret|sk-longsecret|tok-secret|shh-secret|lower-secret|json-secret|json-client-secret|abc\.def/);
+    assert.match(worker.command, /OPENAI_API_KEY=\[REDACTED\]/);
+    assert.match(log, /OPENAI_API_KEY=\[REDACTED\]/);
+    assert.match(log, /access_token=\[REDACTED\]/);
+    assert.match(log, /"access_token": \[REDACTED\]/);
+    assert.match(log, /"client_secret": \[REDACTED\]/);
+    assert.match(log, /client_secret: \[REDACTED\]/);
+    assert.match(log, /api_key=\[REDACTED\]/);
+    assert.match(log, /\[REDACTED_AUTH_HEADER\]/);
+    assert.match(log, /--api-key=\[REDACTED\]/);
+    assert.match(log, /chars omitted from long unterminated line/);
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate start streams large worker output without buffer failure', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerCommand = [
+    JSON.stringify(process.execPath),
+    '-e',
+    JSON.stringify("for (let index = 0; index < 11000; index += 1) process.stdout.write('x'.repeat(1024) + '\\n'); console.error('done');"),
+  ].join(' ');
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Stream large worker output', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+
+    const started = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    }).stdout);
+    const worker = started.run.slices[0].worker;
+
+    assert.equal(started.status, 'completed');
+    assert.equal(worker.status, 'succeeded');
+    assert.equal(worker.exitCode, 0);
+    assert.ok(statSync(worker.logPath).size > 10 * 1024 * 1024);
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate start succeeds when a worker exits zero after closing stdin early', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerCommand = [
+    JSON.stringify(process.execPath),
+    '-e',
+    JSON.stringify("process.stdin.destroy(); console.log('stdin closed'); setTimeout(() => process.exit(0), 50);"),
+  ].join(' ');
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Handle early stdin close', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+
+    const started = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    }).stdout);
+
+    assert.equal(started.status, 'completed');
+    assert.equal(started.run.slices[0].worker.status, 'succeeded');
+    assert.equal(started.run.slices[0].worker.error, null);
+    assert.match(readFileSync(started.run.slices[0].worker.logPath, 'utf8'), /stdin closed/);
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate start timeout terminates the worker process group', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const markerPath = path.join(repoRoot, 'orphan-worker-marker.txt');
+  const workerCommand = [
+    '(',
+    JSON.stringify(process.execPath),
+    '-e',
+    JSON.stringify("setTimeout(() => require('node:fs').writeFileSync(process.argv[1], 'orphan'), 500)"),
+    JSON.stringify(markerPath),
+    '& ) ; sleep 10',
+  ].join(' ');
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Timeout kills process group', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+
+    const started = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+      PIPELANE_ORCHESTRATE_WORKER_TIMEOUT_MS: '100',
+    }).stdout);
+    await new Promise((resolve) => setTimeout(resolve, 900));
+
+    assert.equal(started.status, 'failed');
+    assert.equal(started.run.slices[0].worker.status, 'failed');
+    assert.match(started.run.slices[0].worker.error, /timed out/);
+    assert.equal(existsSync(markerPath), false);
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate start records worker failure and blocks dependent slices', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerCommand = 'node -e "if (process.env.PIPELANE_ORCHESTRATE_SLICE_INDEX === \'1\') { console.error(\'worker boom\'); process.exit(7); } console.log(\'should not run\');"';
+  const recoveryCommand = 'node -e "console.log(process.env.PIPELANE_ORCHESTRATE_SLICE_ID + \' recovered\')"';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'failed-start-plan.md'), [
+      '# Failed Start Plan',
+      '',
+      '## Slice 1: Failing worker',
+      '- Touch `src/operator/orchestration-ledger.ts`',
+      '',
+      '## Slice 2: Blocked worker',
+      '- Touch `src/operator/commands/orchestrate.ts`',
+    ].join('\n') + '\n', 'utf8');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/failed-start-plan.md', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+
+    const started = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    }).stdout);
+    const onDisk = JSON.parse(readFileSync(started.ledgerPath, 'utf8'));
+
+    assert.equal(started.status, 'failed');
+    assert.equal(started.startedCount, 1);
+    assert.equal(started.failedCount, 1);
+    assert.equal(started.blockedCount, 1);
+    assert.equal(onDisk.status, 'failed');
+    assert.equal(onDisk.slices[0].status, 'failed');
+    assert.equal(onDisk.slices[0].worker.status, 'failed');
+    assert.equal(onDisk.slices[0].worker.exitCode, 7);
+    assert.match(readFileSync(onDisk.slices[0].worker.logPath, 'utf8'), /worker boom/);
+    assert.equal(onDisk.slices[1].status, 'blocked');
+    assert.equal(onDisk.slices[1].worker, null);
+    assert.match(started.slices[1].blocker, /dependency failing-worker failed/);
+
+    const failedLogPath = onDisk.slices[0].worker.logPath;
+    const noForceRetry = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: recoveryCommand,
+    }).stdout);
+    assert.equal(noForceRetry.status, 'failed');
+    assert.equal(noForceRetry.startedCount, 0);
+    assert.equal(noForceRetry.restartedCount, 0);
+    assert.equal(noForceRetry.existingCount, 1);
+    assert.equal(noForceRetry.blockedCount, 1);
+    assert.equal(noForceRetry.run.slices[0].worker.logPath, failedLogPath);
+    assert.match(noForceRetry.message, /--force to retry failed or stale running workers/);
+
+    const forcedRetry = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--force', '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: recoveryCommand,
+    }).stdout);
+    assert.equal(forcedRetry.status, 'completed');
+    assert.equal(forcedRetry.startedCount, 1);
+    assert.equal(forcedRetry.restartedCount, 1);
+    assert.equal(forcedRetry.existingCount, 0);
+    assert.equal(forcedRetry.run.slices.every((slice) => slice.worker.status === 'succeeded'), true);
+    assert.notEqual(forcedRetry.run.slices[0].worker.logPath, failedLogPath);
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate start --force retries a stale running worker record', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerCommand = 'node -e "console.log(\'stale recovered\')"';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Recover stale running worker', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    const dispatched = JSON.parse(runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const staleLedger = JSON.parse(readFileSync(dispatched.ledgerPath, 'utf8'));
+    staleLedger.status = 'running';
+    staleLedger.slices[0].status = 'running';
+    staleLedger.slices[0].worker = {
+      status: 'running',
+      provider: staleLedger.slices[0].provider,
+      command: 'stale-command',
+      pid: null,
+      promptPath: staleLedger.slices[0].dispatch.promptPath,
+      logPath: path.join(path.dirname(dispatched.ledgerPath), 'workers', 'stale.log'),
+      startedAt: '2026-06-17T00:00:00.000Z',
+      finishedAt: null,
+      exitCode: null,
+      signal: null,
+      error: null,
+    };
+    writeFileSync(dispatched.ledgerPath, `${JSON.stringify(staleLedger, null, 2)}\n`, 'utf8');
+
+    const noForceRetry = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    }).stdout);
+    assert.equal(noForceRetry.status, 'running');
+    assert.equal(noForceRetry.existingCount, 1);
+    assert.equal(noForceRetry.restartedCount, 0);
+
+    const forcedRetry = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--force', '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    }).stdout);
+    assert.equal(forcedRetry.status, 'completed');
+    assert.equal(forcedRetry.startedCount, 0);
+    assert.equal(forcedRetry.restartedCount, 1);
+    assert.equal(forcedRetry.run.slices[0].worker.status, 'succeeded');
+    assert.match(readFileSync(forcedRetry.run.slices[0].worker.logPath, 'utf8'), /stale recovered/);
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate start --force terminates a live running worker before retry', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const markerPath = path.join(repoRoot, 'live-running-worker-marker.txt');
+  let liveWorker = null;
+  const workerCommand = 'node -e "console.log(\'replacement worker\')"';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Force kills live stale worker', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    const dispatched = JSON.parse(runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    liveWorker = spawn(process.execPath, [
+      '-e',
+      "setTimeout(() => require('node:fs').writeFileSync(process.argv[1], 'still-running'), 1200); setTimeout(() => {}, 5000);",
+      markerPath,
+    ], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    liveWorker.unref();
+    const staleLedger = JSON.parse(readFileSync(dispatched.ledgerPath, 'utf8'));
+    staleLedger.status = 'running';
+    staleLedger.slices[0].status = 'running';
+    staleLedger.slices[0].worker = {
+      status: 'running',
+      provider: staleLedger.slices[0].provider,
+      command: 'live-stale-command',
+      pid: liveWorker.pid ?? null,
+      promptPath: staleLedger.slices[0].dispatch.promptPath,
+      logPath: path.join(path.dirname(dispatched.ledgerPath), 'workers', 'live-stale.log'),
+      startedAt: '2026-06-17T00:00:00.000Z',
+      finishedAt: null,
+      exitCode: null,
+      signal: null,
+      error: null,
+    };
+    writeFileSync(dispatched.ledgerPath, `${JSON.stringify(staleLedger, null, 2)}\n`, 'utf8');
+
+    const forcedRetry = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--force', '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    }).stdout);
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+
+    assert.equal(forcedRetry.status, 'completed');
+    assert.equal(forcedRetry.restartedCount, 1);
+    assert.equal(forcedRetry.run.slices[0].worker.status, 'succeeded');
+    assert.notEqual(forcedRetry.run.slices[0].worker.pid, liveWorker.pid ?? null);
+    assert.equal(existsSync(markerPath), false);
+  } finally {
+    if (liveWorker?.pid) {
+      try {
+        process.kill(-liveWorker.pid, 'SIGKILL');
+      } catch {}
+      try {
+        process.kill(liveWorker.pid, 'SIGKILL');
+      } catch {}
+    }
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate start re-evaluates pending slices when ledger order is not dependency order', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerCommand = 'node -e "console.log(process.env.PIPELANE_ORCHESTRATE_SLICE_ID)"';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'reordered-start-plan.md'), [
+      '# Reordered Start Plan',
+      '',
+      '## Slice 1: Dependency first',
+      '- Touch `src/operator/orchestration-ledger.ts`',
+      '',
+      '## Slice 2: Dependent second',
+      '- Touch `src/operator/commands/orchestrate.ts`',
+    ].join('\n') + '\n', 'utf8');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/reordered-start-plan.md', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    const dispatched = JSON.parse(runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const reorderedLedger = JSON.parse(readFileSync(dispatched.ledgerPath, 'utf8'));
+    reorderedLedger.slices = [reorderedLedger.slices[1], reorderedLedger.slices[0]];
+    writeFileSync(dispatched.ledgerPath, `${JSON.stringify(reorderedLedger, null, 2)}\n`, 'utf8');
+
+    const started = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    }).stdout);
+
+    assert.equal(started.status, 'completed');
+    assert.equal(started.startedCount, 2);
+    assert.equal(started.blockedCount, 0);
+    assert.deepEqual(started.slices.map((slice) => slice.id), ['dependency-first', 'dependent-second']);
+    assert.equal(started.run.slices.every((slice) => slice.status === 'completed'), true);
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate start can run one selected dispatched slice when dependencies are satisfied', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerCommand = 'node -e "console.log(process.env.PIPELANE_ORCHESTRATE_SLICE_ID)"';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'slice-start-plan.md'), [
+      '# Slice Start Plan',
+      '',
+      '## Slice 1: First selected',
+      '- Touch `src/operator/orchestration-ledger.ts`',
+      '',
+      '## Slice 2: Second selected',
+      '- Touch `src/operator/commands/orchestrate.ts`',
+    ].join('\n') + '\n', 'utf8');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/slice-start-plan.md', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    const dispatched = JSON.parse(runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+
+    const blocked = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--slice-id', dispatched.run.slices[1].id, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    }).stdout);
+    assert.equal(blocked.status, 'blocked');
+    assert.equal(blocked.blockedCount, 1);
+
+    const first = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--slice-id', dispatched.run.slices[0].id, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    }).stdout);
+    assert.equal(first.startedCount, 1);
+    assert.equal(first.run.slices[0].worker.status, 'succeeded');
+
+    const second = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--slice-id', dispatched.run.slices[1].id, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    }).stdout);
+    assert.equal(second.startedCount, 1);
+    assert.equal(second.run.status, 'completed');
+    assert.equal(second.run.slices[1].worker.status, 'succeeded');
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate start rejects missing launcher and missing dispatch prompt', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject missing start inputs', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+
+    const unprepared = runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: 'node -e "process.exit(0)"',
+    }, true);
+    assert.notEqual(unprepared.status, 0);
+    assert.match(unprepared.stderr, /orchestrate start requires a dispatched run/);
+
+    const dispatched = JSON.parse(runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const missingCommand = runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {}, true);
+    assert.notEqual(missingCommand.status, 0);
+    assert.match(missingCommand.stderr, /orchestrate start requires PIPELANE_ORCHESTRATE_CODEX_COMMAND or PIPELANE_ORCHESTRATE_WORKER_COMMAND/);
+
+    rmSync(dispatched.run.slices[0].dispatch.promptPath, { force: true });
+    const missingPrompt = runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: 'node -e "process.exit(0)"',
+    }, true);
+    assert.notEqual(missingPrompt.status, 0);
+    assert.match(missingPrompt.stderr, /dispatch prompt is missing/);
+
+    const missingSlice = runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--slice-id', 'nope'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: 'node -e "process.exit(0)"',
+    }, true);
+    assert.notEqual(missingSlice.status, 0);
+    assert.match(missingSlice.stderr, /No slice nope found/);
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
   }

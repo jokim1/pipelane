@@ -233,6 +233,7 @@ Current implementation surface:
 /pipelane orchestrate plan --plan-file docs/plan.md
 /pipelane orchestrate prepare --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
 /pipelane orchestrate dispatch --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
+/pipelane orchestrate start --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef [--slice-id <id>] [--force]
 /pipelane orchestrate goal-spec --plan-file docs/plan.md
 /pipelane orchestrate goal-spec --outcome "Implement review gate enforcement"
 /pipelane orchestrate goal-spec --provider codex --json
@@ -245,8 +246,28 @@ ledger, creates missing slice worktrees using the same task-lock machinery as
 `/new`, and records each task slug, branch, and worktree path. `orchestrate
 dispatch` consumes prepared ledgers and writes durable provider handoff prompts
 under the run state directory. It records which prompt belongs to which prepared
-worktree, but still does not start provider agents. `goal-spec` remains the
-single-slice draft-only command.
+worktree. `orchestrate start` consumes dispatch records, runs a configured
+worker command from each eligible worktree, feeds the handoff prompt on stdin,
+streams redacted per-slice log/exit evidence, and supports `--force` to retry
+failed or stale running worker records. It still does not run review gates,
+merge, deploy, or cleanup. `goal-spec` remains the single-slice draft-only
+command.
+
+`orchestrate start` launcher configuration is explicit:
+
+```bash
+PIPELANE_ORCHESTRATE_WORKER_COMMAND='your-worker-command'
+PIPELANE_ORCHESTRATE_CODEX_COMMAND='codex-specific-command'
+PIPELANE_ORCHESTRATE_CLAUDE_COMMAND='claude-specific-command'
+PIPELANE_ORCHESTRATE_WORKER_TIMEOUT_MS=3600000
+```
+
+The worker command runs with the slice worktree as `cwd`. The prompt is passed
+on stdin, stdout/stderr are streamed to redacted evidence logs, and Pipelane
+also sets `PIPELANE_ORCHESTRATE_RUN_ID`,
+`PIPELANE_ORCHESTRATE_SLICE_ID`, `PIPELANE_ORCHESTRATE_PROVIDER`,
+`PIPELANE_ORCHESTRATE_PROMPT_PATH`, `PIPELANE_ORCHESTRATE_WORKTREE_PATH`,
+`PIPELANE_ORCHESTRATE_LOG_PATH`, and `PIPELANE_ORCHESTRATE_LEDGER_PATH`.
 
 ## Presets
 
@@ -426,7 +447,8 @@ Do not add:
 8. Done: add durable `/pipelane orchestrate plan` ledger compilation.
 9. Done: add `/pipelane orchestrate prepare` worktree assignment on top of the ledger.
 10. Done: add `/pipelane orchestrate dispatch` provider handoff prompts for prepared slice worktrees.
-11. Next: launch provider workers from dispatch records and capture completion evidence.
+11. Done: add `/pipelane orchestrate start` configured worker launch and completion evidence.
+12. Next: add native Codex/Claude adapter defaults and review-gate execution over completed worker slices.
 
 ## Acceptance Criteria
 
@@ -451,5 +473,5 @@ Do not add:
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | not run | Recommended before board UI implementation. |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | not run | Optional; useful before shipping setup UX. |
 
-- **UNRESOLVED:** Provider process launch, human-gate execution, and full gate-runner trusted-baseline semantics still need implementation-level detail before full `/orchestrate`.
-- **VERDICT:** ENG CLEARED for earlier slices. Review runner, `/pr` enforcement, provider-neutral `GoalSpec` generation, durable ledger compilation, worktree preparation, and dispatch prompt generation are implemented; next proceed to provider worker launch.
+- **UNRESOLVED:** Native provider adapter defaults, human-gate execution, and full gate-runner trusted-baseline semantics still need implementation-level detail before full `/orchestrate`.
+- **VERDICT:** ENG CLEARED for earlier slices. Review runner, `/pr` enforcement, provider-neutral `GoalSpec` generation, durable ledger compilation, worktree preparation, dispatch prompt generation, and configured worker launch evidence are implemented; next proceed to native provider adapters and per-slice review gate execution.
