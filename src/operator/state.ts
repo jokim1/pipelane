@@ -3236,9 +3236,9 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
     case 'review': {
       const subcommand = parsed.positional[0] ?? '';
       if (subcommand === 'setup') {
-        assertOnlyFlags(parsed, ['reviewPreset', 'reviewPrint', 'reviewListGates']);
+        assertOnlyFlags(parsed, ['reviewPreset', 'reviewPrint', 'reviewListGates', 'yes']);
         if (parsed.positional.length !== 1) {
-          throw new Error('review setup requires exactly: pipelane run review setup [--preset lean|standard|strict-production] [--print] [--list-gates]');
+          throw new Error('review setup requires exactly: pipelane run review setup [--yes] [--preset lean|standard|strict-production] [--print] [--list-gates]');
         }
         const preset = parsed.flags.reviewPreset.trim();
         if (preset && !includesString(REVIEW_GATE_PRESETS, preset)) {
@@ -3261,7 +3261,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       }
       assertOnlyFlags(parsed, ['reviewDryRun', 'reviewGate', 'reviewPhase']);
       if (parsed.positional.length > 0) {
-        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review pass --gate <id> --message <text>, or pipelane run review setup [--preset lean|standard|strict-production] [--print] [--list-gates]');
+        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review pass --gate <id> --message <text>, or pipelane run review setup [--yes] [--preset lean|standard|strict-production] [--print] [--list-gates]');
       }
       const phase = parsed.flags.reviewPhase.trim();
       if (phase && !includesString(REVIEW_GATE_PHASES, phase)) {

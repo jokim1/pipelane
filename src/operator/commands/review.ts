@@ -1,11 +1,15 @@
 import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
+import { existsSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import readline from 'node:readline/promises';
 
 import {
   detectPackageScripts,
   resolveReviewGateCatalog,
   buildReviewGatesConfigForPreset,
+  type ResolvedReviewGateCatalogEntry,
 } from '../review-gates.ts';
 import { readWorktreeStatusSnapshot } from '../worktree-status.ts';
 import {
@@ -31,7 +35,7 @@ import {
   type ReviewPlanGateConfig,
 } from '../state.ts';
 
-type ReviewSetupStatus = 'configured' | 'reported';
+type ReviewSetupStatus = 'configured' | 'reported' | 'cancelled';
 type ReviewCommandStatus = ReviewRunRecord['status'];
 type ReviewAttestStatus = 'attested';
 
@@ -40,6 +44,18 @@ const REVIEW_CONFIG_CHANGE_PATHS = ['.pipelane.json', '.project-workflow.json', 
 const REVIEW_PHASE_ORDER = REVIEW_GATE_PHASES;
 const DEFAULT_GATE_TIMEOUT_MS = 10 * 60 * 1000;
 const OUTPUT_TAIL_CHARS = 4000;
+const REVIEW_SETUP_RECOMMENDED_PRESET: ReviewGatePreset = 'strict-production';
+
+type GateInstallState = 'installed' | 'not installed' | 'unavailable' | 'not applicable';
+
+interface ReviewSetupGateOption {
+  number: number;
+  entry: ResolvedReviewGateCatalogEntry;
+  label: string;
+  selected: boolean;
+  recommended: boolean;
+  installState: GateInstallState;
+}
 
 interface ReviewSetupReport {
   command: 'review setup';
@@ -108,7 +124,7 @@ export interface BuildReviewRunRecordOptions {
 export async function handleReview(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const subcommand = parsed.positional[0] ?? '';
   if (subcommand === 'setup') {
-    handleReviewSetup(cwd, parsed);
+    await handleReviewSetup(cwd, parsed);
     return;
   }
   if (subcommand === 'pass' || subcommand === 'attest') {
@@ -119,7 +135,7 @@ export async function handleReview(cwd: string, parsed: ParsedOperatorArgs): Pro
   handleReviewRun(cwd, parsed);
 }
 
-function handleReviewSetup(cwd: string, parsed: ParsedOperatorArgs): void {
+async function handleReviewSetup(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   let context = resolveWorkflowContext(cwd);
   const presetFlag = parsed.flags.reviewPreset.trim();
   let writeResult: { configPath: string; isLegacy: boolean } | null = null;
@@ -131,6 +147,26 @@ function handleReviewSetup(cwd: string, parsed: ParsedOperatorArgs): void {
       reviewGates: buildReviewGatesPresetPatch(raw, preset, context.repoRoot),
     }));
     context = resolveWorkflowContext(cwd);
+  }
+
+  if (!presetFlag && parsed.flags.yes) {
+    const prepared = prepareInteractiveReviewSetup(context.repoRoot);
+    writeResult = saveInteractiveReviewSetup(context.repoRoot, prepared.gates);
+    context = resolveWorkflowContext(cwd);
+  }
+
+  if (
+    !presetFlag
+    && !parsed.flags.yes
+    && !parsed.flags.reviewPrint
+    && !parsed.flags.reviewListGates
+    && !parsed.flags.json
+  ) {
+    if (!canRunInteractiveReviewSetup()) {
+      throw new Error('review setup requires a TTY for interactive setup. Use --yes to save recommended gates, --preset for automation, --print, --list-gates, or --json for non-interactive output.');
+    }
+    await runInteractiveReviewSetup(cwd, parsed);
+    return;
   }
 
   const preset = context.config.reviewGates?.preset ?? 'standard';
@@ -300,6 +336,322 @@ export function buildReviewPassRecord(options: {
     worktreeStatusWarnings: worktreeStatus.statusDigestWarnings,
     gates: nextGates,
     signature: undefined,
+  };
+}
+
+function canRunInteractiveReviewSetup(): boolean {
+  return (process.stdin.isTTY === true && process.stdout.isTTY === true)
+    || (process.env.NODE_ENV === 'test' && process.env.PIPELANE_REVIEW_SETUP_INPUT !== undefined);
+}
+
+async function runInteractiveReviewSetup(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
+  const context = resolveWorkflowContext(cwd);
+  const prepared = prepareInteractiveReviewSetup(context.repoRoot);
+  const prompter = createReviewSetupPrompter();
+
+  try {
+    process.stdout.write(`${renderInteractiveReviewSetup(prepared)}\n`);
+    for (;;) {
+      const answer = (await prompter.question('> ')).trim().toLowerCase();
+      if (answer === 's' || answer === 'save') {
+        const writeResult = saveInteractiveReviewSetup(context.repoRoot, prepared.gates);
+        process.stdout.write(`${renderInteractiveReviewSetupSaved(context.repoRoot, writeResult, prepared.gates)}\n`);
+        return;
+      }
+      if (answer === 'c' || answer === 'cancel') {
+        const report: ReviewSetupReport = {
+          command: 'review setup',
+          status: 'cancelled',
+          repoRoot: context.repoRoot,
+          configPath: resolveReadableConfigPath(context.repoRoot),
+          configPathIsLegacy: false,
+          preset: context.config.reviewGates?.preset ?? 'standard',
+          packageJson: {
+            path: prepared.packageJson.path,
+            found: prepared.packageJson.found,
+            malformed: prepared.packageJson.malformed,
+            parseError: prepared.packageJson.parseError,
+          },
+          detectedScripts: prepared.detectedScripts,
+          effective: {
+            planReview: { gates: context.config.reviewGates?.planReview?.gates ?? [] },
+            gates: context.config.reviewGates?.gates ?? [],
+          },
+          missing: [],
+          message: 'Review setup cancelled. No changes written.',
+        };
+        printResult(parsed.flags, report);
+        return;
+      }
+
+      const gateNumber = Number.parseInt(answer, 10);
+      const gate = Number.isSafeInteger(gateNumber)
+        ? prepared.gates.find((candidate) => candidate.number === gateNumber)
+        : undefined;
+      if (!gate) {
+        process.stdout.write('Choose a gate number, s to save, or c to cancel.\n');
+        continue;
+      }
+
+      await toggleInteractiveGate(gate, prompter);
+      process.stdout.write(`\n${renderInteractiveReviewSetup(prepared)}\n`);
+    }
+  } finally {
+    prompter.close();
+  }
+}
+
+function prepareInteractiveReviewSetup(repoRoot: string): {
+  repoRoot: string;
+  packageJson: ReviewSetupReport['packageJson'];
+  detectedScripts: string[];
+  gates: ReviewSetupGateOption[];
+} {
+  const detection = detectPackageScripts(repoRoot);
+  const orderedCatalog = orderInteractiveReviewCatalog(resolveReviewGateCatalog({ repoRoot })
+    .filter((entry) => entry.kind === 'review'));
+  const gates = orderedCatalog.map((entry, index) => {
+    const installState = detectGateInstallState(repoRoot, entry);
+    const recommended = isRecommendedInteractiveGate(entry, installState);
+    return {
+      number: index + 1,
+      entry,
+      label: reviewSetupGateLabel(entry),
+      selected: recommended,
+      recommended,
+      installState,
+    };
+  });
+  return {
+    repoRoot,
+    packageJson: {
+      path: detection.packageJsonPath,
+      found: detection.found,
+      malformed: detection.malformed,
+      parseError: detection.parseError,
+    },
+    detectedScripts: Object.keys(detection.scripts).sort(),
+    gates,
+  };
+}
+
+function orderInteractiveReviewCatalog(entries: ResolvedReviewGateCatalogEntry[]): ResolvedReviewGateCatalogEntry[] {
+  const order = new Map<string, number>([
+    ['typecheck', 10],
+    ['format-check', 20],
+    ['lint', 30],
+    ['secret-scan', 40],
+    ['dependency-audit', 50],
+    ['test', 60],
+    ['build', 70],
+    ['karpathy-diff', 80],
+    ['gstack-review', 90],
+    ['adversarial-review', 100],
+    ['browser-qa', 110],
+    ['karpathy-audit', 120],
+    ['human-merge-approval', 130],
+    ['human-prod-deploy-approval', 140],
+    ['human-rollback-approval', 150],
+  ]);
+  return [...entries].sort((left, right) => {
+    const leftOrder = order.get(left.id) ?? 1000;
+    const rightOrder = order.get(right.id) ?? 1000;
+    if (leftOrder !== rightOrder) return leftOrder - rightOrder;
+    const phaseDelta = REVIEW_PHASE_ORDER.indexOf(left.phase as ReviewGatePhase) - REVIEW_PHASE_ORDER.indexOf(right.phase as ReviewGatePhase);
+    return phaseDelta !== 0 ? phaseDelta : left.id.localeCompare(right.id);
+  });
+}
+
+function isRecommendedInteractiveGate(entry: ResolvedReviewGateCatalogEntry, installState: GateInstallState): boolean {
+  if (!entry.presets.includes(REVIEW_SETUP_RECOMMENDED_PRESET)) return false;
+  if (!entry.available) return false;
+  if (entry.type === 'skill' || entry.type === 'agent') return installState === 'installed';
+  return true;
+}
+
+function detectGateInstallState(repoRoot: string, entry: ResolvedReviewGateCatalogEntry): GateInstallState {
+  if (entry.type !== 'skill' && entry.type !== 'agent') return 'not applicable';
+  const names = knownInstallNamesForGate(entry);
+  if (names.length === 0) return 'unavailable';
+  if (names.some((name) => isSkillInstalled(repoRoot, name))) return 'installed';
+  return hasReviewGateInstaller(entry) ? 'not installed' : 'unavailable';
+}
+
+function knownInstallNamesForGate(entry: ResolvedReviewGateCatalogEntry): string[] {
+  if (entry.type === 'skill' && entry.skill) return [...new Set([entry.skill, entry.id])];
+  if (entry.id === 'adversarial-review') return ['adversarial-review', 'adversarial-code-reviewer'];
+  return entry.role ? [entry.role, entry.id] : [entry.id];
+}
+
+function isSkillInstalled(repoRoot: string, name: string): boolean {
+  const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+  const claudeHome = process.env.CLAUDE_HOME || path.join(os.homedir(), '.claude');
+  const candidates = [
+    path.join(repoRoot, '.agents', 'skills', name, 'SKILL.md'),
+    path.join(codexHome, 'skills', name, 'SKILL.md'),
+    path.join(claudeHome, 'skills', name, 'SKILL.md'),
+    path.join(os.homedir(), '.gstack', 'repos', 'gstack', '.agents', 'skills', `gstack-${name}`, 'SKILL.md'),
+  ];
+  return candidates.some((candidate) => existsSync(candidate));
+}
+
+async function toggleInteractiveGate(
+  gate: ReviewSetupGateOption,
+  prompter: { question(prompt: string): Promise<string> },
+): Promise<void> {
+  if (gate.selected) {
+    gate.selected = false;
+    return;
+  }
+
+  if (!gate.entry.available) {
+    process.stdout.write(`${gate.label} cannot be enabled: ${gate.entry.missingReason ?? 'gate unavailable'}.\n`);
+    return;
+  }
+
+  if ((gate.entry.type === 'skill' || gate.entry.type === 'agent') && gate.installState === 'unavailable') {
+    process.stdout.write([
+      `${gate.label} is unavailable.`,
+      `Install ${reviewSetupInstallTarget(gate.entry)} outside Pipelane, then rerun review setup.`,
+    ].join('\n') + '\n');
+    gate.selected = false;
+    return;
+  }
+
+  if ((gate.entry.type === 'skill' || gate.entry.type === 'agent') && gate.installState !== 'installed') {
+    process.stdout.write([
+      `${gate.label} is ${gate.installState}.`,
+      '',
+      `Install ${reviewSetupInstallTarget(gate.entry)} now?`,
+      '',
+      '1. Install and enable',
+      '2. Leave disabled',
+    ].join('\n') + '\n');
+    const installAnswer = (await prompter.question('> ')).trim();
+    if (installAnswer !== '1') {
+      gate.selected = false;
+      return;
+    }
+    if (installMissingReviewGate(gate)) {
+      gate.installState = 'installed';
+      gate.selected = true;
+      return;
+    }
+    gate.selected = false;
+    process.stdout.write('No installer is configured for this gate yet. It remains disabled.\n');
+    return;
+  }
+
+  gate.selected = true;
+}
+
+function hasReviewGateInstaller(entry: ResolvedReviewGateCatalogEntry): boolean {
+  if (process.env.NODE_ENV === 'test') {
+    const allowed = configuredTestReviewGateInstallers();
+    return allowed.includes(entry.id);
+  }
+  return false;
+}
+
+function installMissingReviewGate(gate: ReviewSetupGateOption): boolean {
+  if (process.env.NODE_ENV === 'test') {
+    const allowed = configuredTestReviewGateInstallers();
+    return allowed.includes(gate.entry.id);
+  }
+  return false;
+}
+
+function configuredTestReviewGateInstallers(): string[] {
+  return (process.env.PIPELANE_REVIEW_SETUP_INSTALL_SUCCESS ?? '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function reviewSetupInstallTarget(entry: ResolvedReviewGateCatalogEntry): string {
+  if (entry.type === 'agent') return entry.role ?? entry.id;
+  return entry.skill ?? entry.id;
+}
+
+function saveInteractiveReviewSetup(
+  repoRoot: string,
+  gates: ReviewSetupGateOption[],
+): { configPath: string; isLegacy: boolean } {
+  const selectedGates = orderReviewGates(gates
+    .filter((gate) => gate.selected && gate.entry.available)
+    .map((gate) => reviewSetupGateToConfig(gate.entry)));
+  const recommendedConfig = buildReviewGatesConfigForPreset(REVIEW_SETUP_RECOMMENDED_PRESET, { repoRoot });
+  const recommendedGates = orderReviewGates(recommendedConfig.gates);
+  return patchReadableWorkflowConfig(repoRoot, (raw) => ({
+    ...raw,
+    reviewGates: sameJson(selectedGates, recommendedGates)
+      ? buildReviewGatesPresetPatch(raw, REVIEW_SETUP_RECOMMENDED_PRESET, repoRoot)
+      : buildReviewGatesExplicitPatch(raw, REVIEW_SETUP_RECOMMENDED_PRESET, selectedGates, repoRoot),
+  }));
+}
+
+function buildReviewGatesExplicitPatch(
+  raw: Record<string, unknown>,
+  preset: ReviewGatePreset,
+  gates: ReviewGateConfig[],
+  repoRoot: string,
+): Record<string, unknown> {
+  const existing = asRecord(raw.reviewGates);
+  const next: Record<string, unknown> = existing ? { ...existing, preset } : { preset };
+  const planReview = asRecord(existing?.planReview);
+  if (
+    planReview
+    && Array.isArray(planReview.gates)
+    && getGeneratedDefaultCandidates(isReviewGatePreset(existing?.preset) ? existing.preset : 'standard', repoRoot)
+      .some((candidate) => sameJson(planReview.gates, candidate.planReview?.gates ?? []))
+  ) {
+    delete next.planReview;
+  }
+  next.gates = gates;
+  return next;
+}
+
+function reviewSetupGateToConfig(entry: ResolvedReviewGateCatalogEntry): ReviewGateConfig {
+  return {
+    id: entry.id,
+    phase: entry.phase as ReviewGatePhase,
+    type: entry.type,
+    blocking: true,
+    command: entry.command,
+    skill: entry.skill,
+    role: entry.role,
+    when: entry.when,
+    whenChanged: entry.whenChanged,
+    userCommands: entry.userCommands,
+  };
+}
+
+function createReviewSetupPrompter(): {
+  question(prompt: string): Promise<string>;
+  close(): void;
+} {
+  if (process.env.NODE_ENV === 'test' && process.env.PIPELANE_REVIEW_SETUP_INPUT !== undefined) {
+    const answers = process.env.PIPELANE_REVIEW_SETUP_INPUT.split(/\r?\n/);
+    let index = 0;
+    return {
+      question(prompt: string): Promise<string> {
+        process.stdout.write(prompt);
+        if (index >= answers.length) {
+          throw new Error('PIPELANE_REVIEW_SETUP_INPUT exhausted before review setup completed.');
+        }
+        return Promise.resolve(answers[index++]);
+      },
+      close(): void {},
+    };
+  }
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return {
+    question(prompt: string): Promise<string> {
+      return rl.question(prompt);
+    },
+    close(): void {
+      rl.close();
+    },
   };
 }
 
@@ -782,6 +1134,134 @@ function renderReviewSetupReport(
 
   lines.push('', 'Next: run /pipelane review to write gate evidence before PR handoff.');
   return lines.join('\n');
+}
+
+function renderInteractiveReviewSetup(prepared: {
+  packageJson: ReviewSetupReport['packageJson'];
+  detectedScripts: string[];
+  gates: ReviewSetupGateOption[];
+}): string {
+  const lines = [
+    'Review setup',
+    '',
+    'I found these repo checks:',
+    ...formatDetectedRepoChecks(prepared.gates),
+    '',
+    'Recommended gates are preselected below.',
+    'Type a gate number to toggle it. Type s to save, or c to cancel.',
+  ];
+
+  for (const section of reviewSetupSections()) {
+    const gates = prepared.gates.filter((gate) => section.ids.includes(gate.entry.id));
+    if (gates.length === 0) continue;
+    lines.push('', `${section.title}:`);
+    for (const gate of gates) {
+      lines.push(formatInteractiveGate(gate));
+    }
+  }
+
+  lines.push('', 'Actions:', 's. Save and continue', 'c. Cancel');
+  return lines.join('\n');
+}
+
+function renderInteractiveReviewSetupSaved(
+  repoRoot: string,
+  writeResult: { configPath: string; isLegacy: boolean },
+  gates: ReviewSetupGateOption[],
+): string {
+  const enabled = gates
+    .filter((gate) => gate.selected)
+    .map((gate) => gate.entry.id);
+  const byPhase = REVIEW_PHASE_ORDER
+    .map((phase) => ({
+      phase,
+      ids: enabled.filter((id) => gates.find((gate) => gate.entry.id === id)?.entry.phase === phase),
+    }))
+    .filter((entry) => entry.ids.length > 0);
+  const lines = [
+    '',
+    'Review gates configured.',
+    `Config: ${path.relative(repoRoot, writeResult.configPath) || writeResult.configPath}`,
+    '',
+    'Enabled:',
+  ];
+  for (const entry of byPhase) {
+    lines.push(`- ${entry.phase}: ${entry.ids.join(', ')}`);
+  }
+  if (byPhase.length === 0) lines.push('- none');
+  lines.push('', 'Next: run /pipelane orchestrate');
+  return lines.join('\n');
+}
+
+function formatDetectedRepoChecks(gates: ReviewSetupGateOption[]): string[] {
+  const checks = gates
+    .filter((gate) => gate.entry.type === 'command' && gate.entry.command)
+    .map((gate) => `- ${gate.entry.command}`);
+  return checks.length > 0 ? checks : ['- none'];
+}
+
+function reviewSetupSections(): Array<{ title: string; ids: string[] }> {
+  return [
+    { title: 'Static gates', ids: ['typecheck', 'format-check', 'lint', 'secret-scan', 'dependency-audit'] },
+    { title: 'Behavioral gates', ids: ['test', 'build'] },
+    { title: 'AI review gates', ids: ['karpathy-diff', 'gstack-review', 'adversarial-review'] },
+    { title: 'Conditional gates', ids: ['browser-qa', 'karpathy-audit'] },
+    { title: 'Human approval gates', ids: ['human-merge-approval', 'human-prod-deploy-approval', 'human-rollback-approval'] },
+  ];
+}
+
+function formatInteractiveGate(gate: ReviewSetupGateOption): string {
+  const selected = gate.selected ? '[on] ' : '[off]';
+  const number = `${gate.number}.`.padEnd(4, ' ');
+  const label = gate.label.padEnd(27, ' ');
+  const detail = reviewSetupGateDetail(gate);
+  return `${number}${selected} ${label}${detail}`;
+}
+
+function reviewSetupGateDetail(gate: ReviewSetupGateOption): string {
+  const entry = gate.entry;
+  if (entry.type === 'command') {
+    if (entry.command) return entry.command;
+    return noScriptFoundLabel(entry);
+  }
+  const target = entry.userCommands?.[0]
+    ?? entry.skill
+    ?? entry.role
+    ?? entry.when
+    ?? entry.type;
+  const install = gate.installState === 'not applicable' ? '' : ` ${gate.installState}`;
+  const condition = entry.whenChanged && entry.whenChanged.length > 0
+    ? ` when ${entry.whenChanged.join(', ')} changes`
+    : entry.when
+      ? ` ${entry.when}`
+      : '';
+  return `${target}${condition}${install}`;
+}
+
+function noScriptFoundLabel(entry: ResolvedReviewGateCatalogEntry): string {
+  const script = entry.scriptNames?.[0] ?? entry.id;
+  return `no ${script} script found`;
+}
+
+function reviewSetupGateLabel(entry: ResolvedReviewGateCatalogEntry): string {
+  const labels: Record<string, string> = {
+    'typecheck': 'Typecheck',
+    'format-check': 'Format check',
+    'lint': 'Lint',
+    'secret-scan': 'Secret scan',
+    'dependency-audit': 'Dependency audit',
+    'test': 'Tests',
+    'build': 'Build',
+    'karpathy-diff': 'Karpathy diff review',
+    'gstack-review': 'gstack /review',
+    'adversarial-review': 'Adversarial review',
+    'browser-qa': 'Browser QA',
+    'karpathy-audit': 'Instruction audit',
+    'human-merge-approval': 'Merge approval',
+    'human-prod-deploy-approval': 'Production deploy approval',
+    'human-rollback-approval': 'Rollback approval',
+  };
+  return labels[entry.id] ?? entry.id;
 }
 
 function buildReviewGatesPresetPatch(
