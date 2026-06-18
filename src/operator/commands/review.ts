@@ -81,6 +81,17 @@ interface ReviewSetupReport {
   message: string;
 }
 
+export interface BuildReviewRunRecordOptions {
+  repoRoot: string;
+  baseBranch: string;
+  preset: ReviewGatePreset;
+  gates: ReviewGateConfig[];
+  dryRun: boolean;
+  gateFilter?: string;
+  phaseFilter?: ReviewGatePhase | '';
+  activeSurfaces: string[];
+}
+
 export async function handleReview(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const subcommand = parsed.positional[0] ?? '';
   if (subcommand === 'setup') {
@@ -170,11 +181,50 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
   const phaseFilter = parsed.flags.reviewPhase.trim() as ReviewGatePhase | '';
   const gateFilter = parsed.flags.reviewGate.trim();
   const dryRun = parsed.flags.reviewDryRun;
-  const changedFiles = collectChangedFiles(context.repoRoot, context.config.baseBranch);
-  const worktreeStatus = readWorktreeStatusSnapshot(context.repoRoot, { includeStatusDigest: true });
-  const reviewConfigChanged = changedFiles.some(isReviewConfigPath);
   const activeSurfaces = context.modeState.requestedSurfaces ?? context.config.surfaces;
-  const allGates = orderReviewGates(context.config.reviewGates?.gates ?? []);
+
+  const record = buildReviewRunRecord({
+    repoRoot: context.repoRoot,
+    baseBranch: context.config.baseBranch,
+    preset,
+    gates: context.config.reviewGates?.gates ?? [],
+    dryRun,
+    gateFilter,
+    phaseFilter,
+    activeSurfaces,
+  });
+
+  appendReviewRunRecord(context.commonDir, context.config, record);
+
+  const report = {
+    command: 'review',
+    status: record.status,
+    runId: record.id,
+    repoRoot: context.repoRoot,
+    evidencePath: reviewStatePath(context.commonDir, context.config),
+    preset,
+    dryRun,
+    gateFilter: gateFilter || null,
+    phaseFilter: phaseFilter || null,
+    changedFiles: record.changedFiles,
+    gates: record.gates,
+    message: renderReviewRunReport(record, reviewStatePath(context.commonDir, context.config)),
+  };
+
+  printResult(parsed.flags, report);
+
+  if (record.status === 'failed') {
+    process.exitCode = 1;
+  }
+}
+
+export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): ReviewRunRecord {
+  const phaseFilter = options.phaseFilter ?? '';
+  const gateFilter = options.gateFilter?.trim() ?? '';
+  const changedFiles = collectChangedFiles(options.repoRoot, options.baseBranch);
+  const worktreeStatus = readWorktreeStatusSnapshot(options.repoRoot, { includeStatusDigest: true });
+  const reviewConfigChanged = changedFiles.some(isReviewConfigPath);
+  const allGates = orderReviewGates(options.gates);
   const selectedGates = maybeAddReviewConfigChangeGate(allGates.filter((gate) =>
     (!phaseFilter || gate.phase === phaseFilter)
     && (!gateFilter || gate.id === gateFilter)
@@ -191,22 +241,23 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
   const gateRecords = selectedGates.map((gate) =>
     runReviewGate({
       gate,
-      repoRoot: context.repoRoot,
-      dryRun,
+      repoRoot: options.repoRoot,
+      dryRun: options.dryRun,
       reviewConfigChanged,
       changedFiles,
-      activeSurfaces,
+      activeSurfaces: options.activeSurfaces,
     })
   );
   const finishedAt = nowIso();
   const status = summarizeRunStatus(gateRecords);
-  const record: ReviewRunRecord = {
+
+  return {
     id: `review-${new Date(startedAt).toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto.randomUUID().slice(0, 8)}`,
-    branchName: runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '',
-    sha: runGit(context.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '',
-    preset,
+    branchName: runGit(options.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '',
+    sha: runGit(options.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '',
+    preset: options.preset,
     status,
-    dryRun,
+    dryRun: options.dryRun,
     gateFilter: gateFilter || undefined,
     phaseFilter: phaseFilter || undefined,
     startedAt,
@@ -218,29 +269,6 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
     worktreeStatusWarnings: worktreeStatus.statusDigestWarnings,
     gates: gateRecords,
   };
-
-  appendReviewRunRecord(context.commonDir, context.config, record);
-
-  const report = {
-    command: 'review',
-    status,
-    runId: record.id,
-    repoRoot: context.repoRoot,
-    evidencePath: reviewStatePath(context.commonDir, context.config),
-    preset,
-    dryRun,
-    gateFilter: gateFilter || null,
-    phaseFilter: phaseFilter || null,
-    changedFiles,
-    gates: gateRecords,
-    message: renderReviewRunReport(record, reviewStatePath(context.commonDir, context.config)),
-  };
-
-  printResult(parsed.flags, report);
-
-  if (status === 'failed') {
-    process.exitCode = 1;
-  }
 }
 
 function orderReviewGates(gates: ReviewGateConfig[]): ReviewGateConfig[] {

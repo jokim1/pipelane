@@ -91,12 +91,14 @@ slash command names only when alias config cannot be loaded.
 
 `/pipelane orchestrate goal-spec`, `/pipelane orchestrate plan`,
 `/pipelane orchestrate prepare`, `/pipelane orchestrate dispatch`, and
-`/pipelane orchestrate start` are
+`/pipelane orchestrate start`, and `/pipelane orchestrate review` are
 shipped as orchestration surfaces: they draft provider-neutral goals, write
 durable slice ledgers, assign slice worktrees, and write provider handoff
 prompts. Start can run explicitly configured workers and record log/exit
-evidence, including `--force` retries for failed or stale running workers, but
-it does not run review gates, merge, deploy, or cleanup. The board should add
+evidence, including `--force` retries for failed or stale running workers.
+Review runs the configured gate snapshot over completed worker slices and
+records per-slice gate evidence. These commands do not merge, deploy, or
+cleanup. The board should add
 read-only visibility for orchestration runs without changing the existing
 branch, PR, deploy, rollback, and cleanup model.
 

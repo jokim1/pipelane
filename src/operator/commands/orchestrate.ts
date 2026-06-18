@@ -1,5 +1,5 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import path from 'node:path';
 
 import {
@@ -12,9 +12,11 @@ import {
   orchestrationRunPath,
   saveOrchestrationRunRecord,
   type OrchestrationRunRecord,
+  type OrchestrationSliceReviewRecord,
   type OrchestrationSliceRecord,
   type OrchestrationSliceWorkerRecord,
 } from '../orchestration-ledger.ts';
+import { buildReviewRunRecord } from './review.ts';
 import {
   DEFAULT_GOAL_PROVIDER,
   TASK_SLUG_MAX_LENGTH,
@@ -26,6 +28,8 @@ import {
   resolveWorkflowContext,
   runGit,
   type ParsedOperatorArgs,
+  type ReviewGatePhase,
+  type ReviewRunRecord,
   type WorkflowContext,
 } from '../state.ts';
 import {
@@ -38,6 +42,8 @@ import {
 } from '../task-workspaces.ts';
 
 const MAX_PLAN_FILE_BYTES = 256 * 1024;
+const ORCHESTRATION_REVIEW_DIAGNOSTIC_MAX = 10;
+const NATIVE_COMMAND_PROBE_TIMEOUT_MS = 5000;
 
 interface OrchestrateGoalSpecReport {
   command: 'orchestrate goal-spec';
@@ -154,6 +160,37 @@ interface OrchestrateStartReport {
   message: string;
 }
 
+interface ReviewedSliceReport {
+  id: string;
+  status: OrchestrationSliceRecord['status'];
+  reviewStatus: ReviewRunRecord['status'] | null;
+  branchName: string;
+  worktreePath: string;
+  runId: string | null;
+  gateCount: number;
+  action: 'reviewed' | 'blocked';
+  blocker: string | null;
+}
+
+interface OrchestrateReviewReport {
+  command: 'orchestrate review';
+  status: 'passed' | 'pending' | 'failed' | 'blocked' | 'noop';
+  repoRoot: string;
+  runId: string;
+  ledgerPath: string;
+  sliceId: string | null;
+  dryRun: boolean;
+  gateFilter: string | null;
+  phaseFilter: ReviewGatePhase | null;
+  reviewedCount: number;
+  failedCount: number;
+  pendingCount: number;
+  blockedCount: number;
+  slices: ReviewedSliceReport[];
+  run: OrchestrationRunRecord;
+  message: string;
+}
+
 interface StartSlicePreparation {
   slice: OrchestrationSliceRecord;
   taskSlug: string;
@@ -191,8 +228,12 @@ export async function handleOrchestrate(cwd: string, parsed: ParsedOperatorArgs)
     await handleStart(cwd, parsed);
     return;
   }
+  if (subcommand === 'review') {
+    handleOrchestrationReview(cwd, parsed);
+    return;
+  }
 
-  throw new Error('orchestrate requires exactly: pipelane run orchestrate <goal-spec|plan|prepare|dispatch|start> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--run-id <id>] [--provider codex|claude|generic]');
+  throw new Error('orchestrate requires exactly: pipelane run orchestrate <goal-spec|plan|prepare|dispatch|start|review> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--run-id <id>] [--provider codex|claude|generic]');
 }
 
 function handleGoalSpec(cwd: string, parsed: ParsedOperatorArgs): void {
@@ -320,6 +361,54 @@ async function handleStart(cwd: string, parsed: ParsedOperatorArgs): Promise<voi
   };
 
   printResult(parsed.flags, report);
+}
+
+function handleOrchestrationReview(cwd: string, parsed: ParsedOperatorArgs): void {
+  const context = resolveWorkflowContext(cwd);
+  const runId = parsed.flags.orchestrationRunId.trim();
+  const sliceId = parsed.flags.goalSliceId.trim() || null;
+  const phaseFilter = parsed.flags.reviewPhase.trim() as ReviewGatePhase | '';
+  const gateFilter = parsed.flags.reviewGate.trim();
+  const run = loadOrchestrationRunRecord(context.commonDir, context.config, runId);
+  if (!run) {
+    throw new Error(`No orchestration run ledger found for ${runId}.`);
+  }
+
+  const result = reviewCompletedSlices(context, run, {
+    sliceId,
+    dryRun: parsed.flags.reviewDryRun,
+    gateFilter,
+    phaseFilter,
+  });
+  const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+  const report: OrchestrateReviewReport = {
+    command: 'orchestrate review',
+    status: result.status,
+    repoRoot: context.repoRoot,
+    runId: run.id,
+    ledgerPath,
+    sliceId,
+    dryRun: parsed.flags.reviewDryRun,
+    gateFilter: gateFilter || null,
+    phaseFilter: phaseFilter || null,
+    reviewedCount: result.reviewedCount,
+    failedCount: result.failedCount,
+    pendingCount: result.pendingCount,
+    blockedCount: result.blockedCount,
+    slices: result.slices,
+    run,
+    message: renderOrchestrationReviewReport(run, ledgerPath, sliceId, result, {
+      dryRun: parsed.flags.reviewDryRun,
+      gateFilter,
+      phaseFilter,
+    }),
+  };
+
+  printResult(parsed.flags, report);
+
+  if (result.status === 'failed') {
+    process.exitCode = 1;
+  }
 }
 
 function dispatchPreparedSlices(
@@ -508,6 +597,206 @@ async function startDispatchedSlices(
   };
 }
 
+function reviewCompletedSlices(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+  options: {
+    sliceId: string | null;
+    dryRun: boolean;
+    gateFilter: string;
+    phaseFilter: ReviewGatePhase | '';
+  },
+): {
+  status: OrchestrateReviewReport['status'];
+  reviewedCount: number;
+  failedCount: number;
+  pendingCount: number;
+  blockedCount: number;
+  slices: ReviewedSliceReport[];
+} {
+  const selectedSlices = resolveReviewSlices(run, options.sliceId);
+  const reports: ReviewedSliceReport[] = [];
+  let reviewedCount = 0;
+  let failedCount = 0;
+  let pendingCount = 0;
+  let blockedCount = 0;
+
+  for (const slice of selectedSlices) {
+    const blocker = reviewBlocker(context, slice);
+    if (blocker) {
+      blockedCount += 1;
+      reports.push(buildBlockedReviewReport(slice, blocker));
+      continue;
+    }
+
+    assertPreparedWorktreeSafe(context, slice.id, slice.branchName ?? '', slice.worktreePath ?? '');
+    const reviewRun = buildReviewRunRecord({
+      repoRoot: slice.worktreePath ?? context.repoRoot,
+      baseBranch: context.config.baseBranch,
+      preset: run.gateSnapshot.preset ?? context.config.reviewGates?.preset ?? 'standard',
+      gates: run.gateSnapshot.gates,
+      dryRun: options.dryRun,
+      gateFilter: options.gateFilter,
+      phaseFilter: options.phaseFilter,
+      activeSurfaces: resolveSliceActiveSurfaces(context, run, slice),
+    });
+    const reviewRecord = buildSliceReviewRecord(context, run, reviewRun);
+    if (reviewRunCoversFullGateSet(reviewRun)) {
+      slice.review = reviewRecord;
+    } else {
+      appendSliceReviewDiagnostic(slice, reviewRecord);
+    }
+    slice.status = summarizeSliceReviewStatus(slice);
+    reviewedCount += 1;
+    if (reviewRun.status === 'failed') failedCount += 1;
+    if (reviewRun.status === 'pending') pendingCount += 1;
+    reports.push({
+      id: slice.id,
+      status: slice.status,
+      reviewStatus: reviewRun.status,
+      branchName: slice.branchName ?? '',
+      worktreePath: slice.worktreePath ?? '',
+      runId: reviewRun.id,
+      gateCount: reviewRun.gates.length,
+      action: 'reviewed',
+      blocker: null,
+    });
+    persistOrchestrationReviewProgress(context, run);
+  }
+
+  run.status = summarizeRunReviewStatus(run);
+  run.updatedAt = nowIso();
+  return {
+    status: reportStatusForOrchestrationReview(run.status, reviewedCount, failedCount, pendingCount, blockedCount, {
+      incompleteEvidence: options.dryRun || Boolean(options.gateFilter) || Boolean(options.phaseFilter),
+    }),
+    reviewedCount,
+    failedCount,
+    pendingCount,
+    blockedCount,
+    slices: reports,
+  };
+}
+
+function resolveReviewSlices(run: OrchestrationRunRecord, sliceId: string | null): OrchestrationSliceRecord[] {
+  if (!sliceId) return run.slices;
+  const slice = run.slices.find((candidate) => candidate.id === sliceId);
+  if (!slice) {
+    throw new Error(`No slice ${sliceId} found in orchestration run ${run.id}.`);
+  }
+  return [slice];
+}
+
+function reviewBlocker(context: WorkflowContext, slice: OrchestrationSliceRecord): string | null {
+  if (slice.worker?.status !== 'succeeded') return 'worker has not completed successfully';
+  if (!slice.branchName || !slice.worktreePath) return 'slice is missing a prepared worktree assignment';
+  if (!existsSync(slice.worktreePath)) return `assigned worktree is missing: ${slice.worktreePath}`;
+  try {
+    assertPreparedWorktreeSafe(context, slice.id, slice.branchName, slice.worktreePath);
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  return null;
+}
+
+function buildSliceReviewRecord(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+  reviewRun: ReviewRunRecord,
+): OrchestrationSliceReviewRecord {
+  return {
+    status: reviewRun.status,
+    evidencePath: orchestrationRunPath(context.commonDir, context.config, run.id),
+    reviewedAt: nowIso(),
+    run: reviewRun,
+  };
+}
+
+function reviewRunCoversFullGateSet(reviewRun: ReviewRunRecord): boolean {
+  return reviewRun.dryRun === false && !reviewRun.gateFilter && !reviewRun.phaseFilter;
+}
+
+function appendSliceReviewDiagnostic(slice: OrchestrationSliceRecord, reviewRecord: OrchestrationSliceReviewRecord): void {
+  const diagnostics = slice.reviewDiagnostics ?? [];
+  diagnostics.push(reviewRecord);
+  slice.reviewDiagnostics = diagnostics.slice(-ORCHESTRATION_REVIEW_DIAGNOSTIC_MAX);
+}
+
+function resolveSliceActiveSurfaces(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+  slice: OrchestrationSliceRecord,
+): string[] {
+  const taskSlug = slice.taskSlug || buildOrchestrationTaskSlug(run.id, slice);
+  const taskLock = loadTaskLock(context.commonDir, context.config, taskSlug);
+  if (taskLock?.surfaces && taskLock.surfaces.length > 0) return taskLock.surfaces;
+  if (context.modeState.requestedSurfaces.length > 0) return context.modeState.requestedSurfaces;
+  return context.config.surfaces;
+}
+
+function buildBlockedReviewReport(slice: OrchestrationSliceRecord, blocker: string): ReviewedSliceReport {
+  return {
+    id: slice.id,
+    status: slice.status,
+    reviewStatus: slice.review?.status ?? null,
+    branchName: slice.branchName ?? '',
+    worktreePath: slice.worktreePath ?? '',
+    runId: slice.review?.run.id ?? null,
+    gateCount: slice.review?.run.gates.length ?? 0,
+    action: 'blocked',
+    blocker,
+  };
+}
+
+function summarizeRunReviewStatus(run: OrchestrationRunRecord): OrchestrationRunRecord['status'] {
+  if (run.slices.some((slice) => slice.worker?.status === 'failed' || slice.status === 'failed' || slice.review?.run.status === 'failed')) return 'failed';
+  if (run.slices.some((slice) => slice.worker?.status === 'running' || slice.status === 'running')) return 'running';
+  if (run.slices.every(sliceReviewFullySatisfied)) return 'completed';
+  if (run.slices.some((slice) => slice.worker?.status === 'succeeded' && !sliceReviewFullySatisfied(slice))) return 'blocked';
+  if (run.slices.some((slice) => slice.status === 'blocked')) return 'blocked';
+  return run.status;
+}
+
+function summarizeSliceReviewStatus(slice: OrchestrationSliceRecord): OrchestrationSliceRecord['status'] {
+  if (sliceReviewFullySatisfied(slice)) return 'completed';
+  if (slice.review?.run.status === 'failed') return 'failed';
+  return 'blocked';
+}
+
+function sliceReviewFullySatisfied(slice: OrchestrationSliceRecord): boolean {
+  return slice.worker?.status === 'succeeded'
+    && slice.review?.run.status === 'passed'
+    && slice.review.run.dryRun === false
+    && !slice.review.run.gateFilter
+    && !slice.review.run.phaseFilter
+    && Boolean(slice.review.run.sha)
+    && slice.review.run.sha === currentSliceHead(slice);
+}
+
+function currentSliceHead(slice: OrchestrationSliceRecord): string {
+  if (!slice.worktreePath || !existsSync(slice.worktreePath)) return '';
+  return runGit(slice.worktreePath, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '';
+}
+
+function reportStatusForOrchestrationReview(
+  runStatus: OrchestrationRunRecord['status'],
+  reviewedCount: number,
+  failedCount: number,
+  pendingCount: number,
+  blockedCount: number,
+  options: {
+    incompleteEvidence: boolean;
+  },
+): OrchestrateReviewReport['status'] {
+  if (failedCount > 0 || runStatus === 'failed') return 'failed';
+  if (pendingCount > 0) return 'pending';
+  if (blockedCount > 0) return 'blocked';
+  if (reviewedCount === 0) return 'noop';
+  if (options.incompleteEvidence) return 'blocked';
+  if (runStatus !== 'completed') return 'blocked';
+  return 'passed';
+}
+
 function resolveStartSlices(run: OrchestrationRunRecord, sliceId: string | null): OrchestrationSliceRecord[] {
   if (!sliceId) return run.slices;
   const slice = run.slices.find((candidate) => candidate.id === sliceId);
@@ -560,11 +849,43 @@ function resolveProviderCommand(provider: GoalProvider): string {
   const providerKey = provider.toUpperCase().replace(/[^A-Z0-9]/g, '_');
   const providerSpecific = process.env[`PIPELANE_ORCHESTRATE_${providerKey}_COMMAND`]?.trim();
   const fallback = process.env.PIPELANE_ORCHESTRATE_WORKER_COMMAND?.trim();
-  const command = providerSpecific || fallback || '';
+  const command = providerSpecific || fallback || defaultProviderCommand(provider);
   if (!command) {
-    throw new Error(`orchestrate start requires PIPELANE_ORCHESTRATE_${providerKey}_COMMAND or PIPELANE_ORCHESTRATE_WORKER_COMMAND.`);
+    throw new Error(`orchestrate start requires PIPELANE_ORCHESTRATE_${providerKey}_COMMAND, PIPELANE_ORCHESTRATE_WORKER_COMMAND, or an installed native ${provider} adapter on PATH.`);
   }
   return command;
+}
+
+function defaultProviderCommand(provider: GoalProvider): string {
+  if (provider === 'codex' && commandExists('codex')) return 'codex exec --full-auto -';
+  if (provider === 'claude' && commandExists('claude')) return defaultClaudeProviderCommand();
+  return '';
+}
+
+function defaultClaudeProviderCommand(): string {
+  const help = commandHelp('claude');
+  if (/\bdontAsk\b/.test(help)) return 'claude --print --permission-mode dontAsk';
+  if (/\bbypassPermissions\b/.test(help)) return 'claude --print --permission-mode bypassPermissions';
+  if (help.includes('--dangerously-skip-permissions')) return 'claude --print --dangerously-skip-permissions';
+  return 'claude --print';
+}
+
+function commandExists(command: string): boolean {
+  const result = spawnSync(command, ['--help'], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: NATIVE_COMMAND_PROBE_TIMEOUT_MS,
+  });
+  return !result.error;
+}
+
+function commandHelp(command: string): string {
+  const result = spawnSync(command, ['--help'], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: NATIVE_COMMAND_PROBE_TIMEOUT_MS,
+  });
+  return `${typeof result.stdout === 'string' ? result.stdout : ''}\n${typeof result.stderr === 'string' ? result.stderr : ''}`;
 }
 
 function assertDispatchPromptSafe(runDir: string, sliceId: string, promptPath: string): void {
@@ -1077,6 +1398,11 @@ function persistOrchestrationStartProgress(context: WorkflowContext, run: Orches
   saveOrchestrationRunRecord(context.commonDir, context.config, run);
 }
 
+function persistOrchestrationReviewProgress(context: WorkflowContext, run: OrchestrationRunRecord): void {
+  run.updatedAt = nowIso();
+  saveOrchestrationRunRecord(context.commonDir, context.config, run);
+}
+
 function buildOrchestrationTaskSlug(runId: string, slice: OrchestrationSliceRecord): string {
   const runPrefix = runId.replace(/^orchestrate-/, 'orch-');
   const prefix = `${runPrefix}-s${slice.index}-`;
@@ -1441,6 +1767,77 @@ function renderStartReport(
     '',
     'Worker completion only. Review gates, merge, deploy, and cleanup were not run by this command.',
   );
+
+  return lines.join('\n');
+}
+
+function renderOrchestrationReviewReport(
+  run: OrchestrationRunRecord,
+  ledgerPath: string,
+  sliceId: string | null,
+  result: {
+    status: OrchestrateReviewReport['status'];
+    reviewedCount: number;
+    failedCount: number;
+    pendingCount: number;
+    blockedCount: number;
+    slices: ReviewedSliceReport[];
+  },
+  options: {
+    dryRun: boolean;
+    gateFilter: string;
+    phaseFilter: ReviewGatePhase | '';
+  },
+): string {
+  const lines = [
+    'Pipelane orchestrate review',
+    '',
+    `Status: ${result.status}`,
+    `Run: ${run.id}`,
+    `Ledger: ${ledgerPath}`,
+    `Slice filter: ${sliceId ?? '(all slices)'}`,
+    `Gate filter: ${options.gateFilter || '(none)'}`,
+    `Phase filter: ${options.phaseFilter || '(none)'}`,
+    `Dry run: ${options.dryRun ? 'yes' : 'no'}`,
+    `Reviewed slices: ${result.reviewedCount}`,
+    `Pending slices: ${result.pendingCount}`,
+    `Failed slices: ${result.failedCount}`,
+    `Blocked slices: ${result.blockedCount}`,
+    `Run status: ${run.status}`,
+    '',
+    'Slice review evidence:',
+  ];
+
+  if (result.slices.length === 0) {
+    lines.push('- none');
+  } else {
+    for (const slice of result.slices) {
+      if (slice.action === 'blocked') {
+        lines.push(`- ${slice.id}: blocked - ${slice.blocker}`);
+      } else {
+        lines.push(`- ${slice.id}: ${slice.reviewStatus ?? 'unknown'} ${slice.runId ?? ''} (${slice.gateCount} gates)`);
+      }
+    }
+  }
+
+  if (sliceId || options.dryRun || options.gateFilter || options.phaseFilter) {
+    lines.push(
+      '',
+      'Slice-filtered, gate-filtered, phase-filtered, or dry-run review evidence is recorded for diagnosis, but every slice needs a full non-dry-run review before merge/deploy automation can trust the orchestration run.',
+    );
+  }
+
+  if (result.failedCount > 0) {
+    lines.push('', 'Next: fix failed blocking gates in the slice worktree, then rerun /pipelane orchestrate review.');
+  } else if (result.pendingCount > 0) {
+    lines.push('', 'Next: complete pending AI/manual gates for each slice, then rerun or attach trusted evidence before merge/deploy automation.');
+  } else if (result.blockedCount > 0) {
+    lines.push('', 'Next: finish or recover blocked workers, then rerun /pipelane orchestrate review.');
+  } else if (result.status === 'blocked') {
+    lines.push('', 'Next: complete and review the remaining slices, then rerun /pipelane orchestrate review without filters.');
+  } else {
+    lines.push('', 'Review gate execution complete. Merge, deploy, and cleanup were not run by this command.');
+  }
 
   return lines.join('\n');
 }

@@ -234,6 +234,7 @@ Current implementation surface:
 /pipelane orchestrate prepare --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
 /pipelane orchestrate dispatch --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
 /pipelane orchestrate start --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef [--slice-id <id>] [--force]
+/pipelane orchestrate review --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef [--slice-id <id>]
 /pipelane orchestrate goal-spec --plan-file docs/plan.md
 /pipelane orchestrate goal-spec --outcome "Implement review gate enforcement"
 /pipelane orchestrate goal-spec --provider codex --json
@@ -249,14 +250,23 @@ under the run state directory. It records which prompt belongs to which prepared
 worktree. `orchestrate start` consumes dispatch records, runs a configured
 worker command from each eligible worktree, feeds the handoff prompt on stdin,
 streams redacted per-slice log/exit evidence, and supports `--force` to retry
-failed or stale running worker records. It still does not run review gates,
-merge, deploy, or cleanup. `goal-spec` remains the single-slice draft-only
-command.
+failed or stale running worker records. Codex and Claude providers use native
+CLI defaults when their CLIs are available on `PATH`; explicit
+`PIPELANE_ORCHESTRATE_*_COMMAND` values still override those defaults.
+`orchestrate review` consumes completed worker slices, runs the run's
+review-gate snapshot from each slice worktree, records per-slice gate evidence
+in the orchestration ledger, and blocks the run on failed, pending,
+slice-filtered, gate-filtered, phase-filtered, or dry-run evidence. Merge,
+deploy, and cleanup remain outside orchestration.
+`goal-spec` remains the single-slice draft-only command.
 
 `orchestrate start` launcher configuration is explicit:
 
 ```bash
 PIPELANE_ORCHESTRATE_WORKER_COMMAND='your-worker-command'
+# Optional overrides. Without these, Codex defaults to `codex exec --full-auto -`
+# when `codex` is installed. Claude defaults to `claude --print` plus the
+# best supported non-interactive permission mode from `claude --help`.
 PIPELANE_ORCHESTRATE_CODEX_COMMAND='codex-specific-command'
 PIPELANE_ORCHESTRATE_CLAUDE_COMMAND='claude-specific-command'
 PIPELANE_ORCHESTRATE_WORKER_TIMEOUT_MS=3600000
@@ -448,7 +458,7 @@ Do not add:
 9. Done: add `/pipelane orchestrate prepare` worktree assignment on top of the ledger.
 10. Done: add `/pipelane orchestrate dispatch` provider handoff prompts for prepared slice worktrees.
 11. Done: add `/pipelane orchestrate start` configured worker launch and completion evidence.
-12. Next: add native Codex/Claude adapter defaults and review-gate execution over completed worker slices.
+12. Done: add native Codex/Claude adapter defaults and review-gate execution over completed worker slices.
 
 ## Acceptance Criteria
 
@@ -473,5 +483,5 @@ Do not add:
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | not run | Recommended before board UI implementation. |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | not run | Optional; useful before shipping setup UX. |
 
-- **UNRESOLVED:** Native provider adapter defaults, human-gate execution, and full gate-runner trusted-baseline semantics still need implementation-level detail before full `/orchestrate`.
-- **VERDICT:** ENG CLEARED for earlier slices. Review runner, `/pr` enforcement, provider-neutral `GoalSpec` generation, durable ledger compilation, worktree preparation, dispatch prompt generation, and configured worker launch evidence are implemented; next proceed to native provider adapters and per-slice review gate execution.
+- **UNRESOLVED:** Human/manual evidence attachment and board/API visibility for orchestration runs still need implementation-level detail before full autonomous `/orchestrate`.
+- **VERDICT:** ENG CLEARED for earlier slices. Review runner, `/pr` enforcement, provider-neutral `GoalSpec` generation, durable ledger compilation, worktree preparation, dispatch prompt generation, configured worker launch evidence, native provider defaults, and per-slice review gate execution are implemented.

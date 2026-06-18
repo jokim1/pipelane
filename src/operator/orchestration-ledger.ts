@@ -22,6 +22,7 @@ import {
   type OrchestrateConfig,
   type ReviewGateConfig,
   type ReviewGatePreset,
+  type ReviewRunRecord,
   type ReviewPlanGateConfig,
   type WorkflowConfig,
 } from './state.ts';
@@ -54,6 +55,13 @@ export interface OrchestrationSliceWorkerRecord {
   error: string | null;
 }
 
+export interface OrchestrationSliceReviewRecord {
+  status: ReviewRunRecord['status'];
+  evidencePath: string;
+  reviewedAt: string;
+  run: ReviewRunRecord;
+}
+
 export interface OrchestrationSliceRecord {
   id: string;
   index: number;
@@ -67,6 +75,8 @@ export interface OrchestrationSliceRecord {
   branchName: string | null;
   dispatch: OrchestrationSliceDispatchRecord | null;
   worker: OrchestrationSliceWorkerRecord | null;
+  review: OrchestrationSliceReviewRecord | null;
+  reviewDiagnostics?: OrchestrationSliceReviewRecord[];
   goalSpec: GoalSpec;
   provider: GoalProvider;
   providerPrompt: string;
@@ -172,6 +182,8 @@ export function buildOrchestrationRunRecord(input: BuildOrchestrationRunInput): 
       branchName: null,
       dispatch: null,
       worker: null,
+      review: null,
+      reviewDiagnostics: [],
       goalSpec,
       provider: draft.provider,
       providerPrompt: renderProviderGoalPrompt(goalSpec, draft.provider),

@@ -496,6 +496,7 @@ Draft a goal from a plan without starting execution:
 /pipelane orchestrate prepare --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
 /pipelane orchestrate dispatch --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
 /pipelane orchestrate start --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef [--slice-id <id>] [--force]
+/pipelane orchestrate review --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef [--slice-id <id>]
 /pipelane orchestrate goal-spec --plan-file docs/plan.md
 /pipelane orchestrate goal-spec --outcome "Implement review gate enforcement" --provider claude
 ```
@@ -507,7 +508,11 @@ worktrees from that ledger and records their task locks, branches, and paths.
 prepared worktrees. `orchestrate start` runs a configured worker command from
 each dispatched worktree, feeds the prompt on stdin, streams redacted log/exit
 evidence, and supports `--force` to retry failed or stale running workers. It
-does not run review gates, merge, deploy, or clean up.
+does not merge, deploy, or clean up. `orchestrate review` runs the run's
+review-gate snapshot against completed worker slices and records per-slice
+gate evidence in the orchestration ledger. Slice-filtered, gate-filtered,
+phase-filtered, dry-run, pending, or failed evidence is diagnostic only; a run
+passes only after every slice has full non-dry-run review evidence.
 
 The intended review order is:
 

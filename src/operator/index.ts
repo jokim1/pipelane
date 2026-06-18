@@ -176,6 +176,7 @@ Pipelane commands:
   orchestrate prepare --run-id <id> [--offline]
   orchestrate dispatch --run-id <id>
   orchestrate start --run-id <id> [--slice-id <id>] [--force]
+  orchestrate review --run-id <id> [--slice-id <id>] [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human]
   status
   doctor [--probe | --fix | --check-guard]
   rollback <staging|prod> [--surfaces ...] [--revert-pr]

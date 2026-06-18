@@ -3258,19 +3258,27 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
     }
     case 'orchestrate': {
       const subcommand = parsed.positional[0] ?? '';
-      if (subcommand !== 'goal-spec' && subcommand !== 'plan' && subcommand !== 'prepare' && subcommand !== 'dispatch' && subcommand !== 'start') {
-        throw new Error('orchestrate requires exactly: pipelane run orchestrate <goal-spec|plan|prepare|dispatch|start> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--run-id <id>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]');
+      if (subcommand !== 'goal-spec' && subcommand !== 'plan' && subcommand !== 'prepare' && subcommand !== 'dispatch' && subcommand !== 'start' && subcommand !== 'review') {
+        throw new Error('orchestrate requires exactly: pipelane run orchestrate <goal-spec|plan|prepare|dispatch|start|review> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--run-id <id>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]');
       }
-      if (subcommand === 'prepare' || subcommand === 'dispatch' || subcommand === 'start') {
-        assertOnlyFlags(parsed, subcommand === 'start' ? ['orchestrationRunId', 'goalSliceId', 'force'] : ['orchestrationRunId', 'offline']);
+      if (subcommand === 'prepare' || subcommand === 'dispatch' || subcommand === 'start' || subcommand === 'review') {
+        assertOnlyFlags(parsed, subcommand === 'start'
+          ? ['orchestrationRunId', 'goalSliceId', 'force']
+          : subcommand === 'review'
+            ? ['orchestrationRunId', 'goalSliceId', 'reviewDryRun', 'reviewGate', 'reviewPhase']
+            : ['orchestrationRunId', 'offline']);
         if (parsed.positional.length !== 1) {
-          throw new Error(`orchestrate ${subcommand} requires exactly: pipelane run orchestrate ${subcommand} --run-id <id>${subcommand === 'prepare' ? ' [--offline]' : subcommand === 'start' ? ' [--slice-id <id>] [--force]' : ''}`);
+          throw new Error(`orchestrate ${subcommand} requires exactly: pipelane run orchestrate ${subcommand} --run-id <id>${subcommand === 'prepare' ? ' [--offline]' : subcommand === 'start' ? ' [--slice-id <id>] [--force]' : subcommand === 'review' ? ' [--slice-id <id>] [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human]' : ''}`);
         }
         if (!parsed.flags.orchestrationRunId.trim()) {
           throw new Error(`orchestrate ${subcommand} requires --run-id <id>.`);
         }
         if (subcommand === 'dispatch' && parsed.flags.offline) {
           throw new Error('orchestrate dispatch does not accept --offline.');
+        }
+        const phase = parsed.flags.reviewPhase.trim();
+        if (subcommand === 'review' && phase && !includesString(REVIEW_GATE_PHASES, phase)) {
+          throw new Error(`--phase must be one of: ${REVIEW_GATE_PHASES.join(', ')}.`);
         }
         return;
       }

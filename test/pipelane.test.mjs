@@ -2595,6 +2595,7 @@ test('pipelane.md documents exact first-token routing for subcommands', () => {
   assert.match(template, /\/pipelane orchestrate prepare --run-id <id>/);
   assert.match(template, /\/pipelane orchestrate dispatch --run-id <id>/);
   assert.match(template, /\/pipelane orchestrate start --run-id <id>/);
+  assert.match(template, /\/pipelane orchestrate review --run-id <id>/);
   assert.match(template, /Exactly equals `update`/);
   assert.match(template, /No prefix matching/);
   assert.match(template, /`\/pipelane update-this-thing` routes to UNKNOWN MODE, not UPDATE MODE/);
@@ -4775,7 +4776,7 @@ test('orchestrate goal-spec rejects invalid command forms', () => {
 
     const invalidSubcommand = runCli(['run', 'orchestrate', 'nope'], repoRoot, {}, true);
     assert.notEqual(invalidSubcommand.status, 0);
-    assert.match(invalidSubcommand.stderr, /orchestrate requires exactly: pipelane run orchestrate <goal-spec\|plan\|prepare\|dispatch\|start>/);
+    assert.match(invalidSubcommand.stderr, /orchestrate requires exactly: pipelane run orchestrate <goal-spec\|plan\|prepare\|dispatch\|start\|review>/);
 
     const extraPositional = runCli(['run', 'orchestrate', 'goal-spec', 'extra'], repoRoot, {}, true);
     assert.notEqual(extraPositional.status, 0);
@@ -4856,6 +4857,30 @@ test('orchestrate goal-spec rejects invalid command forms', () => {
     const missingStartLedger = runCli(['run', 'orchestrate', 'start', '--run-id', 'orchestrate-20260617000000-deadbeef'], repoRoot, {}, true);
     assert.notEqual(missingStartLedger.status, 0);
     assert.match(missingStartLedger.stderr, /No orchestration run ledger found/);
+
+    const missingReviewRunId = runCli(['run', 'orchestrate', 'review'], repoRoot, {}, true);
+    assert.notEqual(missingReviewRunId.status, 0);
+    assert.match(missingReviewRunId.stderr, /orchestrate review requires --run-id <id>/);
+
+    const extraReviewPositional = runCli(['run', 'orchestrate', 'review', 'extra', '--run-id', 'orchestrate-20260617000000-deadbeef'], repoRoot, {}, true);
+    assert.notEqual(extraReviewPositional.status, 0);
+    assert.match(extraReviewPositional.stderr, /orchestrate review requires exactly/);
+
+    const reviewPlanFile = runCli(['run', 'orchestrate', 'review', '--run-id', 'orchestrate-20260617000000-deadbeef', '--plan-file', 'docs/large-plan.md'], repoRoot, {}, true);
+    assert.notEqual(reviewPlanFile.status, 0);
+    assert.match(reviewPlanFile.stderr, /orchestrate does not accept flag\(s\): --plan-file/);
+
+    const invalidReviewPhase = runCli(['run', 'orchestrate', 'review', '--run-id', 'orchestrate-20260617000000-deadbeef', '--phase', 'fast'], repoRoot, {}, true);
+    assert.notEqual(invalidReviewPhase.status, 0);
+    assert.match(invalidReviewPhase.stderr, /--phase must be one of/);
+
+    const invalidReviewRunId = runCli(['run', 'orchestrate', 'review', '--run-id', '../escape'], repoRoot, {}, true);
+    assert.notEqual(invalidReviewRunId.status, 0);
+    assert.match(invalidReviewRunId.stderr, /Invalid orchestration run id/);
+
+    const missingReviewLedger = runCli(['run', 'orchestrate', 'review', '--run-id', 'orchestrate-20260617000000-deadbeef'], repoRoot, {}, true);
+    assert.notEqual(missingReviewLedger.status, 0);
+    assert.match(missingReviewLedger.stderr, /No orchestration run ledger found/);
 
     const invalidProvider = runCli(['run', 'orchestrate', 'goal-spec', '--provider', 'openai'], repoRoot, {}, true);
     assert.notEqual(invalidProvider.status, 0);
@@ -5411,6 +5436,307 @@ test('orchestrate start runs configured workers and records completion evidence'
   }
 });
 
+test('orchestrate start uses native Codex and Claude adapter defaults when available', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-native-adapters-'));
+  try {
+    writeFileSync(
+      path.join(binDir, 'codex'),
+      [
+        '#!/usr/bin/env node',
+        "import { readFileSync, writeFileSync } from 'node:fs';",
+        "const args = process.argv.slice(2);",
+        "if (args.includes('--help')) {",
+        "  console.log('Usage: codex exec --full-auto -');",
+        "  process.exit(0);",
+        "}",
+        "if (args.join(' ') !== 'exec --full-auto -') {",
+        "  console.error(`unexpected codex args: ${args.join(' ')}`);",
+        "  process.exit(2);",
+        "}",
+        "const prompt = readFileSync(0, 'utf8');",
+        "writeFileSync('codex-default.txt', `${args.join(' ')}\\n${prompt.includes('GoalSpec JSON')}\\n`, 'utf8');",
+        "console.log('codex default ran');",
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    writeFileSync(
+      path.join(binDir, 'claude'),
+      [
+        '#!/usr/bin/env node',
+        "import { readFileSync, writeFileSync } from 'node:fs';",
+        "const args = process.argv.slice(2);",
+        "if (args.includes('--help')) {",
+        "  console.log('Usage: claude [options] [prompt]');",
+        "  console.log('--permission-mode <mode> (choices: \"acceptEdits\", \"auto\", \"bypassPermissions\", \"default\", \"dontAsk\", \"plan\")');",
+        "  process.exit(0);",
+        "}",
+        "if (args.join(' ') !== '--print --permission-mode dontAsk') {",
+        "  console.error(`unexpected claude args: ${args.join(' ')}`);",
+        "  process.exit(2);",
+        "}",
+        "const prompt = readFileSync(0, 'utf8');",
+        "writeFileSync('claude-default.txt', `${args.join(' ')}\\n${prompt.includes('GoalSpec JSON')}\\n`, 'utf8');",
+        "console.log('claude default ran');",
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    chmodSync(path.join(binDir, 'codex'), 0o755);
+    chmodSync(path.join(binDir, 'claude'), 0o755);
+
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const codexPlan = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Use codex native default', '--provider', 'codex', '--json'], repoRoot).stdout);
+    const codexPrepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', codexPlan.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...codexPrepared.slices.map((slice) => slice.worktreePath));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', codexPlan.runId], repoRoot);
+    const codexStarted = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', codexPlan.runId, '--json'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+    }).stdout);
+    assert.equal(codexStarted.status, 'completed');
+    assert.equal(codexStarted.run.slices[0].worker.command, 'codex exec --full-auto -');
+    assert.equal(readFileSync(path.join(codexStarted.run.slices[0].worktreePath, 'codex-default.txt'), 'utf8'), 'exec --full-auto -\ntrue\n');
+
+    const claudePlan = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Use claude native default', '--provider', 'claude', '--json'], repoRoot).stdout);
+    const claudePrepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', claudePlan.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...claudePrepared.slices.map((slice) => slice.worktreePath));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', claudePlan.runId], repoRoot);
+    const claudeStarted = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', claudePlan.runId, '--json'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+    }).stdout);
+    assert.equal(claudeStarted.status, 'completed');
+    assert.equal(claudeStarted.run.slices[0].worker.command, 'claude --print --permission-mode dontAsk');
+    assert.equal(readFileSync(path.join(claudeStarted.run.slices[0].worktreePath, 'claude-default.txt'), 'utf8'), '--print --permission-mode dontAsk\ntrue\n');
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate review runs gate snapshot against completed worker slices', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerCommand = 'node -e "require(\'node:fs\').writeFileSync(\'slice-output.txt\', \'done\\n\', \'utf8\')"';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      preset: 'standard',
+      planReview: { gates: [] },
+      gates: [{
+        id: 'slice-static',
+        phase: 'static',
+        type: 'command',
+        command: `${process.execPath} -e "console.log('slice review ok')"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt custom review gate');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Review completed slice', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    });
+
+    const filtered = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--phase', 'static', '--json'], repoRoot).stdout);
+    assert.equal(filtered.status, 'blocked');
+    assert.equal(filtered.run.status, 'blocked');
+    assert.match(filtered.message, /gate-filtered, phase-filtered, or dry-run review evidence/);
+
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const onDisk = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
+    const slice = onDisk.slices[0];
+
+    assert.equal(reviewed.command, 'orchestrate review');
+    assert.equal(reviewed.status, 'passed');
+    assert.equal(reviewed.reviewedCount, 1);
+    assert.equal(reviewed.failedCount, 0);
+    assert.equal(reviewed.pendingCount, 0);
+    assert.equal(onDisk.status, 'completed');
+    assert.equal(slice.status, 'completed');
+    assert.equal(slice.review.status, 'passed');
+    assert.equal(slice.review.run.status, 'passed');
+    assert.equal(slice.review.run.gates[0].gateId, 'slice-static');
+    assert.equal(slice.review.run.gates[0].status, 'passed');
+    assert.match(slice.review.run.gates[0].stdoutTail, /slice review ok/);
+    assert.equal(realpathSync(slice.review.evidencePath), realpathSync(reviewed.ledgerPath));
+    assert.equal(slice.reviewDiagnostics.length, 1);
+    assert.equal(slice.reviewDiagnostics[0].run.phaseFilter, 'static');
+    assert.match(reviewed.message, /Review gate execution complete/);
+
+    const trustedReviewId = slice.review.run.id;
+    const trustedReviewSha = slice.review.run.sha;
+    const diagnostic = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--dry-run', '--json'], repoRoot).stdout);
+    const afterDiagnostic = JSON.parse(readFileSync(diagnostic.ledgerPath, 'utf8'));
+    const afterDiagnosticSlice = afterDiagnostic.slices[0];
+    const latestDiagnostic = afterDiagnosticSlice.reviewDiagnostics[afterDiagnosticSlice.reviewDiagnostics.length - 1];
+
+    assert.equal(diagnostic.status, 'blocked');
+    assert.equal(afterDiagnostic.status, 'completed');
+    assert.equal(afterDiagnosticSlice.status, 'completed');
+    assert.equal(afterDiagnosticSlice.review.run.id, trustedReviewId);
+    assert.equal(afterDiagnosticSlice.review.run.dryRun, false);
+    assert.equal(latestDiagnostic.run.dryRun, true);
+
+    writeFileSync(path.join(slice.worktreePath, 'post-review-change.txt'), 'changed after review\n', 'utf8');
+    execFileSync('git', ['add', 'post-review-change.txt'], { cwd: slice.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Change after review'], { cwd: slice.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const staleCheck = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--dry-run', '--json'], repoRoot).stdout);
+    const afterStaleCheck = JSON.parse(readFileSync(staleCheck.ledgerPath, 'utf8'));
+
+    assert.equal(staleCheck.status, 'blocked');
+    assert.equal(afterStaleCheck.status, 'blocked');
+    assert.equal(afterStaleCheck.slices[0].status, 'blocked');
+    assert.equal(afterStaleCheck.slices[0].review.run.id, trustedReviewId);
+    assert.equal(afterStaleCheck.slices[0].review.run.sha, trustedReviewSha);
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate review blocks slice-filtered evidence until every slice is fully reviewed', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerCommand = 'node -e "require(\'node:fs\').writeFileSync(\'slice-output.txt\', \'done\\n\', \'utf8\')"';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      preset: 'standard',
+      planReview: { gates: [] },
+      gates: [{
+        id: 'slice-static',
+        phase: 'static',
+        type: 'command',
+        command: `${process.execPath} -e "console.log('slice review ok')"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt custom review gate');
+
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'partial-review-plan.md'), [
+      '# Partial Review Plan',
+      '',
+      '## Slice 1: Finished first',
+      '- Implement first slice',
+      '',
+      '## Slice 2: Still waiting',
+      '- Implement second slice',
+    ].join('\n') + '\n', 'utf8');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/partial-review-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    const dispatched = JSON.parse(runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--slice-id', dispatched.run.slices[0].id], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    });
+
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--slice-id', dispatched.run.slices[0].id, '--json'], repoRoot).stdout);
+    const onDisk = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
+
+    assert.equal(reviewed.status, 'blocked');
+    assert.equal(reviewed.reviewedCount, 1);
+    assert.equal(reviewed.failedCount, 0);
+    assert.equal(reviewed.pendingCount, 0);
+    assert.equal(reviewed.blockedCount, 0);
+    assert.notEqual(onDisk.status, 'completed');
+    assert.equal(onDisk.slices[0].status, 'completed');
+    assert.equal(onDisk.slices[0].review.run.status, 'passed');
+    assert.equal(onDisk.slices[1].review, null);
+    assert.match(reviewed.message, /Slice-filtered/);
+    assert.match(reviewed.message, /remaining slices/);
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate review records pending AI gates and blocks incomplete slice evidence', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerCommand = 'node -e "console.log(\'implemented\')"';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      preset: 'standard',
+      planReview: { gates: [] },
+      gates: [{
+        id: 'karpathy-diff',
+        phase: 'ai-diff',
+        type: 'skill',
+        skill: 'karpathy-diff',
+        userCommands: ['/karpathy diff'],
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt AI review gate');
+
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'pending-review-plan.md'), [
+      '# Pending Review Plan',
+      '',
+      '## Slice 1: Reviewed first',
+      '- Implement first slice',
+      '',
+      '## Slice 2: Not started second',
+      '- Implement second slice',
+    ].join('\n') + '\n', 'utf8');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/pending-review-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    const dispatched = JSON.parse(runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--slice-id', dispatched.run.slices[0].id], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    });
+
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const onDisk = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
+
+    assert.equal(reviewed.status, 'pending');
+    assert.equal(reviewed.reviewedCount, 1);
+    assert.equal(reviewed.pendingCount, 1);
+    assert.equal(reviewed.blockedCount, 1);
+    assert.equal(onDisk.status, 'blocked');
+    assert.equal(onDisk.slices[0].status, 'blocked');
+    assert.equal(onDisk.slices[0].review.run.gates[0].status, 'pending');
+    assert.equal(onDisk.slices[1].review, null);
+    assert.match(reviewed.slices.find((slice) => slice.id === onDisk.slices[1].id).blocker, /worker has not completed successfully/);
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('orchestrate start redacts credential material in worker evidence', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];
@@ -5855,7 +6181,7 @@ test('orchestrate start rejects missing launcher and missing dispatch prompt', (
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
-    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject missing start inputs', '--json'], repoRoot).stdout);
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject missing start inputs', '--provider', 'generic', '--json'], repoRoot).stdout);
     const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
 
@@ -5868,7 +6194,7 @@ test('orchestrate start rejects missing launcher and missing dispatch prompt', (
     const dispatched = JSON.parse(runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot).stdout);
     const missingCommand = runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {}, true);
     assert.notEqual(missingCommand.status, 0);
-    assert.match(missingCommand.stderr, /orchestrate start requires PIPELANE_ORCHESTRATE_CODEX_COMMAND or PIPELANE_ORCHESTRATE_WORKER_COMMAND/);
+    assert.match(missingCommand.stderr, /orchestrate start requires PIPELANE_ORCHESTRATE_GENERIC_COMMAND, PIPELANE_ORCHESTRATE_WORKER_COMMAND, or an installed native generic adapter on PATH/);
 
     rmSync(dispatched.run.slices[0].dispatch.promptPath, { force: true });
     const missingPrompt = runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
