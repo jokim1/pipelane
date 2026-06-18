@@ -85,6 +85,10 @@ Run deterministic checks before AI review whenever this repo has them:
 4. structural review such as gstack `/review`
 5. specialist review when needed: security, design, QA, docs drift
 
+For manual review gates, run the referenced skill, fix any findings, then
+record the clean gate with Pipelane, for example
+`pipelane run review pass --gate gstack-review --message "Ran /review clean"`.
+
 Use `/fix` to repair bugs, review findings, CI failures, and code-quality
 issues. Use `/fix rethink` for planning-only architecture review before large
 refactors.

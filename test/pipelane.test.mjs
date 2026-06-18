@@ -6702,6 +6702,90 @@ test('review runner records pending AI gates without failing the process', () =>
   }
 });
 
+test('review pass records clean manual gates against current review evidence', () => {
+  const repoRoot = createRepo();
+  const npmShim = createNpmShimEnv();
+  try {
+    const review = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, npmShim.env).stdout);
+    assert.equal(review.status, 'pending');
+
+    const gstack = JSON.parse(runCli([
+      'run',
+      'review',
+      'pass',
+      '--gate',
+      'gstack-review',
+      '--message',
+      'Ran /review clean',
+      '--json',
+    ], repoRoot).stdout);
+    const afterGstack = JSON.parse(readFileSync(gstack.evidencePath, 'utf8')).records[0];
+
+    assert.equal(gstack.command, 'review pass');
+    assert.equal(gstack.status, 'attested');
+    assert.equal(afterGstack.status, 'pending');
+    assert.equal(afterGstack.gates.find((gate) => gate.gateId === 'gstack-review').status, 'passed');
+    assert.match(afterGstack.gates.find((gate) => gate.gateId === 'gstack-review').summary, /Ran \/review clean/);
+    assert.equal(afterGstack.gates.find((gate) => gate.gateId === 'karpathy-diff').status, 'pending');
+
+    const karpathy = JSON.parse(runCli([
+      'run',
+      'review',
+      'pass',
+      '--gate',
+      'karpathy-diff',
+      '--message',
+      'Ran /karpathy diff clean',
+      '--json',
+    ], repoRoot).stdout);
+    const afterKarpathy = JSON.parse(readFileSync(karpathy.evidencePath, 'utf8')).records[0];
+
+    assert.equal(afterKarpathy.status, 'passed');
+    assert.equal(afterKarpathy.gates.find((gate) => gate.gateId === 'gstack-review').status, 'passed');
+    assert.equal(afterKarpathy.gates.find((gate) => gate.gateId === 'karpathy-diff').status, 'passed');
+    assert.equal(afterKarpathy.gates.find((gate) => gate.gateId === 'karpathy-audit').status, 'skipped');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(npmShim.binDir, { recursive: true, force: true });
+  }
+});
+
+test('review pass refuses stale or executable gate evidence', () => {
+  const repoRoot = createRepo();
+  const npmShim = createNpmShimEnv();
+  try {
+    runCli(['run', 'review', '--json'], repoRoot, npmShim.env);
+
+    const commandGate = runCli([
+      'run',
+      'review',
+      'pass',
+      '--gate',
+      'typecheck',
+      '--message',
+      'Typecheck looked fine',
+    ], repoRoot, {}, true);
+    assert.notEqual(commandGate.status, 0);
+    assert.match(commandGate.stderr, /review pass only accepts manual gates/);
+
+    writeFileSync(path.join(repoRoot, 'feature.txt'), 'changed after review\n', 'utf8');
+    const stale = runCli([
+      'run',
+      'review',
+      'pass',
+      '--gate',
+      'gstack-review',
+      '--message',
+      'Ran /review clean',
+    ], repoRoot, {}, true);
+    assert.notEqual(stale.status, 0);
+    assert.match(stale.stderr, /requires a full, non-dry-run \/pipelane review/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(npmShim.binDir, { recursive: true, force: true });
+  }
+});
+
 test('review runner includes staged-only files for whenChanged gates', () => {
   const repoRoot = createRepo();
   try {
@@ -9648,6 +9732,40 @@ test('api action pr uses matching review evidence instead of the global latest r
     assert.equal(preflight.status, 0, preflight.stderr);
     const envelope = JSON.parse(preflight.stdout);
     assert.equal(envelope.data.preflight.allowed, true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('api action pr ignores unrelated pending review evidence from another branch', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Review Unrelated Pending', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'needs its own review\n', 'utf8');
+    writePassingReviewEvidence(repoRoot, {
+      status: 'pending',
+      gateStatuses: { 'karpathy-diff': 'pending' },
+      gateSummaries: { 'karpathy-diff': 'manual skill gate pending: run /karpathy diff' },
+    });
+
+    const preflight = runCli(
+      ['run', 'api', 'action', 'pr', '--title', 'Review Unrelated Pending'],
+      created.worktreePath,
+      {},
+      true,
+    );
+    assert.equal(preflight.status, 1);
+    const envelope = JSON.parse(preflight.stdout);
+    assert.equal(envelope.data.preflight.allowed, false);
+    assert.match(envelope.data.preflight.reason, /no review run has been recorded/);
+    assert.doesNotMatch(envelope.data.preflight.reason, /karpathy-diff is pending/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });

@@ -82,7 +82,6 @@ export function selectReviewEvidenceRecord(
   )
     ?? records.find((record) => record.branchName === currentBranch && record.sha === currentSha)
     ?? records.find((record) => record.branchName === currentBranch)
-    ?? records[0]
     ?? null;
 }
 

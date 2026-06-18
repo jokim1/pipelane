@@ -457,6 +457,7 @@ Common slash commands:
 | `/repo-guard` | Check that the current checkout is safe. |
 | `/pipelane review setup` | Configure review-gate presets. |
 | `/pipelane review` | Run review gates and record evidence. |
+| `/pipelane review pass` | Record a clean manual review gate after running the referenced skill or approval. |
 | `/pr` | Run checks, commit, push, and open or update a PR. |
 | `/merge` | Merge the PR and record the merged SHA. |
 | `/deploy staging` | Deploy the merged SHA to staging. |

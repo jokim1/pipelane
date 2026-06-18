@@ -2425,6 +2425,7 @@
       const orchestrationRows = [
         { command: '/pipelane review setup', description: 'Configure review gate presets, print the effective stack, and list available gates.' },
         { command: '/pipelane review', description: 'Run configured review gates, write evidence, and surface pending AI/manual gates.' },
+        { command: '/pipelane review pass', description: 'Record a clean manual skill, agent, or approval gate after running it outside Pipelane.' },
         { command: '/pipelane orchestrate plan', description: 'Compile an implementation plan into a durable slice ledger without running workers.' },
         { command: '/pipelane orchestrate prepare', description: 'Create slice worktrees from a durable orchestration ledger without starting provider agents.' },
         { command: '/pipelane orchestrate dispatch', description: 'Write provider handoff prompts for prepared orchestration slices without starting agents.' },

@@ -153,6 +153,10 @@ Recommended review order before merge:
 4. structural review: gstack `/review`
 5. specialist review when needed: security, design, browser QA, docs drift
 
+For manual review gates, run the referenced skill, fix any findings, then
+record the clean gate with Pipelane, for example
+`pipelane run review pass --gate gstack-review --message "Ran /review clean"`.
+
 The static gates should run before AI review. Do not spend review-model tokens
 on issues ESLint, TypeScript, tests, or the build can reject deterministically.
 
