@@ -63,6 +63,8 @@ Helpful anytime:
   /fix rethink                   Plan a larger codebase restructure before changing code.
   /pipelane orchestrate plan --plan-file <path>
                                   Compile a plan into a durable slice ledger.
+  /pipelane orchestrate prepare --run-id <id>
+                                  Create slice worktrees from a run ledger.
   /pipelane orchestrate goal-spec --plan-file <path>
                                   Draft one provider-neutral GoalSpec without writing a run ledger.
   /pipelane web                  Open the local Pipelane Board.
@@ -145,7 +147,7 @@ npm run pipelane:orchestrate -- $REST
 
 where `$REST` is `$ARGUMENTS` with the leading `orchestrate` token stripped.
 
-Use this path for `/pipelane orchestrate plan --plan-file <path>`, `/pipelane orchestrate plan --outcome "<text>"`, `/pipelane orchestrate goal-spec --plan-file <path>`, `/pipelane orchestrate goal-spec --provider codex`, and `/pipelane orchestrate goal-spec --json`. Display the output directly.
+Use this path for `/pipelane orchestrate plan --plan-file <path>`, `/pipelane orchestrate plan --outcome "<text>"`, `/pipelane orchestrate prepare --run-id <id>`, `/pipelane orchestrate goal-spec --plan-file <path>`, `/pipelane orchestrate goal-spec --provider codex`, and `/pipelane orchestrate goal-spec --json`. Display the output directly.
 
 ---
 

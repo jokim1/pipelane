@@ -679,6 +679,7 @@ export interface OperatorFlags {
   goalProvider: string;
   goalMaxTurns: string;
   goalMaxMinutes: string;
+  orchestrationRunId: string;
 }
 
 export interface ParsedOperatorArgs {
@@ -2650,6 +2651,7 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     goalProvider: '',
     goalMaxTurns: '',
     goalMaxMinutes: '',
+    orchestrationRunId: '',
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -3023,6 +3025,10 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       flags.goalMaxMinutes = readFlagValue('--max-minutes').trim();
       continue;
     }
+    if (flagName === '--run-id') {
+      flags.orchestrationRunId = readFlagValue('--run-id').trim();
+      continue;
+    }
 
     if (token.startsWith('--')) {
       throw new Error(`Unknown flag "${flagName}" for pipelane run. Run "pipelane run --help" for supported commands and flags.`);
@@ -3252,8 +3258,18 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
     }
     case 'orchestrate': {
       const subcommand = parsed.positional[0] ?? '';
-      if (subcommand !== 'goal-spec' && subcommand !== 'plan') {
-        throw new Error('orchestrate requires exactly: pipelane run orchestrate <goal-spec|plan> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]');
+      if (subcommand !== 'goal-spec' && subcommand !== 'plan' && subcommand !== 'prepare') {
+        throw new Error('orchestrate requires exactly: pipelane run orchestrate <goal-spec|plan|prepare> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--run-id <id>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]');
+      }
+      if (subcommand === 'prepare') {
+        assertOnlyFlags(parsed, ['orchestrationRunId', 'offline']);
+        if (parsed.positional.length !== 1) {
+          throw new Error('orchestrate prepare requires exactly: pipelane run orchestrate prepare --run-id <id> [--offline]');
+        }
+        if (!parsed.flags.orchestrationRunId.trim()) {
+          throw new Error('orchestrate prepare requires --run-id <id>.');
+        }
+        return;
       }
       assertOnlyFlags(parsed, [
         'goalSliceId',
@@ -3523,6 +3539,7 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'goalProvider', label: '--provider', active: (flags) => flags.goalProvider.trim().length > 0 },
   { key: 'goalMaxTurns', label: '--max-turns', active: (flags) => flags.goalMaxTurns.trim().length > 0 },
   { key: 'goalMaxMinutes', label: '--max-minutes', active: (flags) => flags.goalMaxMinutes.trim().length > 0 },
+  { key: 'orchestrationRunId', label: '--run-id', active: (flags) => flags.orchestrationRunId.trim().length > 0 },
 ];
 
 function assertOnlyFlags(parsed: ParsedOperatorArgs, allowed: OperatorFlagKey[]): void {

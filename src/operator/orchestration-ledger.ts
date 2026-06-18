@@ -1,4 +1,4 @@
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import crypto from 'node:crypto';
 import path from 'node:path';
 
@@ -13,6 +13,7 @@ import {
   ensureInstallMarker,
   normalizePath,
   nowIso,
+  readVersionedJsonFile,
   resolveStateDir,
   runGit,
   TASK_SLUG_MAX_LENGTH,
@@ -25,8 +26,8 @@ import {
   type WorkflowConfig,
 } from './state.ts';
 
-export type OrchestrationRunStatus = 'planned' | 'running' | 'blocked' | 'completed' | 'failed';
-export type OrchestrationSliceStatus = 'planned' | 'running' | 'blocked' | 'completed' | 'failed';
+export type OrchestrationRunStatus = 'planned' | 'prepared' | 'running' | 'blocked' | 'completed' | 'failed';
+export type OrchestrationSliceStatus = 'planned' | 'prepared' | 'running' | 'blocked' | 'completed' | 'failed';
 
 export interface OrchestrationSliceRecord {
   id: string;
@@ -36,6 +37,7 @@ export interface OrchestrationSliceRecord {
   dependsOn: string[];
   requestedFiles: string[];
   forbiddenFiles: string[];
+  taskSlug: string | null;
   worktreePath: string | null;
   branchName: string | null;
   goalSpec: GoalSpec;
@@ -138,6 +140,7 @@ export function buildOrchestrationRunRecord(input: BuildOrchestrationRunInput): 
       dependsOn: [],
       requestedFiles: extractPathHints(slice.text),
       forbiddenFiles: [...input.config.prPathDenyList],
+      taskSlug: null,
       worktreePath: null,
       branchName: null,
       goalSpec,
@@ -198,6 +201,23 @@ export function saveOrchestrationRunRecord(
   mkdirSync(path.dirname(targetPath), { recursive: true });
   writeVersionedJsonFile('orchestrationRun', targetPath, record);
   return targetPath;
+}
+
+export function loadOrchestrationRunRecord(
+  commonDir: string,
+  config: WorkflowConfig,
+  runId: string,
+): OrchestrationRunRecord | null {
+  assertSafeOrchestrationRunId(runId);
+  const targetPath = orchestrationRunPath(commonDir, config, runId);
+  if (!existsSync(targetPath)) return null;
+  return readVersionedJsonFile<OrchestrationRunRecord | null>('orchestrationRun', commonDir, config, targetPath, null);
+}
+
+function assertSafeOrchestrationRunId(runId: string): void {
+  if (!/^orchestrate-\d{14}-[a-f0-9]{8}$/.test(runId)) {
+    throw new Error(`Invalid orchestration run id: ${runId}`);
+  }
 }
 
 function resolvePlanSections(planText: string, outcome: string | undefined): { globalText: string; slices: PlanSliceSource[] } {

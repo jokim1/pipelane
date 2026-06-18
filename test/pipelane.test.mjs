@@ -2592,6 +2592,7 @@ test('pipelane.md documents exact first-token routing for subcommands', () => {
   assert.match(template, /Exactly equals `orchestrate`/);
   assert.match(template, /npm run pipelane:orchestrate -- \$REST/);
   assert.match(template, /\/pipelane orchestrate plan --plan-file <path>/);
+  assert.match(template, /\/pipelane orchestrate prepare --run-id <id>/);
   assert.match(template, /Exactly equals `update`/);
   assert.match(template, /No prefix matching/);
   assert.match(template, /`\/pipelane update-this-thing` routes to UNKNOWN MODE, not UPDATE MODE/);
@@ -3901,6 +3902,19 @@ test('durable Codex runner dispatches /pipelane orchestrate goal-spec', () => {
     ).trim();
 
     assert.equal(planOutput, 'MANAGED:1:run orchestrate plan --outcome Demo plan');
+
+    const prepareOutput = execFileSync(
+      path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      ['pipelane', 'orchestrate', 'prepare', '--run-id', 'orchestrate-20260617000000-deadbeef'],
+      {
+        cwd: repoRoot,
+        env: { ...process.env, CODEX_HOME: codexHome },
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    ).trim();
+
+    assert.equal(prepareOutput, 'MANAGED:1:run orchestrate prepare --run-id orchestrate-20260617000000-deadbeef');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -4733,7 +4747,7 @@ test('orchestrate goal-spec rejects invalid command forms', () => {
 
     const invalidSubcommand = runCli(['run', 'orchestrate', 'nope'], repoRoot, {}, true);
     assert.notEqual(invalidSubcommand.status, 0);
-    assert.match(invalidSubcommand.stderr, /orchestrate requires exactly: pipelane run orchestrate <goal-spec\|plan>/);
+    assert.match(invalidSubcommand.stderr, /orchestrate requires exactly: pipelane run orchestrate <goal-spec\|plan\|prepare>/);
 
     const extraPositional = runCli(['run', 'orchestrate', 'goal-spec', 'extra'], repoRoot, {}, true);
     assert.notEqual(extraPositional.status, 0);
@@ -4746,6 +4760,26 @@ test('orchestrate goal-spec rejects invalid command forms', () => {
     const extraPlanPositional = runCli(['run', 'orchestrate', 'plan', 'extra', '--outcome', 'Demo'], repoRoot, {}, true);
     assert.notEqual(extraPlanPositional.status, 0);
     assert.match(extraPlanPositional.stderr, /orchestrate plan requires exactly/);
+
+    const missingPrepareRunId = runCli(['run', 'orchestrate', 'prepare'], repoRoot, {}, true);
+    assert.notEqual(missingPrepareRunId.status, 0);
+    assert.match(missingPrepareRunId.stderr, /orchestrate prepare requires --run-id <id>/);
+
+    const extraPreparePositional = runCli(['run', 'orchestrate', 'prepare', 'extra', '--run-id', 'orchestrate-20260617000000-deadbeef'], repoRoot, {}, true);
+    assert.notEqual(extraPreparePositional.status, 0);
+    assert.match(extraPreparePositional.stderr, /orchestrate prepare requires exactly/);
+
+    const preparePlanFile = runCli(['run', 'orchestrate', 'prepare', '--run-id', 'orchestrate-20260617000000-deadbeef', '--plan-file', 'docs/large-plan.md'], repoRoot, {}, true);
+    assert.notEqual(preparePlanFile.status, 0);
+    assert.match(preparePlanFile.stderr, /orchestrate does not accept flag\(s\): --plan-file/);
+
+    const invalidPrepareRunId = runCli(['run', 'orchestrate', 'prepare', '--run-id', '../escape'], repoRoot, {}, true);
+    assert.notEqual(invalidPrepareRunId.status, 0);
+    assert.match(invalidPrepareRunId.stderr, /Invalid orchestration run id/);
+
+    const missingPrepareLedger = runCli(['run', 'orchestrate', 'prepare', '--run-id', 'orchestrate-20260617000000-deadbeef'], repoRoot, {}, true);
+    assert.notEqual(missingPrepareLedger.status, 0);
+    assert.match(missingPrepareLedger.stderr, /No orchestration run ledger found/);
 
     const invalidProvider = runCli(['run', 'orchestrate', 'goal-spec', '--provider', 'openai'], repoRoot, {}, true);
     assert.notEqual(invalidProvider.status, 0);
@@ -4963,9 +4997,214 @@ test('orchestrate plan writes a durable slice ledger from a plan file', () => {
     assert.equal(worktreeListAfter, worktreeListBefore);
     assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks')), false);
     assert.equal(installMarker.stateFiles.some((entry) => entry.endsWith('/orchestration.json')), true);
-    assert.match(report.message, /Next: review the generated GoalSpec prompts/);
+    assert.match(report.message, /Next: run \/pipelane orchestrate prepare --run-id <run-id>/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate prepare creates durable slice worktrees from a planned ledger', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'prepare-plan.md'), [
+      '# Prepare Plan',
+      '',
+      '## Slice 1: Ledger workspace',
+      '- Touch `src/operator/orchestration-ledger.ts`',
+      '',
+      '## Slice 2: Command workspace',
+      '- Touch `src/operator/commands/orchestrate.ts`',
+    ].join('\n') + '\n', 'utf8');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/prepare-plan.md', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    const onDisk = JSON.parse(readFileSync(prepared.ledgerPath, 'utf8'));
+
+    assert.equal(prepared.command, 'orchestrate prepare');
+    assert.equal(prepared.status, 'prepared');
+    assert.equal(prepared.createdCount, 2);
+    assert.equal(prepared.existingCount, 0);
+    assert.equal(prepared.slices.length, 2);
+    assert.equal(prepared.run.status, 'prepared');
+    assert.equal(onDisk.status, 'prepared');
+    assert.equal(onDisk.slices.every((slice) => slice.status === 'prepared'), true);
+    assert.equal(new Set(onDisk.slices.map((slice) => slice.taskSlug)).size, 2);
+    assert.equal(onDisk.slices.every((slice) => /^orch-\d{14}-[a-f0-9]{8}-s\d+-/.test(slice.taskSlug)), true);
+    assert.equal(onDisk.slices.every((slice) => slice.branchName.startsWith('codex/')), true);
+    assert.equal(onDisk.slices.every((slice) => existsSync(slice.worktreePath)), true);
+    assert.match(prepared.message, /Provider agents were not started/);
+
+    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    for (const slice of onDisk.slices) {
+      const lock = JSON.parse(readFileSync(path.join(stateDir, 'task-locks', `${slice.taskSlug}.json`), 'utf8'));
+      assert.equal(lock.taskSlug, slice.taskSlug);
+      assert.match(lock.taskName, new RegExp(`slice ${slice.index}`));
+      assert.equal(lock.branchName, slice.branchName);
+      assert.equal(lock.worktreePath, slice.worktreePath);
+      assert.deepEqual(lock.surfaces, ['frontend', 'edge', 'sql']);
+    }
+
+    rmSync(path.join(stateDir, 'task-locks', `${onDisk.slices[0].taskSlug}.json`), { force: true });
+    const rerun = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    assert.equal(rerun.createdCount, 0);
+    assert.equal(rerun.existingCount, 2);
+    assert.deepEqual(rerun.slices.map((slice) => slice.worktreePath), prepared.slices.map((slice) => slice.worktreePath));
+    assert.equal(existsSync(path.join(stateDir, 'task-locks', `${onDisk.slices[0].taskSlug}.json`)), true);
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate prepare blocks when a ledger-assigned worktree is missing', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Prepare missing workspace check', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    rmSync(prepared.slices[0].worktreePath, { recursive: true, force: true });
+
+    const rerun = runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot, {}, true);
+    assert.notEqual(rerun.status, 0);
+    assert.match(rerun.stderr, /assigned worktree is missing/);
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate prepare rejects ledger-assigned worktrees outside the task root', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const outsideDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-outside-worktree-'));
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject unsafe workspace assignment', '--json'], repoRoot).stdout);
+    const ledger = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
+    ledger.slices[0].taskSlug = 'unsafe-ledger-assignment';
+    ledger.slices[0].branchName = 'codex/unsafe-ledger-assignment';
+    ledger.slices[0].worktreePath = outsideDir;
+    writeFileSync(planned.ledgerPath, JSON.stringify(ledger, null, 2) + '\n', 'utf8');
+
+    const rejected = runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot, {}, true);
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stderr, /assigned worktree must stay under/);
+    assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', 'unsafe-ledger-assignment.json')), false);
+  } finally {
+    rmSync(outsideDir, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate prepare rejects ledger-provided task slugs that could escape state paths', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject unsafe task slug', '--json'], repoRoot).stdout);
+    const ledger = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
+    ledger.slices[0].taskSlug = '../../evil';
+    writeFileSync(planned.ledgerPath, JSON.stringify(ledger, null, 2) + '\n', 'utf8');
+
+    const rejected = runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot, {}, true);
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stderr, /unsafe orchestration task slug/);
+    assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'evil.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate prepare cleans up a created worktree when task-lock write fails', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Cleanup failed prepare workspace', '--json'], repoRoot).stdout);
+    const worktreesBefore = run('git', ['worktree', 'list', '--porcelain'], repoRoot);
+    const taskLocksPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks');
+    rmSync(taskLocksPath, { recursive: true, force: true });
+    writeFileSync(taskLocksPath, 'not a directory\n', 'utf8');
+
+    const failed = runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot, {}, true);
+    assert.notEqual(failed.status, 0);
+    assert.match(failed.stderr, /ENOTDIR|EEXIST|not a directory/);
+    assert.equal(run('git', ['worktree', 'list', '--porcelain'], repoRoot), worktreesBefore);
+    const ledger = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
+    assert.equal(ledger.slices[0].worktreePath, null);
+    assert.equal(ledger.slices[0].branchName, null);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate prepare rejects a prepared worktree on a different branch than the ledger', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject branch mismatch', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    execFileSync('git', ['switch', '-c', 'codex/mismatched-prepared-branch'], {
+      cwd: prepared.slices[0].worktreePath,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const rejected = runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot, {}, true);
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stderr, /assigned worktree branch mismatch/);
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate prepare rejects an existing task lock that diverges from the ledger assignment', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject lock mismatch', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    const taskSlug = prepared.run.slices[0].taskSlug;
+    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${taskSlug}.json`);
+    const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+    lock.branchName = 'codex/diverged-task-lock';
+    writeFileSync(lockPath, JSON.stringify(lock, null, 2) + '\n', 'utf8');
+
+    const rejected = runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot, {}, true);
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stderr, /does not match its ledger assignment/);
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
   }
 });
 
