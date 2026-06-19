@@ -181,7 +181,7 @@ Run the global pipelane bootstrap for this machine.
 
 1. Parse any arguments that appear after \`/${INIT_PIPELANE_SKILL_NAME}\` in the user's message.
 2. Preserve quoted substrings when building the shell command.
-3. Before running, tell the user: "This can write .pipelane.json, .claude/, .agents/, package.json scripts, docs, and other generated repo files. Do not run this in Rocketboard unless you intentionally want those local or committed surfaces." Ask for confirmation.
+3. Before running, tell the user: "This can write .pipelane.json, .claude/, .agents/, package.json scripts, docs, and other generated repo files. Do not run this in public, open-source, or otherwise clean repos unless you intentionally want those local or committed surfaces." Ask for confirmation.
 4. After the user confirms, run:
    \`${options.bootstrapScriptPath} --yes <parsed arguments>\`
 5. Stream the command output directly.

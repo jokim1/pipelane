@@ -12,6 +12,8 @@ import {
   loadWorkflowConfig,
   MANAGED_COMMANDS,
   MANAGED_EXTRA_COMMANDS,
+  readPackageJsonOverlay,
+  REPO_LOCAL_SYNC_DOCS,
   type ManagedCommand,
   readJsonFile,
   resolveReadableConfigPath,
@@ -37,6 +39,7 @@ const CLAUDE_COMMAND_MARKER = '<!-- pipelane:command:';
 const CONSUMER_EXTENSION_MARKER_START = '<!-- pipelane:consumer-extension:start -->';
 const CONSUMER_EXTENSION_MARKER_END = '<!-- pipelane:consumer-extension:end -->';
 const MANAGED_CLAUDE_COMMANDS_FILENAME = '.pipelane-managed.json';
+const SYNC_DOC_KEYS = Object.keys(REPO_LOCAL_SYNC_DOCS) as (keyof SyncDocsConfig)[];
 // Two-signature legacy detection: first-line description + a distinctive body
 // string. For workflow commands the body string is usually the npm script
 // prefix, truncated to `npm run pipelane:<cmd>` so the match survives any
@@ -391,6 +394,127 @@ function renderManagedClaudeCommand(
   return injectConsumerExtension(rendered, capturedExtension);
 }
 
+function hasOwn(value: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function readJsonObject(targetPath: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(readFileSync(targetPath, 'utf8')) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return null;
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function fileContains(targetPath: string, needle: string): boolean {
+  return existsSync(targetPath) && readFileSync(targetPath, 'utf8').includes(needle);
+}
+
+interface DeclaredSyncDocs {
+  declared: boolean;
+  raw: unknown;
+}
+
+function readDeclaredSyncDocs(repoRoot: string): DeclaredSyncDocs {
+  const configPath = resolveReadableConfigPath(repoRoot);
+  if (configPath) {
+    const parsed = readJsonObject(configPath);
+    if (parsed && hasOwn(parsed, 'syncDocs')) {
+      return { declared: true, raw: parsed.syncDocs };
+    }
+  }
+  const overlay = readPackageJsonOverlay(repoRoot);
+  if (overlay && hasOwn(overlay, 'syncDocs')) {
+    return { declared: true, raw: overlay.syncDocs };
+  }
+  return { declared: false, raw: undefined };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function hasManagedPackageScripts(repoRoot: string): boolean {
+  const pkg = readJsonObject(path.join(repoRoot, 'package.json'));
+  if (!pkg || !isRecord(pkg.scripts)) {
+    return false;
+  }
+  return (
+    Object.entries(REQUIRED_PACKAGE_SCRIPTS).some(([script, command]) => pkg.scripts[script] === command) ||
+    (typeof pkg.scripts.preinstall === 'string' && pkg.scripts.preinstall.includes(PREINSTALL_GUARD_FINGERPRINT))
+  );
+}
+
+function hasPipelaneReleaseWorkflowDoc(repoRoot: string): boolean {
+  const target = path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md');
+  return (
+    fileContains(target, "This document is the full operator guide for this repo's pipelane setup.") &&
+    fileContains(target, '## Supported Operator Surfaces')
+  );
+}
+
+function hasLegacyRepoLocalFootprint(repoRoot: string): boolean {
+  return (
+    existsSync(path.join(repoRoot, '.claude', 'commands', MANAGED_CLAUDE_COMMANDS_FILENAME)) ||
+    existsSync(path.join(repoRoot, '.agents', 'skills', '.pipelane-managed.json')) ||
+    existsSync(path.join(repoRoot, 'pipelane', 'CLAUDE.template.md')) ||
+    hasPipelaneReleaseWorkflowDoc(repoRoot) ||
+    hasManagedPackageScripts(repoRoot) ||
+    fileContains(path.join(repoRoot, 'README.md'), README_MARKER_START) ||
+    fileContains(path.join(repoRoot, 'CONTRIBUTING.md'), CONTRIBUTING_MARKER_START) ||
+    fileContains(path.join(repoRoot, 'AGENTS.md'), AGENTS_MARKER_START)
+  );
+}
+
+function hasLegacyPartialSyncDocsShape(raw: unknown): boolean {
+  if (!isRecord(raw)) {
+    return false;
+  }
+  const hasOmittedKey = SYNC_DOC_KEYS.some((key) => typeof raw[key] !== 'boolean');
+  return hasOmittedKey;
+}
+
+function resolveSyncDocsFromDefaults(
+  defaults: Required<SyncDocsConfig>,
+  raw: SyncDocsConfig | undefined,
+): Required<SyncDocsConfig> {
+  const resolved: Required<SyncDocsConfig> = { ...defaults };
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return resolved;
+  }
+  for (const key of SYNC_DOC_KEYS) {
+    const value = (raw as Record<string, unknown>)[key];
+    if (typeof value === 'boolean') {
+      resolved[key] = value;
+    }
+  }
+  return resolved;
+}
+
+function resolveEffectiveSyncDocs(repoRoot: string, config: WorkflowConfig): Required<SyncDocsConfig> {
+  const declared = readDeclaredSyncDocs(repoRoot);
+  const hasLegacyFootprint = hasLegacyRepoLocalFootprint(repoRoot);
+  if (config.syncDocs === undefined && !declared.declared && hasLegacyFootprint) {
+    return { ...REPO_LOCAL_SYNC_DOCS };
+  }
+  if (hasLegacyFootprint && hasLegacyPartialSyncDocsShape(declared.raw)) {
+    return resolveSyncDocsFromDefaults(REPO_LOCAL_SYNC_DOCS, config.syncDocs);
+  }
+  return resolveSyncDocs(config.syncDocs);
+}
+
+function shouldScaffoldClaudeMd(syncDocs: Required<SyncDocsConfig>): boolean {
+  return syncDocs.claudeCommands || syncDocs.pipelaneClaudeTemplate;
+}
+
+function shouldScaffoldRepoGuidance(syncDocs: Required<SyncDocsConfig>): boolean {
+  return syncDocs.agentsSection || syncDocs.codexSkills;
+}
+
 // Pure computation of what replaceMarkedSection would write. Shared by the
 // writer below and by detectSetupDrift so both agree on the resulting bytes.
 function computeReplaceMarkedSection(
@@ -523,13 +647,13 @@ function assertPackageScriptConsistency(repoRoot: string, syncDocs: Required<Syn
       `The generated .claude/commands/*.md templates invoke these via \`npm run pipelane:<cmd>\`. ` +
       `Fix it one of three ways: ` +
       `(a) add the missing scripts to package.json yourself, ` +
-      `(b) set syncDocs.packageScripts to true (or drop the flag), or ` +
+      `(b) set syncDocs.packageScripts to true (required when generating Claude commands unless those scripts already exist), or ` +
       `(c) set syncDocs.claudeCommands to false so the command files aren't generated.`,
   );
 }
 
 export function syncConsumerDocs(repoRoot: string, config: WorkflowConfig): void {
-  const syncDocs = resolveSyncDocs(config.syncDocs);
+  const syncDocs = resolveEffectiveSyncDocs(repoRoot, config);
   assertPackageScriptConsistency(repoRoot, syncDocs);
 
   if (syncDocs.claudeCommands) {
@@ -639,6 +763,7 @@ export function initConsumerRepo(cwd: string, projectName: string): { repoRoot: 
   const inferredName = projectName.trim() || path.basename(repoRoot);
   const projectKey = inferProjectKey(inferredName);
   const config = defaultWorkflowConfig(projectKey, inferredName);
+  config.syncDocs = { ...REPO_LOCAL_SYNC_DOCS };
 
   writeWorkflowConfig(repoRoot, config);
   syncConsumerDocs(repoRoot, config);
@@ -653,6 +778,8 @@ export interface SetupConsumerRepoResult {
   repoRoot: string;
   createdClaude: boolean;
   createdRepoGuidance: boolean;
+  skippedClaudeScaffold: boolean;
+  skippedRepoGuidanceScaffold: boolean;
   codexSkillsDir: string;
   installedCodexSkills: string[];
   removedLegacyCodexSkills: string[];
@@ -820,14 +947,19 @@ export function formatAgentsGuidanceMigrations(migrations: AgentsGuidanceMigrati
 export function setupConsumerRepo(cwd: string, options: SetupConsumerRepoOptions = {}): SetupConsumerRepoResult {
   const repoRoot = resolveRepoRoot(cwd, true);
   const config = loadWorkflowConfig(repoRoot);
-  const syncDocs = resolveSyncDocs(config.syncDocs);
+  const syncDocs = resolveEffectiveSyncDocs(repoRoot, config);
   syncConsumerDocs(repoRoot, config);
+  const scaffoldClaudeMd = shouldScaffoldClaudeMd(syncDocs);
+  const scaffoldRepoGuidance = shouldScaffoldRepoGuidance(syncDocs);
 
   const claudePath = path.join(repoRoot, 'CLAUDE.md');
   let createdClaude = false;
-  if (!existsSync(claudePath)) {
+  let skippedClaudeScaffold = false;
+  if (!existsSync(claudePath) && scaffoldClaudeMd) {
     writeFileSync(claudePath, renderClaudeMdFromTemplate(config), 'utf8');
     createdClaude = true;
+  } else if (!existsSync(claudePath)) {
+    skippedClaudeScaffold = true;
   }
 
   // REPO_GUIDANCE.md is consumer-owned forever: pipelane writes the scaffold
@@ -835,26 +967,35 @@ export function setupConsumerRepo(cwd: string, options: SetupConsumerRepoOptions
   // exists, preserving whatever the consumer has customized.
   const repoGuidancePath = path.join(repoRoot, 'REPO_GUIDANCE.md');
   let createdRepoGuidance = false;
-  if (!existsSync(repoGuidancePath)) {
+  let skippedRepoGuidanceScaffold = false;
+  if (!existsSync(repoGuidancePath) && scaffoldRepoGuidance) {
     writeFileSync(repoGuidancePath, readTemplate('REPO_GUIDANCE.template.md'), 'utf8');
     createdRepoGuidance = true;
+  } else if (!existsSync(repoGuidancePath)) {
+    skippedRepoGuidanceScaffold = true;
   }
 
   const removedLegacyCodexSkills = syncDocs.codexSkills
     ? pruneLegacyCodexWrapperSkills()
     : [];
-  let agentsGuidanceMigrations = detectAgentsGuidanceMigrationsForConfig(repoRoot, config);
+  let agentsGuidanceMigrations = syncDocs.agentsSection
+    ? detectAgentsGuidanceMigrationsForConfig(repoRoot, config)
+    : [];
   const appliedAgentsGuidanceMigrations = options.applyAgentsGuidanceMigrations
     ? applyAgentsGuidanceMigrations(agentsGuidanceMigrations)
     : [];
   if (appliedAgentsGuidanceMigrations.length > 0) {
-    agentsGuidanceMigrations = detectAgentsGuidanceMigrationsForConfig(repoRoot, config);
+    agentsGuidanceMigrations = syncDocs.agentsSection
+      ? detectAgentsGuidanceMigrationsForConfig(repoRoot, config)
+      : [];
   }
 
   return {
     repoRoot,
     createdClaude,
     createdRepoGuidance,
+    skippedClaudeScaffold,
+    skippedRepoGuidanceScaffold,
     codexSkillsDir: path.join(repoRoot, '.agents', 'skills'),
     installedCodexSkills: syncDocs.codexSkills
       ? WORKFLOW_COMMANDS.map((command) => config.aliases[command])
@@ -888,6 +1029,7 @@ export interface SetupDrift {
   needsReopenCodex: boolean;
   claude: ClaudeCommandDrift;
   codex: CodexSkillDrift & { enabled: boolean };
+  claudeGuidance: { willScaffold: boolean };
   repoGuidance: { willScaffold: boolean };
   // Names of other syncConsumerDocs surfaces setup would re-render. Values
   // come from the SyncDocsConfig keys enabled for this consumer.
@@ -904,7 +1046,7 @@ export interface SetupDrift {
 export function detectSetupDrift(cwd: string): SetupDrift {
   const repoRoot = resolveRepoRoot(cwd, true);
   const config = loadWorkflowConfig(repoRoot);
-  const syncDocs = resolveSyncDocs(config.syncDocs);
+  const syncDocs = resolveEffectiveSyncDocs(repoRoot, config);
   const aliases = resolveWorkflowAliases(config.aliases);
 
   // Claude surface
@@ -972,9 +1114,12 @@ export function detectSetupDrift(cwd: string): SetupDrift {
       };
   const codex = { ...codexDrift, enabled: syncDocs.codexSkills };
 
-  // REPO_GUIDANCE.md scaffold — write-once, never re-sync.
+  // Local guidance scaffolds — write-once, never re-sync.
+  const claudeGuidance = {
+    willScaffold: shouldScaffoldClaudeMd(syncDocs) && !existsSync(path.join(repoRoot, 'CLAUDE.md')),
+  };
   const repoGuidance = {
-    willScaffold: !existsSync(path.join(repoRoot, 'REPO_GUIDANCE.md')),
+    willScaffold: shouldScaffoldRepoGuidance(syncDocs) && !existsSync(path.join(repoRoot, 'REPO_GUIDANCE.md')),
   };
 
   // Other re-rendered surfaces — each conditional block in syncConsumerDocs.
@@ -1026,7 +1171,9 @@ export function detectSetupDrift(cwd: string): SetupDrift {
       otherSurfaces.push('packageScripts');
     }
   }
-  const agentsGuidanceMigrations = detectAgentsGuidanceMigrationsForConfig(repoRoot, config);
+  const agentsGuidanceMigrations = syncDocs.agentsSection
+    ? detectAgentsGuidanceMigrationsForConfig(repoRoot, config)
+    : [];
 
   const claudeDirty =
     claude.addedCommands.length > 0 ||
@@ -1045,6 +1192,7 @@ export function detectSetupDrift(cwd: string): SetupDrift {
     needsSetup:
       claudeDirty ||
       codexDirty ||
+      claudeGuidance.willScaffold ||
       repoGuidance.willScaffold ||
       otherSurfaces.length > 0,
     // Reopen is only relevant when command files actually change — collisions
@@ -1057,6 +1205,7 @@ export function detectSetupDrift(cwd: string): SetupDrift {
     needsReopenCodex: codexDirty,
     claude,
     codex,
+    claudeGuidance,
     repoGuidance,
     otherSurfaces,
     agentsGuidanceMigrations,
@@ -1095,10 +1244,14 @@ export function formatSetupResult(result: SetupConsumerRepoResult): string[] {
     `Pipelane setup complete in ${result.repoRoot}`,
     result.createdClaude
       ? 'Created local CLAUDE.md from the Pipelane template.'
-      : 'Preserved existing local CLAUDE.md.',
+      : result.skippedClaudeScaffold
+        ? 'Skipped local CLAUDE.md scaffold because local guidance scaffolds are disabled.'
+        : 'Preserved existing local CLAUDE.md.',
     result.createdRepoGuidance
       ? 'Created REPO_GUIDANCE.md from the scaffold — run `/fix refresh-guidance` to fill it in.'
-      : 'Preserved existing REPO_GUIDANCE.md.',
+      : result.skippedRepoGuidanceScaffold
+        ? 'Skipped REPO_GUIDANCE.md scaffold because local guidance scaffolds are disabled.'
+        : 'Preserved existing REPO_GUIDANCE.md.',
     setupDeployConfigMessage(result.repoRoot),
   ];
   if (result.installedCodexSkills.length > 0) {

@@ -14,6 +14,7 @@ import {
 import { bucketPathsBySurface } from './surface-map.ts';
 import { findQualifyingSmokeRun, resolveSmokeConfig } from './smoke-gate.ts';
 import { readWorktreeStatusSnapshot } from './worktree-status.ts';
+import { inferTargetSurfacesFromSurfacePathMap, targetSurfaceInferenceBlockers } from './target-surface-map.ts';
 import {
   loadDeployState,
   loadTaskLock,
@@ -110,6 +111,7 @@ export interface DestinationSnapshot {
   requestedSurfaces: string[];
   configuredSurfaces: string[];
   explicitSurfaces: boolean;
+  surfacePathMapBlockers: string[];
   smoke: {
     requireStagingSmoke: boolean;
     stagingConfigured: boolean;
@@ -219,8 +221,6 @@ export function resolveDestinationSnapshot(
   const prRecord = taskSlug ? loadPrRecord(context.commonDir, context.config, taskSlug) : null;
   const deployState = loadDeployState(context.commonDir, context.config);
   const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
-  const explicitSurfaces = [...parsed.flags.surfaces, ...deploySurfacePositionals(parsed)];
-  const requestedSurfaces = resolveCommandSurfaces(context, explicitSurfaces, lock?.surfaces ?? []);
   const smokeConfig = resolveSmokeConfig(context.config);
   const explicitDeploySha = parsed.command === 'deploy' || parsed.command === 'smoke'
     ? parsed.flags.sha.trim()
@@ -232,6 +232,21 @@ export function resolveDestinationSnapshot(
     ? `Could not resolve ${explicitDeploySha}.`
     : '';
   const targetSha = resolvedExplicitDeploySha || (explicitDeploySha ? explicitDeploySha : resolveReleaseSha(livePr, prRecord, headSha));
+  const explicitSurfaces = [...parsed.flags.surfaces, ...deploySurfacePositionals(parsed)];
+  const baseRequestedSurfaces = resolveCommandSurfaces(context, explicitSurfaces, lock?.surfaces ?? []);
+  const surfaceInference = explicitSurfaces.length === 0
+    ? inferTargetSurfacesFromSurfacePathMap({
+      repoRoot: context.repoRoot,
+      config: context.config,
+      targetSha,
+    })
+    : null;
+  const surfacePathMapBlockers = targetSurfaceInferenceBlockers(surfaceInference);
+  const requestedSurfaces = surfaceInference
+    && surfacePathMapBlockers.length === 0
+    && surfaceInference.surfaces.length > 0
+    ? surfaceInference.surfaces
+    : baseRequestedSurfaces;
 
   return {
     target,
@@ -271,6 +286,7 @@ export function resolveDestinationSnapshot(
     requestedSurfaces,
     configuredSurfaces: [...context.config.surfaces],
     explicitSurfaces: explicitSurfaces.length > 0,
+    surfacePathMapBlockers,
     smoke: {
       requireStagingSmoke: smokeConfig.requireStagingSmoke,
       stagingConfigured: Boolean(smokeConfig.staging?.command?.trim()),
@@ -634,6 +650,9 @@ function buildDestinationBlockers(snapshot: DestinationSnapshot, target: Destina
         'Commit them separately, map them to a surface, or clean the worktree before continuing this deployment route',
       ].join(' '));
     }
+  }
+  if (needsDeploySideEffect) {
+    blockers.push(...snapshot.surfacePathMapBlockers);
   }
   if (snapshot.dirty && !steps.some((step) => step.id === 'pr') && dirtyExplicitTargetBlockers.length === 0) {
     blockers.push('worktree has uncommitted changes; run /pr for those changes or clean the worktree before continuing this route');

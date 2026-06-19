@@ -87,7 +87,7 @@ command.
 
 ### What Each User Still Needs To Do
 
-- One repo maintainer runs `pipelane bootstrap --project "<name>"`, reviews
+- One repo maintainer runs `pipelane bootstrap --yes --project "<name>"`, reviews
   `.pipelane.json` (or a `pipelane` block in `package.json`), and commits the
   tracked Pipelane files. Consumers who prefer to gitignore `.pipelane.json`
   can declare the `pipelane` overlay in `package.json` and skip `init` — fresh

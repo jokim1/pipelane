@@ -61,6 +61,7 @@ import {
 import { maybeHandleDestinationCommand } from './destination.ts';
 import { observeFrontendRuntime, toDeployRuntimeObservation } from '../runtime-observation.ts';
 import { DESTINATION_APPROVED_TARGET_SHA_ENV, DESTINATION_INTERNAL_STEP_ENV } from '../destination-executor.ts';
+import { inferTargetSurfacesFromSurfacePathMap, targetSurfaceInferenceBlockers } from '../target-surface-map.ts';
 
 function surfacesKey(surfaces: string[]): string {
   return [...surfaces].sort().join(',');
@@ -233,26 +234,10 @@ export async function dispatchDeploy(
   const explicitSurfaces = options.explicitSurfaces ?? [...parsed.flags.surfaces, ...parsed.positional.slice(1)];
   const identity = resolveDeployCommandIdentity(context, parsed, options);
   const { taskSlug } = identity;
-  const surfaces = resolveCommandSurfaces(context, explicitSurfaces, identity.lock?.surfaces ?? []);
   const prRecord = resolveDeployPrRecord(context, identity, environment);
   const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
   const allowHealthcheckStubBypass = process.env.NODE_ENV === 'test'
     && Boolean(process.env.PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS);
-  const missingConfig = listMissingDeployConfiguration({
-    config: deployConfig,
-    environment,
-    surfaces,
-    defaultWorkflowName: context.config.deployWorkflowName,
-    allowHealthcheckStubBypass,
-  });
-  if (missingConfig.length > 0) {
-    throw new Error(buildDeployConfigurationError({
-      environment,
-      surfaces,
-      missing: missingConfig,
-      deployCommand: formatWorkflowCommand(context.config, 'deploy'),
-    }));
-  }
   const routeApprovedBuildSha = process.env[DESTINATION_INTERNAL_STEP_ENV] === '1'
     && context.modeState.mode === 'build'
     ? (process.env[DESTINATION_APPROVED_TARGET_SHA_ENV] ?? '').trim()
@@ -268,6 +253,27 @@ export async function dispatchDeploy(
       config: context.config,
     });
   const asyncRequested = options.async ?? parsed.flags.async;
+  const surfaces = resolveDeploySurfacesForTarget({
+    context,
+    explicitSurfaces,
+    fallbackSurfaces: identity.lock?.surfaces ?? [],
+    targetSha: target.sha,
+  });
+  const missingConfig = listMissingDeployConfiguration({
+    config: deployConfig,
+    environment,
+    surfaces,
+    defaultWorkflowName: context.config.deployWorkflowName,
+    allowHealthcheckStubBypass,
+  });
+  if (missingConfig.length > 0) {
+    throw new Error(buildDeployConfigurationError({
+      environment,
+      surfaces,
+      missing: missingConfig,
+      deployCommand: formatWorkflowCommand(context.config, 'deploy'),
+    }));
+  }
   const smokeConfig = resolveSmokeConfig(context.config);
   const requestedSmokeCoverageOverrideReason = parsed.flags.skipSmokeCoverage
     ? parsed.flags.reason.trim()
@@ -717,6 +723,34 @@ export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Pro
 
   const result = await dispatchDeploy(cwd, parsed);
   printResult(parsed.flags, result);
+}
+
+function resolveDeploySurfacesForTarget(options: {
+  context: WorkflowContext;
+  explicitSurfaces: string[];
+  fallbackSurfaces: string[];
+  targetSha: string;
+}): string[] {
+  const surfaces = resolveCommandSurfaces(options.context, options.explicitSurfaces, options.fallbackSurfaces);
+  if (options.explicitSurfaces.length > 0) return surfaces;
+
+  const inference = inferTargetSurfacesFromSurfacePathMap({
+    repoRoot: options.context.repoRoot,
+    config: options.context.config,
+    targetSha: options.targetSha,
+  });
+  if (!inference) return surfaces;
+
+  const blockers = targetSurfaceInferenceBlockers(inference);
+  if (blockers.length > 0) {
+    throw new Error([
+      'Deploy blocked: target changes do not match surfacePathMap.',
+      ...blockers,
+      'Add missing paths to .pipelane.json:surfacePathMap or re-run with --surfaces <csv> if this deployment is intentionally manual.',
+    ].join('\n'));
+  }
+
+  return inference.surfaces.length > 0 ? inference.surfaces : surfaces;
 }
 
 export function persistRecord(
