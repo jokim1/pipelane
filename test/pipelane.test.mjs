@@ -9810,6 +9810,154 @@ test('pr, merge, deploy, and task-lock work with a fake gh adapter', () => {
   }
 });
 
+test('deploy infers target surfaces from surfacePathMap instead of stale task lock surfaces', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.surfaces = ['frontend', 'sql', 'mcp'];
+    config.surfacePathMap = {
+      frontend: ['src/frontend/'],
+      sql: ['supabase/'],
+      mcp: ['packages/mcp-server/'],
+    };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    mkdirSync(path.join(repoRoot, 'packages', 'mcp-server'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'packages', 'mcp-server', 'index.ts'), 'export const changed = true;\n', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Change MCP server'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    const targetSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+
+    writeTaskLock(repoRoot, 'mcp-only', { mode: 'build', surfaces: ['frontend', 'sql'] });
+    writePrRecord(repoRoot, 'mcp-only', targetSha);
+
+    const result = runCli(['run', 'deploy', 'staging', '--task', 'mcp-only', '--json'], repoRoot, env);
+    const output = JSON.parse(result.stdout);
+    assert.deepEqual(output.surfaces, ['mcp']);
+
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.workflows.length, 1);
+    assert.ok(ghState.workflows[0].args.includes('surfaces=mcp'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('deploy blocks unmapped target files before falling back to stale surfaces', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.surfaces = ['frontend', 'sql', 'mcp'];
+    config.surfacePathMap = {
+      frontend: ['src/frontend/'],
+      sql: ['supabase/'],
+    };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    mkdirSync(path.join(repoRoot, 'packages', 'mcp-server'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'packages', 'mcp-server', 'index\x1b[2K.ts'), 'export const changed = true;\n', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Change MCP server'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    const targetSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+
+    writeTaskLock(repoRoot, 'mcp-only', { mode: 'build', surfaces: ['frontend', 'sql'] });
+    writePrRecord(repoRoot, 'mcp-only', targetSha);
+
+    const result = runCli(['run', 'deploy', 'staging', '--task', 'mcp-only', '--json'], repoRoot, env, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Deploy blocked: target changes do not match surfacePathMap/);
+    assert.match(result.stderr, /packages\/mcp-server\/index\.ts/);
+    assert.equal(result.stderr.includes('\x1b[2K'), false);
+
+    const ghState = existsSync(ghStateFile)
+      ? JSON.parse(readFileSync(ghStateFile, 'utf8'))
+      : { workflows: [] };
+    assert.equal(ghState.workflows.length, 0);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('deploy explicit surfaces bypass target surfacePathMap inference', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.surfaces = ['frontend', 'sql', 'mcp'];
+    config.surfacePathMap = {
+      frontend: ['src/frontend/'],
+      sql: ['supabase/'],
+    };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    mkdirSync(path.join(repoRoot, 'packages', 'mcp-server'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'packages', 'mcp-server', 'index.ts'), 'export const changed = true;\n', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Change MCP server'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    const targetSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+
+    writeTaskLock(repoRoot, 'mcp-only', { mode: 'build', surfaces: ['frontend', 'sql'] });
+    writePrRecord(repoRoot, 'mcp-only', targetSha);
+
+    const result = runCli(['run', 'deploy', 'staging', '--task', 'mcp-only', '--surfaces', 'mcp', '--json'], repoRoot, env);
+    const output = JSON.parse(result.stdout);
+    assert.deepEqual(output.surfaces, ['mcp']);
+
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.workflows.length, 1);
+    assert.ok(ghState.workflows[0].args.includes('surfaces=mcp'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
 test('pr blocks stale task branches before committing or opening review', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
@@ -21185,6 +21333,90 @@ test('destination planner treats newer requested deploys as pending before older
     assert.match(payload.blockers.join('\n'), /staging deploy is already in flight/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('destination planner infers target surfaces from surfacePathMap', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.surfaces = ['frontend', 'sql', 'mcp'];
+      config.surfacePathMap = {
+        frontend: ['src/frontend/'],
+        sql: ['supabase/'],
+        mcp: ['packages/mcp-server/'],
+      };
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    mkdirSync(path.join(repoRoot, 'packages', 'mcp-server'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'packages', 'mcp-server', 'index.ts'), 'export const changed = true;\n', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Change MCP server'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    const targetSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+
+    writeTaskLock(repoRoot, 'mcp-only', { mode: 'build', surfaces: ['frontend', 'sql'] });
+    writePrRecord(repoRoot, 'mcp-only', targetSha);
+
+    const result = runCli(
+      ['run', 'deploy', 'staging', '--task', 'mcp-only', '--plan', '--json'],
+      repoRoot,
+      { PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200' },
+      true,
+    );
+    const plan = JSON.parse(result.stdout);
+    assert.deepEqual(plan.requestedSurfaces, ['mcp']);
+    assert.deepEqual(plan.blockers, []);
+    assert.equal(plan.surfaces.find((surface) => surface.surface === 'mcp').requested, true);
+    assert.equal(plan.surfaces.find((surface) => surface.surface === 'frontend').requested, false);
+    assert.equal(plan.surfaces.find((surface) => surface.surface === 'sql').requested, false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('destination planner blocks unmapped target files before stale surfaces', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.surfaces = ['frontend', 'sql', 'mcp'];
+      config.surfacePathMap = {
+        frontend: ['src/frontend/'],
+        sql: ['supabase/'],
+      };
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    mkdirSync(path.join(repoRoot, 'packages', 'mcp-server'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'packages', 'mcp-server', 'index.ts'), 'export const changed = true;\n', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Change MCP server'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    const targetSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+
+    writeTaskLock(repoRoot, 'mcp-only', { mode: 'build', surfaces: ['frontend', 'sql'] });
+    writePrRecord(repoRoot, 'mcp-only', targetSha);
+
+    const result = runCli(
+      ['run', 'deploy', 'staging', '--task', 'mcp-only', '--plan', '--json'],
+      repoRoot,
+      {},
+      true,
+    );
+    const plan = JSON.parse(result.stdout);
+    assert.equal(result.status, 1);
+    assert.match(plan.blockers.join('\n'), /target file\(s\) do not match surfacePathMap/);
+    assert.match(plan.blockers.join('\n'), /packages\/mcp-server\/index\.ts/);
+    assert.deepEqual(plan.requestedSurfaces, ['frontend', 'sql']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
   }
 });
 
