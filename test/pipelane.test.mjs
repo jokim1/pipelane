@@ -17649,6 +17649,125 @@ test('api action execute: non-risky clean.plan runs without a token and does not
   }
 });
 
+async function seedStatusCleanupCandidate(repoRoot, taskName) {
+  const created = JSON.parse(runCli(['run', 'new', '--task', taskName, '--json'], repoRoot).stdout);
+  const mergedSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+  writePrRecord(repoRoot, created.taskSlug, mergedSha);
+  const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`);
+  const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+  await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, lock.surfaces, { taskSlug: created.taskSlug });
+  lock.updatedAt = '2026-04-17T00:00:00Z';
+  writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`, 'utf8');
+  return { created, lockPath };
+}
+
+test('status interactive action does not prompt for routine clean plan when nothing is stale', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const result = runCli(['run', 'status'], repoRoot, {
+      PIPELANE_STATUS_INPUT: 'y\n',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, /NEXT ACTION/);
+    assert.equal(
+      existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'action-state.json')),
+      false,
+      'status should not persist a decision when no meaningful action is offered',
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('status interactive action cancel persists a human decision without executing', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    await seedStatusCleanupCandidate(repoRoot, 'Status Cancel');
+
+    const result = runCli(['run', 'status'], repoRoot, {
+      PIPELANE_STATUS_INPUT: 'n\n',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /NEXT ACTION/);
+    assert.match(result.stdout, /Clean/);
+    assert.match(result.stdout, /Action cancelled/);
+
+    const actionStatePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'action-state.json');
+    const actionState = JSON.parse(readFileSync(actionStatePath, 'utf8'));
+    assert.equal(actionState.decisions.length, 1);
+    assert.equal(actionState.decisions[0].actionId, 'clean.plan');
+    assert.equal(actionState.decisions[0].status, 'cancelled');
+    assert.equal(actionState.decisions[0].source, 'board');
+    assert.equal(actionState.decisions[0].executionExitCode, undefined);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('status interactive action approval executes through api action and records outcome', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    await seedStatusCleanupCandidate(repoRoot, 'Status Approval');
+
+    const result = runCli(['run', 'status'], repoRoot, {
+      PIPELANE_STATUS_INPUT: 'y\n',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /NEXT ACTION/);
+    assert.match(result.stdout, /Action completed: clean\.plan executed/);
+
+    const actionStatePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'action-state.json');
+    const actionState = JSON.parse(readFileSync(actionStatePath, 'utf8'));
+    assert.equal(actionState.decisions.length, 1);
+    assert.equal(actionState.decisions[0].actionId, 'clean.plan');
+    assert.equal(actionState.decisions[0].status, 'executed');
+    assert.equal(actionState.decisions[0].selectedOption, 'approve');
+    assert.equal(actionState.decisions[0].preflightAllowed, true);
+    assert.equal(actionState.decisions[0].executionExitCode, 0);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('status interactive action input errors persist a failed decision', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Status Title', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'status-change.txt'), 'pending work\n', 'utf8');
+
+    const result = runCli(['run', 'status'], created.worktreePath, {
+      PIPELANE_STATUS_INPUT: '\n',
+    }, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /NEXT ACTION/);
+    assert.match(result.stdout, /Action failed: PR title is required\./);
+
+    const actionStatePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'action-state.json');
+    const actionState = JSON.parse(readFileSync(actionStatePath, 'utf8'));
+    assert.equal(actionState.decisions.length, 1);
+    assert.equal(actionState.decisions[0].actionId, 'pr');
+    assert.equal(actionState.decisions[0].status, 'failed');
+    assert.equal(actionState.decisions[0].selectedOption, 'error');
+    assert.equal(actionState.decisions[0].source, 'branch');
+    assert.equal(actionState.decisions[0].executionMessage, 'PR title is required.');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('api action execute: devmode actions switch the repo mode', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {

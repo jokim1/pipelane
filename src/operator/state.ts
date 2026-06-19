@@ -348,8 +348,35 @@ export interface ActionRunRecord {
   stderr: string;
 }
 
+export type StatusDecisionStatus = 'pending' | 'cancelled' | 'blocked' | 'executed' | 'failed';
+
+export interface StatusDecisionRecord {
+  id: string;
+  actionId: string;
+  label: string;
+  status: StatusDecisionStatus;
+  question: string;
+  selectedOption: string;
+  createdAt: string;
+  answeredAt: string;
+  actor: string;
+  branchName: string;
+  headSha: string;
+  source: 'board' | 'branch' | 'orchestration';
+  taskSlug?: string;
+  runId?: string;
+  sliceId?: string;
+  preflightAllowed?: boolean;
+  preflightReason?: string;
+  executionExitCode?: number;
+  executionMessage?: string;
+  confirmationRequired?: boolean;
+  normalizedInputs?: Record<string, unknown>;
+}
+
 export interface ActionState {
   records: Record<string, ActionRunRecord[]>;
+  decisions?: StatusDecisionRecord[];
 }
 
 export type ReviewGateRunStatus = 'passed' | 'failed' | 'skipped' | 'pending';
@@ -725,6 +752,7 @@ const ACTION_STATE_FILENAME = 'action-state.json';
 const REVIEW_STATE_FILENAME = 'review-state.json';
 const REVIEW_STATE_LOCK_FILENAME = 'review-state.lock';
 const REVIEW_STATE_MAX_RECORDS = 20;
+const ACTION_STATE_MAX_DECISIONS = 100;
 const REVIEW_STATE_LOCK_STALE_MS = 2 * 60 * 1000;
 const DEPLOY_CONFIG_FILENAME = 'deploy-config.json';
 const PROBE_STATE_FILENAME = 'probe-state.json';
@@ -2261,8 +2289,9 @@ export function savePrState(commonDir: string, config: WorkflowConfig, value: { 
 export function loadActionState(commonDir: string, config: WorkflowConfig): ActionState {
   const raw = readVersionedJsonFile<ActionState>('actionState', commonDir, config, actionStatePath(commonDir, config), { records: {} });
   const records: Record<string, ActionRunRecord[]> = {};
+  const decisions: StatusDecisionRecord[] = [];
   if (!raw || typeof raw !== 'object' || Array.isArray(raw) || !raw.records || typeof raw.records !== 'object' || Array.isArray(raw.records)) {
-    return { records };
+    return { records, decisions };
   }
 
   for (const [taskSlug, entries] of Object.entries(raw.records)) {
@@ -2286,7 +2315,13 @@ export function loadActionState(commonDir: string, config: WorkflowConfig): Acti
       })
       .slice(0, 20);
   }
-  return { records };
+  if (Array.isArray(raw.decisions)) {
+    decisions.push(...raw.decisions
+      .map(normalizeStatusDecisionRecord)
+      .filter((record): record is StatusDecisionRecord => record !== null)
+      .slice(0, ACTION_STATE_MAX_DECISIONS));
+  }
+  return { records, decisions };
 }
 
 export function saveActionState(commonDir: string, config: WorkflowConfig, value: ActionState): void {
@@ -2300,6 +2335,70 @@ export function appendActionRunRecord(commonDir: string, config: WorkflowConfig,
   state.records[record.taskSlug] = [record, ...existing].slice(0, 20);
   saveActionState(commonDir, config, state);
   return record;
+}
+
+export function saveStatusDecisionRecord(commonDir: string, config: WorkflowConfig, record: StatusDecisionRecord): StatusDecisionRecord {
+  const state = loadActionState(commonDir, config);
+  const existing = state.decisions ?? [];
+  state.decisions = [record, ...existing.filter((entry) => entry.id !== record.id)].slice(0, ACTION_STATE_MAX_DECISIONS);
+  saveActionState(commonDir, config, state);
+  return record;
+}
+
+function normalizeStatusDecisionRecord(value: unknown): StatusDecisionRecord | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  if (
+    typeof raw.id !== 'string'
+    || typeof raw.actionId !== 'string'
+    || typeof raw.label !== 'string'
+    || !isStatusDecisionStatus(raw.status)
+    || typeof raw.question !== 'string'
+    || typeof raw.selectedOption !== 'string'
+    || typeof raw.createdAt !== 'string'
+    || typeof raw.answeredAt !== 'string'
+    || typeof raw.actor !== 'string'
+    || typeof raw.branchName !== 'string'
+    || typeof raw.headSha !== 'string'
+    || (raw.source !== 'board' && raw.source !== 'branch' && raw.source !== 'orchestration')
+  ) {
+    return null;
+  }
+
+  const record: StatusDecisionRecord = {
+    id: raw.id,
+    actionId: raw.actionId,
+    label: raw.label,
+    status: raw.status,
+    question: raw.question,
+    selectedOption: raw.selectedOption,
+    createdAt: raw.createdAt,
+    answeredAt: raw.answeredAt,
+    actor: raw.actor,
+    branchName: raw.branchName,
+    headSha: raw.headSha,
+    source: raw.source,
+  };
+  if (typeof raw.taskSlug === 'string') record.taskSlug = raw.taskSlug;
+  if (typeof raw.runId === 'string') record.runId = raw.runId;
+  if (typeof raw.sliceId === 'string') record.sliceId = raw.sliceId;
+  if (typeof raw.preflightAllowed === 'boolean') record.preflightAllowed = raw.preflightAllowed;
+  if (typeof raw.preflightReason === 'string') record.preflightReason = raw.preflightReason;
+  if (typeof raw.executionExitCode === 'number') record.executionExitCode = raw.executionExitCode;
+  if (typeof raw.executionMessage === 'string') record.executionMessage = raw.executionMessage;
+  if (typeof raw.confirmationRequired === 'boolean') record.confirmationRequired = raw.confirmationRequired;
+  if (raw.normalizedInputs && typeof raw.normalizedInputs === 'object' && !Array.isArray(raw.normalizedInputs)) {
+    record.normalizedInputs = raw.normalizedInputs as Record<string, unknown>;
+  }
+  return record;
+}
+
+function isStatusDecisionStatus(value: unknown): value is StatusDecisionStatus {
+  return value === 'pending'
+    || value === 'cancelled'
+    || value === 'blocked'
+    || value === 'executed'
+    || value === 'failed';
 }
 
 export function loadReviewState(commonDir: string, config: WorkflowConfig): ReviewState {
