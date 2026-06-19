@@ -74,6 +74,29 @@ export function buildSkillMarker(prefix: string, name: string): string {
 }
 
 function renderWorkflowSkillGuidance(command: WorkflowCommand | 'pipelane', slashAlias: string): string {
+  if (command === 'pipelane') {
+    return `
+## Interactive review setup behavior
+
+Agent Bash tools commonly run commands without an interactive TTY, and shell
+pipes make stdout non-TTY. When the user invokes bare
+\`${slashAlias} review setup\` with no flags, do not run the interactive setup
+command first. Instead use the runner command above with these parsed arguments:
+
+1. \`review setup --print\` to inspect the current effective gate config.
+2. If the user needs the available gate catalog, use
+   \`review setup --list-gates\`.
+3. Present deterministic choices in chat:
+   \`1. Save recommended gates: review setup --yes\`
+   \`2. Cancel\`
+4. After the user chooses, run the matching command exactly.
+
+If the user supplied \`--yes\`, \`--print\`, \`--list-gates\`, or \`--json\`,
+run the command directly through the runner. Do not add shell pipes to setup
+commands that may need interactivity.
+`;
+  }
+
   if (command === 'deploy') {
     return `
 ## Blocked deploy follow-up behavior
