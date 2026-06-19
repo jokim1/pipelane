@@ -255,14 +255,22 @@ The gate order is:
 
 1. **Static gates:** lint, typecheck, format check, secret scan, dependency audit.
 2. **Behavioral gates:** tests, integration checks, build.
-3. **AI diff gates:** `/karpathy diff`, gstack `/review`, adversarial review.
+3. **AI diff gates:** gstack `/review`, `/karpathy diff`, adversarial review.
 4. **Instruction gates:** `/karpathy audit` when agent instruction files change.
 5. **Runtime gates:** browser QA, deploy health checks, staging evidence.
 6. **Human gates:** approval for schema, auth, billing, secrets, deploy, rollback,
    and other irreversible work.
 
-Static gates run before AI review. There is no reason to spend model attention
-on syntax, type, style, or build errors that deterministic tools can catch.
+Static and behavioral gates run before AI review. There is no reason to spend
+model attention on syntax, type, style, or build errors that deterministic
+tools can catch. gstack `/review` runs before the read-only AI confirmations
+because it may apply fix-first edits; if any review gate changes `HEAD` or the
+worktree, Pipelane restarts the review and records evidence only for the final
+tree.
+
+AI gates are autonomous. Pipelane runs them through `PIPELANE_REVIEW_AI_COMMAND`
+when set, otherwise through an installed native `codex` or `claude` adapter. The
+runner must print `PIPELANE_REVIEW_STATUS: passed`, `failed`, or `pending`.
 
 `/pipelane review` writes evidence for the current branch, HEAD, and worktree
 state. `/pr` checks that evidence before it commits, pushes, or opens a PR.
@@ -457,7 +465,7 @@ Common slash commands:
 | `/repo-guard` | Check that the current checkout is safe. |
 | `/pipelane review setup` | Configure review-gate presets. |
 | `/pipelane review` | Run review gates and record evidence. |
-| `/pipelane review pass` | Record a clean manual review gate after running the referenced skill or approval. |
+| `/pipelane review pass` | Record a clean approval or external fallback gate against current review evidence. |
 | `/pr` | Run checks, commit, push, and open or update a PR. |
 | `/merge` | Merge the PR and record the merged SHA. |
 | `/deploy staging` | Deploy the merged SHA to staging. |

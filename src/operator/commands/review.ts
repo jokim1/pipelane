@@ -43,6 +43,9 @@ const REVIEW_CONFIG_CHANGE_GATE_ID = 'review-config-change';
 const REVIEW_CONFIG_CHANGE_PATHS = ['.pipelane.json', '.project-workflow.json', 'package.json'];
 const REVIEW_PHASE_ORDER = REVIEW_GATE_PHASES;
 const DEFAULT_GATE_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_AI_GATE_TIMEOUT_MS = 30 * 60 * 1000;
+const NATIVE_COMMAND_PROBE_TIMEOUT_MS = 5000;
+const MAX_REVIEW_RESTARTS_AFTER_MUTATION = 2;
 const OUTPUT_TAIL_CHARS = 4000;
 const REVIEW_SETUP_RECOMMENDED_PRESET: ReviewGatePreset = 'strict-production';
 
@@ -119,6 +122,25 @@ export interface BuildReviewRunRecordOptions {
   gateFilter?: string;
   phaseFilter?: ReviewGatePhase | '';
   activeSurfaces: string[];
+}
+
+interface BuildReviewAttempt {
+  selectedGates: ReviewGateConfig[];
+  changedFiles: string[];
+  reviewConfigChanged: boolean;
+}
+
+interface ReviewGateMutation {
+  gate: ReviewGateRunRecord;
+  beforeHead: string;
+  afterHead: string;
+  beforeDigest: string;
+  afterDigest: string;
+}
+
+interface AiReviewStatusMarker {
+  status: Extract<ReviewGateRunRecord['status'], 'passed' | 'failed' | 'pending'> | null;
+  summary: string;
 }
 
 export async function handleReview(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
@@ -273,8 +295,8 @@ export function buildReviewPassRecord(options: {
   if (!expectedGate) {
     throw new Error(`No configured review gate matches --gate ${gateId}. Run "pipelane run review setup --list-gates" to inspect configured gates.`);
   }
-  if (!isManualReviewGate(expectedGate)) {
-    throw new Error(`review pass only accepts manual gates. Gate ${gateId} is type ${expectedGate.type}; rerun /pipelane review to execute it.`);
+  if (!isPassAttestableGate(expectedGate)) {
+    throw new Error(`review pass only accepts approval, skill, or agent fallback gates. Gate ${gateId} is type ${expectedGate.type}; rerun /pipelane review to execute it.`);
   }
 
   const currentBranch = runGit(options.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
@@ -301,8 +323,8 @@ export function buildReviewPassRecord(options: {
   if (!gate) {
     throw new Error(`Gate ${gateId} is missing from the latest current review evidence. Rerun /pipelane review before passing it.`);
   }
-  if (!isManualReviewGate(gate)) {
-    throw new Error(`review pass only accepts manual gates. Gate ${gateId} is type ${gate.type}; rerun /pipelane review to execute it.`);
+  if (!isPassAttestableGate(gate)) {
+    throw new Error(`review pass only accepts approval, skill, or agent fallback gates. Gate ${gateId} is type ${gate.type}; rerun /pipelane review to execute it.`);
   }
   if (gate.status === 'failed') {
     throw new Error(`Gate ${gateId} is failed, not pending. Fix it and rerun /pipelane review before passing it.`);
@@ -317,7 +339,7 @@ export function buildReviewPassRecord(options: {
     return {
       ...entry,
       status: 'passed' as const,
-      summary: manualPassSummary(message),
+      summary: fallbackPassSummary(message),
       startedAt,
       finishedAt: startedAt,
       durationMs: 0,
@@ -444,8 +466,8 @@ function orderInteractiveReviewCatalog(entries: ResolvedReviewGateCatalogEntry[]
     ['dependency-audit', 50],
     ['test', 60],
     ['build', 70],
-    ['karpathy-diff', 80],
-    ['gstack-review', 90],
+    ['gstack-review', 80],
+    ['karpathy-diff', 90],
     ['adversarial-review', 100],
     ['browser-qa', 110],
     ['karpathy-audit', 120],
@@ -687,6 +709,9 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
     gateFilter: gateFilter || null,
     phaseFilter: phaseFilter || null,
     changedFiles: record.changedFiles,
+    worktreeStatusDigest: record.worktreeStatusDigest,
+    worktreeStatusReliable: record.worktreeStatusReliable,
+    worktreeStatusWarnings: record.worktreeStatusWarnings,
     gates: record.gates,
     message: renderReviewRunReport(record, reviewStatePath(context.commonDir, context.config)),
   };
@@ -701,35 +726,51 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
 export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): ReviewRunRecord {
   const phaseFilter = options.phaseFilter ?? '';
   const gateFilter = options.gateFilter?.trim() ?? '';
-  const changedFiles = collectChangedFiles(options.repoRoot, options.baseBranch);
-  const worktreeStatus = readWorktreeStatusSnapshot(options.repoRoot, { includeStatusDigest: true });
-  const reviewConfigChanged = changedFiles.some(isReviewConfigPath);
-  const allGates = orderReviewGates(options.gates);
-  const selectedGates = maybeAddReviewConfigChangeGate(allGates.filter((gate) =>
-    (!phaseFilter || gate.phase === phaseFilter)
-    && (!gateFilter || gate.id === gateFilter)
-  ), {
-    reviewConfigChanged,
-  });
-
-  if (gateFilter && selectedGates.length === 0) {
-    throw new Error(`No review gate matches --gate ${gateFilter}. Run "pipelane run review setup --list-gates" to inspect configured gates.`);
-  }
-
   const startedAt = nowIso();
   const runStartMs = Date.now();
-  const gateRecords = selectedGates.map((gate) =>
-    runReviewGate({
-      gate,
+  let attemptNumber = 0;
+  let gateRecords: ReviewGateRunRecord[] = [];
+
+  for (;;) {
+    const attempt = buildReviewAttempt({
       repoRoot: options.repoRoot,
+      baseBranch: options.baseBranch,
+      gates: options.gates,
+      gateFilter,
+      phaseFilter,
+    });
+    if (gateFilter && attempt.selectedGates.length === 0) {
+      throw new Error(`No review gate matches --gate ${gateFilter}. Run "pipelane run review setup --list-gates" to inspect configured gates.`);
+    }
+
+    const result = runReviewAttempt({
+      repoRoot: options.repoRoot,
+      baseBranch: options.baseBranch,
       dryRun: options.dryRun,
-      reviewConfigChanged,
-      changedFiles,
+      reviewConfigChanged: attempt.reviewConfigChanged,
+      changedFiles: attempt.changedFiles,
       activeSurfaces: options.activeSurfaces,
-    })
-  );
+      selectedGates: attempt.selectedGates,
+      restartAttempt: attemptNumber,
+    });
+    gateRecords = result.gates;
+
+    if (!result.mutation) {
+      break;
+    }
+
+    if (attemptNumber >= MAX_REVIEW_RESTARTS_AFTER_MUTATION) {
+      gateRecords = markMutationRestartExhausted(gateRecords, result.mutation, attemptNumber, attempt.selectedGates);
+      break;
+    }
+
+    attemptNumber += 1;
+  }
+
   const finishedAt = nowIso();
   const status = summarizeRunStatus(gateRecords);
+  const finalWorktreeStatus = readWorktreeStatusSnapshot(options.repoRoot, { includeStatusDigest: true });
+  const finalChangedFiles = collectChangedFiles(options.repoRoot, options.baseBranch);
 
   return {
     id: `review-${new Date(startedAt).toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto.randomUUID().slice(0, 8)}`,
@@ -743,30 +784,120 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
     startedAt,
     finishedAt,
     durationMs: Math.max(0, Date.now() - runStartMs),
-    changedFiles,
-    worktreeStatusDigest: worktreeStatus.statusDigest,
-    worktreeStatusReliable: worktreeStatus.statusDigestReliable,
-    worktreeStatusWarnings: worktreeStatus.statusDigestWarnings,
+    changedFiles: finalChangedFiles,
+    worktreeStatusDigest: finalWorktreeStatus.statusDigest,
+    worktreeStatusReliable: finalWorktreeStatus.statusDigestReliable,
+    worktreeStatusWarnings: finalWorktreeStatus.statusDigestWarnings,
     gates: gateRecords,
   };
+}
+
+function buildReviewAttempt(options: {
+  repoRoot: string;
+  baseBranch: string;
+  gates: ReviewGateConfig[];
+  gateFilter: string;
+  phaseFilter: ReviewGatePhase | '';
+}): BuildReviewAttempt {
+  const changedFiles = collectChangedFiles(options.repoRoot, options.baseBranch);
+  const reviewConfigChanged = changedFiles.some(isReviewConfigPath);
+  const allGates = orderReviewGates(options.gates);
+  const selectedGates = maybeAddReviewConfigChangeGate(allGates.filter((gate) =>
+    (!options.phaseFilter || gate.phase === options.phaseFilter)
+    && (!options.gateFilter || gate.id === options.gateFilter)
+  ), {
+    reviewConfigChanged,
+  });
+
+  return {
+    selectedGates,
+    changedFiles,
+    reviewConfigChanged,
+  };
+}
+
+function runReviewAttempt(options: {
+  repoRoot: string;
+  baseBranch: string;
+  dryRun: boolean;
+  reviewConfigChanged: boolean;
+  changedFiles: string[];
+  activeSurfaces: string[];
+  selectedGates: ReviewGateConfig[];
+  restartAttempt: number;
+}): { gates: ReviewGateRunRecord[]; mutation: ReviewGateMutation | null } {
+  const gateRecords: ReviewGateRunRecord[] = [];
+  let blockingFailureBeforeAi = false;
+
+  for (const gate of options.selectedGates) {
+    if (blockingFailureBeforeAi && isAiReviewGate(gate)) {
+      gateRecords.push(skippedGateRecord(gate, `skipped: earlier blocking gate failed; ${gate.type} review waits for deterministic gates to pass`));
+      continue;
+    }
+
+    const before = readWorktreeStatusSnapshot(options.repoRoot, { includeStatusDigest: true });
+    const record = runReviewGate({
+      gate,
+      repoRoot: options.repoRoot,
+      baseBranch: options.baseBranch,
+      dryRun: options.dryRun,
+      reviewConfigChanged: options.reviewConfigChanged,
+      changedFiles: options.changedFiles,
+      activeSurfaces: options.activeSurfaces,
+      restartAttempt: options.restartAttempt,
+    });
+    const after = readWorktreeStatusSnapshot(options.repoRoot, { includeStatusDigest: true });
+    gateRecords.push(record);
+
+    if (record.blocking && record.status === 'failed') {
+      blockingFailureBeforeAi = true;
+    }
+
+    if (!options.dryRun && worktreeFingerprintChanged(before, after)) {
+      return {
+        gates: gateRecords,
+        mutation: {
+          gate: record,
+          beforeHead: before.head,
+          afterHead: after.head,
+          beforeDigest: before.statusDigest,
+          afterDigest: after.statusDigest,
+        },
+      };
+    }
+  }
+
+  return { gates: gateRecords, mutation: null };
 }
 
 function orderReviewGates(gates: ReviewGateConfig[]): ReviewGateConfig[] {
   return [...gates].sort((left, right) => {
     const phaseDelta = REVIEW_PHASE_ORDER.indexOf(left.phase) - REVIEW_PHASE_ORDER.indexOf(right.phase);
-    return phaseDelta !== 0 ? phaseDelta : left.id.localeCompare(right.id);
+    if (phaseDelta !== 0) return phaseDelta;
+    const reviewDelta = reviewGateExecutionPriority(left) - reviewGateExecutionPriority(right);
+    return reviewDelta !== 0 ? reviewDelta : left.id.localeCompare(right.id);
   });
+}
+
+function reviewGateExecutionPriority(gate: ReviewGateConfig): number {
+  if (gate.phase !== 'ai-diff') return 100;
+  if (gate.id === 'gstack-review') return 10;
+  if (gate.id === 'karpathy-diff') return 20;
+  if (gate.id === 'adversarial-review') return 30;
+  return 100;
 }
 
 function runReviewGate(options: {
   gate: ReviewGateConfig;
   repoRoot: string;
+  baseBranch: string;
   dryRun: boolean;
   reviewConfigChanged: boolean;
   changedFiles: string[];
   activeSurfaces: string[];
+  restartAttempt: number;
 }): ReviewGateRunRecord {
-  const { gate, repoRoot, dryRun, reviewConfigChanged, changedFiles, activeSurfaces } = options;
+  const { gate, repoRoot, baseBranch, dryRun, reviewConfigChanged, changedFiles, activeSurfaces, restartAttempt } = options;
   const startedAt = nowIso();
   const startMs = Date.now();
   const base: Omit<ReviewGateRunRecord, 'status' | 'summary' | 'finishedAt' | 'durationMs'> = {
@@ -789,10 +920,18 @@ function runReviewGate(options: {
     });
   }
 
-  if (gate.type !== 'command' && gate.type !== 'pipelane') {
+  if (dryRun && gate.type !== 'approval') {
+    return finishGate(base, startMs, {
+      status: 'skipped',
+      summary: `dry-run: would run ${reviewGateCommandLabel(gate)}`,
+      skipReason: 'dry-run',
+    });
+  }
+
+  if (gate.type === 'approval') {
     return finishGate(base, startMs, {
       status: 'pending',
-      summary: manualGateSummary(gate),
+      summary: approvalGateSummary(gate),
     });
   }
 
@@ -804,19 +943,23 @@ function runReviewGate(options: {
     });
   }
 
+  if (gate.type === 'skill' || gate.type === 'agent') {
+    return runAiReviewGate({
+      base,
+      startMs,
+      gate,
+      repoRoot,
+      baseBranch,
+      changedFiles,
+      restartAttempt,
+    });
+  }
+
   if (!gate.command) {
     return finishGate(base, startMs, {
       status: 'failed',
       summary: 'gate is executable but has no command configured',
       exitCode: null,
-    });
-  }
-
-  if (dryRun) {
-    return finishGate(base, startMs, {
-      status: 'skipped',
-      summary: `dry-run: would run ${gate.command}`,
-      skipReason: 'dry-run',
     });
   }
 
@@ -848,6 +991,106 @@ function runReviewGate(options: {
   });
 }
 
+function runAiReviewGate(options: {
+  base: Omit<ReviewGateRunRecord, 'status' | 'summary' | 'finishedAt' | 'durationMs'>;
+  startMs: number;
+  gate: ReviewGateConfig;
+  repoRoot: string;
+  baseBranch: string;
+  changedFiles: string[];
+  restartAttempt: number;
+}): ReviewGateRunRecord {
+  const { base, startMs, gate, repoRoot, baseBranch, changedFiles, restartAttempt } = options;
+  const command = resolveAiReviewCommand(gate);
+  if (!command) {
+    return finishGate(base, startMs, {
+      status: 'failed',
+      summary: `AI review gate ${gate.id} has no runner; install codex/claude or set ${specificAiReviewCommandEnvName(gate)} or PIPELANE_REVIEW_AI_COMMAND`,
+      exitCode: null,
+    });
+  }
+
+  const prompt = renderAiReviewPrompt({
+    repoRoot,
+    baseBranch,
+    gate,
+    changedFiles,
+    restartAttempt,
+  });
+  const timeoutMs = gate.timeoutMs ?? DEFAULT_AI_GATE_TIMEOUT_MS;
+  const result = spawnSync('/bin/sh', ['-lc', command], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    input: prompt,
+    shell: false,
+    timeout: timeoutMs,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      PIPELANE_REVIEW_GATE_ID: gate.id,
+      PIPELANE_REVIEW_GATE_TYPE: gate.type,
+      PIPELANE_REVIEW_GATE_SKILL: gate.skill ?? '',
+      PIPELANE_REVIEW_GATE_ROLE: gate.role ?? '',
+    },
+  });
+  const exitCode = typeof result.status === 'number' ? result.status : null;
+  const stdout = typeof result.stdout === 'string' ? result.stdout : '';
+  const stderr = typeof result.stderr === 'string' ? result.stderr : '';
+  const combinedOutput = `${stdout}\n${stderr}`;
+  const marker = parseAiReviewStatusMarker(combinedOutput);
+  const timedOut = result.error && (result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT';
+
+  if (timedOut) {
+    return finishGate(base, startMs, {
+      command,
+      status: 'failed',
+      summary: `AI review command timed out after ${timeoutMs}ms`,
+      exitCode,
+      stdoutTail: tail(redactReviewOutput(stdout)),
+      stderrTail: tail(redactReviewOutput(stderr)),
+    });
+  }
+  if (result.error) {
+    return finishGate(base, startMs, {
+      command,
+      status: 'failed',
+      summary: `AI review command failed to start: ${result.error.message}`,
+      exitCode,
+      stdoutTail: tail(redactReviewOutput(stdout)),
+      stderrTail: tail(redactReviewOutput(stderr)),
+    });
+  }
+  if (exitCode !== 0) {
+    return finishGate(base, startMs, {
+      command,
+      status: 'failed',
+      summary: marker.summary || `AI review command exited ${exitCode}`,
+      exitCode,
+      stdoutTail: tail(redactReviewOutput(stdout)),
+      stderrTail: tail(redactReviewOutput(stderr)),
+    });
+  }
+  if (!marker.status) {
+    return finishGate(base, startMs, {
+      command,
+      status: 'failed',
+      summary: 'AI review command did not print PIPELANE_REVIEW_STATUS: passed|failed|pending',
+      exitCode,
+      stdoutTail: tail(redactReviewOutput(stdout)),
+      stderrTail: tail(redactReviewOutput(stderr)),
+    });
+  }
+
+  return finishGate(base, startMs, {
+    command,
+    status: marker.status,
+    summary: marker.summary || `AI review ${marker.status}: ${reviewGateCommandLabel(gate)}`,
+    exitCode,
+    stdoutTail: tail(redactReviewOutput(stdout)),
+    stderrTail: tail(redactReviewOutput(stderr)),
+  });
+}
+
 function finishGate(
   base: Omit<ReviewGateRunRecord, 'status' | 'summary' | 'finishedAt' | 'durationMs'>,
   startMs: number,
@@ -867,12 +1110,16 @@ function summarizeRunStatus(gates: ReviewGateRunRecord[]): ReviewCommandStatus {
   return 'passed';
 }
 
-function isManualReviewGate(gate: Pick<ReviewGateConfig | ReviewGateRunRecord, 'type'>): boolean {
+function isPassAttestableGate(gate: Pick<ReviewGateConfig | ReviewGateRunRecord, 'type'>): boolean {
   return gate.type === 'skill' || gate.type === 'agent' || gate.type === 'approval';
 }
 
-function manualPassSummary(message: string): string {
-  return `manual pass: ${message}`;
+function fallbackPassSummary(message: string): string {
+  return `fallback pass: ${message}`;
+}
+
+function isAiReviewGate(gate: Pick<ReviewGateConfig, 'type'>): boolean {
+  return gate.type === 'skill' || gate.type === 'agent';
 }
 
 function skipReasonForGate(gate: ReviewGateConfig, changedFiles: string[], activeSurfaces: string[]): string | null {
@@ -891,18 +1138,196 @@ function skipReasonForGate(gate: ReviewGateConfig, changedFiles: string[], activ
   return null;
 }
 
-function manualGateSummary(gate: ReviewGateConfig): string {
-  if (gate.type === 'skill') {
-    const command = gate.userCommands?.[0] ?? (gate.skill ? `skill:${gate.skill}` : 'the configured skill');
-    return `manual skill gate pending: run ${command}`;
-  }
-  if (gate.type === 'agent') {
-    return `agent gate pending: ${gate.role ?? gate.id}`;
-  }
+function approvalGateSummary(gate: ReviewGateConfig): string {
   if (gate.type === 'approval') {
     return `approval gate pending${gate.when ? ` (${gate.when})` : ''}`;
   }
-  return `manual gate pending: ${gate.id}`;
+  return `approval gate pending: ${gate.id}`;
+}
+
+function skippedGateRecord(gate: ReviewGateConfig, summary: string, skipReason = 'prior-blocking-failure'): ReviewGateRunRecord {
+  const startedAt = nowIso();
+  return {
+    id: `${gate.id}-${crypto.randomUUID().slice(0, 8)}`,
+    gateId: gate.id,
+    phase: gate.phase,
+    type: gate.type,
+    blocking: gate.blocking !== false,
+    command: gate.command,
+    skill: gate.skill,
+    role: gate.role,
+    startedAt,
+    finishedAt: startedAt,
+    durationMs: 0,
+    status: 'skipped',
+    summary,
+    skipReason,
+  };
+}
+
+function worktreeFingerprintChanged(
+  before: ReturnType<typeof readWorktreeStatusSnapshot>,
+  after: ReturnType<typeof readWorktreeStatusSnapshot>,
+): boolean {
+  return before.head !== after.head || before.statusDigest !== after.statusDigest;
+}
+
+function markMutationRestartExhausted(
+  gates: ReviewGateRunRecord[],
+  mutation: ReviewGateMutation,
+  restartAttempt: number,
+  selectedGates: ReviewGateConfig[],
+): ReviewGateRunRecord[] {
+  const markedGates = gates.map((gate) => {
+    if (gate.id !== mutation.gate.id) return gate;
+    const headChanged = mutation.beforeHead !== mutation.afterHead
+      ? `HEAD ${shortSha(mutation.beforeHead)} -> ${shortSha(mutation.afterHead)}`
+      : 'HEAD unchanged';
+    const digestChanged = mutation.beforeDigest !== mutation.afterDigest
+      ? 'worktree digest changed'
+      : 'worktree digest unchanged';
+    return {
+      ...gate,
+      blocking: true,
+      status: 'failed' as const,
+      summary: `${gate.summary}; changed the tree after ${restartAttempt + 1} review attempts (${headChanged}, ${digestChanged}); rerun /pipelane review after the tree settles`,
+    };
+  });
+  const seen = new Set(markedGates.map((gate) => gate.gateId));
+  const mutationIndex = selectedGates.findIndex((gate) => gate.id === mutation.gate.gateId);
+  const remainingGates = mutationIndex >= 0 ? selectedGates.slice(mutationIndex + 1) : [];
+  return [
+    ...markedGates,
+    ...remainingGates
+      .filter((gate) => !seen.has(gate.id))
+      .map((gate) => skippedGateRecord(
+        gate,
+        'skipped: review restart exhausted before this gate could run',
+        'restart-exhausted',
+      )),
+  ];
+}
+
+function reviewGateCommandLabel(gate: ReviewGateConfig): string {
+  if (gate.command) return gate.command;
+  if (gate.type === 'skill') {
+    return gate.userCommands?.[0] ?? (gate.skill ? `skill:${gate.skill}` : gate.id);
+  }
+  if (gate.type === 'agent') {
+    return gate.role ? `agent:${gate.role}` : gate.id;
+  }
+  return gate.id;
+}
+
+function resolveAiReviewCommand(gate: ReviewGateConfig): string {
+  const specific = process.env[specificAiReviewCommandEnvName(gate)]?.trim();
+  if (specific) return specific;
+  const fallback = process.env.PIPELANE_REVIEW_AI_COMMAND?.trim();
+  if (fallback) return fallback;
+  return defaultAiReviewCommand();
+}
+
+function specificAiReviewCommandEnvName(gate: ReviewGateConfig): string {
+  return `PIPELANE_REVIEW_${gate.id.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_COMMAND`;
+}
+
+function defaultAiReviewCommand(): string {
+  if (commandExists('codex')) return 'codex exec --full-auto -';
+  if (commandExists('claude')) return defaultClaudeReviewCommand();
+  return '';
+}
+
+function defaultClaudeReviewCommand(): string {
+  const help = commandHelp('claude');
+  if (/\bdontAsk\b/.test(help)) return 'claude --print --permission-mode dontAsk';
+  if (/\bbypassPermissions\b/.test(help)) return 'claude --print --permission-mode bypassPermissions';
+  if (help.includes('--dangerously-skip-permissions')) return 'claude --print --dangerously-skip-permissions';
+  return 'claude --print';
+}
+
+function commandExists(command: string): boolean {
+  const result = spawnSync(command, ['--help'], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: NATIVE_COMMAND_PROBE_TIMEOUT_MS,
+  });
+  return !result.error;
+}
+
+function commandHelp(command: string): string {
+  const result = spawnSync(command, ['--help'], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: NATIVE_COMMAND_PROBE_TIMEOUT_MS,
+  });
+  return `${typeof result.stdout === 'string' ? result.stdout : ''}\n${typeof result.stderr === 'string' ? result.stderr : ''}`;
+}
+
+function renderAiReviewPrompt(options: {
+  repoRoot: string;
+  baseBranch: string;
+  gate: ReviewGateConfig;
+  changedFiles: string[];
+  restartAttempt: number;
+}): string {
+  const { repoRoot, baseBranch, gate, changedFiles, restartAttempt } = options;
+  const command = reviewGateCommandLabel(gate);
+  const changedFileList = changedFiles.length > 0
+    ? changedFiles.slice(0, 200).map((file) => `- ${file}`).join('\n')
+    : '- none';
+  const truncated = changedFiles.length > 200
+    ? `\n- ... ${changedFiles.length - 200} more files omitted from this prompt`
+    : '';
+
+  return [
+    'You are running an autonomous Pipelane review gate.',
+    '',
+    `Gate: ${gate.id}`,
+    `Type: ${gate.type}`,
+    `Skill: ${gate.skill ?? ''}`,
+    `Role: ${gate.role ?? ''}`,
+    `Command hint: ${command}`,
+    `Repository: ${repoRoot}`,
+    `Base branch: ${baseBranch}`,
+    `Restart attempt after review-side edits: ${restartAttempt}`,
+    '',
+    'Changed files:',
+    `${changedFileList}${truncated}`,
+    '',
+    'Rules:',
+    '- Do not commit, push, merge, deploy, or create a PR.',
+    '- Use the configured review command/skill/role named above.',
+    '- If this is gstack-review, run the fix-first gstack /review flow. Apply only its allowed automatic fixes; do not ask the user for new approvals inside this gate.',
+    '- If this is karpathy-diff, run it as a read-only traceability review. Do not apply proposed fixes during this gate.',
+    '- If this is adversarial-review, perform a read-only adversarial code review.',
+    '- If a clean result requires human judgment, unresolved non-mechanical fixes, or approval, report pending or failed instead of asking the user.',
+    '- If you changed files, leave them in the worktree. Pipelane will restart deterministic gates and re-run review against the new tree.',
+    '',
+    'At the very end, print exactly one status marker line:',
+    'PIPELANE_REVIEW_STATUS: passed',
+    'or',
+    'PIPELANE_REVIEW_STATUS: failed',
+    'or',
+    'PIPELANE_REVIEW_STATUS: pending',
+    '',
+    'Also print one concise summary marker line:',
+    'PIPELANE_REVIEW_SUMMARY: <one sentence>',
+  ].join('\n');
+}
+
+function parseAiReviewStatusMarker(output: string): AiReviewStatusMarker {
+  const statusMatches = [...output.matchAll(/^PIPELANE_REVIEW_STATUS:\s*(passed|failed|pending)\s*$/gim)];
+  const summaryMatches = [...output.matchAll(/^PIPELANE_REVIEW_SUMMARY:\s*(.+)$/gim)];
+  const statusMatch = statusMatches[statusMatches.length - 1];
+  const summaryMatch = summaryMatches[summaryMatches.length - 1];
+  return {
+    status: statusMatch ? statusMatch[1] as AiReviewStatusMarker['status'] : null,
+    summary: summaryMatch?.[1]?.trim() ?? '',
+  };
+}
+
+function shortSha(value: string): string {
+  return value ? value.slice(0, 7) : 'unknown';
 }
 
 function collectChangedFiles(repoRoot: string, baseBranch: string): string[] {
@@ -1042,7 +1467,7 @@ function renderReviewRunReport(record: ReviewRunRecord, evidencePath: string): s
   if (record.status === 'failed') {
     lines.push('', 'Next: fix failed blocking gates, then rerun /pipelane review.');
   } else if (record.status === 'pending') {
-    lines.push('', 'Next: complete pending AI/manual gates, then rerun or attach their evidence before PR enforcement.');
+    lines.push('', 'Next: resolve pending AI runner output or approval gates, then rerun /pipelane review before PR enforcement.');
   } else {
     lines.push('', 'Next: continue to /pr when ready.');
   }
@@ -1076,7 +1501,7 @@ function renderReviewPassReport(record: ReviewRunRecord, gateId: string, evidenc
   if (record.status === 'passed') {
     lines.push('', 'Next: continue to /pr when ready.');
   } else {
-    lines.push('', 'Next: complete the remaining pending AI/manual gates, then record each pass.');
+    lines.push('', 'Next: resolve remaining pending approvals or external fallback gates, then rerun /pipelane review.');
   }
 
   return lines.join('\n');
@@ -1204,7 +1629,7 @@ function reviewSetupSections(): Array<{ title: string; ids: string[] }> {
   return [
     { title: 'Static gates', ids: ['typecheck', 'format-check', 'lint', 'secret-scan', 'dependency-audit'] },
     { title: 'Behavioral gates', ids: ['test', 'build'] },
-    { title: 'AI review gates', ids: ['karpathy-diff', 'gstack-review', 'adversarial-review'] },
+    { title: 'AI review gates', ids: ['gstack-review', 'karpathy-diff', 'adversarial-review'] },
     { title: 'Conditional gates', ids: ['browser-qa', 'karpathy-audit'] },
     { title: 'Human approval gates', ids: ['human-merge-approval', 'human-prod-deploy-approval', 'human-rollback-approval'] },
   ];

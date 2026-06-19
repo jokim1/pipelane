@@ -41,8 +41,9 @@ Decisions captured through 2026-06-16:
   runtime, then human gates.
 - Static gates run before AI review. Lint, typecheck, format checks,
   secret scans, dependency audits, tests, and build should reject cheap
-  deterministic failures before `/karpathy diff`, gstack `/review`, or an
-  adversarial reviewer runs.
+  deterministic failures before gstack `/review`, `/karpathy diff`, or an
+  adversarial reviewer runs. Fix-first AI gates run before read-only AI
+  confirmations.
 - `/karpathy diff` is the code-diff review gate. `/karpathy audit` is the
   instruction/memory-file audit gate and should only run when files like
   `CLAUDE.md`, `AGENTS.md`, `.cursor/rules/**`, or `.codex/skills/**` change.

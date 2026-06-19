@@ -172,15 +172,6 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     presets: ALL_PRESETS,
   },
   {
-    id: 'karpathy-diff',
-    kind: 'review',
-    phase: 'ai-diff',
-    type: 'skill',
-    skill: 'karpathy-diff',
-    userCommands: ['/karpathy diff', '/karpathy-diff', '/karpathy:diff'],
-    presets: ALL_PRESETS,
-  },
-  {
     id: 'gstack-review',
     kind: 'review',
     phase: 'ai-diff',
@@ -188,6 +179,15 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     skill: 'review',
     userCommands: ['/review', '/gstack review', '/gstack-review'],
     presets: STANDARD_AND_STRICT,
+  },
+  {
+    id: 'karpathy-diff',
+    kind: 'review',
+    phase: 'ai-diff',
+    type: 'skill',
+    skill: 'karpathy-diff',
+    userCommands: ['/karpathy diff', '/karpathy-diff', '/karpathy:diff'],
+    presets: ALL_PRESETS,
   },
   {
     id: 'adversarial-review',

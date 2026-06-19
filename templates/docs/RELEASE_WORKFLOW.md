@@ -81,13 +81,16 @@ Run deterministic checks before AI review whenever this repo has them:
 
 1. lint, typecheck, format check, and secret scan when configured
 2. tests and build
-3. traceability review such as `karpathy-diff`
-4. structural review such as gstack `/review`
+3. fix-first structural review such as gstack `/review`
+4. read-only traceability/adversarial review such as `karpathy-diff`
 5. specialist review when needed: security, design, QA, docs drift
 
-For manual review gates, run the referenced skill, fix any findings, then
-record the clean gate with Pipelane, for example
-`pipelane run review pass --gate gstack-review --message "Ran /review clean"`.
+`/pipelane review` runs configured AI review gates autonomously through
+`PIPELANE_REVIEW_AI_COMMAND` or an installed native `codex`/`claude` adapter.
+AI runners must end with `PIPELANE_REVIEW_STATUS: passed`, `failed`, or
+`pending`. If any review gate changes `HEAD` or the tracked/non-ignored
+worktree, Pipelane restarts the review and records evidence only after the tree
+settles. Deterministic gates should not write non-ignored outputs during review.
 
 Use `/fix` to repair bugs, review findings, CI failures, and code-quality
 issues. Use `/fix rethink` for planning-only architecture review before large

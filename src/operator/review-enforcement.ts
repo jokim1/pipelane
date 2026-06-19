@@ -89,7 +89,7 @@ export function formatReviewEvidenceBlocker(context: WorkflowContext, issues: Re
   return [
     `${formatWorkflowCommand(context.config, 'pr')} blocked because review gate evidence is not ready.`,
     ...issues.map((issue) => `- ${issue.message}`),
-    `Run /pipelane review and complete any pending AI/manual gates before retrying ${formatWorkflowCommand(context.config, 'pr')}.`,
+    `Run /pipelane review and resolve any pending AI runner output or approvals before retrying ${formatWorkflowCommand(context.config, 'pr')}.`,
   ].join('\n');
 }
 

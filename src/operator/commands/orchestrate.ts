@@ -2413,7 +2413,7 @@ function renderOrchestrationReviewReport(
   if (result.failedCount > 0) {
     lines.push('', 'Next: fix failed blocking gates in the slice worktree, then rerun /pipelane orchestrate review.');
   } else if (result.pendingCount > 0) {
-    lines.push('', 'Next: complete pending AI/manual gates for each slice, then rerun or attach trusted evidence before merge/deploy automation.');
+    lines.push('', 'Next: resolve pending AI runner output or approvals for each slice, then rerun /pipelane orchestrate review before merge/deploy automation.');
   } else if (result.blockedCount > 0) {
     lines.push('', 'Next: finish or recover blocked workers, then rerun /pipelane orchestrate review.');
   } else if (result.status === 'blocked') {

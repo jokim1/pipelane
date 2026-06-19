@@ -97,7 +97,7 @@ Review gates run after implementation:
 
 - static gates: lint, typecheck, format check, secret scan, dependency audit
 - behavioral gates: tests, integration checks, build
-- AI diff gates: `/karpathy diff`, gstack `/review`, adversarial review
+- AI diff gates: gstack `/review`, `/karpathy diff`, adversarial review
 - instruction gates: `/karpathy audit` when agent instruction files change
 - runtime gates: browser QA, deploy health checks, staging evidence
 - human gates: approval for schema, auth, billing, secrets, deploy, rollback
@@ -339,6 +339,7 @@ Each gate has:
       { "id": "format-check", "phase": "static", "type": "command", "command": "npm run format:check", "blocking": true },
       { "id": "test", "phase": "behavioral", "type": "command", "command": "npm run test", "blocking": true },
       { "id": "build", "phase": "behavioral", "type": "command", "command": "npm run build", "blocking": true },
+      { "id": "gstack-review", "phase": "ai-diff", "type": "skill", "skill": "review", "blocking": true },
       {
         "id": "karpathy-diff",
         "phase": "ai-diff",
@@ -347,7 +348,6 @@ Each gate has:
         "userCommands": ["/karpathy diff", "/karpathy-diff", "/karpathy:diff"],
         "blocking": true
       },
-      { "id": "gstack-review", "phase": "ai-diff", "type": "skill", "skill": "review", "blocking": true },
       { "id": "adversarial-review", "phase": "ai-diff", "type": "agent", "role": "adversarial-code-reviewer", "blocking": true },
       {
         "id": "karpathy-audit",
@@ -396,17 +396,17 @@ the current branch, HEAD, and worktree state, and cannot come from a dry-run or
 filtered review. A skipped or unavailable optional gate records a warning, not a
 crash.
 
-Manual skill, agent, and approval gates are not expected to write Pipelane
-state themselves. After the operator runs the referenced command, fixes any
-findings, and determines the gate is clean, record the pass explicitly:
+Skill and agent gates run inside `/pipelane review` through
+`PIPELANE_REVIEW_AI_COMMAND` or an installed native `codex`/`claude` adapter.
+The runner must print `PIPELANE_REVIEW_STATUS: passed`, `failed`, or `pending`
+so Pipelane can record trusted evidence without a human attestation step.
 
-```bash
-pipelane run review pass --gate gstack-review --message "Ran /review clean"
-```
-
-The pass command only applies to a full, non-dry-run review for the current
-branch, HEAD, and worktree state. If the worktree changes, rerun
-`/pipelane review` before recording manual passes again.
+If any review gate changes `HEAD` or the tracked/non-ignored worktree, Pipelane
+discards the stale attempt, restarts the review, and records evidence only for
+the final branch, HEAD, and worktree state. Deterministic gates should not write
+non-ignored outputs during review. `pipelane run review pass` remains available
+for approval gates and external fallback evidence, but it is not the normal AI
+review path.
 
 ## Orchestration Ledger
 

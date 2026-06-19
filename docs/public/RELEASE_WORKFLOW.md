@@ -106,7 +106,8 @@ For current Pipelane flows, verification happens in this order:
 8. `/clean` only after task state is safe to close
 
 The orchestration foundation makes this ordering explicit by separating
-deterministic gates from AI/manual gates before PR handoff.
+deterministic gates, autonomous AI gates, and human approval gates before PR
+handoff.
 See [Orchestration Roadmap](./ORCHESTRATION.md).
 
 ## Safe Defaults
@@ -149,13 +150,16 @@ Recommended review order before merge:
 
 1. static checks: lint, typecheck, format check, secret scan when configured
 2. behavioral checks: tests and build
-3. traceability review: `karpathy-diff`
-4. structural review: gstack `/review`
+3. fix-first structural review: gstack `/review`
+4. read-only traceability/adversarial review: `karpathy-diff`, adversarial review
 5. specialist review when needed: security, design, browser QA, docs drift
 
-For manual review gates, run the referenced skill, fix any findings, then
-record the clean gate with Pipelane, for example
-`pipelane run review pass --gate gstack-review --message "Ran /review clean"`.
+`/pipelane review` runs configured AI review gates autonomously through
+`PIPELANE_REVIEW_AI_COMMAND` or an installed native `codex`/`claude` adapter.
+AI runners must end with `PIPELANE_REVIEW_STATUS: passed`, `failed`, or
+`pending`. If any review gate changes `HEAD` or the tracked/non-ignored
+worktree, Pipelane restarts the review and records evidence only after the tree
+settles. Deterministic gates should not write non-ignored outputs during review.
 
 The static gates should run before AI review. Do not spend review-model tokens
 on issues ESLint, TypeScript, tests, or the build can reject deterministically.

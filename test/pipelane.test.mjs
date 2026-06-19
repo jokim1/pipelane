@@ -108,6 +108,44 @@ process.exit(typeof result.status === 'number' ? result.status : 1);
   };
 }
 
+function createAiReviewShimEnv() {
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-ai-review-shim-'));
+  const shimPath = path.join(binDir, 'ai-review.mjs');
+  writeFileSync(
+    shimPath,
+    `import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+
+readFileSync(0, 'utf8');
+const gate = process.env.PIPELANE_REVIEW_GATE_ID || 'unknown';
+const logPath = process.env.PIPELANE_TEST_AI_REVIEW_LOG || '';
+if (logPath) writeFileSync(logPath, gate + '\\n', { flag: 'a' });
+
+const mutateGate = process.env.PIPELANE_TEST_AI_REVIEW_MUTATE_GATE || '';
+const marker = process.env.PIPELANE_TEST_AI_REVIEW_MUTATION_MARKER || 'ai-review-mutated.txt';
+if (mutateGate && gate === mutateGate && (process.env.PIPELANE_TEST_AI_REVIEW_MUTATE_ALWAYS === '1' || !existsSync(marker))) {
+  writeFileSync(marker, 'mutated by ai review ' + process.hrtime.bigint() + '\\n', 'utf8');
+}
+
+const statusMap = JSON.parse(process.env.PIPELANE_TEST_AI_REVIEW_STATUS_MAP || '{}');
+const status = statusMap[gate] || process.env.PIPELANE_TEST_AI_REVIEW_STATUS || 'passed';
+if (process.env.PIPELANE_TEST_AI_REVIEW_PREFIX_STATUS) {
+  console.log('PIPELANE_REVIEW_STATUS: ' + process.env.PIPELANE_TEST_AI_REVIEW_PREFIX_STATUS);
+}
+console.log('AI review shim gate=' + gate);
+console.log('PIPELANE_REVIEW_STATUS: ' + status);
+console.log('PIPELANE_REVIEW_SUMMARY: shim ' + status + ' for ' + gate);
+process.exit(Number(process.env.PIPELANE_TEST_AI_REVIEW_EXIT || '0'));
+`,
+    'utf8',
+  );
+  return {
+    binDir,
+    env: {
+      PIPELANE_REVIEW_AI_COMMAND: `${JSON.stringify(process.execPath)} ${JSON.stringify(shimPath)}`,
+    },
+  };
+}
+
 function seedLegacyCodexWrappers(codexHome, skills = ['new', 'resume', 'pr']) {
   mkdirSync(path.join(codexHome, 'skills', '.pipelane'), { recursive: true });
   writeFileSync(
@@ -4749,7 +4787,7 @@ test('review setup interactive toggle of installed AI gate writes explicit gate 
 
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
-      PIPELANE_REVIEW_SETUP_INPUT: '8\ns\n',
+      PIPELANE_REVIEW_SETUP_INPUT: '9\ns\n',
     });
     const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
 
@@ -4770,7 +4808,7 @@ test('review setup interactive install decline leaves known missing AI gate disa
   try {
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
-      PIPELANE_REVIEW_SETUP_INPUT: '8\n2\ns\n',
+      PIPELANE_REVIEW_SETUP_INPUT: '9\n2\ns\n',
       PIPELANE_REVIEW_SETUP_INSTALL_SUCCESS: 'karpathy-diff',
     });
     const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
@@ -4790,7 +4828,7 @@ test('review setup interactive unavailable AI gate explains manual install', () 
   try {
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
-      PIPELANE_REVIEW_SETUP_INPUT: '8\ns\n',
+      PIPELANE_REVIEW_SETUP_INPUT: '9\ns\n',
     });
     const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
 
@@ -4810,7 +4848,7 @@ test('review setup interactive install approval can enable known missing AI gate
   try {
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
-      PIPELANE_REVIEW_SETUP_INPUT: '8\n1\ns\n',
+      PIPELANE_REVIEW_SETUP_INPUT: '9\n1\ns\n',
       PIPELANE_REVIEW_SETUP_INSTALL_SUCCESS: 'karpathy-diff',
     });
     const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
@@ -6009,10 +6047,11 @@ test('orchestrate review blocks slice-filtered evidence until every slice is ful
   }
 });
 
-test('orchestrate review records pending AI gates and blocks incomplete slice evidence', () => {
+test('orchestrate review runs AI gates and blocks incomplete slice evidence', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];
   const workerCommand = 'node -e "console.log(\'implemented\')"';
+  const aiShim = createAiReviewShimEnv();
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
     const configPath = path.join(repoRoot, '.pipelane.json');
@@ -6051,16 +6090,16 @@ test('orchestrate review records pending AI gates and blocks incomplete slice ev
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
     });
 
-    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot, aiShim.env).stdout);
     const onDisk = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
 
-    assert.equal(reviewed.status, 'pending');
+    assert.equal(reviewed.status, 'blocked');
     assert.equal(reviewed.reviewedCount, 1);
-    assert.equal(reviewed.pendingCount, 1);
+    assert.equal(reviewed.pendingCount, 0);
     assert.equal(reviewed.blockedCount, 1);
-    assert.equal(onDisk.status, 'blocked');
-    assert.equal(onDisk.slices[0].status, 'blocked');
-    assert.equal(onDisk.slices[0].review.run.gates[0].status, 'pending');
+    assert.equal(onDisk.status, 'dispatched');
+    assert.equal(onDisk.slices[0].status, 'completed');
+    assert.equal(onDisk.slices[0].review.run.gates[0].status, 'passed');
     assert.equal(onDisk.slices[1].review, null);
     assert.match(reviewed.slices.find((slice) => slice.id === onDisk.slices[1].id).blocker, /worker has not completed successfully/);
   } finally {
@@ -6069,6 +6108,7 @@ test('orchestrate review records pending AI gates and blocks incomplete slice ev
     }
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(aiShim.binDir, { recursive: true, force: true });
   }
 });
 
@@ -7016,32 +7056,188 @@ test('review runner executes command gates and writes evidence', () => {
   }
 });
 
-test('review runner records pending AI gates without failing the process', () => {
+test('review runner runs configured AI gates autonomously', () => {
   const repoRoot = createRepo();
   const npmShim = createNpmShimEnv();
+  const aiShim = createAiReviewShimEnv();
   try {
-    const result = runCli(['run', 'review', '--json'], repoRoot, npmShim.env);
+    const result = runCli(['run', 'review', '--json'], repoRoot, { ...npmShim.env, ...aiShim.env });
     const report = JSON.parse(result.stdout);
 
     assert.equal(result.status, 0);
-    assert.equal(report.status, 'pending');
+    assert.equal(report.status, 'passed');
     assert.ok(report.gates.some((gate) => gate.gateId === 'typecheck' && gate.status === 'passed'));
     assert.ok(report.gates.some((gate) => gate.gateId === 'test' && gate.status === 'passed'));
     assert.ok(report.gates.some((gate) => gate.gateId === 'build' && gate.status === 'passed'));
-    assert.ok(report.gates.some((gate) => gate.gateId === 'karpathy-diff' && gate.status === 'pending'));
-    assert.ok(report.gates.some((gate) => gate.gateId === 'gstack-review' && gate.status === 'pending'));
+    assert.ok(report.gates.some((gate) => gate.gateId === 'gstack-review' && gate.status === 'passed'));
+    assert.ok(report.gates.some((gate) => gate.gateId === 'karpathy-diff' && gate.status === 'passed'));
     assert.ok(report.gates.some((gate) => gate.gateId === 'karpathy-audit' && gate.status === 'skipped'));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(npmShim.binDir, { recursive: true, force: true });
+    rmSync(aiShim.binDir, { recursive: true, force: true });
   }
 });
 
-test('review pass records clean manual gates against current review evidence', () => {
+test('review runner restarts when an autonomous AI gate changes the tree', () => {
   const repoRoot = createRepo();
   const npmShim = createNpmShimEnv();
+  const aiShim = createAiReviewShimEnv();
+  const logPath = path.join(aiShim.binDir, 'ai-review-log.txt');
+  const markerFile = 'ai-review-mutated.txt';
   try {
-    const review = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, npmShim.env).stdout);
+    const review = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      ...npmShim.env,
+      ...aiShim.env,
+      PIPELANE_TEST_AI_REVIEW_LOG: logPath,
+      PIPELANE_TEST_AI_REVIEW_MUTATE_GATE: 'gstack-review',
+      PIPELANE_TEST_AI_REVIEW_MUTATION_MARKER: markerFile,
+    }).stdout);
+    const evidence = JSON.parse(readFileSync(review.evidencePath, 'utf8')).records[0];
+    const aiGateLog = readFileSync(logPath, 'utf8').trim().split(/\r?\n/);
+
+    assert.equal(review.status, 'passed');
+    assert.ok(review.changedFiles.includes(markerFile));
+    assert.equal(evidence.worktreeStatusDigest, review.worktreeStatusDigest);
+    assert.deepEqual(aiGateLog, ['gstack-review', 'gstack-review', 'karpathy-diff']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(npmShim.binDir, { recursive: true, force: true });
+    rmSync(aiShim.binDir, { recursive: true, force: true });
+  }
+});
+
+test('review runner fails when an autonomous AI gate never settles the tree', () => {
+  const repoRoot = createRepo();
+  const aiShim = createAiReviewShimEnv();
+  const logPath = path.join(aiShim.binDir, 'ai-review-log.txt');
+  const markerFile = 'ai-review-mutated.txt';
+  try {
+    writeFileSync(
+      path.join(repoRoot, '.pipelane.json'),
+      `${JSON.stringify({
+        displayName: 'Demo App',
+        reviewGates: {
+          preset: 'standard',
+          planReview: { gates: [] },
+          gates: [{
+            id: 'typecheck',
+            phase: 'static',
+            type: 'command',
+            command: `${process.execPath} -e "console.log('typecheck ok')"`,
+            blocking: true,
+          }, {
+            id: 'gstack-review',
+            phase: 'ai-diff',
+            type: 'skill',
+            skill: 'review',
+            userCommands: ['/review'],
+            blocking: false,
+          }, {
+            id: 'karpathy-diff',
+            phase: 'ai-diff',
+            type: 'skill',
+            skill: 'karpathy-diff',
+            userCommands: ['/karpathy diff'],
+            blocking: true,
+          }],
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+    execFileSync('git', ['add', '.pipelane.json'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Configure review gates'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const result = runCli(['run', 'review', '--json'], repoRoot, {
+      ...aiShim.env,
+      PIPELANE_TEST_AI_REVIEW_LOG: logPath,
+      PIPELANE_TEST_AI_REVIEW_MUTATE_GATE: 'gstack-review',
+      PIPELANE_TEST_AI_REVIEW_MUTATION_MARKER: markerFile,
+      PIPELANE_TEST_AI_REVIEW_MUTATE_ALWAYS: '1',
+    }, true);
+    const review = JSON.parse(result.stdout);
+    const evidence = JSON.parse(readFileSync(review.evidencePath, 'utf8')).records[0];
+    const aiGateLog = readFileSync(logPath, 'utf8').trim().split(/\r?\n/);
+    const gstackGate = review.gates.find((gate) => gate.gateId === 'gstack-review');
+    const karpathyGate = review.gates.find((gate) => gate.gateId === 'karpathy-diff');
+
+    assert.notEqual(result.status, 0);
+    assert.equal(review.status, 'failed');
+    assert.equal(gstackGate.status, 'failed');
+    assert.equal(gstackGate.blocking, true);
+    assert.match(gstackGate.summary, /changed the tree after 3 review attempts/);
+    assert.equal(karpathyGate.status, 'skipped');
+    assert.equal(karpathyGate.skipReason, 'restart-exhausted');
+    assert.ok(review.changedFiles.includes(markerFile));
+    assert.equal(evidence.worktreeStatusDigest, review.worktreeStatusDigest);
+    assert.deepEqual(aiGateLog, ['gstack-review', 'gstack-review', 'gstack-review']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(aiShim.binDir, { recursive: true, force: true });
+  }
+});
+
+test('review runner honors the final AI status marker', () => {
+  const repoRoot = createRepo();
+  const npmShim = createNpmShimEnv();
+  const aiShim = createAiReviewShimEnv();
+  try {
+    const result = runCli(['run', 'review', '--gate', 'gstack-review', '--json'], repoRoot, {
+      ...npmShim.env,
+      ...aiShim.env,
+      PIPELANE_TEST_AI_REVIEW_PREFIX_STATUS: 'passed',
+      PIPELANE_TEST_AI_REVIEW_STATUS: 'failed',
+    }, true);
+    const report = JSON.parse(result.stdout);
+
+    assert.notEqual(result.status, 0);
+    assert.equal(report.status, 'failed');
+    assert.deepEqual(report.gates.map((gate) => gate.gateId), ['gstack-review']);
+    assert.equal(report.gates[0].status, 'failed');
+    assert.match(report.gates[0].summary, /shim failed for gstack-review/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(npmShim.binDir, { recursive: true, force: true });
+    rmSync(aiShim.binDir, { recursive: true, force: true });
+  }
+});
+
+test('review pass records clean fallback gates against current review evidence', () => {
+  const repoRoot = createRepo();
+  const aiShim = createAiReviewShimEnv();
+  try {
+    writeFileSync(
+      path.join(repoRoot, '.pipelane.json'),
+      `${JSON.stringify({
+        displayName: 'Demo App',
+        reviewGates: {
+          preset: 'standard',
+          planReview: { gates: [] },
+          gates: [{
+            id: 'typecheck',
+            phase: 'static',
+            type: 'command',
+            command: `${process.execPath} -e "console.log('typecheck ok')"`,
+            blocking: true,
+          }, {
+            id: 'gstack-review',
+            phase: 'ai-diff',
+            type: 'skill',
+            skill: 'review',
+            userCommands: ['/review'],
+            blocking: true,
+          }],
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+    execFileSync('git', ['add', '.pipelane.json'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Configure review gate'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const review = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      ...aiShim.env,
+      PIPELANE_TEST_AI_REVIEW_STATUS_MAP: JSON.stringify({ 'gstack-review': 'pending' }),
+    }).stdout);
     assert.equal(review.status, 'pending');
 
     const gstack = JSON.parse(runCli([
@@ -7058,38 +7254,50 @@ test('review pass records clean manual gates against current review evidence', (
 
     assert.equal(gstack.command, 'review pass');
     assert.equal(gstack.status, 'attested');
-    assert.equal(afterGstack.status, 'pending');
+    assert.equal(afterGstack.status, 'passed');
     assert.equal(afterGstack.gates.find((gate) => gate.gateId === 'gstack-review').status, 'passed');
     assert.match(afterGstack.gates.find((gate) => gate.gateId === 'gstack-review').summary, /Ran \/review clean/);
-    assert.equal(afterGstack.gates.find((gate) => gate.gateId === 'karpathy-diff').status, 'pending');
-
-    const karpathy = JSON.parse(runCli([
-      'run',
-      'review',
-      'pass',
-      '--gate',
-      'karpathy-diff',
-      '--message',
-      'Ran /karpathy diff clean',
-      '--json',
-    ], repoRoot).stdout);
-    const afterKarpathy = JSON.parse(readFileSync(karpathy.evidencePath, 'utf8')).records[0];
-
-    assert.equal(afterKarpathy.status, 'passed');
-    assert.equal(afterKarpathy.gates.find((gate) => gate.gateId === 'gstack-review').status, 'passed');
-    assert.equal(afterKarpathy.gates.find((gate) => gate.gateId === 'karpathy-diff').status, 'passed');
-    assert.equal(afterKarpathy.gates.find((gate) => gate.gateId === 'karpathy-audit').status, 'skipped');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(npmShim.binDir, { recursive: true, force: true });
+    rmSync(aiShim.binDir, { recursive: true, force: true });
   }
 });
 
 test('review pass refuses stale or executable gate evidence', () => {
   const repoRoot = createRepo();
-  const npmShim = createNpmShimEnv();
+  const aiShim = createAiReviewShimEnv();
   try {
-    runCli(['run', 'review', '--json'], repoRoot, npmShim.env);
+    writeFileSync(
+      path.join(repoRoot, '.pipelane.json'),
+      `${JSON.stringify({
+        displayName: 'Demo App',
+        reviewGates: {
+          preset: 'standard',
+          planReview: { gates: [] },
+          gates: [{
+            id: 'typecheck',
+            phase: 'static',
+            type: 'command',
+            command: `${process.execPath} -e "console.log('typecheck ok')"`,
+            blocking: true,
+          }, {
+            id: 'gstack-review',
+            phase: 'ai-diff',
+            type: 'skill',
+            skill: 'review',
+            userCommands: ['/review'],
+            blocking: true,
+          }],
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+    execFileSync('git', ['add', '.pipelane.json'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Configure review gate'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    runCli(['run', 'review', '--json'], repoRoot, {
+      ...aiShim.env,
+      PIPELANE_TEST_AI_REVIEW_STATUS_MAP: JSON.stringify({ 'gstack-review': 'pending' }),
+    });
 
     const commandGate = runCli([
       'run',
@@ -7101,7 +7309,7 @@ test('review pass refuses stale or executable gate evidence', () => {
       'Typecheck looked fine',
     ], repoRoot, {}, true);
     assert.notEqual(commandGate.status, 0);
-    assert.match(commandGate.stderr, /review pass only accepts manual gates/);
+    assert.match(commandGate.stderr, /review pass only accepts approval, skill, or agent fallback gates/);
 
     writeFileSync(path.join(repoRoot, 'feature.txt'), 'changed after review\n', 'utf8');
     const stale = runCli([
@@ -7117,26 +7325,28 @@ test('review pass refuses stale or executable gate evidence', () => {
     assert.match(stale.stderr, /requires a full, non-dry-run \/pipelane review/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(npmShim.binDir, { recursive: true, force: true });
+    rmSync(aiShim.binDir, { recursive: true, force: true });
   }
 });
 
 test('review runner includes staged-only files for whenChanged gates', () => {
   const repoRoot = createRepo();
+  const aiShim = createAiReviewShimEnv();
   try {
     writeFileSync(path.join(repoRoot, 'AGENTS.md'), 'Agent guidance\n', 'utf8');
     execFileSync('git', ['add', 'AGENTS.md'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
 
-    const result = runCli(['run', 'review', '--gate', 'karpathy-audit', '--json'], repoRoot);
+    const result = runCli(['run', 'review', '--gate', 'karpathy-audit', '--json'], repoRoot, aiShim.env);
     const report = JSON.parse(result.stdout);
 
-    assert.equal(report.status, 'pending');
+    assert.equal(report.status, 'passed');
     assert.ok(report.changedFiles.includes('AGENTS.md'));
     assert.deepEqual(report.gates.map((gate) => gate.gateId), ['karpathy-audit']);
-    assert.equal(report.gates[0].status, 'pending');
-    assert.match(report.gates[0].summary, /karpathy audit/);
+    assert.equal(report.gates[0].status, 'passed');
+    assert.match(report.gates[0].summary, /shim passed for karpathy-audit/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(aiShim.binDir, { recursive: true, force: true });
   }
 });
 
@@ -7238,6 +7448,61 @@ test('review runner fails when a blocking command gate fails', () => {
   }
 });
 
+test('review runner skips AI gates after a blocking deterministic failure', () => {
+  const repoRoot = createRepo();
+  const aiShim = createAiReviewShimEnv();
+  try {
+    writeFileSync(
+      path.join(repoRoot, '.pipelane.json'),
+      `${JSON.stringify({
+        displayName: 'Demo App',
+        reviewGates: {
+          preset: 'standard',
+          planReview: { gates: [] },
+          gates: [{
+            id: 'typecheck',
+            phase: 'static',
+            type: 'command',
+            command: `${process.execPath} -e "process.exit(2)"`,
+            blocking: true,
+          }, {
+            id: 'gstack-review',
+            phase: 'ai-diff',
+            type: 'skill',
+            skill: 'review',
+            userCommands: ['/review'],
+            blocking: true,
+          }, {
+            id: 'karpathy-diff',
+            phase: 'ai-diff',
+            type: 'skill',
+            skill: 'karpathy-diff',
+            userCommands: ['/karpathy diff'],
+            blocking: true,
+          }],
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+    execFileSync('git', ['add', '.pipelane.json'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Configure review gates'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const result = runCli(['run', 'review', '--json'], repoRoot, aiShim.env, true);
+    const report = JSON.parse(result.stdout);
+
+    assert.notEqual(result.status, 0);
+    assert.equal(report.status, 'failed');
+    assert.equal(report.gates.find((gate) => gate.gateId === 'typecheck').status, 'failed');
+    assert.equal(report.gates.find((gate) => gate.gateId === 'gstack-review').status, 'skipped');
+    assert.equal(report.gates.find((gate) => gate.gateId === 'karpathy-diff').status, 'skipped');
+    assert.equal(report.gates.find((gate) => gate.gateId === 'gstack-review').skipReason, 'prior-blocking-failure');
+    assert.equal(report.gates.find((gate) => gate.gateId === 'karpathy-diff').skipReason, 'prior-blocking-failure');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(aiShim.binDir, { recursive: true, force: true });
+  }
+});
+
 test('review runner fails timed out command gates', () => {
   const repoRoot = createRepo();
   try {
@@ -7333,8 +7598,13 @@ test('api snapshot exposes the latest review run', () => {
 test('api snapshot degrades pending, failed, and incomplete review evidence', () => {
   const pendingRepoRoot = createRepo();
   const pendingNpmShim = createNpmShimEnv();
+  const pendingAiShim = createAiReviewShimEnv();
   try {
-    JSON.parse(runCli(['run', 'review', '--json'], pendingRepoRoot, pendingNpmShim.env).stdout);
+    JSON.parse(runCli(['run', 'review', '--json'], pendingRepoRoot, {
+      ...pendingNpmShim.env,
+      ...pendingAiShim.env,
+      PIPELANE_TEST_AI_REVIEW_STATUS: 'pending',
+    }).stdout);
     const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], pendingRepoRoot).stdout);
     const reviewHealth = envelope.data.sourceHealth.find((entry) => entry.name === 'review.latest');
     const issue = envelope.data.attention.find((entry) => entry.code === 'review.pending');
@@ -7346,6 +7616,7 @@ test('api snapshot degrades pending, failed, and incomplete review evidence', ()
   } finally {
     rmSync(pendingRepoRoot, { recursive: true, force: true });
     rmSync(pendingNpmShim.binDir, { recursive: true, force: true });
+    rmSync(pendingAiShim.binDir, { recursive: true, force: true });
   }
 
   const failedRepoRoot = createRepo();
@@ -10150,7 +10421,7 @@ test('api action pr preflight blocks pending and filtered review evidence', () =
     writePassingReviewEvidence(created.worktreePath, {
       status: 'pending',
       gateStatuses: { 'karpathy-diff': 'pending' },
-      gateSummaries: { 'karpathy-diff': 'manual skill gate pending: run /karpathy diff' },
+      gateSummaries: { 'karpathy-diff': 'AI review pending: /karpathy diff' },
     });
 
     const pending = runCli(
@@ -10227,7 +10498,7 @@ test('api action pr ignores unrelated pending review evidence from another branc
     writePassingReviewEvidence(repoRoot, {
       status: 'pending',
       gateStatuses: { 'karpathy-diff': 'pending' },
-      gateSummaries: { 'karpathy-diff': 'manual skill gate pending: run /karpathy diff' },
+      gateSummaries: { 'karpathy-diff': 'AI review pending: /karpathy diff' },
     });
 
     const preflight = runCli(
@@ -18051,8 +18322,8 @@ test('review gate preset resolution uses detected scripts and reports unavailabl
     'format-check',
     'test',
     'build',
-    'karpathy-diff',
     'gstack-review',
+    'karpathy-diff',
     'karpathy-audit',
     'browser-qa',
   ]);
@@ -18069,8 +18340,8 @@ test('review gate preset resolution uses detected scripts and reports unavailabl
   });
   assert.deepEqual(missingScripts.gates.map((gate) => gate.id), [
     'test',
-    'karpathy-diff',
     'gstack-review',
+    'karpathy-diff',
     'karpathy-audit',
     'browser-qa',
   ]);
@@ -18124,8 +18395,8 @@ test('default review gates are built from the canonical catalog without frontend
   const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
   const defaults = stateMod.defaultReviewGatesConfig();
   assert.deepEqual(defaults.gates.map((gate) => gate.id), [
-    'karpathy-diff',
     'gstack-review',
+    'karpathy-diff',
     'karpathy-audit',
   ]);
   assert.ok(defaults.planReview.gates.some((gate) => gate.id === 'plan-eng-review'));
