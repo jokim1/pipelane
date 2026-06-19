@@ -158,6 +158,31 @@ function seedCodexReviewSkills(codexHome, skills = ['karpathy-diff', 'review', '
   }
 }
 
+function seedCodexClaudeReviewBridge(codexHome, options = {}) {
+  const skillRoot = path.join(codexHome, 'skills', 'claude');
+  mkdirSync(path.join(skillRoot, 'scripts'), { recursive: true });
+  writeFileSync(path.join(skillRoot, 'SKILL.md'), 'Claude review bridge\n', 'utf8');
+  writeFileSync(path.join(skillRoot, 'scripts', 'run-review.sh'), '#!/usr/bin/env bash\nexit 0\n', 'utf8');
+  writeFileSync(path.join(skillRoot, 'scripts', 'build-review-artifact.sh'), '#!/usr/bin/env bash\nexit 0\n', 'utf8');
+  if (options.executable !== false) {
+    chmodSync(path.join(skillRoot, 'scripts', 'run-review.sh'), 0o755);
+    chmodSync(path.join(skillRoot, 'scripts', 'build-review-artifact.sh'), 0o755);
+  }
+  return skillRoot;
+}
+
+function seedKarpathySkillSource(sourceRoot, skills = ['karpathy-diff', 'karpathy-audit']) {
+  for (const skill of skills) {
+    const skillRoot = path.join(sourceRoot, 'skills', skill);
+    mkdirSync(skillRoot, { recursive: true });
+    writeFileSync(
+      path.join(skillRoot, 'SKILL.md'),
+      `---\nname: ${skill}\ndescription: ${skill} test skill\n---\n\n# ${skill}\n`,
+      'utf8',
+    );
+  }
+}
+
 function createRemoteBackedRepo() {
   const repoRoot = createRepo();
   const remoteRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-remote-'));
@@ -4167,7 +4192,7 @@ test('durable Codex runner dispatches /pipelane review setup', () => {
 
     const output = execFileSync(
       path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
-      ['pipelane', 'review', 'setup', '--preset', 'standard'],
+      ['pipelane', 'review', 'setup', '--list-gates'],
       {
         cwd: repoRoot,
         env: { ...process.env, CODEX_HOME: codexHome },
@@ -4176,7 +4201,7 @@ test('durable Codex runner dispatches /pipelane review setup', () => {
       },
     ).trim();
 
-    assert.equal(output, 'MANAGED:1:run review setup --preset standard');
+    assert.equal(output, 'MANAGED:1:run review setup --list-gates');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -4721,31 +4746,6 @@ test('loadWorkflowConfig applies a package.json:pipelane overlay when the file i
   }
 });
 
-test('loadWorkflowConfig materializes preset-only package reviewGates overlays', async () => {
-  const repoRoot = createRepo();
-  try {
-    const packageJsonPath = path.join(repoRoot, 'package.json');
-    const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
-    pkg.pipelane = {
-      reviewGates: {
-        preset: 'strict-production',
-      },
-    };
-    writeFileSync(packageJsonPath, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
-
-    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
-    const loaded = stateMod.loadWorkflowConfig(repoRoot);
-    assert.equal(loaded.reviewGates.preset, 'strict-production');
-    assert.ok(loaded.reviewGates.planReview.gates.some((gate) => gate.id === 'security-data-review'));
-    assert.ok(loaded.reviewGates.gates.some((gate) => gate.id === 'adversarial-review'));
-    assert.ok(loaded.reviewGates.gates.some((gate) => gate.id === 'human-merge-approval'));
-    assert.ok(loaded.reviewGates.gates.some((gate) => gate.id === 'human-prod-deploy-approval'));
-    assert.ok(loaded.reviewGates.gates.some((gate) => gate.id === 'human-rollback-approval'));
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
 test('loadWorkflowConfig detects package scripts for default review gates without inventing missing scripts', async () => {
   const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
   const repoRoot = createRepo();
@@ -4778,7 +4778,6 @@ test('review setup reports effective review gates without materializing config',
     const report = JSON.parse(result.stdout);
     assert.equal(report.command, 'review setup');
     assert.equal(report.status, 'reported');
-    assert.equal(report.preset, 'standard');
     assert.equal(report.configPath, null);
     assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
     assert.deepEqual(report.detectedScripts, ['build', 'test', 'typecheck']);
@@ -4791,29 +4790,38 @@ test('review setup reports effective review gates without materializing config',
   }
 });
 
-test('review setup persists preset-only reviewGates config', () => {
+test('review setup --yes persists the recommended gate checklist', () => {
   const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
   try {
-    const result = runCli(['run', 'review', 'setup', '--preset', 'strict-production', '--json'], repoRoot);
-    const report = JSON.parse(result.stdout);
-    assert.equal(report.status, 'configured');
-    assert.equal(report.preset, 'strict-production');
-    assert.equal(realpathSync(report.configPath), realpathSync(path.join(repoRoot, '.pipelane.json')));
-    assert.ok(report.effective.planReview.gates.some((gate) => gate.id === 'security-data-review'));
-    assert.ok(report.effective.gates.some((gate) => gate.id === 'adversarial-review'));
-    assert.ok(report.effective.gates.some((gate) => gate.id === 'human-merge-approval'));
-    assert.ok(report.effective.gates.some((gate) => gate.id === 'human-prod-deploy-approval'));
+    seedCodexReviewSkills(codexHome);
 
+    const result = runCli(['run', 'review', 'setup', '--yes', '--json'], repoRoot, { CODEX_HOME: codexHome });
+    const report = JSON.parse(result.stdout);
     const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
-    assert.deepEqual(raw.reviewGates, { preset: 'strict-production' });
+
+    assert.equal(report.status, 'configured');
+    assert.equal(realpathSync(report.configPath), realpathSync(path.join(repoRoot, '.pipelane.json')));
+    assert.deepEqual(Object.keys(raw.reviewGates).sort(), ['gates', 'planReview']);
+    assert.ok(Array.isArray(raw.reviewGates.gates));
+    assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'typecheck'));
+    assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'test'));
+    assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'build'));
+    assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'));
+    assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'));
+    assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-audit'));
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'adversarial-review'), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
   }
 });
 
-test('review setup preset preserves custom review gate arrays', () => {
+test('review setup preserves custom plan gates while replacing the review checklist', () => {
   const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
   try {
+    seedCodexReviewSkills(codexHome);
     runCli(['init', '--project', 'Demo App'], repoRoot);
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
@@ -4826,97 +4834,32 @@ test('review setup preset preserves custom review gate arrays', () => {
         when: 'before:implementation',
       },
     ];
-    const customGates = [
-      {
-        id: 'custom-security-check',
-        phase: 'static',
-        type: 'command',
-        command: 'npm run custom-security',
-        blocking: false,
-      },
-    ];
     config.reviewGates = {
-      preset: 'standard',
       planReview: { gates: customPlanGates },
-      gates: customGates,
+      gates: [],
     };
     writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
 
-    const result = runCli(['run', 'review', 'setup', '--preset', 'strict-production', '--json'], repoRoot);
-    const report = JSON.parse(result.stdout);
+    runCli(['run', 'review', 'setup', '--yes', '--json'], repoRoot, { CODEX_HOME: codexHome });
     const raw = JSON.parse(readFileSync(configPath, 'utf8'));
 
-    assert.equal(report.status, 'configured');
-    assert.equal(report.preset, 'strict-production');
     assert.deepEqual(raw.reviewGates.planReview.gates, customPlanGates);
-    assert.deepEqual(raw.reviewGates.gates, customGates);
-    assert.ok(report.effective.planReview.gates.some((gate) => gate.id === 'human-plan-check'));
-    assert.ok(report.effective.gates.some((gate) => gate.id === 'custom-security-check'));
+    assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
   }
 });
 
-test('review setup preset preserves package overlay review gate arrays when materializing config', () => {
+test('review setup interactive lists adversarial review as an option', () => {
   const repoRoot = createRepo();
   try {
-    const packageJsonPath = path.join(repoRoot, 'package.json');
-    const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
-    const customPlanGates = [
-      {
-        id: 'overlay-plan-check',
-        phase: 'plan',
-        type: 'approval',
-        blocking: false,
-        when: 'before:implementation',
-      },
-    ];
-    const customGates = [
-      {
-        id: 'overlay-security-check',
-        phase: 'static',
-        type: 'command',
-        command: 'npm run overlay-security',
-        blocking: false,
-      },
-    ];
-    pkg.pipelane = {
-      reviewGates: {
-        planReview: { gates: customPlanGates },
-        gates: customGates,
-      },
-    };
-    writeFileSync(packageJsonPath, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
+    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+      PIPELANE_REVIEW_SETUP_INPUT: 'c\n',
+    });
 
-    const result = runCli(['run', 'review', 'setup', '--preset', 'strict-production', '--json'], repoRoot);
-    const report = JSON.parse(result.stdout);
-    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
-
-    assert.equal(report.status, 'configured');
-    assert.equal(report.preset, 'strict-production');
-    assert.deepEqual(raw.reviewGates.planReview.gates, customPlanGates);
-    assert.deepEqual(raw.reviewGates.gates, customGates);
-    assert.ok(report.effective.planReview.gates.some((gate) => gate.id === 'overlay-plan-check'));
-    assert.ok(report.effective.gates.some((gate) => gate.id === 'overlay-security-check'));
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('review setup preset replaces generated default gate arrays', () => {
-  const repoRoot = createRepo();
-  try {
-    runCli(['init', '--project', 'Demo App'], repoRoot);
-
-    const result = runCli(['run', 'review', 'setup', '--preset', 'strict-production', '--json'], repoRoot);
-    const report = JSON.parse(result.stdout);
-    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
-
-    assert.equal(report.status, 'configured');
-    assert.equal(report.preset, 'strict-production');
-    assert.deepEqual(raw.reviewGates, { preset: 'strict-production' });
-    assert.ok(report.effective.planReview.gates.some((gate) => gate.id === 'security-data-review'));
-    assert.ok(report.effective.gates.some((gate) => gate.id === 'human-merge-approval'));
+    assert.match(result.stdout, /AI review gates:/);
+    assert.match(result.stdout, /Adversarial review/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -4928,7 +4871,6 @@ test('review setup print renders the effective reviewGates block', () => {
     const result = runCli(['run', 'review', 'setup', '--print'], repoRoot);
 
     assert.match(result.stdout, /Effective reviewGates:/);
-    assert.match(result.stdout, /"preset": "standard"/);
     assert.match(result.stdout, /"id": "karpathy-diff"/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -4992,7 +4934,7 @@ test('review setup bare command refuses non-interactive execution', () => {
   }
 });
 
-test('review setup --yes saves compact recommended gates when detected tools match', () => {
+test('review setup --yes saves explicit recommended gates when detected tools match', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
   try {
@@ -5003,10 +4945,11 @@ test('review setup --yes saves compact recommended gates when detected tools mat
     const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
 
     assert.equal(report.status, 'configured');
-    assert.equal(report.preset, 'strict-production');
-    assert.deepEqual(raw.reviewGates, { preset: 'strict-production' });
-    assert.ok(report.effective.gates.some((gate) => gate.id === 'human-prod-deploy-approval'));
-    assert.ok(report.effective.gates.some((gate) => gate.id === 'adversarial-review'));
+    assert.deepEqual(Object.keys(raw.reviewGates).sort(), ['gates', 'planReview']);
+    assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'));
+    assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'));
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'human-prod-deploy-approval'), false);
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'adversarial-review'), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -5029,7 +4972,9 @@ test('review setup interactive save writes recommended gates', () => {
     assert.match(result.stdout, /Actions:/);
     assert.match(result.stdout, /s\. Save and continue/);
     assert.match(result.stdout, /Review gates configured/);
-    assert.deepEqual(raw.reviewGates, { preset: 'strict-production' });
+    assert.deepEqual(Object.keys(raw.reviewGates).sort(), ['gates', 'planReview']);
+    assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'));
+    assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -5063,7 +5008,7 @@ test('review setup interactive toggle of installed AI gate writes explicit gate 
     const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
 
     assert.doesNotMatch(result.stdout, /Install and enable/);
-    assert.equal(raw.reviewGates.preset, 'strict-production');
+    assert.deepEqual(Object.keys(raw.reviewGates).sort(), ['gates', 'planReview']);
     assert.ok(Array.isArray(raw.reviewGates.gates));
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'), false);
     assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'));
@@ -5073,12 +5018,197 @@ test('review setup interactive toggle of installed AI gate writes explicit gate 
   }
 });
 
-test('review setup interactive install decline leaves known missing AI gate disabled', () => {
+test('review setup detects provider-prefixed Karpathy skills as installed', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
   try {
+    seedCodexReviewSkills(codexHome, ['gstack-karpathy-diff', 'review', 'karpathy-audit']);
+
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
+      PIPELANE_REVIEW_SETUP_INPUT: '8\ns\n',
+    });
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+
+    assert.doesNotMatch(result.stdout, /Karpathy diff review is not installed|Karpathy diff review is unavailable/);
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup interactive can enable installed adversarial review', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-claude-'));
+  try {
+    seedCodexReviewSkills(codexHome, ['karpathy-diff', 'review', 'karpathy-audit']);
+    seedCodexClaudeReviewBridge(codexHome);
+
+    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+      CODEX_HOME: codexHome,
+      CLAUDE_HOME: claudeHome,
+      PIPELANE_REVIEW_SETUP_INPUT: '10\ns\n',
+    });
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+    const gate = raw.reviewGates.gates.find((entry) => entry.id === 'adversarial-review');
+
+    assert.match(result.stdout, /Adversarial review/);
+    assert.deepEqual(gate.userCommands, ['/claude review code']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup detects the Codex /claude review bridge as adversarial review support', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-claude-'));
+  try {
+    seedCodexReviewSkills(codexHome, ['karpathy-diff', 'review', 'karpathy-audit']);
+    seedCodexClaudeReviewBridge(codexHome);
+
+    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+      CODEX_HOME: codexHome,
+      CLAUDE_HOME: claudeHome,
+      PIPELANE_REVIEW_SETUP_INPUT: '10\ns\n',
+    });
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+
+    assert.match(result.stdout, /Adversarial review/);
+    assert.match(result.stdout, /\/claude review code .*installed/);
+    assert.doesNotMatch(result.stdout, /Install and enable/);
+    assert.deepEqual(raw.reviewGates.gates.find((gate) => gate.id === 'adversarial-review').userCommands, ['/claude review code']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup saves Claude-side gstack /codex challenge as the adversarial command', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-claude-'));
+  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-bin-'));
+  try {
+    seedCodexReviewSkills(codexHome, ['karpathy-diff', 'review', 'karpathy-audit']);
+    const codexShim = path.join(fakeBin, 'codex');
+    writeFileSync(codexShim, '#!/usr/bin/env bash\nexit 0\n', 'utf8');
+    chmodSync(codexShim, 0o755);
+    mkdirSync(path.join(claudeHome, 'skills', 'gstack', 'codex'), { recursive: true });
+    writeFileSync(
+      path.join(claudeHome, 'skills', 'gstack', 'codex', 'SKILL.md'),
+      'codex adversarial challenge skill\n',
+      'utf8',
+    );
+
+    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+      CODEX_HOME: codexHome,
+      CLAUDE_HOME: claudeHome,
+      PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
+      PIPELANE_REVIEW_SETUP_INPUT: '10\ns\n',
+    });
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+    const gate = raw.reviewGates.gates.find((entry) => entry.id === 'adversarial-review');
+
+    assert.match(result.stdout, /\/codex challenge .*installed/);
+    assert.deepEqual(gate.userCommands, ['/codex challenge']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
+test('review setup does not treat a broken Codex /claude bridge as installed', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-claude-'));
+  try {
+    seedCodexReviewSkills(codexHome, ['karpathy-diff', 'review', 'karpathy-audit']);
+    seedCodexClaudeReviewBridge(codexHome, { executable: false });
+
+    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+      CODEX_HOME: codexHome,
+      CLAUDE_HOME: claudeHome,
+      PIPELANE_REVIEW_SETUP_INPUT: '10\n2\ns\n',
+    });
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+
+    assert.match(result.stdout, /Adversarial review is not installed/);
+    assert.match(result.stdout, /Install and enable/);
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'adversarial-review'), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup interactive install approval can enable missing adversarial review', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-claude-'));
+  try {
+    seedCodexReviewSkills(codexHome, ['karpathy-diff', 'review', 'karpathy-audit']);
+
+    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+      CODEX_HOME: codexHome,
+      CLAUDE_HOME: claudeHome,
+      PIPELANE_REVIEW_SETUP_INPUT: '10\n1\ns\n',
+      PIPELANE_REVIEW_SETUP_INSTALL_SUCCESS: 'adversarial-review',
+    });
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+
+    assert.match(result.stdout, /Adversarial review is not installed/);
+    assert.match(result.stdout, /Install and enable/);
+    assert.match(result.stdout, /Installed adversarial-review/);
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'adversarial-review'), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup interactive failed adversarial install leaves the gate disabled', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-claude-'));
+  try {
+    seedCodexReviewSkills(codexHome, ['karpathy-diff', 'review', 'karpathy-audit']);
+
+    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+      CODEX_HOME: codexHome,
+      CLAUDE_HOME: claudeHome,
+      PIPELANE_REVIEW_SETUP_INPUT: '10\n1\ns\n',
+    });
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+
+    assert.match(result.stdout, /Adversarial review is not installed/);
+    assert.match(result.stdout, /No test installer succeeded for adversarial-review/);
+    assert.match(result.stdout, /Adversarial review remains disabled/);
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'adversarial-review'), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup interactive install decline leaves known missing AI gate disabled', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-claude-'));
+  try {
+    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+      CODEX_HOME: codexHome,
+      CLAUDE_HOME: claudeHome,
       PIPELANE_REVIEW_SETUP_INPUT: '8\n2\ns\n',
       PIPELANE_REVIEW_SETUP_INSTALL_SUCCESS: 'karpathy-diff',
     });
@@ -5090,35 +5220,68 @@ test('review setup interactive install decline leaves known missing AI gate disa
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
   }
 });
 
-test('review setup interactive unavailable AI gate explains manual install', () => {
+test('review setup interactive missing Karpathy gate offers installer', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-claude-'));
   try {
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
-      PIPELANE_REVIEW_SETUP_INPUT: '8\ns\n',
+      CLAUDE_HOME: claudeHome,
+      PIPELANE_REVIEW_SETUP_INPUT: '8\n2\ns\n',
     });
     const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
 
-    assert.match(result.stdout, /Karpathy diff review is unavailable/);
-    assert.match(result.stdout, /Install karpathy-diff outside Pipelane/);
-    assert.doesNotMatch(result.stdout, /Install and enable/);
+    assert.match(result.stdout, /Karpathy diff review is not installed/);
+    assert.match(result.stdout, /Install karpathy-diff skill now/);
+    assert.match(result.stdout, /Install and enable/);
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup interactive installs Karpathy from a configured local source', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-claude-'));
+  const karpathySource = mkdtempSync(path.join(os.tmpdir(), 'pipelane-karpathy-source-'));
+  try {
+    seedKarpathySkillSource(karpathySource, ['karpathy-diff']);
+
+    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+      CODEX_HOME: codexHome,
+      CLAUDE_HOME: claudeHome,
+      PIPELANE_KARPATHY_SKILLS_SOURCE: karpathySource,
+      PIPELANE_REVIEW_SETUP_INPUT: '8\n1\ns\n',
+    });
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+
+    assert.match(result.stdout, /Installed karpathy-diff from/);
+    assert.equal(existsSync(path.join(codexHome, 'skills', 'karpathy-diff', 'SKILL.md')), true);
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+    rmSync(karpathySource, { recursive: true, force: true });
   }
 });
 
 test('review setup interactive install approval can enable known missing AI gate', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-claude-'));
   try {
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
+      CLAUDE_HOME: claudeHome,
       PIPELANE_REVIEW_SETUP_INPUT: '8\n1\ns\n',
       PIPELANE_REVIEW_SETUP_INSTALL_SUCCESS: 'karpathy-diff',
     });
@@ -5131,6 +5294,7 @@ test('review setup interactive install approval can enable known missing AI gate
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
   }
 });
 
@@ -5631,7 +5795,6 @@ test('orchestrate plan writes a durable slice ledger from a plan file', () => {
       },
     };
     config.reviewGates = {
-      preset: 'standard',
       planReview: { gates: customPlanGates },
       gates: customGates,
     };
@@ -5699,7 +5862,6 @@ test('orchestrate plan writes a durable slice ledger from a plan file', () => {
     assert.equal(onDisk.plan.title, 'Orchestrate Ledger Plan');
     assert.equal(onDisk.plan.outcome, null);
     assert.equal(onDisk.plan.dependencyPolicy, 'sequential');
-    assert.equal(onDisk.gateSnapshot.preset, 'standard');
     assert.deepEqual(onDisk.configSnapshot, {
       maxConcurrentSlices: 3,
       goalMode: {
@@ -6166,7 +6328,6 @@ test('orchestrate review runs gate snapshot against completed worker slices', ()
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.reviewGates = {
-      preset: 'standard',
       planReview: { gates: [] },
       gates: [{
         id: 'slice-static',
@@ -6263,7 +6424,6 @@ test('orchestrate review blocks slice-filtered evidence until every slice is ful
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.reviewGates = {
-      preset: 'standard',
       planReview: { gates: [] },
       gates: [{
         id: 'slice-static',
@@ -6327,7 +6487,6 @@ test('orchestrate review records pending AI gates and blocks incomplete slice ev
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.reviewGates = {
-      preset: 'standard',
       planReview: { gates: [] },
       gates: [{
         id: 'karpathy-diff',
@@ -7102,7 +7261,6 @@ test('orchestrate plan run records isolate config snapshots from later mutation'
       hardStops: { maxIterationsPerSlice: 2, maxMinutesPerSlice: 30 },
     };
     config.reviewGates = {
-      preset: 'standard',
       planReview: {
         gates: [{ id: 'plan-check', phase: 'plan', type: 'skill', blocking: true, skill: '/plan-eng-review' }],
       },
@@ -7472,7 +7630,6 @@ test('review runner adds a pending config-change gate when review config inputs 
       `${JSON.stringify({
         displayName: 'Demo App',
         reviewGates: {
-          preset: 'standard',
           planReview: { gates: [] },
           gates: [{
             id: 'typecheck',
@@ -7510,7 +7667,6 @@ test('review runner fails when a blocking command gate fails', () => {
       `${JSON.stringify({
         displayName: 'Demo App',
         reviewGates: {
-          preset: 'standard',
           planReview: { gates: [] },
           gates: [{
             id: 'typecheck',
@@ -7555,7 +7711,6 @@ test('review runner fails timed out command gates', () => {
       `${JSON.stringify({
         displayName: 'Demo App',
         reviewGates: {
-          preset: 'standard',
           planReview: { gates: [] },
           gates: [{
             id: 'slow',
@@ -7610,7 +7765,6 @@ test('api snapshot exposes the latest review run', () => {
       `${JSON.stringify({
         displayName: 'Demo App',
         reviewGates: {
-          preset: 'standard',
           planReview: { gates: [] },
           gates: [{
             id: 'typecheck',
@@ -7664,7 +7818,6 @@ test('api snapshot degrades pending, failed, and incomplete review evidence', ()
       `${JSON.stringify({
         displayName: 'Demo App',
         reviewGates: {
-          preset: 'standard',
           planReview: { gates: [] },
           gates: [{
             id: 'typecheck',
@@ -7866,7 +8019,6 @@ test('loadReviewState rejects malformed nested review gate records', async () =>
             id: 'review-bad-run-field',
             branchName: 'main',
             sha: 'abc',
-            preset: 'standard',
             status: 'passed',
             dryRun: false,
             gateFilter: 123,
@@ -7891,7 +8043,6 @@ test('loadReviewState rejects malformed nested review gate records', async () =>
             id: 'review-bad-nested-gate',
             branchName: 'main',
             sha: 'abc',
-            preset: 'standard',
             status: 'passed',
             dryRun: false,
             startedAt: '2026-06-16T00:00:00Z',
@@ -16063,10 +16214,6 @@ test('operator parser rejects unknown flags, missing values, unused flags, and u
     assert.notEqual(wrongPositionalForCommand.status, 0);
     assert.match(wrongPositionalForCommand.stderr, /status does not accept positional argument/);
 
-    const invalidReviewPreset = runCli(['run', 'review', 'setup', '--preset', 'extreme'], repoRoot, {}, true);
-    assert.notEqual(invalidReviewPreset.status, 0);
-    assert.match(invalidReviewPreset.stderr, /--preset must be one of: lean, standard, strict-production/);
-
     const invalidReviewSubcommand = runCli(['run', 'review', 'list'], repoRoot, {}, true);
     assert.notEqual(invalidReviewSubcommand.status, 0);
     assert.match(invalidReviewSubcommand.stderr, /review requires: pipelane run review/);
@@ -18391,7 +18538,6 @@ test('normalizeWorkflowConfig filters malformed orchestrate config', async () =>
 test('normalizeReviewGatesConfig keeps defaults and filters malformed gate entries', async () => {
   const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
   const defaults = mod.defaultWorkflowConfig('demo', 'Demo').reviewGates;
-  assert.equal(defaults.preset, 'standard');
   assert.equal(defaults.gates.some((gate) => ['typecheck', 'test', 'build'].includes(gate.id)), false);
   const karpathyDiff = defaults.gates.find((gate) => gate.id === 'karpathy-diff');
   assert.equal(karpathyDiff.phase, 'ai-diff');
@@ -18404,7 +18550,6 @@ test('normalizeReviewGatesConfig keeps defaults and filters malformed gate entri
   assert.ok(karpathyAudit.whenChanged.includes('CLAUDE.md'));
 
   const normalized = mod.normalizeReviewGatesConfig({
-    preset: 'invalid',
     planReview: {
       gates: [
         { id: ' plan-eng ', phase: 'nope', type: 'skill', skill: ' plan-eng-review ', blocking: false },
@@ -18423,7 +18568,6 @@ test('normalizeReviewGatesConfig keeps defaults and filters malformed gate entri
     ],
   });
 
-  assert.equal(normalized.preset, 'standard');
   assert.deepEqual(normalized.planReview.gates.map((gate) => gate.id), ['plan-eng', 'human-plan']);
   assert.equal(normalized.planReview.gates[0].blocking, false);
   assert.deepEqual(normalized.gates.map((gate) => gate.id), ['lint', 'diff', 'audit', 'adversarial']);
@@ -18443,18 +18587,6 @@ test('normalizeReviewGatesConfig keeps defaults and filters malformed gate entri
   assert.deepEqual(normalized.gates[1].userCommands, ['/karpathy diff']);
   assert.deepEqual(normalized.gates[2].whenChanged, ['CLAUDE.md']);
   assert.equal(normalized.gates[3].role, 'adversarial-code-reviewer');
-});
-
-test('normalizeReviewGatesConfig materializes strict-production when only preset is configured', async () => {
-  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
-  const normalized = mod.normalizeReviewGatesConfig({ preset: 'strict-production' });
-
-  assert.equal(normalized.preset, 'strict-production');
-  assert.ok(normalized.planReview.gates.some((gate) => gate.id === 'security-data-review'));
-  assert.ok(normalized.gates.some((gate) => gate.id === 'adversarial-review'));
-  assert.ok(normalized.gates.some((gate) => gate.id === 'human-merge-approval'));
-  assert.ok(normalized.gates.some((gate) => gate.id === 'human-prod-deploy-approval'));
-  assert.ok(normalized.gates.some((gate) => gate.id === 'human-rollback-approval'));
 });
 
 test('review gate catalog detects package scripts and separates human aliases', async () => {
@@ -18490,6 +18622,12 @@ test('review gate catalog detects package scripts and separates human aliases', 
     assert.equal(mod.resolveReviewGateAlias('/karpathy-audit'), 'karpathy-audit');
     assert.equal(mod.resolveReviewGateAlias('/karpathy:audit'), 'karpathy-audit');
     assert.equal(mod.resolveReviewGateAlias('/gstack review'), 'gstack-review');
+    assert.equal(mod.resolveReviewGateAlias('/claude review'), 'adversarial-review');
+    assert.equal(mod.resolveReviewGateAlias('/claude review code'), 'adversarial-review');
+    assert.equal(mod.resolveReviewGateAlias('/codex challenge'), 'adversarial-review');
+    assert.equal(mod.resolveReviewGateAlias('/codex review'), null);
+    assert.equal(mod.resolveReviewGateAlias('/adversarial review'), null);
+    assert.equal(mod.resolveReviewGateAlias('/adversarial-review'), null);
     assert.equal(mod.resolveReviewGateAlias('/not-a-real-gate'), null);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -18525,8 +18663,7 @@ test('review gate catalog handles missing and malformed package.json without thr
     assert.match(malformed.parseError, /Expected property name|Unexpected token|JSON/);
     assert.deepEqual(malformed.scripts, {});
 
-    const resolved = mod.resolveReviewGatePreset({
-      preset: 'standard',
+    const resolved = mod.resolveDefaultReviewGates({
       repoRoot,
     });
     const typecheck = resolved.missing.find((entry) => entry.id === 'typecheck');
@@ -18537,10 +18674,9 @@ test('review gate catalog handles missing and malformed package.json without thr
   }
 });
 
-test('review gate preset resolution uses detected scripts and reports unavailable gates', async () => {
+test('default review gate resolution uses detected scripts and reports unavailable gates', async () => {
   const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-gates.ts'));
-  const standard = mod.resolveReviewGatePreset({
-    preset: 'standard',
+  const standard = mod.resolveDefaultReviewGates({
     scripts: {
       typecheck: 'tsc --noEmit',
       test: 'node --test',
@@ -18560,15 +18696,13 @@ test('review gate preset resolution uses detected scripts and reports unavailabl
     'karpathy-diff',
     'gstack-review',
     'karpathy-audit',
-    'browser-qa',
   ]);
   assert.equal(standard.gates.find((gate) => gate.id === 'lint').command, 'npm run lint');
   assert.equal(standard.gates.find((gate) => gate.id === 'format-check').command, 'npm run format:check');
   assert.equal(standard.gates.some((gate) => gate.id === 'adversarial-review'), false);
   assert.deepEqual(standard.missing, []);
 
-  const missingScripts = mod.resolveReviewGatePreset({
-    preset: 'standard',
+  const missingScripts = mod.resolveDefaultReviewGates({
     scripts: {
       test: 'node --test',
     },
@@ -18578,7 +18712,6 @@ test('review gate preset resolution uses detected scripts and reports unavailabl
     'karpathy-diff',
     'gstack-review',
     'karpathy-audit',
-    'browser-qa',
   ]);
   assert.deepEqual(missingScripts.missing.map((entry) => entry.id), [
     'typecheck',
@@ -18586,44 +18719,6 @@ test('review gate preset resolution uses detected scripts and reports unavailabl
     'format-check',
     'build',
   ]);
-});
-
-test('strict-production review preset adds adversarial, audit, security, and human gates', async () => {
-  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-gates.ts'));
-  const strict = mod.resolveReviewGatePreset({
-    preset: 'strict-production',
-    scripts: {
-      typecheck: 'tsc --noEmit',
-      test: 'node --test',
-      build: 'vite build',
-      'secrets:scan': 'gitleaks detect',
-      audit: 'npm audit --audit-level=high',
-    },
-  });
-
-  assert.ok(strict.planReview.gates.some((gate) => gate.id === 'security-data-review'));
-  assert.ok(strict.gates.some((gate) => gate.id === 'adversarial-review'));
-  assert.ok(strict.gates.some((gate) => gate.id === 'karpathy-audit'));
-  assert.equal(strict.gates.find((gate) => gate.id === 'secret-scan').command, 'npm run secrets:scan');
-  assert.equal(strict.gates.find((gate) => gate.id === 'dependency-audit').command, 'npm run audit');
-  const phaseOrder = new Map([
-    ['static', 0],
-    ['behavioral', 1],
-    ['ai-diff', 2],
-    ['instruction', 3],
-    ['runtime', 4],
-    ['human', 5],
-  ]);
-  let previousPhase = -1;
-  for (const gate of strict.gates) {
-    const currentPhase = phaseOrder.get(gate.phase);
-    assert.notEqual(currentPhase, undefined, `${gate.id} has unknown review-gate phase ${gate.phase}`);
-    assert.ok(currentPhase >= previousPhase, `${gate.id} is out of canonical review-gate phase order`);
-    previousPhase = currentPhase;
-  }
-  assert.ok(strict.gates.some((gate) => gate.id === 'human-merge-approval'));
-  assert.ok(strict.gates.some((gate) => gate.id === 'human-prod-deploy-approval'));
-  assert.ok(strict.gates.some((gate) => gate.id === 'human-rollback-approval'));
 });
 
 test('default review gates are built from the canonical catalog without frontend runtime QA', async () => {

@@ -4,7 +4,6 @@ import path from 'node:path';
 import type {
   ReviewGateConfig,
   ReviewGatePhase,
-  ReviewGatePreset,
   ReviewGateType,
   ReviewGatesConfig,
   ReviewPlanGateConfig,
@@ -17,7 +16,7 @@ export interface ReviewGateCatalogEntry {
   kind: ReviewGateCatalogKind;
   phase: ReviewGatePhase | 'plan';
   type: ReviewGateType;
-  presets: ReviewGatePreset[];
+  recommended?: boolean;
   command?: string;
   scriptNames?: string[];
   skill?: string;
@@ -43,8 +42,7 @@ export interface ResolvedReviewGateCatalogEntry extends ReviewGateCatalogEntry {
   missingReason?: string;
 }
 
-export interface ReviewGatePresetResolution {
-  preset: ReviewGatePreset;
+export interface ReviewGateDefaultResolution {
   planReview: {
     gates: ReviewPlanGateConfig[];
   };
@@ -55,10 +53,6 @@ export interface ReviewGatePresetResolution {
   }>;
   catalog: ResolvedReviewGateCatalogEntry[];
 }
-
-const ALL_PRESETS: ReviewGatePreset[] = ['lean', 'standard', 'strict-production'];
-const STANDARD_AND_STRICT: ReviewGatePreset[] = ['standard', 'strict-production'];
-const STRICT_ONLY: ReviewGatePreset[] = ['strict-production'];
 
 export const REVIEW_GATE_ALIAS_MAP: Record<string, string> = {
   '/karpathy diff': 'karpathy-diff',
@@ -78,10 +72,12 @@ export const REVIEW_GATE_ALIAS_MAP: Record<string, string> = {
   '/gstack-review': 'gstack-review',
   'gstack review': 'gstack-review',
   'gstack-review': 'gstack-review',
-  '/adversarial review': 'adversarial-review',
-  '/adversarial-review': 'adversarial-review',
-  'adversarial review': 'adversarial-review',
-  'adversarial-review': 'adversarial-review',
+  '/claude review': 'adversarial-review',
+  '/claude review code': 'adversarial-review',
+  '/codex challenge': 'adversarial-review',
+  'claude review': 'adversarial-review',
+  'claude review code': 'adversarial-review',
+  'codex challenge': 'adversarial-review',
 };
 
 export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
@@ -91,7 +87,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     phase: 'plan',
     type: 'skill',
     skill: 'plan-eng-review',
-    presets: ALL_PRESETS,
+    recommended: true,
   },
   {
     id: 'plan-design-review',
@@ -100,7 +96,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     type: 'skill',
     skill: 'plan-design-review',
     when: 'surface:frontend',
-    presets: STANDARD_AND_STRICT,
+    recommended: true,
   },
   {
     id: 'security-data-review',
@@ -109,7 +105,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     type: 'skill',
     skill: 'cso',
     when: 'risk:auth|billing|sql|secrets|deploy|infra',
-    presets: STRICT_ONLY,
+    recommended: false,
   },
   {
     id: 'typecheck',
@@ -117,7 +113,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     phase: 'static',
     type: 'command',
     scriptNames: ['typecheck', 'check:types', 'tsc'],
-    presets: ALL_PRESETS,
+    recommended: true,
   },
   {
     id: 'lint',
@@ -125,7 +121,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     phase: 'static',
     type: 'command',
     scriptNames: ['lint', 'eslint'],
-    presets: STANDARD_AND_STRICT,
+    recommended: true,
     optional: true,
   },
   {
@@ -134,7 +130,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     phase: 'static',
     type: 'command',
     scriptNames: ['format:check', 'format:ci', 'check:format', 'prettier:check'],
-    presets: STANDARD_AND_STRICT,
+    recommended: true,
     optional: true,
   },
   {
@@ -143,7 +139,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     phase: 'static',
     type: 'command',
     scriptNames: ['secrets:scan', 'secret:scan', 'scan:secrets', 'gitleaks'],
-    presets: STRICT_ONLY,
+    recommended: false,
     optional: true,
   },
   {
@@ -152,7 +148,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     phase: 'static',
     type: 'command',
     scriptNames: ['audit', 'security:audit', 'audit:deps'],
-    presets: STRICT_ONLY,
+    recommended: false,
     optional: true,
   },
   {
@@ -161,7 +157,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     phase: 'behavioral',
     type: 'command',
     scriptNames: ['test', 'test:unit'],
-    presets: ALL_PRESETS,
+    recommended: true,
   },
   {
     id: 'build',
@@ -169,7 +165,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     phase: 'behavioral',
     type: 'command',
     scriptNames: ['build'],
-    presets: ALL_PRESETS,
+    recommended: true,
   },
   {
     id: 'karpathy-diff',
@@ -178,7 +174,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     type: 'skill',
     skill: 'karpathy-diff',
     userCommands: ['/karpathy diff', '/karpathy-diff', '/karpathy:diff'],
-    presets: ALL_PRESETS,
+    recommended: true,
   },
   {
     id: 'gstack-review',
@@ -187,7 +183,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     type: 'skill',
     skill: 'review',
     userCommands: ['/review', '/gstack review', '/gstack-review'],
-    presets: STANDARD_AND_STRICT,
+    recommended: true,
   },
   {
     id: 'adversarial-review',
@@ -195,8 +191,8 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     phase: 'ai-diff',
     type: 'agent',
     role: 'adversarial-code-reviewer',
-    userCommands: ['/adversarial review', '/adversarial-review'],
-    presets: STRICT_ONLY,
+    userCommands: ['/claude review code', '/codex challenge'],
+    recommended: false,
   },
   {
     id: 'karpathy-audit',
@@ -206,7 +202,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     skill: 'karpathy-audit',
     whenChanged: ['CLAUDE.md', 'AGENTS.md', '.cursor/rules/**', '.codex/skills/**'],
     userCommands: ['/karpathy audit', '/karpathy-audit', '/karpathy:audit'],
-    presets: STANDARD_AND_STRICT,
+    recommended: true,
   },
   {
     id: 'browser-qa',
@@ -215,7 +211,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     type: 'skill',
     skill: 'qa-only',
     when: 'surface:frontend',
-    presets: STANDARD_AND_STRICT,
+    recommended: false,
   },
   {
     id: 'human-merge-approval',
@@ -223,7 +219,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     phase: 'human',
     type: 'approval',
     when: 'before:merge',
-    presets: STRICT_ONLY,
+    recommended: false,
   },
   {
     id: 'human-prod-deploy-approval',
@@ -231,7 +227,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     phase: 'human',
     type: 'approval',
     when: 'before:prod-deploy',
-    presets: STRICT_ONLY,
+    recommended: false,
   },
   {
     id: 'human-rollback-approval',
@@ -239,7 +235,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     phase: 'human',
     type: 'approval',
     when: 'before:rollback',
-    presets: STRICT_ONLY,
+    recommended: false,
   },
 ];
 
@@ -287,17 +283,16 @@ export function resolveReviewGateCatalog(options: {
   ));
 }
 
-export function resolveReviewGatePreset(options: {
-  preset: ReviewGatePreset;
+export function resolveDefaultReviewGates(options: {
   repoRoot?: string;
   scripts?: Record<string, string>;
   includeMissingCoreScripts?: boolean;
-}): ReviewGatePresetResolution {
+} = {}): ReviewGateDefaultResolution {
   const catalog = resolveReviewGateCatalog({
     repoRoot: options.repoRoot,
     scripts: options.scripts,
     includeMissingCoreScripts: options.includeMissingCoreScripts,
-  }).filter((entry) => entry.presets.includes(options.preset));
+  }).filter((entry) => entry.recommended === true);
 
   const planGates = catalog
     .filter((entry) => entry.kind === 'plan' && entry.available)
@@ -313,7 +308,6 @@ export function resolveReviewGatePreset(options: {
     }));
 
   return {
-    preset: options.preset,
     planReview: { gates: planGates },
     gates,
     missing,
@@ -325,15 +319,14 @@ export function buildDefaultReviewGatesConfig(options: {
   repoRoot?: string;
   scripts?: Record<string, string>;
 } = {}): ReviewGatesConfig {
-  return buildReviewGatesConfigForPreset('standard', {
+  return buildReviewGatesConfig({
     repoRoot: options.repoRoot,
     scripts: options.scripts,
     includeRuntimeGates: false,
   });
 }
 
-export function buildReviewGatesConfigForPreset(
-  preset: ReviewGatePreset,
+export function buildReviewGatesConfig(
   options: {
     includeRuntimeGates?: boolean;
     repoRoot?: string;
@@ -341,14 +334,12 @@ export function buildReviewGatesConfigForPreset(
     includeMissingCoreScripts?: boolean;
   } = {},
 ): ReviewGatesConfig {
-  const resolution = resolveReviewGatePreset({
-    preset,
+  const resolution = resolveDefaultReviewGates({
     repoRoot: options.repoRoot,
     scripts: options.scripts,
     includeMissingCoreScripts: options.includeMissingCoreScripts === true,
   });
   return {
-    preset,
     planReview: resolution.planReview,
     gates: options.includeRuntimeGates === false
       ? resolution.gates.filter((gate) => gate.id !== 'browser-qa')

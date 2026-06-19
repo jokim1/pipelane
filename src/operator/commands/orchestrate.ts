@@ -1231,7 +1231,6 @@ function reviewCompletedSlices(
     const reviewRun = buildReviewRunRecord({
       repoRoot: slice.worktreePath ?? context.repoRoot,
       baseBranch: context.config.baseBranch,
-      preset: run.gateSnapshot.preset ?? context.config.reviewGates?.preset ?? 'standard',
       gates: run.gateSnapshot.gates,
       dryRun: options.dryRun,
       gateFilter: options.gateFilter,

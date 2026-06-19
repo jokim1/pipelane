@@ -107,8 +107,7 @@ responsibility boundaries. They are not the normal user journey.
 ## Interactive Review Setup
 
 The default setup command should not ask users to choose a named review
-profile. Profiles are internal presets and automation shortcuts, not the
-primary UX.
+profile. The primary UX is a short gate checklist.
 
 ```text
 User:
@@ -142,7 +141,7 @@ Behavioral gates:
 AI review gates:
 8.  [on]  Karpathy diff review        /karpathy-diff        installed
 9.  [on]  gstack /review              /review               installed
-10. [off] Adversarial review          Codex reviewer        not installed
+10. [off] Adversarial review          /claude review code (Codex /claude review bridge) not installed
 
 Conditional gates:
 11. [on]  Browser QA                  when frontend files change
@@ -176,14 +175,19 @@ User:
 Pipelane:
 Adversarial review is not installed.
 
-Install the Codex adversarial reviewer now?
+Install the Codex /claude review bridge now?
+
+Target: https://github.com/jokim1/codexskill-claude-review.git -> ~/.codex/skills/claude
 
 1. Install and enable
 2. Leave disabled
 ```
 
-Install is never implicit. The install subflow should show the tool/skill to be
+Install is never implicit. The install subflow shows the tool/skill to be
 installed, the source, whether auth is required, and the resulting gate command.
+Adversarial review can be satisfied by Codex `/claude review code`,
+or Claude-side gstack `/codex challenge`. Missing Karpathy review skills can be
+installed from `https://github.com/jokim1/karpathy-skills.git` after approval.
 If install fails or auth is missing, the gate remains disabled.
 
 After save:
@@ -196,6 +200,7 @@ Enabled:
 - static: typecheck, format-check
 - behavioral: test, build
 - ai-diff: karpathy-diff, gstack /review, adversarial review
+  (/claude review code or /codex challenge)
 - runtime: browser QA for frontend changes
 - instruction: audit when agent instruction files change
 - human: merge approval, production deploy approval
@@ -204,12 +209,10 @@ Next:
 Run /pipelane orchestrate
 ```
 
-The saved config should stay compact when the user accepts the recommended
-gates unchanged. In that case, persist the preset/recommendation seed, the
-recommendation algorithm version, and any repo-specific detection metadata
-needed for reproducibility. Only materialize explicit gate arrays when the user
-toggles gates, installs an optional AI gate, or uses advanced custom gates. This
-avoids freezing today's defaults into every repo while still making user edits
+The saved config should persist the selected gate arrays. This keeps the result
+visible and avoids making users remember named bundles. Only materialize
+advanced custom command gates when the user uses advanced setup. This
+keeps the default checklist small while still making user edits
 durable.
 
 Every orchestration run must still snapshot the resolved gate list into the
@@ -309,7 +312,7 @@ Human decisions needed before start:
 
 Provider plan:
 - implementation: Codex, because this orchestration was started from Codex
-- AI review: Claude/Opus when available, otherwise fresh Codex reviewer
+- AI review: `/claude review code` or `/codex challenge` when available
 - note: Pipelane selected this plan automatically to prefer independent review
 
 Actions:
@@ -577,8 +580,8 @@ Implementation:
 - Codex workers
 
 Review:
-- Claude/Opus for AI review gates when available
-- fresh Codex reviewer sessions otherwise
+- `/claude review code` for Codex-side Claude review when available
+- `/codex challenge` for Claude-side gstack Codex review when available
 
 Reason:
 Started from Codex, with independent cross-provider review preferred.
@@ -598,7 +601,7 @@ parallel systems:
 
 | Existing code/flow | What it already solves | Plan use |
 | --- | --- | --- |
-| `src/operator/commands/review.ts` | Review gate catalog, package-script detection, preset config compaction, review evidence writing | Extend for the interactive setup wizard and AI gate install-state labels |
+| `src/operator/commands/review.ts` | Review gate catalog, package-script detection, selected gate persistence, review evidence writing | Extend for the interactive setup wizard and AI gate install-state labels |
 | `src/operator/commands/orchestrate.ts` | Goal spec, plan, prepare, dispatch, start, and review primitives | Wrap with bare `/pipelane orchestrate`; keep primitives as advanced commands |
 | `src/operator/orchestration-ledger.ts` | Durable run, slice, worktree, worker, gate snapshot, and review records | Add human decision records and reviewer identity fields |
 | `src/operator/api/snapshot.ts` | Single API snapshot consumed by `/pipelane status` | Add orchestration summary and human inbox fields here |
@@ -654,13 +657,13 @@ Review setup should expose independence:
 AI review gates:
 8.  [on]  Karpathy diff review        /karpathy-diff        installed, independent session
 9.  [on]  gstack /review              /review               installed, independent session
-10. [on]  Adversarial review          Claude Opus           installed, cross-model
+10. [on]  Adversarial review          /claude review code   installed, cross-model
 ```
 
 If no independent reviewer is available:
 
 ```text
-10. [off] Adversarial review          no independent reviewer installed
+10. [off] Adversarial review          /claude review code   not installed
 ```
 
 ## State Machine
@@ -795,18 +798,17 @@ Each slice should land with focused tests before the next slice starts.
 
 - Convert bare `/pipelane review setup` from report-only to an interactive
   wizard when stdout is a TTY.
-- Keep existing flags for automation: `--preset`, `--print`, `--list-gates`,
+- Keep existing flags for automation: `--yes`, `--print`, `--list-gates`,
   and future advanced/custom-gate flags.
 - Detect package scripts and known skills/tools before rendering the gate list.
 - Add install-state detection for AI gates.
 - Add install approval flow for known missing AI gates.
-- Save compact recommendation config when unchanged.
-- Save explicit selected gate config only when the user customizes gates.
+- Save explicit selected gate config.
 - In non-TTY mode, do not hang and do not silently accept defaults. Either
-  require explicit flags such as `--preset`, `--yes`, or `--print`, or print
+  require explicit flags such as `--yes` or `--print`, or print
   the available choices and exit non-zero.
 - Automation examples:
-  - `/pipelane review setup --preset strict-production --yes`
+  - `/pipelane review setup --yes`
   - `/pipelane review setup --print --json`
   - `/pipelane review setup --list-gates --json`
 
@@ -952,8 +954,7 @@ Conflict flags:
 - Bare `/pipelane review setup` renders the interactive gate list.
 - Bare `/pipelane review setup` exits non-zero in non-TTY mode unless explicit
   automation flags are provided.
-- Accepting unchanged recommendations writes compact config, not a fully
-  materialized gate array.
+- Accepting unchanged recommendations writes the explicit selected gate list.
 - Customizing any gate writes explicit selected gate config.
 - Saving writes selected gates and preserves existing compatible config.
 - Toggling an installed AI gate updates selection without install prompt.
@@ -961,8 +962,7 @@ Conflict flags:
 - Declining install leaves the gate disabled.
 - Missing package-script gates show `no script found`.
 - Custom command gates do not appear in the primary wizard.
-- Existing `--preset`, `--print`, and `--list-gates` behavior remains
-  scriptable.
+- Existing `--yes`, `--print`, and `--list-gates` behavior remains scriptable.
 
 ### Orchestration
 

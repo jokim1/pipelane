@@ -171,7 +171,7 @@ Pipelane commands:
   smoke
   review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human]
   review pass --gate <id> --message <text>
-  review setup [--yes] [--preset lean|standard|strict-production] [--print] [--list-gates]
+  review setup [--yes] [--print] [--list-gates]
   orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]
   orchestrate goal-spec [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]
   orchestrate plan [--slice-id <id>] (--plan-file <path> | --outcome <text>) [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]

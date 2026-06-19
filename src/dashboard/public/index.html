@@ -2417,13 +2417,13 @@
       const reviewRows = [
         { command: 'Static gates', description: 'Run lint, typecheck, format checks, secret scans, and dependency audits before AI review.' },
         { command: 'Behavioral gates', description: 'Run tests, integration checks, and build before spending reviewer attention.' },
-        { command: 'AI diff gates', description: 'Use /karpathy diff, gstack review, and adversarial review for logic, traceability, and risk.' },
+        { command: 'AI diff gates', description: 'Use /karpathy diff, gstack review, and adversarial passes via /claude review code or /codex challenge.' },
         { command: 'Instruction gates', description: 'Use /karpathy audit only when agent instruction or memory files change.' },
         { command: 'Runtime gates', description: 'Use browser QA, deploy health checks, and staging evidence where the surface needs live proof.' },
         { command: 'Human gates', description: 'Keep merge, production deploy, rollback, schema, auth, billing, and secrets explicitly approved.' },
       ];
       const orchestrationRows = [
-        { command: '/pipelane review setup', description: 'Configure review gate presets, print the effective stack, and list available gates.' },
+        { command: '/pipelane review setup', description: 'Select review gates, print the effective stack, and list available gates.' },
         { command: '/pipelane review', description: 'Run configured review gates, write evidence, and surface pending AI/manual gates.' },
         { command: '/pipelane review pass', description: 'Record a clean manual skill, agent, or approval gate after running it outside Pipelane.' },
         { command: '/pipelane orchestrate plan', description: 'Compile an implementation plan into a durable slice ledger without running workers.' },

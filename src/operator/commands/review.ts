@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { accessSync, chmodSync, constants, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline/promises';
@@ -8,13 +8,11 @@ import readline from 'node:readline/promises';
 import {
   detectPackageScripts,
   resolveReviewGateCatalog,
-  buildReviewGatesConfigForPreset,
   type ResolvedReviewGateCatalogEntry,
 } from '../review-gates.ts';
 import { readWorktreeStatusSnapshot } from '../worktree-status.ts';
 import {
   appendReviewRunRecord,
-  defaultReviewGatesConfig,
   loadReviewState,
   nowIso,
   patchReadableWorkflowConfig,
@@ -28,8 +26,6 @@ import {
   type ReviewGateConfig,
   type ReviewGatePhase,
   type ReviewGateRunRecord,
-  type ReviewGatePreset,
-  type ReviewGatesConfig,
   type ReviewRunRecord,
   type WorkflowConfig,
   type ReviewPlanGateConfig,
@@ -44,9 +40,32 @@ const REVIEW_CONFIG_CHANGE_PATHS = ['.pipelane.json', '.project-workflow.json', 
 const REVIEW_PHASE_ORDER = REVIEW_GATE_PHASES;
 const DEFAULT_GATE_TIMEOUT_MS = 10 * 60 * 1000;
 const OUTPUT_TAIL_CHARS = 4000;
-const REVIEW_SETUP_RECOMMENDED_PRESET: ReviewGatePreset = 'strict-production';
+const CODEX_CLAUDE_REVIEW_REPO = 'https://github.com/jokim1/codexskill-claude-review.git';
+const CODEX_CLAUDE_REVIEW_SKILL_NAME = 'claude';
+const KARPATHY_SKILLS_REPO = 'https://github.com/jokim1/karpathy-skills.git';
 
 type GateInstallState = 'installed' | 'not installed' | 'unavailable' | 'not applicable';
+
+interface ReviewGateInstallResult {
+  ok: boolean;
+  message: string;
+}
+
+interface ReviewGateInstallOption {
+  id: string;
+  label: string;
+  target: string;
+  install(): ReviewGateInstallResult;
+}
+
+interface AdversarialReviewProvider {
+  id: string;
+  label: string;
+  command: string;
+  installed: boolean;
+  installable: boolean;
+  target?: string;
+}
 
 interface ReviewSetupGateOption {
   number: number;
@@ -55,6 +74,7 @@ interface ReviewSetupGateOption {
   selected: boolean;
   recommended: boolean;
   installState: GateInstallState;
+  adversarialProvider?: AdversarialReviewProvider;
 }
 
 interface ReviewSetupReport {
@@ -63,7 +83,6 @@ interface ReviewSetupReport {
   repoRoot: string;
   configPath: string | null;
   configPathIsLegacy: boolean;
-  preset: ReviewGatePreset;
   packageJson: {
     path: string;
     found: boolean;
@@ -86,7 +105,6 @@ interface ReviewSetupReport {
     kind: string;
     phase: string;
     type: string;
-    presets: ReviewGatePreset[];
     available: boolean;
     command?: string;
     skill?: string;
@@ -113,7 +131,6 @@ interface ReviewAttestReport {
 export interface BuildReviewRunRecordOptions {
   repoRoot: string;
   baseBranch: string;
-  preset: ReviewGatePreset;
   gates: ReviewGateConfig[];
   dryRun: boolean;
   gateFilter?: string;
@@ -137,42 +154,29 @@ export async function handleReview(cwd: string, parsed: ParsedOperatorArgs): Pro
 
 async function handleReviewSetup(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   let context = resolveWorkflowContext(cwd);
-  const presetFlag = parsed.flags.reviewPreset.trim();
   let writeResult: { configPath: string; isLegacy: boolean } | null = null;
 
-  if (presetFlag) {
-    const preset = presetFlag as ReviewGatePreset;
-    writeResult = patchReadableWorkflowConfig(context.repoRoot, (raw) => ({
-      ...raw,
-      reviewGates: buildReviewGatesPresetPatch(raw, preset, context.repoRoot),
-    }));
-    context = resolveWorkflowContext(cwd);
-  }
-
-  if (!presetFlag && parsed.flags.yes) {
+  if (parsed.flags.yes) {
     const prepared = prepareInteractiveReviewSetup(context.repoRoot);
     writeResult = saveInteractiveReviewSetup(context.repoRoot, prepared.gates);
     context = resolveWorkflowContext(cwd);
   }
 
   if (
-    !presetFlag
-    && !parsed.flags.yes
+    !parsed.flags.yes
     && !parsed.flags.reviewPrint
     && !parsed.flags.reviewListGates
     && !parsed.flags.json
   ) {
     if (!canRunInteractiveReviewSetup()) {
-      throw new Error('review setup requires a TTY for interactive setup. Use --yes to save recommended gates, --preset for automation, --print, --list-gates, or --json for non-interactive output.');
+      throw new Error('review setup requires a TTY for interactive setup. Use --yes to save recommended gates, --print, --list-gates, or --json for non-interactive output.');
     }
     await runInteractiveReviewSetup(cwd, parsed);
     return;
   }
 
-  const preset = context.config.reviewGates?.preset ?? 'standard';
   const detection = detectPackageScripts(context.repoRoot);
-  const resolvedCatalog = resolveReviewGateCatalog({ repoRoot: context.repoRoot })
-    .filter((entry) => entry.presets.includes(preset));
+  const resolvedCatalog = resolveReviewGateCatalog({ repoRoot: context.repoRoot });
   const effectivePlanGates = context.config.reviewGates?.planReview?.gates ?? [];
   const effectiveGates = context.config.reviewGates?.gates ?? [];
   const configPath = writeResult?.configPath ?? resolveReadableConfigPath(context.repoRoot);
@@ -182,7 +186,6 @@ async function handleReviewSetup(cwd: string, parsed: ParsedOperatorArgs): Promi
     repoRoot: context.repoRoot,
     configPath,
     configPathIsLegacy: writeResult?.isLegacy ?? (configPath ? path.basename(configPath) !== '.pipelane.json' : false),
-    preset,
     packageJson: {
       path: detection.packageJsonPath,
       found: detection.found,
@@ -206,7 +209,6 @@ async function handleReviewSetup(cwd: string, parsed: ParsedOperatorArgs): Promi
           kind: entry.kind,
           phase: entry.phase,
           type: entry.type,
-          presets: entry.presets,
           available: entry.available,
           command: entry.command,
           skill: entry.skill,
@@ -365,7 +367,6 @@ async function runInteractiveReviewSetup(cwd: string, parsed: ParsedOperatorArgs
           repoRoot: context.repoRoot,
           configPath: resolveReadableConfigPath(context.repoRoot),
           configPathIsLegacy: false,
-          preset: context.config.reviewGates?.preset ?? 'standard',
           packageJson: {
             path: prepared.packageJson.path,
             found: prepared.packageJson.found,
@@ -393,7 +394,7 @@ async function runInteractiveReviewSetup(cwd: string, parsed: ParsedOperatorArgs
         continue;
       }
 
-      await toggleInteractiveGate(gate, prompter);
+      await toggleInteractiveGate(gate, prompter, context.repoRoot);
       process.stdout.write(`\n${renderInteractiveReviewSetup(prepared)}\n`);
     }
   } finally {
@@ -463,7 +464,7 @@ function orderInteractiveReviewCatalog(entries: ResolvedReviewGateCatalogEntry[]
 }
 
 function isRecommendedInteractiveGate(entry: ResolvedReviewGateCatalogEntry, installState: GateInstallState): boolean {
-  if (!entry.presets.includes(REVIEW_SETUP_RECOMMENDED_PRESET)) return false;
+  if (entry.recommended !== true) return false;
   if (!entry.available) return false;
   if (entry.type === 'skill' || entry.type === 'agent') return installState === 'installed';
   return true;
@@ -471,6 +472,13 @@ function isRecommendedInteractiveGate(entry: ResolvedReviewGateCatalogEntry, ins
 
 function detectGateInstallState(repoRoot: string, entry: ResolvedReviewGateCatalogEntry): GateInstallState {
   if (entry.type !== 'skill' && entry.type !== 'agent') return 'not applicable';
+  if (entry.id === 'adversarial-review') {
+    return isAdversarialReviewInstalled(repoRoot)
+      ? 'installed'
+      : reviewGateInstallOptions(entry).length > 0
+        ? 'not installed'
+        : 'unavailable';
+  }
   const names = knownInstallNamesForGate(entry);
   if (names.length === 0) return 'unavailable';
   if (names.some((name) => isSkillInstalled(repoRoot, name))) return 'installed';
@@ -479,27 +487,171 @@ function detectGateInstallState(repoRoot: string, entry: ResolvedReviewGateCatal
 
 function knownInstallNamesForGate(entry: ResolvedReviewGateCatalogEntry): string[] {
   if (entry.type === 'skill' && entry.skill) return [...new Set([entry.skill, entry.id])];
-  if (entry.id === 'adversarial-review') return ['adversarial-review', 'adversarial-code-reviewer'];
   return entry.role ? [entry.role, entry.id] : [entry.id];
 }
 
 function isSkillInstalled(repoRoot: string, name: string): boolean {
-  const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
-  const claudeHome = process.env.CLAUDE_HOME || path.join(os.homedir(), '.claude');
-  const candidates = [
-    path.join(repoRoot, '.agents', 'skills', name, 'SKILL.md'),
-    path.join(codexHome, 'skills', name, 'SKILL.md'),
-    path.join(claudeHome, 'skills', name, 'SKILL.md'),
-    path.join(os.homedir(), '.gstack', 'repos', 'gstack', '.agents', 'skills', `gstack-${name}`, 'SKILL.md'),
-  ];
+  const codexHome = codexHomePath();
+  const claudeHome = claudeHomePath();
+  const names = skillInstallNameVariants(name);
+  const candidates = names.flatMap((candidateName) => [
+    path.join(repoRoot, '.agents', 'skills', candidateName, 'SKILL.md'),
+    path.join(codexHome, 'skills', candidateName, 'SKILL.md'),
+    path.join(claudeHome, 'skills', candidateName, 'SKILL.md'),
+    path.join(claudeHome, 'skills', 'gstack', candidateName.replace(/^gstack-/, ''), 'SKILL.md'),
+    path.join(os.homedir(), '.gstack', 'repos', 'gstack', '.agents', 'skills', candidateName, 'SKILL.md'),
+  ]);
+  if (isClaudeKarpathyPluginCommandInstalled(claudeHome, name)) {
+    return true;
+  }
   return candidates.some((candidate) => existsSync(candidate));
+}
+
+function skillInstallNameVariants(name: string): string[] {
+  const trimmed = name.trim();
+  if (!trimmed) return [];
+  const variants = new Set([trimmed]);
+  if (!trimmed.startsWith('gstack-')) {
+    variants.add(`gstack-${trimmed}`);
+  }
+  return [...variants];
+}
+
+function isClaudeKarpathyPluginCommandInstalled(claudeHome: string, name: string): boolean {
+  const command = name === 'karpathy-diff'
+    ? 'diff.md'
+    : name === 'karpathy-audit'
+      ? 'audit.md'
+      : '';
+  if (!command) return false;
+
+  const versionRoot = path.join(claudeHome, 'plugins', 'cache', 'karpathy-skills', 'karpathy');
+  if (!existsSync(versionRoot)) return false;
+  try {
+    return readdirSync(versionRoot, { withFileTypes: true }).some((entry) =>
+      entry.isDirectory()
+      && existsSync(path.join(versionRoot, entry.name, 'commands', command))
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isAdversarialReviewInstalled(repoRoot: string): boolean {
+  return adversarialReviewProviders(repoRoot).some((provider) => provider.installed);
+}
+
+function preferredAdversarialReviewProvider(repoRoot: string): AdversarialReviewProvider | undefined {
+  const providers = adversarialReviewProviders(repoRoot);
+  return providers.find((provider) => provider.installed)
+    ?? providers.find((provider) => provider.installable)
+    ?? providers[0];
+}
+
+function adversarialReviewProviders(repoRoot: string): AdversarialReviewProvider[] {
+  const codexHome = codexHomePath();
+  const claudeHome = claudeHomePath();
+  const codexClaudeTarget = path.join(codexHome, 'skills', CODEX_CLAUDE_REVIEW_SKILL_NAME);
+  return [
+    {
+      id: 'codex-claude-review',
+      label: 'Codex /claude review bridge',
+      command: '/claude review code',
+      installed: isCodexClaudeReviewBridgeInstalled(codexHome),
+      installable: true,
+      target: `${CODEX_CLAUDE_REVIEW_REPO} -> ${codexClaudeTarget}`,
+    },
+    {
+      id: 'claude-side-gstack-codex-challenge',
+      label: 'Claude-side gstack /codex challenge',
+      command: '/codex challenge',
+      installed: isClaudeGstackCodexChallengeInstalled(claudeHome),
+      installable: false,
+    },
+  ];
+}
+
+function codexHomePath(): string {
+  return process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+}
+
+function claudeHomePath(): string {
+  return process.env.CLAUDE_HOME || path.join(os.homedir(), '.claude');
+}
+
+function isCodexClaudeReviewBridgeInstalled(codexHome: string): boolean {
+  return isCodexClaudeReviewSkillRoot(path.join(codexHome, 'skills', CODEX_CLAUDE_REVIEW_SKILL_NAME));
+}
+
+function isCodexClaudeReviewSkillRoot(skillRoot: string): boolean {
+  const requiredFiles = [
+    'SKILL.md',
+    path.join('scripts', 'run-review.sh'),
+    path.join('scripts', 'build-review-artifact.sh'),
+  ];
+  if (!requiredFiles.every((relativePath) => existsSync(path.join(skillRoot, relativePath)))) {
+    return false;
+  }
+  return isExecutableFile(path.join(skillRoot, 'scripts', 'run-review.sh'))
+    && isExecutableFile(path.join(skillRoot, 'scripts', 'build-review-artifact.sh'));
+}
+
+function isClaudeGstackCodexChallengeInstalled(claudeHome: string): boolean {
+  if (!isExecutableOnPath('codex')) return false;
+  const candidates = [
+    path.join(claudeHome, 'skills', 'gstack', 'codex', 'SKILL.md'),
+    path.join(claudeHome, 'skills', 'gstack', 'ship', 'sections', 'adversarial.md'),
+    ...globalGstackCodexReviewCandidates(),
+  ];
+  return candidates.some((candidate) => fileContainsAll(candidate, ['codex', 'adversarial']));
+}
+
+function globalGstackCodexReviewCandidates(): string[] {
+  if (process.env.NODE_ENV === 'test' && process.env.PIPELANE_REVIEW_SETUP_USE_REAL_HOME !== '1') {
+    return [];
+  }
+  return [
+    path.join(os.homedir(), '.gstack', 'repos', 'gstack', '.agents', 'skills', 'gstack-codex', 'SKILL.md'),
+    path.join(os.homedir(), '.gstack', 'repos', 'gstack', '.agents', 'skills', 'gstack-ship', 'SKILL.md'),
+  ];
+}
+
+function fileContainsAll(filePath: string, needles: string[]): boolean {
+  if (!existsSync(filePath)) return false;
+  try {
+    const content = readFileSync(filePath, 'utf8').toLowerCase();
+    return needles.every((needle) => content.includes(needle.toLowerCase()));
+  } catch {
+    return false;
+  }
+}
+
+function isExecutableOnPath(command: string): boolean {
+  const pathValue = process.env.PATH || '';
+  return pathValue.split(path.delimiter).some((dir) => {
+    if (!dir) return false;
+    return isExecutableFile(path.join(dir, command));
+  });
+}
+
+function isExecutableFile(filePath: string): boolean {
+  try {
+    const stats = statSync(filePath);
+    if (!stats.isFile()) return false;
+    accessSync(filePath, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function toggleInteractiveGate(
   gate: ReviewSetupGateOption,
   prompter: { question(prompt: string): Promise<string> },
+  repoRoot: string,
 ): Promise<void> {
   if (gate.selected) {
+    gate.adversarialProvider = undefined;
     gate.selected = false;
     return;
   }
@@ -519,46 +671,315 @@ async function toggleInteractiveGate(
   }
 
   if ((gate.entry.type === 'skill' || gate.entry.type === 'agent') && gate.installState !== 'installed') {
-    process.stdout.write([
-      `${gate.label} is ${gate.installState}.`,
-      '',
-      `Install ${reviewSetupInstallTarget(gate.entry)} now?`,
-      '',
-      '1. Install and enable',
-      '2. Leave disabled',
-    ].join('\n') + '\n');
-    const installAnswer = (await prompter.question('> ')).trim();
-    if (installAnswer !== '1') {
+    const installers = reviewGateInstallOptions(gate.entry);
+    if (installers.length === 0) {
+      process.stdout.write([
+        `${gate.label} is unavailable.`,
+        `Install ${reviewSetupInstallTarget(gate.entry)} outside Pipelane, then rerun review setup.`,
+      ].join('\n') + '\n');
       gate.selected = false;
       return;
     }
-    if (installMissingReviewGate(gate)) {
+
+    const selectedInstaller = installers.length === 1
+      ? await chooseSingleReviewGateInstaller(gate, installers[0], prompter)
+      : await chooseReviewGateInstaller(gate, installers, prompter);
+    if (!selectedInstaller) {
+      gate.selected = false;
+      return;
+    }
+
+    const result = selectedInstaller.install();
+    if (result.ok) {
       gate.installState = 'installed';
+      if (gate.entry.id === 'adversarial-review') {
+        gate.adversarialProvider = preferredAdversarialReviewProvider(repoRoot);
+      }
       gate.selected = true;
+      process.stdout.write(`${result.message}\n`);
       return;
     }
     gate.selected = false;
-    process.stdout.write('No installer is configured for this gate yet. It remains disabled.\n');
+    gate.adversarialProvider = undefined;
+    process.stdout.write(`${result.message}\n${gate.label} remains disabled.\n`);
     return;
   }
 
+  if (gate.entry.id === 'adversarial-review') {
+    gate.adversarialProvider = preferredAdversarialReviewProvider(repoRoot);
+  }
   gate.selected = true;
 }
 
-function hasReviewGateInstaller(entry: ResolvedReviewGateCatalogEntry): boolean {
-  if (process.env.NODE_ENV === 'test') {
-    const allowed = configuredTestReviewGateInstallers();
-    return allowed.includes(entry.id);
-  }
-  return false;
+async function chooseSingleReviewGateInstaller(
+  gate: ReviewSetupGateOption,
+  installer: ReviewGateInstallOption,
+  prompter: { question(prompt: string): Promise<string> },
+): Promise<ReviewGateInstallOption | null> {
+  process.stdout.write([
+    `${gate.label} is ${gate.installState}.`,
+    '',
+    `Install ${installer.label} now?`,
+    `Target: ${installer.target}`,
+    '',
+    '1. Install and enable',
+    '2. Leave disabled',
+  ].join('\n') + '\n');
+  const installAnswer = (await prompter.question('> ')).trim();
+  return installAnswer === '1' ? installer : null;
 }
 
-function installMissingReviewGate(gate: ReviewSetupGateOption): boolean {
+async function chooseReviewGateInstaller(
+  gate: ReviewSetupGateOption,
+  installers: ReviewGateInstallOption[],
+  prompter: { question(prompt: string): Promise<string> },
+): Promise<ReviewGateInstallOption | null> {
+  process.stdout.write(`${gate.label} is ${gate.installState}.\n\nChoose an installer:\n`);
+  installers.forEach((installer, index) => {
+    process.stdout.write(`${index + 1}. ${installer.label} (${installer.target})\n`);
+  });
+  process.stdout.write(`${installers.length + 1}. Leave disabled\n`);
+  const installAnswer = Number.parseInt((await prompter.question('> ')).trim(), 10);
+  if (!Number.isSafeInteger(installAnswer) || installAnswer < 1 || installAnswer > installers.length) {
+    return null;
+  }
+  return installers[installAnswer - 1];
+}
+
+function hasReviewGateInstaller(entry: ResolvedReviewGateCatalogEntry): boolean {
+  return reviewGateInstallOptions(entry).length > 0;
+}
+
+function reviewGateInstallOptions(entry: ResolvedReviewGateCatalogEntry): ReviewGateInstallOption[] {
+  const testInstaller = testReviewGateInstallOption(entry);
+  if (testInstaller) return [testInstaller];
+
+  if (entry.id === 'adversarial-review') {
+    const codexHome = codexHomePath();
+    return [
+      {
+        id: 'codex-claude-review',
+        label: 'Codex /claude review bridge',
+        target: `${CODEX_CLAUDE_REVIEW_REPO} -> ${path.join(codexHome, 'skills', CODEX_CLAUDE_REVIEW_SKILL_NAME)}`,
+        install: () => installCodexClaudeReviewBridge(codexHome),
+      },
+    ];
+  }
+
+  if (isKarpathyReviewGate(entry)) {
+    const codexHome = codexHomePath();
+    const skillId = entry.skill ?? entry.id;
+    return [
+      {
+        id: `karpathy-${skillId}`,
+        label: `${skillId} skill`,
+        target: `${KARPATHY_SKILLS_REPO} skills/${skillId} -> ${path.join(codexHome, 'skills', skillId)}`,
+        install: () => installKarpathySkill(codexHome, skillId),
+      },
+    ];
+  }
+
+  return [];
+}
+
+function isKarpathyReviewGate(entry: ResolvedReviewGateCatalogEntry): boolean {
+  return entry.id === 'karpathy-diff' || entry.id === 'karpathy-audit';
+}
+
+function testReviewGateInstallOption(entry: ResolvedReviewGateCatalogEntry): ReviewGateInstallOption | null {
   if (process.env.NODE_ENV === 'test') {
     const allowed = configuredTestReviewGateInstallers();
-    return allowed.includes(gate.entry.id);
+    if (allowed.includes(entry.id) || entry.id === 'adversarial-review') {
+      return {
+        id: `test-${entry.id}`,
+        label: reviewSetupInstallTarget(entry),
+        target: reviewSetupInstallTarget(entry),
+        install: () => allowed.includes(entry.id)
+          ? { ok: true, message: `Installed ${entry.id}.` }
+          : { ok: false, message: `No test installer succeeded for ${entry.id}.` },
+      };
+    }
   }
-  return false;
+  return null;
+}
+
+function installCodexClaudeReviewBridge(codexHome: string): ReviewGateInstallResult {
+  const skillRoot = path.join(codexHome, 'skills', CODEX_CLAUDE_REVIEW_SKILL_NAME);
+  if (isCodexClaudeReviewSkillRoot(skillRoot)) {
+    return { ok: true, message: 'Codex /claude review bridge is already installed.' };
+  }
+
+  if (existsSync(skillRoot)) {
+    ensureSkillScriptsExecutable(skillRoot);
+    if (isCodexClaudeReviewSkillRoot(skillRoot)) {
+      return { ok: true, message: 'Codex /claude review bridge scripts were repaired.' };
+    }
+    return {
+      ok: false,
+      message: `${skillRoot} exists but is not a working /claude review skill. Move it aside or repair SKILL.md and scripts/*.sh, then rerun review setup.`,
+    };
+  }
+
+  mkdirSync(path.dirname(skillRoot), { recursive: true });
+  const localSource = findLocalCodexClaudeReviewSource();
+  if (localSource) {
+    try {
+      symlinkSync(localSource, skillRoot, 'dir');
+      ensureSkillScriptsExecutable(skillRoot);
+    } catch (error) {
+      return {
+        ok: false,
+        message: `Could not link ${localSource} to ${skillRoot}: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+    return isCodexClaudeReviewSkillRoot(skillRoot)
+      ? { ok: true, message: `Installed Codex /claude review bridge from ${localSource}. Restart Codex if /claude is not visible yet.` }
+      : { ok: false, message: `Linked ${localSource}, but ${skillRoot} is still missing executable review scripts.` };
+  }
+
+  const clone = spawnSync('git', ['clone', CODEX_CLAUDE_REVIEW_REPO, skillRoot], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (clone.status !== 0) {
+    return {
+      ok: false,
+      message: `Could not clone ${CODEX_CLAUDE_REVIEW_REPO}: ${tail(redactReviewOutput(`${clone.stderr ?? ''}\n${clone.stdout ?? ''}`)) || `git exited ${clone.status}`}`,
+    };
+  }
+
+  ensureSkillScriptsExecutable(skillRoot);
+  return isCodexClaudeReviewSkillRoot(skillRoot)
+    ? { ok: true, message: `Installed Codex /claude review bridge at ${skillRoot}. Restart Codex if /claude is not visible yet.` }
+    : { ok: false, message: `Cloned ${CODEX_CLAUDE_REVIEW_REPO}, but ${skillRoot} is missing executable review scripts.` };
+}
+
+function installKarpathySkill(codexHome: string, skillId: string): ReviewGateInstallResult {
+  const skillRoot = path.join(codexHome, 'skills', skillId);
+  if (isNamedSkillRoot(skillRoot, skillId)) {
+    return { ok: true, message: `${skillId} is already installed.` };
+  }
+
+  if (existsSync(skillRoot)) {
+    return {
+      ok: false,
+      message: `${skillRoot} exists but is not a working ${skillId} skill. Move it aside or repair SKILL.md, then rerun review setup.`,
+    };
+  }
+
+  mkdirSync(path.dirname(skillRoot), { recursive: true });
+  const localSource = findLocalKarpathySkillSource(skillId);
+  if (localSource) {
+    return copyKarpathySkill(localSource, skillRoot, skillId, `Installed ${skillId} from ${localSource}. Restart Codex if /karpathy is not visible yet.`);
+  }
+
+  const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-karpathy-skills-'));
+  try {
+    const repoRoot = path.join(tmpRoot, 'repo');
+    const clone = spawnSync('git', ['clone', '--depth', '1', KARPATHY_SKILLS_REPO, repoRoot], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (clone.status !== 0) {
+      return {
+        ok: false,
+        message: `Could not clone ${KARPATHY_SKILLS_REPO}: ${tail(redactReviewOutput(`${clone.stderr ?? ''}\n${clone.stdout ?? ''}`)) || `git exited ${clone.status}`}`,
+      };
+    }
+    return copyKarpathySkill(
+      path.join(repoRoot, 'skills', skillId),
+      skillRoot,
+      skillId,
+      `Installed ${skillId} from ${KARPATHY_SKILLS_REPO}. Restart Codex if /karpathy is not visible yet.`,
+    );
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+}
+
+function copyKarpathySkill(sourceRoot: string, skillRoot: string, skillId: string, successMessage: string): ReviewGateInstallResult {
+  if (!isNamedSkillRoot(sourceRoot, skillId)) {
+    return { ok: false, message: `${sourceRoot} is not a working ${skillId} skill source.` };
+  }
+  try {
+    cpSync(sourceRoot, skillRoot, { recursive: true });
+  } catch (error) {
+    rmSync(skillRoot, { recursive: true, force: true });
+    return {
+      ok: false,
+      message: `Could not install ${skillId} to ${skillRoot}: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  if (!isNamedSkillRoot(skillRoot, skillId)) {
+    rmSync(skillRoot, { recursive: true, force: true });
+    return { ok: false, message: `Installed ${skillId}, but ${skillRoot} is missing a valid SKILL.md.` };
+  }
+  return { ok: true, message: successMessage };
+}
+
+function findLocalKarpathySkillSource(skillId: string): string | null {
+  const explicitSource = process.env.PIPELANE_KARPATHY_SKILLS_SOURCE;
+  const candidates = [
+    ...karpathySkillSourceCandidates(explicitSource, skillId),
+    path.join(os.homedir(), 'dev', 'karpathy-skills', 'skills', skillId),
+    path.join(os.homedir(), '.codex', 'skills', skillId),
+    ...claudeKarpathyPluginSkillCandidates(claudeHomePath(), skillId),
+  ];
+  return candidates.find((candidate) => isNamedSkillRoot(candidate, skillId)) ?? null;
+}
+
+function karpathySkillSourceCandidates(root: string | undefined, skillId: string): string[] {
+  if (!root || root.trim().length === 0) return [];
+  const normalized = root.trim();
+  return [
+    normalized,
+    path.join(normalized, 'skills', skillId),
+    path.join(normalized, skillId),
+  ];
+}
+
+function claudeKarpathyPluginSkillCandidates(claudeHome: string, skillId: string): string[] {
+  const versionRoot = path.join(claudeHome, 'plugins', 'cache', 'karpathy-skills', 'karpathy');
+  if (!existsSync(versionRoot)) return [];
+  try {
+    return readdirSync(versionRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => path.join(versionRoot, entry.name, 'skills', skillId));
+  } catch {
+    return [];
+  }
+}
+
+function isNamedSkillRoot(skillRoot: string, skillId: string): boolean {
+  const skillFile = path.join(skillRoot, 'SKILL.md');
+  return existsSync(skillFile) && fileContainsAll(skillFile, [`name: ${skillId}`]);
+}
+
+function findLocalCodexClaudeReviewSource(): string | null {
+  const candidates = [
+    process.env.PIPELANE_CODEX_CLAUDE_REVIEW_SOURCE,
+    path.join(os.homedir(), 'dev', 'codexskill-claude-review'),
+  ].filter((candidate): candidate is string => typeof candidate === 'string' && candidate.trim().length > 0);
+  return candidates.find((candidate) => isCodexClaudeReviewSourceRoot(candidate)) ?? null;
+}
+
+function isCodexClaudeReviewSourceRoot(sourceRoot: string): boolean {
+  return existsSync(path.join(sourceRoot, 'SKILL.md'))
+    && existsSync(path.join(sourceRoot, 'scripts', 'run-review.sh'))
+    && existsSync(path.join(sourceRoot, 'scripts', 'build-review-artifact.sh'));
+}
+
+function ensureSkillScriptsExecutable(skillRoot: string): void {
+  const scriptsDir = path.join(skillRoot, 'scripts');
+  if (!existsSync(scriptsDir)) return;
+  try {
+    for (const entry of readdirSync(scriptsDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith('.sh')) continue;
+      chmodSync(path.join(scriptsDir, entry.name), 0o755);
+    }
+  } catch {
+    // Installation verification below reports the user-visible failure.
+  }
 }
 
 function configuredTestReviewGateInstallers(): string[] {
@@ -569,6 +990,7 @@ function configuredTestReviewGateInstallers(): string[] {
 }
 
 function reviewSetupInstallTarget(entry: ResolvedReviewGateCatalogEntry): string {
+  if (entry.id === 'adversarial-review') return 'Codex /claude review bridge or Claude-side gstack /codex challenge';
   if (entry.type === 'agent') return entry.role ?? entry.id;
   return entry.skill ?? entry.id;
 }
@@ -579,39 +1001,32 @@ function saveInteractiveReviewSetup(
 ): { configPath: string; isLegacy: boolean } {
   const selectedGates = orderReviewGates(gates
     .filter((gate) => gate.selected && gate.entry.available)
-    .map((gate) => reviewSetupGateToConfig(gate.entry)));
-  const recommendedConfig = buildReviewGatesConfigForPreset(REVIEW_SETUP_RECOMMENDED_PRESET, { repoRoot });
-  const recommendedGates = orderReviewGates(recommendedConfig.gates);
+    .map((gate) => reviewSetupGateToConfig(gate)));
   return patchReadableWorkflowConfig(repoRoot, (raw) => ({
     ...raw,
-    reviewGates: sameJson(selectedGates, recommendedGates)
-      ? buildReviewGatesPresetPatch(raw, REVIEW_SETUP_RECOMMENDED_PRESET, repoRoot)
-      : buildReviewGatesExplicitPatch(raw, REVIEW_SETUP_RECOMMENDED_PRESET, selectedGates, repoRoot),
+    reviewGates: buildReviewGatesExplicitPatch(raw, selectedGates),
   }));
 }
 
 function buildReviewGatesExplicitPatch(
   raw: Record<string, unknown>,
-  preset: ReviewGatePreset,
   gates: ReviewGateConfig[],
-  repoRoot: string,
 ): Record<string, unknown> {
   const existing = asRecord(raw.reviewGates);
-  const next: Record<string, unknown> = existing ? { ...existing, preset } : { preset };
+  const next: Record<string, unknown> = {};
   const planReview = asRecord(existing?.planReview);
-  if (
-    planReview
-    && Array.isArray(planReview.gates)
-    && getGeneratedDefaultCandidates(isReviewGatePreset(existing?.preset) ? existing.preset : 'standard', repoRoot)
-      .some((candidate) => sameJson(planReview.gates, candidate.planReview?.gates ?? []))
-  ) {
-    delete next.planReview;
+  if (planReview) {
+    next.planReview = planReview;
   }
   next.gates = gates;
   return next;
 }
 
-function reviewSetupGateToConfig(entry: ResolvedReviewGateCatalogEntry): ReviewGateConfig {
+function reviewSetupGateToConfig(gate: ReviewSetupGateOption): ReviewGateConfig {
+  const entry = gate.entry;
+  const userCommands = entry.id === 'adversarial-review' && gate.adversarialProvider
+    ? [gate.adversarialProvider.command]
+    : entry.userCommands;
   return {
     id: entry.id,
     phase: entry.phase as ReviewGatePhase,
@@ -622,7 +1037,7 @@ function reviewSetupGateToConfig(entry: ResolvedReviewGateCatalogEntry): ReviewG
     role: entry.role,
     when: entry.when,
     whenChanged: entry.whenChanged,
-    userCommands: entry.userCommands,
+    userCommands,
   };
 }
 
@@ -657,7 +1072,6 @@ function createReviewSetupPrompter(): {
 
 function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
   const context = resolveWorkflowContext(cwd);
-  const preset = context.config.reviewGates?.preset ?? 'standard';
   const phaseFilter = parsed.flags.reviewPhase.trim() as ReviewGatePhase | '';
   const gateFilter = parsed.flags.reviewGate.trim();
   const dryRun = parsed.flags.reviewDryRun;
@@ -666,7 +1080,6 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
   const record = buildReviewRunRecord({
     repoRoot: context.repoRoot,
     baseBranch: context.config.baseBranch,
-    preset,
     gates: context.config.reviewGates?.gates ?? [],
     dryRun,
     gateFilter,
@@ -682,7 +1095,6 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
     runId: record.id,
     repoRoot: context.repoRoot,
     evidencePath: reviewStatePath(context.commonDir, context.config),
-    preset,
     dryRun,
     gateFilter: gateFilter || null,
     phaseFilter: phaseFilter || null,
@@ -735,7 +1147,6 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
     id: `review-${new Date(startedAt).toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto.randomUUID().slice(0, 8)}`,
     branchName: runGit(options.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '',
     sha: runGit(options.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '',
-    preset: options.preset,
     status,
     dryRun: options.dryRun,
     gateFilter: gateFilter || undefined,
@@ -897,7 +1308,10 @@ function manualGateSummary(gate: ReviewGateConfig): string {
     return `manual skill gate pending: run ${command}`;
   }
   if (gate.type === 'agent') {
-    return `agent gate pending: ${gate.role ?? gate.id}`;
+    const command = gate.userCommands?.[0];
+    return command
+      ? `agent gate pending: run ${command}`
+      : `agent gate pending: ${gate.role ?? gate.id}`;
   }
   if (gate.type === 'approval') {
     return `approval gate pending${gate.when ? ` (${gate.when})` : ''}`;
@@ -1011,7 +1425,6 @@ function renderReviewRunReport(record: ReviewRunRecord, evidencePath: string): s
   const lines = [
     'Pipelane review',
     `Status: ${record.status}`,
-    `Preset: ${record.preset}`,
     `Evidence: ${evidencePath}`,
     `Run: ${record.id}`,
   ];
@@ -1092,7 +1505,6 @@ function renderReviewSetupReport(
   const lines = [
     'Pipelane review setup',
     `Status: ${report.status}`,
-    `Preset: ${report.preset}`,
     `Config: ${report.configPath ?? 'inferred from defaults/package.json overlay'}`,
   ];
 
@@ -1125,7 +1537,6 @@ function renderReviewSetupReport(
       '',
       'Effective reviewGates:',
       JSON.stringify({
-        preset: report.preset,
         planReview: report.effective.planReview,
         gates: report.effective.gates,
       }, null, 2),
@@ -1137,6 +1548,7 @@ function renderReviewSetupReport(
 }
 
 function renderInteractiveReviewSetup(prepared: {
+  repoRoot: string;
   packageJson: ReviewSetupReport['packageJson'];
   detectedScripts: string[];
   gates: ReviewSetupGateOption[];
@@ -1156,7 +1568,7 @@ function renderInteractiveReviewSetup(prepared: {
     if (gates.length === 0) continue;
     lines.push('', `${section.title}:`);
     for (const gate of gates) {
-      lines.push(formatInteractiveGate(gate));
+      lines.push(formatInteractiveGate(gate, prepared.repoRoot));
     }
   }
 
@@ -1210,19 +1622,27 @@ function reviewSetupSections(): Array<{ title: string; ids: string[] }> {
   ];
 }
 
-function formatInteractiveGate(gate: ReviewSetupGateOption): string {
+function formatInteractiveGate(gate: ReviewSetupGateOption, repoRoot: string): string {
   const selected = gate.selected ? '[on] ' : '[off]';
   const number = `${gate.number}.`.padEnd(4, ' ');
   const label = gate.label.padEnd(27, ' ');
-  const detail = reviewSetupGateDetail(gate);
+  const detail = reviewSetupGateDetail(gate, repoRoot);
   return `${number}${selected} ${label}${detail}`;
 }
 
-function reviewSetupGateDetail(gate: ReviewSetupGateOption): string {
+function reviewSetupGateDetail(gate: ReviewSetupGateOption, repoRoot: string): string {
   const entry = gate.entry;
   if (entry.type === 'command') {
     if (entry.command) return entry.command;
     return noScriptFoundLabel(entry);
+  }
+  if (entry.id === 'adversarial-review') {
+    const provider = preferredAdversarialReviewProvider(repoRoot);
+    const target = provider
+      ? `${provider.command} (${provider.label})`
+      : entry.userCommands?.[0] ?? entry.role ?? entry.id;
+    const install = gate.installState === 'not applicable' ? '' : ` ${gate.installState}`;
+    return `${target}${install}`;
   }
   const target = entry.userCommands?.[0]
     ?? entry.skill
@@ -1264,73 +1684,10 @@ function reviewSetupGateLabel(entry: ResolvedReviewGateCatalogEntry): string {
   return labels[entry.id] ?? entry.id;
 }
 
-function buildReviewGatesPresetPatch(
-  raw: Record<string, unknown>,
-  preset: ReviewGatePreset,
-  repoRoot: string,
-): Record<string, unknown> {
-  const existing = asRecord(raw.reviewGates);
-  if (!existing) {
-    return { preset };
-  }
-
-  const next: Record<string, unknown> = { ...existing, preset };
-  const existingPreset = isReviewGatePreset(existing.preset) ? existing.preset : 'standard';
-  const generatedDefaultCandidates = getGeneratedDefaultCandidates(existingPreset, repoRoot);
-
-  const planReview = asRecord(existing.planReview);
-  if (
-    planReview
-    && Array.isArray(planReview.gates)
-    && generatedDefaultCandidates.some((candidate) => sameJson(planReview.gates, candidate.planReview?.gates ?? []))
-  ) {
-    const nextPlanReview = { ...planReview };
-    delete nextPlanReview.gates;
-    if (Object.keys(nextPlanReview).length > 0) {
-      next.planReview = nextPlanReview;
-    } else {
-      delete next.planReview;
-    }
-  }
-
-  if (
-    Array.isArray(existing.gates)
-    && generatedDefaultCandidates.some((candidate) => sameJson(existing.gates, candidate.gates ?? []))
-  ) {
-    delete next.gates;
-  }
-
-  return next;
-}
-
-function getGeneratedDefaultCandidates(
-  preset: ReviewGatePreset,
-  repoRoot: string,
-): ReviewGatesConfig[] {
-  if (preset === 'standard') {
-    return [
-      defaultReviewGatesConfig({ repoRoot }),
-      defaultReviewGatesConfig(),
-    ];
-  }
-  return [
-    buildReviewGatesConfigForPreset(preset, { repoRoot }),
-    buildReviewGatesConfigForPreset(preset),
-  ];
-}
-
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
-}
-
-function isReviewGatePreset(value: unknown): value is ReviewGatePreset {
-  return value === 'lean' || value === 'standard' || value === 'strict-production';
-}
-
-function sameJson(left: unknown, right: unknown): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function formatPlanGates(gates: ReviewPlanGateConfig[]): string[] {
@@ -1377,6 +1734,6 @@ function formatCatalog(catalog: NonNullable<ReviewSetupReport['catalog']>): stri
       : '';
     const optional = entry.optional ? ' optional' : '';
     const matched = entry.matchedScript ? ` script:${entry.matchedScript}` : '';
-    return `- ${entry.id} [${entry.kind}/${entry.phase}] ${target} - ${status} presets:${entry.presets.join('|')}${optional}${matched}${aliases}`;
+    return `- ${entry.id} [${entry.kind}/${entry.phase}] ${target} - ${status}${optional}${matched}${aliases}`;
   });
 }

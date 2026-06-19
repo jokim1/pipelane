@@ -84,6 +84,10 @@ pipelane install-claude
 This writes durable commands under your local Codex and Claude skill folders. It
 does not write Pipelane files into the current repo.
 
+`/pipelane review setup` can install missing Karpathy review skills from
+`https://github.com/jokim1/karpathy-skills.git` into `$CODEX_HOME/skills` after
+you explicitly approve the install prompt.
+
 If your task worktrees share `node_modules` through a symlink, install the local
 npm guard too:
 
@@ -262,9 +266,7 @@ Set up the review stack:
 
 ```text
 /pipelane review setup
-/pipelane review setup --preset lean
-/pipelane review setup --preset standard
-/pipelane review setup --preset strict-production
+/pipelane review setup --yes
 /pipelane review setup --print
 /pipelane review setup --list-gates
 ```
@@ -279,7 +281,8 @@ The gate order is:
 
 1. **Static gates:** lint, typecheck, format check, secret scan, dependency audit.
 2. **Behavioral gates:** tests, integration checks, build.
-3. **AI diff gates:** `/karpathy diff`, gstack `/review`, adversarial review.
+3. **AI diff gates:** `/karpathy diff`, gstack `/review`, adversarial review
+   via Codex `/claude review code` or Claude-side gstack `/codex challenge`.
 4. **Instruction gates:** `/karpathy audit` when agent instruction files change.
 5. **Runtime gates:** browser QA, deploy health checks, staging evidence.
 6. **Human gates:** approval for schema, auth, billing, secrets, deploy, rollback,
@@ -479,7 +482,7 @@ Common slash commands:
 | `/new` | Create a task branch and worktree. Task name is optional. |
 | `/resume` | Reopen or recover existing task work. |
 | `/repo-guard` | Check that the current checkout is safe. |
-| `/pipelane review setup` | Configure review-gate presets. |
+| `/pipelane review setup` | Select review gates. |
 | `/pipelane review` | Run review gates and record evidence. |
 | `/pipelane review pass` | Record a clean manual review gate after running the referenced skill or approval. |
 | `/pr` | Run checks, commit, push, and open or update a PR. |

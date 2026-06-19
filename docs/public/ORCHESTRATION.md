@@ -51,9 +51,7 @@ Current commands:
 
 ```text
 /pipelane review setup
-/pipelane review setup --preset lean
-/pipelane review setup --preset standard
-/pipelane review setup --preset strict-production
+/pipelane review setup --yes
 /pipelane review setup --print
 /pipelane review setup --list-gates
 ```
@@ -81,6 +79,8 @@ Karpathy gates should use the names humans naturally type:
 Do not conflate them. `/karpathy audit` should not run on ordinary product-code
 diffs. It should run only when agent instruction files change, such as
 `CLAUDE.md`, `AGENTS.md`, `.cursor/rules/**`, or `.codex/skills/**`.
+If either Karpathy skill is missing, interactive setup can install it from
+`https://github.com/jokim1/karpathy-skills.git` after explicit user approval.
 
 ## Gate Taxonomy
 
@@ -97,7 +97,8 @@ Review gates run after implementation:
 
 - static gates: lint, typecheck, format check, secret scan, dependency audit
 - behavioral gates: tests, integration checks, build
-- AI diff gates: `/karpathy diff`, gstack `/review`, adversarial review
+- AI diff gates: `/karpathy diff`, gstack `/review`, adversarial review via
+  Codex `/claude review code` or Claude-side gstack `/codex challenge`
 - instruction gates: `/karpathy audit` when agent instruction files change
 - runtime gates: browser QA, deploy health checks, staging evidence
 - human gates: approval for schema, auth, billing, secrets, deploy, rollback
@@ -120,8 +121,9 @@ User-facing commands:
 ```
 
 `/pipelane review setup` configures the gate stack. The implementation
-supports preset selection, printing the effective config, and listing the gate
-catalog with detected or missing scripts. `/pipelane review` runs the
+supports an interactive checklist, saving the recommended checklist with
+`--yes`, printing the effective config, and listing the gate catalog with
+detected or missing scripts. `/pipelane review` runs the
 configured gates against the current diff and writes evidence. `/pr` enforces
 fresh, unfiltered evidence for the current branch, HEAD, and worktree state
 before commit, push, or PR handoff.
@@ -279,33 +281,6 @@ also sets `PIPELANE_ORCHESTRATE_RUN_ID`,
 `PIPELANE_ORCHESTRATE_PROMPT_PATH`, `PIPELANE_ORCHESTRATE_WORKTREE_PATH`,
 `PIPELANE_ORCHESTRATE_LOG_PATH`, and `PIPELANE_ORCHESTRATE_LEDGER_PATH`.
 
-## Presets
-
-`lean`:
-
-- plan gates: engineering plan review
-- static gates: detected typecheck/build
-- behavioral gates: detected tests
-- AI gates: `/karpathy diff`
-
-`standard`:
-
-- everything in `lean`
-- design plan review for frontend work
-- lint and format check when available
-- gstack `/review`
-- `/karpathy audit` when agent instruction files change
-- browser QA for frontend work
-
-`strict-production`:
-
-- everything in `standard`
-- security/data review for auth, billing, SQL, secrets, deploy, and infra
-- adversarial review
-- docs drift review
-- secret scan and dependency audit when available
-- human approval gates before merge, prod deploy, and rollback
-
 ## Config Contract
 
 Review gates live in `.pipelane.json` under top-level `reviewGates`. They are
@@ -326,7 +301,6 @@ Each gate has:
 ```jsonc
 {
   "reviewGates": {
-    "preset": "standard",
     "planReview": {
       "gates": [
         { "id": "plan-eng-review", "phase": "plan", "type": "skill", "skill": "plan-eng-review", "blocking": true },
@@ -348,7 +322,14 @@ Each gate has:
         "blocking": true
       },
       { "id": "gstack-review", "phase": "ai-diff", "type": "skill", "skill": "review", "blocking": true },
-      { "id": "adversarial-review", "phase": "ai-diff", "type": "agent", "role": "adversarial-code-reviewer", "blocking": true },
+      {
+        "id": "adversarial-review",
+        "phase": "ai-diff",
+        "type": "agent",
+        "role": "adversarial-code-reviewer",
+        "userCommands": ["/claude review code", "/codex challenge"],
+        "blocking": true
+      },
       {
         "id": "karpathy-audit",
         "phase": "instruction",
@@ -386,7 +367,7 @@ Every `/pipelane review` run writes evidence under existing Pipelane state:
 <git-common-dir>/<config.stateDir>/review-state.json
 ```
 
-The bounded ledger records the latest runs with branch, SHA, preset, changed
+The bounded ledger records the latest runs with branch, SHA, changed
 files, gate order, skipped gates and skip reasons, command or skill result,
 timeout status, output tails, and final blocking/advisory verdict.
 
@@ -474,7 +455,7 @@ Do not add:
 
 ## Acceptance Criteria
 
-- `/pipelane review setup` can print the effective gate config, list available gates, and persist lean/standard/strict-production presets.
+- `/pipelane review setup` can print the effective gate config, list available gates, and persist the selected gate checklist.
 - Later setup extensions can add or remove individual plan-review gates independently from implementation review gates.
 - Static gates run before AI gates.
 - Missing optional scripts or skills produce warnings, not crashes.
@@ -490,7 +471,7 @@ Do not add:
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
 | CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | not run | Optional for product scope. |
-| Codex Review | `/codex review` | Independent 2nd opinion | 0 | not run | Optional outside voice not run for this pass. |
+| Codex Review | `/codex challenge` | Adversarial Codex review | 0 | not run | Optional outside voice not run for this pass. |
 | Eng Review | `/plan-eng-review` | Architecture & tests (required) | 3 | CLEAR | Slices 1 and 2 reviewed clean; Slice 2 fixed catalog/example drift before handoff. |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | not run | Recommended before board UI implementation. |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | not run | Optional; useful before shipping setup UX. |

@@ -21,7 +21,6 @@ import {
   type GoalProvider,
   type OrchestrateConfig,
   type ReviewGateConfig,
-  type ReviewGatePreset,
   type ReviewRunRecord,
   type ReviewPlanGateConfig,
   type WorkflowConfig,
@@ -109,7 +108,6 @@ export interface OrchestrationRunRecord {
     hardStops: OrchestrateConfig['hardStops'] | null;
   };
   gateSnapshot: {
-    preset: ReviewGatePreset | null;
     planReview: {
       gates: ReviewPlanGateConfig[];
     };
@@ -222,7 +220,6 @@ export function buildOrchestrationRunRecord(input: BuildOrchestrationRunInput): 
       hardStops: input.config.orchestrate?.hardStops ? cloneJson(input.config.orchestrate.hardStops) : null,
     },
     gateSnapshot: {
-      preset: input.config.reviewGates?.preset ?? null,
       planReview: {
         gates: cloneJson(input.config.reviewGates?.planReview?.gates ?? []),
       },

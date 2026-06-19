@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { computeUrlFingerprint, resolveProbeStateKey, resolveReviewStateKey, signSignedPayload, verifySignedPayload } from './integrity.ts';
-import { buildDefaultReviewGatesConfig, buildReviewGatesConfigForPreset } from './review-gates.ts';
+import { buildDefaultReviewGatesConfig } from './review-gates.ts';
 
 export type Mode = 'build' | 'release';
 export type KnownSurface = 'frontend' | 'edge' | 'sql';
@@ -99,7 +99,6 @@ export interface SmokeConfig {
   concurrency?: SmokeConcurrencyConfig;
 }
 
-export type ReviewGatePreset = 'lean' | 'standard' | 'strict-production';
 export type ReviewPlanGatePhase = 'plan';
 export type ReviewGatePhase = 'static' | 'behavioral' | 'ai-diff' | 'instruction' | 'runtime' | 'human';
 export type ReviewGateType = 'command' | 'skill' | 'agent' | 'approval' | 'pipelane';
@@ -129,7 +128,6 @@ export interface ReviewGateConfig {
 }
 
 export interface ReviewGatesConfig {
-  preset?: ReviewGatePreset;
   planReview?: {
     gates?: ReviewPlanGateConfig[];
   };
@@ -381,7 +379,6 @@ export interface ReviewRunRecord {
   id: string;
   branchName: string;
   sha: string;
-  preset: ReviewGatePreset;
   status: ReviewRunStatus;
   dryRun: boolean;
   gateFilter?: string;
@@ -680,7 +677,6 @@ export interface OperatorFlags {
   smokeFeedback: string[];
   scenarioFile: string;
   makeBlocking: boolean;
-  reviewPreset: string;
   reviewPrint: boolean;
   reviewListGates: boolean;
   reviewDryRun: boolean;
@@ -1092,16 +1088,13 @@ function mergeWorkflowLayers(
       };
     }
     if (overlay.reviewGates) {
-      const presetOverlay = hasOwn(overlay.reviewGates, 'preset');
-      next.reviewGates = presetOverlay
-        ? { ...overlay.reviewGates }
-        : {
-            ...current.reviewGates,
-            ...overlay.reviewGates,
-            planReview: overlay.reviewGates.planReview
-              ? { ...current.reviewGates?.planReview, ...overlay.reviewGates.planReview }
-              : current.reviewGates?.planReview,
-          };
+      next.reviewGates = {
+        ...current.reviewGates,
+        ...overlay.reviewGates,
+        planReview: overlay.reviewGates.planReview
+          ? { ...current.reviewGates?.planReview, ...overlay.reviewGates.planReview }
+          : current.reviewGates?.planReview,
+      };
     }
     if (overlay.buildMode) next.buildMode = { ...current.buildMode, ...overlay.buildMode } as WorkflowConfig['buildMode'];
     if (overlay.releaseMode) next.releaseMode = { ...current.releaseMode, ...overlay.releaseMode } as WorkflowConfig['releaseMode'];
@@ -1184,7 +1177,6 @@ export function normalizeWorkflowConfig(
   };
 }
 
-const REVIEW_GATE_PRESETS: readonly ReviewGatePreset[] = ['lean', 'standard', 'strict-production'];
 export const REVIEW_GATE_PHASES: readonly ReviewGatePhase[] = ['static', 'behavioral', 'ai-diff', 'instruction', 'runtime', 'human'];
 const REVIEW_GATE_TYPES: readonly ReviewGateType[] = ['command', 'skill', 'agent', 'approval', 'pipelane'];
 const REVIEW_PLAN_GATE_TYPES: readonly ReviewPlanGateConfig['type'][] = ['skill', 'agent', 'approval'];
@@ -1227,20 +1219,15 @@ export function normalizeReviewGatesConfig(
   const defaults = defaultReviewGatesConfig({ repoRoot: options.repoRoot });
   if (!isRecord(raw)) return defaults;
 
-  const preset = includesString(REVIEW_GATE_PRESETS, raw.preset) ? raw.preset : defaults.preset;
-  const presetDefaults = preset === defaults.preset
-    ? defaults
-    : buildReviewGatesConfigForPreset(preset, { repoRoot: options.repoRoot });
   const planReview = isRecord(raw.planReview) ? raw.planReview : undefined;
   const planGates = Array.isArray(planReview?.gates)
     ? normalizeReviewPlanGateList(planReview.gates)
-    : presetDefaults.planReview?.gates;
+    : defaults.planReview?.gates;
   const gates = Array.isArray(raw.gates)
     ? normalizeReviewGateList(raw.gates)
-    : presetDefaults.gates;
+    : defaults.gates;
 
   return {
-    preset,
     planReview: {
       gates: planGates ?? [],
     },
@@ -1323,10 +1310,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function includesString<const T extends string>(allowed: readonly T[], value: unknown): value is T {
   return typeof value === 'string' && (allowed as readonly string[]).includes(value);
-}
-
-function hasOwn(value: object, key: string): boolean {
-  return Object.prototype.hasOwnProperty.call(value, key);
 }
 
 function cleanString(value: unknown): string | undefined {
@@ -2351,7 +2334,6 @@ function isReviewRunRecord(value: unknown): value is ReviewRunRecord {
   return typeof raw.id === 'string'
     && typeof raw.branchName === 'string'
     && typeof raw.sha === 'string'
-    && includesString(REVIEW_GATE_PRESETS, raw.preset)
     && (raw.status === 'passed' || raw.status === 'failed' || raw.status === 'pending')
     && typeof raw.dryRun === 'boolean'
     && (raw.gateFilter === undefined || typeof raw.gateFilter === 'string')
@@ -2653,7 +2635,6 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     smokeFeedback: [],
     scenarioFile: '',
     makeBlocking: false,
-    reviewPreset: '',
     reviewPrint: false,
     reviewListGates: false,
     reviewDryRun: false,
@@ -2994,10 +2975,6 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       continue;
     }
 
-    if (flagName === '--preset') {
-      flags.reviewPreset = readFlagValue('--preset').trim();
-      continue;
-    }
     if (flagName === '--print') {
       rejectInlineValue('--print');
       flags.reviewPrint = true;
@@ -3256,13 +3233,9 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
     case 'review': {
       const subcommand = parsed.positional[0] ?? '';
       if (subcommand === 'setup') {
-        assertOnlyFlags(parsed, ['reviewPreset', 'reviewPrint', 'reviewListGates', 'yes']);
+        assertOnlyFlags(parsed, ['reviewPrint', 'reviewListGates', 'yes']);
         if (parsed.positional.length !== 1) {
-          throw new Error('review setup requires exactly: pipelane run review setup [--yes] [--preset lean|standard|strict-production] [--print] [--list-gates]');
-        }
-        const preset = parsed.flags.reviewPreset.trim();
-        if (preset && !includesString(REVIEW_GATE_PRESETS, preset)) {
-          throw new Error(`--preset must be one of: ${REVIEW_GATE_PRESETS.join(', ')}.`);
+          throw new Error('review setup requires exactly: pipelane run review setup [--yes] [--print] [--list-gates]');
         }
         return;
       }
@@ -3281,7 +3254,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       }
       assertOnlyFlags(parsed, ['reviewDryRun', 'reviewGate', 'reviewPhase']);
       if (parsed.positional.length > 0) {
-        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review pass --gate <id> --message <text>, or pipelane run review setup [--yes] [--preset lean|standard|strict-production] [--print] [--list-gates]');
+        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review pass --gate <id> --message <text>, or pipelane run review setup [--yes] [--print] [--list-gates]');
       }
       const phase = parsed.flags.reviewPhase.trim();
       if (phase && !includesString(REVIEW_GATE_PHASES, phase)) {
@@ -3626,7 +3599,6 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'smokeFeedback', label: '--feedback', active: (flags) => flags.smokeFeedback.length > 0 },
   { key: 'scenarioFile', label: '--scenario-file', active: (flags) => flags.scenarioFile.trim().length > 0 },
   { key: 'makeBlocking', label: '--make-blocking', active: (flags) => flags.makeBlocking },
-  { key: 'reviewPreset', label: '--preset', active: (flags) => flags.reviewPreset.trim().length > 0 },
   { key: 'reviewPrint', label: '--print', active: (flags) => flags.reviewPrint },
   { key: 'reviewListGates', label: '--list-gates', active: (flags) => flags.reviewListGates },
   { key: 'reviewDryRun', label: '--dry-run', active: (flags) => flags.reviewDryRun },
