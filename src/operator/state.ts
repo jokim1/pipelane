@@ -3302,6 +3302,23 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         if (parsed.flags.yes && !parsed.flags.goalPlanFile.trim() && !parsed.flags.goalOutcome.trim()) {
           throw new Error('orchestrate --yes requires --plan-file <path> or --outcome <text>.');
         }
+        if (parsed.flags.orchestrationRunId.trim()) {
+          const newRunFlags = [
+            ['--slice-id', parsed.flags.goalSliceId],
+            ['--outcome', parsed.flags.goalOutcome],
+            ['--plan-file', parsed.flags.goalPlanFile],
+            ['--provider', parsed.flags.goalProvider],
+            ['--max-turns', parsed.flags.goalMaxTurns],
+            ['--max-minutes', parsed.flags.goalMaxMinutes],
+          ].filter(([, value]) => value.trim()).map(([flag]) => flag);
+          if (parsed.flags.offline) newRunFlags.push('--offline');
+          if (parsed.flags.plan) newRunFlags.push('--plan');
+          if (parsed.flags.preview) newRunFlags.push('--preview');
+          if (parsed.flags.yes) newRunFlags.push('--yes');
+          if (newRunFlags.length > 0) {
+            throw new Error(`orchestrate --run-id only shows an existing run and cannot combine with: ${newRunFlags.join(', ')}.`);
+          }
+        }
         const provider = parsed.flags.goalProvider.trim();
         if (provider && !includesString(GOAL_PROVIDERS, provider)) {
           throw new Error(`--provider must be one of: ${GOAL_PROVIDERS.join(', ')}.`);

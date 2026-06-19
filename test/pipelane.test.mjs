@@ -5106,6 +5106,10 @@ test('orchestrate goal-spec rejects invalid command forms', () => {
     assert.notEqual(missingPlanInput.status, 0);
     assert.match(missingPlanInput.stderr, /orchestrate plan requires --plan-file <path> or --outcome <text>/);
 
+    const bareRunIdWithNewRunFlags = runCli(['run', 'orchestrate', '--run-id', 'orchestrate-20260617000000-deadbeef', '--outcome', 'Demo', '--yes'], repoRoot, {}, true);
+    assert.notEqual(bareRunIdWithNewRunFlags.status, 0);
+    assert.match(bareRunIdWithNewRunFlags.stderr, /orchestrate --run-id only shows an existing run and cannot combine with: --outcome, --yes/);
+
     const extraPlanPositional = runCli(['run', 'orchestrate', 'plan', 'extra', '--outcome', 'Demo'], repoRoot, {}, true);
     assert.notEqual(extraPlanPositional.status, 0);
     assert.match(extraPlanPositional.stderr, /orchestrate plan requires exactly/);
