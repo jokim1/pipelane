@@ -141,6 +141,17 @@ where `$REST` is `$ARGUMENTS` with the leading `review` token stripped.
 
 Use this path for `/pipelane review`, `/pipelane review --json`, `/pipelane review --dry-run`, `/pipelane review --gate <id>`, `/pipelane review --phase <phase>`, and `/pipelane review setup ...`. Display the output directly.
 
+Special case: when `$REST` is exactly `setup`, do not run the interactive setup command first. Agent Bash tools commonly run without an interactive TTY, and shell pipes make stdout non-TTY.
+
+1. Run `npm run pipelane:review -- setup --print` to inspect the current effective gate config.
+2. If the user needs the available gate catalog, run `npm run pipelane:review -- setup --list-gates`.
+3. Present deterministic choices in chat:
+   - `1. Save recommended gates: npm run pipelane:review -- setup --yes`
+   - `2. Cancel`
+4. After the user chooses, run the matching command exactly.
+
+If `$REST` starts with `setup --yes`, `setup --print`, `setup --list-gates`, or `setup --json`, run the command directly. Do not add shell pipes to setup commands that may need interactivity.
+
 ---
 
 ## ORCHESTRATION MODE

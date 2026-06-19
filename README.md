@@ -67,19 +67,56 @@ Optional:
 
 ## Quick Start
 
-From the repo you want to use with Pipelane:
+Install the machine-local commands first:
 
 ```bash
-npx -y pipelane@github:jokim1/pipelane#main bootstrap --project "My App"
+npx -y pipelane@github:jokim1/pipelane#main install-codex
+npx -y pipelane@github:jokim1/pipelane#main install-claude
 ```
 
 If `pipelane` is already on your `PATH`, use:
 
 ```bash
+pipelane install-codex
+pipelane install-claude
+```
+
+This writes durable commands under your local Codex and Claude skill folders. It
+does not write Pipelane files into the current repo.
+
+If your task worktrees share `node_modules` through a symlink, install the local
+npm guard too:
+
+```bash
+pipelane install-npm-guard
+export PATH="$HOME/.pipelane/bin:$PATH"
+```
+
+Then open a repo and use:
+
+```text
+/pipelane status
+/new
+/pipelane review
+/pr
+```
+
+### Repo-Local Opt-In
+
+Only run bootstrap when you intentionally want committed repo-local Pipelane
+config, command adapters, docs, and npm scripts:
+
+```bash
+npx -y pipelane@github:jokim1/pipelane#main bootstrap --yes --project "My App"
+```
+
+or:
+
+```bash
 pipelane bootstrap --yes --project "My App"
 ```
 
-Then review and commit the generated files.
+Then review the generated files before committing anything.
 
 Use `git status` first:
 
@@ -101,24 +138,11 @@ git push
 If your repo does not have one of those files, skip that `git add` line or leave
 the missing file out.
 
-Commit before using `/new`.
+Commit repo-local adapters before using `/new` from a remote-backed repo.
 
 `/new` creates task worktrees from the repo's base branch. If the base branch
 does not contain the Pipelane files yet, new worktrees will not inherit the
 workflow.
-
-### Machine-Local Install Only
-
-If a repo should not commit Pipelane config or generated adapters, install the
-machine-local commands instead:
-
-```bash
-pipelane install-codex
-pipelane install-claude
-```
-
-This writes durable default commands under your local Codex and Claude skill
-folders. It does not write Pipelane files into the current repo.
 
 ## How to Use It
 
@@ -364,14 +388,14 @@ normal Pipelane release flow after the orchestration run is reviewed.
 
 Pipelane has two command surfaces.
 
-Machine-local commands:
+Machine-local commands are the default install path:
 
 - installed by `pipelane install-codex`
 - installed by `pipelane install-claude`
 - live under your local Codex and Claude skill directories
 - do not require repo changes
 
-Repo-local adapters:
+Repo-local adapters are opt-in:
 
 - created by `pipelane bootstrap` or `pipelane setup`
 - committed with the repo
@@ -390,7 +414,7 @@ Bootstrapping can add or manage:
 
 ## Configuration and State
 
-Tracked repo policy usually lives in:
+Tracked repo policy for opt-in repo-local installs usually lives in:
 
 - `.pipelane.json`
 - `package.json:pipelane`
@@ -398,7 +422,7 @@ Tracked repo policy usually lives in:
 - generated workflow docs
 - `REPO_GUIDANCE.md`
 
-Local operator state usually lives in:
+Machine-local and operator state usually lives in:
 
 - `CLAUDE.md` for local deploy configuration
 - the git common-dir, shared across worktrees

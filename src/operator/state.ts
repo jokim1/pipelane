@@ -179,8 +179,9 @@ export interface WorkflowConfig {
   };
   // Optional; absent in default config. See ChecksConfig for semantics.
   checks?: ChecksConfig;
-  // Optional; absent in default config. Per-surface opt-outs for
-  // syncConsumerDocs. Missing entry = default true (current behavior).
+  // Optional; absent in default config. Per-surface opt-ins for
+  // syncConsumerDocs. Missing entry = default false, so machine-local
+  // installs do not write generated repo surfaces unless the repo opts in.
   syncDocs?: SyncDocsConfig;
   // v1.4: path-prefix map for `/status --blast <sha>`. Keys are surface
   // names (typically the entries in `surfaces`), values are POSIX
@@ -193,11 +194,11 @@ export interface WorkflowConfig {
   smoke?: SmokeConfig;
 }
 
-// Per-surface opt-out flags for `pipelane setup` / `pipelane sync-docs`.
-// Absent or undefined means "sync this surface" (default true). Consumers
-// that want partial regeneration (e.g. commands regen but NO marker
-// injection into README/AGENTS/CONTRIBUTING) set the surfaces they want
-// skipped to false.
+// Per-surface opt-in flags for `pipelane setup` / `pipelane sync-docs`.
+// Absent or undefined means "do not sync this surface" (default false).
+// Explicit `pipelane init` writes REPO_LOCAL_SYNC_DOCS below so repo-local
+// adapters remain available, but synthesized configs and old configs that
+// never opted in stay machine-local by default.
 export interface SyncDocsConfig {
   claudeCommands?: boolean;
   codexSkills?: boolean;
@@ -210,6 +211,17 @@ export interface SyncDocsConfig {
 }
 
 export const DEFAULT_SYNC_DOCS: Required<SyncDocsConfig> = {
+  claudeCommands: false,
+  codexSkills: false,
+  readmeSection: false,
+  contributingSection: false,
+  agentsSection: false,
+  docsReleaseWorkflow: false,
+  pipelaneClaudeTemplate: false,
+  packageScripts: false,
+};
+
+export const REPO_LOCAL_SYNC_DOCS: Required<SyncDocsConfig> = {
   claudeCommands: true,
   codexSkills: true,
   readmeSection: true,
@@ -226,9 +238,9 @@ export function resolveSyncDocs(raw: SyncDocsConfig | undefined): Required<SyncD
   // values (string "false", null, arrays, spread-of-a-string) can reach
   // here unsanitized. Per-key type-check at use time guarantees that
   // only real booleans flip a surface, and any non-boolean value (or a
-  // non-object `raw`) falls back to the declared default. This is what
-  // prevents `{ "readmeSection": "false" }` from injecting the README
-  // section (truthy string) when the consumer clearly meant to skip it.
+  // non-object `raw`) falls back to the declared default. This prevents
+  // truthy junk such as `{ "readmeSection": "false" }` from enabling a
+  // repo write when the consumer clearly meant to skip it.
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return { ...DEFAULT_SYNC_DOCS };
   }
@@ -1025,7 +1037,7 @@ export function resolveReadableConfigPath(repoRoot: string): string | null {
 
 // Read a tracked `pipelane` block from the repo's package.json. Consumers who
 // gitignore `.pipelane.json` can persist durable customizations here
-// (aliases, smoke commands, syncDocs opt-outs) so fresh checkouts and new
+// (aliases, smoke commands, syncDocs opt-ins) so fresh checkouts and new
 // worktrees don't regress to bare defaults. Returns null when package.json
 // is missing, malformed, or has no `pipelane` field.
 export function readPackageJsonOverlay(repoRoot: string): Partial<WorkflowConfig> | null {
@@ -1442,7 +1454,7 @@ function normalizeSurfacePathMap(
 
 // Strip non-boolean and unknown keys. Returns undefined when no boolean
 // flags remain so the serialized config stays minimal for consumers that
-// never opt out. Explicit `true` values are preserved as-is (they don't
+// never opt in. Explicit `true` values are preserved as-is (they don't
 // collapse to undefined). Runs on the `loadWorkflowConfig` path only;
 // setup + sync-docs bypass it and rely on `resolveSyncDocs` at use-time
 // for runtime defense.

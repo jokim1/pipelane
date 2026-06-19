@@ -74,6 +74,29 @@ export function buildSkillMarker(prefix: string, name: string): string {
 }
 
 function renderWorkflowSkillGuidance(command: WorkflowCommand | 'pipelane', slashAlias: string): string {
+  if (command === 'pipelane') {
+    return `
+## Interactive review setup behavior
+
+Agent Bash tools commonly run commands without an interactive TTY, and shell
+pipes make stdout non-TTY. When the user invokes bare
+\`${slashAlias} review setup\` with no flags, do not run the interactive setup
+command first. Instead use the runner command above with these parsed arguments:
+
+1. \`review setup --print\` to inspect the current effective gate config.
+2. If the user needs the available gate catalog, use
+   \`review setup --list-gates\`.
+3. Present deterministic choices in chat:
+   \`1. Save recommended gates: review setup --yes\`
+   \`2. Cancel\`
+4. After the user chooses, run the matching command exactly.
+
+If the user supplied \`--yes\`, \`--print\`, \`--list-gates\`, or \`--json\`,
+run the command directly through the runner. Do not add shell pipes to setup
+commands that may need interactivity.
+`;
+  }
+
   if (command === 'deploy') {
     return `
 ## Blocked deploy follow-up behavior
@@ -181,7 +204,7 @@ Run the global pipelane bootstrap for this machine.
 
 1. Parse any arguments that appear after \`/${INIT_PIPELANE_SKILL_NAME}\` in the user's message.
 2. Preserve quoted substrings when building the shell command.
-3. Before running, tell the user: "This can write .pipelane.json, .claude/, .agents/, package.json scripts, docs, and other generated repo files. Do not run this in Rocketboard unless you intentionally want those local or committed surfaces." Ask for confirmation.
+3. Before running, tell the user: "This can write .pipelane.json, .claude/, .agents/, package.json scripts, docs, and other generated repo files. Do not run this in public, open-source, or otherwise clean repos unless you intentionally want those local or committed surfaces." Ask for confirmation.
 4. After the user confirms, run:
    \`${options.bootstrapScriptPath} --yes <parsed arguments>\`
 5. Stream the command output directly.

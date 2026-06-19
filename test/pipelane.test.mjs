@@ -907,6 +907,12 @@ test('init writes tracked Pipelane files and setup seeds CLAUDE plus tracked Cod
     assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'smoke.md')));
     const newCommand = readFileSync(path.join(repoRoot, '.claude', 'commands', 'new.md'), 'utf8');
     assert.match(newCommand, /infer a concise task label/);
+    const pipelaneCommand = readFileSync(path.join(repoRoot, '.claude', 'commands', 'pipelane.md'), 'utf8');
+    assert.match(pipelaneCommand, /when `\$REST` is exactly `setup`/);
+    assert.match(pipelaneCommand, /npm run pipelane:review -- setup --print/);
+    assert.match(pipelaneCommand, /npm run pipelane:review -- setup --yes/);
+    assert.doesNotMatch(pipelaneCommand, /setup --preset/);
+    assert.doesNotMatch(pipelaneCommand, /lean\|standard\|strict-production/);
     const smokeCommand = readFileSync(path.join(repoRoot, '.claude', 'commands', 'smoke.md'), 'utf8');
     assert.match(smokeCommand, /Guided empty states/);
     assert.match(smokeCommand, /Offer the exact choices from `emptyState\.options`/);
@@ -948,6 +954,73 @@ test('bootstrap installs pipelane, initializes the repo, and seeds the global bo
     assert.equal(typeof packageJson.devDependencies.pipelane, 'string');
     assert.equal(packageJson.scripts['pipelane:new'], 'pipelane run new');
     assert.equal(packageJson.scripts['pipelane:smoke'], 'pipelane run smoke');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('bootstrap --yes on an existing config materializes repo-local syncDocs opt-in', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    delete config.syncDocs;
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    rmSync(path.join(repoRoot, '.claude'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, '.agents'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md'), { force: true });
+
+    const result = runCli(
+      ['bootstrap', '--yes', '--project', 'Demo App'],
+      repoRoot,
+      { CODEX_HOME: codexHome, PIPELANE_INSTALL_SPEC: LOCAL_PIPELANE_INSTALL_SPEC },
+    );
+
+    assert.match(result.stdout, /Repo was already pipelane-enabled; refreshed local setup\./);
+    const afterConfig = JSON.parse(readFileSync(configPath, 'utf8'));
+    assert.equal(afterConfig.syncDocs.claudeCommands, true);
+    assert.equal(afterConfig.syncDocs.codexSkills, true);
+    assert.equal(afterConfig.syncDocs.docsReleaseWorkflow, true);
+    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'new.md')));
+    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'new', 'SKILL.md')));
+    assert.ok(existsSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md')));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('bootstrap --yes reports skipped CLAUDE.md scaffold when local guidance is disabled', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.syncDocs = { claudeCommands: false, pipelaneClaudeTemplate: false };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+    rmSync(path.join(repoRoot, 'CLAUDE.md'), { force: true });
+
+    const result = runCli(
+      ['bootstrap', '--yes', '--project', 'Demo App'],
+      repoRoot,
+      { CODEX_HOME: codexHome, PIPELANE_INSTALL_SPEC: LOCAL_PIPELANE_INSTALL_SPEC },
+    );
+
+    assert.match(result.stdout, /Skipped local CLAUDE\.md scaffold because local guidance scaffolds are disabled\./);
+    assert.doesNotMatch(result.stdout, /Preserved existing local CLAUDE\.md\./);
+    assert.equal(existsSync(path.join(repoRoot, 'CLAUDE.md')), false);
+    const afterConfig = JSON.parse(readFileSync(configPath, 'utf8'));
+    assert.equal(afterConfig.syncDocs.claudeCommands, false);
+    assert.equal(afterConfig.syncDocs.pipelaneClaudeTemplate, false);
+    assert.equal(afterConfig.syncDocs.codexSkills, true);
+    assert.equal(afterConfig.syncDocs.packageScripts, true);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -1884,6 +1957,13 @@ test('install-codex outside a pipelane repo installs durable global default skil
     const deploySkill = readFileSync(path.join(codexHome, 'skills', 'deploy', 'SKILL.md'), 'utf8');
     assert.match(deploySkill, /Blocked deploy follow-up behavior/);
     assert.match(deploySkill, /Reply 1 or Y to execute/);
+    const pipelaneSkill = readFileSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
+    assert.match(pipelaneSkill, /Interactive review setup behavior/);
+    assert.match(pipelaneSkill, /runner command above/);
+    assert.match(pipelaneSkill, /review setup --print/);
+    assert.match(pipelaneSkill, /review setup --yes/);
+    assert.doesNotMatch(pipelaneSkill, /review setup --preset/);
+    assert.doesNotMatch(pipelaneSkill, /lean\|standard\|strict-production/);
     const fixSkill = readFileSync(path.join(codexHome, 'skills', 'fix', 'SKILL.md'), 'utf8');
     assert.match(fixSkill, /Pipelane-enabled repo detection/);
     assert.match(fixSkill, /Resolve `<base>` from the Pipelane config first/);
@@ -1921,6 +2001,13 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane-fix', 'SKILL.md')));
     assert.match(readFileSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md'), 'utf8'), /disable-model-invocation: true/);
     assert.match(readFileSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md'), 'utf8'), /Bare invocation behavior/);
+    const pipelaneSkill = readFileSync(path.join(claudeHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
+    assert.match(pipelaneSkill, /Interactive review setup behavior/);
+    assert.match(pipelaneSkill, /runner command above/);
+    assert.match(pipelaneSkill, /review setup --print/);
+    assert.match(pipelaneSkill, /review setup --yes/);
+    assert.doesNotMatch(pipelaneSkill, /review setup --preset/);
+    assert.doesNotMatch(pipelaneSkill, /lean\|standard\|strict-production/);
     assert.match(
       readFileSync(path.join(claudeHome, 'skills', 'pipelane', 'bin', 'bootstrap-pipelane.sh'), 'utf8'),
       new RegExp(path.join(claudeHome, 'skills', 'pipelane', 'bin', 'pipelane').replaceAll('\\', '\\\\')),
@@ -2693,7 +2780,7 @@ test('setup allows /pipelane operator alias when claudeCommands syncing is disab
     config.aliases.new = '/pipelane';
     // packageScripts must stay on so `pipelane:*` scripts exist; claudeCommands
     // off is the operative opt-out here.
-    config.syncDocs = { claudeCommands: false };
+    config.syncDocs = { ...config.syncDocs, claudeCommands: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
     // Wipe init-written command files so the next setup path exercises the
@@ -2793,12 +2880,12 @@ test('pipelane.md consumer-extension persists when syncDocs.claudeCommands flips
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
 
-    config.syncDocs = { claudeCommands: false };
+    config.syncDocs = { ...config.syncDocs, claudeCommands: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
     assert.match(readFileSync(pipelanePath, 'utf8'), /FLIP-SENTINEL/);
 
-    config.syncDocs = { claudeCommands: true };
+    config.syncDocs = { ...config.syncDocs, claudeCommands: true };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
@@ -3053,7 +3140,7 @@ test('syncDocs.readmeSection: false leaves README.md untouched', () => {
 
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = { readmeSection: false };
+    config.syncDocs = { ...config.syncDocs, readmeSection: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
@@ -3079,7 +3166,7 @@ test('syncDocs.contributingSection + agentsSection: false leave those files unto
 
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = { contributingSection: false, agentsSection: false };
+    config.syncDocs = { ...config.syncDocs, contributingSection: false, agentsSection: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
@@ -3101,18 +3188,18 @@ test('syncDocs.docsReleaseWorkflow + pipelaneClaudeTemplate: false skip those fi
 
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = { docsReleaseWorkflow: false, pipelaneClaudeTemplate: false };
+    config.syncDocs = { ...config.syncDocs, docsReleaseWorkflow: false, pipelaneClaudeTemplate: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
     // Clear files that init already wrote with the default config so the
     // assertion exercises "setup with opt-out doesn't recreate them."
     rmSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md'), { force: true });
-    rmSync(path.join(repoRoot, 'workflow', 'CLAUDE.template.md'), { force: true });
+    rmSync(path.join(repoRoot, 'pipelane', 'CLAUDE.template.md'), { force: true });
 
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
     assert.equal(existsSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md')), false);
-    assert.equal(existsSync(path.join(repoRoot, 'workflow', 'CLAUDE.template.md')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'pipelane', 'CLAUDE.template.md')), false);
     // Opting out of one surface must not suppress others — commands still regen.
     assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'clean.md')));
   } finally {
@@ -3130,7 +3217,7 @@ test('syncDocs.claudeCommands: false skips the entire command-regen path', () =>
 
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = { claudeCommands: false };
+    config.syncDocs = { ...config.syncDocs, claudeCommands: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
     // Wipe what init pre-created so the assertion exercises "opt-out
@@ -3195,7 +3282,7 @@ test('syncDocs.packageScripts: false preserves consumer-customized workflow scri
 
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = { packageScripts: false };
+    config.syncDocs = { ...config.syncDocs, packageScripts: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
@@ -3229,7 +3316,7 @@ test('syncDocs.packageScripts: false without required pipelane:* scripts throws 
 
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = { packageScripts: false };
+    config.syncDocs = { ...config.syncDocs, packageScripts: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
     const result = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome }, true);
@@ -3281,7 +3368,7 @@ test('setup consistency check requires pipelane:orchestrate when /pipelane comma
 
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = { packageScripts: false };
+    config.syncDocs = { ...config.syncDocs, packageScripts: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
     const result = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome }, true);
@@ -3335,7 +3422,7 @@ test('syncDocs.packageScripts: false is allowed when claudeCommands is also fals
 
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = { packageScripts: false, claudeCommands: false, codexSkills: false };
+    config.syncDocs = { ...config.syncDocs, packageScripts: false, claudeCommands: false, codexSkills: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
@@ -3361,7 +3448,7 @@ test('syncDocs.packageScripts: false still allows tracked Codex skills when Clau
 
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = { packageScripts: false, claudeCommands: false };
+    config.syncDocs = { ...config.syncDocs, packageScripts: false, claudeCommands: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
@@ -3376,22 +3463,254 @@ test('syncDocs.packageScripts: false still allows tracked Codex skills when Clau
   }
 });
 
-test('syncDocs absent preserves current all-surfaces-sync behavior', () => {
+test('syncDocs absent defaults to machine-local and writes no generated repo surfaces', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    delete config.syncDocs;
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    rmSync(path.join(repoRoot, '.agents'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, '.claude'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, 'docs'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, 'pipelane'), { recursive: true, force: true });
+    writeFileSync(path.join(repoRoot, 'README.md'), '# Consumer README\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), '# Consumer Contributing\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'AGENTS.md'), '# Consumer Agents\n', 'utf8');
+    const pristinePackage = { name: 'consumer-app', private: true, type: 'module', scripts: { build: 'my-build' } };
+    writeFileSync(path.join(repoRoot, 'package.json'), `${JSON.stringify(pristinePackage, null, 2)}\n`, 'utf8');
+
+    const result = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    assert.match(result.stdout, /Skipped local CLAUDE\.md scaffold because local guidance scaffolds are disabled\./);
+    assert.match(result.stdout, /Skipped REPO_GUIDANCE\.md scaffold because local guidance scaffolds are disabled\./);
+    assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'docs')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'pipelane')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'CLAUDE.md')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'REPO_GUIDANCE.md')), false);
+    assert.equal(readFileSync(path.join(repoRoot, 'README.md'), 'utf8'), '# Consumer README\n');
+    assert.equal(readFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), 'utf8'), '# Consumer Contributing\n');
+    assert.equal(readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8'), '# Consumer Agents\n');
+    const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    assert.deepEqual(pkg.scripts, { build: 'my-build' });
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('syncDocs absent ignores existing managed footprint and stays machine-local', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    delete config.syncDocs;
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    rmSync(path.join(repoRoot, '.agents'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, '.claude'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, 'docs'), { recursive: true, force: true });
+    writeFileSync(path.join(repoRoot, 'README.md'), '# Consumer README\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), '# Consumer Contributing\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'AGENTS.md'), '# Consumer Agents\n', 'utf8');
+    assert.ok(existsSync(path.join(repoRoot, 'pipelane', 'CLAUDE.template.md')));
+    const beforePackage = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    assert.equal(beforePackage.scripts['pipelane:new'], 'pipelane run new');
+
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
-    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'clean.md')));
-    assert.ok(existsSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md')));
+    assert.equal(existsSync(path.join(repoRoot, 'docs')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
+    assert.equal(readFileSync(path.join(repoRoot, 'README.md'), 'utf8'), '# Consumer README\n');
+    assert.equal(readFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), 'utf8'), '# Consumer Contributing\n');
+    assert.equal(readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8'), '# Consumer Agents\n');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('partial syncDocs keeps omitted surfaces disabled even with a managed footprint', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.syncDocs = { readmeSection: false };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    rmSync(path.join(repoRoot, 'docs'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, '.claude'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, '.agents'), { recursive: true, force: true });
+    writeFileSync(path.join(repoRoot, 'README.md'), '# Consumer README\n', 'utf8');
+    const pristinePackage = { name: 'consumer-app', private: true, type: 'module', scripts: { build: 'my-build' } };
+    writeFileSync(path.join(repoRoot, 'package.json'), `${JSON.stringify(pristinePackage, null, 2)}\n`, 'utf8');
     assert.ok(existsSync(path.join(repoRoot, 'pipelane', 'CLAUDE.template.md')));
-    assert.match(readFileSync(path.join(repoRoot, 'README.md'), 'utf8'), /pipelane:readme:start/);
-    assert.match(readFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), 'utf8'), /pipelane:contributing:start/);
-    assert.match(readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8'), /pipelane:agents:start/);
+
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    assert.equal(readFileSync(path.join(repoRoot, 'README.md'), 'utf8'), '# Consumer README\n');
+    assert.equal(existsSync(path.join(repoRoot, 'docs')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
     const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
-    assert.equal(pkg.scripts['pipelane:setup'], 'pipelane setup');
+    assert.deepEqual(pkg.scripts, { build: 'my-build' });
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('partial true-only syncDocs enables only that surface', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.syncDocs = { claudeCommands: true };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    rmSync(path.join(repoRoot, 'docs'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, '.agents'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, 'pipelane'), { recursive: true, force: true });
+
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'new.md')));
+    assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'docs')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'pipelane')), false);
+    const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    assert.equal(pkg.scripts['pipelane:new'], 'pipelane run new');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('syncDocs absent ignores a remaining release workflow doc', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    delete config.syncDocs;
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    rmSync(path.join(repoRoot, '.agents'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, '.claude'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, 'pipelane'), { recursive: true, force: true });
+    writeFileSync(path.join(repoRoot, 'README.md'), '# Consumer README\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), '# Consumer Contributing\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'AGENTS.md'), '# Consumer Agents\n', 'utf8');
+    const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    pkg.scripts = { build: 'my-build' };
+    writeFileSync(path.join(repoRoot, 'package.json'), `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+    assert.ok(existsSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md')));
+
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'pipelane')), false);
+    assert.equal(readFileSync(path.join(repoRoot, 'README.md'), 'utf8'), '# Consumer README\n');
+    assert.equal(readFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), 'utf8'), '# Consumer Contributing\n');
+    assert.equal(readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8'), '# Consumer Agents\n');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('syncDocs absent ignores remaining managed package scripts', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    delete config.syncDocs;
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    rmSync(path.join(repoRoot, '.agents'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, '.claude'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, 'docs'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, 'pipelane'), { recursive: true, force: true });
+    writeFileSync(path.join(repoRoot, 'README.md'), '# Consumer README\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), '# Consumer Contributing\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'AGENTS.md'), '# Consumer Agents\n', 'utf8');
+    const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    assert.equal(pkg.scripts['pipelane:new'], 'pipelane run new');
+
+    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+
+    assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'docs')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'pipelane')), false);
+    assert.equal(readFileSync(path.join(repoRoot, 'README.md'), 'utf8'), '# Consumer README\n');
+    assert.equal(readFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), 'utf8'), '# Consumer Contributing\n');
+    assert.equal(readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8'), '# Consumer Agents\n');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('syncDocs.packageScripts only does not scaffold local guidance files', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.syncDocs = {
+      claudeCommands: false,
+      codexSkills: false,
+      readmeSection: false,
+      contributingSection: false,
+      agentsSection: false,
+      docsReleaseWorkflow: false,
+      pipelaneClaudeTemplate: false,
+      packageScripts: true,
+    };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    rmSync(path.join(repoRoot, 'CLAUDE.md'), { force: true });
+    rmSync(path.join(repoRoot, 'REPO_GUIDANCE.md'), { force: true });
+
+    const result = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
+    assert.match(result.stdout, /Skipped local CLAUDE\.md scaffold because local guidance scaffolds are disabled\./);
+    assert.match(result.stdout, /Skipped REPO_GUIDANCE\.md scaffold because local guidance scaffolds are disabled\./);
+    assert.equal(existsSync(path.join(repoRoot, 'CLAUDE.md')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'REPO_GUIDANCE.md')), false);
+    const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    assert.equal(pkg.scripts['pipelane:new'], 'pipelane run new');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -3408,9 +3727,8 @@ test('syncDocs resolver coerces non-boolean junk back to defaults', () => {
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     // Garbage values: string 'false' is truthy in JS, but the resolver
-    // must treat non-booleans as "use the default" or a consumer who
-    // wrote "false" expecting to disable the surface would silently get
-    // the surface synced instead (real footgun).
+    // must treat non-booleans as "use the default" or a truthy string
+    // would silently enable a repo write.
     config.syncDocs = {
       readmeSection: 'false',
       contributingSection: 'no',
@@ -3424,7 +3742,8 @@ test('syncDocs resolver coerces non-boolean junk back to defaults', () => {
     // opt-out pass's actual behavior instead of left-over init state.
     rmSync(path.join(repoRoot, '.agents'), { recursive: true, force: true });
     rmSync(path.join(repoRoot, 'docs'), { recursive: true, force: true });
-    rmSync(path.join(repoRoot, 'workflow'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, '.claude'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, 'pipelane'), { recursive: true, force: true });
     writeFileSync(path.join(repoRoot, 'README.md'), '# Consumer README\n', 'utf8');
     writeFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), '# Consumer Contributing\n', 'utf8');
     writeFileSync(path.join(repoRoot, 'AGENTS.md'), '# Consumer Agents\n', 'utf8');
@@ -3433,23 +3752,24 @@ test('syncDocs resolver coerces non-boolean junk back to defaults', () => {
 
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
-    // docsReleaseWorkflow: false is a real boolean → honored → no file.
+    // docsReleaseWorkflow: false is a real boolean -> honored -> no file.
     assert.equal(existsSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md')), false);
-    // Junk values fall back to default true → surface DID sync.
-    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'clean', 'SKILL.md')));
-    assert.match(readFileSync(path.join(repoRoot, 'README.md'), 'utf8'), /pipelane:readme:start/);
-    assert.match(readFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), 'utf8'), /pipelane:contributing:start/);
-    assert.match(readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8'), /pipelane:agents:start/);
+    // Junk values fall back to default false -> no repo surfaces sync.
+    assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'pipelane')), false);
+    assert.equal(readFileSync(path.join(repoRoot, 'README.md'), 'utf8'), '# Consumer README\n');
+    assert.equal(readFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), 'utf8'), '# Consumer Contributing\n');
+    assert.equal(readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8'), '# Consumer Agents\n');
     const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
-    assert.equal(pkg.scripts['pipelane:setup'], 'pipelane setup');
-    assert.equal(pkg.scripts.build, 'my-build');
+    assert.deepEqual(pkg.scripts, { build: 'my-build' });
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
   }
 });
 
-test('syncDocs as a non-object (string) resolves to all defaults without crashing', () => {
+test('syncDocs as a non-object (string) resolves to machine-local defaults without crashing', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
@@ -3464,13 +3784,20 @@ test('syncDocs as a non-object (string) resolves to all defaults without crashin
     config.syncDocs = 'true';
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
+    rmSync(path.join(repoRoot, '.agents'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, '.claude'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, 'docs'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, 'pipelane'), { recursive: true, force: true });
+    writeFileSync(path.join(repoRoot, 'README.md'), '# Consumer README\n', 'utf8');
+
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
-    // Every surface still syncs (all defaults remain true).
-    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'clean', 'SKILL.md')));
-    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'clean.md')));
-    assert.ok(existsSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md')));
-    assert.match(readFileSync(path.join(repoRoot, 'README.md'), 'utf8'), /pipelane:readme:start/);
+    // Malformed syncDocs falls back to the machine-local default.
+    assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'docs')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'pipelane')), false);
+    assert.equal(readFileSync(path.join(repoRoot, 'README.md'), 'utf8'), '# Consumer README\n');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -3493,7 +3820,7 @@ test('readmeSection: false preserves pre-existing pipelane marker block byte-for
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.displayName = 'Renamed App';
-    config.syncDocs = { readmeSection: false };
+    config.syncDocs = { ...config.syncDocs, readmeSection: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
@@ -3526,7 +3853,7 @@ test('claudeCommands: false preserves consumer-extension content without pruning
 
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = { claudeCommands: false };
+    config.syncDocs = { ...config.syncDocs, claudeCommands: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
@@ -3567,7 +3894,7 @@ test('all eight flags: false produces zero writes from a wiped repo', () => {
     rmSync(path.join(repoRoot, '.agents'), { recursive: true, force: true });
     rmSync(path.join(repoRoot, '.claude'), { recursive: true, force: true });
     rmSync(path.join(repoRoot, 'docs'), { recursive: true, force: true });
-    rmSync(path.join(repoRoot, 'workflow'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, 'pipelane'), { recursive: true, force: true });
     writeFileSync(path.join(repoRoot, 'README.md'), '# Consumer-owned\n', 'utf8');
     writeFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), '# Consumer-owned\n', 'utf8');
     writeFileSync(path.join(repoRoot, 'AGENTS.md'), '# Consumer-owned\n', 'utf8');
@@ -3579,7 +3906,9 @@ test('all eight flags: false produces zero writes from a wiped repo', () => {
     assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
     assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
     assert.equal(existsSync(path.join(repoRoot, 'docs')), false);
-    assert.equal(existsSync(path.join(repoRoot, 'workflow')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'pipelane')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'CLAUDE.md')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'REPO_GUIDANCE.md')), false);
     assert.equal(readFileSync(path.join(repoRoot, 'README.md'), 'utf8'), '# Consumer-owned\n');
     assert.equal(readFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), 'utf8'), '# Consumer-owned\n');
     assert.equal(readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8'), '# Consumer-owned\n');
@@ -3600,7 +3929,7 @@ test('syncDocs.codexSkills: false preserves legacy machine-local Codex wrappers'
 
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = { codexSkills: false };
+    config.syncDocs = { ...config.syncDocs, codexSkills: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
     rmSync(path.join(repoRoot, '.agents'), { recursive: true, force: true });
@@ -8817,16 +9146,65 @@ test('loadWorkflowConfig lets .pipelane.json win over a package.json:pipelane ov
   }
 });
 
-test('setup succeeds without a pre-existing .pipelane.json', async () => {
+test('setup without .pipelane.json stays machine-local and read-only', async () => {
   const repoRoot = createRepo();
   try {
     // No `pipelane init` — just run setup directly. With self-heal, this
-    // should succeed and render CLAUDE.md from the synthesized config
-    // instead of failing closed.
+    // succeeds from the synthesized config, but the missing syncDocs block
+    // defaults to machine-local so setup does not scaffold repo files.
     const result = runCli(['setup'], repoRoot);
     assert.equal(result.status, 0, `setup exited ${result.status}: ${result.stderr}`);
-    assert.ok(existsSync(path.join(repoRoot, 'CLAUDE.md')), 'setup should create CLAUDE.md');
+    assert.match(result.stdout, /Skipped local CLAUDE\.md scaffold because local guidance scaffolds are disabled\./);
+    assert.match(result.stdout, /Skipped REPO_GUIDANCE\.md scaffold because local guidance scaffolds are disabled\./);
+    assert.equal(existsSync(path.join(repoRoot, 'CLAUDE.md')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'REPO_GUIDANCE.md')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
     // .pipelane.json stays un-materialized because setup only reads.
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup without .pipelane.json ignores unrelated release workflow docs', async () => {
+  const repoRoot = createRepo();
+  try {
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    const releaseWorkflowPath = path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md');
+    const unrelatedDoc = '# Release Workflow\n\nShip from staging after QA signs off.\n';
+    writeFileSync(releaseWorkflowPath, unrelatedDoc, 'utf8');
+
+    const result = runCli(['setup'], repoRoot);
+
+    assert.equal(result.status, 0, `setup exited ${result.status}: ${result.stderr}`);
+    assert.match(result.stdout, /Skipped local CLAUDE\.md scaffold because local guidance scaffolds are disabled\./);
+    assert.equal(readFileSync(releaseWorkflowPath, 'utf8'), unrelatedDoc);
+    assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup without .pipelane.json ignores user-owned pipelane package script names', async () => {
+  const repoRoot = createRepo();
+  try {
+    const packageJsonPath = path.join(repoRoot, 'package.json');
+    const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+    pkg.scripts = { ...pkg.scripts, 'pipelane:new': 'echo user-owned-pipelane-script' };
+    writeFileSync(packageJsonPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+
+    const result = runCli(['setup'], repoRoot);
+    const after = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+
+    assert.equal(result.status, 0, `setup exited ${result.status}: ${result.stderr}`);
+    assert.match(result.stdout, /Skipped local CLAUDE\.md scaffold because local guidance scaffolds are disabled\./);
+    assert.equal(after.scripts['pipelane:new'], 'echo user-owned-pipelane-script');
+    assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md')), false);
     assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -11136,6 +11514,154 @@ test('pr, merge, deploy, and task-lock work with a fake gh adapter', () => {
     assert.ok(ghState.workflows[0].args.includes('sha=deadbeefcafebabe'));
     assert.ok(ghState.workflows[0].args.includes('surfaces=frontend,edge,sql'));
     assert.ok(ghState.workflows[0].args.includes('bypass_staging_guard=true'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('deploy infers target surfaces from surfacePathMap instead of stale task lock surfaces', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.surfaces = ['frontend', 'sql', 'mcp'];
+    config.surfacePathMap = {
+      frontend: ['src/frontend/'],
+      sql: ['supabase/'],
+      mcp: ['packages/mcp-server/'],
+    };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    mkdirSync(path.join(repoRoot, 'packages', 'mcp-server'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'packages', 'mcp-server', 'index.ts'), 'export const changed = true;\n', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Change MCP server'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    const targetSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+
+    writeTaskLock(repoRoot, 'mcp-only', { mode: 'build', surfaces: ['frontend', 'sql'] });
+    writePrRecord(repoRoot, 'mcp-only', targetSha);
+
+    const result = runCli(['run', 'deploy', 'staging', '--task', 'mcp-only', '--json'], repoRoot, env);
+    const output = JSON.parse(result.stdout);
+    assert.deepEqual(output.surfaces, ['mcp']);
+
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.workflows.length, 1);
+    assert.ok(ghState.workflows[0].args.includes('surfaces=mcp'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('deploy blocks unmapped target files before falling back to stale surfaces', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.surfaces = ['frontend', 'sql', 'mcp'];
+    config.surfacePathMap = {
+      frontend: ['src/frontend/'],
+      sql: ['supabase/'],
+    };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    mkdirSync(path.join(repoRoot, 'packages', 'mcp-server'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'packages', 'mcp-server', 'index\x1b[2K.ts'), 'export const changed = true;\n', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Change MCP server'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    const targetSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+
+    writeTaskLock(repoRoot, 'mcp-only', { mode: 'build', surfaces: ['frontend', 'sql'] });
+    writePrRecord(repoRoot, 'mcp-only', targetSha);
+
+    const result = runCli(['run', 'deploy', 'staging', '--task', 'mcp-only', '--json'], repoRoot, env, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Deploy blocked: target changes do not match surfacePathMap/);
+    assert.match(result.stderr, /packages\/mcp-server\/index\.ts/);
+    assert.equal(result.stderr.includes('\x1b[2K'), false);
+
+    const ghState = existsSync(ghStateFile)
+      ? JSON.parse(readFileSync(ghStateFile, 'utf8'))
+      : { workflows: [] };
+    assert.equal(ghState.workflows.length, 0);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('deploy explicit surfaces bypass target surfacePathMap inference', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.surfaces = ['frontend', 'sql', 'mcp'];
+    config.surfacePathMap = {
+      frontend: ['src/frontend/'],
+      sql: ['supabase/'],
+    };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    mkdirSync(path.join(repoRoot, 'packages', 'mcp-server'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'packages', 'mcp-server', 'index.ts'), 'export const changed = true;\n', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Change MCP server'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    const targetSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+
+    writeTaskLock(repoRoot, 'mcp-only', { mode: 'build', surfaces: ['frontend', 'sql'] });
+    writePrRecord(repoRoot, 'mcp-only', targetSha);
+
+    const result = runCli(['run', 'deploy', 'staging', '--task', 'mcp-only', '--surfaces', 'mcp', '--json'], repoRoot, env);
+    const output = JSON.parse(result.stdout);
+    assert.deepEqual(output.surfaces, ['mcp']);
+
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.workflows.length, 1);
+    assert.ok(ghState.workflows[0].args.includes('surfaces=mcp'));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -17547,7 +18073,7 @@ test('setup consistency check requires pipelane:configure when opting out of pac
 
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = { packageScripts: false };
+    config.syncDocs = { ...config.syncDocs, packageScripts: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
     const result = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome }, true);
@@ -21046,6 +21572,40 @@ test('setup --yes applies the AGENTS.md stale workflow guidance migration', () =
   }
 });
 
+test('setup --yes skips AGENTS.md stale workflow guidance migration when agentsSection is disabled', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.syncDocs = { ...config.syncDocs, agentsSection: false };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    const agentsPath = path.join(repoRoot, 'AGENTS.md');
+    const current = readFileSync(agentsPath, 'utf8');
+    writeFileSync(
+      agentsPath,
+      [
+        '# Demo App Repo Context',
+        '',
+        '- Agent default workflow: `npm run workflow:new -- --task "task name"`.',
+        '',
+        current,
+      ].join('\n'),
+      'utf8',
+    );
+
+    const result = runCli(['setup', '--yes'], repoRoot);
+    const agents = readFileSync(agentsPath, 'utf8');
+    assert.doesNotMatch(result.stdout, /Updated AGENTS\.md stale workflow guidance/);
+    assert.doesNotMatch(result.stdout, /AGENTS\.md guidance migration requires approval/);
+    assert.match(agents, /npm run workflow:new/);
+    assert.doesNotMatch(agents, /Agent default workflow: `\/new`/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('detectSetupDrift flags a deleted managed command as addedCommands', async () => {
   const repoRoot = createRepo();
   try {
@@ -21108,14 +21668,16 @@ test('detectSetupDrift preserves edits INSIDE consumer-extension markers (no dri
   }
 });
 
-test('detectSetupDrift reports willScaffold=true when REPO_GUIDANCE.md is absent', async () => {
+test('detectSetupDrift reports local guidance scaffolds when absent', async () => {
   const repoRoot = createRepo();
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
     runCli(['setup'], repoRoot);
+    rmSync(path.join(repoRoot, 'CLAUDE.md'), { force: true });
     rmSync(path.join(repoRoot, 'REPO_GUIDANCE.md'), { force: true });
     const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
     const drift = docs.detectSetupDrift(repoRoot);
+    assert.equal(drift.claudeGuidance.willScaffold, true);
     assert.equal(drift.repoGuidance.willScaffold, true);
     assert.equal(drift.needsSetup, true);
   } finally {
@@ -21132,7 +21694,7 @@ test('detectSetupDrift respects syncDocs.claudeCommands opt-out', async () => {
     // check only runs when claudeCommands is still on).
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = { claudeCommands: false };
+    config.syncDocs = { ...config.syncDocs, claudeCommands: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
     runCli(['setup'], repoRoot);
     // Even if a stale managed command file sits in the commands dir, the
@@ -22861,6 +23423,90 @@ test('destination planner treats newer requested deploys as pending before older
     assert.match(payload.blockers.join('\n'), /staging deploy is already in flight/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('destination planner infers target surfaces from surfacePathMap', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.surfaces = ['frontend', 'sql', 'mcp'];
+      config.surfacePathMap = {
+        frontend: ['src/frontend/'],
+        sql: ['supabase/'],
+        mcp: ['packages/mcp-server/'],
+      };
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    mkdirSync(path.join(repoRoot, 'packages', 'mcp-server'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'packages', 'mcp-server', 'index.ts'), 'export const changed = true;\n', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Change MCP server'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    const targetSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+
+    writeTaskLock(repoRoot, 'mcp-only', { mode: 'build', surfaces: ['frontend', 'sql'] });
+    writePrRecord(repoRoot, 'mcp-only', targetSha);
+
+    const result = runCli(
+      ['run', 'deploy', 'staging', '--task', 'mcp-only', '--plan', '--json'],
+      repoRoot,
+      { PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200' },
+      true,
+    );
+    const plan = JSON.parse(result.stdout);
+    assert.deepEqual(plan.requestedSurfaces, ['mcp']);
+    assert.deepEqual(plan.blockers, []);
+    assert.equal(plan.surfaces.find((surface) => surface.surface === 'mcp').requested, true);
+    assert.equal(plan.surfaces.find((surface) => surface.surface === 'frontend').requested, false);
+    assert.equal(plan.surfaces.find((surface) => surface.surface === 'sql').requested, false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('destination planner blocks unmapped target files before stale surfaces', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.surfaces = ['frontend', 'sql', 'mcp'];
+      config.surfacePathMap = {
+        frontend: ['src/frontend/'],
+        sql: ['supabase/'],
+      };
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    mkdirSync(path.join(repoRoot, 'packages', 'mcp-server'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'packages', 'mcp-server', 'index.ts'), 'export const changed = true;\n', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Change MCP server'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    const targetSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+
+    writeTaskLock(repoRoot, 'mcp-only', { mode: 'build', surfaces: ['frontend', 'sql'] });
+    writePrRecord(repoRoot, 'mcp-only', targetSha);
+
+    const result = runCli(
+      ['run', 'deploy', 'staging', '--task', 'mcp-only', '--plan', '--json'],
+      repoRoot,
+      {},
+      true,
+    );
+    const plan = JSON.parse(result.stdout);
+    assert.equal(result.status, 1);
+    assert.match(plan.blockers.join('\n'), /target file\(s\) do not match surfacePathMap/);
+    assert.match(plan.blockers.join('\n'), /packages\/mcp-server\/index\.ts/);
+    assert.deepEqual(plan.requestedSurfaces, ['frontend', 'sql']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
   }
 });
 

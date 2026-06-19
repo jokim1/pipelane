@@ -711,6 +711,9 @@ export function formatFollowUpSummary(drift: SetupDrift): string {
   if (drift.repoGuidance.willScaffold) {
     changes.push('REPO_GUIDANCE.md scaffold available');
   }
+  if (drift.claudeGuidance?.willScaffold) {
+    changes.push('CLAUDE.md scaffold available');
+  }
   if (drift.codex.enabled) {
     const added = truncateList(drift.codex.addedSkills);
     const updated = truncateList(drift.codex.updatedSkills);

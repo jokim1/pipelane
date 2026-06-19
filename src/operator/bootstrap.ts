@@ -1,7 +1,14 @@
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { readPackageJsonOverlay, resolveReadableConfigPath, resolveRepoRoot, runCommandCapture } from './state.ts';
+import {
+  patchReadableWorkflowConfig,
+  readPackageJsonOverlay,
+  REPO_LOCAL_SYNC_DOCS,
+  resolveReadableConfigPath,
+  resolveRepoRoot,
+  runCommandCapture,
+} from './state.ts';
 import { resolvePipelaneInstallSpec } from './install-source.ts';
 
 export interface BootstrapOptions {
@@ -15,6 +22,7 @@ export interface BootstrapResult {
   installedPackage: boolean;
   initializedRepo: boolean;
   createdClaude: boolean;
+  skippedClaudeScaffold: boolean;
   codexSkillsDir: string;
   installedCodexSkills: string[];
   warnings: string[];
@@ -65,15 +73,21 @@ function runLocalPipelane(repoRoot: string, args: string[]): string {
   return [result.stdout, result.stderr].filter(Boolean).join('\n').trim();
 }
 
-function parseSetupOutput(stdout: string): { createdClaude: boolean; codexSkillsDir: string; installedCodexSkills: string[] } {
+function parseSetupOutput(stdout: string): {
+  createdClaude: boolean;
+  skippedClaudeScaffold: boolean;
+  codexSkillsDir: string;
+  installedCodexSkills: string[];
+} {
   const createdClaude = stdout.includes('Created local CLAUDE.md from the Pipelane template.');
+  const skippedClaudeScaffold = stdout.includes('Skipped local CLAUDE.md scaffold because local guidance scaffolds are disabled.');
   const codexSkillsDir = stdout.match(/Synced Codex skills in (.+)/)?.[1]?.trim() ?? '';
   const wrapperCsv = stdout.match(/Slash commands: (.+)/)?.[1]?.trim() ?? '';
   const installedCodexSkills = wrapperCsv
     .split(',')
     .map((entry) => entry.trim())
     .filter(Boolean);
-  return { createdClaude, codexSkillsDir, installedCodexSkills };
+  return { createdClaude, skippedClaudeScaffold, codexSkillsDir, installedCodexSkills };
 }
 
 function readDisplayName(repoRoot: string): string {
@@ -108,6 +122,53 @@ function readBaseBranch(repoRoot: string): string {
   const fromOverlay = typeof overlay?.baseBranch === 'string' ? overlay.baseBranch.trim() : '';
   if (fromOverlay) return fromOverlay;
   return 'main';
+}
+
+function hasOwn(value: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+const SYNC_DOC_KEYS = Object.keys(REPO_LOCAL_SYNC_DOCS) as (keyof typeof REPO_LOCAL_SYNC_DOCS)[];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function mergeRepoLocalSyncDocs(raw: unknown): typeof REPO_LOCAL_SYNC_DOCS {
+  const next = { ...REPO_LOCAL_SYNC_DOCS };
+  if (!isRecord(raw)) {
+    return next;
+  }
+  for (const key of SYNC_DOC_KEYS) {
+    if (typeof raw[key] === 'boolean') {
+      next[key] = raw[key];
+    }
+  }
+  return next;
+}
+
+function shouldMaterializeRepoLocalSyncDocs(raw: Record<string, unknown>): boolean {
+  if (!hasOwn(raw, 'syncDocs')) {
+    return true;
+  }
+  const syncDocs = raw.syncDocs;
+  if (!isRecord(syncDocs)) {
+    return true;
+  }
+  const hasOmittedKey = SYNC_DOC_KEYS.some((key) => typeof syncDocs[key] !== 'boolean');
+  return hasOmittedKey;
+}
+
+function ensureRepoLocalSyncDocsOptIn(repoRoot: string): void {
+  patchReadableWorkflowConfig(repoRoot, (raw) => {
+    if (!shouldMaterializeRepoLocalSyncDocs(raw)) {
+      return raw;
+    }
+    return {
+      ...raw,
+      syncDocs: mergeRepoLocalSyncDocs(raw.syncDocs),
+    };
+  });
 }
 
 export function collectBootstrapWarnings(repoRoot: string): string[] {
@@ -187,6 +248,8 @@ export function runBootstrap(cwd: string, options: BootstrapOptions): BootstrapR
 
   if (initializedRepo) {
     runLocalPipelane(repoRoot, ['init', '--project', projectName]);
+  } else {
+    ensureRepoLocalSyncDocsOptIn(repoRoot);
   }
 
   const setupOutput = runLocalPipelane(repoRoot, ['setup', ...(options.yes ? ['--yes'] : [])]);
@@ -198,6 +261,7 @@ export function runBootstrap(cwd: string, options: BootstrapOptions): BootstrapR
     installedPackage,
     initializedRepo,
     createdClaude: parsedSetup.createdClaude,
+    skippedClaudeScaffold: parsedSetup.skippedClaudeScaffold,
     codexSkillsDir: parsedSetup.codexSkillsDir,
     installedCodexSkills: parsedSetup.installedCodexSkills,
     warnings: collectBootstrapWarnings(repoRoot),

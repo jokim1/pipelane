@@ -230,14 +230,14 @@ Surfaces:
 
 ## Supporting Files
 
-Tracked (choose one shape for the workflow contract):
+Tracked for repo-local adapter installs (choose one shape for the workflow contract):
 
 - `.pipelane.json` — the default. Full workflow contract in one file.
 - `package.json` `"pipelane"` overlay — for consumers that gitignore
   `.pipelane.json` and want customizations (aliases, deploy settings,
   `syncDocs`) to survive fresh checkouts without a re-bootstrap.
 
-Always tracked:
+Tracked when this repo intentionally opts into generated adapters:
 
 - `AGENTS.md`
 - `.claude/commands/*`
@@ -266,17 +266,20 @@ Runtime mutations from `pipelane configure` write to `.pipelane.json`. If it
 doesn't exist yet, the mutator materializes it from the synthesized config at
 write time.
 
-### Optional `syncDocs` opt-outs
+### Optional `syncDocs` opt-ins
 
-By default, `pipelane setup` and `pipelane sync-docs` write every surface:
-regenerate `.claude/commands/*.md` and `.agents/skills/*`, inject marker sections into
-`README.md` / `CONTRIBUTING.md` / `AGENTS.md`, create or refresh
-`docs/RELEASE_WORKFLOW.md` and `pipelane/CLAUDE.template.md`, and ensure
-the `pipelane:*` scripts in `package.json`.
+Machine-local and synthesized configs default every `syncDocs` surface to
+`false`, so `pipelane setup` and `pipelane sync-docs` do not write generated
+repo surfaces unless the repo opts in.
 
-Consumers that want partial regeneration can opt out per surface by
-adding a `syncDocs` block. Every flag defaults to `true`; absent or
-`true` = sync that surface, `false` = leave it alone.
+`pipelane init` and `pipelane bootstrap` are the explicit repo-local opt-in
+path: they write a `.pipelane.json` with the generated adapter surfaces enabled.
+Existing repo-local installs that still have old partial `syncDocs` maps keep
+their previous default-on behavior until the map is made explicit for every
+surface.
+Consumers that want partial regeneration can enable only the surfaces they want
+in `syncDocs`. Missing flags default to `false`; `true` = sync that surface,
+`false` = leave it alone.
 
 ```json
 {
@@ -302,9 +305,13 @@ adding a `syncDocs` block. Every flag defaults to `true`; absent or
 | `agentsSection` | Marker-wrapped `AGENTS.md` section. |
 | `docsReleaseWorkflow` | `docs/RELEASE_WORKFLOW.md` file write. |
 | `pipelaneClaudeTemplate` | `pipelane/CLAUDE.template.md` file write. |
-| `packageScripts` | `pipelane:*` script entries in `package.json`. Setting this to `false` while `claudeCommands` or `codexSkills` is `true` requires the consumer's `package.json` to already define the full managed `pipelane:*` workflow script set for that Pipelane version, plus `pipelane:configure`. Setup fails fast with guidance if any are missing. |
+| `packageScripts` | `pipelane:*` script entries in `package.json`. Setting this to `false` while `claudeCommands` is `true` requires the consumer's `package.json` to already define the full managed `pipelane:*` workflow script set for that Pipelane version, plus `pipelane:configure`. Setup fails fast with guidance if any are missing. |
 
-Opting out never removes content that a previous sync already wrote; it
+Enabling `claudeCommands` means the generated `.claude/commands/*.md` files will
+invoke `npm run pipelane:<cmd>`, so also enable `packageScripts` unless the repo
+already owns equivalent scripts.
+
+Disabling a surface never removes content that a previous sync already wrote; it
 just stops future syncs from touching the surface.
 
 ## Required `AGENTS.md`
@@ -313,27 +320,28 @@ This repo tracks `AGENTS.md` as the repo policy surface for pipelane.
 
 ## Required local `CLAUDE.md`
 
-`CLAUDE.md` is machine-local and git-ignored. Setup creates it if missing.
+`CLAUDE.md` is machine-local and git-ignored. Setup creates it when Claude-facing
+repo-local surfaces are enabled.
 
 ## What each user must do
 
 ### One repo maintainer
 
-1. run `pipelane bootstrap --yes --project "{{DISPLAY_NAME}}"` or `npx -y pipelane@github:jokim1/pipelane#main bootstrap --project "{{DISPLAY_NAME}}"`
+1. run `pipelane bootstrap --yes --project "{{DISPLAY_NAME}}"` or `npx -y pipelane@github:jokim1/pipelane#main bootstrap --yes --project "{{DISPLAY_NAME}}"`
 2. review `.pipelane.json`, especially `aliases` (or the `pipelane` block in
    `package.json` if using the gitignored-config flow)
 3. commit the tracked Pipelane files
 
 ### Each Claude user
 
-1. optional once per machine: run `pipelane install-claude` for durable default personal skills under `~/.claude/skills`
+1. once per machine: run `pipelane install-claude` for durable default personal skills under `~/.claude/skills`
 2. pull the committed workflow files
 3. open the repo in Claude
 4. reopen or restart Claude if aliases changed or the command files were added while it was already open
 
 ### Each Codex user
 
-1. optional once per machine: run `pipelane install-codex` for durable default skills under `~/.codex/skills`
+1. once per machine: run `pipelane install-codex` for durable default skills under `~/.codex/skills`
 2. pull the committed workflow files
 3. if this machine previously used pipelane's machine-local Codex wrappers, rerun setup once to prune them
 4. open the repo in Codex
@@ -357,9 +365,9 @@ first in `PATH`, and verify with `pipelane run doctor --check-guard`.
 ## Install In A New Repo
 
 ```bash
-npx -y pipelane@github:jokim1/pipelane#main bootstrap --project "{{DISPLAY_NAME}}"
+npx -y pipelane@github:jokim1/pipelane#main bootstrap --yes --project "{{DISPLAY_NAME}}"
 # or, if pipelane is already on PATH:
-pipelane bootstrap --project "{{DISPLAY_NAME}}"
+pipelane bootstrap --yes --project "{{DISPLAY_NAME}}"
 ```
 
 For first-time adoption in an existing remote-backed repo, commit the tracked Pipelane files
@@ -377,7 +385,7 @@ workflow contract needs to exist there first.
 ## Troubleshooting and Common Failures
 
 - missing `.pipelane.json`
-  - run `pipelane bootstrap --project "{{DISPLAY_NAME}}"` or `pipelane init`
+  - run `pipelane bootstrap --yes --project "{{DISPLAY_NAME}}"` or `pipelane init`
 - task already active
   - use `{{ALIAS_RESUME}} --task "<task-name>"`
 - release mode blocked
