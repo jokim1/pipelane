@@ -1281,6 +1281,16 @@ function collectSurfaceProbes(options: {
           expectedUrl: resolveSurfaceProbeUrl(deployConfig, 'staging', surface),
         }),
       });
+    } else if (surface === 'mcp' && deployConfig.mcp?.staging.healthcheckUrl) {
+      entries.push({
+        surface,
+        result: explainSurfaceProbe({
+          probeState,
+          surface,
+          environment: 'staging',
+          expectedUrl: resolveSurfaceProbeUrl(deployConfig, 'staging', surface),
+        }),
+      });
     }
   }
   return entries;

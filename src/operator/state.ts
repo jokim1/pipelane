@@ -8,7 +8,14 @@ import { computeUrlFingerprint, resolveProbeStateKey, resolveReviewStateKey, sig
 import { buildDefaultReviewGatesConfig, buildReviewGatesConfigForPreset } from './review-gates.ts';
 
 export type Mode = 'build' | 'release';
-export type KnownSurface = 'frontend' | 'edge' | 'sql';
+export type KnownSurface = 'frontend' | 'edge' | 'sql' | 'mcp';
+// Allowed surface vocabulary across pipelane. `config.surfaces` controls
+// which surfaces a consumer has opted into (and provides defaults when
+// no --surfaces flag is passed); KNOWN_SURFACES is the broader set that
+// `--surfaces <name>` will accept on the command line so newer surfaces
+// like `mcp` work without each consumer first editing their (gitignored)
+// `.pipelane.json`.
+export const KNOWN_SURFACES = ['frontend', 'edge', 'sql', 'mcp'] as const satisfies readonly KnownSurface[];
 export const WORKFLOW_COMMANDS = ['devmode', 'new', 'resume', 'repo-guard', 'pr', 'merge', 'deploy', 'smoke', 'clean', 'status', 'doctor', 'rollback'] as const;
 export type WorkflowCommand = (typeof WORKFLOW_COMMANDS)[number];
 export const DEFAULT_WORKFLOW_ALIASES: Record<WorkflowCommand, string> = {
@@ -3653,9 +3660,14 @@ function assertOnlyFlags(parsed: ParsedOperatorArgs, allowed: OperatorFlagKey[])
 export function parseSurfaceList(config: WorkflowConfig, values: string[]): string[] {
   const requested = [...new Set(values.flatMap((value) => value.split(',').map((item) => item.trim()).filter(Boolean)))];
 
+  // Accept any KNOWN_SURFACE (e.g. 'mcp') even when a consumer hasn't yet
+  // added it to `config.surfaces`. `config.surfaces` still drives the
+  // implicit default below, so adding 'mcp' to KNOWN_SURFACES does not
+  // change behavior for consumers who don't pass --surfaces.
+  const allowed = new Set<string>([...config.surfaces, ...KNOWN_SURFACES]);
   for (const surface of requested) {
-    if (!config.surfaces.includes(surface)) {
-      throw new Error(`Unsupported surface "${surface}". Supported surfaces: ${config.surfaces.join(', ')}`);
+    if (!allowed.has(surface)) {
+      throw new Error(`Unsupported surface "${surface}". Supported surfaces: ${[...allowed].join(', ')}`);
     }
   }
 

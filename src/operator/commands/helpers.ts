@@ -285,6 +285,10 @@ export function resolveSurfaceHealthcheckUrl(
     const sql = staging ? deployConfig.sql.staging : deployConfig.sql.production;
     return sql.healthcheckUrl || '';
   }
+  if (surface === 'mcp') {
+    const mcp = staging ? deployConfig.mcp?.staging : deployConfig.mcp?.production;
+    return mcp?.healthcheckUrl || '';
+  }
   return '';
 }
 

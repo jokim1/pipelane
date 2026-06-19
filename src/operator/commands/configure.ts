@@ -38,6 +38,12 @@ export interface ConfigureOptions {
   sqlProductionApplyCommand?: string;
   sqlProductionVerificationCommand?: string;
   sqlProductionHealthcheck?: string;
+  mcpStagingDeployCommand?: string;
+  mcpStagingVerificationCommand?: string;
+  mcpStagingHealthcheck?: string;
+  mcpProductionDeployCommand?: string;
+  mcpProductionVerificationCommand?: string;
+  mcpProductionHealthcheck?: string;
   supabaseStagingProjectRef?: string;
   supabaseProductionProjectRef?: string;
 }
@@ -69,6 +75,12 @@ const STRING_FLAGS: Array<[string, keyof ConfigureOptions]> = [
   ['--sql-production-apply-command', 'sqlProductionApplyCommand'],
   ['--sql-production-verification-command', 'sqlProductionVerificationCommand'],
   ['--sql-production-healthcheck', 'sqlProductionHealthcheck'],
+  ['--mcp-staging-deploy-command', 'mcpStagingDeployCommand'],
+  ['--mcp-staging-verification-command', 'mcpStagingVerificationCommand'],
+  ['--mcp-staging-healthcheck', 'mcpStagingHealthcheck'],
+  ['--mcp-production-deploy-command', 'mcpProductionDeployCommand'],
+  ['--mcp-production-verification-command', 'mcpProductionVerificationCommand'],
+  ['--mcp-production-healthcheck', 'mcpProductionHealthcheck'],
   ['--supabase-staging-project-ref', 'supabaseStagingProjectRef'],
   ['--supabase-production-project-ref', 'supabaseProductionProjectRef'],
 ];
@@ -219,6 +231,26 @@ function applyFlagOverrides(base: DeployConfig, options: ConfigureOptions): Depl
   if (options.sqlProductionApplyCommand !== undefined) next.sql.production.applyCommand = options.sqlProductionApplyCommand;
   if (options.sqlProductionVerificationCommand !== undefined) next.sql.production.verificationCommand = options.sqlProductionVerificationCommand;
   if (options.sqlProductionHealthcheck !== undefined) next.sql.production.healthcheckUrl = options.sqlProductionHealthcheck;
+  const mcpFlagSet =
+    options.mcpStagingDeployCommand !== undefined
+    || options.mcpStagingVerificationCommand !== undefined
+    || options.mcpStagingHealthcheck !== undefined
+    || options.mcpProductionDeployCommand !== undefined
+    || options.mcpProductionVerificationCommand !== undefined
+    || options.mcpProductionHealthcheck !== undefined;
+  if (mcpFlagSet || next.mcp) {
+    const mcp = next.mcp ?? {
+      staging: { deployCommand: '', verificationCommand: '', healthcheckUrl: '' },
+      production: { deployCommand: '', verificationCommand: '', healthcheckUrl: '' },
+    };
+    if (options.mcpStagingDeployCommand !== undefined) mcp.staging.deployCommand = options.mcpStagingDeployCommand;
+    if (options.mcpStagingVerificationCommand !== undefined) mcp.staging.verificationCommand = options.mcpStagingVerificationCommand;
+    if (options.mcpStagingHealthcheck !== undefined) mcp.staging.healthcheckUrl = options.mcpStagingHealthcheck;
+    if (options.mcpProductionDeployCommand !== undefined) mcp.production.deployCommand = options.mcpProductionDeployCommand;
+    if (options.mcpProductionVerificationCommand !== undefined) mcp.production.verificationCommand = options.mcpProductionVerificationCommand;
+    if (options.mcpProductionHealthcheck !== undefined) mcp.production.healthcheckUrl = options.mcpProductionHealthcheck;
+    next.mcp = mcp;
+  }
   if (options.supabaseStagingProjectRef !== undefined) next.supabase.staging.projectRef = options.supabaseStagingProjectRef;
   if (options.supabaseProductionProjectRef !== undefined) next.supabase.production.projectRef = options.supabaseProductionProjectRef;
   return next;
@@ -321,6 +353,12 @@ Flags (all optional; any omitted field keeps its current value):
   --sql-production-apply-command=<cmd>
   --sql-production-verification-command=<cmd>
   --sql-production-healthcheck=<url>
+  --mcp-staging-deploy-command=<cmd>
+  --mcp-staging-verification-command=<cmd>
+  --mcp-staging-healthcheck=<url>
+  --mcp-production-deploy-command=<cmd>
+  --mcp-production-verification-command=<cmd>
+  --mcp-production-healthcheck=<url>
   --supabase-staging-project-ref=<ref>
   --supabase-production-project-ref=<ref>
 
