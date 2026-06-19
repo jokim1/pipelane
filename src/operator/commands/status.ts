@@ -1,17 +1,32 @@
+import { randomUUID } from 'node:crypto';
+import readline from 'node:readline/promises';
+
+import {
+  buildActionPreflightEnvelope,
+  isStableActionId,
+  runActionExecute,
+  type ActionExecutionData,
+  type ActionPreflightData,
+  type StableActionId,
+} from '../api/actions.ts';
 import { buildWorkflowApiSnapshot, type BranchRow, type SnapshotData } from '../api/snapshot.ts';
-import type { ApiEnvelope, ApiIssue, LaneState, SourceHealthEntry } from '../api/envelope.ts';
+import type { ApiActionInput, ApiActionState, ApiEnvelope, ApiIssue, LaneState, SourceHealthEntry } from '../api/envelope.ts';
 import { bucketPathsBySurface } from '../surface-map.ts';
 import {
   loadAllTaskLocks,
   loadDeployState,
   loadPrState,
+  nowIso,
   printResult,
   resolveWorkflowContext,
   runGit,
+  saveStatusDecisionRecord,
   type DeployRecord,
   type Mode,
+  type OperatorFlags,
   type ParsedOperatorArgs,
   type PrRecord,
+  type StatusDecisionRecord,
   type TaskLock,
   type WorkflowConfig,
 } from '../state.ts';
@@ -102,10 +117,387 @@ export async function handleStatus(cwd: string, parsed: ParsedOperatorArgs): Pro
     color: process.stdout.isTTY === true && !noColor,
   });
   process.stdout.write(rendered.endsWith('\n') ? rendered : `${rendered}\n`);
+  await maybeRunInteractiveStatusAction(cwd, parsed, envelope);
 }
 
 export interface RenderCockpitOptions {
   color?: boolean;
+}
+
+interface StatusActionCandidate {
+  id: StableActionId;
+  label: string;
+  reason: string;
+  risky: boolean;
+  requiresConfirmation: boolean;
+  inputs: ApiActionInput[];
+  defaultParams: Record<string, unknown>;
+  source: StatusDecisionRecord['source'];
+  taskSlug?: string;
+  branchName?: string;
+  runId?: string;
+  sliceId?: string;
+}
+
+interface StatusPrompter {
+  ask: (question: string) => Promise<string>;
+  close: () => void;
+}
+
+type StatusActionPreflightEnvelope = ApiEnvelope<ActionPreflightData>;
+
+async function maybeRunInteractiveStatusAction(
+  cwd: string,
+  parsed: ParsedOperatorArgs,
+  envelope: ApiEnvelope<SnapshotData>,
+): Promise<void> {
+  if (!canPromptForStatusAction()) return;
+  const candidate = chooseStatusActionCandidate(envelope.data);
+  if (!candidate) return;
+
+  const context = resolveWorkflowContext(cwd);
+  const createdAt = nowIso();
+  let decision: StatusDecisionRecord = {
+    id: `status-${createdAt.replace(/[-:.TZ]/g, '').slice(0, 14)}-${randomUUID().slice(0, 8)}`,
+    actionId: candidate.id,
+    label: candidate.label,
+    status: 'pending',
+    question: `Run ${candidate.label}?`,
+    selectedOption: '',
+    createdAt,
+    answeredAt: '',
+    actor: resolveStatusDecisionActor(),
+    branchName: runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '',
+    headSha: runGit(context.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '',
+    source: candidate.source,
+    ...(candidate.taskSlug ? { taskSlug: candidate.taskSlug } : {}),
+    ...(candidate.runId ? { runId: candidate.runId } : {}),
+    ...(candidate.sliceId ? { sliceId: candidate.sliceId } : {}),
+  };
+  saveStatusDecisionRecord(context.commonDir, context.config, decision);
+
+  const prompter = createStatusPrompter();
+  try {
+    process.stdout.write(renderStatusActionCandidate(candidate));
+    const resolved = await resolveStatusActionPreflight(cwd, parsed, candidate, prompter);
+    const preflight = resolved.preflight.data.preflight;
+    decision = {
+      ...decision,
+      preflightAllowed: preflight.allowed,
+      preflightReason: preflight.reason,
+      confirmationRequired: preflight.requiresConfirmation,
+      normalizedInputs: preflight.normalizedInputs,
+    };
+
+    if (!preflight.allowed) {
+      decision = {
+        ...decision,
+        status: 'blocked',
+        selectedOption: 'blocked',
+        answeredAt: nowIso(),
+      };
+      saveStatusDecisionRecord(context.commonDir, context.config, decision);
+      process.stdout.write(`\nAction blocked: ${sanitizeForTerminal(preflight.reason || resolved.preflight.message)}\n`);
+      process.exitCode = 1;
+      return;
+    }
+
+    const approval = (await prompter.ask(`Run ${candidate.label}? [y/N] `)).trim();
+    if (!isAffirmativeAnswer(approval)) {
+      decision = {
+        ...decision,
+        status: 'cancelled',
+        selectedOption: approval || 'cancel',
+        answeredAt: nowIso(),
+      };
+      saveStatusDecisionRecord(context.commonDir, context.config, decision);
+      process.stdout.write('Action cancelled.\n');
+      return;
+    }
+
+    const confirmToken = preflight.confirmation?.token ?? '';
+    const executed = await runActionExecute(cwd, candidate.id, resolved.parsed, confirmToken);
+    const execution = hasActionExecution(executed.data) ? executed.data.execution : null;
+    decision = {
+      ...decision,
+      status: executed.ok ? 'executed' : 'failed',
+      selectedOption: 'approve',
+      answeredAt: nowIso(),
+      executionMessage: executed.message,
+      ...(execution ? { executionExitCode: execution.exitCode } : {}),
+    };
+    saveStatusDecisionRecord(context.commonDir, context.config, decision);
+
+    process.stdout.write(`${executed.ok ? 'Action completed' : 'Action failed'}: ${sanitizeForTerminal(executed.message)}\n`);
+    if (!executed.ok) {
+      process.exitCode = 1;
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    decision = {
+      ...decision,
+      status: 'failed',
+      selectedOption: 'error',
+      answeredAt: nowIso(),
+      executionMessage: message,
+    };
+    saveStatusDecisionRecord(context.commonDir, context.config, decision);
+    process.stdout.write(`Action failed: ${sanitizeForTerminal(message)}\n`);
+    process.exitCode = 1;
+  } finally {
+    prompter.close();
+  }
+}
+
+function canPromptForStatusAction(): boolean {
+  if (process.env.NODE_ENV === 'test' && process.env.PIPELANE_STATUS_INPUT !== undefined) {
+    return true;
+  }
+  return process.stdin.isTTY === true && process.stdout.isTTY === true;
+}
+
+function createStatusPrompter(): StatusPrompter {
+  if (process.env.NODE_ENV === 'test' && process.env.PIPELANE_STATUS_INPUT !== undefined) {
+    const answers = process.env.PIPELANE_STATUS_INPUT.split(/\r?\n/);
+    let index = 0;
+    return {
+      ask: async () => {
+        if (index >= answers.length) {
+          throw new Error('PIPELANE_STATUS_INPUT exhausted');
+        }
+        const answer = answers[index];
+        index += 1;
+        return answer;
+      },
+      close: () => undefined,
+    };
+  }
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  return {
+    ask: (question: string) => rl.question(question),
+    close: () => rl.close(),
+  };
+}
+
+function chooseStatusActionCandidate(data: SnapshotData): StatusActionCandidate | null {
+  const orchestrationAction = data.orchestration?.activeRun?.nextAction ?? null;
+  if (orchestrationAction && isStableActionId(orchestrationAction.id) && isSelectableLaneState(orchestrationAction.state, false)) {
+    return {
+      id: orchestrationAction.id,
+      label: orchestrationAction.label,
+      reason: orchestrationAction.reason,
+      risky: orchestrationAction.risky,
+      requiresConfirmation: orchestrationAction.requiresConfirmation,
+      inputs: [],
+      defaultParams: {},
+      source: 'orchestration',
+      ...(data.orchestration?.activeRun?.id ? { runId: data.orchestration.activeRun.id } : {}),
+    };
+  }
+
+  const currentBranch = data.branches.find((branch) => branch.current);
+  const branchAction = currentBranch?.availableActions.find(isSelectableApiAction);
+  if (branchAction) {
+    return {
+      ...candidateFromApiAction(branchAction, 'branch'),
+      branchName: currentBranch?.name,
+      ...(currentBranch?.task?.taskSlug ? { taskSlug: currentBranch.task.taskSlug } : {}),
+    };
+  }
+
+  const boardAction = data.availableActions.find((action) => isSelectableBoardAction(action, data));
+  return boardAction ? candidateFromApiAction(boardAction, 'board') : null;
+}
+
+function candidateFromApiAction(action: ApiActionState, source: StatusDecisionRecord['source']): StatusActionCandidate {
+  return {
+    id: action.id as StableActionId,
+    label: action.label,
+    reason: action.reason,
+    risky: action.risky,
+    requiresConfirmation: action.requiresConfirmation,
+    inputs: action.inputs,
+    defaultParams: action.defaultParams,
+    source,
+  };
+}
+
+function isSelectableApiAction(action: ApiActionState): boolean {
+  return isStableActionId(action.id) && isSelectableLaneState(action.state, action.inputs.length > 0);
+}
+
+function isSelectableBoardAction(action: ApiActionState, data: SnapshotData): boolean {
+  if (!isSelectableApiAction(action)) return false;
+  if (action.id !== 'clean.plan' && action.id !== 'clean.apply') return false;
+  return data.branches.some((branch) => branch.cleanup?.available && branch.cleanup?.eligible);
+}
+
+function isSelectableLaneState(state: LaneState, hasInputs: boolean): boolean {
+  return state === 'awaiting_preflight' || state === 'healthy' || (state === 'blocked' && hasInputs);
+}
+
+function renderStatusActionCandidate(candidate: StatusActionCandidate): string {
+  const risk = candidate.requiresConfirmation || candidate.risky ? 'requires confirmation' : 'safe preflight';
+  return [
+    '',
+    'NEXT ACTION',
+    `  ${sanitizeForTerminal(candidate.label)} - ${sanitizeForTerminal(candidate.reason || risk)}`,
+    `  source: ${sanitizeForTerminal(candidate.source)}; ${risk}`,
+    '',
+  ].join('\n');
+}
+
+async function resolveStatusActionPreflight(
+  cwd: string,
+  parsed: ParsedOperatorArgs,
+  candidate: StatusActionCandidate,
+  prompter: StatusPrompter,
+): Promise<{ preflight: StatusActionPreflightEnvelope; parsed: ParsedOperatorArgs }> {
+  const params: Record<string, unknown> = {
+    ...candidate.defaultParams,
+    ...(candidate.taskSlug ? { task: candidate.taskSlug } : {}),
+  };
+
+  let actionParsed = buildStatusActionParsed(parsed, params);
+  let preflight = buildActionPreflightEnvelope(cwd, candidate.id, actionParsed);
+  let remainingAttempts = 3;
+  while (!preflight.data.preflight.allowed && preflight.data.preflight.needsInput && remainingAttempts > 0) {
+    remainingAttempts -= 1;
+    process.stdout.write(`\n${sanitizeForTerminal(preflight.data.preflight.reason)}\n`);
+    applyActionParams(params, preflight.data.preflight.defaultParams);
+    await collectStatusActionInputs(prompter, preflight.data.preflight.inputs, params);
+    actionParsed = buildStatusActionParsed(parsed, params);
+    preflight = buildActionPreflightEnvelope(cwd, candidate.id, actionParsed);
+  }
+  return { preflight, parsed: actionParsed };
+}
+
+async function collectStatusActionInputs(
+  prompter: StatusPrompter,
+  inputs: ApiActionInput[],
+  params: Record<string, unknown>,
+): Promise<void> {
+  for (const input of inputs) {
+    if (input.type === 'choice') {
+      const options = input.options ?? [];
+      if (options.length === 0) {
+        throw new Error(`${input.label} has no selectable options.`);
+      }
+      process.stdout.write(`${sanitizeForTerminal(input.label)}:\n`);
+      options.forEach((option, index) => {
+        process.stdout.write(`  ${index + 1}. ${sanitizeForTerminal(option.label)} - ${sanitizeForTerminal(option.description)}\n`);
+      });
+      const answer = (await prompter.ask(`Choose ${input.label} [1-${options.length}]: `)).trim();
+      const selectedIndex = Number.parseInt(answer, 10) - 1;
+      const option = Number.isInteger(selectedIndex) && selectedIndex >= 0 && selectedIndex < options.length
+        ? options[selectedIndex]
+        : options.find((entry) => entry.value === answer || entry.label === answer);
+      if (!option) {
+        throw new Error(`Invalid ${input.label} selection.`);
+      }
+      params[input.name] = option.value;
+      applyActionParams(params, option.params ?? {});
+      continue;
+    }
+
+    if (input.type === 'boolean') {
+      const current = params[input.name];
+      const suffix = typeof current === 'boolean' ? ` [${current ? 'Y/n' : 'y/N'}]` : ' [y/N]';
+      const answer = (await prompter.ask(`${input.label}${suffix}: `)).trim();
+      params[input.name] = answer
+        ? isAffirmativeAnswer(answer)
+        : current === true;
+      continue;
+    }
+
+    const current = params[input.name];
+    const defaultText = typeof current === 'string' && current.trim() ? ` [${current}]` : '';
+    const answer = (await prompter.ask(`${input.label}${defaultText}: `)).trim();
+    const resolved = answer || (typeof current === 'string' ? current.trim() : '');
+    if (input.required && !resolved) {
+      throw new Error(`${input.label} is required.`);
+    }
+    params[input.name] = resolved;
+  }
+}
+
+function buildStatusActionParsed(parsed: ParsedOperatorArgs, params: Record<string, unknown>): ParsedOperatorArgs {
+  const flags = cloneOperatorFlags(parsed.flags);
+  flags.execute = false;
+  flags.confirmToken = '';
+  applyParamsToFlags(flags, params);
+  return {
+    command: 'api',
+    positional: ['action'],
+    flags,
+  };
+}
+
+function cloneOperatorFlags(flags: OperatorFlags): OperatorFlags {
+  return {
+    ...flags,
+    surfaces: [...flags.surfaces],
+    forceInclude: [...flags.forceInclude],
+    criticalPaths: [...flags.criticalPaths],
+    smokeFeedback: [...flags.smokeFeedback],
+  };
+}
+
+function applyActionParams(target: Record<string, unknown>, params: Record<string, unknown>): void {
+  for (const [key, value] of Object.entries(params)) {
+    target[key] = value;
+  }
+}
+
+function applyParamsToFlags(flags: OperatorFlags, params: Record<string, unknown>): void {
+  const applyString = (key: keyof Pick<OperatorFlags,
+    'task' | 'title' | 'message' | 'pr' | 'sha' | 'reason' | 'recover' | 'bindingFingerprint' | 'mode' | 'scope'
+  >): void => {
+    const value = params[key];
+    if (typeof value === 'string') flags[key] = value;
+  };
+
+  applyString('task');
+  applyString('title');
+  applyString('message');
+  applyString('pr');
+  applyString('sha');
+  applyString('reason');
+  applyString('recover');
+  applyString('bindingFingerprint');
+  applyString('mode');
+  applyString('scope');
+
+  if (typeof params.allStale === 'boolean') flags.allStale = params.allStale;
+  if (typeof params.override === 'boolean') flags.override = params.override;
+  if (typeof params.skipSmokeCoverage === 'boolean') flags.skipSmokeCoverage = params.skipSmokeCoverage;
+  if (Array.isArray(params.surfaces)) {
+    flags.surfaces = params.surfaces.filter((entry): entry is string => typeof entry === 'string');
+  } else if (typeof params.surfaces === 'string') {
+    flags.surfaces = params.surfaces.split(',').map((entry) => entry.trim()).filter(Boolean);
+  }
+  if (Array.isArray(params.forceInclude)) {
+    flags.forceInclude = params.forceInclude.filter((entry): entry is string => typeof entry === 'string');
+  }
+}
+
+function hasActionExecution(data: ActionPreflightData | ActionExecutionData): data is ActionExecutionData {
+  return 'execution' in data;
+}
+
+function isAffirmativeAnswer(value: string): boolean {
+  return value === '1' || /^y(?:es)?$/i.test(value);
+}
+
+function resolveStatusDecisionActor(): string {
+  return process.env.GITHUB_ACTOR
+    || process.env.USER
+    || process.env.LOGNAME
+    || 'local';
 }
 
 // Pure envelope → string renderer. Exported for golden-file tests.
