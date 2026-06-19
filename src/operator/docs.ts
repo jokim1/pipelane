@@ -12,7 +12,6 @@ import {
   loadWorkflowConfig,
   MANAGED_COMMANDS,
   MANAGED_EXTRA_COMMANDS,
-  readPackageJsonOverlay,
   REPO_LOCAL_SYNC_DOCS,
   type ManagedCommand,
   readJsonFile,
@@ -39,7 +38,6 @@ const CLAUDE_COMMAND_MARKER = '<!-- pipelane:command:';
 const CONSUMER_EXTENSION_MARKER_START = '<!-- pipelane:consumer-extension:start -->';
 const CONSUMER_EXTENSION_MARKER_END = '<!-- pipelane:consumer-extension:end -->';
 const MANAGED_CLAUDE_COMMANDS_FILENAME = '.pipelane-managed.json';
-const SYNC_DOC_KEYS = Object.keys(REPO_LOCAL_SYNC_DOCS) as (keyof SyncDocsConfig)[];
 // Two-signature legacy detection: first-line description + a distinctive body
 // string. For workflow commands the body string is usually the npm script
 // prefix, truncated to `npm run pipelane:<cmd>` so the match survives any
@@ -394,116 +392,7 @@ function renderManagedClaudeCommand(
   return injectConsumerExtension(rendered, capturedExtension);
 }
 
-function hasOwn(value: object, key: string): boolean {
-  return Object.prototype.hasOwnProperty.call(value, key);
-}
-
-function readJsonObject(targetPath: string): Record<string, unknown> | null {
-  try {
-    const parsed = JSON.parse(readFileSync(targetPath, 'utf8')) as unknown;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return null;
-    }
-    return parsed as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-}
-
-function fileContains(targetPath: string, needle: string): boolean {
-  return existsSync(targetPath) && readFileSync(targetPath, 'utf8').includes(needle);
-}
-
-interface DeclaredSyncDocs {
-  declared: boolean;
-  raw: unknown;
-}
-
-function readDeclaredSyncDocs(repoRoot: string): DeclaredSyncDocs {
-  const configPath = resolveReadableConfigPath(repoRoot);
-  if (configPath) {
-    const parsed = readJsonObject(configPath);
-    if (parsed && hasOwn(parsed, 'syncDocs')) {
-      return { declared: true, raw: parsed.syncDocs };
-    }
-  }
-  const overlay = readPackageJsonOverlay(repoRoot);
-  if (overlay && hasOwn(overlay, 'syncDocs')) {
-    return { declared: true, raw: overlay.syncDocs };
-  }
-  return { declared: false, raw: undefined };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
-}
-
-function hasManagedPackageScripts(repoRoot: string): boolean {
-  const pkg = readJsonObject(path.join(repoRoot, 'package.json'));
-  if (!pkg || !isRecord(pkg.scripts)) {
-    return false;
-  }
-  return (
-    Object.entries(REQUIRED_PACKAGE_SCRIPTS).some(([script, command]) => pkg.scripts[script] === command) ||
-    (typeof pkg.scripts.preinstall === 'string' && pkg.scripts.preinstall.includes(PREINSTALL_GUARD_FINGERPRINT))
-  );
-}
-
-function hasPipelaneReleaseWorkflowDoc(repoRoot: string): boolean {
-  const target = path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md');
-  return (
-    fileContains(target, "This document is the full operator guide for this repo's pipelane setup.") &&
-    fileContains(target, '## Supported Operator Surfaces')
-  );
-}
-
-function hasLegacyRepoLocalFootprint(repoRoot: string): boolean {
-  return (
-    existsSync(path.join(repoRoot, '.claude', 'commands', MANAGED_CLAUDE_COMMANDS_FILENAME)) ||
-    existsSync(path.join(repoRoot, '.agents', 'skills', '.pipelane-managed.json')) ||
-    existsSync(path.join(repoRoot, 'pipelane', 'CLAUDE.template.md')) ||
-    hasPipelaneReleaseWorkflowDoc(repoRoot) ||
-    hasManagedPackageScripts(repoRoot) ||
-    fileContains(path.join(repoRoot, 'README.md'), README_MARKER_START) ||
-    fileContains(path.join(repoRoot, 'CONTRIBUTING.md'), CONTRIBUTING_MARKER_START) ||
-    fileContains(path.join(repoRoot, 'AGENTS.md'), AGENTS_MARKER_START)
-  );
-}
-
-function hasLegacyPartialSyncDocsShape(raw: unknown): boolean {
-  if (!isRecord(raw)) {
-    return false;
-  }
-  const hasOmittedKey = SYNC_DOC_KEYS.some((key) => typeof raw[key] !== 'boolean');
-  return hasOmittedKey;
-}
-
-function resolveSyncDocsFromDefaults(
-  defaults: Required<SyncDocsConfig>,
-  raw: SyncDocsConfig | undefined,
-): Required<SyncDocsConfig> {
-  const resolved: Required<SyncDocsConfig> = { ...defaults };
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    return resolved;
-  }
-  for (const key of SYNC_DOC_KEYS) {
-    const value = (raw as Record<string, unknown>)[key];
-    if (typeof value === 'boolean') {
-      resolved[key] = value;
-    }
-  }
-  return resolved;
-}
-
-function resolveEffectiveSyncDocs(repoRoot: string, config: WorkflowConfig): Required<SyncDocsConfig> {
-  const declared = readDeclaredSyncDocs(repoRoot);
-  const hasLegacyFootprint = hasLegacyRepoLocalFootprint(repoRoot);
-  if (config.syncDocs === undefined && !declared.declared && hasLegacyFootprint) {
-    return { ...REPO_LOCAL_SYNC_DOCS };
-  }
-  if (hasLegacyFootprint && hasLegacyPartialSyncDocsShape(declared.raw)) {
-    return resolveSyncDocsFromDefaults(REPO_LOCAL_SYNC_DOCS, config.syncDocs);
-  }
+function resolveEffectiveSyncDocs(_repoRoot: string, config: WorkflowConfig): Required<SyncDocsConfig> {
   return resolveSyncDocs(config.syncDocs);
 }
 
