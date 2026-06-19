@@ -45,6 +45,15 @@ import {
 } from '../runtime-observation.ts';
 import { TASK_LOCK_MIN_PRUNE_AGE_MS } from '../task-workspaces.ts';
 import {
+  isActiveOrchestrationRun,
+  listOrchestrationRunRecords,
+  sliceReviewFullySatisfied,
+  type OrchestrationReviewSatisfactionOptions,
+  type OrchestrationRunRecord,
+  type OrchestrationRunStatus,
+  type OrchestrationSliceRecord,
+} from '../orchestration-ledger.ts';
+import {
   buildApiActionState,
   buildApiEnvelope,
   buildApiIssue,
@@ -145,6 +154,71 @@ export interface CurrentCheckoutTruth {
   };
 }
 
+export interface OrchestrationSliceSummary {
+  id: string;
+  status: OrchestrationSliceRecord['status'];
+  provider: OrchestrationSliceRecord['provider'];
+  outcome: string;
+  branchName: string | null;
+  worktreePath: string | null;
+  workerStatus: NonNullable<OrchestrationSliceRecord['worker']>['status'] | null;
+  reviewStatus: NonNullable<OrchestrationSliceRecord['review']>['run']['status'] | null;
+  trustedReviewComplete: boolean;
+}
+
+export interface OrchestrationActionSummary {
+  id: string;
+  label: string;
+  state: LaneState;
+  reason: string;
+  command: string;
+  risky: boolean;
+  requiresConfirmation: boolean;
+}
+
+export interface OrchestrationInboxItem {
+  id: string;
+  runId: string;
+  sliceId: string | null;
+  severity: ApiIssue['severity'];
+  title: string;
+  message: string;
+  action: OrchestrationActionSummary | null;
+}
+
+export interface OrchestrationRunSummary {
+  id: string;
+  status: OrchestrationRunStatus;
+  state: LaneState;
+  title: string;
+  planPath: string | null;
+  createdAt: string;
+  updatedAt: string;
+  sliceCount: number;
+  counts: {
+    planned: number;
+    prepared: number;
+    dispatched: number;
+    running: number;
+    blocked: number;
+    completed: number;
+    failed: number;
+    workerSucceeded: number;
+    reviewPassed: number;
+    trustedReviewComplete: number;
+  };
+  providerCounts: Record<string, number>;
+  nextAction: OrchestrationActionSummary | null;
+  slices: OrchestrationSliceSummary[];
+}
+
+export interface OrchestrationSnapshot {
+  activeRun: OrchestrationRunSummary | null;
+  runs: OrchestrationRunSummary[];
+  humanInbox: OrchestrationInboxItem[];
+  availableActions: OrchestrationActionSummary[];
+}
+
 export interface SnapshotData {
   boardContext: {
     mode: string;
@@ -194,6 +268,7 @@ export interface SnapshotData {
   review: {
     latest: ReviewRunRecord | null;
   };
+  orchestration: OrchestrationSnapshot;
   sourceHealth: SourceHealthEntry[];
   attention: unknown[];
   availableActions: ApiActionState[];
@@ -214,6 +289,8 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
   const reviewState = loadReviewState(context.commonDir, context.config);
   const reviewEvidence = evaluateReviewEvidenceForPr(context);
   const reviewHealth = summarizeReviewEvidenceHealth(reviewEvidence);
+  const orchestration = buildOrchestrationSnapshot(context.commonDir, context.config, currentBranch);
+  const orchestrationHealth = summarizeOrchestrationHealth(orchestration);
   const smokeLatest = loadSmokeLatestState(context.commonDir, context.config);
   const smokeConfig = resolveSmokeConfig(context.config);
   const smokeRegistry = loadSmokeRegistry(context.repoRoot, context.config);
@@ -303,6 +380,14 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
       name: 'task-locks',
       reason: locks.length === 0 ? 'no active task locks' : `${locks.length} active task lock(s)`,
       checkedAt,
+    }),
+    buildSourceHealthEntry({
+      name: 'orchestration.runs',
+      state: orchestrationHealth.state,
+      blocking: orchestrationHealth.blocking,
+      reason: orchestrationHealth.reason,
+      checkedAt,
+      observedAt: orchestrationHealth.observedAt,
     }),
     ...surfaceProbes.map((entry) => buildSourceHealthEntry({
       name: `deployProbe.${entry.surface}`,
@@ -453,6 +538,9 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
       action: 'review',
     }));
   }
+  if (orchestrationHealth.issue) {
+    attention.push(orchestrationHealth.issue);
+  }
 
   const boardMessage = mode === 'release'
     ? 'Release mode: promote merged SHA through staging before prod.'
@@ -503,6 +591,7 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
       review: {
         latest: reviewEvidence.latest ?? reviewState.records[0] ?? null,
       },
+      orchestration,
       sourceHealth,
       attention,
       availableActions: buildBoardActions({ mode, releaseReadiness, branches, checkedAt }),
@@ -631,6 +720,270 @@ function buildBoardActions(options: {
       checkedAt: options.checkedAt,
     }),
   ];
+}
+
+function buildOrchestrationSnapshot(commonDir: string, config: WorkflowConfig, currentBranch: string): OrchestrationSnapshot {
+  const records = listOrchestrationRunRecords(commonDir, config);
+  const reviewOptions: OrchestrationReviewSatisfactionOptions = {
+    headCache: new Map(),
+    worktreeExistsCache: new Map(),
+  };
+  const recentRecords = records.slice(0, 10);
+  const currentBranchRecords = currentBranch
+    ? records.filter((run) => run.branchName === currentBranch)
+    : records;
+  const activeRecord = currentBranchRecords.find((run, index) =>
+    run.status !== 'completed'
+    || (index < 10 && (isActiveOrchestrationRun(run, reviewOptions) || isPrReadyOrchestrationRun(run, reviewOptions))),
+  )
+    ?? null;
+  const summaryRecords = activeRecord
+    ? [activeRecord, ...recentRecords.filter((run) => run.id !== activeRecord.id)].slice(0, 10)
+    : recentRecords;
+  const summaries = summaryRecords.map((run) => summarizeOrchestrationRun(run, config, reviewOptions));
+  const activeRun = activeRecord ? summaries.find((run) => run.id === activeRecord.id) ?? null : null;
+  const humanInbox = activeRun ? buildOrchestrationInbox(activeRun) : [];
+  return {
+    activeRun,
+    runs: summaries.slice(0, 10),
+    humanInbox,
+    availableActions: activeRun?.nextAction ? [activeRun.nextAction] : [],
+  };
+}
+
+function isPrReadyOrchestrationRun(
+  run: OrchestrationRunRecord,
+  reviewOptions: OrchestrationReviewSatisfactionOptions,
+): boolean {
+  return run.status === 'completed'
+    && run.slices.length > 0
+    && run.slices.every((slice) => sliceReviewFullySatisfied(slice, reviewOptions));
+}
+
+function summarizeOrchestrationRun(
+  run: OrchestrationRunRecord,
+  config: WorkflowConfig,
+  reviewOptions: OrchestrationReviewSatisfactionOptions,
+): OrchestrationRunSummary {
+  const counts = {
+    planned: 0,
+    prepared: 0,
+    dispatched: 0,
+    running: 0,
+    blocked: 0,
+    completed: 0,
+    failed: 0,
+    workerSucceeded: 0,
+    reviewPassed: 0,
+    trustedReviewComplete: 0,
+  };
+  const providerCounts: Record<string, number> = {};
+  const trustedReviewBySlice = new Map<string, boolean>();
+  const slices = run.slices.map((slice) => {
+    counts[slice.status] += 1;
+    if (slice.worker?.status === 'succeeded') counts.workerSucceeded += 1;
+    if (slice.review?.run.status === 'passed') counts.reviewPassed += 1;
+    const trustedReviewComplete = sliceReviewFullySatisfied(slice, reviewOptions);
+    trustedReviewBySlice.set(slice.id, trustedReviewComplete);
+    if (trustedReviewComplete) counts.trustedReviewComplete += 1;
+    providerCounts[slice.provider] = (providerCounts[slice.provider] ?? 0) + 1;
+    return {
+      id: slice.id,
+      status: slice.status,
+      provider: slice.provider,
+      outcome: slice.outcome,
+      branchName: slice.branchName,
+      worktreePath: slice.worktreePath,
+      workerStatus: slice.worker?.status ?? null,
+      reviewStatus: slice.review?.status ?? null,
+      trustedReviewComplete,
+    };
+  });
+
+  return {
+    id: run.id,
+    status: run.status,
+    state: orchestrationLaneStateFromCounts(run.slices.length, counts),
+    title: run.plan.title,
+    planPath: run.source.planPath,
+    createdAt: run.createdAt,
+    updatedAt: run.updatedAt,
+    sliceCount: run.slices.length,
+    counts,
+    providerCounts,
+    nextAction: buildOrchestrationNextAction(run, config, trustedReviewBySlice),
+    slices,
+  };
+}
+
+function buildOrchestrationNextAction(
+  run: OrchestrationRunRecord,
+  config: WorkflowConfig,
+  trustedReviewBySlice: Map<string, boolean>,
+): OrchestrationActionSummary | null {
+  const orchestrateCommand = '/pipelane orchestrate';
+  const prCommand = formatWorkflowCommand(config, 'pr');
+  const runIdArg = `--run-id ${run.id}`;
+  const hasFailedWorker = run.slices.some((slice) => slice.worker?.status === 'failed' || slice.status === 'failed');
+  const hasRunningWorker = run.slices.some((slice) => slice.worker?.status === 'running' || slice.status === 'running');
+  const hasBlockedSlice = run.slices.some((slice) => slice.status === 'blocked');
+  const needsPrepare = run.status === 'planned' || run.slices.some((slice) => slice.status === 'planned');
+  const needsDispatch = !needsPrepare && (run.status === 'prepared' || run.slices.some((slice) => slice.status === 'prepared'));
+  const needsStart = !needsPrepare && !needsDispatch && run.slices.some((slice) =>
+    slice.status === 'dispatched' || (slice.status === 'blocked' && !slice.worker),
+  );
+  const needsReview = run.slices.some((slice) =>
+    slice.worker?.status === 'succeeded' && !trustedReviewBySlice.get(slice.id),
+  );
+  const fullyReviewed = run.slices.length > 0 && run.slices.every((slice) => trustedReviewBySlice.get(slice.id));
+
+  if (hasFailedWorker) {
+    return buildOrchestrationAction({
+      id: 'orchestrate.retry-workers',
+      label: 'Retry failed orchestration workers',
+      state: 'blocked',
+      reason: 'one or more slice workers failed',
+      command: `${orchestrateCommand} start ${runIdArg} --force`,
+    });
+  }
+  if (hasRunningWorker) {
+    return buildOrchestrationAction({
+      id: 'orchestrate.wait-workers',
+      label: 'Wait for running workers',
+      state: 'running',
+      reason: 'one or more slice workers are still running',
+      command: formatWorkflowCommand(config, 'status'),
+    });
+  }
+  if (needsPrepare) {
+    return buildOrchestrationAction({
+      id: 'orchestrate.prepare',
+      label: 'Prepare orchestration worktrees',
+      state: 'awaiting_preflight',
+      reason: 'slice worktrees have not been prepared',
+      command: `${orchestrateCommand} prepare ${runIdArg}`,
+    });
+  }
+  if (needsDispatch) {
+    return buildOrchestrationAction({
+      id: 'orchestrate.dispatch',
+      label: 'Write orchestration handoff prompts',
+      state: 'awaiting_preflight',
+      reason: 'slice prompts have not been dispatched',
+      command: `${orchestrateCommand} dispatch ${runIdArg}`,
+    });
+  }
+  if (needsStart) {
+    return buildOrchestrationAction({
+      id: 'orchestrate.start',
+      label: 'Start orchestration workers',
+      state: hasBlockedSlice ? 'blocked' : 'awaiting_preflight',
+      reason: hasBlockedSlice ? 'blocked slices need recovery before more workers can start' : 'workers have not started',
+      command: `${orchestrateCommand} start ${runIdArg}`,
+    });
+  }
+  if (needsReview) {
+    return buildOrchestrationAction({
+      id: 'orchestrate.review',
+      label: 'Review completed orchestration slices',
+      state: 'awaiting_preflight',
+      reason: 'worker output exists, but trusted full-slice review evidence is incomplete',
+      command: `${orchestrateCommand} review ${runIdArg}`,
+    });
+  }
+  if (fullyReviewed) {
+    return buildOrchestrationAction({
+      id: 'pr',
+      label: 'Open PR for reviewed orchestration work',
+      state: 'awaiting_preflight',
+      reason: 'all slices have trusted review evidence',
+      command: prCommand,
+    });
+  }
+  return null;
+}
+
+function buildOrchestrationAction(options: {
+  id: string;
+  label: string;
+  state: LaneState;
+  reason: string;
+  command: string;
+}): OrchestrationActionSummary {
+  return {
+    id: options.id,
+    label: options.label,
+    state: options.state,
+    reason: options.reason,
+    command: options.command,
+    risky: false,
+    requiresConfirmation: false,
+  };
+}
+
+function buildOrchestrationInbox(activeRun: OrchestrationRunSummary): OrchestrationInboxItem[] {
+  const items: OrchestrationInboxItem[] = [];
+  for (const slice of activeRun.slices) {
+    if (slice.status !== 'failed' && slice.status !== 'blocked') continue;
+    items.push({
+      id: `${activeRun.id}:${slice.id}:${slice.status}`,
+      runId: activeRun.id,
+      sliceId: slice.id,
+      severity: slice.status === 'failed' ? 'error' : 'warning',
+      title: slice.status === 'failed' ? 'Slice worker failed' : 'Slice is blocked',
+      message: `${slice.id} is ${slice.status}. ${activeRun.nextAction?.reason ?? 'Inspect the orchestration run for recovery details.'}`,
+      action: activeRun.nextAction,
+    });
+  }
+  return items;
+}
+
+function summarizeOrchestrationHealth(orchestration: OrchestrationSnapshot): {
+  state: LaneState;
+  blocking: boolean;
+  reason: string;
+  observedAt?: string;
+  issue: ApiIssue | null;
+} {
+  if (!orchestration.activeRun) {
+    return {
+      state: 'healthy',
+      blocking: false,
+      reason: orchestration.runs.length === 0 ? 'no orchestration runs recorded' : 'no active orchestration runs',
+      observedAt: orchestration.runs[0]?.updatedAt,
+      issue: null,
+    };
+  }
+
+  const run = orchestration.activeRun;
+  const state = run.state;
+  const blocking = state === 'blocked';
+  const reason = run.nextAction
+    ? `${run.title}: ${run.nextAction.reason}`
+    : `${run.title}: ${run.status}`;
+  return {
+    state,
+    blocking,
+    reason,
+    observedAt: run.updatedAt,
+    issue: blocking
+      ? buildApiIssue({
+          code: 'orchestration.blocked',
+          severity: 'error',
+          message: `Orchestration ${run.id} is blocked. ${run.nextAction ? `Next: ${run.nextAction.command}.` : 'Inspect the run for recovery guidance.'}`,
+          source: 'orchestration',
+          blocking: true,
+          action: run.nextAction?.id ?? 'orchestrate',
+        })
+      : null,
+  };
+}
+
+function orchestrationLaneStateFromCounts(sliceCount: number, counts: OrchestrationRunSummary['counts']): LaneState {
+  if (counts.failed > 0 || counts.blocked > 0) return 'blocked';
+  if (counts.running > 0) return 'running';
+  if (sliceCount > 0 && counts.trustedReviewComplete === sliceCount) return 'healthy';
+  return 'awaiting_preflight';
 }
 
 function smokeLaneState(record: SmokeRunRecord | null): LaneState {

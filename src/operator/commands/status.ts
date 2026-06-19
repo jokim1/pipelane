@@ -114,7 +114,7 @@ export function renderCockpit(
   options: RenderCockpitOptions = {},
 ): string {
   const color = options.color === true;
-  const { boardContext, branches, smoke, sourceHealth, attention } = envelope.data;
+  const { boardContext, branches, smoke, sourceHealth, attention, orchestration } = envelope.data;
   const baseBranch = boardContext.baseBranch;
 
   const lines: string[] = [];
@@ -161,6 +161,9 @@ export function renderCockpit(
   lines.push(...renderCurrentCheckout(boardContext.currentCheckout, color));
   lines.push('');
 
+  lines.push(...renderOrchestration(orchestration, color));
+  lines.push('');
+
   lines.push(...renderAttention(attention as ApiIssue[], color));
   lines.push('');
 
@@ -205,6 +208,48 @@ export function renderCockpit(
   }
 
   return lines.join('\n');
+}
+
+function renderOrchestration(
+  orchestration: SnapshotData['orchestration'] | undefined,
+  color: boolean,
+): string[] {
+  if (!orchestration) return [];
+  const lines = [colorize('ORCHESTRATION', color, 'bold')];
+  const activeRun = orchestration.activeRun;
+  if (!activeRun) {
+    lines.push('  no active orchestration runs');
+    if (orchestration.runs.length > 0) {
+      const latest = orchestration.runs[0];
+      lines.push(`  latest: ${sanitizeForTerminal(latest.id)} [${sanitizeForTerminal(latest.status)}] ${sanitizeForTerminal(latest.title)}`);
+    }
+    lines.push(`  next: ${sanitizeForTerminal(orchestration.availableActions[0]?.command ?? '/pipelane orchestrate')}`);
+    return lines;
+  }
+
+  lines.push(`  active: ${sanitizeForTerminal(activeRun.id)} [${colorize(activeRun.state, color, toneForState(activeRun.state))}] ${sanitizeForTerminal(activeRun.title)}`);
+  lines.push(
+    `  progress: workers ${activeRun.counts.workerSucceeded}/${activeRun.sliceCount} succeeded, reviews ${activeRun.counts.trustedReviewComplete}/${activeRun.sliceCount} trusted, failed ${activeRun.counts.failed}, blocked ${activeRun.counts.blocked}`,
+  );
+  if (activeRun.nextAction) {
+    lines.push(`  next: ${sanitizeForTerminal(activeRun.nextAction.command)} (${sanitizeForTerminal(activeRun.nextAction.reason)})`);
+  }
+  if (orchestration.humanInbox.length > 0) {
+    lines.push('  inbox:');
+    for (const item of orchestration.humanInbox.slice(0, 5)) {
+      lines.push(`    - ${sanitizeForTerminal(item.title)}: ${sanitizeForTerminal(item.message)}`);
+    }
+  }
+  lines.push('  slices:');
+  for (const slice of activeRun.slices.slice(0, 8)) {
+    const worker = slice.workerStatus ?? 'none';
+    const review = slice.trustedReviewComplete ? 'trusted' : slice.reviewStatus ?? 'none';
+    lines.push(`    - ${sanitizeForTerminal(slice.id)}: ${sanitizeForTerminal(slice.status)} provider=${sanitizeForTerminal(slice.provider)} worker=${sanitizeForTerminal(worker)} review=${sanitizeForTerminal(review)}`);
+  }
+  if (activeRun.slices.length > 8) {
+    lines.push(`    +${activeRun.slices.length - 8} more slice${activeRun.slices.length - 8 === 1 ? '' : 's'}`);
+  }
+  return lines;
 }
 
 function renderHeader(envelope: ApiEnvelope<SnapshotData>, color: boolean): string {

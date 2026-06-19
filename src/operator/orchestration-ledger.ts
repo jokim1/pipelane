@@ -269,6 +269,36 @@ export function listOrchestrationRunRecords(commonDir: string, config: WorkflowC
   return records.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
 }
 
+export function isActiveOrchestrationRun(
+  record: OrchestrationRunRecord,
+  options: OrchestrationReviewSatisfactionOptions = {},
+): boolean {
+  if (record.status !== 'completed') return true;
+  return record.slices.some((slice) =>
+    slice.worker?.status === 'succeeded'
+    && !sliceReviewFullySatisfied(slice, options)
+    && sliceWorktreeExists(slice, options),
+  );
+}
+
+export interface OrchestrationReviewSatisfactionOptions {
+  headCache?: Map<string, string | null>;
+  worktreeExistsCache?: Map<string, boolean>;
+}
+
+export function sliceReviewFullySatisfied(
+  slice: OrchestrationSliceRecord,
+  options: OrchestrationReviewSatisfactionOptions = {},
+): boolean {
+  const reviewRun = slice.review?.run;
+  if (slice.worker?.status !== 'succeeded') return false;
+  if (reviewRun?.status !== 'passed') return false;
+  if (reviewRun.dryRun || reviewRun.gateFilter || reviewRun.phaseFilter || !reviewRun.sha) return false;
+  const currentHead = currentSliceHead(slice, options);
+  if (!currentHead) return slice.status === 'completed';
+  return reviewRun.sha === currentHead;
+}
+
 function assertSafeOrchestrationRunId(runId: string): void {
   if (!isSafeOrchestrationRunId(runId)) {
     throw new Error(`Invalid orchestration run id: ${runId}`);
@@ -277,6 +307,22 @@ function assertSafeOrchestrationRunId(runId: string): void {
 
 function isSafeOrchestrationRunId(runId: string): boolean {
   return /^orchestrate-\d{14}-[a-f0-9]{8}$/.test(runId);
+}
+
+function currentSliceHead(slice: OrchestrationSliceRecord, options: OrchestrationReviewSatisfactionOptions): string | null {
+  if (!slice.worktreePath || !sliceWorktreeExists(slice, options)) return null;
+  if (options.headCache?.has(slice.worktreePath)) return options.headCache.get(slice.worktreePath) ?? null;
+  const head = runGit(slice.worktreePath, ['rev-parse', '--verify', 'HEAD'], true)?.trim() || null;
+  options.headCache?.set(slice.worktreePath, head);
+  return head;
+}
+
+function sliceWorktreeExists(slice: OrchestrationSliceRecord, options: OrchestrationReviewSatisfactionOptions = {}): boolean {
+  if (!slice.worktreePath) return false;
+  if (options.worktreeExistsCache?.has(slice.worktreePath)) return options.worktreeExistsCache.get(slice.worktreePath) ?? false;
+  const exists = existsSync(slice.worktreePath);
+  options.worktreeExistsCache?.set(slice.worktreePath, exists);
+  return exists;
 }
 
 function resolvePlanSections(planText: string, outcome: string | undefined): { globalText: string; slices: PlanSliceSource[] } {

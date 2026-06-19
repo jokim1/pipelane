@@ -9,10 +9,12 @@ import {
 } from '../goal-spec.ts';
 import {
   buildOrchestrationRunRecord,
+  isActiveOrchestrationRun,
   listOrchestrationRunRecords,
   loadOrchestrationRunRecord,
   orchestrationRunPath,
   saveOrchestrationRunRecord,
+  sliceReviewFullySatisfied,
   type OrchestrationRunRecord,
   type OrchestrationSliceReviewRecord,
   type OrchestrationSliceRecord,
@@ -591,7 +593,7 @@ function createOrchestratePrompter(): {
 
 function listActiveOrchestrationRuns(context: WorkflowContext): OrchestrateEntryRunSummary[] {
   return listOrchestrationRunRecords(context.commonDir, context.config)
-    .filter((run) => run.status !== 'completed')
+    .filter((run) => isActiveOrchestrationRun(run))
     .map(summarizeEntryRun);
 }
 
@@ -798,7 +800,7 @@ function renderActiveRunReport(context: WorkflowContext, run: OrchestrationRunRe
     'Slice status:',
   ];
   for (const slice of run.slices) {
-    lines.push(`- ${slice.id}: ${slice.status}${slice.worker ? ` worker=${slice.worker.status}` : ''}${slice.review ? ` review=${slice.review.status}` : ''}`);
+    lines.push(`- ${slice.id}: ${slice.status}${slice.worker ? ` worker=${slice.worker.status}` : ''} review=${slice.review?.status ?? 'none'}`);
   }
   lines.push('', 'Next: run /pipelane status for the full cockpit, or use advanced orchestrate commands for recovery.');
   return lines.join('\n');
@@ -1347,7 +1349,7 @@ function buildBlockedReviewReport(slice: OrchestrationSliceRecord, blocker: stri
 function summarizeRunReviewStatus(run: OrchestrationRunRecord): OrchestrationRunRecord['status'] {
   if (run.slices.some((slice) => slice.worker?.status === 'failed' || slice.status === 'failed' || slice.review?.run.status === 'failed')) return 'failed';
   if (run.slices.some((slice) => slice.worker?.status === 'running' || slice.status === 'running')) return 'running';
-  if (run.slices.every(sliceReviewFullySatisfied)) return 'completed';
+  if (run.slices.every((slice) => sliceReviewFullySatisfied(slice))) return 'completed';
   if (run.slices.some((slice) => slice.worker?.status === 'succeeded' && !sliceReviewFullySatisfied(slice))) return 'blocked';
   if (run.slices.some((slice) => slice.status === 'blocked')) return 'blocked';
   return run.status;
@@ -1357,21 +1359,6 @@ function summarizeSliceReviewStatus(slice: OrchestrationSliceRecord): Orchestrat
   if (sliceReviewFullySatisfied(slice)) return 'completed';
   if (slice.review?.run.status === 'failed') return 'failed';
   return 'blocked';
-}
-
-function sliceReviewFullySatisfied(slice: OrchestrationSliceRecord): boolean {
-  return slice.worker?.status === 'succeeded'
-    && slice.review?.run.status === 'passed'
-    && slice.review.run.dryRun === false
-    && !slice.review.run.gateFilter
-    && !slice.review.run.phaseFilter
-    && Boolean(slice.review.run.sha)
-    && slice.review.run.sha === currentSliceHead(slice);
-}
-
-function currentSliceHead(slice: OrchestrationSliceRecord): string {
-  if (!slice.worktreePath || !existsSync(slice.worktreePath)) return '';
-  return runGit(slice.worktreePath, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '';
 }
 
 function reportStatusForOrchestrationReview(

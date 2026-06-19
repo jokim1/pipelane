@@ -4918,6 +4918,11 @@ test('orchestrate bare command --yes plans, prepares, dispatches, and starts wor
     assert.equal(report.run.slices[0].dispatch.status, 'ready');
     assert.equal(report.run.slices[0].worker.status, 'succeeded');
     assert.ok(existsSync(report.run.slices[0].worktreePath));
+
+    const stillActive = JSON.parse(runCli(['run', 'orchestrate', '--json'], repoRoot).stdout);
+    assert.equal(stillActive.status, 'active');
+    assert.equal(stillActive.runId, report.runId);
+    assert.match(stillActive.message, /review=none/);
   } finally {
     for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
     rmSync(repoRoot, { recursive: true, force: true });
@@ -5898,6 +5903,12 @@ test('orchestrate review runs gate snapshot against completed worker slices', ()
     assert.equal(slice.reviewDiagnostics.length, 1);
     assert.equal(slice.reviewDiagnostics[0].run.phaseFilter, 'static');
     assert.match(reviewed.message, /Review gate execution complete/);
+
+    const reviewedSnapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    assert.equal(reviewedSnapshot.data.orchestration.activeRun.id, planned.runId);
+    assert.equal(reviewedSnapshot.data.orchestration.activeRun.state, 'healthy');
+    assert.equal(reviewedSnapshot.data.orchestration.activeRun.counts.trustedReviewComplete, 1);
+    assert.equal(reviewedSnapshot.data.orchestration.activeRun.nextAction.id, 'pr');
 
     const trustedReviewId = slice.review.run.id;
     const trustedReviewSha = slice.review.run.sha;
@@ -7387,6 +7398,146 @@ test('api snapshot degrades pending, failed, and incomplete review evidence', ()
   } finally {
     rmSync(dryRunRepoRoot, { recursive: true, force: true });
   }
+});
+
+test('api snapshot exposes active orchestration run summaries', () => {
+  const repoRoot = createRepo();
+  try {
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Expose orchestration in status', '--json'], repoRoot).stdout);
+    const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    const orchestrationHealth = envelope.data.sourceHealth.find((entry) => entry.name === 'orchestration.runs');
+
+    assert.equal(envelope.data.orchestration.activeRun.id, planned.runId);
+    assert.equal(envelope.data.orchestration.activeRun.status, 'planned');
+    assert.equal(envelope.data.orchestration.activeRun.sliceCount, 1);
+    assert.equal(envelope.data.orchestration.activeRun.counts.planned, 1);
+    assert.equal(envelope.data.orchestration.activeRun.counts.workerSucceeded, 0);
+    assert.equal(envelope.data.orchestration.activeRun.nextAction.id, 'orchestrate.prepare');
+    assert.match(envelope.data.orchestration.activeRun.nextAction.command, new RegExp(`orchestrate prepare --run-id ${planned.runId}`));
+    assert.deepEqual(envelope.data.orchestration.humanInbox, []);
+    assert.equal(orchestrationHealth.state, 'awaiting_preflight');
+
+    const status = runCli(['run', 'status'], repoRoot).stdout;
+    assert.match(status, /ORCHESTRATION/);
+    assert.match(status, new RegExp(planned.runId));
+    assert.match(status, /workers 0\/1 succeeded, reviews 0\/1 trusted/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('status keeps worker-completed orchestration active until trusted review exists', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const result = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      '--outcome',
+      'Review completed workers from status',
+      '--provider',
+      'generic',
+      '--yes',
+      '--json',
+    ], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: 'node -e "process.exit(0)"',
+    }).stdout);
+    createdWorktrees.push(...result.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+
+    assert.equal(result.run.status, 'completed');
+
+    const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    assert.equal(envelope.data.orchestration.activeRun.id, result.runId);
+    assert.equal(envelope.data.orchestration.activeRun.counts.workerSucceeded, 1);
+    assert.equal(envelope.data.orchestration.activeRun.counts.trustedReviewComplete, 0);
+    assert.equal(envelope.data.orchestration.activeRun.nextAction.id, 'orchestrate.review');
+
+    const status = runCli(['run', 'status'], repoRoot).stdout;
+    assert.match(status, /ORCHESTRATION/);
+    assert.match(status, /orchestrate review --run-id/);
+    assert.match(status, /worker=succeeded review=none/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('api snapshot surfaces failed orchestration workers as inbox and attention', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const result = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      '--outcome',
+      'Surface failed workers in status',
+      '--provider',
+      'generic',
+      '--yes',
+      '--json',
+    ], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: 'node -e "process.exit(2)"',
+    }, true).stdout);
+    createdWorktrees.push(...result.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+
+    assert.equal(result.status, 'failed');
+
+    const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    const activeRun = envelope.data.orchestration.activeRun;
+    const orchestrationHealth = envelope.data.sourceHealth.find((entry) => entry.name === 'orchestration.runs');
+    const orchestrationIssue = envelope.data.attention.find((issue) => issue.code === 'orchestration.blocked');
+
+    assert.equal(activeRun.id, result.runId);
+    assert.equal(activeRun.state, 'blocked');
+    assert.equal(activeRun.nextAction.id, 'orchestrate.retry-workers');
+    assert.equal(envelope.data.orchestration.humanInbox[0].severity, 'error');
+    assert.equal(envelope.data.orchestration.humanInbox[0].title, 'Slice worker failed');
+    assert.equal(orchestrationHealth.state, 'blocked');
+    assert.equal(orchestrationHealth.blocking, true);
+    assert.equal(orchestrationIssue.blocking, true);
+
+    const status = runCli(['run', 'status'], repoRoot).stdout;
+    assert.match(status, /inbox:/);
+    assert.match(status, /Slice worker failed/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('completed reviewed orchestration stays inactive after worktree cleanup', async () => {
+  const { isActiveOrchestrationRun } = await import(path.join(KIT_ROOT, 'src', 'operator', 'orchestration-ledger.ts'));
+  const missingWorktree = path.join(os.tmpdir(), `pipelane-missing-orchestration-worktree-${Date.now()}`);
+  rmSync(missingWorktree, { recursive: true, force: true });
+  const run = {
+    status: 'completed',
+    slices: [{
+      status: 'completed',
+      worktreePath: missingWorktree,
+      worker: { status: 'succeeded' },
+      review: {
+        run: {
+          status: 'passed',
+          dryRun: false,
+          gateFilter: null,
+          phaseFilter: null,
+          sha: 'reviewed-sha',
+        },
+      },
+    }],
+  };
+
+  assert.equal(isActiveOrchestrationRun(run), false);
+  mkdirSync(missingWorktree);
+  run.slices[0].review = null;
+  assert.equal(isActiveOrchestrationRun(run), true);
+  rmSync(missingWorktree, { recursive: true, force: true });
 });
 
 test('loadReviewState rejects malformed nested review gate records', async () => {
