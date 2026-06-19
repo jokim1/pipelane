@@ -1,5 +1,6 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import readline from 'node:readline/promises';
 
@@ -20,6 +21,13 @@ import {
   type OrchestrationSliceRecord,
   type OrchestrationSliceWorkerRecord,
 } from '../orchestration-ledger.ts';
+import { resolveReviewStateKey } from '../integrity.ts';
+import {
+  blockingAiReviewEvidenceBlocker,
+  classifyReviewEvidenceIndependence,
+  createReviewActorIdentity,
+  resolveReviewActorIdentity,
+} from '../review-identity.ts';
 import { buildReviewRunRecord } from './review.ts';
 import {
   DEFAULT_GOAL_PROVIDER,
@@ -29,9 +37,12 @@ import {
   nowIso,
   type GoalProvider,
   printResult,
+  resolveGitCommonDir,
   resolveWorkflowContext,
   runGit,
+  loadReviewState,
   type ParsedOperatorArgs,
+  type ReviewGateRunRecord,
   type ReviewGatePhase,
   type ReviewRunRecord,
   type WorkflowContext,
@@ -50,6 +61,52 @@ const MAX_LIKELY_PLAN_FILES = 5;
 const MAX_PLAN_SCAN_FILES = 200;
 const ORCHESTRATION_REVIEW_DIAGNOSTIC_MAX = 10;
 const NATIVE_COMMAND_PROBE_TIMEOUT_MS = 5000;
+const INHERITED_AGENT_SESSION_ENV_KEYS = [
+  'CODEX_SESSION_ID',
+  'CLAUDE_SESSION_ID',
+  'OPENAI_SESSION_ID',
+  'ANTHROPIC_SESSION_ID',
+  'OPENCLAW_SESSION',
+] as const;
+const WORKER_SECRET_ENV_KEYS = [
+  'PIPELANE_REVIEW_STATE_KEY',
+  'PIPELANE_DEPLOY_STATE_KEY',
+  'PIPELANE_PROBE_STATE_KEY',
+] as const;
+const WORKER_CREDENTIAL_ENV_PATTERN = /(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASS|COOKIE|SESSION|API_KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIALS?|AUTH)(?:_|$)/i;
+const WORKER_CREDENTIAL_ENV_PREFIXES = [
+  'AWS_',
+  'CLOUDFLARE_',
+  'GCP_',
+  'GOOGLE_',
+  'SUPABASE_',
+  'STRIPE_',
+] as const;
+const WORKER_CREDENTIAL_ENV_EXACT_KEYS = [
+  'SSH_AUTH_SOCK',
+  'AUTHORIZATION',
+  'HTTP_AUTHORIZATION',
+  'PROXY_AUTHORIZATION',
+  'NPM_AUTH_TOKEN',
+  'NODE_AUTH_TOKEN',
+  'DATABASE_URL',
+  'DATABASE_URI',
+  'DB_URL',
+  'DB_URI',
+  'POSTGRES_URL',
+  'POSTGRES_URI',
+  'POSTGRESQL_URL',
+  'POSTGRESQL_URI',
+  'MYSQL_URL',
+  'MYSQL_URI',
+  'REDIS_URL',
+  'REDIS_URI',
+  'MONGO_URL',
+  'MONGO_URI',
+  'MONGODB_URL',
+  'MONGODB_URI',
+] as const;
+const WORKER_ENV_ALLOWLIST_ENV = 'PIPELANE_ORCHESTRATE_WORKER_ENV_ALLOW';
 
 type OrchestrateEntryStatus = 'needs-input' | 'preview' | 'active' | 'multiple-active' | 'cancelled' | OrchestrateStartReport['status'];
 
@@ -1228,8 +1285,10 @@ function reviewCompletedSlices(
     }
 
     assertPreparedWorktreeSafe(context, slice.id, slice.branchName ?? '', slice.worktreePath ?? '');
-    const reviewRun = buildReviewRunRecord({
-      repoRoot: slice.worktreePath ?? context.repoRoot,
+    const sliceRepoRoot = slice.worktreePath ?? context.repoRoot;
+    const sliceContext = buildSliceReviewContext(context, sliceRepoRoot);
+    const reviewRun = attachAttestedManualGateEvidence(sliceContext, buildReviewRunRecord({
+      repoRoot: sliceRepoRoot,
       baseBranch: context.config.baseBranch,
       preset: run.gateSnapshot.preset ?? context.config.reviewGates?.preset ?? 'standard',
       gates: run.gateSnapshot.gates,
@@ -1237,10 +1296,31 @@ function reviewCompletedSlices(
       gateFilter: options.gateFilter,
       phaseFilter: options.phaseFilter,
       activeSurfaces: resolveSliceActiveSurfaces(context, run, slice),
-    });
-    const reviewRecord = buildSliceReviewRecord(context, run, reviewRun);
+    }));
+    const reviewRecord = buildSliceReviewRecord(context, run, slice, reviewRun);
+    const independenceBlocker = sliceReviewIndependenceBlocker(slice, reviewRecord);
+    if (independenceBlocker) {
+      appendSliceReviewDiagnostic(slice, reviewRecord);
+      slice.review = null;
+      slice.status = 'blocked';
+      blockedCount += 1;
+      reports.push({
+        id: slice.id,
+        status: slice.status,
+        reviewStatus: reviewRun.status,
+        branchName: slice.branchName ?? '',
+        worktreePath: slice.worktreePath ?? '',
+        runId: reviewRun.id,
+        gateCount: reviewRun.gates.length,
+        action: 'blocked',
+        blocker: independenceBlocker,
+      });
+      persistOrchestrationReviewProgress(context, run);
+      continue;
+    }
     if (reviewRunCoversFullGateSet(reviewRun)) {
       slice.review = reviewRecord;
+      slice.reviewDiagnostics = [];
     } else {
       appendSliceReviewDiagnostic(slice, reviewRecord);
     }
@@ -1276,6 +1356,15 @@ function reviewCompletedSlices(
   };
 }
 
+function buildSliceReviewContext(parentContext: WorkflowContext, sliceRepoRoot: string): WorkflowContext {
+  return {
+    ...parentContext,
+    cwd: sliceRepoRoot,
+    repoRoot: sliceRepoRoot,
+    commonDir: resolveGitCommonDir(sliceRepoRoot),
+  };
+}
+
 function resolveReviewSlices(run: OrchestrationRunRecord, sliceId: string | null): OrchestrationSliceRecord[] {
   if (!sliceId) return run.slices;
   const slice = run.slices.find((candidate) => candidate.id === sliceId);
@@ -1300,18 +1389,139 @@ function reviewBlocker(context: WorkflowContext, slice: OrchestrationSliceRecord
 function buildSliceReviewRecord(
   context: WorkflowContext,
   run: OrchestrationRunRecord,
+  slice: OrchestrationSliceRecord,
   reviewRun: ReviewRunRecord,
 ): OrchestrationSliceReviewRecord {
+  const reviewer = reviewRun.reviewer ?? resolveReviewActorIdentity();
+  const runWithReviewer = reviewRun.reviewer ? reviewRun : { ...reviewRun, reviewer };
+  const independence = classifyReviewEvidenceIndependence({
+    worker: slice.worker?.identity ?? null,
+    reviewRun: runWithReviewer,
+  });
   return {
     status: reviewRun.status,
     evidencePath: orchestrationRunPath(context.commonDir, context.config, run.id),
     reviewedAt: nowIso(),
-    run: reviewRun,
+    reviewer,
+    independence: independence.label,
+    independenceReason: independence.reason,
+    run: runWithReviewer,
   };
 }
 
 function reviewRunCoversFullGateSet(reviewRun: ReviewRunRecord): boolean {
   return reviewRun.dryRun === false && !reviewRun.gateFilter && !reviewRun.phaseFilter;
+}
+
+function attachAttestedManualGateEvidence(
+  sliceContext: WorkflowContext,
+  reviewRun: ReviewRunRecord,
+): ReviewRunRecord {
+  if (!reviewRunCoversFullGateSet(reviewRun)) return reviewRun;
+  if (!resolveReviewStateKey()) return reviewRun;
+  const evidenceRecords = selectMatchingAttestedManualGateEvidenceRecords(sliceContext, reviewRun);
+  if (evidenceRecords.length === 0) return reviewRun;
+
+  const passedManualGates = new Map<string, ReviewGateRunRecord>();
+  for (const evidence of evidenceRecords) {
+    for (const gate of evidence.gates) {
+      if (!isPassedManualReviewGate(gate)) continue;
+      if (!passedManualGates.has(gate.gateId)) {
+        passedManualGates.set(gate.gateId, gate);
+      }
+    }
+  }
+  if (passedManualGates.size === 0) return reviewRun;
+
+  let attached = false;
+  const gates = reviewRun.gates.map((gate): ReviewGateRunRecord => {
+    const passedGate = passedManualGates.get(gate.gateId);
+    if (!passedGate || gate.status !== 'pending' || !manualReviewGateEvidenceMatches(gate, passedGate)) {
+      return gate;
+    }
+    attached = true;
+    return {
+      ...gate,
+      status: 'passed',
+      attester: passedGate.attester,
+      summary: passedGate.summary,
+      startedAt: passedGate.startedAt,
+      finishedAt: passedGate.finishedAt,
+      durationMs: passedGate.durationMs,
+    };
+  });
+
+  if (!attached) return reviewRun;
+  return {
+    ...reviewRun,
+    status: summarizeReviewRunStatus(gates),
+    gates,
+  };
+}
+
+function selectMatchingAttestedManualGateEvidenceRecords(
+  sliceContext: WorkflowContext,
+  reviewRun: ReviewRunRecord,
+): ReviewRunRecord[] {
+  if (!reviewRun.worktreeStatusDigest || reviewRun.worktreeStatusReliable !== true) return [];
+  const state = loadReviewState(sliceContext.commonDir, sliceContext.config);
+  return state.records.filter((record) =>
+    !record.dryRun
+    && !record.gateFilter
+    && !record.phaseFilter
+    && record.branchName === reviewRun.branchName
+    && record.sha === reviewRun.sha
+    && record.worktreeStatusDigest === reviewRun.worktreeStatusDigest
+    && record.worktreeStatusReliable === true
+    && record.gates.some(isPassedManualReviewGate)
+  );
+}
+
+function isPassedManualReviewGate(gate: ReviewGateRunRecord): boolean {
+  return gate.status === 'passed' && isManualReviewGateRun(gate) && gate.attester !== undefined;
+}
+
+function manualReviewGateEvidenceMatches(expected: ReviewGateRunRecord, evidence: ReviewGateRunRecord): boolean {
+  return isManualReviewGateRun(expected)
+    && isManualReviewGateRun(evidence)
+    && expected.gateId === evidence.gateId
+    && expected.type === evidence.type
+    && expected.phase === evidence.phase
+    && expected.blocking === evidence.blocking
+    && normalizeOptionalGateField(expected.skill) === normalizeOptionalGateField(evidence.skill)
+    && normalizeOptionalGateField(expected.role) === normalizeOptionalGateField(evidence.role)
+    && normalizeOptionalGateField(expected.command) === normalizeOptionalGateField(evidence.command)
+    && normalizeOptionalGateList(expected.userCommands) === normalizeOptionalGateList(evidence.userCommands);
+}
+
+function isManualReviewGateRun(gate: Pick<ReviewGateRunRecord, 'type'>): boolean {
+  return gate.type === 'skill' || gate.type === 'agent' || gate.type === 'approval';
+}
+
+function normalizeOptionalGateField(value: string | undefined): string {
+  return value ?? '';
+}
+
+function normalizeOptionalGateList(value: string[] | undefined): string {
+  return JSON.stringify(value ?? []);
+}
+
+function summarizeReviewRunStatus(gates: ReviewGateRunRecord[]): ReviewRunRecord['status'] {
+  if (gates.some((gate) => gate.blocking && gate.status === 'failed')) return 'failed';
+  if (gates.some((gate) => gate.blocking && gate.status === 'pending')) return 'pending';
+  return 'passed';
+}
+
+function sliceReviewIndependenceBlocker(
+  slice: OrchestrationSliceRecord,
+  reviewRecord: OrchestrationSliceReviewRecord,
+): string | null {
+  if (reviewRecord.run.status !== 'passed') return null;
+  if (!reviewRunCoversFullGateSet(reviewRecord.run)) return null;
+  return blockingAiReviewEvidenceBlocker({
+    reviewRun: reviewRecord.run,
+    worker: slice.worker?.identity ?? null,
+  });
 }
 
 function appendSliceReviewDiagnostic(slice: OrchestrationSliceRecord, reviewRecord: OrchestrationSliceReviewRecord): void {
@@ -1495,9 +1705,16 @@ async function runProviderWorker(
   const logPath = path.join(runDir, 'workers', `${taskSlug}-${Date.now()}.log`);
   const redactedProviderCommand = redactOrchestrationWorkerText(providerCommand);
   const prompt = readFileSync(promptPath, 'utf8');
+  const workerSessionId = `orchestrate-worker:${run.id}:${slice.id}:${crypto.randomUUID()}`;
+  const workerIdentity = createReviewActorIdentity({
+    provider: slice.provider,
+    sessionId: workerSessionId,
+    source: 'PIPELANE_ORCHESTRATE_WORKER_SESSION_ID',
+  });
   const runningWorker: OrchestrationSliceWorkerRecord = {
     status: 'running',
     provider: slice.provider,
+    identity: workerIdentity,
     command: redactedProviderCommand,
     pid: null,
     promptPath,
@@ -1531,19 +1748,15 @@ async function runProviderWorker(
   const result = await executeProviderWorker({
     command: providerCommand,
     cwd: slice.worktreePath ?? context.repoRoot,
-    env: {
-      ...process.env,
-      PIPELANE_ORCHESTRATE_RUN_ID: run.id,
-      PIPELANE_ORCHESTRATE_SLICE_ID: slice.id,
-      PIPELANE_ORCHESTRATE_SLICE_INDEX: String(slice.index),
-      PIPELANE_ORCHESTRATE_PROVIDER: slice.provider,
-      PIPELANE_ORCHESTRATE_TASK_SLUG: taskSlug,
-      PIPELANE_ORCHESTRATE_BRANCH_NAME: slice.branchName ?? '',
-      PIPELANE_ORCHESTRATE_WORKTREE_PATH: slice.worktreePath ?? '',
-      PIPELANE_ORCHESTRATE_PROMPT_PATH: promptPath,
-      PIPELANE_ORCHESTRATE_LOG_PATH: logPath,
-      PIPELANE_ORCHESTRATE_LEDGER_PATH: orchestrationRunPath(context.commonDir, context.config, run.id),
-    },
+    env: buildProviderWorkerEnv({
+      run,
+      slice,
+      taskSlug,
+      promptPath,
+      logPath,
+      workerSessionId,
+      ledgerPath: orchestrationRunPath(context.commonDir, context.config, run.id),
+    }),
     prompt,
     logPath,
     timeoutMs: resolveWorkerTimeoutMs(slice),
@@ -1575,6 +1788,97 @@ async function runProviderWorker(
     signal: result.signal,
     error: errorMessage,
   };
+}
+
+function buildProviderWorkerEnv(options: {
+  run: OrchestrationRunRecord;
+  slice: OrchestrationSliceRecord;
+  taskSlug: string;
+  promptPath: string;
+  logPath: string;
+  workerSessionId: string;
+  ledgerPath: string;
+}): NodeJS.ProcessEnv {
+  const env = scrubProviderWorkerEnv(process.env);
+  return {
+    ...env,
+    PIPELANE_ORCHESTRATE_RUN_ID: options.run.id,
+    PIPELANE_ORCHESTRATE_SLICE_ID: options.slice.id,
+    PIPELANE_ORCHESTRATE_SLICE_INDEX: String(options.slice.index),
+    PIPELANE_ORCHESTRATE_PROVIDER: options.slice.provider,
+    PIPELANE_AGENT_PROVIDER: options.slice.provider,
+    PIPELANE_AGENT_SESSION_ID: options.workerSessionId,
+    PIPELANE_ORCHESTRATE_WORKER_SESSION_ID: options.workerSessionId,
+    PIPELANE_ORCHESTRATE_TASK_SLUG: options.taskSlug,
+    PIPELANE_ORCHESTRATE_BRANCH_NAME: options.slice.branchName ?? '',
+    PIPELANE_ORCHESTRATE_WORKTREE_PATH: options.slice.worktreePath ?? '',
+    PIPELANE_ORCHESTRATE_PROMPT_PATH: options.promptPath,
+    PIPELANE_ORCHESTRATE_LOG_PATH: options.logPath,
+    PIPELANE_ORCHESTRATE_LEDGER_PATH: options.ledgerPath,
+  };
+}
+
+function scrubProviderWorkerEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...source };
+  const allowlist = parseWorkerEnvAllowlist(source[WORKER_ENV_ALLOWLIST_ENV]);
+  for (const key of INHERITED_AGENT_SESSION_ENV_KEYS) {
+    delete env[key];
+  }
+  for (const key of WORKER_SECRET_ENV_KEYS) {
+    delete env[key];
+  }
+  for (const key of Object.keys(env)) {
+    if (!allowlist.has(key) && isSensitiveWorkerEnvKey(key)) {
+      delete env[key];
+    }
+  }
+  return env;
+}
+
+function parseWorkerEnvAllowlist(raw: string | undefined): Set<string> {
+  return new Set((raw ?? '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(entry)));
+}
+
+function isSensitiveWorkerEnvKey(key: string): boolean {
+  const upperKey = key.toUpperCase();
+  if ((INHERITED_AGENT_SESSION_ENV_KEYS as readonly string[]).includes(key)) return true;
+  if ((WORKER_SECRET_ENV_KEYS as readonly string[]).includes(key)) return true;
+  if ((WORKER_CREDENTIAL_ENV_EXACT_KEYS as readonly string[]).includes(upperKey)) return true;
+  if (WORKER_CREDENTIAL_ENV_PREFIXES.some((prefix) => upperKey.startsWith(prefix))) return true;
+  if (WORKER_CREDENTIAL_ENV_PATTERN.test(key)) return true;
+  const compact = upperKey.replace(/[^A-Z0-9]/g, '');
+  if ([
+    'TOKEN',
+    'SECRET',
+    'PASSWORD',
+    'COOKIE',
+    'APIKEY',
+    'ACCESSKEY',
+    'PRIVATEKEY',
+    'CREDENTIAL',
+    'JWT',
+    'DATABASEURL',
+    'DATABASEURI',
+    'DBURL',
+    'DBURI',
+    'POSTGRESURL',
+    'POSTGRESURI',
+    'POSTGRESQLURL',
+    'POSTGRESQLURI',
+    'MYSQLURL',
+    'MYSQLURI',
+    'REDISURL',
+    'REDISURI',
+    'MONGOURL',
+    'MONGOURI',
+    'MONGODBURL',
+    'MONGODBURI',
+    'DSN',
+  ].some((term) => compact.includes(term))) return true;
+  return false;
 }
 
 function executeProviderWorker(options: {
@@ -1717,21 +2021,20 @@ function createRedactedLogAppender(logPath: string, label: string): { write: (ch
   };
 }
 
-const CREDENTIAL_FIELD_PATTERN = '(?:token|key|secret|password|pass|auth|session|cookie|access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|api[_-]?key|access[_-]?key)';
+const CREDENTIAL_FIELD_PATTERN = '(?:token|key|secret|password|pass|auth|session|cookie|jwt|access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|api[_-]?key|access[_-]?key|database[_-]?(?:url|uri)|db[_-]?(?:url|uri)|postgres(?:ql)?[_-]?(?:url|uri)|mysql[_-]?(?:url|uri)|redis[_-]?(?:url|uri)|mongo(?:db)?[_-]?(?:url|uri)|dsn)';
 
 function redactOrchestrationWorkerText(value: string): string {
   return value
     .replace(new RegExp(`([?&]${CREDENTIAL_FIELD_PATTERN}=)[^&\\s]+`, 'gi'), '$1[REDACTED]')
     .replace(new RegExp(`(["'])(${CREDENTIAL_FIELD_PATTERN})\\1\\s*:\\s*("[^"]*"|'[^']*'|[^\\s,}]+)`, 'gi'), '$1$2$1: [REDACTED]')
     .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, '[REDACTED_AUTH_HEADER]')
-    .replace(/(^|\s)(--(?:token|key|secret|password|pass|auth|session|cookie|api-key|access-key)(?:[-_][a-z0-9]+)?)=("[^"]*"|'[^']*'|[^\s]+)/gi, '$1$2=[REDACTED]')
-    .replace(/(^|\s)(--(?:token|key|secret|password|pass|auth|session|cookie|api-key|access-key)(?:[-_][a-z0-9]+)?)\s+("[^"]*"|'[^']*'|[^\s]+)/gi, '$1$2 [REDACTED]')
-    .replace(new RegExp(`(^|[\\s{,])(${CREDENTIAL_FIELD_PATTERN}\\s*:\\s*)("[^"]*"|'[^']*'|[^\\s,}]+)`, 'gi'), '$1$2[REDACTED]')
+    .replace(/(^|\s)(--(?:token|key|secret|password|pass|auth|session|cookie|jwt|api-key|access-key)(?:[-_][a-z0-9]+)?)=("[^"]*"|'[^']*'|[^\s]+)/gi, '$1$2=[REDACTED]')
+    .replace(/(^|\s)(--(?:token|key|secret|password|pass|auth|session|cookie|jwt|api-key|access-key)(?:[-_][a-z0-9]+)?)\s+("[^"]*"|'[^']*'|[^\s]+)/gi, '$1$2 [REDACTED]')
+    .replace(new RegExp(`(^|[\\s{,"'])(${CREDENTIAL_FIELD_PATTERN}\\s*:\\s*)("[^"]*"|'[^']*'|[^\\s,}"'\\\\)]+)`, 'gi'), '$1$2[REDACTED]')
+    .replace(new RegExp(`(^|[\\s{,"'])(${CREDENTIAL_FIELD_PATTERN}\\s*=\\s*)("[^"]*"|'[^']*'|[^\\s,}"'\\\\)]+)`, 'gi'), '$1$2[REDACTED]')
     .replace(new RegExp(`(^|\\s)(${CREDENTIAL_FIELD_PATTERN}=)("[^"]*"|'[^']*'|[^\\s]+)`, 'gi'), '$1$2[REDACTED]')
-    .replace(/\b[A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|COOKIE|SESSION|API_KEY|ACCESS_KEY)[A-Za-z0-9_]*=("[^"]*"|'[^']*'|[^\s]+)/g, (match) => {
-      const key = match.split('=')[0];
-      return `${key}=[REDACTED]`;
-    });
+    .replace(/\b(?:postgres(?:ql)?|mysql|rediss?|mongo(?:db)?(?:\+srv)?):\/\/[^\s"'\\)]+/gi, '[REDACTED_DSN]')
+    .replace(/\b([A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|COOKIE|SESSION|API_KEY|ACCESS_KEY|JWT|DATABASE_URL|DATABASE_URI|DB_URL|DB_URI|POSTGRES_URL|POSTGRES_URI|POSTGRESQL_URL|POSTGRESQL_URI|MYSQL_URL|MYSQL_URI|REDIS_URL|REDIS_URI|MONGO_URL|MONGO_URI|MONGODB_URL|MONGODB_URI|DSN)[A-Za-z0-9_]*\s*=\s*)("[^"]*"|'[^']*'|[^\s"',})]+)/gi, '$1[REDACTED]');
 }
 
 function resolveWorkerTimeoutMs(slice: OrchestrationSliceRecord): number {
@@ -2414,6 +2717,8 @@ function renderOrchestrationReviewReport(
     lines.push('', 'Next: fix failed blocking gates in the slice worktree, then rerun /pipelane orchestrate review.');
   } else if (result.pendingCount > 0) {
     lines.push('', 'Next: complete pending AI/manual gates for each slice, then rerun or attach trusted evidence before merge/deploy automation.');
+  } else if (result.blockedCount > 0 && result.slices.some(isBlockedReviewEvidenceReport)) {
+    lines.push('', 'Next: record independent attested AI/manual gate evidence for blocked slices, then rerun /pipelane orchestrate review.');
   } else if (result.blockedCount > 0) {
     lines.push('', 'Next: finish or recover blocked workers, then rerun /pipelane orchestrate review.');
   } else if (result.status === 'blocked') {
@@ -2423,4 +2728,8 @@ function renderOrchestrationReviewReport(
   }
 
   return lines.join('\n');
+}
+
+function isBlockedReviewEvidenceReport(slice: ReviewedSliceReport): boolean {
+  return slice.action === 'blocked' && slice.reviewStatus === 'passed';
 }

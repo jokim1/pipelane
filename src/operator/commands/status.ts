@@ -243,7 +243,7 @@ function renderOrchestration(
   lines.push('  slices:');
   for (const slice of activeRun.slices.slice(0, 8)) {
     const worker = slice.workerStatus ?? 'none';
-    const review = slice.trustedReviewComplete ? 'trusted' : slice.reviewStatus ?? 'none';
+    const review = slice.trustedReviewComplete ? `trusted:${slice.reviewEvidenceLabel}` : slice.reviewEvidenceLabel;
     lines.push(`    - ${sanitizeForTerminal(slice.id)}: ${sanitizeForTerminal(slice.status)} provider=${sanitizeForTerminal(slice.provider)} worker=${sanitizeForTerminal(worker)} review=${sanitizeForTerminal(review)}`);
   }
   if (activeRun.slices.length > 8) {

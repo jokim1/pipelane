@@ -22,10 +22,16 @@ import {
   type OrchestrateConfig,
   type ReviewGateConfig,
   type ReviewGatePreset,
+  type ReviewActorIdentity,
   type ReviewRunRecord,
   type ReviewPlanGateConfig,
   type WorkflowConfig,
 } from './state.ts';
+import {
+  blockingAiReviewEvidenceBlocker,
+  type ReviewIndependenceLabel,
+} from './review-identity.ts';
+import { readWorktreeStatusSnapshot } from './worktree-status.ts';
 
 export type OrchestrationRunStatus = 'planned' | 'prepared' | 'dispatched' | 'running' | 'blocked' | 'completed' | 'failed';
 export type OrchestrationSliceStatus = 'planned' | 'prepared' | 'dispatched' | 'running' | 'blocked' | 'completed' | 'failed';
@@ -44,6 +50,7 @@ export interface OrchestrationSliceDispatchRecord {
 export interface OrchestrationSliceWorkerRecord {
   status: OrchestrationSliceWorkerStatus;
   provider: GoalProvider;
+  identity?: ReviewActorIdentity;
   command: string;
   pid: number | null;
   promptPath: string;
@@ -59,6 +66,9 @@ export interface OrchestrationSliceReviewRecord {
   status: ReviewRunRecord['status'];
   evidencePath: string;
   reviewedAt: string;
+  reviewer?: ReviewActorIdentity;
+  independence?: ReviewIndependenceLabel;
+  independenceReason?: string;
   run: ReviewRunRecord;
 }
 
@@ -283,6 +293,7 @@ export function isActiveOrchestrationRun(
 
 export interface OrchestrationReviewSatisfactionOptions {
   headCache?: Map<string, string | null>;
+  statusDigestCache?: Map<string, { digest: string; reliable: boolean } | null>;
   worktreeExistsCache?: Map<string, boolean>;
 }
 
@@ -293,10 +304,57 @@ export function sliceReviewFullySatisfied(
   const reviewRun = slice.review?.run;
   if (slice.worker?.status !== 'succeeded') return false;
   if (reviewRun?.status !== 'passed') return false;
-  if (reviewRun.dryRun || reviewRun.gateFilter || reviewRun.phaseFilter || !reviewRun.sha) return false;
+  if (
+    reviewRun.dryRun
+    || reviewRun.gateFilter
+    || reviewRun.phaseFilter
+    || !reviewRun.sha
+  ) {
+    return false;
+  }
+  if (sliceHasRejectedBlockingAiDiagnostic(slice)) return false;
+  if (sliceReviewHasUntrustedBlockingAiEvidence(slice)) return false;
+
+  if (!slice.worktreePath || !sliceWorktreeExists(slice, options)) {
+    return slice.status === 'completed';
+  }
+  if (!reviewRun.worktreeStatusDigest || reviewRun.worktreeStatusReliable !== true) {
+    return false;
+  }
   const currentHead = currentSliceHead(slice, options);
-  if (!currentHead) return slice.status === 'completed';
-  return reviewRun.sha === currentHead;
+  if (!currentHead) return false;
+  if (reviewRun.sha !== currentHead) return false;
+  const currentStatus = currentSliceStatusDigest(slice, options);
+  return currentStatus !== null
+    && currentStatus.reliable
+    && reviewRun.worktreeStatusDigest === currentStatus.digest;
+}
+
+function sliceHasRejectedBlockingAiDiagnostic(slice: OrchestrationSliceRecord): boolean {
+  const activeReviewTime = slice.review?.reviewedAt ?? '';
+  return (slice.reviewDiagnostics ?? []).some((diagnostic) =>
+    diagnosticIsNewerThanActiveReview(diagnostic, activeReviewTime)
+    && diagnostic.run.status === 'passed'
+    && blockingAiReviewEvidenceBlocker({
+      reviewRun: diagnostic.run,
+      worker: slice.worker?.identity ?? null,
+    }) !== null
+  );
+}
+
+function diagnosticIsNewerThanActiveReview(
+  diagnostic: OrchestrationSliceReviewRecord,
+  activeReviewTime: string,
+): boolean {
+  return !activeReviewTime || diagnostic.reviewedAt > activeReviewTime;
+}
+
+function sliceReviewHasUntrustedBlockingAiEvidence(slice: OrchestrationSliceRecord): boolean {
+  if (!slice.review) return false;
+  return blockingAiReviewEvidenceBlocker({
+    reviewRun: slice.review.run,
+    worker: slice.worker?.identity ?? null,
+  }) !== null;
 }
 
 function assertSafeOrchestrationRunId(runId: string): void {
@@ -315,6 +373,22 @@ function currentSliceHead(slice: OrchestrationSliceRecord, options: Orchestratio
   const head = runGit(slice.worktreePath, ['rev-parse', '--verify', 'HEAD'], true)?.trim() || null;
   options.headCache?.set(slice.worktreePath, head);
   return head;
+}
+
+function currentSliceStatusDigest(
+  slice: OrchestrationSliceRecord,
+  options: OrchestrationReviewSatisfactionOptions,
+): { digest: string; reliable: boolean } | null {
+  if (!slice.worktreePath || !sliceWorktreeExists(slice, options)) return null;
+  if (options.statusDigestCache?.has(slice.worktreePath)) {
+    return options.statusDigestCache.get(slice.worktreePath) ?? null;
+  }
+  const snapshot = readWorktreeStatusSnapshot(slice.worktreePath, { includeStatusDigest: true });
+  const status = snapshot.exists
+    ? { digest: snapshot.statusDigest, reliable: snapshot.statusDigestReliable }
+    : null;
+  options.statusDigestCache?.set(slice.worktreePath, status);
+  return status;
 }
 
 function sliceWorktreeExists(slice: OrchestrationSliceRecord, options: OrchestrationReviewSatisfactionOptions = {}): boolean {

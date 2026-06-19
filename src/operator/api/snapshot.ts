@@ -54,6 +54,10 @@ import {
   type OrchestrationSliceRecord,
 } from '../orchestration-ledger.ts';
 import {
+  blockingAiReviewEvidenceBlocker,
+  type ReviewIndependenceLabel,
+} from '../review-identity.ts';
+import {
   buildApiActionState,
   buildApiEnvelope,
   buildApiIssue,
@@ -163,6 +167,8 @@ export interface OrchestrationSliceSummary {
   worktreePath: string | null;
   workerStatus: NonNullable<OrchestrationSliceRecord['worker']>['status'] | null;
   reviewStatus: NonNullable<OrchestrationSliceRecord['review']>['run']['status'] | null;
+  reviewIndependence: ReviewIndependenceLabel | null;
+  reviewEvidenceLabel: string;
   trustedReviewComplete: boolean;
 }
 
@@ -726,6 +732,7 @@ function buildOrchestrationSnapshot(commonDir: string, config: WorkflowConfig, c
   const records = listOrchestrationRunRecords(commonDir, config);
   const reviewOptions: OrchestrationReviewSatisfactionOptions = {
     headCache: new Map(),
+    statusDigestCache: new Map(),
     worktreeExistsCache: new Map(),
   };
   const recentRecords = records.slice(0, 10);
@@ -796,6 +803,8 @@ function summarizeOrchestrationRun(
       worktreePath: slice.worktreePath,
       workerStatus: slice.worker?.status ?? null,
       reviewStatus: slice.review?.status ?? null,
+      reviewIndependence: slice.review?.independence ?? null,
+      reviewEvidenceLabel: orchestrationReviewEvidenceLabel(slice, trustedReviewComplete),
       trustedReviewComplete,
     };
   });
@@ -814,6 +823,37 @@ function summarizeOrchestrationRun(
     nextAction: buildOrchestrationNextAction(run, config, trustedReviewBySlice),
     slices,
   };
+}
+
+function orchestrationReviewEvidenceLabel(slice: OrchestrationSliceRecord, trustedReviewComplete: boolean): string {
+  const rejected = latestRejectedReviewEvidenceLabel(slice);
+  if (rejected) return rejected;
+  if (!slice.review) {
+    return slice.worker?.status === 'succeeded' ? 'pending' : 'none';
+  }
+  if (slice.review.status === 'failed') return 'failed';
+  if (slice.review.status === 'pending') return 'pending';
+  if (!trustedReviewComplete) return `untrusted:${slice.review.independence ?? 'legacy'}`;
+  return slice.review.independence ?? 'legacy';
+}
+
+function latestRejectedReviewEvidenceLabel(slice: OrchestrationSliceRecord): string | null {
+  const diagnostics = slice.reviewDiagnostics ?? [];
+  const activeReviewTime = slice.review?.reviewedAt ?? '';
+  for (let index = diagnostics.length - 1; index >= 0; index -= 1) {
+    const diagnostic = diagnostics[index];
+    if (activeReviewTime && diagnostic.reviewedAt <= activeReviewTime) continue;
+    if (
+      diagnostic.run.status === 'passed'
+      && blockingAiReviewEvidenceBlocker({
+        reviewRun: diagnostic.run,
+        worker: slice.worker?.identity ?? null,
+      })
+    ) {
+      return `rejected:${diagnostic.independence ?? 'unknown'}`;
+    }
+  }
+  return null;
 }
 
 function buildOrchestrationNextAction(

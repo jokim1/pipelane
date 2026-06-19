@@ -258,6 +258,26 @@ review-gate snapshot from each slice worktree, records per-slice gate evidence
 in the orchestration ledger, and blocks the run on failed, pending,
 slice-filtered, gate-filtered, phase-filtered, or dry-run evidence. Merge,
 deploy, and cleanup remain outside orchestration.
+`orchestrate start` mints a per-worker run identity, exports it to the worker
+as `PIPELANE_AGENT_SESSION_ID`, and stores only its hashed fingerprint in the
+ledger. Review evidence also stores hashed reviewer or attester fingerprints
+when the host exposes one. The ledger trust check evaluates passed blocking AI
+review evidence only when such passed evidence is recorded: the recorded
+reviewer must be from a different session than the recorded worker.
+Cross-provider review is preferred and labeled as such; same-provider review
+can satisfy the gate only when it records a separate known-provider session.
+Manual AI gates stay pending until an attested evidence flow records a pass,
+rather than being treated as rejected review evidence. When an operator runs a
+full `/pipelane review` inside the slice worktree and records a manual pass
+there, the next `orchestrate review` attaches matching passed manual gates by
+branch, HEAD, worktree digest, and gate definition. These fingerprints are
+provenance evidence for Pipelane's quality gates, not cryptographic
+authentication. Pre-identity review records remain legacy-compatible, but new
+review evidence that records a reviewer identity must also record attesters for
+passed blocking AI gates. Live slice worktrees reviewed before worktree-status
+digests were recorded may need a fresh full review after upgrade; completed
+slices whose worktrees have already been removed keep their terminal review
+state.
 `goal-spec` remains the single-slice draft-only command.
 
 `orchestrate start` launcher configuration is explicit:
@@ -274,10 +294,31 @@ PIPELANE_ORCHESTRATE_WORKER_TIMEOUT_MS=3600000
 
 The worker command runs with the slice worktree as `cwd`. The prompt is passed
 on stdin, stdout/stderr are streamed to redacted evidence logs, and Pipelane
-also sets `PIPELANE_ORCHESTRATE_RUN_ID`,
+also sets `PIPELANE_AGENT_PROVIDER`, `PIPELANE_AGENT_SESSION_ID`,
+`PIPELANE_ORCHESTRATE_WORKER_SESSION_ID`, `PIPELANE_ORCHESTRATE_RUN_ID`,
 `PIPELANE_ORCHESTRATE_SLICE_ID`, `PIPELANE_ORCHESTRATE_PROVIDER`,
 `PIPELANE_ORCHESTRATE_PROMPT_PATH`, `PIPELANE_ORCHESTRATE_WORKTREE_PATH`,
 `PIPELANE_ORCHESTRATE_LOG_PATH`, and `PIPELANE_ORCHESTRATE_LEDGER_PATH`.
+Native parent session variables such as `CODEX_SESSION_ID` and
+`CLAUDE_SESSION_ID` are not inherited by worker children; worker-context
+identity resolves through `PIPELANE_ORCHESTRATE_WORKER_SESSION_ID`. State
+signing keys such as `PIPELANE_REVIEW_STATE_KEY` are also stripped from worker
+children so autonomous implementation workers cannot accidentally mint trusted
+review evidence. Credential-shaped environment variables such as tokens,
+secrets, API keys, passwords, cookies, cloud provider credentials, and
+`SSH_AUTH_SOCK` are stripped by default. If a worker truly needs a credential,
+pass it explicitly with `PIPELANE_ORCHESTRATE_WORKER_ENV_ALLOW=NAME,OTHER_NAME`;
+Pipelane still strips native agent session ids and state signing keys. This
+default includes provider-style API keys such as `OPENAI_API_KEY` and
+`ANTHROPIC_API_KEY`; allowlist them only when the worker CLI genuinely uses
+environment-based auth instead of local subscription/config auth.
+
+Manual AI review evidence from a slice worktree is only promoted into
+orchestration review when review state signing is enabled. Set the same
+`PIPELANE_REVIEW_STATE_KEY` for the standalone slice `/pipelane review`,
+`/pipelane review pass`, and parent `/pipelane orchestrate review` commands.
+Unsigned manual evidence stays visible in the slice worktree but does not
+complete orchestration review gates.
 
 ## Presets
 
@@ -394,7 +435,8 @@ timeout status, output tails, and final blocking/advisory verdict.
 handoff. A failed or pending blocking gate stops `/pr`. Evidence must be for
 the current branch, HEAD, and worktree state, and cannot come from a dry-run or
 filtered review. A skipped or unavailable optional gate records a warning, not a
-crash.
+crash. When review evidence records a reviewer session, any passed blocking AI
+gate must also record an attester from a separate trusted session.
 
 Manual skill, agent, and approval gates are not expected to write Pipelane
 state themselves. After the operator runs the referenced command, fixes any
@@ -407,6 +449,10 @@ pipelane run review pass --gate gstack-review --message "Ran /review clean"
 The pass command only applies to a full, non-dry-run review for the current
 branch, HEAD, and worktree state. If the worktree changes, rerun
 `/pipelane review` before recording manual passes again.
+
+For orchestration slices, run those two commands from the slice worktree. The
+parent `orchestrate review` command will attach matching passed manual gates on
+the next run while still rerunning command gates from the slice worktree.
 
 ## Orchestration Ledger
 
@@ -495,5 +541,5 @@ Do not add:
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | not run | Recommended before board UI implementation. |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | not run | Optional; useful before shipping setup UX. |
 
-- **UNRESOLVED:** Human/manual evidence attachment and board/API visibility for orchestration runs still need implementation-level detail before full autonomous `/orchestrate`.
-- **VERDICT:** ENG CLEARED for earlier slices. Review runner, `/pr` enforcement, provider-neutral `GoalSpec` generation, durable ledger compilation, worktree preparation, dispatch prompt generation, configured worker launch evidence, native provider defaults, and per-slice review gate execution are implemented.
+- **UNRESOLVED:** Board/API visibility for orchestration runs still needs implementation-level detail before full autonomous `/orchestrate`.
+- **VERDICT:** ENG CLEARED for earlier slices. Review runner, `/pr` enforcement, provider-neutral `GoalSpec` generation, durable ledger compilation, worktree preparation, dispatch prompt generation, configured worker launch evidence, native provider defaults, per-slice review gate execution, and matching manual evidence attachment are implemented.

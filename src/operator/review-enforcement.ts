@@ -7,6 +7,7 @@ import {
   type ReviewRunRecord,
   type WorkflowContext,
 } from './state.ts';
+import { blockingAiReviewEvidenceBlocker } from './review-identity.ts';
 import { readWorktreeStatusSnapshot } from './worktree-status.ts';
 
 export type ReviewEvidenceGateStatus = 'missing' | 'failed' | 'pending' | 'incomplete';
@@ -197,6 +198,20 @@ function collectReviewEvidenceIssues(options: {
       });
     }
   }
+
+  const aiReviewBlocker = blockingAiReviewEvidenceBlocker({
+    reviewRun: latest,
+    worker: latest.reviewer ?? null,
+    allowTrustedAttesterWithoutWorker: true,
+  });
+  if (aiReviewBlocker) {
+    issues.push({
+      status: 'incomplete',
+      message: `blocking AI review evidence is not independently attested: ${aiReviewBlocker}`,
+      blocking: true,
+    });
+  }
+
   if (
     latest.status !== 'passed'
     && !issues.some((issue) => issue.status === latest.status)

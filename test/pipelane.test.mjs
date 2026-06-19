@@ -51,6 +51,10 @@ function runCli(args, cwd, env = {}, allowFailure = false) {
   return result;
 }
 
+function hashedSessionId(value) {
+  return `sha256:${createHash('sha256').update(value).digest('hex').slice(0, 16)}`;
+}
+
 function shouldSeedPassingReviewEvidence(args) {
   if (args[0] !== 'run') return false;
   if (args[1] === 'pr') return true;
@@ -5900,8 +5904,7 @@ test('orchestrate review runs gate snapshot against completed worker slices', ()
     assert.equal(slice.review.run.gates[0].status, 'passed');
     assert.match(slice.review.run.gates[0].stdoutTail, /slice review ok/);
     assert.equal(realpathSync(slice.review.evidencePath), realpathSync(reviewed.ledgerPath));
-    assert.equal(slice.reviewDiagnostics.length, 1);
-    assert.equal(slice.reviewDiagnostics[0].run.phaseFilter, 'static');
+    assert.equal(slice.reviewDiagnostics.length, 0);
     assert.match(reviewed.message, /Review gate execution complete/);
 
     const reviewedSnapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
@@ -5909,6 +5912,29 @@ test('orchestrate review runs gate snapshot against completed worker slices', ()
     assert.equal(reviewedSnapshot.data.orchestration.activeRun.state, 'healthy');
     assert.equal(reviewedSnapshot.data.orchestration.activeRun.counts.trustedReviewComplete, 1);
     assert.equal(reviewedSnapshot.data.orchestration.activeRun.nextAction.id, 'pr');
+
+    const uncommittedChangePath = path.join(slice.worktreePath, 'uncommitted-after-review.txt');
+    writeFileSync(uncommittedChangePath, 'changed after review without commit\n', 'utf8');
+    const dirtySnapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    assert.equal(dirtySnapshot.data.orchestration.activeRun.counts.trustedReviewComplete, 0);
+    assert.equal(dirtySnapshot.data.orchestration.activeRun.nextAction.id, 'orchestrate.review');
+    rmSync(uncommittedChangePath, { force: true });
+    const restoredSnapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    assert.equal(restoredSnapshot.data.orchestration.activeRun.counts.trustedReviewComplete, 1);
+
+    const opaqueStatusFile = path.join(slice.worktreePath, 'opaque-after-review.txt');
+    writeFileSync(opaqueStatusFile, 'opaque dirty output\n', 'utf8');
+    chmodSync(opaqueStatusFile, 0o000);
+    try {
+      const opaqueSnapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+      assert.equal(opaqueSnapshot.data.orchestration.activeRun.counts.trustedReviewComplete, 0);
+      assert.equal(opaqueSnapshot.data.orchestration.activeRun.nextAction.id, 'orchestrate.review');
+    } finally {
+      chmodSync(opaqueStatusFile, 0o644);
+      rmSync(opaqueStatusFile, { force: true });
+    }
+    const restoredAfterOpaqueSnapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    assert.equal(restoredAfterOpaqueSnapshot.data.orchestration.activeRun.counts.trustedReviewComplete, 1);
 
     const trustedReviewId = slice.review.run.id;
     const trustedReviewSha = slice.review.run.sha;
@@ -6072,6 +6098,1121 @@ test('orchestrate review records pending AI gates and blocks incomplete slice ev
   }
 });
 
+test('review identity hashes sessions and validates independent AI evidence', async () => {
+  const identityMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-identity.ts'));
+  const ledgerMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'orchestration-ledger.ts'));
+  const worker = identityMod.createReviewActorIdentity({
+    provider: 'codex',
+    sessionId: 'token-like-session-value',
+    source: 'PIPELANE_ORCHESTRATE_WORKER_SESSION_ID',
+  });
+  const unknownWorker = identityMod.resolveReviewActorIdentity({
+    env: { PIPELANE_AGENT_SESSION_ID: 'unknown-worker-session' },
+  });
+  const reviewer = identityMod.resolveReviewActorIdentity({
+    provider: 'codex',
+    env: { PIPELANE_AGENT_SESSION_ID: 'token-like-session-value' },
+  });
+  const unknownReviewer = identityMod.resolveReviewActorIdentity({
+    env: { PIPELANE_AGENT_SESSION_ID: 'unknown-reviewer-session' },
+  });
+  const genericWorker = identityMod.resolveReviewActorIdentity({
+    provider: 'generic',
+    env: { PIPELANE_AGENT_SESSION_ID: 'generic-worker-session' },
+  });
+  const genericOrchestrationWorker = identityMod.createReviewActorIdentity({
+    provider: 'generic',
+    sessionId: 'generic-orchestration-worker-session',
+    source: 'PIPELANE_ORCHESTRATE_WORKER_SESSION_ID',
+  });
+  const genericReviewer = identityMod.resolveReviewActorIdentity({
+    provider: 'generic',
+    env: { PIPELANE_AGENT_SESSION_ID: 'generic-reviewer-session' },
+  });
+  const codexReviewer = identityMod.resolveReviewActorIdentity({
+    env: { CODEX_SESSION_ID: 'codex-reviewer-session' },
+  });
+  const nativeCodexSameAsGenericReviewer = identityMod.resolveReviewActorIdentity({
+    env: { CODEX_SESSION_ID: 'generic-reviewer-session' },
+  });
+  const claudeReviewer = identityMod.resolveReviewActorIdentity({
+    env: { CLAUDE_SESSION_ID: 'claude-reviewer-session' },
+  });
+  const nativeCodexReviewer = identityMod.resolveReviewActorIdentity({
+    env: {
+      PIPELANE_AGENT_SESSION_ID: 'inherited-generic-session',
+      CODEX_SESSION_ID: 'native-codex-reviewer-session',
+    },
+  });
+  const workerContextReviewer = identityMod.resolveReviewActorIdentity({
+    env: {
+      PIPELANE_AGENT_PROVIDER: 'codex',
+      PIPELANE_AGENT_SESSION_ID: 'worker-context-session',
+      PIPELANE_ORCHESTRATE_WORKER_SESSION_ID: 'worker-context-session',
+      CODEX_SESSION_ID: 'inherited-native-session',
+    },
+  });
+  const noisyProvider = identityMod.resolveReviewActorIdentity({
+    env: {
+      PIPELANE_AGENT_PROVIDER: 'codex\u001b[31m',
+      PIPELANE_AGENT_SESSION_ID: 'noisy-provider-session',
+    },
+  });
+  const spoofedClaudeReviewer = identityMod.resolveReviewActorIdentity({
+    env: {
+      PIPELANE_AGENT_PROVIDER: 'claude',
+      PIPELANE_AGENT_SESSION_ID: 'spoofed-claude-session',
+    },
+  });
+  const passedBlockingAi = {
+    gates: [{ type: 'skill', blocking: true, status: 'passed' }],
+  };
+  const passedBlockingAiWithCodexAttester = {
+    reviewer: claudeReviewer,
+    gates: [{ type: 'skill', blocking: true, status: 'passed', gateId: 'karpathy-diff', attester: codexReviewer }],
+  };
+  const passedBlockingAiWithClaudeAttester = {
+    reviewer: codexReviewer,
+    gates: [{ type: 'skill', blocking: true, status: 'passed', gateId: 'karpathy-diff', attester: claudeReviewer }],
+  };
+  const passedBlockingAiWithSameSessionAttester = {
+    reviewer: claudeReviewer,
+    gates: [{ type: 'skill', blocking: true, status: 'passed', gateId: 'karpathy-diff', attester: reviewer }],
+  };
+  const passedBlockingAiWithGenericAttester = {
+    reviewer: genericReviewer,
+    gates: [{ type: 'skill', blocking: true, status: 'passed', gateId: 'karpathy-diff', attester: genericReviewer }],
+  };
+  const passedBlockingAiWithGenericReviewerAndTrustedAttester = {
+    reviewer: genericReviewer,
+    gates: [{ type: 'skill', blocking: true, status: 'passed', gateId: 'karpathy-diff', attester: claudeReviewer }],
+  };
+  const passedBlockingAiWithGenericReviewerAndSameNativeAttester = {
+    reviewer: genericReviewer,
+    gates: [{ type: 'skill', blocking: true, status: 'passed', gateId: 'karpathy-diff', attester: nativeCodexSameAsGenericReviewer }],
+  };
+  const pendingBlockingAi = {
+    gates: [{ type: 'skill', blocking: true, status: 'pending' }],
+  };
+  const passedAdvisoryAi = {
+    gates: [{ type: 'agent', blocking: false, status: 'passed' }],
+  };
+  const legacyPassedBlockingAi = {
+    gates: [{ type: 'skill', blocking: true, status: 'passed', gateId: 'karpathy-diff' }],
+  };
+  const legacyPassedBlockingAiWithTrustedAttester = {
+    gates: [{ type: 'skill', blocking: true, status: 'passed', gateId: 'karpathy-diff', attester: codexReviewer }],
+  };
+  const legacyPassedBlockingAiWithGenericAttester = {
+    gates: [{ type: 'skill', blocking: true, status: 'passed', gateId: 'karpathy-diff', attester: genericReviewer }],
+  };
+
+  assert.equal(worker.sessionId, hashedSessionId('token-like-session-value'));
+  assert.notEqual(worker.sessionId, 'token-like-session-value');
+  assert.equal(codexReviewer.provider, 'codex');
+  assert.equal(claudeReviewer.provider, 'claude');
+  assert.equal(nativeCodexReviewer.provider, 'codex');
+  assert.equal(nativeCodexReviewer.source, 'CODEX_SESSION_ID');
+  assert.equal(nativeCodexReviewer.sessionId, hashedSessionId('native-codex-reviewer-session'));
+  assert.equal(workerContextReviewer.provider, 'codex');
+  assert.equal(workerContextReviewer.source, 'PIPELANE_ORCHESTRATE_WORKER_SESSION_ID');
+  assert.equal(workerContextReviewer.sessionId, hashedSessionId('worker-context-session'));
+  assert.doesNotMatch(noisyProvider.provider, /\u001b/);
+  assert.equal(identityMod.classifyReviewIndependence({ worker, reviewer: noisyProvider }).label, 'unknown');
+  assert.equal(spoofedClaudeReviewer.provider, 'claude');
+  assert.equal(spoofedClaudeReviewer.source, 'PIPELANE_AGENT_SESSION_ID');
+  assert.equal(identityMod.classifyReviewIndependence({ worker, reviewer: spoofedClaudeReviewer }).label, 'unknown');
+  assert.equal(identityMod.classifyReviewIndependence({ worker, reviewer }).label, 'same-session');
+  assert.equal(identityMod.classifyReviewIndependence({ worker, reviewer: claudeReviewer }).label, 'cross-provider');
+  assert.equal(identityMod.classifyReviewIndependence({ worker: unknownWorker, reviewer: unknownReviewer }).label, 'unknown');
+  assert.equal(identityMod.classifyReviewIndependence({ worker: genericWorker, reviewer: genericReviewer }).label, 'unknown');
+  assert.equal(identityMod.classifyReviewIndependence({ worker: genericOrchestrationWorker, reviewer: claudeReviewer }).label, 'cross-provider');
+  assert.match(
+    identityMod.aiReviewIndependenceBlocker({
+      reviewRun: passedBlockingAi,
+      independence: 'same-session',
+      reason: 'same recorded session',
+    }),
+    /separate reviewer session/,
+  );
+  assert.match(
+    identityMod.aiReviewIndependenceBlocker({
+      reviewRun: passedBlockingAi,
+      independence: 'unknown',
+      reason: 'missing identity',
+    }),
+    /requires recorded worker and reviewer session identities/,
+  );
+  assert.equal(identityMod.aiReviewIndependenceBlocker({
+    reviewRun: pendingBlockingAi,
+    independence: 'same-session',
+  }), null);
+  assert.equal(identityMod.aiReviewIndependenceBlocker({
+    reviewRun: passedAdvisoryAi,
+    independence: 'same-session',
+  }), null);
+  assert.equal(identityMod.classifyReviewIndependence({ worker, reviewer: codexReviewer }).label, 'same-provider-independent');
+  assert.equal(identityMod.aiReviewIndependenceBlocker({
+    reviewRun: passedBlockingAi,
+    independence: 'same-provider-independent',
+  }), null);
+  assert.match(identityMod.blockingAiReviewEvidenceBlocker({
+    reviewRun: {
+      reviewer: unknownReviewer,
+      gates: [{ type: 'skill', blocking: true, status: 'passed', gateId: 'karpathy-diff' }],
+    },
+    worker: unknownWorker,
+  }), /missing attester identity/);
+  assert.match(identityMod.blockingAiReviewEvidenceBlocker({
+    reviewRun: {
+      reviewer: claudeReviewer,
+      gates: [{ type: 'skill', blocking: true, status: 'passed', gateId: 'karpathy-diff' }],
+    },
+    worker,
+  }), /missing attester identity/);
+  assert.match(identityMod.blockingAiReviewEvidenceBlocker({
+    reviewRun: legacyPassedBlockingAi,
+    worker: null,
+  }), /missing attester identity/);
+  assert.equal(identityMod.blockingAiReviewEvidenceBlocker({
+    reviewRun: legacyPassedBlockingAiWithTrustedAttester,
+    worker: null,
+    allowTrustedAttesterWithoutWorker: true,
+  }), null);
+  assert.match(identityMod.blockingAiReviewEvidenceBlocker({
+    reviewRun: legacyPassedBlockingAiWithGenericAttester,
+    worker: null,
+    allowTrustedAttesterWithoutWorker: true,
+  }), /recorded worker session identity is unavailable/);
+  assert.equal(identityMod.classifyReviewEvidenceIndependence({
+    reviewRun: legacyPassedBlockingAi,
+    worker: null,
+  }).label, 'legacy');
+  assert.equal(identityMod.blockingAiReviewEvidenceBlocker({
+    reviewRun: passedBlockingAiWithClaudeAttester,
+    worker,
+  }), null);
+  assert.match(identityMod.blockingAiReviewEvidenceBlocker({
+    reviewRun: passedBlockingAiWithClaudeAttester,
+    worker: null,
+  }), /recorded worker session identity is unavailable/);
+  assert.equal(identityMod.blockingAiReviewEvidenceBlocker({
+    reviewRun: passedBlockingAiWithClaudeAttester,
+    worker: genericOrchestrationWorker,
+  }), null);
+  assert.equal(identityMod.classifyReviewEvidenceIndependence({
+    reviewRun: passedBlockingAiWithClaudeAttester,
+    worker,
+  }).label, 'cross-provider');
+  assert.equal(identityMod.blockingAiReviewEvidenceBlocker({
+    reviewRun: passedBlockingAiWithCodexAttester,
+    worker,
+  }), null);
+  assert.match(
+    identityMod.blockingAiReviewEvidenceBlocker({
+      reviewRun: passedBlockingAiWithSameSessionAttester,
+      worker,
+    }),
+    /gate karpathy-diff/,
+  );
+  assert.match(
+    identityMod.blockingAiReviewEvidenceBlocker({
+      reviewRun: passedBlockingAiWithGenericAttester,
+      worker: genericWorker,
+    }),
+    /provider identity is unavailable/,
+  );
+  assert.equal(identityMod.blockingAiReviewEvidenceBlocker({
+    reviewRun: passedBlockingAiWithGenericReviewerAndTrustedAttester,
+    worker: genericReviewer,
+    allowTrustedAttesterWithoutWorker: true,
+  }), null);
+  assert.match(identityMod.blockingAiReviewEvidenceBlocker({
+    reviewRun: passedBlockingAiWithGenericReviewerAndSameNativeAttester,
+    worker: genericReviewer,
+    allowTrustedAttesterWithoutWorker: true,
+  }), /separate reviewer session/);
+  assert.match(
+    identityMod.blockingAiReviewEvidenceBlocker({
+      reviewRun: {
+        reviewer: spoofedClaudeReviewer,
+        gates: [{ type: 'skill', blocking: true, status: 'passed', gateId: 'karpathy-diff', attester: spoofedClaudeReviewer }],
+      },
+      worker,
+    }),
+    /provider identity is unavailable/,
+  );
+  assert.equal(identityMod.classifyReviewEvidenceIndependence({
+    reviewRun: passedBlockingAiWithSameSessionAttester,
+    worker,
+  }).label, 'same-session');
+  assert.equal(ledgerMod.sliceReviewFullySatisfied({
+    status: 'completed',
+    worker: { status: 'succeeded' },
+    review: {
+      independence: 'unknown',
+      run: { status: 'passed', dryRun: false, sha: 'abc123', gates: passedBlockingAi.gates, reviewer: codexReviewer },
+    },
+  }), false);
+  assert.equal(ledgerMod.sliceReviewFullySatisfied({
+    status: 'completed',
+    worktreePath: '/tmp/missing-reviewed-slice',
+    worker: { status: 'succeeded', identity: worker },
+    review: {
+      independence: 'cross-provider',
+      run: {
+        status: 'passed',
+        dryRun: false,
+        sha: 'abc123',
+        worktreeStatusDigest: 'clean-status-digest',
+        worktreeStatusReliable: true,
+        gates: passedBlockingAiWithClaudeAttester.gates,
+      },
+    },
+  }, {
+    worktreeExistsCache: new Map([['/tmp/missing-reviewed-slice', false]]),
+  }), true);
+  assert.equal(ledgerMod.sliceReviewFullySatisfied({
+    status: 'completed',
+    worktreePath: '/tmp/reviewed-slice',
+    worker: { status: 'succeeded' },
+    review: {
+      independence: 'cross-provider',
+      run: {
+        status: 'passed',
+        dryRun: false,
+        sha: 'abc123',
+        worktreeStatusDigest: 'clean-status-digest',
+        worktreeStatusReliable: true,
+        gates: passedBlockingAiWithClaudeAttester.gates,
+        reviewer: codexReviewer,
+      },
+    },
+  }, {
+    worktreeExistsCache: new Map([['/tmp/reviewed-slice', true]]),
+    headCache: new Map([['/tmp/reviewed-slice', 'abc123']]),
+    statusDigestCache: new Map([['/tmp/reviewed-slice', {
+      digest: 'clean-status-digest',
+      reliable: true,
+    }]]),
+  }), false);
+  assert.equal(ledgerMod.sliceReviewFullySatisfied({
+    status: 'completed',
+    worktreePath: '/tmp/reviewed-slice',
+    worker: { status: 'succeeded', identity: worker },
+    review: {
+      independence: 'cross-provider',
+      run: {
+        status: 'passed',
+        dryRun: false,
+        sha: 'abc123',
+        worktreeStatusDigest: 'clean-status-digest',
+        worktreeStatusReliable: true,
+        gates: passedBlockingAiWithClaudeAttester.gates,
+      },
+    },
+  }, {
+    worktreeExistsCache: new Map([['/tmp/reviewed-slice', true]]),
+    headCache: new Map([['/tmp/reviewed-slice', 'abc123']]),
+    statusDigestCache: new Map([['/tmp/reviewed-slice', {
+      digest: 'clean-status-digest',
+      reliable: true,
+    }]]),
+  }), true);
+  assert.equal(ledgerMod.sliceReviewFullySatisfied({
+    status: 'completed',
+    worker: { status: 'succeeded', identity: worker },
+    review: {
+      independence: 'same-session',
+      run: { status: 'passed', dryRun: false, sha: 'abc123', gates: passedBlockingAiWithSameSessionAttester.gates, reviewer: claudeReviewer },
+    },
+  }), false);
+});
+
+test('orchestrate review keeps pending same-session AI gates incomplete', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerSessionFile = 'worker-session.txt';
+  const nativeSessionFile = 'native-session.txt';
+  const reviewStateKeyFile = 'review-state-key.txt';
+  const apiKeyFile = 'api-key.txt';
+  const githubTokenFile = 'github-token.txt';
+  const sshAuthSockFile = 'ssh-auth-sock.txt';
+  const ciJwtFile = 'ci-jwt.txt';
+  const databaseUrlFile = 'database-url.txt';
+  const mongodbUriFile = 'mongodb-uri.txt';
+  const customDsnFile = 'custom-dsn.txt';
+  const allowlistedSecretFile = 'allowlisted-secret.txt';
+  const gitAuthorNameFile = 'git-author-name.txt';
+  const gitAuthorEmailFile = 'git-author-email.txt';
+  const httpAuthorizationFile = 'http-authorization.txt';
+  const basicAuthFile = 'basic-auth.txt';
+  const reviewStateKey = 'review-state-signing-secret';
+  const workerScript = [
+    'const fs = require("node:fs");',
+    `fs.writeFileSync(${JSON.stringify(workerSessionFile)}, process.env.PIPELANE_AGENT_SESSION_ID || '', 'utf8');`,
+    `fs.writeFileSync(${JSON.stringify(nativeSessionFile)}, process.env.CODEX_SESSION_ID || '', 'utf8');`,
+    `fs.writeFileSync(${JSON.stringify(reviewStateKeyFile)}, process.env.PIPELANE_REVIEW_STATE_KEY || '', 'utf8');`,
+    `fs.writeFileSync(${JSON.stringify(apiKeyFile)}, process.env.OPENAI_API_KEY || '', 'utf8');`,
+    `fs.writeFileSync(${JSON.stringify(githubTokenFile)}, process.env.GITHUB_TOKEN || '', 'utf8');`,
+    `fs.writeFileSync(${JSON.stringify(sshAuthSockFile)}, process.env.SSH_AUTH_SOCK || '', 'utf8');`,
+    `fs.writeFileSync(${JSON.stringify(ciJwtFile)}, process.env.CI_JOB_JWT || '', 'utf8');`,
+    `fs.writeFileSync(${JSON.stringify(databaseUrlFile)}, process.env.DATABASE_URL || '', 'utf8');`,
+    `fs.writeFileSync(${JSON.stringify(mongodbUriFile)}, process.env.MONGODB_URI || '', 'utf8');`,
+    `fs.writeFileSync(${JSON.stringify(customDsnFile)}, process.env.CUSTOM_DSN || '', 'utf8');`,
+    `fs.writeFileSync(${JSON.stringify(allowlistedSecretFile)}, process.env.ALLOWLISTED_SECRET || '', 'utf8');`,
+    `fs.writeFileSync(${JSON.stringify(gitAuthorNameFile)}, process.env.GIT_AUTHOR_NAME || '', 'utf8');`,
+    `fs.writeFileSync(${JSON.stringify(gitAuthorEmailFile)}, process.env.GIT_AUTHOR_EMAIL || '', 'utf8');`,
+    `fs.writeFileSync(${JSON.stringify(httpAuthorizationFile)}, process.env.HTTP_AUTHORIZATION || '', 'utf8');`,
+    `fs.writeFileSync(${JSON.stringify(basicAuthFile)}, process.env.BASIC_AUTH || '', 'utf8');`,
+    'console.log("CI_JOB_JWT=stdout-ci-jwt-secret");',
+    'console.log("jwt=stdout-jwt-secret");',
+    'console.log("CI_JOB_JWT = stdout-spaced-ci-jwt-secret");',
+    'console.log("jwt = stdout-spaced-jwt-secret");',
+    'console.log("client_secret = stdout-spaced-client-secret");',
+    'console.log("DATABASE_URL=postgres://user:stdout-db-secret@db.example/app");',
+    'console.log("database_url = postgres://user:stdout-spaced-db-secret@db.example/app");',
+    'console.log("{\\"database_url\\":\\"postgres://user:stdout-json-db-secret@db.example/app\\"}");',
+    'console.log("CUSTOM_DSN=mysql://user:stdout-custom-dsn-secret@db.example/app");',
+    'console.error("jwt: stderr-jwt-secret");',
+  ].join('');
+  const workerCommand = [
+    'JWT_ARG=command-jwt-secret',
+    JSON.stringify(process.execPath),
+    '-e',
+    JSON.stringify(workerScript),
+  ].join(' ');
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      preset: 'standard',
+      planReview: { gates: [] },
+      gates: [{
+        id: 'karpathy-diff',
+        phase: 'ai-diff',
+        type: 'skill',
+        skill: 'karpathy-diff',
+        userCommands: ['/karpathy diff'],
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt AI review gate');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject same-session review', '--provider', 'codex', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
+      CODEX_SESSION_ID: 'parent-native-codex-session',
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+      OPENAI_API_KEY: 'sk-parent-secret',
+      GITHUB_TOKEN: 'ghp_parent_secret',
+      SSH_AUTH_SOCK: '/tmp/parent-ssh-agent.sock',
+      CI_JOB_JWT: 'parent-ci-jwt-secret',
+      DATABASE_URL: 'postgres://user:parent-db-secret@db.example/app',
+      MONGODB_URI: 'mongodb://parent-mongo-secret@db.example/app',
+      CUSTOM_DSN: 'mysql://user:parent-custom-dsn-secret@db.example/app',
+      ALLOWLISTED_SECRET: 'parent-allowlisted-secret',
+      GIT_AUTHOR_NAME: 'CI Bot',
+      GIT_AUTHOR_EMAIL: 'ci@example.com',
+      HTTP_AUTHORIZATION: 'Bearer parent-http-auth-secret',
+      BASIC_AUTH: 'parent-basic-auth-secret',
+      PIPELANE_ORCHESTRATE_WORKER_ENV_ALLOW: 'ALLOWLISTED_SECRET,PIPELANE_REVIEW_STATE_KEY,CODEX_SESSION_ID',
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    });
+    const rawWorkerSession = readFileSync(path.join(prepared.slices[0].worktreePath, workerSessionFile), 'utf8').trim();
+    const inheritedNativeSession = readFileSync(path.join(prepared.slices[0].worktreePath, nativeSessionFile), 'utf8').trim();
+    const inheritedReviewStateKey = readFileSync(path.join(prepared.slices[0].worktreePath, reviewStateKeyFile), 'utf8').trim();
+    const inheritedApiKey = readFileSync(path.join(prepared.slices[0].worktreePath, apiKeyFile), 'utf8').trim();
+    const inheritedGithubToken = readFileSync(path.join(prepared.slices[0].worktreePath, githubTokenFile), 'utf8').trim();
+    const inheritedSshAuthSock = readFileSync(path.join(prepared.slices[0].worktreePath, sshAuthSockFile), 'utf8').trim();
+    const inheritedCiJwt = readFileSync(path.join(prepared.slices[0].worktreePath, ciJwtFile), 'utf8').trim();
+    const inheritedDatabaseUrl = readFileSync(path.join(prepared.slices[0].worktreePath, databaseUrlFile), 'utf8').trim();
+    const inheritedMongodbUri = readFileSync(path.join(prepared.slices[0].worktreePath, mongodbUriFile), 'utf8').trim();
+    const inheritedCustomDsn = readFileSync(path.join(prepared.slices[0].worktreePath, customDsnFile), 'utf8').trim();
+    const inheritedAllowlistedSecret = readFileSync(path.join(prepared.slices[0].worktreePath, allowlistedSecretFile), 'utf8').trim();
+    const inheritedGitAuthorName = readFileSync(path.join(prepared.slices[0].worktreePath, gitAuthorNameFile), 'utf8').trim();
+    const inheritedGitAuthorEmail = readFileSync(path.join(prepared.slices[0].worktreePath, gitAuthorEmailFile), 'utf8').trim();
+    const inheritedHttpAuthorization = readFileSync(path.join(prepared.slices[0].worktreePath, httpAuthorizationFile), 'utf8').trim();
+    const inheritedBasicAuth = readFileSync(path.join(prepared.slices[0].worktreePath, basicAuthFile), 'utf8').trim();
+    assert.equal(inheritedNativeSession, '');
+    assert.equal(inheritedReviewStateKey, '');
+    assert.equal(inheritedApiKey, '');
+    assert.equal(inheritedGithubToken, '');
+    assert.equal(inheritedSshAuthSock, '');
+    assert.equal(inheritedCiJwt, '');
+    assert.equal(inheritedDatabaseUrl, '');
+    assert.equal(inheritedMongodbUri, '');
+    assert.equal(inheritedCustomDsn, '');
+    assert.equal(inheritedAllowlistedSecret, 'parent-allowlisted-secret');
+    assert.equal(inheritedGitAuthorName, 'CI Bot');
+    assert.equal(inheritedGitAuthorEmail, 'ci@example.com');
+    assert.equal(inheritedHttpAuthorization, '');
+    assert.equal(inheritedBasicAuth, '');
+
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_AGENT_SESSION_ID: rawWorkerSession,
+      PIPELANE_ORCHESTRATE_WORKER_SESSION_ID: rawWorkerSession,
+      PIPELANE_AGENT_PROVIDER: 'codex',
+      CODEX_SESSION_ID: 'parent-native-codex-session',
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    const onDisk = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
+
+    assert.equal(reviewed.status, 'pending');
+    assert.equal(reviewed.reviewedCount, 1);
+    assert.equal(reviewed.pendingCount, 1);
+    assert.equal(reviewed.blockedCount, 0);
+    assert.equal(onDisk.status, 'blocked');
+    assert.equal(onDisk.slices[0].status, 'blocked');
+    assert.equal(onDisk.slices[0].review.run.status, 'pending');
+    assert.equal(onDisk.slices[0].worker.identity.provider, 'codex');
+    assert.equal(onDisk.slices[0].worker.identity.source, 'PIPELANE_ORCHESTRATE_WORKER_SESSION_ID');
+    assert.equal(onDisk.slices[0].worker.identity.sessionId, hashedSessionId(rawWorkerSession));
+    assert.equal(onDisk.slices[0].review.reviewer.sessionId, hashedSessionId(rawWorkerSession));
+    assert.equal(onDisk.slices[0].review.independence, 'same-session');
+    assert.equal(onDisk.slices[0].reviewDiagnostics.length, 0);
+    assert.equal(reviewed.slices[0].blocker, null);
+    const workerLog = readFileSync(onDisk.slices[0].worker.logPath, 'utf8');
+    assert.doesNotMatch(workerLog, /parent-ci-jwt-secret/);
+    assert.doesNotMatch(workerLog, /command-jwt-secret/);
+    assert.doesNotMatch(workerLog, /stdout-ci-jwt-secret/);
+    assert.doesNotMatch(workerLog, /stdout-jwt-secret/);
+    assert.doesNotMatch(workerLog, /stdout-spaced-ci-jwt-secret/);
+    assert.doesNotMatch(workerLog, /stdout-spaced-jwt-secret/);
+    assert.doesNotMatch(workerLog, /stdout-spaced-client-secret/);
+    assert.doesNotMatch(workerLog, /parent-db-secret/);
+    assert.doesNotMatch(workerLog, /parent-mongo-secret/);
+    assert.doesNotMatch(workerLog, /parent-custom-dsn-secret/);
+    assert.doesNotMatch(workerLog, /stdout-db-secret/);
+    assert.doesNotMatch(workerLog, /stdout-spaced-db-secret/);
+    assert.doesNotMatch(workerLog, /stdout-json-db-secret/);
+    assert.doesNotMatch(workerLog, /stdout-custom-dsn-secret/);
+    assert.doesNotMatch(workerLog, /stderr-jwt-secret/);
+    assert.match(workerLog, /JWT_ARG=\[REDACTED\]/);
+    assert.match(workerLog, /CI_JOB_JWT=\[REDACTED\]/);
+    assert.match(workerLog, /jwt=\[REDACTED\]/);
+    assert.match(workerLog, /CI_JOB_JWT = \[REDACTED\]/);
+    assert.match(workerLog, /jwt = \[REDACTED\]/);
+    assert.match(workerLog, /client_secret = \[REDACTED\]/);
+    assert.match(workerLog, /DATABASE_URL=\[REDACTED\]/);
+    assert.match(workerLog, /database_url = \[REDACTED\]/);
+    assert.match(workerLog, /"database_url": \[REDACTED\]/);
+    assert.match(workerLog, /CUSTOM_DSN=\[REDACTED\]/);
+    assert.match(workerLog, /jwt: \[REDACTED\]/);
+
+    const sliceWorktree = prepared.slices[0].worktreePath;
+    const standaloneReview = JSON.parse(runCli(['run', 'review', '--json'], sliceWorktree, {
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    assert.equal(standaloneReview.status, 'pending');
+    const sameSessionPass = JSON.parse(runCli([
+      'run',
+      'review',
+      'pass',
+      '--gate',
+      'karpathy-diff',
+      '--message',
+      'Ran /karpathy diff from the worker session',
+      '--json',
+    ], sliceWorktree, {
+      PIPELANE_AGENT_PROVIDER: 'codex',
+      PIPELANE_AGENT_SESSION_ID: rawWorkerSession,
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    assert.equal(sameSessionPass.status, 'attested');
+
+    const rejected = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    assert.equal(rejected.status, 'blocked');
+    assert.equal(rejected.pendingCount, 0);
+    assert.equal(rejected.blockedCount, 1);
+    assert.match(rejected.slices[0].blocker, /separate reviewer session/);
+    assert.match(rejected.message, /independent attested AI\/manual gate evidence/);
+    assert.doesNotMatch(rejected.message, /recover blocked workers/);
+    assert.match(runCli(['run', 'status'], repoRoot).stdout, /review=rejected:same-session/);
+
+    const identityMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-identity.ts'));
+    const ledgerMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'orchestration-ledger.ts'));
+    const crossProviderAttester = identityMod.resolveReviewActorIdentity({
+      env: { CLAUDE_SESSION_ID: 'cross-provider-reviewer-session' },
+    });
+    assert.equal(ledgerMod.sliceReviewFullySatisfied({
+      status: 'completed',
+      worktreePath: '/tmp/attested-reviewed-slice',
+      worker: { status: 'succeeded', identity: onDisk.slices[0].worker.identity },
+      review: {
+        run: {
+          status: 'passed',
+          dryRun: false,
+          sha: 'abc123',
+          worktreeStatusDigest: 'clean-status-digest',
+          worktreeStatusReliable: true,
+          gates: [{
+            type: 'skill',
+            blocking: true,
+            status: 'passed',
+            gateId: 'karpathy-diff',
+            attester: crossProviderAttester,
+          }],
+        },
+      },
+    }, {
+      worktreeExistsCache: new Map([['/tmp/attested-reviewed-slice', true]]),
+      headCache: new Map([['/tmp/attested-reviewed-slice', 'abc123']]),
+      statusDigestCache: new Map([['/tmp/attested-reviewed-slice', {
+        digest: 'clean-status-digest',
+        reliable: true,
+      }]]),
+    }), true);
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate review records config-change evidence when slice config is malformed', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerScript = [
+    'const fs = require("node:fs");',
+    'fs.writeFileSync(".pipelane.json", "{ malformed", "utf8");',
+    'console.log("malformed slice config written");',
+  ].join('');
+  const workerCommand = [
+    JSON.stringify(process.execPath),
+    '-e',
+    JSON.stringify(workerScript),
+  ].join(' ');
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      preset: 'standard',
+      planReview: { gates: [] },
+      gates: [],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt empty review gate snapshot');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Change review config', '--provider', 'codex', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    });
+
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const onDisk = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
+    const gate = onDisk.slices[0].review.run.gates[0];
+
+    assert.equal(reviewed.status, 'pending');
+    assert.equal(reviewed.reviewedCount, 1);
+    assert.equal(reviewed.pendingCount, 1);
+    assert.equal(reviewed.blockedCount, 0);
+    assert.equal(onDisk.status, 'blocked');
+    assert.equal(onDisk.slices[0].review.run.status, 'pending');
+    assert.equal(gate.gateId, 'review-config-change');
+    assert.equal(gate.type, 'approval');
+    assert.equal(gate.status, 'pending');
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate review attaches matching attested manual AI gate evidence', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerCommand = 'node -e "console.log(\'implemented\')"';
+  const reviewStateKey = 'orchestration-review-state-signing-secret';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      preset: 'standard',
+      planReview: { gates: [] },
+      gates: [{
+        id: 'karpathy-diff',
+        phase: 'ai-diff',
+        type: 'skill',
+        skill: 'karpathy-diff',
+        userCommands: ['/karpathy diff'],
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt AI review gate');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Attach independent AI review evidence', '--provider', 'codex', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    });
+
+    const pending = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    assert.equal(pending.status, 'pending');
+    assert.equal(pending.run.slices[0].review.run.gates[0].status, 'pending');
+
+    const sliceWorktree = prepared.slices[0].worktreePath;
+    const standaloneReview = JSON.parse(runCli(['run', 'review', '--json'], sliceWorktree, {
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    assert.equal(standaloneReview.status, 'pending');
+    assert.equal(standaloneReview.gates[0].gateId, 'karpathy-diff');
+    assert.equal(standaloneReview.gates[0].status, 'pending');
+
+    const attested = JSON.parse(runCli([
+      'run',
+      'review',
+      'pass',
+      '--gate',
+      'karpathy-diff',
+      '--message',
+      'Ran /karpathy diff clean from an independent Claude session',
+      '--json',
+    ], sliceWorktree, {
+      CLAUDE_SESSION_ID: 'independent-claude-review-session',
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    assert.equal(attested.status, 'attested');
+
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    const onDisk = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
+    const gate = onDisk.slices[0].review.run.gates[0];
+
+    assert.equal(reviewed.status, 'passed');
+    assert.equal(reviewed.reviewedCount, 1);
+    assert.equal(reviewed.pendingCount, 0);
+    assert.equal(reviewed.blockedCount, 0);
+    assert.equal(onDisk.status, 'completed');
+    assert.equal(onDisk.slices[0].status, 'completed');
+    assert.equal(onDisk.slices[0].review.independence, 'cross-provider');
+    assert.equal(gate.gateId, 'karpathy-diff');
+    assert.equal(gate.status, 'passed');
+    assert.equal(gate.attester.provider, 'claude');
+    assert.equal(gate.attester.sessionId, hashedSessionId('independent-claude-review-session'));
+    assert.match(gate.summary, /independent Claude session/);
+
+    const secondStandaloneReview = JSON.parse(runCli(['run', 'review', '--json'], sliceWorktree, {
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    assert.equal(secondStandaloneReview.status, 'pending');
+    const genericAttested = JSON.parse(runCli([
+      'run',
+      'review',
+      'pass',
+      '--gate',
+      'karpathy-diff',
+      '--message',
+      'Ran /karpathy diff from an untrusted generic reviewer',
+      '--json',
+    ], sliceWorktree, {
+      PIPELANE_AGENT_PROVIDER: 'generic',
+      PIPELANE_AGENT_SESSION_ID: 'generic-reviewer-session',
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    assert.equal(genericAttested.status, 'attested');
+
+    const rejected = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    const rejectedOnDisk = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
+    const status = runCli(['run', 'status'], repoRoot).stdout;
+    assert.equal(rejected.status, 'blocked');
+    assert.equal(rejected.blockedCount, 1);
+    assert.match(rejected.slices[0].blocker, /provider identity is unavailable/);
+    assert.equal(rejectedOnDisk.slices[0].review, null);
+    assert.equal(rejectedOnDisk.slices[0].reviewDiagnostics.at(-1).independence, 'unknown');
+    assert.match(status, /reviews 0\/1 trusted/);
+    assert.match(status, /review=rejected:unknown/);
+
+    const recoveryReview = JSON.parse(runCli(['run', 'review', '--json'], sliceWorktree, {
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    assert.equal(recoveryReview.status, 'pending');
+    const recoveredAttested = JSON.parse(runCli([
+      'run',
+      'review',
+      'pass',
+      '--gate',
+      'karpathy-diff',
+      '--message',
+      'Ran /karpathy diff clean from a new independent Claude session',
+      '--json',
+    ], sliceWorktree, {
+      CLAUDE_SESSION_ID: 'second-independent-claude-review-session',
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    assert.equal(recoveredAttested.status, 'attested');
+
+    const recovered = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    const recoveredOnDisk = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
+    const recoveredStatus = runCli(['run', 'status'], repoRoot).stdout;
+    assert.equal(recovered.status, 'passed');
+    assert.equal(recovered.blockedCount, 0);
+    assert.equal(recoveredOnDisk.slices[0].review.independence, 'cross-provider');
+    assert.deepEqual(recoveredOnDisk.slices[0].reviewDiagnostics, []);
+    assert.match(recoveredStatus, /reviews 1\/1 trusted/);
+    assert.match(recoveredStatus, /review=trusted:cross-provider/);
+    assert.doesNotMatch(recoveredStatus, /review=rejected/);
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate review ignores unsigned manual AI gate evidence', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerCommand = 'node -e "console.log(\'implemented\')"';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      preset: 'standard',
+      planReview: { gates: [] },
+      gates: [{
+        id: 'karpathy-diff',
+        phase: 'ai-diff',
+        type: 'skill',
+        skill: 'karpathy-diff',
+        userCommands: ['/karpathy diff'],
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt AI review gate');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Ignore unsigned AI review evidence', '--provider', 'codex', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    });
+
+    const sliceWorktree = prepared.slices[0].worktreePath;
+    const standaloneReview = JSON.parse(runCli(['run', 'review', '--json'], sliceWorktree).stdout);
+    assert.equal(standaloneReview.status, 'pending');
+    const attested = JSON.parse(runCli([
+      'run',
+      'review',
+      'pass',
+      '--gate',
+      'karpathy-diff',
+      '--message',
+      'Unsigned manual evidence from an independent Claude session',
+      '--json',
+    ], sliceWorktree, {
+      CLAUDE_SESSION_ID: 'unsigned-independent-claude-session',
+    }).stdout);
+    assert.equal(attested.status, 'attested');
+
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const onDisk = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
+    const gate = onDisk.slices[0].review.run.gates.find((entry) => entry.gateId === 'karpathy-diff');
+
+    assert.equal(reviewed.status, 'pending');
+    assert.equal(reviewed.pendingCount, 1);
+    assert.equal(onDisk.status, 'blocked');
+    assert.equal(onDisk.slices[0].status, 'blocked');
+    assert.equal(gate.status, 'pending');
+    assert.equal(gate.attester, undefined);
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate review attaches signed manual AI evidence across matching records', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerCommand = 'node -e "console.log(\'implemented\')"';
+  const reviewStateKey = 'multi-record-review-state-signing-secret';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      preset: 'standard',
+      planReview: { gates: [] },
+      gates: [
+        {
+          id: 'karpathy-diff',
+          phase: 'ai-diff',
+          type: 'skill',
+          skill: 'karpathy-diff',
+          userCommands: ['/karpathy diff'],
+          blocking: true,
+        },
+        {
+          id: 'gstack-review',
+          phase: 'ai-diff',
+          type: 'skill',
+          skill: 'review',
+          userCommands: ['/review'],
+          blocking: true,
+        },
+      ],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt AI review gates');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Attach split AI review evidence', '--provider', 'codex', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    });
+
+    const sliceWorktree = prepared.slices[0].worktreePath;
+    assert.equal(JSON.parse(runCli(['run', 'review', '--json'], sliceWorktree, {
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout).status, 'pending');
+    assert.equal(JSON.parse(runCli([
+      'run',
+      'review',
+      'pass',
+      '--gate',
+      'gstack-review',
+      '--message',
+      'Ran /review clean from Claude',
+      '--json',
+    ], sliceWorktree, {
+      CLAUDE_SESSION_ID: 'review-gate-claude-session',
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout).status, 'attested');
+
+    assert.equal(JSON.parse(runCli(['run', 'review', '--json'], sliceWorktree, {
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout).status, 'pending');
+    assert.equal(JSON.parse(runCli([
+      'run',
+      'review',
+      'pass',
+      '--gate',
+      'karpathy-diff',
+      '--message',
+      'Ran /karpathy diff clean from Claude',
+      '--json',
+    ], sliceWorktree, {
+      CLAUDE_SESSION_ID: 'karpathy-gate-claude-session',
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout).status, 'attested');
+
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    const onDisk = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
+    const gates = new Map(onDisk.slices[0].review.run.gates.map((gate) => [gate.gateId, gate]));
+
+    assert.equal(reviewed.status, 'passed');
+    assert.equal(onDisk.status, 'completed');
+    assert.equal(gates.get('karpathy-diff').status, 'passed');
+    assert.equal(gates.get('gstack-review').status, 'passed');
+    assert.equal(gates.get('karpathy-diff').attester.sessionId, hashedSessionId('karpathy-gate-claude-session'));
+    assert.equal(gates.get('gstack-review').attester.sessionId, hashedSessionId('review-gate-claude-session'));
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate review refuses attested manual AI evidence for a mismatched gate definition', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerCommand = 'node -e "console.log(\'implemented\')"';
+  const reviewStateKey = 'mismatched-gate-review-state-signing-secret';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      preset: 'standard',
+      planReview: { gates: [] },
+      gates: [{
+        id: 'karpathy-diff',
+        phase: 'ai-diff',
+        type: 'skill',
+        skill: 'karpathy-diff',
+        userCommands: ['/karpathy diff'],
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt AI review gate');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject mismatched AI review evidence', '--provider', 'codex', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    });
+
+    const sliceWorktree = prepared.slices[0].worktreePath;
+    const sliceConfigPath = path.join(sliceWorktree, '.pipelane.json');
+    const sliceConfig = JSON.parse(readFileSync(sliceConfigPath, 'utf8'));
+    sliceConfig.reviewGates.gates.find((gate) => gate.id === 'karpathy-diff').skill = 'review';
+    writeFileSync(sliceConfigPath, JSON.stringify(sliceConfig, null, 2) + '\n', 'utf8');
+
+    const standaloneReview = JSON.parse(runCli(['run', 'review', '--json'], sliceWorktree, {
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    const standaloneGate = standaloneReview.gates.find((gate) => gate.gateId === 'karpathy-diff');
+    assert.equal(standaloneReview.status, 'pending');
+    assert.equal(standaloneGate.skill, 'review');
+
+    const attested = JSON.parse(runCli([
+      'run',
+      'review',
+      'pass',
+      '--gate',
+      'karpathy-diff',
+      '--message',
+      'Ran /review clean from an independent Claude session',
+      '--json',
+    ], sliceWorktree, {
+      CLAUDE_SESSION_ID: 'independent-claude-review-session',
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    assert.equal(attested.status, 'attested');
+
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    const onDisk = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
+    const gate = onDisk.slices[0].review.run.gates.find((entry) => entry.gateId === 'karpathy-diff');
+
+    assert.equal(reviewed.status, 'pending');
+    assert.equal(onDisk.status, 'blocked');
+    assert.equal(onDisk.slices[0].status, 'blocked');
+    assert.equal(gate.gateId, 'karpathy-diff');
+    assert.equal(gate.skill, 'karpathy-diff');
+    assert.equal(gate.status, 'pending');
+    assert.equal(gate.attester, undefined);
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate review refuses attested manual AI evidence for mismatched user commands', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerCommand = 'node -e "console.log(\'implemented\')"';
+  const reviewStateKey = 'mismatched-command-review-state-signing-secret';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      preset: 'standard',
+      planReview: { gates: [] },
+      gates: [{
+        id: 'karpathy-diff',
+        phase: 'ai-diff',
+        type: 'skill',
+        skill: 'karpathy-diff',
+        userCommands: ['/karpathy diff'],
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt AI review gate');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject mismatched AI review command evidence', '--provider', 'codex', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    });
+
+    const sliceWorktree = prepared.slices[0].worktreePath;
+    const sliceConfigPath = path.join(sliceWorktree, '.pipelane.json');
+    const sliceConfig = JSON.parse(readFileSync(sliceConfigPath, 'utf8'));
+    sliceConfig.reviewGates.gates.find((gate) => gate.id === 'karpathy-diff').userCommands = ['/review'];
+    writeFileSync(sliceConfigPath, JSON.stringify(sliceConfig, null, 2) + '\n', 'utf8');
+
+    const standaloneReview = JSON.parse(runCli(['run', 'review', '--json'], sliceWorktree, {
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    const standaloneGate = standaloneReview.gates.find((gate) => gate.gateId === 'karpathy-diff');
+    assert.equal(standaloneReview.status, 'pending');
+    assert.deepEqual(standaloneGate.userCommands, ['/review']);
+
+    const attested = JSON.parse(runCli([
+      'run',
+      'review',
+      'pass',
+      '--gate',
+      'karpathy-diff',
+      '--message',
+      'Ran /review clean from an independent Claude session',
+      '--json',
+    ], sliceWorktree, {
+      CLAUDE_SESSION_ID: 'independent-claude-review-session',
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    assert.equal(attested.status, 'attested');
+
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    const onDisk = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
+    const gate = onDisk.slices[0].review.run.gates.find((entry) => entry.gateId === 'karpathy-diff');
+
+    assert.equal(reviewed.status, 'pending');
+    assert.equal(gate.skill, 'karpathy-diff');
+    assert.deepEqual(gate.userCommands, ['/karpathy diff']);
+    assert.equal(gate.status, 'pending');
+    assert.equal(gate.attester, undefined);
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('orchestrate start redacts credential material in worker evidence', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];
@@ -6079,7 +7220,7 @@ test('orchestrate start redacts credential material in worker evidence', () => {
     'OPENAI_API_KEY=sk-secret',
     JSON.stringify(process.execPath),
     '-e',
-    JSON.stringify("console.log('OPENAI_API_KEY=sk-secret https://example.test/cb?access_token=tok-secret&next=ok'); console.log(JSON.stringify({ access_token: 'json-secret', client_secret: 'json-client-secret' })); console.error('Bearer abc.def --api-key=plainsecret client_secret: shh-secret api_key=lower-secret'); process.stdout.write('x'.repeat(70 * 1024) + 'OPENAI_API_KEY=sk-longsecret');"),
+    JSON.stringify("console.log('OPENAI_API_KEY=sk-secret https://example.test/cb?access_token=tok-secret&next=ok'); console.log('mongodb+srv://user:atlas-secret@cluster.mongodb.net/app rediss://user:redis-secret@cache.example/0'); console.log(JSON.stringify({ access_token: 'json-secret', client_secret: 'json-client-secret' })); console.error('Bearer abc.def --api-key=plainsecret client_secret: shh-secret api_key=lower-secret'); process.stdout.write('x'.repeat(70 * 1024) + 'OPENAI_API_KEY=sk-longsecret');"),
   ].join(' ');
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
@@ -6098,7 +7239,7 @@ test('orchestrate start redacts credential material in worker evidence', () => {
 
     assert.equal(started.status, 'completed');
     assert.doesNotMatch(worker.command, /sk-secret|plainsecret|sk-longsecret|tok-secret|shh-secret|lower-secret|json-secret|json-client-secret/);
-    assert.doesNotMatch(log, /sk-secret|plainsecret|sk-longsecret|tok-secret|shh-secret|lower-secret|json-secret|json-client-secret|abc\.def/);
+    assert.doesNotMatch(log, /sk-secret|plainsecret|sk-longsecret|tok-secret|shh-secret|lower-secret|json-secret|json-client-secret|atlas-secret|redis-secret|abc\.def/);
     assert.match(worker.command, /OPENAI_API_KEY=\[REDACTED\]/);
     assert.match(log, /OPENAI_API_KEY=\[REDACTED\]/);
     assert.match(log, /access_token=\[REDACTED\]/);
@@ -6106,6 +7247,8 @@ test('orchestrate start redacts credential material in worker evidence', () => {
     assert.match(log, /"client_secret": \[REDACTED\]/);
     assert.match(log, /client_secret: \[REDACTED\]/);
     assert.match(log, /api_key=\[REDACTED\]/);
+    assert.doesNotMatch(log, /mongodb\+srv:\/\/|rediss:\/\//);
+    assert.match(log, /\[REDACTED_DSN\].*\[REDACTED_DSN\]/s);
     assert.match(log, /\[REDACTED_AUTH_HEADER\]/);
     assert.match(log, /--api-key=\[REDACTED\]/);
     assert.match(log, /chars omitted from long unterminated line/);
@@ -7041,7 +8184,10 @@ test('review pass records clean manual gates against current review evidence', (
   const repoRoot = createRepo();
   const npmShim = createNpmShimEnv();
   try {
-    const review = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, npmShim.env).stdout);
+    const review = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      ...npmShim.env,
+      PIPELANE_AGENT_SESSION_ID: 'initial-review-session',
+    }).stdout);
     assert.equal(review.status, 'pending');
 
     const gstack = JSON.parse(runCli([
@@ -7053,13 +8199,17 @@ test('review pass records clean manual gates against current review evidence', (
       '--message',
       'Ran /review clean',
       '--json',
-    ], repoRoot).stdout);
+    ], repoRoot, {
+      PIPELANE_AGENT_SESSION_ID: 'gstack-attester-session',
+    }).stdout);
     const afterGstack = JSON.parse(readFileSync(gstack.evidencePath, 'utf8')).records[0];
 
     assert.equal(gstack.command, 'review pass');
     assert.equal(gstack.status, 'attested');
     assert.equal(afterGstack.status, 'pending');
+    assert.equal(afterGstack.reviewer.sessionId, hashedSessionId('initial-review-session'));
     assert.equal(afterGstack.gates.find((gate) => gate.gateId === 'gstack-review').status, 'passed');
+    assert.equal(afterGstack.gates.find((gate) => gate.gateId === 'gstack-review').attester.sessionId, hashedSessionId('gstack-attester-session'));
     assert.match(afterGstack.gates.find((gate) => gate.gateId === 'gstack-review').summary, /Ran \/review clean/);
     assert.equal(afterGstack.gates.find((gate) => gate.gateId === 'karpathy-diff').status, 'pending');
 
@@ -7072,12 +8222,17 @@ test('review pass records clean manual gates against current review evidence', (
       '--message',
       'Ran /karpathy diff clean',
       '--json',
-    ], repoRoot).stdout);
+    ], repoRoot, {
+      PIPELANE_AGENT_SESSION_ID: 'karpathy-attester-session',
+    }).stdout);
     const afterKarpathy = JSON.parse(readFileSync(karpathy.evidencePath, 'utf8')).records[0];
 
     assert.equal(afterKarpathy.status, 'passed');
+    assert.equal(afterKarpathy.reviewer.sessionId, hashedSessionId('initial-review-session'));
     assert.equal(afterKarpathy.gates.find((gate) => gate.gateId === 'gstack-review').status, 'passed');
+    assert.equal(afterKarpathy.gates.find((gate) => gate.gateId === 'gstack-review').attester.sessionId, hashedSessionId('gstack-attester-session'));
     assert.equal(afterKarpathy.gates.find((gate) => gate.gateId === 'karpathy-diff').status, 'passed');
+    assert.equal(afterKarpathy.gates.find((gate) => gate.gateId === 'karpathy-diff').attester.sessionId, hashedSessionId('karpathy-attester-session'));
     assert.equal(afterKarpathy.gates.find((gate) => gate.gateId === 'karpathy-audit').status, 'skipped');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -7457,7 +8612,7 @@ test('status keeps worker-completed orchestration active until trusted review ex
     const status = runCli(['run', 'status'], repoRoot).stdout;
     assert.match(status, /ORCHESTRATION/);
     assert.match(status, /orchestrate review --run-id/);
-    assert.match(status, /worker=succeeded review=none/);
+    assert.match(status, /worker=succeeded review=pending/);
   } finally {
     for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
     rmSync(repoRoot, { recursive: true, force: true });
@@ -7528,6 +8683,7 @@ test('completed reviewed orchestration stays inactive after worktree cleanup', a
           gateFilter: null,
           phaseFilter: null,
           sha: 'reviewed-sha',
+          gates: [],
         },
       },
     }],
@@ -8424,7 +9580,24 @@ function writePassingReviewEvidence(repoRoot, options = {}) {
   const review = JSON.parse(runCli(['run', 'review', '--dry-run', '--json'], repoRoot).stdout);
   const state = JSON.parse(readFileSync(review.evidencePath, 'utf8'));
   const record = state.records[0];
+  const defaultReviewer = {
+    provider: 'codex',
+    sessionId: hashedSessionId('test-review-runner-session'),
+    source: 'CODEX_SESSION_ID',
+  };
+  const defaultAiGateAttester = {
+    provider: 'claude',
+    sessionId: hashedSessionId('test-review-attester-session'),
+    source: 'CLAUDE_SESSION_ID',
+  };
   record.status = options.status || 'passed';
+  if (Object.prototype.hasOwnProperty.call(options, 'reviewer')) {
+    record.reviewer = options.reviewer;
+  } else if (options.omitReviewer) {
+    delete record.reviewer;
+  } else {
+    record.reviewer = defaultReviewer;
+  }
   record.dryRun = options.dryRun === true;
   if (Object.prototype.hasOwnProperty.call(options, 'gateFilter')) {
     record.gateFilter = options.gateFilter;
@@ -8438,11 +9611,20 @@ function writePassingReviewEvidence(repoRoot, options = {}) {
   }
   if (options.sha) record.sha = options.sha;
   if (options.branchName) record.branchName = options.branchName;
-  record.gates = record.gates.map((gate) => ({
-    ...gate,
-    status: options.gateStatuses?.[gate.gateId] || (gate.status === 'skipped' ? 'skipped' : 'passed'),
-    summary: options.gateSummaries?.[gate.gateId] || gate.summary,
-  }));
+  record.gates = record.gates.map((gate) => {
+    const defaultAttester = gate.type === 'skill' || gate.type === 'agent'
+      ? defaultAiGateAttester
+      : undefined;
+    const attester = options.omitGateAttester
+      ? undefined
+      : options.gateAttesters?.[gate.gateId] ?? options.gateAttester ?? defaultAttester;
+    const next = {
+      ...gate,
+      status: options.gateStatuses?.[gate.gateId] || (gate.status === 'skipped' ? 'skipped' : 'passed'),
+      summary: options.gateSummaries?.[gate.gateId] || gate.summary,
+    };
+    return attester ? { ...next, attester } : next;
+  });
   if (options.removeGateId) {
     record.gates = record.gates.filter((gate) => gate.gateId !== options.removeGateId);
   }
@@ -10129,6 +11311,349 @@ test('pr blocks when dirty worktree changes after review evidence is recorded', 
     assert.match(result.stderr, /different worktree state/);
     assert.match(run('git', ['status', '--short'], created.worktreePath), /feature\.txt/);
     assert.equal(existsSync(ghStateFile), false, 'stale review evidence should block before gh is called');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('pr blocks same-session AI review attestation', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Same Session Review', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'same-session review\n', 'utf8');
+
+    const identityMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-identity.ts'));
+    const sameSessionReviewer = identityMod.resolveReviewActorIdentity({
+      env: { CODEX_SESSION_ID: 'same-review-session' },
+    });
+    writePassingReviewEvidence(created.worktreePath, {
+      reviewer: sameSessionReviewer,
+      gateAttester: sameSessionReviewer,
+    });
+
+    const result = runCli(['run', 'pr', '--title', 'Same Session Review', '--json'], created.worktreePath, env, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /blocking AI review evidence is not independently attested/);
+    assert.match(result.stderr, /separate reviewer session/);
+    assert.equal(existsSync(ghStateFile), false, 'same-session AI evidence should block before gh is called');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('pr blocks reviewer-less AI review evidence without attester', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Reviewerless Missing Attester', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'reviewerless missing attester\n', 'utf8');
+    writePassingReviewEvidence(created.worktreePath, {
+      omitReviewer: true,
+      omitGateAttester: true,
+    });
+
+    const result = runCli(['run', 'pr', '--title', 'Reviewerless Missing Attester', '--json'], created.worktreePath, env, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /passed blocking AI review gate is missing attester identity/);
+    assert.equal(existsSync(ghStateFile), false, 'reviewer-less missing attester should block before gh is called');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('pr blocks reviewer-less AI review evidence with generic attester', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Reviewerless Generic Attester', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'reviewerless generic attester\n', 'utf8');
+    const identityMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-identity.ts'));
+    const genericAttester = identityMod.resolveReviewActorIdentity({
+      provider: 'generic',
+      env: { PIPELANE_AGENT_SESSION_ID: 'generic-attester-session' },
+    });
+    writePassingReviewEvidence(created.worktreePath, {
+      omitReviewer: true,
+      gateAttester: genericAttester,
+    });
+
+    const result = runCli(['run', 'pr', '--title', 'Reviewerless Generic Attester', '--json'], created.worktreePath, env, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /recorded worker session identity is unavailable/);
+    assert.equal(existsSync(ghStateFile), false, 'reviewer-less generic attester should block before gh is called');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('pr blocks missing AI gate attester on new review evidence without session env', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Missing AI Attester', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'missing attester\n', 'utf8');
+    writePassingReviewEvidence(created.worktreePath, {
+      reviewer: { provider: 'unknown', sessionId: null, source: 'unavailable' },
+      omitGateAttester: true,
+    });
+
+    const result = runCli(['run', 'pr', '--title', 'Missing AI Attester', '--json'], created.worktreePath, env, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /passed blocking AI review gate is missing attester identity/);
+    assert.equal(existsSync(ghStateFile), false, 'missing AI attester should block before gh is called');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('pr accepts trusted AI gate attester when review runner identity is unavailable', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Trusted AI Attester', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'trusted attester\n', 'utf8');
+    const identityMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-identity.ts'));
+    const claudeAttester = identityMod.resolveReviewActorIdentity({
+      env: { CLAUDE_SESSION_ID: 'trusted-claude-attester-session' },
+    });
+    writePassingReviewEvidence(created.worktreePath, {
+      reviewer: { provider: 'unknown', sessionId: null, source: 'unavailable' },
+      gateAttester: claudeAttester,
+    });
+
+    const result = runCli(['run', 'pr', '--title', 'Trusted AI Attester', '--json'], created.worktreePath, env, true);
+    assert.equal(result.status, 0);
+    const pr = JSON.parse(result.stdout);
+    assert.match(pr.url, /example\.test\/pr/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('pr accepts trusted AI gate attester when review runner has only generic identity', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Generic Review Runner', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'generic review runner\n', 'utf8');
+    const identityMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-identity.ts'));
+    const genericReviewer = identityMod.resolveReviewActorIdentity({
+      provider: 'generic',
+      env: { PIPELANE_AGENT_SESSION_ID: 'generic-review-runner-session' },
+    });
+    const claudeAttester = identityMod.resolveReviewActorIdentity({
+      env: { CLAUDE_SESSION_ID: 'trusted-claude-attester-for-generic-runner' },
+    });
+    writePassingReviewEvidence(created.worktreePath, {
+      reviewer: genericReviewer,
+      gateAttester: claudeAttester,
+    });
+
+    const result = runCli(['run', 'pr', '--title', 'Generic Review Runner', '--json'], created.worktreePath, env, true);
+    assert.equal(result.status, 0);
+    const pr = JSON.parse(result.stdout);
+    assert.match(pr.url, /example\.test\/pr/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('pr blocks trusted AI gate attester matching a generic review runner session', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Generic Native Same Session', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'generic-native same session\n', 'utf8');
+    const identityMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-identity.ts'));
+    const genericReviewer = identityMod.resolveReviewActorIdentity({
+      provider: 'generic',
+      env: { PIPELANE_AGENT_SESSION_ID: 'same-generic-native-session' },
+    });
+    const nativeAttester = identityMod.resolveReviewActorIdentity({
+      env: { CODEX_SESSION_ID: 'same-generic-native-session' },
+    });
+    writePassingReviewEvidence(created.worktreePath, {
+      reviewer: genericReviewer,
+      gateAttester: nativeAttester,
+    });
+
+    const result = runCli(['run', 'pr', '--title', 'Generic Native Same Session', '--json'], created.worktreePath, env, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /blocking AI review evidence is not independently attested/);
+    assert.match(result.stderr, /separate reviewer session/);
+    assert.equal(existsSync(ghStateFile), false, 'same-session AI evidence should block before gh is called');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('pr accepts legacy reviewer-less review pass evidence with trusted AI attester', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.reviewGates = {
+        preset: 'standard',
+        planReview: { gates: [] },
+        gates: [{
+          id: 'karpathy-diff',
+          phase: 'ai-diff',
+          type: 'skill',
+          skill: 'karpathy-diff',
+          userCommands: ['/karpathy diff'],
+          blocking: true,
+        }],
+      };
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Legacy Review Pass', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'legacy review pass\n', 'utf8');
+    const review = JSON.parse(runCli(['run', 'review', '--json'], created.worktreePath).stdout);
+    assert.equal(review.status, 'pending');
+
+    const reviewState = JSON.parse(readFileSync(review.evidencePath, 'utf8'));
+    delete reviewState.records[0].reviewer;
+    writeFileSync(review.evidencePath, `${JSON.stringify(reviewState, null, 2)}\n`, 'utf8');
+
+    const pass = JSON.parse(runCli([
+      'run',
+      'review',
+      'pass',
+      '--gate',
+      'karpathy-diff',
+      '--message',
+      'Ran /karpathy diff clean from an independent session',
+      '--json',
+    ], created.worktreePath, {
+      CLAUDE_SESSION_ID: 'trusted-legacy-review-pass-session',
+    }).stdout);
+    assert.equal(pass.status, 'attested');
+    const attestedState = JSON.parse(readFileSync(pass.evidencePath, 'utf8'));
+    assert.equal(attestedState.records[0].reviewer, undefined);
+    assert.equal(attestedState.records[0].gates[0].attester.sessionId, hashedSessionId('trusted-legacy-review-pass-session'));
+
+    const result = runCli(['run', 'pr', '--title', 'Legacy Review Pass', '--json'], created.worktreePath, env, true);
+    assert.equal(result.status, 0);
+    const pr = JSON.parse(result.stdout);
+    assert.match(pr.url, /example\.test\/pr/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });

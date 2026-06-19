@@ -11,6 +11,7 @@ import {
   buildReviewGatesConfigForPreset,
   type ResolvedReviewGateCatalogEntry,
 } from '../review-gates.ts';
+import { resolveReviewActorIdentity } from '../review-identity.ts';
 import { readWorktreeStatusSnapshot } from '../worktree-status.ts';
 import {
   appendReviewRunRecord,
@@ -312,11 +313,13 @@ export function buildReviewPassRecord(options: {
   }
 
   const startedAt = nowIso();
+  const attester = resolveReviewActorIdentity();
   const nextGates = base.gates.map((entry) => {
     if (entry.gateId !== gateId || entry.status !== 'pending') return entry;
     return {
       ...entry,
       status: 'passed' as const,
+      attester,
       summary: manualPassSummary(message),
       startedAt,
       finishedAt: startedAt,
@@ -334,6 +337,7 @@ export function buildReviewPassRecord(options: {
     worktreeStatusDigest: worktreeStatus.statusDigest,
     worktreeStatusReliable: worktreeStatus.statusDigestReliable,
     worktreeStatusWarnings: worktreeStatus.statusDigestWarnings,
+    reviewer: base.reviewer,
     gates: nextGates,
     signature: undefined,
   };
@@ -747,6 +751,7 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
     worktreeStatusDigest: worktreeStatus.statusDigest,
     worktreeStatusReliable: worktreeStatus.statusDigestReliable,
     worktreeStatusWarnings: worktreeStatus.statusDigestWarnings,
+    reviewer: resolveReviewActorIdentity(),
     gates: gateRecords,
   };
 }
@@ -778,6 +783,7 @@ function runReviewGate(options: {
     command: gate.command,
     skill: gate.skill,
     role: gate.role,
+    userCommands: gate.userCommands,
     startedAt,
   };
   const skipReason = skipReasonForGate(gate, changedFiles, activeSurfaces);

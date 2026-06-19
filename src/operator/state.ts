@@ -352,9 +352,11 @@ export interface ReviewGateRunRecord {
   type: ReviewGateType;
   blocking: boolean;
   status: ReviewGateRunStatus;
+  attester?: ReviewActorIdentity;
   command?: string;
   skill?: string;
   role?: string;
+  userCommands?: string[];
   summary: string;
   exitCode?: number | null;
   durationMs: number;
@@ -363,6 +365,12 @@ export interface ReviewGateRunRecord {
   stdoutTail?: string;
   stderrTail?: string;
   skipReason?: string;
+}
+
+export interface ReviewActorIdentity {
+  provider: string;
+  sessionId: string | null;
+  source: string;
 }
 
 export interface ReviewRunRecord {
@@ -381,6 +389,7 @@ export interface ReviewRunRecord {
   worktreeStatusDigest?: string;
   worktreeStatusReliable?: boolean;
   worktreeStatusWarnings?: string[];
+  reviewer?: ReviewActorIdentity;
   gates: ReviewGateRunRecord[];
   signature?: string;
 }
@@ -2351,6 +2360,7 @@ function isReviewRunRecord(value: unknown): value is ReviewRunRecord {
     && changedFiles.every((entry) => typeof entry === 'string')
     && (raw.worktreeStatusDigest === undefined || typeof raw.worktreeStatusDigest === 'string')
     && (raw.worktreeStatusReliable === undefined || typeof raw.worktreeStatusReliable === 'boolean')
+    && (raw.reviewer === undefined || isReviewActorIdentity(raw.reviewer))
     && (raw.signature === undefined || typeof raw.signature === 'string')
     && (
       raw.worktreeStatusWarnings === undefined
@@ -2363,6 +2373,14 @@ function isReviewRunRecord(value: unknown): value is ReviewRunRecord {
     && gates.every(isReviewGateRunRecord);
 }
 
+function isReviewActorIdentity(value: unknown): value is ReviewActorIdentity {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return typeof raw.provider === 'string'
+    && (raw.sessionId === null || typeof raw.sessionId === 'string')
+    && typeof raw.source === 'string';
+}
+
 function isReviewGateRunRecord(value: unknown): value is ReviewGateRunRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const raw = value as Record<string, unknown>;
@@ -2372,9 +2390,17 @@ function isReviewGateRunRecord(value: unknown): value is ReviewGateRunRecord {
     && includesString(REVIEW_GATE_TYPES, raw.type)
     && typeof raw.blocking === 'boolean'
     && (raw.status === 'passed' || raw.status === 'failed' || raw.status === 'skipped' || raw.status === 'pending')
+    && (raw.attester === undefined || isReviewActorIdentity(raw.attester))
     && (raw.command === undefined || typeof raw.command === 'string')
     && (raw.skill === undefined || typeof raw.skill === 'string')
     && (raw.role === undefined || typeof raw.role === 'string')
+    && (
+      raw.userCommands === undefined
+      || (
+        Array.isArray(raw.userCommands)
+        && raw.userCommands.every((entry) => typeof entry === 'string')
+      )
+    )
     && typeof raw.summary === 'string'
     && (raw.exitCode === undefined || raw.exitCode === null || typeof raw.exitCode === 'number')
     && typeof raw.durationMs === 'number'
