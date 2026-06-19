@@ -22,6 +22,15 @@ export interface TextEmptyState {
   replyPrompt?: string;
 }
 
+// Strip terminal control characters before embedding untrusted strings in CLI
+// output. Defends against ANSI/OSC injection via branch-controlled paths,
+// remote PR metadata, hand-edited state files, and env-derived attribution.
+export function sanitizeForTerminal(raw: string): string {
+  if (!raw) return '';
+  // eslint-disable-next-line no-control-regex
+  return raw.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|[\x00-\x08\x0B-\x1F\x7F\x80-\x9F]/g, '');
+}
+
 function formatOptionPrefix(option: TextEmptyStateOption): string {
   const aliases = option.aliases ?? [];
   const affirmativeAlias = aliases.find((alias) => alias.toLowerCase() === 'y');

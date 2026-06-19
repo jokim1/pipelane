@@ -243,7 +243,8 @@ below).
 
 ### `.pipelane.json:surfacePathMap` (optional, v1.4+)
 
-Opt-in map consumed by `--blast`. Keys are surface names (typically
+Opt-in map consumed by `--blast` and by deploy preflight when the
+operator does not pass `--surfaces`. Keys are surface names (typically
 entries from `surfaces`), values are POSIX directory prefixes or exact
 filenames matched against `git diff --name-only` output. Example:
 
@@ -258,10 +259,16 @@ filenames matched against `git diff --name-only` output. Example:
 ```
 
 Empty / absent = `--blast` still runs; every file lands in the `other`
-bucket and the render adds a one-line hint pointing at this key.
-Unknown keys inside the map are accepted — the key string is the
-surface label. Non-string-array values are dropped by
-`normalizeWorkflowConfig`; an all-invalid map collapses to `undefined`.
+bucket and the render adds a one-line hint pointing at this key. Deploy
+keeps the pre-v1.4 stored-surface behavior when the map is absent. When
+the map is present and a target commit cannot be inspected, or contains
+files that do not match it, direct deploys and destination route preflight
+block instead of falling back to stale task or mode surfaces; pass
+`--surfaces` to opt out for an intentionally manual deployment.
+Unknown keys inside the map are accepted by config normalization — the key
+string is the surface label. Deploy preflight still requires inferred
+surface labels to exist in `surfaces`. Non-string-array values are dropped
+by `normalizeWorkflowConfig`; an all-invalid map collapses to `undefined`.
 Patterns are normalized to POSIX separators (backslashes are rewritten
 to forward slashes) so Windows-authored maps match git's forward-slash
 path output.
