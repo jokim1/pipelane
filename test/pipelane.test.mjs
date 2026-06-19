@@ -3482,7 +3482,7 @@ test('syncDocs absent defaults to machine-local and writes no generated repo sur
   }
 });
 
-test('syncDocs absent with an existing managed footprint preserves repo-local syncing', () => {
+test('syncDocs absent ignores existing managed footprint and stays machine-local', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
@@ -3494,20 +3494,31 @@ test('syncDocs absent with an existing managed footprint preserves repo-local sy
     delete config.syncDocs;
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
-    rmSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md'), { force: true });
-    rmSync(path.join(repoRoot, '.claude', 'commands', 'new.md'), { force: true });
+    rmSync(path.join(repoRoot, '.agents'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, '.claude'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, 'docs'), { recursive: true, force: true });
+    writeFileSync(path.join(repoRoot, 'README.md'), '# Consumer README\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), '# Consumer Contributing\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'AGENTS.md'), '# Consumer Agents\n', 'utf8');
+    assert.ok(existsSync(path.join(repoRoot, 'pipelane', 'CLAUDE.template.md')));
+    const beforePackage = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    assert.equal(beforePackage.scripts['pipelane:new'], 'pipelane run new');
+
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
-    assert.ok(existsSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md')));
-    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'new.md')));
-    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'new', 'SKILL.md')));
+    assert.equal(existsSync(path.join(repoRoot, 'docs')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
+    assert.equal(readFileSync(path.join(repoRoot, 'README.md'), 'utf8'), '# Consumer README\n');
+    assert.equal(readFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), 'utf8'), '# Consumer Contributing\n');
+    assert.equal(readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8'), '# Consumer Agents\n');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
   }
 });
 
-test('legacy false-only partial syncDocs keeps old opt-out semantics when a managed footprint exists', () => {
+test('partial syncDocs keeps omitted surfaces disabled even with a managed footprint', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
@@ -3519,25 +3530,29 @@ test('legacy false-only partial syncDocs keeps old opt-out semantics when a mana
     config.syncDocs = { readmeSection: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
-    rmSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md'), { force: true });
-    rmSync(path.join(repoRoot, '.claude', 'commands', 'new.md'), { force: true });
+    rmSync(path.join(repoRoot, 'docs'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, '.claude'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, '.agents'), { recursive: true, force: true });
     writeFileSync(path.join(repoRoot, 'README.md'), '# Consumer README\n', 'utf8');
+    const pristinePackage = { name: 'consumer-app', private: true, type: 'module', scripts: { build: 'my-build' } };
+    writeFileSync(path.join(repoRoot, 'package.json'), `${JSON.stringify(pristinePackage, null, 2)}\n`, 'utf8');
+    assert.ok(existsSync(path.join(repoRoot, 'pipelane', 'CLAUDE.template.md')));
 
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
     assert.equal(readFileSync(path.join(repoRoot, 'README.md'), 'utf8'), '# Consumer README\n');
-    assert.ok(existsSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md')));
-    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'new.md')));
-    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'new', 'SKILL.md')));
+    assert.equal(existsSync(path.join(repoRoot, 'docs')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
     const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
-    assert.equal(pkg.scripts['pipelane:new'], 'pipelane run new');
+    assert.deepEqual(pkg.scripts, { build: 'my-build' });
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
   }
 });
 
-test('legacy true-only partial syncDocs keeps old default-on semantics when a managed footprint exists', () => {
+test('partial true-only syncDocs enables only that surface', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
@@ -3549,14 +3564,16 @@ test('legacy true-only partial syncDocs keeps old default-on semantics when a ma
     config.syncDocs = { claudeCommands: true };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
-    rmSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md'), { force: true });
+    rmSync(path.join(repoRoot, 'docs'), { recursive: true, force: true });
     rmSync(path.join(repoRoot, '.agents'), { recursive: true, force: true });
+    rmSync(path.join(repoRoot, 'pipelane'), { recursive: true, force: true });
 
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
     assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'new.md')));
-    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'new', 'SKILL.md')));
-    assert.ok(existsSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md')));
+    assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'docs')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'pipelane')), false);
     const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
     assert.equal(pkg.scripts['pipelane:new'], 'pipelane run new');
   } finally {
@@ -3565,7 +3582,7 @@ test('legacy true-only partial syncDocs keeps old default-on semantics when a ma
   }
 });
 
-test('syncDocs absent preserves repo-local syncing when only release workflow docs remain', () => {
+test('syncDocs absent ignores a remaining release workflow doc', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
@@ -3590,15 +3607,19 @@ test('syncDocs absent preserves repo-local syncing when only release workflow do
 
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
-    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'new.md')));
-    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'new', 'SKILL.md')));
+    assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'pipelane')), false);
+    assert.equal(readFileSync(path.join(repoRoot, 'README.md'), 'utf8'), '# Consumer README\n');
+    assert.equal(readFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), 'utf8'), '# Consumer Contributing\n');
+    assert.equal(readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8'), '# Consumer Agents\n');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
   }
 });
 
-test('syncDocs absent preserves repo-local syncing when only managed package scripts remain', () => {
+test('syncDocs absent ignores remaining managed package scripts', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
@@ -3622,9 +3643,13 @@ test('syncDocs absent preserves repo-local syncing when only managed package scr
 
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
-    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'new.md')));
-    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'new', 'SKILL.md')));
-    assert.ok(existsSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md')));
+    assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'docs')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'pipelane')), false);
+    assert.equal(readFileSync(path.join(repoRoot, 'README.md'), 'utf8'), '# Consumer README\n');
+    assert.equal(readFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), 'utf8'), '# Consumer Contributing\n');
+    assert.equal(readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8'), '# Consumer Agents\n');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
