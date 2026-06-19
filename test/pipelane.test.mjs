@@ -903,6 +903,12 @@ test('init writes tracked Pipelane files and setup seeds CLAUDE plus tracked Cod
     assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'smoke.md')));
     const newCommand = readFileSync(path.join(repoRoot, '.claude', 'commands', 'new.md'), 'utf8');
     assert.match(newCommand, /infer a concise task label/);
+    const pipelaneCommand = readFileSync(path.join(repoRoot, '.claude', 'commands', 'pipelane.md'), 'utf8');
+    assert.match(pipelaneCommand, /when `\$REST` is exactly `setup`/);
+    assert.match(pipelaneCommand, /npm run pipelane:review -- setup --print/);
+    assert.match(pipelaneCommand, /npm run pipelane:review -- setup --yes/);
+    assert.doesNotMatch(pipelaneCommand, /setup --preset/);
+    assert.doesNotMatch(pipelaneCommand, /lean\|standard\|strict-production/);
     const smokeCommand = readFileSync(path.join(repoRoot, '.claude', 'commands', 'smoke.md'), 'utf8');
     assert.match(smokeCommand, /Guided empty states/);
     assert.match(smokeCommand, /Offer the exact choices from `emptyState\.options`/);
@@ -1947,6 +1953,13 @@ test('install-codex outside a pipelane repo installs durable global default skil
     const deploySkill = readFileSync(path.join(codexHome, 'skills', 'deploy', 'SKILL.md'), 'utf8');
     assert.match(deploySkill, /Blocked deploy follow-up behavior/);
     assert.match(deploySkill, /Reply 1 or Y to execute/);
+    const pipelaneSkill = readFileSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
+    assert.match(pipelaneSkill, /Interactive review setup behavior/);
+    assert.match(pipelaneSkill, /runner command above/);
+    assert.match(pipelaneSkill, /review setup --print/);
+    assert.match(pipelaneSkill, /review setup --yes/);
+    assert.doesNotMatch(pipelaneSkill, /review setup --preset/);
+    assert.doesNotMatch(pipelaneSkill, /lean\|standard\|strict-production/);
     const fixSkill = readFileSync(path.join(codexHome, 'skills', 'fix', 'SKILL.md'), 'utf8');
     assert.match(fixSkill, /Pipelane-enabled repo detection/);
     assert.match(fixSkill, /Resolve `<base>` from the Pipelane config first/);
@@ -1984,6 +1997,13 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane-fix', 'SKILL.md')));
     assert.match(readFileSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md'), 'utf8'), /disable-model-invocation: true/);
     assert.match(readFileSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md'), 'utf8'), /Bare invocation behavior/);
+    const pipelaneSkill = readFileSync(path.join(claudeHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
+    assert.match(pipelaneSkill, /Interactive review setup behavior/);
+    assert.match(pipelaneSkill, /runner command above/);
+    assert.match(pipelaneSkill, /review setup --print/);
+    assert.match(pipelaneSkill, /review setup --yes/);
+    assert.doesNotMatch(pipelaneSkill, /review setup --preset/);
+    assert.doesNotMatch(pipelaneSkill, /lean\|standard\|strict-production/);
     assert.match(
       readFileSync(path.join(claudeHome, 'skills', 'pipelane', 'bin', 'bootstrap-pipelane.sh'), 'utf8'),
       new RegExp(path.join(claudeHome, 'skills', 'pipelane', 'bin', 'pipelane').replaceAll('\\', '\\\\')),
