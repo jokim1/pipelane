@@ -45,9 +45,10 @@ Commands:
   run <operator command...>
 
 Examples:
-  pipelane bootstrap --project "My Project"
+  pipelane install-codex
   pipelane install-claude
   pipelane install-npm-guard
+  pipelane bootstrap --yes --project "My Project"
   pipelane board
   pipelane board stop
   pipelane update --check
@@ -297,7 +298,11 @@ async function main(): Promise<void> {
       result.initializedRepo
         ? `Initialized tracked Pipelane files for ${result.displayName}.`
         : 'Repo was already pipelane-enabled; refreshed local setup.',
-      result.createdClaude ? 'Created local CLAUDE.md from the Pipelane template.' : 'Preserved existing local CLAUDE.md.',
+      result.createdClaude
+        ? 'Created local CLAUDE.md from the Pipelane template.'
+        : result.skippedClaudeScaffold
+          ? 'Skipped local CLAUDE.md scaffold because local guidance scaffolds are disabled.'
+          : 'Preserved existing local CLAUDE.md.',
       'Commit the tracked Pipelane files before using /new from a remote-backed repo.',
       'Claude picks up the tracked .claude/commands files after the repo is initialized.',
     ];

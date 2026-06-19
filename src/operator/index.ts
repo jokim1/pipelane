@@ -147,7 +147,7 @@ function printUsage(): void {
   process.stdout.write(`pipelane
 
 Usage:
-  pipelane bootstrap --project "Project Name"
+  pipelane bootstrap --yes --project "Project Name"
   pipelane init --project "Project Name"
   pipelane setup
   pipelane run <command> [args...]
