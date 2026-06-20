@@ -6061,6 +6061,314 @@ test('orchestrate plan writes a durable slice ledger from a plan file', () => {
   }
 });
 
+test('orchestrate plan prefers an explicit expected slice ledger over phase headings', () => {
+  const repoRoot = createRepo();
+  try {
+    const planPath = path.join(repoRoot, 'docs', 'rate-limit-orchestrate.md');
+    mkdirSync(path.dirname(planPath), { recursive: true });
+    writeFileSync(planPath, [
+      '# Use Pipelane Orchestrate For This Implementation',
+      '',
+      'Run it as **4 Pipelane worker slices + 1 coordinator integration phase**:',
+      '1. HTTP limiter consolidation',
+      '2. Spend broker core',
+      '3. Provider/tool cost-path wiring',
+      '4. Scheduler spend-denial semantics',
+      '5. Coordinator integration, final verification, review gates',
+      '',
+      'Expected slice ledger:',
+      '- `http-limiter`: route classifier, shared 429, public auth/OAuth coverage, inline limiter cleanup.',
+      '- `spend-broker-core`: `SpendBroker`, `SpendUserGate`, `SpendWorkspaceGate`, modes, TTL, idempotency.',
+      '- `cost-path-wiring`: LLM client and billable web-search/tool broker wiring.',
+      '- `scheduler-denial`: durable no-loop handling for spend-denied scheduled jobs.',
+      '',
+      '## Implementation Phases',
+      '',
+      '### Phase 1: HTTP Consolidation',
+      '- A broader phase that should not win over the explicit expected ledger.',
+      '',
+      '### Phase 2: Durable Spend Broker',
+      '- This phase intentionally combines broker core and provider wiring.',
+      '',
+      '### Phase 3: Scheduler Denial Semantics',
+      '- Scheduler work.',
+    ].join('\n') + '\n', 'utf8');
+
+    const report = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/rate-limit-orchestrate.md',
+      '--json',
+    ], repoRoot).stdout);
+    const sliceIds = report.run.slices.map((slice) => slice.id);
+
+    assert.deepEqual(sliceIds, [
+      'http-limiter',
+      'spend-broker-core',
+      'cost-path-wiring',
+      'scheduler-denial',
+    ]);
+    assert.equal(report.sliceCount, 4);
+    assert.deepEqual(report.run.slices[1].dependsOn, ['http-limiter']);
+    assert.equal(report.run.slices[0].goalSpec.finishLine[0], 'route classifier, shared 429, public auth/OAuth coverage, inline limiter cleanup');
+    assert.equal(sliceIds.some((id) => id.includes('coordinator')), false);
+    assert.equal(report.run.slices[0].goalSpec.finishLine.includes('This phase intentionally combines broker core and provider wiring'), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate plan keeps nested expected-ledger bullets inside the parent slice', () => {
+  const repoRoot = createRepo();
+  try {
+    const planPath = path.join(repoRoot, 'docs', 'nested-ledger-plan.md');
+    mkdirSync(path.dirname(planPath), { recursive: true });
+    writeFileSync(planPath, [
+      '# Nested Ledger Plan',
+      '',
+      'Expected slice ledger:',
+      '- `api`: implement API',
+      '  - Update `src/api.ts`',
+      '- `ui`: implement UI',
+    ].join('\n') + '\n', 'utf8');
+
+    const report = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/nested-ledger-plan.md',
+      '--json',
+    ], repoRoot).stdout);
+
+    assert.deepEqual(report.run.slices.map((slice) => slice.id), ['api', 'ui']);
+    assert.equal(report.run.slices[0].goalSpec.finishLine.includes('Update `src/api.ts`'), true);
+    assert.equal(report.run.slices.some((slice) => slice.id === 'update-src-api-ts'), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate plan keeps indented expected-ledger labels inside the parent slice', () => {
+  const repoRoot = createRepo();
+  try {
+    const planPath = path.join(repoRoot, 'docs', 'nested-label-ledger-plan.md');
+    mkdirSync(path.dirname(planPath), { recursive: true });
+    writeFileSync(planPath, [
+      '# Nested Label Ledger Plan',
+      '',
+      'Expected slice ledger:',
+      '- `api`: implement API',
+      '  Files:',
+      '  - `src/api.ts`',
+      '  Acceptance criteria:',
+      '  - Validate input before writing state.',
+      '- `ui`: implement UI',
+    ].join('\n') + '\n', 'utf8');
+
+    const report = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/nested-label-ledger-plan.md',
+      '--json',
+    ], repoRoot).stdout);
+
+    assert.deepEqual(report.run.slices.map((slice) => slice.id), ['api', 'ui']);
+    assert.equal(report.run.slices[0].goalSpec.finishLine[0], 'Validate input before writing state');
+    assert.equal(report.run.slices[0].requestedFiles.includes('src/api.ts'), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate plan does not drop explicit ledger slices named review gates', () => {
+  const repoRoot = createRepo();
+  try {
+    const planPath = path.join(repoRoot, 'docs', 'review-gates-ledger-plan.md');
+    mkdirSync(path.dirname(planPath), { recursive: true });
+    writeFileSync(planPath, [
+      '# Review Gates Ledger Plan',
+      '',
+      'Expected slice ledger:',
+      '- `review-gates`: implement review gate persistence.',
+      '- `status-ui`: render gate status.',
+    ].join('\n') + '\n', 'utf8');
+
+    const report = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/review-gates-ledger-plan.md',
+      '--json',
+    ], repoRoot).stdout);
+
+    assert.deepEqual(report.run.slices.map((slice) => slice.id), ['review-gates', 'status-ui']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate plan does not mistake a slice-ledger topic heading for a ledger marker', () => {
+  const repoRoot = createRepo();
+  try {
+    const planPath = path.join(repoRoot, 'docs', 'slice-ledger-parser-plan.md');
+    mkdirSync(path.dirname(planPath), { recursive: true });
+    writeFileSync(planPath, [
+      '# Slice Ledger Parser Plan',
+      '',
+      '## Slice ledger parser fixes',
+      '- Tighten marker detection.',
+      '- Preserve normal implementation bullets.',
+    ].join('\n') + '\n', 'utf8');
+
+    const report = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/slice-ledger-parser-plan.md',
+      '--json',
+    ], repoRoot).stdout);
+
+    assert.equal(report.sliceCount, 1);
+    assert.deepEqual(report.run.slices.map((slice) => slice.id), ['ledger-parser-fixes']);
+    assert.equal(report.run.slices[0].goalSpec.finishLine.includes('Tighten marker detection'), true);
+    assert.equal(report.run.slices[0].goalSpec.finishLine.includes('Preserve normal implementation bullets'), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate plan prefers detailed phase headings over a worker-slices summary', () => {
+  const repoRoot = createRepo();
+  try {
+    const planPath = path.join(repoRoot, 'docs', 'worker-summary-plus-phases.md');
+    mkdirSync(path.dirname(planPath), { recursive: true });
+    writeFileSync(planPath, [
+      '# Worker Summary Plus Phases',
+      '',
+      'Run it as **2 Pipelane worker slices**:',
+      '1. API summary',
+      '2. UI summary',
+      '',
+      '## Implementation Phases',
+      '',
+      '### Phase 1: Detailed API',
+      'Tasks:',
+      '1. Validate request input.',
+      '',
+      '### Phase 2: Detailed UI',
+      'Tasks:',
+      '1. Render status output.',
+    ].join('\n') + '\n', 'utf8');
+
+    const report = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/worker-summary-plus-phases.md',
+      '--json',
+    ], repoRoot).stdout);
+
+    assert.deepEqual(report.run.slices.map((slice) => slice.id), ['detailed-api', 'detailed-ui']);
+    assert.equal(report.run.slices[0].goalSpec.finishLine[0], 'Validate request input');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate plan keeps review-gates entries from worker-slices summaries', () => {
+  const repoRoot = createRepo();
+  try {
+    const planPath = path.join(repoRoot, 'docs', 'worker-review-gates-summary.md');
+    mkdirSync(path.dirname(planPath), { recursive: true });
+    writeFileSync(planPath, [
+      '# Worker Review Gates Summary',
+      '',
+      'Run it as **3 Pipelane worker slices**:',
+      '1. Review gates persistence',
+      '2. Status UI',
+      '3. Audit logs',
+    ].join('\n') + '\n', 'utf8');
+
+    const report = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/worker-review-gates-summary.md',
+      '--json',
+    ], repoRoot).stdout);
+
+    assert.deepEqual(report.run.slices.map((slice) => slice.id), [
+      'review-gates-persistence',
+      'status-ui',
+      'audit-logs',
+    ]);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate plan keeps slice task bullets ahead of global review context', () => {
+  const repoRoot = createRepo();
+  try {
+    const planPath = path.join(repoRoot, 'docs', 'context-heavy-plan.md');
+    mkdirSync(path.dirname(planPath), { recursive: true });
+    writeFileSync(planPath, [
+      '# Context Heavy Plan',
+      '',
+      '## Review Context',
+      '- Existing evidence 1 should stay context, not the first finish-line item.',
+      '- Existing evidence 2 should stay context, not the first finish-line item.',
+      '- Existing evidence 3 should stay context, not the first finish-line item.',
+      '- Existing evidence 4 should stay context, not the first finish-line item.',
+      '- Existing evidence 5 should stay context, not the first finish-line item.',
+      '- Existing evidence 6 should stay context, not the first finish-line item.',
+      '- Existing evidence 7 should stay context, not the first finish-line item.',
+      '- Existing evidence 8 should stay context, not the first finish-line item.',
+      '- Existing evidence 9 should stay context, not the first finish-line item.',
+      '',
+      '## Implementation Phases',
+      '',
+      '### Phase 1: HTTP Consolidation',
+      '',
+      'Files likely touched:',
+      '- `src/clawtalk/web/middleware/rate-limit.ts`',
+      '- `src/clawtalk/web/worker-app.ts`',
+      '',
+      'Tasks:',
+      '1. Define route classes and route matching table.',
+      '2. Add production limiter adapter and test/local adapter.',
+      '3. Replace inline route checks with middleware-classified route limits.',
+      '4. Add one shared 429 helper.',
+    ].join('\n') + '\n', 'utf8');
+
+    const report = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/context-heavy-plan.md',
+      '--json',
+    ], repoRoot).stdout);
+    const finishLine = report.run.slices[0].goalSpec.finishLine;
+
+    assert.equal(report.sliceCount, 1);
+    assert.equal(finishLine[0], 'Define route classes and route matching table');
+    assert.equal(finishLine.includes('Add one shared 429 helper'), true);
+    assert.equal(finishLine.includes('Existing evidence 1 should stay context, not the first finish-line item'), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('orchestrate prepare creates durable slice worktrees from a planned ledger', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];

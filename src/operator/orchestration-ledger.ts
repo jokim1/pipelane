@@ -620,8 +620,14 @@ function sliceWorktreeExists(slice: OrchestrationSliceRecord, options: Orchestra
 }
 
 function resolvePlanSections(planText: string, outcome: string | undefined): { globalText: string; slices: PlanSliceSource[] } {
+  const ledgerSections = extractExplicitSliceLedgerSections(planText, 'slice-ledger');
+  if (ledgerSections.slices.length > 0) return ledgerSections;
+
   const sections = extractExplicitSliceSections(planText);
   if (sections.slices.length > 0) return sections;
+
+  const workerSections = extractExplicitSliceLedgerSections(planText, 'worker-slices');
+  if (workerSections.slices.length > 0) return workerSections;
 
   const title = outcome?.trim() || inferPlanTitle(planText) || 'Orchestration slice';
   return {
@@ -631,6 +637,114 @@ function resolvePlanSections(planText: string, outcome: string | undefined): { g
       text: planText || `# ${title}`,
     }],
   };
+}
+
+function extractExplicitSliceLedgerSections(
+  planText: string,
+  acceptedMarkerKind: 'slice-ledger' | 'worker-slices',
+): { globalText: string; slices: PlanSliceSource[] } {
+  if (!planText.trim()) return { globalText: '', slices: [] };
+  const lines = planText.split(/\r?\n/);
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const markerKind = sliceLedgerMarkerKind(lines[index]);
+    if (markerKind !== acceptedMarkerKind) continue;
+
+    const parsed = parseSliceLedgerList(lines, index, markerKind);
+    if (parsed.slices.length < 2) continue;
+
+    const globalText = [
+      ...lines.slice(0, index),
+      ...lines.slice(parsed.endIndex),
+    ].join('\n').trim();
+    const sections = { globalText, slices: parsed.slices };
+    return sections;
+  }
+
+  return { globalText: '', slices: [] };
+}
+
+function sliceLedgerMarkerKind(line: string): 'slice-ledger' | 'worker-slices' | null {
+  const trimmed = line.trim();
+  const normalized = cleanHeading(trimmed.replace(/^#{1,6}\s+/, '').replace(/:$/, ''));
+  if (/^(?:expected\s+)?slice\s+ledger$/i.test(normalized)) return 'slice-ledger';
+  if (/^worker\s+slices$/i.test(normalized) || (/:$/.test(trimmed) && /\bworker\s+slices\b/i.test(normalized))) return 'worker-slices';
+  return null;
+}
+
+function parseSliceLedgerList(
+  lines: string[],
+  markerIndex: number,
+  markerKind: 'slice-ledger' | 'worker-slices',
+): { endIndex: number; slices: PlanSliceSource[] } {
+  const slices: PlanSliceSource[] = [];
+  let index = markerIndex + 1;
+  let sawListItem = false;
+  let topLevelIndent: number | null = null;
+
+  for (; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = line.trim();
+    if (!trimmed && !sawListItem) continue;
+    if (!trimmed && sawListItem) break;
+    if (/^#{1,6}\s+\S/.test(trimmed)) break;
+
+    const bullet = /^(\s*)(?:[-*]|\d+[.)])\s+(.+)$/.exec(line);
+    if (!bullet) {
+      const indent = (/^(\s*)/.exec(line)?.[1] ?? '').length;
+      if (sawListItem && topLevelIndent !== null && indent > topLevelIndent) {
+        const previousSlice = slices.at(-1);
+        if (previousSlice) previousSlice.text += `\n${line}`;
+        continue;
+      }
+      if (sawListItem) break;
+      continue;
+    }
+
+    const indent = (bullet[1] ?? '').length;
+    topLevelIndent ??= indent;
+    if (indent > topLevelIndent) {
+      const previousSlice = slices.at(-1);
+      if (previousSlice) previousSlice.text += `\n${line}`;
+      continue;
+    }
+    if (indent < topLevelIndent) break;
+
+    sawListItem = true;
+    const entry = parseSliceLedgerEntry(bullet[2] ?? '');
+    if (!entry || (markerKind === 'worker-slices' && isCoordinatorLedgerEntry(entry.title, entry.description))) continue;
+    slices.push({
+      title: entry.title,
+      text: [
+        `## Slice: ${entry.title}`,
+        `- ${entry.description || entry.title}`,
+      ].join('\n'),
+    });
+  }
+
+  return { endIndex: index, slices };
+}
+
+function parseSliceLedgerEntry(value: string): { title: string; description: string } | null {
+  const cleaned = cleanLine(value);
+  if (!cleaned) return null;
+
+  const explicitId = /^`?([A-Za-z][A-Za-z0-9_-]{1,127})`?\s*:\s*(.+)$/.exec(cleaned);
+  if (explicitId) {
+    return {
+      title: cleanHeading(explicitId[1] ?? ''),
+      description: cleanLine(explicitId[2] ?? ''),
+    };
+  }
+
+  return {
+    title: cleanHeading(cleaned),
+    description: '',
+  };
+}
+
+function isCoordinatorLedgerEntry(title: string, description: string): boolean {
+  return /^(?:coordinator\b|integration phase\b|final verification\b)/i.test(`${title} ${description}`);
 }
 
 function extractExplicitSliceSections(planText: string): { globalText: string; slices: PlanSliceSource[] } {
@@ -703,12 +817,28 @@ function extractPathHints(text: string): string[] {
 
 function buildSliceGoalPlanText(sliceText: string, globalText: string): string {
   const combinedText = [globalText, sliceText].filter((part) => part.trim()).join('\n\n');
-  const actionableBullets = extractActionableBullets(combinedText);
+  const slicePreferredBullets = extractActionableBulletsFromLabeledBlocks(sliceText, [
+    'acceptance criteria',
+    'finish line',
+    'done when',
+    'tasks',
+    'required semantics',
+    'implementation shape',
+  ]);
+  const sliceActionableBullets = extractActionableBullets(sliceText);
+  const globalFinishLineItems = extractFinishLineItemsFromLabeledBlocks(globalText, [
+    'run outcome',
+    'global constraints',
+    'constraints',
+    'requirements',
+    'guardrails',
+  ]);
   const finishLineItems = normalizeList([
-    ...actionableBullets,
-    ...extractProseContextLines(globalText),
+    ...slicePreferredBullets,
+    ...sliceActionableBullets,
     ...extractProseContextLines(sliceText),
-    ...(actionableBullets.length === 0 ? extractProseContextLines(combinedText) : []),
+    ...globalFinishLineItems,
+    ...(sliceActionableBullets.length === 0 && globalFinishLineItems.length === 0 ? extractProseContextLines(combinedText) : []),
   ]);
   if (finishLineItems.length === 0) return combinedText || sliceText;
   return [
@@ -729,6 +859,59 @@ function buildGlobalPlanContext(globalText: string, prompt: string | null): stri
 
 function extractActionableBullets(text: string): string[] {
   return normalizeList(text.split(/\r?\n/).map(parseBullet));
+}
+
+function extractFinishLineItemsFromLabeledBlocks(text: string, labels: string[]): string[] {
+  const blockLines = extractLinesFromLabeledBlocks(text, labels);
+  return normalizeList([
+    ...blockLines.map(parseBullet),
+    ...blockLines
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !parseBullet(line)),
+  ]);
+}
+
+function extractActionableBulletsFromLabeledBlocks(text: string, labels: string[]): string[] {
+  return normalizeList(extractLinesFromLabeledBlocks(text, labels).map(parseBullet));
+}
+
+function extractLinesFromLabeledBlocks(text: string, labels: string[]): string[] {
+  const lines = text.split(/\r?\n/);
+  const out: string[] = [];
+  let inBlock = false;
+  let headingLevel = 0;
+  let plainLabelBlock = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const heading = /^(#{1,6})\s+(.+)$/.exec(trimmed);
+    if (heading) {
+      const level = heading[1].length;
+      const title = cleanHeading(heading[2] ?? '').toLowerCase();
+      if (inBlock && !plainLabelBlock && level <= headingLevel) inBlock = false;
+      if (inBlock && plainLabelBlock) inBlock = false;
+      if (labels.some((label) => title.includes(label))) {
+        inBlock = true;
+        headingLevel = level;
+        plainLabelBlock = false;
+      }
+      continue;
+    }
+
+    const plainLabel = /^([A-Za-z][A-Za-z0-9 /_-]+):$/.exec(trimmed);
+    if (plainLabel) {
+      const title = cleanHeading(plainLabel[1] ?? '').toLowerCase();
+      inBlock = labels.some((label) => title.includes(label));
+      headingLevel = 7;
+      plainLabelBlock = inBlock;
+      continue;
+    }
+
+    if (!inBlock) continue;
+    out.push(line);
+  }
+
+  return out;
 }
 
 function extractProseContextLines(text: string): string[] {
