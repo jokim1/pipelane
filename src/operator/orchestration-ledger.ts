@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import crypto from 'node:crypto';
 import path from 'node:path';
 
@@ -13,6 +13,7 @@ import {
   ensureInstallMarker,
   normalizePath,
   nowIso,
+  normalizeVersionedJsonValue,
   readVersionedJsonFile,
   resolveStateDir,
   runGit,
@@ -35,6 +36,8 @@ import { readWorktreeStatusSnapshot } from './worktree-status.ts';
 export type OrchestrationRunStatus = 'planned' | 'prepared' | 'dispatched' | 'running' | 'blocked' | 'completed' | 'failed';
 export type OrchestrationSliceStatus = 'planned' | 'prepared' | 'dispatched' | 'running' | 'blocked' | 'completed' | 'failed';
 export type OrchestrationSliceWorkerStatus = 'running' | 'succeeded' | 'failed';
+
+export const ORCHESTRATION_CORRUPT_LEDGER_BLOCK_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 
 export interface OrchestrationSliceDispatchRecord {
   status: 'ready';
@@ -136,6 +139,60 @@ export interface BuildOrchestrationRunInput {
   provider?: GoalProvider;
   maxTurns?: number;
   maxMinutes?: number;
+}
+
+export type OrchestrationLedgerDiagnostic =
+  | {
+    status: 'valid';
+    runId: string;
+    ledgerPath: string;
+    mtimeMs: number;
+    record: OrchestrationRunRecord;
+  }
+  | {
+    status: 'missing';
+    runId: string;
+    ledgerPath: string;
+    mtimeMs: null;
+    reason: string;
+  }
+  | {
+    status: 'corrupt';
+    runId: string;
+    ledgerPath: string;
+    mtimeMs: number | null;
+    reason: string;
+  }
+  | {
+    status: 'invalid-run-id';
+    runId: string;
+    ledgerPath: null;
+    mtimeMs: null;
+    reason: string;
+  };
+
+export interface OrchestrationRunDirectoryDiagnostic {
+  status: 'invalid-run-directory';
+  runId: string;
+  directoryPath: string;
+  ledgerPath: string | null;
+  mtimeMs: number | null;
+  reason: string;
+}
+
+export interface OrchestrationRunScanDiagnostics {
+  records: OrchestrationRunRecord[];
+  valid: Extract<OrchestrationLedgerDiagnostic, { status: 'valid' }>[];
+  corrupt: Extract<OrchestrationLedgerDiagnostic, { status: 'corrupt' }>[];
+  invalidDirectories: OrchestrationRunDirectoryDiagnostic[];
+}
+
+export interface OrchestrationMissingWorktreeDiagnostic {
+  sliceId: string;
+  status: OrchestrationSliceStatus;
+  branchName: string | null;
+  worktreePath: string;
+  reason: string;
 }
 
 interface PlanSliceSource {
@@ -262,18 +319,161 @@ export function loadOrchestrationRunRecord(
   return readVersionedJsonFile<OrchestrationRunRecord | null>('orchestrationRun', commonDir, config, targetPath, null);
 }
 
-export function listOrchestrationRunRecords(commonDir: string, config: WorkflowConfig): OrchestrationRunRecord[] {
-  const runsRoot = path.join(resolveStateDir(commonDir, config), 'orchestrate', 'runs');
-  if (!existsSync(runsRoot)) return [];
-  const records: OrchestrationRunRecord[] = [];
-  for (const entry of readdirSync(runsRoot, { withFileTypes: true })) {
-    if (!entry.isDirectory() || !isSafeOrchestrationRunId(entry.name)) continue;
-    const targetPath = path.join(runsRoot, entry.name, 'orchestration.json');
-    if (!existsSync(targetPath)) continue;
-    const record = readVersionedJsonFile<OrchestrationRunRecord | null>('orchestrationRun', commonDir, config, targetPath, null);
-    if (record) records.push(record);
+export function diagnoseOrchestrationRunRecord(
+  commonDir: string,
+  config: WorkflowConfig,
+  runId: string,
+): OrchestrationLedgerDiagnostic {
+  if (!isSafeOrchestrationRunId(runId)) {
+    return {
+      status: 'invalid-run-id',
+      runId,
+      ledgerPath: null,
+      mtimeMs: null,
+      reason: `Invalid orchestration run id: ${runId}`,
+    };
   }
-  return records.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  return diagnoseOrchestrationRunPath(commonDir, config, runId, orchestrationRunPath(commonDir, config, runId));
+}
+
+export function scanOrchestrationRunDiagnostics(
+  commonDir: string,
+  config: WorkflowConfig,
+): OrchestrationRunScanDiagnostics {
+  const runsRoot = orchestrationRunsRoot(commonDir, config);
+  const valid: Extract<OrchestrationLedgerDiagnostic, { status: 'valid' }>[] = [];
+  const corrupt: Extract<OrchestrationLedgerDiagnostic, { status: 'corrupt' }>[] = [];
+  const invalidDirectories: OrchestrationRunDirectoryDiagnostic[] = [];
+  if (!existsSync(runsRoot)) {
+    return { records: [], valid, corrupt, invalidDirectories };
+  }
+
+  for (const entry of readdirSync(runsRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const directoryPath = path.join(runsRoot, entry.name);
+    const targetPath = path.join(directoryPath, 'orchestration.json');
+    if (!isSafeOrchestrationRunId(entry.name)) {
+      invalidDirectories.push({
+        status: 'invalid-run-directory',
+        runId: entry.name,
+        directoryPath,
+        ledgerPath: existsSync(targetPath) ? targetPath : null,
+        mtimeMs: statMtimeMs(existsSync(targetPath) ? targetPath : directoryPath),
+        reason: 'directory name is not an addressable orchestration run id',
+      });
+      continue;
+    }
+
+    const diagnostic = diagnoseOrchestrationRunPath(commonDir, config, entry.name, targetPath);
+    if (diagnostic.status === 'valid') valid.push(diagnostic);
+    if (diagnostic.status === 'corrupt') corrupt.push(diagnostic);
+  }
+
+  valid.sort((left, right) => right.record.updatedAt.localeCompare(left.record.updatedAt));
+  corrupt.sort((left, right) => (right.mtimeMs ?? 0) - (left.mtimeMs ?? 0));
+  invalidDirectories.sort((left, right) => (right.mtimeMs ?? 0) - (left.mtimeMs ?? 0));
+  return {
+    records: valid.map((entry) => entry.record),
+    valid,
+    corrupt,
+    invalidDirectories,
+  };
+}
+
+export function listOrchestrationRunRecords(commonDir: string, config: WorkflowConfig): OrchestrationRunRecord[] {
+  return scanOrchestrationRunDiagnostics(commonDir, config).records;
+}
+
+function orchestrationRunsRoot(commonDir: string, config: WorkflowConfig): string {
+  return path.join(resolveStateDir(commonDir, config), 'orchestrate', 'runs');
+}
+
+function diagnoseOrchestrationRunPath(
+  _commonDir: string,
+  _config: WorkflowConfig,
+  runId: string,
+  targetPath: string,
+): OrchestrationLedgerDiagnostic {
+  if (!existsSync(targetPath)) {
+    return {
+      status: 'missing',
+      runId,
+      ledgerPath: targetPath,
+      mtimeMs: null,
+      reason: 'orchestration ledger file is missing',
+    };
+  }
+
+  const mtimeMs = statMtimeMs(targetPath);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(targetPath, 'utf8')) as unknown;
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      return {
+        status: 'corrupt',
+        runId,
+        ledgerPath: targetPath,
+        mtimeMs,
+        reason: `malformed JSON: ${error.message}`,
+      };
+    }
+    throw error;
+  }
+
+  const normalized = normalizeVersionedJsonValue<unknown>('orchestrationRun', parsed);
+  if (!isOrchestrationRunRecord(normalized)) {
+    return {
+      status: 'corrupt',
+      runId,
+      ledgerPath: targetPath,
+      mtimeMs,
+      reason: 'ledger JSON does not match the orchestration run schema',
+    };
+  }
+  return {
+    status: 'valid',
+    runId,
+    ledgerPath: targetPath,
+    mtimeMs: mtimeMs ?? 0,
+    record: normalized,
+  };
+}
+
+function statMtimeMs(targetPath: string): number | null {
+  try {
+    return statSync(targetPath).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
+function isOrchestrationRunRecord(value: unknown): value is OrchestrationRunRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Partial<OrchestrationRunRecord>;
+  if (!isSafeOrchestrationRunId(typeof record.id === 'string' ? record.id : '')) return false;
+  if (!['planned', 'prepared', 'dispatched', 'running', 'blocked', 'completed', 'failed'].includes(record.status ?? '')) return false;
+  if (typeof record.createdAt !== 'string' || typeof record.updatedAt !== 'string') return false;
+  if (typeof record.branchName !== 'string' || typeof record.sha !== 'string') return false;
+  if (!record.source || typeof record.source !== 'object') return false;
+  if (!record.plan || typeof record.plan !== 'object') return false;
+  if (!Array.isArray(record.slices)) return false;
+  return record.slices.every(isOrchestrationSliceRecord);
+}
+
+function isOrchestrationSliceRecord(value: unknown): value is OrchestrationSliceRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const slice = value as Partial<OrchestrationSliceRecord>;
+  return typeof slice.id === 'string'
+    && typeof slice.index === 'number'
+    && ['planned', 'prepared', 'dispatched', 'running', 'blocked', 'completed', 'failed'].includes(slice.status ?? '')
+    && typeof slice.outcome === 'string'
+    && Array.isArray(slice.dependsOn)
+    && Array.isArray(slice.requestedFiles)
+    && Array.isArray(slice.forbiddenFiles)
+    && (slice.worktreePath === null || typeof slice.worktreePath === 'string' || slice.worktreePath === undefined)
+    && (slice.branchName === null || typeof slice.branchName === 'string' || slice.branchName === undefined)
+    && typeof slice.provider === 'string';
 }
 
 export function isActiveOrchestrationRun(
@@ -325,6 +525,29 @@ export function sliceReviewFullySatisfied(
   return currentStatus !== null
     && currentStatus.reliable
     && reviewRun.worktreeStatusDigest === currentStatus.digest;
+}
+
+export function missingRelevantSliceWorktreeDiagnostic(
+  slice: OrchestrationSliceRecord,
+  options: OrchestrationReviewSatisfactionOptions = {},
+): OrchestrationMissingWorktreeDiagnostic | null {
+  if (!slice.worktreePath) return null;
+  if (!sliceWorktreeShouldBeUsable(slice)) return null;
+  if (sliceWorktreeExists(slice, options)) return null;
+  return {
+    sliceId: slice.id,
+    status: slice.status,
+    branchName: slice.branchName,
+    worktreePath: slice.worktreePath,
+    reason: `assigned worktree is missing: ${slice.worktreePath}`,
+  };
+}
+
+function sliceWorktreeShouldBeUsable(slice: OrchestrationSliceRecord): boolean {
+  return slice.status === 'prepared'
+    || slice.status === 'dispatched'
+    || slice.status === 'running'
+    || (slice.status === 'planned' && Boolean(slice.worktreePath));
 }
 
 function sliceHasRejectedBlockingAiDiagnostic(slice: OrchestrationSliceRecord): boolean {

@@ -10,13 +10,20 @@ import {
 } from '../goal-spec.ts';
 import {
   buildOrchestrationRunRecord,
+  diagnoseOrchestrationRunRecord,
   isActiveOrchestrationRun,
   listOrchestrationRunRecords,
   loadOrchestrationRunRecord,
+  missingRelevantSliceWorktreeDiagnostic,
+  ORCHESTRATION_CORRUPT_LEDGER_BLOCK_AGE_MS,
   orchestrationRunPath,
   saveOrchestrationRunRecord,
+  scanOrchestrationRunDiagnostics,
   sliceReviewFullySatisfied,
+  type OrchestrationLedgerDiagnostic,
   type OrchestrationRunRecord,
+  type OrchestrationRunScanDiagnostics,
+  type OrchestrationRunDirectoryDiagnostic,
   type OrchestrationSliceReviewRecord,
   type OrchestrationSliceRecord,
   type OrchestrationSliceWorkerRecord,
@@ -108,7 +115,7 @@ const WORKER_CREDENTIAL_ENV_EXACT_KEYS = [
 ] as const;
 const WORKER_ENV_ALLOWLIST_ENV = 'PIPELANE_ORCHESTRATE_WORKER_ENV_ALLOW';
 
-type OrchestrateEntryStatus = 'needs-input' | 'preview' | 'active' | 'multiple-active' | 'cancelled' | OrchestrateStartReport['status'];
+type OrchestrateEntryStatus = 'needs-input' | 'preview' | 'active' | 'multiple-active' | 'cancelled' | 'blocked' | OrchestrateStartReport['status'];
 
 interface OrchestrateEntryRunSummary {
   id: string;
@@ -137,8 +144,28 @@ interface OrchestrateEntryReport {
   planPath: string | null;
   activeRuns: OrchestrateEntryRunSummary[];
   likelyPlanFiles: LikelyPlanFile[];
+  warnings?: string[];
+  attention?: string[];
+  corruptLedgers?: OrchestrationCorruptLedgerSummary[];
+  invalidRunDirectories?: OrchestrationInvalidRunDirectorySummary[];
   run?: OrchestrationRunRecord;
   message: string;
+}
+
+interface OrchestrationCorruptLedgerSummary {
+  runId: string;
+  ledgerPath: string;
+  reason: string;
+  mtimeMs: number | null;
+  recent: boolean;
+}
+
+interface OrchestrationInvalidRunDirectorySummary {
+  runId: string;
+  directoryPath: string;
+  ledgerPath: string | null;
+  reason: string;
+  mtimeMs: number | null;
 }
 
 interface OrchestrateGoalSpecReport {
@@ -342,44 +369,69 @@ async function handleOrchestrateEntry(cwd: string, parsed: ParsedOperatorArgs): 
   const outcome = parsed.flags.goalOutcome.trim();
   const explicitRunId = parsed.flags.orchestrationRunId.trim();
   const likelyPlanFiles = collectLikelyPlanFiles(context.repoRoot);
-  const activeRuns = listActiveOrchestrationRuns(context);
+  const scan = scanOrchestrationRunDiagnostics(context.commonDir, context.config);
+  const activeRuns = listActiveOrchestrationRuns(context, scan.records);
+  const ledgerWarnings = buildOrchestrationScanWarnings(scan);
+  const recentCorruptLedgers = recentCorruptDiagnostics(scan);
 
   if (explicitRunId) {
-    const run = loadOrchestrationRunRecord(context.commonDir, context.config, explicitRunId);
+    const diagnostic = diagnoseOrchestrationRunRecord(context.commonDir, context.config, explicitRunId);
+    if (diagnostic.status === 'invalid-run-id') {
+      throw new Error(diagnostic.reason);
+    }
+    if (diagnostic.status === 'corrupt') {
+      printResult(parsed.flags, buildCorruptLedgerBlockReport(context, diagnostic, activeRuns, likelyPlanFiles));
+      process.exitCode = 1;
+      return;
+    }
+    const run = diagnostic.status === 'valid'
+      ? diagnostic.record
+      : loadOrchestrationRunRecord(context.commonDir, context.config, explicitRunId);
     if (!run) throw new Error(`No orchestration run ledger found for ${explicitRunId}.`);
-    printResult(parsed.flags, buildOrchestrateEntryStatusReport(context, run, activeRuns, likelyPlanFiles));
+    printResult(parsed.flags, buildOrchestrateEntryStatusReport(context, run, activeRuns, likelyPlanFiles, ledgerWarnings, scan));
     return;
   }
 
   if (planPath || outcome) {
+    if (recentCorruptLedgers.length > 0 && (parsed.flags.yes || (!parsed.flags.preview && !parsed.flags.plan && canRunInteractiveOrchestrate()))) {
+      printResult(parsed.flags, buildCorruptLedgerBlockReport(context, recentCorruptLedgers[0], activeRuns, likelyPlanFiles, ledgerWarnings, scan));
+      process.exitCode = 1;
+      return;
+    }
     const run = buildEntryRunRecord(context, parsed, planPath, outcome);
     if (parsed.flags.yes) {
-      const report = await runApprovedOrchestration(context, run, planPath, activeRuns, likelyPlanFiles, parsed.flags.offline);
+      const report = await runApprovedOrchestration(context, run, planPath, activeRuns, likelyPlanFiles, parsed.flags.offline, ledgerWarnings, scan);
       printResult(parsed.flags, report);
       if (report.status === 'failed') process.exitCode = 1;
       return;
     }
     if (!parsed.flags.preview && !parsed.flags.plan && canRunInteractiveOrchestrate()) {
-      await confirmAndMaybeRunOrchestration(context, parsed, run, planPath, activeRuns, likelyPlanFiles);
+      await confirmAndMaybeRunOrchestration(context, parsed, run, planPath, activeRuns, likelyPlanFiles, undefined, ledgerWarnings, scan);
       return;
     }
-    printResult(parsed.flags, buildOrchestratePreviewReport(context, run, planPath, activeRuns, likelyPlanFiles));
+    printResult(parsed.flags, buildOrchestratePreviewReport(context, run, planPath, activeRuns, likelyPlanFiles, ledgerWarnings, scan));
     return;
   }
 
   if (activeRuns.length === 1) {
     const run = loadOrchestrationRunRecord(context.commonDir, context.config, activeRuns[0].id);
     if (!run) throw new Error(`No orchestration run ledger found for ${activeRuns[0].id}.`);
-    printResult(parsed.flags, buildOrchestrateEntryStatusReport(context, run, activeRuns, likelyPlanFiles));
+    printResult(parsed.flags, buildOrchestrateEntryStatusReport(context, run, activeRuns, likelyPlanFiles, ledgerWarnings, scan));
     return;
   }
 
   if (activeRuns.length > 1) {
     if (canRunInteractiveOrchestrate() && !parsed.flags.json) {
-      await chooseActiveOrchestrationRun(context, parsed, activeRuns, likelyPlanFiles);
+      await chooseActiveOrchestrationRun(context, parsed, activeRuns, likelyPlanFiles, ledgerWarnings, scan);
       return;
     }
-    printResult(parsed.flags, buildMultipleActiveRunsReport(context, activeRuns, likelyPlanFiles));
+    printResult(parsed.flags, buildMultipleActiveRunsReport(context, activeRuns, likelyPlanFiles, ledgerWarnings, scan));
+    return;
+  }
+
+  if (recentCorruptLedgers.length > 0) {
+    printResult(parsed.flags, buildCorruptLedgerBlockReport(context, recentCorruptLedgers[0], activeRuns, likelyPlanFiles, ledgerWarnings, scan));
+    process.exitCode = 1;
     return;
   }
 
@@ -387,7 +439,7 @@ async function handleOrchestrateEntry(cwd: string, parsed: ParsedOperatorArgs): 
     throw new Error('orchestrate requires a TTY for interactive setup. Use --plan-file <path> --preview to inspect, --plan-file <path> --yes to start, or --outcome <text> --preview for automation.');
   }
 
-  await runInteractiveOrchestrateSetup(context, parsed, likelyPlanFiles);
+  await runInteractiveOrchestrateSetup(context, parsed, likelyPlanFiles, ledgerWarnings, scan);
 }
 
 function buildEntryRunRecord(
@@ -420,6 +472,8 @@ async function runApprovedOrchestration(
   previousActiveRuns: OrchestrateEntryRunSummary[],
   likelyPlanFiles: LikelyPlanFile[],
   offline: boolean,
+  warnings: string[] = [],
+  scan?: OrchestrationRunScanDiagnostics,
 ): Promise<OrchestrateEntryReport> {
   const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
   prepareSliceWorktrees(context, run, offline);
@@ -435,8 +489,12 @@ async function runApprovedOrchestration(
     planPath,
     activeRuns: [summarizeEntryRun(run), ...previousActiveRuns.filter((entry) => entry.id !== run.id)],
     likelyPlanFiles,
+    warnings,
+    attention: scan ? buildOrchestrationScanAttention(scan) : [],
+    corruptLedgers: scan ? summarizeCorruptLedgers(scan.corrupt) : [],
+    invalidRunDirectories: scan ? summarizeInvalidRunDirectories(scan.invalidDirectories) : [],
     run,
-    message: renderApprovedOrchestrationReport(run, finalLedgerPath || ledgerPath, planPath, startResult),
+    message: appendOrchestrationDiagnostics(renderApprovedOrchestrationReport(run, finalLedgerPath || ledgerPath, planPath, startResult), warnings, scan),
   };
   return report;
 }
@@ -447,6 +505,8 @@ function buildOrchestratePreviewReport(
   planPath: string | null,
   activeRuns: OrchestrateEntryRunSummary[],
   likelyPlanFiles: LikelyPlanFile[],
+  warnings: string[] = [],
+  scan?: OrchestrationRunScanDiagnostics,
 ): OrchestrateEntryReport {
   return {
     command: 'orchestrate',
@@ -457,8 +517,12 @@ function buildOrchestratePreviewReport(
     planPath,
     activeRuns,
     likelyPlanFiles,
+    warnings,
+    attention: scan ? buildOrchestrationScanAttention(scan) : [],
+    corruptLedgers: scan ? summarizeCorruptLedgers(scan.corrupt) : [],
+    invalidRunDirectories: scan ? summarizeInvalidRunDirectories(scan.invalidDirectories) : [],
     run,
-    message: renderOrchestrationPreview(context.repoRoot, run, planPath),
+    message: appendOrchestrationDiagnostics(renderOrchestrationPreview(context.repoRoot, run, planPath), warnings, scan),
   };
 }
 
@@ -467,6 +531,8 @@ function buildOrchestrateEntryStatusReport(
   run: OrchestrationRunRecord,
   activeRuns: OrchestrateEntryRunSummary[],
   likelyPlanFiles: LikelyPlanFile[],
+  warnings: string[] = [],
+  scan?: OrchestrationRunScanDiagnostics,
 ): OrchestrateEntryReport {
   return {
     command: 'orchestrate',
@@ -477,8 +543,12 @@ function buildOrchestrateEntryStatusReport(
     planPath: run.source.planPath ? path.join(context.repoRoot, run.source.planPath) : null,
     activeRuns,
     likelyPlanFiles,
+    warnings,
+    attention: scan ? buildOrchestrationScanAttention(scan) : [],
+    corruptLedgers: scan ? summarizeCorruptLedgers(scan.corrupt) : [],
+    invalidRunDirectories: scan ? summarizeInvalidRunDirectories(scan.invalidDirectories) : [],
     run,
-    message: renderActiveRunReport(context, run),
+    message: appendOrchestrationDiagnostics(renderActiveRunReport(context, run), warnings, scan),
   };
 }
 
@@ -486,6 +556,8 @@ function buildMultipleActiveRunsReport(
   context: WorkflowContext,
   activeRuns: OrchestrateEntryRunSummary[],
   likelyPlanFiles: LikelyPlanFile[],
+  warnings: string[] = [],
+  scan?: OrchestrationRunScanDiagnostics,
 ): OrchestrateEntryReport {
   return {
     command: 'orchestrate',
@@ -496,8 +568,142 @@ function buildMultipleActiveRunsReport(
     planPath: null,
     activeRuns,
     likelyPlanFiles,
-    message: renderMultipleActiveRunsReport(activeRuns),
+    warnings,
+    attention: scan ? buildOrchestrationScanAttention(scan) : [],
+    corruptLedgers: scan ? summarizeCorruptLedgers(scan.corrupt) : [],
+    invalidRunDirectories: scan ? summarizeInvalidRunDirectories(scan.invalidDirectories) : [],
+    message: appendOrchestrationDiagnostics(renderMultipleActiveRunsReport(activeRuns), warnings, scan),
   };
+}
+
+function buildCorruptLedgerBlockReport(
+  context: WorkflowContext,
+  diagnostic: Extract<OrchestrationLedgerDiagnostic, { status: 'corrupt' }>,
+  activeRuns: OrchestrateEntryRunSummary[],
+  likelyPlanFiles: LikelyPlanFile[],
+  warnings: string[] = [],
+  scan?: OrchestrationRunScanDiagnostics,
+): OrchestrateEntryReport {
+  const corruptLedgers = scan ? summarizeCorruptLedgers(scan.corrupt) : [summarizeCorruptLedger(diagnostic)];
+  return {
+    command: 'orchestrate',
+    status: 'blocked',
+    repoRoot: context.repoRoot,
+    runId: diagnostic.runId,
+    ledgerPath: diagnostic.ledgerPath,
+    planPath: null,
+    activeRuns,
+    likelyPlanFiles,
+    warnings,
+    attention: [
+      `Orchestration ledger is unreadable: ${diagnostic.ledgerPath}`,
+      ...(scan ? buildOrchestrationScanAttention(scan) : []),
+    ],
+    corruptLedgers,
+    invalidRunDirectories: scan ? summarizeInvalidRunDirectories(scan.invalidDirectories) : [],
+    message: appendOrchestrationDiagnostics(renderCorruptLedgerBlock(diagnostic), warnings, scan),
+  };
+}
+
+function recentCorruptDiagnostics(
+  scan: OrchestrationRunScanDiagnostics,
+): Extract<OrchestrationLedgerDiagnostic, { status: 'corrupt' }>[] {
+  return scan.corrupt.filter(isRecentCorruptLedger);
+}
+
+function isRecentCorruptLedger(diagnostic: Pick<OrchestrationCorruptLedgerSummary, 'mtimeMs'>): boolean {
+  if (diagnostic.mtimeMs === null) return true;
+  return diagnostic.mtimeMs >= Date.now() - ORCHESTRATION_CORRUPT_LEDGER_BLOCK_AGE_MS;
+}
+
+function buildOrchestrationScanWarnings(scan: OrchestrationRunScanDiagnostics): string[] {
+  const warnings: string[] = [];
+  for (const diagnostic of scan.corrupt) {
+    if (isRecentCorruptLedger(diagnostic)) continue;
+    warnings.push(`Ignored older corrupt orchestration ledger ${diagnostic.ledgerPath}: ${diagnostic.reason}`);
+  }
+  for (const diagnostic of scan.invalidDirectories) {
+    warnings.push(`Ignored invalid orchestration run directory ${diagnostic.directoryPath}: ${diagnostic.reason}`);
+  }
+  return warnings;
+}
+
+function buildOrchestrationScanAttention(scan: OrchestrationRunScanDiagnostics): string[] {
+  return scan.corrupt
+    .filter(isRecentCorruptLedger)
+    .map((diagnostic) => `Repair or move aside unreadable orchestration ledger ${diagnostic.ledgerPath}`);
+}
+
+function summarizeCorruptLedgers(
+  diagnostics: Extract<OrchestrationLedgerDiagnostic, { status: 'corrupt' }>[],
+): OrchestrationCorruptLedgerSummary[] {
+  return diagnostics.map(summarizeCorruptLedger);
+}
+
+function summarizeCorruptLedger(
+  diagnostic: Extract<OrchestrationLedgerDiagnostic, { status: 'corrupt' }>,
+): OrchestrationCorruptLedgerSummary {
+  return {
+    runId: diagnostic.runId,
+    ledgerPath: diagnostic.ledgerPath,
+    reason: diagnostic.reason,
+    mtimeMs: diagnostic.mtimeMs,
+    recent: isRecentCorruptLedger(diagnostic),
+  };
+}
+
+function summarizeInvalidRunDirectories(
+  diagnostics: OrchestrationRunDirectoryDiagnostic[],
+): OrchestrationInvalidRunDirectorySummary[] {
+  return diagnostics.map((diagnostic) => ({
+    runId: diagnostic.runId,
+    directoryPath: diagnostic.directoryPath,
+    ledgerPath: diagnostic.ledgerPath,
+    reason: diagnostic.reason,
+    mtimeMs: diagnostic.mtimeMs,
+  }));
+}
+
+function appendOrchestrationDiagnostics(
+  base: string,
+  warnings: string[],
+  scan?: OrchestrationRunScanDiagnostics,
+): string {
+  const attention = scan ? buildOrchestrationScanAttention(scan) : [];
+  if (warnings.length === 0 && attention.length === 0) return base;
+  const lines = [base];
+  if (attention.length > 0) {
+    lines.push('', 'Attention:');
+    for (const item of attention) lines.push(`- ${item}`);
+  }
+  if (warnings.length > 0) {
+    lines.push('', 'Warnings:');
+    for (const warning of warnings) lines.push(`- ${warning}`);
+  }
+  return lines.join('\n');
+}
+
+function renderCorruptLedgerBlock(
+  diagnostic: Extract<OrchestrationLedgerDiagnostic, { status: 'corrupt' }>,
+): string {
+  const abandonedPath = path.join(path.dirname(path.dirname(path.dirname(diagnostic.ledgerPath))), 'abandoned', diagnostic.runId);
+  return [
+    'Pipelane orchestrate',
+    '',
+    'Status: blocked',
+    '',
+    'Orchestration ledger is unreadable:',
+    `  path: ${diagnostic.ledgerPath}`,
+    `  reason: ${diagnostic.reason}`,
+    '',
+    'No state was changed.',
+    '',
+    'Next:',
+    '1. Restore the ledger from a known-good backup/local copy if this run matters.',
+    '2. Move the corrupt run directory outside .pipelane/state/orchestrate/runs/ if the run is abandoned, for example to:',
+    `   ${abandonedPath}`,
+    '3. Re-run /pipelane orchestrate after repair.',
+  ].join('\n');
 }
 
 async function confirmAndMaybeRunOrchestration(
@@ -511,16 +717,18 @@ async function confirmAndMaybeRunOrchestration(
     question(prompt: string): Promise<string>;
     close(): void;
   },
+  warnings: string[] = [],
+  scan?: OrchestrationRunScanDiagnostics,
 ): Promise<void> {
   const prompter = existingPrompter ?? createOrchestratePrompter();
   try {
-    process.stdout.write(`${renderOrchestrationPreview(context.repoRoot, run, planPath)}\n\nStart orchestration now?\n1. Start now\n2. Cancel\n`);
+    process.stdout.write(`${appendOrchestrationDiagnostics(renderOrchestrationPreview(context.repoRoot, run, planPath), warnings, scan)}\n\nStart orchestration now?\n1. Start now\n2. Cancel\n`);
     const answer = (await prompter.question('> ')).trim().toLowerCase();
     if (answer !== '1' && answer !== 'y' && answer !== 'yes' && answer !== 'start') {
       printResult(parsed.flags, buildCancelledOrchestrationReport(context, likelyPlanFiles));
       return;
     }
-    const report = await runApprovedOrchestration(context, run, planPath, activeRuns, likelyPlanFiles, parsed.flags.offline);
+    const report = await runApprovedOrchestration(context, run, planPath, activeRuns, likelyPlanFiles, parsed.flags.offline, warnings, scan);
     printResult(parsed.flags, report);
     if (report.status === 'failed') process.exitCode = 1;
   } finally {
@@ -532,10 +740,12 @@ async function runInteractiveOrchestrateSetup(
   context: WorkflowContext,
   parsed: ParsedOperatorArgs,
   likelyPlanFiles: LikelyPlanFile[],
+  warnings: string[] = [],
+  scan?: OrchestrationRunScanDiagnostics,
 ): Promise<void> {
   const prompter = createOrchestratePrompter();
   try {
-    process.stdout.write(`${renderInteractiveOrchestrationSetup(likelyPlanFiles)}\n`);
+    process.stdout.write(`${appendOrchestrationDiagnostics(renderInteractiveOrchestrationSetup(likelyPlanFiles), warnings, scan)}\n`);
     const answer = (await prompter.question('> ')).trim().toLowerCase();
     if (answer === 'c' || answer === 'cancel') {
       printResult(parsed.flags, buildCancelledOrchestrationReport(context, likelyPlanFiles));
@@ -565,7 +775,7 @@ async function runInteractiveOrchestrateSetup(
       outcome,
       provider: DEFAULT_GOAL_PROVIDER,
     });
-    await confirmAndMaybeRunOrchestration(context, parsed, run, planPath, [], likelyPlanFiles, prompter);
+    await confirmAndMaybeRunOrchestration(context, parsed, run, planPath, [], likelyPlanFiles, prompter, warnings, scan);
   } finally {
     prompter.close();
   }
@@ -576,10 +786,12 @@ async function chooseActiveOrchestrationRun(
   parsed: ParsedOperatorArgs,
   activeRuns: OrchestrateEntryRunSummary[],
   likelyPlanFiles: LikelyPlanFile[],
+  warnings: string[] = [],
+  scan?: OrchestrationRunScanDiagnostics,
 ): Promise<void> {
   const prompter = createOrchestratePrompter();
   try {
-    process.stdout.write(`${renderMultipleActiveRunsReport(activeRuns)}\n`);
+    process.stdout.write(`${appendOrchestrationDiagnostics(renderMultipleActiveRunsReport(activeRuns), warnings, scan)}\n`);
     const answer = (await prompter.question('> ')).trim().toLowerCase();
     if (answer === 'c' || answer === 'cancel') {
       printResult(parsed.flags, buildCancelledOrchestrationReport(context, likelyPlanFiles));
@@ -591,7 +803,7 @@ async function chooseActiveOrchestrationRun(
     }
     const run = loadOrchestrationRunRecord(context.commonDir, context.config, activeRuns[index - 1].id);
     if (!run) throw new Error(`No orchestration run ledger found for ${activeRuns[index - 1].id}.`);
-    printResult(parsed.flags, buildOrchestrateEntryStatusReport(context, run, activeRuns, likelyPlanFiles));
+    printResult(parsed.flags, buildOrchestrateEntryStatusReport(context, run, activeRuns, likelyPlanFiles, warnings, scan));
   } finally {
     prompter.close();
   }
@@ -648,8 +860,8 @@ function createOrchestratePrompter(): {
   };
 }
 
-function listActiveOrchestrationRuns(context: WorkflowContext): OrchestrateEntryRunSummary[] {
-  return listOrchestrationRunRecords(context.commonDir, context.config)
+function listActiveOrchestrationRuns(context: WorkflowContext, records?: OrchestrationRunRecord[]): OrchestrateEntryRunSummary[] {
+  return (records ?? listOrchestrationRunRecords(context.commonDir, context.config))
     .filter((run) => isActiveOrchestrationRun(run))
     .map(summarizeEntryRun);
 }
@@ -856,8 +1068,29 @@ function renderActiveRunReport(context: WorkflowContext, run: OrchestrationRunRe
     '',
     'Slice status:',
   ];
+  const reviewOptions = { worktreeExistsCache: new Map<string, boolean>() };
+  const missingWorktrees = run.slices
+    .map((slice) => missingRelevantSliceWorktreeDiagnostic(slice, reviewOptions))
+    .filter((diagnostic): diagnostic is NonNullable<ReturnType<typeof missingRelevantSliceWorktreeDiagnostic>> => Boolean(diagnostic));
+  if (missingWorktrees.length > 0) {
+    lines.push('', 'Blocked worktrees:');
+    for (const diagnostic of missingWorktrees) {
+      lines.push(`- ${diagnostic.sliceId}: assigned worktree is missing at ${diagnostic.worktreePath}`);
+    }
+  }
   for (const slice of run.slices) {
-    lines.push(`- ${slice.id}: ${slice.status}${slice.worker ? ` worker=${slice.worker.status}` : ''} review=${slice.review?.status ?? 'none'}`);
+    const missing = missingWorktrees.find((diagnostic) => diagnostic.sliceId === slice.id);
+    const worktree = missing ? ` worktree=missing:${missing.worktreePath}` : '';
+    lines.push(`- ${slice.id}: ${slice.status}${slice.worker ? ` worker=${slice.worker.status}` : ''} review=${slice.review?.status ?? 'none'}${worktree}`);
+  }
+  if (missingWorktrees.length > 0) {
+    lines.push(
+      '',
+      'Recovery:',
+      '- Restore the missing assigned worktree path, or manually repair/move aside the stale ledger/task-lock assignment before retrying prepare.',
+      '- Use /pipelane orchestrate prepare --run-id <run-id> only for unassigned planned slices.',
+      '- Use /pipelane orchestrate start --run-id <run-id> --slice-id <slice> --force only when the worktree exists and a stale worker record needs retry.',
+    );
   }
   lines.push('', 'Next: run /pipelane status for the full cockpit, or use advanced orchestrate commands for recovery.');
   return lines.join('\n');

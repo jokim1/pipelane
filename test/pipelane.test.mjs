@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, cpSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer as createNetServer } from 'node:net';
@@ -5461,6 +5461,139 @@ test('orchestrate bare command reports multiple active runs', () => {
   }
 });
 
+test('orchestration hardening: explicit corrupt run id fails with repair guidance', () => {
+  const repoRoot = createRepo();
+  const runId = 'orchestrate-20260619000000-deadbeef';
+  try {
+    const ledgerPath = writeCorruptOrchestrationLedger(repoRoot, runId);
+    const result = runCli(['run', 'orchestrate', '--run-id', runId, '--json'], repoRoot, {}, true);
+    const report = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 1);
+    assert.equal(report.status, 'blocked');
+    assert.equal(report.ledgerPath.endsWith(`/orchestrate/runs/${runId}/orchestration.json`), true);
+    assert.match(report.message, /Orchestration ledger is unreadable/);
+    assert.match(report.message, /No state was changed/);
+    assert.match(report.message, /abandoned\/orchestrate-20260619000000-deadbeef/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestration hardening: recent corrupt bare orchestrate blocks setup before TTY fallback', () => {
+  const repoRoot = createRepo();
+  const runId = 'orchestrate-20260619000100-deadbeef';
+  try {
+    const ledgerPath = writeCorruptOrchestrationLedger(repoRoot, runId);
+    const result = runCli(['run', 'orchestrate', '--json'], repoRoot, {}, true);
+    const report = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 1);
+    assert.equal(report.status, 'blocked');
+    assert.equal(report.corruptLedgers.length, 1);
+    assert.equal(report.corruptLedgers[0].ledgerPath.endsWith(`/orchestrate/runs/${runId}/orchestration.json`), true);
+    assert.equal(report.corruptLedgers[0].recent, true);
+    assert.doesNotMatch(result.stderr, /orchestrate requires a TTY/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestration hardening: valid active run remains openable beside recent corrupt ledger', () => {
+  const repoRoot = createRepo();
+  const corruptRunId = 'orchestrate-20260619000200-deadbeef';
+  try {
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Open around corruption', '--json'], repoRoot).stdout);
+    const ledgerPath = writeCorruptOrchestrationLedger(repoRoot, corruptRunId);
+    const result = runCli(['run', 'orchestrate', '--json'], repoRoot);
+    const report = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0);
+    assert.equal(report.status, 'active');
+    assert.equal(report.runId, planned.runId);
+    assert.equal(report.corruptLedgers.length, 1);
+    assert.equal(report.corruptLedgers[0].ledgerPath.endsWith(`/orchestrate/runs/${corruptRunId}/orchestration.json`), true);
+    assert.ok(report.attention.some((entry) => entry.includes(corruptRunId)));
+    assert.match(report.message, /Attention:/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestration hardening: old corrupt ledger and invalid run directory warn without blocking preview', () => {
+  const repoRoot = createRepo();
+  const runId = 'orchestrate-20260619000300-deadbeef';
+  try {
+    const oldMtime = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000);
+    const ledgerPath = writeCorruptOrchestrationLedger(repoRoot, runId, { mtime: oldMtime });
+    const invalid = writeInvalidOrchestrationRunDirectory(repoRoot);
+    const result = runCli(['run', 'orchestrate', '--outcome', 'Preview despite stale state', '--preview', '--json'], repoRoot);
+    const report = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0);
+    assert.equal(report.status, 'preview');
+    assert.ok(report.warnings.some((entry) => entry.includes(runId)));
+    assert.ok(report.warnings.some((entry) => entry.includes('renamed-corrupt-run')));
+    assert.equal(report.corruptLedgers[0].recent, false);
+    assert.equal(report.invalidRunDirectories[0].directoryPath.endsWith('/orchestrate/runs/renamed-corrupt-run'), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestration hardening: moving corrupt run outside active scan root unblocks bare preview', () => {
+  const repoRoot = createRepo();
+  const runId = 'orchestrate-20260619000400-deadbeef';
+  try {
+    writeCorruptOrchestrationLedger(repoRoot, runId);
+    const blocked = runCli(['run', 'orchestrate', '--json'], repoRoot, {}, true);
+    assert.equal(blocked.status, 1);
+
+    const sourceDir = path.dirname(orchestrationLedgerPath(repoRoot, runId));
+    const abandonedDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'orchestrate', 'abandoned', runId);
+    mkdirSync(path.dirname(abandonedDir), { recursive: true });
+    renameSync(sourceDir, abandonedDir);
+
+    const preview = JSON.parse(runCli(['run', 'orchestrate', '--outcome', 'Recovered preview', '--preview', '--json'], repoRoot).stdout);
+    assert.equal(preview.status, 'preview');
+    assert.deepEqual(preview.corruptLedgers, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestration hardening: missing assigned worktree surfaces through orchestrate and status snapshot', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  let worktreePath = '';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Detect missing worktree', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    worktreePath = prepared.run.slices[0].worktreePath;
+    rmSync(worktreePath, { recursive: true, force: true });
+
+    const active = JSON.parse(runCli(['run', 'orchestrate', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    assert.equal(active.status, 'active');
+    assert.match(active.message, /Blocked worktrees/);
+    assert.match(active.message, /worktree=missing:/);
+    assert.doesNotMatch(active.message, /prepare --run-id <run-id> --slice-id/);
+
+    const envelope = JSON.parse(runCli(['run', 'status', '--json'], repoRoot).stdout);
+    const run = envelope.data.orchestration.activeRun;
+    assert.equal(run.id, planned.runId);
+    assert.equal(run.state, 'blocked');
+    assert.equal(run.missingWorktrees[0].worktreePath, worktreePath);
+    assert.equal(run.slices[0].missingWorktree.worktreePath, worktreePath);
+    assert.ok(envelope.data.attention.some((issue) => issue.code === 'orchestration.slice_worktree_missing'));
+    assert.ok(envelope.data.orchestration.humanInbox.some((item) => item.id.includes('missing-worktree')));
+  } finally {
+    if (worktreePath) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('orchestrate interactive setup suggests likely plan files and can cancel', () => {
   const repoRoot = createRepo();
   try {
@@ -10061,6 +10194,31 @@ function inferSmokeExitCode(checks) {
 
 function resolveCommonDir(repoRoot) {
   return path.resolve(repoRoot, run('git', ['rev-parse', '--git-common-dir'], repoRoot));
+}
+
+function orchestrationRunsRoot(repoRoot) {
+  return path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'orchestrate', 'runs');
+}
+
+function orchestrationLedgerPath(repoRoot, runId) {
+  return path.join(orchestrationRunsRoot(repoRoot), runId, 'orchestration.json');
+}
+
+function writeCorruptOrchestrationLedger(repoRoot, runId, options = {}) {
+  const ledgerPath = orchestrationLedgerPath(repoRoot, runId);
+  mkdirSync(path.dirname(ledgerPath), { recursive: true });
+  writeFileSync(ledgerPath, options.content ?? '{ nope', 'utf8');
+  const mtime = options.mtime ?? new Date();
+  utimesSync(ledgerPath, mtime, mtime);
+  return ledgerPath;
+}
+
+function writeInvalidOrchestrationRunDirectory(repoRoot, name = 'renamed-corrupt-run') {
+  const directoryPath = path.join(orchestrationRunsRoot(repoRoot), name);
+  mkdirSync(directoryPath, { recursive: true });
+  const ledgerPath = path.join(directoryPath, 'orchestration.json');
+  writeFileSync(ledgerPath, '{ nope', 'utf8');
+  return { directoryPath, ledgerPath };
 }
 
 function resolveSharedSmokeStateRoot(repoRoot) {
@@ -17768,6 +17926,112 @@ test('status interactive action input errors persist a failed decision', () => {
   }
 });
 
+test('status interactive action exhausted input records failed decision instead of pending', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  let created = null;
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    created = JSON.parse(runCli(['run', 'new', '--task', 'Status Exhaustion', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'status-change.txt'), 'pending work\n', 'utf8');
+    writePassingReviewEvidence(created.worktreePath);
+
+    const result = runCli(['run', 'status'], created.worktreePath, {
+      PIPELANE_STATUS_INPUT: 'Ready PR',
+    }, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /NEXT ACTION/);
+    assert.match(result.stdout, /Action failed: PIPELANE_STATUS_INPUT exhausted/);
+
+    const actionStatePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'action-state.json');
+    const actionState = JSON.parse(readFileSync(actionStatePath, 'utf8'));
+    assert.equal(actionState.decisions.length, 1);
+    assert.equal(actionState.decisions[0].actionId, 'pr');
+    assert.equal(actionState.decisions[0].status, 'failed');
+    assert.equal(actionState.decisions[0].selectedOption, 'error');
+    assert.notEqual(actionState.decisions[0].status, 'pending');
+    assert.match(actionState.decisions[0].executionMessage, /PIPELANE_STATUS_INPUT exhausted/);
+  } finally {
+    if (created?.worktreePath) rmSync(created.worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('status interactive action blocked preflight records blocked decision instead of pending', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  let created = null;
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    created = JSON.parse(runCli(['run', 'new', '--task', 'Status Blocked Preflight', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'status-change.txt'), 'pending work\n', 'utf8');
+
+    const result = runCli(['run', 'status'], created.worktreePath, {
+      PIPELANE_STATUS_INPUT: 'Blocked PR',
+    }, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /NEXT ACTION/);
+    assert.match(result.stdout, /Action blocked:/);
+
+    const actionStatePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'action-state.json');
+    const actionState = JSON.parse(readFileSync(actionStatePath, 'utf8'));
+    assert.equal(actionState.decisions.length, 1);
+    assert.equal(actionState.decisions[0].actionId, 'pr');
+    assert.equal(actionState.decisions[0].status, 'blocked');
+    assert.equal(actionState.decisions[0].selectedOption, 'blocked');
+    assert.equal(actionState.decisions[0].preflightAllowed, false);
+    assert.notEqual(actionState.decisions[0].status, 'pending');
+    assert.equal(actionState.decisions[0].executionExitCode, undefined);
+  } finally {
+    if (created?.worktreePath) rmSync(created.worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('status interactive action execute failure records failed decision instead of pending', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-failing-gh-'));
+  let created = null;
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    created = JSON.parse(runCli(['run', 'new', '--task', 'Status Execute Failure', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'status-change.txt'), 'pending work\n', 'utf8');
+    writePassingReviewEvidence(created.worktreePath);
+    writeFileSync(
+      path.join(binDir, 'gh'),
+      '#!/bin/sh\necho "forced gh failure" >&2\nexit 42\n',
+      { mode: 0o755, encoding: 'utf8' },
+    );
+
+    const result = runCli(['run', 'status'], created.worktreePath, {
+      PIPELANE_STATUS_INPUT: 'Failing PR\ny',
+      PATH: `${binDir}:${process.env.PATH}`,
+    }, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /NEXT ACTION/);
+    assert.match(result.stdout, /Action failed:/);
+
+    const actionStatePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'action-state.json');
+    const actionState = JSON.parse(readFileSync(actionStatePath, 'utf8'));
+    assert.equal(actionState.decisions.length, 1);
+    assert.equal(actionState.decisions[0].actionId, 'pr');
+    assert.equal(actionState.decisions[0].status, 'failed');
+    assert.equal(actionState.decisions[0].selectedOption, 'approve');
+    assert.equal(actionState.decisions[0].preflightAllowed, true);
+    assert.notEqual(actionState.decisions[0].status, 'pending');
+    assert.notEqual(actionState.decisions[0].executionExitCode, 0);
+    assert.match(actionState.decisions[0].executionMessage, /forced gh failure|pr failed/);
+  } finally {
+    if (created?.worktreePath) rmSync(created.worktreePath, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('api action execute: devmode actions switch the repo mode', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
@@ -20398,6 +20662,23 @@ test('default review gates are built from the canonical catalog without frontend
   assert.equal(defaults.gates.some((gate) => gate.id === 'browser-qa'), false);
   assert.ok(defaults.gates.find((gate) => gate.id === 'karpathy-diff').userCommands.includes('/karpathy:diff'));
   assert.ok(defaults.gates.find((gate) => gate.id === 'karpathy-audit').userCommands.includes('/karpathy:audit'));
+});
+
+test('instruction audit default gate stays scoped to explicit repo-owned instruction paths', async () => {
+  const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+  const defaults = stateMod.defaultReviewGatesConfig();
+  const karpathyAudit = defaults.gates.find((gate) => gate.id === 'karpathy-audit');
+
+  assert.deepEqual(karpathyAudit.whenChanged, [
+    'CLAUDE.md',
+    'AGENTS.md',
+    '.cursor/rules/**',
+    '.codex/skills/**',
+  ]);
+  assert.equal(karpathyAudit.whenChanged.includes('~/.claude/**'), false);
+  assert.equal(karpathyAudit.whenChanged.includes('~/.codex/skills/**'), false);
+  assert.equal(karpathyAudit.whenChanged.includes('.claude/skills/**'), false);
+  assert.equal(karpathyAudit.whenChanged.some((pattern) => pattern.includes('plugins/cache')), false);
 });
 
 // Review fixup: buildBlastView throws on unresolvable sha (first user-facing error path).

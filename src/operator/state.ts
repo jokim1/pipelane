@@ -2152,6 +2152,10 @@ export function readVersionedJsonFile<T>(
 
   const raw = readJsonFile<unknown>(targetPath, fallback as unknown);
   if (raw === fallback) return fallback;
+  return normalizeVersionedJsonValue<T>(kind, raw);
+}
+
+export function normalizeVersionedJsonValue<T>(kind: StateKind, raw: unknown): T {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return raw as T;
   }

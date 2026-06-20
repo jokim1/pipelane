@@ -46,10 +46,14 @@ import {
 import { TASK_LOCK_MIN_PRUNE_AGE_MS } from '../task-workspaces.ts';
 import {
   isActiveOrchestrationRun,
-  listOrchestrationRunRecords,
+  missingRelevantSliceWorktreeDiagnostic,
+  ORCHESTRATION_CORRUPT_LEDGER_BLOCK_AGE_MS,
+  scanOrchestrationRunDiagnostics,
   sliceReviewFullySatisfied,
+  type OrchestrationMissingWorktreeDiagnostic,
   type OrchestrationReviewSatisfactionOptions,
   type OrchestrationRunRecord,
+  type OrchestrationRunScanDiagnostics,
   type OrchestrationRunStatus,
   type OrchestrationSliceRecord,
 } from '../orchestration-ledger.ts';
@@ -170,7 +174,10 @@ export interface OrchestrationSliceSummary {
   reviewIndependence: ReviewIndependenceLabel | null;
   reviewEvidenceLabel: string;
   trustedReviewComplete: boolean;
+  missingWorktree: OrchestrationMissingWorktreeDiagnostic | null;
 }
+
+export type OrchestrationMissingWorktreeSummary = OrchestrationMissingWorktreeDiagnostic;
 
 export interface OrchestrationActionSummary {
   id: string;
@@ -215,6 +222,7 @@ export interface OrchestrationRunSummary {
   };
   providerCounts: Record<string, number>;
   nextAction: OrchestrationActionSummary | null;
+  missingWorktrees: OrchestrationMissingWorktreeSummary[];
   slices: OrchestrationSliceSummary[];
 }
 
@@ -223,6 +231,20 @@ export interface OrchestrationSnapshot {
   runs: OrchestrationRunSummary[];
   humanInbox: OrchestrationInboxItem[];
   availableActions: OrchestrationActionSummary[];
+  corruptLedgers: {
+    runId: string;
+    ledgerPath: string;
+    reason: string;
+    mtimeMs: number | null;
+    recent: boolean;
+  }[];
+  invalidRunDirectories: {
+    runId: string;
+    directoryPath: string;
+    ledgerPath: string | null;
+    reason: string;
+    mtimeMs: number | null;
+  }[];
 }
 
 export interface SnapshotData {
@@ -295,7 +317,8 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
   const reviewState = loadReviewState(context.commonDir, context.config);
   const reviewEvidence = evaluateReviewEvidenceForPr(context);
   const reviewHealth = summarizeReviewEvidenceHealth(reviewEvidence);
-  const orchestration = buildOrchestrationSnapshot(context.commonDir, context.config, currentBranch);
+  const orchestrationScan = scanOrchestrationRunDiagnostics(context.commonDir, context.config);
+  const orchestration = buildOrchestrationSnapshot(context.commonDir, context.config, currentBranch, orchestrationScan);
   const orchestrationHealth = summarizeOrchestrationHealth(orchestration);
   const smokeLatest = loadSmokeLatestState(context.commonDir, context.config);
   const smokeConfig = resolveSmokeConfig(context.config);
@@ -547,6 +570,28 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
   if (orchestrationHealth.issue) {
     attention.push(orchestrationHealth.issue);
   }
+  for (const corruptLedger of orchestration.corruptLedgers) {
+    attention.push(buildApiIssue({
+      code: corruptLedger.recent ? 'orchestration.ledger_corrupt' : 'orchestration.ledger_corrupt_stale',
+      severity: corruptLedger.recent ? 'error' : 'warning',
+      message: corruptLedger.recent
+        ? `Orchestration ledger is unreadable at ${corruptLedger.ledgerPath}. Restore it or move the run directory outside .pipelane/state/orchestrate/runs/.`
+        : `Older corrupt orchestration ledger ignored at ${corruptLedger.ledgerPath}. Move it outside .pipelane/state/orchestrate/runs/ if abandoned.`,
+      source: 'orchestration',
+      blocking: corruptLedger.recent,
+      action: 'orchestrate',
+    }));
+  }
+  for (const invalidDirectory of orchestration.invalidRunDirectories) {
+    attention.push(buildApiIssue({
+      code: 'orchestration.invalid_run_directory',
+      severity: 'warning',
+      message: `Invalid orchestration run directory ignored at ${invalidDirectory.directoryPath}. Move abandoned state outside .pipelane/state/orchestrate/runs/.`,
+      source: 'orchestration',
+      blocking: false,
+      action: 'orchestrate',
+    }));
+  }
 
   const boardMessage = mode === 'release'
     ? 'Release mode: promote merged SHA through staging before prod.'
@@ -728,8 +773,13 @@ function buildBoardActions(options: {
   ];
 }
 
-function buildOrchestrationSnapshot(commonDir: string, config: WorkflowConfig, currentBranch: string): OrchestrationSnapshot {
-  const records = listOrchestrationRunRecords(commonDir, config);
+function buildOrchestrationSnapshot(
+  commonDir: string,
+  config: WorkflowConfig,
+  currentBranch: string,
+  scan: OrchestrationRunScanDiagnostics = scanOrchestrationRunDiagnostics(commonDir, config),
+): OrchestrationSnapshot {
+  const records = scan.records;
   const reviewOptions: OrchestrationReviewSatisfactionOptions = {
     headCache: new Map(),
     statusDigestCache: new Map(),
@@ -755,7 +805,26 @@ function buildOrchestrationSnapshot(commonDir: string, config: WorkflowConfig, c
     runs: summaries.slice(0, 10),
     humanInbox,
     availableActions: activeRun?.nextAction ? [activeRun.nextAction] : [],
+    corruptLedgers: scan.corrupt.map((diagnostic) => ({
+      runId: diagnostic.runId,
+      ledgerPath: diagnostic.ledgerPath,
+      reason: diagnostic.reason,
+      mtimeMs: diagnostic.mtimeMs,
+      recent: isRecentOrchestrationCorruptLedger(diagnostic.mtimeMs),
+    })),
+    invalidRunDirectories: scan.invalidDirectories.map((diagnostic) => ({
+      runId: diagnostic.runId,
+      directoryPath: diagnostic.directoryPath,
+      ledgerPath: diagnostic.ledgerPath,
+      reason: diagnostic.reason,
+      mtimeMs: diagnostic.mtimeMs,
+    })),
   };
+}
+
+function isRecentOrchestrationCorruptLedger(mtimeMs: number | null): boolean {
+  if (mtimeMs === null) return true;
+  return mtimeMs >= Date.now() - ORCHESTRATION_CORRUPT_LEDGER_BLOCK_AGE_MS;
 }
 
 function isPrReadyOrchestrationRun(
@@ -786,6 +855,7 @@ function summarizeOrchestrationRun(
   };
   const providerCounts: Record<string, number> = {};
   const trustedReviewBySlice = new Map<string, boolean>();
+  const missingWorktrees: OrchestrationMissingWorktreeSummary[] = [];
   const slices = run.slices.map((slice) => {
     counts[slice.status] += 1;
     if (slice.worker?.status === 'succeeded') counts.workerSucceeded += 1;
@@ -794,6 +864,8 @@ function summarizeOrchestrationRun(
     trustedReviewBySlice.set(slice.id, trustedReviewComplete);
     if (trustedReviewComplete) counts.trustedReviewComplete += 1;
     providerCounts[slice.provider] = (providerCounts[slice.provider] ?? 0) + 1;
+    const missingWorktree = missingRelevantSliceWorktreeDiagnostic(slice, reviewOptions);
+    if (missingWorktree) missingWorktrees.push(missingWorktree);
     return {
       id: slice.id,
       status: slice.status,
@@ -806,13 +878,15 @@ function summarizeOrchestrationRun(
       reviewIndependence: slice.review?.independence ?? null,
       reviewEvidenceLabel: orchestrationReviewEvidenceLabel(slice, trustedReviewComplete),
       trustedReviewComplete,
+      missingWorktree,
     };
   });
 
+  const nextAction = buildOrchestrationNextAction(run, config, trustedReviewBySlice, missingWorktrees);
   return {
     id: run.id,
     status: run.status,
-    state: orchestrationLaneStateFromCounts(run.slices.length, counts),
+    state: missingWorktrees.length > 0 ? 'blocked' : orchestrationLaneStateFromCounts(run.slices.length, counts),
     title: run.plan.title,
     planPath: run.source.planPath,
     createdAt: run.createdAt,
@@ -820,7 +894,8 @@ function summarizeOrchestrationRun(
     sliceCount: run.slices.length,
     counts,
     providerCounts,
-    nextAction: buildOrchestrationNextAction(run, config, trustedReviewBySlice),
+    nextAction,
+    missingWorktrees,
     slices,
   };
 }
@@ -860,6 +935,7 @@ function buildOrchestrationNextAction(
   run: OrchestrationRunRecord,
   config: WorkflowConfig,
   trustedReviewBySlice: Map<string, boolean>,
+  missingWorktrees: OrchestrationMissingWorktreeSummary[] = [],
 ): OrchestrationActionSummary | null {
   const orchestrateCommand = '/pipelane orchestrate';
   const prCommand = formatWorkflowCommand(config, 'pr');
@@ -877,6 +953,15 @@ function buildOrchestrationNextAction(
   );
   const fullyReviewed = run.slices.length > 0 && run.slices.every((slice) => trustedReviewBySlice.get(slice.id));
 
+  if (missingWorktrees.length > 0) {
+    return buildOrchestrationAction({
+      id: 'orchestrate.recover-worktree',
+      label: 'Recover missing orchestration worktree',
+      state: 'blocked',
+      reason: `assigned worktree is missing for ${missingWorktrees[0].sliceId}`,
+      command: `${orchestrateCommand} ${runIdArg}`,
+    });
+  }
   if (hasFailedWorker) {
     return buildOrchestrationAction({
       id: 'orchestrate.retry-workers',
@@ -963,6 +1048,17 @@ function buildOrchestrationAction(options: {
 
 function buildOrchestrationInbox(activeRun: OrchestrationRunSummary): OrchestrationInboxItem[] {
   const items: OrchestrationInboxItem[] = [];
+  for (const missing of activeRun.missingWorktrees) {
+    items.push({
+      id: `${activeRun.id}:${missing.sliceId}:missing-worktree`,
+      runId: activeRun.id,
+      sliceId: missing.sliceId,
+      severity: 'error',
+      title: 'Slice worktree missing',
+      message: `${missing.sliceId} assigned worktree is missing at ${missing.worktreePath}. Restore that path, or manually repair/move aside the stale ledger/task-lock assignment before retrying prepare.`,
+      action: activeRun.nextAction,
+    });
+  }
   for (const slice of activeRun.slices) {
     if (slice.status !== 'failed' && slice.status !== 'blocked') continue;
     items.push({
@@ -1001,6 +1097,7 @@ function summarizeOrchestrationHealth(orchestration: OrchestrationSnapshot): {
   const reason = run.nextAction
     ? `${run.title}: ${run.nextAction.reason}`
     : `${run.title}: ${run.status}`;
+  const missingWorktree = run.missingWorktrees[0] ?? null;
   return {
     state,
     blocking,
@@ -1008,9 +1105,11 @@ function summarizeOrchestrationHealth(orchestration: OrchestrationSnapshot): {
     observedAt: run.updatedAt,
     issue: blocking
       ? buildApiIssue({
-          code: 'orchestration.blocked',
+          code: missingWorktree ? 'orchestration.slice_worktree_missing' : 'orchestration.blocked',
           severity: 'error',
-          message: `Orchestration ${run.id} is blocked. ${run.nextAction ? `Next: ${run.nextAction.command}.` : 'Inspect the run for recovery guidance.'}`,
+          message: missingWorktree
+            ? `Orchestration ${run.id} slice ${missingWorktree.sliceId} assigned worktree is missing at ${missingWorktree.worktreePath}. Restore the path or repair the stale assignment, then run ${run.nextAction?.command ?? `/pipelane orchestrate --run-id ${run.id}`}.`
+            : `Orchestration ${run.id} is blocked. ${run.nextAction ? `Next: ${run.nextAction.command}.` : 'Inspect the run for recovery guidance.'}`,
           source: 'orchestration',
           blocking: true,
           action: run.nextAction?.id ?? 'orchestrate',

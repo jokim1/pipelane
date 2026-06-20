@@ -1,7 +1,7 @@
 # Pipelane Orchestration Hardening Plan
 
 Last updated: June 19, 2026
-Status: next-slice plan for engineering review
+Status: reviewed and ready to implement
 
 ## Summary
 
@@ -104,6 +104,24 @@ Planned behavior:
 - Listing valid active runs should keep working when unrelated stale/malformed
   directories are absent or safely ignored.
 
+Diagnostic exit/output contract:
+
+- Explicit corrupt `--run-id`: exit 1, print `Orchestration ledger is
+  unreadable`, the exact ledger path, `No state was changed.`, and the repair
+  choices.
+- Bare `/pipelane orchestrate` with only recent corrupt active-looking ledgers:
+  exit 1, print the same unreadable-ledger block, and do not enter setup.
+- Bare `/pipelane orchestrate` with at least one valid active run plus recent
+  corrupt ledgers: exit 0 when the operator opens/cancels a valid run path, keep
+  valid runs selectable, and include a blocking attention line naming each
+  corrupt ledger path. Do not start a new run while hiding the corrupt state.
+- Bare `/pipelane orchestrate` with only older corrupt ledgers or invalid
+  run-id directories under `runs/`: exit 0 when normal setup/open flow succeeds
+  or is cancelled, print cleanup warnings naming the ignored paths, and do not
+  treat those paths as addressable run records.
+- Explicit invalid `--run-id`: exit 1 before file access with the existing run
+  id validation error.
+
 User-facing guidance should be concrete:
 
 ```text
@@ -131,10 +149,18 @@ Planned behavior:
   (prepared/dispatched/running, or planned with a stale assignment),
   `/pipelane orchestrate --run-id <id>` should show a blocked slice row when
   the assigned path is missing.
+- Define the "missing and relevant worktree" predicate once in the orchestration
+  snapshot/summarization layer: assigned path is present, path does not exist,
+  and slice status is prepared/dispatched/running or planned with a stale
+  assignment. `/pipelane orchestrate`, `/status --json`, terminal `/status`, and
+  board consumers must render that same computed result instead of duplicating
+  predicate logic.
 - `buildWorkflowApiSnapshot()` should surface an attention item for the missing
   slice worktree when the run is active, so `/status --json`, the board, and
   terminal `/status` all see the same truth.
 - Recovery guidance should prefer existing primitives:
+  - verified CLI surface today: `orchestrate start` accepts `--slice-id` and
+    `--force`; `orchestrate prepare` does not accept `--slice-id`
   - `orchestrate prepare --run-id <id>` only for unassigned planned slices; do
     not show an unsupported `prepare --slice-id` command
   - restore the missing assigned worktree path, or manually repair/move aside
@@ -253,6 +279,7 @@ For status:
 buildWorkflowApiSnapshot()
         |
         +--> valid orchestration run summaries
+        +--> shared missing-and-relevant worktree diagnostics
         +--> attention[] for missing active slice worktrees
         |
         v
@@ -382,11 +409,11 @@ Coverage target for this slice: every listed GAP gets a focused regression test.
 
 | Codepath | Realistic failure | Handling required | Test required |
 | --- | --- | --- | --- |
-| Ledger load | JSON is truncated after crash | Fail closed, show path, no mutation | Corrupt ledger blocks bare orchestrate |
-| Active run scan | One run is corrupt and active-looking while another is valid | Keep valid runs openable; surface corrupt run as blocking attention; do not start new work while hiding it | Mixed valid/corrupt active-run directory test |
-| Stale run scan | Ancient abandoned run JSON is corrupt | Do not permanently block new work; warn or ignore by documented age/status policy | Corrupt abandoned-run policy test |
+| Ledger load | JSON is truncated after crash | Fail closed, show path, no mutation, exit 1 | Corrupt ledger blocks bare orchestrate |
+| Active run scan | One run is corrupt and active-looking while another is valid | Keep valid runs openable; surface corrupt run as blocking attention; do not start new work while hiding it; valid open/cancel paths exit 0 | Mixed valid/corrupt active-run directory test |
+| Stale run scan | Ancient abandoned run JSON is corrupt | Do not permanently block new work; warn or ignore by documented age/status policy; normal open/setup/cancel paths keep exit 0 | Corrupt abandoned-run policy test |
 | Move-aside recovery | User follows printed corrupt-ledger move-aside guidance | Scanner ignores the moved directory and bare orchestrate can proceed | Move-aside unblocks bare-orchestrate test |
-| Invalid run directory | User renamed a corrupt run under `runs/` to an invalid id | Non-blocking cleanup warning; explicit invalid `--run-id` still errors | Invalid run-id directory scan test |
+| Invalid run directory | User renamed a corrupt run under `runs/` to an invalid id | Non-blocking cleanup warning; explicit invalid `--run-id` still errors before file access with exit 1 | Invalid run-id directory scan test |
 | Missing worktree | User deletes slice worktree manually | Show blocked slice and accurate recovery guidance; never show unsupported commands | Deleted worktree status/orchestrate test |
 | Status prompt | Scripted input ends mid-prompt | Failed decision, no pending orphan | Exhausted `PIPELANE_STATUS_INPUT` test |
 | Status preflight | Collected input still cannot satisfy preflight | Blocked decision, exit 1 | Blocked preflight decision test |
@@ -535,20 +562,6 @@ land with the slice.
 - Parallelization: 1 lane, sequential
 - Lake Score: 3/3 recommendations chose the complete option
 
-## GSTACK REVIEW REPORT
-
-| Review | Trigger | Why | Runs | Status | Findings |
-| --- | --- | --- | --- | --- | --- |
-| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
-| Codex Review | `codex exec` | Independent 2nd opinion | 0 | — | Original parent plan had Codex review; this hardening slice did not rerun outside voice |
-| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | clean | 3 issues found and fixed in plan; 11 required test gaps; 0 unresolved; 0 critical gaps |
-| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | Not needed for CLI recovery hardening |
-| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | Not run |
-
-**UNRESOLVED:** 0
-
-**VERDICT:** ENG CLEARED — ready to implement the hardening slice.
-
 ## Triple Review Follow-up
 
 Generated on June 19, 2026 after `/review`, `/karpathy-diff`, and `/claude`
@@ -579,3 +592,40 @@ Verified issues fixed in this document:
 **UNRESOLVED:** 0
 
 **VERDICT:** TRIPLE REVIEW CLEARED — ready to implement the hardening slice.
+
+## Current Review Follow-up
+
+Generated on June 19, 2026 after `/plan-eng-review` and a Claude adversarial
+plan review.
+
+Verified issues addressed in this update:
+
+- Verified that `orchestrate start --run-id <id> --slice-id <slice> --force` is
+  supported today; kept that recovery command and documented the verified flag
+  surface beside the unsupported `prepare --slice-id` warning.
+- Defined missing assigned worktree relevance once in the orchestration
+  snapshot/summarization layer so `/pipelane orchestrate`, `/status --json`,
+  terminal `/status`, and board consumers cannot drift.
+- Added an explicit exit-code and output-line contract for corrupt ledger,
+  mixed valid/corrupt run, stale corrupt run, invalid run directory, and explicit
+  invalid `--run-id` outcomes.
+
+**UNRESOLVED:** 0
+
+**VERDICT:** REVIEW CLEARED — ready to implement the hardening slice.
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+| --- | --- | --- | --- | --- | --- |
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
+| Codex Review | `codex exec` | Independent 2nd opinion | 0 | — | Original parent plan had Codex review; current adversarial outside voice used Claude |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 2 | clean | 3 earlier issues fixed plus 2 current plan ambiguities fixed; 11 required test gaps; 0 unresolved; 0 critical gaps |
+| Claude Review | `/claude` plan review | Adversarial outside voice | 1 | clean after fixes | 3 findings returned; 2 verified and fixed, 1 verified false against CLI parser but documented |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | Not needed for CLI recovery hardening |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | Not run |
+
+**UNRESOLVED:** 0
+
+**VERDICT:** ENG + ADVERSARIAL REVIEW CLEARED — ready to implement the hardening
+slice.
