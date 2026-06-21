@@ -336,13 +336,25 @@ Use planning-only refactor mode when the code is too tangled to patch safely:
 
 Pipelane now has an orchestration foundation.
 
-It is not yet a single "do the whole plan for me" button. It is a set of durable
-steps for turning a plan into isolated slices, preparing worktrees, dispatching
-provider prompts, running workers, and reviewing completed slices.
+The approved bare command can turn a plan into isolated slices, prepare
+worktrees, dispatch provider prompts, run workers, and review completed slices:
+
+```text
+/pipelane orchestrate --plan-file docs/plan.md --provider codex --yes
+```
+
+It still stops before PR creation, merge, deploy, and cleanup. Failed executable
+review gates get a bounded review-fix worker attempt before Pipelane reruns
+review. Remaining failed, pending, or blocked slice reviews leave the
+orchestration active and return a non-zero exit code; orchestration review
+completion requires at least one effective review gate.
+The advanced commands below remain available for recovery and step-by-step
+control.
 
 Current orchestration commands:
 
 ```text
+/pipelane orchestrate --plan-file docs/plan.md --provider codex --yes
 /pipelane orchestrate goal-spec --plan-file docs/plan.md
 /pipelane orchestrate plan --plan-file docs/plan.md
 /pipelane orchestrate prepare --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
@@ -353,6 +365,7 @@ Current orchestration commands:
 
 What those commands do:
 
+- bare `orchestrate --yes` runs plan, prepare, dispatch, start, review, and bounded review-fix attempts in one durable pass.
 - `goal-spec` drafts a provider-neutral goal from a plan or outcome.
 - `plan` writes a durable slice ledger.
 - `prepare` creates slice worktrees and task locks.
@@ -493,6 +506,7 @@ Common slash commands:
 | `/clean` | Clean finished or stale task state when safe. |
 | `/doctor` | Diagnose deploy config, probes, and release readiness. |
 | `/fix` | Fix bugs, failures, and review findings. |
+| `/pipelane orchestrate --plan-file docs/plan.md --yes` | Run plan, prepare, dispatch, start, and slice review in one approved pass. |
 | `/pipelane orchestrate plan` | Compile a plan into a durable slice ledger. |
 | `/pipelane orchestrate prepare` | Create slice worktrees. |
 | `/pipelane orchestrate dispatch` | Write provider handoff prompts. |

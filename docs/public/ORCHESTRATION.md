@@ -232,6 +232,7 @@ Provider adapters render `GoalSpec` into native `/goal` prompts when available:
 Current implementation surface:
 
 ```text
+/pipelane orchestrate --plan-file docs/plan.md --provider codex --yes
 /pipelane orchestrate plan --plan-file docs/plan.md
 /pipelane orchestrate prepare --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
 /pipelane orchestrate dispatch --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
@@ -241,6 +242,15 @@ Current implementation surface:
 /pipelane orchestrate goal-spec --outcome "Implement review gate enforcement"
 /pipelane orchestrate goal-spec --provider codex --json
 ```
+
+The approved bare command runs `plan`, `prepare`, `dispatch`, `start`, full
+slice review, and bounded review-fix attempts in one durable pass. It does not
+create an integrated PR, merge, deploy, or clean worktrees. Failed executable
+review gates are handed back to the slice worker before Pipelane reruns review;
+remaining failed, pending, or blocked review leaves the run active and returns a
+non-zero exit code. Automatic completion requires at least one effective review
+gate; orchestration review blocks zero-gate evidence and asks the operator to
+run `/pipelane review setup`.
 
 `orchestrate plan` compiles an implementation plan into a durable orchestration
 ledger with slice records, provider-neutral `GoalSpec` prompts, a review-gate
@@ -498,6 +508,7 @@ Do not add:
 10. Done: add `/pipelane orchestrate dispatch` provider handoff prompts for prepared slice worktrees.
 11. Done: add `/pipelane orchestrate start` configured worker launch and completion evidence.
 12. Done: add native Codex/Claude adapter defaults and review-gate execution over completed worker slices.
+13. Done: make approved bare `/pipelane orchestrate --yes` run slice review, make bounded review-fix attempts for failed executable gates, and fail closed on remaining pending, blocked, failed, or missing-gate review.
 
 ## Acceptance Criteria
 

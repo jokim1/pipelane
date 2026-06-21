@@ -74,6 +74,18 @@ export interface OrchestrationSliceReviewRecord {
   run: ReviewRunRecord;
 }
 
+export interface OrchestrationReviewFixRecord {
+  sliceId: string;
+  status: OrchestrationSliceStatus;
+  workerStatus: OrchestrationSliceWorkerStatus;
+  attempt: number;
+  failedGateIds: string[];
+  promptPath: string;
+  logPath: string | null;
+  exitCode: number | null;
+  recordedAt: string;
+}
+
 export interface OrchestrationSliceRecord {
   id: string;
   index: number;
@@ -127,6 +139,7 @@ export interface OrchestrationRunRecord {
     gates: ReviewGateConfig[];
   };
   slices: OrchestrationSliceRecord[];
+  reviewFixes?: OrchestrationReviewFixRecord[];
 }
 
 export interface BuildOrchestrationRunInput {
@@ -293,6 +306,7 @@ export function buildOrchestrationRunRecord(input: BuildOrchestrationRunInput): 
       gates: cloneJson(input.config.reviewGates?.gates ?? []),
     },
     slices,
+    reviewFixes: [],
   };
 }
 

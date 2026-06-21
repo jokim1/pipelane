@@ -5375,11 +5375,24 @@ test('orchestrate bare command previews an explicit plan without writing state',
   }
 });
 
-test('orchestrate bare command --yes plans, prepares, dispatches, and starts workers', () => {
+test('orchestrate bare command --yes plans, prepares, dispatches, starts workers, and reviews slices', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'bare-static',
+        phase: 'static',
+        type: 'command',
+        command: `${process.execPath} -e "console.log('bare review ok')"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     commitAll(repoRoot, 'Adopt pipelane');
     mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
     writeFileSync(path.join(repoRoot, 'docs', 'entry-plan.md'), [
@@ -5414,12 +5427,269 @@ test('orchestrate bare command --yes plans, prepares, dispatches, and starts wor
     assert.equal(report.run.slices[0].status, 'completed');
     assert.equal(report.run.slices[0].dispatch.status, 'ready');
     assert.equal(report.run.slices[0].worker.status, 'succeeded');
+    assert.equal(report.review.status, 'passed');
+    assert.equal(report.review.reviewedCount, 1);
+    assert.equal(report.autoFix, null);
+    assert.equal(report.run.slices[0].review.status, 'passed');
+    assert.equal(report.run.slices[0].review.run.gates[0].gateId, 'bare-static');
+    assert.equal(report.run.slices[0].review.run.gates[0].status, 'passed');
+    assert.match(report.run.slices[0].review.run.gates[0].stdoutTail, /bare review ok/);
     assert.ok(existsSync(report.run.slices[0].worktreePath));
+    assert.match(report.message, /Review status: passed/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate bare command --yes auto-fixes failed executable review gates and reruns review', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerScript = [
+    'const fs = require("node:fs");',
+    'let prompt = "";',
+    'process.stdin.setEncoding("utf8");',
+    'process.stdin.on("data", (chunk) => { prompt += chunk; });',
+    'process.stdin.on("end", () => {',
+    '  if (prompt.includes("Review fix attempt: 1")) {',
+    '    fs.writeFileSync("review-fixed.txt", "fixed\\n", "utf8");',
+    '    console.log("review fix applied");',
+    '  } else {',
+    '    console.log("initial worker left review failure");',
+    '  }',
+    '});',
+  ].join('');
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'requires-fix-file',
+        phase: 'static',
+        type: 'command',
+        command: `${process.execPath} -e "process.exit(require('node:fs').existsSync('review-fixed.txt') ? 0 : 7)"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt review fix gate');
+
+    const result = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      '--outcome',
+      'Auto-fix failed review gate',
+      '--provider',
+      'generic',
+      '--yes',
+      '--json',
+    ], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: `${process.execPath} -e ${JSON.stringify(workerScript)}`,
+    }).stdout);
+    createdWorktrees.push(...result.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    const onDisk = JSON.parse(readFileSync(result.ledgerPath, 'utf8'));
+    const attempt = result.autoFix.attempts[0];
+
+    assert.equal(result.status, 'completed');
+    assert.equal(result.review.status, 'passed');
+    assert.equal(result.autoFix.status, 'fixed');
+    assert.equal(result.autoFix.attemptedCount, 1);
+    assert.equal(result.autoFix.fixedCount, 1);
+    assert.equal(attempt.failedGateIds[0], 'requires-fix-file');
+    assert.match(readFileSync(attempt.promptPath, 'utf8'), /Review fix attempt: 1/);
+    assert.match(readFileSync(attempt.logPath, 'utf8'), /review fix applied/);
+    assert.equal(existsSync(path.join(result.run.slices[0].worktreePath, 'review-fixed.txt')), true);
+    assert.equal(onDisk.status, 'completed');
+    assert.equal(onDisk.slices[0].review.status, 'passed');
+    assert.equal(onDisk.slices[0].review.run.gates[0].status, 'passed');
+    assert.equal(onDisk.reviewFixes[0].sliceId, result.run.slices[0].id);
+    assert.equal(onDisk.reviewFixes[0].attempt, 1);
+    assert.equal(onDisk.reviewFixes[0].failedGateIds[0], 'requires-fix-file');
+    assert.equal(onDisk.reviewFixes[0].promptPath, attempt.promptPath);
+    assert.equal(onDisk.reviewFixes[0].logPath, attempt.logPath);
+    assert.equal(onDisk.reviewFixes[0].exitCode, 0);
+    assert.match(result.message, /Auto-fix status: fixed/);
+    assert.match(result.message, /Auto-fix attempts: 1/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate bare command --yes records pending manual gates instead of declaring completion', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'manual-ai-review',
+        phase: 'ai-diff',
+        type: 'skill',
+        skill: 'review',
+        userCommands: ['/review'],
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const cliResult = runCli([
+      'run',
+      'orchestrate',
+      '--outcome',
+      'Keep manual review pending',
+      '--provider',
+      'generic',
+      '--yes',
+      '--json',
+    ], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: 'node -e "process.exit(0)"',
+    }, true);
+    const result = JSON.parse(cliResult.stdout);
+    createdWorktrees.push(...result.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    const onDisk = JSON.parse(readFileSync(result.ledgerPath, 'utf8'));
+
+    assert.equal(cliResult.status, 1);
+    assert.equal(result.status, 'pending');
+    assert.equal(result.review.status, 'pending');
+    assert.equal(result.autoFix, null);
+    assert.equal(result.review.reviewedCount, 1);
+    assert.equal(result.review.pendingCount, 1);
+    assert.equal(result.run.status, 'blocked');
+    assert.equal(onDisk.status, 'blocked');
+    assert.equal(onDisk.slices[0].worker.status, 'succeeded');
+    assert.equal(onDisk.slices[0].status, 'blocked');
+    assert.equal(onDisk.slices[0].review.status, 'pending');
+    assert.equal(onDisk.slices[0].review.run.gates[0].gateId, 'manual-ai-review');
+    assert.equal(onDisk.slices[0].review.run.gates[0].status, 'pending');
+    assert.match(result.message, /Status: pending/);
+    assert.match(result.message, /Review status: pending/);
+    assert.match(result.message, /complete pending AI\/manual gates/);
 
     const stillActive = JSON.parse(runCli(['run', 'orchestrate', '--json'], repoRoot).stdout);
     assert.equal(stillActive.status, 'active');
-    assert.equal(stillActive.runId, report.runId);
-    assert.match(stillActive.message, /review=none/);
+    assert.equal(stillActive.runId, result.runId);
+    assert.match(stillActive.message, /review=pending/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate bare command --yes fails when slice review gates fail', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'bare-static-fail',
+        phase: 'static',
+        type: 'command',
+        command: `${process.execPath} -e "console.error('bare review failed'); process.exit(7)"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const result = runCli([
+      'run',
+      'orchestrate',
+      '--outcome',
+      'Fail static review gate',
+      '--provider',
+      'generic',
+      '--yes',
+      '--json',
+    ], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: 'node -e "process.exit(0)"',
+    }, true);
+    const report = JSON.parse(result.stdout);
+    createdWorktrees.push(...report.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    const onDisk = JSON.parse(readFileSync(report.ledgerPath, 'utf8'));
+
+    assert.equal(result.status, 1);
+    assert.equal(report.status, 'failed');
+    assert.equal(report.review.status, 'failed');
+    assert.equal(report.review.failedCount, 1);
+    assert.equal(report.autoFix.status, 'exhausted');
+    assert.equal(report.autoFix.attemptedCount, 1);
+    assert.equal(report.autoFix.attempts[0].failedGateIds[0], 'bare-static-fail');
+    assert.equal(onDisk.status, 'failed');
+    assert.equal(onDisk.slices[0].worker.status, 'succeeded');
+    assert.equal(onDisk.slices[0].status, 'failed');
+    assert.equal(onDisk.slices[0].review.status, 'failed');
+    assert.equal(onDisk.slices[0].review.run.gates[0].gateId, 'bare-static-fail');
+    assert.equal(onDisk.slices[0].review.run.gates[0].exitCode, 7);
+    assert.match(onDisk.slices[0].review.run.gates[0].stderrTail, /bare review failed/);
+    assert.match(report.message, /Status: failed/);
+    assert.match(report.message, /Review status: failed/);
+    assert.match(report.message, /Auto-fix status: exhausted/);
+    assert.match(report.message, /inspect exhausted auto-fix attempts/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate bare command --yes blocks when no effective review gates are configured', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const result = runCli([
+      'run',
+      'orchestrate',
+      '--outcome',
+      'Require review gates before completion',
+      '--provider',
+      'generic',
+      '--yes',
+      '--json',
+    ], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: 'node -e "process.exit(0)"',
+    }, true);
+    const report = JSON.parse(result.stdout);
+    createdWorktrees.push(...report.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    const onDisk = JSON.parse(readFileSync(report.ledgerPath, 'utf8'));
+
+    assert.equal(result.status, 1);
+    assert.equal(report.status, 'blocked');
+    assert.equal(report.review.status, 'blocked');
+    assert.equal(report.autoFix, null);
+    assert.equal(report.review.reviewedCount, 0);
+    assert.equal(report.review.blockedCount, 1);
+    assert.equal(onDisk.status, 'blocked');
+    assert.equal(onDisk.slices[0].worker.status, 'succeeded');
+    assert.equal(onDisk.slices[0].status, 'blocked');
+    assert.equal(onDisk.slices[0].review, null);
+    assert.equal(onDisk.slices[0].reviewDiagnostics[0].run.gates.length, 0);
+    assert.match(report.message, /Status: blocked/);
+    assert.match(report.message, /Review status: blocked/);
+    assert.match(report.message, /missing review gates/);
   } finally {
     for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
     rmSync(repoRoot, { recursive: true, force: true });
@@ -6897,6 +7167,46 @@ test('orchestrate review runs gate snapshot against completed worker slices', ()
     for (const worktreePath of createdWorktrees) {
       rmSync(worktreePath, { recursive: true, force: true });
     }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate review blocks when no effective review gates are configured', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt empty review gates');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Review requires gates', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: 'node -e "process.exit(0)"',
+    });
+
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const onDisk = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
+
+    assert.equal(reviewed.status, 'blocked');
+    assert.equal(reviewed.reviewedCount, 0);
+    assert.equal(reviewed.blockedCount, 1);
+    assert.equal(onDisk.status, 'blocked');
+    assert.equal(onDisk.slices[0].status, 'blocked');
+    assert.equal(onDisk.slices[0].review, null);
+    assert.equal(onDisk.slices[0].reviewDiagnostics[0].run.gates.length, 0);
+    assert.match(reviewed.slices[0].blocker, /no effective review gates configured/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
   }
@@ -9510,24 +9820,18 @@ test('status keeps worker-completed orchestration active until trusted review ex
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
-    const result = JSON.parse(runCli([
-      'run',
-      'orchestrate',
-      '--outcome',
-      'Review completed workers from status',
-      '--provider',
-      'generic',
-      '--yes',
-      '--json',
-    ], repoRoot, {
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Review completed workers from status', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    const result = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: 'node -e "process.exit(0)"',
     }).stdout);
-    createdWorktrees.push(...result.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
 
     assert.equal(result.run.status, 'completed');
 
     const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
-    assert.equal(envelope.data.orchestration.activeRun.id, result.runId);
+    assert.equal(envelope.data.orchestration.activeRun.id, planned.runId);
     assert.equal(envelope.data.orchestration.activeRun.counts.workerSucceeded, 1);
     assert.equal(envelope.data.orchestration.activeRun.counts.trustedReviewComplete, 0);
     assert.equal(envelope.data.orchestration.activeRun.nextAction.id, 'orchestrate.review');

@@ -21,6 +21,7 @@ import {
   scanOrchestrationRunDiagnostics,
   sliceReviewFullySatisfied,
   type OrchestrationLedgerDiagnostic,
+  type OrchestrationReviewFixRecord,
   type OrchestrationRunRecord,
   type OrchestrationRunScanDiagnostics,
   type OrchestrationRunDirectoryDiagnostic,
@@ -115,7 +116,7 @@ const WORKER_CREDENTIAL_ENV_EXACT_KEYS = [
 ] as const;
 const WORKER_ENV_ALLOWLIST_ENV = 'PIPELANE_ORCHESTRATE_WORKER_ENV_ALLOW';
 
-type OrchestrateEntryStatus = 'needs-input' | 'preview' | 'active' | 'multiple-active' | 'cancelled' | 'blocked' | OrchestrateStartReport['status'];
+type OrchestrateEntryStatus = 'needs-input' | 'preview' | 'active' | 'multiple-active' | 'cancelled' | 'blocked' | 'pending' | OrchestrateStartReport['status'];
 
 interface OrchestrateEntryRunSummary {
   id: string;
@@ -149,6 +150,8 @@ interface OrchestrateEntryReport {
   corruptLedgers?: OrchestrationCorruptLedgerSummary[];
   invalidRunDirectories?: OrchestrationInvalidRunDirectorySummary[];
   run?: OrchestrationRunRecord;
+  review?: OrchestrateEntryReviewSummary | null;
+  autoFix?: OrchestrateEntryAutoFixSummary | null;
   message: string;
 }
 
@@ -314,6 +317,47 @@ interface OrchestrateReviewReport {
   message: string;
 }
 
+interface OrchestrateEntryReviewSummary {
+  status: OrchestrateReviewReport['status'];
+  reviewedCount: number;
+  failedCount: number;
+  pendingCount: number;
+  blockedCount: number;
+}
+
+interface OrchestrateEntryAutoFixSummary {
+  status: 'fixed' | 'failed' | 'exhausted' | 'skipped' | 'noop';
+  attemptedCount: number;
+  fixedCount: number;
+  failedCount: number;
+  attempts: ReviewAutoFixAttemptReport[];
+  reason?: string;
+}
+
+interface ReviewAutoFixAttemptReport {
+  id: string;
+  status: OrchestrationSliceRecord['status'];
+  workerStatus: OrchestrationSliceWorkerRecord['status'];
+  attempt: number;
+  failedGateIds: string[];
+  promptPath: string;
+  logPath: string | null;
+  exitCode: number | null;
+}
+
+type ReviewCompletedSlicesResult = {
+  status: OrchestrateReviewReport['status'];
+  reviewedCount: number;
+  failedCount: number;
+  pendingCount: number;
+  blockedCount: number;
+  slices: ReviewedSliceReport[];
+};
+
+type ReviewAutoFixResult = OrchestrateEntryAutoFixSummary & {
+  finalReview: ReviewCompletedSlicesResult | null;
+};
+
 interface StartSlicePreparation {
   slice: OrchestrationSliceRecord;
   taskSlug: string;
@@ -402,7 +446,7 @@ async function handleOrchestrateEntry(cwd: string, parsed: ParsedOperatorArgs): 
     if (parsed.flags.yes) {
       const report = await runApprovedOrchestration(context, run, planPath, activeRuns, likelyPlanFiles, parsed.flags.offline, ledgerWarnings, scan);
       printResult(parsed.flags, report);
-      if (report.status === 'failed') process.exitCode = 1;
+      if (approvedOrchestrationStatusRequiresAttention(report.status)) process.exitCode = 1;
       return;
     }
     if (!parsed.flags.preview && !parsed.flags.plan && canRunInteractiveOrchestrate()) {
@@ -479,10 +523,25 @@ async function runApprovedOrchestration(
   prepareSliceWorktrees(context, run, offline);
   dispatchPreparedSlices(context, run);
   const startResult = await startDispatchedSlices(context, run, null, false);
+  let reviewResult = shouldRunApprovedOrchestrationReview(startResult, run)
+    ? reviewCompletedSlices(context, run, {
+        sliceId: null,
+        dryRun: false,
+        gateFilter: '',
+        phaseFilter: '',
+        requireGates: true,
+      })
+    : null;
+  const autoFixResult = reviewResult?.status === 'failed'
+    ? await autoFixFailedReviewSlices(context, run, reviewResult)
+    : null;
+  if (autoFixResult?.finalReview) {
+    reviewResult = autoFixResult.finalReview;
+  }
   const finalLedgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
   const report: OrchestrateEntryReport = {
     command: 'orchestrate',
-    status: startResult.status,
+    status: approvedOrchestrationEntryStatus(startResult.status, reviewResult),
     repoRoot: context.repoRoot,
     runId: run.id,
     ledgerPath: finalLedgerPath || ledgerPath,
@@ -494,9 +553,185 @@ async function runApprovedOrchestration(
     corruptLedgers: scan ? summarizeCorruptLedgers(scan.corrupt) : [],
     invalidRunDirectories: scan ? summarizeInvalidRunDirectories(scan.invalidDirectories) : [],
     run,
-    message: appendOrchestrationDiagnostics(renderApprovedOrchestrationReport(run, finalLedgerPath || ledgerPath, planPath, startResult), warnings, scan),
+    review: reviewResult ? summarizeEntryReview(reviewResult) : null,
+    autoFix: autoFixResult ? summarizeEntryAutoFix(autoFixResult) : null,
+    message: appendOrchestrationDiagnostics(renderApprovedOrchestrationReport(run, finalLedgerPath || ledgerPath, planPath, startResult, reviewResult, autoFixResult), warnings, scan),
   };
   return report;
+}
+
+function shouldRunApprovedOrchestrationReview(
+  startResult: {
+    failedCount: number;
+    blockedCount: number;
+  },
+  run: OrchestrationRunRecord,
+): boolean {
+  if (startResult.failedCount > 0 || startResult.blockedCount > 0) return false;
+  if (run.slices.some((slice) => slice.worker?.status === 'running' || slice.status === 'running')) return false;
+  return run.slices.some((slice) => slice.worker?.status === 'succeeded');
+}
+
+function approvedOrchestrationEntryStatus(
+  startStatus: OrchestrateStartReport['status'],
+  reviewResult: ReviewCompletedSlicesResult | null,
+): OrchestrateEntryStatus {
+  if (!reviewResult) return startStatus;
+  if (reviewResult.status === 'passed') return 'completed';
+  if (reviewResult.status === 'noop') return startStatus;
+  return reviewResult.status;
+}
+
+function summarizeEntryReview(result: ReviewCompletedSlicesResult): OrchestrateEntryReviewSummary {
+  return {
+    status: result.status,
+    reviewedCount: result.reviewedCount,
+    failedCount: result.failedCount,
+    pendingCount: result.pendingCount,
+    blockedCount: result.blockedCount,
+  };
+}
+
+function summarizeEntryAutoFix(result: ReviewAutoFixResult): OrchestrateEntryAutoFixSummary {
+  return {
+    status: result.status,
+    attemptedCount: result.attemptedCount,
+    fixedCount: result.fixedCount,
+    failedCount: result.failedCount,
+    attempts: result.attempts,
+    reason: result.reason,
+  };
+}
+
+function approvedOrchestrationStatusRequiresAttention(status: OrchestrateEntryStatus): boolean {
+  return status === 'failed' || status === 'blocked' || status === 'pending';
+}
+
+async function autoFixFailedReviewSlices(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+  initialReview: ReviewCompletedSlicesResult,
+): Promise<ReviewAutoFixResult> {
+  const maxFixAttempts = resolveReviewAutoFixAttemptLimit(run);
+  if (maxFixAttempts <= 0) {
+    return {
+      status: 'skipped',
+      attemptedCount: 0,
+      fixedCount: 0,
+      failedCount: initialReview.failedCount,
+      attempts: [],
+      finalReview: null,
+      reason: 'orchestrate.hardStops.maxIterationsPerSlice leaves no review-fix attempt budget',
+    };
+  }
+
+  const attempts: ReviewAutoFixAttemptReport[] = [];
+  let latestReview = initialReview;
+  let workerFailureCount = 0;
+  for (let attempt = 1; attempt <= maxFixAttempts; attempt += 1) {
+    const failedSlices = run.slices
+      .map((slice) => ({ slice, failedGates: failedBlockingReviewGates(slice) }))
+      .filter((entry) => entry.failedGates.length > 0);
+    if (failedSlices.length === 0) {
+      return {
+        status: 'noop',
+        attemptedCount: attempts.length,
+        fixedCount: 0,
+        failedCount: 0,
+        attempts,
+        finalReview: latestReview,
+        reason: 'no failed blocking review gates were eligible for auto-fix',
+      };
+    }
+
+    for (const { slice, failedGates } of failedSlices) {
+      const prepared = prepareSliceForReviewAutoFix(context, run, slice, failedGates, attempt);
+      if (slice.review) {
+        appendSliceReviewDiagnostic(slice, slice.review);
+        slice.review = null;
+      }
+      const worker = await runProviderWorker(context, run, prepared);
+      slice.worker = worker;
+      slice.status = worker.status === 'succeeded' ? 'completed' : 'failed';
+      attempts.push({
+        id: slice.id,
+        status: slice.status,
+        workerStatus: worker.status,
+        attempt,
+        failedGateIds: failedGates.map((gate) => gate.gateId),
+        promptPath: prepared.promptPath,
+        logPath: worker.logPath,
+        exitCode: worker.exitCode,
+      });
+      appendRunReviewFixRecord(run, {
+        sliceId: slice.id,
+        status: slice.status,
+        workerStatus: worker.status,
+        attempt,
+        failedGateIds: failedGates.map((gate) => gate.gateId),
+        promptPath: prepared.promptPath,
+        logPath: worker.logPath,
+        exitCode: worker.exitCode,
+        recordedAt: nowIso(),
+      });
+      if (worker.status === 'failed') workerFailureCount += 1;
+      run.status = summarizeRunWorkerStatus(run);
+      persistOrchestrationStartProgress(context, run);
+    }
+
+    if (workerFailureCount > 0) {
+      return {
+        status: 'failed',
+        attemptedCount: attempts.length,
+        fixedCount: 0,
+        failedCount: workerFailureCount,
+        attempts,
+        finalReview: null,
+        reason: 'one or more review-fix workers failed before review could be retried',
+      };
+    }
+
+    latestReview = reviewCompletedSlices(context, run, {
+      sliceId: null,
+      dryRun: false,
+      gateFilter: '',
+      phaseFilter: '',
+      requireGates: true,
+    });
+    if (latestReview.status !== 'failed') {
+      return {
+        status: 'fixed',
+        attemptedCount: attempts.length,
+        fixedCount: failedSlices.length,
+        failedCount: latestReview.failedCount,
+        attempts,
+        finalReview: latestReview,
+      };
+    }
+  }
+
+  return {
+    status: 'exhausted',
+    attemptedCount: attempts.length,
+    fixedCount: 0,
+    failedCount: latestReview.failedCount,
+    attempts,
+    finalReview: latestReview,
+    reason: 'review still failed after all configured review-fix attempts',
+  };
+}
+
+function resolveReviewAutoFixAttemptLimit(run: OrchestrationRunRecord): number {
+  const maxIterations = run.configSnapshot.hardStops?.maxIterationsPerSlice ?? 2;
+  return Math.max(0, maxIterations - 1);
+}
+
+function failedBlockingReviewGates(slice: OrchestrationSliceRecord): ReviewGateRunRecord[] {
+  return slice.review?.run.gates.filter((gate) => gate.blocking && gate.status === 'failed') ?? [];
+}
+
+function appendRunReviewFixRecord(run: OrchestrationRunRecord, record: OrchestrationReviewFixRecord): void {
+  run.reviewFixes = [...(run.reviewFixes ?? []), record];
 }
 
 function buildOrchestratePreviewReport(
@@ -730,7 +965,7 @@ async function confirmAndMaybeRunOrchestration(
     }
     const report = await runApprovedOrchestration(context, run, planPath, activeRuns, likelyPlanFiles, parsed.flags.offline, warnings, scan);
     printResult(parsed.flags, report);
-    if (report.status === 'failed') process.exitCode = 1;
+    if (approvedOrchestrationStatusRequiresAttention(report.status)) process.exitCode = 1;
   } finally {
     if (!existingPrompter) prompter.close();
   }
@@ -1033,11 +1268,13 @@ function renderApprovedOrchestrationReport(
     blockedCount: number;
     slices: StartedSliceReport[];
   },
+  reviewResult: ReviewCompletedSlicesResult | null,
+  autoFixResult: ReviewAutoFixResult | null,
 ): string {
   const lines = [
     'Pipelane orchestrate',
     '',
-    `Status: ${startResult.status}`,
+    `Status: ${approvedOrchestrationEntryStatus(startResult.status, reviewResult)}`,
     `Run: ${run.id}`,
     `Ledger: ${ledgerPath}`,
     `Plan: ${planPath ?? run.source.prompt ?? '(outcome only)'}`,
@@ -1045,13 +1282,33 @@ function renderApprovedOrchestrationReport(
     `Existing workers: ${startResult.existingCount}`,
     `Failed workers: ${startResult.failedCount}`,
     `Blocked slices: ${startResult.blockedCount}`,
+    `Review status: ${reviewResult?.status ?? 'not-run'}`,
+    `Reviewed slices: ${reviewResult?.reviewedCount ?? 0}`,
+    `Pending review slices: ${reviewResult?.pendingCount ?? 0}`,
+    `Failed review slices: ${reviewResult?.failedCount ?? 0}`,
+    `Auto-fix status: ${autoFixResult?.status ?? 'not-run'}`,
+    `Auto-fix attempts: ${autoFixResult?.attemptedCount ?? 0}`,
     '',
     'Slices:',
   ];
   for (const slice of run.slices) {
-    lines.push(`- ${slice.id}: ${slice.status}${slice.worker ? ` (${slice.worker.status})` : ''}`);
+    lines.push(`- ${slice.id}: ${slice.status}${slice.worker ? ` worker=${slice.worker.status}` : ''} review=${slice.review?.status ?? 'none'}`);
   }
-  lines.push('', 'Next: run /pipelane status to monitor progress and pending decisions.');
+  if (!reviewResult) {
+    lines.push('', 'Next: resolve worker failures or blocked slices, then rerun /pipelane orchestrate start or /pipelane orchestrate review.');
+  } else if (reviewResult.failedCount > 0) {
+    if (autoFixResult?.status === 'exhausted') {
+      lines.push('', 'Next: inspect exhausted auto-fix attempts, fix remaining failed blocking gates in each slice worktree, then rerun /pipelane orchestrate review.');
+    } else {
+      lines.push('', 'Next: fix failed blocking gates in each slice worktree, then rerun /pipelane orchestrate review.');
+    }
+  } else if (reviewResult.pendingCount > 0) {
+    lines.push('', 'Next: complete pending AI/manual gates for each slice, then rerun or attach trusted evidence before merge/deploy automation.');
+  } else if (reviewResult.blockedCount > 0 || reviewResult.status === 'blocked') {
+    lines.push('', 'Next: resolve blocked slice review conditions, such as missing review gates, then rerun /pipelane orchestrate review.');
+  } else {
+    lines.push('', 'Next: run /pipelane status to inspect the reviewed run and continue to PR handoff.');
+  }
   return lines.join('\n');
 }
 
@@ -1267,6 +1524,7 @@ function handleOrchestrationReview(cwd: string, parsed: ParsedOperatorArgs): voi
     dryRun: parsed.flags.reviewDryRun,
     gateFilter,
     phaseFilter,
+    requireGates: true,
   });
   const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
   const report: OrchestrateReviewReport = {
@@ -1493,15 +1751,9 @@ function reviewCompletedSlices(
     dryRun: boolean;
     gateFilter: string;
     phaseFilter: ReviewGatePhase | '';
+    requireGates: boolean;
   },
-): {
-  status: OrchestrateReviewReport['status'];
-  reviewedCount: number;
-  failedCount: number;
-  pendingCount: number;
-  blockedCount: number;
-  slices: ReviewedSliceReport[];
-} {
+): ReviewCompletedSlicesResult {
   const selectedSlices = resolveReviewSlices(run, options.sliceId);
   const reports: ReviewedSliceReport[] = [];
   let reviewedCount = 0;
@@ -1530,6 +1782,25 @@ function reviewCompletedSlices(
       activeSurfaces: resolveSliceActiveSurfaces(context, run, slice),
     }));
     const reviewRecord = buildSliceReviewRecord(context, run, slice, reviewRun);
+    if (options.requireGates && reviewRun.gates.length === 0) {
+      appendSliceReviewDiagnostic(slice, reviewRecord);
+      slice.review = null;
+      slice.status = 'blocked';
+      blockedCount += 1;
+      reports.push({
+        id: slice.id,
+        status: slice.status,
+        reviewStatus: null,
+        branchName: slice.branchName ?? '',
+        worktreePath: slice.worktreePath ?? '',
+        runId: reviewRun.id,
+        gateCount: 0,
+        action: 'blocked',
+        blocker: 'no effective review gates configured for automatic orchestration; run /pipelane review setup, then rerun /pipelane orchestrate review',
+      });
+      persistOrchestrationReviewProgress(context, run);
+      continue;
+    }
     const independenceBlocker = sliceReviewIndependenceBlocker(slice, reviewRecord);
     if (independenceBlocker) {
       appendSliceReviewDiagnostic(slice, reviewRecord);
@@ -1868,6 +2139,44 @@ function prepareSliceForStart(
     providerCommand: resolveProviderCommand(slice.provider),
     restarting,
   };
+}
+
+function prepareSliceForReviewAutoFix(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+  slice: OrchestrationSliceRecord,
+  failedGates: ReviewGateRunRecord[],
+  attempt: number,
+): StartSlicePreparation {
+  if (!slice.branchName || !slice.worktreePath || !slice.dispatch) {
+    throw new Error(`Slice ${slice.id} is missing dispatch metadata for review auto-fix.`);
+  }
+  if (!existsSync(slice.worktreePath)) {
+    throw new Error(`Slice ${slice.id} assigned worktree is missing: ${slice.worktreePath}`);
+  }
+  assertPreparedWorktreeSafe(context, slice.id, slice.branchName, slice.worktreePath);
+  const runDir = path.dirname(orchestrationRunPath(context.commonDir, context.config, run.id));
+  const fixRoot = path.join(runDir, 'review-fixes');
+  const workerRoot = path.join(runDir, 'workers');
+  mkdirSync(fixRoot, { recursive: true });
+  mkdirSync(workerRoot, { recursive: true });
+  const taskSlug = reviewFixTaskSlug(run.id, slice, attempt);
+  const promptPath = path.join(fixRoot, `${taskSlug}.md`);
+  writeFileSync(promptPath, renderReviewAutoFixPrompt(run, slice, failedGates, attempt), 'utf8');
+  return {
+    slice,
+    taskSlug,
+    promptPath,
+    providerCommand: resolveProviderCommand(slice.provider),
+    restarting: true,
+  };
+}
+
+function reviewFixTaskSlug(runId: string, slice: OrchestrationSliceRecord, attempt: number): string {
+  const base = resolveOrchestrationTaskSlug(runId, slice);
+  const suffix = `-review-fix-${attempt}`;
+  const prefix = base.slice(0, Math.max(1, TASK_SLUG_MAX_LENGTH - suffix.length)).replace(/-+$/g, '') || 'slice';
+  return `${prefix}${suffix}`;
 }
 
 function resolveProviderCommand(provider: GoalProvider): string {
@@ -2588,6 +2897,55 @@ function renderDispatchPrompt(
     'Do not merge, deploy, or clean this task workspace from inside the slice worker.',
     '',
   ].join('\n');
+}
+
+function renderReviewAutoFixPrompt(
+  run: OrchestrationRunRecord,
+  slice: OrchestrationSliceRecord,
+  failedGates: ReviewGateRunRecord[],
+  attempt: number,
+): string {
+  const lines = [
+    '# Pipelane Orchestration Review Fix',
+    '',
+    `Run: ${run.id}`,
+    `Slice: ${slice.id}`,
+    `Provider: ${slice.provider}`,
+    `Branch: ${slice.branchName ?? '(unassigned)'}`,
+    `Worktree: ${slice.worktreePath ?? '(unassigned)'}`,
+    `Review fix attempt: ${attempt}`,
+    '',
+    '## Task',
+    '',
+    'Fix only the verified blocking review failures listed below in this slice worktree.',
+    'Do not merge, deploy, clean worktrees, change unrelated files, or rerun release automation.',
+    'After fixing, leave the worktree ready for Pipelane to rerun `/pipelane orchestrate review`.',
+    '',
+    '## Failed Review Gates',
+    '',
+  ];
+  for (const gate of failedGates) {
+    lines.push(`### ${gate.gateId}`);
+    lines.push(`- Phase: ${gate.phase}`);
+    lines.push(`- Type: ${gate.type}`);
+    lines.push(`- Summary: ${gate.summary}`);
+    if (gate.command) lines.push(`- Command: ${gate.command}`);
+    if (gate.exitCode !== undefined) lines.push(`- Exit code: ${gate.exitCode ?? 'unknown'}`);
+    if (gate.stdoutTail) {
+      lines.push('- Stdout tail:', '', '```text', gate.stdoutTail, '```');
+    }
+    if (gate.stderrTail) {
+      lines.push('- Stderr tail:', '', '```text', gate.stderrTail, '```');
+    }
+    lines.push('');
+  }
+  lines.push(
+    '## Original Slice Goal',
+    '',
+    slice.providerPrompt,
+    '',
+  );
+  return lines.join('\n');
 }
 
 function shellQuote(value: string): string {

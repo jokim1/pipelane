@@ -249,7 +249,7 @@ run_pipelane() {
 
   if [ "$subcommand" = "pipelane" ]; then
     if [ "$#" -eq 0 ]; then
-      echo "pipelane: use /pipelane status, /pipelane review setup, /pipelane orchestrate plan, /pipelane orchestrate prepare, /pipelane orchestrate dispatch, /pipelane orchestrate start, /pipelane orchestrate goal-spec, /pipelane web, /pipelane board, or /pipelane update" >&2
+      echo "pipelane: use /pipelane status, /pipelane review setup, /pipelane orchestrate --plan-file <file> --yes, /pipelane orchestrate plan, /pipelane orchestrate prepare, /pipelane orchestrate dispatch, /pipelane orchestrate start, /pipelane orchestrate goal-spec, /pipelane web, /pipelane board, or /pipelane update" >&2
       exit 0
     fi
     dispatcher="$1"
@@ -271,7 +271,7 @@ run_pipelane() {
         exec "$bin" update "$@"
         ;;
       help|--help|-h)
-        echo "pipelane: use /pipelane status, /pipelane review setup, /pipelane orchestrate plan, /pipelane orchestrate prepare, /pipelane orchestrate dispatch, /pipelane orchestrate start, /pipelane orchestrate goal-spec, /pipelane web, /pipelane board, or /pipelane update" >&2
+        echo "pipelane: use /pipelane status, /pipelane review setup, /pipelane orchestrate --plan-file <file> --yes, /pipelane orchestrate plan, /pipelane orchestrate prepare, /pipelane orchestrate dispatch, /pipelane orchestrate start, /pipelane orchestrate goal-spec, /pipelane web, /pipelane board, or /pipelane update" >&2
         exit 0
         ;;
       *)
