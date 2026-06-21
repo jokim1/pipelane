@@ -54,9 +54,12 @@ Current commands:
 /pipelane review setup --yes
 /pipelane review setup --print
 /pipelane review setup --list-gates
+/pipelane review setup --enable adversarial-review
+/pipelane review setup --disable gstack-review
+/pipelane review setup --install lint
 ```
 
-Future extensions:
+Custom extensions:
 
 ```text
 /pipelane review setup --add-plan-gate plan-eng-review
@@ -68,6 +71,16 @@ Setup should detect existing scripts before suggesting new gates. If a repo has
 `lint`, `typecheck`, `test`, `build`, or `format:check`, use those commands. If
 a script is missing, suggest it as a setup gap instead of silently inventing a
 toolchain.
+
+Known package-script installers are allowed to help, but only conservatively:
+npm projects can install standard dev dependencies for lint and format-check;
+pnpm, Yarn, Bun, mixed lockfiles, and framework-specific ESLint setups should
+receive a concrete manual recipe rather than a generic generated config or an
+unexpected package-manager mutation.
+
+`--print` and `--list-gates` are read-only inspection modes. Do not combine
+them with `--enable`, `--disable`, or `--install`; run the modifying command
+first, then inspect the saved config.
 
 Karpathy gates should use the names humans naturally type:
 
@@ -270,6 +283,11 @@ review-gate snapshot from each slice worktree, records per-slice gate evidence
 in the orchestration ledger, and blocks the run on failed, pending,
 slice-filtered, gate-filtered, phase-filtered, or dry-run evidence. Merge,
 deploy, and cleanup remain outside orchestration.
+While command gates run, `orchestrate review` and the bare `orchestrate --yes`
+review phase print slice and gate progress on stderr. Review-fix attempts also
+announce the failed gates they are fixing and when review is rerun. If AI,
+agent, or approval gates remain pending, the final report lists the pending
+slice/gate pairs, the command to run, and the slice worktree.
 `orchestrate start` mints a per-worker run identity, exports it to the worker
 as `PIPELANE_AGENT_SESSION_ID`, and stores only its hashed fingerprint in the
 ledger. Review evidence also stores hashed reviewer or attester fingerprints

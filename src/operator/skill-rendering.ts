@@ -80,20 +80,24 @@ function renderWorkflowSkillGuidance(command: WorkflowCommand | 'pipelane', slas
 
 Agent Bash tools commonly run commands without an interactive TTY, and shell
 pipes make stdout non-TTY. When the user invokes bare
-\`${slashAlias} review setup\` with no flags, do not run the interactive setup
-command first. Instead use the runner command above with these parsed arguments:
+\`${slashAlias} review setup\` with no flags, run the setup command directly
+through the runner command above. The CLI prints a non-interactive selector
+with gate numbers, installable gaps, and exact follow-up commands.
 
-1. \`review setup --print\` to inspect the current effective gate config.
-2. If the user needs the available gate catalog, use
-   \`review setup --list-gates\`.
-3. Present deterministic choices in chat:
-   \`1. Save recommended gates: review setup --yes\`
-   \`2. Cancel\`
-4. After the user chooses, run the matching command exactly.
+Relay the selectable gates to the user, especially the AI review gates
+\`karpathy-diff\`, \`gstack-review\`, and \`adversarial-review\`. When the user
+chooses gates, run the matching deterministic command exactly:
 
-If the user supplied \`--yes\`, \`--print\`, \`--list-gates\`, or \`--json\`,
-run the command directly through the runner. Do not add shell pipes to setup
-commands that may need interactivity.
+- \`review setup --yes\` to save the current recommended selection.
+- \`review setup --enable <gate-id>\` to enable an available gate.
+- \`review setup --disable <gate-id>\` to disable a preselected gate.
+- \`review setup --install <gate-id>\` to install and enable an optional gate
+  such as \`lint\` or \`adversarial-review\`.
+- \`review setup --list-gates\` to inspect the full catalog.
+- \`review setup --print\` to print the effective config.
+
+If the user supplied any setup flag, run the command directly through the
+runner. Do not add shell pipes to setup commands that may need interactivity.
 `;
   }
 

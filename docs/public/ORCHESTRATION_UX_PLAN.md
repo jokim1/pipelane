@@ -803,12 +803,18 @@ Each slice should land with focused tests before the next slice starts.
 - Detect package scripts and known skills/tools before rendering the gate list.
 - Add install-state detection for AI gates.
 - Add install approval flow for known missing AI gates.
+- Keep package-script installers conservative: use npm only when the repo looks
+  npm-managed, and return manual recipes for pnpm, Yarn, Bun, mixed lockfiles,
+  or framework-specific ESLint setup.
 - Save explicit selected gate config.
 - In non-TTY mode, do not hang and do not silently accept defaults. Either
-  require explicit flags such as `--yes` or `--print`, or print
-  the available choices and exit non-zero.
+  require explicit flags such as `--yes` or `--print`, or print the available
+  choices with exact follow-up commands and exit without writing config.
 - Automation examples:
   - `/pipelane review setup --yes`
+  - `/pipelane review setup --enable adversarial-review`
+  - `/pipelane review setup --disable gstack-review`
+  - `/pipelane review setup --install lint`
   - `/pipelane review setup --print --json`
   - `/pipelane review setup --list-gates --json`
 
@@ -890,7 +896,7 @@ Failure-mode matrix:
 
 | Codepath | Realistic failure | Required handling | Required test |
 | --- | --- | --- | --- |
-| Interactive review setup | Missing TTY in CI or scripted usage | Print explicit flags/options and exit non-zero | Non-TTY bare setup test |
+| Interactive review setup | Missing TTY in CI or scripted usage | Print explicit flags/options and exit without writing config | Non-TTY bare setup test |
 | AI gate enablement | Skill install unavailable or auth missing | Leave gate disabled with clear guidance | Missing AI gate decline/failure test |
 | Compact review config save | Existing custom config accidentally overwritten | Preserve compatible custom keys; only remove generated defaults | Existing config preservation test |
 | Likely plan scan | Huge docs directory or binary-like Markdown file | Cap scan count and bytes; continue with ranked partial results | Large/ignored file ranking test |
@@ -952,8 +958,8 @@ Conflict flags:
 ### Review Setup
 
 - Bare `/pipelane review setup` renders the interactive gate list.
-- Bare `/pipelane review setup` exits non-zero in non-TTY mode unless explicit
-  automation flags are provided.
+- Bare `/pipelane review setup` exits without writing config in non-TTY mode
+  unless explicit automation flags are provided.
 - Accepting unchanged recommendations writes the explicit selected gate list.
 - Customizing any gate writes explicit selected gate config.
 - Saving writes selected gates and preserves existing compatible config.

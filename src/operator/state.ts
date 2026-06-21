@@ -715,6 +715,9 @@ export interface OperatorFlags {
   makeBlocking: boolean;
   reviewPrint: boolean;
   reviewListGates: boolean;
+  reviewEnable: string[];
+  reviewDisable: string[];
+  reviewInstall: string[];
   reviewDryRun: boolean;
   reviewGate: string;
   reviewPhase: string;
@@ -2766,6 +2769,9 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     makeBlocking: false,
     reviewPrint: false,
     reviewListGates: false,
+    reviewEnable: [],
+    reviewDisable: [],
+    reviewInstall: [],
     reviewDryRun: false,
     reviewGate: '',
     reviewPhase: '',
@@ -3114,6 +3120,18 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       flags.reviewListGates = true;
       continue;
     }
+    if (flagName === '--enable') {
+      flags.reviewEnable.push(...splitCsvFlagValue(readFlagValue('--enable')));
+      continue;
+    }
+    if (flagName === '--disable') {
+      flags.reviewDisable.push(...splitCsvFlagValue(readFlagValue('--disable')));
+      continue;
+    }
+    if (flagName === '--install') {
+      flags.reviewInstall.push(...splitCsvFlagValue(readFlagValue('--install')));
+      continue;
+    }
     if (flagName === '--dry-run') {
       rejectInlineValue('--dry-run');
       flags.reviewDryRun = true;
@@ -3168,6 +3186,13 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     positional: positional.slice(1),
     flags,
   };
+}
+
+function splitCsvFlagValue(value: string): string[] {
+  return value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
 }
 
 export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
@@ -3362,9 +3387,9 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
     case 'review': {
       const subcommand = parsed.positional[0] ?? '';
       if (subcommand === 'setup') {
-        assertOnlyFlags(parsed, ['reviewPrint', 'reviewListGates', 'yes']);
+        assertOnlyFlags(parsed, ['reviewPrint', 'reviewListGates', 'reviewEnable', 'reviewDisable', 'reviewInstall', 'yes']);
         if (parsed.positional.length !== 1) {
-          throw new Error('review setup requires exactly: pipelane run review setup [--yes] [--print] [--list-gates]');
+          throw new Error('review setup requires exactly: pipelane run review setup [--yes] [--print] [--list-gates] [--enable <gate>] [--disable <gate>] [--install <gate>]');
         }
         return;
       }
@@ -3383,7 +3408,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       }
       assertOnlyFlags(parsed, ['reviewDryRun', 'reviewGate', 'reviewPhase']);
       if (parsed.positional.length > 0) {
-        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review pass --gate <id> --message <text>, or pipelane run review setup [--yes] [--print] [--list-gates]');
+        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review pass --gate <id> --message <text>, or pipelane run review setup [--yes] [--print] [--list-gates] [--enable <gate>] [--disable <gate>] [--install <gate>]');
       }
       const phase = parsed.flags.reviewPhase.trim();
       if (phase && !includesString(REVIEW_GATE_PHASES, phase)) {
@@ -3730,6 +3755,9 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'makeBlocking', label: '--make-blocking', active: (flags) => flags.makeBlocking },
   { key: 'reviewPrint', label: '--print', active: (flags) => flags.reviewPrint },
   { key: 'reviewListGates', label: '--list-gates', active: (flags) => flags.reviewListGates },
+  { key: 'reviewEnable', label: '--enable', active: (flags) => flags.reviewEnable.length > 0 },
+  { key: 'reviewDisable', label: '--disable', active: (flags) => flags.reviewDisable.length > 0 },
+  { key: 'reviewInstall', label: '--install', active: (flags) => flags.reviewInstall.length > 0 },
   { key: 'reviewDryRun', label: '--dry-run', active: (flags) => flags.reviewDryRun },
   { key: 'reviewGate', label: '--gate', active: (flags) => flags.reviewGate.trim().length > 0 },
   { key: 'reviewPhase', label: '--phase', active: (flags) => flags.reviewPhase.trim().length > 0 },

@@ -50,6 +50,7 @@ import {
   runGit,
   loadReviewState,
   type ParsedOperatorArgs,
+  type ReviewGateConfig,
   type ReviewGateRunRecord,
   type ReviewGatePhase,
   type ReviewRunRecord,
@@ -644,13 +645,27 @@ async function autoFixFailedReviewSlices(
       };
     }
 
+    writeOrchestrationReviewProgress(
+      { dryRun: false },
+      `review auto-fix attempt ${attempt}/${maxFixAttempts}: ${failedSlices.length} ${failedSlices.length === 1 ? 'slice' : 'slices'} with failed blocking gates`,
+    );
+
     for (const { slice, failedGates } of failedSlices) {
+      const failedGateIds = failedGates.map((gate) => gate.gateId);
       const prepared = prepareSliceForReviewAutoFix(context, run, slice, failedGates, attempt);
       if (slice.review) {
         appendSliceReviewDiagnostic(slice, slice.review);
         slice.review = null;
       }
+      writeOrchestrationReviewProgress(
+        { dryRun: false },
+        `slice ${slice.id}: starting review auto-fix attempt ${attempt}/${maxFixAttempts} for gates ${failedGateIds.join(', ')}`,
+      );
       const worker = await runProviderWorker(context, run, prepared);
+      writeOrchestrationReviewProgress(
+        { dryRun: false },
+        `slice ${slice.id}: review auto-fix attempt ${attempt}/${maxFixAttempts} worker ${worker.status}; log ${worker.logPath}`,
+      );
       slice.worker = worker;
       slice.status = worker.status === 'succeeded' ? 'completed' : 'failed';
       attempts.push({
@@ -658,7 +673,7 @@ async function autoFixFailedReviewSlices(
         status: slice.status,
         workerStatus: worker.status,
         attempt,
-        failedGateIds: failedGates.map((gate) => gate.gateId),
+        failedGateIds,
         promptPath: prepared.promptPath,
         logPath: worker.logPath,
         exitCode: worker.exitCode,
@@ -668,7 +683,7 @@ async function autoFixFailedReviewSlices(
         status: slice.status,
         workerStatus: worker.status,
         attempt,
-        failedGateIds: failedGates.map((gate) => gate.gateId),
+        failedGateIds,
         promptPath: prepared.promptPath,
         logPath: worker.logPath,
         exitCode: worker.exitCode,
@@ -691,6 +706,10 @@ async function autoFixFailedReviewSlices(
       };
     }
 
+    writeOrchestrationReviewProgress(
+      { dryRun: false },
+      `review auto-fix attempt ${attempt}/${maxFixAttempts}: rerunning review gates`,
+    );
     latestReview = reviewCompletedSlices(context, run, {
       sliceId: null,
       dryRun: false,
@@ -698,6 +717,10 @@ async function autoFixFailedReviewSlices(
       phaseFilter: '',
       requireGates: true,
     });
+    writeOrchestrationReviewProgress(
+      { dryRun: false },
+      `review auto-fix attempt ${attempt}/${maxFixAttempts}: review ${latestReview.status} (${latestReview.failedCount} failed, ${latestReview.pendingCount} pending, ${latestReview.blockedCount} blocked)`,
+    );
     if (latestReview.status !== 'failed') {
       return {
         status: 'fixed',
@@ -1294,6 +1317,10 @@ function renderApprovedOrchestrationReport(
   for (const slice of run.slices) {
     lines.push(`- ${slice.id}: ${slice.status}${slice.worker ? ` worker=${slice.worker.status}` : ''} review=${slice.review?.status ?? 'none'}`);
   }
+  const pendingGateLines = reviewResult?.pendingCount ? formatPendingReviewGateInstructions(run) : [];
+  if (pendingGateLines.length > 0) {
+    lines.push('', 'Pending gates:', ...pendingGateLines);
+  }
   if (!reviewResult) {
     lines.push('', 'Next: resolve worker failures or blocked slices, then rerun /pipelane orchestrate start or /pipelane orchestrate review.');
   } else if (reviewResult.failedCount > 0) {
@@ -1761,9 +1788,10 @@ function reviewCompletedSlices(
   let pendingCount = 0;
   let blockedCount = 0;
 
-  for (const slice of selectedSlices) {
+  for (const [sliceIndex, slice] of selectedSlices.entries()) {
     const blocker = reviewBlocker(context, slice);
     if (blocker) {
+      writeOrchestrationReviewProgress(options, `slice ${slice.id} (${sliceIndex + 1}/${selectedSlices.length}) blocked - ${blocker}`);
       blockedCount += 1;
       reports.push(buildBlockedReviewReport(slice, blocker));
       continue;
@@ -1771,6 +1799,7 @@ function reviewCompletedSlices(
 
     assertPreparedWorktreeSafe(context, slice.id, slice.branchName ?? '', slice.worktreePath ?? '');
     const sliceRepoRoot = slice.worktreePath ?? context.repoRoot;
+    writeOrchestrationReviewProgress(options, `reviewing slice ${slice.id} (${sliceIndex + 1}/${selectedSlices.length}) in ${sliceRepoRoot}`);
     const sliceContext = buildSliceReviewContext(context, sliceRepoRoot);
     const reviewRun = attachAttestedManualGateEvidence(sliceContext, buildReviewRunRecord({
       repoRoot: sliceRepoRoot,
@@ -1780,6 +1809,12 @@ function reviewCompletedSlices(
       gateFilter: options.gateFilter,
       phaseFilter: options.phaseFilter,
       activeSurfaces: resolveSliceActiveSurfaces(context, run, slice),
+      onGateStart: (gate) => {
+        writeOrchestrationReviewProgress(options, `slice ${slice.id}: starting gate ${gate.id} [${gate.phase}] ${formatReviewGateProgressTarget(gate)}`);
+      },
+      onGateFinish: (gate) => {
+        writeOrchestrationReviewProgress(options, `slice ${slice.id}: gate ${gate.gateId} ${gate.status} after ${gate.durationMs}ms - ${gate.summary}`);
+      },
     }));
     const reviewRecord = buildSliceReviewRecord(context, run, slice, reviewRun);
     if (options.requireGates && reviewRun.gates.length === 0) {
@@ -1857,6 +1892,34 @@ function reviewCompletedSlices(
     blockedCount,
     slices: reports,
   };
+}
+
+function writeOrchestrationReviewProgress(
+  options: { dryRun: boolean },
+  message: string,
+): void {
+  if (options.dryRun) return;
+  process.stderr.write(`[pipelane] orchestrate review: ${oneLineForProgress(message)}\n`);
+}
+
+function formatReviewGateProgressTarget(gate: {
+  type: ReviewGateConfig['type'];
+  command?: string;
+  skill?: string;
+  role?: string;
+  userCommands?: string[];
+}): string {
+  if (gate.command) return oneLineForProgress(gate.command);
+  if (gate.userCommands?.[0]) return oneLineForProgress(gate.userCommands[0]);
+  if (gate.skill) return oneLineForProgress(`skill:${gate.skill}`);
+  if (gate.role) return oneLineForProgress(gate.role);
+  return oneLineForProgress(gate.type);
+}
+
+function oneLineForProgress(value: string): string {
+  const collapsed = redactOrchestrationWorkerText(value).replace(/\s+/g, ' ').trim();
+  if (collapsed.length <= 240) return collapsed;
+  return `${collapsed.slice(0, 237)}...`;
 }
 
 function buildSliceReviewContext(parentContext: WorkflowContext, sliceRepoRoot: string): WorkflowContext {
@@ -3283,6 +3346,7 @@ function renderOrchestrationReviewReport(
     '',
     'Slice review evidence:',
   ];
+  const pendingGateLines = formatPendingReviewGateInstructions(run);
 
   if (result.slices.length === 0) {
     lines.push('- none');
@@ -3294,6 +3358,10 @@ function renderOrchestrationReviewReport(
         lines.push(`- ${slice.id}: ${slice.reviewStatus ?? 'unknown'} ${slice.runId ?? ''} (${slice.gateCount} gates)`);
       }
     }
+  }
+
+  if (pendingGateLines.length > 0) {
+    lines.push('', 'Pending gates:', ...pendingGateLines);
   }
 
   if (sliceId || options.dryRun || options.gateFilter || options.phaseFilter) {
@@ -3318,6 +3386,44 @@ function renderOrchestrationReviewReport(
   }
 
   return lines.join('\n');
+}
+
+function formatPendingReviewGateInstructions(run: OrchestrationRunRecord): string[] {
+  const lines: string[] = [];
+  const seen = new Set<string>();
+
+  for (const slice of run.slices) {
+    const review = latestSliceReviewRecord(slice);
+    if (!review) continue;
+
+    for (const gate of review.run.gates) {
+      if (gate.status !== 'pending') continue;
+      const key = `${slice.id}:${review.run.id}:${gate.gateId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const worktree = slice.worktreePath ? ` (worktree: ${slice.worktreePath})` : '';
+      lines.push(`- ${slice.id}/${gate.gateId}: ${formatPendingReviewGateAction(gate)}${worktree}`);
+    }
+  }
+
+  return lines;
+}
+
+function latestSliceReviewRecord(slice: OrchestrationSliceRecord): OrchestrationSliceReviewRecord | null {
+  const records = [
+    ...(slice.review ? [slice.review] : []),
+    ...(slice.reviewDiagnostics ?? []),
+  ];
+  return records.reduce<OrchestrationSliceReviewRecord | null>((latest, record) =>
+    latest === null || record.reviewedAt > latest.reviewedAt ? record : latest
+  , null);
+}
+
+function formatPendingReviewGateAction(gate: ReviewGateRunRecord): string {
+  const summary = oneLineForProgress(gate.summary || 'pending review gate');
+  const target = formatReviewGateProgressTarget(gate);
+  if (!target || summary.includes(target)) return summary;
+  return `${summary}; ${target}`;
 }
 
 function isBlockedReviewEvidenceReport(slice: ReviewedSliceReport): boolean {

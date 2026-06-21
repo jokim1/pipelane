@@ -88,6 +88,11 @@ does not write Pipelane files into the current repo.
 `https://github.com/jokim1/karpathy-skills.git` into `$CODEX_HOME/skills` after
 you explicitly approve the install prompt.
 
+For package-script gates such as lint and format check, automatic dependency
+installation is intentionally conservative: it runs only for npm projects. pnpm,
+Yarn, Bun, conflicting lockfiles, and framework-specific ESLint setups get a
+manual recipe instead of a generated config or package-manager mutation.
+
 If your task worktrees share `node_modules` through a symlink, install the local
 npm guard too:
 
@@ -269,6 +274,9 @@ Set up the review stack:
 /pipelane review setup --yes
 /pipelane review setup --print
 /pipelane review setup --list-gates
+/pipelane review setup --enable adversarial-review
+/pipelane review setup --disable gstack-review
+/pipelane review setup --install lint
 ```
 
 Run the review stack:
@@ -290,6 +298,12 @@ The gate order is:
 
 Static gates run before AI review. There is no reason to spend model attention
 on syntax, type, style, or build errors that deterministic tools can catch.
+Bare setup prints a selector for available, missing, and installable gates.
+Use `--enable`, `--disable`, and `--install` to save exact choices from a
+non-interactive agent session. `--install` uses npm only for package-script
+gates; unsupported package managers and framework-specific lint configs print a
+manual recipe to apply with your project tooling. `--print` and `--list-gates`
+are read-only and cannot be combined with modifying flags.
 
 `/pipelane review` writes evidence for the current branch, HEAD, and worktree
 state. `/pr` checks that evidence before it commits, pushes, or opens a PR.
@@ -347,7 +361,9 @@ It still stops before PR creation, merge, deploy, and cleanup. Failed executable
 review gates get a bounded review-fix worker attempt before Pipelane reruns
 review. Remaining failed, pending, or blocked slice reviews leave the
 orchestration active and return a non-zero exit code; orchestration review
-completion requires at least one effective review gate.
+completion requires at least one effective review gate. The review and
+review-fix phases print progress on stderr, and pending manual/AI gates are
+reported with the slice, gate, command, and worktree to act on.
 The advanced commands below remain available for recovery and step-by-step
 control.
 

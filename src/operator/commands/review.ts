@@ -1,12 +1,13 @@
 import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
-import { accessSync, chmodSync, constants, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync } from 'node:fs';
+import { accessSync, chmodSync, constants, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline/promises';
 
 import {
   detectPackageScripts,
+  resolveReviewGateAlias,
   resolveReviewGateCatalog,
   type ResolvedReviewGateCatalogEntry,
 } from '../review-gates.ts';
@@ -40,6 +41,7 @@ const REVIEW_CONFIG_CHANGE_GATE_ID = 'review-config-change';
 const REVIEW_CONFIG_CHANGE_PATHS = ['.pipelane.json', '.project-workflow.json', 'package.json'];
 const REVIEW_PHASE_ORDER = REVIEW_GATE_PHASES;
 const DEFAULT_GATE_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_REVIEW_SETUP_NPM_INSTALL_TIMEOUT_MS = 2 * 60 * 1000;
 const OUTPUT_TAIL_CHARS = 4000;
 const CODEX_CLAUDE_REVIEW_REPO = 'https://github.com/jokim1/codexskill-claude-review.git';
 const CODEX_CLAUDE_REVIEW_SKILL_NAME = 'claude';
@@ -57,6 +59,31 @@ interface ReviewGateInstallOption {
   label: string;
   target: string;
   install(): ReviewGateInstallResult;
+}
+
+type PackageManagerId = 'npm' | 'pnpm' | 'yarn' | 'bun' | 'unknown' | 'unsupported' | 'conflict';
+
+interface DetectedPackageManager {
+  id: PackageManagerId;
+  source: string;
+  packageManager?: string;
+  lockfile?: string;
+  conflicts?: string[];
+}
+
+interface ReviewSetupSelectionResult {
+  messages: string[];
+  enabledIds: string[];
+  disabledIds: string[];
+  installedIds: string[];
+}
+
+interface ReviewSetupSaveOptions {
+  existingReviewGates?: ReviewGateConfig[];
+  preserveExistingReviewGates?: boolean;
+  useSelectedDefaults?: boolean;
+  changedGateIds?: Set<string>;
+  disabledGateIds?: Set<string>;
 }
 
 interface AdversarialReviewProvider {
@@ -116,6 +143,7 @@ interface ReviewSetupReport {
     optional?: boolean;
     missingReason?: string;
   }>;
+  actions?: string[];
   message: string;
 }
 
@@ -137,6 +165,8 @@ export interface BuildReviewRunRecordOptions {
   gateFilter?: string;
   phaseFilter?: ReviewGatePhase | '';
   activeSurfaces: string[];
+  onGateStart?: (gate: ReviewGateConfig) => void;
+  onGateFinish?: (gate: ReviewGateRunRecord) => void;
 }
 
 export async function handleReview(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
@@ -156,21 +186,38 @@ export async function handleReview(cwd: string, parsed: ParsedOperatorArgs): Pro
 async function handleReviewSetup(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   let context = resolveWorkflowContext(cwd);
   let writeResult: { configPath: string; isLegacy: boolean } | null = null;
+  const actionMessages: string[] = [];
+  const selectionFlags = hasReviewSetupSelectionFlags(parsed);
+  if (selectionFlags && (parsed.flags.reviewPrint || parsed.flags.reviewListGates)) {
+    throw new Error('review setup cannot combine modifying flags (--enable, --disable, --install) with read-only flags (--print, --list-gates). Run the modifying command first, then inspect with --print or --list-gates.');
+  }
 
-  if (parsed.flags.yes) {
+  if (parsed.flags.yes || selectionFlags) {
     const prepared = prepareInteractiveReviewSetup(context.repoRoot);
-    writeResult = saveInteractiveReviewSetup(context.repoRoot, prepared.gates);
+    const selectionResult = applyReviewSetupSelections(context.repoRoot, prepared, parsed);
+    actionMessages.push(...selectionResult.messages);
+    const existingReviewGates = context.config.reviewGates?.gates ?? [];
+    writeResult = saveInteractiveReviewSetup(context.repoRoot, prepared.gates, {
+      existingReviewGates,
+      preserveExistingReviewGates: selectionFlags,
+      useSelectedDefaults: parsed.flags.yes,
+      changedGateIds: new Set([...selectionResult.enabledIds, ...selectionResult.installedIds]),
+      disabledGateIds: new Set(selectionResult.disabledIds),
+    });
     context = resolveWorkflowContext(cwd);
   }
 
   if (
     !parsed.flags.yes
+    && !selectionFlags
     && !parsed.flags.reviewPrint
     && !parsed.flags.reviewListGates
     && !parsed.flags.json
   ) {
     if (!canRunInteractiveReviewSetup()) {
-      throw new Error('review setup requires a TTY for interactive setup. Use --yes to save recommended gates, --print, --list-gates, or --json for non-interactive output.');
+      const prepared = prepareInteractiveReviewSetup(context.repoRoot);
+      process.stdout.write(`${renderNonInteractiveReviewSetup(prepared)}\n`);
+      return;
     }
     await runInteractiveReviewSetup(cwd, parsed);
     return;
@@ -221,6 +268,7 @@ async function handleReviewSetup(cwd: string, parsed: ParsedOperatorArgs): Promi
           missingReason: entry.missingReason,
         }))
       : undefined,
+    actions: actionMessages,
     message: '',
   };
   report.message = renderReviewSetupReport(report, {
@@ -440,6 +488,156 @@ function prepareInteractiveReviewSetup(repoRoot: string): {
   };
 }
 
+function hasReviewSetupSelectionFlags(parsed: ParsedOperatorArgs): boolean {
+  return parsed.flags.reviewEnable.length > 0
+    || parsed.flags.reviewDisable.length > 0
+    || parsed.flags.reviewInstall.length > 0;
+}
+
+function applyReviewSetupSelections(
+  repoRoot: string,
+  prepared: { gates: ReviewSetupGateOption[] },
+  parsed: ParsedOperatorArgs,
+): ReviewSetupSelectionResult {
+  const installIds = resolveReviewSetupGateInputs(prepared.gates, parsed.flags.reviewInstall, '--install');
+  const enableIds = resolveReviewSetupGateInputs(prepared.gates, parsed.flags.reviewEnable, '--enable');
+  const disableIds = resolveReviewSetupGateInputs(prepared.gates, parsed.flags.reviewDisable, '--disable');
+  const installSet = new Set(installIds);
+  const enableSet = new Set(enableIds);
+  const disableSet = new Set(disableIds);
+  const conflicting = [...new Set([...installIds, ...enableIds])]
+    .filter((id) => disableSet.has(id));
+  if (conflicting.length > 0) {
+    throw new Error(`review setup cannot both enable/install and disable: ${conflicting.join(', ')}`);
+  }
+
+  const messages: string[] = [];
+  for (const id of installSet) {
+    const gate = requirePreparedGate(prepared.gates, id);
+    messages.push(installPreparedReviewGate(repoRoot, prepared.gates, gate));
+  }
+  for (const id of disableSet) {
+    const gate = requirePreparedGate(prepared.gates, id);
+    gate.selected = false;
+    gate.adversarialProvider = undefined;
+    messages.push(`Disabled ${gate.entry.id}.`);
+  }
+  for (const id of enableSet) {
+    const gate = requirePreparedGate(prepared.gates, id);
+    enablePreparedReviewGate(repoRoot, gate);
+    messages.push(`Enabled ${gate.entry.id}.`);
+  }
+
+  return {
+    messages,
+    enabledIds: enableIds,
+    disabledIds: disableIds,
+    installedIds: installIds,
+  };
+}
+
+function resolveReviewSetupGateInputs(
+  gates: ReviewSetupGateOption[],
+  inputs: string[],
+  flagName: string,
+): string[] {
+  return [...new Set(inputs.map((input) => resolveReviewSetupGateInput(gates, input, flagName)))];
+}
+
+function resolveReviewSetupGateInput(
+  gates: ReviewSetupGateOption[],
+  input: string,
+  flagName: string,
+): string {
+  const trimmed = input.trim();
+  const numeric = Number.parseInt(trimmed, 10);
+  if (/^\d+$/.test(trimmed) && Number.isSafeInteger(numeric)) {
+    const gate = gates.find((candidate) => candidate.number === numeric);
+    if (gate) return gate.entry.id;
+  }
+
+  const alias = resolveReviewGateAlias(trimmed);
+  const normalized = (alias ?? trimmed).toLowerCase();
+  const gate = gates.find((candidate) => candidate.entry.id === normalized);
+  if (!gate) {
+    throw new Error(`${flagName} received unknown review gate "${input}". Run "pipelane run review setup --list-gates" to inspect available gate ids.`);
+  }
+  return gate.entry.id;
+}
+
+function requirePreparedGate(gates: ReviewSetupGateOption[], id: string): ReviewSetupGateOption {
+  const gate = gates.find((candidate) => candidate.entry.id === id);
+  if (!gate) {
+    throw new Error(`Unknown review gate "${id}".`);
+  }
+  return gate;
+}
+
+function enablePreparedReviewGate(repoRoot: string, gate: ReviewSetupGateOption): void {
+  if (!gate.entry.available) {
+    const installHint = hasReviewGateInstaller(gate.entry, repoRoot)
+      ? ` Run "pipelane run review setup --install ${gate.entry.id}" to install and enable it.`
+      : '';
+    throw new Error(`${gate.entry.id} cannot be enabled: ${gate.entry.missingReason ?? 'gate unavailable'}.${installHint}`);
+  }
+
+  if ((gate.entry.type === 'skill' || gate.entry.type === 'agent') && gate.installState !== 'installed') {
+    throw new Error(`${gate.entry.id} needs an installed reviewer before it can be enabled. Run "pipelane run review setup --install ${gate.entry.id}" to install and enable it.`);
+  }
+
+  if (gate.entry.id === 'adversarial-review') {
+    gate.adversarialProvider = preferredAdversarialReviewProvider(repoRoot);
+  }
+  gate.selected = true;
+}
+
+function installPreparedReviewGate(
+  repoRoot: string,
+  gates: ReviewSetupGateOption[],
+  gate: ReviewSetupGateOption,
+): string {
+  if (gate.entry.type === 'command' && gate.entry.available) {
+    gate.installState = 'not applicable';
+    gate.selected = true;
+    return `${gate.entry.id} already has a package.json script${gate.entry.matchedScript ? ` (${gate.entry.matchedScript})` : ''}; enabled without install.`;
+  }
+
+  const installers = reviewGateInstallOptions(gate.entry, repoRoot);
+  if (installers.length === 0) {
+    throw new Error(`${gate.entry.id} has no automatic installer. ${gate.entry.missingReason ?? ''}`.trim());
+  }
+
+  const result = installers[0].install();
+  if (!result.ok) {
+    throw new Error(result.message);
+  }
+
+  if (gate.entry.type === 'command') {
+    const refreshed = resolveReviewGateCatalog({ repoRoot }).find((entry) => entry.id === gate.entry.id);
+    if (!refreshed?.available) {
+      gate.selected = false;
+      throw new Error(`${result.message} ${gate.entry.id} is still unavailable: ${refreshed?.missingReason ?? 'package.json script not detected'}`);
+    }
+    gate.entry = refreshed;
+    gate.installState = 'not applicable';
+  } else {
+    gate.installState = 'installed';
+  }
+
+  if (gate.entry.id === 'adversarial-review') {
+    gate.adversarialProvider = preferredAdversarialReviewProvider(repoRoot);
+  }
+  gate.selected = true;
+  renumberPreparedGates(gates);
+  return result.message;
+}
+
+function renumberPreparedGates(gates: ReviewSetupGateOption[]): void {
+  gates.forEach((gate, index) => {
+    gate.number = index + 1;
+  });
+}
+
 function orderInteractiveReviewCatalog(entries: ResolvedReviewGateCatalogEntry[]): ResolvedReviewGateCatalogEntry[] {
   const order = new Map<string, number>([
     ['typecheck', 10],
@@ -475,18 +673,22 @@ function isRecommendedInteractiveGate(entry: ResolvedReviewGateCatalogEntry, ins
 }
 
 function detectGateInstallState(repoRoot: string, entry: ResolvedReviewGateCatalogEntry): GateInstallState {
+  if (entry.type === 'command') {
+    if (entry.available) return 'not applicable';
+    return reviewGateInstallOptions(entry, repoRoot).length > 0 ? 'not installed' : 'unavailable';
+  }
   if (entry.type !== 'skill' && entry.type !== 'agent') return 'not applicable';
   if (entry.id === 'adversarial-review') {
     return isAdversarialReviewInstalled(repoRoot)
       ? 'installed'
-      : reviewGateInstallOptions(entry).length > 0
+      : reviewGateInstallOptions(entry, repoRoot).length > 0
         ? 'not installed'
         : 'unavailable';
   }
   const names = knownInstallNamesForGate(entry);
   if (names.length === 0) return 'unavailable';
   if (names.some((name) => isSkillInstalled(repoRoot, name))) return 'installed';
-  return hasReviewGateInstaller(entry) ? 'not installed' : 'unavailable';
+  return hasReviewGateInstaller(entry, repoRoot) ? 'not installed' : 'unavailable';
 }
 
 function knownInstallNamesForGate(entry: ResolvedReviewGateCatalogEntry): string[] {
@@ -660,12 +862,12 @@ async function toggleInteractiveGate(
     return;
   }
 
-  if (!gate.entry.available) {
+  if (!gate.entry.available && gate.installState === 'unavailable') {
     process.stdout.write(`${gate.label} cannot be enabled: ${gate.entry.missingReason ?? 'gate unavailable'}.\n`);
     return;
   }
 
-  if ((gate.entry.type === 'skill' || gate.entry.type === 'agent') && gate.installState === 'unavailable') {
+  if ((gate.entry.type === 'command' || gate.entry.type === 'skill' || gate.entry.type === 'agent') && gate.installState === 'unavailable') {
     process.stdout.write([
       `${gate.label} is unavailable.`,
       `Install ${reviewSetupInstallTarget(gate.entry)} outside Pipelane, then rerun review setup.`,
@@ -674,8 +876,8 @@ async function toggleInteractiveGate(
     return;
   }
 
-  if ((gate.entry.type === 'skill' || gate.entry.type === 'agent') && gate.installState !== 'installed') {
-    const installers = reviewGateInstallOptions(gate.entry);
+  if ((gate.entry.type === 'command' || gate.entry.type === 'skill' || gate.entry.type === 'agent') && gate.installState !== 'installed' && gate.installState !== 'not applicable') {
+    const installers = reviewGateInstallOptions(gate.entry, repoRoot);
     if (installers.length === 0) {
       process.stdout.write([
         `${gate.label} is unavailable.`,
@@ -695,7 +897,18 @@ async function toggleInteractiveGate(
 
     const result = selectedInstaller.install();
     if (result.ok) {
-      gate.installState = 'installed';
+      if (gate.entry.type === 'command') {
+        const refreshed = resolveReviewGateCatalog({ repoRoot }).find((entry) => entry.id === gate.entry.id);
+        if (!refreshed?.available) {
+          gate.selected = false;
+          process.stdout.write(`${result.message}\n${gate.label} remains disabled: ${refreshed?.missingReason ?? 'package.json script not detected'}.\n`);
+          return;
+        }
+        gate.entry = refreshed;
+        gate.installState = 'not applicable';
+      } else {
+        gate.installState = 'installed';
+      }
       if (gate.entry.id === 'adversarial-review') {
         gate.adversarialProvider = preferredAdversarialReviewProvider(repoRoot);
       }
@@ -706,6 +919,11 @@ async function toggleInteractiveGate(
     gate.selected = false;
     gate.adversarialProvider = undefined;
     process.stdout.write(`${result.message}\n${gate.label} remains disabled.\n`);
+    return;
+  }
+
+  if (!gate.entry.available) {
+    process.stdout.write(`${gate.label} cannot be enabled: ${gate.entry.missingReason ?? 'gate unavailable'}.\n`);
     return;
   }
 
@@ -750,13 +968,16 @@ async function chooseReviewGateInstaller(
   return installers[installAnswer - 1];
 }
 
-function hasReviewGateInstaller(entry: ResolvedReviewGateCatalogEntry): boolean {
-  return reviewGateInstallOptions(entry).length > 0;
+function hasReviewGateInstaller(entry: ResolvedReviewGateCatalogEntry, repoRoot?: string): boolean {
+  return reviewGateInstallOptions(entry, repoRoot).length > 0;
 }
 
-function reviewGateInstallOptions(entry: ResolvedReviewGateCatalogEntry): ReviewGateInstallOption[] {
-  const testInstaller = testReviewGateInstallOption(entry);
+function reviewGateInstallOptions(entry: ResolvedReviewGateCatalogEntry, repoRoot?: string): ReviewGateInstallOption[] {
+  const testInstaller = testReviewGateInstallOption(entry, repoRoot);
   if (testInstaller) return [testInstaller];
+
+  const commandInstaller = commandReviewGateInstallOption(entry, repoRoot);
+  if (commandInstaller) return [commandInstaller];
 
   if (entry.id === 'adversarial-review') {
     const codexHome = codexHomePath();
@@ -790,7 +1011,7 @@ function isKarpathyReviewGate(entry: ResolvedReviewGateCatalogEntry): boolean {
   return entry.id === 'karpathy-diff' || entry.id === 'karpathy-audit';
 }
 
-function testReviewGateInstallOption(entry: ResolvedReviewGateCatalogEntry): ReviewGateInstallOption | null {
+function testReviewGateInstallOption(entry: ResolvedReviewGateCatalogEntry, repoRoot?: string): ReviewGateInstallOption | null {
   if (process.env.NODE_ENV === 'test') {
     const allowed = configuredTestReviewGateInstallers();
     if (allowed.includes(entry.id) || entry.id === 'adversarial-review') {
@@ -799,12 +1020,521 @@ function testReviewGateInstallOption(entry: ResolvedReviewGateCatalogEntry): Rev
         label: reviewSetupInstallTarget(entry),
         target: reviewSetupInstallTarget(entry),
         install: () => allowed.includes(entry.id)
-          ? { ok: true, message: `Installed ${entry.id}.` }
+          ? installTestReviewGate(repoRoot, entry)
           : { ok: false, message: `No test installer succeeded for ${entry.id}.` },
       };
     }
   }
   return null;
+}
+
+function installTestReviewGate(repoRoot: string | undefined, entry: ResolvedReviewGateCatalogEntry): ReviewGateInstallResult {
+  if (entry.type === 'command') {
+    if (!repoRoot) return { ok: false, message: `No repo root available for ${entry.id} test install.` };
+    const scriptName = entry.scriptNames?.[0] ?? entry.id;
+    const command = defaultPackageScriptForCommandGate(entry.id, scriptName);
+    const patched = patchPackageJsonScript(repoRoot, scriptName, command);
+    return patched.ok
+      ? { ok: true, message: `Installed ${entry.id}.` }
+      : patched;
+  }
+  return { ok: true, message: `Installed ${entry.id}.` };
+}
+
+function commandReviewGateInstallOption(entry: ResolvedReviewGateCatalogEntry, repoRoot?: string): ReviewGateInstallOption | null {
+  if (entry.type !== 'command') return null;
+  if (!repoRoot) return null;
+  if (!['lint', 'format-check', 'dependency-audit', 'secret-scan'].includes(entry.id)) return null;
+
+  const scriptName = entry.scriptNames?.[0] ?? entry.id;
+  return {
+    id: `package-${entry.id}`,
+    label: `${entry.id} package script`,
+    target: path.join(repoRoot, 'package.json'),
+    install: () => installCommandReviewGate(repoRoot, entry, scriptName),
+  };
+}
+
+function installCommandReviewGate(
+  repoRoot: string,
+  entry: ResolvedReviewGateCatalogEntry,
+  scriptName: string,
+): ReviewGateInstallResult {
+  if (entry.id === 'dependency-audit') {
+    const packageManager = detectPackageManager(repoRoot);
+    if (packageManager.id !== 'npm' && packageManager.id !== 'unknown') {
+      return unsupportedPackageManagerScriptRecipe(packageManager, entry.id, scriptName);
+    }
+    if (!hasNpmAuditLockfile(repoRoot)) {
+      return missingNpmAuditLockfileRecipe(entry.id, scriptName);
+    }
+    return patchPackageJsonScript(repoRoot, scriptName, defaultPackageScriptForCommandGate(entry.id, scriptName));
+  }
+
+  if (entry.id === 'secret-scan') {
+    if (!isExecutableOnPath('gitleaks')) {
+      return {
+        ok: false,
+        message: 'gitleaks is not installed or not on PATH. Install gitleaks, then rerun review setup --install secret-scan.',
+      };
+    }
+    return patchPackageJsonScript(repoRoot, scriptName, defaultPackageScriptForCommandGate(entry.id, scriptName));
+  }
+
+  if (entry.id === 'format-check') {
+    const install = installNpmDevDependencies(repoRoot, ['prettier'], entry.id, scriptName);
+    if (!install.ok) return install;
+    return patchPackageJsonScript(repoRoot, scriptName, defaultPackageScriptForCommandGate(entry.id, scriptName));
+  }
+
+  if (entry.id === 'lint') {
+    const devDeps = usesTypeScript(repoRoot)
+      ? ['eslint', '@eslint/js', 'typescript-eslint', 'globals']
+      : ['eslint', '@eslint/js', 'globals'];
+    const installPreflight = preflightNpmDevDependencyInstall(repoRoot, devDeps, entry.id, scriptName);
+    if (!installPreflight.ok) return installPreflight;
+    const configSafety = defaultEslintConfigSafety(repoRoot);
+    if (!configSafety.ok) return configSafety;
+    const install = installNpmDevDependencies(repoRoot, devDeps, entry.id, scriptName);
+    if (!install.ok) return install;
+    const config = writeDefaultEslintConfig(repoRoot, usesTypeScript(repoRoot));
+    if (!config.ok) return config;
+    return patchPackageJsonScript(repoRoot, scriptName, defaultPackageScriptForCommandGate(entry.id, scriptName));
+  }
+
+  return { ok: false, message: `${entry.id} has no automatic installer.` };
+}
+
+function defaultPackageScriptForCommandGate(gateId: string, scriptName: string): string {
+  if (gateId === 'lint') return 'eslint .';
+  if (gateId === 'format-check') return 'prettier --check .';
+  if (gateId === 'secret-scan') return 'gitleaks detect --source . --redact';
+  if (gateId === 'dependency-audit') return 'npm audit';
+  return `npm run ${scriptName}`;
+}
+
+function readPackageJsonObject(repoRoot: string): Record<string, unknown> | null {
+  const packageJsonPath = path.join(repoRoot, 'package.json');
+  if (!existsSync(packageJsonPath)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function detectPackageManager(repoRoot: string): DetectedPackageManager {
+  const packageJson = readPackageJsonObject(repoRoot);
+  const declared = typeof packageJson?.packageManager === 'string'
+    ? packageJson.packageManager.trim()
+    : '';
+  const foundLockfiles = detectPackageManagerLockfiles(repoRoot);
+  const foundIds = [...new Set(foundLockfiles.map((candidate) => candidate.id))];
+  if (declared) {
+    const declaredId = parsePackageManagerId(declared);
+    if (
+      foundIds.length > 1
+      || (declaredId !== 'unsupported' && foundIds.some((id) => id !== declaredId))
+    ) {
+      return {
+        id: 'conflict',
+        source: `packageManager "${declared}" conflicts with lockfiles: ${foundLockfiles.map((candidate) => candidate.file).join(', ')}`,
+        packageManager: declared,
+        conflicts: foundLockfiles.map((candidate) => candidate.file),
+      };
+    }
+    return {
+      id: declaredId,
+      source: declaredId === 'unsupported'
+        ? `unsupported packageManager "${declared}"`
+        : `packageManager "${declared}"`,
+      packageManager: declared,
+    };
+  }
+
+  const found = foundLockfiles;
+  const ids = foundIds;
+  if (ids.length === 0) {
+    return { id: 'unknown', source: 'no packageManager field or lockfile' };
+  }
+  if (ids.length === 1) {
+    return { id: ids[0], source: `${found[0].file} lockfile`, lockfile: found[0].file };
+  }
+  return {
+    id: 'conflict',
+    source: `multiple package-manager lockfiles: ${found.map((candidate) => candidate.file).join(', ')}`,
+    conflicts: found.map((candidate) => candidate.file),
+  };
+}
+
+function detectPackageManagerLockfiles(repoRoot: string): Array<{ id: PackageManagerId; file: string }> {
+  const lockfiles: Array<{ id: PackageManagerId; file: string }> = [
+    { id: 'pnpm', file: 'pnpm-lock.yaml' },
+    { id: 'yarn', file: 'yarn.lock' },
+    { id: 'bun', file: 'bun.lockb' },
+    { id: 'bun', file: 'bun.lock' },
+    { id: 'npm', file: 'package-lock.json' },
+    { id: 'npm', file: 'npm-shrinkwrap.json' },
+  ];
+  return lockfiles.filter((candidate) => existsSync(path.join(repoRoot, candidate.file)));
+}
+
+function parsePackageManagerId(value: string): PackageManagerId {
+  const name = value.split('@')[0]?.trim().toLowerCase();
+  if (name === 'npm' || name === 'pnpm' || name === 'yarn' || name === 'bun') return name;
+  return 'unsupported';
+}
+
+function preflightNpmDevDependencyInstall(
+  repoRoot: string,
+  packages: string[],
+  gateId: string,
+  scriptName: string,
+): ReviewGateInstallResult {
+  if (!existsSync(path.join(repoRoot, 'package.json'))) {
+    const installCommand = `npm install --save-dev --ignore-scripts ${packages.join(' ')}`;
+    return {
+      ok: false,
+      message: `No package.json found; automatic ${gateId} install requires an existing npm project. Recipe: create package.json, run "${installCommand}", add package.json script "${scriptName}": "${defaultPackageScriptForCommandGate(gateId, scriptName)}", then rerun "review setup --enable ${gateId}".`,
+    };
+  }
+
+  const packageManager = detectPackageManager(repoRoot);
+  if (packageManager.id !== 'npm' && packageManager.id !== 'unknown') {
+    return unsupportedPackageManagerInstallRecipe(packageManager, packages, gateId, scriptName);
+  }
+
+  const nodeModulesPath = path.join(repoRoot, 'node_modules');
+  try {
+    if (lstatSync(nodeModulesPath).isSymbolicLink()) {
+      return {
+        ok: false,
+        message: 'node_modules is a symlink; refusing to run npm install through it. Remove the symlink or install dependencies in the real dependency root, then rerun review setup.',
+      };
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      return {
+        ok: false,
+        message: 'Could not inspect node_modules safely; refusing to run npm install.',
+      };
+    }
+  }
+
+  if (!isExecutableOnPath('npm')) {
+    return { ok: false, message: 'npm is not installed or not on PATH.' };
+  }
+
+  return { ok: true, message: 'npm install preflight passed.' };
+}
+
+function unsupportedPackageManagerInstallRecipe(
+  packageManager: DetectedPackageManager,
+  packages: string[],
+  gateId: string,
+  scriptName: string,
+): ReviewGateInstallResult {
+  const installCommand = packageManagerDependencyInstallCommand(packageManager.id, packages);
+  const scriptCommand = defaultPackageScriptForCommandGate(gateId, scriptName);
+  const recipe = installCommand
+    ? `Recipe: run "${installCommand}", add package.json script "${scriptName}": "${scriptCommand}", then rerun "review setup --enable ${gateId}".`
+    : `Recipe: install ${packages.join(', ')} with the correct package manager, add package.json script "${scriptName}": "${scriptCommand}", then rerun "review setup --enable ${gateId}".`;
+  return {
+    ok: false,
+    message: `Detected ${packageManager.source}; automatic ${gateId} install currently supports npm projects only. ${recipe}`,
+  };
+}
+
+function unsupportedPackageManagerScriptRecipe(
+  packageManager: DetectedPackageManager,
+  gateId: string,
+  scriptName: string,
+): ReviewGateInstallResult {
+  const scriptCommand = packageManagerScriptCommand(packageManager.id, gateId) ?? defaultPackageScriptForCommandGate(gateId, scriptName);
+  const managerNote = packageManager.id === 'yarn'
+    ? ' For Yarn Classic, use "yarn audit" instead if that is your configured audit command.'
+    : '';
+  return {
+    ok: false,
+    message: `Detected ${packageManager.source}; automatic ${gateId} setup currently supports npm projects only. Recipe: add package.json script "${scriptName}": "${scriptCommand}", then rerun "review setup --enable ${gateId}".${managerNote}`,
+  };
+}
+
+function packageManagerDependencyInstallCommand(id: PackageManagerId, packages: string[]): string | null {
+  const packageList = packages.join(' ');
+  if (id === 'pnpm') return `pnpm add -D ${packageList}`;
+  if (id === 'yarn') return `yarn add -D ${packageList}`;
+  if (id === 'bun') return `bun add -d ${packageList}`;
+  return null;
+}
+
+function packageManagerScriptCommand(id: PackageManagerId, gateId: string): string | null {
+  if (gateId !== 'dependency-audit') return null;
+  if (id === 'pnpm') return 'pnpm audit';
+  if (id === 'yarn') return 'yarn npm audit';
+  if (id === 'bun') return 'bun audit';
+  return null;
+}
+
+function hasNpmAuditLockfile(repoRoot: string): boolean {
+  return existsSync(path.join(repoRoot, 'package-lock.json'))
+    || existsSync(path.join(repoRoot, 'npm-shrinkwrap.json'));
+}
+
+function missingNpmAuditLockfileRecipe(gateId: string, scriptName: string): ReviewGateInstallResult {
+  return {
+    ok: false,
+    message: `No npm lockfile found; automatic ${gateId} setup uses npm audit, which requires package-lock.json or npm-shrinkwrap.json. Recipe: run "npm install --package-lock-only", add package.json script "${scriptName}": "${defaultPackageScriptForCommandGate(gateId, scriptName)}", then rerun "review setup --enable ${gateId}".`,
+  };
+}
+
+function patchPackageJsonScript(repoRoot: string, scriptName: string, command: string): ReviewGateInstallResult {
+  const packageJsonPath = path.join(repoRoot, 'package.json');
+  if (!existsSync(packageJsonPath)) {
+    return { ok: false, message: `No package.json found at ${packageJsonPath}.` };
+  }
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as Record<string, unknown>;
+  } catch (error) {
+    return {
+      ok: false,
+      message: `Could not parse ${packageJsonPath}: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+
+  const scripts = parsed.scripts && typeof parsed.scripts === 'object' && !Array.isArray(parsed.scripts)
+    ? parsed.scripts as Record<string, unknown>
+    : {};
+  const existing = scripts[scriptName];
+  if (typeof existing === 'string' && existing.trim().length > 0) {
+    return { ok: true, message: `${scriptName} already exists in package.json.` };
+  }
+
+  parsed.scripts = {
+    ...scripts,
+    [scriptName]: command,
+  };
+  writeJsonFileAtomic(packageJsonPath, parsed);
+  return { ok: true, message: `Added package.json script "${scriptName}": ${command}` };
+}
+
+function writeJsonFileAtomic(filePath: string, value: unknown): void {
+  const tmpPath = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.${Date.now()}.tmp`);
+  try {
+    writeFileSync(tmpPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+    renameSync(tmpPath, filePath);
+  } catch (error) {
+    rmSync(tmpPath, { force: true });
+    throw error;
+  }
+}
+
+function installNpmDevDependencies(
+  repoRoot: string,
+  packages: string[],
+  gateId: string,
+  scriptName: string,
+): ReviewGateInstallResult {
+  const preflight = preflightNpmDevDependencyInstall(repoRoot, packages, gateId, scriptName);
+  if (!preflight.ok) return preflight;
+
+  const result = spawnSync('npm', ['install', '--save-dev', '--ignore-scripts', ...packages], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: reviewSetupNpmInstallTimeoutMs(),
+  });
+  const timedOut = result.error && (result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT';
+  if (timedOut) {
+    return {
+      ok: false,
+      message: `Could not install ${packages.join(', ')}: npm install timed out after ${reviewSetupNpmInstallTimeoutMs()}ms.`,
+    };
+  }
+  if (result.status !== 0) {
+    return {
+      ok: false,
+      message: `Could not install ${packages.join(', ')}: ${tail(redactReviewOutput(`${result.stderr ?? ''}\n${result.stdout ?? ''}`)) || `npm exited ${result.status}`}`,
+    };
+  }
+  return { ok: true, message: `Installed ${packages.join(', ')}.` };
+}
+
+function reviewSetupNpmInstallTimeoutMs(): number {
+  const raw = process.env.PIPELANE_REVIEW_SETUP_NPM_INSTALL_TIMEOUT_MS?.trim();
+  if (!raw) return DEFAULT_REVIEW_SETUP_NPM_INSTALL_TIMEOUT_MS;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(parsed) && parsed > 0
+    ? parsed
+    : DEFAULT_REVIEW_SETUP_NPM_INSTALL_TIMEOUT_MS;
+}
+
+function usesTypeScript(repoRoot: string): boolean {
+  if (existsSync(path.join(repoRoot, 'tsconfig.json')) || existsSync(path.join(repoRoot, 'tsconfig.build.json'))) {
+    return true;
+  }
+  return containsFileWithExtension(repoRoot, '.ts') || containsFileWithExtension(repoRoot, '.tsx');
+}
+
+function containsFileWithExtension(root: string, extension: string): boolean {
+  const ignored = new Set(['.git', 'node_modules', 'dist', 'build', 'coverage']);
+  try {
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      if (ignored.has(entry.name)) continue;
+      const fullPath = path.join(root, entry.name);
+      if (entry.isFile() && entry.name.endsWith(extension)) return true;
+      if (entry.isDirectory() && containsFileWithExtension(fullPath, extension)) return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+function defaultEslintConfigSafety(repoRoot: string): ReviewGateInstallResult {
+  if (hasExistingFlatEslintConfig(repoRoot)) {
+    return { ok: true, message: 'ESLint flat config already exists.' };
+  }
+
+  if (hasLegacyEslintConfig(repoRoot)) {
+    return {
+      ok: false,
+      message: 'Could not safely use the existing legacy ESLint config with a generic ESLint 9 install. Recipe: add an ESLint flat config and package.json script "lint", or install the ESLint version your legacy config expects, then rerun "review setup --enable lint".',
+    };
+  }
+
+  const blockers = defaultEslintConfigBlockers(repoRoot);
+  if (blockers.length === 0) {
+    return { ok: true, message: 'Default ESLint config can be created.' };
+  }
+
+  return {
+    ok: false,
+    message: `Could not safely create a generic ESLint config because this repo looks project-specific (${blockers.join(', ')}). Recipe: add a project-specific ESLint config and package.json script "lint", then rerun "review setup --enable lint".`,
+  };
+}
+
+function hasExistingEslintConfig(repoRoot: string): boolean {
+  return hasExistingFlatEslintConfig(repoRoot) || hasLegacyEslintConfig(repoRoot);
+}
+
+function hasExistingFlatEslintConfig(repoRoot: string): boolean {
+  const configNames = [
+    'eslint.config.js',
+    'eslint.config.mjs',
+    'eslint.config.cjs',
+    'eslint.config.ts',
+    'eslint.config.mts',
+    'eslint.config.cts',
+  ];
+  return configNames.some((name) => existsSync(path.join(repoRoot, name)));
+}
+
+function hasLegacyEslintConfig(repoRoot: string): boolean {
+  const configNames = [
+    '.eslintrc',
+    '.eslintrc.json',
+    '.eslintrc.js',
+    '.eslintrc.cjs',
+    '.eslintrc.yaml',
+    '.eslintrc.yml',
+  ];
+  if (configNames.some((name) => existsSync(path.join(repoRoot, name)))) {
+    return true;
+  }
+  const packageJson = readPackageJsonObject(repoRoot);
+  return Boolean(packageJson?.eslintConfig && typeof packageJson.eslintConfig === 'object');
+}
+
+function defaultEslintConfigBlockers(repoRoot: string): string[] {
+  const blockers: string[] = [];
+  const packageJson = readPackageJsonObject(repoRoot);
+  if (packageJson?.workspaces) {
+    blockers.push('package.json workspaces');
+  }
+
+  const markerFiles = [
+    'next.config.js',
+    'next.config.mjs',
+    'next.config.ts',
+    'vite.config.js',
+    'vite.config.mjs',
+    'vite.config.ts',
+    'vue.config.js',
+    'svelte.config.js',
+    'svelte.config.ts',
+    'astro.config.js',
+    'astro.config.mjs',
+    'astro.config.ts',
+    'nuxt.config.js',
+    'nuxt.config.ts',
+    'remix.config.js',
+    'angular.json',
+    'pnpm-workspace.yaml',
+    'lerna.json',
+    'turbo.json',
+    'nx.json',
+  ];
+  for (const marker of markerFiles) {
+    if (existsSync(path.join(repoRoot, marker))) blockers.push(marker);
+  }
+
+  for (const workspaceDir of ['apps', 'packages']) {
+    try {
+      if (statSync(path.join(repoRoot, workspaceDir)).isDirectory()) blockers.push(`${workspaceDir}/`);
+    } catch {
+      // Missing workspace marker directories are fine.
+    }
+  }
+
+  const dependencyNames = packageDependencyNames(packageJson);
+  const frameworkDeps = [
+    '@angular/core',
+    '@remix-run/react',
+    'astro',
+    'next',
+    'nuxt',
+    'react',
+    'react-dom',
+    'svelte',
+    'vite',
+    'vue',
+  ];
+  for (const dependency of frameworkDeps) {
+    if (dependencyNames.has(dependency)) blockers.push(`dependency ${dependency}`);
+  }
+
+  return [...new Set(blockers)];
+}
+
+function packageDependencyNames(packageJson: Record<string, unknown> | null): Set<string> {
+  const names = new Set<string>();
+  for (const key of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+    const dependencies = packageJson?.[key];
+    if (!dependencies || typeof dependencies !== 'object' || Array.isArray(dependencies)) continue;
+    for (const dependencyName of Object.keys(dependencies)) {
+      names.add(dependencyName);
+    }
+  }
+  return names;
+}
+
+function writeDefaultEslintConfig(repoRoot: string, includeTypeScript: boolean): ReviewGateInstallResult {
+  if (hasExistingEslintConfig(repoRoot)) {
+    return { ok: true, message: 'ESLint config already exists.' };
+  }
+
+  const configPath = path.join(repoRoot, 'eslint.config.mjs');
+  const body = includeTypeScript
+    ? `import js from '@eslint/js';\nimport globals from 'globals';\nimport tseslint from 'typescript-eslint';\n\nexport default [\n  { ignores: ['dist/**', 'build/**', 'coverage/**', 'node_modules/**'] },\n  js.configs.recommended,\n  ...tseslint.configs.recommended,\n  {\n    languageOptions: {\n      globals: {\n        ...globals.browser,\n        ...globals.node,\n      },\n    },\n  },\n];\n`
+    : `import js from '@eslint/js';\nimport globals from 'globals';\n\nexport default [\n  { ignores: ['dist/**', 'build/**', 'coverage/**', 'node_modules/**'] },\n  js.configs.recommended,\n  {\n    languageOptions: {\n      globals: {\n        ...globals.browser,\n        ...globals.node,\n      },\n    },\n  },\n];\n`;
+  writeFileSync(configPath, body, 'utf8');
+  return { ok: true, message: `Created ${path.relative(repoRoot, configPath)}.` };
 }
 
 function installCodexClaudeReviewBridge(codexHome: string): ReviewGateInstallResult {
@@ -1002,14 +1732,49 @@ function reviewSetupInstallTarget(entry: ResolvedReviewGateCatalogEntry): string
 function saveInteractiveReviewSetup(
   repoRoot: string,
   gates: ReviewSetupGateOption[],
+  options: ReviewSetupSaveOptions = {},
 ): { configPath: string; isLegacy: boolean } {
-  const selectedGates = orderReviewGates(gates
+  const selectedGates = gates
     .filter((gate) => gate.selected && gate.entry.available)
-    .map((gate) => reviewSetupGateToConfig(gate)));
+    .map((gate) => reviewSetupGateToConfig(gate));
+  const gatesToSave = orderReviewGates(options.preserveExistingReviewGates
+    ? mergeReviewSetupGates(selectedGates, options)
+    : selectedGates);
   return patchReadableWorkflowConfig(repoRoot, (raw) => ({
     ...raw,
-    reviewGates: buildReviewGatesExplicitPatch(raw, selectedGates),
+    reviewGates: buildReviewGatesExplicitPatch(raw, gatesToSave),
   }));
+}
+
+function mergeReviewSetupGates(
+  selectedGates: ReviewGateConfig[],
+  options: ReviewSetupSaveOptions,
+): ReviewGateConfig[] {
+  const selectedById = new Map(selectedGates.map((gate) => [gate.id, gate]));
+  const changedGateIds = options.changedGateIds ?? new Set<string>();
+  const disabledGateIds = options.disabledGateIds ?? new Set<string>();
+  const nextById = new Map<string, ReviewGateConfig>();
+
+  if (options.useSelectedDefaults) {
+    for (const gate of selectedGates) {
+      if (!disabledGateIds.has(gate.id)) nextById.set(gate.id, gate);
+    }
+    for (const gate of options.existingReviewGates ?? []) {
+      if (!selectedById.has(gate.id) && !disabledGateIds.has(gate.id)) {
+        nextById.set(gate.id, gate);
+      }
+    }
+    return [...nextById.values()];
+  }
+
+  for (const gate of options.existingReviewGates ?? []) {
+    if (!disabledGateIds.has(gate.id)) nextById.set(gate.id, gate);
+  }
+  for (const id of changedGateIds) {
+    const selected = selectedById.get(id);
+    if (selected && !disabledGateIds.has(id)) nextById.set(id, selected);
+  }
+  return [...nextById.values()];
 }
 
 function buildReviewGatesExplicitPatch(
@@ -1134,16 +1899,19 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
 
   const startedAt = nowIso();
   const runStartMs = Date.now();
-  const gateRecords = selectedGates.map((gate) =>
-    runReviewGate({
+  const gateRecords = selectedGates.map((gate) => {
+    options.onGateStart?.(gate);
+    const record = runReviewGate({
       gate,
       repoRoot: options.repoRoot,
       dryRun: options.dryRun,
       reviewConfigChanged,
       changedFiles,
       activeSurfaces: options.activeSurfaces,
-    })
-  );
+    });
+    options.onGateFinish?.(record);
+    return record;
+  });
   const finishedAt = nowIso();
   const status = summarizeRunStatus(gateRecords);
 
@@ -1533,10 +2301,22 @@ function renderReviewSetupReport(
     lines.push(...report.missing.map((entry) => `- ${entry.id}: ${entry.reason}`));
   }
 
+  if (report.actions && report.actions.length > 0) {
+    lines.push('', 'Setup actions:');
+    lines.push(...report.actions.map((entry) => `- ${entry}`));
+  }
+
   if (options.includeCatalog) {
     lines.push('', 'Gate catalog:');
     lines.push(...formatCatalog(report.catalog ?? []));
   }
+
+  lines.push('', 'Setup controls:');
+  lines.push('- Enable a gate: /pipelane review setup --enable <gate-id>');
+  lines.push('- Disable a gate: /pipelane review setup --disable <gate-id>');
+  lines.push('- Install an optional gate: /pipelane review setup --install <gate-id>');
+  lines.push('- Save defaults plus changes: combine --yes with --enable/--disable/--install as needed.');
+  lines.push('- AI review gates: karpathy-diff, gstack-review, adversarial-review.');
 
   if (options.includeEffectiveJson) {
     lines.push(
@@ -1551,6 +2331,24 @@ function renderReviewSetupReport(
 
   lines.push('', 'Next: run /pipelane review to write gate evidence before PR handoff.');
   return lines.join('\n');
+}
+
+function renderNonInteractiveReviewSetup(prepared: {
+  repoRoot: string;
+  packageJson: ReviewSetupReport['packageJson'];
+  detectedScripts: string[];
+  gates: ReviewSetupGateOption[];
+}): string {
+  return [
+    renderInteractiveReviewSetup(prepared),
+    '',
+    'Non-interactive actions:',
+    '- Save current selection: /pipelane review setup --yes',
+    '- Enable a gate: /pipelane review setup --enable <gate-id>',
+    '- Disable a gate: /pipelane review setup --disable <gate-id>',
+    '- Install and enable an optional gate: /pipelane review setup --install <gate-id>',
+    '- Print effective config: /pipelane review setup --print',
+  ].join('\n');
 }
 
 function renderInteractiveReviewSetup(prepared: {
@@ -1640,7 +2438,12 @@ function reviewSetupGateDetail(gate: ReviewSetupGateOption, repoRoot: string): s
   const entry = gate.entry;
   if (entry.type === 'command') {
     if (entry.command) return entry.command;
-    return noScriptFoundLabel(entry);
+    const install = gate.installState === 'not installed'
+      ? ' (installable)'
+      : gate.installState === 'unavailable'
+        ? ' (unavailable)'
+        : '';
+    return `${noScriptFoundLabel(entry)}${install}`;
   }
   if (entry.id === 'adversarial-review') {
     const provider = preferredAdversarialReviewProvider(repoRoot);
@@ -1653,7 +2456,7 @@ function reviewSetupGateDetail(gate: ReviewSetupGateOption, repoRoot: string): s
   const target = entry.userCommands?.[0]
     ?? entry.skill
     ?? entry.role
-    ?? entry.when
+    ?? (entry.type === 'approval' ? 'approval' : entry.when)
     ?? entry.type;
   const install = gate.installState === 'not applicable' ? '' : ` ${gate.installState}`;
   const condition = entry.whenChanged && entry.whenChanged.length > 0

@@ -1985,7 +1985,9 @@ test('install-codex outside a pipelane repo installs durable global default skil
     const pipelaneSkill = readFileSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
     assert.match(pipelaneSkill, /Interactive review setup behavior/);
     assert.match(pipelaneSkill, /runner command above/);
-    assert.match(pipelaneSkill, /review setup --print/);
+    assert.match(pipelaneSkill, /review setup --enable <gate-id>/);
+    assert.match(pipelaneSkill, /review setup --disable <gate-id>/);
+    assert.match(pipelaneSkill, /review setup --install <gate-id>/);
     assert.match(pipelaneSkill, /review setup --yes/);
     assert.doesNotMatch(pipelaneSkill, /review setup --preset/);
     assert.doesNotMatch(pipelaneSkill, /lean\|standard\|strict-production/);
@@ -2029,7 +2031,9 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     const pipelaneSkill = readFileSync(path.join(claudeHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
     assert.match(pipelaneSkill, /Interactive review setup behavior/);
     assert.match(pipelaneSkill, /runner command above/);
-    assert.match(pipelaneSkill, /review setup --print/);
+    assert.match(pipelaneSkill, /review setup --enable <gate-id>/);
+    assert.match(pipelaneSkill, /review setup --disable <gate-id>/);
+    assert.match(pipelaneSkill, /review setup --install <gate-id>/);
     assert.match(pipelaneSkill, /review setup --yes/);
     assert.doesNotMatch(pipelaneSkill, /review setup --preset/);
     assert.doesNotMatch(pipelaneSkill, /lean\|standard\|strict-production/);
@@ -4945,13 +4949,16 @@ test('review setup list-gates text reports resolved availability', () => {
   }
 });
 
-test('review setup bare command refuses non-interactive execution', () => {
+test('review setup bare command renders a non-interactive selector without writing config', () => {
   const repoRoot = createRepo();
   try {
-    const result = runCli(['run', 'review', 'setup'], repoRoot, {}, true);
+    const result = runCli(['run', 'review', 'setup'], repoRoot);
 
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /review setup requires a TTY for interactive setup/);
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /Review setup/);
+    assert.match(result.stdout, /AI review gates:/);
+    assert.match(result.stdout, /Adversarial review/);
+    assert.match(result.stdout, /Install and enable an optional gate: \/pipelane review setup --install <gate-id>/);
     assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -4999,6 +5006,575 @@ test('review setup interactive save writes recommended gates', () => {
     assert.deepEqual(Object.keys(raw.reviewGates).sort(), ['gates', 'planReview']);
     assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'));
     assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup can install and enable a missing lint gate non-interactively', () => {
+  const repoRoot = createRepo();
+  try {
+    const result = runCli(['run', 'review', 'setup', '--install', 'lint', '--json'], repoRoot, {
+      PIPELANE_REVIEW_SETUP_INSTALL_SUCCESS: 'lint',
+    });
+    const report = JSON.parse(result.stdout);
+    const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+
+    assert.equal(report.status, 'configured');
+    assert.ok(report.actions.includes('Installed lint.'));
+    assert.equal(pkg.scripts.lint, 'eslint .');
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'lint' && gate.command === 'npm run lint'), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review setup command installers ignore npm lifecycle scripts', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-npm-'));
+  const npmArgsFile = path.join(repoRoot, 'npm-args.txt');
+  try {
+    const npmPath = path.join(binDir, 'npm');
+    writeFileSync(npmPath, [
+      '#!/usr/bin/env node',
+      "const fs = require('node:fs');",
+      "fs.writeFileSync(process.env.NPM_ARGS_FILE, process.argv.slice(2).join('\\n'), 'utf8');",
+    ].join('\n') + '\n', 'utf8');
+    chmodSync(npmPath, 0o755);
+
+    const result = runCli(['run', 'review', 'setup', '--install', 'format-check', '--json'], repoRoot, {
+      PATH: `${binDir}:${process.env.PATH || ''}`,
+      NPM_ARGS_FILE: npmArgsFile,
+    });
+    const report = JSON.parse(result.stdout);
+    const npmArgs = readFileSync(npmArgsFile, 'utf8').split('\n');
+
+    assert.equal(report.status, 'configured');
+    assert.ok(npmArgs.includes('install'));
+    assert.ok(npmArgs.includes('--save-dev'));
+    assert.ok(npmArgs.includes('--ignore-scripts'));
+    assert.ok(npmArgs.includes('prettier'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('review setup command installers time out stalled npm installs', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-npm-'));
+  try {
+    const npmPath = path.join(binDir, 'npm');
+    writeFileSync(npmPath, [
+      '#!/usr/bin/env node',
+      'setTimeout(() => {}, 10_000);',
+    ].join('\n') + '\n', 'utf8');
+    chmodSync(npmPath, 0o755);
+
+    const result = runCli(['run', 'review', 'setup', '--install', 'format-check', '--json'], repoRoot, {
+      PATH: `${binDir}:${process.env.PATH || ''}`,
+      PIPELANE_REVIEW_SETUP_NPM_INSTALL_TIMEOUT_MS: '25',
+    }, true);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /npm install timed out after 25ms/);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('review setup command installers refuse repos without package.json before npm install', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-npm-'));
+  const npmArgsFile = path.join(repoRoot, 'npm-args.txt');
+  try {
+    rmSync(path.join(repoRoot, 'package.json'), { force: true });
+    const npmPath = path.join(binDir, 'npm');
+    writeFileSync(npmPath, [
+      '#!/usr/bin/env node',
+      "const fs = require('node:fs');",
+      "fs.writeFileSync(process.env.NPM_ARGS_FILE, process.argv.slice(2).join('\\n'), 'utf8');",
+    ].join('\n') + '\n', 'utf8');
+    chmodSync(npmPath, 0o755);
+
+    const result = runCli(['run', 'review', 'setup', '--install', 'format-check', '--json'], repoRoot, {
+      PATH: `${binDir}:${process.env.PATH || ''}`,
+      NPM_ARGS_FILE: npmArgsFile,
+    }, true);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /No package\.json found/);
+    assert.match(result.stderr, /automatic format-check install requires an existing npm project/);
+    assert.match(result.stderr, /npm install --save-dev --ignore-scripts prettier/);
+    assert.equal(existsSync(npmArgsFile), false);
+    assert.equal(existsSync(path.join(repoRoot, 'package.json')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('review setup dependency audit installer requires an npm lockfile', () => {
+  const repoRoot = createRepo();
+  try {
+    const result = runCli(['run', 'review', 'setup', '--install', 'dependency-audit', '--json'], repoRoot, {}, true);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /No npm lockfile found/);
+    assert.match(result.stderr, /npm audit/);
+    assert.match(result.stderr, /npm install --package-lock-only/);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review setup dependency audit installer enables npm projects with a lockfile', () => {
+  const repoRoot = createRepo();
+  try {
+    writeFileSync(path.join(repoRoot, 'package-lock.json'), JSON.stringify({
+      name: 'sample-repo',
+      lockfileVersion: 3,
+      packages: {},
+    }, null, 2) + '\n', 'utf8');
+
+    const result = runCli(['run', 'review', 'setup', '--install', 'dependency-audit', '--json'], repoRoot);
+    const report = JSON.parse(result.stdout);
+    const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+
+    assert.equal(report.status, 'configured');
+    assert.equal(pkg.scripts.audit, 'npm audit');
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'dependency-audit' && gate.command === 'npm run audit'), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review setup command installers refuse dangling node_modules symlinks before npm install', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-npm-'));
+  const npmArgsFile = path.join(repoRoot, 'npm-args.txt');
+  try {
+    symlinkSync(path.join(repoRoot, 'missing-shared-node-modules'), path.join(repoRoot, 'node_modules'), 'dir');
+    const npmPath = path.join(binDir, 'npm');
+    writeFileSync(npmPath, [
+      '#!/usr/bin/env node',
+      "const fs = require('node:fs');",
+      "fs.writeFileSync(process.env.NPM_ARGS_FILE, process.argv.slice(2).join('\\n'), 'utf8');",
+    ].join('\n') + '\n', 'utf8');
+    chmodSync(npmPath, 0o755);
+
+    const result = runCli(['run', 'review', 'setup', '--install', 'format-check', '--json'], repoRoot, {
+      PATH: `${binDir}:${process.env.PATH || ''}`,
+      NPM_ARGS_FILE: npmArgsFile,
+    }, true);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /node_modules is a symlink; refusing to run npm install/);
+    assert.equal(existsSync(npmArgsFile), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('review setup install no-ops for command gates that already have a package script', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-npm-'));
+  const npmArgsFile = path.join(repoRoot, 'npm-args.txt');
+  try {
+    const packageJsonPath = path.join(repoRoot, 'package.json');
+    const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+    pkg.scripts.lint = 'echo existing lint';
+    writeFileSync(packageJsonPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+    const npmPath = path.join(binDir, 'npm');
+    writeFileSync(npmPath, [
+      '#!/usr/bin/env node',
+      "const fs = require('node:fs');",
+      "fs.writeFileSync(process.env.NPM_ARGS_FILE, process.argv.slice(2).join('\\n'), 'utf8');",
+    ].join('\n') + '\n', 'utf8');
+    chmodSync(npmPath, 0o755);
+
+    const result = runCli(['run', 'review', 'setup', '--install', 'lint', '--json'], repoRoot, {
+      PATH: `${binDir}:${process.env.PATH || ''}`,
+      NPM_ARGS_FILE: npmArgsFile,
+    });
+    const report = JSON.parse(result.stdout);
+    const patchedPkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+
+    assert.equal(report.status, 'configured');
+    assert.ok(report.actions.some((action) => /lint already has a package\.json script/.test(action)));
+    assert.equal(existsSync(npmArgsFile), false);
+    assert.equal(existsSync(path.join(repoRoot, 'eslint.config.mjs')), false);
+    assert.equal(patchedPkg.scripts.lint, 'echo existing lint');
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'lint' && gate.command === 'npm run lint'), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('review setup command installers refuse unsupported package managers with a recipe', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-npm-'));
+  const npmArgsFile = path.join(repoRoot, 'npm-args.txt');
+  try {
+    writeFileSync(path.join(repoRoot, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n', 'utf8');
+    const npmPath = path.join(binDir, 'npm');
+    writeFileSync(npmPath, [
+      '#!/usr/bin/env node',
+      "const fs = require('node:fs');",
+      "fs.writeFileSync(process.env.NPM_ARGS_FILE, process.argv.slice(2).join('\\n'), 'utf8');",
+    ].join('\n') + '\n', 'utf8');
+    chmodSync(npmPath, 0o755);
+
+    const result = runCli(['run', 'review', 'setup', '--install', 'format-check', '--json'], repoRoot, {
+      PATH: `${binDir}:${process.env.PATH || ''}`,
+      NPM_ARGS_FILE: npmArgsFile,
+    }, true);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Detected pnpm-lock\.yaml lockfile/);
+    assert.match(result.stderr, /automatic format-check install currently supports npm projects only/);
+    assert.match(result.stderr, /pnpm add -D prettier/);
+    assert.match(result.stderr, /review setup --enable format-check/);
+    assert.equal(existsSync(npmArgsFile), false);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('review setup command installers refuse packageManager and lockfile conflicts', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-npm-'));
+  const npmArgsFile = path.join(repoRoot, 'npm-args.txt');
+  try {
+    const packageJsonPath = path.join(repoRoot, 'package.json');
+    const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+    pkg.packageManager = 'npm@10.0.0';
+    writeFileSync(packageJsonPath, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n', 'utf8');
+    const npmPath = path.join(binDir, 'npm');
+    writeFileSync(npmPath, [
+      '#!/usr/bin/env node',
+      "const fs = require('node:fs');",
+      "fs.writeFileSync(process.env.NPM_ARGS_FILE, process.argv.slice(2).join('\\n'), 'utf8');",
+    ].join('\n') + '\n', 'utf8');
+    chmodSync(npmPath, 0o755);
+
+    const result = runCli(['run', 'review', 'setup', '--install', 'format-check', '--json'], repoRoot, {
+      PATH: `${binDir}:${process.env.PATH || ''}`,
+      NPM_ARGS_FILE: npmArgsFile,
+    }, true);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /packageManager "npm@10\.0\.0" conflicts with lockfiles: pnpm-lock\.yaml/);
+    assert.match(result.stderr, /automatic format-check install currently supports npm projects only/);
+    assert.equal(existsSync(npmArgsFile), false);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('review setup dependency audit installer refuses unsupported package managers with a script recipe', () => {
+  const repoRoot = createRepo();
+  try {
+    writeFileSync(path.join(repoRoot, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n', 'utf8');
+
+    const result = runCli(['run', 'review', 'setup', '--install', 'dependency-audit', '--json'], repoRoot, {}, true);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Detected pnpm-lock\.yaml lockfile/);
+    assert.match(result.stderr, /automatic dependency-audit setup currently supports npm projects only/);
+    assert.match(result.stderr, /"audit": "pnpm audit"/);
+    assert.match(result.stderr, /review setup --enable dependency-audit/);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review setup lint installer refuses legacy ESLint config without a flat config', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-npm-'));
+  const npmArgsFile = path.join(repoRoot, 'npm-args.txt');
+  try {
+    writeFileSync(path.join(repoRoot, '.eslintrc.json'), '{"env":{"node":true}}\n', 'utf8');
+    const npmPath = path.join(binDir, 'npm');
+    writeFileSync(npmPath, [
+      '#!/usr/bin/env node',
+      "const fs = require('node:fs');",
+      "fs.writeFileSync(process.env.NPM_ARGS_FILE, process.argv.slice(2).join('\\n'), 'utf8');",
+    ].join('\n') + '\n', 'utf8');
+    chmodSync(npmPath, 0o755);
+
+    const result = runCli(['run', 'review', 'setup', '--install', 'lint', '--json'], repoRoot, {
+      PATH: `${binDir}:${process.env.PATH || ''}`,
+      NPM_ARGS_FILE: npmArgsFile,
+    }, true);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /legacy ESLint config/);
+    assert.match(result.stderr, /add an ESLint flat config/);
+    assert.equal(existsSync(npmArgsFile), false);
+    assert.equal(existsSync(path.join(repoRoot, 'eslint.config.mjs')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('review setup lint installer refuses framework repos without existing ESLint config', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-npm-'));
+  const npmArgsFile = path.join(repoRoot, 'npm-args.txt');
+  try {
+    const packageJsonPath = path.join(repoRoot, 'package.json');
+    const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+    pkg.dependencies = { next: '15.0.0' };
+    writeFileSync(packageJsonPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+    const npmPath = path.join(binDir, 'npm');
+    writeFileSync(npmPath, [
+      '#!/usr/bin/env node',
+      "const fs = require('node:fs');",
+      "fs.writeFileSync(process.env.NPM_ARGS_FILE, process.argv.slice(2).join('\\n'), 'utf8');",
+    ].join('\n') + '\n', 'utf8');
+    chmodSync(npmPath, 0o755);
+
+    const result = runCli(['run', 'review', 'setup', '--install', 'lint', '--json'], repoRoot, {
+      PATH: `${binDir}:${process.env.PATH || ''}`,
+      NPM_ARGS_FILE: npmArgsFile,
+    }, true);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Could not safely create a generic ESLint config/);
+    assert.match(result.stderr, /dependency next/);
+    assert.match(result.stderr, /add a project-specific ESLint config and package\.json script "lint"/);
+    assert.equal(existsSync(path.join(repoRoot, 'eslint.config.mjs')), false);
+    assert.equal(existsSync(npmArgsFile), false);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('review setup lint installer allows framework repos with existing ESLint config', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-npm-'));
+  const npmArgsFile = path.join(repoRoot, 'npm-args.txt');
+  try {
+    const packageJsonPath = path.join(repoRoot, 'package.json');
+    const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+    pkg.dependencies = { next: '15.0.0' };
+    writeFileSync(packageJsonPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+    writeFileSync(path.join(repoRoot, 'eslint.config.mjs'), 'export default [];\n', 'utf8');
+    const npmPath = path.join(binDir, 'npm');
+    writeFileSync(npmPath, [
+      '#!/usr/bin/env node',
+      "const fs = require('node:fs');",
+      "fs.writeFileSync(process.env.NPM_ARGS_FILE, process.argv.slice(2).join('\\n'), 'utf8');",
+    ].join('\n') + '\n', 'utf8');
+    chmodSync(npmPath, 0o755);
+
+    const result = runCli(['run', 'review', 'setup', '--install', 'lint', '--json'], repoRoot, {
+      PATH: `${binDir}:${process.env.PATH || ''}`,
+      NPM_ARGS_FILE: npmArgsFile,
+    });
+    const report = JSON.parse(result.stdout);
+    const patchedPkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+    const npmArgs = readFileSync(npmArgsFile, 'utf8').split('\n');
+
+    assert.equal(report.status, 'configured');
+    assert.equal(patchedPkg.scripts.lint, 'eslint .');
+    assert.ok(npmArgs.includes('install'));
+    assert.ok(npmArgs.includes('--ignore-scripts'));
+    assert.ok(npmArgs.includes('eslint'));
+    assert.equal(readFileSync(path.join(repoRoot, 'eslint.config.mjs'), 'utf8'), 'export default [];\n');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('review setup lint installer preserves existing TypeScript ESLint flat config', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-npm-'));
+  const npmArgsFile = path.join(repoRoot, 'npm-args.txt');
+  try {
+    writeFileSync(path.join(repoRoot, 'eslint.config.ts'), 'export default [];\n', 'utf8');
+    const npmPath = path.join(binDir, 'npm');
+    writeFileSync(npmPath, [
+      '#!/usr/bin/env node',
+      "const fs = require('node:fs');",
+      "fs.writeFileSync(process.env.NPM_ARGS_FILE, process.argv.slice(2).join('\\n'), 'utf8');",
+    ].join('\n') + '\n', 'utf8');
+    chmodSync(npmPath, 0o755);
+
+    const result = runCli(['run', 'review', 'setup', '--install', 'lint', '--json'], repoRoot, {
+      PATH: `${binDir}:${process.env.PATH || ''}`,
+      NPM_ARGS_FILE: npmArgsFile,
+    });
+    const report = JSON.parse(result.stdout);
+    const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    const npmArgs = readFileSync(npmArgsFile, 'utf8').split('\n');
+
+    assert.equal(report.status, 'configured');
+    assert.ok(npmArgs.includes('install'));
+    assert.ok(npmArgs.includes('eslint'));
+    assert.equal(pkg.scripts.lint, 'eslint .');
+    assert.equal(readFileSync(path.join(repoRoot, 'eslint.config.ts'), 'utf8'), 'export default [];\n');
+    assert.equal(existsSync(path.join(repoRoot, 'eslint.config.mjs')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('review setup selection flags reject unknown gates', () => {
+  const repoRoot = createRepo();
+  try {
+    const result = runCli(['run', 'review', 'setup', '--enable', 'not-a-gate', '--json'], repoRoot, {}, true);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /--enable received unknown review gate "not-a-gate"/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review setup selection flags reject conflicting gate choices', () => {
+  const repoRoot = createRepo();
+  try {
+    const result = runCli(['run', 'review', 'setup', '--enable', 'gstack-review', '--disable', 'gstack-review', '--json'], repoRoot, {}, true);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /review setup cannot both enable\/install and disable: gstack-review/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review setup selection flags cannot mutate through read-only reporting flags', () => {
+  const repoRoot = createRepo();
+  try {
+    const result = runCli(['run', 'review', 'setup', '--enable', 'karpathy-diff', '--print', '--json'], repoRoot, {}, true);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /cannot combine modifying flags/);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review setup targeted enable preserves an explicit empty gate list', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [],
+    };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    runCli(['run', 'review', 'setup', '--enable', 'human-merge-approval', '--json'], repoRoot);
+    const raw = JSON.parse(readFileSync(configPath, 'utf8'));
+
+    assert.deepEqual(raw.reviewGates.gates.map((gate) => gate.id), ['human-merge-approval']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review setup can explicitly toggle AI review gates non-interactively', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-claude-'));
+  try {
+    seedCodexReviewSkills(codexHome, ['karpathy-diff', 'review', 'karpathy-audit']);
+    seedCodexClaudeReviewBridge(codexHome);
+
+    runCli(['run', 'review', 'setup', '--disable', 'gstack-review', '--enable', 'adversarial-review', '--json'], repoRoot, {
+      CODEX_HOME: codexHome,
+      CLAUDE_HOME: claudeHome,
+    });
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'), true);
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'), false);
+    assert.deepEqual(raw.reviewGates.gates.find((gate) => gate.id === 'adversarial-review').userCommands, ['/claude review code']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup targeted flags preserve existing custom review gates', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  try {
+    seedCodexReviewSkills(codexHome, ['karpathy-diff', 'review', 'karpathy-audit']);
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [
+        {
+          id: 'typecheck',
+          phase: 'static',
+          type: 'command',
+          command: 'npm run typecheck:strict',
+          blocking: false,
+          timeoutMs: 12345,
+        },
+        {
+          id: 'custom-security',
+          phase: 'human',
+          type: 'approval',
+          blocking: true,
+          role: 'security-review',
+        },
+        {
+          id: 'gstack-review',
+          phase: 'ai-diff',
+          type: 'skill',
+          skill: 'review',
+          userCommands: ['/review'],
+          blocking: true,
+        },
+      ],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+
+    runCli(['run', 'review', 'setup', '--disable', 'gstack-review', '--enable', 'karpathy-diff', '--json'], repoRoot, {
+      CODEX_HOME: codexHome,
+    });
+    const raw = JSON.parse(readFileSync(configPath, 'utf8'));
+    const typecheck = raw.reviewGates.gates.find((gate) => gate.id === 'typecheck');
+
+    assert.equal(typecheck.command, 'npm run typecheck:strict');
+    assert.equal(typecheck.blocking, false);
+    assert.equal(typecheck.timeoutMs, 12345);
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'custom-security'), true);
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'), false);
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'), true);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -5477,7 +6053,7 @@ test('orchestrate bare command --yes auto-fixes failed executable review gates a
     writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     commitAll(repoRoot, 'Adopt review fix gate');
 
-    const result = JSON.parse(runCli([
+    const cliResult = runCli([
       'run',
       'orchestrate',
       '--outcome',
@@ -5488,7 +6064,8 @@ test('orchestrate bare command --yes auto-fixes failed executable review gates a
       '--json',
     ], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: `${process.execPath} -e ${JSON.stringify(workerScript)}`,
-    }).stdout);
+    });
+    const result = JSON.parse(cliResult.stdout);
     createdWorktrees.push(...result.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
     const onDisk = JSON.parse(readFileSync(result.ledgerPath, 'utf8'));
     const attempt = result.autoFix.attempts[0];
@@ -5513,6 +6090,11 @@ test('orchestrate bare command --yes auto-fixes failed executable review gates a
     assert.equal(onDisk.reviewFixes[0].exitCode, 0);
     assert.match(result.message, /Auto-fix status: fixed/);
     assert.match(result.message, /Auto-fix attempts: 1/);
+    assert.match(cliResult.stderr, /review auto-fix attempt 1\/1: 1 slice with failed blocking gates/);
+    assert.match(cliResult.stderr, /starting review auto-fix attempt 1\/1 for gates requires-fix-file/);
+    assert.match(cliResult.stderr, /review auto-fix attempt 1\/1 worker succeeded/);
+    assert.match(cliResult.stderr, /review auto-fix attempt 1\/1: rerunning review gates/);
+    assert.match(cliResult.stderr, /review auto-fix attempt 1\/1: review passed/);
   } finally {
     for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
     rmSync(repoRoot, { recursive: true, force: true });
@@ -5572,6 +6154,10 @@ test('orchestrate bare command --yes records pending manual gates instead of dec
     assert.equal(onDisk.slices[0].review.run.gates[0].status, 'pending');
     assert.match(result.message, /Status: pending/);
     assert.match(result.message, /Review status: pending/);
+    assert.match(result.message, /Pending gates:/);
+    assert.ok(result.message.includes(`${onDisk.slices[0].id}/manual-ai-review`));
+    assert.match(result.message, /manual skill gate pending: run \/review/);
+    assert.ok(result.message.includes(`worktree: ${onDisk.slices[0].worktreePath}`));
     assert.match(result.message, /complete pending AI\/manual gates/);
 
     const stillActive = JSON.parse(runCli(['run', 'orchestrate', '--json'], repoRoot).stdout);
@@ -7083,10 +7669,14 @@ test('orchestrate review runs gate snapshot against completed worker slices', ()
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
     });
 
-    const filtered = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--phase', 'static', '--json'], repoRoot).stdout);
+    const filteredResult = runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--phase', 'static', '--json'], repoRoot);
+    const filtered = JSON.parse(filteredResult.stdout);
     assert.equal(filtered.status, 'blocked');
     assert.equal(filtered.run.status, 'blocked');
     assert.match(filtered.message, /gate-filtered, phase-filtered, or dry-run review evidence/);
+    assert.match(filteredResult.stderr, /\[pipelane\] orchestrate review: reviewing slice/);
+    assert.match(filteredResult.stderr, /starting gate slice-static \[static\]/);
+    assert.match(filteredResult.stderr, /gate slice-static passed after \d+ms - command passed:/);
 
     const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot).stdout);
     const onDisk = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
@@ -7212,6 +7802,46 @@ test('orchestrate review blocks when no effective review gates are configured', 
   }
 });
 
+test('orchestrate review progress redacts configured command secrets', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'secret-static',
+        phase: 'static',
+        type: 'command',
+        command: `TOKEN=sk-secret ${process.execPath} -e "process.exit(0)"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt secret-bearing review gate');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Review redacts progress', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: 'node -e "process.exit(0)"',
+    });
+
+    const reviewed = runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId], repoRoot);
+
+    assert.doesNotMatch(reviewed.stderr, /sk-secret/);
+    assert.match(reviewed.stderr, /TOKEN=\[REDACTED\]/);
+    assert.match(reviewed.stderr, /secret-static/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('orchestrate review blocks slice-filtered evidence until every slice is fully reviewed', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];
@@ -7328,6 +7958,10 @@ test('orchestrate review records pending AI gates and blocks incomplete slice ev
     assert.equal(onDisk.slices[0].review.run.gates[0].status, 'pending');
     assert.equal(onDisk.slices[1].review, null);
     assert.match(reviewed.slices.find((slice) => slice.id === onDisk.slices[1].id).blocker, /worker has not completed successfully/);
+    assert.match(reviewed.message, /Pending gates:/);
+    assert.match(reviewed.message, new RegExp(`${onDisk.slices[0].id}/karpathy-diff`));
+    assert.match(reviewed.message, /manual skill gate pending: run \/karpathy diff/);
+    assert.ok(reviewed.message.includes(`worktree: ${onDisk.slices[0].worktreePath}`));
   } finally {
     for (const worktreePath of createdWorktrees) {
       rmSync(worktreePath, { recursive: true, force: true });
@@ -8051,6 +8685,15 @@ test('orchestrate review attaches matching attested manual AI gate evidence', ()
     assert.equal(gate.attester.provider, 'claude');
     assert.equal(gate.attester.sessionId, hashedSessionId('independent-claude-review-session'));
     assert.match(gate.summary, /independent Claude session/);
+
+    const laterPendingDiagnostic = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--dry-run', '--json'], repoRoot, {
+      PIPELANE_REVIEW_STATE_KEY: 'different-review-state-key',
+    }).stdout);
+    assert.equal(laterPendingDiagnostic.status, 'pending');
+    assert.equal(laterPendingDiagnostic.run.slices[0].review.run.gates[0].status, 'passed');
+    assert.equal(laterPendingDiagnostic.run.slices[0].reviewDiagnostics.at(-1).run.gates[0].status, 'pending');
+    assert.match(laterPendingDiagnostic.message, /Pending gates:/);
+    assert.match(laterPendingDiagnostic.message, /karpathy-diff: manual skill gate pending: run \/karpathy diff/);
 
     const secondStandaloneReview = JSON.parse(runCli(['run', 'review', '--json'], sliceWorktree, {
       PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
