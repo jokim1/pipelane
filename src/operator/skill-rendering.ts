@@ -103,6 +103,12 @@ runner. Do not add shell pipes to setup commands that may need interactivity.
 
   if (command === 'deploy') {
     return `
+## PR shorthand behavior
+
+When the user writes \`PR #625\`, \`PR 625\`, or \`#625\` as the target PR,
+pass it as \`--pr 625\`. Do not pass a raw unquoted \`#625\` token to a shell;
+\`#\` starts a shell comment before Pipelane can parse it.
+
 ## Blocked deploy follow-up behavior
 
 When ${slashAlias} staging or ${slashAlias} prod exits blocked before starting a
@@ -120,6 +126,16 @@ listed commands in order from the required worktree(s). Do not bypass Pipelane
 gates; use the normal ${slashAlias}, PR, merge, smoke, and clean commands the
 path calls for. If any step is not deterministic, state the missing input and
 stop before side effects.
+`;
+  }
+
+  if (command === 'merge' || command === 'smoke') {
+    return `
+## PR shorthand behavior
+
+When the user writes \`PR #625\`, \`PR 625\`, or \`#625\` as the target PR,
+pass it as \`--pr 625\`. Do not pass a raw unquoted \`#625\` token to a shell;
+\`#\` starts a shell comment before Pipelane can parse it.
 `;
   }
 

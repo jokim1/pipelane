@@ -12,6 +12,10 @@ Expected arguments:
 - `staging [surfaces...]`
 - `prod [surfaces...]`
 
+If the user writes `PR #625`, `PR 625`, or `#625`, pass it as `--pr 625`.
+Do not pass a raw unquoted `#625` token to a shell; `#` starts a shell
+comment before Pipelane can parse it.
+
 Release mode requires staging before production for the same merged SHA and surface set.
 
 Production deploys in release mode require typed-SHA-prefix confirmation. The operator

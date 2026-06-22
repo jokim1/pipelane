@@ -84,6 +84,11 @@ pipelane install-claude
 This writes durable commands under your local Codex and Claude skill folders. It
 does not write Pipelane files into the current repo.
 
+During install, Pipelane also checks the current repo's repo-local
+`node_modules/pipelane` when one exists. If that repo-local package is behind
+latest `main`, install output tells you to run `pipelane update` before using
+release commands such as `/deploy`.
+
 `/pipelane review setup` can install missing Karpathy review skills from
 `https://github.com/jokim1/karpathy-skills.git` into `$CODEX_HOME/skills` after
 you explicitly approve the install prompt.
@@ -126,6 +131,15 @@ pipelane bootstrap --yes --project "My App"
 ```
 
 Then review the generated files before committing anything.
+
+For the first deploy from a newly onboarded release-mode repo, run:
+
+```bash
+pipelane configure
+```
+
+Use `pipelane configure --json ...` when filling the Deploy Configuration block
+from automation.
 
 Use `git status` first:
 
@@ -580,7 +594,7 @@ Common fixes:
 | Unsafe checkout | `/repo-guard` |
 | Missing review evidence | `/pipelane review` |
 | Review or CI failed | `/fix`, then `/pipelane review`, then `/pr` |
-| Release config missing | `/doctor` |
+| Release config missing | `pipelane configure` |
 | Staging probe stale | `/doctor --probe` |
 | Production regression | `/rollback prod` |
 | Old task state | `/clean --status-only`, then scoped cleanup |

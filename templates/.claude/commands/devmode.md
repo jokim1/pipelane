@@ -14,7 +14,7 @@ Display the output directly. The key line is:
 - `Dev Mode: [build]`
 - `Dev Mode: [release]`
 
-If release mode is blocked, show the blocked surfaces and tell the user to run `{{ALIAS_DOCTOR}} --fix`.
+If release mode is blocked by missing Deploy Configuration fields, tell the user to run `pipelane configure`. If it is blocked by stale or missing staging probes, tell the user to run `{{ALIAS_DOCTOR}} --probe`.
 
 Bypassing the release gate is possible but must be auditable:
 

@@ -2788,6 +2788,27 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     orchestrationRunId: '',
   };
 
+  const setPrFromShorthand = (raw: string, source: string): void => {
+    const normalized = raw.replace(/^#/, '').trim();
+    if (!/^[1-9]\d*$/.test(normalized)) {
+      throw new Error(`${source} requires a positive PR number. Use --pr <number>.`);
+    }
+    if (flags.pr && flags.pr !== normalized) {
+      throw new Error(`Conflicting PR values: --pr ${flags.pr} and ${source} ${raw}.`);
+    }
+    flags.pr = normalized;
+  };
+
+  const commandAcceptsPrShorthand = (): boolean => {
+    const command = positional[0] ?? '';
+    if (command === 'merge' || command === 'deploy' || command === 'smoke') return true;
+    if (command === 'api') {
+      const actionId = positional[1] === 'action' ? positional[2] ?? '' : '';
+      return ['merge', 'deploy.staging', 'deploy.prod', 'route.deploy.staging', 'route.deploy.prod'].includes(actionId);
+    }
+    return false;
+  };
+
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
     const equalsIndex = token.startsWith('--') ? token.indexOf('=') : -1;
@@ -3180,6 +3201,24 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
 
     if (token.startsWith('--')) {
       throw new Error(`Unknown flag "${flagName}" for pipelane run. Run "pipelane run --help" for supported commands and flags.`);
+    }
+
+    if (commandAcceptsPrShorthand()) {
+      const hashMatch = /^#([1-9]\d*)$/.exec(token);
+      if (hashMatch) {
+        setPrFromShorthand(hashMatch[1], '#');
+        continue;
+      }
+      if (/^pr$/i.test(token)) {
+        const next = argv[index + 1];
+        const nextMatch = next ? /^#?([1-9]\d*)$/.exec(next) : null;
+        if (!nextMatch) {
+          throw new Error('PR shorthand requires a number. Use `--pr 625`; in shells, do not leave `#625` unquoted because `#` starts a comment.');
+        }
+        setPrFromShorthand(nextMatch[1], 'PR');
+        index += 1;
+        continue;
+      }
     }
 
     positional.push(token);

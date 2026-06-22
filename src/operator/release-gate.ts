@@ -889,7 +889,7 @@ export function buildReleaseCheckMessage(
     } else if (onlyObservedOrProbeBlockers && hasDeployActionObservedBlocker) {
       lines.push(`Next: re-run \`${formatWorkflowCommand(config, 'deploy', 'staging')}\` for the blocked surface(s), then retry this command.`);
     } else {
-      lines.push(`Next: run \`${formatWorkflowCommand(config, 'doctor', '--fix')}\` to fill in the Deploy Configuration block in CLAUDE.md, then`);
+      lines.push('Next: run `pipelane configure` to fill in the Deploy Configuration block in CLAUDE.md, then');
       lines.push(`\`${formatWorkflowCommand(config, 'devmode', 'build')}\` and \`${formatWorkflowCommand(config, 'deploy', 'staging')}\` to register a staging success.`);
     }
   }

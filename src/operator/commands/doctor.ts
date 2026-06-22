@@ -574,7 +574,7 @@ async function runFix(context: WorkflowContext, parsed: ParsedOperatorArgs): Pro
     throw new Error('/doctor --fix is interactive and cannot run under --json. Use `pipelane configure` for scripted configuration.');
   }
   if (!process.stdin.isTTY && !process.env.PIPELANE_DOCTOR_FIX_STUB) {
-    throw new Error('/doctor --fix requires a TTY. Re-run from a terminal, or use `pipelane configure --json=...` for scripted config.');
+    throw new Error('/doctor --fix requires a TTY. Re-run from a terminal, or use `pipelane configure --json ...` for scripted config.');
   }
   const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
   const detected = detectPlatform(context.repoRoot, deployConfig);

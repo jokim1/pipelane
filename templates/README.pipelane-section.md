@@ -106,7 +106,7 @@ command.
 - Optional raw-npm protection: run `pipelane install-npm-guard`, put
   `~/.pipelane/bin` first in `PATH`, and verify with
   `pipelane run doctor --check-guard`. The guard does not edit shell profiles.
-- Each release operator fills local deploy config in `CLAUDE.md`, refreshes probes
-  with `{{ALIAS_DOCTOR}} --probe`, and verifies readiness with `{{ALIAS_DEVMODE}} release`.
+- Each release operator runs `pipelane configure`, refreshes probes with
+  `{{ALIAS_DOCTOR}} --probe`, and verifies readiness with `{{ALIAS_DEVMODE}} release`.
 
 Use [docs/RELEASE_WORKFLOW.md](./docs/RELEASE_WORKFLOW.md) for the full operator workflow.

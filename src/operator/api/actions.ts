@@ -49,6 +49,7 @@ import {
   destinationPlanFingerprintDigest,
   type DestinationPlan,
 } from '../destination-planner.ts';
+import { buildMissingDeployOnboardingMessage } from '../onboarding.ts';
 import {
   DESTINATION_APPROVED_ROUTE_FINGERPRINT_ENV,
   DESTINATION_ROUTE_PROD_CONFIRMED_ENV,
@@ -165,6 +166,11 @@ export function isStableActionId(value: string): value is StableActionId {
 }
 
 export function buildActionPreflightEnvelope(cwd: string, actionId: StableActionId, parsed: ParsedOperatorArgs): ApiEnvelope<ActionPreflightData> {
+  const onboardingBlock = buildDeployActionOnboardingBlock(cwd, actionId, parsed);
+  if (onboardingBlock) {
+    return onboardingBlock;
+  }
+
   const context = resolveWorkflowContext(cwd);
   const destinationPlan = buildRoutePlanForAction(cwd, actionId, parsed);
   const normalizedInputs = normalizeInputs(actionId, parsed, cwd, destinationPlan);
@@ -531,7 +537,76 @@ function buildReleaseOverrideInputGate(reason: string): PreflightGateResult {
   };
 }
 
+function deployEnvironmentForAction(actionId: StableActionId): 'staging' | 'prod' | null {
+  if (actionId === 'deploy.staging' || actionId === 'route.deploy.staging') {
+    return 'staging';
+  }
+  if (actionId === 'deploy.prod' || actionId === 'route.deploy.prod') {
+    return 'prod';
+  }
+  return null;
+}
+
+function buildDeployActionOnboardingBlock(
+  cwd: string,
+  actionId: StableActionId,
+  parsed: ParsedOperatorArgs,
+): ApiEnvelope<ActionPreflightData> | null {
+  const environment = deployEnvironmentForAction(actionId);
+  if (!environment) {
+    return null;
+  }
+
+  const message = buildMissingDeployOnboardingMessage(cwd, {
+    environment,
+    pr: parsed.flags.pr,
+  });
+  if (!message) {
+    return null;
+  }
+
+  const checkedAt = nowIso();
+  const normalizedInputs = normalizeInputs(actionId, parsed, cwd, null);
+  if (actionId === 'route.deploy.staging' || actionId === 'route.deploy.prod') {
+    normalizedInputs.routeBlockers = ['repo not onboarded'];
+  }
+  const data: ActionPreflightData = {
+    action: {
+      id: actionId,
+      label: ACTION_LABELS[actionId],
+      risky: API_RISKY_ACTION_IDS.has(actionId),
+    },
+    preflight: {
+      allowed: false,
+      state: 'blocked',
+      reason: message,
+      needsInput: false,
+      missingInputs: [],
+      inputs: [],
+      defaultParams: {},
+      warnings: [],
+      issues: [],
+      normalizedInputs,
+      requiresConfirmation: false,
+      confirmation: null,
+      freshness: buildFreshness({ checkedAt, stale: true }),
+    },
+  };
+
+  return buildApiEnvelope<ActionPreflightData>({
+    command: 'pipelane.api.action',
+    ok: false,
+    message,
+    data,
+  });
+}
+
 export async function runActionExecute(cwd: string, actionId: StableActionId, parsed: ParsedOperatorArgs, confirmToken: string): Promise<ApiEnvelope<ActionExecutionData | ActionPreflightData>> {
+  const onboardingBlock = buildDeployActionOnboardingBlock(cwd, actionId, parsed);
+  if (onboardingBlock) {
+    return onboardingBlock;
+  }
+
   const context = resolveWorkflowContext(cwd);
   const destinationPlan = buildRoutePlanForAction(cwd, actionId, parsed);
   const normalizedInputs = normalizeInputs(actionId, parsed, cwd, destinationPlan);

@@ -17,7 +17,7 @@ This repo uses `pipelane` for task workspaces, PR prep, merge handoff, and deplo
 - Use `{{ALIAS_ROLLBACK}} staging|prod` to roll back the last deploy to the last-good SHA.
 - Use `{{ALIAS_CLEAN}}` for workflow cleanup status.
 - Use `{{ALIAS_STATUS}}` for the one-screen cockpit of task + lane state.
-- Use `{{ALIAS_DOCTOR}}` to diagnose deploy config; `{{ALIAS_DOCTOR}} --probe` to refresh staging healthcheck probes; `{{ALIAS_DOCTOR}} --fix` for the guided wizard.
+- Use `pipelane configure` to fill deploy config; use `{{ALIAS_DOCTOR}}` to diagnose deploy config and `{{ALIAS_DOCTOR}} --probe` to refresh staging healthcheck probes.
 - Use `/fix` for review findings, CI failures, bugs, and code-quality repairs.
 
 ### Repo guard and task locks

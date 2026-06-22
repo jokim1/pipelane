@@ -18,6 +18,7 @@ import { handleRollback } from './commands/rollback.ts';
 import { handleSmoke } from './commands/smoke.ts';
 import { handleStatus } from './commands/status.ts';
 import { handleTaskLock } from './commands/task-lock.ts';
+import { assertRepoOnboardedForDeploy as assertDeployRepoOnboarded } from './onboarding.ts';
 import { loadDeployConfig } from './release-gate.ts';
 import {
   parseOperatorArgs,
@@ -54,6 +55,7 @@ export async function runOperator(cwd: string, argv: string[]): Promise<void> {
   }
 
   validateOperatorArgs(parsed);
+  assertRepoOnboardedForDeploy(cwd, parsed);
 
   if (command === 'devmode') {
     await handleDevmode(cwd, parsed);
@@ -141,6 +143,16 @@ export async function runOperator(cwd: string, argv: string[]): Promise<void> {
   }
 
   throw new Error(`Unknown Pipelane command "${command}". Run "pipelane run --help" to see supported commands.`);
+}
+
+function assertRepoOnboardedForDeploy(cwd: string, parsed: ParsedOperatorArgs): void {
+  if (parsed.command !== 'deploy') {
+    return;
+  }
+  assertDeployRepoOnboarded(cwd, {
+    environment: parsed.positional[0],
+    pr: parsed.flags.pr,
+  });
 }
 
 function printUsage(): void {

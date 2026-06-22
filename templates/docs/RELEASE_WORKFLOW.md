@@ -330,7 +330,8 @@ repo-local surfaces are enabled.
 1. run `pipelane bootstrap --yes --project "{{DISPLAY_NAME}}"` or `npx -y pipelane@github:jokim1/pipelane#main bootstrap --yes --project "{{DISPLAY_NAME}}"`
 2. review `.pipelane.json`, especially `aliases` (or the `pipelane` block in
    `package.json` if using the gitignored-config flow)
-3. commit the tracked Pipelane files
+3. run `pipelane configure` before the first deploy
+4. commit the tracked Pipelane files
 
 ### Each Claude user
 
@@ -358,7 +359,7 @@ first in `PATH`, and verify with `pipelane run doctor --check-guard`.
 ### Each release operator
 
 1. run setup
-2. fill local deploy config in `CLAUDE.md`
+2. run `pipelane configure`
 3. run `{{ALIAS_DOCTOR}} --probe`
 4. verify with `{{ALIAS_DEVMODE}} release`
 
@@ -389,6 +390,6 @@ workflow contract needs to exist there first.
 - task already active
   - use `{{ALIAS_RESUME}} --task "<task-name>"`
 - release mode blocked
-  - complete local `CLAUDE.md`
+  - run `pipelane configure` to complete Deploy Configuration
   - rerun `{{ALIAS_DOCTOR}} --probe` after any staging URL or healthcheck-path change because cached probe results are URL-bound
   - if probe-state signing is enabled, make sure `PIPELANE_PROBE_STATE_KEY` is set on the machine running the probe and then rerun it

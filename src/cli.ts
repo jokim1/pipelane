@@ -21,9 +21,10 @@ import {
 } from './operator/docs.ts';
 import { runOperator } from './operator/index.ts';
 import { installNpmGuard } from './operator/npm-guard-install.ts';
+import { loadDeployConfig } from './operator/release-gate.ts';
 import { resolveRepoRoot } from './operator/state.ts';
 import { bootstrapWorktreeNodeModulesIfNeeded } from './operator/task-workspaces.ts';
-import { maybeAutoUpdate, parseUpdateArgs, runUpdate } from './operator/update.ts';
+import { collectUpdateStatus, maybeAutoUpdate, parseUpdateArgs, runUpdate, type UpdateStatus } from './operator/update.ts';
 import { runVerify } from './operator/verify.ts';
 
 function printTopLevelHelp(): void {
@@ -217,6 +218,113 @@ async function confirmBootstrapWrites(yes: boolean | undefined): Promise<void> {
   }
 }
 
+function installUpdateCheckTimeoutMs(): number {
+  const raw = process.env.PIPELANE_INSTALL_UPDATE_CHECK_TIMEOUT_MS?.trim();
+  if (!raw) return 5000;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 5000;
+}
+
+function repoLocalPipelanePackageExists(repoRoot: string): boolean {
+  return existsSync(path.join(repoRoot, 'node_modules', 'pipelane', 'package.json'));
+}
+
+function formatRepoLocalUpdateWarning(status: UpdateStatus): string[] {
+  if (status.upToDate) {
+    return [`Repo-local pipelane is up to date (${status.installedShaShort}).`];
+  }
+  return [
+    `Repo-local pipelane is behind: ${status.installedShaShort || '(unknown)'} -> ${status.latestShaShort}.`,
+    `Run \`pipelane update\` in ${status.repoRoot} before deploying, or set PIPELANE_AUTO_UPDATE=1 to opt into automatic workflow-command updates.`,
+  ];
+}
+
+function repoLocalInstallCheckLines(cwd: string): string[] {
+  let repoRoot: string;
+  try {
+    repoRoot = resolveRepoRoot(cwd, true);
+  } catch {
+    repoRoot = cwd;
+  }
+  if (!repoLocalPipelanePackageExists(repoRoot)) {
+    return [];
+  }
+  try {
+    return formatRepoLocalUpdateWarning(collectUpdateStatus(repoRoot, { timeoutMs: installUpdateCheckTimeoutMs() }));
+  } catch (error) {
+    return [
+      `Repo-local pipelane update check failed: ${error instanceof Error ? error.message : String(error)}`,
+      `Run \`pipelane update --check\` in ${repoRoot} before deploying.`,
+    ];
+  }
+}
+
+async function prepareRepoLocalPipelaneForBootstrap(repoRoot: string, yes: boolean | undefined): Promise<void> {
+  if (!repoLocalPipelanePackageExists(repoRoot)) {
+    return;
+  }
+
+  let status: UpdateStatus;
+  try {
+    status = collectUpdateStatus(repoRoot, { timeoutMs: installUpdateCheckTimeoutMs() });
+  } catch (error) {
+    process.stderr.write(`[pipelane] Could not check repo-local pipelane before bootstrap: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.stderr.write('[pipelane] Continuing with the installed repo-local pipelane. Run `pipelane update --check` if bootstrap behaves unexpectedly.\n');
+    return;
+  }
+
+  if (status.upToDate) {
+    return;
+  }
+
+  if (!yes) {
+    if (!process.stdin.isTTY || !process.stdout.isTTY) {
+      throw new Error(
+        `Repo-local pipelane is behind (${status.installedShaShort || '(unknown)'} -> ${status.latestShaShort}). ` +
+        'Re-run bootstrap with --yes to update repo-local pipelane before setup, or run `pipelane update` manually first.',
+      );
+    }
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      const answer = (await rl.question(
+        `Repo-local pipelane is behind (${status.installedShaShort || '(unknown)'} -> ${status.latestShaShort}). Update it before bootstrap? [Y/n] `,
+      )).trim().toLowerCase();
+      if (answer === 'n' || answer === 'no') {
+        throw new Error('pipelane bootstrap cancelled; update repo-local pipelane first with `pipelane update`.');
+      }
+    } finally {
+      rl.close();
+    }
+  }
+
+  await runUpdate(repoRoot, {
+    check: false,
+    yes: true,
+    json: false,
+    output: 'stderr',
+    initialStatus: status,
+    stopBoard: false,
+    followUp: false,
+  });
+}
+
+async function maybeOfferConfigureAfterBootstrap(repoRoot: string): Promise<void> {
+  if (loadDeployConfig(repoRoot) || !process.stdin.isTTY || !process.stdout.isTTY) {
+    return;
+  }
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (await rl.question('Deploy Configuration is still empty. Configure deploy targets now? [Y/n] ')).trim().toLowerCase();
+    if (answer === 'n' || answer === 'no') {
+      process.stdout.write('Next: run `pipelane configure` before the first /deploy.\n');
+      return;
+    }
+  } finally {
+    rl.close();
+  }
+  await handleConfigure(repoRoot, []);
+}
+
 async function maybeApplyAgentsGuidanceMigrationsAfterPrompt(
   result: SetupConsumerRepoResult,
   yes: boolean,
@@ -291,6 +399,8 @@ async function main(): Promise<void> {
   if (command === 'bootstrap') {
     const options = parseBootstrapArgs(rest);
     await confirmBootstrapWrites(options.yes);
+    const bootstrapRepoRoot = resolveRepoRoot(process.cwd(), true);
+    await prepareRepoLocalPipelaneForBootstrap(bootstrapRepoRoot, options.yes);
     const result = runBootstrap(process.cwd(), options);
     const lines = [
       `Bootstrapped pipelane in ${result.repoRoot}`,
@@ -318,6 +428,7 @@ async function main(): Promise<void> {
       lines.push(...result.warnings.map((warning) => `- ${warning}`));
     }
     process.stdout.write(lines.join('\n') + '\n');
+    await maybeOfferConfigureAfterBootstrap(result.repoRoot);
     return;
   }
 
@@ -356,6 +467,7 @@ async function main(): Promise<void> {
     const lines = [
       `Installed ${result.installed.length} durable Pipelane Codex commands in ${result.codexHome}.`,
     ];
+    lines.push(...repoLocalInstallCheckLines(process.cwd()));
     if (result.removedLegacySkills.length > 0) {
       lines.push(`Removed legacy machine-local wrapper skills: ${result.removedLegacySkills.join(', ')}`);
     }
@@ -375,6 +487,7 @@ async function main(): Promise<void> {
     const verbose = parseVerboseArg(rest, 'install-claude');
     const result = installClaudeBootstrapSkill();
     const lines = [`Installed ${result.installed.length} durable Pipelane Claude commands in ${result.claudeHome}.`];
+    lines.push(...repoLocalInstallCheckLines(process.cwd()));
     if (result.skipped.length > 0) {
       lines.push(`Skipped unmanaged optional skills: ${result.skipped.join(', ')}. Use /pipelane-fix.`);
     }

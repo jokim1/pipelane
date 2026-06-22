@@ -985,6 +985,53 @@ test('bootstrap installs pipelane, initializes the repo, and seeds the global bo
   }
 });
 
+test('bootstrap --yes updates stale repo-local pipelane before running repo-local setup', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-bootstrap-update-bin-'));
+  const oldSha = '1111111111111111111111111111111111111111';
+  const newSha = '2222222222222222222222222222222222222222';
+
+  try {
+    writeFakeConsumer(repoRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    mkdirSync(path.join(repoRoot, 'node_modules', '.bin'), { recursive: true });
+    writeFileSync(
+      path.join(repoRoot, 'node_modules', '.bin', 'pipelane'),
+      `#!/bin/sh
+if grep -q "${newSha}" package-lock.json; then
+  exec node "${CLI_PATH}" "$@"
+fi
+echo "STALE_LOCAL_BEFORE_BOOTSTRAP:$*" >&2
+exit 42
+`,
+      { mode: 0o755, encoding: 'utf8' },
+    );
+    makeFakeUpdateBin(binDir, { latestSha: newSha });
+
+    const result = runCli(
+      ['bootstrap', '--yes', '--project', 'Demo App'],
+      repoRoot,
+      {
+        CODEX_HOME: codexHome,
+        PATH: `${binDir}:${process.env.PATH}`,
+      },
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /pipelane has updates available/);
+    assert.match(result.stderr, /Upgrade complete/);
+    assert.doesNotMatch(result.stderr, /STALE_LOCAL_BEFORE_BOOTSTRAP/);
+    assert.match(result.stdout, /Bootstrapped pipelane/);
+    assert.ok(existsSync(path.join(repoRoot, '.pipelane.json')));
+    const lock = JSON.parse(readFileSync(path.join(repoRoot, 'package-lock.json'), 'utf8'));
+    assert.equal(lock.packages['node_modules/pipelane'].resolved.endsWith(`#${newSha}`), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
 test('bootstrap --yes on an existing config materializes repo-local syncDocs opt-in', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
@@ -1982,6 +2029,8 @@ test('install-codex outside a pipelane repo installs durable global default skil
     const deploySkill = readFileSync(path.join(codexHome, 'skills', 'deploy', 'SKILL.md'), 'utf8');
     assert.match(deploySkill, /Blocked deploy follow-up behavior/);
     assert.match(deploySkill, /Reply 1 or Y to execute/);
+    assert.match(deploySkill, /PR shorthand behavior/);
+    assert.match(deploySkill, /pass it as `--pr 625`/);
     const pipelaneSkill = readFileSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
     assert.match(pipelaneSkill, /Interactive review setup behavior/);
     assert.match(pipelaneSkill, /runner command above/);
@@ -2028,6 +2077,9 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane-fix', 'SKILL.md')));
     assert.match(readFileSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md'), 'utf8'), /disable-model-invocation: true/);
     assert.match(readFileSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md'), 'utf8'), /Bare invocation behavior/);
+    const deploySkill = readFileSync(path.join(claudeHome, 'skills', 'deploy', 'SKILL.md'), 'utf8');
+    assert.match(deploySkill, /PR shorthand behavior/);
+    assert.match(deploySkill, /pass it as `--pr 625`/);
     const pipelaneSkill = readFileSync(path.join(claudeHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
     assert.match(pipelaneSkill, /Interactive review setup behavior/);
     assert.match(pipelaneSkill, /runner command above/);
@@ -2044,6 +2096,32 @@ test('install-claude outside a pipelane repo installs durable personal skills an
   } finally {
     rmSync(workspaceRoot, { recursive: true, force: true });
     rmSync(claudeHome, { recursive: true, force: true });
+  }
+});
+
+test('machine-local install warns when the current repo has stale repo-local pipelane', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-install-update-bin-'));
+  const oldSha = '1111111111111111111111111111111111111111';
+  const newSha = '2222222222222222222222222222222222222222';
+
+  try {
+    writeFakeConsumer(repoRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    makeFakeUpdateBin(binDir, { latestSha: newSha });
+
+    const result = runCli(['install-codex'], repoRoot, {
+      CODEX_HOME: codexHome,
+      PATH: `${binDir}:${process.env.PATH}`,
+    });
+
+    assert.match(result.stdout, /Installed \d+ durable Pipelane Codex commands/);
+    assert.match(result.stdout, /Repo-local pipelane is behind: 1111111 -> 2222222/);
+    assert.match(result.stdout, /Run `pipelane update`/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
   }
 });
 
@@ -12105,7 +12183,7 @@ test('release-check keeps config remediation when staging is pending but deploy 
     assert.equal(result.status, 1);
     assert.ok(output.message.includes(`latest staging deploy is still in flight since ${requestedAt}`));
     assert.match(output.message, /frontend production URL or workflow/);
-    assert.match(output.message, /\/doctor --fix/);
+    assert.match(output.message, /pipelane configure/);
     assert.doesNotMatch(output.message, /Next: wait for the staging deploy verification to finish/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -12518,7 +12596,7 @@ test('setup output mentions shared deploy configuration when the empty local CLA
   }
 });
 
-test('setup output points the operator at doctor or configure when no deploy config exists yet', () => {
+test('setup output points the operator at configure when no deploy config exists yet', () => {
   const repoRoot = createRepo();
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
@@ -12526,7 +12604,7 @@ test('setup output points the operator at doctor or configure when no deploy con
     const result = runCli(['setup'], repoRoot);
     assert.match(
       result.stdout,
-      /Release mode still requires deploy configuration\. Run `\/doctor --fix`\./,
+      /Release mode still requires deploy configuration\. Run `pipelane configure` interactively, or `pipelane configure --json \.\.\.` for scripted setup\./,
     );
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -19657,6 +19735,34 @@ test('operator parser accepts --pr for merge, deploy, and API actions', async ()
   assert.throws(() => state.validateOperatorArgs(apiAmbiguousSha), /deploy\.staging cannot combine --pr and --sha/);
 });
 
+test('operator parser normalizes PR shorthand for PR-targeted commands', async () => {
+  const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+
+  const deployHash = state.parseOperatorArgs(['deploy', 'staging', '#625']);
+  state.validateOperatorArgs(deployHash);
+  assert.equal(deployHash.flags.pr, '625');
+  assert.deepEqual(deployHash.positional, ['staging']);
+
+  const deployPrHash = state.parseOperatorArgs(['deploy', 'staging', 'PR', '#625']);
+  state.validateOperatorArgs(deployPrHash);
+  assert.equal(deployPrHash.flags.pr, '625');
+  assert.deepEqual(deployPrHash.positional, ['staging']);
+
+  const mergePrNumber = state.parseOperatorArgs(['merge', 'PR', '625']);
+  state.validateOperatorArgs(mergePrNumber);
+  assert.equal(mergePrNumber.flags.pr, '625');
+  assert.deepEqual(mergePrNumber.positional, []);
+
+  const apiPrNumber = state.parseOperatorArgs(['api', 'action', 'deploy.staging', 'PR', '625']);
+  state.validateOperatorArgs(apiPrNumber);
+  assert.equal(apiPrNumber.flags.pr, '625');
+
+  assert.throws(
+    () => state.parseOperatorArgs(['deploy', 'staging', 'PR']),
+    /PR shorthand requires a number/,
+  );
+});
+
 test('init refuses to overwrite an existing pipelane config', () => {
   const repoRoot = createRepo();
   try {
@@ -19823,9 +19929,23 @@ test('setup installs the pipelane:configure script and rewrites devmode.md point
     assert.equal(pkg.scripts['pipelane:configure'], 'pipelane configure');
 
     const devmode = readFileSync(path.join(repoRoot, '.claude', 'commands', 'devmode.md'), 'utf8');
-    // The devmode slash command points operators at the guided doctor flow.
-    assert.match(devmode, /\/doctor --fix/);
+    // The devmode slash command points operators at configure for missing
+    // Deploy Configuration and doctor --probe for stale health checks.
+    assert.match(devmode, /pipelane configure/);
+    assert.match(devmode, /\/doctor --probe/);
+    assert.doesNotMatch(devmode, /\/doctor --fix/);
     assert.doesNotMatch(devmode, /run `npm run pipelane:setup`/);
+
+    const agents = readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8');
+    assert.match(agents, /pipelane configure/);
+    assert.doesNotMatch(agents, /\/doctor --fix/);
+
+    const readme = readFileSync(path.join(repoRoot, 'README.md'), 'utf8');
+    assert.match(readme, /Each release operator runs `pipelane configure`/);
+
+    const releaseWorkflow = readFileSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md'), 'utf8');
+    assert.match(releaseWorkflow, /run `pipelane configure`/);
+    assert.doesNotMatch(releaseWorkflow, /\/doctor --fix/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -21400,6 +21520,49 @@ test('release-check blocks when staging probe is degraded (non-2xx)', async () =
     assert.match(output.message, /HTTP 503|probe failed/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('deploy in an un-onboarded repo fails with guided setup before dispatch', () => {
+  const repoRoot = createRepo();
+
+  try {
+    const result = runCli(['run', 'deploy', 'staging', 'PR', '#625'], repoRoot, {}, true);
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /repo is not onboarded yet/);
+    assert.match(result.stderr, /No \.pipelane\.json, \.project-workflow\.json, or package\.json:pipelane block/);
+    assert.match(result.stderr, /pipelane bootstrap --project "pipelane-repo-/);
+    assert.match(result.stderr, /pipelane configure/);
+    assert.match(result.stderr, /Then retry: pipelane run deploy staging --pr 625/);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('api deploy preflight in an un-onboarded repo blocks with guided setup', () => {
+  for (const actionId of ['deploy.staging', 'deploy.prod', 'route.deploy.staging', 'route.deploy.prod']) {
+    const repoRoot = createRepo();
+    try {
+      const result = runCli(['run', 'api', 'action', actionId, 'PR', '#625'], repoRoot, {}, true);
+      const output = JSON.parse(result.stdout);
+
+      assert.equal(result.status, 1, actionId);
+      assert.equal(output.ok, false, actionId);
+      assert.match(output.message, /repo is not onboarded yet/);
+      assert.equal(output.data.preflight.allowed, false, actionId);
+      assert.equal(output.data.preflight.state, 'blocked', actionId);
+      assert.match(output.data.preflight.reason, /pipelane configure/);
+      assert.match(output.data.preflight.reason, /No deploy started/);
+      assert.match(output.data.preflight.reason, new RegExp(`Then retry: pipelane run deploy ${actionId.endsWith('.prod') ? 'prod' : 'staging'} --pr 625`));
+      if (actionId.startsWith('route.')) {
+        assert.deepEqual(output.data.preflight.normalizedInputs.routeBlockers, ['repo not onboarded']);
+      }
+      assert.doesNotMatch(output.message, /preflight ready/);
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+    }
   }
 });
 
