@@ -149,6 +149,7 @@ export interface OrchestrateConfig {
   };
   hardStops?: {
     maxIterationsPerSlice?: number;
+    maxReviewLoops?: number;
     maxMinutesPerSlice?: number;
   };
 }
@@ -1242,6 +1243,7 @@ function normalizeOrchestrateConfig(raw: OrchestrateConfig | undefined): Orchest
     hardStops: hardStops
       ? {
           maxIterationsPerSlice: positiveConfigInteger(hardStops.maxIterationsPerSlice),
+          maxReviewLoops: positiveConfigInteger(hardStops.maxReviewLoops),
           maxMinutesPerSlice: positiveConfigInteger(hardStops.maxMinutesPerSlice),
         }
       : undefined,
@@ -1332,7 +1334,9 @@ function normalizeReviewGateList(raw: unknown[]): ReviewGateConfig[] {
       phase,
       type,
       blocking: entry.blocking !== false,
-      command: type === 'command' || type === 'pipelane' ? command : undefined,
+      command: type === 'command' || type === 'pipelane' || type === 'skill' || type === 'agent'
+        ? command
+        : undefined,
       skill: type === 'skill' ? skill : undefined,
       role: type === 'agent' ? role : undefined,
       when: cleanString(entry.when),

@@ -12,7 +12,7 @@ import {
   type ResolvedReviewGateCatalogEntry,
 } from '../review-gates.ts';
 import { resolveReviewActorIdentity } from '../review-identity.ts';
-import { readWorktreeStatusSnapshot } from '../worktree-status.ts';
+import { readWorktreeStatusSnapshot, type WorktreeStatusSnapshot } from '../worktree-status.ts';
 import {
   appendReviewRunRecord,
   loadReviewState,
@@ -43,6 +43,8 @@ const REVIEW_PHASE_ORDER = REVIEW_GATE_PHASES;
 const DEFAULT_GATE_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_REVIEW_SETUP_NPM_INSTALL_TIMEOUT_MS = 2 * 60 * 1000;
 const OUTPUT_TAIL_CHARS = 4000;
+const REVIEW_GATE_RESULT_MARKER = 'PIPELANE_REVIEW_GATE_RESULT';
+const REVIEW_GATE_SESSION_ENV = 'PIPELANE_REVIEW_GATE_SESSION_ID';
 const CODEX_CLAUDE_REVIEW_REPO = 'https://github.com/jokim1/codexskill-claude-review.git';
 const CODEX_CLAUDE_REVIEW_SKILL_NAME = 'claude';
 const KARPATHY_SKILLS_REPO = 'https://github.com/jokim1/karpathy-skills.git';
@@ -1904,6 +1906,7 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
     const record = runReviewGate({
       gate,
       repoRoot: options.repoRoot,
+      baseBranch: options.baseBranch,
       dryRun: options.dryRun,
       reviewConfigChanged,
       changedFiles,
@@ -1945,12 +1948,13 @@ function orderReviewGates(gates: ReviewGateConfig[]): ReviewGateConfig[] {
 function runReviewGate(options: {
   gate: ReviewGateConfig;
   repoRoot: string;
+  baseBranch: string;
   dryRun: boolean;
   reviewConfigChanged: boolean;
   changedFiles: string[];
   activeSurfaces: string[];
 }): ReviewGateRunRecord {
-  const { gate, repoRoot, dryRun, reviewConfigChanged, changedFiles, activeSurfaces } = options;
+  const { gate, repoRoot, baseBranch, dryRun, reviewConfigChanged, changedFiles, activeSurfaces } = options;
   const startedAt = nowIso();
   const startMs = Date.now();
   const base: Omit<ReviewGateRunRecord, 'status' | 'summary' | 'finishedAt' | 'durationMs'> = {
@@ -1971,6 +1975,19 @@ function runReviewGate(options: {
       status: 'skipped',
       summary: skipReason,
       skipReason,
+    });
+  }
+
+  if (gate.type === 'skill' || gate.type === 'agent') {
+    return runAiReviewGate({
+      base,
+      startMs,
+      gate,
+      repoRoot,
+      baseBranch,
+      dryRun,
+      reviewConfigChanged,
+      changedFiles,
     });
   }
 
@@ -2031,6 +2048,343 @@ function runReviewGate(options: {
     stdoutTail: tail(redactReviewOutput(stdout)),
     stderrTail: tail(redactReviewOutput(stderr)),
   });
+}
+
+function runAiReviewGate(options: {
+  base: Omit<ReviewGateRunRecord, 'status' | 'summary' | 'finishedAt' | 'durationMs'>;
+  startMs: number;
+  gate: ReviewGateConfig;
+  repoRoot: string;
+  baseBranch: string;
+  dryRun: boolean;
+  reviewConfigChanged: boolean;
+  changedFiles: string[];
+}): ReviewGateRunRecord {
+  const { base, startMs, gate, repoRoot, baseBranch, dryRun, reviewConfigChanged, changedFiles } = options;
+  const resolved = resolveAiReviewGateCommand(gate);
+  if (!resolved) {
+    return finishGate(base, startMs, {
+      status: 'pending',
+      summary: manualGateSummary(gate),
+    });
+  }
+
+  const command = resolved.command;
+  if (reviewConfigChanged) {
+    return finishGate({ ...base, command }, startMs, {
+      status: 'skipped',
+      summary: `skipped: review config inputs changed; ${gate.type} gates require trusted approval before execution`,
+      skipReason: 'review-config-changed',
+    });
+  }
+
+  if (dryRun) {
+    return finishGate({ ...base, command }, startMs, {
+      status: 'skipped',
+      summary: `dry-run: would run AI review command ${command}`,
+      skipReason: 'dry-run',
+    });
+  }
+
+  const timeoutMs = gate.timeoutMs ?? DEFAULT_GATE_TIMEOUT_MS;
+  const sessionId = `review-gate:${gate.id}:${crypto.randomUUID()}`;
+  const env = buildAiReviewGateEnv(resolved.provider, sessionId, gate);
+  const prompt = renderAiReviewGatePrompt({
+    gate,
+    repoRoot,
+    baseBranch,
+    changedFiles,
+  });
+  const beforeStatus = readWorktreeStatusSnapshot(repoRoot, { includeStatusDigest: true });
+  const result = spawnSync(command, {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    shell: true,
+    input: prompt,
+    timeout: timeoutMs,
+    env,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const exitCode = typeof result.status === 'number' ? result.status : null;
+  const stdout = typeof result.stdout === 'string' ? result.stdout : '';
+  const stderr = typeof result.stderr === 'string' ? result.stderr : '';
+  const output = `${stdout}\n${stderr}`;
+  const declared = parseAiReviewGateResult(output);
+  const timedOut = result.error && (result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT';
+  const attester = resolveReviewActorIdentity({ provider: resolved.provider, env });
+  const redactedStdout = tail(redactReviewOutput(stdout));
+  const redactedStderr = tail(redactReviewOutput(stderr));
+  const afterStatus = readWorktreeStatusSnapshot(repoRoot, { includeStatusDigest: true });
+  const worktreeMutationSummary = aiReviewWorktreeMutationSummary(beforeStatus, afterStatus);
+
+  if (result.error && !timedOut) {
+    return finishGate({ ...base, command }, startMs, {
+      status: 'failed',
+      summary: `AI review command failed to start: ${result.error.message}`,
+      exitCode,
+      attester,
+      stdoutTail: redactedStdout,
+      stderrTail: redactedStderr,
+    });
+  }
+
+  if (timedOut) {
+    return finishGate({ ...base, command }, startMs, {
+      status: 'failed',
+      summary: `AI review command timed out after ${timeoutMs}ms`,
+      exitCode,
+      attester,
+      stdoutTail: redactedStdout,
+      stderrTail: redactedStderr,
+    });
+  }
+
+  if (exitCode !== 0) {
+    return finishGate({ ...base, command }, startMs, {
+      status: 'failed',
+      summary: declared === 'failed'
+        ? `AI review reported failed: ${formatAiReviewGateTarget(gate)}`
+        : `AI review command exited ${exitCode}`,
+      exitCode,
+      attester,
+      stdoutTail: redactedStdout,
+      stderrTail: redactedStderr,
+    });
+  }
+
+  if (declared === 'failed') {
+    return finishGate({ ...base, command }, startMs, {
+      status: 'failed',
+      summary: `AI review reported failed: ${formatAiReviewGateTarget(gate)}`,
+      exitCode,
+      attester,
+      stdoutTail: redactedStdout,
+      stderrTail: redactedStderr,
+    });
+  }
+
+  if (worktreeMutationSummary) {
+    return finishGate({ ...base, command }, startMs, {
+      status: 'failed',
+      summary: worktreeMutationSummary,
+      exitCode,
+      attester,
+      stdoutTail: redactedStdout,
+      stderrTail: redactedStderr,
+    });
+  }
+
+  if (declared !== 'passed') {
+    return finishGate({ ...base, command }, startMs, {
+      status: 'failed',
+      summary: `AI review command completed without ${REVIEW_GATE_RESULT_MARKER}=passed or ${REVIEW_GATE_RESULT_MARKER}=failed`,
+      exitCode,
+      attester,
+      stdoutTail: redactedStdout,
+      stderrTail: redactedStderr,
+    });
+  }
+
+  return finishGate({ ...base, command }, startMs, {
+    status: 'passed',
+    summary: `AI review passed: ${formatAiReviewGateTarget(gate)}`,
+    exitCode,
+    attester,
+    stdoutTail: redactedStdout,
+    stderrTail: redactedStderr,
+  });
+}
+
+function resolveAiReviewGateCommand(gate: ReviewGateConfig): { command: string; provider: string } | null {
+  const explicit = gate.command?.trim();
+  const command = explicit
+    || firstEnvValue(process.env, reviewGateCommandEnvKeys(gate))?.value
+    || defaultAiReviewGateCommand(gate);
+  if (!command) return null;
+  return {
+    command,
+    provider: resolveAiReviewGateProvider(gate, command),
+  };
+}
+
+function reviewGateCommandEnvKeys(gate: Pick<ReviewGateConfig, 'id'>): string[] {
+  const key = reviewGateEnvKey(gate.id);
+  return [
+    `PIPELANE_REVIEW_${key}_COMMAND`,
+    `PIPELANE_REVIEW_GATE_${key}_COMMAND`,
+    'PIPELANE_REVIEW_AI_COMMAND',
+    'PIPELANE_REVIEW_GATE_COMMAND',
+  ];
+}
+
+function reviewGateProviderEnvKeys(gate: Pick<ReviewGateConfig, 'id'>): string[] {
+  const key = reviewGateEnvKey(gate.id);
+  return [
+    `PIPELANE_REVIEW_${key}_PROVIDER`,
+    `PIPELANE_REVIEW_GATE_${key}_PROVIDER`,
+    'PIPELANE_REVIEW_PROVIDER',
+    'PIPELANE_REVIEW_GATE_PROVIDER',
+  ];
+}
+
+function reviewGateEnvKey(id: string): string {
+  return id.toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'GATE';
+}
+
+function firstEnvValue(env: NodeJS.ProcessEnv, keys: string[]): { key: string; value: string } | null {
+  for (const key of keys) {
+    const value = env[key]?.trim();
+    if (value) return { key, value };
+  }
+  return null;
+}
+
+function defaultAiReviewGateCommand(gate: ReviewGateConfig): string {
+  if (process.env.NODE_ENV === 'test' && process.env.PIPELANE_REVIEW_GATE_USE_REAL_NATIVE !== '1') {
+    return '';
+  }
+  if (gate.type === 'agent' && isExecutableOnPath('claude')) return defaultClaudeReviewCommand();
+  if (isExecutableOnPath('codex')) return 'codex exec --full-auto -';
+  if (isExecutableOnPath('claude')) return defaultClaudeReviewCommand();
+  return '';
+}
+
+function defaultClaudeReviewCommand(): string {
+  const help = commandHelp('claude');
+  if (/\bdontAsk\b/.test(help)) return 'claude --print --permission-mode dontAsk';
+  if (/\bbypassPermissions\b/.test(help)) return 'claude --print --permission-mode bypassPermissions';
+  if (help.includes('--dangerously-skip-permissions')) return 'claude --print --dangerously-skip-permissions';
+  return 'claude --print';
+}
+
+function commandHelp(command: string): string {
+  const result = spawnSync(command, ['--help'], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 5000,
+  });
+  return `${typeof result.stdout === 'string' ? result.stdout : ''}\n${typeof result.stderr === 'string' ? result.stderr : ''}`;
+}
+
+function resolveAiReviewGateProvider(gate: ReviewGateConfig, command: string): string {
+  const envProvider = firstEnvValue(process.env, reviewGateProviderEnvKeys(gate))?.value;
+  if (envProvider) return normalizeReviewProvider(envProvider);
+  const token = firstCommandToken(command);
+  if (token === 'codex') return 'codex';
+  if (token === 'claude') return 'claude';
+  if (token === 'openclaw') return 'openclaw';
+  return 'unknown';
+}
+
+function firstCommandToken(command: string): string {
+  const match = command.trim().match(/^["']?([A-Za-z0-9_.:/-]+)/);
+  if (!match) return '';
+  return path.basename(match[1]).toLowerCase();
+}
+
+function normalizeReviewProvider(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_.:/-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 96) || 'unknown';
+}
+
+function buildAiReviewGateEnv(provider: string, sessionId: string, gate: ReviewGateConfig): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    [REVIEW_GATE_SESSION_ENV]: sessionId,
+    PIPELANE_REVIEW_PROVIDER: provider,
+    PIPELANE_AGENT_PROVIDER: provider,
+    PIPELANE_REVIEW_GATE_ID: gate.id,
+    PIPELANE_REVIEW_GATE_TYPE: gate.type,
+    PIPELANE_REVIEW_GATE_PHASE: gate.phase,
+  };
+}
+
+function renderAiReviewGatePrompt(options: {
+  gate: ReviewGateConfig;
+  repoRoot: string;
+  baseBranch: string;
+  changedFiles: string[];
+}): string {
+  const { gate, repoRoot, baseBranch, changedFiles } = options;
+  const target = formatAiReviewGateTarget(gate);
+  const changedFileLines = changedFiles.length > 0
+    ? changedFiles.slice(0, 250).map((file) => `- ${file}`)
+    : ['- none detected'];
+  const truncated = changedFiles.length > 250
+    ? [`- ... ${changedFiles.length - 250} more files omitted`]
+    : [];
+  return [
+    'You are running as an independent Pipelane AI review gate.',
+    '',
+    `Gate: ${gate.id}`,
+    `Gate type: ${gate.type}`,
+    `Gate phase: ${gate.phase}`,
+    `Requested review: ${target}`,
+    `Repository: ${repoRoot}`,
+    `Base branch: ${baseBranch}`,
+    '',
+    'Changed files:',
+    ...changedFileLines,
+    ...truncated,
+    '',
+    'Review the current checkout against the base branch. Do not modify files.',
+    'Report blocking correctness, security, data-loss, regression, or test-coverage issues.',
+    'If the requested skill or slash command is unavailable, perform the closest equivalent review yourself.',
+    '',
+    'Required result protocol:',
+    `- Print ${REVIEW_GATE_RESULT_MARKER}=failed if you found any blocking issue or could not complete the review.`,
+    `- Print ${REVIEW_GATE_RESULT_MARKER}=passed only if the gate is clean.`,
+    '- Put the result marker on its own line after your findings.',
+  ].join('\n');
+}
+
+function parseAiReviewGateResult(output: string): 'passed' | 'failed' | null {
+  const matches = [...output.matchAll(new RegExp(`(?:^|\\n)\\s*${REVIEW_GATE_RESULT_MARKER}\\s*[:=]\\s*(passed|failed)\\b`, 'gi'))];
+  const last = matches.at(-1);
+  if (!last) return null;
+  return last[1].toLowerCase() === 'passed' ? 'passed' : 'failed';
+}
+
+function aiReviewWorktreeMutationSummary(
+  before: WorktreeStatusSnapshot,
+  after: WorktreeStatusSnapshot,
+): string | null {
+  if (!before.statusDigestReliable) {
+    return `AI review command could not verify unchanged worktree before execution: ${formatWorktreeStatusWarnings(before)}`;
+  }
+  if (!after.statusDigestReliable) {
+    return `AI review command could not verify unchanged worktree after execution: ${formatWorktreeStatusWarnings(after)}`;
+  }
+  if (before.statusDigest !== after.statusDigest) {
+    return `AI review command mutated the worktree; revert reviewer changes and rerun (${formatWorktreeStatusDelta(before, after)})`;
+  }
+  return null;
+}
+
+function formatWorktreeStatusWarnings(snapshot: Pick<WorktreeStatusSnapshot, 'statusDigestWarnings'>): string {
+  return snapshot.statusDigestWarnings.join('; ') || 'status digest was unreliable';
+}
+
+function formatWorktreeStatusDelta(
+  before: Pick<WorktreeStatusSnapshot, 'changedPaths'>,
+  after: Pick<WorktreeStatusSnapshot, 'changedPaths'>,
+): string {
+  const changedPaths = [...new Set([...before.changedPaths, ...after.changedPaths])];
+  if (changedPaths.length === 0) return 'status digest changed';
+  const shown = changedPaths.slice(0, 5).join(', ');
+  const omitted = changedPaths.length > 5 ? `, +${changedPaths.length - 5} more` : '';
+  return `changed paths: ${shown}${omitted}`;
+}
+
+function formatAiReviewGateTarget(gate: ReviewGateConfig): string {
+  return gate.userCommands?.[0]
+    ?? (gate.skill ? `skill:${gate.skill}` : undefined)
+    ?? (gate.role ? `role:${gate.role}` : undefined)
+    ?? gate.id;
 }
 
 function finishGate(

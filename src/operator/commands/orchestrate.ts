@@ -70,6 +70,7 @@ const MAX_LIKELY_PLAN_FILES = 5;
 const MAX_PLAN_SCAN_FILES = 200;
 const ORCHESTRATION_REVIEW_DIAGNOSTIC_MAX = 10;
 const NATIVE_COMMAND_PROBE_TIMEOUT_MS = 5000;
+const DEFAULT_REVIEW_LOOP_LIMIT = 2;
 const INHERITED_AGENT_SESSION_ENV_KEYS = [
   'CODEX_SESSION_ID',
   'CLAUDE_SESSION_ID',
@@ -613,7 +614,8 @@ async function autoFixFailedReviewSlices(
   run: OrchestrationRunRecord,
   initialReview: ReviewCompletedSlicesResult,
 ): Promise<ReviewAutoFixResult> {
-  const maxFixAttempts = resolveReviewAutoFixAttemptLimit(run);
+  const budget = resolveReviewAutoFixBudget(run);
+  const maxFixAttempts = budget.maxFixAttempts;
   if (maxFixAttempts <= 0) {
     return {
       status: 'skipped',
@@ -622,7 +624,7 @@ async function autoFixFailedReviewSlices(
       failedCount: initialReview.failedCount,
       attempts: [],
       finalReview: null,
-      reason: 'orchestrate.hardStops.maxIterationsPerSlice leaves no review-fix attempt budget',
+      reason: `${budget.source}=${budget.reviewLoops} leaves no review-fix attempt budget`,
     };
   }
 
@@ -744,9 +746,33 @@ async function autoFixFailedReviewSlices(
   };
 }
 
-function resolveReviewAutoFixAttemptLimit(run: OrchestrationRunRecord): number {
-  const maxIterations = run.configSnapshot.hardStops?.maxIterationsPerSlice ?? 2;
-  return Math.max(0, maxIterations - 1);
+function resolveReviewAutoFixBudget(run: OrchestrationRunRecord): {
+  reviewLoops: number;
+  maxFixAttempts: number;
+  source: string;
+} {
+  const hardStops = run.configSnapshot.hardStops ?? {};
+  const configuredReviewLoops = hardStops.maxReviewLoops;
+  if (configuredReviewLoops !== undefined) {
+    return {
+      reviewLoops: configuredReviewLoops,
+      maxFixAttempts: Math.max(0, configuredReviewLoops - 1),
+      source: 'orchestrate.hardStops.maxReviewLoops',
+    };
+  }
+  const legacyIterations = hardStops.maxIterationsPerSlice;
+  if (legacyIterations !== undefined) {
+    return {
+      reviewLoops: legacyIterations,
+      maxFixAttempts: Math.max(0, legacyIterations - 1),
+      source: 'orchestrate.hardStops.maxIterationsPerSlice',
+    };
+  }
+  return {
+    reviewLoops: DEFAULT_REVIEW_LOOP_LIMIT,
+    maxFixAttempts: Math.max(0, DEFAULT_REVIEW_LOOP_LIMIT - 1),
+    source: 'default review loop limit',
+  };
 }
 
 function failedBlockingReviewGates(slice: OrchestrationSliceRecord): ReviewGateRunRecord[] {

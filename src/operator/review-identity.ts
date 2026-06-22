@@ -11,6 +11,7 @@ export type ReviewIndependenceLabel =
 
 const SESSION_ID_ENV_KEYS = [
   'PIPELANE_ORCHESTRATE_WORKER_SESSION_ID',
+  'PIPELANE_REVIEW_GATE_SESSION_ID',
   'PIPELANE_AGENT_SESSION_ID',
   'CODEX_SESSION_ID',
   'CLAUDE_SESSION_ID',
@@ -21,6 +22,7 @@ const SESSION_ID_ENV_KEYS = [
 
 const SESSION_ID_ENV_SOURCES: Array<{ key: typeof SESSION_ID_ENV_KEYS[number]; provider: string | null }> = [
   { key: 'PIPELANE_ORCHESTRATE_WORKER_SESSION_ID', provider: null },
+  { key: 'PIPELANE_REVIEW_GATE_SESSION_ID', provider: null },
   { key: 'PIPELANE_AGENT_SESSION_ID', provider: null },
   { key: 'CODEX_SESSION_ID', provider: 'codex' },
   { key: 'CLAUDE_SESSION_ID', provider: 'claude' },
@@ -227,6 +229,7 @@ function hasTrustedWorkerProviderIdentity(identity: ReviewActorIdentity): boolea
 
 function hasTrustedReviewerProviderIdentity(identity: ReviewActorIdentity): boolean {
   if (!identity.sessionId || !knownProvider(identity.provider)) return false;
+  if (identity.source === 'PIPELANE_REVIEW_GATE_SESSION_ID') return true;
   return TRUSTED_REVIEWER_PROVIDER_SOURCES.get(identity.source) === identity.provider;
 }
 
@@ -252,6 +255,10 @@ function selectSessionEnvValue(
   const workerSession = env.PIPELANE_ORCHESTRATE_WORKER_SESSION_ID?.trim();
   if (workerSession) {
     return { key: 'PIPELANE_ORCHESTRATE_WORKER_SESSION_ID', value: workerSession, provider: null };
+  }
+  const reviewGateSession = env.PIPELANE_REVIEW_GATE_SESSION_ID?.trim();
+  if (reviewGateSession) {
+    return { key: 'PIPELANE_REVIEW_GATE_SESSION_ID', value: reviewGateSession, provider: null };
   }
   const available = SESSION_ID_ENV_SOURCES.flatMap((source) => {
     const value = env[source.key]?.trim();

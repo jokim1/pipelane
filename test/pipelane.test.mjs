@@ -6102,6 +6102,61 @@ test('orchestrate bare command --yes auto-fixes failed executable review gates a
   }
 });
 
+test('orchestrate bare command --yes honors maxReviewLoops before review auto-fix', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.orchestrate = {
+      hardStops: {
+        maxReviewLoops: 1,
+        maxIterationsPerSlice: 5,
+      },
+    };
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'always-fails',
+        phase: 'static',
+        type: 'command',
+        command: `${process.execPath} -e "process.exit(7)"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt capped review loop gate');
+
+    const cliResult = runCli([
+      'run',
+      'orchestrate',
+      '--outcome',
+      'Do not auto-fix after one review loop',
+      '--provider',
+      'generic',
+      '--yes',
+      '--json',
+    ], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: 'node -e "process.exit(0)"',
+    }, true);
+    const result = JSON.parse(cliResult.stdout);
+    createdWorktrees.push(...result.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+
+    assert.equal(cliResult.status, 1);
+    assert.equal(result.status, 'failed');
+    assert.equal(result.review.status, 'failed');
+    assert.equal(result.autoFix.status, 'skipped');
+    assert.equal(result.autoFix.attemptedCount, 0);
+    assert.equal(result.autoFix.reason, 'orchestrate.hardStops.maxReviewLoops=1 leaves no review-fix attempt budget');
+    assert.doesNotMatch(cliResult.stderr, /review auto-fix attempt/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('orchestrate bare command --yes records pending manual gates instead of declaring completion', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];
@@ -6164,6 +6219,170 @@ test('orchestrate bare command --yes records pending manual gates instead of dec
     assert.equal(stillActive.status, 'active');
     assert.equal(stillActive.runId, result.runId);
     assert.match(stillActive.message, /review=pending/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('review executes configured AI skill gate command and records attester evidence', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'gstack-review',
+        phase: 'ai-diff',
+        type: 'skill',
+        skill: 'review',
+        userCommands: ['/review'],
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt AI review gate');
+
+    const aiReviewCommand = [
+      'node -e "',
+      'let input = \'\';',
+      'process.stdin.on(\'data\', chunk => input += chunk);',
+      'process.stdin.on(\'end\', () => {',
+      'if (!input.includes(\'Gate: gstack-review\') || !input.includes(\'Requested review: /review\')) process.exit(2);',
+      'console.log(\'review clean\');',
+      'console.log(\'PIPELANE_REVIEW_GATE_RESULT=passed\');',
+      '});',
+      '"',
+    ].join('');
+    const result = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      PIPELANE_REVIEW_GATE_COMMAND: aiReviewCommand,
+      PIPELANE_REVIEW_PROVIDER: 'codex',
+    }).stdout);
+
+    assert.equal(result.status, 'passed');
+    assert.equal(result.gates.length, 1);
+    assert.equal(result.gates[0].gateId, 'gstack-review');
+    assert.equal(result.gates[0].status, 'passed');
+    assert.equal(result.gates[0].summary, 'AI review passed: /review');
+    assert.equal(result.gates[0].attester.provider, 'codex');
+    assert.equal(result.gates[0].attester.source, 'PIPELANE_REVIEW_GATE_SESSION_ID');
+    assert.match(result.gates[0].stdoutTail, /PIPELANE_REVIEW_GATE_RESULT=passed/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('review fails configured AI skill gate when command mutates the worktree', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'gstack-review',
+        phase: 'ai-diff',
+        type: 'skill',
+        skill: 'review',
+        userCommands: ['/review'],
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt AI review gate');
+
+    const aiReviewCommand = [
+      'node -e "',
+      'const fs = require(\'node:fs\');',
+      'process.stdin.resume();',
+      'process.stdin.on(\'end\', () => {',
+      'fs.writeFileSync(\'ai-review-mutation.txt\', \'mutated by reviewer\\\\n\');',
+      'console.log(\'PIPELANE_REVIEW_GATE_RESULT=passed\');',
+      '});',
+      '"',
+    ].join('');
+    const cliResult = runCli(['run', 'review', '--json'], repoRoot, {
+      PIPELANE_REVIEW_GATE_COMMAND: aiReviewCommand,
+      PIPELANE_REVIEW_PROVIDER: 'codex',
+    }, true);
+    const result = JSON.parse(cliResult.stdout);
+
+    assert.equal(cliResult.status, 1);
+    assert.equal(result.status, 'failed');
+    assert.equal(result.gates[0].status, 'failed');
+    assert.match(result.gates[0].summary, /mutated the worktree/);
+    assert.equal(existsSync(path.join(repoRoot, 'ai-review-mutation.txt')), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate bare command --yes completes when configured AI review gate passes', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'gstack-review',
+        phase: 'ai-diff',
+        type: 'skill',
+        skill: 'review',
+        userCommands: ['/review'],
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt AI review gate');
+
+    const aiReviewCommand = [
+      'node -e "',
+      'process.stdin.resume();',
+      'process.stdin.on(\'end\', () => {',
+      'console.log(\'review clean\');',
+      'console.log(\'PIPELANE_REVIEW_GATE_RESULT=passed\');',
+      '});',
+      '"',
+    ].join('');
+    const result = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      '--outcome',
+      'Run AI review gate automatically',
+      '--provider',
+      'generic',
+      '--yes',
+      '--json',
+    ], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: 'node -e "process.exit(0)"',
+      PIPELANE_REVIEW_GATE_COMMAND: aiReviewCommand,
+      PIPELANE_REVIEW_PROVIDER: 'codex',
+    }).stdout);
+    createdWorktrees.push(...result.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    const onDisk = JSON.parse(readFileSync(result.ledgerPath, 'utf8'));
+
+    assert.equal(result.status, 'completed');
+    assert.equal(result.review.status, 'passed');
+    assert.equal(result.review.reviewedCount, 1);
+    assert.equal(result.review.pendingCount, 0);
+    assert.equal(result.run.status, 'completed');
+    assert.equal(onDisk.status, 'completed');
+    assert.equal(onDisk.slices[0].worker.status, 'succeeded');
+    assert.equal(onDisk.slices[0].status, 'completed');
+    assert.equal(onDisk.slices[0].review.status, 'passed');
+    assert.equal(onDisk.slices[0].review.run.gates[0].gateId, 'gstack-review');
+    assert.equal(onDisk.slices[0].review.run.gates[0].status, 'passed');
+    assert.equal(onDisk.slices[0].review.run.gates[0].attester.provider, 'codex');
+    assert.equal(onDisk.slices[0].review.run.gates[0].attester.source, 'PIPELANE_REVIEW_GATE_SESSION_ID');
   } finally {
     for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
     rmSync(repoRoot, { recursive: true, force: true });
@@ -9815,7 +10034,7 @@ test('orchestrate plan run records isolate config snapshots from later mutation'
     config.orchestrate = {
       maxConcurrentSlices: 2,
       goalMode: { default: 'auto', maxTurns: 5, maxMinutes: 20, requireConfirmationFor: ['prod'] },
-      hardStops: { maxIterationsPerSlice: 2, maxMinutesPerSlice: 30 },
+      hardStops: { maxIterationsPerSlice: 2, maxReviewLoops: 4, maxMinutesPerSlice: 30 },
     };
     config.reviewGates = {
       planReview: {
@@ -9831,11 +10050,13 @@ test('orchestrate plan run records isolate config snapshots from later mutation'
     });
 
     config.orchestrate.goalMode.maxTurns = 99;
+    config.orchestrate.hardStops.maxReviewLoops = 99;
     config.orchestrate.hardStops.maxMinutesPerSlice = 99;
     config.reviewGates.planReview.gates[0].id = 'mutated-plan-check';
     config.reviewGates.gates[0].id = 'mutated-static-check';
 
     assert.equal(record.configSnapshot.goalMode.maxTurns, 5);
+    assert.equal(record.configSnapshot.hardStops.maxReviewLoops, 4);
     assert.equal(record.configSnapshot.hardStops.maxMinutesPerSlice, 30);
     assert.equal(record.gateSnapshot.planReview.gates[0].id, 'plan-check');
     assert.equal(record.gateSnapshot.gates[0].id, 'static-check');
@@ -21688,6 +21909,7 @@ test('normalizeWorkflowConfig filters malformed orchestrate config', async () =>
       },
       hardStops: {
         maxIterationsPerSlice: 3,
+        maxReviewLoops: 4,
         maxMinutesPerSlice: Number.NaN,
       },
     },
@@ -21703,6 +21925,7 @@ test('normalizeWorkflowConfig filters malformed orchestrate config', async () =>
     },
     hardStops: {
       maxIterationsPerSlice: 3,
+      maxReviewLoops: 4,
       maxMinutesPerSlice: undefined,
     },
   });

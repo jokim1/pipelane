@@ -422,11 +422,17 @@ Each gate has:
     },
     "hardStops": {
       "maxIterationsPerSlice": 3,
+      "maxReviewLoops": 2,
       "maxMinutesPerSlice": 60
     }
   }
 }
 ```
+
+`maxReviewLoops` caps review/fix cycles per slice during approved orchestration.
+`1` runs only the initial review and stops on failure; `2` permits one
+review-fix worker attempt followed by one rerun of the review gates. If omitted,
+Pipelane falls back to `maxIterationsPerSlice` for older configs, then to `2`.
 
 ## Review Gate Evidence
 
@@ -447,9 +453,24 @@ filtered review. A skipped or unavailable optional gate records a warning, not a
 crash. When review evidence records a reviewer session, any passed blocking AI
 gate must also record an attester from a separate trusted session.
 
-Manual skill, agent, and approval gates are not expected to write Pipelane
-state themselves. After the operator runs the referenced command, fixes any
-findings, and determines the gate is clean, record the pass explicitly:
+Skill and agent gates run automatically when Pipelane can resolve an AI review
+command. Resolution order is gate `command`, gate-specific environment
+override (`PIPELANE_REVIEW_<GATE_ID>_COMMAND` or
+`PIPELANE_REVIEW_GATE_<GATE_ID>_COMMAND`), shared environment override
+(`PIPELANE_REVIEW_AI_COMMAND` or `PIPELANE_REVIEW_GATE_COMMAND`), then the
+installed native Codex/Claude CLI default. The command receives a review prompt
+on stdin and must print `PIPELANE_REVIEW_GATE_RESULT=passed` or
+`PIPELANE_REVIEW_GATE_RESULT=failed` on its own line. Missing result markers
+fail closed.
+
+AI review commands must not modify files. Pipelane snapshots the worktree
+before and after each AI review command; if the digest changes or cannot be
+verified, the gate fails and the operator must revert reviewer changes before
+rerunning review.
+
+If no AI command resolves, skill, agent, and approval gates remain manual. After
+the operator runs the referenced command, fixes any findings, and determines
+the gate is clean, record the pass explicitly:
 
 ```bash
 pipelane run review pass --gate gstack-review --message "Ran /review clean"
