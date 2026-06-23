@@ -36,9 +36,11 @@ import {
 import { TASK_LOCK_MIN_PRUNE_AGE_MS } from '../task-workspaces.ts';
 import {
   isActiveOrchestrationRun,
+  listOrchestrationRunRecords,
   missingRelevantSliceWorktreeDiagnostic,
   ORCHESTRATION_CORRUPT_LEDGER_BLOCK_AGE_MS,
   scanOrchestrationRunDiagnostics,
+  selectActiveSlices,
   sliceReviewFullySatisfied,
   type OrchestrationMissingWorktreeDiagnostic,
   type OrchestrationReviewSatisfactionOptions,
@@ -709,9 +711,10 @@ function isPrReadyOrchestrationRun(
   run: OrchestrationRunRecord,
   reviewOptions: OrchestrationReviewSatisfactionOptions,
 ): boolean {
+  const active = selectActiveSlices(run);
   return run.status === 'completed'
-    && run.slices.length > 0
-    && run.slices.every((slice) => sliceReviewFullySatisfied(slice, reviewOptions));
+    && active.length > 0
+    && active.every((slice) => sliceReviewFullySatisfied(slice, reviewOptions));
 }
 
 function summarizeOrchestrationRun(
@@ -818,18 +821,21 @@ function buildOrchestrationNextAction(
   const orchestrateCommand = '/pipelane orchestrate';
   const prCommand = formatWorkflowCommand(config, 'pr');
   const runIdArg = `--run-id ${run.id}`;
-  const hasFailedWorker = run.slices.some((slice) => slice.worker?.status === 'failed' || slice.status === 'failed');
-  const hasRunningWorker = run.slices.some((slice) => slice.worker?.status === 'running' || slice.status === 'running');
-  const hasBlockedSlice = run.slices.some((slice) => slice.status === 'blocked');
-  const needsPrepare = run.status === 'planned' || run.slices.some((slice) => slice.status === 'planned');
-  const needsDispatch = !needsPrepare && (run.status === 'prepared' || run.slices.some((slice) => slice.status === 'prepared'));
-  const needsStart = !needsPrepare && !needsDispatch && run.slices.some((slice) =>
+  // Deferred slices are out of the active set: they must not drive the next action
+  // (else a paused run keeps asking to prepare/start work the operator deferred).
+  const active = selectActiveSlices(run);
+  const hasFailedWorker = active.some((slice) => slice.worker?.status === 'failed' || slice.status === 'failed');
+  const hasRunningWorker = active.some((slice) => slice.worker?.status === 'running' || slice.status === 'running');
+  const hasBlockedSlice = active.some((slice) => slice.status === 'blocked');
+  const needsPrepare = run.status === 'planned' || active.some((slice) => slice.status === 'planned');
+  const needsDispatch = !needsPrepare && (run.status === 'prepared' || active.some((slice) => slice.status === 'prepared'));
+  const needsStart = !needsPrepare && !needsDispatch && active.some((slice) =>
     slice.status === 'dispatched' || (slice.status === 'blocked' && !slice.worker),
   );
-  const needsReview = run.slices.some((slice) =>
+  const needsReview = active.some((slice) =>
     slice.worker?.status === 'succeeded' && !trustedReviewBySlice.get(slice.id),
   );
-  const fullyReviewed = run.slices.length > 0 && run.slices.every((slice) => trustedReviewBySlice.get(slice.id));
+  const fullyReviewed = active.length > 0 && active.every((slice) => trustedReviewBySlice.get(slice.id));
 
   if (missingWorktrees.length > 0) {
     return buildOrchestrationAction({
@@ -895,6 +901,18 @@ function buildOrchestrationNextAction(
     });
   }
   if (fullyReviewed) {
+    if (run.status === 'paused') {
+      // In-scope slices are reviewed but deferred slices remain: the next step is to
+      // resume (run the rest) or finalize (abandon them), not to open a PR. This keeps
+      // the next action consistent with isPrReadyOrchestrationRun, which rejects paused.
+      return buildOrchestrationAction({
+        id: 'orchestrate.resume',
+        label: 'Resume deferred orchestration slices',
+        state: 'awaiting_preflight',
+        reason: 'in-scope slices are reviewed; deferred slices remain — resume to run them or finalize to abandon them',
+        command: orchestrateCommand,
+      });
+    }
     return buildOrchestrationAction({
       id: 'pr',
       label: 'Open PR for reviewed orchestration work',

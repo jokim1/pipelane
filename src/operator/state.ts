@@ -731,6 +731,8 @@ export interface OperatorFlags {
   goalMaxTurns: string;
   goalMaxMinutes: string;
   orchestrationRunId: string;
+  goalSlicesFile: string;
+  scopeThrough: string;
 }
 
 export interface ParsedOperatorArgs {
@@ -2788,6 +2790,8 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     goalMaxTurns: '',
     goalMaxMinutes: '',
     orchestrationRunId: '',
+    goalSlicesFile: '',
+    scopeThrough: '',
   };
 
   const setPrFromShorthand = (raw: string, source: string): void => {
@@ -3200,6 +3204,14 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       flags.orchestrationRunId = readFlagValue('--run-id').trim();
       continue;
     }
+    if (flagName === '--slices-file') {
+      flags.goalSlicesFile = readFlagValue('--slices-file').trim();
+      continue;
+    }
+    if (flagName === '--through') {
+      flags.scopeThrough = readFlagValue('--through').trim();
+      continue;
+    }
 
     if (token.startsWith('--')) {
       throw new Error(`Unknown flag "${flagName}" for pipelane run. Run "pipelane run --help" for supported commands and flags.`);
@@ -3517,8 +3529,23 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         }
         return;
       }
-      if (subcommand !== 'goal-spec' && subcommand !== 'plan' && subcommand !== 'prepare' && subcommand !== 'dispatch' && subcommand !== 'start' && subcommand !== 'review') {
-        throw new Error('orchestrate requires exactly: pipelane run orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes], or pipelane run orchestrate <goal-spec|plan|prepare|dispatch|start|review> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--run-id <id>] [--provider codex|claude|generic]');
+      if (subcommand !== 'goal-spec' && subcommand !== 'plan' && subcommand !== 'prepare' && subcommand !== 'dispatch' && subcommand !== 'start' && subcommand !== 'review' && subcommand !== 'scope' && subcommand !== 'outline' && subcommand !== 'finalize') {
+        throw new Error('orchestrate requires exactly: pipelane run orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes], or pipelane run orchestrate <goal-spec|plan|prepare|dispatch|start|review|scope|outline|finalize> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--slices-file <path>] [--run-id <id>] [--through <slice-id>] [--provider codex|claude|generic]');
+      }
+      if (subcommand === 'scope' || subcommand === 'outline' || subcommand === 'finalize') {
+        assertOnlyFlags(parsed, subcommand === 'scope'
+          ? ['orchestrationRunId', 'scopeThrough']
+          : ['orchestrationRunId']);
+        if (parsed.positional.length !== 1) {
+          throw new Error(`orchestrate ${subcommand} requires exactly: pipelane run orchestrate ${subcommand} --run-id <id>${subcommand === 'scope' ? ' --through <slice-id>' : ''}`);
+        }
+        if (!parsed.flags.orchestrationRunId.trim()) {
+          throw new Error(`orchestrate ${subcommand} requires --run-id <id>.`);
+        }
+        if (subcommand === 'scope' && !parsed.flags.scopeThrough.trim()) {
+          throw new Error('orchestrate scope requires --through <slice-id>.');
+        }
+        return;
       }
       if (subcommand === 'prepare' || subcommand === 'dispatch' || subcommand === 'start' || subcommand === 'review') {
         assertOnlyFlags(parsed, subcommand === 'start'
@@ -3548,12 +3575,21 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         'goalProvider',
         'goalMaxTurns',
         'goalMaxMinutes',
+        'goalSlicesFile',
       ]);
       if (parsed.positional.length !== 1) {
-        throw new Error(`orchestrate ${subcommand} requires exactly: pipelane run orchestrate ${subcommand} [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]`);
+        throw new Error(`orchestrate ${subcommand} requires exactly: pipelane run orchestrate ${subcommand} [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--slices-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]`);
       }
       if (subcommand === 'plan' && !parsed.flags.goalPlanFile.trim() && !parsed.flags.goalOutcome.trim()) {
         throw new Error('orchestrate plan requires --plan-file <path> or --outcome <text>.');
+      }
+      if (parsed.flags.goalSlicesFile.trim()) {
+        if (subcommand !== 'plan') {
+          throw new Error('orchestrate --slices-file is only valid with: pipelane run orchestrate plan.');
+        }
+        if (!parsed.flags.goalPlanFile.trim()) {
+          throw new Error('orchestrate plan --slices-file requires --plan-file <path>.');
+        }
       }
       const provider = parsed.flags.goalProvider.trim();
       if (provider && !includesString(GOAL_PROVIDERS, provider)) {
@@ -3812,6 +3848,8 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'goalMaxTurns', label: '--max-turns', active: (flags) => flags.goalMaxTurns.trim().length > 0 },
   { key: 'goalMaxMinutes', label: '--max-minutes', active: (flags) => flags.goalMaxMinutes.trim().length > 0 },
   { key: 'orchestrationRunId', label: '--run-id', active: (flags) => flags.orchestrationRunId.trim().length > 0 },
+  { key: 'goalSlicesFile', label: '--slices-file', active: (flags) => flags.goalSlicesFile.trim().length > 0 },
+  { key: 'scopeThrough', label: '--through', active: (flags) => flags.scopeThrough.trim().length > 0 },
 ];
 
 function assertOnlyFlags(parsed: ParsedOperatorArgs, allowed: OperatorFlagKey[]): void {

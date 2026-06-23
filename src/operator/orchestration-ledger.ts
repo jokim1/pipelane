@@ -33,7 +33,16 @@ import {
 } from './review-identity.ts';
 import { readWorktreeStatusSnapshot } from './worktree-status.ts';
 
-export type OrchestrationRunStatus = 'planned' | 'prepared' | 'dispatched' | 'running' | 'blocked' | 'completed' | 'failed';
+export type OrchestrationRunStatus = 'planned' | 'prepared' | 'dispatched' | 'running' | 'blocked' | 'paused' | 'completed' | 'failed';
+
+export type OrchestrationCoverageDisposition = 'slice' | 'deferred' | 'excluded';
+
+export interface OrchestrationCoverageEntry {
+  section: string;
+  disposition: OrchestrationCoverageDisposition;
+  sliceId?: string;
+  reason?: string;
+}
 export type OrchestrationSliceStatus = 'planned' | 'prepared' | 'dispatched' | 'running' | 'blocked' | 'completed' | 'failed';
 export type OrchestrationSliceWorkerStatus = 'running' | 'succeeded' | 'failed';
 
@@ -107,6 +116,14 @@ export interface OrchestrationSliceRecord {
   confirmationPrompt: string;
   requiresConfirmation: boolean;
   critique: string[];
+  // PR1: optional grouping label and deferral flag. Absent (not `false`) on the
+  // heading-decomposed path so existing slice-headed plans serialize identically.
+  phase?: string;
+  deferred?: boolean;
+  // Set by `orchestrate finalize` when a deferred slice is abandoned; the record
+  // is kept (not deleted) so the audit trail survives.
+  excludedReason?: string;
+  excludedAt?: string;
 }
 
 export interface OrchestrationRunRecord {
@@ -140,6 +157,17 @@ export interface OrchestrationRunRecord {
   };
   slices: OrchestrationSliceRecord[];
   reviewFixes?: OrchestrationReviewFixRecord[];
+  // PR1: agent-authored coverage map, persisted as durable, inspectable evidence
+  // of which plan section maps to which slice / deferred / excluded. Absent on the
+  // heading-decomposed path.
+  coverage?: OrchestrationCoverageEntry[];
+}
+
+export interface BuildOrchestrationSliceInput {
+  id?: string;
+  title: string;
+  phase?: string;
+  text?: string;
 }
 
 export interface BuildOrchestrationRunInput {
@@ -152,6 +180,10 @@ export interface BuildOrchestrationRunInput {
   provider?: GoalProvider;
   maxTurns?: number;
   maxMinutes?: number;
+  // PR1: agent-proposed decomposition. When present it replaces heading-splitting;
+  // the ledger still binds source.planPath/textSha256 to the REAL plan text.
+  slices?: BuildOrchestrationSliceInput[];
+  coverage?: OrchestrationCoverageEntry[];
 }
 
 export type OrchestrationLedgerDiagnostic =
@@ -221,18 +253,43 @@ export function orchestrationRunPath(commonDir: string, config: WorkflowConfig, 
   return path.join(resolveStateDir(commonDir, config), 'orchestrate', 'runs', runId, 'orchestration.json');
 }
 
+// PR1: the in-scope set for this pass. Deferred slices (set by `orchestrate scope`)
+// are excluded from prepare/dispatch/start/review/status so a partial run can
+// complete and resume cleanly instead of blocking on work the operator deferred.
+export function selectActiveSlices(run: OrchestrationRunRecord): OrchestrationSliceRecord[] {
+  return run.slices.filter((slice) => slice.deferred !== true);
+}
+
+// A deferred slice that has not been permanently abandoned by `orchestrate finalize`
+// keeps the run resumable (status `paused`) rather than letting it report completed.
+export function hasResumableDeferredSlices(run: OrchestrationRunRecord): boolean {
+  return run.slices.some((slice) => slice.deferred === true && !slice.excludedReason);
+}
+
 export function buildOrchestrationRunRecord(input: BuildOrchestrationRunInput): OrchestrationRunRecord {
   const createdAt = nowIso();
   const rawPlanText = input.planText ?? '';
   const planText = rawPlanText.trim();
   const prompt = input.outcome?.trim() || null;
-  const planSections = resolvePlanSections(planText, input.outcome);
+  // Agent-proposed decomposition (PR1) replaces heading-splitting when present.
+  // The real plan text still drives source binding, title, and per-slice goal text.
+  const structured = input.slices && input.slices.length > 0 ? input.slices : null;
+  const planSections = structured
+    ? {
+        globalText: '',
+        slices: structured.map((slice) => ({
+          title: slice.title,
+          text: slice.text && slice.text.trim() ? slice.text : slice.title,
+        })),
+      }
+    : resolvePlanSections(planText, input.outcome);
   const sliceIdCounts = new Map<string, number>();
   const assignedSliceIds = new Set<string>();
-  const slices = planSections.slices.map((slice, index) => {
+  const slices = planSections.slices.map((slice, index): OrchestrationSliceRecord => {
+    const proposed = structured?.[index];
     const draft = buildGoalSpecDraft({
       config: input.config,
-      sliceId: planSections.slices.length === 1 ? input.sliceId : undefined,
+      sliceId: proposed?.id?.trim() || (planSections.slices.length === 1 ? input.sliceId : undefined),
       outcome: slice.title,
       planPath: input.planPath,
       planText: planText
@@ -247,10 +304,10 @@ export function buildOrchestrationRunRecord(input: BuildOrchestrationRunInput): 
       ? draft.spec
       : { ...draft.spec, sliceId };
 
-    return {
+    const record: OrchestrationSliceRecord = {
       id: goalSpec.sliceId,
       index: index + 1,
-      status: 'planned' as const,
+      status: 'planned',
       outcome: goalSpec.outcome,
       dependsOn: [],
       requestedFiles: extractPathHints(slice.text),
@@ -269,6 +326,9 @@ export function buildOrchestrationRunRecord(input: BuildOrchestrationRunInput): 
       requiresConfirmation: draft.requiresConfirmation,
       critique: draft.critique,
     };
+    const phase = proposed?.phase?.trim();
+    if (phase) record.phase = phase;
+    return record;
   });
 
   for (let index = 1; index < slices.length; index += 1) {
@@ -307,6 +367,7 @@ export function buildOrchestrationRunRecord(input: BuildOrchestrationRunInput): 
     },
     slices,
     reviewFixes: [],
+    ...(input.coverage && input.coverage.length > 0 ? { coverage: input.coverage } : {}),
   };
 }
 
@@ -466,7 +527,7 @@ function isOrchestrationRunRecord(value: unknown): value is OrchestrationRunReco
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const record = value as Partial<OrchestrationRunRecord>;
   if (!isSafeOrchestrationRunId(typeof record.id === 'string' ? record.id : '')) return false;
-  if (!['planned', 'prepared', 'dispatched', 'running', 'blocked', 'completed', 'failed'].includes(record.status ?? '')) return false;
+  if (!['planned', 'prepared', 'dispatched', 'running', 'blocked', 'paused', 'completed', 'failed'].includes(record.status ?? '')) return false;
   if (typeof record.createdAt !== 'string' || typeof record.updatedAt !== 'string') return false;
   if (typeof record.branchName !== 'string' || typeof record.sha !== 'string') return false;
   if (!record.source || typeof record.source !== 'object') return false;

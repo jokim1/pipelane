@@ -8,6 +8,7 @@ import {
   buildGoalSpecDraft,
   type GoalSpecDraft,
 } from '../goal-spec.ts';
+import { sanitizeForTerminal } from '../text-output.ts';
 import {
   buildOrchestrationRunRecord,
   diagnoseOrchestrationRunRecord,
@@ -19,7 +20,11 @@ import {
   orchestrationRunPath,
   saveOrchestrationRunRecord,
   scanOrchestrationRunDiagnostics,
+  selectActiveSlices,
+  hasResumableDeferredSlices,
   sliceReviewFullySatisfied,
+  type BuildOrchestrationSliceInput,
+  type OrchestrationCoverageEntry,
   type OrchestrationLedgerDiagnostic,
   type OrchestrationReviewFixRecord,
   type OrchestrationRunRecord,
@@ -129,6 +134,7 @@ interface OrchestrateEntryRunSummary {
   completedSlices: number;
   failedSlices: number;
   pendingSlices: number;
+  deferredSlices: number;
   planPath: string | null;
 }
 
@@ -405,8 +411,20 @@ export async function handleOrchestrate(cwd: string, parsed: ParsedOperatorArgs)
     handleOrchestrationReview(cwd, parsed);
     return;
   }
+  if (subcommand === 'scope') {
+    handleScope(cwd, parsed);
+    return;
+  }
+  if (subcommand === 'outline') {
+    handleOutline(cwd, parsed);
+    return;
+  }
+  if (subcommand === 'finalize') {
+    handleFinalize(cwd, parsed);
+    return;
+  }
 
-  throw new Error('orchestrate requires exactly: pipelane run orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes], or pipelane run orchestrate <goal-spec|plan|prepare|dispatch|start|review> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--run-id <id>] [--provider codex|claude|generic]');
+  throw new Error('orchestrate requires exactly: pipelane run orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes], or pipelane run orchestrate <goal-spec|plan|prepare|dispatch|start|review|scope|outline|finalize> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--slices-file <path>] [--run-id <id>] [--through <slice-id>] [--provider codex|claude|generic]');
 }
 
 async function handleOrchestrateEntry(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
@@ -446,7 +464,7 @@ async function handleOrchestrateEntry(cwd: string, parsed: ParsedOperatorArgs): 
     }
     const run = buildEntryRunRecord(context, parsed, planPath, outcome);
     if (parsed.flags.yes) {
-      const report = await runApprovedOrchestration(context, run, planPath, activeRuns, likelyPlanFiles, parsed.flags.offline, ledgerWarnings, scan);
+      const report = await runApprovedOrchestration(context, run, planPath, activeRuns, likelyPlanFiles, parsed.flags.offline, ledgerWarnings, scan, !parsed.flags.json);
       printResult(parsed.flags, report);
       if (approvedOrchestrationStatusRequiresAttention(report.status)) process.exitCode = 1;
       return;
@@ -520,11 +538,19 @@ async function runApprovedOrchestration(
   offline: boolean,
   warnings: string[] = [],
   scan?: OrchestrationRunScanDiagnostics,
+  reprint = false,
 ): Promise<OrchestrateEntryReport> {
   const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
   prepareSliceWorktrees(context, run, offline);
   dispatchPreparedSlices(context, run);
-  const startResult = await startDispatchedSlices(context, run, null, false);
+  // No silent autopilot: even --yes reprints the outline after each slice (text
+  // mode only — JSON output stays a single clean document).
+  const onSliceSettled = reprint
+    ? (settledRun: OrchestrationRunRecord, settledSlice: OrchestrationSliceRecord): void => {
+        process.stdout.write(`\n${renderSliceHeadline(settledRun, settledSlice)}\n\n${renderOrchestrationOutline(settledRun)}\n`);
+      }
+    : undefined;
+  const startResult = await startDispatchedSlices(context, run, null, false, onSliceSettled);
   let reviewResult = shouldRunApprovedOrchestrationReview(startResult, run)
     ? reviewCompletedSlices(context, run, {
         sliceId: null,
@@ -1012,7 +1038,7 @@ async function confirmAndMaybeRunOrchestration(
       printResult(parsed.flags, buildCancelledOrchestrationReport(context, likelyPlanFiles));
       return;
     }
-    const report = await runApprovedOrchestration(context, run, planPath, activeRuns, likelyPlanFiles, parsed.flags.offline, warnings, scan);
+    const report = await runApprovedOrchestration(context, run, planPath, activeRuns, likelyPlanFiles, parsed.flags.offline, warnings, scan, !parsed.flags.json);
     printResult(parsed.flags, report);
     if (approvedOrchestrationStatusRequiresAttention(report.status)) process.exitCode = 1;
   } finally {
@@ -1153,6 +1179,7 @@ function listActiveOrchestrationRuns(context: WorkflowContext, records?: Orchest
 function summarizeEntryRun(run: OrchestrationRunRecord): OrchestrateEntryRunSummary {
   const completedSlices = run.slices.filter((slice) => slice.status === 'completed' || slice.worker?.status === 'succeeded').length;
   const failedSlices = run.slices.filter((slice) => slice.status === 'failed' || slice.worker?.status === 'failed').length;
+  const deferredSlices = run.slices.filter((slice) => slice.deferred === true && !slice.excludedReason).length;
   return {
     id: run.id,
     status: run.status,
@@ -1161,7 +1188,10 @@ function summarizeEntryRun(run: OrchestrationRunRecord): OrchestrateEntryRunSumm
     sliceCount: run.slices.length,
     completedSlices,
     failedSlices,
-    pendingSlices: Math.max(0, run.slices.length - completedSlices - failedSlices),
+    deferredSlices,
+    // Deferred slices are resumable, not pending work, so they must not inflate the
+    // "pending" count on a paused run.
+    pendingSlices: Math.max(0, run.slices.length - completedSlices - failedSlices - deferredSlices),
     planPath: run.source.planPath,
   };
 }
@@ -1374,7 +1404,7 @@ function renderActiveRunReport(context: WorkflowContext, run: OrchestrationRunRe
     `Run: ${run.id}`,
     `Ledger: ${orchestrationRunPath(context.commonDir, context.config, run.id)}`,
     `Plan: ${run.source.planPath ?? run.source.prompt ?? '(outcome only)'}`,
-    `Slices: ${summary.completedSlices}/${summary.sliceCount} complete, ${summary.failedSlices} failed, ${summary.pendingSlices} pending`,
+    `Slices: ${summary.completedSlices}/${summary.sliceCount} complete, ${summary.failedSlices} failed, ${summary.pendingSlices} pending${summary.deferredSlices > 0 ? `, ${summary.deferredSlices} deferred` : ''}`,
     '',
     'Slice status:',
   ];
@@ -1624,10 +1654,16 @@ function dispatchPreparedSlices(
   const reports: DispatchedSliceReport[] = [];
   let writtenCount = 0;
   let existingCount = 0;
-  const preparedSlices = run.slices.map((slice): DispatchSlicePreparation => {
-    if (slice.status !== 'prepared' && slice.status !== 'dispatched') {
-      throw new Error(`Slice ${slice.id} must be prepared before dispatch; current status is ${slice.status}.`);
-    }
+  const preparedSlices = selectActiveSlices(run)
+    .filter((slice) => {
+      if (slice.status === 'planned') {
+        throw new Error(`Slice ${slice.id} must be prepared before dispatch; current status is ${slice.status}.`);
+      }
+      // Resume: active slices already completed/failed/running in a prior pass are
+      // past dispatch and skipped (start re-skips succeeded workers).
+      return slice.status === 'prepared' || slice.status === 'dispatched';
+    })
+    .map((slice): DispatchSlicePreparation => {
     const taskSlug = resolveOrchestrationTaskSlug(run.id, slice);
     if (!slice.branchName || !slice.worktreePath) {
       throw new Error(`Slice ${slice.id} is missing a prepared worktree assignment.`);
@@ -1687,6 +1723,7 @@ async function startDispatchedSlices(
   run: OrchestrationRunRecord,
   sliceId: string | null,
   force: boolean,
+  onSliceSettled?: (run: OrchestrationRunRecord, slice: OrchestrationSliceRecord) => void,
 ): Promise<{
   status: OrchestrateStartReport['status'];
   startedCount: number;
@@ -1769,6 +1806,7 @@ async function startDispatchedSlices(
         blocker: null,
       });
       persistOrchestrationStartProgress(context, run);
+      onSliceSettled?.(run, slice);
       pendingSlices.splice(index, 1);
       progressed = true;
     }
@@ -1958,7 +1996,7 @@ function buildSliceReviewContext(parentContext: WorkflowContext, sliceRepoRoot: 
 }
 
 function resolveReviewSlices(run: OrchestrationRunRecord, sliceId: string | null): OrchestrationSliceRecord[] {
-  if (!sliceId) return run.slices;
+  if (!sliceId) return selectActiveSlices(run);
   const slice = run.slices.find((candidate) => candidate.id === sliceId);
   if (!slice) {
     throw new Error(`No slice ${sliceId} found in orchestration run ${run.id}.`);
@@ -2149,11 +2187,14 @@ function buildBlockedReviewReport(slice: OrchestrationSliceRecord, blocker: stri
 }
 
 function summarizeRunReviewStatus(run: OrchestrationRunRecord): OrchestrationRunRecord['status'] {
-  if (run.slices.some((slice) => slice.worker?.status === 'failed' || slice.status === 'failed' || slice.review?.run.status === 'failed')) return 'failed';
-  if (run.slices.some((slice) => slice.worker?.status === 'running' || slice.status === 'running')) return 'running';
-  if (run.slices.every((slice) => sliceReviewFullySatisfied(slice))) return 'completed';
-  if (run.slices.some((slice) => slice.worker?.status === 'succeeded' && !sliceReviewFullySatisfied(slice))) return 'blocked';
-  if (run.slices.some((slice) => slice.status === 'blocked')) return 'blocked';
+  const active = selectActiveSlices(run);
+  if (active.some((slice) => slice.worker?.status === 'failed' || slice.status === 'failed' || slice.review?.run.status === 'failed')) return 'failed';
+  if (active.some((slice) => slice.worker?.status === 'running' || slice.status === 'running')) return 'running';
+  if (active.length > 0 && active.every((slice) => sliceReviewFullySatisfied(slice))) {
+    return hasResumableDeferredSlices(run) ? 'paused' : 'completed';
+  }
+  if (active.some((slice) => slice.worker?.status === 'succeeded' && !sliceReviewFullySatisfied(slice))) return 'blocked';
+  if (active.some((slice) => slice.status === 'blocked')) return 'blocked';
   return run.status;
 }
 
@@ -2178,15 +2219,20 @@ function reportStatusForOrchestrationReview(
   if (blockedCount > 0) return 'blocked';
   if (reviewedCount === 0) return 'noop';
   if (options.incompleteEvidence) return 'blocked';
-  if (runStatus !== 'completed') return 'blocked';
+  // A paused run (in-scope slices all reviewed, deferred remainder pending) is not
+  // blocked — its in-scope review passed. Only a genuinely incomplete run is blocked.
+  if (runStatus !== 'completed' && runStatus !== 'paused') return 'blocked';
   return 'passed';
 }
 
 function resolveStartSlices(run: OrchestrationRunRecord, sliceId: string | null): OrchestrationSliceRecord[] {
-  if (!sliceId) return run.slices;
+  if (!sliceId) return selectActiveSlices(run);
   const slice = run.slices.find((candidate) => candidate.id === sliceId);
   if (!slice) {
     throw new Error(`No slice ${sliceId} found in orchestration run ${run.id}.`);
+  }
+  if (slice.deferred === true) {
+    throw new Error(`Slice ${sliceId} is deferred; bring it into scope before starting it.`);
   }
   return [slice];
 }
@@ -2744,10 +2790,13 @@ function buildBlockedWorkerReport(slice: OrchestrationSliceRecord, blocker: stri
 }
 
 function summarizeRunWorkerStatus(run: OrchestrationRunRecord): OrchestrationRunRecord['status'] {
-  if (run.slices.some((slice) => slice.worker?.status === 'failed' || slice.status === 'failed')) return 'failed';
-  if (run.slices.every((slice) => slice.worker?.status === 'succeeded' || slice.status === 'completed')) return 'completed';
-  if (run.slices.some((slice) => slice.worker?.status === 'running' || slice.status === 'running')) return 'running';
-  if (run.slices.some((slice) => slice.status === 'blocked')) return 'blocked';
+  const active = selectActiveSlices(run);
+  if (active.some((slice) => slice.worker?.status === 'failed' || slice.status === 'failed')) return 'failed';
+  if (active.length > 0 && active.every((slice) => slice.worker?.status === 'succeeded' || slice.status === 'completed')) {
+    return hasResumableDeferredSlices(run) ? 'paused' : 'completed';
+  }
+  if (active.some((slice) => slice.worker?.status === 'running' || slice.status === 'running')) return 'running';
+  if (active.some((slice) => slice.status === 'blocked')) return 'blocked';
   return 'dispatched';
 }
 
@@ -2786,8 +2835,22 @@ function prepareSliceWorktrees(
 
   mkdirSync(resolveTaskWorktreeRoot(context.commonDir, context.config), { recursive: true });
 
-  for (const slice of run.slices) {
+  for (const slice of selectActiveSlices(run)) {
     const taskSlug = resolveOrchestrationTaskSlug(run.id, slice);
+    // Resume: a slice already completed in a prior pass is past prepare; skip it so a
+    // worktree cleaned between passes does not abort the resume. Dispatch/start skip it too.
+    if (slice.worker?.status === 'succeeded' || slice.status === 'completed') {
+      existingCount += 1;
+      reports.push({
+        id: slice.id,
+        status: slice.status,
+        taskSlug,
+        branchName: slice.branchName ?? '',
+        worktreePath: slice.worktreePath ?? '',
+        action: 'existing',
+      });
+      continue;
+    }
     const existingLock = loadTaskLock(context.commonDir, context.config, taskSlug);
 
     if (slice.worktreePath || slice.branchName) {
@@ -3094,6 +3157,7 @@ function handlePlan(cwd: string, parsed: ParsedOperatorArgs): void {
     throw new Error('orchestrate plan requires --plan-file <path> or --outcome <text>.');
   }
 
+  const slicesFile = parseSlicesFile(parsed.flags.goalSlicesFile, cwd);
   const run = buildOrchestrationRunRecord({
     repoRoot: context.repoRoot,
     config: context.config,
@@ -3104,6 +3168,8 @@ function handlePlan(cwd: string, parsed: ParsedOperatorArgs): void {
     provider: (parsed.flags.goalProvider.trim() as GoalProvider) || DEFAULT_GOAL_PROVIDER,
     maxTurns: parsePositiveInteger(parsed.flags.goalMaxTurns),
     maxMinutes: parsePositiveInteger(parsed.flags.goalMaxMinutes),
+    slices: slicesFile?.slices,
+    coverage: slicesFile?.coverage,
   });
   const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
   const confirmationRecommended = run.slices.some((slice) => slice.requiresConfirmation || slice.critique.length > 0);
@@ -3121,6 +3187,292 @@ function handlePlan(cwd: string, parsed: ParsedOperatorArgs): void {
   };
 
   printResult(parsed.flags, report);
+}
+
+interface OrchestrateScopeReport {
+  command: 'orchestrate scope';
+  status: 'scoped';
+  repoRoot: string;
+  runId: string;
+  ledgerPath: string;
+  throughSliceId: string;
+  activeCount: number;
+  deferredCount: number;
+  run: OrchestrationRunRecord;
+  message: string;
+}
+
+interface OrchestrateFinalizeReport {
+  command: 'orchestrate finalize';
+  status: OrchestrationRunRecord['status'];
+  repoRoot: string;
+  runId: string;
+  ledgerPath: string;
+  excludedCount: number;
+  run: OrchestrationRunRecord;
+  message: string;
+}
+
+interface OrchestrateOutlineSliceSnapshot {
+  id: string;
+  index: number;
+  phase: string | null;
+  state: string;
+  glyph: string;
+  deferred: boolean;
+  excluded: boolean;
+  reviewSatisfied: boolean;
+  sensitive: boolean;
+}
+
+interface OrchestrateOutlineReport {
+  command: 'orchestrate outline';
+  status: OrchestrationRunRecord['status'];
+  repoRoot: string;
+  runId: string;
+  title: string;
+  total: number;
+  done: number;
+  deferred: number;
+  excluded: number;
+  phaseCount: number;
+  slices: OrchestrateOutlineSliceSnapshot[];
+  run: OrchestrationRunRecord;
+  message: string;
+}
+
+function handleScope(cwd: string, parsed: ParsedOperatorArgs): void {
+  const context = resolveWorkflowContext(cwd);
+  const runId = parsed.flags.orchestrationRunId.trim();
+  const through = parsed.flags.scopeThrough.trim();
+  const run = loadOrchestrationRunRecord(context.commonDir, context.config, runId);
+  if (!run) {
+    throw new Error(`No orchestration run ledger found for ${runId}.`);
+  }
+  const targetIndex = run.slices.findIndex((slice) => slice.id === through);
+  if (targetIndex < 0) {
+    throw new Error(`No slice ${through} found in orchestration run ${runId}.`);
+  }
+  // Resume extends scope forward freely, but deferring a slice whose worker
+  // already started would orphan in-flight or finished work.
+  if (run.slices.some((slice, index) => index > targetIndex && slice.worker)) {
+    throw new Error(`orchestrate scope cannot defer a slice in ${runId} whose worker has already started.`);
+  }
+  let activeCount = 0;
+  let deferredCount = 0;
+  run.slices.forEach((slice, index) => {
+    if (index <= targetIndex) {
+      slice.deferred = false;
+      activeCount += 1;
+    } else {
+      slice.deferred = true;
+      deferredCount += 1;
+    }
+  });
+  run.status = summarizeScopeRunStatus(run);
+  run.updatedAt = nowIso();
+  const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+  const report: OrchestrateScopeReport = {
+    command: 'orchestrate scope',
+    status: 'scoped',
+    repoRoot: context.repoRoot,
+    runId: run.id,
+    ledgerPath,
+    throughSliceId: through,
+    activeCount,
+    deferredCount,
+    run,
+    message: [
+      'Pipelane orchestrate scope',
+      '',
+      `Run: ${run.id}`,
+      `Through: ${through}`,
+      `In scope: ${activeCount} slice(s)`,
+      `Deferred: ${deferredCount} slice(s)`,
+      '',
+      renderOrchestrationOutline(run),
+    ].join('\n'),
+  };
+  printResult(parsed.flags, report);
+}
+
+function handleFinalize(cwd: string, parsed: ParsedOperatorArgs): void {
+  const context = resolveWorkflowContext(cwd);
+  const runId = parsed.flags.orchestrationRunId.trim();
+  const run = loadOrchestrationRunRecord(context.commonDir, context.config, runId);
+  if (!run) {
+    throw new Error(`No orchestration run ledger found for ${runId}.`);
+  }
+  const at = nowIso();
+  let excludedCount = 0;
+  for (const slice of run.slices) {
+    if (slice.deferred === true && !slice.excludedReason) {
+      slice.excludedReason = 'abandoned via orchestrate finalize';
+      slice.excludedAt = at;
+      excludedCount += 1;
+    }
+  }
+  run.status = summarizeRunReviewStatus(run);
+  run.updatedAt = at;
+  const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+  const report: OrchestrateFinalizeReport = {
+    command: 'orchestrate finalize',
+    status: run.status,
+    repoRoot: context.repoRoot,
+    runId: run.id,
+    ledgerPath,
+    excludedCount,
+    run,
+    message: [
+      'Pipelane orchestrate finalize',
+      '',
+      `Run: ${run.id}`,
+      `Status: ${run.status}`,
+      `Excluded (abandoned) slices: ${excludedCount}`,
+      'The excluded slices are kept in the ledger with a reason and timestamp for audit.',
+      '',
+      renderOrchestrationOutline(run),
+    ].join('\n'),
+  };
+  printResult(parsed.flags, report);
+}
+
+function handleOutline(cwd: string, parsed: ParsedOperatorArgs): void {
+  const context = resolveWorkflowContext(cwd);
+  const runId = parsed.flags.orchestrationRunId.trim();
+  const run = loadOrchestrationRunRecord(context.commonDir, context.config, runId);
+  if (!run) {
+    throw new Error(`No orchestration run ledger found for ${runId}.`);
+  }
+  const snapshot = buildOrchestrationOutlineSnapshot(run);
+  const report: OrchestrateOutlineReport = {
+    command: 'orchestrate outline',
+    status: run.status,
+    repoRoot: context.repoRoot,
+    runId: run.id,
+    title: run.plan.title,
+    ...snapshot,
+    run,
+    message: renderOrchestrationOutline(run),
+  };
+  printResult(parsed.flags, report);
+}
+
+function summarizeScopeRunStatus(run: OrchestrationRunRecord): OrchestrationRunRecord['status'] {
+  const active = selectActiveSlices(run);
+  if (active.some((slice) => slice.status === 'planned')) return 'planned';
+  if (active.some((slice) => slice.status === 'prepared')) return 'prepared';
+  if (active.some((slice) => slice.status === 'dispatched')) return 'dispatched';
+  return summarizeRunWorkerStatus(run);
+}
+
+function groupSlicesByPhase(
+  slices: OrchestrationSliceRecord[],
+): Array<{ name: string | null; slices: OrchestrationSliceRecord[] }> {
+  const groups: Array<{ name: string | null; slices: OrchestrationSliceRecord[] }> = [];
+  for (const slice of slices) {
+    const name = slice.phase ?? null;
+    const last = groups[groups.length - 1];
+    if (last && last.name === name) last.slices.push(slice);
+    else groups.push({ name, slices: [slice] });
+  }
+  return groups;
+}
+
+function sliceOutlineState(slice: OrchestrationSliceRecord): { glyph: string; label: string; state: string; done: boolean } {
+  if (slice.excludedReason) return { glyph: '◻', label: `excluded (${slice.excludedReason})`, state: 'excluded', done: false };
+  if (slice.deferred === true) return { glyph: '◻', label: 'deferred (resume later)', state: 'deferred', done: false };
+  if (slice.worker?.status === 'failed' || slice.status === 'failed') return { glyph: '✗', label: 'failed', state: 'failed', done: false };
+  if (slice.review?.run.status === 'failed') return { glyph: '✗', label: 'review failed', state: 'review-failed', done: false };
+  if (slice.worker?.status === 'running' || slice.status === 'running') return { glyph: '▸', label: 'running', state: 'running', done: false };
+  if (slice.status === 'blocked') return { glyph: '⚠', label: 'blocked', state: 'blocked', done: false };
+  if (slice.worker?.status === 'succeeded' || slice.status === 'completed') {
+    const reviewed = sliceReviewFullySatisfied(slice);
+    return { glyph: '✓', label: reviewed ? 'done · review ✓' : 'done · review pending', state: reviewed ? 'done' : 'awaiting-review', done: true };
+  }
+  return { glyph: '◻', label: 'queued', state: 'queued', done: false };
+}
+
+function buildOrchestrationOutlineSnapshot(run: OrchestrationRunRecord): {
+  total: number;
+  done: number;
+  deferred: number;
+  excluded: number;
+  phaseCount: number;
+  slices: OrchestrateOutlineSliceSnapshot[];
+} {
+  const phases = groupSlicesByPhase(run.slices);
+  const active = selectActiveSlices(run);
+  const slices = run.slices.map((slice): OrchestrateOutlineSliceSnapshot => {
+    const state = sliceOutlineState(slice);
+    return {
+      id: slice.id,
+      index: slice.index,
+      phase: slice.phase ?? null,
+      state: state.state,
+      glyph: state.glyph,
+      deferred: slice.deferred === true && !slice.excludedReason,
+      excluded: Boolean(slice.excludedReason),
+      reviewSatisfied: sliceReviewFullySatisfied(slice),
+      sensitive: slice.requiresConfirmation,
+    };
+  });
+  return {
+    total: run.slices.length,
+    done: active.filter((slice) => sliceOutlineState(slice).done).length,
+    deferred: run.slices.filter((slice) => slice.deferred === true && !slice.excludedReason).length,
+    excluded: run.slices.filter((slice) => Boolean(slice.excludedReason)).length,
+    phaseCount: phases.filter((phase) => phase.name).length,
+    slices,
+  };
+}
+
+function renderSliceHeadline(run: OrchestrationRunRecord, slice: OrchestrationSliceRecord): string {
+  const state = sliceOutlineState(slice);
+  return `${state.glyph} slice ${slice.index}/${run.slices.length} · ${slice.id} — ${state.label}`;
+}
+
+// PR1 terminal output spec: full phase -> slice -> status outline. Deterministic
+// and typed so the agent (and `--yes`) relay identical output across hosts.
+function renderOrchestrationOutline(run: OrchestrationRunRecord): string {
+  const snapshot = buildOrchestrationOutlineSnapshot(run);
+  const active = selectActiveSlices(run);
+  const phases = groupSlicesByPhase(run.slices);
+  const lines: string[] = [];
+  const phasePrefix = snapshot.phaseCount > 1 ? `${snapshot.phaseCount} phases, ` : '';
+  lines.push(`Plan — ${phasePrefix}${snapshot.total} slice${snapshot.total === 1 ? '' : 's'}`);
+  const progress = [`${snapshot.done}/${active.length} done`];
+  if (snapshot.deferred > 0) progress.push(`${snapshot.deferred} deferred`);
+  if (snapshot.excluded > 0) progress.push(`${snapshot.excluded} excluded`);
+  progress.push(`status ${run.status}`);
+  lines.push(`Progress: ${progress.join(' · ')}`);
+  lines.push('');
+  for (const phase of phases) {
+    if (phase.name) lines.push(`  Phase · ${sanitizeForTerminal(phase.name)}`);
+    for (const slice of phase.slices) {
+      const state = sliceOutlineState(slice);
+      const sensitive = slice.requiresConfirmation ? '  ⚠ sensitive' : '';
+      lines.push(`    ${state.glyph} ${slice.index}. ${sanitizeForTerminal(slice.id)} — ${state.label}${sensitive}`);
+    }
+  }
+
+  // Edge states (pinned, not improvised).
+  if (snapshot.total === 1 && !run.slices[0]?.phase) {
+    lines.push('', 'Heads up: single slice (no phase split). Consider adding structure to the plan.');
+  }
+  if (active.length === 0 || active.every((slice) => Boolean(slice.excludedReason))) {
+    lines.push('', 'No implementation work in scope.');
+  }
+  const failed = active.find((slice) => {
+    const state = sliceOutlineState(slice).state;
+    return state === 'failed' || state === 'review-failed';
+  });
+  if (failed) {
+    lines.push('', `Stopped at ${sanitizeForTerminal(failed.id)}. Fix in ${sanitizeForTerminal(failed.worktreePath ?? '<worktree>')}, then /pipelane orchestrate resumes here.`);
+  } else if (snapshot.deferred > 0 && active.length > 0 && snapshot.done >= active.length) {
+    lines.push('', `Paused — ${snapshot.deferred} slice(s) deferred. Resume with /pipelane orchestrate.`);
+  }
+  return lines.join('\n');
 }
 
 function resolvePlanPath(repoRoot: string, rawPlanPath: string): string | null {
@@ -3148,6 +3500,103 @@ function readPlanFile(planPath: string): string {
     throw new Error(`--plan-file is too large: ${stat.size} bytes, max ${MAX_PLAN_FILE_BYTES}.`);
   }
   return readFileSync(planPath, 'utf8');
+}
+
+// The agent's proposed decomposition. It is agent OUTPUT, not the audit source,
+// so it may live outside the repo and is intentionally NOT routed through
+// resolvePlanPath's in-repo containment check. The ledger still binds its source
+// to the real --plan-file.
+function parseSlicesFile(
+  rawPath: string,
+  baseDir: string,
+): { slices: BuildOrchestrationSliceInput[]; coverage?: OrchestrationCoverageEntry[] } | null {
+  const trimmed = rawPath.trim();
+  if (!trimmed) return null;
+  const resolved = path.isAbsolute(trimmed) ? trimmed : path.resolve(baseDir, trimmed);
+  if (!existsSync(resolved)) {
+    throw new Error(`--slices-file not found: ${trimmed}`);
+  }
+  const stat = statSync(resolved);
+  if (!stat.isFile()) {
+    throw new Error(`--slices-file must point to a regular file: ${trimmed}`);
+  }
+  if (stat.size > MAX_PLAN_FILE_BYTES) {
+    throw new Error(`--slices-file is too large: ${stat.size} bytes, max ${MAX_PLAN_FILE_BYTES}.`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(resolved, 'utf8'));
+  } catch (error) {
+    throw new Error(`--slices-file is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('--slices-file must be a JSON object with a "slices" array.');
+  }
+  const rawSlices = (parsed as { slices?: unknown }).slices;
+  if (!Array.isArray(rawSlices) || rawSlices.length === 0) {
+    throw new Error('--slices-file "slices" must be a non-empty array.');
+  }
+  const slices = rawSlices.map((entry, index) => parseSliceEntry(entry, index));
+  const coverage = parseCoverageEntries((parsed as { coverage?: unknown }).coverage);
+  return coverage ? { slices, coverage } : { slices };
+}
+
+function parseSliceEntry(entry: unknown, index: number): BuildOrchestrationSliceInput {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+    throw new Error(`--slices-file slice ${index + 1} must be an object.`);
+  }
+  const record = entry as Record<string, unknown>;
+  const title = typeof record.title === 'string' ? record.title.trim() : '';
+  if (!title) {
+    throw new Error(`--slices-file slice ${index + 1} requires a non-empty "title".`);
+  }
+  const result: BuildOrchestrationSliceInput = { title };
+  if (record.id !== undefined) {
+    const id = typeof record.id === 'string' ? record.id.trim() : '';
+    if (!/^[A-Za-z0-9][A-Za-z0-9 ._-]{0,79}$/.test(id)) {
+      throw new Error(`--slices-file slice ${index + 1} has an unsafe "id".`);
+    }
+    result.id = id;
+  }
+  if (record.phase !== undefined) {
+    if (typeof record.phase !== 'string') {
+      throw new Error(`--slices-file slice ${index + 1} "phase" must be a string.`);
+    }
+    const phase = record.phase.trim();
+    if (phase) result.phase = phase;
+  }
+  if (record.text !== undefined) {
+    if (typeof record.text !== 'string') {
+      throw new Error(`--slices-file slice ${index + 1} "text" must be a string.`);
+    }
+    result.text = record.text;
+  }
+  return result;
+}
+
+function parseCoverageEntries(raw: unknown): OrchestrationCoverageEntry[] | undefined {
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) {
+    throw new Error('--slices-file "coverage" must be an array.');
+  }
+  return raw.map((entry, index) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error(`--slices-file coverage ${index + 1} must be an object.`);
+    }
+    const record = entry as Record<string, unknown>;
+    const section = typeof record.section === 'string' ? record.section.trim() : '';
+    if (!section) {
+      throw new Error(`--slices-file coverage ${index + 1} requires a non-empty "section".`);
+    }
+    const disposition = record.disposition;
+    if (disposition !== 'slice' && disposition !== 'deferred' && disposition !== 'excluded') {
+      throw new Error(`--slices-file coverage ${index + 1} "disposition" must be slice|deferred|excluded.`);
+    }
+    const out: OrchestrationCoverageEntry = { section, disposition };
+    if (typeof record.sliceId === 'string' && record.sliceId.trim()) out.sliceId = record.sliceId.trim();
+    if (typeof record.reason === 'string' && record.reason.trim()) out.reason = record.reason.trim();
+    return out;
+  });
 }
 
 function parsePositiveInteger(raw: string): number | undefined {

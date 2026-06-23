@@ -7011,7 +7011,7 @@ test('orchestrate goal-spec rejects invalid command forms', () => {
 
     const invalidSubcommand = runCli(['run', 'orchestrate', 'nope'], repoRoot, {}, true);
     assert.notEqual(invalidSubcommand.status, 0);
-    assert.match(invalidSubcommand.stderr, /orchestrate requires exactly: pipelane run orchestrate .*<goal-spec\|plan\|prepare\|dispatch\|start\|review>/);
+    assert.match(invalidSubcommand.stderr, /orchestrate requires exactly: pipelane run orchestrate .*<goal-spec\|plan\|prepare\|dispatch\|start\|review\|scope\|outline\|finalize>/);
 
     const extraPositional = runCli(['run', 'orchestrate', 'goal-spec', 'extra'], repoRoot, {}, true);
     assert.notEqual(extraPositional.status, 0);
@@ -26002,5 +26002,417 @@ test('api route actions forward approved PR title and message into the PR child'
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
     rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
+// --- PR1: communicative orchestrate (slices-file decomposition, scope/deferred, outline) ---
+
+const PR1_PASS_WORKER = 'node -e "process.exit(0)"';
+
+function writePr1SlicesFile(slices, coverage) {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-slices-'));
+  const file = path.join(dir, 'slices.json');
+  writeFileSync(file, JSON.stringify(coverage ? { slices, coverage } : { slices }), 'utf8');
+  return { dir, file };
+}
+
+function planPr1ThreeSliceRun(repoRoot) {
+  mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+  writeFileSync(path.join(repoRoot, 'docs', 'arch.md'), '# Architecture\n\nProse with no slice headings.\n', 'utf8');
+  const written = writePr1SlicesFile([
+    { id: 'one', title: 'First slice', phase: 'Phase A', text: 'do one' },
+    { id: 'two', title: 'Second slice', phase: 'Phase A', text: 'do two' },
+    { id: 'three', title: 'Third slice', phase: 'Phase B', text: 'do three' },
+  ]);
+  const report = JSON.parse(runCli([
+    'run', 'orchestrate', 'plan', '--plan-file', 'docs/arch.md', '--slices-file', written.file, '--provider', 'generic', '--json',
+  ], repoRoot).stdout);
+  return { runId: report.runId, slicesDir: written.dir, run: report.run };
+}
+
+test('orchestrate plan keeps heading decomposition byte-identical (no phase/deferred/coverage keys)', () => {
+  const repoRoot = createRepo();
+  try {
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'heading-plan.md'), [
+      '# Heading Plan',
+      '',
+      '## Slice 1: First',
+      '- Update `src/a.ts`',
+      '',
+      '## Slice 2: Second',
+      '- Update `src/b.ts`',
+    ].join('\n') + '\n', 'utf8');
+    const report = JSON.parse(runCli([
+      'run', 'orchestrate', 'plan', '--plan-file', 'docs/heading-plan.md', '--provider', 'generic', '--json',
+    ], repoRoot).stdout);
+    assert.equal(report.run.slices.length, 2);
+    assert.deepEqual(report.run.slices[1].dependsOn, [report.run.slices[0].id]);
+    // The heading path must not gain new optional fields.
+    assert.equal('phase' in report.run.slices[0], false);
+    assert.equal('deferred' in report.run.slices[0], false);
+    assert.equal('coverage' in report.run, false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate plan --slices-file builds ordered slices, binds source to the real plan, persists coverage', () => {
+  const repoRoot = createRepo();
+  let slicesDir;
+  try {
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    const realPlan = ['# Real Architecture', '', '## Overview', 'Prose, no slice headings.', '', '## Schema', 'More prose.'].join('\n') + '\n';
+    writeFileSync(path.join(repoRoot, 'docs', 'arch.md'), realPlan, 'utf8');
+    const written = writePr1SlicesFile(
+      [
+        { id: 'schema-plan', title: 'Schema plan', phase: 'Schema & RLS', text: 'Define schema' },
+        { id: 'rls-grants', title: 'RLS and grants', phase: 'Schema & RLS', text: 'Add RLS' },
+        { id: 'resolver', title: 'Resolver contract', phase: 'Parser & resolver', text: 'Implement resolver' },
+      ],
+      [
+        { section: 'Overview', disposition: 'excluded', reason: 'context only' },
+        { section: 'Schema', disposition: 'slice', sliceId: 'schema-plan' },
+      ],
+    );
+    slicesDir = written.dir;
+    const report = JSON.parse(runCli([
+      'run', 'orchestrate', 'plan', '--plan-file', 'docs/arch.md', '--slices-file', written.file, '--provider', 'generic', '--json',
+    ], repoRoot).stdout);
+    const run = report.run;
+    assert.equal(run.slices.length, 3);
+    assert.equal(run.slices[0].phase, 'Schema & RLS');
+    assert.equal(run.slices[2].phase, 'Parser & resolver');
+    assert.deepEqual(run.slices[1].dependsOn, [run.slices[0].id]);
+    assert.equal(run.source.planPath, 'docs/arch.md');
+    assert.equal(run.source.textSha256, createHash('sha256').update(realPlan).digest('hex'));
+    assert.equal(run.coverage.length, 2);
+    assert.equal(run.coverage[0].disposition, 'excluded');
+    assert.equal(run.coverage[0].reason, 'context only');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    if (slicesDir) rmSync(slicesDir, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate plan --slices-file rejects malformed, missing-title, and unsafe-id input', () => {
+  const repoRoot = createRepo();
+  const dirs = [];
+  try {
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'arch.md'), '# Arch\nProse.\n', 'utf8');
+    const runWith = (content) => {
+      const dir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-slices-'));
+      dirs.push(dir);
+      const file = path.join(dir, 'slices.json');
+      writeFileSync(file, content, 'utf8');
+      return runCli([
+        'run', 'orchestrate', 'plan', '--plan-file', 'docs/arch.md', '--slices-file', file, '--provider', 'generic', '--json',
+      ], repoRoot, {}, true);
+    };
+    assert.match(runWith('{ not json').stderr, /not valid JSON/);
+    assert.match(runWith(JSON.stringify({ slices: [{ text: 'no title' }] })).stderr, /requires a non-empty "title"/);
+    assert.match(runWith(JSON.stringify({ slices: [{ title: 'ok', id: '../escape' }] })).stderr, /unsafe "id"/);
+    // --slices-file without --plan-file is rejected by the parser.
+    assert.match(
+      runCli(['run', 'orchestrate', 'plan', '--outcome', 'x', '--slices-file', '/tmp/x.json', '--json'], repoRoot, {}, true).stderr,
+      /--slices-file requires --plan-file/,
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate scope --through defers the remainder and refuses deferring a started worker', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  let slicesDir;
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const planned = planPr1ThreeSliceRun(repoRoot);
+    slicesDir = planned.slicesDir;
+    const runId = planned.runId;
+
+    const scoped = JSON.parse(runCli(['run', 'orchestrate', 'scope', '--run-id', runId, '--through', 'one', '--json'], repoRoot).stdout);
+    assert.equal(scoped.deferredCount, 2);
+    assert.equal(scoped.run.slices[0].deferred, false);
+    assert.equal(scoped.run.slices[1].deferred, true);
+    assert.equal(scoped.run.slices[2].deferred, true);
+
+    // Bring all slices back into scope and run them, then try to defer the started work.
+    runCli(['run', 'orchestrate', 'scope', '--run-id', runId, '--through', 'three'], repoRoot);
+    runCli(['run', 'orchestrate', 'prepare', '--run-id', runId], repoRoot);
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', runId], repoRoot);
+    const started = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: PR1_PASS_WORKER,
+    }).stdout);
+    createdWorktrees.push(...started.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+
+    const refuse = runCli(['run', 'orchestrate', 'scope', '--run-id', runId, '--through', 'one', '--json'], repoRoot, {}, true);
+    assert.notEqual(refuse.status, 0);
+    assert.match(refuse.stderr, /whose worker has already started/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    if (slicesDir) rmSync(slicesDir, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate deferred slices create no worktrees and stay out of the snapshot next action', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  let slicesDir;
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const planned = planPr1ThreeSliceRun(repoRoot);
+    slicesDir = planned.slicesDir;
+    const runId = planned.runId;
+
+    runCli(['run', 'orchestrate', 'scope', '--run-id', runId, '--through', 'one'], repoRoot);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    assert.ok(prepared.run.slices[0].worktreePath);
+    assert.equal(prepared.run.slices[1].worktreePath, null);
+    assert.equal(prepared.run.slices[2].worktreePath, null);
+
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', runId], repoRoot);
+    const started = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: PR1_PASS_WORKER,
+    }).stdout);
+    assert.equal(started.run.status, 'paused');
+
+    const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    const nextAction = envelope.data.orchestration.activeRun.nextAction;
+    // The deferred slices must not pull the next action back to prepare/dispatch/start.
+    assert.notEqual(nextAction?.id, 'orchestrate.prepare');
+    assert.notEqual(nextAction?.id, 'orchestrate.dispatch');
+    assert.equal(nextAction?.id, 'orchestrate.review');
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    if (slicesDir) rmSync(slicesDir, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate pass with deferred slices pauses, then resume un-defers and completes', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  let slicesDir;
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const planned = planPr1ThreeSliceRun(repoRoot);
+    slicesDir = planned.slicesDir;
+    const runId = planned.runId;
+
+    // Pass 1: only the first slice.
+    runCli(['run', 'orchestrate', 'scope', '--run-id', runId, '--through', 'one'], repoRoot);
+    runCli(['run', 'orchestrate', 'prepare', '--run-id', runId], repoRoot);
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', runId], repoRoot);
+    const pass1 = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: PR1_PASS_WORKER,
+    }).stdout);
+    createdWorktrees.push(...pass1.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    assert.equal(pass1.run.status, 'paused');
+
+    // Resume: bring the rest into scope and run them.
+    runCli(['run', 'orchestrate', 'scope', '--run-id', runId, '--through', 'three'], repoRoot);
+    runCli(['run', 'orchestrate', 'prepare', '--run-id', runId], repoRoot);
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', runId], repoRoot);
+    const pass2 = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: PR1_PASS_WORKER,
+    }).stdout);
+    createdWorktrees.push(...pass2.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    assert.equal(pass2.run.status, 'completed');
+    assert.ok(pass2.run.slices.every((slice) => slice.worker?.status === 'succeeded'));
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    if (slicesDir) rmSync(slicesDir, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate finalize marks the deferred remainder excluded and keeps the record', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  let slicesDir;
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const planned = planPr1ThreeSliceRun(repoRoot);
+    slicesDir = planned.slicesDir;
+    const runId = planned.runId;
+
+    runCli(['run', 'orchestrate', 'scope', '--run-id', runId, '--through', 'one'], repoRoot);
+    runCli(['run', 'orchestrate', 'prepare', '--run-id', runId], repoRoot);
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', runId], repoRoot);
+    const started = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: PR1_PASS_WORKER,
+    }).stdout);
+    createdWorktrees.push(...started.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    assert.equal(started.run.status, 'paused');
+
+    const finalized = JSON.parse(runCli(['run', 'orchestrate', 'finalize', '--run-id', runId, '--json'], repoRoot).stdout);
+    // Excluded slices are KEPT (not deleted), with a reason + timestamp.
+    assert.equal(finalized.run.slices.length, 3);
+    assert.equal(finalized.excludedCount, 2);
+    assert.ok(finalized.run.slices[1].excludedReason);
+    assert.ok(finalized.run.slices[2].excludedAt);
+    // The deferred remainder no longer keeps the run paused/resumable.
+    assert.notEqual(finalized.run.status, 'paused');
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    if (slicesDir) rmSync(slicesDir, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate outline --json snapshots phases, slice glyphs, and deferral', () => {
+  const repoRoot = createRepo();
+  let slicesDir;
+  try {
+    const planned = planPr1ThreeSliceRun(repoRoot);
+    slicesDir = planned.slicesDir;
+    const runId = planned.runId;
+
+    const outline = JSON.parse(runCli(['run', 'orchestrate', 'outline', '--run-id', runId, '--json'], repoRoot).stdout);
+    assert.equal(outline.command, 'orchestrate outline');
+    assert.equal(outline.total, 3);
+    assert.equal(outline.phaseCount, 2);
+    assert.equal(outline.deferred, 0);
+    assert.equal(outline.slices[0].glyph, '◻');
+    assert.equal(outline.slices[0].state, 'queued');
+    assert.equal(outline.slices[0].deferred, false);
+    assert.match(outline.message, /Plan — 2 phases, 3 slices/);
+
+    runCli(['run', 'orchestrate', 'scope', '--run-id', runId, '--through', 'one'], repoRoot);
+    const scopedOutline = JSON.parse(runCli(['run', 'orchestrate', 'outline', '--run-id', runId, '--json'], repoRoot).stdout);
+    assert.equal(scopedOutline.deferred, 2);
+    assert.equal(scopedOutline.slices[1].deferred, true);
+    assert.match(scopedOutline.message, /deferred/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    if (slicesDir) rmSync(slicesDir, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate paused run reviews as passed (not blocked) and the next action is resume, not pr', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  let slicesDir;
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      preset: 'standard',
+      planReview: { gates: [] },
+      gates: [{
+        id: 'slice-static',
+        phase: 'static',
+        type: 'command',
+        command: `${process.execPath} -e "console.log('slice review ok')"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt pipelane + review gate');
+    const planned = planPr1ThreeSliceRun(repoRoot);
+    slicesDir = planned.slicesDir;
+    const runId = planned.runId;
+
+    runCli(['run', 'orchestrate', 'scope', '--run-id', runId, '--through', 'one'], repoRoot);
+    runCli(['run', 'orchestrate', 'prepare', '--run-id', runId], repoRoot);
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', runId], repoRoot);
+    const started = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: PR1_PASS_WORKER,
+    }).stdout);
+    createdWorktrees.push(...started.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    assert.equal(started.run.status, 'paused');
+
+    // #1a: a paused run whose in-scope slice passed review must NOT report blocked.
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', runId, '--json'], repoRoot).stdout);
+    assert.equal(reviewed.status, 'passed');
+    assert.equal(reviewed.run.status, 'paused');
+
+    // #1b: the next action for a reviewed paused run is resume, not pr.
+    const snapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    assert.equal(snapshot.data.orchestration.activeRun.nextAction.id, 'orchestrate.resume');
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    if (slicesDir) rmSync(slicesDir, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate outline strips control characters from agent-authored phase labels', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  let slicesDir;
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'arch.md'), '# Architecture\n\nProse.\n', 'utf8');
+    const written = writePr1SlicesFile([
+      { id: 'one', title: 'First slice', phase: 'P\u001b[31mRED\u001b[0m\u0007BEL', text: 'do one' },
+    ]);
+    slicesDir = written.dir;
+    const planned = JSON.parse(runCli([
+      'run', 'orchestrate', 'plan', '--plan-file', 'docs/arch.md', '--slices-file', written.file, '--provider', 'generic', '--json',
+    ], repoRoot).stdout);
+    const outline = runCli(['run', 'orchestrate', 'outline', '--run-id', planned.runId], repoRoot).stdout;
+    assert.ok(!outline.includes('\u001b'), 'ESC sequences must be stripped from the outline');
+    assert.ok(!outline.includes('\u0007'), 'BEL control char must be stripped from the outline');
+    assert.match(outline, /Phase · PREDBEL/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    if (slicesDir) rmSync(slicesDir, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate resume does not abort when a completed slice worktree was cleaned between passes', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  let slicesDir;
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const planned = planPr1ThreeSliceRun(repoRoot);
+    slicesDir = planned.slicesDir;
+    const runId = planned.runId;
+
+    runCli(['run', 'orchestrate', 'scope', '--run-id', runId, '--through', 'one'], repoRoot);
+    runCli(['run', 'orchestrate', 'prepare', '--run-id', runId], repoRoot);
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', runId], repoRoot);
+    const pass1 = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: PR1_PASS_WORKER,
+    }).stdout);
+    createdWorktrees.push(...pass1.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    assert.equal(pass1.run.status, 'paused');
+
+    // Simulate /clean removing the finished slice's worktree before resuming.
+    rmSync(pass1.run.slices[0].worktreePath, { recursive: true, force: true });
+
+    runCli(['run', 'orchestrate', 'scope', '--run-id', runId, '--through', 'three'], repoRoot);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    // The completed slice is skipped (not re-validated); the remaining slices prepare.
+    assert.equal(prepared.run.slices[0].status, 'completed');
+    assert.ok(prepared.run.slices[1].worktreePath);
+    assert.ok(prepared.run.slices[2].worktreePath);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    if (slicesDir) rmSync(slicesDir, { recursive: true, force: true });
   }
 });

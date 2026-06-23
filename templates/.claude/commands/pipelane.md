@@ -189,15 +189,48 @@ If `$REST` starts with `setup --yes`, `setup --print`, `setup --list-gates`, or 
 
 ## ORCHESTRATION MODE
 
-Run:
+Run advanced subcommands directly:
 
 ```bash
 npm run pipelane:orchestrate -- $REST
 ```
 
-where `$REST` is `$ARGUMENTS` with the leading `orchestrate` token stripped.
+where `$REST` is `$ARGUMENTS` with the leading `orchestrate` token stripped. Use this
+direct path for the low-level subcommands: `plan`, `prepare`, `dispatch`, `start`,
+`review`, `scope`, `outline`, `finalize`, and `goal-spec`. Display the output directly.
 
-Use this path for `/pipelane orchestrate plan --plan-file <path>`, `/pipelane orchestrate plan --outcome "<text>"`, `/pipelane orchestrate prepare --run-id <id>`, `/pipelane orchestrate dispatch --run-id <id>`, `/pipelane orchestrate start --run-id <id>`, `/pipelane orchestrate start --run-id <id> --force`, `/pipelane orchestrate review --run-id <id>`, `/pipelane orchestrate review --run-id <id> --gate <id>`, `/pipelane orchestrate goal-spec --plan-file <path>`, `/pipelane orchestrate goal-spec --provider codex`, and `/pipelane orchestrate goal-spec --json`. Display the output directly.
+### `/pipelane orchestrate <plan-file>` — communicative driven flow
+
+When the operator points orchestrate at a plan file (or a goal to implement), do NOT
+just run `--yes` and wait silently. Drive a slice-by-slice flow that keeps them
+oriented:
+
+1. **Read the plan yourself.** Print **Plan read** in bullets (strengths, then
+   risks/gaps) plus a **coverage map** that accounts for every plan section as
+   in-scope (→ a slice), deferred, or excluded (one-line reason). Nothing silently
+   dropped.
+2. **Decompose** into phases and slices. Write a scratch JSON
+   `{ "slices": [{ "id", "title", "phase", "text" }], "coverage": [{ "section", "disposition", "sliceId", "reason" }] }`
+   then compile WITHOUT starting workers and capture the run id:
+   `/pipelane orchestrate plan --plan-file <real-plan> --slices-file <scratch.json> --json`.
+   The ledger's audit source stays bound to the real plan, not the scratch file.
+3. **Relay the CLI outline verbatim** (`/pipelane orchestrate outline --run-id <id>`),
+   then print the **review model** in bullets (static checks, tests, independent AI
+   review of each slice diff, human confirm on sensitive slices).
+4. **Recommend a scope** — full, or a justified partial boundary (sensitive phase
+   first). Offer approve / edit scope / cancel; for partial run
+   `/pipelane orchestrate scope --run-id <id> --through <last-slice-id-in-scope>`.
+5. On approval drive in order: `prepare`, `dispatch`, then per in-scope slice
+   `start --run-id <id> --slice-id <id>` then `review --run-id <id> --slice-id <id>`,
+   and after **each** slice relay `/pipelane orchestrate outline --run-id <id>` so the
+   updated outline shows where the run is. Never use `--yes` here.
+6. When the in-scope slices pass: if the outline lists deferred slices, the run is
+   `paused` — tell the operator a later `/pipelane orchestrate` resumes it (re-scope
+   `--through <next>`, continue). Use `/pipelane orchestrate finalize --run-id <id>`
+   only to deliberately abandon the deferred remainder (kept in the ledger for audit).
+
+If the plan compiles to a single unstructured slice, say so and propose a phase/slice
+breakdown before running one long opaque slice.
 
 ---
 
