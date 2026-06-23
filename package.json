@@ -38,7 +38,6 @@
     "pipelane:release-check": "pipelane run release-check",
     "pipelane:task-lock": "pipelane run task-lock",
     "pipelane:deploy": "pipelane run deploy",
-    "pipelane:smoke": "pipelane run smoke",
     "pipelane:clean": "pipelane run clean",
     "pipelane:status": "pipelane run status",
     "pipelane:doctor": "pipelane run doctor",

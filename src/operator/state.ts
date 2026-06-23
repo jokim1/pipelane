@@ -11,6 +11,8 @@ export type Mode = 'build' | 'release';
 export type KnownSurface = 'frontend' | 'edge' | 'sql';
 export const WORKFLOW_COMMANDS = ['devmode', 'new', 'resume', 'repo-guard', 'pr', 'merge', 'deploy', 'smoke', 'clean', 'status', 'doctor', 'rollback'] as const;
 export type WorkflowCommand = (typeof WORKFLOW_COMMANDS)[number];
+export const MANAGED_WORKFLOW_COMMANDS = ['devmode', 'new', 'resume', 'repo-guard', 'pr', 'merge', 'deploy', 'clean', 'status', 'doctor', 'rollback'] as const;
+export type ManagedWorkflowCommand = (typeof MANAGED_WORKFLOW_COMMANDS)[number];
 export const DEFAULT_WORKFLOW_ALIASES: Record<WorkflowCommand, string> = {
   devmode: '/devmode',
   new: '/new',
@@ -32,7 +34,7 @@ export const DEFAULT_WORKFLOW_ALIASES: Record<WorkflowCommand, string> = {
 // (filename is fixed) and are not dispatched via `pipelane run <name>`.
 export const MANAGED_EXTRA_COMMANDS = ['pipelane', 'fix'] as const;
 export type ManagedExtraCommand = (typeof MANAGED_EXTRA_COMMANDS)[number];
-export const MANAGED_COMMANDS = [...WORKFLOW_COMMANDS, ...MANAGED_EXTRA_COMMANDS] as const;
+export const MANAGED_COMMANDS = [...MANAGED_WORKFLOW_COMMANDS, ...MANAGED_EXTRA_COMMANDS] as const;
 export type ManagedCommand = (typeof MANAGED_COMMANDS)[number];
 
 // v4: optional-plugin checks declared per-consumer. Absent = no checks run.
@@ -3712,7 +3714,6 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
           'deploy.prod',
           'route.merge',
           'route.deploy.staging',
-          'route.smoke.staging',
           'route.deploy.prod',
         ]);
         const prShaExclusiveActions = new Set([

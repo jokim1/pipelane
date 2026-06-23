@@ -12,7 +12,6 @@ import {
   verifyDeployRecord,
 } from './release-gate.ts';
 import { bucketPathsBySurface } from './surface-map.ts';
-import { findQualifyingSmokeRun, resolveSmokeConfig } from './smoke-gate.ts';
 import { readWorktreeStatusSnapshot } from './worktree-status.ts';
 import { inferTargetSurfacesFromSurfacePathMap, targetSurfaceInferenceBlockers } from './target-surface-map.ts';
 import {
@@ -27,7 +26,6 @@ import {
   type DeployRecord,
   type ParsedOperatorArgs,
   type PrRecord,
-  type SmokeRunRecord,
   type TaskLock,
   type WorkflowConfig,
   type WorkflowContext,
@@ -48,7 +46,6 @@ export type DestinationMilestone =
   | 'pr_open'
   | 'merged'
   | 'staging_deployed'
-  | 'staging_smoked'
   | 'prod_deployed';
 
 export type DestinationStepId =
@@ -56,7 +53,6 @@ export type DestinationStepId =
   | 'review_gate'
   | 'merge'
   | 'deploy_staging'
-  | 'smoke_staging'
   | 'deploy_prod';
 
 export interface DestinationStep {
@@ -112,10 +108,6 @@ export interface DestinationSnapshot {
   configuredSurfaces: string[];
   explicitSurfaces: boolean;
   surfacePathMapBlockers: string[];
-  smoke: {
-    requireStagingSmoke: boolean;
-    stagingConfigured: boolean;
-  };
   titleProvided: boolean;
 }
 
@@ -144,9 +136,6 @@ export function destinationTargetForParsed(parsed: ParsedOperatorArgs): Destinat
     const env = parsed.positional[0] === 'production' ? 'prod' : parsed.positional[0];
     if (env === 'staging') return 'staging_deployed';
     if (env === 'prod') return 'prod_deployed';
-  }
-  if (parsed.command === 'smoke' && parsed.positional[0] === 'staging') {
-    return 'staging_smoked';
   }
   return null;
 }
@@ -221,8 +210,7 @@ export function resolveDestinationSnapshot(
   const prRecord = taskSlug ? loadPrRecord(context.commonDir, context.config, taskSlug) : null;
   const deployState = loadDeployState(context.commonDir, context.config);
   const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
-  const smokeConfig = resolveSmokeConfig(context.config);
-  const explicitDeploySha = parsed.command === 'deploy' || parsed.command === 'smoke'
+  const explicitDeploySha = parsed.command === 'deploy'
     ? parsed.flags.sha.trim()
     : '';
   const resolvedExplicitDeploySha = explicitDeploySha
@@ -287,10 +275,6 @@ export function resolveDestinationSnapshot(
     configuredSurfaces: [...context.config.surfaces],
     explicitSurfaces: explicitSurfaces.length > 0,
     surfacePathMapBlockers,
-    smoke: {
-      requireStagingSmoke: smokeConfig.requireStagingSmoke,
-      stagingConfigured: Boolean(smokeConfig.staging?.command?.trim()),
-    },
     titleProvided: parsed.flags.title.trim().length > 0,
   };
 }
@@ -299,20 +283,8 @@ export function planDestination(snapshot: DestinationSnapshot, target: Destinati
   const releaseSha = snapshot.targetSha;
   const stagingDeploy = findQualifiedDeploy(snapshot, 'staging', snapshot.requestedSurfaces);
   const prodDeploy = findQualifiedDeploy(snapshot, 'prod', snapshot.requestedSurfaces);
-  const qualifyingStagingSmoke = stagingDeploy && releaseSha
-    ? findQualifyingSmokeRun({
-      commonDir: snapshot.commonDir,
-      config: snapshot.config,
-      environment: 'staging',
-      sha: releaseSha,
-      taskSlug: snapshot.taskSlug || undefined,
-      surfaces: snapshot.requestedSurfaces,
-      deployIdempotencyKey: stagingDeploy.idempotencyKey,
-      repoRoot: snapshot.repoRoot,
-    })
-    : null;
   const route = buildRouteForSnapshot(snapshot, target);
-  const currentMilestone = resolveCurrentMilestone(snapshot, target, stagingDeploy, prodDeploy, qualifyingStagingSmoke);
+  const currentMilestone = resolveCurrentMilestone(snapshot, target, stagingDeploy, prodDeploy);
   const currentIndex = resolveRouteCurrentIndex(route, currentMilestone, target);
   const targetIndex = route.findIndex((step) => step.milestone === target);
   const remainingSteps = route.filter((_, index) => index > currentIndex && (targetIndex === -1 || index <= targetIndex));
@@ -349,11 +321,6 @@ export function planDestination(snapshot: DestinationSnapshot, target: Destinati
     mergedSha: snapshot.prRecord?.mergedSha ?? snapshot.livePr?.mergeCommit?.oid ?? null,
     routeSteps: remainingSteps.map((step) => step.id),
     surfaces: [...snapshot.requestedSurfaces].sort(),
-    smoke: {
-      requireStagingSmoke: snapshot.smoke.requireStagingSmoke,
-      stagingConfigured: snapshot.smoke.stagingConfigured,
-      qualifyingRunId: qualifyingStagingSmoke?.runId ?? null,
-    },
     deployConfigFingerprints: snapshot.deployConfigFingerprints,
   };
   const plan: DestinationPlan = {
@@ -404,7 +371,6 @@ export function renderDestinationPlan(plan: DestinationPlan): string {
   for (const surface of plan.surfaces.filter((entry) => entry.requested)) {
     const gates: string[] = [];
     if (plan.remainingSteps.some((step) => step.id === 'deploy_staging')) gates.push('staging deploy workflow');
-    if (plan.remainingSteps.some((step) => step.id === 'smoke_staging')) gates.push('staging smoke');
     if (plan.remainingSteps.some((step) => step.id === 'deploy_prod')) gates.push('prod deploy workflow');
     lines.push(`  ${surface.surface.padEnd(8)}  ${gates.length > 0 ? `needs ${gates.join(' + ')}` : 'no pending gate'}`);
   }
@@ -462,7 +428,6 @@ export function shouldInterceptDestinationPlan(plan: DestinationPlan, parsed: Pa
 
 function hasAutomaticDestinationJump(parsed: ParsedOperatorArgs, executableSteps: DestinationStep[]): boolean {
   if (executableSteps.length <= 1) return false;
-  if (parsed.command === 'smoke') return false;
 
   if (parsed.command === 'deploy') {
     const env = parsed.positional[0] === 'production' ? 'prod' : parsed.positional[0];
@@ -489,14 +454,12 @@ function formatDestinationCommand(context: WorkflowContext, parsed: ParsedOperat
   const alias = context.config.aliases[parsed.command as keyof typeof context.config.aliases] ?? `/${parsed.command}`;
   if (target === 'staging_deployed') return `${alias} staging`;
   if (target === 'prod_deployed') return `${alias} prod`;
-  if (target === 'staging_smoked') return `${alias} staging`;
   return alias;
 }
 
 function buildRoute(
   mode: 'build' | 'release',
   target: DestinationMilestone,
-  includeSmoke: boolean,
   config: WorkflowConfig,
 ): DestinationStep[] {
   const route: DestinationStep[] = [
@@ -505,13 +468,9 @@ function buildRoute(
     { id: 'merge', command: formatWorkflowCommand(config, 'merge'), label: 'Merged', milestone: 'merged' },
   ];
   const needsStagingStep = target === 'staging_deployed'
-    || target === 'staging_smoked'
     || (mode === 'release' && target === 'prod_deployed');
   if (needsStagingStep) {
     route.push({ id: 'deploy_staging', command: formatWorkflowCommand(config, 'deploy', 'staging'), label: 'Staging deployed', milestone: 'staging_deployed' });
-    if (target === 'staging_smoked' || (mode === 'release' && includeSmoke)) {
-      route.push({ id: 'smoke_staging', command: formatWorkflowCommand(config, 'smoke', 'staging'), label: 'Staging smoked', milestone: 'staging_smoked' });
-    }
   }
   if (target === 'prod_deployed') {
     route.push({ id: 'deploy_prod', command: formatWorkflowCommand(config, 'deploy', 'prod'), label: 'Production deployed', milestone: 'prod_deployed' });
@@ -520,7 +479,7 @@ function buildRoute(
 }
 
 function buildRouteForSnapshot(snapshot: DestinationSnapshot, target: DestinationMilestone): DestinationStep[] {
-  const route = buildRoute(snapshot.mode, target, snapshot.smoke.stagingConfigured || snapshot.smoke.requireStagingSmoke, snapshot.config);
+  const route = buildRoute(snapshot.mode, target, snapshot.config);
   if (snapshot.explicitDeploySha) {
     return route.filter((step) => step.id !== 'pr' && step.id !== 'review_gate' && step.id !== 'merge');
   }
@@ -553,8 +512,7 @@ function milestoneRank(milestone: DestinationMilestone): number {
     case 'pr_open': return 1;
     case 'merged': return 2;
     case 'staging_deployed': return 3;
-    case 'staging_smoked': return 4;
-    case 'prod_deployed': return 5;
+    case 'prod_deployed': return 4;
   }
 }
 
@@ -563,13 +521,11 @@ function resolveCurrentMilestone(
   target: DestinationMilestone,
   stagingDeploy: DeployRecord | null,
   prodDeploy: DeployRecord | null,
-  qualifyingStagingSmoke: SmokeRunRecord | null,
 ): DestinationMilestone {
   const merged = Boolean(snapshot.prRecord?.mergedSha || snapshot.livePr?.state === 'MERGED');
   if (snapshot.dirty && !merged) return 'local_dirty';
   const targetRank = milestoneRank(target);
   if (target === 'prod_deployed' && prodDeploy) return 'prod_deployed';
-  if (targetRank >= milestoneRank('staging_smoked') && qualifyingStagingSmoke) return 'staging_smoked';
   if (targetRank >= milestoneRank('staging_deployed') && stagingDeploy) return 'staging_deployed';
   if (merged) return 'merged';
   if (snapshot.livePr || snapshot.prRecord?.number) return 'pr_open';
@@ -580,8 +536,7 @@ function buildDestinationBlockers(snapshot: DestinationSnapshot, target: Destina
   const blockers: string[] = [];
   const needsStagingDeploy = steps.some((step) => step.id === 'deploy_staging');
   const needsProdDeploy = steps.some((step) => step.id === 'deploy_prod');
-  const needsStagingSmoke = steps.some((step) => step.id === 'smoke_staging');
-  const needsDeploySideEffect = needsStagingDeploy || needsProdDeploy || needsStagingSmoke;
+  const needsDeploySideEffect = needsStagingDeploy || needsProdDeploy;
 
   if (!snapshot.taskSlug) blockers.push('no active task could be inferred');
   if (snapshot.livePrError && !snapshot.livePr && !snapshot.prRecord?.number) blockers.push(snapshot.livePrError);
@@ -677,12 +632,6 @@ function buildDestinationBlockers(snapshot: DestinationSnapshot, target: Destina
     }));
     blockers.push(...listPendingDeployBlockers(snapshot, 'prod', snapshot.requestedSurfaces));
   }
-  if (needsStagingSmoke && snapshot.smoke.requireStagingSmoke && !snapshot.smoke.stagingConfigured) {
-    blockers.push('staging smoke is required but smoke.staging.command is not configured');
-  }
-  if (target === 'staging_smoked' && !snapshot.smoke.stagingConfigured) {
-    blockers.push('smoke staging is not configured; run /smoke setup');
-  }
   return [...new Set(blockers)];
 }
 
@@ -725,9 +674,6 @@ function buildDestinationWarnings(snapshot: DestinationSnapshot, steps: Destinat
   const warnings: string[] = [];
   if (steps.some((step) => step.id === 'review_gate')) {
     warnings.push('review gate is covered by /merge watching PR checks; no separate /review command is configured');
-  }
-  if (steps.some((step) => step.id === 'deploy_prod') && !snapshot.smoke.requireStagingSmoke && !snapshot.smoke.stagingConfigured) {
-    warnings.push('staging smoke is optional or unconfigured; production promotion will rely on deploy verification only');
   }
   if (snapshot.changedOther.length > 0) {
     warnings.push(`${snapshot.changedOther.length} changed file(s) do not match surfacePathMap`);
@@ -829,7 +775,6 @@ function surfaceReason(snapshot: DestinationSnapshot, surface: string, requested
 
 function currentStatusLine(snapshot: DestinationSnapshot, milestone: DestinationMilestone, releaseSha: string): string {
   if (milestone === 'prod_deployed') return `production deployed and verified at ${releaseSha.slice(0, 7)}`;
-  if (milestone === 'staging_smoked') return `staging smoke passed at ${releaseSha.slice(0, 7)}`;
   if (milestone === 'staging_deployed') return `staging deployed at ${releaseSha.slice(0, 7)}`;
   if (milestone === 'merged') return `PR merged at ${releaseSha.slice(0, 7)}`;
   if (milestone === 'pr_open') {

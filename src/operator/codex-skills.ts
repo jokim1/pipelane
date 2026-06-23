@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import path from 'node:path';
 
 import { readFixPromptBody } from './fix-prompt.ts';
-import { aliasCommandName, readJsonFile, resolveWorkflowAliases, type WorkflowCommand, WORKFLOW_COMMANDS, type WorkflowConfig, writeJsonFile } from './state.ts';
+import { aliasCommandName, MANAGED_WORKFLOW_COMMANDS, readJsonFile, resolveWorkflowAliases, type WorkflowCommand, type WorkflowConfig, writeJsonFile } from './state.ts';
 import { REPO_CODEX_SKILL_MARKER_PREFIX } from './skill-rendering.ts';
 
 const MANAGED_CODEX_SKILLS_FILENAME = '.pipelane-managed.json';
@@ -71,7 +71,7 @@ path actionable by presenting explicit choices and asking for confirmation:
 
 Ask "Reply 1 or Y to execute, or 2 to cancel." If the user confirms, run the
 listed commands in order from the required worktree(s). Do not bypass Pipelane
-gates; use the normal ${slashAlias}, PR, merge, smoke, and clean commands the
+gates; use the normal ${slashAlias}, PR, merge, deploy, and clean commands the
 path calls for. If any step is not deterministic, state the missing input and
 stop before side effects.
 `;
@@ -95,39 +95,7 @@ generated task slug.
 `;
   }
 
-  if (command !== 'smoke') {
-    return '';
-  }
-
-  return `
-## Guided empty state behavior
-
-When bare ${slashAlias} returns an \`emptyState\`, do not stop at the raw
-warning. Offer the exact choices from \`emptyState.options\` in chat. Follow each
-option's \`intent\` or \`command\`; do not assume the same number always means
-the same action for every empty-state kind.
-
-- If an option has \`intent: "start_smoke_interview"\`, start the interview.
-- If an option has \`command\`, run or offer that command.
-- If the selected option is manual tagging, explain how to tag existing tests,
-  then run ${slashAlias} plan after tags are added.
-
-For the smoke interview, ask one question at a time. The first question must be:
-
-\`\`\`text
-What are the 1-3 user journeys that must work before this app is considered alive?
-\`\`\`
-
-After the user answers, convert the answer into the deterministic setup path,
-primarily:
-
-\`\`\`bash
-${slashAlias} setup --feedback "<answer>"
-\`\`\`
-
-Keep command execution deterministic; the interview is agent-side guidance over
-existing ${slashAlias} setup and plan commands.
-`;
+  return '';
 }
 
 function buildSkill(command: WorkflowCommand, slashAlias: string): string {
@@ -292,7 +260,7 @@ export function detectCodexSkillDrift(
   const desiredSkills = new Set<string>();
   const desiredBodies = new Map<string, string>();
 
-  for (const command of WORKFLOW_COMMANDS) {
+  for (const command of MANAGED_WORKFLOW_COMMANDS) {
     const slashAlias = aliases[command];
     const skillName = aliasCommandName(slashAlias);
     if (skillName === INIT_PIPELANE_SKILL_NAME) {
@@ -360,7 +328,7 @@ export function syncCodexSkills(
   const desiredSkills = new Set<string>();
   const desiredBodies = new Map<string, string>();
 
-  for (const command of WORKFLOW_COMMANDS) {
+  for (const command of MANAGED_WORKFLOW_COMMANDS) {
     const slashAlias = aliases[command];
     const skillName = aliasCommandName(slashAlias);
     if (skillName === INIT_PIPELANE_SKILL_NAME) {
@@ -400,6 +368,6 @@ export function syncCodexSkills(
 
   return {
     skillsDir: skillsRoot,
-    installed: WORKFLOW_COMMANDS.map((command) => aliases[command]),
+    installed: MANAGED_WORKFLOW_COMMANDS.map((command) => aliases[command]),
   };
 }

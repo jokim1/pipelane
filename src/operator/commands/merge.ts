@@ -13,7 +13,6 @@ import {
   type WorkflowContext,
 } from '../state.ts';
 import {
-  buildSmokeHandoffMessage,
   buildStaleBaseBlocker,
   deriveTaskSlugFromPr,
   ensureTaskLockMatchesCurrent,
@@ -126,17 +125,10 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
       lines.push(`Next: run ${formatWorkflowCommand(context.config, 'deploy', 'prod')}.`);
     }
   } else {
-    // Release-mode merge. Smoke-aware handoff: tell the operator to deploy
-    // staging next and, based on whether smoke is configured/required/
-    // optional, add the right follow-up line. See buildSmokeHandoffMessage.
-    const handoff = buildSmokeHandoffMessage({
-      config: context.config,
-      stage: 'after-merge-release',
-      shortSha,
-    });
-    setNextAction(context.commonDir, context.config, taskSlug, handoff.nextAction);
+    const nextAction = `merged at ${shortSha}, run ${formatWorkflowCommand(context.config, 'deploy', 'staging')}`;
+    setNextAction(context.commonDir, context.config, taskSlug, nextAction);
     lines.push('Stay in this task worktree and deploy staging from here.');
-    lines.push(`Next: ${handoff.nextAction}`);
+    lines.push(`Next: ${nextAction}`);
   }
 
   printResult(parsed.flags, {

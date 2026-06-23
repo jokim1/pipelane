@@ -68,7 +68,6 @@ export const STABLE_ACTION_IDS = [
   'deploy.prod',
   'route.merge',
   'route.deploy.staging',
-  'route.smoke.staging',
   'route.deploy.prod',
   'clean.plan',
   'clean.apply',
@@ -103,7 +102,6 @@ export const API_RISKY_ACTION_IDS: ReadonlySet<StableActionId> = new Set<StableA
   'deploy.prod',
   'route.merge',
   'route.deploy.staging',
-  'route.smoke.staging',
   'route.deploy.prod',
   'rollback.prod',
 ]);
@@ -122,7 +120,6 @@ const ACTION_LABELS: Record<StableActionId, string> = {
   'deploy.prod': 'Deploy production',
   'route.merge': 'Take task to merge',
   'route.deploy.staging': 'Take task to staging',
-  'route.smoke.staging': 'Take task to smoke passed',
   'route.deploy.prod': 'Take task to production',
   'clean.plan': 'Plan cleanup',
   'clean.apply': 'Apply cleanup',
@@ -835,7 +832,6 @@ function actionRequiresConfirmation(actionId: StableActionId, normalizedInputs: 
 function isRouteActionId(actionId: StableActionId): boolean {
   return actionId === 'route.merge'
     || actionId === 'route.deploy.staging'
-    || actionId === 'route.smoke.staging'
     || actionId === 'route.deploy.prod';
 }
 
@@ -854,9 +850,6 @@ function parsedForRouteAction(actionId: StableActionId, parsed: ParsedOperatorAr
   }
   if (actionId === 'route.deploy.staging') {
     return { command: 'deploy', positional: ['staging'], flags: parsed.flags };
-  }
-  if (actionId === 'route.smoke.staging') {
-    return { command: 'smoke', positional: ['staging'], flags: parsed.flags };
   }
   return { command: 'deploy', positional: ['prod'], flags: parsed.flags };
 }
@@ -897,12 +890,10 @@ function normalizeInputs(
         pr: flags.pr,
         sha: flags.sha,
         surfaces: flags.surfaces,
-        skipSmokeCoverage: flags.skipSmokeCoverage,
         reason: flags.reason,
       };
     case 'route.merge':
     case 'route.deploy.staging':
-    case 'route.smoke.staging':
     case 'route.deploy.prod':
       return {
         task: flags.task,
@@ -911,7 +902,6 @@ function normalizeInputs(
         surfaces: flags.surfaces,
         title: flags.title,
         message: flags.message,
-        skipSmokeCoverage: flags.skipSmokeCoverage,
         reason: flags.reason,
         route: destinationPlan?.fingerprintInputs,
         routeBlockers: destinationPlan?.blockers ?? ['route could not be planned'],
@@ -1114,7 +1104,6 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
       pushOpt('--pr', flags.pr);
       pushOpt('--sha', flags.sha);
       pushSurfaces();
-      if (flags.skipSmokeCoverage) args.push('--skip-smoke-coverage');
       pushOpt('--reason', flags.reason);
       break;
     case 'route.merge':
@@ -1129,20 +1118,12 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
       pushOpt('--sha', flags.sha);
       pushSurfaces();
       break;
-    case 'route.smoke.staging':
-      args.push('smoke', 'staging', '--yes');
-      pushRouteTaskOrPr();
-      pushRoutePrMetadata();
-      pushOpt('--sha', flags.sha);
-      pushSurfaces();
-      break;
     case 'route.deploy.prod':
       args.push('deploy', 'prod', '--yes');
       pushRouteTaskOrPr();
       pushRoutePrMetadata();
       pushOpt('--sha', flags.sha);
       pushSurfaces();
-      if (flags.skipSmokeCoverage) args.push('--skip-smoke-coverage');
       pushOpt('--reason', flags.reason);
       break;
     case 'clean.plan':

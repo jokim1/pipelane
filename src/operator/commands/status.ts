@@ -443,7 +443,6 @@ function cloneOperatorFlags(flags: OperatorFlags): OperatorFlags {
     surfaces: [...flags.surfaces],
     forceInclude: [...flags.forceInclude],
     criticalPaths: [...flags.criticalPaths],
-    smokeFeedback: [...flags.smokeFeedback],
   };
 }
 
@@ -474,7 +473,6 @@ function applyParamsToFlags(flags: OperatorFlags, params: Record<string, unknown
 
   if (typeof params.allStale === 'boolean') flags.allStale = params.allStale;
   if (typeof params.override === 'boolean') flags.override = params.override;
-  if (typeof params.skipSmokeCoverage === 'boolean') flags.skipSmokeCoverage = params.skipSmokeCoverage;
   if (Array.isArray(params.surfaces)) {
     flags.surfaces = params.surfaces.filter((entry): entry is string => typeof entry === 'string');
   } else if (typeof params.surfaces === 'string') {
@@ -506,7 +504,7 @@ export function renderCockpit(
   options: RenderCockpitOptions = {},
 ): string {
   const color = options.color === true;
-  const { boardContext, branches, smoke, sourceHealth, attention, orchestration } = envelope.data;
+  const { boardContext, branches, sourceHealth, attention, orchestration } = envelope.data;
   const baseBranch = boardContext.baseBranch;
 
   const lines: string[] = [];
@@ -557,9 +555,6 @@ export function renderCockpit(
   lines.push('');
 
   lines.push(...renderAttention(attention as ApiIssue[], color));
-  lines.push('');
-
-  lines.push(...renderSmoke(smoke, color));
   lines.push('');
 
   const grouped = groupBranches(branches);
@@ -706,31 +701,6 @@ function renderAttention(attention: ApiIssue[], color: boolean): string[] {
   return lines;
 }
 
-function renderSmoke(
-  smoke: SnapshotData['smoke'],
-  color: boolean,
-): string[] {
-  const lines = [colorize('SMOKE', color, 'bold')];
-  const renderLine = (label: string, record: SnapshotData['smoke']['staging']) => {
-    if (!record) {
-      lines.push(`  ${label}: none`);
-      return;
-    }
-    const statusTone = record.status === 'failed' ? 'red' : 'green';
-    lines.push(
-      `  ${label}: ${colorize(record.status, color, statusTone)} sha=${sanitizeForTerminal(record.sha.slice(0, 7))} finished=${sanitizeForTerminal(record.finishedAt)}`,
-    );
-  };
-  renderLine('staging', smoke?.staging ?? null);
-  renderLine('prod', smoke?.prod ?? null);
-  if (Array.isArray(smoke?.locks)) {
-    for (const lock of smoke.locks) {
-      lines.push(`  active: ${sanitizeForTerminal(lock.environment)} ${sanitizeForTerminal(lock.operation)} runId=${sanitizeForTerminal(lock.runId)}`);
-    }
-  }
-  return lines;
-}
-
 function renderBranch(branch: BranchRow, baseBranch: string, color: boolean): string[] {
   const marker = branch.current ? '▶' : ' ';
   const taskSlug = sanitizeForTerminal(branch.task?.taskSlug ?? branch.name);
@@ -743,9 +713,6 @@ function renderBranch(branch: BranchRow, baseBranch: string, color: boolean): st
   const lockNextAction = readNextAction(branch);
   if (lockNextAction) {
     detail.push(`    next: ${sanitizeForTerminal(lockNextAction)}`);
-  }
-  if (branch.task?.promotedWithoutStagingSmoke) {
-    detail.push(`    smoke: promoted without staging smoke — add coverage via /smoke setup`);
   }
   return [header, laneLine, ...detail];
 }

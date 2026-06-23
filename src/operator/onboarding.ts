@@ -23,7 +23,7 @@ export function buildMissingDeployOnboardingMessage(
   const environment = options.environment?.trim() || 'staging';
   const projectName = path.basename(repoRoot);
   const retry = [
-    'pipelane run deploy',
+    '/deploy',
     environment,
     options.pr?.trim() ? `--pr ${options.pr.trim()}` : '',
   ].filter(Boolean).join(' ');
@@ -34,11 +34,11 @@ export function buildMissingDeployOnboardingMessage(
     'No deploy started.',
     '',
     'Run the guided repo setup first:',
-    `  pipelane bootstrap --project "${projectName}"`,
-    '  pipelane configure',
+    `  /init-pipelane --project "${projectName}"`,
+    '  /pipelane configure',
     `Then retry: ${retry}`,
     '',
-    'For non-interactive setup, add --yes to bootstrap and pass deploy values with `pipelane configure --json ...`.',
+    'For non-interactive setup, pass deploy values with `/pipelane configure --json ...`.',
   ].join('\n');
 }
 

@@ -12,6 +12,7 @@ import {
   loadWorkflowConfig,
   MANAGED_COMMANDS,
   MANAGED_EXTRA_COMMANDS,
+  MANAGED_WORKFLOW_COMMANDS,
   REPO_LOCAL_SYNC_DOCS,
   type ManagedCommand,
   readJsonFile,
@@ -20,7 +21,6 @@ import {
   resolveSyncDocs,
   resolveWorkflowAliases,
   runGit,
-  WORKFLOW_COMMANDS,
   writeJsonFile,
   writeWorkflowConfig,
 } from './state.ts';
@@ -56,10 +56,6 @@ export const LEGACY_CLAUDE_SIGNATURES: Record<ManagedCommand, string[]> = {
   deploy: [
     'Deploy the merged SHA for this repo.',
     'npm run pipelane:deploy',
-  ],
-  smoke: [
-    'Plan smoke coverage or run deterministic staging smoke.',
-    'npm run pipelane:smoke',
   ],
   devmode: [
     "Switch or check the repo's development mode (build or release).",
@@ -117,10 +113,6 @@ export const LEGACY_CLAUDE_SIGNATURES: Record<ManagedCommand, string[]> = {
 };
 
 const ADDITIONAL_LEGACY_CLAUDE_SIGNATURES: Partial<Record<ManagedCommand, string[][]>> = {
-  smoke: [[
-    'Plan smoke coverage or run deterministic smoke against staging or prod.',
-    'npm run pipelane:smoke',
-  ]],
   // Pre-overview `/pipelane` opened the board by default and shipped without
   // the command marker. Keep recognizing that exact old shape without forcing
   // stale "Board (default)" copy to remain in the current template forever.
@@ -172,7 +164,6 @@ function renderTemplate(template: string, config: WorkflowConfig): string {
     ALIAS_PR: aliases.pr,
     ALIAS_MERGE: aliases.merge,
     ALIAS_DEPLOY: aliases.deploy,
-    ALIAS_SMOKE: aliases.smoke,
     ALIAS_CLEAN: aliases.clean,
     ALIAS_STATUS: aliases.status,
     ALIAS_DOCTOR: aliases.doctor,
@@ -440,7 +431,6 @@ const REQUIRED_PACKAGE_SCRIPTS: Record<string, string> = {
   'pipelane:release-check': 'pipelane run release-check',
   'pipelane:task-lock': 'pipelane run task-lock',
   'pipelane:deploy': 'pipelane run deploy',
-  'pipelane:smoke': 'pipelane run smoke',
   'pipelane:clean': 'pipelane run clean',
   'pipelane:status': 'pipelane run status',
   'pipelane:doctor': 'pipelane run doctor',
@@ -453,7 +443,7 @@ const REQUIRED_PACKAGE_SCRIPTS: Record<string, string> = {
 };
 
 const CLAUDE_COMMAND_PACKAGE_SCRIPTS = [
-  ...WORKFLOW_COMMANDS.map((cmd) => `pipelane:${cmd}`),
+  ...MANAGED_WORKFLOW_COMMANDS.map((cmd) => `pipelane:${cmd}`),
   'pipelane:configure',
   'pipelane:board',
   'pipelane:update',
@@ -699,7 +689,7 @@ const AGENTS_GUIDANCE_EXTRA_COMMANDS: Record<string, string> = {
 };
 
 function replacementForAgentsWorkflowCommand(command: string, aliases: Record<WorkflowCommand, string>): string | null {
-  if ((WORKFLOW_COMMANDS as readonly string[]).includes(command)) {
+  if ((MANAGED_WORKFLOW_COMMANDS as readonly string[]).includes(command)) {
     return aliases[command as WorkflowCommand];
   }
   return AGENTS_GUIDANCE_EXTRA_COMMANDS[command] ?? null;
@@ -887,7 +877,7 @@ export function setupConsumerRepo(cwd: string, options: SetupConsumerRepoOptions
     skippedRepoGuidanceScaffold,
     codexSkillsDir: path.join(repoRoot, '.agents', 'skills'),
     installedCodexSkills: syncDocs.codexSkills
-      ? WORKFLOW_COMMANDS.map((command) => config.aliases[command])
+      ? MANAGED_WORKFLOW_COMMANDS.map((command) => config.aliases[command])
       : [],
     removedLegacyCodexSkills,
     agentsGuidanceMigrations,
@@ -1122,7 +1112,7 @@ export function setupDeployConfigMessage(repoRoot: string): string {
   if (loadDeployConfig(repoRoot)) {
     return 'Release mode can use shared deploy configuration when available. Edit local CLAUDE.md only for worktree-local overrides.';
   }
-  return 'Release mode still requires deploy configuration. Run `pipelane configure` interactively, or `pipelane configure --json ...` for scripted setup.';
+  return 'Release mode still requires deploy configuration. Run `/pipelane configure` in Claude/Codex, or `pipelane configure --json ...` for scripted setup.';
 }
 
 // Canonical setup-complete output. Used by `pipelane setup` (cli.ts) and by

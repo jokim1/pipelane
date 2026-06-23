@@ -1,6 +1,6 @@
 import readline from 'node:readline';
 
-import { acquireSmokeEnvironmentLock, evaluateSmokeCoverage, findLatestSmokeRun, findQualifyingSmokeRun, isSmokeSuccessStatus, releaseSmokeEnvironmentLock, resolveSmokeConfig } from '../smoke-gate.ts';
+import { acquireSmokeEnvironmentLock, releaseSmokeEnvironmentLock } from '../smoke-gate.ts';
 import {
   buildReleaseCheckMessage,
   computeDeployConfigFingerprint,
@@ -18,7 +18,6 @@ import { listMissingDeployConfiguration } from '../deploy-config-validation.ts';
 import {
   formatWorkflowCommand,
   loadDeployState,
-  loadSmokeRegistry,
   loadPrRecord,
   loadTaskLock,
   loadProbeState,
@@ -41,10 +40,8 @@ import {
   type WorkflowContext,
 } from '../state.ts';
 import {
-  buildSmokeHandoffMessage,
   deriveTaskSlugFromPr,
   inferActiveTaskLock,
-  isStagingSmokeConfigured,
   loadPrByNumber,
   loadPrForBranch,
   makeIdempotencyKey,
@@ -56,7 +53,6 @@ import {
   resolveDeployTargetForTask,
   setNextAction,
   type LivePr,
-  updatePromotedWithoutStagingSmoke,
 } from './helpers.ts';
 import { maybeHandleDestinationCommand } from './destination.ts';
 import { observeFrontendRuntime, toDeployRuntimeObservation } from '../runtime-observation.ts';
@@ -274,15 +270,8 @@ export async function dispatchDeploy(
       deployCommand: formatWorkflowCommand(context.config, 'deploy'),
     }));
   }
-  const smokeConfig = resolveSmokeConfig(context.config);
-  const requestedSmokeCoverageOverrideReason = parsed.flags.skipSmokeCoverage
-    ? parsed.flags.reason.trim()
-    : '';
-  if (parsed.flags.skipSmokeCoverage && !requestedSmokeCoverageOverrideReason) {
-    throw new Error([
-      'Smoke coverage override requires --reason.',
-      `Example: ${formatWorkflowCommand(context.config, 'deploy', 'prod')} --skip-smoke-coverage --reason "critical hotfix while smoke coverage catches up"`,
-    ].join('\n'));
+  if (parsed.flags.skipSmokeCoverage) {
+    throw new Error('--skip-smoke-coverage is no longer supported. Pipelane release deploys use deploy verification and healthchecks; QA smoke coverage belongs in a separate QA workflow.');
   }
 
   const deployState = loadDeployState(context.commonDir, context.config);
@@ -294,8 +283,6 @@ export async function dispatchDeploy(
   const trustedRecords = stateKey
     ? deployState.records.filter((record) => verifyDeployRecord(record, stateKey))
     : deployState.records;
-  let smokeCoverageOverrideReason: string | undefined;
-
   if (context.modeState.mode === 'release') {
     // v1.2 readiness is now observed, not asserted. Callers to prod are also
     // allowed to promote the same SHA they just verified in staging, so
@@ -346,75 +333,6 @@ export async function dispatchDeploy(
         `deploy prod blocked: matching staging record is not promotable — ${disqualification}.`,
         `Re-run ${formatWorkflowCommand(context.config, 'deploy', 'staging')} and let it verify before promoting.`,
       ].join('\n'));
-    }
-
-    if (smokeConfig.requireStagingSmoke) {
-      // Misconfigured release gate — requireStagingSmoke=true but no staging
-      // command is configured. The old "run /smoke staging" message was the
-      // original bug: /smoke staging would immediately reject because smoke
-      // is not wired up. Route the operator to /smoke setup instead.
-      const prodHandoff = buildSmokeHandoffMessage({
-        config: context.config,
-        stage: 'before-deploy-prod',
-      });
-      if (prodHandoff.blocks) {
-        throw new Error(prodHandoff.nextAction);
-      }
-      const qualifyingSmoke = findQualifyingSmokeRun({
-        commonDir: context.commonDir,
-        repoRoot: context.repoRoot,
-        config: context.config,
-        environment: 'staging',
-        sha: target.sha,
-        taskSlug,
-        surfaces,
-        deployIdempotencyKey: staging.idempotencyKey,
-      });
-      if (!qualifyingSmoke) {
-        const latestSmoke = findLatestSmokeRun({
-          commonDir: context.commonDir,
-          repoRoot: context.repoRoot,
-          config: context.config,
-          environment: 'staging',
-          sha: target.sha,
-          taskSlug,
-          surfaces,
-          deployIdempotencyKey: staging.idempotencyKey,
-        });
-        if (latestSmoke && !isSmokeSuccessStatus(latestSmoke.status)) {
-          throw new Error([
-            `deploy prod blocked: staging smoke failed for SHA ${target.sha.slice(0, 7)}.`,
-            `Run ${formatWorkflowCommand(context.config, 'smoke', 'staging')} after fixing the failing smoke checks.`,
-          ].join('\n'));
-        }
-        throw new Error([
-          `deploy prod blocked: no qualifying staging smoke found for SHA ${target.sha.slice(0, 7)}.`,
-          `Run ${formatWorkflowCommand(context.config, 'smoke', 'staging')}.`,
-        ].join('\n'));
-      }
-
-      const coverage = evaluateSmokeCoverage({
-        registry: loadSmokeRegistry(context.repoRoot, context.config),
-        environment: 'staging',
-        config: context.config,
-      });
-      if (coverage.uncoveredCriticalPaths.length > 0) {
-        const coverageMessage = `critical-path smoke gaps: ${coverage.uncoveredCriticalPaths.join(', ')}`;
-        if (coverage.mode === 'block') {
-          if (!requestedSmokeCoverageOverrideReason) {
-            throw new Error([
-              `deploy prod blocked: ${coverageMessage}.`,
-              `Run ${formatWorkflowCommand(context.config, 'smoke', 'plan')} or add smoke coverage before promoting.`,
-              'If you must ship anyway, re-run with `--skip-smoke-coverage --reason "<why>"`.',
-            ].join('\n'));
-          }
-          smokeCoverageOverrideReason = requestedSmokeCoverageOverrideReason;
-          process.stderr.write(`[pipelane] WARNING: bypassing smoke coverage block: ${coverageMessage}\n`);
-          process.stderr.write(`[pipelane] WARNING: smoke coverage override reason: ${smokeCoverageOverrideReason}\n`);
-        } else {
-          process.stderr.write(`[pipelane] WARNING: ${coverageMessage}\n`);
-        }
-      }
     }
   }
 
@@ -540,7 +458,6 @@ export async function dispatchDeploy(
       workflowRunUrl: run?.url,
       idempotencyKey,
       triggeredBy,
-      smokeCoverageOverrideReason,
     };
 
     // Persist the 'requested' record immediately so an interrupted run
@@ -567,7 +484,6 @@ export async function dispatchDeploy(
           `Task: ${taskSlug}`,
           `SHA: ${target.sha}`,
           `Surfaces: ${surfaces.join(', ')}`,
-          record.smokeCoverageOverrideReason ? `Smoke coverage override: ${record.smokeCoverageOverrideReason}` : '',
           `Workflow: ${workflowName}`,
           run?.id ? `Workflow run: ${run.url ?? run.id}` : 'Workflow run: not yet resolvable',
           'Exit without watching per --async.',
@@ -671,28 +587,10 @@ export async function dispatchDeploy(
   }
 
   const shortSha = target.sha.slice(0, 7);
-  // Build the next-action breadcrumb. Staging: smoke-aware handoff. Prod:
-  // the existing flow is unchanged here (cleanup guidance).
-  const stagingHandoff = environment === 'staging'
-    ? buildSmokeHandoffMessage({
-        config: context.config,
-        stage: 'after-deploy-staging',
-        shortSha,
-      })
-    : null;
   const nextStage = environment === 'staging'
-    ? stagingHandoff!.nextAction
+    ? `staging verified at ${shortSha}, run ${formatWorkflowCommand(context.config, 'deploy', 'prod')} when ready to promote`
     : `prod verified at ${shortSha}, run ${formatWorkflowCommand(context.config, 'clean', `--apply --task ${taskSlug}`)} to close out the workspace`;
   setNextAction(context.commonDir, context.config, taskSlug, nextStage);
-
-  // Skip-smoke observability. On successful prod promotion, record whether
-  // the promotion happened without staging smoke configured so `/status` can
-  // surface the skip decision. If smoke is now configured, clear any
-  // previously-set flag from an earlier skipped promotion.
-  if (environment === 'prod' && context.modeState.mode === 'release') {
-    const skipped = !isStagingSmokeConfigured(context.config);
-    updatePromotedWithoutStagingSmoke(context.commonDir, context.config, taskSlug, skipped);
-  }
 
     return {
       ...record,
@@ -702,14 +600,13 @@ export async function dispatchDeploy(
         `Task: ${taskSlug}`,
         `SHA: ${target.sha}`,
         `Surfaces: ${surfaces.join(', ')}`,
-        record.smokeCoverageOverrideReason ? `Smoke coverage override: ${record.smokeCoverageOverrideReason}` : '',
         `Workflow: ${workflowName}`,
         run?.url ? `Workflow run: ${run.url}` : '',
         verification?.healthcheckUrl
           ? `Healthcheck: ${verification.healthcheckUrl} → HTTP ${verification.statusCode} in ${verification.latencyMs}ms (${verification.probes} probe(s))`
           : 'Healthcheck: skipped (no URL configured)',
         environment === 'staging'
-          ? `Next: ${stagingHandoff!.nextAction}`
+          ? `Next: ${nextStage}`
           : `Next: run ${formatWorkflowCommand(context.config, 'clean', `--apply --task ${taskSlug}`)} to close out this workspace (removes lock + worktree + local branch).`,
       ].filter(Boolean).join('\n'),
     };

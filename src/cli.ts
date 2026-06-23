@@ -316,7 +316,7 @@ async function maybeOfferConfigureAfterBootstrap(repoRoot: string): Promise<void
   try {
     const answer = (await rl.question('Deploy Configuration is still empty. Configure deploy targets now? [Y/n] ')).trim().toLowerCase();
     if (answer === 'n' || answer === 'no') {
-      process.stdout.write('Next: run `pipelane configure` before the first /deploy.\n');
+      process.stdout.write('Next: run `/pipelane configure` before the first /deploy.\n');
       return;
     }
   } finally {
@@ -437,6 +437,9 @@ async function main(): Promise<void> {
     let result = setupConsumerRepo(process.cwd());
     result = await maybeApplyAgentsGuidanceMigrationsAfterPrompt(result, options.yes);
     process.stdout.write(formatSetupResult(result).join('\n') + '\n');
+    if (!options.yes) {
+      await maybeOfferConfigureAfterBootstrap(result.repoRoot);
+    }
     return;
   }
 

@@ -106,7 +106,7 @@ whether a confirm token is required); `action <id> --execute` with the
 returned token to actually run it.
 
 Risky actions (`merge`, `deploy.prod`, `route.merge`,
-`route.deploy.staging`, `route.smoke.staging`, `route.deploy.prod`,
+`route.deploy.staging`, `route.deploy.prod`,
 `clean.apply`, `rollback.prod`) always require a fresh confirmation token.
 `pr` remains non-risky in the normal path, but a task-binding recovery choice
 returns a confirmation token so the selected checkout and fingerprint are
@@ -125,7 +125,6 @@ consumed atomically. Other non-risky actions complete in one call.
 | `deploy.prod` | **yes** | Deploy the merged SHA to production. |
 | `route.merge` | **yes** | Run the remaining destination route steps through merge. |
 | `route.deploy.staging` | **yes** | Run the remaining destination route steps through staging deploy. |
-| `route.smoke.staging` | **yes** | Run the remaining destination route steps through staging smoke. |
 | `route.deploy.prod` | **yes** | Run the remaining destination route steps through production deploy. |
 | `clean.plan` | no | Preview workspace cleanup. |
 | `clean.apply` | **yes** | Apply stale workspace cleanup with an explicit scope such as `allStale`. |

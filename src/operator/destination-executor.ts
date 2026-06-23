@@ -192,7 +192,6 @@ function milestoneChecklistLabel(milestone: DestinationMilestone): string {
     case 'pr_open': return 'PR opened';
     case 'merged': return 'Merged';
     case 'staging_deployed': return 'Staging deployed';
-    case 'staging_smoked': return 'Staging smoked';
     case 'prod_deployed': return 'Production deployed';
   }
 }
@@ -203,7 +202,6 @@ function currentPhaseLabel(plan: DestinationPlan): string {
     case 'pr_open': return 'PR opened';
     case 'merged': return 'merged';
     case 'staging_deployed': return 'staging deployed';
-    case 'staging_smoked': return 'staging smoked';
     case 'prod_deployed': return 'production deployed';
   }
 }
@@ -233,7 +231,6 @@ function stepCommandPrefixLength(step: DestinationStep): number {
     case 'merge':
       return 1;
     case 'deploy_staging':
-    case 'smoke_staging':
     case 'deploy_prod':
       return 2;
     case 'review_gate':
@@ -369,8 +366,7 @@ function destinationMilestoneRank(milestone: DestinationMilestone): number {
     case 'pr_open': return 1;
     case 'merged': return 2;
     case 'staging_deployed': return 3;
-    case 'staging_smoked': return 4;
-    case 'prod_deployed': return 5;
+    case 'prod_deployed': return 4;
   }
 }
 
@@ -381,7 +377,7 @@ function routeStaticDrift(approved: DestinationPlan, current: DestinationPlan): 
   ) {
     return '';
   }
-  return 'destination route target changed during execution. Re-run the destination command to approve the current task, mode, surfaces, smoke settings, and deploy configuration.';
+  return 'destination route target changed during execution. Re-run the destination command to approve the current task, mode, surfaces, and deploy configuration.';
 }
 
 function routeStaticFingerprint(plan: DestinationPlan): Record<string, unknown> {
@@ -392,10 +388,6 @@ function routeStaticFingerprint(plan: DestinationPlan): Record<string, unknown> 
     target: fp.target,
     explicitDeploySha: fp.explicitDeploySha,
     surfaces: fp.surfaces,
-    smoke: {
-      requireStagingSmoke: fp.smoke.requireStagingSmoke,
-      stagingConfigured: fp.smoke.stagingConfigured,
-    },
     targetSha: fp.explicitDeploySha ? fp.targetSha : undefined,
     deployConfigFingerprints: fp.deployConfigFingerprints,
   };
@@ -411,7 +403,6 @@ function routeFingerprint(plan: DestinationPlan): {
   targetSha: unknown;
   explicitDeploySha: unknown;
   surfaces: unknown;
-  smoke: { requireStagingSmoke?: unknown; stagingConfigured?: unknown; qualifyingRunId?: unknown };
   deployConfigFingerprints: unknown;
 } {
   const fp = plan.fingerprintInputs as {
@@ -424,7 +415,6 @@ function routeFingerprint(plan: DestinationPlan): {
     targetSha?: unknown;
     explicitDeploySha?: unknown;
     surfaces?: unknown;
-    smoke?: { requireStagingSmoke?: unknown; stagingConfigured?: unknown; qualifyingRunId?: unknown };
     deployConfigFingerprints?: unknown;
   };
   return {
@@ -437,7 +427,6 @@ function routeFingerprint(plan: DestinationPlan): {
     targetSha: fp.targetSha,
     explicitDeploySha: fp.explicitDeploySha,
     surfaces: fp.surfaces,
-    smoke: fp.smoke ?? {},
     deployConfigFingerprints: fp.deployConfigFingerprints,
   };
 }
@@ -497,19 +486,11 @@ function buildStepArgs(step: DestinationStep, parsed: ParsedOperatorArgs, plan: 
     pushSurfaces();
     return args;
   }
-  if (step.id === 'smoke_staging') {
-    args.push('smoke', 'staging');
-    pushTaskOrPr();
-    pushRouteTargetSha();
-    pushSurfaces();
-    return args;
-  }
   if (step.id === 'deploy_prod') {
     args.push('deploy', 'prod');
     pushTaskOrPr();
     pushApprovedDeploySha();
     pushSurfaces();
-    if (parsed.flags.skipSmokeCoverage) args.push('--skip-smoke-coverage');
     pushOpt('--reason', parsed.flags.reason);
     return args;
   }

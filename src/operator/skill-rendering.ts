@@ -1,4 +1,4 @@
-import { aliasCommandName, resolveWorkflowAliases, type WorkflowCommand, WORKFLOW_COMMANDS, type WorkflowConfig } from './state.ts';
+import { aliasCommandName, MANAGED_WORKFLOW_COMMANDS, resolveWorkflowAliases, type WorkflowCommand, type WorkflowConfig } from './state.ts';
 
 export type HostInstall = 'codex' | 'claude';
 export type HostInstallScope = 'repo-local' | 'machine-local';
@@ -76,6 +76,27 @@ export function buildSkillMarker(prefix: string, name: string): string {
 function renderWorkflowSkillGuidance(command: WorkflowCommand | 'pipelane', slashAlias: string): string {
   if (command === 'pipelane') {
     return `
+## Setup and configure behavior
+
+Treat \`${slashAlias} setup\` as the normal repo setup path and
+\`${slashAlias} configure\` as the normal deploy configuration path. Do not ask
+the user to run \`! pipelane configure\` in a terminal; the durable runner knows
+where the managed pipelane runtime is even when \`pipelane\` is not on PATH.
+
+Plain \`${slashAlias} setup\` configures the repo-wide Pipelane files. Plain
+\`${slashAlias} review setup\` configures the pre-PR review gates. Keep those
+two setup flows distinct.
+
+When \`${slashAlias} configure\` prints "Choose the action to take:", ask the
+user for the deploy values in chat, then run the matching
+\`${slashAlias} configure --json ...\` command with the provided flags.
+
+## Help behavior
+
+Bare \`${slashAlias}\`, \`${slashAlias} help\`, and \`${slashAlias} --help\`
+print the dispatcher command reference. Use that output when the user asks what
+Pipelane can do instead of guessing from memory.
+
 ## Interactive review setup behavior
 
 Agent Bash tools commonly run commands without an interactive TTY, and shell
@@ -123,13 +144,13 @@ path actionable by presenting explicit choices and asking for confirmation:
 
 Ask "Reply 1 or Y to execute, or 2 to cancel." If the user confirms, run the
 listed commands in order from the required worktree(s). Do not bypass Pipelane
-gates; use the normal ${slashAlias}, PR, merge, smoke, and clean commands the
+gates; use the normal ${slashAlias}, PR, merge, deploy, and clean commands the
 path calls for. If any step is not deterministic, state the missing input and
 stop before side effects.
-`;
+	`;
   }
 
-  if (command === 'merge' || command === 'smoke') {
+  if (command === 'merge') {
     return `
 ## PR shorthand behavior
 
@@ -261,6 +282,65 @@ if [ ! -x "$managed_bin" ]; then
   managed_bin="${globalBinFallback}"
 fi
 
+print_pipelane_help() {
+  cat <<'PIPELANE_HELP'
+Pipelane dispatcher
+
+Usage:
+  /pipelane <command> [args...]
+  /pipelane help
+
+Setup and maintenance:
+  /pipelane setup [--yes]
+      Sync or repair repo-local Pipelane files: generated commands, Codex
+      skills, docs, package scripts, and local guidance scaffolds.
+
+  /pipelane configure [--json] [flags...]
+      Fill or update Deploy Configuration values such as staging/prod URLs,
+      deploy workflow names, healthchecks, edge/sql commands, and Supabase refs.
+
+  /pipelane update [--check] [--yes] [--json]
+      Check or update the repo-local Pipelane install used by slash commands.
+
+Status and UI:
+  /pipelane status [--json]
+      Show the current lane state and next recommended action.
+
+  /pipelane board [status|stop] [--port <port>] [--no-open]
+      Open, inspect, or stop the local Pipelane board.
+
+  /pipelane web [status|stop] [--port <port>] [--no-open]
+      Alias for /pipelane board.
+
+Review gates:
+  /pipelane review [--dry-run] [--gate <id>] [--phase <phase>]
+      Run configured review gates and write evidence for the current diff.
+
+  /pipelane review setup [--yes] [--print] [--list-gates]
+                         [--enable <gate>] [--disable <gate>] [--install <gate>]
+      Configure pre-PR review gates. This is different from /pipelane setup,
+      which configures repo-wide Pipelane files.
+
+Orchestration:
+  /pipelane orchestrate --plan-file <file> --yes
+      Plan, prepare, dispatch, start, and review a multi-slice implementation.
+
+  /pipelane orchestrate plan|prepare|dispatch|start|review
+      Run one orchestration phase at a time.
+
+  /pipelane orchestrate goal-spec [--plan-file <file>] [--slice-id <id>]
+      Draft a provider-neutral implementation goal spec.
+
+Common companion slash commands after setup:
+  /new, /resume, /repo-guard, /pr, /merge, /deploy, /clean, /doctor,
+  /rollback
+
+Tip:
+  Use /pipelane setup as the guided first-run repair flow. Use
+  /pipelane configure later when only deploy values need to change.
+PIPELANE_HELP
+}
+
 run_pipelane() {
   bin="$1"
   shift
@@ -269,12 +349,18 @@ run_pipelane() {
 
   if [ "$subcommand" = "pipelane" ]; then
     if [ "$#" -eq 0 ]; then
-      echo "pipelane: use /pipelane status, /pipelane review setup, /pipelane orchestrate --plan-file <file> --yes, /pipelane orchestrate plan, /pipelane orchestrate prepare, /pipelane orchestrate dispatch, /pipelane orchestrate start, /pipelane orchestrate goal-spec, /pipelane web, /pipelane board, or /pipelane update" >&2
+      print_pipelane_help
       exit 0
     fi
     dispatcher="$1"
     shift
     case "$dispatcher" in
+      setup)
+        exec "$bin" setup "$@"
+        ;;
+      configure)
+        exec "$bin" configure "$@"
+        ;;
       web|board)
         exec "$bin" board "$@"
         ;;
@@ -291,12 +377,13 @@ run_pipelane() {
         exec "$bin" update "$@"
         ;;
       help|--help|-h)
-        echo "pipelane: use /pipelane status, /pipelane review setup, /pipelane orchestrate --plan-file <file> --yes, /pipelane orchestrate plan, /pipelane orchestrate prepare, /pipelane orchestrate dispatch, /pipelane orchestrate start, /pipelane orchestrate goal-spec, /pipelane web, /pipelane board, or /pipelane update" >&2
+        print_pipelane_help
         exit 0
         ;;
       *)
         echo "Unknown /pipelane mode: $dispatcher" >&2
-        echo "Supported modes: status, review, orchestrate, web, board, update" >&2
+        echo "" >&2
+        print_pipelane_help >&2
         exit 64
         ;;
     esac
@@ -316,7 +403,7 @@ should_use_managed_bootloader() {
         return 1
       fi
       case "$1" in
-        status|review|web|board|update)
+        setup|configure|status|review|orchestrate|web|board|update|help|--help|-h)
           return 0
           ;;
       esac
@@ -382,7 +469,7 @@ export function desiredHostInstall(
       : REPO_CODEX_SKILL_MARKER_PREFIX;
   const entries: DesiredInstallEntry[] = [];
 
-  for (const command of WORKFLOW_COMMANDS) {
+  for (const command of MANAGED_WORKFLOW_COMMANDS) {
     const slashAlias = aliases[command];
     const name = aliasCommandName(slashAlias);
     entries.push({

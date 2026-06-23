@@ -2145,7 +2145,6 @@
       pr: '/pr',
       merge: '/merge',
       deploy: '/deploy',
-      smoke: '/smoke',
       clean: '/clean',
       status: '/status',
       doctor: '/doctor',
@@ -2820,14 +2819,6 @@
       return `${freshness.state || 'unknown'} · ${observed} · ${checked}`;
     }
 
-    function smokeSummary(record, environment) {
-      if (!record) return `no ${environment} smoke run recorded`;
-      const sha = shortSha(record.sha);
-      const finished = record.finishedAt ? ` · ${formatDateWithRelative(record.finishedAt)}` : '';
-      const retries = record.retryCount ? ` · ${record.retryCount} retry` : '';
-      return `${record.status || 'unknown'} @ ${sha}${finished}${retries}`;
-    }
-
     function sourceHealthLine(item) {
       const freshness = item.freshness ? ` (${freshnessLabel(item.freshness)})` : '';
       const blocking = item.blocking ? 'blocking' : 'advisory';
@@ -2856,12 +2847,6 @@
           return `Run ${aliases.doctor} --probe`;
         case 'doctor.diagnose':
           return `Run ${aliases.doctor}`;
-        case 'smoke.plan':
-          return `Run ${aliases.smoke} plan`;
-        case 'smoke.staging':
-          return `Run ${aliases.smoke} staging`;
-        case 'smoke.prod':
-          return `Run ${aliases.smoke} prod`;
         case 'review':
           return 'Run /pipelane review';
         case 'deploy.staging':
@@ -2969,36 +2954,39 @@
       };
     }
 
-    function isSmokeLockedFor(smokeState, environment) {
-      return (smokeState?.locks || []).some((lock) => lock.environment === environment);
-    }
-
-    function describeSmokePill(smokeState, environment) {
-      const record = smokeState ? smokeState[environment] : null;
-      if (isSmokeLockedFor(smokeState, environment)) {
-        const lock = (smokeState?.locks || []).find((entry) => entry.environment === environment);
-        return { tone: 'running', value: 'running', detail: lock ? `${lock.operation} ${lock.runId}` : '' };
-      }
-      if (!record) {
-        return { tone: 'unknown', value: '—', detail: `no ${environment} smoke history yet` };
-      }
-      if (record.status === 'failed') {
-        return { tone: 'blocked', value: 'fail', detail: `failed @ ${shortSha(record.sha)} · ${record.finishedAt}` };
-      }
-      return { tone: 'healthy', value: 'pass', detail: smokeSummary(record, environment) };
-    }
-
-    function describeStagingPill(release, smokeState) {
-      const smoke = describeSmokePill(smokeState, 'staging');
-      if (smoke.tone !== 'healthy') return smoke;
+    function describeStagingPill(release) {
       const probeState = release?.probeState;
       if (probeState === 'degraded') {
-        return { tone: 'degraded', value: 'degraded', detail: `staging probe degraded (${smoke.detail})` };
+        return { tone: 'degraded', value: 'degraded', detail: 'staging probe degraded' };
       }
       if (probeState === 'stale') {
-        return { tone: 'stale', value: 'stale', detail: `staging probe stale (${smoke.detail})` };
+        return { tone: 'stale', value: 'stale', detail: 'staging probe stale' };
       }
-      return smoke;
+      if (probeState === 'healthy') {
+        return { tone: 'healthy', value: 'verified', detail: 'staging probes are healthy' };
+      }
+      return { tone: 'unknown', value: '—', detail: 'no staging probe evidence yet' };
+    }
+
+    function describeProdPill(boardContext) {
+      const checkout = boardContext?.currentCheckout || {};
+      const runtimeLayer = checkout.layers?.runtime || {};
+      const deployLayer = checkout.layers?.deploy || {};
+      const health = runtimeLayer.health || deployLayer.health || 'unknown';
+      const labels = {
+        healthy: 'live',
+        degraded: 'degraded',
+        blocked: 'blocked',
+        stale: 'stale',
+        running: 'running',
+        awaiting_preflight: 'pending',
+        unknown: '—',
+      };
+      return {
+        tone: health,
+        value: labels[health] || health,
+        detail: runtimeLayer.reason || deployLayer.reason || 'no production runtime evidence yet',
+      };
     }
 
     function describeWorktreePill(activeTask) {
@@ -3012,18 +3000,18 @@
       };
     }
 
-    function buildHeroPills(boardContext, smokeState) {
+    function buildHeroPills(boardContext) {
       const release = boardContext?.releaseReadiness || {};
       const gate = describeReleaseGate(release);
-      const staging = describeStagingPill(release, smokeState);
-      const prod = describeSmokePill(smokeState, 'prod');
+      const staging = describeStagingPill(release);
+      const prod = describeProdPill(boardContext);
       const worktree = describeWorktreePill(boardContext?.activeTask);
       const sourceHealth = state.snapshot?.data?.sourceHealth || [];
       const attention = state.snapshot?.data?.attention || [];
       return [
         renderPill('Release Gate', gate.value, gate.tone, buildReleaseGateTooltip(boardContext, release, sourceHealth, attention)),
-        renderPill('Staging', staging.value, staging.tone, buildStagingTooltip(boardContext, release, smokeState, sourceHealth, attention)),
-        renderPill('Prod', prod.value, prod.tone, buildProdTooltip(boardContext, smokeState, sourceHealth)),
+        renderPill('Staging', staging.value, staging.tone, buildStagingTooltip(boardContext, release, sourceHealth, attention)),
+        renderPill('Prod', prod.value, prod.tone, buildProdTooltip(boardContext, sourceHealth)),
         renderPill('Base', boardContext?.baseBranch || 'main', 'unknown', buildBaseTooltip(boardContext)),
         renderPill('Worktree', worktree.value, worktree.tone, buildWorktreeTooltip(boardContext)),
       ];
@@ -3053,10 +3041,9 @@
         item.blocking
         || item.lane === 'staging'
         || item.lane === 'production'
-        || String(item.code || '').startsWith('probe.')
-        || String(item.code || '').startsWith('smoke.'),
+        || String(item.code || '').startsWith('probe.'),
       );
-      const releaseSources = sourceHealthByPrefix(sourceHealth, ['deployProbe.', 'smoke.']);
+      const releaseSources = sourceHealthByPrefix(sourceHealth, ['deployProbe.']);
       const next = release.state === 'healthy'
         ? [
             `If you are in release mode, promote only the same merged SHA that passed staging; production deploys use ${aliases.deploy} prod and require confirmation.`,
@@ -3094,7 +3081,7 @@
             title: 'Signals behind this pill',
             items: releaseSources.length
               ? releaseSources.map(sourceHealthLine)
-              : ['No staging probe or smoke source-health rows are present in the snapshot.'],
+              : ['No staging probe source-health rows are present in the snapshot.'],
           },
           {
             title: 'What to do next',
@@ -3104,18 +3091,11 @@
       };
     }
 
-    function buildStagingTooltip(boardContext, release, smokeState, sourceHealth, attention) {
+    function buildStagingTooltip(boardContext, release, sourceHealth, attention) {
       const aliases = currentHelpAliases();
-      const record = smokeState?.staging;
-      const lock = (smokeState?.locks || []).find((entry) => entry.environment === 'staging');
-      const stagingSources = [
-        ...sourceHealthByPrefix(sourceHealth, ['deployProbe.']),
-        ...sourceHealthByName(sourceHealth, ['smoke.staging', 'smoke.coverage']),
-      ];
+      const stagingSources = sourceHealthByPrefix(sourceHealth, ['deployProbe.']);
       const stagingIssues = (attention || []).filter((item) => item.lane === 'staging');
       const next = [
-        lock ? 'An optional staging smoke operation is already running; wait for it to finish before judging this pill.' : '',
-        !record ? 'No optional staging smoke history is recorded. The default release journey relies on staging deploy evidence and health probes.' : '',
         release.probeState !== 'healthy' ? `Probe state is ${release.probeState || 'unknown'}; run ${aliases.doctor} probe to refresh staging healthchecks.` : '',
         ...stagingIssues.map(issueLine),
         `Staging deploy actions use ${aliases.deploy} staging; this should deploy the merged SHA before production.`,
@@ -3123,13 +3103,9 @@
 
       return {
         kicker: 'Pre-production',
-        heading: `Staging: ${textOrDash(lock ? 'running' : record?.status || 'no smoke history')}`,
-        summary: 'Staging is the environment Pipelane uses to prove the merged SHA works before production. This pill combines staging deploy evidence, probe health, and optional smoke history when present.',
+        heading: `Staging: ${textOrDash(release.probeState || 'unknown')}`,
+        summary: 'Staging is the environment Pipelane uses to prove the merged SHA works before production. This pill combines staging deploy evidence and health probe state.',
         rows: [
-          ['Smoke status', lock ? `running · ${lock.operation || 'operation'} ${lock.runId || ''}`.trim() : smokeSummary(record, 'staging')],
-          ['Smoke SHA', shortSha(record?.sha)],
-          ['Smoke URL', record?.baseUrl || '—'],
-          ['Smoke finished', record?.finishedAt ? formatDateWithRelative(record.finishedAt) : '—'],
           ['Probe rollup', release.probeState || 'unknown'],
           ['Blocked surfaces', listLabel(release.blockedSurfaces, 'none')],
           ['Mode', boardContext?.mode || 'unknown'],
@@ -3149,17 +3125,13 @@
       };
     }
 
-    function buildProdTooltip(boardContext, smokeState, sourceHealth) {
+    function buildProdTooltip(boardContext, sourceHealth) {
       const aliases = currentHelpAliases();
-      const record = smokeState?.prod;
-      const lock = (smokeState?.locks || []).find((entry) => entry.environment === 'prod');
       const checkout = boardContext?.currentCheckout || {};
       const deployLayer = checkout.layers?.deploy || {};
       const runtimeLayer = checkout.layers?.runtime || {};
-      const prodSources = sourceHealthByName(sourceHealth, ['smoke.prod', 'runtime.frontend.production']);
+      const prodSources = sourceHealthByName(sourceHealth, ['runtime.frontend.production']);
       const next = [
-        lock ? 'A production smoke operation is already running; wait for it to finish before judging this pill.' : '',
-        !record ? 'No production smoke history is recorded yet. Normal journeys do not require production smoke; use it only when this repo explicitly opts in.' : '',
         `Production deploy actions use ${aliases.deploy} prod, require confirmation, and should only promote a SHA that already passed staging.`,
         checkout.relationships?.runtimeToDeploy?.reason,
         checkout.relationships?.runtimeToOrigin?.reason,
@@ -3167,13 +3139,9 @@
 
       return {
         kicker: 'Live environment',
-        heading: `Prod: ${textOrDash(lock ? 'running' : record?.status || 'no smoke history')}`,
-        summary: 'Prod is the live environment. The pill reflects production smoke history; the details also show the latest recorded production deploy and runtime marker when available.',
+        heading: `Prod: ${textOrDash(runtimeLayer.health || deployLayer.health || 'unknown')}`,
+        summary: 'Prod is the live environment. The pill reflects the latest recorded production deploy and runtime marker when available.',
         rows: [
-          ['Smoke status', lock ? `running · ${lock.operation || 'operation'} ${lock.runId || ''}`.trim() : smokeSummary(record, 'prod')],
-          ['Smoke SHA', shortSha(record?.sha)],
-          ['Smoke URL', record?.baseUrl || '—'],
-          ['Smoke finished', record?.finishedAt ? formatDateWithRelative(record.finishedAt) : '—'],
           ['Recorded deploy', `${deployLayer.health || 'unknown'} · ${deployLayer.reason || 'no deploy layer'}`],
           ['Deploy SHA', shortSha(deployLayer.sha)],
           ['Runtime marker', `${runtimeLayer.health || 'unknown'} · ${runtimeLayer.reason || 'no runtime layer'}`],
@@ -3299,7 +3267,6 @@
       const activeTask = boardContext?.activeTask;
       const release = boardContext?.releaseReadiness || {};
       const mode = boardContext?.mode || 'unknown';
-      const smoke = state.snapshot?.data?.smoke;
       const health = state.health;
       const checkout = boardContext?.currentCheckout || {};
       const aliases = currentHelpAliases();
@@ -3324,14 +3291,6 @@
         && (release.reason || (release.blockedSurfaces || []).length)
       ) {
         items.push(release.reason || `Release gate is ${release.state}.`);
-      }
-
-      const stagingSmoke = smoke?.staging;
-      if (stagingSmoke?.finishedAt && stagingSmoke.status !== 'failed') {
-        const ageHours = (Date.now() - new Date(stagingSmoke.finishedAt).getTime()) / 3_600_000;
-        if (Number.isFinite(ageHours) && ageHours >= 24) {
-          items.push(`Optional staging smoke last ran ${relativeTime(stagingSmoke.finishedAt)}; rely on fresh deploy and probe evidence before promoting.`);
-        }
       }
 
       return items;
@@ -3421,37 +3380,13 @@
         actionId: 'doctor.probe',
         actionLabel: 'Update health checks',
         actionReason: 'Run a fresh live probe for the configured staging health URLs.',
-        tooltip: `A probe pings the configured staging health URLs. It is narrower than a smoke test: if it passes, this warning clears; if it fails, staging may be down or misconfigured.`,
+        tooltip: 'A probe pings the configured staging health URLs. If it passes, this warning clears; if it fails, staging may be down or misconfigured.',
       };
     }
 
     function normalizeAttentionItem(item) {
       const aliases = currentHelpAliases();
       const code = item?.code || '';
-      if (code === 'smoke.staging.missing') {
-        const blocking = item?.blocking === true;
-        return {
-          severity: normalizeAttentionSeverity(item.severity),
-          scope: 'staging',
-          reason: blocking ? 'Required staging smoke has not run.' : 'No optional staging smoke test has run.',
-          detail: blocking
-            ? 'This repo has required staging smoke enabled. A health probe is not enough to clear that gate.'
-            : 'The default release journey no longer asks operators to run smoke. Use staging deploy evidence and fresh health probes before promotion.',
-          details: blocking
-            ? [
-                `Run ${aliases.smoke} staging after the staging deploy to record the required smoke result.`,
-                `If smoke checks are not registered yet, start with ${aliases.smoke} plan.`,
-              ]
-            : [
-                `Use ${aliases.deploy} staging to deploy the merged SHA to staging.`,
-                `Use ${aliases.doctor} --probe to refresh staging health checks.`,
-              ],
-          next: blocking ? `Run ${aliases.smoke} staging` : `Run ${aliases.doctor} --probe`,
-          tooltip: blocking
-            ? 'Required smoke is a configured release gate. Run the staging smoke command for the current SHA.'
-            : 'Smoke history is optional legacy evidence. The default release journey relies on staging deploy and probe evidence.',
-        };
-      }
       if (code === 'git.base.stale') {
         const baseBranch = state.snapshot?.data?.boardContext?.baseBranch || 'main';
         return {
@@ -3593,8 +3528,7 @@
       document.getElementById('hero-title').textContent = settings.boardTitle || DEFAULT_BOARD_TITLE;
       document.getElementById('hero-copy').textContent = settings.boardSubtitle || DEFAULT_BOARD_SUBTITLE;
       document.title = settings.boardTitle || DEFAULT_BOARD_TITLE;
-      const smokeState = state.snapshot?.data?.smoke;
-      const pills = boardContext ? buildHeroPills(boardContext, smokeState) : [];
+      const pills = boardContext ? buildHeroPills(boardContext) : [];
       document.getElementById('hero-pills').innerHTML = pills.join('') || '<div class="pill"><span>Snapshot</span><strong>Loading…</strong></div>';
       if (!boardContext) {
         heroMode.innerHTML = `

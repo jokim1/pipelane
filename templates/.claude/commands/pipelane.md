@@ -6,6 +6,8 @@ Run a Pipelane subcommand for this repo.
 Parse `$ARGUMENTS` by whitespace. Evaluate only the first token.
 
 - Empty, `help`, `-h`, or `--help` → **JOURNEY OVERVIEW**. Do not run shell commands.
+- Exactly equals `setup` → **SETUP MODE**. Strip the leading `setup` token and pass the rest to `pipelane:setup`.
+- Exactly equals `configure` → **CONFIGURE MODE**. Strip the leading `configure` token and pass the rest to `pipelane:configure`.
 - Exactly equals `web` → **WEB BOARD MODE**. Strip the leading `web` token and pass the rest to `pipelane:board`.
 - Exactly equals `board` → **WEB BOARD MODE** compatibility alias. Strip the leading `board` token and pass the rest to `pipelane:board`.
 - Exactly equals `status` → **STATUS MODE**. Strip the leading `status` token and pass the rest to `pipelane:status`.
@@ -36,11 +38,10 @@ Fast path. Merge hands off to production deploy.
   /pipelane review              Run review gates and write evidence for the current diff.
   {{ALIAS_PR}} --title "PR title"  Enforce review evidence, run checks, commit, push, and open or update the PR.
   {{ALIAS_MERGE}}                Merge the PR. In build mode, this hands off to the prod deploy path.
-  {{ALIAS_SMOKE}} prod           Optional: run production-safe smoke checks if configured.
   {{ALIAS_CLEAN}}                Clean up finished task state after the release is complete.
 
 2. Release journey
-Protected path. Promote the same merged SHA through staging, smoke, then prod.
+Protected path. Promote the same merged SHA through staging, healthcheck verification, then prod.
 
   {{ALIAS_STATUS}}               See active tasks, deploy state, and release gates.
   {{ALIAS_DEVMODE}} release      Set the repo to release mode. Usually set once, until you switch lanes.
@@ -49,12 +50,12 @@ Protected path. Promote the same merged SHA through staging, smoke, then prod.
   {{ALIAS_PR}} --title "PR title"  Enforce review evidence, run checks, commit, push, and open or update the PR.
   {{ALIAS_MERGE}}                Merge the PR and record the merged SHA.
   {{ALIAS_DEPLOY}} staging       Deploy the merged SHA to staging.
-  {{ALIAS_SMOKE}} staging        Run or verify staging smoke checks.
   {{ALIAS_DEPLOY}} prod          Promote the same merged SHA to production.
-  {{ALIAS_SMOKE}} prod           Optional: run production-safe smoke checks.
   {{ALIAS_CLEAN}}                Clean up finished task state after production is verified.
 
 Helpful anytime:
+  /pipelane setup                Sync or repair generated Pipelane repo files.
+  /pipelane configure            Fill or update deploy targets and healthchecks.
   {{ALIAS_STATUS}}               See where tasks, PRs, deploys, and release gates stand.
   {{ALIAS_RESUME}}               Reopen or recover an existing task workspace.
   {{ALIAS_DOCTOR}}               Diagnose deploy config, probes, and release readiness.
@@ -76,6 +77,38 @@ Helpful anytime:
   /pipelane web                  Open the local Pipelane Board.
   /pipelane update --check       Check whether Pipelane itself has updates.
 ```
+
+---
+
+## SETUP MODE
+
+Run:
+
+```bash
+npm run pipelane:setup -- $REST
+```
+
+where `$REST` is `$ARGUMENTS` with the leading `setup` token stripped.
+
+Use this path for `/pipelane setup` and `/pipelane setup --yes`. Display the output directly.
+
+If setup offers to configure deploy targets, ask the user for the deploy values in chat, then run the matching `/pipelane configure --json ...` command.
+
+---
+
+## CONFIGURE MODE
+
+Run:
+
+```bash
+npm run pipelane:configure -- $REST
+```
+
+where `$REST` is `$ARGUMENTS` with the leading `configure` token stripped.
+
+Use this path for `/pipelane configure`, `/pipelane configure --json ...`, and deploy-config updates. Display the output directly.
+
+When configure prints "Choose the action to take:", ask the user for deploy values in chat, then run the matching `npm run pipelane:configure -- --json ...` command with the provided flags.
 
 ---
 

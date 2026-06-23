@@ -171,9 +171,9 @@ export async function handleConfigure(cwd: string, argv: string[]): Promise<Conf
   const baseConfig = parseDeployConfigMarkdown(markdown) ?? emptyDeployConfig();
   const flagged = applyFlagOverrides(baseConfig, options);
   if (!options.json && !process.stdin.isTTY) {
-    throw new Error(
-      'pipelane configure requires a TTY for interactive prompts. Use `--json` with flags for non-interactive use.',
-    );
+    process.stdout.write(renderNonInteractiveConfigurePrompt(repoRoot, claudePath, createdClaude, flagged));
+    process.exitCode = 64;
+    return { repoRoot, claudePath, createdClaude, config: flagged };
   }
   const finalConfig = options.json ? flagged : await promptForValues(flagged);
 
@@ -222,6 +222,126 @@ function applyFlagOverrides(base: DeployConfig, options: ConfigureOptions): Depl
   if (options.supabaseStagingProjectRef !== undefined) next.supabase.staging.projectRef = options.supabaseStagingProjectRef;
   if (options.supabaseProductionProjectRef !== undefined) next.supabase.production.projectRef = options.supabaseProductionProjectRef;
   return next;
+}
+
+interface ConfigurePromptSection {
+  heading: string;
+  fields: Array<{ label: string; flag: string; value: string | boolean }>;
+}
+
+function renderNonInteractiveConfigurePrompt(
+  repoRoot: string,
+  claudePath: string,
+  createdClaude: boolean,
+  config: DeployConfig,
+): string {
+  const sections = configurePromptSections(config);
+  const lines = [
+    'Pipelane configure needs deploy values, but this shell is non-interactive.',
+    `Repo: ${repoRoot}`,
+    `CLAUDE.md: ${claudePath}${createdClaude ? ' (will be created when values are saved)' : ''}`,
+    '',
+    'Current Deploy Configuration:',
+  ];
+
+  for (const section of sections) {
+    lines.push('', `${section.heading}:`);
+    for (const field of section.fields) {
+      lines.push(`- ${field.label}: ${formatConfigurePromptValue(field.value)} (${field.flag})`);
+    }
+  }
+
+  lines.push(
+    '',
+    'Choose the action to take:',
+    '1. Reply with deploy values in chat; I will run /pipelane configure --json with the matching flags.',
+    '2. Refresh generated setup files first: /pipelane setup --yes',
+    '3. Cancel.',
+    '',
+    'Command shape for option 1:',
+    '/pipelane configure --json \\',
+    '  --platform=<value> \\',
+    '  --frontend-staging-url=<url> \\',
+    '  --frontend-production-url=<url>',
+    '',
+    'Any omitted field keeps its current value.',
+  );
+
+  return `${lines.join('\n')}\n`;
+}
+
+function configurePromptSections(config: DeployConfig): ConfigurePromptSection[] {
+  return [
+    {
+      heading: 'Platform',
+      fields: [
+        { label: 'platform', flag: '--platform=<value>', value: config.platform },
+      ],
+    },
+    {
+      heading: 'Frontend staging',
+      fields: [
+        { label: 'url', flag: '--frontend-staging-url=<url>', value: config.frontend.staging.url },
+        { label: 'deploy workflow', flag: '--frontend-staging-workflow=<name>', value: config.frontend.staging.deployWorkflow },
+        { label: 'healthcheck', flag: '--frontend-staging-healthcheck=<url>', value: config.frontend.staging.healthcheckUrl },
+      ],
+    },
+    {
+      heading: 'Frontend production',
+      fields: [
+        { label: 'url', flag: '--frontend-production-url=<url>', value: config.frontend.production.url },
+        { label: 'deploy workflow', flag: '--frontend-production-workflow=<name>', value: config.frontend.production.deployWorkflow },
+        { label: 'auto-deploy on main', flag: '--frontend-production-auto-deploy-on-main=<true|false>', value: config.frontend.production.autoDeployOnMain },
+        { label: 'healthcheck', flag: '--frontend-production-healthcheck=<url>', value: config.frontend.production.healthcheckUrl },
+      ],
+    },
+    {
+      heading: 'Edge staging',
+      fields: [
+        { label: 'deploy command', flag: '--edge-staging-deploy-command=<cmd>', value: config.edge.staging.deployCommand },
+        { label: 'verification command', flag: '--edge-staging-verification-command=<cmd>', value: config.edge.staging.verificationCommand },
+        { label: 'healthcheck', flag: '--edge-staging-healthcheck=<url>', value: config.edge.staging.healthcheckUrl },
+      ],
+    },
+    {
+      heading: 'Edge production',
+      fields: [
+        { label: 'deploy command', flag: '--edge-production-deploy-command=<cmd>', value: config.edge.production.deployCommand },
+        { label: 'verification command', flag: '--edge-production-verification-command=<cmd>', value: config.edge.production.verificationCommand },
+        { label: 'healthcheck', flag: '--edge-production-healthcheck=<url>', value: config.edge.production.healthcheckUrl },
+      ],
+    },
+    {
+      heading: 'SQL staging',
+      fields: [
+        { label: 'apply command', flag: '--sql-staging-apply-command=<cmd>', value: config.sql.staging.applyCommand },
+        { label: 'verification command', flag: '--sql-staging-verification-command=<cmd>', value: config.sql.staging.verificationCommand },
+        { label: 'healthcheck', flag: '--sql-staging-healthcheck=<url>', value: config.sql.staging.healthcheckUrl },
+      ],
+    },
+    {
+      heading: 'SQL production',
+      fields: [
+        { label: 'apply command', flag: '--sql-production-apply-command=<cmd>', value: config.sql.production.applyCommand },
+        { label: 'verification command', flag: '--sql-production-verification-command=<cmd>', value: config.sql.production.verificationCommand },
+        { label: 'healthcheck', flag: '--sql-production-healthcheck=<url>', value: config.sql.production.healthcheckUrl },
+      ],
+    },
+    {
+      heading: 'Supabase',
+      fields: [
+        { label: 'staging project ref', flag: '--supabase-staging-project-ref=<ref>', value: config.supabase.staging.projectRef },
+        { label: 'production project ref', flag: '--supabase-production-project-ref=<ref>', value: config.supabase.production.projectRef },
+      ],
+    },
+  ];
+}
+
+function formatConfigurePromptValue(value: string | boolean): string {
+  if (typeof value === 'boolean') {
+    return String(value);
+  }
+  return value.trim() ? value : '<empty>';
 }
 
 async function promptForValues(base: DeployConfig): Promise<DeployConfig> {

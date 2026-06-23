@@ -1,15 +1,12 @@
 import { existsSync } from 'node:fs';
 
-import type { DeployRecord, PrRecord, ProbeState, ReviewRunRecord, SmokeEnvironmentLock, SmokeRunRecord, TaskLock, WorkflowConfig } from '../state.ts';
+import type { DeployRecord, PrRecord, ProbeState, ReviewRunRecord, TaskLock, WorkflowConfig } from '../state.ts';
 import {
   DEFAULT_MODE,
   formatWorkflowCommand,
   loadAllTaskLocks,
   loadDeployState,
   loadReviewState,
-  loadSmokeEnvironmentLock,
-  loadSmokeLatestState,
-  loadSmokeRegistry,
   loadPrState,
   loadProbeState,
   nowIso,
@@ -32,13 +29,6 @@ import {
   type ProbeFreshnessState,
   type ProbeSurfaceFreshness,
 } from '../release-gate.ts';
-import {
-  evaluateSmokeCoverage,
-  findLatestSmokeRun,
-  findQualifyingSmokeRun,
-  isSmokeSuccessStatus,
-  resolveSmokeConfig,
-} from '../smoke-gate.ts';
 import {
   observeFrontendRuntime,
   type FrontendRuntimeObservation,
@@ -101,11 +91,6 @@ export interface BranchRow {
     // by state-mutating commands (pr/merge/deploy). Null when the lock
     // hasn't been touched by a state mutation yet.
     nextAction: string | null;
-    // Skip-smoke observability (from TaskLock.promotedWithoutStagingSmoke).
-    // True iff the latest `/deploy prod` on this task promoted without
-    // staging smoke being configured. Cleared on next `/deploy prod` that
-    // ran with smoke wired up.
-    promotedWithoutStagingSmoke: boolean;
   } | null;
   surfaces: string[];
   cleanup: {
@@ -288,11 +273,6 @@ export interface SnapshotData {
     currentCheckout: CurrentCheckoutTruth;
     overallFreshness: ReturnType<typeof buildFreshness>;
   };
-  smoke: {
-    staging: SmokeRunRecord | null;
-    prod: SmokeRunRecord | null;
-    locks: SmokeEnvironmentLock[];
-  };
   review: {
     latest: ReviewRunRecord | null;
   };
@@ -320,24 +300,9 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
   const orchestrationScan = scanOrchestrationRunDiagnostics(context.commonDir, context.config);
   const orchestration = buildOrchestrationSnapshot(context.commonDir, context.config, currentBranch, orchestrationScan);
   const orchestrationHealth = summarizeOrchestrationHealth(orchestration);
-  const smokeLatest = loadSmokeLatestState(context.commonDir, context.config);
-  const smokeConfig = resolveSmokeConfig(context.config);
-  const smokeRegistry = loadSmokeRegistry(context.repoRoot, context.config);
-  const smokeLocks = (['staging', 'prod'] as const)
-    .map((environment) => loadSmokeEnvironmentLock(context.commonDir, environment))
-    .filter((entry): entry is SmokeEnvironmentLock => entry !== null);
   const probeState = loadProbeState(context.commonDir, context.config);
   const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
   const requestedSurfaces = context.modeState.requestedSurfaces ?? context.config.surfaces;
-  const smokeCoverage = evaluateSmokeCoverage({
-    registry: smokeRegistry,
-    environment: 'staging',
-    config: context.config,
-  });
-  const smokeCoverageBlocking = mode === 'release'
-    && smokeConfig.requireStagingSmoke
-    && smokeCoverage.mode === 'block'
-    && smokeCoverage.uncoveredCriticalPaths.length > 0;
   const surfaceProbes = collectSurfaceProbes({
     deployConfig,
     probeState,
@@ -351,20 +316,6 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
   });
   const activeLock = locks.find((lock) => lock.branchName === currentBranch) ?? null;
   const currentPrRecord = activeLock ? prState.records[activeLock.taskSlug] ?? null : null;
-  const stagingSmokeStatus = resolveStagingSmokeStatus({
-    repoRoot: context.repoRoot,
-    commonDir: context.commonDir,
-    config: context.config,
-    mode,
-    smokeConfig,
-    latestRecord: smokeLatest.staging,
-    currentPrRecord,
-    deployRecords: deployState.records,
-    deployConfig,
-    taskSlug: activeLock?.taskSlug ?? currentPrRecord?.taskSlug ?? undefined,
-    surfaces: activeLock?.surfaces?.length ? activeLock.surfaces : requestedSurfaces,
-  });
-
   const branches = buildBranchRows({
     locks,
     config: context.config,
@@ -431,39 +382,6 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
       stale: entry.result.state === 'stale',
     })),
     buildSourceHealthEntry({
-      name: 'smoke.staging',
-      state: stagingSmokeStatus.state,
-      blocking: stagingSmokeStatus.blocking,
-      reason: stagingSmokeStatus.reason,
-      checkedAt,
-      observedAt: stagingSmokeStatus.observedAt,
-    }),
-    buildSourceHealthEntry({
-      name: 'smoke.prod',
-      state: smokeLaneState(smokeLatest.prod),
-      blocking: false,
-      reason: describeSmokeSummary(smokeLatest.prod, 'prod'),
-      checkedAt,
-      observedAt: smokeLatest.prod?.finishedAt,
-    }),
-    ...(smokeConfig.criticalPaths.length > 0
-      ? [
-          buildSourceHealthEntry({
-            name: 'smoke.coverage',
-            state: smokeCoverage.uncoveredCriticalPaths.length === 0
-              ? 'healthy'
-              : smokeCoverageBlocking
-                ? 'blocked'
-                : 'degraded',
-            blocking: smokeCoverageBlocking,
-            reason: smokeCoverage.uncoveredCriticalPaths.length === 0
-              ? 'critical paths covered by the smoke registry'
-              : `critical path smoke gaps: ${smokeCoverage.uncoveredCriticalPaths.join(', ')}`,
-            checkedAt,
-          }),
-        ]
-      : []),
-    buildSourceHealthEntry({
       name: 'runtime.frontend.production',
       state: mapShellHealthToLaneState(runtimeObservation.health),
       // Runtime provenance is advisory: it helps explain what is live in
@@ -506,41 +424,6 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
       blocking: true,
       lane: 'staging',
       action: 'doctor.probe',
-    }));
-  }
-  for (const lock of smokeLocks) {
-    attention.push(buildApiIssue({
-      code: 'smoke.locked',
-      severity: 'warning',
-      message: `${lock.environment} ${lock.operation} in progress: ${lock.runId}.`,
-      source: 'smokeLock',
-      blocking: false,
-      lane: lock.environment,
-    }));
-  }
-  if (stagingSmokeStatus.issue) {
-    attention.push(stagingSmokeStatus.issue);
-  }
-  if (smokeLatest.prod?.status === 'failed') {
-    attention.push(buildApiIssue({
-      code: 'smoke.prod.failed',
-      severity: 'warning',
-      message: `Latest prod smoke failed for ${smokeLatest.prod.sha.slice(0, 7)}.`,
-      source: 'smokeLatest',
-      blocking: false,
-      lane: 'production',
-      action: 'smoke.prod',
-    }));
-  }
-  if (smokeCoverage.uncoveredCriticalPaths.length > 0) {
-    attention.push(buildApiIssue({
-      code: 'smoke.coverage.missing',
-      severity: smokeCoverageBlocking ? 'error' : 'warning',
-      message: `Staging smoke coverage gaps: ${smokeCoverage.uncoveredCriticalPaths.join(', ')}. Run \`${formatWorkflowCommand(context.config, 'smoke', 'plan')}\`.`,
-      source: 'smokeRegistry',
-      blocking: smokeCoverageBlocking,
-      lane: 'staging',
-      action: 'smoke.plan',
     }));
   }
   const staleBaseIssue = buildStaleBaseIssue({
@@ -633,11 +516,6 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
           : null,
         currentCheckout,
         overallFreshness: buildFreshness({ checkedAt }),
-      },
-      smoke: {
-        staging: smokeLatest.staging,
-        prod: smokeLatest.prod,
-        locks: smokeLocks,
       },
       review: {
         latest: reviewEvidence.latest ?? reviewState.records[0] ?? null,
@@ -1123,240 +1001,6 @@ function orchestrationLaneStateFromCounts(sliceCount: number, counts: Orchestrat
   if (counts.running > 0) return 'running';
   if (sliceCount > 0 && counts.trustedReviewComplete === sliceCount) return 'healthy';
   return 'awaiting_preflight';
-}
-
-function smokeLaneState(record: SmokeRunRecord | null): LaneState {
-  if (!record) return 'unknown';
-  if (record.status === 'passed' || record.status === 'passed_with_retries') return 'healthy';
-  return 'degraded';
-}
-
-function describeSmokeSummary(record: SmokeRunRecord | null, environment: 'staging' | 'prod'): string {
-  if (!record) {
-    return `no ${environment} smoke history`;
-  }
-  return `${record.status} @ ${record.sha.slice(0, 7)} (${record.finishedAt})`;
-}
-
-interface StagingSmokeStatus {
-  state: LaneState;
-  blocking: boolean;
-  reason: string;
-  observedAt?: string;
-  issue: ApiIssue | null;
-}
-
-function resolveStagingSmokeStatus(options: {
-  repoRoot: string;
-  commonDir: string;
-  config: WorkflowConfig;
-  mode: string;
-  smokeConfig: ReturnType<typeof resolveSmokeConfig>;
-  latestRecord: SmokeRunRecord | null;
-  currentPrRecord: PrRecord | null;
-  deployRecords: DeployRecord[];
-  deployConfig: DeployConfig;
-  taskSlug?: string;
-  surfaces: string[];
-}): StagingSmokeStatus {
-  const gateBlocking = options.mode === 'release' && options.smokeConfig.requireStagingSmoke;
-  const latestSummary = describeSmokeSummary(options.latestRecord, 'staging');
-  const latestIssue = buildLatestStagingSmokeIssue({
-    latestRecord: options.latestRecord,
-    gateBlocking,
-    config: options.config,
-  });
-
-  if (!gateBlocking || !options.currentPrRecord?.mergedSha) {
-    return {
-      state: smokeLaneState(options.latestRecord),
-      blocking: gateBlocking,
-      reason: latestSummary,
-      observedAt: options.latestRecord?.finishedAt,
-      issue: latestIssue,
-    };
-  }
-
-  const targetSha = options.currentPrRecord.mergedSha.trim();
-  const stagingDeploy = findQualifiedStagingDeployForSnapshot({
-    deployRecords: options.deployRecords,
-    deployConfig: options.deployConfig,
-    sha: targetSha,
-    taskSlug: options.taskSlug,
-    surfaces: options.surfaces,
-  });
-  if (!stagingDeploy) {
-    return {
-      state: 'blocked',
-      blocking: true,
-      reason: `no verified staging deploy for current promotion SHA ${shortSha(targetSha)} and surfaces ${options.surfaces.join(', ')}`,
-      observedAt: options.latestRecord?.finishedAt,
-      issue: buildApiIssue({
-        code: 'smoke.staging.deploy_missing',
-        severity: 'error',
-        message: `No verified staging deploy found for current promotion SHA ${shortSha(targetSha)} and surfaces ${options.surfaces.join(', ')}. Run \`${formatWorkflowCommand(options.config, 'deploy', 'staging')}\`.`,
-        source: 'smokeLatest',
-        blocking: true,
-        lane: 'staging',
-        action: 'deploy.staging',
-      }),
-    };
-  }
-  const qualifyingRecord = findQualifyingSmokeRun({
-    commonDir: options.commonDir,
-    repoRoot: options.repoRoot,
-    config: options.config,
-    environment: 'staging',
-    sha: targetSha,
-    taskSlug: options.taskSlug,
-    surfaces: options.surfaces,
-    deployIdempotencyKey: stagingDeploy.idempotencyKey,
-  });
-  if (qualifyingRecord) {
-    return {
-      state: 'healthy',
-      blocking: true,
-      reason: `qualifying staging smoke passed for current promotion SHA ${shortSha(targetSha)} (${qualifyingRecord.finishedAt})`,
-      observedAt: qualifyingRecord.finishedAt,
-      issue: null,
-    };
-  }
-
-  const latestForTarget = findLatestSmokeRun({
-    commonDir: options.commonDir,
-    repoRoot: options.repoRoot,
-    config: options.config,
-    environment: 'staging',
-    sha: targetSha,
-    taskSlug: options.taskSlug,
-    surfaces: options.surfaces,
-    deployIdempotencyKey: stagingDeploy.idempotencyKey,
-  });
-
-  if (!latestForTarget) {
-    const latestContext = options.latestRecord
-      ? ` Latest staging smoke is ${options.latestRecord.status} @ ${shortSha(options.latestRecord.sha)} (${options.latestRecord.finishedAt}).`
-      : '';
-    return {
-      state: 'blocked',
-      blocking: true,
-      reason: `no qualifying staging smoke for current promotion SHA ${shortSha(targetSha)}.${latestContext}`,
-      observedAt: options.latestRecord?.finishedAt,
-      issue: buildApiIssue({
-        code: 'smoke.staging.target_missing',
-        severity: 'error',
-        message: `No qualifying staging smoke found for current promotion SHA ${shortSha(targetSha)}. Run \`${formatWorkflowCommand(options.config, 'smoke', 'staging')}\`.`,
-        source: 'smokeLatest',
-        blocking: true,
-        lane: 'staging',
-        action: 'smoke.staging',
-      }),
-    };
-  }
-
-  if (latestForTarget.drifted) {
-    return {
-      state: 'blocked',
-      blocking: true,
-      reason: `latest staging smoke for current promotion SHA ${shortSha(targetSha)} drifted during execution (${latestForTarget.finishedAt})`,
-      observedAt: latestForTarget.finishedAt,
-      issue: buildApiIssue({
-        code: 'smoke.staging.target_drifted',
-        severity: 'error',
-        message: `Latest staging smoke for current promotion SHA ${shortSha(targetSha)} drifted during execution. Re-run \`${formatWorkflowCommand(options.config, 'smoke', 'staging')}\`.`,
-        source: 'smokeLatest',
-        blocking: true,
-        lane: 'staging',
-        action: 'smoke.staging',
-      }),
-    };
-  }
-
-  if (!isSmokeSuccessStatus(latestForTarget.status)) {
-    return {
-      state: 'blocked',
-      blocking: true,
-      reason: `latest staging smoke failed for current promotion SHA ${shortSha(targetSha)} (${latestForTarget.finishedAt})`,
-      observedAt: latestForTarget.finishedAt,
-      issue: buildApiIssue({
-        code: 'smoke.staging.target_failed',
-        severity: 'error',
-        message: `Latest staging smoke failed for current promotion SHA ${shortSha(targetSha)}. Run \`${formatWorkflowCommand(options.config, 'smoke', 'staging')}\` after fixing the failing checks.`,
-        source: 'smokeLatest',
-        blocking: true,
-        lane: 'staging',
-        action: 'smoke.staging',
-      }),
-    };
-  }
-
-  return {
-    state: smokeLaneState(options.latestRecord),
-    blocking: gateBlocking,
-    reason: latestSummary,
-    observedAt: options.latestRecord?.finishedAt,
-    issue: latestIssue,
-  };
-}
-
-function findQualifiedStagingDeployForSnapshot(options: {
-  deployRecords: DeployRecord[];
-  deployConfig: DeployConfig;
-  sha: string;
-  taskSlug?: string;
-  surfaces: string[];
-}): DeployRecord | null {
-  const expectedFingerprint = computeDeployConfigFingerprint(options.deployConfig, 'staging');
-  const stateKey = resolveDeployStateKey();
-  const surfaceKey = [...options.surfaces].sort().join(',');
-  for (let index = options.deployRecords.length - 1; index >= 0; index -= 1) {
-    const record = options.deployRecords[index];
-    if (record.environment !== 'staging') continue;
-    if (record.sha !== options.sha) continue;
-    if (options.taskSlug && record.taskSlug !== options.taskSlug) continue;
-    if ([...(record.surfaces ?? [])].sort().join(',') !== surfaceKey) continue;
-    const reason = disqualifyDeployRecord({
-      record,
-      surfaces: options.surfaces,
-      expectedFingerprint,
-      stateKey,
-    });
-    if (!reason) return record;
-    return null;
-  }
-  return null;
-}
-
-function buildLatestStagingSmokeIssue(options: {
-  latestRecord: SmokeRunRecord | null;
-  gateBlocking: boolean;
-  config: WorkflowConfig;
-}): ApiIssue | null {
-  if (!options.latestRecord) {
-    return buildApiIssue({
-      code: 'smoke.staging.missing',
-      severity: options.gateBlocking ? 'error' : 'warning',
-      message: `No staging smoke history yet. Run \`${formatWorkflowCommand(options.config, 'smoke', 'staging')}\` before promoting.`,
-      source: 'smokeLatest',
-      blocking: options.gateBlocking,
-      lane: 'staging',
-      action: 'smoke.staging',
-    });
-  }
-
-  if (options.latestRecord.status === 'failed') {
-    return buildApiIssue({
-      code: 'smoke.staging.failed',
-      severity: options.gateBlocking ? 'error' : 'warning',
-      message: `Latest staging smoke failed for ${options.latestRecord.sha.slice(0, 7)}.`,
-      source: 'smokeLatest',
-      blocking: options.gateBlocking,
-      lane: 'staging',
-      action: 'smoke.staging',
-    });
-  }
-
-  return null;
 }
 
 interface SurfaceProbeEntry {
@@ -2146,7 +1790,6 @@ function buildBranchRow(options: {
       worktreePath: lock.worktreePath,
       updatedAt: lock.updatedAt ?? null,
       nextAction: lock.nextAction ?? null,
-      promotedWithoutStagingSmoke: lock.promotedWithoutStagingSmoke === true,
     },
     surfaces: lock.surfaces ?? [],
     cleanup: {

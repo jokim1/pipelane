@@ -16,6 +16,21 @@ const FIXTURE_ROOT = path.join(KIT_ROOT, 'test', 'fixtures', 'sample-repo');
 const DEFAULT_CODEX_HOME = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-global-'));
 const DEFAULT_PIPELANE_HOME = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-global-'));
 const LOCAL_PIPELANE_INSTALL_SPEC = `file:${KIT_ROOT}`;
+const GENERATED_CLAUDE_COMMANDS = [
+  'clean',
+  'deploy',
+  'devmode',
+  'doctor',
+  'fix',
+  'merge',
+  'new',
+  'pipelane',
+  'pr',
+  'repo-guard',
+  'resume',
+  'rollback',
+  'status',
+];
 
 // Mark this process + every child spawn as a test run. Production-gated test
 // hooks (PIPELANE_DEPLOY_PROD_CONFIRM_STUB, PIPELANE_CLEAN_MIN_AGE_MS) only
@@ -898,7 +913,7 @@ test('init writes tracked Pipelane files and setup seeds CLAUDE plus tracked Cod
     assert.match(setupResult.stdout, /Removed legacy machine-local wrapper skills: new, pr, resume/);
     assert.ok(existsSync(path.join(repoRoot, 'CLAUDE.md')));
     assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'new', 'SKILL.md')));
-    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'smoke', 'SKILL.md')));
+    assert.equal(existsSync(path.join(repoRoot, '.agents', 'skills', 'smoke', 'SKILL.md')), false);
     assert.equal(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')), false);
     assert.equal(existsSync(path.join(codexHome, 'skills', 'resume', 'SKILL.md')), false);
     assert.equal(existsSync(path.join(codexHome, 'skills', 'pr', 'SKILL.md')), false);
@@ -906,15 +921,6 @@ test('init writes tracked Pipelane files and setup seeds CLAUDE plus tracked Cod
     const newSkill = readFileSync(path.join(repoRoot, '.agents', 'skills', 'new', 'SKILL.md'), 'utf8');
     assert.match(newSkill, /Bare invocation behavior/);
     assert.match(newSkill, /infer a\s+concise task label/);
-
-    const smokeSkill = readFileSync(path.join(repoRoot, '.agents', 'skills', 'smoke', 'SKILL.md'), 'utf8');
-    assert.match(smokeSkill, /Guided empty state behavior/);
-    assert.match(smokeSkill, /Offer the exact choices from `emptyState\.options`/);
-    assert.match(smokeSkill, /intent: "start_smoke_interview"/);
-    assert.match(
-      smokeSkill,
-      /What are the 1-3 user journeys that must work before this app is considered alive\?/,
-    );
 
     const deploySkill = readFileSync(path.join(repoRoot, '.agents', 'skills', 'deploy', 'SKILL.md'), 'utf8');
     assert.match(deploySkill, /Blocked deploy follow-up behavior/);
@@ -925,11 +931,11 @@ test('init writes tracked Pipelane files and setup seeds CLAUDE plus tracked Cod
     assert.equal(packageJson.scripts['pipelane:new'], 'pipelane run new');
     assert.equal(packageJson.scripts['pipelane:resume'], 'pipelane run resume');
     assert.equal(packageJson.scripts['pipelane:repo-guard'], 'pipelane run repo-guard');
-    assert.equal(packageJson.scripts['pipelane:smoke'], 'pipelane run smoke');
+    assert.equal(packageJson.scripts['pipelane:smoke'], undefined);
     assert.equal(packageJson.scripts['pipelane:orchestrate'], 'pipelane run orchestrate');
     assert.equal(packageJson.scripts['pipelane:board'], 'pipelane board');
     assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'repo-guard.md')));
-    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'smoke.md')));
+    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'smoke.md')), false);
     const newCommand = readFileSync(path.join(repoRoot, '.claude', 'commands', 'new.md'), 'utf8');
     assert.match(newCommand, /infer a concise task label/);
     const pipelaneCommand = readFileSync(path.join(repoRoot, '.claude', 'commands', 'pipelane.md'), 'utf8');
@@ -938,10 +944,6 @@ test('init writes tracked Pipelane files and setup seeds CLAUDE plus tracked Cod
     assert.match(pipelaneCommand, /npm run pipelane:review -- setup --yes/);
     assert.doesNotMatch(pipelaneCommand, /setup --preset/);
     assert.doesNotMatch(pipelaneCommand, /lean\|standard\|strict-production/);
-    const smokeCommand = readFileSync(path.join(repoRoot, '.claude', 'commands', 'smoke.md'), 'utf8');
-    assert.match(smokeCommand, /Guided empty states/);
-    assert.match(smokeCommand, /Offer the exact choices from `emptyState\.options`/);
-    assert.match(smokeCommand, /intent: "start_smoke_interview"/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -978,7 +980,7 @@ test('bootstrap installs pipelane, initializes the repo, and seeds the global bo
     const packageJson = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
     assert.equal(typeof packageJson.devDependencies.pipelane, 'string');
     assert.equal(packageJson.scripts['pipelane:new'], 'pipelane run new');
-    assert.equal(packageJson.scripts['pipelane:smoke'], 'pipelane run smoke');
+    assert.equal(packageJson.scripts['pipelane:smoke'], undefined);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -1140,14 +1142,13 @@ test('bootstrap without --yes fails before repo writes in non-TTY mode', () => {
   }
 });
 
-test('smoke and runtime source files are tracked in git so the branch stays self-contained', () => {
+test('legacy smoke internals and runtime observation source files stay tracked', () => {
   for (const relativePath of [
     'src/operator/commands/smoke.ts',
     'src/operator/runtime-observation.ts',
     'src/operator/smoke-gate.ts',
     'src/operator/smoke-hot-paths.ts',
     'src/operator/text-output.ts',
-    'templates/.claude/commands/smoke.md',
   ]) {
     const trackedPath = execFileSync('git', ['ls-files', '--error-unmatch', relativePath], {
       cwd: KIT_ROOT,
@@ -1213,7 +1214,7 @@ test('smoke plan scaffolds an empty smoke registry before any smoke tags exist',
   }
 });
 
-test('smoke staging runs the configured command, injects env vars, and surfaces state in /status', async () => {
+test('legacy smoke staging runs the configured command and stays out of /status', async () => {
   const repoRoot = createRepo();
 
   try {
@@ -1254,7 +1255,8 @@ test('smoke staging runs the configured command, injects env vars, and surfaces 
     assert.match(logText, /staging\|default\|1111111/);
     assert.match(logText, /https:\/\/staging\.example\.test/);
     assert.match(readFileSync(path.join(repoRoot, 'docs', 'smoke', 'README.md'), 'utf8'), /@smoke-auth/);
-    assert.equal(statusOutput.data.smoke.staging.status, 'passed');
+    assert.equal(statusOutput.data.smoke, undefined);
+    assert.equal(statusOutput.data.sourceHealth.some((entry) => String(entry.name).startsWith('smoke.')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -1571,8 +1573,10 @@ test('release deploy prod does not require smoke unless the repo opts in', async
   }
 });
 
-test('release deploy prod blocks when staging smoke for the same SHA is missing', async () => {
+test('release deploy prod ignores legacy staging smoke requirement when staging deploy succeeded', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(fakeBin, 'gh-state.json');
 
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
@@ -1592,19 +1596,28 @@ test('release deploy prod blocks when staging smoke for the same SHA is missing'
     writeHealthyProbeState(repoRoot, ['frontend']);
     runCli(['run', 'devmode', 'release', '--surfaces', 'frontend'], repoRoot);
 
+    writeFakeGh(fakeBin, ghStateFile);
     const result = runCli(
-      ['run', 'deploy', 'prod', '--task', 'bootstrap'],
+      ['run', 'deploy', 'prod', '--task', 'bootstrap', '--json'],
       repoRoot,
-      { PIPELANE_DEPLOY_PROD_CONFIRM_STUB: headSha.slice(0, 4) },
-      true,
+      {
+        PATH: `${fakeBin}:${process.env.PATH}`,
+        GH_STATE_FILE: ghStateFile,
+        PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+        PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+        PIPELANE_DEPLOY_PROD_CONFIRM_STUB: headSha.slice(0, 4),
+      },
     );
+    const output = JSON.parse(result.stdout);
 
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /no qualifying staging smoke found/i);
-    assert.match(result.stderr, /Run \/smoke staging/i);
+    assert.equal(output.environment, 'prod');
+    assert.equal(output.sha, headSha);
+    assert.match(output.message, /Deploy verified: prod/);
+    assert.doesNotMatch(output.message, /Smoke coverage/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
   }
 });
 
@@ -1663,8 +1676,10 @@ test('release deploy prod accepts a qualifying staging smoke run for the same SH
   }
 });
 
-test('latest staging smoke failure for a SHA overrides an older pass', async () => {
+test('latest staging smoke failure does not block production deploy', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(fakeBin, 'gh-state.json');
 
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
@@ -1696,22 +1711,31 @@ test('latest staging smoke failure for a SHA overrides an older pass', async () 
     });
     runCli(['run', 'smoke', 'staging'], repoRoot, {}, true);
 
+    writeFakeGh(fakeBin, ghStateFile);
     const result = runCli(
-      ['run', 'deploy', 'prod', '--task', 'bootstrap'],
+      ['run', 'deploy', 'prod', '--task', 'bootstrap', '--json'],
       repoRoot,
-      { PIPELANE_DEPLOY_PROD_CONFIRM_STUB: headSha.slice(0, 4) },
-      true,
+      {
+        PATH: `${fakeBin}:${process.env.PATH}`,
+        GH_STATE_FILE: ghStateFile,
+        PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+        PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+        PIPELANE_DEPLOY_PROD_CONFIRM_STUB: headSha.slice(0, 4),
+      },
     );
+    const output = JSON.parse(result.stdout);
 
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /staging smoke failed for SHA/i);
+    assert.equal(output.environment, 'prod');
+    assert.equal(output.sha, headSha);
+    assert.match(output.message, /Deploy verified: prod/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
   }
 });
 
-test('release override does not bypass smoke coverage gaps; deploy prod needs an explicit smoke coverage override', async () => {
+test('deploy prod rejects legacy smoke coverage override flag and otherwise ignores smoke coverage gaps', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
   const ghStateFile = path.join(fakeBin, 'gh-state.json');
@@ -1744,20 +1768,19 @@ test('release override does not bypass smoke coverage gaps; deploy prod needs an
     });
     runCli(['run', 'smoke', 'staging'], repoRoot);
 
-    const blocked = runCli(
-      ['run', 'deploy', 'prod', '--task', 'bootstrap'],
+    const legacyOverride = runCli(
+      ['run', 'deploy', 'prod', '--task', 'bootstrap', '--skip-smoke-coverage', '--reason', 'billing smoke follow-up'],
       repoRoot,
       { PIPELANE_DEPLOY_PROD_CONFIRM_STUB: headSha.slice(0, 4) },
       true,
     );
 
-    assert.notEqual(blocked.status, 0);
-    assert.match(blocked.stderr, /critical-path smoke gaps: billing/i);
-    assert.match(blocked.stderr, /--skip-smoke-coverage --reason/);
+    assert.notEqual(legacyOverride.status, 0);
+    assert.match(legacyOverride.stderr, /--skip-smoke-coverage is no longer supported/);
 
     writeFakeGh(fakeBin, ghStateFile);
     const result = runCli(
-      ['run', 'deploy', 'prod', '--task', 'bootstrap', '--skip-smoke-coverage', '--reason', 'billing smoke follow-up', '--json'],
+      ['run', 'deploy', 'prod', '--task', 'bootstrap', '--json'],
       repoRoot,
       {
         PATH: `${fakeBin}:${process.env.PATH}`,
@@ -1772,8 +1795,8 @@ test('release override does not bypass smoke coverage gaps; deploy prod needs an
     const latestRecord = deployState.records.at(-1);
 
     assert.equal(output.environment, 'prod');
-    assert.match(output.message, /Smoke coverage override: billing smoke follow-up/);
-    assert.equal(latestRecord.smokeCoverageOverrideReason, 'billing smoke follow-up');
+    assert.doesNotMatch(output.message, /Smoke coverage override/);
+    assert.equal(latestRecord.smokeCoverageOverrideReason, undefined);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -2606,10 +2629,10 @@ test('every managed command template renders with an empty consumer-extension ma
 
     // CI invariant: if a future template edit accidentally drops the
     // empty marker pair, consumer extensions would silently vanish on
-    // the next re-sync. This test catches that at kit-time. pipelane is
-    // in the list even though it's an "extra" (fixed filename, not
-    // aliased) — same marker contract applies.
-    for (const cmd of ['clean', 'deploy', 'devmode', 'merge', 'new', 'pr', 'resume', 'smoke', 'pipelane']) {
+    // the next re-sync. This test catches that at kit-time. pipelane and
+    // fix are in the list even though they're "extras" (fixed filenames,
+    // not aliases) — same marker contract applies.
+    for (const cmd of GENERATED_CLAUDE_COMMANDS) {
       const contents = readFileSync(path.join(repoRoot, '.claude', 'commands', `${cmd}.md`), 'utf8');
       assert.match(
         contents,
@@ -2636,7 +2659,7 @@ test('consumer-extension preservation works for every managed command', () => {
     runCli(['init', '--project', 'Demo App'], repoRoot);
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
-    const commands = ['clean', 'deploy', 'devmode', 'merge', 'new', 'pr', 'resume', 'smoke', 'pipelane'];
+    const commands = GENERATED_CLAUDE_COMMANDS;
     for (const cmd of commands) {
       const p = path.join(repoRoot, '.claude', 'commands', `${cmd}.md`);
       const seeded = readFileSync(p, 'utf8').replace(
@@ -2710,7 +2733,7 @@ test('legacy pipelane.md (no marker) is upgraded in place on next setup', () => 
   }
 });
 
-test('legacy smoke.md staging-or-prod signature is upgraded in place on next setup', () => {
+test('unmanaged legacy smoke.md is left alone because smoke is no longer generated', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
@@ -2737,9 +2760,8 @@ test('legacy smoke.md staging-or-prod signature is upgraded in place on next set
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
     const after = readFileSync(smokePath, 'utf8');
-    assert.match(after, /<!-- pipelane:command:smoke -->/);
-    assert.match(after, /Plan smoke coverage, configure the smoke runner/);
-    assert.doesNotMatch(after, /Legacy body that predates the command marker\./);
+    assert.match(after, /Legacy body that predates the command marker\./);
+    assert.doesNotMatch(after, /<!-- pipelane:command:smoke -->/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -2774,7 +2796,8 @@ test('pipelane.md renders a journey-first overview with real slash aliases', () 
     assert.match(pipelane, /\/tidy\s+Clean up finished task state after the release is complete\./);
     assert.match(pipelane, /2\. Release journey/);
     assert.match(pipelane, /\/deploy staging\s+Deploy the merged SHA to staging\./);
-    assert.match(pipelane, /\/smoke staging\s+Run or verify staging smoke checks\./);
+    assert.doesNotMatch(pipelane, /\/smoke\b/);
+    assert.match(pipelane, /healthcheck verification, then prod/);
     assert.match(pipelane, /\/deploy prod\s+Promote the same merged SHA to production\./);
     assert.match(pipelane, /\/where\s+See where tasks, PRs, deploys, and release gates stand\./);
     assert.match(pipelane, /\/pipelane web\s+Open the local Pipelane Board\./);
@@ -4277,6 +4300,110 @@ test('durable Codex runner marks managed fallback and dispatches /pipelane statu
     ).trim();
 
     assert.equal(output, `MANAGED:1:${path.join(codexHome, 'skills', '.pipelane')}:run status --json`);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('durable Codex runner prints detailed /pipelane help', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    runCli(['install-codex'], repoRoot, { CODEX_HOME: codexHome });
+    const runner = path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh');
+
+    const bareOutput = execFileSync(runner, ['pipelane'], {
+      cwd: repoRoot,
+      env: { ...process.env, CODEX_HOME: codexHome },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const helpOutput = execFileSync(runner, ['pipelane', 'help'], {
+      cwd: repoRoot,
+      env: { ...process.env, CODEX_HOME: codexHome },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    assert.equal(bareOutput, helpOutput);
+    assert.match(helpOutput, /Pipelane dispatcher/);
+    assert.match(helpOutput, /\/pipelane setup \[--yes\]/);
+    assert.match(helpOutput, /\/pipelane configure \[--json\] \[flags\.\.\.\]/);
+    assert.match(helpOutput, /\/pipelane review setup/);
+    assert.match(helpOutput, /\/pipelane orchestrate --plan-file <file> --yes/);
+    assert.match(helpOutput, /Common companion slash commands after setup:/);
+    assert.match(helpOutput, /\/deploy/);
+    assert.doesNotMatch(helpOutput, /pipelane: use \/pipelane/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('durable Codex runner prints /pipelane help after an unknown dispatcher mode', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    runCli(['install-codex'], repoRoot, { CODEX_HOME: codexHome });
+    const result = spawnSync(
+      path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      ['pipelane', 'unknown-mode'],
+      {
+        cwd: repoRoot,
+        env: { ...process.env, CODEX_HOME: codexHome },
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+
+    assert.equal(result.status, 64);
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, /Unknown \/pipelane mode: unknown-mode/);
+    assert.match(result.stderr, /Pipelane dispatcher/);
+    assert.match(result.stderr, /\/pipelane help/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('durable Codex runner dispatches /pipelane setup and configure', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    runCli(['install-codex'], repoRoot, { CODEX_HOME: codexHome });
+    const managedBin = path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane');
+    writeFileSync(
+      managedBin,
+      '#!/bin/sh\necho "MANAGED:$PIPELANE_MANAGED_RUNTIME:$*"\n',
+      { mode: 0o755, encoding: 'utf8' },
+    );
+
+    const runner = path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh');
+    const setupOutput = execFileSync(runner, ['pipelane', 'setup', '--yes'], {
+      cwd: repoRoot,
+      env: { ...process.env, CODEX_HOME: codexHome },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+
+    const configureOutput = execFileSync(
+      runner,
+      ['pipelane', 'configure', '--json', '--frontend-staging-url=https://staging.example.test'],
+      {
+        cwd: repoRoot,
+        env: { ...process.env, CODEX_HOME: codexHome },
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    ).trim();
+
+    assert.equal(setupOutput, 'MANAGED:1:setup --yes');
+    assert.equal(configureOutput, 'MANAGED:1:configure --json --frontend-staging-url=https://staging.example.test');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -12183,7 +12310,7 @@ test('release-check keeps config remediation when staging is pending but deploy 
     assert.equal(result.status, 1);
     assert.ok(output.message.includes(`latest staging deploy is still in flight since ${requestedAt}`));
     assert.match(output.message, /frontend production URL or workflow/);
-    assert.match(output.message, /pipelane configure/);
+    assert.match(output.message, /\/pipelane configure/);
     assert.doesNotMatch(output.message, /Next: wait for the staging deploy verification to finish/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -12604,8 +12731,27 @@ test('setup output points the operator at configure when no deploy config exists
     const result = runCli(['setup'], repoRoot);
     assert.match(
       result.stdout,
-      /Release mode still requires deploy configuration\. Run `pipelane configure` interactively, or `pipelane configure --json \.\.\.` for scripted setup\./,
+      /Release mode still requires deploy configuration\. Run `\/pipelane configure` in Claude\/Codex, or `pipelane configure --json \.\.\.` for scripted setup\./,
     );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('missing deploy onboarding points at slash setup and configure flows', async () => {
+  const repoRoot = createRepo();
+  try {
+    const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'onboarding.ts'));
+    const message = mod.buildMissingDeployOnboardingMessage(repoRoot, {
+      environment: 'staging',
+      pr: '625',
+    });
+
+    assert.match(message, /\/init-pipelane --project/);
+    assert.match(message, /\/pipelane configure/);
+    assert.match(message, /Then retry: \/deploy staging --pr 625/);
+    assert.doesNotMatch(message, /pipelane bootstrap/);
+    assert.doesNotMatch(message, /pipelane run deploy/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -17518,9 +17664,9 @@ test('dashboard UI ships a Pipelane help drawer', () => {
   assert.match(html, /Release Journey/);
   assert.match(html, /Web Commands/);
   assert.match(html, /\/pipelane update --check/);
-  assert.match(html, /smoke: '\/smoke'/);
-  assert.match(html, /case 'smoke\.plan':\s+return `Run \$\{aliases\.smoke\} plan`;/);
-  assert.match(html, /blocking \? `Run \$\{aliases\.smoke\} staging` : `Run \$\{aliases\.doctor\} --probe`/);
+  assert.doesNotMatch(html, /smoke: '\/smoke'/);
+  assert.doesNotMatch(html, /aliases\.smoke/);
+  assert.doesNotMatch(html, /smoke\.staging/);
 });
 
 test('dashboard action input modal renders visible required-field errors', () => {
@@ -18931,40 +19077,30 @@ test('api snapshot distinguishes config readiness from hosted readiness when sta
   }
 });
 
-test('api snapshot only marks missing staging smoke as blocking when the repo opts into the smoke gate', () => {
+test('api snapshot does not surface legacy smoke gate config', () => {
   const repoRoot = createRepo();
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
     runCli(['setup'], repoRoot);
     writeFullDeployConfigClaude(repoRoot);
-    runCli(['run', 'devmode', 'release', '--surfaces', 'frontend', '--override', '--reason', 'snapshot smoke fixture'], repoRoot);
-
-    const advisoryEnvelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
-    const advisoryIssue = advisoryEnvelope.data.attention.find((issue) => issue.code === 'smoke.staging.missing');
-    const advisorySource = advisoryEnvelope.data.sourceHealth.find((entry) => entry.name === 'smoke.staging');
-    assert.equal(advisoryIssue.severity, 'warning');
-    assert.equal(advisoryIssue.blocking, false);
-    assert.equal(advisorySource.blocking, false);
-
     updateWorkflowConfig(repoRoot, (config) => {
       config.smoke = {
         requireStagingSmoke: true,
         staging: { command: 'node -e "process.exit(0)"' },
       };
     });
+    runCli(['run', 'devmode', 'release', '--surfaces', 'frontend', '--override', '--reason', 'snapshot legacy smoke fixture'], repoRoot);
 
-    const blockingEnvelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
-    const blockingIssue = blockingEnvelope.data.attention.find((issue) => issue.code === 'smoke.staging.missing');
-    const blockingSource = blockingEnvelope.data.sourceHealth.find((entry) => entry.name === 'smoke.staging');
-    assert.equal(blockingIssue.severity, 'error');
-    assert.equal(blockingIssue.blocking, true);
-    assert.equal(blockingSource.blocking, true);
+    const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    assert.equal(envelope.data.smoke, undefined);
+    assert.equal(envelope.data.attention.some((issue) => String(issue.code).startsWith('smoke.')), false);
+    assert.equal(envelope.data.sourceHealth.some((entry) => String(entry.name).startsWith('smoke.')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
 });
 
-test('api snapshot surfaces blocking smoke coverage gaps that would stop prod promotion', async () => {
+test('api snapshot ignores legacy smoke coverage gaps', async () => {
   const repoRoot = createRepo();
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
@@ -18993,21 +19129,15 @@ test('api snapshot surfaces blocking smoke coverage gaps that would stop prod pr
     const result = await runCliAsync(['run', 'api', 'snapshot'], repoRoot);
     assert.equal(result.status, 0);
     const envelope = JSON.parse(result.stdout);
-    const coverageIssue = envelope.data.attention.find((issue) => issue.code === 'smoke.coverage.missing');
-    const coverageSource = envelope.data.sourceHealth.find((entry) => entry.name === 'smoke.coverage');
-
-    assert.equal(coverageIssue.severity, 'error');
-    assert.equal(coverageIssue.blocking, true);
-    assert.match(coverageIssue.message, /billing/);
-    assert.equal(coverageSource.state, 'blocked');
-    assert.equal(coverageSource.blocking, true);
-    assert.match(coverageSource.reason, /billing/);
+    assert.equal(envelope.data.smoke, undefined);
+    assert.equal(envelope.data.attention.some((issue) => String(issue.code).startsWith('smoke.')), false);
+    assert.equal(envelope.data.sourceHealth.some((entry) => String(entry.name).startsWith('smoke.')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
 });
 
-test('api snapshot keys staging smoke health to the current promotion SHA, not just the latest smoke run', async () => {
+test('api snapshot excludes legacy staging smoke history even when present', async () => {
   const repoRoot = createRepo();
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
@@ -19036,16 +19166,9 @@ test('api snapshot keys staging smoke health to the current promotion SHA, not j
     runCli(['run', 'devmode', 'release', '--surfaces', 'frontend', '--override', '--reason', 'target smoke fixture'], repoRoot);
 
     const envelope = JSON.parse((await runCliAsync(['run', 'api', 'snapshot'], repoRoot)).stdout);
-    const smokeSource = envelope.data.sourceHealth.find((entry) => entry.name === 'smoke.staging');
-    const smokeIssue = envelope.data.attention.find((issue) => issue.code === 'smoke.staging.target_missing');
-
-    assert.equal(envelope.data.smoke.staging.sha, smokedSha);
-    assert.equal(smokeSource.state, 'blocked');
-    assert.equal(smokeSource.blocking, true);
-    assert.match(smokeSource.reason, /current promotion SHA 2222222/i);
-    assert.match(smokeSource.reason, /latest staging smoke is passed @ 1111111/i);
-    assert.equal(smokeIssue.blocking, true);
-    assert.match(smokeIssue.message, /current promotion SHA 2222222/i);
+    assert.equal(envelope.data.smoke, undefined);
+    assert.equal(envelope.data.sourceHealth.some((entry) => String(entry.name).startsWith('smoke.')), false);
+    assert.equal(envelope.data.attention.some((issue) => String(issue.code).startsWith('smoke.')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -20146,9 +20269,10 @@ test('configure does not overwrite a sibling `## Deploy Configuration Notes` sec
   }
 });
 
-test('configure without --json errors when stdin is not a TTY', () => {
-  // Codex-identified: interactive path used to hang on closed stdin. Now it
-  // fails fast with guidance to use --json.
+test('configure without --json prints an agent-actionable selector when stdin is not a TTY', () => {
+  // Codex-identified: interactive path used to hang on closed stdin, then
+  // regressed into telling agents to leave the slash-command flow. Closed
+  // stdin now produces a chat-driven selector and exact /pipelane follow-ups.
   const repoRoot = createRepo();
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
@@ -20161,7 +20285,11 @@ test('configure without --json errors when stdin is not a TTY', () => {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /requires a TTY|use `--json`/);
+    assert.equal(result.stderr, '');
+    assert.match(result.stdout, /Choose the action to take:/);
+    assert.match(result.stdout, /\/pipelane configure --json/);
+    assert.match(result.stdout, /--frontend-staging-url=<url>/);
+    assert.doesNotMatch(result.stdout, /requires a TTY|use `--json`/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -25646,7 +25774,7 @@ test('destination planner blocks unmapped target files before stale surfaces', (
   }
 });
 
-test('api snapshot requires staging smoke to match current task surfaces and deploy identity', async () => {
+test('api snapshot ignores legacy smoke records with mismatched surfaces', async () => {
   const {
     loadSmokeRegistry,
     resolveWorkflowContext,
@@ -25706,13 +25834,9 @@ test('api snapshot requires staging smoke to match current task surfaces and dep
     updateSmokeLatest({ commonDir: context.commonDir, config: context.config, record: wrongSurfaceSmoke });
 
     const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
-    const smokeSource = envelope.data.sourceHealth.find((entry) => entry.name === 'smoke.staging');
-    const smokeIssue = envelope.data.attention.find((issue) => issue.code === 'smoke.staging.target_missing');
-
-    assert.equal(smokeSource.state, 'blocked');
-    assert.equal(smokeSource.blocking, true);
-    assert.match(smokeSource.reason, /no qualifying staging smoke/i);
-    assert.equal(smokeIssue.blocking, true);
+    assert.equal(envelope.data.smoke, undefined);
+    assert.equal(envelope.data.sourceHealth.some((entry) => String(entry.name).startsWith('smoke.')), false);
+    assert.equal(envelope.data.attention.some((issue) => String(issue.code).startsWith('smoke.')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
