@@ -21660,9 +21660,9 @@ test('deploy in an un-onboarded repo fails with guided setup before dispatch', (
     assert.equal(result.status, 1);
     assert.match(result.stderr, /repo is not onboarded yet/);
     assert.match(result.stderr, /No \.pipelane\.json, \.project-workflow\.json, or package\.json:pipelane block/);
-    assert.match(result.stderr, /pipelane bootstrap --project "pipelane-repo-/);
+    assert.match(result.stderr, /\/init-pipelane --project "pipelane-repo-/);
     assert.match(result.stderr, /pipelane configure/);
-    assert.match(result.stderr, /Then retry: pipelane run deploy staging --pr 625/);
+    assert.match(result.stderr, /Then retry: \/deploy staging --pr 625/);
     assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -21683,7 +21683,7 @@ test('api deploy preflight in an un-onboarded repo blocks with guided setup', ()
       assert.equal(output.data.preflight.state, 'blocked', actionId);
       assert.match(output.data.preflight.reason, /pipelane configure/);
       assert.match(output.data.preflight.reason, /No deploy started/);
-      assert.match(output.data.preflight.reason, new RegExp(`Then retry: pipelane run deploy ${actionId.endsWith('.prod') ? 'prod' : 'staging'} --pr 625`));
+      assert.match(output.data.preflight.reason, new RegExp(`Then retry: /deploy ${actionId.endsWith('.prod') ? 'prod' : 'staging'} --pr 625`));
       if (actionId.startsWith('route.')) {
         assert.deepEqual(output.data.preflight.normalizedInputs.routeBlockers, ['repo not onboarded']);
       }
