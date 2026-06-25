@@ -4992,6 +4992,127 @@ test('loadWorkflowConfig applies a package.json:pipelane overlay when the file i
   }
 });
 
+test('linked worktrees read untracked shared checkout workflow config', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const worktreePath = path.join(os.tmpdir(), `pipelane-linked-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+
+  try {
+    const gitignorePath = path.join(repoRoot, '.gitignore');
+    const existingGitignore = existsSync(gitignorePath) ? readFileSync(gitignorePath, 'utf8') : '';
+    writeFileSync(
+      gitignorePath,
+      `${existingGitignore}${existingGitignore && !existingGitignore.endsWith('\n') ? '\n' : ''}.pipelane.json\n`,
+      'utf8',
+    );
+    commitAll(repoRoot, 'Ignore local pipelane config');
+
+    const sharedConfigPath = path.join(repoRoot, '.pipelane.json');
+    writeFileSync(
+      sharedConfigPath,
+      `${JSON.stringify({
+        displayName: 'Shared Local App',
+        projectKey: 'shared-local-app',
+        aliases: { deploy: '/deploy-shared' },
+        surfaces: ['frontend'],
+      }, null, 2)}\n`,
+      'utf8',
+    );
+
+    execFileSync('git', ['worktree', 'add', '-b', 'task/shared-local-config', worktreePath, 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    assert.equal(existsSync(path.join(worktreePath, '.pipelane.json')), false);
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const onboardingMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'onboarding.ts'));
+    assert.equal(realpathSync(stateMod.resolveReadableConfigPath(worktreePath)), realpathSync(sharedConfigPath));
+    const loaded = stateMod.loadWorkflowConfig(worktreePath);
+    assert.equal(loaded.displayName, 'Shared Local App');
+    assert.equal(loaded.projectKey, 'shared-local-app');
+    assert.equal(loaded.aliases.deploy, '/deploy-shared');
+    assert.deepEqual(loaded.surfaces, ['frontend']);
+    assert.equal(onboardingMod.buildMissingDeployOnboardingMessage(worktreePath, { environment: 'staging' }), null);
+  } finally {
+    spawnSync('git', ['worktree', 'remove', '--force', worktreePath], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('linked worktrees do not inherit tracked config from another checkout', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const worktreePath = path.join(os.tmpdir(), `pipelane-linked-tracked-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+
+  try {
+    const preOnboardingSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim();
+    runCli(['init', '--project', 'Tracked Config App'], repoRoot);
+    commitAll(repoRoot, 'Track pipelane config');
+
+    execFileSync('git', ['worktree', 'add', '-b', 'task/pre-onboarding', worktreePath, preOnboardingSha], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    assert.equal(existsSync(path.join(worktreePath, '.pipelane.json')), false);
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const onboardingMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'onboarding.ts'));
+    assert.equal(stateMod.resolveReadableConfigPath(worktreePath), null);
+    const loaded = stateMod.loadWorkflowConfig(worktreePath);
+    assert.equal(loaded.displayName, 'sample-repo');
+    assert.match(
+      onboardingMod.buildMissingDeployOnboardingMessage(worktreePath, { environment: 'staging' }),
+      /repo is not onboarded yet/,
+    );
+  } finally {
+    spawnSync('git', ['worktree', 'remove', '--force', worktreePath], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('linked worktrees do not inherit unignored untracked config from another checkout', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const worktreePath = path.join(os.tmpdir(), `pipelane-linked-unignored-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+
+  try {
+    const sharedConfigPath = path.join(repoRoot, '.pipelane.json');
+    writeFileSync(
+      sharedConfigPath,
+      `${JSON.stringify({
+        displayName: 'Accidental Local App',
+        projectKey: 'accidental-local-app',
+        surfaces: ['frontend'],
+      }, null, 2)}\n`,
+      'utf8',
+    );
+
+    execFileSync('git', ['worktree', 'add', '-b', 'task/unignored-local-config', worktreePath, 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    assert.equal(existsSync(path.join(worktreePath, '.pipelane.json')), false);
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const onboardingMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'onboarding.ts'));
+    assert.equal(stateMod.resolveReadableConfigPath(worktreePath), null);
+    assert.match(
+      onboardingMod.buildMissingDeployOnboardingMessage(worktreePath, { environment: 'staging' }),
+      /repo is not onboarded yet/,
+    );
+  } finally {
+    spawnSync('git', ['worktree', 'remove', '--force', worktreePath], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('loadWorkflowConfig detects package scripts for default review gates without inventing missing scripts', async () => {
   const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
   const repoRoot = createRepo();

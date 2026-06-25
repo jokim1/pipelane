@@ -1064,7 +1064,45 @@ export function resolveReadableConfigPath(repoRoot: string): string | null {
     return legacyConfigPath;
   }
 
+  // Linked task worktrees do not receive ignored machine-local config files.
+  // Borrow only untracked config from the shared checkout; tracked config stays
+  // branch-local so an older worktree does not silently inherit main's config.
+  const sharedLocalConfigPath = resolveSharedLocalConfigPath(repoRoot);
+  if (sharedLocalConfigPath) {
+    return sharedLocalConfigPath;
+  }
+
   return null;
+}
+
+function resolveSharedLocalConfigPath(repoRoot: string): string | null {
+  const commonDir = runGit(repoRoot, ['rev-parse', '--git-common-dir'], true);
+  if (!commonDir) return null;
+
+  const normalizedRepoRoot = normalizePath(repoRoot);
+  const sharedRoot = normalizePath(path.dirname(path.resolve(repoRoot, commonDir)));
+  if (sharedRoot === normalizedRepoRoot) return null;
+
+  const sharedGitRoot = runGit(sharedRoot, ['rev-parse', '--show-toplevel'], true);
+  if (!sharedGitRoot || normalizePath(sharedGitRoot) !== sharedRoot) return null;
+
+  for (const fileName of [CONFIG_FILENAME, LEGACY_CONFIG_FILENAME]) {
+    const candidate = path.join(sharedRoot, fileName);
+    if (!existsSync(candidate)) continue;
+    if (isGitTracked(sharedRoot, fileName)) continue;
+    if (!isGitIgnored(sharedRoot, fileName)) continue;
+    return candidate;
+  }
+
+  return null;
+}
+
+function isGitTracked(repoRoot: string, relativePath: string): boolean {
+  return runCommandCapture('git', ['ls-files', '--error-unmatch', '--', relativePath], { cwd: repoRoot }).ok;
+}
+
+function isGitIgnored(repoRoot: string, relativePath: string): boolean {
+  return runCommandCapture('git', ['check-ignore', '--quiet', '--', relativePath], { cwd: repoRoot }).ok;
 }
 
 // Read a tracked `pipelane` block from the repo's package.json. Consumers who
