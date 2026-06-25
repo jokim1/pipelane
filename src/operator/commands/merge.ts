@@ -21,7 +21,6 @@ import {
   loadPrByNumber,
   parsePrNumberFlag,
   pollForMergedSha,
-  resolveCommandSurfaces,
   setNextAction,
   type LivePr,
   watchPrChecks,
@@ -35,7 +34,7 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
 
   const context = resolveWorkflowContext(cwd);
   const mergeContext = resolveMergeCommandContext(context, parsed);
-  const { taskSlug, lock, prBranchName, pr, surfaces } = mergeContext;
+  const { taskSlug, lock, prBranchName, pr } = mergeContext;
   const currentBranchName = runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
   const currentHeadSha = runGit(context.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '';
   assertPrIsOpenForMerge(pr);
@@ -102,11 +101,12 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
     const deploy = await dispatchDeploy(cwd, parsed, {
       environment: 'prod',
       explicitTask: taskSlug,
-      explicitSurfaces: surfaces,
       async: true,
       allowMissingTaskLock: lock === null,
     });
-    lines.push(`Production deploy dispatched via ${deploy.workflowName}.`);
+    lines.push(deploy.dispatchMode === 'push'
+      ? `Production deploy is handled by ${deploy.workflowName} on ${context.config.baseBranch} push.`
+      : `Production deploy dispatched via ${deploy.workflowName}.`);
     if (deploy.workflowRunUrl) {
       lines.push(`Workflow run: ${deploy.workflowRunUrl}`);
     } else if (deploy.workflowRunId) {
@@ -143,7 +143,6 @@ interface MergeCommandContext {
   lock: TaskLock | null;
   prBranchName: string;
   pr: LivePr;
-  surfaces: string[];
 }
 
 function resolveMergeCommandContext(
@@ -160,8 +159,7 @@ function resolveMergeCommandContext(
       ? slugifyTaskName(parsed.flags.task)
       : deriveTaskSlugFromPr(context.config, pr, prBranchName);
     const lock = loadTaskLock(context.commonDir, context.config, taskSlug);
-    const surfaces = resolveCommandSurfaces(context, [], lock?.surfaces ?? []);
-    return { taskSlug, lock: lock ?? null, prBranchName, pr, surfaces };
+    return { taskSlug, lock: lock ?? null, prBranchName, pr };
   }
 
   try {
@@ -172,8 +170,7 @@ function resolveMergeCommandContext(
     if (!pr) {
       throw new Error(`No open pull request found for branch ${branchName}. Run ${formatWorkflowCommand(context.config, 'pr')} first.`);
     }
-    const surfaces = resolveCommandSurfaces(context, [], lock.surfaces);
-    return { taskSlug, lock, prBranchName: branchName, pr, surfaces };
+    return { taskSlug, lock, prBranchName: branchName, pr };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (!/^No task lock (matches|found)/.test(message) || parsed.flags.task.trim()) {
@@ -193,8 +190,7 @@ function resolveMergeCommandContext(
       ].join('\n'));
     }
     const taskSlug = deriveTaskSlugFromPr(context.config, pr, branchName);
-    const surfaces = resolveCommandSurfaces(context, [], []);
-    return { taskSlug, lock: null, prBranchName: branchName, pr, surfaces };
+    return { taskSlug, lock: null, prBranchName: branchName, pr };
   }
 }
 

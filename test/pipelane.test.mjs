@@ -324,6 +324,10 @@ if (args[0] === 'pr' && args[1] === 'merge') {
   }
   process.exit(0);
 }
+if (args[0] === 'workflow' && args[1] === 'view' && args.includes('--yaml')) {
+  process.stdout.write(process.env.GH_WORKFLOW_YAML || '');
+  process.exit(0);
+}
 if (args[0] === 'workflow' && args[1] === 'run') {
   state.workflows.push({ name: args[2], args: args.slice(3) });
   writeState();
@@ -15005,7 +15009,7 @@ test('pr, merge, deploy, and task-lock work with a fake gh adapter', () => {
     assert.equal(ghState.workflows[0].name, 'Deploy Hosted');
     assert.ok(ghState.workflows[0].args.includes('environment=production'));
     assert.ok(ghState.workflows[0].args.includes('sha=deadbeefcafebabe'));
-    assert.ok(ghState.workflows[0].args.includes('surfaces=frontend,edge,sql'));
+    assert.ok(ghState.workflows[0].args.includes('surfaces=frontend'));
     assert.ok(ghState.workflows[0].args.includes('bypass_staging_guard=true'));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -16619,6 +16623,169 @@ test('deploy fails before dispatch when a requested surface has no configured he
     assert.match(blocked.stderr, /edge staging health check/);
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
     assert.equal(ghState.workflows.length, 0, 'deploy should fail before gh workflow dispatch');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('build-mode deploy prod treats default all-surfaces config as frontend-only', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  writeFileSync(ghStateFile, JSON.stringify({ prs: {}, workflows: [] }, null, 2), 'utf8');
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const config = buildFullDeployConfig();
+    config.edge.production.healthcheckUrl = '';
+    config.sql.production.healthcheckUrl = '';
+    writeSharedDeployConfig(repoRoot, config);
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Build Prod', '--json'], repoRoot).stdout);
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
+    const deployed = JSON.parse(runCli(
+      ['run', 'deploy', 'prod', '--sha', sha, '--async', '--json'],
+      created.worktreePath,
+      env,
+    ).stdout);
+
+    assert.equal(deployed.status, 'requested');
+    assert.equal(deployed.environment, 'prod');
+    assert.deepEqual(deployed.surfaces, ['frontend']);
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.workflows.length, 1);
+    assert.ok(ghState.workflows[0].args.includes('environment=production'));
+    assert.ok(ghState.workflows[0].args.includes('surfaces=frontend'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('build-mode deploy prod still validates explicitly requested non-frontend surfaces', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  writeFileSync(ghStateFile, JSON.stringify({ prs: {}, workflows: [] }, null, 2), 'utf8');
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const config = buildFullDeployConfig();
+    config.edge.production.healthcheckUrl = '';
+    writeSharedDeployConfig(repoRoot, config);
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Build Edge Prod', '--json'], repoRoot).stdout);
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
+    const blocked = runCli(
+      ['run', 'deploy', 'prod', '--surfaces', 'edge', '--sha', sha, '--async', '--json'],
+      created.worktreePath,
+      env,
+      true,
+    );
+
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /Deploy blocked: prod/);
+    assert.match(blocked.stderr, /edge production health check/);
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.workflows.length, 0, 'deploy should fail before gh workflow dispatch');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('deploy filters workflow_dispatch inputs to the deploy workflow schema', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  writeFileSync(ghStateFile, JSON.stringify({ prs: {}, workflows: [] }, null, 2), 'utf8');
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_WORKFLOW_YAML: [
+      'name: Deploy Hosted',
+      'on:',
+      '  workflow_dispatch:',
+      '    inputs:',
+      '      environment:',
+      '        required: false',
+    ].join('\n'),
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    writeSharedDeployConfig(repoRoot, buildFullDeployConfig());
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Filtered Inputs', '--json'], repoRoot).stdout);
+    const sha = execFileSync('git', ['rev-parse', 'origin/main'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
+    const deployed = JSON.parse(runCli(
+      ['run', 'deploy', 'prod', '--sha', sha, '--async', '--json'],
+      created.worktreePath,
+      env,
+    ).stdout);
+
+    assert.equal(deployed.status, 'requested');
+    assert.equal(deployed.dispatchMode, 'workflow_dispatch');
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.workflows.length, 1);
+    assert.deepEqual(ghState.workflows[0].args, ['-f', 'environment=production']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('build-mode merge treats push-triggered deploy workflow as deployed without manual dispatch', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  writeFileSync(ghStateFile, JSON.stringify({ prs: {}, workflows: [] }, null, 2), 'utf8');
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_PR_MERGE_PUSH_HEAD: '1',
+    GH_WORKFLOW_YAML: [
+      'name: Deploy Hosted',
+      'on:',
+      '  push:',
+      '    branches: [main]',
+    ].join('\n'),
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Push Deploy', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Push Deploy', '--json'], created.worktreePath, env);
+    const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
+
+    assert.match(merged.message, /Production deploy is handled by Deploy Hosted on main push/);
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.workflows.length, 0);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });

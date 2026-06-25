@@ -130,6 +130,7 @@ export type DispatchDeployResult = DeployRecord & {
   surfaces: string[];
   workflowName: string;
   taskSlug: string;
+  dispatchMode: 'workflow_dispatch' | 'push' | 'idempotent';
   message: string;
 };
 
@@ -251,6 +252,7 @@ export async function dispatchDeploy(
   const asyncRequested = options.async ?? parsed.flags.async;
   const surfaces = resolveDeploySurfacesForTarget({
     context,
+    environment,
     explicitSurfaces,
     fallbackSurfaces: identity.lock?.surfaces ?? [],
     targetSha: target.sha,
@@ -402,6 +404,7 @@ export async function dispatchDeploy(
         surfaces,
         workflowName: existingSucceeded.workflowName,
         taskSlug,
+        dispatchMode: 'idempotent',
         message: [
           `Deploy already succeeded: ${environment}`,
           `Task: ${taskSlug}`,
@@ -430,21 +433,20 @@ export async function dispatchDeploy(
     const triggeredBy = resolveTriggeredBy();
     const dispatchStart = Date.now();
 
-    const dispatchArgs = [
-      'workflow',
-      'run',
+    const workflowTriggers = resolveWorkflowTriggers(context.repoRoot, workflowName);
+    const baseBranchSha = resolveCurrentBaseBranchSha(context);
+    const workflowInvocation = planDeployWorkflowInvocation({
+      context,
+      environment,
       workflowName,
-      '-f',
-      `environment=${environment === 'prod' ? 'production' : 'staging'}`,
-      '-f',
-      `sha=${target.sha}`,
-      '-f',
-      `surfaces=${surfaces.join(',')}`,
-    ];
-    if (environment === 'prod' && context.modeState.mode === 'build') {
-      dispatchArgs.push('-f', 'bypass_staging_guard=true');
+      targetSha: target.sha,
+      targetIsCurrentBase: Boolean(baseBranchSha && baseBranchSha === target.sha),
+      surfaces,
+      triggers: workflowTriggers,
+    });
+    if (workflowInvocation.dispatchMode === 'workflow_dispatch') {
+      runGh(context.repoRoot, workflowInvocation.args);
     }
-    runGh(context.repoRoot, dispatchArgs);
 
     const run = findRecentRun(context.repoRoot, workflowName, target.sha, dispatchStart);
 
@@ -486,10 +488,13 @@ export async function dispatchDeploy(
           `Task: ${taskSlug}`,
           `SHA: ${target.sha}`,
           `Surfaces: ${surfaces.join(', ')}`,
-          `Workflow: ${workflowName}`,
+          workflowInvocation.dispatchMode === 'push'
+            ? `Workflow: ${workflowName} (push-triggered on ${context.config.baseBranch})`
+            : `Workflow: ${workflowName}`,
           run?.id ? `Workflow run: ${run.url ?? run.id}` : 'Workflow run: not yet resolvable',
           'Exit without watching per --async.',
         ].join('\n'),
+        dispatchMode: workflowInvocation.dispatchMode,
       };
     }
 
@@ -597,12 +602,15 @@ export async function dispatchDeploy(
     return {
       ...record,
       taskSlug,
+      dispatchMode: workflowInvocation.dispatchMode,
       message: [
         `Deploy verified: ${environment}`,
         `Task: ${taskSlug}`,
         `SHA: ${target.sha}`,
         `Surfaces: ${surfaces.join(', ')}`,
-        `Workflow: ${workflowName}`,
+        workflowInvocation.dispatchMode === 'push'
+          ? `Workflow: ${workflowName} (push-triggered on ${context.config.baseBranch})`
+          : `Workflow: ${workflowName}`,
         run?.url ? `Workflow run: ${run.url}` : '',
         verification?.healthcheckUrl
           ? `Healthcheck: ${verification.healthcheckUrl} → HTTP ${verification.statusCode} in ${verification.latencyMs}ms (${verification.probes} probe(s))`
@@ -626,6 +634,7 @@ export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Pro
 
 function resolveDeploySurfacesForTarget(options: {
   context: WorkflowContext;
+  environment: 'staging' | 'prod';
   explicitSurfaces: string[];
   fallbackSurfaces: string[];
   targetSha: string;
@@ -638,7 +647,7 @@ function resolveDeploySurfacesForTarget(options: {
     config: options.context.config,
     targetSha: options.targetSha,
   });
-  if (!inference) return surfaces;
+  if (!inference) return resolveBuildModeProductionDefaultSurfaces(options.context, options.environment, surfaces);
 
   const blockers = targetSurfaceInferenceBlockers(inference);
   if (blockers.length > 0) {
@@ -649,7 +658,27 @@ function resolveDeploySurfacesForTarget(options: {
     ].join('\n'));
   }
 
-  return inference.surfaces.length > 0 ? inference.surfaces : surfaces;
+  if (inference.surfaces.length > 0) return inference.surfaces;
+
+  return resolveBuildModeProductionDefaultSurfaces(options.context, options.environment, surfaces);
+}
+
+function resolveBuildModeProductionDefaultSurfaces(
+  context: WorkflowContext,
+  environment: 'staging' | 'prod',
+  surfaces: string[],
+): string[] {
+  // Build mode is the fast lane: default all-surfaces config should not turn a
+  // frontend deploy into edge/sql release ceremony unless deploy input narrowed it.
+  if (context.modeState.mode !== 'build' || environment !== 'prod') return surfaces;
+  if (!sameSurfaceSet(surfaces, context.config.surfaces)) return surfaces;
+  return context.config.surfaces.includes('frontend') ? ['frontend'] : surfaces;
+}
+
+function sameSurfaceSet(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) return false;
+  const rightSet = new Set(right);
+  return left.every((surface) => rightSet.has(surface));
 }
 
 export function persistRecord(
@@ -729,6 +758,258 @@ export function resolveTriggeredBy(): string {
     || process.env.USER
     || 'pipelane'
   );
+}
+
+type WorkflowTriggerPresence = 'present' | 'missing' | 'unknown';
+
+interface WorkflowTriggers {
+  workflowDispatch: WorkflowTriggerPresence;
+  workflowDispatchInputs: Set<string> | null;
+  push: WorkflowTriggerPresence;
+}
+
+interface DeployWorkflowInvocation {
+  dispatchMode: 'workflow_dispatch' | 'push';
+  args: string[];
+}
+
+function resolveWorkflowTriggers(repoRoot: string, workflowName: string): WorkflowTriggers {
+  const output = runCommandCapture('gh', ['workflow', 'view', workflowName, '--yaml'], { cwd: repoRoot });
+  if (!output.ok || !output.stdout.trim()) {
+    return { workflowDispatch: 'unknown', workflowDispatchInputs: null, push: 'unknown' };
+  }
+  return parseWorkflowTriggers(output.stdout);
+}
+
+function planDeployWorkflowInvocation(options: {
+  context: WorkflowContext;
+  environment: 'staging' | 'prod';
+  workflowName: string;
+  targetSha: string;
+  targetIsCurrentBase: boolean;
+  surfaces: string[];
+  triggers: WorkflowTriggers;
+}): DeployWorkflowInvocation {
+  if (
+    options.context.modeState.mode === 'build'
+    && options.environment === 'prod'
+    && options.targetIsCurrentBase
+    && options.triggers.push === 'present'
+  ) {
+    return { dispatchMode: 'push', args: [] };
+  }
+
+  if (options.triggers.workflowDispatch === 'missing') {
+    throw new Error([
+      `Deploy workflow ${options.workflowName} does not declare workflow_dispatch.`,
+      options.context.modeState.mode === 'build' && options.environment === 'prod'
+        ? `Merge to ${options.context.config.baseBranch} with a push-triggered deploy workflow, or add workflow_dispatch to ${options.workflowName}.`
+        : `Add workflow_dispatch to ${options.workflowName} so ${formatWorkflowCommand(options.context.config, 'deploy', options.environment)} can request this deploy.`,
+    ].join('\n'));
+  }
+
+  const desiredInputs: Array<[string, string]> = [
+    ['environment', options.environment === 'prod' ? 'production' : 'staging'],
+    ['sha', options.targetSha],
+    ['surfaces', options.surfaces.join(',')],
+  ];
+  if (options.environment === 'prod' && options.context.modeState.mode === 'build') {
+    desiredInputs.push(['bypass_staging_guard', 'true']);
+  }
+
+  const acceptedInputs = options.triggers.workflowDispatchInputs;
+  if (acceptedInputs && !acceptedInputs.has('sha') && !options.targetIsCurrentBase) {
+    throw new Error([
+      `Deploy workflow ${options.workflowName} does not accept a sha input.`,
+      `Requested SHA: ${options.targetSha}`,
+      `Current ${options.context.config.baseBranch}: ${resolveCurrentBaseBranchSha(options.context) || 'unresolved'}`,
+      'Refusing to dispatch because the workflow would not be pinned to the requested deploy target.',
+    ].join('\n'));
+  }
+
+  const dispatchInputs = acceptedInputs
+    ? desiredInputs.filter(([name]) => acceptedInputs.has(name))
+    : desiredInputs;
+  const args = ['workflow', 'run', options.workflowName];
+  for (const [name, value] of dispatchInputs) {
+    args.push('-f', `${name}=${value}`);
+  }
+  return { dispatchMode: 'workflow_dispatch', args };
+}
+
+function resolveCurrentBaseBranchSha(context: WorkflowContext): string {
+  return runGit(context.repoRoot, ['rev-parse', '--verify', `origin/${context.config.baseBranch}`], true)?.trim()
+    || runGit(context.repoRoot, ['rev-parse', '--verify', context.config.baseBranch], true)?.trim()
+    || '';
+}
+
+function parseWorkflowTriggers(yaml: string): WorkflowTriggers {
+  const lines = yaml.split(/\r?\n/u);
+  const onEntry = findYamlKey(lines, 0, -1, 'on', true);
+  if (!onEntry) {
+    return {
+      workflowDispatch: /\bworkflow_dispatch\b/u.test(yaml) ? 'present' : 'missing',
+      workflowDispatchInputs: /\bworkflow_dispatch\b/u.test(yaml) ? parseWorkflowDispatchInputsFromAnyBlock(lines) : null,
+      push: /(^|\s)push\s*:/um.test(yaml) ? 'present' : 'missing',
+    };
+  }
+
+  if (onEntry.value && hasInlineYamlToken(onEntry.value, 'workflow_dispatch')) {
+    return {
+      workflowDispatch: 'present',
+      workflowDispatchInputs: new Set(),
+      push: hasInlineYamlToken(onEntry.value, 'push') ? 'present' : 'missing',
+    };
+  }
+
+  const onListItems = collectYamlListItems(lines, onEntry.index + 1, onEntry.indent);
+  if (onListItems.length > 0) {
+    return {
+      workflowDispatch: onListItems.includes('workflow_dispatch') ? 'present' : 'missing',
+      workflowDispatchInputs: onListItems.includes('workflow_dispatch') ? new Set() : null,
+      push: onListItems.includes('push') ? 'present' : 'missing',
+    };
+  }
+
+  const dispatchEntry = findDirectYamlChildKey(lines, onEntry.index + 1, onEntry.indent, 'workflow_dispatch');
+  const pushEntry = findDirectYamlChildKey(lines, onEntry.index + 1, onEntry.indent, 'push');
+  return {
+    workflowDispatch: dispatchEntry ? 'present' : 'missing',
+    workflowDispatchInputs: dispatchEntry ? parseWorkflowDispatchInputs(lines, dispatchEntry) : null,
+    push: pushEntry ? 'present' : 'missing',
+  };
+}
+
+interface YamlKeyEntry {
+  index: number;
+  indent: number;
+  key: string;
+  value: string;
+}
+
+function parseWorkflowDispatchInputsFromAnyBlock(lines: string[]): Set<string> | null {
+  const dispatchEntry = findYamlKey(lines, 0, -1, 'workflow_dispatch');
+  return dispatchEntry ? parseWorkflowDispatchInputs(lines, dispatchEntry) : null;
+}
+
+function parseWorkflowDispatchInputs(lines: string[], dispatchEntry: YamlKeyEntry): Set<string> {
+  const inputsEntry = findDirectYamlChildKey(lines, dispatchEntry.index + 1, dispatchEntry.indent, 'inputs');
+  if (!inputsEntry) return new Set();
+
+  const inlineInputs = parseInlineYamlMappingKeys(inputsEntry.value);
+  if (inlineInputs) return inlineInputs;
+
+  return collectDirectYamlChildKeys(lines, inputsEntry.index + 1, inputsEntry.indent);
+}
+
+function findYamlKey(
+  lines: string[],
+  startIndex: number,
+  parentIndent: number,
+  targetKey: string,
+  topLevelOnly = false,
+): YamlKeyEntry | null {
+  for (let index = startIndex; index < lines.length; index += 1) {
+    const entry = parseYamlKeyLine(lines[index], index);
+    if (!entry) continue;
+    if (entry.indent <= parentIndent) return null;
+    if (topLevelOnly && entry.indent !== 0) continue;
+    if (entry.key === targetKey) return entry;
+  }
+  return null;
+}
+
+function findDirectYamlChildKey(
+  lines: string[],
+  startIndex: number,
+  parentIndent: number,
+  targetKey: string,
+): YamlKeyEntry | null {
+  let childIndent: number | null = null;
+  for (let index = startIndex; index < lines.length; index += 1) {
+    const entry = parseYamlKeyLine(lines[index], index);
+    if (!entry) continue;
+    if (entry.indent <= parentIndent) return null;
+    if (childIndent === null || entry.indent < childIndent) {
+      childIndent = entry.indent;
+    }
+    if (entry.indent === childIndent && entry.key === targetKey) {
+      return entry;
+    }
+  }
+  return null;
+}
+
+function collectDirectYamlChildKeys(lines: string[], startIndex: number, parentIndent: number): Set<string> {
+  const keys = new Set<string>();
+  let childIndent: number | null = null;
+  for (let index = startIndex; index < lines.length; index += 1) {
+    const entry = parseYamlKeyLine(lines[index], index);
+    if (!entry) continue;
+    if (entry.indent <= parentIndent) break;
+    if (childIndent === null || entry.indent < childIndent) {
+      childIndent = entry.indent;
+      keys.clear();
+    }
+    if (entry.indent === childIndent) {
+      keys.add(entry.key);
+    }
+  }
+  return keys;
+}
+
+function collectYamlListItems(lines: string[], startIndex: number, parentIndent: number): string[] {
+  const items: string[] = [];
+  for (let index = startIndex; index < lines.length; index += 1) {
+    const keyEntry = parseYamlKeyLine(lines[index], index);
+    if (keyEntry && keyEntry.indent <= parentIndent) break;
+
+    const withoutComment = lines[index].replace(/\s+#.*$/u, '').trimEnd();
+    const match = /^(\s*)-\s+(.+)$/u.exec(withoutComment);
+    if (!match) continue;
+    const indent = match[1].replace(/\t/gu, '  ').length;
+    if (indent <= parentIndent) break;
+    items.push(unquoteYamlKey(match[2].trim()));
+  }
+  return items;
+}
+
+function parseInlineYamlMappingKeys(value: string): Set<string> | null {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return null;
+  const keys = new Set<string>();
+  for (const match of trimmed.matchAll(/(?:^|[{,]\s*)(['"]?)([A-Za-z0-9_-]+)\1\s*:/gu)) {
+    keys.add(match[2]);
+  }
+  return keys;
+}
+
+function parseYamlKeyLine(line: string, index: number): YamlKeyEntry | null {
+  const withoutComment = line.replace(/\s+#.*$/u, '').trimEnd();
+  if (!withoutComment.trim() || withoutComment.trimStart().startsWith('- ')) return null;
+  const match = /^(\s*)(["'][^"']+["']|[^:#\s][^:#]*?)\s*:\s*(.*)$/u.exec(withoutComment);
+  if (!match) return null;
+  return {
+    index,
+    indent: match[1].replace(/\t/gu, '  ').length,
+    key: unquoteYamlKey(match[2].trim()),
+    value: match[3].trim(),
+  };
+}
+
+function unquoteYamlKey(key: string): string {
+  if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) {
+    return key.slice(1, -1);
+  }
+  return key;
+}
+
+function hasInlineYamlToken(value: string, token: string): boolean {
+  return new RegExp(`(^|[\\s,[{])${escapeRegExp(token)}($|[\\s,\\]}])`, 'u').test(value);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
 }
 
 export function findRecentRun(
