@@ -202,6 +202,7 @@ export interface OrchestrationRunSummary {
     running: number;
     blocked: number;
     completed: number;
+    empty: number;
     failed: number;
     workerSucceeded: number;
     reviewPassed: number;
@@ -729,6 +730,7 @@ function summarizeOrchestrationRun(
     running: 0,
     blocked: 0,
     completed: 0,
+    empty: 0,
     failed: 0,
     workerSucceeded: 0,
     reviewPassed: 0,
@@ -827,13 +829,16 @@ function buildOrchestrationNextAction(
   const hasFailedWorker = active.some((slice) => slice.worker?.status === 'failed' || slice.status === 'failed');
   const hasRunningWorker = active.some((slice) => slice.worker?.status === 'running' || slice.status === 'running');
   const hasBlockedSlice = active.some((slice) => slice.status === 'blocked');
+  // B1: an `empty` slice ran but produced no material change; it blocks the run
+  // and its dependents until re-dispatched (sharper goal) or deferred.
+  const emptySlice = active.find((slice) => slice.status === 'empty');
   const needsPrepare = run.status === 'planned' || active.some((slice) => slice.status === 'planned');
   const needsDispatch = !needsPrepare && (run.status === 'prepared' || active.some((slice) => slice.status === 'prepared'));
   const needsStart = !needsPrepare && !needsDispatch && active.some((slice) =>
     slice.status === 'dispatched' || (slice.status === 'blocked' && !slice.worker),
   );
   const needsReview = active.some((slice) =>
-    slice.worker?.status === 'succeeded' && !trustedReviewBySlice.get(slice.id),
+    slice.worker?.status === 'succeeded' && slice.status !== 'empty' && !trustedReviewBySlice.get(slice.id),
   );
   const fullyReviewed = active.length > 0 && active.every((slice) => trustedReviewBySlice.get(slice.id));
 
@@ -862,6 +867,15 @@ function buildOrchestrationNextAction(
       state: 'running',
       reason: 'one or more slice workers are still running',
       command: formatWorkflowCommand(config, 'status'),
+    });
+  }
+  if (emptySlice) {
+    return buildOrchestrationAction({
+      id: 'orchestrate.redispatch-empty',
+      label: 'Re-dispatch slice that produced no changes',
+      state: 'blocked',
+      reason: `slice ${emptySlice.id} produced no material change; re-dispatch with a sharper goal, or defer it`,
+      command: `${orchestrateCommand} start ${runIdArg} --force`,
     });
   }
   if (needsPrepare) {
@@ -956,13 +970,17 @@ function buildOrchestrationInbox(activeRun: OrchestrationRunSummary): Orchestrat
     });
   }
   for (const slice of activeRun.slices) {
-    if (slice.status !== 'failed' && slice.status !== 'blocked') continue;
+    if (slice.status !== 'failed' && slice.status !== 'blocked' && slice.status !== 'empty') continue;
     items.push({
       id: `${activeRun.id}:${slice.id}:${slice.status}`,
       runId: activeRun.id,
       sliceId: slice.id,
       severity: slice.status === 'failed' ? 'error' : 'warning',
-      title: slice.status === 'failed' ? 'Slice worker failed' : 'Slice is blocked',
+      title: slice.status === 'failed'
+        ? 'Slice worker failed'
+        : slice.status === 'empty'
+          ? 'Slice produced no changes'
+          : 'Slice is blocked',
       message: `${slice.id} is ${slice.status}. ${activeRun.nextAction?.reason ?? 'Inspect the orchestration run for recovery details.'}`,
       action: activeRun.nextAction,
     });

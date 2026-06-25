@@ -810,7 +810,7 @@ export const STATE_SCHEMA_VERSIONS = {
   prState: 1,
   actionState: 1,
   reviewState: 1,
-  orchestrationRun: 1,
+  orchestrationRun: 2,
   deployConfig: 1,
   taskLock: 1,
 } as const;
@@ -830,7 +830,25 @@ export const STATE_MIGRATIONS: Record<StateKind, Record<number, (raw: Record<str
   prState: {},
   actionState: {},
   reviewState: {},
-  orchestrationRun: {},
+  orchestrationRun: {
+    // v1 -> v2 (G1): providerPrompt/confirmationPrompt are no longer persisted
+    // on the slice record. The worker prompt is derived from the resolved
+    // goalSpec at dispatch time (Decision 1 — kills the stale-prompt class).
+    // Strip the dead fields from in-flight v1 ledgers on read so they shed them
+    // on the next save; goalSpec + provider remain, so derivation is lossless.
+    1: (raw) => {
+      if (Array.isArray(raw.slices)) {
+        raw.slices = raw.slices.map((slice) => {
+          if (!slice || typeof slice !== 'object' || Array.isArray(slice)) return slice;
+          const next = { ...(slice as Record<string, unknown>) };
+          delete next.providerPrompt;
+          delete next.confirmationPrompt;
+          return next;
+        });
+      }
+      return raw;
+    },
+  },
   deployConfig: {},
   taskLock: {},
 };

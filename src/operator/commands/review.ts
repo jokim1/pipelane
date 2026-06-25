@@ -2447,7 +2447,9 @@ function manualGateSummary(gate: ReviewGateConfig): string {
   return `manual gate pending: ${gate.id}`;
 }
 
-function collectChangedFiles(repoRoot: string, baseBranch: string): string[] {
+// Exported for B1: the orchestration material-change check reuses this exact
+// committed+staged+unstaged+untracked detection to decide if a slice is `empty`.
+export function collectChangedFiles(repoRoot: string, baseBranch: string): string[] {
   const compareRef = runGit(repoRoot, ['rev-parse', '--verify', `origin/${baseBranch}`], true)?.trim()
     ? `origin/${baseBranch}`
     : baseBranch;

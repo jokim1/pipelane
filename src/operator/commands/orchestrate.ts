@@ -18,6 +18,7 @@ import {
   missingRelevantSliceWorktreeDiagnostic,
   ORCHESTRATION_CORRUPT_LEDGER_BLOCK_AGE_MS,
   orchestrationRunPath,
+  renderSliceWorkerPrompt,
   saveOrchestrationRunRecord,
   scanOrchestrationRunDiagnostics,
   selectActiveSlices,
@@ -41,7 +42,7 @@ import {
   createReviewActorIdentity,
   resolveReviewActorIdentity,
 } from '../review-identity.ts';
-import { buildReviewRunRecord } from './review.ts';
+import { buildReviewRunRecord, collectChangedFiles } from './review.ts';
 import {
   DEFAULT_GOAL_PROVIDER,
   TASK_SLUG_MAX_LENGTH,
@@ -369,7 +370,12 @@ type ReviewAutoFixResult = OrchestrateEntryAutoFixSummary & {
 interface StartSlicePreparation {
   slice: OrchestrationSliceRecord;
   taskSlug: string;
+  // The human artifact on disk (dispatch handoff `.md` or review-fix `.md`).
   promptPath: string;
+  // A3: the EXACT prompt piped to the worker. The initial run supplies the
+  // derived worker prompt (no handoff boilerplate); the auto-fix run supplies
+  // the review-fix prompt. The worker never re-reads promptPath.
+  prompt: string;
   providerCommand: string;
   restarting: boolean;
 }
@@ -1751,11 +1757,14 @@ async function startDispatchedSlices(
     for (let index = 0; index < pendingSlices.length;) {
       const slice = pendingSlices[index];
       const existingWorker = slice.worker;
-      const recoverableExistingWorker = existingWorker?.status === 'running' || existingWorker?.status === 'failed';
+      // B1 (B-3 recovery): an `empty` slice (succeeded worker, no material change)
+      // is NOT done — it is recoverable so `start --force` re-runs it, clearing the
+      // strand instead of skipping it as an existing/completed worker.
+      const recoverableExistingWorker = existingWorker?.status === 'running' || existingWorker?.status === 'failed' || slice.status === 'empty';
       if (
         existingWorker
         && (
-          existingWorker.status === 'succeeded'
+          (existingWorker.status === 'succeeded' && slice.status !== 'empty')
           || (recoverableExistingWorker && !force)
         )
       ) {
@@ -1788,7 +1797,9 @@ async function startDispatchedSlices(
       const prepared = prepareSliceForStart(context, run, workerRoot, slice, restarting);
       const worker = await runProviderWorker(context, run, prepared);
       slice.worker = worker;
-      slice.status = worker.status === 'succeeded' ? 'completed' : 'failed';
+      slice.status = worker.status === 'succeeded'
+        ? (sliceProducedMaterialChange(context, slice) ? 'completed' : 'empty')
+        : 'failed';
       if (restarting) restartedCount += 1;
       else startedCount += 1;
       if (worker.status === 'failed') failedCount += 1;
@@ -2190,7 +2201,11 @@ function summarizeRunReviewStatus(run: OrchestrationRunRecord): OrchestrationRun
   const active = selectActiveSlices(run);
   if (active.some((slice) => slice.worker?.status === 'failed' || slice.status === 'failed' || slice.review?.run.status === 'failed')) return 'failed';
   if (active.some((slice) => slice.worker?.status === 'running' || slice.status === 'running')) return 'running';
-  if (active.length > 0 && active.every((slice) => sliceReviewFullySatisfied(slice))) {
+  // B1: an `empty` slice can never be review-satisfied (the guard in
+  // `sliceReviewFullySatisfied`); the explicit exclusion here mirrors
+  // `summarizeRunWorkerStatus` so the completion gate is robust even if that
+  // guard is ever weakened.
+  if (active.length > 0 && active.every((slice) => slice.status !== 'empty' && sliceReviewFullySatisfied(slice))) {
     return hasResumableDeferredSlices(run) ? 'paused' : 'completed';
   }
   if (active.some((slice) => slice.worker?.status === 'succeeded' && !sliceReviewFullySatisfied(slice))) return 'blocked';
@@ -2199,6 +2214,11 @@ function summarizeRunReviewStatus(run: OrchestrationRunRecord): OrchestrationRun
 }
 
 function summarizeSliceReviewStatus(slice: OrchestrationSliceRecord): OrchestrationSliceRecord['status'] {
+  // B1: `empty` is durable through review. Review cannot "un-empty" a no-change
+  // slice, and without this the empty marker would be overwritten (empty→blocked)
+  // here, defeating the empty guard in `sliceReviewFullySatisfied` on the next
+  // pass and letting a no-change slice reach `completed`.
+  if (slice.status === 'empty') return 'empty';
   if (sliceReviewFullySatisfied(slice)) return 'completed';
   if (slice.review?.run.status === 'failed') return 'failed';
   return 'blocked';
@@ -2244,7 +2264,7 @@ function prepareSliceForStart(
   slice: OrchestrationSliceRecord,
   restarting: boolean,
 ): StartSlicePreparation {
-  if (slice.status !== 'dispatched' && slice.status !== 'blocked' && !(restarting && (slice.status === 'running' || slice.status === 'failed'))) {
+  if (slice.status !== 'dispatched' && slice.status !== 'blocked' && !(restarting && (slice.status === 'running' || slice.status === 'failed' || slice.status === 'empty'))) {
     throw new Error(`Slice ${slice.id} must be dispatched before start; current status is ${slice.status}.`);
   }
   const taskSlug = resolveOrchestrationTaskSlug(run.id, slice);
@@ -2271,6 +2291,7 @@ function prepareSliceForStart(
     slice,
     taskSlug,
     promptPath,
+    prompt: renderSliceWorkerPrompt(slice),
     providerCommand: resolveProviderCommand(slice.provider),
     restarting,
   };
@@ -2297,11 +2318,13 @@ function prepareSliceForReviewAutoFix(
   mkdirSync(workerRoot, { recursive: true });
   const taskSlug = reviewFixTaskSlug(run.id, slice, attempt);
   const promptPath = path.join(fixRoot, `${taskSlug}.md`);
-  writeFileSync(promptPath, renderReviewAutoFixPrompt(run, slice, failedGates, attempt), 'utf8');
+  const prompt = renderReviewAutoFixPrompt(run, slice, failedGates, attempt);
+  writeFileSync(promptPath, prompt, 'utf8');
   return {
     slice,
     taskSlug,
     promptPath,
+    prompt,
     providerCommand: resolveProviderCommand(slice.provider),
     restarting: true,
   };
@@ -2380,7 +2403,11 @@ async function runProviderWorker(
   const runDir = path.dirname(orchestrationRunPath(context.commonDir, context.config, run.id));
   const logPath = path.join(runDir, 'workers', `${taskSlug}-${Date.now()}.log`);
   const redactedProviderCommand = redactOrchestrationWorkerText(providerCommand);
-  const prompt = readFileSync(promptPath, 'utf8');
+  // A3 (problem #10): the worker receives the prompt the preparation step chose
+  // (derived worker prompt on the initial run; review-fix prompt on auto-fix),
+  // NOT the raw human-handoff `.md` at promptPath. promptPath stays the durable
+  // human artifact and is still recorded on the worker record below.
+  const prompt = prepared.prompt;
   const workerSessionId = `orchestrate-worker:${run.id}:${slice.id}:${crypto.randomUUID()}`;
   const workerIdentity = createReviewActorIdentity({
     provider: slice.provider,
@@ -2727,10 +2754,23 @@ function writeWorkerLog(logPath: string, body: string): void {
   writeFileSync(logPath, body, 'utf8');
 }
 
+// B1: a slice is `empty` when its worker exited 0 but produced no material
+// change (committed+staged+unstaged+untracked, via the shared review detector)
+// measured against the slice's base. Pre-E1a every slice branches from
+// `config.baseBranch`, so that is the base here; E1a will thread the dependency
+// branch in.
+function sliceProducedMaterialChange(context: WorkflowContext, slice: OrchestrationSliceRecord): boolean {
+  const worktree = slice.worktreePath ?? context.repoRoot;
+  return collectChangedFiles(worktree, context.config.baseBranch).length > 0;
+}
+
 function dependencyBlocker(slice: OrchestrationSliceRecord, byId: Map<string, OrchestrationSliceRecord>): string | null {
   for (const dependencyId of slice.dependsOn) {
     const dependency = byId.get(dependencyId);
     if (!dependency) return `missing dependency ${dependencyId}`;
+    // B1 (#10): an `empty` dependency does not satisfy dependents even though its
+    // worker.status is `succeeded`; check it before the succeeded short-circuit.
+    if (dependency.status === 'empty') return `dependency ${dependencyId} produced no changes`;
     if (dependency.worker?.status === 'succeeded' || dependency.status === 'completed') continue;
     if (dependency.worker?.status === 'failed' || dependency.status === 'failed') return `dependency ${dependencyId} failed`;
     return `dependency ${dependencyId} has not completed`;
@@ -2747,6 +2787,9 @@ function dependencyMayCompleteLater(
   for (const dependencyId of slice.dependsOn) {
     const dependency = byId.get(dependencyId);
     if (!dependency) return false;
+    // B1: an `empty` dependency will not progress on its own (it needs a
+    // re-dispatch), so it cannot "complete later" within this pass.
+    if (dependency.status === 'empty') return false;
     if (dependency.worker?.status === 'succeeded' || dependency.status === 'completed') continue;
     if (dependency.worker?.status === 'failed' || dependency.status === 'failed') return false;
     if (pendingIds.has(dependencyId)) return true;
@@ -2760,7 +2803,9 @@ function buildExistingWorkerReport(
 ): StartedSliceReport {
   return {
     id: slice.id,
-    status: worker.status === 'succeeded' ? 'completed' : worker.status === 'failed' ? 'failed' : 'running',
+    status: slice.status === 'empty'
+      ? 'empty'
+      : worker.status === 'succeeded' ? 'completed' : worker.status === 'failed' ? 'failed' : 'running',
     provider: slice.provider,
     branchName: slice.branchName ?? '',
     worktreePath: slice.worktreePath ?? '',
@@ -2792,11 +2837,13 @@ function buildBlockedWorkerReport(slice: OrchestrationSliceRecord, blocker: stri
 function summarizeRunWorkerStatus(run: OrchestrationRunRecord): OrchestrationRunRecord['status'] {
   const active = selectActiveSlices(run);
   if (active.some((slice) => slice.worker?.status === 'failed' || slice.status === 'failed')) return 'failed';
-  if (active.length > 0 && active.every((slice) => slice.worker?.status === 'succeeded' || slice.status === 'completed')) {
+  // B1: an `empty` slice has worker.status === 'succeeded' but must NOT count as
+  // done — the run cannot complete while any in-scope slice is empty.
+  if (active.length > 0 && active.every((slice) => (slice.worker?.status === 'succeeded' || slice.status === 'completed') && slice.status !== 'empty')) {
     return hasResumableDeferredSlices(run) ? 'paused' : 'completed';
   }
   if (active.some((slice) => slice.worker?.status === 'running' || slice.status === 'running')) return 'running';
-  if (active.some((slice) => slice.status === 'blocked')) return 'blocked';
+  if (active.some((slice) => slice.status === 'blocked' || slice.status === 'empty')) return 'blocked';
   return 'dispatched';
 }
 
@@ -3041,7 +3088,7 @@ function renderDispatchPrompt(
     '',
     '## Provider Prompt',
     '',
-    slice.providerPrompt,
+    renderSliceWorkerPrompt(slice),
     '',
     '## Required Slice Review',
     '',
@@ -3094,7 +3141,7 @@ function renderReviewAutoFixPrompt(
   lines.push(
     '## Original Slice Goal',
     '',
-    slice.providerPrompt,
+    renderSliceWorkerPrompt(slice),
     '',
   );
   return lines.join('\n');
@@ -3386,6 +3433,10 @@ function sliceOutlineState(slice: OrchestrationSliceRecord): { glyph: string; la
   if (slice.review?.run.status === 'failed') return { glyph: '✗', label: 'review failed', state: 'review-failed', done: false };
   if (slice.worker?.status === 'running' || slice.status === 'running') return { glyph: '▸', label: 'running', state: 'running', done: false };
   if (slice.status === 'blocked') return { glyph: '⚠', label: 'blocked', state: 'blocked', done: false };
+  // B1: an `empty` slice has a succeeded worker but produced no change — it is not
+  // done; it needs re-dispatch (sharper goal) or defer. Check before the
+  // succeeded/done branch so the glyph does not contradict the cockpit.
+  if (slice.status === 'empty') return { glyph: '⚠', label: 'empty (no changes — re-dispatch or defer)', state: 'empty', done: false };
   if (slice.worker?.status === 'succeeded' || slice.status === 'completed') {
     const reviewed = sliceReviewFullySatisfied(slice);
     return { glyph: '✓', label: reviewed ? 'done · review ✓' : 'done · review pending', state: reviewed ? 'done' : 'awaiting-review', done: true };

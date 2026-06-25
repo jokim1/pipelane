@@ -4,7 +4,6 @@ import path from 'node:path';
 
 import {
   buildGoalSpecDraft,
-  renderGoalConfirmationPrompt,
   renderProviderGoalPrompt,
   type GoalSpec,
 } from './goal-spec.ts';
@@ -43,7 +42,12 @@ export interface OrchestrationCoverageEntry {
   sliceId?: string;
   reason?: string;
 }
-export type OrchestrationSliceStatus = 'planned' | 'prepared' | 'dispatched' | 'running' | 'blocked' | 'completed' | 'failed';
+// B1: `empty` = the worker exited 0 but produced no material change
+// (`collectChangedFiles` empty). It is conservative — it blocks dependents and
+// the run from completing (Decision 2); the remedy is re-dispatch with a sharper
+// goal, or defer. When adding a status here, also update the runtime whitelist in
+// `isOrchestrationSliceRecord` below.
+export type OrchestrationSliceStatus = 'planned' | 'prepared' | 'dispatched' | 'running' | 'blocked' | 'completed' | 'empty' | 'failed';
 export type OrchestrationSliceWorkerStatus = 'running' | 'succeeded' | 'failed';
 
 export const ORCHESTRATION_CORRUPT_LEDGER_BLOCK_AGE_MS = 14 * 24 * 60 * 60 * 1000;
@@ -112,8 +116,10 @@ export interface OrchestrationSliceRecord {
   reviewDiagnostics?: OrchestrationSliceReviewRecord[];
   goalSpec: GoalSpec;
   provider: GoalProvider;
-  providerPrompt: string;
-  confirmationPrompt: string;
+  // G1 / Decision 1: providerPrompt/confirmationPrompt are NOT persisted here.
+  // The worker prompt is derived from goalSpec + provider at dispatch time via
+  // `renderSliceWorkerPrompt` (single source), so a slice can never carry a
+  // stale prompt that drifts from its spec.
   requiresConfirmation: boolean;
   critique: string[];
   // PR1: optional grouping label and deferral flag. Absent (not `false`) on the
@@ -321,8 +327,6 @@ export function buildOrchestrationRunRecord(input: BuildOrchestrationRunInput): 
       reviewDiagnostics: [],
       goalSpec,
       provider: draft.provider,
-      providerPrompt: renderProviderGoalPrompt(goalSpec, draft.provider),
-      confirmationPrompt: renderGoalConfirmationPrompt(goalSpec),
       requiresConfirmation: draft.requiresConfirmation,
       critique: draft.critique,
     };
@@ -334,6 +338,17 @@ export function buildOrchestrationRunRecord(input: BuildOrchestrationRunInput): 
   for (let index = 1; index < slices.length; index += 1) {
     slices[index].dependsOn = [slices[index - 1].id];
   }
+
+  // Compile-time, fail-closed validation of the resolved spec (G1). Cross-refs
+  // and the dependency graph must be coherent before any worktree is created or
+  // worker spawned: a dangling/cyclic ref is a pre-flight error, not a run that
+  // hangs blocked at execution time.
+  validateOrchestrationSpec({
+    slices: slices.map((slice) => ({ id: slice.id, dependsOn: slice.dependsOn })),
+    coverage: input.coverage,
+    gates: input.config.reviewGates?.gates ?? [],
+    planGates: input.config.reviewGates?.planReview?.gates ?? [],
+  });
 
   const runId = makeRunId(input.repoRoot, slices);
   return {
@@ -369,6 +384,143 @@ export function buildOrchestrationRunRecord(input: BuildOrchestrationRunInput): 
     reviewFixes: [],
     ...(input.coverage && input.coverage.length > 0 ? { coverage: input.coverage } : {}),
   };
+}
+
+// G1 / Decision 1 + A3 groundwork: the worker prompt is a function of the
+// resolved spec, derived at dispatch time rather than persisted. This is the
+// single source for "the prompt a worker runs"; the human handoff (the dispatch
+// `.md`) is rendered separately in the orchestrate command and wraps this.
+export function renderSliceWorkerPrompt(slice: OrchestrationSliceRecord): string {
+  const sections = [renderProviderGoalPrompt(slice.goalSpec, slice.provider)];
+  const fileScope = renderAdvisoryFileScope(slice);
+  if (fileScope) sections.push(fileScope);
+  // A3: the worker now receives this prompt directly (not the human-handoff
+  // `.md`), so the execution guardrail that used to live in the handoff file
+  // must travel with the worker prompt — otherwise piping the clean prompt would
+  // silently drop a safety constraint.
+  sections.push([
+    '## Worker execution policy',
+    'Work only inside this slice worktree. Do not merge, deploy, clean worktrees, change unrelated files, or run release automation; Pipelane runs review and integration after you finish.',
+  ].join('\n'));
+  return sections.join('\n\n');
+}
+
+// A2: requestedFiles/forbiddenFiles are surfaced to the worker EXPLICITLY as
+// advisory. Pipelane does not enforce them (forbiddenFiles == prPathDenyList, a
+// PR-time path gate, not a worker sandbox), so the label must not imply a
+// protection that does not exist.
+function renderAdvisoryFileScope(slice: OrchestrationSliceRecord): string {
+  const lines: string[] = [];
+  if (slice.requestedFiles.length > 0) {
+    lines.push('Suggested files (hints parsed from the plan):', ...slice.requestedFiles.map((file) => `- ${file}`));
+  }
+  if (slice.forbiddenFiles.length > 0) {
+    if (lines.length > 0) lines.push('');
+    lines.push('Avoid changing (repo deny list):', ...slice.forbiddenFiles.map((file) => `- ${file}`));
+  }
+  if (lines.length === 0) return '';
+  return ['## File scope (advisory only — Pipelane does NOT enforce these)', ...lines].join('\n');
+}
+
+export interface OrchestrationSpecValidationSlice {
+  id: string;
+  dependsOn: string[];
+}
+
+export interface OrchestrationSpecValidationInput {
+  slices: OrchestrationSpecValidationSlice[];
+  coverage?: OrchestrationCoverageEntry[];
+  // Gate cross-references in pipelane are id-addressable only: gates do not
+  // reference goal/finish-line criteria the way a council rubric does, and gate
+  // well-formedness (required type fields, allowed phases/types) is already
+  // enforced by `normalizeReviewGatesConfig`. The compile step therefore checks
+  // gate-id uniqueness — the one integrity property the agent-proposed /
+  // hand-built config path (which bypasses normalization) can still violate.
+  // The substantive "a blocking semantic gate is configured" invariant (B3) is
+  // a separate, flag-gated check that lands later; it is intentionally not here.
+  gates?: { id: string }[];
+  planGates?: { id: string }[];
+}
+
+// G1 compile step: validate the resolved spec fail-closed. Throws a single,
+// actionable `Orchestration compile error: ...` on the first violation so the
+// CLI surfaces it as a pre-flight error (handlePlan/buildEntryRunRecord already
+// run inside throw-tolerant command handlers). Exported so the dependency-graph
+// invariants are unit-testable directly with crafted cyclic/diamond inputs that
+// `buildOrchestrationRunRecord` cannot otherwise produce (it always rebuilds
+// `dependsOn` as a linear chain).
+export function validateOrchestrationSpec(input: OrchestrationSpecValidationInput): void {
+  const sliceIds = new Set<string>();
+  for (const slice of input.slices) {
+    if (sliceIds.has(slice.id)) {
+      throw new Error(`Orchestration compile error: duplicate slice id "${slice.id}".`);
+    }
+    sliceIds.add(slice.id);
+  }
+
+  for (const slice of input.slices) {
+    for (const dependencyId of slice.dependsOn) {
+      if (dependencyId === slice.id) {
+        throw new Error(`Orchestration compile error: slice "${slice.id}" depends on itself.`);
+      }
+      if (!sliceIds.has(dependencyId)) {
+        throw new Error(`Orchestration compile error: slice "${slice.id}" depends on unknown slice "${dependencyId}".`);
+      }
+    }
+  }
+
+  assertNoDependencyCycle(input.slices);
+
+  (input.coverage ?? []).forEach((entry, index) => {
+    if (entry.disposition === 'slice') {
+      if (!entry.sliceId) {
+        throw new Error(`Orchestration compile error: coverage ${index + 1} for section "${entry.section}" maps to a slice but has no sliceId.`);
+      }
+      if (!sliceIds.has(entry.sliceId)) {
+        throw new Error(`Orchestration compile error: coverage ${index + 1} references unknown slice "${entry.sliceId}".`);
+      }
+    } else if (entry.sliceId && !sliceIds.has(entry.sliceId)) {
+      throw new Error(`Orchestration compile error: coverage ${index + 1} references unknown slice "${entry.sliceId}".`);
+    }
+  });
+
+  assertUniqueGateIds(input.gates ?? [], 'gate');
+  assertUniqueGateIds(input.planGates ?? [], 'plan-review gate');
+}
+
+function assertNoDependencyCycle(slices: OrchestrationSpecValidationSlice[]): void {
+  const dependenciesById = new Map(slices.map((slice) => [slice.id, slice.dependsOn]));
+  const state = new Map<string, 'visiting' | 'done'>();
+  const stack: string[] = [];
+
+  const visit = (id: string): void => {
+    const current = state.get(id);
+    if (current === 'done') return;
+    if (current === 'visiting') {
+      const cycleStart = stack.indexOf(id);
+      const cycle = [...stack.slice(cycleStart >= 0 ? cycleStart : 0), id].join(' -> ');
+      throw new Error(`Orchestration compile error: dependency cycle detected: ${cycle}.`);
+    }
+    state.set(id, 'visiting');
+    stack.push(id);
+    for (const dependencyId of dependenciesById.get(id) ?? []) {
+      if (dependenciesById.has(dependencyId)) visit(dependencyId);
+    }
+    stack.pop();
+    state.set(id, 'done');
+  };
+
+  for (const slice of slices) visit(slice.id);
+}
+
+function assertUniqueGateIds(gates: { id: string }[], label: string): void {
+  const seen = new Set<string>();
+  for (const gate of gates) {
+    if (seen.has(gate.id)) {
+      throw new Error(`Orchestration compile error: duplicate ${label} id "${gate.id}".`);
+    }
+    seen.add(gate.id);
+  }
 }
 
 export function saveOrchestrationRunRecord(
@@ -541,7 +693,7 @@ function isOrchestrationSliceRecord(value: unknown): value is OrchestrationSlice
   const slice = value as Partial<OrchestrationSliceRecord>;
   return typeof slice.id === 'string'
     && typeof slice.index === 'number'
-    && ['planned', 'prepared', 'dispatched', 'running', 'blocked', 'completed', 'failed'].includes(slice.status ?? '')
+    && ['planned', 'prepared', 'dispatched', 'running', 'blocked', 'completed', 'empty', 'failed'].includes(slice.status ?? '')
     && typeof slice.outcome === 'string'
     && Array.isArray(slice.dependsOn)
     && Array.isArray(slice.requestedFiles)
@@ -575,6 +727,10 @@ export function sliceReviewFullySatisfied(
 ): boolean {
   const reviewRun = slice.review?.run;
   if (slice.worker?.status !== 'succeeded') return false;
+  // B1 (Decision 2): an `empty` slice is never completion-satisfied, even if its
+  // gates passed on the unchanged worktree. The run cannot complete with an
+  // in-scope empty slice; the remedy is re-dispatch with a sharper goal, or defer.
+  if (slice.status === 'empty') return false;
   if (reviewRun?.status !== 'passed') return false;
   if (
     reviewRun.dryRun
