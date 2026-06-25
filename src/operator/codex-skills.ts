@@ -124,8 +124,11 @@ Run the repo-native pipelane command currently mapped to ${slashAlias}.
    \`"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.agents/skills/${MANAGED_CODEX_RUNNER}" ${command} <parsed arguments>\`
 4. Stream the command output directly.
 5. If the output prints "Choose the action to take:", ask the user to pick one
-   of the printed choices. Do not reduce it to "rerun with --yes"; when the
-   user picks a runnable choice, run the matching command.
+   of the printed numbered choices and preserve each number, label, and command
+   in your chat prompt. Do not reduce it to "rerun with --yes", "option 1", or
+   "option 2"; when the user picks a runnable choice, run the matching command.
+   In follow-up reminders, restate the action label, for example
+   "1 (Continue to /deploy staging)" or "2 (Take one step only)".
 ${buildWorkflowSkillGuidance(command, slashAlias)}
 `;
 }

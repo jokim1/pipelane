@@ -98,6 +98,14 @@ Bare \`${slashAlias}\`, \`${slashAlias} help\`, and \`${slashAlias} --help\`
 print the dispatcher command reference. Use that output when the user asks what
 Pipelane can do instead of guessing from memory.
 
+## Choice handoff behavior
+
+If \`${slashAlias} update\`, setup, status, or any other dispatcher flow runs
+after a prior command printed a numbered selector, do not refer back to only
+"option 1" or "option 2". Restate the number with its action label and command,
+for example \`1 (Continue to /deploy staging: run /merge, then /deploy staging)\`
+or \`2 (Take one step only: run /merge)\`.
+
 ## Interactive review setup behavior
 
 Agent Bash tools commonly run commands without an interactive TTY, and shell
@@ -262,8 +270,11 @@ Run ${commandLabel}.
    \`${runnerCommand}\`
 4. Stream the command output directly.
 5. If the output prints "Choose the action to take:", ask the user to pick one
-   of the printed choices. Do not reduce it to "rerun with --yes"; when the
-   user picks a runnable choice, run the matching command.
+   of the printed numbered choices and preserve each number, label, and command
+   in your chat prompt. Do not reduce it to "rerun with --yes", "option 1", or
+   "option 2"; when the user picks a runnable choice, run the matching command.
+   In follow-up reminders, restate the action label, for example
+   "1 (Continue to /deploy staging)" or "2 (Take one step only)".
 ${renderWorkflowSkillGuidance(options.command, options.slashAlias)}
 `;
 }

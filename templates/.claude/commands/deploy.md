@@ -25,8 +25,12 @@ the deploy through `pipelane run api action deploy.prod --execute --confirm-toke
 using the token issued by a prior `api action deploy.prod` preflight.
 
 Display the output directly. If the output prints "Choose the action to take:",
-ask the user to pick one of the printed choices; do not reduce it to "rerun with
---yes". When the user picks a runnable choice, run the matching slash command.
+ask the user to pick one of the printed numbered choices and preserve each
+number, label, and command in your chat prompt; do not reduce it to "rerun with
+--yes", "option 1", or "option 2". In follow-up reminders, restate the action
+label, for example `1 (Continue to /deploy staging)` or
+`2 (Take one step only)`. When the user picks a runnable choice, run the
+matching slash command.
 Report the environment, SHA, surfaces, and next step using slash commands only.
 
 <!-- pipelane:consumer-extension:start -->

@@ -65,7 +65,7 @@ export function nonTtyConfirmationMessageForParsed(plan: DestinationPlan, parsed
   return [
     routeActionChoicesMessage(plan, parsed),
     '',
-    'Reply with 1, 2, or 3. For a raw shell, use --yes for option 1 or run the option 2 command directly.',
+    routeActionReplyMessage(plan, parsed),
   ].join('\n');
 }
 
@@ -150,11 +150,21 @@ function routeActionChoicesMessage(plan: DestinationPlan, parsed: ParsedOperator
     ...routeChecklistLines(plan),
     '',
     ...reviewGateLine,
-    'Choose the action to take:',
+    'Choose the action to take: reply with the number and label.',
     `1. Continue to ${sanitizeForTerminal(plan.targetCommand)}: run ${allSteps}`,
     nextStep ? `2. Take one step only: run ${formatRunnableStepCommand(nextStep, parsed, plan)}` : '2. Take one step only: no next step is available',
     '3. Cancel',
   ].join('\n');
+}
+
+function routeActionReplyMessage(plan: DestinationPlan, parsed: ParsedOperatorArgs | null): string {
+  const targetCommand = sanitizeForTerminal(plan.targetCommand);
+  const nextStep = nextExecutableStep(plan);
+  if (!nextStep) {
+    return `Reply 1 (Continue to ${targetCommand}) or 3 (Cancel). No single-step command is currently available.`;
+  }
+  const nextCommand = formatRunnableStepCommand(nextStep, parsed, plan);
+  return `Reply 1 (Continue to ${targetCommand}), 2 (Take one step only: ${nextCommand}), or 3 (Cancel). For a raw shell, use --yes to continue or run ${nextCommand} directly.`;
 }
 
 function routeChecklistLines(plan: DestinationPlan): string[] {

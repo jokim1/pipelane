@@ -160,6 +160,12 @@ where `$REST` is `$ARGUMENTS` with the leading `status` token stripped.
 
 Use this path for `/pipelane status`, `/pipelane status --json`, `/pipelane status --week`, `/pipelane status --stuck`, and `/pipelane status --blast <sha>`. Display the output directly.
 
+If `/pipelane update`, setup, status, or any other dispatcher flow runs after a
+prior command printed a numbered selector, do not refer back to only "option 1"
+or "option 2". Restate the number with its action label and command, for
+example `1 (Continue to /deploy staging: run /merge, then /deploy staging)` or
+`2 (Take one step only: run /merge)`.
+
 ---
 
 ## REVIEW MODE

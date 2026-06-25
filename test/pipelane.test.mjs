@@ -2074,9 +2074,14 @@ test('install-codex outside a pipelane repo installs durable global default skil
     assert.match(deploySkill, /Reply 1 or Y to execute/);
     assert.match(deploySkill, /PR shorthand behavior/);
     assert.match(deploySkill, /pass it as `--pr 625`/);
+    assert.match(deploySkill, /printed numbered choices/);
+    assert.match(deploySkill, /preserve each number, label, and command/);
+    assert.match(deploySkill, /1 \(Continue to \/deploy staging\)/);
     const pipelaneSkill = readFileSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
     assert.match(pipelaneSkill, /normal clean repo setup and repair path/);
     assert.match(pipelaneSkill, /should not be treated as consent to materialize/);
+    assert.match(pipelaneSkill, /Choice handoff behavior/);
+    assert.match(pipelaneSkill, /do not refer back to only\n"option 1" or "option 2"/);
     assert.match(pipelaneSkill, /Interactive review setup behavior/);
     assert.match(pipelaneSkill, /runner command above/);
     assert.match(pipelaneSkill, /npm run workflow:\*/);
@@ -2132,9 +2137,14 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     const deploySkill = readFileSync(path.join(claudeHome, 'skills', 'deploy', 'SKILL.md'), 'utf8');
     assert.match(deploySkill, /PR shorthand behavior/);
     assert.match(deploySkill, /pass it as `--pr 625`/);
+    assert.match(deploySkill, /printed numbered choices/);
+    assert.match(deploySkill, /preserve each number, label, and command/);
+    assert.match(deploySkill, /1 \(Continue to \/deploy staging\)/);
     const pipelaneSkill = readFileSync(path.join(claudeHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
     assert.match(pipelaneSkill, /normal clean repo setup and repair path/);
     assert.match(pipelaneSkill, /should not be treated as consent to materialize/);
+    assert.match(pipelaneSkill, /Choice handoff behavior/);
+    assert.match(pipelaneSkill, /do not refer back to only\n"option 1" or "option 2"/);
     assert.match(pipelaneSkill, /Interactive review setup behavior/);
     assert.match(pipelaneSkill, /runner command above/);
     assert.match(pipelaneSkill, /npm run workflow:\*/);
@@ -2453,7 +2463,12 @@ test('custom aliases drive generated Claude commands, docs, and tracked Codex sk
     assert.equal(existsSync(path.join(repoRoot, '.agents', 'skills', 'new', 'SKILL.md')), false);
     assert.equal(existsSync(path.join(repoRoot, '.agents', 'skills', 'resume', 'SKILL.md')), false);
     assert.equal(existsSync(path.join(repoRoot, '.agents', 'skills', 'pr', 'SKILL.md')), false);
-    assert.match(readFileSync(path.join(repoRoot, '.agents', 'skills', 'branch', 'SKILL.md'), 'utf8'), /run-pipelane\.sh" new/);
+    const branchSkill = readFileSync(path.join(repoRoot, '.agents', 'skills', 'branch', 'SKILL.md'), 'utf8');
+    assert.match(branchSkill, /run-pipelane\.sh" new/);
+    assert.match(branchSkill, /preserve each number, label, and command/);
+    const deployCommand = readFileSync(path.join(repoRoot, '.claude', 'commands', 'deploy.md'), 'utf8');
+    assert.match(deployCommand, /printed numbered choices/);
+    assert.match(deployCommand, /preserve each\nnumber, label, and command/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -16255,6 +16270,8 @@ test('lockless PR branch can report, merge by PR number, and deploy the merged P
     assert.match(`${openDeploy.stdout}\n${openDeploy.stderr}`, /1\. Continue to \/deploy staging: run \/merge --pr 1, then \/deploy staging --pr 1/);
     assert.match(`${openDeploy.stdout}\n${openDeploy.stderr}`, /2\. Take one step only: run \/merge --pr 1/);
     assert.match(`${openDeploy.stdout}\n${openDeploy.stderr}`, /3\. Cancel/);
+    assert.match(`${openDeploy.stdout}\n${openDeploy.stderr}`, /Reply 1 \(Continue to \/deploy staging\), 2 \(Take one step only: \/merge --pr 1\), or 3 \(Cancel\)/);
+    assert.doesNotMatch(`${openDeploy.stdout}\n${openDeploy.stderr}`, /option 1|option 2/);
     assert.equal(existsSync(lockPath), false, 'failed lockless deploy must not recreate the task lock');
 
     const currentBranch = run('git', ['branch', '--show-current'], repoRoot);
