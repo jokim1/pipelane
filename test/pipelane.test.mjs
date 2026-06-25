@@ -19240,6 +19240,15 @@ function autoUpdateCachePathForTest(repoRoot, pipelaneHome) {
   return path.join(pipelaneHome, 'update-checks', `${key}.json`);
 }
 
+async function waitForPathForTest(targetPath, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(targetPath)) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for ${targetPath}`);
+}
+
 test('CLI auto-updates workflow commands and re-execs the updated local bin without stdout noise', () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-bin-'));
@@ -19318,17 +19327,28 @@ test('CLI notifies about updates by default without installing or re-pinning', a
       ],
       npmMarkerPath: npmInstallLog,
     });
+    const cachePath = autoUpdateCachePathForTest(consumerRoot, pipelaneHome);
 
     // Default behavior: PIPELANE_AUTO_UPDATE unset -> notify-only. The global
     // test setup pins it to '0'; clear it here to exercise the real default.
     const env = {
       ...process.env,
       PIPELANE_HOME: pipelaneHome,
-      PIPELANE_AUTO_UPDATE_TTL_MS: '0',
       PORT: String(port),
       PATH: `${binDir}:${process.env.PATH}`,
     };
     delete env.PIPELANE_AUTO_UPDATE;
+
+    const first = spawnSync('node', [CLI_PATH, 'board', 'status'], {
+      cwd: consumerRoot,
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(first.status, 0, first.stderr);
+    assert.doesNotMatch(first.stderr, /New Pipelane update available/);
+    assert.equal(existsSync(npmInstallLog), false, 'notify-only must not run npm install');
+    await waitForPathForTest(cachePath);
 
     const result = spawnSync('node', [CLI_PATH, 'board', 'status'], {
       cwd: consumerRoot,
@@ -19336,7 +19356,6 @@ test('CLI notifies about updates by default without installing or re-pinning', a
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-
     assert.equal(result.status, 0, result.stderr);
     // Notice fired: names the available update, tells slash-command users what
     // to run, and summarizes the update from compare commits.
@@ -19350,6 +19369,66 @@ test('CLI notifies about updates by default without installing or re-pinning', a
     // package.json pin untouched: lock still resolves to the old sha.
     const lock = JSON.parse(readFileSync(path.join(consumerRoot, 'package-lock.json'), 'utf8'));
     assert.equal(lock.packages['node_modules/pipelane'].resolved.endsWith(`#${oldSha}`), true);
+  } finally {
+    rmSync(consumerRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('CLI notifies from a fresh cached update without re-checking remote status', async () => {
+  const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-cached-notify-consumer-'));
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-cached-notify-bin-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  const remoteCallLog = path.join(consumerRoot, 'remote-calls.log');
+  const oldSha = '1111111111111111111111111111111111111111';
+  const newSha = '2222222222222222222222222222222222222222';
+  const port = await getFreePort();
+  try {
+    writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    const cachePath = autoUpdateCachePathForTest(consumerRoot, pipelaneHome);
+    mkdirSync(path.dirname(cachePath), { recursive: true });
+    writeFileSync(
+      cachePath,
+      JSON.stringify({
+        checkedAt: new Date().toISOString(),
+        installedSha: oldSha,
+        latestSha: newSha,
+        upToDate: false,
+        aheadBy: 2,
+        commits: [
+          { sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', subject: 'Ship cached update notices' },
+          { sha: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', subject: 'Polish upgrade copy' },
+        ],
+      }, null, 2) + '\n',
+      'utf8',
+    );
+    makeFakeUpdateBin(binDir, {
+      latestSha: newSha,
+      gitMarkerPath: remoteCallLog,
+      compareMarkerPath: remoteCallLog,
+    });
+
+    const env = {
+      ...process.env,
+      PIPELANE_HOME: pipelaneHome,
+      PORT: String(port),
+      PATH: `${binDir}:${process.env.PATH}`,
+    };
+    delete env.PIPELANE_AUTO_UPDATE;
+
+    const result = spawnSync('node', [CLI_PATH, 'board', 'status'], {
+      cwd: consumerRoot,
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /New Pipelane update available \(1111111 -> 2222222\)/);
+    assert.match(result.stderr, /Run `\/pipelane update` to install it/);
+    assert.match(result.stderr, /What's new: Ship cached update notices\. Polish upgrade copy\./);
+    assert.equal(existsSync(remoteCallLog), false, 'fresh cached update notice must not re-check remote status');
   } finally {
     rmSync(consumerRoot, { recursive: true, force: true });
     rmSync(binDir, { recursive: true, force: true });
@@ -19466,7 +19545,7 @@ test('CLI auto-update cache write failures do not block commands', async () => {
   }
 });
 
-test('CLI auto-update ignores cached stale status entries', () => {
+test('CLI auto-update installs from cached stale status entries', () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-bin-'));
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
