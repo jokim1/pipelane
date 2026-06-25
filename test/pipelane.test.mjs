@@ -6985,6 +6985,72 @@ test('review executes configured AI skill gate command and records attester evid
   }
 });
 
+// B4 (programmatic-before-judge): when a blocking deterministic gate fails, the
+// expensive AI judge that follows is deferred to `pending` (not `skipped`, which
+// can pass) and is NOT invoked — proven by the judge's sentinel file staying
+// absent. The review fails on the deterministic gate regardless.
+test('review defers the AI judge to pending when a blocking deterministic gate fails', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [
+        {
+          id: 'always-fails',
+          phase: 'static',
+          type: 'command',
+          command: `${process.execPath} -e "process.exit(7)"`,
+          blocking: true,
+        },
+        {
+          id: 'gstack-review',
+          phase: 'ai-diff',
+          type: 'skill',
+          skill: 'review',
+          userCommands: ['/review'],
+          blocking: true,
+        },
+      ],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt a failing deterministic gate before an AI judge');
+
+    // If invoked, the AI judge writes a sentinel and reports passed.
+    const aiReviewCommand = [
+      'node -e "',
+      'const fs = require(\'fs\');',
+      'let input = \'\';',
+      'process.stdin.on(\'data\', chunk => input += chunk);',
+      'process.stdin.on(\'end\', () => {',
+      'fs.writeFileSync(\'ai-judge-invoked.txt\', \'invoked\', \'utf8\');',
+      'console.log(\'PIPELANE_REVIEW_GATE_RESULT=passed\');',
+      '});',
+      '"',
+    ].join('');
+    const result = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      PIPELANE_REVIEW_GATE_COMMAND: aiReviewCommand,
+      PIPELANE_REVIEW_PROVIDER: 'codex',
+    }, true).stdout);
+
+    assert.equal(result.status, 'failed');
+    const deterministic = result.gates.find((gate) => gate.gateId === 'always-fails');
+    const judge = result.gates.find((gate) => gate.gateId === 'gstack-review');
+    assert.equal(deterministic.status, 'failed');
+    // Deferred to pending — not skipped (which can pass), not passing.
+    assert.equal(judge.status, 'pending');
+    assert.match(judge.summary, /deferred: a blocking deterministic gate failed/);
+    // The judge command never ran: no sentinel, no attester evidence.
+    assert.equal(existsSync(path.join(repoRoot, 'ai-judge-invoked.txt')), false);
+    assert.equal(judge.attester, undefined);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('review fails configured AI skill gate when command mutates the worktree', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {

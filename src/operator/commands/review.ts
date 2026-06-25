@@ -1901,7 +1901,14 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
 
   const startedAt = nowIso();
   const runStartMs = Date.now();
-  const gateRecords = selectedGates.map((gate) => {
+  // B4 (programmatic-before-judge): gates already run in phase order (static and
+  // behavioral before ai-diff). As deterministic gates run, track whether a
+  // blocking one failed; if so, defer the expensive AI judge gates that follow to
+  // `pending` instead of invoking them. The review fails on the deterministic gate
+  // regardless, so this saves tokens and fails closed (`pending`, never `skipped`).
+  const gateRecords: ReviewGateRunRecord[] = [];
+  let blockingDeterministicFailure = false;
+  for (const gate of selectedGates) {
     options.onGateStart?.(gate);
     const record = runReviewGate({
       gate,
@@ -1911,10 +1918,14 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
       reviewConfigChanged,
       changedFiles,
       activeSurfaces: options.activeSurfaces,
+      deferAiGate: blockingDeterministicFailure,
     });
+    if (isDeterministicReviewGate(gate) && record.blocking && record.status === 'failed') {
+      blockingDeterministicFailure = true;
+    }
     options.onGateFinish?.(record);
-    return record;
-  });
+    gateRecords.push(record);
+  }
   const finishedAt = nowIso();
   const status = summarizeRunStatus(gateRecords);
 
@@ -1938,6 +1949,12 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
   };
 }
 
+// B4: deterministic gates execute programmatically (pass/fail) with no AI judge —
+// these run before and gate the expensive skill/agent judges.
+function isDeterministicReviewGate(gate: Pick<ReviewGateConfig, 'type'>): boolean {
+  return gate.type === 'command' || gate.type === 'pipelane';
+}
+
 function orderReviewGates(gates: ReviewGateConfig[]): ReviewGateConfig[] {
   return [...gates].sort((left, right) => {
     const phaseDelta = REVIEW_PHASE_ORDER.indexOf(left.phase) - REVIEW_PHASE_ORDER.indexOf(right.phase);
@@ -1953,6 +1970,9 @@ function runReviewGate(options: {
   reviewConfigChanged: boolean;
   changedFiles: string[];
   activeSurfaces: string[];
+  // B4: when a blocking deterministic gate has already failed this run, defer the
+  // expensive AI judge to `pending` instead of invoking it.
+  deferAiGate?: boolean;
 }): ReviewGateRunRecord {
   const { gate, repoRoot, baseBranch, dryRun, reviewConfigChanged, changedFiles, activeSurfaces } = options;
   const startedAt = nowIso();
@@ -1979,6 +1999,15 @@ function runReviewGate(options: {
   }
 
   if (gate.type === 'skill' || gate.type === 'agent') {
+    if (options.deferAiGate) {
+      // B4 (programmatic-before-judge): a blocking deterministic gate already
+      // failed, so the review fails regardless — defer the judge to `pending`
+      // (not `skipped`, which can pass) without spending tokens on it.
+      return finishGate(base, startMs, {
+        status: 'pending',
+        summary: `deferred: a blocking deterministic gate failed; ${gate.type} judge ${gate.id} not invoked until programmatic gates pass`,
+      });
+    }
     return runAiReviewGate({
       base,
       startMs,
