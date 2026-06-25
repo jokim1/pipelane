@@ -1,5 +1,9 @@
 import crypto from 'node:crypto';
 
+import {
+  isCrossModelReviewGate,
+  isIndependentAiReviewGate,
+} from './review-gate-policy.ts';
 import type { ReviewActorIdentity, ReviewRunRecord } from './state.ts';
 
 export type ReviewIndependenceLabel =
@@ -35,6 +39,19 @@ const PROVIDER_ENV_KEYS = [
   'PIPELANE_AGENT_PROVIDER',
   'PIPELANE_REVIEW_PROVIDER',
   'PIPELANE_ORCHESTRATE_PROVIDER',
+] as const;
+
+const AUTHOR_SESSION_ENV_KEYS = [
+  'PIPELANE_AUTHOR_SESSION_ID',
+  'PIPELANE_WORKER_SESSION_ID',
+  'PIPELANE_ORCHESTRATE_WORKER_SESSION_ID',
+] as const;
+
+const AUTHOR_PROVIDER_ENV_KEYS = [
+  'PIPELANE_AUTHOR_PROVIDER',
+  'PIPELANE_WORKER_PROVIDER',
+  'PIPELANE_ORCHESTRATE_PROVIDER',
+  'PIPELANE_AGENT_PROVIDER',
 ] as const;
 
 const KNOWN_REVIEW_PROVIDERS = new Set(['codex', 'claude', 'openclaw']);
@@ -73,6 +90,26 @@ export function resolveReviewActorIdentity(options: {
     sessionId: session ? hashSessionId(session.value) : null,
     source: session?.key ?? 'unavailable',
   };
+}
+
+export function resolveReviewAuthorIdentity(options: {
+  provider?: string;
+  env?: NodeJS.ProcessEnv;
+} = {}): ReviewActorIdentity | null {
+  const env = options.env ?? process.env;
+  const session = firstEnvValue(env, AUTHOR_SESSION_ENV_KEYS);
+  if (session) {
+    const provider = normalizeOptionalIdentityText(options.provider)
+      || normalizeOptionalIdentityText(firstEnvValue(env, AUTHOR_PROVIDER_ENV_KEYS)?.value)
+      || 'unknown';
+    return createReviewActorIdentity({
+      provider,
+      sessionId: session.value,
+      source: session.key,
+    });
+  }
+  const fallback = resolveReviewActorIdentity(options);
+  return fallback.sessionId ? fallback : null;
 }
 
 export function classifyReviewIndependence(options: {
@@ -115,7 +152,7 @@ export function classifyReviewEvidenceIndependence(options: {
     if (
       gate.blocking === false
       || gate.status !== 'passed'
-      || (gate.type !== 'skill' && gate.type !== 'agent')
+      || !isIndependentAiReviewGate(gate)
     ) {
       continue;
     }
@@ -146,7 +183,7 @@ export function reviewRunHasBlockingPassedAiGate(reviewRun: Pick<ReviewRunRecord
   return reviewRun.gates.some((gate) =>
     gate.blocking !== false
     && gate.status === 'passed'
-    && (gate.type === 'skill' || gate.type === 'agent')
+    && isIndependentAiReviewGate(gate)
   );
 }
 
@@ -169,6 +206,7 @@ export function blockingAiReviewEvidenceBlocker(options: {
   reviewRun: Pick<ReviewRunRecord, 'gates' | 'reviewer'>;
   worker?: ReviewActorIdentity | null;
   allowTrustedAttesterWithoutWorker?: boolean;
+  allowSessionOnlyIndependence?: boolean;
 }): string | null {
   const worker = options.worker ?? null;
   const availableComparisonWorker = worker?.sessionId ? worker : null;
@@ -180,7 +218,7 @@ export function blockingAiReviewEvidenceBlocker(options: {
     if (
       gate.blocking === false
       || gate.status !== 'passed'
-      || (gate.type !== 'skill' && gate.type !== 'agent')
+      || !isIndependentAiReviewGate(gate)
     ) {
       continue;
     }
@@ -206,6 +244,18 @@ export function blockingAiReviewEvidenceBlocker(options: {
       return `gate ${gate.gateId}: recorded worker session identity is unavailable; blocking AI review evidence requires recorded worker and reviewer session identities`;
     }
     const independence = classifyReviewIndependence({ worker: comparisonWorker, reviewer: gate.attester });
+    if (isCrossModelReviewGate(gate) && independence.label !== 'cross-provider') {
+      return `gate ${gate.gateId}: cross-model review requires a different trusted provider family; ${independence.reason}`;
+    }
+    if (
+      options.allowSessionOnlyIndependence
+      && independence.label === 'unknown'
+      && availableComparisonWorker?.sessionId
+      && gate.attester.sessionId
+      && availableComparisonWorker.sessionId !== gate.attester.sessionId
+    ) {
+      continue;
+    }
     const blocker = aiReviewIndependenceBlocker({
       reviewRun: { gates: [gate] },
       independence: independence.label,

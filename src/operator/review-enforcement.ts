@@ -8,6 +8,7 @@ import {
   type WorkflowContext,
 } from './state.ts';
 import { blockingAiReviewEvidenceBlocker } from './review-identity.ts';
+import { REVIEW_GATES_POLICY_VERSION } from './review-gate-policy.ts';
 import { readWorktreeStatusSnapshot } from './worktree-status.ts';
 
 export type ReviewEvidenceGateStatus = 'missing' | 'failed' | 'pending' | 'incomplete';
@@ -52,6 +53,7 @@ export function evaluateReviewEvidenceForPr(
   const issues = collectReviewEvidenceIssues({
     latest,
     expectedGates,
+    strictIndependentAi: context.config.reviewGates?.policyVersion === REVIEW_GATES_POLICY_VERSION,
     currentBranch,
     currentSha,
     currentWorktreeStatusDigest: worktreeStatus.statusDigest,
@@ -97,6 +99,7 @@ export function formatReviewEvidenceBlocker(context: WorkflowContext, issues: Re
 function collectReviewEvidenceIssues(options: {
   latest: ReviewRunRecord | null;
   expectedGates: ReviewGateConfig[];
+  strictIndependentAi: boolean;
   currentBranch: string;
   currentSha: string;
   currentWorktreeStatusDigest: string;
@@ -106,6 +109,7 @@ function collectReviewEvidenceIssues(options: {
   const {
     latest,
     expectedGates,
+    strictIndependentAi,
     currentBranch,
     currentSha,
     currentWorktreeStatusDigest,
@@ -199,11 +203,17 @@ function collectReviewEvidenceIssues(options: {
     }
   }
 
-  const aiReviewBlocker = blockingAiReviewEvidenceBlocker({
-    reviewRun: latest,
-    worker: latest.reviewer ?? null,
-    allowTrustedAttesterWithoutWorker: true,
-  });
+  const aiReviewBlocker = strictIndependentAi
+    ? blockingAiReviewEvidenceBlocker({
+        reviewRun: latest,
+        worker: latest.authorIdentity ?? null,
+        allowSessionOnlyIndependence: true,
+      })
+    : blockingAiReviewEvidenceBlocker({
+        reviewRun: latest,
+        worker: latest.reviewer ?? null,
+        allowTrustedAttesterWithoutWorker: true,
+      });
   if (aiReviewBlocker) {
     issues.push({
       status: 'incomplete',

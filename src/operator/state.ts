@@ -130,6 +130,7 @@ export interface ReviewGateConfig {
 }
 
 export interface ReviewGatesConfig {
+  policyVersion?: number;
   planReview?: {
     gates?: ReviewPlanGateConfig[];
   };
@@ -428,6 +429,7 @@ export interface ReviewRunRecord {
   worktreeStatusDigest?: string;
   worktreeStatusReliable?: boolean;
   worktreeStatusWarnings?: string[];
+  authorIdentity?: ReviewActorIdentity | null;
   reviewer?: ReviewActorIdentity;
   gates: ReviewGateRunRecord[];
   signature?: string;
@@ -1274,6 +1276,9 @@ export function normalizeReviewGatesConfig(
     : defaults.gates;
 
   return {
+    policyVersion: typeof raw.policyVersion === 'number' && Number.isFinite(raw.policyVersion)
+      ? Math.trunc(raw.policyVersion)
+      : undefined,
     planReview: {
       gates: planGates ?? [],
     },
@@ -2468,6 +2473,7 @@ function isReviewRunRecord(value: unknown): value is ReviewRunRecord {
     && changedFiles.every((entry) => typeof entry === 'string')
     && (raw.worktreeStatusDigest === undefined || typeof raw.worktreeStatusDigest === 'string')
     && (raw.worktreeStatusReliable === undefined || typeof raw.worktreeStatusReliable === 'boolean')
+    && (raw.authorIdentity === undefined || raw.authorIdentity === null || isReviewActorIdentity(raw.authorIdentity))
     && (raw.reviewer === undefined || isReviewActorIdentity(raw.reviewer))
     && (raw.signature === undefined || typeof raw.signature === 'string')
     && (
