@@ -14821,6 +14821,68 @@ test('deploy fails closed when healthcheck returns non-2xx', () => {
   }
 });
 
+test('release-mode deploy staging can retry after the latest staging record failed', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  writeFileSync(ghStateFile, JSON.stringify({ prs: {}, workflows: [] }, null, 2), 'utf8');
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const sha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+    writeTaskLock(repoRoot, 'retry-staging', { mode: 'release', surfaces: ['frontend'] });
+    writePrRecord(repoRoot, 'retry-staging', sha);
+    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    writeFileSync(path.join(stateDir, 'mode-state.json'), JSON.stringify({
+      mode: 'release',
+      requestedSurfaces: ['frontend'],
+      override: null,
+      updatedAt: '2026-04-25T00:00:00Z',
+    }, null, 2), 'utf8');
+    writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({
+      records: [{
+        environment: 'staging',
+        sha,
+        surfaces: ['frontend'],
+        workflowName: 'Deploy Hosted',
+        requestedAt: '2026-04-25T00:00:00Z',
+        finishedAt: '2026-04-25T00:01:00Z',
+        taskSlug: 'retry-staging',
+        status: 'failed',
+        failureReason: 'remote migration history drift',
+        idempotencyKey: 'failed-staging-before-repair',
+        triggeredBy: 'test',
+      }],
+    }, null, 2), 'utf8');
+
+    const deployed = JSON.parse(runCli(
+      ['run', 'deploy', 'staging', '--task', 'retry-staging', '--json'],
+      repoRoot,
+      env,
+    ).stdout);
+
+    assert.equal(deployed.status, 'succeeded');
+    assert.equal(deployed.environment, 'staging');
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.workflows.length, 1, 'retry should dispatch without requiring a release override');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
 test('deploy fails before dispatch when a requested surface has no configured healthcheck URL', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-gh-'));
@@ -25659,6 +25721,70 @@ test('destination routes block opaque dirty approvals before local PR side effec
     assert.equal(result.status, 1);
     assert.match(payload.blockers.join('\n'), /worktree dirty state is too large or opaque/);
     assert.match(payload.blockers.join('\n'), /untracked directories are opaque/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('destination routes infer a task slug from a dirty lockless branch', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'configure pipelane'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['checkout', '-b', 'codex/add-custom-column-grouping-abcd'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(repoRoot, 'feature.txt'), 'hello\n', 'utf8');
+
+    const result = runCli(
+      ['run', 'deploy', 'staging', '--title', 'Add custom column grouping', '--plan', '--json'],
+      repoRoot,
+    );
+    const payload = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0);
+    assert.equal(payload.taskSlug, 'add-custom-column-grouping');
+    assert.equal(payload.taskName, '');
+    assert.deepEqual(payload.blockers, []);
+    assert.deepEqual(
+      payload.remainingSteps.map((step) => step.id),
+      ['pr', 'review_gate', 'merge', 'deploy_staging'],
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('destination routes require a title for dirty lockless branch PR creation', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'configure pipelane'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['checkout', '-b', 'codex/add-custom-column-grouping-abcd'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(repoRoot, 'feature.txt'), 'hello\n', 'utf8');
+
+    const result = runCli(
+      ['run', 'deploy', 'staging', '--plan', '--json'],
+      repoRoot,
+      {},
+      true,
+    );
+    const payload = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 1);
+    assert.equal(payload.taskSlug, 'add-custom-column-grouping');
+    assert.equal(payload.taskName, '');
+    assert.match(payload.blockers.join('\n'), /dirty local changes require --title/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }

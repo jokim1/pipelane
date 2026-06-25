@@ -469,7 +469,7 @@ function buildStepArgs(step: DestinationStep, parsed: ParsedOperatorArgs, plan: 
   if (step.id === 'pr') {
     args.push('pr');
     pushOpt('--task', parsed.flags.task || plan.taskSlug);
-    pushOpt('--title', parsed.flags.title || plan.taskSlug);
+    pushOpt('--title', parsed.flags.title || plan.taskName || plan.taskSlug);
     pushOpt('--message', parsed.flags.message);
     for (const force of parsed.flags.forceInclude) args.push('--force-include', force);
     return args;

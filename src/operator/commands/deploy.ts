@@ -283,10 +283,12 @@ export async function dispatchDeploy(
   const trustedRecords = stateKey
     ? deployState.records.filter((record) => verifyDeployRecord(record, stateKey))
     : deployState.records;
-  if (context.modeState.mode === 'release') {
-    // v1.2 readiness is now observed, not asserted. Callers to prod are also
-    // allowed to promote the same SHA they just verified in staging, so
-    // release-readiness for prod deploys counts the current deployState.
+  if (context.modeState.mode === 'release' && environment === 'prod') {
+    // v1.2 readiness is now observed, not asserted. Only production deploys
+    // require the release-readiness gate. Staging deploys are the remediation
+    // path that creates or repairs that evidence, so blocking them on a prior
+    // staging success would force unnecessary release overrides after any
+    // failed staging attempt.
     const probeState = loadProbeState(context.commonDir, context.config);
     const readiness = evaluateReleaseReadiness({
       config: context.config,
