@@ -109,28 +109,24 @@ export PATH="$HOME/.pipelane/bin:$PATH"
 Then open a repo and use:
 
 ```text
+/pipelane setup
 /pipelane status
 /new
 /pipelane review
 /pr
 ```
 
-### Repo-Local Opt-In
+### Clean Repo Setup
 
-Only run bootstrap when you intentionally want committed repo-local Pipelane
-config, command adapters, docs, and npm scripts:
-
-```bash
-npx -y pipelane@github:jokim1/pipelane#main bootstrap --yes --project "My App"
-```
-
-or:
+The normal first-run path is clean:
 
 ```bash
-pipelane bootstrap --yes --project "My App"
+pipelane setup
 ```
 
-Then review the generated files before committing anything.
+This uses machine-local commands and default repo inference. It does not create
+tracked Pipelane files unless the repo has explicitly opted into generated
+surfaces.
 
 For the first deploy from a newly onboarded release-mode repo, run:
 
@@ -445,13 +441,13 @@ Machine-local commands are the default install path:
 - live under your local Codex and Claude skill directories
 - do not require repo changes
 
-Repo-local adapters are opt-in:
+Repo-local adapters are legacy opt-in surfaces:
 
-- created by `pipelane bootstrap` or `pipelane setup`
+- created only by repos that explicitly enable `syncDocs`
 - committed with the repo
 - give each repo custom command text, aliases, and workflow docs
 
-Bootstrapping can add or manage:
+Those legacy repo-local surfaces can add or manage:
 - `.pipelane.json`
 - `.claude/commands/*`
 - `.agents/skills/*`

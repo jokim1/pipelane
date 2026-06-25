@@ -869,7 +869,7 @@ function emitGlobalSurfaceRefreshHint(result: GlobalSurfaceRefresh, options: Pic
 function emitDriftHint(result: DriftResult, options: Pick<UpdateOptions, 'output'>): void {
   if (result.error) {
     writeUpdateOutput(options, `\n[pipelane] Skipped drift detection: ${result.error}\n`);
-    writeUpdateOutput(options, 'Run `pipelane init` or `pipelane bootstrap` to enable setup follow-up.\n');
+    writeUpdateOutput(options, 'Run `pipelane setup` for clean local setup, or `pipelane configure` if deploy values are missing.\n');
     return;
   }
   const drift = result.drift;

@@ -340,7 +340,7 @@ export function syncCodexSkills(
     const skillName = aliasCommandName(slashAlias);
     if (skillName === INIT_PIPELANE_SKILL_NAME) {
       throw new Error(
-        `Workflow aliases must stay distinct from the reserved Codex bootstrap skill. ${command} resolves to ${slashAlias}, which conflicts with ${INIT_PIPELANE_SKILL_NAME}.`,
+        `Workflow aliases must stay distinct from the deprecated init-pipelane skill name. ${command} resolves to ${slashAlias}, which conflicts with ${INIT_PIPELANE_SKILL_NAME}.`,
       );
     }
     desiredSkills.add(skillName);

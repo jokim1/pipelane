@@ -1,5 +1,3 @@
-import path from 'node:path';
-
 import {
   readPackageJsonOverlay,
   resolveReadableConfigPath,
@@ -21,7 +19,6 @@ export function buildMissingDeployOnboardingMessage(
   }
 
   const environment = options.environment?.trim() || 'staging';
-  const projectName = path.basename(repoRoot);
   const retry = [
     '/deploy',
     environment,
@@ -33,8 +30,8 @@ export function buildMissingDeployOnboardingMessage(
     'No .pipelane.json, .project-workflow.json, or package.json:pipelane block was found.',
     'No deploy started.',
     '',
-    'Run the guided repo setup first:',
-    `  /init-pipelane --project "${projectName}"`,
+    'Run clean setup and deploy configuration first:',
+    '  /pipelane setup',
     '  /pipelane configure',
     `Then retry: ${retry}`,
     '',

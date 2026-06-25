@@ -12,7 +12,7 @@ export const MACHINE_CODEX_SKILL_MARKER_PREFIX = '<!-- pipelane:codex-global-ski
 export const MACHINE_CLAUDE_SKILL_MARKER_PREFIX = '<!-- pipelane:claude-global-skill:';
 export const REPO_CODEX_SKILL_MARKER_PREFIX = '<!-- pipelane:codex-skill:';
 
-export type DesiredInstallEntryKind = 'workflow' | 'dispatcher' | 'bootstrap' | 'prompt';
+export type DesiredInstallEntryKind = 'workflow' | 'dispatcher' | 'prompt';
 
 export interface DesiredInstallEntry {
   kind: DesiredInstallEntryKind;
@@ -48,12 +48,6 @@ export interface PromptSkillBodyOptions {
   markerPrefix: string;
 }
 
-export interface BootstrapSkillBodyOptions {
-  host: HostInstall;
-  bootstrapScriptPath: string;
-  markerPrefix: string;
-}
-
 export interface ManagedRunnerScriptOptions {
   managedRuntimeRoot: string;
   managedPipelaneBin: string;
@@ -78,7 +72,7 @@ function renderWorkflowSkillGuidance(command: WorkflowCommand | 'pipelane', slas
     return `
 ## Setup and configure behavior
 
-Treat \`${slashAlias} setup\` as the normal repo setup path and
+Treat \`${slashAlias} setup\` as the normal clean repo setup and repair path and
 \`${slashAlias} configure\` as the normal deploy configuration path. Do not ask
 the user to run \`! pipelane configure\` in a terminal; the durable runner knows
 where the managed pipelane runtime is even when \`pipelane\` is not on PATH.
@@ -87,7 +81,10 @@ scripts for bootstrap/task-start flows in a fresh checkout; npm resolves those
 through \`node_modules/.bin/pipelane\` and can fail before Pipelane links or
 installs dependencies.
 
-Plain \`${slashAlias} setup\` configures the repo-wide Pipelane files. Plain
+Plain \`${slashAlias} setup\` should not be treated as consent to materialize
+tracked repo-local adapters. It uses the machine-local Pipelane runtime and
+only syncs repo-local files for repos that have explicitly opted into those
+surfaces. Plain
 \`${slashAlias} review setup\` configures the pre-PR review gates. Keep those
 two setup flows distinct.
 
@@ -289,28 +286,6 @@ ${buildSkillMarker(options.markerPrefix, options.name)}
 ${options.body}`;
 }
 
-export function renderBootstrapSkillBody(options: BootstrapSkillBodyOptions): string {
-  return `---
-name: ${INIT_PIPELANE_SKILL_NAME}
-version: 1.0.0
-description: Bootstrap the current repo with pipelane.
-allowed-tools:
-  - Bash
-${sideEffectFrontmatter(options.host)}---
-${buildSkillMarker(options.markerPrefix, INIT_PIPELANE_SKILL_NAME)}
-
-Run the global pipelane bootstrap for this machine.
-
-1. Parse any arguments that appear after \`/${INIT_PIPELANE_SKILL_NAME}\` in the user's message.
-2. Preserve quoted substrings when building the shell command.
-3. Before running, tell the user: "This can write .pipelane.json, .claude/, .agents/, package.json scripts, docs, and other generated repo files. Do not run this in public, open-source, or otherwise clean repos unless you intentionally want those local or committed surfaces." Ask for confirmation.
-4. After the user confirms, run:
-   \`${options.bootstrapScriptPath} --yes <parsed arguments>\`
-5. Stream the command output directly.
-6. After success, tell the user they may need to reopen ${hostDescription(options.host)} so refreshed commands and skills are visible.
-`;
-}
-
 export function renderBootstrapScript(pipelaneBinPath: string): string {
   return `#!/bin/sh
 set -eu
@@ -342,23 +317,32 @@ fi
 
 print_pipelane_help() {
   cat <<'PIPELANE_HELP'
-Pipelane dispatcher
+Pipelane is a build, release, and development orchestrator for AI-assisted
+codebases. It keeps task worktrees, PRs, review gates, deploy promotion,
+rollback, cleanup, and multi-agent implementation work on an explicit path so
+agents do not invent local process or skip release safety.
+
+The normal first-run path is clean: /pipelane setup uses the machine-local
+runtime and should not create tracked repo files unless the repo has explicitly
+opted into repo-local generated surfaces. /pipelane configure is the place to
+add deploy targets, health checks, and release-mode details. /pipelane update
+only updates Pipelane itself.
 
 Usage:
   /pipelane <command> [args...]
   /pipelane help
 
-Setup and maintenance:
+Start here:
   /pipelane setup [--yes]
-      Sync or repair repo-local Pipelane files: generated commands, Codex
-      skills, docs, package scripts, and local guidance scaffolds.
+      Run clean first-time setup or repair. Uses local defaults unless the repo
+      has explicitly opted into generated command/docs/package-script surfaces.
 
   /pipelane configure [--json] [flags...]
       Fill or update Deploy Configuration values such as staging/prod URLs,
       deploy workflow names, healthchecks, edge/sql commands, and Supabase refs.
 
   /pipelane update [--check] [--yes] [--json]
-      Check or update the repo-local Pipelane install used by slash commands.
+      Check or update Pipelane itself when this repo has a pinned install.
 
 Status and UI:
   /pipelane status [--json]
@@ -372,16 +356,19 @@ Status and UI:
 
 Review gates:
   /pipelane review [--dry-run] [--gate <id>] [--phase <phase>]
-      Run configured review gates and write evidence for the current diff.
+      Run configured review gates for the current diff and write evidence that
+      /pr and orchestrated slice review can trust.
 
   /pipelane review setup [--yes] [--print] [--list-gates]
                          [--enable <gate>] [--disable <gate>] [--install <gate>]
-      Configure pre-PR review gates. This is different from /pipelane setup,
-      which configures repo-wide Pipelane files.
+      Choose the pre-PR review model. This is different from /pipelane setup;
+      it configures quality gates such as tests, self-review, independent AI
+      review, instruction audit, and human approval for high-stakes changes.
 
 Orchestration:
   /pipelane orchestrate --plan-file <file> --yes
-      Plan, prepare, dispatch, start, and review a multi-slice implementation.
+      Turn a plan into reviewed implementation slices with isolated worktrees,
+      worker prompts, status tracking, and per-slice review before merge.
 
   /pipelane orchestrate plan|prepare|dispatch|start|review
       Run one orchestration phase at a time.
@@ -389,13 +376,18 @@ Orchestration:
   /pipelane orchestrate goal-spec [--plan-file <file>] [--slice-id <id>]
       Draft a provider-neutral implementation goal spec.
 
-Common companion slash commands after setup:
-  /new, /resume, /repo-guard, /pr, /merge, /deploy, /clean, /doctor,
-  /rollback
+Build and release companion commands:
+  /new              Create an isolated task worktree.
+  /pr               Prepare and gate a pull request.
+  /merge            Merge an approved PR.
+  /deploy staging   Deploy the merged SHA to staging.
+  /deploy prod      Promote a verified staging SHA to production.
+  /clean            Close out merged/deployed task worktrees.
+  /doctor           Diagnose deploy and runtime configuration.
+  /rollback         Roll back staging or production to a prior verified deploy.
 
 Tip:
-  Use /pipelane setup as the guided first-run repair flow. Use
-  /pipelane configure later when only deploy values need to change.
+  Use /pipelane status when you are unsure what is safe next.
 PIPELANE_HELP
 }
 
@@ -587,18 +579,6 @@ export function desiredHostInstall(
       name: FIX_SKILL_NAME,
       description: 'Produce durable, root-cause fixes without running a shell wrapper.',
       body: paths.fixPromptBody,
-      markerPrefix,
-    }),
-  });
-
-  entries.push({
-    kind: 'bootstrap',
-    name: INIT_PIPELANE_SKILL_NAME,
-    slashAlias: `/${INIT_PIPELANE_SKILL_NAME}`,
-    required: true,
-    body: renderBootstrapSkillBody({
-      host,
-      bootstrapScriptPath: paths.bootstrapScriptPath,
       markerPrefix,
     }),
   });

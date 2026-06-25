@@ -28,19 +28,16 @@ import { collectUpdateStatus, maybeAutoUpdate, parseUpdateArgs, refreshAutoUpdat
 import { runVerify } from './operator/verify.ts';
 
 function printTopLevelHelp(): void {
-  process.stdout.write(`Pipelane - release pipeline management and safety for AI vibe coders
+  process.stdout.write(`Pipelane - build, release, and development orchestration for AI-assisted codebases
 
 Commands:
-  bootstrap [--yes] [--project "Project Name"]
-  init --project "Project Name"
   setup [--yes]
-  sync-docs
   configure [--json] [surface flags...]
+  update [--check] [--yes] [--json]
   install-claude [--verbose]
   install-codex [--verbose]
   install-npm-guard
   verify
-  update [--check] [--yes] [--json]
   dashboard [--repo <repo-root>] [--host <host>] [--port <port>]
   board [stop|status] [--repo <repo-root>] [--port <port>] [--no-open]
   run <operator command...>
@@ -49,7 +46,8 @@ Examples:
   pipelane install-codex
   pipelane install-claude
   pipelane install-npm-guard
-  pipelane bootstrap --yes --project "My Project"
+  pipelane setup
+  pipelane configure
   pipelane board
   pipelane board stop
   pipelane update --check
@@ -496,6 +494,9 @@ async function main(): Promise<void> {
     const result = installClaudeBootstrapSkill();
     const lines = [`Installed ${result.installed.length} durable Pipelane Claude commands in ${result.claudeHome}.`];
     lines.push(...repoLocalInstallCheckLines(process.cwd()));
+    if (result.removedLegacySkills.length > 0) {
+      lines.push(`Removed legacy machine-local wrapper skills: ${result.removedLegacySkills.join(', ')}`);
+    }
     if (result.skipped.length > 0) {
       lines.push(`Skipped unmanaged optional skills: ${result.skipped.join(', ')}. Use /pipelane-fix.`);
     }

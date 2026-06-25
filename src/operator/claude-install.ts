@@ -3,7 +3,7 @@ import path from 'node:path';
 
 import { readFixPromptBody } from './fix-prompt.ts';
 import { installGlobalRuntime } from './global-runtime.ts';
-import { defaultWorkflowConfig, homeClaudeDir, writeJsonFile } from './state.ts';
+import { defaultWorkflowConfig, homeClaudeDir, readJsonFile, writeJsonFile } from './state.ts';
 import {
   desiredHostInstall,
   INIT_PIPELANE_SKILL_NAME,
@@ -21,17 +21,49 @@ export interface InstallClaudeSkillsResult {
   runtimeRoot: string;
   installed: string[];
   skipped: string[];
+  removedLegacySkills: string[];
+}
+
+interface ManagedSkillsManifest {
+  skills?: unknown;
 }
 
 function runtimeRoot(claudeHome: string): string {
   return path.join(claudeHome, 'skills', MANAGED_CLAUDE_RUNTIME_DIR);
 }
 
+function isSafeSkillName(skillName: string): boolean {
+  return (
+    skillName.length > 0
+    && skillName.trim() === skillName
+    && !path.isAbsolute(skillName)
+    && !skillName.includes('/')
+    && !skillName.includes('\\')
+    && skillName !== '.'
+    && skillName !== '..'
+  );
+}
+
+function skillDirPath(skillsRoot: string, skillName: string): string {
+  if (!isSafeSkillName(skillName)) {
+    throw new Error(`Unsafe Claude skill name in managed manifest: ${skillName}`);
+  }
+  const root = path.resolve(skillsRoot);
+  const target = path.resolve(root, skillName);
+  if (!target.startsWith(`${root}${path.sep}`)) {
+    throw new Error(`Unsafe Claude skill path escaped skills root: ${skillName}`);
+  }
+  return target;
+}
+
 function skillDocPath(skillsRoot: string, skillName: string): string {
-  return path.join(skillsRoot, skillName, 'SKILL.md');
+  return path.join(skillDirPath(skillsRoot, skillName), 'SKILL.md');
 }
 
 function readSkillBody(skillsRoot: string, skillName: string): string | null {
+  if (!isSafeSkillName(skillName)) {
+    return null;
+  }
   const targetPath = skillDocPath(skillsRoot, skillName);
   if (!existsSync(targetPath)) {
     return null;
@@ -51,8 +83,54 @@ function isManagedClaudeSkill(skillsRoot: string, skillName: string): boolean {
   return body !== null && isManagedClaudeSkillBody(body, skillName);
 }
 
+function readManagedSkillNames(runtimeRootPath: string): Set<string> {
+  const manifest = readJsonFile<ManagedSkillsManifest>(
+    path.join(runtimeRootPath, MANAGED_CLAUDE_SKILLS_FILENAME),
+    { skills: [] },
+  );
+  const names = new Set<string>();
+  if (Array.isArray(manifest.skills)) {
+    for (const entry of manifest.skills) {
+      if (typeof entry === 'string' && isSafeSkillName(entry)) {
+        names.add(entry);
+      }
+    }
+  }
+  return names;
+}
+
+function pruneRemovedManagedClaudeSkills(
+  skillsRoot: string,
+  runtimeRootPath: string,
+  desired: DesiredInstallEntry[],
+): string[] {
+  const candidates = new Set<string>([
+    ...readManagedSkillNames(runtimeRootPath),
+    INIT_PIPELANE_SKILL_NAME,
+  ]);
+  const desiredNames = new Set(desired.map((entry) => entry.name));
+  const removed: string[] = [];
+
+  for (const skillName of candidates) {
+    if (!isSafeSkillName(skillName)) {
+      continue;
+    }
+    if (desiredNames.has(skillName) || !isManagedClaudeSkill(skillsRoot, skillName)) {
+      continue;
+    }
+    const skillDir = skillDirPath(skillsRoot, skillName);
+    if (path.resolve(skillDir) === path.resolve(runtimeRootPath)) {
+      continue;
+    }
+    rmSync(skillDir, { recursive: true, force: true });
+    removed.push(skillName);
+  }
+
+  return removed.sort();
+}
+
 function assertOrSkipCollision(skillsRoot: string, entry: DesiredInstallEntry, skipped: string[]): boolean {
-  const targetDir = path.join(skillsRoot, entry.name);
+  const targetDir = skillDirPath(skillsRoot, entry.name);
   if (
     !existsSync(targetDir)
     || isManagedClaudeSkill(skillsRoot, entry.name)
@@ -72,7 +150,7 @@ function assertOrSkipCollision(skillsRoot: string, entry: DesiredInstallEntry, s
 }
 
 function writeSkill(skillsRoot: string, runtimeDir: string, entry: DesiredInstallEntry): void {
-  const skillDir = path.join(skillsRoot, entry.name);
+  const skillDir = skillDirPath(skillsRoot, entry.name);
   if (path.resolve(skillDir) !== path.resolve(runtimeDir)) {
     rmSync(skillDir, { recursive: true, force: true });
     mkdirSync(skillDir, { recursive: true });
@@ -98,6 +176,7 @@ export function installClaudeBootstrapSkill(
   });
 
   mkdirSync(skillsRoot, { recursive: true });
+  const removedLegacySkills = pruneRemovedManagedClaudeSkills(skillsRoot, pipelaneRoot, install.entries);
   installGlobalRuntime(pipelaneRoot, { host: 'claude' });
   mkdirSync(binDir, { recursive: true });
   writeFileSync(path.join(binDir, 'run-pipelane.sh'), install.runnerScript, { mode: 0o755, encoding: 'utf8' });
@@ -111,9 +190,6 @@ export function installClaudeBootstrapSkill(
     if (!assertOrSkipCollision(skillsRoot, entry, skipped)) {
       continue;
     }
-    if (entry.name === INIT_PIPELANE_SKILL_NAME) {
-      rmSync(path.join(pipelaneRoot, INIT_PIPELANE_SKILL_NAME), { recursive: true, force: true });
-    }
     writeSkill(skillsRoot, pipelaneRoot, entry);
     installed.push(entry.slashAlias);
     managedNames.push(entry.name);
@@ -126,5 +202,6 @@ export function installClaudeBootstrapSkill(
     runtimeRoot: pipelaneRoot,
     installed: installed.sort(),
     skipped: skipped.sort(),
+    removedLegacySkills,
   };
 }

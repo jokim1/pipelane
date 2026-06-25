@@ -963,7 +963,7 @@ test('init writes tracked Pipelane files and setup seeds CLAUDE plus tracked Cod
   }
 });
 
-test('bootstrap installs pipelane, initializes the repo, and seeds the global bootstrap skill', () => {
+test('bootstrap installs pipelane and initializes repo-local files without installing /init-pipelane', () => {
   const repoRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-bootstrap-'));
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
@@ -2057,7 +2057,7 @@ test('install-codex outside a pipelane repo installs durable global default skil
   try {
     const result = runCli(['install-codex'], workspaceRoot, { CODEX_HOME: codexHome });
     assert.match(result.stdout, /Installed \d+ durable Pipelane Codex commands/);
-    assert.ok(existsSync(path.join(codexHome, 'skills', 'init-pipelane', 'SKILL.md')));
+    assert.equal(existsSync(path.join(codexHome, 'skills', 'init-pipelane', 'SKILL.md')), false);
     assert.ok(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')));
     assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md')));
     assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane-fix', 'SKILL.md')));
@@ -2071,6 +2071,8 @@ test('install-codex outside a pipelane repo installs durable global default skil
     assert.match(deploySkill, /PR shorthand behavior/);
     assert.match(deploySkill, /pass it as `--pr 625`/);
     const pipelaneSkill = readFileSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
+    assert.match(pipelaneSkill, /normal clean repo setup and repair path/);
+    assert.match(pipelaneSkill, /should not be treated as consent to materialize/);
     assert.match(pipelaneSkill, /Interactive review setup behavior/);
     assert.match(pipelaneSkill, /runner command above/);
     assert.match(pipelaneSkill, /npm run workflow:\*/);
@@ -2114,7 +2116,7 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     const result = runCli(['install-claude'], workspaceRoot, { CLAUDE_HOME: claudeHome });
     assert.match(result.stdout, /Installed \d+ durable Pipelane Claude commands/);
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane', 'bin', 'pipelane')));
-    assert.ok(existsSync(path.join(claudeHome, 'skills', 'init-pipelane', 'SKILL.md')));
+    assert.equal(existsSync(path.join(claudeHome, 'skills', 'init-pipelane', 'SKILL.md')), false);
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md')));
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane', 'SKILL.md')));
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane-fix', 'SKILL.md')));
@@ -2127,6 +2129,8 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     assert.match(deploySkill, /PR shorthand behavior/);
     assert.match(deploySkill, /pass it as `--pr 625`/);
     const pipelaneSkill = readFileSync(path.join(claudeHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
+    assert.match(pipelaneSkill, /normal clean repo setup and repair path/);
+    assert.match(pipelaneSkill, /should not be treated as consent to materialize/);
     assert.match(pipelaneSkill, /Interactive review setup behavior/);
     assert.match(pipelaneSkill, /runner command above/);
     assert.match(pipelaneSkill, /npm run workflow:\*/);
@@ -2324,7 +2328,7 @@ test('verify executes the Claude durable runner self-test', () => {
   }
 });
 
-test('install-claude fails closed when init-pipelane already exists as an unrelated Claude skill', () => {
+test('install-claude preserves unrelated init-pipelane skills', () => {
   const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-install-claude-'));
   const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
 
@@ -2332,10 +2336,63 @@ test('install-claude fails closed when init-pipelane already exists as an unrela
     mkdirSync(path.join(claudeHome, 'skills', 'init-pipelane'), { recursive: true });
     writeFileSync(path.join(claudeHome, 'skills', 'init-pipelane', 'SKILL.md'), 'custom claude skill\n', 'utf8');
 
-    const result = runCli(['install-claude'], workspaceRoot, { CLAUDE_HOME: claudeHome }, true);
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /Claude skill alias collision/);
+    const result = runCli(['install-claude'], workspaceRoot, { CLAUDE_HOME: claudeHome });
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /Installed \d+ durable Pipelane Claude commands/);
     assert.equal(readFileSync(path.join(claudeHome, 'skills', 'init-pipelane', 'SKILL.md'), 'utf8'), 'custom claude skill\n');
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+  }
+});
+
+test('install-claude removes a legacy managed init-pipelane skill', () => {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-install-claude-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
+
+  try {
+    mkdirSync(path.join(claudeHome, 'skills', 'init-pipelane'), { recursive: true });
+    writeFileSync(
+      path.join(claudeHome, 'skills', 'init-pipelane', 'SKILL.md'),
+      '<!-- pipelane:claude-skill:init-pipelane -->\nlegacy managed bootstrap skill\n',
+      'utf8',
+    );
+
+    const result = runCli(['install-claude'], workspaceRoot, { CLAUDE_HOME: claudeHome });
+    assert.match(result.stdout, /Installed \d+ durable Pipelane Claude commands/);
+    assert.match(result.stdout, /Removed legacy machine-local wrapper skills: init-pipelane/);
+    assert.equal(existsSync(path.join(claudeHome, 'skills', 'init-pipelane', 'SKILL.md')), false);
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+  }
+});
+
+test('install-claude ignores unsafe managed manifest skill names instead of deleting outside skills root', () => {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-install-claude-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
+  const runtimeRoot = path.join(claudeHome, 'skills', 'pipelane');
+  const outsideDir = path.join(claudeHome, 'outside-skill');
+  const outsideSkill = path.join(outsideDir, 'SKILL.md');
+  const outsideBody = '<!-- pipelane:claude-global-skill:../outside-skill -->\nshould never be deleted\n';
+
+  try {
+    mkdirSync(runtimeRoot, { recursive: true });
+    mkdirSync(outsideDir, { recursive: true });
+    writeFileSync(
+      path.join(runtimeRoot, '.pipelane-runtime.json'),
+      `${JSON.stringify({ managedBy: 'pipelane' }, null, 2)}\n`,
+      'utf8',
+    );
+    writeFileSync(
+      path.join(runtimeRoot, 'managed-skills.json'),
+      `${JSON.stringify({ skills: ['../outside-skill'] }, null, 2)}\n`,
+      'utf8',
+    );
+    writeFileSync(outsideSkill, outsideBody, 'utf8');
+
+    runCli(['install-claude'], workspaceRoot, { CLAUDE_HOME: claudeHome });
+    assert.equal(readFileSync(outsideSkill, 'utf8'), outsideBody);
   } finally {
     rmSync(workspaceRoot, { recursive: true, force: true });
     rmSync(claudeHome, { recursive: true, force: true });
@@ -4355,13 +4412,18 @@ test('durable Codex runner prints detailed /pipelane help', () => {
     });
 
     assert.equal(bareOutput, helpOutput);
-    assert.match(helpOutput, /Pipelane dispatcher/);
+    assert.match(helpOutput, /Pipelane is a build, release, and development orchestrator/);
+    assert.match(helpOutput, /normal first-run path is clean/);
     assert.match(helpOutput, /\/pipelane setup \[--yes\]/);
     assert.match(helpOutput, /\/pipelane configure \[--json\] \[flags\.\.\.\]/);
+    assert.match(helpOutput, /\/pipelane review \[--dry-run\]/);
     assert.match(helpOutput, /\/pipelane review setup/);
     assert.match(helpOutput, /\/pipelane orchestrate --plan-file <file> --yes/);
-    assert.match(helpOutput, /Common companion slash commands after setup:/);
-    assert.match(helpOutput, /\/deploy/);
+    assert.match(helpOutput, /Build and release companion commands:/);
+    assert.match(helpOutput, /\/deploy staging\s+Deploy the merged SHA to staging/);
+    assert.match(helpOutput, /\/deploy prod\s+Promote a verified staging SHA to production/);
+    assert.match(helpOutput, /\/pipelane status when you are unsure what is safe next/);
+    assert.doesNotMatch(helpOutput, /init-pipelane/);
     assert.doesNotMatch(helpOutput, /pipelane: use \/pipelane/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -4389,7 +4451,7 @@ test('durable Codex runner prints /pipelane help after an unknown dispatcher mod
     assert.equal(result.status, 64);
     assert.equal(result.stdout, '');
     assert.match(result.stderr, /Unknown \/pipelane mode: unknown-mode/);
-    assert.match(result.stderr, /Pipelane dispatcher/);
+    assert.match(result.stderr, /Pipelane is a build, release, and development orchestrator/);
     assert.match(result.stderr, /\/pipelane help/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -4651,7 +4713,7 @@ test('install-codex upgrades legacy machine-local wrapper skills in place', () =
     assert.ok(existsSync(path.join(codexHome, 'skills', 'resume', 'SKILL.md')));
     assert.ok(existsSync(path.join(codexHome, 'skills', 'pr', 'SKILL.md')));
     assert.match(readFileSync(path.join(codexHome, 'skills', 'new', 'SKILL.md'), 'utf8'), /pipelane:codex-global-skill:new/);
-    assert.ok(existsSync(path.join(codexHome, 'skills', 'init-pipelane', 'SKILL.md')));
+    assert.equal(existsSync(path.join(codexHome, 'skills', 'init-pipelane', 'SKILL.md')), false);
     assert.ok(existsSync(path.join(codexHome, 'skills', '.pipelane', 'managed-skills.json')));
     assert.ok(existsSync(path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh')));
   } finally {
@@ -4705,7 +4767,7 @@ test('install-codex fails closed when a user skill only contains legacy prose', 
   }
 });
 
-test('install-codex upgrades a legacy managed init-pipelane skill in place', () => {
+test('install-codex removes a legacy managed init-pipelane skill', () => {
   const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-install-codex-'));
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
@@ -4714,11 +4776,10 @@ test('install-codex upgrades a legacy managed init-pipelane skill in place', () 
 
     const result = runCli(['install-codex'], workspaceRoot, { CODEX_HOME: codexHome });
     assert.match(result.stdout, /Installed \d+ durable Pipelane Codex commands/);
+    assert.match(result.stdout, /Removed legacy machine-local wrapper skills: init-pipelane/);
 
     const skillPath = path.join(codexHome, 'skills', 'init-pipelane', 'SKILL.md');
-    const skill = readFileSync(skillPath, 'utf8');
-    assert.match(skill, /pipelane:codex-global-skill:init-pipelane/);
-    assert.match(skill, /Run the global pipelane bootstrap for this machine\./);
+    assert.equal(existsSync(skillPath), false);
   } finally {
     rmSync(workspaceRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -14169,9 +14230,10 @@ test('missing deploy onboarding points at slash setup and configure flows', asyn
       pr: '625',
     });
 
-    assert.match(message, /\/init-pipelane --project/);
+    assert.match(message, /\/pipelane setup/);
     assert.match(message, /\/pipelane configure/);
     assert.match(message, /Then retry: \/deploy staging --pr 625/);
+    assert.doesNotMatch(message, /\/init-pipelane/);
     assert.doesNotMatch(message, /pipelane bootstrap/);
     assert.doesNotMatch(message, /pipelane run deploy/);
   } finally {
@@ -23473,9 +23535,10 @@ test('deploy in an un-onboarded repo fails with guided setup before dispatch', (
     assert.equal(result.status, 1);
     assert.match(result.stderr, /repo is not onboarded yet/);
     assert.match(result.stderr, /No \.pipelane\.json, \.project-workflow\.json, or package\.json:pipelane block/);
-    assert.match(result.stderr, /\/init-pipelane --project "pipelane-repo-/);
+    assert.match(result.stderr, /\/pipelane setup/);
     assert.match(result.stderr, /pipelane configure/);
     assert.match(result.stderr, /Then retry: \/deploy staging --pr 625/);
+    assert.doesNotMatch(result.stderr, /\/init-pipelane/);
     assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });

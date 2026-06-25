@@ -159,11 +159,10 @@ function printUsage(): void {
   process.stdout.write(`pipelane
 
 Usage:
-  pipelane bootstrap --yes --project "Project Name"
-  pipelane init --project "Project Name"
   pipelane setup
+  pipelane configure
+  pipelane update
   pipelane run <command> [args...]
-  pipelane sync-docs
   pipelane install-claude
   pipelane install-codex
   pipelane install-npm-guard
