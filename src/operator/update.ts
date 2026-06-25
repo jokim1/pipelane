@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { accessSync, constants, existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { accessSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -288,12 +288,29 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
   const summary = buildStatusMessage(status);
   if (!options.json) writeUpdateOutput(options, `${summary}\n`);
 
-  assertSafeNpmInstallTarget(repoRoot);
-  installLatest(repoRoot, {
-    quiet: options.json,
-    output: options.output,
-    installSpec: resolvePipelaneInstallSpecForSha(status.latestSha),
-  });
+  const npmInstallTarget = prepareSafeNpmInstallTarget(repoRoot, options);
+  try {
+    installLatest(repoRoot, {
+      quiet: options.json,
+      output: options.output,
+      installSpec: resolvePipelaneInstallSpecForSha(status.latestSha),
+    });
+  } catch (error) {
+    try {
+      npmInstallTarget.restoreOnFailure();
+    } catch (restoreError) {
+      const installDetail = error instanceof Error ? error.message : String(error);
+      const restoreDetail = restoreError instanceof Error ? restoreError.message : String(restoreError);
+      throw new Error([
+        'npm install failed after replacing symlinked node_modules, and restoring the original symlink also failed:',
+        installDetail,
+        '',
+        'node_modules restore failed:',
+        restoreDetail,
+      ].join('\n'));
+    }
+    throw error;
+  }
   const boardStop = options.stopBoard === false
     ? { stopped: false, pid: null, reason: 'dashboard stop skipped' }
     : await stopDashboardForRepo(repoRoot);
@@ -621,22 +638,39 @@ function symlinkedNodeModulesTarget(repoRoot: string): string | null {
   }
 }
 
-function assertSafeNpmInstallTarget(repoRoot: string): void {
+interface PreparedNpmInstallTarget {
+  restoreOnFailure(): void;
+}
+
+function prepareSafeNpmInstallTarget(repoRoot: string, options: UpdateOptions): PreparedNpmInstallTarget {
   const target = symlinkedNodeModulesTarget(repoRoot);
   if (!target) {
-    return;
+    return { restoreOnFailure() {} };
   }
-  const sharedRepoHint = path.basename(target) === 'node_modules'
-    ? path.dirname(target)
-    : null;
-  const rerun = sharedRepoHint
-    ? `Run \`pipelane update\` from the shared checkout instead: cd ${sharedRepoHint} && pipelane update`
-    : 'Run `pipelane update` from a checkout whose node_modules is a real directory, not a symlink.';
-  throw new Error([
-    `Refusing to run npm install for pipelane update in ${repoRoot} because node_modules is a symlink to ${target}.`,
-    'Running npm install/update through a symlinked node_modules can remove or corrupt the shared dependency tree.',
-    rerun,
-  ].join('\n'));
+  if (path.basename(target) !== 'node_modules') {
+    throw new Error([
+      `Refusing to run npm install for pipelane update in ${repoRoot} because node_modules is a symlink to ${target}.`,
+      'Run `pipelane update` from a checkout whose node_modules is a real directory, not a symlink.',
+    ].join('\n'));
+  }
+
+  const nodeModulesPath = path.join(repoRoot, 'node_modules');
+  unlinkSync(nodeModulesPath);
+  mkdirSync(nodeModulesPath, { recursive: true });
+
+  if (!options.json) {
+    writeUpdateOutput(
+      options,
+      `[pipelane] Replaced symlinked node_modules with a local directory before running npm install; shared dependencies at ${target} were left untouched.\n`,
+    );
+  }
+
+  return {
+    restoreOnFailure() {
+      rmSync(nodeModulesPath, { recursive: true, force: true });
+      symlinkSync(target, nodeModulesPath, 'dir');
+    },
+  };
 }
 
 function emitGlobalSurfaceRefreshHint(result: GlobalSurfaceRefresh, options: Pick<UpdateOptions, 'output'>): void {

@@ -12446,12 +12446,13 @@ test('managed update bootstraps worktree node_modules without re-execing stale l
   }
 });
 
-test('update refuses to npm install through symlinked worktree node_modules', () => {
+test('explicit update from a symlinked worktree installs in the task worktree', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-bin-'));
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
   const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
   const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  const npmInstallLog = path.join(repoRoot, 'explicit-update-install.log');
   const oldSha = '1111111111111111111111111111111111111111';
   const newSha = '2222222222222222222222222222222222222222';
   try {
@@ -12467,12 +12468,12 @@ test('update refuses to npm install through symlinked worktree node_modules', ()
     });
     execFileSync('git', ['push'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
 
-    const worktreePath = path.join(repoRoot, '.claude', 'worktrees', 'update-refuses-symlink');
-    execFileSync('git', ['worktree', 'add', worktreePath, '-b', 'update-refuses-symlink'], {
+    const worktreePath = path.join(repoRoot, '.claude', 'worktrees', 'explicit-update-symlink');
+    execFileSync('git', ['worktree', 'add', worktreePath, '-b', 'explicit-update-symlink'], {
       cwd: repoRoot,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    makeFakeUpdateBin(binDir, { latestSha: newSha });
+    makeFakeUpdateBin(binDir, { latestSha: newSha, npmMarkerPath: npmInstallLog });
 
     const result = spawnSync('node', [CLI_PATH, 'update'], {
       cwd: worktreePath,
@@ -12489,11 +12490,82 @@ test('update refuses to npm install through symlinked worktree node_modules', ()
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /Refusing to run npm install for pipelane update/);
-    assert.match(result.stderr, /node_modules is a symlink/);
-    assert.match(result.stderr, /Run `pipelane update` from the shared checkout instead/);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /\[pipelane\] Linked node_modules/);
+    assert.match(result.stdout, /Replaced symlinked node_modules with a local directory/);
+    assert.match(result.stdout, /Upgrade complete/);
+    assert.match(readFileSync(npmInstallLog, 'utf8'), new RegExp(`#${newSha}`));
+    assert.equal(lstatSync(path.join(worktreePath, 'node_modules')).isSymbolicLink(), false);
+    assert.equal(statSync(path.join(worktreePath, 'node_modules')).isDirectory(), true);
+    assert.ok(existsSync(path.join(worktreePath, 'node_modules', 'pipelane', 'package.json')));
+    const sharedLock = JSON.parse(readFileSync(path.join(repoRoot, 'package-lock.json'), 'utf8'));
     const worktreeLock = JSON.parse(readFileSync(path.join(worktreePath, 'package-lock.json'), 'utf8'));
+    assert.equal(sharedLock.packages['node_modules/pipelane'].resolved.endsWith(`#${oldSha}`), true);
+    assert.equal(worktreeLock.packages['node_modules/pipelane'].resolved.endsWith(`#${newSha}`), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('explicit update restores symlinked worktree node_modules when npm install fails', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-bin-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  const npmInstallLog = path.join(repoRoot, 'explicit-update-failed-install.log');
+  const oldSha = '1111111111111111111111111111111111111111';
+  const newSha = '2222222222222222222222222222222222222222';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    writeFakeConsumer(repoRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    execFileSync('git', ['add', 'package.json', 'package-lock.json', '.pipelane.json'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    execFileSync('git', ['commit', '-m', 'Adopt fake pipelane install'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    execFileSync('git', ['push'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const worktreePath = path.join(repoRoot, '.claude', 'worktrees', 'explicit-update-fails-symlink');
+    execFileSync('git', ['worktree', 'add', worktreePath, '-b', 'explicit-update-fails-symlink'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    makeFakeUpdateBin(binDir, { latestSha: newSha, npmMarkerPath: npmInstallLog, npmExitCode: 42 });
+
+    const result = spawnSync('node', [CLI_PATH, 'update'], {
+      cwd: worktreePath,
+      env: {
+        ...process.env,
+        CODEX_HOME: codexHome,
+        CLAUDE_HOME: claudeHome,
+        PIPELANE_HOME: pipelaneHome,
+        PIPELANE_MANAGED_RUNTIME: '1',
+        PIPELANE_MANAGED_RUNTIME_ROOT: '/tmp/pipelane-managed-runtime',
+        PATH: `${binDir}:${process.env.PATH}`,
+      },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /\[pipelane\] Linked node_modules/);
+    assert.match(result.stderr, /simulated npm install failure/);
+    assert.match(readFileSync(npmInstallLog, 'utf8'), new RegExp(`#${newSha}`));
+    const linkedNodeModules = path.join(worktreePath, 'node_modules');
+    assert.equal(lstatSync(linkedNodeModules).isSymbolicLink(), true);
+    assert.equal(realpathSync(linkedNodeModules), realpathSync(path.join(repoRoot, 'node_modules')));
+    const sharedLock = JSON.parse(readFileSync(path.join(repoRoot, 'package-lock.json'), 'utf8'));
+    const worktreeLock = JSON.parse(readFileSync(path.join(worktreePath, 'package-lock.json'), 'utf8'));
+    assert.equal(sharedLock.packages['node_modules/pipelane'].resolved.endsWith(`#${oldSha}`), true);
     assert.equal(worktreeLock.packages['node_modules/pipelane'].resolved.endsWith(`#${oldSha}`), true);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -19066,6 +19138,7 @@ function makeFakeUpdateBin(
     compareDelayMs = 0,
     compareMarkerPath = '',
     npmMarkerPath = '',
+    npmExitCode = 0,
   },
 ) {
   mkdirSync(binDir, { recursive: true });
@@ -19122,6 +19195,11 @@ if (args[0] === 'install') {
   const markerPath = ${JSON.stringify(npmMarkerPath)};
   if (markerPath) {
     require('node:fs').appendFileSync(markerPath, args.join(' ') + '\\n', 'utf8');
+  }
+  const exitCode = ${JSON.stringify(npmExitCode)};
+  if (exitCode !== 0) {
+    process.stderr.write('simulated npm install failure\\n');
+    process.exit(exitCode);
   }
   const root = process.cwd();
   const lockPath = path.join(root, 'package-lock.json');
