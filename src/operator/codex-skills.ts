@@ -79,6 +79,13 @@ stop before side effects.
 
   if (command === 'new') {
     return `
+## Fresh checkout behavior
+
+Use this slash command through the managed runner when starting a task from a
+fresh checkout. Do not substitute repo-local \`npm run pipelane:new\` or
+\`npm run workflow:new\` before \`node_modules/.bin/pipelane\` exists; npm will
+fail before Pipelane can create the task worktree or link dependencies.
+
 ## Bare invocation behavior
 
 When the user invokes bare ${slashAlias} after describing an unstarted coding

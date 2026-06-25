@@ -919,8 +919,13 @@ test('init writes tracked Pipelane files and setup seeds CLAUDE plus tracked Cod
     assert.equal(existsSync(path.join(codexHome, 'skills', 'pr', 'SKILL.md')), false);
 
     const newSkill = readFileSync(path.join(repoRoot, '.agents', 'skills', 'new', 'SKILL.md'), 'utf8');
+    assert.match(newSkill, /Fresh checkout behavior/);
+    assert.match(newSkill, /npm run workflow:new/);
     assert.match(newSkill, /Bare invocation behavior/);
     assert.match(newSkill, /infer a\s+concise task label/);
+    const agentsGuidance = readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8');
+    assert.match(agentsGuidance, /managed Pipelane runner/);
+    assert.match(agentsGuidance, /npm run workflow:\*/);
 
     const deploySkill = readFileSync(path.join(repoRoot, '.agents', 'skills', 'deploy', 'SKILL.md'), 'utf8');
     assert.match(deploySkill, /Blocked deploy follow-up behavior/);
@@ -2048,7 +2053,10 @@ test('install-codex outside a pipelane repo installs durable global default skil
     assert.ok(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')));
     assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md')));
     assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane-fix', 'SKILL.md')));
-    assert.match(readFileSync(path.join(codexHome, 'skills', 'new', 'SKILL.md'), 'utf8'), /Bare invocation behavior/);
+    const newSkill = readFileSync(path.join(codexHome, 'skills', 'new', 'SKILL.md'), 'utf8');
+    assert.match(newSkill, /Fresh checkout behavior/);
+    assert.match(newSkill, /npm run workflow:new/);
+    assert.match(newSkill, /Bare invocation behavior/);
     const deploySkill = readFileSync(path.join(codexHome, 'skills', 'deploy', 'SKILL.md'), 'utf8');
     assert.match(deploySkill, /Blocked deploy follow-up behavior/);
     assert.match(deploySkill, /Reply 1 or Y to execute/);
@@ -2057,6 +2065,7 @@ test('install-codex outside a pipelane repo installs durable global default skil
     const pipelaneSkill = readFileSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
     assert.match(pipelaneSkill, /Interactive review setup behavior/);
     assert.match(pipelaneSkill, /runner command above/);
+    assert.match(pipelaneSkill, /npm run workflow:\*/);
     assert.match(pipelaneSkill, /review setup --enable <gate-id>/);
     assert.match(pipelaneSkill, /review setup --disable <gate-id>/);
     assert.match(pipelaneSkill, /review setup --install <gate-id>/);
@@ -2098,14 +2107,18 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md')));
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane', 'SKILL.md')));
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane-fix', 'SKILL.md')));
-    assert.match(readFileSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md'), 'utf8'), /disable-model-invocation: true/);
-    assert.match(readFileSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md'), 'utf8'), /Bare invocation behavior/);
+    const newSkill = readFileSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md'), 'utf8');
+    assert.match(newSkill, /disable-model-invocation: true/);
+    assert.match(newSkill, /Fresh checkout behavior/);
+    assert.match(newSkill, /npm run workflow:new/);
+    assert.match(newSkill, /Bare invocation behavior/);
     const deploySkill = readFileSync(path.join(claudeHome, 'skills', 'deploy', 'SKILL.md'), 'utf8');
     assert.match(deploySkill, /PR shorthand behavior/);
     assert.match(deploySkill, /pass it as `--pr 625`/);
     const pipelaneSkill = readFileSync(path.join(claudeHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
     assert.match(pipelaneSkill, /Interactive review setup behavior/);
     assert.match(pipelaneSkill, /runner command above/);
+    assert.match(pipelaneSkill, /npm run workflow:\*/);
     assert.match(pipelaneSkill, /review setup --enable <gate-id>/);
     assert.match(pipelaneSkill, /review setup --disable <gate-id>/);
     assert.match(pipelaneSkill, /review setup --install <gate-id>/);
