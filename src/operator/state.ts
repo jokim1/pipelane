@@ -153,6 +153,10 @@ export interface OrchestrateConfig {
     maxIterationsPerSlice?: number;
     maxReviewLoops?: number;
     maxMinutesPerSlice?: number;
+    // B2: stop a slice's review auto-fix once its canonical no-progress signature
+    // repeats this many consecutive times (default 2). Guards against looping on a
+    // fix that never changes the failure.
+    maxStalledIterations?: number;
   };
 }
 
@@ -1305,6 +1309,7 @@ function normalizeOrchestrateConfig(raw: OrchestrateConfig | undefined): Orchest
           maxIterationsPerSlice: positiveConfigInteger(hardStops.maxIterationsPerSlice),
           maxReviewLoops: positiveConfigInteger(hardStops.maxReviewLoops),
           maxMinutesPerSlice: positiveConfigInteger(hardStops.maxMinutesPerSlice),
+          maxStalledIterations: positiveConfigInteger(hardStops.maxStalledIterations),
         }
       : undefined,
   };

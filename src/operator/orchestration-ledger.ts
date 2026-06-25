@@ -97,6 +97,16 @@ export interface OrchestrationReviewFixRecord {
   logPath: string | null;
   exitCode: number | null;
   recordedAt: string;
+  // B2 (#15): the fed-forward attempt journal. `signature` is the canonical
+  // no-progress signature of the failure this attempt addressed; `reviewStatus`
+  // is the re-review verdict observed after the attempt; `lesson` is a derived
+  // one-liner (keyed by `signature`) injected into the next attempt's fix prompt
+  // so attempt N+1 forms a hypothesis the prior attempts ruled out. All optional:
+  // legacy records lack them and `isOrchestrationRunRecord` does not validate
+  // `reviewFixes`, so they are additive and migration-free.
+  signature?: string;
+  reviewStatus?: ReviewRunRecord['status'] | null;
+  lesson?: string;
 }
 
 export interface OrchestrationSliceRecord {

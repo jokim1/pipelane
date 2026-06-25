@@ -6449,6 +6449,368 @@ test('orchestrate bare command --yes auto-fixes failed executable review gates a
   }
 });
 
+// B2 sub-step 1 (honesty): a fix worker that clears the failing command gate but
+// leaves a blocking manual gate pending must NOT be reported as `fixed` — the
+// re-review did not pass. Before the honesty fix, any non-`failed` re-review
+// (including `pending`) was laundered into `fixed` with fixedCount = attempted.
+test('orchestrate bare command --yes does not report fixed when the re-review is only pending', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerScript = [
+    'const fs = require("node:fs");',
+    'let prompt = "";',
+    'process.stdin.setEncoding("utf8");',
+    'process.stdin.on("data", (chunk) => { prompt += chunk; });',
+    'process.stdin.on("end", () => {',
+    '  if (prompt.includes("Review fix attempt: 1")) {',
+    '    fs.writeFileSync("review-fixed.txt", "fixed\\n", "utf8");',
+    '    console.log("review fix applied");',
+    '  } else {',
+    '    fs.writeFileSync("pipelane-slice-change.txt", "change", "utf8");',
+    '    console.log("initial worker left review failure");',
+    '  }',
+    '});',
+  ].join('');
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [
+        {
+          id: 'requires-fix-file',
+          phase: 'static',
+          type: 'command',
+          command: `${process.execPath} -e "process.exit(require('node:fs').existsSync('review-fixed.txt') ? 0 : 7)"`,
+          blocking: true,
+        },
+        {
+          id: 'manual-ai-review',
+          phase: 'ai-diff',
+          type: 'skill',
+          skill: 'review',
+          userCommands: ['/review'],
+          blocking: true,
+        },
+      ],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt fixable + pending review gates');
+
+    const cliResult = runCli([
+      'run',
+      'orchestrate',
+      '--outcome',
+      'Pending gate must not read as fixed',
+      '--provider',
+      'generic',
+      '--yes',
+      '--json',
+    ], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: `${process.execPath} -e ${JSON.stringify(workerScript)}`,
+    }, true);
+    const result = JSON.parse(cliResult.stdout);
+    createdWorktrees.push(...result.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    const onDisk = JSON.parse(readFileSync(result.ledgerPath, 'utf8'));
+
+    // The fix worker ran and cleared the command gate...
+    assert.equal(existsSync(path.join(result.run.slices[0].worktreePath, 'review-fixed.txt')), true);
+    const gates = onDisk.slices[0].review.run.gates;
+    assert.equal(gates.find((gate) => gate.gateId === 'requires-fix-file').status, 'passed');
+    assert.equal(gates.find((gate) => gate.gateId === 'manual-ai-review').status, 'pending');
+    // ...but the re-review is pending, so auto-fix must NOT claim `fixed`.
+    assert.notEqual(result.autoFix.status, 'fixed');
+    assert.equal(result.autoFix.status, 'exhausted');
+    assert.equal(result.autoFix.fixedCount, 0);
+    assert.equal(result.autoFix.attemptedCount, 1);
+    assert.equal(result.review.status, 'pending');
+    assert.equal(result.status, 'pending');
+    assert.equal(cliResult.status, 1);
+    assert.equal(onDisk.slices[0].review.status, 'pending');
+    assert.match(result.message, /Auto-fix status: exhausted/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+// B2 sub-step 2 (no-progress signature): a fix worker that never changes the
+// failure must stop after the canonical signature repeats maxStalledIterations
+// times — and the signature must be stable across the per-run noise (the gate
+// emits a different nonce each run, and every review run carries fresh
+// timestamps), or it would never match and never stall.
+test('orchestrate bare command --yes stops a no-progress review auto-fix loop with stalled', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.orchestrate = { hardStops: { maxReviewLoops: 4 } };
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'always-fails',
+        phase: 'static',
+        type: 'command',
+        // Varying stdout (nonce) + a fresh duration/timestamp each run: if the
+        // signature included any of that, it would never repeat and never stall.
+        command: `${process.execPath} -e "console.log('nonce ' + Date.now() + '-' + Math.random()); process.exit(7)"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt an unfixable review gate');
+
+    const cliResult = runCli([
+      'run',
+      'orchestrate',
+      '--outcome',
+      'Stall on a gate the worker cannot fix',
+      '--provider',
+      'generic',
+      '--yes',
+      '--json',
+    ], repoRoot, {
+      // passWorker rewrites the same marker each iteration: a material change so
+      // the slice is not `empty`, but no progress against the always-fails gate.
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(),
+    }, true);
+    const result = JSON.parse(cliResult.stdout);
+    createdWorktrees.push(...result.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    const onDisk = JSON.parse(readFileSync(result.ledgerPath, 'utf8'));
+
+    assert.equal(result.autoFix.status, 'stalled');
+    // One fix worker ran (attempt 1); attempt 2 detected the repeat and stopped
+    // without spending another worker, well short of the maxReviewLoops budget.
+    assert.equal(result.autoFix.attemptedCount, 1);
+    assert.equal(result.autoFix.fixedCount, 0);
+    assert.equal(onDisk.reviewFixes.length, 1);
+    assert.equal(result.review.status, 'failed');
+    assert.equal(result.status, 'failed');
+    assert.equal(cliResult.status, 1);
+    assert.match(cliResult.stderr, /no-progress signature repeated 2x \(>= 2\); marking stalled/);
+    assert.match(result.message, /Auto-fix status: stalled/);
+    assert.match(result.message, /auto-fix stalled \(no-progress detected\)/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+// B2 sub-step 2 (collectChangedFiles digest, NOT worktreeStatusDigest): a fix
+// loop that COMMITS each iteration leaves a clean worktree, so a dirty-tree-only
+// digest would differ between the dirty first iteration and the clean committed
+// one and never detect the stall. The collectChangedFiles digest still sees the
+// committed change set, so the no-progress loop is correctly stalled.
+test('orchestrate bare command --yes detects a committing no-progress loop as stalled', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerScript = [
+    'const fs = require("node:fs");',
+    'const cp = require("node:child_process");',
+    'let prompt = "";',
+    'process.stdin.setEncoding("utf8");',
+    'process.stdin.on("data", (chunk) => { prompt += chunk; });',
+    'process.stdin.on("end", () => {',
+    '  if (prompt.includes("Review fix attempt")) {',
+    // Commit the existing change, leaving a clean worktree but the same net diff.
+    '    cp.execSync("git add -A", { stdio: "ignore" });',
+    '    cp.execSync("git -c user.email=ci@example.com -c user.name=CI commit -m \\"fix attempt\\" --allow-empty", { stdio: "ignore" });',
+    '    console.log("committed fix attempt");',
+    '  } else {',
+    '    fs.writeFileSync("pipelane-slice-change.txt", "change", "utf8");',
+    '    console.log("initial change");',
+    '  }',
+    '});',
+  ].join('');
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.orchestrate = { hardStops: { maxReviewLoops: 4 } };
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'always-fails',
+        phase: 'static',
+        type: 'command',
+        command: `${process.execPath} -e "process.exit(7)"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt an unfixable review gate for a committing loop');
+
+    const cliResult = runCli([
+      'run',
+      'orchestrate',
+      '--outcome',
+      'Stall a committing fix loop',
+      '--provider',
+      'generic',
+      '--yes',
+      '--json',
+    ], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: `${process.execPath} -e ${JSON.stringify(workerScript)}`,
+    }, true);
+    const result = JSON.parse(cliResult.stdout);
+    const worktreePath = result.run.slices[0].worktreePath;
+    createdWorktrees.push(...result.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+
+    assert.equal(result.autoFix.status, 'stalled');
+    assert.equal(result.autoFix.attemptedCount, 1);
+    assert.equal(result.status, 'failed');
+    // The fix worker committed: the worktree is clean, which a worktreeStatusDigest
+    // would read as identical-to-empty and a collectChangedFiles digest reads as
+    // the committed change set — only the latter detects the stall.
+    const porcelain = execFileSync('git', ['status', '--porcelain'], { cwd: worktreePath, encoding: 'utf8' });
+    assert.equal(porcelain.trim(), '');
+    assert.match(cliResult.stderr, /no-progress signature repeated 2x \(>= 2\); marking stalled/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+// B2 sub-step 2: the stall threshold is configurable via
+// orchestrate.hardStops.maxStalledIterations — raising it to 3 makes auto-fix run
+// one more no-progress worker before giving up.
+test('orchestrate bare command --yes honors a configurable maxStalledIterations threshold', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.orchestrate = { hardStops: { maxReviewLoops: 5, maxStalledIterations: 3 } };
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'always-fails',
+        phase: 'static',
+        type: 'command',
+        command: `${process.execPath} -e "process.exit(7)"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt a higher stall threshold');
+
+    const cliResult = runCli([
+      'run',
+      'orchestrate',
+      '--outcome',
+      'Stall only after three repeats',
+      '--provider',
+      'generic',
+      '--yes',
+      '--json',
+    ], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(),
+    }, true);
+    const result = JSON.parse(cliResult.stdout);
+    createdWorktrees.push(...result.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+
+    assert.equal(result.autoFix.status, 'stalled');
+    // Two no-progress workers ran (attempts 1 and 2); the third repeat stalled it.
+    assert.equal(result.autoFix.attemptedCount, 2);
+    assert.match(cliResult.stderr, /no-progress signature repeated 3x \(>= 3\); marking stalled/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+// B2 sub-step 3 (fed-forward attempt journal): a later fix attempt's prompt must
+// carry a Tried/Result/Lesson journal authored from the earlier attempts' real
+// re-review outcomes, reusing this run's reviewFixes records. Each attempt here
+// changes the file set (a new file) so the signature never repeats and the loop
+// runs more than once without stalling.
+test('orchestrate bare command --yes feeds a Tried/Result/Lesson journal into later fix prompts', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerScript = [
+    'const fs = require("node:fs");',
+    'let prompt = "";',
+    'process.stdin.setEncoding("utf8");',
+    'process.stdin.on("data", (chunk) => { prompt += chunk; });',
+    'process.stdin.on("end", () => {',
+    '  const m = prompt.match(/Review fix attempt: (\\d+)/);',
+    // A uniquely-named file per attempt keeps the changed-files set growing, so the
+    // no-progress signature differs each attempt and the loop iterates (not stall).
+    '  const step = m ? m[1] : "0";',
+    '  fs.writeFileSync("fix-step-" + step + ".txt", "step " + step, "utf8");',
+    '  console.log("fix step " + step);',
+    '});',
+  ].join('');
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.orchestrate = { hardStops: { maxReviewLoops: 3 } };
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'always-fails',
+        phase: 'static',
+        type: 'command',
+        command: `${process.execPath} -e "process.exit(7)"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt a gate that drives multiple fix attempts');
+
+    const cliResult = runCli([
+      'run',
+      'orchestrate',
+      '--outcome',
+      'Feed the attempt journal forward',
+      '--provider',
+      'generic',
+      '--yes',
+      '--json',
+    ], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: `${process.execPath} -e ${JSON.stringify(workerScript)}`,
+    }, true);
+    const result = JSON.parse(cliResult.stdout);
+    createdWorktrees.push(...result.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    const onDisk = JSON.parse(readFileSync(result.ledgerPath, 'utf8'));
+
+    // Two fix attempts ran (signature kept changing → no stall), then exhausted.
+    assert.equal(result.autoFix.status, 'exhausted');
+    assert.equal(result.autoFix.attemptedCount, 2);
+    const attempts = result.autoFix.attempts;
+    assert.equal(attempts.length, 2);
+
+    // The first attempt has no prior journal; the second feeds the first forward.
+    const firstPrompt = readFileSync(attempts[0].promptPath, 'utf8');
+    assert.doesNotMatch(firstPrompt, /Prior Fix Attempts/);
+    const secondPrompt = readFileSync(attempts[1].promptPath, 'utf8');
+    assert.match(secondPrompt, /## Prior Fix Attempts \(form a new hypothesis/);
+    assert.match(secondPrompt, /### Attempt 1/);
+    assert.match(secondPrompt, /- Tried: targeted gate\(s\) always-fails \(worker succeeded\)/);
+    assert.match(secondPrompt, /- Result: review still failed/);
+    assert.match(secondPrompt, /- Lesson: symptom [0-9a-f]{12}: the attempted fix for gate\(s\) always-fails still failed/);
+
+    // The journal is authored from the persisted reviewFixes records.
+    assert.equal(onDisk.reviewFixes[0].attempt, 1);
+    assert.equal(onDisk.reviewFixes[0].reviewStatus, 'failed');
+    assert.match(onDisk.reviewFixes[0].signature, /^[0-9a-f]{64}$/);
+    assert.match(onDisk.reviewFixes[0].lesson, /^symptom [0-9a-f]{12}:/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('orchestrate bare command --yes honors maxReviewLoops before review auto-fix', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];
@@ -22803,6 +23165,7 @@ test('normalizeWorkflowConfig filters malformed orchestrate config', async () =>
         maxIterationsPerSlice: 3,
         maxReviewLoops: 4,
         maxMinutesPerSlice: Number.NaN,
+        maxStalledIterations: 0,
       },
     },
   });
@@ -22819,6 +23182,7 @@ test('normalizeWorkflowConfig filters malformed orchestrate config', async () =>
       maxIterationsPerSlice: 3,
       maxReviewLoops: 4,
       maxMinutesPerSlice: undefined,
+      maxStalledIterations: undefined,
     },
   });
 
