@@ -11,7 +11,16 @@ import {
   resolveReviewGateCatalog,
   type ResolvedReviewGateCatalogEntry,
 } from '../review-gates.ts';
-import { resolveReviewActorIdentity } from '../review-identity.ts';
+import {
+  blockingAiReviewEvidenceBlocker,
+  resolveReviewActorIdentity,
+  resolveReviewAuthorIdentity,
+} from '../review-identity.ts';
+import {
+  isIndependentAiReviewGate,
+  matchesReviewRisk,
+  REVIEW_GATES_POLICY_VERSION,
+} from '../review-gate-policy.ts';
 import { readWorktreeStatusSnapshot, type WorktreeStatusSnapshot } from '../worktree-status.ts';
 import {
   appendReviewRunRecord,
@@ -366,6 +375,25 @@ export function buildReviewPassRecord(options: {
 
   const startedAt = nowIso();
   const attester = resolveReviewActorIdentity();
+  if (isIndependentAiReviewGate(gate) && base.authorIdentity) {
+    const candidateGate: ReviewGateRunRecord = {
+      ...gate,
+      status: 'passed',
+      attester,
+      summary: manualPassSummary(message),
+      startedAt,
+      finishedAt: startedAt,
+      durationMs: 0,
+    };
+    const blocker = blockingAiReviewEvidenceBlocker({
+      reviewRun: { ...base, gates: [candidateGate] },
+      worker: base.authorIdentity ?? null,
+      allowSessionOnlyIndependence: true,
+    });
+    if (blocker) {
+      throw new Error(`review pass cannot attest independent AI gate ${gateId}: ${blocker}`);
+    }
+  }
   const nextGates = base.gates.map((entry) => {
     if (entry.gateId !== gateId || entry.status !== 'pending') return entry;
     return {
@@ -389,6 +417,7 @@ export function buildReviewPassRecord(options: {
     worktreeStatusDigest: worktreeStatus.statusDigest,
     worktreeStatusReliable: worktreeStatus.statusDigestReliable,
     worktreeStatusWarnings: worktreeStatus.statusDigestWarnings,
+    authorIdentity: base.authorIdentity,
     reviewer: base.reviewer,
     gates: nextGates,
     signature: undefined,
@@ -475,8 +504,17 @@ function prepareInteractiveReviewSetup(repoRoot: string): {
       selected: recommended,
       recommended,
       installState,
+      adversarialProvider: entry.id === 'adversarial-review' && recommended
+        ? preferredAdversarialReviewProvider(repoRoot)
+        : undefined,
     };
   });
+  const codeReviewHigh = gates.find((gate) => gate.entry.id === 'code-review-high');
+  const gstackReview = gates.find((gate) => gate.entry.id === 'gstack-review');
+  if (codeReviewHigh?.selected && gstackReview?.selected) {
+    gstackReview.selected = false;
+    gstackReview.recommended = false;
+  }
   return {
     repoRoot,
     packageJson: {
@@ -650,13 +688,16 @@ function orderInteractiveReviewCatalog(entries: ResolvedReviewGateCatalogEntry[]
     ['test', 60],
     ['build', 70],
     ['karpathy-diff', 80],
-    ['gstack-review', 90],
-    ['adversarial-review', 100],
-    ['browser-qa', 110],
-    ['karpathy-audit', 120],
-    ['human-merge-approval', 130],
-    ['human-prod-deploy-approval', 140],
-    ['human-rollback-approval', 150],
+    ['code-review-high', 90],
+    ['gstack-review', 100],
+    ['adversarial-review', 110],
+    ['code-review-ultra', 120],
+    ['browser-qa', 130],
+    ['karpathy-audit', 140],
+    ['high-stakes-human-approval', 150],
+    ['human-merge-approval', 160],
+    ['human-prod-deploy-approval', 170],
+    ['human-rollback-approval', 180],
   ]);
   return [...entries].sort((left, right) => {
     const leftOrder = order.get(left.id) ?? 1000;
@@ -668,6 +709,10 @@ function orderInteractiveReviewCatalog(entries: ResolvedReviewGateCatalogEntry[]
 }
 
 function isRecommendedInteractiveGate(entry: ResolvedReviewGateCatalogEntry, installState: GateInstallState): boolean {
+  if (entry.id === 'code-review-high') return installState === 'installed';
+  if (entry.id === 'adversarial-review') return installState === 'installed';
+  if (entry.id === 'code-review-ultra') return installState === 'installed';
+  if (entry.id === 'high-stakes-human-approval') return true;
   if (entry.recommended !== true) return false;
   if (!entry.available) return false;
   if (entry.type === 'skill' || entry.type === 'agent') return installState === 'installed';
@@ -680,6 +725,12 @@ function detectGateInstallState(repoRoot: string, entry: ResolvedReviewGateCatal
     return reviewGateInstallOptions(entry, repoRoot).length > 0 ? 'not installed' : 'unavailable';
   }
   if (entry.type !== 'skill' && entry.type !== 'agent') return 'not applicable';
+  if (entry.id === 'code-review-high') {
+    return isCodeReviewHighAvailable() ? 'installed' : 'unavailable';
+  }
+  if (entry.id === 'code-review-ultra') {
+    return isExecutableOnPath('claude') ? 'installed' : 'unavailable';
+  }
   if (entry.id === 'adversarial-review') {
     return isAdversarialReviewInstalled(repoRoot)
       ? 'installed'
@@ -713,6 +764,18 @@ function isSkillInstalled(repoRoot: string, name: string): boolean {
     return true;
   }
   return candidates.some((candidate) => existsSync(candidate));
+}
+
+function isCodeReviewHighAvailable(): boolean {
+  const forced = process.env.PIPELANE_REVIEW_CODE_REVIEW_HIGH_PROBE_RESULT?.trim().toLowerCase();
+  if (forced === 'pass' || forced === 'passed' || forced === 'true' || forced === '1') return true;
+  if (forced === 'fail' || forced === 'failed' || forced === 'false' || forced === '0') return false;
+  if (process.env.NODE_ENV === 'test' && process.env.PIPELANE_REVIEW_GATE_USE_REAL_NATIVE !== '1') return false;
+  const configuredCommand = firstEnvValue(process.env, [
+    'PIPELANE_REVIEW_CODE_REVIEW_HIGH_COMMAND',
+    'PIPELANE_REVIEW_GATE_CODE_REVIEW_HIGH_COMMAND',
+  ])?.value;
+  return Boolean(configuredCommand || isExecutableOnPath('claude'));
 }
 
 function skillInstallNameVariants(name: string): string[] {
@@ -1789,6 +1852,7 @@ function buildReviewGatesExplicitPatch(
   if (planReview) {
     next.planReview = planReview;
   }
+  next.policyVersion = REVIEW_GATES_POLICY_VERSION;
   next.gates = gates;
   return next;
 }
@@ -1933,6 +1997,7 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
     worktreeStatusDigest: worktreeStatus.statusDigest,
     worktreeStatusReliable: worktreeStatus.statusDigestReliable,
     worktreeStatusWarnings: worktreeStatus.statusDigestWarnings,
+    authorIdentity: resolveReviewAuthorIdentity(),
     reviewer: resolveReviewActorIdentity(),
     gates: gateRecords,
   };
@@ -2243,6 +2308,9 @@ function defaultAiReviewGateCommand(gate: ReviewGateConfig): string {
   if (process.env.NODE_ENV === 'test' && process.env.PIPELANE_REVIEW_GATE_USE_REAL_NATIVE !== '1') {
     return '';
   }
+  if (gate.id === 'code-review-high' || gate.id === 'code-review-ultra') {
+    return '';
+  }
   if (gate.type === 'agent' && isExecutableOnPath('claude')) return defaultClaudeReviewCommand();
   if (isExecutableOnPath('codex')) return 'codex exec --full-auto -';
   if (isExecutableOnPath('claude')) return defaultClaudeReviewCommand();
@@ -2317,7 +2385,13 @@ function renderAiReviewGatePrompt(options: {
   const truncated = changedFiles.length > 250
     ? [`- ... ${changedFiles.length - 250} more files omitted`]
     : [];
+  const prefix = gate.id === 'code-review-high'
+    ? ['/code-review high', '']
+    : gate.id === 'code-review-ultra'
+      ? ['/code-review ultra', '']
+      : [];
   return [
+    ...prefix,
     'You are running as an independent Pipelane AI review gate.',
     '',
     `Gate: ${gate.id}`,
@@ -2427,10 +2501,21 @@ function skipReasonForGate(gate: ReviewGateConfig, changedFiles: string[], activ
       return `skipped: surface ${surface} is not active`;
     }
   }
+  if (gate.when?.startsWith('risk:') && !matchesReviewRisk(changedFiles, gate.when)) {
+    return `skipped: no changed files matched ${gate.when}`;
+  }
   return null;
 }
 
 function manualGateSummary(gate: ReviewGateConfig): string {
+  if (gate.id === 'karpathy-diff') {
+    const command = gate.userCommands?.[0] ?? '/karpathy diff';
+    return `author self-review pending: run ${command}`;
+  }
+  if (isIndependentAiReviewGate(gate)) {
+    const command = gate.userCommands?.[0] ?? gate.role ?? gate.skill ?? gate.id;
+    return `independent AI review pending: run ${command} from a separate reviewer session`;
+  }
   if (gate.type === 'skill') {
     const command = gate.userCommands?.[0] ?? (gate.skill ? `skill:${gate.skill}` : 'the configured skill');
     return `manual skill gate pending: run ${command}`;
@@ -2672,7 +2757,8 @@ function renderReviewSetupReport(
   lines.push('- Disable a gate: /pipelane review setup --disable <gate-id>');
   lines.push('- Install an optional gate: /pipelane review setup --install <gate-id>');
   lines.push('- Save defaults plus changes: combine --yes with --enable/--disable/--install as needed.');
-  lines.push('- AI review gates: karpathy-diff, gstack-review, adversarial-review.');
+  lines.push('- Opinionated default: self-review, deterministic checks, independent AI review, and cross-model review when installed.');
+  lines.push('- Opting out trades speed for higher risk of missed correctness, security, or data-loss bugs.');
 
   if (options.includeEffectiveJson) {
     lines.push(
@@ -2719,7 +2805,8 @@ function renderInteractiveReviewSetup(prepared: {
     'I found these repo checks:',
     ...formatDetectedRepoChecks(prepared.gates),
     '',
-    'Recommended gates are preselected below.',
+    'Recommended review gates are preselected below.',
+    'Turn one off only when you accept the coverage tradeoff.',
     'Type a gate number to toggle it. Type s to save, or c to cancel.',
   ];
 
@@ -2776,9 +2863,9 @@ function reviewSetupSections(): Array<{ title: string; ids: string[] }> {
   return [
     { title: 'Static gates', ids: ['typecheck', 'format-check', 'lint', 'secret-scan', 'dependency-audit'] },
     { title: 'Behavioral gates', ids: ['test', 'build'] },
-    { title: 'AI review gates', ids: ['karpathy-diff', 'gstack-review', 'adversarial-review'] },
+    { title: 'AI review gates', ids: ['karpathy-diff', 'code-review-high', 'gstack-review', 'adversarial-review', 'code-review-ultra'] },
     { title: 'Conditional gates', ids: ['browser-qa', 'karpathy-audit'] },
-    { title: 'Human approval gates', ids: ['human-merge-approval', 'human-prod-deploy-approval', 'human-rollback-approval'] },
+    { title: 'Human approval gates', ids: ['high-stakes-human-approval', 'human-merge-approval', 'human-prod-deploy-approval', 'human-rollback-approval'] },
   ];
 }
 
@@ -2787,7 +2874,10 @@ function formatInteractiveGate(gate: ReviewSetupGateOption, repoRoot: string): s
   const number = `${gate.number}.`.padEnd(4, ' ');
   const label = gate.label.padEnd(27, ' ');
   const detail = reviewSetupGateDetail(gate, repoRoot);
-  return `${number}${selected} ${label}${detail}`;
+  const consequence = !gate.selected && gate.recommended
+    ? ' (opted out: less review coverage)'
+    : '';
+  return `${number}${selected} ${label}${detail}${consequence}`;
 }
 
 function reviewSetupGateDetail(gate: ReviewSetupGateOption, repoRoot: string): string {
@@ -2837,11 +2927,14 @@ function reviewSetupGateLabel(entry: ResolvedReviewGateCatalogEntry): string {
     'dependency-audit': 'Dependency audit',
     'test': 'Tests',
     'build': 'Build',
-    'karpathy-diff': 'Karpathy diff review',
-    'gstack-review': 'gstack /review',
-    'adversarial-review': 'Adversarial review',
+    'karpathy-diff': 'Author self-review',
+    'code-review-high': 'Claude Code review high',
+    'gstack-review': 'Independent AI review',
+    'adversarial-review': 'Cross-model review',
+    'code-review-ultra': 'High-stakes ultra review',
     'browser-qa': 'Browser QA',
     'karpathy-audit': 'Instruction audit',
+    'high-stakes-human-approval': 'High-stakes human approval',
     'human-merge-approval': 'Merge approval',
     'human-prod-deploy-approval': 'Production deploy approval',
     'human-rollback-approval': 'Rollback approval',

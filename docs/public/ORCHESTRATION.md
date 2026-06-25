@@ -54,9 +54,6 @@ Current commands:
 /pipelane review setup --yes
 /pipelane review setup --print
 /pipelane review setup --list-gates
-/pipelane review setup --enable adversarial-review
-/pipelane review setup --disable gstack-review
-/pipelane review setup --install lint
 ```
 
 Custom extensions:
@@ -71,6 +68,14 @@ Setup should detect existing scripts before suggesting new gates. If a repo has
 `lint`, `typecheck`, `test`, `build`, or `format:check`, use those commands. If
 a script is missing, suggest it as a setup gap instead of silently inventing a
 toolchain.
+
+The setup flow is opinionated by default. It should recommend deterministic
+checks first, `/karpathy diff` as build-time author self-review, `/code-review high`
+in a fresh reviewer context when Claude review support is available, gstack
+`/review` as the independent fallback, and cross-model review when installed.
+High-stakes paths add `/code-review ultra` and human approval. Users may opt out
+of gates, but the UI should make the consequence explicit: less review coverage.
+The authoring session must never attest its own independent AI review.
 
 Known package-script installers are allowed to help, but only conservatively:
 npm projects can install standard dev dependencies for lint and format-check;
@@ -376,6 +381,7 @@ Each gate has:
         { "id": "plan-design-review", "phase": "plan", "type": "skill", "skill": "plan-design-review", "when": "surface:frontend", "blocking": true }
       ]
     },
+    "policyVersion": 2,
     "gates": [
       { "id": "typecheck", "phase": "static", "type": "command", "command": "npm run typecheck", "blocking": true },
       { "id": "lint", "phase": "static", "type": "command", "command": "npm run lint", "blocking": true },
@@ -390,6 +396,14 @@ Each gate has:
         "userCommands": ["/karpathy diff", "/karpathy-diff", "/karpathy:diff"],
         "blocking": true
       },
+      {
+        "id": "code-review-high",
+        "phase": "ai-diff",
+        "type": "agent",
+        "role": "claude-code-review-high",
+        "userCommands": ["/code-review high"],
+        "blocking": true
+      },
       { "id": "gstack-review", "phase": "ai-diff", "type": "skill", "skill": "review", "blocking": true },
       {
         "id": "adversarial-review",
@@ -397,6 +411,15 @@ Each gate has:
         "type": "agent",
         "role": "adversarial-code-reviewer",
         "userCommands": ["/claude review code", "/codex challenge"],
+        "blocking": true
+      },
+      {
+        "id": "code-review-ultra",
+        "phase": "ai-diff",
+        "type": "agent",
+        "role": "claude-code-review-ultra",
+        "when": "risk:auth|billing|migrations|sql|secrets|deploy|infra|concurrency|api|rollback",
+        "userCommands": ["/code-review ultra", "claude ultrareview --json"],
         "blocking": true
       },
       {
@@ -409,6 +432,7 @@ Each gate has:
         "blocking": true
       },
       { "id": "browser-qa", "phase": "runtime", "type": "skill", "skill": "qa-only", "when": "surface:frontend", "blocking": true },
+      { "id": "high-stakes-human-approval", "phase": "human", "type": "approval", "when": "risk:auth|billing|migrations|sql|secrets|deploy|infra|concurrency|api|rollback", "blocking": true },
       { "id": "human-prod-deploy-approval", "phase": "human", "type": "approval", "when": "before:prod-deploy", "blocking": true }
     ]
   },

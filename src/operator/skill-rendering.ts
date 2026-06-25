@@ -109,9 +109,18 @@ pipes make stdout non-TTY. When the user invokes bare
 through the runner command above. The CLI prints a non-interactive selector
 with gate numbers, installable gaps, and exact follow-up commands.
 
-Relay the selectable gates to the user, especially the AI review gates
-\`karpathy-diff\`, \`gstack-review\`, and \`adversarial-review\`. When the user
-chooses gates, run the matching deterministic command exactly:
+Relay the opinionated review shape to the user. The recommended AI stack is
+\`karpathy-diff\` as author self-review, \`code-review-high\` when Claude review
+support is available, \`gstack-review\` as the independent fallback, and
+\`adversarial-review\` for a cross-model pass when installed. High-stakes diffs
+can add \`code-review-ultra\` and human approval. Independent AI gates must be
+run from a fresh reviewer session; do not let the authoring session attest its
+own independent review. Same-session evidence will block \`/pr\`.
+
+Prefer saving the recommended setup instead of making the user memorize gate
+ids. If the user opts out of a recommended gate, say that the consequence is
+less review coverage before you save the change. When the user chooses gates,
+run the matching deterministic command exactly:
 
 - \`review setup --yes\` to save the current recommended selection.
 - \`review setup --enable <gate-id>\` to enable an available gate.

@@ -288,9 +288,6 @@ Set up the review stack:
 /pipelane review setup --yes
 /pipelane review setup --print
 /pipelane review setup --list-gates
-/pipelane review setup --enable adversarial-review
-/pipelane review setup --disable gstack-review
-/pipelane review setup --install lint
 ```
 
 Run the review stack:
@@ -303,8 +300,10 @@ The gate order is:
 
 1. **Static gates:** lint, typecheck, format check, secret scan, dependency audit.
 2. **Behavioral gates:** tests, integration checks, build.
-3. **AI diff gates:** `/karpathy diff`, gstack `/review`, adversarial review
-   via Codex `/claude review code` or Claude-side gstack `/codex challenge`.
+3. **AI diff gates:** `/karpathy diff` as author self-review, `/code-review high`
+   in a fresh reviewer context when available, gstack `/review` as the
+   independent fallback, and cross-model review via Codex `/claude review code`
+   or Claude-side gstack `/codex challenge`.
 4. **Instruction gates:** `/karpathy audit` when agent instruction files change.
 5. **Runtime gates:** browser QA, deploy health checks, staging evidence.
 6. **Human gates:** approval for schema, auth, billing, secrets, deploy, rollback,
@@ -313,14 +312,19 @@ The gate order is:
 Static gates run before AI review. There is no reason to spend model attention
 on syntax, type, style, or build errors that deterministic tools can catch.
 Bare setup prints a selector for available, missing, and installable gates.
-Use `--enable`, `--disable`, and `--install` to save exact choices from a
-non-interactive agent session. `--install` uses npm only for package-script
-gates; unsupported package managers and framework-specific lint configs print a
-manual recipe to apply with your project tooling. `--print` and `--list-gates`
-are read-only and cannot be combined with modifying flags.
+The default path is opinionated: save the recommended checklist with `--yes`.
+Users can still opt out with `--disable`, enable available optional gates with
+`--enable`, or install supported gaps with `--install`, but opting out reduces
+review coverage. `--install` uses npm only for package-script gates; unsupported
+package managers and framework-specific lint configs print a manual recipe to
+apply with your project tooling. `--print` and `--list-gates` are read-only and
+cannot be combined with modifying flags.
 
 `/pipelane review` writes evidence for the current branch, HEAD, and worktree
 state. `/pr` checks that evidence before it commits, pushes, or opens a PR.
+In v2 review setups, independent AI evidence must come from a separate reviewer
+session. The authoring session can run `/karpathy diff` as self-review, but it
+cannot attest its own independent review.
 
 `/pr` blocks when review evidence is:
 
