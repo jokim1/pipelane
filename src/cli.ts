@@ -24,7 +24,7 @@ import { installNpmGuard } from './operator/npm-guard-install.ts';
 import { loadDeployConfig } from './operator/release-gate.ts';
 import { resolveRepoRoot } from './operator/state.ts';
 import { bootstrapWorktreeNodeModulesIfNeeded } from './operator/task-workspaces.ts';
-import { collectUpdateStatus, maybeAutoUpdate, parseUpdateArgs, runUpdate, type UpdateStatus } from './operator/update.ts';
+import { collectUpdateStatus, maybeAutoUpdate, parseUpdateArgs, refreshAutoUpdateCache, runUpdate, type UpdateStatus } from './operator/update.ts';
 import { runVerify } from './operator/verify.ts';
 
 function printTopLevelHelp(): void {
@@ -344,6 +344,11 @@ async function maybeApplyAgentsGuidanceMigrationsAfterPrompt(
 }
 
 async function main(): Promise<void> {
+  if (process.env.PIPELANE_REFRESH_UPDATE_CACHE === '1') {
+    refreshAutoUpdateCache(process.cwd());
+    return;
+  }
+
   const [command, ...rest] = process.argv.slice(2);
 
   if (!command || command === '--help' || command === '-h') {

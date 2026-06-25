@@ -77,6 +77,10 @@ const MAX_PLAN_SCAN_FILES = 200;
 const ORCHESTRATION_REVIEW_DIAGNOSTIC_MAX = 10;
 const NATIVE_COMMAND_PROBE_TIMEOUT_MS = 5000;
 const DEFAULT_REVIEW_LOOP_LIMIT = 2;
+// B2: a slice's review auto-fix stops once its canonical no-progress signature
+// repeats this many consecutive times. Configurable via
+// orchestrate.hardStops.maxStalledIterations.
+const DEFAULT_MAX_STALLED_ITERATIONS = 2;
 const INHERITED_AGENT_SESSION_ENV_KEYS = [
   'CODEX_SESSION_ID',
   'CLAUDE_SESSION_ID',
@@ -335,7 +339,10 @@ interface OrchestrateEntryReviewSummary {
 }
 
 interface OrchestrateEntryAutoFixSummary {
-  status: 'fixed' | 'failed' | 'exhausted' | 'skipped' | 'noop';
+  // B2: `fixed` is reported ONLY when the re-review actually passed. `stalled` is
+  // an in-memory terminal (not a persisted slice status) meaning a slice's
+  // canonical no-progress signature repeated, so auto-fix stopped re-running it.
+  status: 'fixed' | 'failed' | 'exhausted' | 'stalled' | 'skipped' | 'noop';
   attemptedCount: number;
   fixedCount: number;
   failedCount: number;
@@ -648,6 +655,7 @@ async function autoFixFailedReviewSlices(
 ): Promise<ReviewAutoFixResult> {
   const budget = resolveReviewAutoFixBudget(run);
   const maxFixAttempts = budget.maxFixAttempts;
+  const maxStalledIterations = budget.maxStalledIterations;
   if (maxFixAttempts <= 0) {
     return {
       status: 'skipped',
@@ -661,30 +669,70 @@ async function autoFixFailedReviewSlices(
   }
 
   const attempts: ReviewAutoFixAttemptReport[] = [];
+  const attemptedSliceIds = new Set<string>();
+  // B2 (#13): per-slice canonical signature history + the set of slices whose
+  // signature repeated maxStalledIterations times (no progress) and are stopped.
+  const stalledSliceIds = new Set<string>();
+  const signatureHistory = new Map<string, string[]>();
   let latestReview = initialReview;
   let workerFailureCount = 0;
   for (let attempt = 1; attempt <= maxFixAttempts; attempt += 1) {
-    const failedSlices = run.slices
+    const candidates = run.slices
       .map((slice) => ({ slice, failedGates: failedBlockingReviewGates(slice) }))
-      .filter((entry) => entry.failedGates.length > 0);
-    if (failedSlices.length === 0) {
+      .filter((entry) => entry.failedGates.length > 0 && !stalledSliceIds.has(entry.slice.id));
+    if (candidates.length === 0) {
+      // B2: nothing actionable remains. If some slices stalled, report `stalled`
+      // (no-progress) so the operator intervenes rather than the loop silently
+      // declaring noop/fixed.
+      if (stalledSliceIds.size > 0) {
+        return buildStalledAutoFixResult(run, attempts, attemptedSliceIds, stalledSliceIds, latestReview);
+      }
+      // Honesty: blocking failures cleared, but the re-review did not pass either
+      // (a passed re-review returns `fixed` at the bottom of the prior attempt).
+      // This is the "failures cleared but not passed" case (e.g. a now-pending
+      // gate) — report noop, never fixed.
       return {
         status: 'noop',
         attemptedCount: attempts.length,
-        fixedCount: 0,
-        failedCount: 0,
+        fixedCount: countFixedSlices(run, attemptedSliceIds),
+        failedCount: latestReview.failedCount,
         attempts,
         finalReview: latestReview,
-        reason: 'no failed blocking review gates were eligible for auto-fix',
+        reason: `no failed blocking review gates remained to auto-fix (review status: ${latestReview.status})`,
       };
+    }
+
+    // B2 (#13): detect no-progress BEFORE spending another fix worker. Record each
+    // slice's canonical signature; once it repeats maxStalledIterations times in a
+    // row the slice is stalled and skipped now and on every later attempt.
+    const toRun: { slice: OrchestrationSliceRecord; failedGates: ReviewGateRunRecord[]; signature: string }[] = [];
+    for (const entry of candidates) {
+      const signature = computeSliceFailureSignature(context, entry.slice, entry.failedGates);
+      const history = [...(signatureHistory.get(entry.slice.id) ?? []), signature];
+      signatureHistory.set(entry.slice.id, history);
+      const repeats = countTrailingRepeats(history);
+      if (repeats >= maxStalledIterations) {
+        stalledSliceIds.add(entry.slice.id);
+        writeOrchestrationReviewProgress(
+          { dryRun: false },
+          `slice ${entry.slice.id}: no-progress signature repeated ${repeats}x (>= ${maxStalledIterations}); marking stalled and stopping its auto-fix`,
+        );
+      } else {
+        toRun.push({ ...entry, signature });
+      }
+    }
+
+    if (toRun.length === 0) {
+      // Every actionable slice just became stalled this pass.
+      return buildStalledAutoFixResult(run, attempts, attemptedSliceIds, stalledSliceIds, latestReview);
     }
 
     writeOrchestrationReviewProgress(
       { dryRun: false },
-      `review auto-fix attempt ${attempt}/${maxFixAttempts}: ${failedSlices.length} ${failedSlices.length === 1 ? 'slice' : 'slices'} with failed blocking gates`,
+      `review auto-fix attempt ${attempt}/${maxFixAttempts}: ${toRun.length} ${toRun.length === 1 ? 'slice' : 'slices'} with failed blocking gates`,
     );
 
-    for (const { slice, failedGates } of failedSlices) {
+    for (const { slice, failedGates, signature } of toRun) {
       const failedGateIds = failedGates.map((gate) => gate.gateId);
       const prepared = prepareSliceForReviewAutoFix(context, run, slice, failedGates, attempt);
       if (slice.review) {
@@ -701,7 +749,15 @@ async function autoFixFailedReviewSlices(
         `slice ${slice.id}: review auto-fix attempt ${attempt}/${maxFixAttempts} worker ${worker.status}; log ${worker.logPath}`,
       );
       slice.worker = worker;
+      // B2 (line 704 reconcile): unlike the initial start path, this is NOT an
+      // `empty` check. A fix worker operates on a slice that already carries the
+      // original material change, so `collectChangedFiles` is non-empty and B1's
+      // `empty` never applies. A fix that changes nothing is the no-progress case,
+      // caught by the canonical signature (stall detection), not by reclassifying
+      // to `empty`. This status is transient for a succeeded worker — the
+      // re-review below recomputes it; it only sticks when the worker failed.
       slice.status = worker.status === 'succeeded' ? 'completed' : 'failed';
+      attemptedSliceIds.add(slice.id);
       attempts.push({
         id: slice.id,
         status: slice.status,
@@ -722,6 +778,10 @@ async function autoFixFailedReviewSlices(
         logPath: worker.logPath,
         exitCode: worker.exitCode,
         recordedAt: nowIso(),
+        // B2 (#15): the failure signature this attempt addressed. reviewStatus +
+        // lesson are filled in by the enrichment loop over `toRun` below, once the
+        // re-review verdict is known.
+        signature,
       });
       if (worker.status === 'failed') workerFailureCount += 1;
       run.status = summarizeRunWorkerStatus(run);
@@ -755,11 +815,23 @@ async function autoFixFailedReviewSlices(
       { dryRun: false },
       `review auto-fix attempt ${attempt}/${maxFixAttempts}: review ${latestReview.status} (${latestReview.failedCount} failed, ${latestReview.pendingCount} pending, ${latestReview.blockedCount} blocked)`,
     );
-    if (latestReview.status !== 'failed') {
+    // B2 (#15): author each attempt's journal entry from the REAL re-review
+    // outcome (Result = re-review verdict, Lesson keyed by the canonical
+    // signature) so the next attempt's fix prompt feeds it forward.
+    for (const { slice, failedGates, signature } of toRun) {
+      const record = findReviewFixRecord(run, slice.id, attempt);
+      if (!record) continue;
+      record.reviewStatus = slice.review?.status ?? null;
+      record.lesson = deriveReviewFixLesson(failedGates.map((gate) => gate.gateId), record.reviewStatus, signature);
+    }
+    if (latestReview.status === 'passed') {
+      // B2 (honesty): report `fixed` ONLY when the re-review actually passed — a
+      // `pending`/`blocked` re-review is not a fix. fixedCount counts the slices
+      // whose review now passes, not the slices we attempted.
       return {
         status: 'fixed',
         attemptedCount: attempts.length,
-        fixedCount: failedSlices.length,
+        fixedCount: countFixedSlices(run, attemptedSliceIds),
         failedCount: latestReview.failedCount,
         attempts,
         finalReview: latestReview,
@@ -767,28 +839,41 @@ async function autoFixFailedReviewSlices(
     }
   }
 
+  // B2: if a slice stalled along the way, report it as the more actionable
+  // terminal even when attempts also ran out.
+  if (stalledSliceIds.size > 0) {
+    return buildStalledAutoFixResult(run, attempts, attemptedSliceIds, stalledSliceIds, latestReview);
+  }
   return {
     status: 'exhausted',
     attemptedCount: attempts.length,
-    fixedCount: 0,
+    fixedCount: countFixedSlices(run, attemptedSliceIds),
     failedCount: latestReview.failedCount,
     attempts,
     finalReview: latestReview,
-    reason: 'review still failed after all configured review-fix attempts',
+    reason: `review did not pass (final status: ${latestReview.status}) after all configured review-fix attempts`,
   };
 }
 
 function resolveReviewAutoFixBudget(run: OrchestrationRunRecord): {
   reviewLoops: number;
   maxFixAttempts: number;
+  maxStalledIterations: number;
   source: string;
 } {
   const hardStops = run.configSnapshot.hardStops ?? {};
+  // Clamp to >= 2: a stall means a fix ran and left the SAME signature, so the
+  // first observation (count 1, the pre-fix baseline) can never be a stall. A
+  // configured 1 — or a hand-edited 0 in the ledger — would otherwise trip the
+  // stall check on the first observation and disable auto-fix without ever
+  // attempting a single fix.
+  const maxStalledIterations = Math.max(2, hardStops.maxStalledIterations ?? DEFAULT_MAX_STALLED_ITERATIONS);
   const configuredReviewLoops = hardStops.maxReviewLoops;
   if (configuredReviewLoops !== undefined) {
     return {
       reviewLoops: configuredReviewLoops,
       maxFixAttempts: Math.max(0, configuredReviewLoops - 1),
+      maxStalledIterations,
       source: 'orchestrate.hardStops.maxReviewLoops',
     };
   }
@@ -797,12 +882,14 @@ function resolveReviewAutoFixBudget(run: OrchestrationRunRecord): {
     return {
       reviewLoops: legacyIterations,
       maxFixAttempts: Math.max(0, legacyIterations - 1),
+      maxStalledIterations,
       source: 'orchestrate.hardStops.maxIterationsPerSlice',
     };
   }
   return {
     reviewLoops: DEFAULT_REVIEW_LOOP_LIMIT,
     maxFixAttempts: Math.max(0, DEFAULT_REVIEW_LOOP_LIMIT - 1),
+    maxStalledIterations,
     source: 'default review loop limit',
   };
 }
@@ -811,8 +898,128 @@ function failedBlockingReviewGates(slice: OrchestrationSliceRecord): ReviewGateR
   return slice.review?.run.gates.filter((gate) => gate.blocking && gate.status === 'failed') ?? [];
 }
 
+// B2 (honesty): a slice counts as fixed only when its re-review actually passed,
+// so the auto-fix summary reports genuine fixes rather than merely attempted
+// slices. A slice left pending/blocked/failed is not counted.
+function countFixedSlices(run: OrchestrationRunRecord, attemptedSliceIds: Set<string>): number {
+  let fixed = 0;
+  for (const slice of run.slices) {
+    if (attemptedSliceIds.has(slice.id) && slice.review?.status === 'passed') fixed += 1;
+  }
+  return fixed;
+}
+
+// B2 (#13): the canonical no-progress signature for a slice's current failure.
+// It hashes {gateId, status, error-class, changed-files-digest} where:
+//   - the changed-files-digest is over `collectChangedFiles` output (committed +
+//     staged + unstaged + untracked) — NOT worktreeStatusDigest. A committing fix
+//     loop leaves a clean tree, so a dirty-tree-only digest would change between a
+//     dirty iteration and a committed one and miss the stall; collectChangedFiles
+//     still reflects what the loop actually changed.
+//   - the error-class is the stable {type, exitCode} pair, deliberately excluding
+//     volatile gate text (summary/stdout/stderr) and timing (durationMs/
+//     startedAt/finishedAt) so reruns that differ only in noise hash identically.
+// Two consecutive identical signatures mean the intervening fix made no progress.
+// Tradeoff: the digest is the changed-file SET, not file contents, so a fix that
+// keeps editing the same file(s) while the gate keeps the same exitCode hashes
+// identically and is treated as no-progress. This is deliberate (content hashing
+// would reintroduce the instability the stable error-class avoids); the escape
+// hatch is raising orchestrate.hardStops.maxStalledIterations, and the
+// fed-forward journal nudges the worker toward a genuinely different approach.
+function computeSliceFailureSignature(
+  context: WorkflowContext,
+  slice: OrchestrationSliceRecord,
+  failedGates: ReviewGateRunRecord[],
+): string {
+  const worktree = slice.worktreePath ?? context.repoRoot;
+  // collectChangedFiles returns a fresh array, so sorting in place is safe.
+  const changedFiles = collectChangedFiles(worktree, context.config.baseBranch).sort();
+  const changedFilesDigest = hashOrchestrationSignature(changedFiles.join('\n'));
+  const gateParts = failedGates
+    .map((gate) => `${gate.gateId}|${gate.status}|${gate.type}|${gate.exitCode ?? 'na'}`)
+    .sort();
+  return hashOrchestrationSignature(JSON.stringify({ gates: gateParts, changedFilesDigest }));
+}
+
+function hashOrchestrationSignature(value: string): string {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+// B2: count of identical entries at the tail of the list (>= 1 when non-empty,
+// reset to 1 whenever the most recent signature differs from the prior one).
+function countTrailingRepeats(signatures: string[]): number {
+  if (signatures.length === 0) return 0;
+  const last = signatures[signatures.length - 1];
+  let count = 0;
+  for (let index = signatures.length - 1; index >= 0 && signatures[index] === last; index -= 1) {
+    count += 1;
+  }
+  return count;
+}
+
+function buildStalledAutoFixResult(
+  run: OrchestrationRunRecord,
+  attempts: ReviewAutoFixAttemptReport[],
+  attemptedSliceIds: Set<string>,
+  stalledSliceIds: Set<string>,
+  latestReview: ReviewCompletedSlicesResult,
+): ReviewAutoFixResult {
+  const stalled = [...stalledSliceIds];
+  return {
+    status: 'stalled',
+    attemptedCount: attempts.length,
+    fixedCount: countFixedSlices(run, attemptedSliceIds),
+    failedCount: latestReview.failedCount,
+    attempts,
+    finalReview: latestReview,
+    reason: `no-progress detected: ${stalled.length === 1 ? 'slice' : 'slices'} ${stalled.join(', ')} repeated the same failure signature without progress`,
+  };
+}
+
 function appendRunReviewFixRecord(run: OrchestrationRunRecord, record: OrchestrationReviewFixRecord): void {
   run.reviewFixes = [...(run.reviewFixes ?? []), record];
+}
+
+// B2 (#15): the most recent review-fix record for a slice+attempt, so the
+// orchestrator can enrich it with the re-review verdict + lesson after review.
+function findReviewFixRecord(
+  run: OrchestrationRunRecord,
+  sliceId: string,
+  attempt: number,
+): OrchestrationReviewFixRecord | undefined {
+  const records = run.reviewFixes ?? [];
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    if (records[index].sliceId === sliceId && records[index].attempt === attempt) return records[index];
+  }
+  return undefined;
+}
+
+// B2 (#15): a derived one-liner whose symptom key IS the canonical no-progress
+// signature, authored from the real re-review verdict — fed forward so a later
+// attempt must try something the journal does not already show failing.
+function deriveReviewFixLesson(
+  failedGateIds: string[],
+  reviewStatus: ReviewRunRecord['status'] | null,
+  signature: string,
+): string {
+  const symptom = signature.slice(0, 12);
+  const gates = failedGateIds.length > 0 ? failedGateIds.join(', ') : 'the failing gate(s)';
+  if (reviewStatus === 'passed') {
+    return `symptom ${symptom}: this fix resolved gate(s) ${gates}.`;
+  }
+  const verdict = reviewStatus === 'failed'
+    ? 'still failed'
+    : reviewStatus === 'pending'
+      ? 'left the gate(s) pending'
+      : `left the review ${reviewStatus ?? 'unresolved'}`;
+  return `symptom ${symptom}: the attempted fix for gate(s) ${gates} ${verdict}; repeating this approach will not work — try a structurally different fix.`;
+}
+
+function formatReviewFixResult(reviewStatus: ReviewRunRecord['status'] | null | undefined): string {
+  if (reviewStatus === 'passed') return 'review passed';
+  if (reviewStatus === 'failed') return 'review still failed';
+  if (reviewStatus === 'pending') return 'review left pending gates';
+  return 'review outcome not recorded';
 }
 
 function buildOrchestratePreviewReport(
@@ -1386,7 +1593,9 @@ function renderApprovedOrchestrationReport(
   if (!reviewResult) {
     lines.push('', 'Next: resolve worker failures or blocked slices, then rerun /pipelane orchestrate start or /pipelane orchestrate review.');
   } else if (reviewResult.failedCount > 0) {
-    if (autoFixResult?.status === 'exhausted') {
+    if (autoFixResult?.status === 'stalled') {
+      lines.push('', 'Next: auto-fix stalled (no-progress detected) — the same failure signature repeated without progress; inspect the stalled slice worktrees, take a different approach to the failing blocking gates, then rerun /pipelane orchestrate review.');
+    } else if (autoFixResult?.status === 'exhausted') {
       lines.push('', 'Next: inspect exhausted auto-fix attempts, fix remaining failed blocking gates in each slice worktree, then rerun /pipelane orchestrate review.');
     } else {
       lines.push('', 'Next: fix failed blocking gates in each slice worktree, then rerun /pipelane orchestrate review.');
@@ -3138,6 +3347,7 @@ function renderReviewAutoFixPrompt(
     }
     lines.push('');
   }
+  appendReviewAutoFixJournal(lines, run, slice, attempt);
   lines.push(
     '## Original Slice Goal',
     '',
@@ -3145,6 +3355,36 @@ function renderReviewAutoFixPrompt(
     '',
   );
   return lines.join('\n');
+}
+
+// B2 (#15): the fed-forward attempt journal. Reuses this run's existing
+// `reviewFixes` records (no new memory store) to show what prior attempts tried
+// and how the re-review responded, so attempt N+1 must form a hypothesis the
+// journal does not already rule out.
+function appendReviewAutoFixJournal(
+  lines: string[],
+  run: OrchestrationRunRecord,
+  slice: OrchestrationSliceRecord,
+  attempt: number,
+): void {
+  const priorAttempts = (run.reviewFixes ?? [])
+    .filter((record) => record.sliceId === slice.id && record.attempt < attempt)
+    .sort((a, b) => a.attempt - b.attempt);
+  if (priorAttempts.length === 0) return;
+  lines.push(
+    '## Prior Fix Attempts (form a new hypothesis — do not repeat what already failed)',
+    '',
+  );
+  for (const record of priorAttempts) {
+    const tried = record.failedGateIds.length > 0
+      ? `targeted gate(s) ${record.failedGateIds.join(', ')}`
+      : 'targeted the failing gate(s)';
+    lines.push(`### Attempt ${record.attempt}`);
+    lines.push(`- Tried: ${tried} (worker ${record.workerStatus})`);
+    lines.push(`- Result: ${formatReviewFixResult(record.reviewStatus)}`);
+    if (record.lesson) lines.push(`- Lesson: ${record.lesson}`);
+    lines.push('');
+  }
 }
 
 function shellQuote(value: string): string {

@@ -6541,6 +6541,420 @@ test('orchestrate bare command --yes auto-fixes failed executable review gates a
   }
 });
 
+// B2 sub-step 1 (honesty): a fix worker that clears the failing command gate but
+// leaves a blocking manual gate pending must NOT be reported as `fixed` — the
+// re-review did not pass. Before the honesty fix, any non-`failed` re-review
+// (including `pending`) was laundered into `fixed` with fixedCount = attempted.
+test('orchestrate bare command --yes does not report fixed when the re-review is only pending', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerScript = [
+    'const fs = require("node:fs");',
+    'let prompt = "";',
+    'process.stdin.setEncoding("utf8");',
+    'process.stdin.on("data", (chunk) => { prompt += chunk; });',
+    'process.stdin.on("end", () => {',
+    '  if (prompt.includes("Review fix attempt: 1")) {',
+    '    fs.writeFileSync("review-fixed.txt", "fixed\\n", "utf8");',
+    '    console.log("review fix applied");',
+    '  } else {',
+    '    fs.writeFileSync("pipelane-slice-change.txt", "change", "utf8");',
+    '    console.log("initial worker left review failure");',
+    '  }',
+    '});',
+  ].join('');
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [
+        {
+          id: 'requires-fix-file',
+          phase: 'static',
+          type: 'command',
+          command: `${process.execPath} -e "process.exit(require('node:fs').existsSync('review-fixed.txt') ? 0 : 7)"`,
+          blocking: true,
+        },
+        {
+          id: 'manual-ai-review',
+          phase: 'ai-diff',
+          type: 'skill',
+          skill: 'review',
+          userCommands: ['/review'],
+          blocking: true,
+        },
+      ],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt fixable + pending review gates');
+
+    const cliResult = runCli([
+      'run',
+      'orchestrate',
+      '--outcome',
+      'Pending gate must not read as fixed',
+      '--provider',
+      'generic',
+      '--yes',
+      '--json',
+    ], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: `${process.execPath} -e ${JSON.stringify(workerScript)}`,
+    }, true);
+    const result = JSON.parse(cliResult.stdout);
+    createdWorktrees.push(...result.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    const onDisk = JSON.parse(readFileSync(result.ledgerPath, 'utf8'));
+
+    // The fix worker ran and cleared the command gate...
+    assert.equal(existsSync(path.join(result.run.slices[0].worktreePath, 'review-fixed.txt')), true);
+    const gates = onDisk.slices[0].review.run.gates;
+    assert.equal(gates.find((gate) => gate.gateId === 'requires-fix-file').status, 'passed');
+    assert.equal(gates.find((gate) => gate.gateId === 'manual-ai-review').status, 'pending');
+    // ...but the re-review is pending, so auto-fix must NOT claim `fixed`.
+    assert.notEqual(result.autoFix.status, 'fixed');
+    assert.equal(result.autoFix.status, 'exhausted');
+    assert.equal(result.autoFix.fixedCount, 0);
+    assert.equal(result.autoFix.attemptedCount, 1);
+    assert.equal(result.review.status, 'pending');
+    assert.equal(result.status, 'pending');
+    assert.equal(cliResult.status, 1);
+    assert.equal(onDisk.slices[0].review.status, 'pending');
+    assert.match(result.message, /Auto-fix status: exhausted/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+// B2 sub-step 2 (no-progress signature): a fix worker that never changes the
+// failure must stop after the canonical signature repeats maxStalledIterations
+// times — and the signature must be stable across the per-run noise (the gate
+// emits a different nonce each run, and every review run carries fresh
+// timestamps), or it would never match and never stall.
+test('orchestrate bare command --yes stops a no-progress review auto-fix loop with stalled', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.orchestrate = { hardStops: { maxReviewLoops: 4 } };
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'always-fails',
+        phase: 'static',
+        type: 'command',
+        // Varying stdout (nonce) + a fresh duration/timestamp each run: if the
+        // signature included any of that, it would never repeat and never stall.
+        command: `${process.execPath} -e "console.log('nonce ' + Date.now() + '-' + Math.random()); process.exit(7)"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt an unfixable review gate');
+
+    const cliResult = runCli([
+      'run',
+      'orchestrate',
+      '--outcome',
+      'Stall on a gate the worker cannot fix',
+      '--provider',
+      'generic',
+      '--yes',
+      '--json',
+    ], repoRoot, {
+      // passWorker rewrites the same marker each iteration: a material change so
+      // the slice is not `empty`, but no progress against the always-fails gate.
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(),
+    }, true);
+    const result = JSON.parse(cliResult.stdout);
+    createdWorktrees.push(...result.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    const onDisk = JSON.parse(readFileSync(result.ledgerPath, 'utf8'));
+
+    assert.equal(result.autoFix.status, 'stalled');
+    // One fix worker ran (attempt 1); attempt 2 detected the repeat and stopped
+    // without spending another worker, well short of the maxReviewLoops budget.
+    assert.equal(result.autoFix.attemptedCount, 1);
+    assert.equal(result.autoFix.fixedCount, 0);
+    assert.equal(onDisk.reviewFixes.length, 1);
+    assert.equal(result.review.status, 'failed');
+    assert.equal(result.status, 'failed');
+    assert.equal(cliResult.status, 1);
+    assert.match(cliResult.stderr, /no-progress signature repeated 2x \(>= 2\); marking stalled/);
+    assert.match(result.message, /Auto-fix status: stalled/);
+    assert.match(result.message, /auto-fix stalled \(no-progress detected\)/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+// B2 sub-step 2 (collectChangedFiles digest, NOT worktreeStatusDigest): a fix
+// loop that COMMITS each iteration leaves a clean worktree, so a dirty-tree-only
+// digest would differ between the dirty first iteration and the clean committed
+// one and never detect the stall. The collectChangedFiles digest still sees the
+// committed change set, so the no-progress loop is correctly stalled.
+test('orchestrate bare command --yes detects a committing no-progress loop as stalled', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerScript = [
+    'const fs = require("node:fs");',
+    'const cp = require("node:child_process");',
+    'let prompt = "";',
+    'process.stdin.setEncoding("utf8");',
+    'process.stdin.on("data", (chunk) => { prompt += chunk; });',
+    'process.stdin.on("end", () => {',
+    '  if (prompt.includes("Review fix attempt")) {',
+    // Commit the existing change, leaving a clean worktree but the same net diff.
+    '    cp.execSync("git add -A", { stdio: "ignore" });',
+    '    cp.execSync("git -c user.email=ci@example.com -c user.name=CI commit -m \\"fix attempt\\" --allow-empty", { stdio: "ignore" });',
+    '    console.log("committed fix attempt");',
+    '  } else {',
+    '    fs.writeFileSync("pipelane-slice-change.txt", "change", "utf8");',
+    '    console.log("initial change");',
+    '  }',
+    '});',
+  ].join('');
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.orchestrate = { hardStops: { maxReviewLoops: 4 } };
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'always-fails',
+        phase: 'static',
+        type: 'command',
+        command: `${process.execPath} -e "process.exit(7)"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt an unfixable review gate for a committing loop');
+
+    const cliResult = runCli([
+      'run',
+      'orchestrate',
+      '--outcome',
+      'Stall a committing fix loop',
+      '--provider',
+      'generic',
+      '--yes',
+      '--json',
+    ], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: `${process.execPath} -e ${JSON.stringify(workerScript)}`,
+    }, true);
+    const result = JSON.parse(cliResult.stdout);
+    const worktreePath = result.run.slices[0].worktreePath;
+    createdWorktrees.push(...result.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+
+    assert.equal(result.autoFix.status, 'stalled');
+    assert.equal(result.autoFix.attemptedCount, 1);
+    assert.equal(result.status, 'failed');
+    // The fix worker committed: the worktree is clean, which a worktreeStatusDigest
+    // would read as identical-to-empty and a collectChangedFiles digest reads as
+    // the committed change set — only the latter detects the stall.
+    const porcelain = execFileSync('git', ['status', '--porcelain'], { cwd: worktreePath, encoding: 'utf8' });
+    assert.equal(porcelain.trim(), '');
+    assert.match(cliResult.stderr, /no-progress signature repeated 2x \(>= 2\); marking stalled/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+// B2 sub-step 2: the stall threshold is configurable via
+// orchestrate.hardStops.maxStalledIterations — raising it to 3 makes auto-fix run
+// one more no-progress worker before giving up.
+test('orchestrate bare command --yes honors a configurable maxStalledIterations threshold', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.orchestrate = { hardStops: { maxReviewLoops: 5, maxStalledIterations: 3 } };
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'always-fails',
+        phase: 'static',
+        type: 'command',
+        command: `${process.execPath} -e "process.exit(7)"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt a higher stall threshold');
+
+    const cliResult = runCli([
+      'run',
+      'orchestrate',
+      '--outcome',
+      'Stall only after three repeats',
+      '--provider',
+      'generic',
+      '--yes',
+      '--json',
+    ], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(),
+    }, true);
+    const result = JSON.parse(cliResult.stdout);
+    createdWorktrees.push(...result.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+
+    assert.equal(result.autoFix.status, 'stalled');
+    // Two no-progress workers ran (attempts 1 and 2); the third repeat stalled it.
+    assert.equal(result.autoFix.attemptedCount, 2);
+    assert.match(cliResult.stderr, /no-progress signature repeated 3x \(>= 3\); marking stalled/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+// B2 sub-step 2 (regression): maxStalledIterations is clamped to >= 2, because a
+// stall requires a fix to have run and left the same signature — the first
+// observation is the pre-fix baseline. A configured 1 must NOT stall before any
+// fix runs (which would silently disable auto-fix with attemptedCount 0).
+test('orchestrate bare command --yes clamps maxStalledIterations to attempt at least one fix', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.orchestrate = { hardStops: { maxReviewLoops: 4, maxStalledIterations: 1 } };
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'always-fails',
+        phase: 'static',
+        type: 'command',
+        command: `${process.execPath} -e "process.exit(7)"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt a degenerate stall threshold');
+
+    const cliResult = runCli([
+      'run',
+      'orchestrate',
+      '--outcome',
+      'Threshold one must still try once',
+      '--provider',
+      'generic',
+      '--yes',
+      '--json',
+    ], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(),
+    }, true);
+    const result = JSON.parse(cliResult.stdout);
+    createdWorktrees.push(...result.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+
+    assert.equal(result.autoFix.status, 'stalled');
+    // The clamp makes the effective threshold 2, so one fix worker still runs.
+    assert.equal(result.autoFix.attemptedCount, 1);
+    assert.notEqual(result.autoFix.attemptedCount, 0);
+    assert.match(cliResult.stderr, /no-progress signature repeated 2x \(>= 2\); marking stalled/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+// B2 sub-step 3 (fed-forward attempt journal): a later fix attempt's prompt must
+// carry a Tried/Result/Lesson journal authored from the earlier attempts' real
+// re-review outcomes, reusing this run's reviewFixes records. Each attempt here
+// changes the file set (a new file) so the signature never repeats and the loop
+// runs more than once without stalling.
+test('orchestrate bare command --yes feeds a Tried/Result/Lesson journal into later fix prompts', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const workerScript = [
+    'const fs = require("node:fs");',
+    'let prompt = "";',
+    'process.stdin.setEncoding("utf8");',
+    'process.stdin.on("data", (chunk) => { prompt += chunk; });',
+    'process.stdin.on("end", () => {',
+    '  const m = prompt.match(/Review fix attempt: (\\d+)/);',
+    // A uniquely-named file per attempt keeps the changed-files set growing, so the
+    // no-progress signature differs each attempt and the loop iterates (not stall).
+    '  const step = m ? m[1] : "0";',
+    '  fs.writeFileSync("fix-step-" + step + ".txt", "step " + step, "utf8");',
+    '  console.log("fix step " + step);',
+    '});',
+  ].join('');
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.orchestrate = { hardStops: { maxReviewLoops: 3 } };
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'always-fails',
+        phase: 'static',
+        type: 'command',
+        command: `${process.execPath} -e "process.exit(7)"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt a gate that drives multiple fix attempts');
+
+    const cliResult = runCli([
+      'run',
+      'orchestrate',
+      '--outcome',
+      'Feed the attempt journal forward',
+      '--provider',
+      'generic',
+      '--yes',
+      '--json',
+    ], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: `${process.execPath} -e ${JSON.stringify(workerScript)}`,
+    }, true);
+    const result = JSON.parse(cliResult.stdout);
+    createdWorktrees.push(...result.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    const onDisk = JSON.parse(readFileSync(result.ledgerPath, 'utf8'));
+
+    // Two fix attempts ran (signature kept changing → no stall), then exhausted.
+    assert.equal(result.autoFix.status, 'exhausted');
+    assert.equal(result.autoFix.attemptedCount, 2);
+    const attempts = result.autoFix.attempts;
+    assert.equal(attempts.length, 2);
+
+    // The first attempt has no prior journal; the second feeds the first forward.
+    const firstPrompt = readFileSync(attempts[0].promptPath, 'utf8');
+    assert.doesNotMatch(firstPrompt, /Prior Fix Attempts/);
+    const secondPrompt = readFileSync(attempts[1].promptPath, 'utf8');
+    assert.match(secondPrompt, /## Prior Fix Attempts \(form a new hypothesis/);
+    assert.match(secondPrompt, /### Attempt 1/);
+    assert.match(secondPrompt, /- Tried: targeted gate\(s\) always-fails \(worker succeeded\)/);
+    assert.match(secondPrompt, /- Result: review still failed/);
+    assert.match(secondPrompt, /- Lesson: symptom [0-9a-f]{12}: the attempted fix for gate\(s\) always-fails still failed/);
+
+    // The journal is authored from the persisted reviewFixes records.
+    assert.equal(onDisk.reviewFixes[0].attempt, 1);
+    assert.equal(onDisk.reviewFixes[0].reviewStatus, 'failed');
+    assert.match(onDisk.reviewFixes[0].signature, /^[0-9a-f]{64}$/);
+    assert.match(onDisk.reviewFixes[0].lesson, /^symptom [0-9a-f]{12}:/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('orchestrate bare command --yes honors maxReviewLoops before review auto-fix', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];
@@ -6719,6 +7133,7 @@ test('review leaves code-review high pending instead of auto-running native clau
   const repoRoot = createRepo();
   const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-fake-claude-'));
   const invokedPath = path.join(fakeBin, 'claude-invoked');
+
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
     const configPath = path.join(repoRoot, '.pipelane.json');
@@ -6754,6 +7169,136 @@ test('review leaves code-review high pending instead of auto-running native clau
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
+// B4 (programmatic-before-judge): when a blocking deterministic gate fails, the
+// expensive AI judge that follows is deferred to `pending` (not `skipped`, which
+// can pass) and is NOT invoked — proven by the judge's sentinel file staying
+// absent. The review fails on the deterministic gate regardless.
+test('review defers the AI judge to pending when a blocking deterministic gate fails', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [
+        {
+          id: 'always-fails',
+          phase: 'static',
+          type: 'command',
+          command: `${process.execPath} -e "process.exit(7)"`,
+          blocking: true,
+        },
+        {
+          id: 'gstack-review',
+          phase: 'ai-diff',
+          type: 'skill',
+          skill: 'review',
+          userCommands: ['/review'],
+          blocking: true,
+        },
+      ],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt a failing deterministic gate before an AI judge');
+
+    // If invoked, the AI judge writes a sentinel and reports passed.
+    const aiReviewCommand = [
+      'node -e "',
+      'const fs = require(\'fs\');',
+      'let input = \'\';',
+      'process.stdin.on(\'data\', chunk => input += chunk);',
+      'process.stdin.on(\'end\', () => {',
+      'fs.writeFileSync(\'ai-judge-invoked.txt\', \'invoked\', \'utf8\');',
+      'console.log(\'PIPELANE_REVIEW_GATE_RESULT=passed\');',
+      '});',
+      '"',
+    ].join('');
+    const result = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      PIPELANE_REVIEW_GATE_COMMAND: aiReviewCommand,
+      PIPELANE_REVIEW_PROVIDER: 'codex',
+    }, true).stdout);
+
+    assert.equal(result.status, 'failed');
+    const deterministic = result.gates.find((gate) => gate.gateId === 'always-fails');
+    const judge = result.gates.find((gate) => gate.gateId === 'gstack-review');
+    assert.equal(deterministic.status, 'failed');
+    // Deferred to pending — not skipped (which can pass), not passing.
+    assert.equal(judge.status, 'pending');
+    assert.match(judge.summary, /deferred: a blocking deterministic gate failed/);
+    // The judge command never ran: no sentinel, no attester evidence.
+    assert.equal(existsSync(path.join(repoRoot, 'ai-judge-invoked.txt')), false);
+    assert.equal(judge.attester, undefined);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+// B4 (regression): the deferral must hold even when the blocking deterministic
+// gate is authored in a phase that sorts AFTER ai-diff (here `runtime`). Gate type
+// is not bound to phase, so deferral keys off type, not authoring order — all
+// deterministic gates are evaluated before any AI judge.
+test('review defers the AI judge even when the failing deterministic gate is in a later phase', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [
+        {
+          // ai-diff (index 2) sorts BEFORE runtime (index 4): without type-first
+          // evaluation, this judge would run before the command gate below fails.
+          id: 'gstack-review',
+          phase: 'ai-diff',
+          type: 'skill',
+          skill: 'review',
+          userCommands: ['/review'],
+          blocking: true,
+        },
+        {
+          id: 'late-fails',
+          phase: 'runtime',
+          type: 'command',
+          command: `${process.execPath} -e "process.exit(7)"`,
+          blocking: true,
+        },
+      ],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt a late-phase failing deterministic gate');
+
+    const aiReviewCommand = [
+      'node -e "',
+      'const fs = require(\'fs\');',
+      'let input = \'\';',
+      'process.stdin.on(\'data\', chunk => input += chunk);',
+      'process.stdin.on(\'end\', () => {',
+      'fs.writeFileSync(\'ai-judge-invoked.txt\', \'invoked\', \'utf8\');',
+      'console.log(\'PIPELANE_REVIEW_GATE_RESULT=passed\');',
+      '});',
+      '"',
+    ].join('');
+    const result = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      PIPELANE_REVIEW_GATE_COMMAND: aiReviewCommand,
+      PIPELANE_REVIEW_PROVIDER: 'codex',
+    }, true).stdout);
+
+    assert.equal(result.status, 'failed');
+    const judge = result.gates.find((gate) => gate.gateId === 'gstack-review');
+    const deterministic = result.gates.find((gate) => gate.gateId === 'late-fails');
+    assert.equal(deterministic.status, 'failed');
+    assert.equal(judge.status, 'pending');
+    assert.match(judge.summary, /deferred: a blocking deterministic gate failed/);
+    assert.equal(existsSync(path.join(repoRoot, 'ai-judge-invoked.txt')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
   }
 });
 
@@ -19273,6 +19818,15 @@ function autoUpdateCachePathForTest(repoRoot, pipelaneHome) {
   return path.join(pipelaneHome, 'update-checks', `${key}.json`);
 }
 
+async function waitForPathForTest(targetPath, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(targetPath)) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for ${targetPath}`);
+}
+
 test('CLI auto-updates workflow commands and re-execs the updated local bin without stdout noise', () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-bin-'));
@@ -19341,14 +19895,101 @@ test('CLI notifies about updates by default without installing or re-pinning', a
       '#!/bin/sh\necho "REEXEC:$*"\n',
       { mode: 0o755, encoding: 'utf8' },
     );
-    makeFakeUpdateBin(binDir, { latestSha: newSha, npmMarkerPath: npmInstallLog });
+    makeFakeUpdateBin(binDir, {
+      latestSha: newSha,
+      aheadCommits: [
+        { sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', subject: 'Add guided update notifications' },
+        { sha: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', subject: 'Fix board runtime refresh' },
+        { sha: 'cccccccccccccccccccccccccccccccccccccccc', subject: 'Document release-gate drift' },
+        { sha: 'dddddddddddddddddddddddddddddddddddddddd', subject: 'Tighten setup follow-up detection' },
+      ],
+      npmMarkerPath: npmInstallLog,
+    });
+    const cachePath = autoUpdateCachePathForTest(consumerRoot, pipelaneHome);
 
     // Default behavior: PIPELANE_AUTO_UPDATE unset -> notify-only. The global
     // test setup pins it to '0'; clear it here to exercise the real default.
     const env = {
       ...process.env,
       PIPELANE_HOME: pipelaneHome,
-      PIPELANE_AUTO_UPDATE_TTL_MS: '0',
+      PORT: String(port),
+      PATH: `${binDir}:${process.env.PATH}`,
+    };
+    delete env.PIPELANE_AUTO_UPDATE;
+
+    const first = spawnSync('node', [CLI_PATH, 'board', 'status'], {
+      cwd: consumerRoot,
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(first.status, 0, first.stderr);
+    assert.doesNotMatch(first.stderr, /New Pipelane update available/);
+    assert.equal(existsSync(npmInstallLog), false, 'notify-only must not run npm install');
+    await waitForPathForTest(cachePath);
+
+    const result = spawnSync('node', [CLI_PATH, 'board', 'status'], {
+      cwd: consumerRoot,
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(result.status, 0, result.stderr);
+    // Notice fired: names the available update, tells slash-command users what
+    // to run, and summarizes the update from compare commits.
+    assert.match(result.stderr, /New Pipelane update available \(1111111 -> 2222222\)/);
+    assert.match(result.stderr, /Run `\/pipelane update` to install it/);
+    assert.match(result.stderr, /What's new: Add guided update notifications\. Fix board runtime refresh\. Document release-gate drift\. 1 more commit is included\./);
+    // Did NOT self-update: no auto-update banner, no npm install, no re-exec.
+    assert.doesNotMatch(result.stderr, /Auto-updating pipelane/);
+    assert.doesNotMatch(result.stdout, /REEXEC/);
+    assert.equal(existsSync(npmInstallLog), false, 'notify-only must not run npm install');
+    // package.json pin untouched: lock still resolves to the old sha.
+    const lock = JSON.parse(readFileSync(path.join(consumerRoot, 'package-lock.json'), 'utf8'));
+    assert.equal(lock.packages['node_modules/pipelane'].resolved.endsWith(`#${oldSha}`), true);
+  } finally {
+    rmSync(consumerRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('CLI notifies from a fresh cached update without re-checking remote status', async () => {
+  const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-cached-notify-consumer-'));
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-cached-notify-bin-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  const remoteCallLog = path.join(consumerRoot, 'remote-calls.log');
+  const oldSha = '1111111111111111111111111111111111111111';
+  const newSha = '2222222222222222222222222222222222222222';
+  const port = await getFreePort();
+  try {
+    writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    const cachePath = autoUpdateCachePathForTest(consumerRoot, pipelaneHome);
+    mkdirSync(path.dirname(cachePath), { recursive: true });
+    writeFileSync(
+      cachePath,
+      JSON.stringify({
+        checkedAt: new Date().toISOString(),
+        installedSha: oldSha,
+        latestSha: newSha,
+        upToDate: false,
+        aheadBy: 2,
+        commits: [
+          { sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', subject: 'Ship cached update notices' },
+          { sha: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', subject: 'Polish upgrade copy' },
+        ],
+      }, null, 2) + '\n',
+      'utf8',
+    );
+    makeFakeUpdateBin(binDir, {
+      latestSha: newSha,
+      gitMarkerPath: remoteCallLog,
+      compareMarkerPath: remoteCallLog,
+    });
+
+    const env = {
+      ...process.env,
+      PIPELANE_HOME: pipelaneHome,
       PORT: String(port),
       PATH: `${binDir}:${process.env.PATH}`,
     };
@@ -19362,16 +20003,10 @@ test('CLI notifies about updates by default without installing or re-pinning', a
     });
 
     assert.equal(result.status, 0, result.stderr);
-    // Notice fired: names the available update and how to apply it.
-    assert.match(result.stderr, /Update available: 1111111 -> 2222222/);
-    assert.match(result.stderr, /pipelane update/);
-    // Did NOT self-update: no auto-update banner, no npm install, no re-exec.
-    assert.doesNotMatch(result.stderr, /Auto-updating pipelane/);
-    assert.doesNotMatch(result.stdout, /REEXEC/);
-    assert.equal(existsSync(npmInstallLog), false, 'notify-only must not run npm install');
-    // package.json pin untouched: lock still resolves to the old sha.
-    const lock = JSON.parse(readFileSync(path.join(consumerRoot, 'package-lock.json'), 'utf8'));
-    assert.equal(lock.packages['node_modules/pipelane'].resolved.endsWith(`#${oldSha}`), true);
+    assert.match(result.stderr, /New Pipelane update available \(1111111 -> 2222222\)/);
+    assert.match(result.stderr, /Run `\/pipelane update` to install it/);
+    assert.match(result.stderr, /What's new: Ship cached update notices\. Polish upgrade copy\./);
+    assert.equal(existsSync(remoteCallLog), false, 'fresh cached update notice must not re-check remote status');
   } finally {
     rmSync(consumerRoot, { recursive: true, force: true });
     rmSync(binDir, { recursive: true, force: true });
@@ -19488,7 +20123,7 @@ test('CLI auto-update cache write failures do not block commands', async () => {
   }
 });
 
-test('CLI auto-update ignores cached stale status entries', () => {
+test('CLI auto-update installs from cached stale status entries', () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-bin-'));
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
@@ -23380,6 +24015,7 @@ test('normalizeWorkflowConfig filters malformed orchestrate config', async () =>
         maxIterationsPerSlice: 3,
         maxReviewLoops: 4,
         maxMinutesPerSlice: Number.NaN,
+        maxStalledIterations: 0,
       },
     },
   });
@@ -23396,6 +24032,7 @@ test('normalizeWorkflowConfig filters malformed orchestrate config', async () =>
       maxIterationsPerSlice: 3,
       maxReviewLoops: 4,
       maxMinutesPerSlice: undefined,
+      maxStalledIterations: undefined,
     },
   });
 
