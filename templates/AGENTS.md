@@ -6,7 +6,7 @@ This repo uses `pipelane` for task workspaces, PR prep, merge handoff, and deplo
 
 - Default slash aliases are `{{ALIAS_DEVMODE}}`, `{{ALIAS_NEW}}`, `{{ALIAS_RESUME}}`, `{{ALIAS_PR}}`, `{{ALIAS_MERGE}}`, `{{ALIAS_DEPLOY}}`, `{{ALIAS_CLEAN}}`, `{{ALIAS_STATUS}}`, `{{ALIAS_DOCTOR}}`, and `{{ALIAS_ROLLBACK}}`.
 - Fixed helper commands include `/fix`, `/fix rethink`, and `/fix refresh-guidance`.
-- Prefer the slash aliases above. Repo-local `npm run pipelane:*` scripts are a fallback path and require `node_modules/.bin/pipelane` to exist.
+- Prefer the slash aliases above. They use the managed Pipelane runner and work before a fresh checkout has `node_modules`. Repo-local `npm run pipelane:*` or `npm run workflow:*` scripts are fallback paths and require `node_modules/.bin/pipelane` to exist.
 - For code changes, ensure work is in a Pipelane task workspace before editing. If the user describes a new task from a non-task checkout, run `{{ALIAS_NEW}}` with an inferred `--task` label before implementation.
 - Use `{{ALIAS_NEW}}` to start new work after the user describes the task; use an explicit task name if the user provided one, otherwise infer a concise `--task` label instead of making the user repeat it.
 - Use `{{ALIAS_RESUME}} --task "<task-name>"` to return to an existing task workspace.

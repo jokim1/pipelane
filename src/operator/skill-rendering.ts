@@ -82,6 +82,10 @@ Treat \`${slashAlias} setup\` as the normal repo setup path and
 \`${slashAlias} configure\` as the normal deploy configuration path. Do not ask
 the user to run \`! pipelane configure\` in a terminal; the durable runner knows
 where the managed pipelane runtime is even when \`pipelane\` is not on PATH.
+Do not substitute repo-local \`npm run pipelane:*\` or \`npm run workflow:*\`
+scripts for bootstrap/task-start flows in a fresh checkout; npm resolves those
+through \`node_modules/.bin/pipelane\` and can fail before Pipelane links or
+installs dependencies.
 
 Plain \`${slashAlias} setup\` configures the repo-wide Pipelane files. Plain
 \`${slashAlias} review setup\` configures the pre-PR review gates. Keep those
@@ -203,6 +207,13 @@ pass it as \`--pr 625\`. Do not pass a raw unquoted \`#625\` token to a shell;
   }
 
   return `
+## Fresh checkout behavior
+
+Use this slash command through the managed runner when starting a task from a
+fresh checkout. Do not substitute repo-local \`npm run pipelane:new\` or
+\`npm run workflow:new\` before \`node_modules/.bin/pipelane\` exists; npm will
+fail before Pipelane can create the task worktree or link dependencies.
+
 ## Bare invocation behavior
 
 When the user invokes bare ${slashAlias} after describing an unstarted coding

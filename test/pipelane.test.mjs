@@ -927,8 +927,13 @@ test('init writes tracked Pipelane files and setup seeds CLAUDE plus tracked Cod
     assert.equal(existsSync(path.join(codexHome, 'skills', 'pr', 'SKILL.md')), false);
 
     const newSkill = readFileSync(path.join(repoRoot, '.agents', 'skills', 'new', 'SKILL.md'), 'utf8');
+    assert.match(newSkill, /Fresh checkout behavior/);
+    assert.match(newSkill, /npm run workflow:new/);
     assert.match(newSkill, /Bare invocation behavior/);
     assert.match(newSkill, /infer a\s+concise task label/);
+    const agentsGuidance = readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8');
+    assert.match(agentsGuidance, /managed Pipelane runner/);
+    assert.match(agentsGuidance, /npm run workflow:\*/);
 
     const deploySkill = readFileSync(path.join(repoRoot, '.agents', 'skills', 'deploy', 'SKILL.md'), 'utf8');
     assert.match(deploySkill, /Blocked deploy follow-up behavior/);
@@ -2056,7 +2061,10 @@ test('install-codex outside a pipelane repo installs durable global default skil
     assert.ok(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')));
     assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md')));
     assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane-fix', 'SKILL.md')));
-    assert.match(readFileSync(path.join(codexHome, 'skills', 'new', 'SKILL.md'), 'utf8'), /Bare invocation behavior/);
+    const newSkill = readFileSync(path.join(codexHome, 'skills', 'new', 'SKILL.md'), 'utf8');
+    assert.match(newSkill, /Fresh checkout behavior/);
+    assert.match(newSkill, /npm run workflow:new/);
+    assert.match(newSkill, /Bare invocation behavior/);
     const deploySkill = readFileSync(path.join(codexHome, 'skills', 'deploy', 'SKILL.md'), 'utf8');
     assert.match(deploySkill, /Blocked deploy follow-up behavior/);
     assert.match(deploySkill, /Reply 1 or Y to execute/);
@@ -2065,6 +2073,7 @@ test('install-codex outside a pipelane repo installs durable global default skil
     const pipelaneSkill = readFileSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
     assert.match(pipelaneSkill, /Interactive review setup behavior/);
     assert.match(pipelaneSkill, /runner command above/);
+    assert.match(pipelaneSkill, /npm run workflow:\*/);
     assert.match(pipelaneSkill, /review setup --enable <gate-id>/);
     assert.match(pipelaneSkill, /review setup --disable <gate-id>/);
     assert.match(pipelaneSkill, /review setup --install <gate-id>/);
@@ -2106,14 +2115,18 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md')));
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane', 'SKILL.md')));
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane-fix', 'SKILL.md')));
-    assert.match(readFileSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md'), 'utf8'), /disable-model-invocation: true/);
-    assert.match(readFileSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md'), 'utf8'), /Bare invocation behavior/);
+    const newSkill = readFileSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md'), 'utf8');
+    assert.match(newSkill, /disable-model-invocation: true/);
+    assert.match(newSkill, /Fresh checkout behavior/);
+    assert.match(newSkill, /npm run workflow:new/);
+    assert.match(newSkill, /Bare invocation behavior/);
     const deploySkill = readFileSync(path.join(claudeHome, 'skills', 'deploy', 'SKILL.md'), 'utf8');
     assert.match(deploySkill, /PR shorthand behavior/);
     assert.match(deploySkill, /pass it as `--pr 625`/);
     const pipelaneSkill = readFileSync(path.join(claudeHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
     assert.match(pipelaneSkill, /Interactive review setup behavior/);
     assert.match(pipelaneSkill, /runner command above/);
+    assert.match(pipelaneSkill, /npm run workflow:\*/);
     assert.match(pipelaneSkill, /review setup --enable <gate-id>/);
     assert.match(pipelaneSkill, /review setup --disable <gate-id>/);
     assert.match(pipelaneSkill, /review setup --install <gate-id>/);
@@ -4984,6 +4997,127 @@ test('loadWorkflowConfig applies a package.json:pipelane overlay when the file i
     assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('linked worktrees read untracked shared checkout workflow config', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const worktreePath = path.join(os.tmpdir(), `pipelane-linked-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+
+  try {
+    const gitignorePath = path.join(repoRoot, '.gitignore');
+    const existingGitignore = existsSync(gitignorePath) ? readFileSync(gitignorePath, 'utf8') : '';
+    writeFileSync(
+      gitignorePath,
+      `${existingGitignore}${existingGitignore && !existingGitignore.endsWith('\n') ? '\n' : ''}.pipelane.json\n`,
+      'utf8',
+    );
+    commitAll(repoRoot, 'Ignore local pipelane config');
+
+    const sharedConfigPath = path.join(repoRoot, '.pipelane.json');
+    writeFileSync(
+      sharedConfigPath,
+      `${JSON.stringify({
+        displayName: 'Shared Local App',
+        projectKey: 'shared-local-app',
+        aliases: { deploy: '/deploy-shared' },
+        surfaces: ['frontend'],
+      }, null, 2)}\n`,
+      'utf8',
+    );
+
+    execFileSync('git', ['worktree', 'add', '-b', 'task/shared-local-config', worktreePath, 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    assert.equal(existsSync(path.join(worktreePath, '.pipelane.json')), false);
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const onboardingMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'onboarding.ts'));
+    assert.equal(realpathSync(stateMod.resolveReadableConfigPath(worktreePath)), realpathSync(sharedConfigPath));
+    const loaded = stateMod.loadWorkflowConfig(worktreePath);
+    assert.equal(loaded.displayName, 'Shared Local App');
+    assert.equal(loaded.projectKey, 'shared-local-app');
+    assert.equal(loaded.aliases.deploy, '/deploy-shared');
+    assert.deepEqual(loaded.surfaces, ['frontend']);
+    assert.equal(onboardingMod.buildMissingDeployOnboardingMessage(worktreePath, { environment: 'staging' }), null);
+  } finally {
+    spawnSync('git', ['worktree', 'remove', '--force', worktreePath], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('linked worktrees do not inherit tracked config from another checkout', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const worktreePath = path.join(os.tmpdir(), `pipelane-linked-tracked-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+
+  try {
+    const preOnboardingSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim();
+    runCli(['init', '--project', 'Tracked Config App'], repoRoot);
+    commitAll(repoRoot, 'Track pipelane config');
+
+    execFileSync('git', ['worktree', 'add', '-b', 'task/pre-onboarding', worktreePath, preOnboardingSha], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    assert.equal(existsSync(path.join(worktreePath, '.pipelane.json')), false);
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const onboardingMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'onboarding.ts'));
+    assert.equal(stateMod.resolveReadableConfigPath(worktreePath), null);
+    const loaded = stateMod.loadWorkflowConfig(worktreePath);
+    assert.equal(loaded.displayName, 'sample-repo');
+    assert.match(
+      onboardingMod.buildMissingDeployOnboardingMessage(worktreePath, { environment: 'staging' }),
+      /repo is not onboarded yet/,
+    );
+  } finally {
+    spawnSync('git', ['worktree', 'remove', '--force', worktreePath], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('linked worktrees do not inherit unignored untracked config from another checkout', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const worktreePath = path.join(os.tmpdir(), `pipelane-linked-unignored-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+
+  try {
+    const sharedConfigPath = path.join(repoRoot, '.pipelane.json');
+    writeFileSync(
+      sharedConfigPath,
+      `${JSON.stringify({
+        displayName: 'Accidental Local App',
+        projectKey: 'accidental-local-app',
+        surfaces: ['frontend'],
+      }, null, 2)}\n`,
+      'utf8',
+    );
+
+    execFileSync('git', ['worktree', 'add', '-b', 'task/unignored-local-config', worktreePath, 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    assert.equal(existsSync(path.join(worktreePath, '.pipelane.json')), false);
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const onboardingMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'onboarding.ts'));
+    assert.equal(stateMod.resolveReadableConfigPath(worktreePath), null);
+    assert.match(
+      onboardingMod.buildMissingDeployOnboardingMessage(worktreePath, { environment: 'staging' }),
+      /repo is not onboarded yet/,
+    );
+  } finally {
+    spawnSync('git', ['worktree', 'remove', '--force', worktreePath], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
   }
 });
 
@@ -15206,6 +15340,68 @@ test('deploy fails closed when healthcheck returns non-2xx', () => {
     assert.equal(latest.status, 'failed');
     assert.equal(latest.verification.statusCode, 503);
     assert.equal(latest.taskSlug, 'bad-healthcheck');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('release-mode deploy staging can retry after the latest staging record failed', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  writeFileSync(ghStateFile, JSON.stringify({ prs: {}, workflows: [] }, null, 2), 'utf8');
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const sha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+    writeTaskLock(repoRoot, 'retry-staging', { mode: 'release', surfaces: ['frontend'] });
+    writePrRecord(repoRoot, 'retry-staging', sha);
+    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    writeFileSync(path.join(stateDir, 'mode-state.json'), JSON.stringify({
+      mode: 'release',
+      requestedSurfaces: ['frontend'],
+      override: null,
+      updatedAt: '2026-04-25T00:00:00Z',
+    }, null, 2), 'utf8');
+    writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({
+      records: [{
+        environment: 'staging',
+        sha,
+        surfaces: ['frontend'],
+        workflowName: 'Deploy Hosted',
+        requestedAt: '2026-04-25T00:00:00Z',
+        finishedAt: '2026-04-25T00:01:00Z',
+        taskSlug: 'retry-staging',
+        status: 'failed',
+        failureReason: 'remote migration history drift',
+        idempotencyKey: 'failed-staging-before-repair',
+        triggeredBy: 'test',
+      }],
+    }, null, 2), 'utf8');
+
+    const deployed = JSON.parse(runCli(
+      ['run', 'deploy', 'staging', '--task', 'retry-staging', '--json'],
+      repoRoot,
+      env,
+    ).stdout);
+
+    assert.equal(deployed.status, 'succeeded');
+    assert.equal(deployed.environment, 'staging');
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.workflows.length, 1, 'retry should dispatch without requiring a release override');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -26051,6 +26247,70 @@ test('destination routes block opaque dirty approvals before local PR side effec
     assert.equal(result.status, 1);
     assert.match(payload.blockers.join('\n'), /worktree dirty state is too large or opaque/);
     assert.match(payload.blockers.join('\n'), /untracked directories are opaque/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('destination routes infer a task slug from a dirty lockless branch', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'configure pipelane'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['checkout', '-b', 'codex/add-custom-column-grouping-abcd'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(repoRoot, 'feature.txt'), 'hello\n', 'utf8');
+
+    const result = runCli(
+      ['run', 'deploy', 'staging', '--title', 'Add custom column grouping', '--plan', '--json'],
+      repoRoot,
+    );
+    const payload = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0);
+    assert.equal(payload.taskSlug, 'add-custom-column-grouping');
+    assert.equal(payload.taskName, '');
+    assert.deepEqual(payload.blockers, []);
+    assert.deepEqual(
+      payload.remainingSteps.map((step) => step.id),
+      ['pr', 'review_gate', 'merge', 'deploy_staging'],
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('destination routes require a title for dirty lockless branch PR creation', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'configure pipelane'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['checkout', '-b', 'codex/add-custom-column-grouping-abcd'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(repoRoot, 'feature.txt'), 'hello\n', 'utf8');
+
+    const result = runCli(
+      ['run', 'deploy', 'staging', '--plan', '--json'],
+      repoRoot,
+      {},
+      true,
+    );
+    const payload = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 1);
+    assert.equal(payload.taskSlug, 'add-custom-column-grouping');
+    assert.equal(payload.taskName, '');
+    assert.match(payload.blockers.join('\n'), /dirty local changes require --title/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }

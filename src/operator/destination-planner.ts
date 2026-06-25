@@ -34,6 +34,7 @@ import {
   buildStaleBaseBlockerForRepo,
   deriveTaskSlugFromPr,
   inferActiveTaskLock,
+  inferTaskSlugFromBranchName,
   loadOpenPrForBranch,
   loadPrByNumber,
   resolveCommandSurfaces,
@@ -118,6 +119,7 @@ export interface DestinationPlan {
   targetCommand: string;
   currentMilestone: DestinationMilestone;
   currentStatus: string;
+  taskName: string;
   requestedSurfaces: string[];
   surfaces: SurfaceSummary[];
   remainingSteps: DestinationStep[];
@@ -205,7 +207,24 @@ export function resolveDestinationSnapshot(
   if (!taskSlug && livePr) {
     taskSlug = deriveTaskSlugFromPr(context.config, livePr, livePr.headRefName ?? branchName);
   }
-  if (!taskName) taskName = taskSlug;
+
+  const explicitTaskSlug = parsed.flags.task.trim() ? slugifyTaskName(parsed.flags.task) : '';
+  const locklessBranchSlug = branchName && !isBaseBranchName(context.config, branchName)
+    ? inferTaskSlugFromBranchName(context.config, branchName) || slugifyTaskName(branchName)
+    : '';
+  let taskSlugInferredFromLocklessBranch = false;
+  if (
+    locklessBranchSlug
+    && (!explicitTaskSlug || explicitTaskSlug === locklessBranchSlug)
+    && (!lock || !taskSlug)
+  ) {
+    taskSlug = explicitTaskSlug || taskSlug || locklessBranchSlug;
+    taskSlugInferredFromLocklessBranch = true;
+    if (/^No task lock (matches|found)/.test(livePrError)) {
+      livePrError = '';
+    }
+  }
+  if (!taskName && !taskSlugInferredFromLocklessBranch) taskName = taskSlug;
 
   const prRecord = taskSlug ? loadPrRecord(context.commonDir, context.config, taskSlug) : null;
   const deployState = loadDeployState(context.commonDir, context.config);
@@ -330,6 +349,7 @@ export function planDestination(snapshot: DestinationSnapshot, target: Destinati
     targetCommand: snapshot.targetCommand,
     currentMilestone,
     currentStatus: currentStatusLine(snapshot, currentMilestone, releaseSha),
+    taskName: snapshot.taskName,
     requestedSurfaces: snapshot.requestedSurfaces,
     surfaces,
     remainingSteps,
@@ -443,6 +463,10 @@ function hasAutomaticDestinationJump(parsed: ParsedOperatorArgs, executableSteps
 function deploySurfacePositionals(parsed: ParsedOperatorArgs): string[] {
   if (parsed.command !== 'deploy') return [];
   return parsed.positional.slice(1);
+}
+
+function isBaseBranchName(config: WorkflowConfig, branchName: string): boolean {
+  return branchName === config.baseBranch || branchName === 'main' || branchName === 'master';
 }
 
 function isDestinationRelevantChangedPath(relativePath: string): boolean {
