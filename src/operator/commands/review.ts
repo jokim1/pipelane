@@ -1901,14 +1901,17 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
 
   const startedAt = nowIso();
   const runStartMs = Date.now();
-  // B4 (programmatic-before-judge): gates already run in phase order (static and
-  // behavioral before ai-diff). As deterministic gates run, track whether a
-  // blocking one failed; if so, defer the expensive AI judge gates that follow to
-  // `pending` instead of invoking them. The review fails on the deterministic gate
-  // regardless, so this saves tokens and fails closed (`pending`, never `skipped`).
-  const gateRecords: ReviewGateRunRecord[] = [];
-  let blockingDeterministicFailure = false;
-  for (const gate of selectedGates) {
+  // B4 (programmatic-before-judge): evaluate ALL deterministic (command/pipelane)
+  // gates before any AI judge (skill/agent), independent of phase authoring order —
+  // gate type is not bound to phase, so a blocking command gate authored in a phase
+  // that sorts after ai-diff must still gate the judges. If a blocking deterministic
+  // gate fails, defer the expensive AI judge gates to `pending` instead of invoking
+  // them. The review fails on the deterministic gate regardless, so this saves
+  // tokens and fails closed (`pending`, never `skipped`). Records are assembled back
+  // in the original gate order, so reordering only affects the deferral decision —
+  // not the persisted/displayed gate order (e.g. a prepended config-change gate).
+  const recordByGate = new Map<ReviewGateConfig, ReviewGateRunRecord>();
+  const evaluateGate = (gate: ReviewGateConfig, deferAiGate: boolean): ReviewGateRunRecord => {
     options.onGateStart?.(gate);
     const record = runReviewGate({
       gate,
@@ -1918,14 +1921,23 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
       reviewConfigChanged,
       changedFiles,
       activeSurfaces: options.activeSurfaces,
-      deferAiGate: blockingDeterministicFailure,
+      deferAiGate,
     });
-    if (isDeterministicReviewGate(gate) && record.blocking && record.status === 'failed') {
-      blockingDeterministicFailure = true;
-    }
     options.onGateFinish?.(record);
-    gateRecords.push(record);
+    recordByGate.set(gate, record);
+    return record;
+  };
+  let blockingDeterministicFailure = false;
+  for (const gate of selectedGates) {
+    if (!isDeterministicReviewGate(gate)) continue;
+    const record = evaluateGate(gate, false);
+    if (record.blocking && record.status === 'failed') blockingDeterministicFailure = true;
   }
+  for (const gate of selectedGates) {
+    if (isDeterministicReviewGate(gate)) continue;
+    evaluateGate(gate, blockingDeterministicFailure);
+  }
+  const gateRecords = selectedGates.map((gate) => recordByGate.get(gate) as ReviewGateRunRecord);
   const finishedAt = nowIso();
   const status = summarizeRunStatus(gateRecords);
 

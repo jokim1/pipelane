@@ -779,7 +779,8 @@ async function autoFixFailedReviewSlices(
         exitCode: worker.exitCode,
         recordedAt: nowIso(),
         // B2 (#15): the failure signature this attempt addressed. reviewStatus +
-        // lesson are filled in after the re-review below (enrichReviewFixJournal).
+        // lesson are filled in by the enrichment loop over `toRun` below, once the
+        // re-review verdict is known.
         signature,
       });
       if (worker.status === 'failed') workerFailureCount += 1;
@@ -861,7 +862,12 @@ function resolveReviewAutoFixBudget(run: OrchestrationRunRecord): {
   source: string;
 } {
   const hardStops = run.configSnapshot.hardStops ?? {};
-  const maxStalledIterations = hardStops.maxStalledIterations ?? DEFAULT_MAX_STALLED_ITERATIONS;
+  // Clamp to >= 2: a stall means a fix ran and left the SAME signature, so the
+  // first observation (count 1, the pre-fix baseline) can never be a stall. A
+  // configured 1 — or a hand-edited 0 in the ledger — would otherwise trip the
+  // stall check on the first observation and disable auto-fix without ever
+  // attempting a single fix.
+  const maxStalledIterations = Math.max(2, hardStops.maxStalledIterations ?? DEFAULT_MAX_STALLED_ITERATIONS);
   const configuredReviewLoops = hardStops.maxReviewLoops;
   if (configuredReviewLoops !== undefined) {
     return {
@@ -914,13 +920,20 @@ function countFixedSlices(run: OrchestrationRunRecord, attemptedSliceIds: Set<st
 //     volatile gate text (summary/stdout/stderr) and timing (durationMs/
 //     startedAt/finishedAt) so reruns that differ only in noise hash identically.
 // Two consecutive identical signatures mean the intervening fix made no progress.
+// Tradeoff: the digest is the changed-file SET, not file contents, so a fix that
+// keeps editing the same file(s) while the gate keeps the same exitCode hashes
+// identically and is treated as no-progress. This is deliberate (content hashing
+// would reintroduce the instability the stable error-class avoids); the escape
+// hatch is raising orchestrate.hardStops.maxStalledIterations, and the
+// fed-forward journal nudges the worker toward a genuinely different approach.
 function computeSliceFailureSignature(
   context: WorkflowContext,
   slice: OrchestrationSliceRecord,
   failedGates: ReviewGateRunRecord[],
 ): string {
   const worktree = slice.worktreePath ?? context.repoRoot;
-  const changedFiles = collectChangedFiles(worktree, context.config.baseBranch).slice().sort();
+  // collectChangedFiles returns a fresh array, so sorting in place is safe.
+  const changedFiles = collectChangedFiles(worktree, context.config.baseBranch).sort();
   const changedFilesDigest = hashOrchestrationSignature(changedFiles.join('\n'));
   const gateParts = failedGates
     .map((gate) => `${gate.gateId}|${gate.status}|${gate.type}|${gate.exitCode ?? 'na'}`)

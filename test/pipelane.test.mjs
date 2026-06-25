@@ -6727,6 +6727,58 @@ test('orchestrate bare command --yes honors a configurable maxStalledIterations 
   }
 });
 
+// B2 sub-step 2 (regression): maxStalledIterations is clamped to >= 2, because a
+// stall requires a fix to have run and left the same signature — the first
+// observation is the pre-fix baseline. A configured 1 must NOT stall before any
+// fix runs (which would silently disable auto-fix with attemptedCount 0).
+test('orchestrate bare command --yes clamps maxStalledIterations to attempt at least one fix', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.orchestrate = { hardStops: { maxReviewLoops: 4, maxStalledIterations: 1 } };
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'always-fails',
+        phase: 'static',
+        type: 'command',
+        command: `${process.execPath} -e "process.exit(7)"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt a degenerate stall threshold');
+
+    const cliResult = runCli([
+      'run',
+      'orchestrate',
+      '--outcome',
+      'Threshold one must still try once',
+      '--provider',
+      'generic',
+      '--yes',
+      '--json',
+    ], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(),
+    }, true);
+    const result = JSON.parse(cliResult.stdout);
+    createdWorktrees.push(...result.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+
+    assert.equal(result.autoFix.status, 'stalled');
+    // The clamp makes the effective threshold 2, so one fix worker still runs.
+    assert.equal(result.autoFix.attemptedCount, 1);
+    assert.notEqual(result.autoFix.attemptedCount, 0);
+    assert.match(cliResult.stderr, /no-progress signature repeated 2x \(>= 2\); marking stalled/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 // B2 sub-step 3 (fed-forward attempt journal): a later fix attempt's prompt must
 // carry a Tried/Result/Lesson journal authored from the earlier attempts' real
 // re-review outcomes, reusing this run's reviewFixes records. Each attempt here
@@ -7045,6 +7097,70 @@ test('review defers the AI judge to pending when a blocking deterministic gate f
     // The judge command never ran: no sentinel, no attester evidence.
     assert.equal(existsSync(path.join(repoRoot, 'ai-judge-invoked.txt')), false);
     assert.equal(judge.attester, undefined);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+// B4 (regression): the deferral must hold even when the blocking deterministic
+// gate is authored in a phase that sorts AFTER ai-diff (here `runtime`). Gate type
+// is not bound to phase, so deferral keys off type, not authoring order — all
+// deterministic gates are evaluated before any AI judge.
+test('review defers the AI judge even when the failing deterministic gate is in a later phase', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [
+        {
+          // ai-diff (index 2) sorts BEFORE runtime (index 4): without type-first
+          // evaluation, this judge would run before the command gate below fails.
+          id: 'gstack-review',
+          phase: 'ai-diff',
+          type: 'skill',
+          skill: 'review',
+          userCommands: ['/review'],
+          blocking: true,
+        },
+        {
+          id: 'late-fails',
+          phase: 'runtime',
+          type: 'command',
+          command: `${process.execPath} -e "process.exit(7)"`,
+          blocking: true,
+        },
+      ],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt a late-phase failing deterministic gate');
+
+    const aiReviewCommand = [
+      'node -e "',
+      'const fs = require(\'fs\');',
+      'let input = \'\';',
+      'process.stdin.on(\'data\', chunk => input += chunk);',
+      'process.stdin.on(\'end\', () => {',
+      'fs.writeFileSync(\'ai-judge-invoked.txt\', \'invoked\', \'utf8\');',
+      'console.log(\'PIPELANE_REVIEW_GATE_RESULT=passed\');',
+      '});',
+      '"',
+    ].join('');
+    const result = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      PIPELANE_REVIEW_GATE_COMMAND: aiReviewCommand,
+      PIPELANE_REVIEW_PROVIDER: 'codex',
+    }, true).stdout);
+
+    assert.equal(result.status, 'failed');
+    const judge = result.gates.find((gate) => gate.gateId === 'gstack-review');
+    const deterministic = result.gates.find((gate) => gate.gateId === 'late-fails');
+    assert.equal(deterministic.status, 'failed');
+    assert.equal(judge.status, 'pending');
+    assert.match(judge.summary, /deferred: a blocking deterministic gate failed/);
+    assert.equal(existsSync(path.join(repoRoot, 'ai-judge-invoked.txt')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -19192,7 +19308,16 @@ test('CLI notifies about updates by default without installing or re-pinning', a
       '#!/bin/sh\necho "REEXEC:$*"\n',
       { mode: 0o755, encoding: 'utf8' },
     );
-    makeFakeUpdateBin(binDir, { latestSha: newSha, npmMarkerPath: npmInstallLog });
+    makeFakeUpdateBin(binDir, {
+      latestSha: newSha,
+      aheadCommits: [
+        { sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', subject: 'Add guided update notifications' },
+        { sha: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', subject: 'Fix board runtime refresh' },
+        { sha: 'cccccccccccccccccccccccccccccccccccccccc', subject: 'Document release-gate drift' },
+        { sha: 'dddddddddddddddddddddddddddddddddddddddd', subject: 'Tighten setup follow-up detection' },
+      ],
+      npmMarkerPath: npmInstallLog,
+    });
 
     // Default behavior: PIPELANE_AUTO_UPDATE unset -> notify-only. The global
     // test setup pins it to '0'; clear it here to exercise the real default.
@@ -19213,9 +19338,11 @@ test('CLI notifies about updates by default without installing or re-pinning', a
     });
 
     assert.equal(result.status, 0, result.stderr);
-    // Notice fired: names the available update and how to apply it.
-    assert.match(result.stderr, /Update available: 1111111 -> 2222222/);
-    assert.match(result.stderr, /pipelane update/);
+    // Notice fired: names the available update, tells slash-command users what
+    // to run, and summarizes the update from compare commits.
+    assert.match(result.stderr, /New Pipelane update available \(1111111 -> 2222222\)/);
+    assert.match(result.stderr, /Run `\/pipelane update` to install it/);
+    assert.match(result.stderr, /What's new: Add guided update notifications\. Fix board runtime refresh\. Document release-gate drift\. 1 more commit is included\./);
     // Did NOT self-update: no auto-update banner, no npm install, no re-exec.
     assert.doesNotMatch(result.stderr, /Auto-updating pipelane/);
     assert.doesNotMatch(result.stdout, /REEXEC/);
