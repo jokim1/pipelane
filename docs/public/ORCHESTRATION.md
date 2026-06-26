@@ -1,13 +1,15 @@
-# Pipelane Orchestration Roadmap
+# Pipelane Orchestration Reference
 
-Last updated: June 16, 2026
-Status: review gate foundation and setup command shipped; full
-orchestration runner not shipped
+Last updated: June 26, 2026
+Status: orchestration ledger, slice worktrees, provider handoff prompts,
+worker launch, per-slice review, and bounded review-fix attempts are shipped.
+PR creation, merge, deploy, cleanup, and full web orchestration visibility stay
+outside orchestration.
 
-`/orchestrate` is the planned execution layer above Pipelane's current release
+`/orchestrate` is the execution layer above Pipelane's current release
 workflow. Its job is to turn an implementation plan into isolated slices,
-configure review gates, run the gates in a deterministic order, and record the
-evidence needed to trust AI-produced production code.
+configure review gates, run worker and review loops in a deterministic order,
+and record the evidence needed to trust AI-produced production code.
 
 ## Product Goal
 
@@ -24,7 +26,7 @@ The goal is not unlimited autonomy. The goal is auditable autonomy.
 
 ## Mental Model
 
-`/orchestrate` should act as a compiler and runner:
+`/orchestrate` acts as a compiler and runner:
 
 1. read a plan
 2. compile it into slices

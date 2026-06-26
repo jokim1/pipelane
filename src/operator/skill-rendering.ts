@@ -112,7 +112,8 @@ Agent Bash tools commonly run commands without an interactive TTY, and shell
 pipes make stdout non-TTY. When the user invokes bare
 \`${slashAlias} review setup\` with no flags, run the setup command directly
 through the runner command above. The CLI prints a non-interactive selector
-with gate numbers, installable gaps, and exact follow-up commands.
+with gate numbers, Claude setup status, installable gaps, and exact follow-up
+commands.
 
 Relay the opinionated review shape to the user. The recommended AI stack is
 \`karpathy-diff\` as author self-review, \`code-review-high\` when Claude review
@@ -122,16 +123,22 @@ can add \`code-review-ultra\` and human approval. Independent AI gates must be
 run from a fresh reviewer session; do not let the authoring session attest its
 own independent review. Same-session evidence will block \`/pr\`.
 
-Prefer saving the recommended setup instead of making the user memorize gate
-ids. If the user opts out of a recommended gate, say that the consequence is
-less review coverage before you save the change. When the user chooses gates,
-run the matching deterministic command exactly:
+Do not reduce the review setup output to only a category summary or only
+\`review setup --yes\`. Preserve the printed selector choices and exact commands,
+especially \`/karpathy diff\`, \`/code-review high\`, \`/claude review code\`, and
+\`review setup --install adversarial-review\` when they appear. After relaying the
+choices, it is fine to recommend saving the current selection. If the user opts
+out of a recommended gate, say that the consequence is less review coverage
+before you save the change. When the user chooses gates, run the matching
+deterministic command exactly:
 
 - \`review setup --yes\` to save the current recommended selection.
 - \`review setup --enable <gate-id>\` to enable an available gate.
 - \`review setup --disable <gate-id>\` to disable a preselected gate.
 - \`review setup --install <gate-id>\` to install and enable an optional gate
   such as \`lint\` or \`adversarial-review\`.
+- Gate values may be repeated or comma-separated, for example
+  \`review setup --enable 3, 4, 5, 13\`.
 - \`review setup --list-gates\` to inspect the full catalog.
 - \`review setup --print\` to print the effective config.
 
@@ -371,7 +378,7 @@ Review gates:
       /pr and orchestrated slice review can trust.
 
   /pipelane review setup [--yes] [--print] [--list-gates]
-                         [--enable <gate>] [--disable <gate>] [--install <gate>]
+                         [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]
       Choose the pre-PR review model. This is different from /pipelane setup;
       it configures quality gates such as tests, self-review, independent AI
       review, instruction audit, and human approval for high-stakes changes.
