@@ -13323,6 +13323,29 @@ async function fingerprintForFullConfig(options = {}, environment = 'staging') {
   return mod.computeDeployConfigFingerprint(normalized, environment);
 }
 
+test('deploy config fingerprint preserves the legacy shape when no additional surfaces are configured', async () => {
+  const releaseGate = await import(path.join(KIT_ROOT, 'src', 'operator', 'release-gate.ts'));
+  const integrity = await import(path.join(KIT_ROOT, 'src', 'operator', 'integrity.ts'));
+  const config = buildFullDeployConfig();
+  const expectedStaging = createHash('sha256').update(integrity.canonicalize({
+    platform: config.platform,
+    frontend: config.frontend.staging,
+    edge: config.edge.staging,
+    sql: config.sql.staging,
+    supabase: config.supabase.staging,
+  })).digest('hex');
+  const expectedProd = createHash('sha256').update(integrity.canonicalize({
+    platform: config.platform,
+    frontend: config.frontend.production,
+    edge: config.edge.production,
+    sql: config.sql.production,
+    supabase: config.supabase.production,
+  })).digest('hex');
+
+  assert.equal(releaseGate.computeDeployConfigFingerprint(config, 'staging'), expectedStaging);
+  assert.equal(releaseGate.computeDeployConfigFingerprint(config, 'prod'), expectedProd);
+});
+
 function updateWorkflowConfig(repoRoot, updater) {
   const configPath = path.join(repoRoot, '.pipelane.json');
   const config = JSON.parse(readFileSync(configPath, 'utf8'));
@@ -24112,8 +24135,9 @@ test('release-check treats configured additional surfaces as managed release sur
     assert.equal(result.status, 1);
     assert.equal(output.ready, false);
     assert.deepEqual(output.blockedSurfaces, ['mcp']);
-    assert.match(output.message, /mcp staging health check/);
-    assert.match(output.message, /mcp production health check/);
+    assert.match(output.message, /mcp staging: no succeeded deploy observed/);
+    assert.doesNotMatch(output.message, /mcp staging health check/);
+    assert.doesNotMatch(output.message, /mcp production health check/);
     assert.doesNotMatch(output.message, /unsupported surface "mcp"/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });

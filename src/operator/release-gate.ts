@@ -433,6 +433,15 @@ function scopedAdditionalDeploySurfaces(
   return scoped;
 }
 
+function appendScopedAdditionalDeploySurfaces<T extends Record<string, unknown>>(
+  scoped: T,
+  deployConfig: DeployConfig,
+  environment: 'staging' | 'prod',
+): T | T & { surfaces: Record<string, AdditionalDeploySurfaceEnvironmentConfig> } {
+  const surfaces = scopedAdditionalDeploySurfaces(deployConfig, environment);
+  return Object.keys(surfaces).length > 0 ? { ...scoped, surfaces } : scoped;
+}
+
 export function computeDeployConfigFingerprint(
   deployConfig: DeployConfig,
   environment: 'staging' | 'prod',
@@ -444,7 +453,6 @@ export function computeDeployConfigFingerprint(
       edge: deployConfig.edge.staging,
       sql: deployConfig.sql.staging,
       supabase: deployConfig.supabase.staging,
-      surfaces: scopedAdditionalDeploySurfaces(deployConfig, environment),
     }
     : {
       platform: deployConfig.platform,
@@ -452,9 +460,10 @@ export function computeDeployConfigFingerprint(
       edge: deployConfig.edge.production,
       sql: deployConfig.sql.production,
       supabase: deployConfig.supabase.production,
-      surfaces: scopedAdditionalDeploySurfaces(deployConfig, environment),
     };
-  return createHash('sha256').update(canonicalize(scoped)).digest('hex');
+  return createHash('sha256')
+    .update(canonicalize(appendScopedAdditionalDeploySurfaces(scoped, deployConfig, environment)))
+    .digest('hex');
 }
 
 export function signDeployRecord(record: DeployRecord, key: string): string {
@@ -870,14 +879,14 @@ export function evaluateReleaseReadiness(options: {
       if (!options.deployConfig.edge.production.deployCommand) {
         addBlocker('config', 'edge production deploy command');
       }
-      if (!options.deployConfig.edge.staging.healthcheckUrl) {
-        addBlocker('config', 'edge staging health check');
-      }
-      if (!options.deployConfig.edge.production.healthcheckUrl) {
-        addBlocker('config', 'edge production health check');
+      if (!options.deployConfig.edge.staging.verificationCommand && !options.deployConfig.edge.production.verificationCommand && !options.deployConfig.edge.staging.healthcheckUrl && !options.deployConfig.edge.production.healthcheckUrl) {
+        addBlocker('config', 'edge verification command or health check');
       }
       const observed = observedStagingSuccess('edge');
       if (observed) addBlocker('observed', observed);
+      // Edge, sql, and custom probes only run when an explicit staging
+      // healthcheckUrl is wired. When unset, observed staging success plus
+      // command/verification config remains the release readiness signal.
       if (options.deployConfig.edge.staging.healthcheckUrl) {
         const probe = probeFreshness('edge');
         if (probe) addBlocker('probe', probe);
@@ -889,11 +898,8 @@ export function evaluateReleaseReadiness(options: {
       if (!options.deployConfig.sql.production.applyCommand) {
         addBlocker('config', 'sql production apply path');
       }
-      if (!options.deployConfig.sql.staging.healthcheckUrl) {
-        addBlocker('config', 'sql staging health check');
-      }
-      if (!options.deployConfig.sql.production.healthcheckUrl) {
-        addBlocker('config', 'sql production health check');
+      if (!options.deployConfig.sql.staging.verificationCommand && !options.deployConfig.sql.production.verificationCommand && !options.deployConfig.sql.staging.healthcheckUrl && !options.deployConfig.sql.production.healthcheckUrl) {
+        addBlocker('config', 'sql verification step');
       }
       const observed = observedStagingSuccess('sql');
       if (observed) addBlocker('observed', observed);
@@ -908,11 +914,8 @@ export function evaluateReleaseReadiness(options: {
       if (!additional.production.deployCommand) {
         addBlocker('config', `${surface} production deploy command`);
       }
-      if (!additional.staging.healthcheckUrl) {
-        addBlocker('config', `${surface} staging health check`);
-      }
-      if (!additional.production.healthcheckUrl) {
-        addBlocker('config', `${surface} production health check`);
+      if (!additional.staging.verificationCommand && !additional.production.verificationCommand && !additional.staging.healthcheckUrl && !additional.production.healthcheckUrl) {
+        addBlocker('config', `${surface} verification command or health check`);
       }
       const observed = observedStagingSuccess(surface);
       if (observed) addBlocker('observed', observed);
