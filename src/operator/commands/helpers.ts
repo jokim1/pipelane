@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-import { getAdditionalDeploySurfaceConfig, type DeployConfig } from '../release-gate.ts';
+import { getAdditionalDeploySurfaceConfig, verificationPassed, type DeployConfig } from '../release-gate.ts';
 import type { ApiStatusCell, LaneState } from '../api/envelope.ts';
 import type { BranchLanes } from '../api/snapshot.ts';
 import type { WorkflowCommand, WorkflowConfig, WorkflowContext } from '../state.ts';
@@ -289,6 +289,28 @@ export function resolveSurfaceHealthcheckUrl(
   if (additional) {
     const surfaceConfig = staging ? additional.staging : additional.production;
     return surfaceConfig.healthcheckUrl || '';
+  }
+  return '';
+}
+
+export function resolveSurfaceVerificationCommand(
+  deployConfig: DeployConfig,
+  environment: 'staging' | 'prod',
+  surface: string,
+): string {
+  const staging = environment === 'staging';
+  if (surface === 'edge') {
+    const edge = staging ? deployConfig.edge.staging : deployConfig.edge.production;
+    return edge.verificationCommand || '';
+  }
+  if (surface === 'sql') {
+    const sql = staging ? deployConfig.sql.staging : deployConfig.sql.production;
+    return sql.verificationCommand || '';
+  }
+  const additional = getAdditionalDeploySurfaceConfig(deployConfig, surface);
+  if (additional) {
+    const surfaceConfig = staging ? additional.staging : additional.production;
+    return surfaceConfig.verificationCommand || '';
   }
   return '';
 }
@@ -845,25 +867,23 @@ export function findLastGoodDeploy(options: {
       && record.configFingerprint !== options.configFingerprint) {
       continue;
     }
-    // Require verified (2xx) liveness. v1.2 per-surface verification is
-    // preferred. Legacy aggregate `verification.statusCode` is accepted
-    // as a fallback ONLY for single-surface rollbacks — a pre-v1.2
-    // record has one probe (historically frontend), which can't
-    // legitimately verify [frontend, edge] together. Rejecting legacy
-    // aggregates on multi-surface rollbacks is the right safety call:
-    // operators get a clear "no earlier verified deploy for these
-    // surfaces" error and re-run the target deploy with per-surface
-    // verification. Codex r6 P2.
+    // Require verified liveness. v1.2 per-surface verification is preferred.
+    // Legacy aggregate `verification.statusCode` is accepted as a fallback
+    // ONLY for single-surface rollbacks — a pre-v1.2 record has one probe
+    // (historically frontend), which can't legitimately verify
+    // [frontend, edge] together. Rejecting legacy aggregates on multi-surface
+    // rollbacks is the right safety call: operators get a clear "no earlier
+    // verified deploy for these surfaces" error and re-run the target deploy
+    // with per-surface verification. Codex r6 P2.
     const perSurface = record.verificationBySurface;
     if (perSurface && typeof perSurface === 'object') {
       const allOk = options.surfaces.every((surface) => {
-        const code = perSurface[surface]?.statusCode;
-        return typeof code === 'number' && code >= 200 && code < 300;
+        const verification = perSurface[surface];
+        return verification ? verificationPassed(verification) : false;
       });
       if (!allOk) continue;
     } else if (options.surfaces.length === 1) {
-      const code = record.verification?.statusCode;
-      if (typeof code !== 'number' || code < 200 || code >= 300) continue;
+      if (!record.verification || !verificationPassed(record.verification)) continue;
     } else {
       // Multi-surface rollback + only aggregate verification → reject.
       continue;

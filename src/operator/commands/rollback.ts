@@ -5,6 +5,7 @@ import {
   normalizeDeployEnvironment,
   resolveDeployStateKey,
   signDeployRecord,
+  verificationPassed,
   verifyDeployRecord,
 } from '../release-gate.ts';
 import {
@@ -28,15 +29,16 @@ import {
   inferActiveTaskLock,
   makeIdempotencyKey,
   resolveCommandSurfaces,
-  resolveSurfaceHealthcheckUrl,
   setNextAction,
 } from './helpers.ts';
 import {
+  describeDeployVerificationFailure,
   findRecentRun,
+  formatDeployVerificationLine,
   persistRecord,
-  probeHealthcheck,
   requireProdConfirmation,
   resolveTriggeredBy,
+  verifyDeploySurface,
   watchWorkflowRun,
 } from './deploy.ts';
 
@@ -357,25 +359,13 @@ export async function handleRollback(cwd: string, parsed: ParsedOperatorArgs): P
   if (watched.ok) {
     verificationBySurface = {};
     const perSurfaceFailures: string[] = [];
-    const stubStatus = process.env.PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS;
     for (const surface of surfaces) {
-      const surfaceUrl = resolveSurfaceHealthcheckUrl(deployConfig, environment, surface);
-      if (!surfaceUrl && !stubStatus) {
-        const empty: DeployVerification = { healthcheckUrl: '', probes: 0 };
-        verificationBySurface[surface] = empty;
-        perSurfaceFailures.push(`${surface}: no healthcheck URL configured`);
-        continue;
-      }
-      const probe = await probeHealthcheck(surfaceUrl);
-      verificationBySurface[surface] = probe;
-      const code = probe.statusCode;
-      if (typeof code !== 'number' || code < 200 || code >= 300) {
-        perSurfaceFailures.push(
-          probe.error
-            ?? (code
-              ? `${surface}: healthcheck returned HTTP ${code}`
-              : `${surface}: healthcheck did not return a 2xx`),
-        );
+      const surfaceVerification = await verifyDeploySurface(deployConfig, environment, surface, {
+        allowHealthcheckStub: Boolean(process.env.PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS),
+      });
+      verificationBySurface[surface] = surfaceVerification;
+      if (!verificationPassed(surfaceVerification)) {
+        perSurfaceFailures.push(describeDeployVerificationFailure(surface, surfaceVerification));
       }
     }
     verification = verificationBySurface['frontend']
@@ -432,9 +422,7 @@ export async function handleRollback(cwd: string, parsed: ParsedOperatorArgs): P
       `Surfaces: ${surfaces.join(', ')}`,
       `Workflow: ${workflowName}`,
       run?.url ? `Workflow run: ${run.url}` : '',
-      verification?.healthcheckUrl
-        ? `Healthcheck: ${verification.healthcheckUrl} → HTTP ${verification.statusCode} in ${verification.latencyMs}ms (${verification.probes} probe(s))`
-        : 'Healthcheck: skipped (no URL configured)',
+      formatDeployVerificationLine(verification),
       environment === 'prod'
         ? `Next: investigate the failing change and open a revert PR if needed (${formatWorkflowCommand(context.config, 'rollback', 'prod')} --revert-pr).`
         : 'Next: validate staging, then decide whether to promote to prod or open a revert PR.',

@@ -1,5 +1,5 @@
 import type { DeployConfig } from './release-gate.ts';
-import { resolveSurfaceHealthcheckUrl } from './commands/helpers.ts';
+import { resolveSurfaceHealthcheckUrl, resolveSurfaceVerificationCommand } from './commands/helpers.ts';
 
 function deployEnvironmentLabel(environment: 'staging' | 'prod'): 'staging' | 'production' {
   return environment === 'prod' ? 'production' : 'staging';
@@ -33,8 +33,12 @@ export function listMissingDeployConfiguration(options: {
       continue;
     }
 
-    if (!options.allowHealthcheckStubBypass && !resolveSurfaceHealthcheckUrl(options.config, options.environment, surface)) {
-      missing.add(`${surface} ${label} health check`);
+    const hasVerificationStep = Boolean(
+      resolveSurfaceHealthcheckUrl(options.config, options.environment, surface)
+      || resolveSurfaceVerificationCommand(options.config, options.environment, surface),
+    );
+    if (!options.allowHealthcheckStubBypass && !hasVerificationStep) {
+      missing.add(`${surface} ${label} verification command or health check`);
     }
   }
 

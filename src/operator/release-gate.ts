@@ -493,12 +493,27 @@ export type DeployVerificationResult =
   | { kind: 'missing'; verification: undefined };
 
 export function verificationPassed(verification: DeployVerification): boolean {
+  if (verification.method === 'command') {
+    return Boolean(verification.verificationCommand) && !verification.error;
+  }
   // A DeployVerification with no statusCode is a deploy where no
   // healthcheckUrl was configured. Treat that as unverified (fail closed)
   // under the v1.2 gate even though status==='succeeded' was written.
   const code = verification.statusCode;
   if (typeof code !== 'number') return false;
   return code >= 200 && code < 300;
+}
+
+function describeVerificationFailure(verification: DeployVerification): string {
+  if (verification.method === 'command') {
+    return verification.error
+      ? `verification command failed: ${sanitizeReleaseGateDetail(verification.error)}`
+      : 'verification command did not complete';
+  }
+  if (verification.statusCode !== undefined) {
+    return `healthcheck did not return 2xx (HTTP ${sanitizeReleaseGateDetail(verification.statusCode)})`;
+  }
+  return `healthcheck returned ${sanitizeReleaseGateDetail('no status')}`;
 }
 
 export function disqualifyDeployRecord(options: {
@@ -532,7 +547,7 @@ export function disqualifyDeployRecord(options: {
       return `${surface}: no per-surface verification recorded`;
     }
     if (!verificationPassed(probe.verification)) {
-      return `${surface}: healthcheck returned ${probe.verification.statusCode ?? 'no status'}`;
+      return `${surface}: ${describeVerificationFailure(probe.verification)}`;
     }
   }
   return null;
@@ -633,9 +648,10 @@ export function describeRequestedDeployRecord(
 // fs-write access can't plant a record to DoS the gate.
 //
 // A record only counts when: valid HMAC signature (when key set),
-// status==='succeeded', verifiedAt is present, per-surface verification has a
-// 2xx probe, configFingerprint matches the current staging-scoped config.
-// Each closes one class of forged-record attack on deploy-state.json.
+// status==='succeeded', verifiedAt is present, per-surface verification passes
+// (2xx healthcheck or configured command verification), and configFingerprint
+// matches the current staging-scoped config. Each closes one class of
+// forged-record attack on deploy-state.json.
 export function explainObservedStagingSuccess(
   records: DeployRecord[],
   surface: string,
@@ -670,7 +686,7 @@ export function explainObservedStagingSuccess(
       return { ok: false, reason: 'no per-surface verification recorded for this surface' };
     }
     if (!verificationPassed(probe.verification)) {
-      return { ok: false, reason: `healthcheck did not return 2xx (HTTP ${sanitizeReleaseGateDetail(probe.verification.statusCode ?? 'none')})` };
+      return { ok: false, reason: describeVerificationFailure(probe.verification) };
     }
     return { ok: true };
   }

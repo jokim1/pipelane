@@ -12,7 +12,9 @@ import {
   normalizeDeployEnvironment,
   resolveDeployStateKey,
   signDeployRecord,
+  verificationPassed,
   verifyDeployRecord,
+  type DeployConfig,
 } from '../release-gate.ts';
 import { listMissingDeployConfiguration } from '../deploy-config-validation.ts';
 import {
@@ -49,6 +51,7 @@ import {
   prRecordFromLivePr,
   requireMergedPr,
   resolveSurfaceHealthcheckUrl,
+  resolveSurfaceVerificationCommand,
   resolveCommandSurfaces,
   resolveDeployTargetForTask,
   setNextAction,
@@ -508,32 +511,19 @@ export async function dispatchDeploy(
   let verificationBySurface: Record<string, DeployVerification> | undefined;
   let runtimeObservation: DeployRecord['runtimeObservation'];
   if (watched.ok) {
-    // v1.2: per-surface probing. A multi-surface deploy produces one probe
+    // v1.2: per-surface verification. A multi-surface deploy produces one
     // entry per surface so a frontend healthcheck can't credit edge or sql.
-    // If any selected surface lacks a healthcheck URL or returns non-2xx,
-    // the whole deploy flips to failed.
+    // Healthcheck URLs are probed directly; command-only surfaces trust the
+    // watched workflow success and record the configured verification command.
     verificationBySurface = {};
     const perSurfaceFailures: string[] = [];
     const stubStatus = process.env.PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS;
 
     for (const surface of surfaces) {
-      const surfaceUrl = resolveSurfaceHealthcheckUrl(deployConfig, environment, surface);
-      if (!surfaceUrl && !stubStatus) {
-        const empty: DeployVerification = { healthcheckUrl: '', probes: 0 };
-        verificationBySurface[surface] = empty;
-        perSurfaceFailures.push(`${surface}: no healthcheck URL configured`);
-        continue;
-      }
-      const probe = await probeHealthcheck(surfaceUrl);
-      verificationBySurface[surface] = probe;
-      const code = probe.statusCode;
-      if (typeof code !== 'number' || code < 200 || code >= 300) {
-        perSurfaceFailures.push(
-          probe.error
-            ?? (code
-              ? `${surface}: healthcheck returned HTTP ${code}`
-              : `${surface}: healthcheck did not return a 2xx`),
-        );
+      const surfaceVerification = await verifyDeploySurface(deployConfig, environment, surface, { allowHealthcheckStub: Boolean(stubStatus) });
+      verificationBySurface[surface] = surfaceVerification;
+      if (!verificationPassed(surfaceVerification)) {
+        perSurfaceFailures.push(describeDeployVerificationFailure(surface, surfaceVerification));
       }
     }
 
@@ -611,9 +601,7 @@ export async function dispatchDeploy(
           ? `Workflow: ${workflowName} (push-triggered on ${context.config.baseBranch})`
           : `Workflow: ${workflowName}`,
         run?.url ? `Workflow run: ${run.url}` : '',
-        verification?.healthcheckUrl
-          ? `Healthcheck: ${verification.healthcheckUrl} → HTTP ${verification.statusCode} in ${verification.latencyMs}ms (${verification.probes} probe(s))`
-          : 'Healthcheck: skipped (no URL configured)',
+        formatDeployVerificationLine(verification),
         environment === 'staging'
           ? `Next: ${nextStage}`
           : `Next: run ${formatWorkflowCommand(context.config, 'clean', `--apply --task ${taskSlug}`)} to close out this workspace (removes lock + worktree + local branch).`,
@@ -1202,4 +1190,59 @@ export async function probeHealthcheck(url: string): Promise<DeployVerification>
     probes: 2,
     error: lastError,
   };
+}
+
+export async function verifyDeploySurface(
+  deployConfig: DeployConfig,
+  environment: 'staging' | 'prod',
+  surface: string,
+  options: { allowHealthcheckStub?: boolean } = {},
+): Promise<DeployVerification> {
+  const surfaceUrl = resolveSurfaceHealthcheckUrl(deployConfig, environment, surface);
+  if (surfaceUrl || options.allowHealthcheckStub) {
+    return {
+      method: 'healthcheck',
+      ...await probeHealthcheck(surfaceUrl),
+    };
+  }
+
+  const verificationCommand = resolveSurfaceVerificationCommand(deployConfig, environment, surface);
+  if (verificationCommand) {
+    return {
+      method: 'command',
+      verificationCommand,
+      probes: 0,
+    };
+  }
+
+  return {
+    healthcheckUrl: '',
+    probes: 0,
+    error: 'no verification command or healthcheck URL configured',
+  };
+}
+
+export function describeDeployVerificationFailure(surface: string, verification: DeployVerification): string {
+  if (verification.method === 'command') {
+    return verification.error
+      ? `${surface}: verification command failed: ${verification.error}`
+      : `${surface}: verification command did not complete`;
+  }
+  if (verification.error) {
+    return `${surface}: ${verification.error}`;
+  }
+  const code = verification.statusCode;
+  return code
+    ? `${surface}: healthcheck returned HTTP ${code}`
+    : `${surface}: healthcheck did not return a 2xx`;
+}
+
+export function formatDeployVerificationLine(verification: DeployVerification | undefined): string {
+  if (verification?.method === 'command' && verification.verificationCommand) {
+    return `Verification command: ${verification.verificationCommand} (workflow succeeded)`;
+  }
+  if (verification?.healthcheckUrl) {
+    return `Healthcheck: ${verification.healthcheckUrl} → HTTP ${verification.statusCode} in ${verification.latencyMs}ms (${verification.probes} probe(s))`;
+  }
+  return 'Healthcheck: skipped (no URL configured)';
 }

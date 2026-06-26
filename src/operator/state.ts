@@ -446,7 +446,9 @@ export interface ReviewState {
 export type DeployStatus = 'requested' | 'succeeded' | 'failed' | 'unknown';
 
 export interface DeployVerification {
+  method?: 'healthcheck' | 'command';
   healthcheckUrl?: string;
+  verificationCommand?: string;
   statusCode?: number;
   latencyMs?: number;
   probes?: number;

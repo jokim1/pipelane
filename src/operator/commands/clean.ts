@@ -21,7 +21,7 @@ import {
   type WorkflowConfig,
 } from '../state.ts';
 import { resolveDeployStateKey } from '../integrity.ts';
-import { verifyDeployRecord } from '../release-gate.ts';
+import { verificationPassed, verifyDeployRecord } from '../release-gate.ts';
 import {
   branchTreeMatchesRef,
   classifyOrphan,
@@ -960,13 +960,9 @@ function deployRecordQualifiesForCleanup(record: DeployRecord, taskSlug: string,
 
 function deployRecordSurfaceVerified(record: DeployRecord, surface: string): boolean {
   const perSurface = record.verificationBySurface?.[surface];
-  if (perSurface) return verificationStatusCodeIs2xx(perSurface.statusCode);
-  if (surface === 'frontend' && record.verification) return verificationStatusCodeIs2xx(record.verification.statusCode);
+  if (perSurface) return verificationPassed(perSurface);
+  if (surface === 'frontend' && record.verification) return verificationPassed(record.verification);
   return false;
-}
-
-function verificationStatusCodeIs2xx(value: unknown): boolean {
-  return typeof value === 'number' && value >= 200 && value < 300;
 }
 
 function explainAutoCleanupBlocker(options: {
