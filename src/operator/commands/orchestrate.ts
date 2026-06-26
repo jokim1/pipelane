@@ -23,6 +23,7 @@ import {
   scanOrchestrationRunDiagnostics,
   selectActiveSlices,
   hasResumableDeferredSlices,
+  signOrchestrationSliceReview,
   sliceReviewFullySatisfied,
   type BuildOrchestrationSliceInput,
   type OrchestrationCoverageEntry,
@@ -436,8 +437,12 @@ export async function handleOrchestrate(cwd: string, parsed: ParsedOperatorArgs)
     handleFinalize(cwd, parsed);
     return;
   }
+  if (subcommand === 'upgrade-ledger') {
+    handleUpgradeLedger(cwd, parsed);
+    return;
+  }
 
-  throw new Error('orchestrate requires exactly: pipelane run orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes], or pipelane run orchestrate <goal-spec|plan|prepare|dispatch|start|review|scope|outline|finalize> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--slices-file <path>] [--run-id <id>] [--through <slice-id>] [--provider codex|claude|generic]');
+  throw new Error('orchestrate requires exactly: pipelane run orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes], or pipelane run orchestrate <goal-spec|plan|prepare|dispatch|start|review|scope|outline|finalize|upgrade-ledger> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--slices-file <path>] [--run-id <id>] [--through <slice-id>] [--provider codex|claude|generic]');
 }
 
 async function handleOrchestrateEntry(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
@@ -2066,6 +2071,9 @@ function reviewCompletedSlices(
   },
 ): ReviewCompletedSlicesResult {
   const selectedSlices = resolveReviewSlices(run, options.sliceId);
+  // C2: resolve the review-state signing key once per invocation (it is constant
+  // for the whole command) rather than re-reading the env for every signed slice.
+  const reviewStateKey = resolveReviewStateKey();
   const reports: ReviewedSliceReport[] = [];
   let reviewedCount = 0;
   let failedCount = 0;
@@ -2141,12 +2149,15 @@ function reviewCompletedSlices(
       continue;
     }
     if (reviewRunCoversFullGateSet(reviewRun)) {
-      slice.review = reviewRecord;
+      // C2: sign ONLY the record that becomes slice.review — it is the sole
+      // embedded evidence the completion read path verifies. Bound to run/slice/
+      // worker/branch/worktree/sha/tree-digest (anti-replay); no-op without a key.
+      slice.review = signOrchestrationSliceReview(reviewRecord, run.id, slice, reviewStateKey);
       slice.reviewDiagnostics = [];
     } else {
       appendSliceReviewDiagnostic(slice, reviewRecord);
     }
-    slice.status = summarizeSliceReviewStatus(slice);
+    slice.status = summarizeSliceReviewStatus(slice, run.id);
     reviewedCount += 1;
     if (reviewRun.status === 'failed') failedCount += 1;
     if (reviewRun.status === 'pending') pendingCount += 1;
@@ -2248,7 +2259,7 @@ function buildSliceReviewRecord(
     worker: slice.worker?.identity ?? null,
     reviewRun: runWithReviewer,
   });
-  return {
+  const record: OrchestrationSliceReviewRecord = {
     status: reviewRun.status,
     evidencePath: orchestrationRunPath(context.commonDir, context.config, run.id),
     reviewedAt: nowIso(),
@@ -2257,6 +2268,12 @@ function buildSliceReviewRecord(
     independenceReason: independence.reason,
     run: runWithReviewer,
   };
+  // C2: the record is signed where it is ASSIGNED to slice.review (in
+  // reviewCompletedSlices), NOT here. This same builder also produces
+  // reviewDiagnostics records, which no read path signature-verifies — signing
+  // those would be dead work that misleads readers into thinking diagnostics are
+  // tamper-protected. Return the unsigned record; the caller signs slice.review.
+  return record;
 }
 
 function reviewRunCoversFullGateSet(reviewRun: ReviewRunRecord): boolean {
@@ -2408,27 +2425,33 @@ function buildBlockedReviewReport(slice: OrchestrationSliceRecord, blocker: stri
 
 function summarizeRunReviewStatus(run: OrchestrationRunRecord): OrchestrationRunRecord['status'] {
   const active = selectActiveSlices(run);
+  // C2: bind the completion verdict to this run so a signed review record cannot be
+  // replayed from another run's ledger.
+  const reviewOptions = { runId: run.id };
   if (active.some((slice) => slice.worker?.status === 'failed' || slice.status === 'failed' || slice.review?.run.status === 'failed')) return 'failed';
   if (active.some((slice) => slice.worker?.status === 'running' || slice.status === 'running')) return 'running';
   // B1: an `empty` slice can never be review-satisfied (the guard in
   // `sliceReviewFullySatisfied`); the explicit exclusion here mirrors
   // `summarizeRunWorkerStatus` so the completion gate is robust even if that
   // guard is ever weakened.
-  if (active.length > 0 && active.every((slice) => slice.status !== 'empty' && sliceReviewFullySatisfied(slice))) {
+  if (active.length > 0 && active.every((slice) => slice.status !== 'empty' && sliceReviewFullySatisfied(slice, reviewOptions))) {
     return hasResumableDeferredSlices(run) ? 'paused' : 'completed';
   }
-  if (active.some((slice) => slice.worker?.status === 'succeeded' && !sliceReviewFullySatisfied(slice))) return 'blocked';
+  if (active.some((slice) => slice.worker?.status === 'succeeded' && !sliceReviewFullySatisfied(slice, reviewOptions))) return 'blocked';
   if (active.some((slice) => slice.status === 'blocked')) return 'blocked';
   return run.status;
 }
 
-function summarizeSliceReviewStatus(slice: OrchestrationSliceRecord): OrchestrationSliceRecord['status'] {
+function summarizeSliceReviewStatus(slice: OrchestrationSliceRecord, runId: string): OrchestrationSliceRecord['status'] {
   // B1: `empty` is durable through review. Review cannot "un-empty" a no-change
   // slice, and without this the empty marker would be overwritten (empty→blocked)
   // here, defeating the empty guard in `sliceReviewFullySatisfied` on the next
   // pass and letting a no-change slice reach `completed`.
   if (slice.status === 'empty') return 'empty';
-  if (sliceReviewFullySatisfied(slice)) return 'completed';
+  // C2: pass runId so per-slice status honors the same anti-replay binding the
+  // run-level completion gate enforces (a verdict replayed from another run's
+  // ledger must not stamp this slice `completed`).
+  if (sliceReviewFullySatisfied(slice, { runId })) return 'completed';
   if (slice.review?.run.status === 'failed') return 'failed';
   return 'blocked';
 }
@@ -3046,11 +3069,13 @@ function buildBlockedWorkerReport(slice: OrchestrationSliceRecord, blocker: stri
 function summarizeRunWorkerStatus(run: OrchestrationRunRecord): OrchestrationRunRecord['status'] {
   const active = selectActiveSlices(run);
   if (active.some((slice) => slice.worker?.status === 'failed' || slice.status === 'failed')) return 'failed';
-  // B1: an `empty` slice has worker.status === 'succeeded' but must NOT count as
-  // done — the run cannot complete while any in-scope slice is empty.
-  if (active.length > 0 && active.every((slice) => (slice.worker?.status === 'succeeded' || slice.status === 'completed') && slice.status !== 'empty')) {
-    return hasResumableDeferredSlices(run) ? 'paused' : 'completed';
-  }
+  // C1 (Decision 8): the worker-status path must NEVER emit `completed` (nor a
+  // completion-implying `paused`). Completion is recompute-authoritative — only
+  // `summarizeRunReviewStatus`, after an in-process review recompute this
+  // invocation, may complete a run. When in-scope workers have all succeeded the
+  // run is awaiting review (`dispatched`), not done. Pre-C1 this branch completed
+  // off worker exit status alone, laundering an unreviewed verdict on the bare
+  // `start` path. (`empty` slices still fall through to `blocked` below.)
   if (active.some((slice) => slice.worker?.status === 'running' || slice.status === 'running')) return 'running';
   if (active.some((slice) => slice.status === 'blocked' || slice.status === 'empty')) return 'blocked';
   return 'dispatched';
@@ -3068,7 +3093,9 @@ function reportStatusForStart(
   if (blockedCount > 0 && startedCount === 0 && restartedCount === 0 && existingCount === 0) return 'blocked';
   if (runStatus === 'running') return 'running';
   if (startedCount === 0 && restartedCount === 0 && existingCount > 0 && blockedCount === 0) return 'noop';
-  if (runStatus === 'completed') return 'completed';
+  // C1: `runStatus` here is summarizeRunWorkerStatus output, which can no longer be
+  // `completed` (the bare start path never completes — review does), so there is no
+  // `completed` arm: the start report is dispatched/blocked/running/failed/noop.
   if (runStatus === 'blocked') return 'blocked';
   return 'dispatched';
 }
@@ -3500,6 +3527,17 @@ interface OrchestrateFinalizeReport {
   message: string;
 }
 
+interface OrchestrateUpgradeLedgerReport {
+  command: 'orchestrate upgrade-ledger';
+  status: OrchestrationRunRecord['status'];
+  repoRoot: string;
+  runId: string;
+  ledgerPath: string;
+  upgradedCount: number;
+  run: OrchestrationRunRecord;
+  message: string;
+}
+
 interface OrchestrateOutlineSliceSnapshot {
   id: string;
   index: number;
@@ -3599,8 +3637,38 @@ function handleFinalize(cwd: string, parsed: ParsedOperatorArgs): void {
       excludedCount += 1;
     }
   }
+  // C1 (Decision 9): finalize is recompute-authoritative — re-run review of the
+  // in-scope slices in-process so any transition to `completed` (e.g. a paused run
+  // whose deferred remainder we just abandoned) is backed by a fresh verdict THIS
+  // invocation, not blindly off a persisted one. Two honest caveats:
+  //  - A slice whose worktree was cleaned cannot be re-reviewed: reviewBlocker
+  //    skips it and the persisted verdict stands. That verdict is still trusted via
+  //    its C2 signature when a review-state key is configured; keyless, it is the
+  //    documented opt-in baseline (unsigned ledgers are not tamper-checked).
+  //  - The re-review must not DESTROY a healthy completed slice's evidence. A real
+  //    gate regression yields a `failed` verdict (kept). But a transient
+  //    can't-evaluate (zero gates / independence trip) nulls slice.review; for a
+  //    slice that was already `completed`, restore its prior evidence rather than
+  //    silently downgrading a finished run to `blocked` on a flaky re-review.
+  const priorBySlice = new Map(run.slices.map((slice) => [slice.id, { review: slice.review, status: slice.status }]));
+  reviewCompletedSlices(context, run, {
+    sliceId: null,
+    dryRun: false,
+    gateFilter: '',
+    phaseFilter: '',
+    requireGates: true,
+  });
+  for (const slice of run.slices) {
+    const prior = priorBySlice.get(slice.id);
+    if (prior?.status === 'completed' && prior.review && slice.review === null) {
+      slice.review = prior.review;
+      slice.status = 'completed';
+    }
+  }
+  // Re-summarize after the restore pass so run.status reflects any preserved
+  // evidence (this is NOT a redundant recompute of reviewCompletedSlices' result).
   run.status = summarizeRunReviewStatus(run);
-  run.updatedAt = at;
+  run.updatedAt = nowIso();
   const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
   const report: OrchestrateFinalizeReport = {
     command: 'orchestrate finalize',
@@ -3619,6 +3687,55 @@ function handleFinalize(cwd: string, parsed: ParsedOperatorArgs): void {
       'The excluded slices are kept in the ledger with a reason and timestamp for audit.',
       '',
       renderOrchestrationOutline(run),
+    ].join('\n'),
+  };
+  printResult(parsed.flags, report);
+}
+
+function handleUpgradeLedger(cwd: string, parsed: ParsedOperatorArgs): void {
+  const context = resolveWorkflowContext(cwd);
+  const runId = parsed.flags.orchestrationRunId.trim();
+  const run = loadOrchestrationRunRecord(context.commonDir, context.config, runId);
+  if (!run) {
+    throw new Error(`No orchestration run ledger found for ${runId}.`);
+  }
+  // C2 migration: sign legacy unsigned embedded review evidence in place so the
+  // signature-aware completion read path accepts it. Requires the review-state key
+  // (signing is impossible without it); trusts the persisted verdict at upgrade
+  // time (no re-review). Already-signed records are left untouched — a tampered
+  // signature is rejected by the read path, not silently re-blessed here.
+  const key = resolveReviewStateKey();
+  if (!key) {
+    throw new Error('orchestrate upgrade-ledger requires PIPELANE_REVIEW_STATE_KEY to sign embedded review evidence.');
+  }
+  // Sign only slice.review — the sole embedded evidence the completion read path
+  // verifies. reviewDiagnostics are not signature-checked on read, so signing them
+  // would inflate the count and imply a tamper-protection they do not have.
+  let upgradedCount = 0;
+  for (const slice of run.slices) {
+    if (slice.review && !slice.review.signature) {
+      slice.review = signOrchestrationSliceReview(slice.review, run.id, slice, key);
+      upgradedCount += 1;
+    }
+  }
+  run.updatedAt = nowIso();
+  const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+  const report: OrchestrateUpgradeLedgerReport = {
+    command: 'orchestrate upgrade-ledger',
+    status: run.status,
+    repoRoot: context.repoRoot,
+    runId: run.id,
+    ledgerPath,
+    upgradedCount,
+    run,
+    message: [
+      'Pipelane orchestrate upgrade-ledger',
+      '',
+      `Run: ${run.id}`,
+      `Signed legacy review records: ${upgradedCount}`,
+      upgradedCount === 0
+        ? 'No unsigned embedded review evidence found; the ledger is already signed.'
+        : 'Embedded review evidence is now signed and bound to this run/slice/worker context.',
     ].join('\n'),
   };
   printResult(parsed.flags, report);
@@ -3650,6 +3767,11 @@ function summarizeScopeRunStatus(run: OrchestrationRunRecord): OrchestrationRunR
   if (active.some((slice) => slice.status === 'planned')) return 'planned';
   if (active.some((slice) => slice.status === 'prepared')) return 'prepared';
   if (active.some((slice) => slice.status === 'dispatched')) return 'dispatched';
+  // C1: with no un-run in-scope slices, preserve an already-terminal completion
+  // status. summarizeRunWorkerStatus no longer emits `completed`/`paused` (C1), so
+  // falling through to it would silently downgrade a finished completed/paused run
+  // to `dispatched` when `scope` is re-run on it (e.g. re-scoping a completed run).
+  if (run.status === 'completed' || run.status === 'paused') return run.status;
   return summarizeRunWorkerStatus(run);
 }
 
@@ -3666,7 +3788,7 @@ function groupSlicesByPhase(
   return groups;
 }
 
-function sliceOutlineState(slice: OrchestrationSliceRecord): { glyph: string; label: string; state: string; done: boolean } {
+function sliceOutlineState(slice: OrchestrationSliceRecord, runId: string): { glyph: string; label: string; state: string; done: boolean } {
   if (slice.excludedReason) return { glyph: '◻', label: `excluded (${slice.excludedReason})`, state: 'excluded', done: false };
   if (slice.deferred === true) return { glyph: '◻', label: 'deferred (resume later)', state: 'deferred', done: false };
   if (slice.worker?.status === 'failed' || slice.status === 'failed') return { glyph: '✗', label: 'failed', state: 'failed', done: false };
@@ -3678,7 +3800,7 @@ function sliceOutlineState(slice: OrchestrationSliceRecord): { glyph: string; la
   // succeeded/done branch so the glyph does not contradict the cockpit.
   if (slice.status === 'empty') return { glyph: '⚠', label: 'empty (no changes — re-dispatch or defer)', state: 'empty', done: false };
   if (slice.worker?.status === 'succeeded' || slice.status === 'completed') {
-    const reviewed = sliceReviewFullySatisfied(slice);
+    const reviewed = sliceReviewFullySatisfied(slice, { runId });
     return { glyph: '✓', label: reviewed ? 'done · review ✓' : 'done · review pending', state: reviewed ? 'done' : 'awaiting-review', done: true };
   }
   return { glyph: '◻', label: 'queued', state: 'queued', done: false };
@@ -3695,7 +3817,7 @@ function buildOrchestrationOutlineSnapshot(run: OrchestrationRunRecord): {
   const phases = groupSlicesByPhase(run.slices);
   const active = selectActiveSlices(run);
   const slices = run.slices.map((slice): OrchestrateOutlineSliceSnapshot => {
-    const state = sliceOutlineState(slice);
+    const state = sliceOutlineState(slice, run.id);
     return {
       id: slice.id,
       index: slice.index,
@@ -3704,13 +3826,13 @@ function buildOrchestrationOutlineSnapshot(run: OrchestrationRunRecord): {
       glyph: state.glyph,
       deferred: slice.deferred === true && !slice.excludedReason,
       excluded: Boolean(slice.excludedReason),
-      reviewSatisfied: sliceReviewFullySatisfied(slice),
+      reviewSatisfied: sliceReviewFullySatisfied(slice, { runId: run.id }),
       sensitive: slice.requiresConfirmation,
     };
   });
   return {
     total: run.slices.length,
-    done: active.filter((slice) => sliceOutlineState(slice).done).length,
+    done: active.filter((slice) => sliceOutlineState(slice, run.id).done).length,
     deferred: run.slices.filter((slice) => slice.deferred === true && !slice.excludedReason).length,
     excluded: run.slices.filter((slice) => Boolean(slice.excludedReason)).length,
     phaseCount: phases.filter((phase) => phase.name).length,
@@ -3719,7 +3841,7 @@ function buildOrchestrationOutlineSnapshot(run: OrchestrationRunRecord): {
 }
 
 function renderSliceHeadline(run: OrchestrationRunRecord, slice: OrchestrationSliceRecord): string {
-  const state = sliceOutlineState(slice);
+  const state = sliceOutlineState(slice, run.id);
   return `${state.glyph} slice ${slice.index}/${run.slices.length} · ${slice.id} — ${state.label}`;
 }
 
@@ -3741,7 +3863,7 @@ function renderOrchestrationOutline(run: OrchestrationRunRecord): string {
   for (const phase of phases) {
     if (phase.name) lines.push(`  Phase · ${sanitizeForTerminal(phase.name)}`);
     for (const slice of phase.slices) {
-      const state = sliceOutlineState(slice);
+      const state = sliceOutlineState(slice, run.id);
       const sensitive = slice.requiresConfirmation ? '  ⚠ sensitive' : '';
       lines.push(`    ${state.glyph} ${slice.index}. ${sanitizeForTerminal(slice.id)} — ${state.label}${sensitive}`);
     }
@@ -3755,7 +3877,7 @@ function renderOrchestrationOutline(run: OrchestrationRunRecord): string {
     lines.push('', 'No implementation work in scope.');
   }
   const failed = active.find((slice) => {
-    const state = sliceOutlineState(slice).state;
+    const state = sliceOutlineState(slice, run.id).state;
     return state === 'failed' || state === 'review-failed';
   });
   if (failed) {

@@ -714,9 +714,11 @@ function isPrReadyOrchestrationRun(
   reviewOptions: OrchestrationReviewSatisfactionOptions,
 ): boolean {
   const active = selectActiveSlices(run);
+  // C2: bind the PR-readiness verdict to this run (anti-replay).
+  const runOptions = { ...reviewOptions, runId: run.id };
   return run.status === 'completed'
     && active.length > 0
-    && active.every((slice) => sliceReviewFullySatisfied(slice, reviewOptions));
+    && active.every((slice) => sliceReviewFullySatisfied(slice, runOptions));
 }
 
 function summarizeOrchestrationRun(
@@ -740,11 +742,13 @@ function summarizeOrchestrationRun(
   const providerCounts: Record<string, number> = {};
   const trustedReviewBySlice = new Map<string, boolean>();
   const missingWorktrees: OrchestrationMissingWorktreeSummary[] = [];
+  // C2: bind the trusted-review verdict to this run (anti-replay).
+  const runReviewOptions = { ...reviewOptions, runId: run.id };
   const slices = run.slices.map((slice) => {
     counts[slice.status] += 1;
     if (slice.worker?.status === 'succeeded') counts.workerSucceeded += 1;
     if (slice.review?.run.status === 'passed') counts.reviewPassed += 1;
-    const trustedReviewComplete = sliceReviewFullySatisfied(slice, reviewOptions);
+    const trustedReviewComplete = sliceReviewFullySatisfied(slice, runReviewOptions);
     trustedReviewBySlice.set(slice.id, trustedReviewComplete);
     if (trustedReviewComplete) counts.trustedReviewComplete += 1;
     providerCounts[slice.provider] = (providerCounts[slice.provider] ?? 0) + 1;

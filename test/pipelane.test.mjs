@@ -52,9 +52,16 @@ function runCli(args, cwd, env = {}, allowFailure = false) {
   if (!allowFailure && shouldSeedPassingReviewEvidence(args)) {
     writePassingReviewEvidence(cwd);
   }
+  const childEnv = { ...process.env, CODEX_HOME: DEFAULT_CODEX_HOME, PIPELANE_HOME: DEFAULT_PIPELANE_HOME, ...env };
+  // Hermeticity: a developer/CI shell may export pipelane signing keys. Scrub them
+  // unless a test explicitly passes one, so C2 signature gating and C1 exact run
+  // status assertions do not drift with the ambient environment.
+  for (const stateKey of ['PIPELANE_REVIEW_STATE_KEY', 'PIPELANE_DEPLOY_STATE_KEY', 'PIPELANE_PROBE_STATE_KEY']) {
+    if (!(stateKey in env)) delete childEnv[stateKey];
+  }
   const result = spawnSync('node', [CLI_PATH, ...args], {
     cwd,
-    env: { ...process.env, CODEX_HOME: DEFAULT_CODEX_HOME, PIPELANE_HOME: DEFAULT_PIPELANE_HOME, ...env },
+    env: childEnv,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -7930,7 +7937,7 @@ test('orchestrate goal-spec rejects invalid command forms', () => {
 
     const invalidSubcommand = runCli(['run', 'orchestrate', 'nope'], repoRoot, {}, true);
     assert.notEqual(invalidSubcommand.status, 0);
-    assert.match(invalidSubcommand.stderr, /orchestrate requires exactly: pipelane run orchestrate .*<goal-spec\|plan\|prepare\|dispatch\|start\|review\|scope\|outline\|finalize>/);
+    assert.match(invalidSubcommand.stderr, /orchestrate requires exactly: pipelane run orchestrate .*<goal-spec\|plan\|prepare\|dispatch\|start\|review\|scope\|outline\|finalize\|upgrade-ledger>/);
 
     const extraPositional = runCli(['run', 'orchestrate', 'goal-spec', 'extra'], repoRoot, {}, true);
     assert.notEqual(extraPositional.status, 0);
@@ -8868,12 +8875,17 @@ test('orchestrate start runs configured workers and records completion evidence'
     const onDisk = JSON.parse(readFileSync(started.ledgerPath, 'utf8'));
 
     assert.equal(started.command, 'orchestrate start');
-    assert.equal(started.status, 'completed');
+    // C1: a bare `orchestrate start` no longer completes the run — completion is
+    // recompute-authoritative (review is the only producer). Workers ran and
+    // produced material change, so each slice is `completed`, but the run is
+    // `dispatched` (awaiting review). Pre-C1 this reported `completed` off worker
+    // exit status alone, laundering an unreviewed verdict.
+    assert.equal(started.status, 'dispatched');
     assert.equal(started.startedCount, 2);
     assert.equal(started.existingCount, 0);
     assert.equal(started.failedCount, 0);
     assert.equal(started.blockedCount, 0);
-    assert.equal(onDisk.status, 'completed');
+    assert.equal(onDisk.status, 'dispatched');
     assert.equal(onDisk.slices.every((slice) => slice.status === 'completed'), true);
     assert.equal(onDisk.slices.every((slice) => slice.worker?.status === 'succeeded'), true);
     assert.equal(onDisk.slices.every((slice) => slice.worker?.exitCode === 0), true);
@@ -8895,6 +8907,262 @@ test('orchestrate start runs configured workers and records completion evidence'
     for (const worktreePath of createdWorktrees) {
       rmSync(worktreePath, { recursive: true, force: true });
     }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('C1 orchestrate start does not complete the run; review is the only completion gate', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    // One passing deterministic blocking gate so review can complete the run.
+    config.reviewGates = { planReview: { gates: [] }, gates: [{ id: 'static-pass', phase: 'static', type: 'command', command: 'node -e "process.exit(0)"', blocking: true }] };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt passing static gate');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'c1-start-plan.md'), ['# C1 Start Plan', '', '## Slice 1: Produces a change', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/c1-start-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+
+    // A successful worker that produced a material change. The bare start path
+    // (summarizeRunWorkerStatus) must NOT complete the run — completion is
+    // recompute-authoritative, so the run is `dispatched` (awaiting review).
+    const started = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker() }).stdout);
+    const afterStart = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
+    assert.equal(started.status, 'dispatched');
+    assert.notEqual(afterStart.status, 'completed');
+    assert.equal(afterStart.status, 'dispatched');
+    assert.equal(afterStart.slices[0].status, 'completed'); // the slice itself did real work
+    assert.equal(afterStart.slices[0].worker.status, 'succeeded');
+    assert.equal(afterStart.slices[0].review, null); // no review evidence yet
+
+    // Review is the single completion producer: it recomputes the verdict this
+    // invocation, then summarizeRunReviewStatus completes the run.
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const afterReview = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
+    assert.equal(reviewed.status, 'passed');
+    assert.equal(afterReview.status, 'completed');
+    assert.equal(afterReview.slices[0].review.run.status, 'passed');
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('C1 orchestrate finalize re-runs review in-process and will not complete off a stale passing verdict', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    // A blocking gate that PASSES normally but FAILS once a `review-fail` sentinel
+    // exists in the slice worktree. Frozen into the run's gateSnapshot at plan time.
+    config.reviewGates = { planReview: { gates: [] }, gates: [{ id: 'sentinel-gate', phase: 'static', type: 'command', command: "node -e \"process.exit(require('fs').existsSync('review-fail') ? 1 : 0)\"", blocking: true }] };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt sentinel gate');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'c1-finalize-plan.md'), ['# C1 Finalize Plan', '', '## Slice 1: Produces a change', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/c1-finalize-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker() });
+
+    // Review passes (no sentinel) and completes the run — persisted passing evidence.
+    runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot);
+    const afterReview = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
+    assert.equal(afterReview.status, 'completed');
+    assert.equal(afterReview.slices[0].review.run.status, 'passed');
+
+    // Now the worktree regresses so a fresh review would FAIL.
+    const sliceWorktree = afterReview.slices[0].worktreePath;
+    writeFileSync(path.join(sliceWorktree, 'review-fail'), 'x', 'utf8');
+
+    // finalize must re-run review in-process (C1/Decision 9) rather than trust the
+    // persisted passing verdict — so it catches the now-failing gate and does NOT
+    // keep/transition the run to completed.
+    runCli(['run', 'orchestrate', 'finalize', '--run-id', planned.runId, '--json'], repoRoot);
+    const afterFinalize = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
+    assert.notEqual(afterFinalize.status, 'completed');
+    assert.equal(afterFinalize.status, 'failed');
+    assert.equal(afterFinalize.slices[0].review.run.status, 'failed'); // proof finalize re-ran review this invocation
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('C2 orchestrate signs embedded review evidence bound to context; replay from another context is rejected', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const reviewStateKey = 'c2-review-state-signing-secret';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = { planReview: { gates: [] }, gates: [{ id: 'static-pass', phase: 'static', type: 'command', command: 'node -e "process.exit(0)"', blocking: true }] };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt passing static gate');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'c2-sign-plan.md'), ['# C2 Sign Plan', '', '## Slice 1: Produces a change', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/c2-sign-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(), PIPELANE_REVIEW_STATE_KEY: reviewStateKey });
+    // Review with the key set: the embedded evidence is signed in place, and the
+    // signature-aware completion gate accepts it -> completed.
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_REVIEW_STATE_KEY: reviewStateKey }).stdout);
+    const onDisk = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
+    assert.equal(reviewed.status, 'passed');
+    assert.equal(onDisk.status, 'completed');
+    const signedReview = onDisk.slices[0].review;
+    assert.equal(typeof signedReview.signature, 'string');
+    assert.equal(signedReview.signature.length, 64);
+    assert.ok(signedReview.binding);
+    assert.equal(signedReview.binding.runId, planned.runId);
+    assert.equal(signedReview.binding.sliceId, onDisk.slices[0].id);
+    assert.equal(signedReview.binding.worktreePath, onDisk.slices[0].worktreePath);
+
+    const ledgerMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'orchestration-ledger.ts'));
+    const slice = onDisk.slices[0];
+    // (a) correct key + run id -> satisfied.
+    assert.equal(ledgerMod.sliceReviewFullySatisfied(slice, { reviewStateKey, runId: planned.runId }), true);
+    // (b) replayed under a different run id -> binding mismatch -> rejected.
+    assert.equal(ledgerMod.sliceReviewFullySatisfied(slice, { reviewStateKey, runId: 'orchestrate-20260101000000-deadbeef' }), false);
+    // (c) evidence copied onto a different slice id -> rejected.
+    assert.equal(ledgerMod.sliceReviewFullySatisfied({ ...slice, id: `${slice.id}-other` }, { reviewStateKey, runId: planned.runId }), false);
+    // (d) evidence copied into a different worktree -> rejected.
+    assert.equal(ledgerMod.sliceReviewFullySatisfied({ ...slice, worktreePath: `${slice.worktreePath}-other` }, { reviewStateKey, runId: planned.runId }), false);
+    // (e) wrong signing key (a worker cannot forge the orchestrator's signature) -> rejected.
+    assert.equal(ledgerMod.sliceReviewFullySatisfied(slice, { reviewStateKey: 'wrong-key', runId: planned.runId }), false);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('C2 orchestrate rejects unsigned review evidence once the key is active; upgrade-ledger signs it in place', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const reviewStateKey = 'c2-upgrade-state-signing-secret';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = { planReview: { gates: [] }, gates: [{ id: 'static-pass', phase: 'static', type: 'command', command: 'node -e "process.exit(0)"', blocking: true }] };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt passing static gate');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'c2-upgrade-plan.md'), ['# C2 Upgrade Plan', '', '## Slice 1: Produces a change', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/c2-upgrade-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker() });
+    // Review WITHOUT a key: a legacy/unsigned record. With no key configured the
+    // completion gate does not enforce signatures, so the run still completes.
+    runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot);
+    const legacy = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
+    assert.equal(legacy.status, 'completed');
+    assert.equal(legacy.slices[0].review.signature, undefined);
+
+    const ledgerMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'orchestration-ledger.ts'));
+    // Reject-unsigned-when-active: once a key is configured, the unsigned legacy
+    // record is no longer accepted by the completion read path.
+    assert.equal(ledgerMod.sliceReviewFullySatisfied(legacy.slices[0], { reviewStateKey, runId: planned.runId }), false);
+
+    // upgrade-ledger signs the legacy record in place (no re-review), restoring it.
+    const upgraded = JSON.parse(runCli(['run', 'orchestrate', 'upgrade-ledger', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_REVIEW_STATE_KEY: reviewStateKey }).stdout);
+    assert.equal(upgraded.upgradedCount >= 1, true);
+    const afterUpgrade = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
+    assert.equal(typeof afterUpgrade.slices[0].review.signature, 'string');
+    assert.equal(afterUpgrade.slices[0].review.binding.runId, planned.runId);
+    assert.equal(ledgerMod.sliceReviewFullySatisfied(afterUpgrade.slices[0], { reviewStateKey, runId: planned.runId }), true);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('C1 orchestrate scope does not downgrade an already-completed run', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = { planReview: { gates: [] }, gates: [{ id: 'static-pass', phase: 'static', type: 'command', command: 'node -e "process.exit(0)"', blocking: true }] };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt passing static gate');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'c1-scope-plan.md'), ['# C1 Scope Plan', '', '## Slice 1: Produces a change', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/c1-scope-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const sliceId = JSON.parse(readFileSync(planned.ledgerPath, 'utf8')).slices[0].id;
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker() });
+    runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot);
+    assert.equal(JSON.parse(readFileSync(planned.ledgerPath, 'utf8')).status, 'completed');
+
+    // Re-running scope on a completed run must NOT downgrade it. Regression: C1
+    // stripped completion from summarizeRunWorkerStatus, and summarizeScopeRunStatus
+    // fell through to it, silently flipping a finished run to `dispatched`.
+    const scoped = JSON.parse(runCli(['run', 'orchestrate', 'scope', '--run-id', planned.runId, '--through', sliceId, '--json'], repoRoot).stdout);
+    assert.equal(scoped.run.status, 'completed');
+    assert.equal(JSON.parse(readFileSync(planned.ledgerPath, 'utf8')).status, 'completed');
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('C2 review gates cannot read the review-state signing key (no signature forgery)', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const reviewStateKey = 'c2-gate-isolation-secret';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    // A blocking gate that FAILS if the gate subprocess can see the signing key.
+    // A gate that inherits the key could HMAC a forged `passed` verdict; with the
+    // key scrubbed from gate envs the gate exits 0 and the run completes. The
+    // orchestrator PARENT keeps the key, so slice.review is still signed.
+    config.reviewGates = { planReview: { gates: [] }, gates: [{ id: 'no-key-gate', phase: 'static', type: 'command', command: 'node -e "process.exit(process.env.PIPELANE_REVIEW_STATE_KEY ? 1 : 0)"', blocking: true }] };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt key-isolation gate');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'c2-gate-plan.md'), ['# C2 Gate Plan', '', '## Slice 1: Produces a change', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/c2-gate-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(), PIPELANE_REVIEW_STATE_KEY: reviewStateKey });
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_REVIEW_STATE_KEY: reviewStateKey }).stdout);
+    const onDisk = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
+    assert.equal(reviewed.status, 'passed'); // gate exit 0 ⇒ gate did not see the key
+    assert.equal(onDisk.status, 'completed');
+    assert.equal(typeof onDisk.slices[0].review.signature, 'string'); // parent kept the key and signed
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
   }
@@ -9124,7 +9392,7 @@ test('orchestrate start uses native Codex and Claude adapter defaults when avail
     const codexStarted = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', codexPlan.runId, '--json'], repoRoot, {
       PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
     }).stdout);
-    assert.equal(codexStarted.status, 'completed');
+    assert.equal(codexStarted.status, 'dispatched'); // C1: bare start awaits review, not completed
     assert.equal(codexStarted.run.slices[0].worker.command, 'codex exec --full-auto -');
     assert.equal(readFileSync(path.join(codexStarted.run.slices[0].worktreePath, 'codex-default.txt'), 'utf8'), 'exec --full-auto -\ntrue\n');
 
@@ -9135,7 +9403,7 @@ test('orchestrate start uses native Codex and Claude adapter defaults when avail
     const claudeStarted = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', claudePlan.runId, '--json'], repoRoot, {
       PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
     }).stdout);
-    assert.equal(claudeStarted.status, 'completed');
+    assert.equal(claudeStarted.status, 'dispatched'); // C1: bare start awaits review, not completed
     assert.equal(claudeStarted.run.slices[0].worker.command, 'claude --print --permission-mode dontAsk');
     assert.equal(readFileSync(path.join(claudeStarted.run.slices[0].worktreePath, 'claude-default.txt'), 'utf8'), '--print --permission-mode dontAsk\ntrue\n');
   } finally {
@@ -10697,7 +10965,7 @@ test('orchestrate start redacts credential material in worker evidence', () => {
     const worker = onDisk.slices[0].worker;
     const log = readFileSync(worker.logPath, 'utf8');
 
-    assert.equal(started.status, 'completed');
+    assert.equal(started.status, 'dispatched'); // C1: bare start awaits review, not completed
     assert.doesNotMatch(worker.command, /sk-secret|plainsecret|sk-longsecret|tok-secret|shh-secret|lower-secret|json-secret|json-client-secret/);
     assert.doesNotMatch(log, /sk-secret|plainsecret|sk-longsecret|tok-secret|shh-secret|lower-secret|json-secret|json-client-secret|atlas-secret|redis-secret|abc\.def/);
     assert.match(worker.command, /OPENAI_API_KEY=\[REDACTED\]/);
@@ -10742,7 +11010,7 @@ test('orchestrate start streams large worker output without buffer failure', () 
     }).stdout);
     const worker = started.run.slices[0].worker;
 
-    assert.equal(started.status, 'completed');
+    assert.equal(started.status, 'dispatched'); // C1: bare start awaits review, not completed
     assert.equal(worker.status, 'succeeded');
     assert.equal(worker.exitCode, 0);
     assert.ok(statSync(worker.logPath).size > 10 * 1024 * 1024);
@@ -10775,7 +11043,7 @@ test('orchestrate start succeeds when a worker exits zero after closing stdin ea
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
     }).stdout);
 
-    assert.equal(started.status, 'completed');
+    assert.equal(started.status, 'dispatched'); // C1: bare start awaits review, not completed
     assert.equal(started.run.slices[0].worker.status, 'succeeded');
     assert.equal(started.run.slices[0].worker.error, null);
     assert.match(readFileSync(started.run.slices[0].worker.logPath, 'utf8'), /stdin closed/);
@@ -10884,7 +11152,7 @@ test('orchestrate start records worker failure and blocks dependent slices', () 
     const forcedRetry = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--force', '--json'], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: recoveryCommand,
     }).stdout);
-    assert.equal(forcedRetry.status, 'completed');
+    assert.equal(forcedRetry.status, 'dispatched'); // C1: workers recovered; run awaits review
     assert.equal(forcedRetry.startedCount, 1);
     assert.equal(forcedRetry.restartedCount, 1);
     assert.equal(forcedRetry.existingCount, 0);
@@ -10938,7 +11206,7 @@ test('orchestrate start --force retries a stale running worker record', () => {
     const forcedRetry = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--force', '--json'], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
     }).stdout);
-    assert.equal(forcedRetry.status, 'completed');
+    assert.equal(forcedRetry.status, 'dispatched'); // C1: stale worker recovered; run awaits review
     assert.equal(forcedRetry.startedCount, 0);
     assert.equal(forcedRetry.restartedCount, 1);
     assert.equal(forcedRetry.run.slices[0].worker.status, 'succeeded');
@@ -10997,7 +11265,7 @@ test('orchestrate start --force terminates a live running worker before retry', 
     }).stdout);
     await new Promise((resolve) => setTimeout(resolve, 1_500));
 
-    assert.equal(forcedRetry.status, 'completed');
+    assert.equal(forcedRetry.status, 'dispatched'); // C1: live worker replaced; run awaits review
     assert.equal(forcedRetry.restartedCount, 1);
     assert.equal(forcedRetry.run.slices[0].worker.status, 'succeeded');
     assert.notEqual(forcedRetry.run.slices[0].worker.pid, liveWorker.pid ?? null);
@@ -11049,7 +11317,7 @@ test('orchestrate start re-evaluates pending slices when ledger order is not dep
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
     }).stdout);
 
-    assert.equal(started.status, 'completed');
+    assert.equal(started.status, 'dispatched'); // C1: bare start awaits review, not completed
     assert.equal(started.startedCount, 2);
     assert.equal(started.blockedCount, 0);
     assert.deepEqual(started.slices.map((slice) => slice.id), ['dependency-first', 'dependent-second']);
@@ -11102,7 +11370,7 @@ test('orchestrate start can run one selected dispatched slice when dependencies 
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
     }).stdout);
     assert.equal(second.startedCount, 1);
-    assert.equal(second.run.status, 'completed');
+    assert.equal(second.run.status, 'dispatched'); // C1: all workers done; run awaits review
     assert.equal(second.run.slices[1].worker.status, 'succeeded');
   } finally {
     for (const worktreePath of createdWorktrees) {
@@ -12320,7 +12588,9 @@ test('status keeps worker-completed orchestration active until trusted review ex
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(),
     }).stdout);
 
-    assert.equal(result.run.status, 'completed');
+    // C1: worker-completed but unreviewed — the run is `dispatched` (awaiting
+    // review), and the cockpit still keeps it active with next action = review.
+    assert.equal(result.run.status, 'dispatched');
 
     const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
     assert.equal(envelope.data.orchestration.activeRun.id, planned.runId);
@@ -28763,7 +29033,7 @@ test('orchestrate deferred slices create no worktrees and stay out of the snapsh
     const started = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', runId, '--json'], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: PR1_PASS_WORKER,
     }).stdout);
-    assert.equal(started.run.status, 'paused');
+    assert.equal(started.run.status, 'dispatched'); // C1: bare start awaits review (deferred remainder still out of scope)
 
     const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
     const nextAction = envelope.data.orchestration.activeRun.nextAction;
@@ -28785,7 +29055,12 @@ test('orchestrate pass with deferred slices pauses, then resume un-defers and co
   let slicesDir;
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
-    commitAll(repoRoot, 'Adopt pipelane');
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    // A passing blocking gate so review can complete the resumed run end-to-end.
+    config.reviewGates = { planReview: { gates: [] }, gates: [{ id: 'static-pass', phase: 'static', type: 'command', command: 'node -e "process.exit(0)"', blocking: true }] };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt pipelane + passing gate');
     const planned = planPr1ThreeSliceRun(repoRoot);
     slicesDir = planned.slicesDir;
     const runId = planned.runId;
@@ -28798,7 +29073,7 @@ test('orchestrate pass with deferred slices pauses, then resume un-defers and co
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: PR1_PASS_WORKER,
     }).stdout);
     createdWorktrees.push(...pass1.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
-    assert.equal(pass1.run.status, 'paused');
+    assert.equal(pass1.run.status, 'dispatched'); // C1: bare start awaits review, not paused
 
     // Resume: bring the rest into scope and run them.
     runCli(['run', 'orchestrate', 'scope', '--run-id', runId, '--through', 'three'], repoRoot);
@@ -28808,8 +29083,16 @@ test('orchestrate pass with deferred slices pauses, then resume un-defers and co
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: PR1_PASS_WORKER,
     }).stdout);
     createdWorktrees.push(...pass2.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
-    assert.equal(pass2.run.status, 'completed');
+    // C1: a bare start (even on resume) no longer completes — review does. All
+    // in-scope slices succeeded, so the run awaits review (`dispatched`).
+    assert.equal(pass2.run.status, 'dispatched');
     assert.ok(pass2.run.slices.every((slice) => slice.worker?.status === 'succeeded'));
+
+    // Review completes the resumed run end-to-end (C1: review is the completion
+    // gate). Restores the deferred → resume → complete coverage that the pre-C1
+    // `pass2.status === 'completed'` assertion used to provide.
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', runId, '--json'], repoRoot).stdout);
+    assert.equal(reviewed.run.status, 'completed');
   } finally {
     for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
     rmSync(repoRoot, { recursive: true, force: true });
@@ -28836,7 +29119,7 @@ test('orchestrate finalize marks the deferred remainder excluded and keeps the r
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: PR1_PASS_WORKER,
     }).stdout);
     createdWorktrees.push(...started.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
-    assert.equal(started.run.status, 'paused');
+    assert.equal(started.run.status, 'dispatched'); // C1: bare start awaits review, not paused
 
     const finalized = JSON.parse(runCli(['run', 'orchestrate', 'finalize', '--run-id', runId, '--json'], repoRoot).stdout);
     // Excluded slices are KEPT (not deleted), with a reason + timestamp.
@@ -28915,7 +29198,7 @@ test('orchestrate paused run reviews as passed (not blocked) and the next action
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: PR1_PASS_WORKER,
     }).stdout);
     createdWorktrees.push(...started.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
-    assert.equal(started.run.status, 'paused');
+    assert.equal(started.run.status, 'dispatched'); // C1: bare start awaits review; review then pauses
 
     // #1a: a paused run whose in-scope slice passed review must NOT report blocked.
     const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', runId, '--json'], repoRoot).stdout);
@@ -28977,7 +29260,7 @@ test('orchestrate resume does not abort when a completed slice worktree was clea
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: PR1_PASS_WORKER,
     }).stdout);
     createdWorktrees.push(...pass1.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
-    assert.equal(pass1.run.status, 'paused');
+    assert.equal(pass1.run.status, 'dispatched'); // C1: bare start awaits review, not paused
 
     // Simulate /clean removing the finished slice's worktree before resuming.
     rmSync(pass1.run.slices[0].worktreePath, { recursive: true, force: true });
