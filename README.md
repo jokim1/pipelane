@@ -213,11 +213,15 @@ For release-mode deploys, configure deploy targets and health checks:
 pipelane configure
 ```
 
-Then work through the four core workflows:
+Then move work through the normal handoff. In build mode, stop after `/merge`
+when production deploys from the base branch automatically; in release mode,
+continue through staging and production:
 
 ```text
 /orchestrate
 /pipelane review
+/pr
+/merge
 /deploy staging
 /deploy prod
 /pipelane web
