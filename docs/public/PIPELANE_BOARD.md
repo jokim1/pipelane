@@ -87,7 +87,7 @@ Shows the quick Pipelane guide:
 The drawer renders configured aliases from the repo when available, falling back to the default
 slash command names only when alias config cannot be loaded.
 
-## Orchestration Roadmap
+## Orchestration Visibility
 
 `/pipelane orchestrate goal-spec`, `/pipelane orchestrate plan`,
 `/pipelane orchestrate prepare`, `/pipelane orchestrate dispatch`, and

@@ -1,69 +1,296 @@
 # Pipelane
 
-Pipelane is a local release cockpit for AI-assisted coding.
+**Rocketboard: a vibe coding orchestrator and release manager.**
 
-It helps you keep track of branches, worktrees, PRs, review gates, deploys,
-rollback, and cleanup when Claude, Codex, or another AI agent is writing code
-with you.
+Pipelane is a local-first command layer and web cockpit for teams building with
+AI agents. It turns AI-assisted work into an auditable flow: plan the work,
+slice it, run agents in isolated worktrees, review the output, open a PR, merge,
+deploy, verify, roll back when needed, and clean up only when it is safe.
 
-AI coding makes it easy to create a lot of work quickly. Pipelane makes that
-work easier to find, review, merge, deploy, and clean up without guessing what
-state the repo is in.
+The package and command namespace are still `pipelane`. The product direction is
+Rocketboard: the operator view for vibe coding at scale.
 
 ![Pipelane Board showing branch pipeline state, attention items, and release actions](docs/public/pipelane-board-example.png)
 
-## What Pipelane Does
+## Why This Exists
 
-Pipelane gives a repo:
+AI-assisted coding changes the bottleneck. The hard part is no longer typing the
+code. The hard part is defining what "correct" means, checking probabilistic
+output, and moving many AI-generated changes through review and release without
+losing track of state.
 
-- slash commands for the normal build and release flow
-- isolated task worktrees for new work
-- a local web board for seeing branch, PR, deploy, and cleanup state
-- review-gate setup and evidence recording
-- safe PR, merge, deploy, rollback, and cleanup commands
-- an orchestration foundation for running plan slices through worker agents and
-  review gates
+Pipelane is built around a simple progression:
 
-Pipelane is local-first. Your repo, git history, GitHub, CI, and deploy platform
-stay the source of truth.
+```text
+PROMPT -> PLAN -> BUILD -> EVAL -> RELEASE -> LOOP
+```
 
-Pipelane is not:
+The philosophy:
 
-- an AI model
-- a hosted SaaS dashboard
-- a replacement for git, GitHub, CI, or your deploy provider
-- a project management tool
-- a one-command production deploy bot
+- Prompting is useful, but it is not enough. Good inputs reduce variance; they
+  do not eliminate it.
+- A plan defines correctness before the build starts. Pipelane can turn that
+  plan into typed `GoalSpec` prompts, slices, worktrees, and review gates.
+- An eval is only real when it produces evidence: changed files, test output,
+  review results, skipped checks, deploy probes, and blockers.
+- Release is a discipline layer, not a button. Production moves only when the
+  right SHA, surfaces, probes, and approvals line up.
+- Autonomy should be auditable. The goal is not unlimited agent freedom; the
+  goal is loops whose actions, evidence, and handoffs survive context loss.
 
-The simple mental model:
+Pipelane lives mainly in Phase 3 and Phase 4 of this model: production-safe
+evals, release gates, autonomous loops, and an evidence ledger that makes the
+work inspectable. The same structure also prepares the repo for later
+self-improvement: captured lessons, reusable skills, and machine-readable
+invariants.
 
-- **Pipelane moves work.** Branch, PR, merge, deploy, rollback, cleanup.
-- **Your tests and review tools judge work.** Lint, typecheck, tests, build,
-  gstack review, Karpathy diff, Claude/Codex review, human approval.
-- **The board shows work.** It makes the next safe action visible.
+## What Pipelane Owns
 
-## Requirements
+Pipelane coordinates the repo-native workflow around AI-generated work:
 
-Hard requirements:
+- orchestration with `/pipelane orchestrate`
+- review gates with `/pipelane review`
+- task branches and isolated worktrees with `/new` and `/resume`
+- PR preparation and enforcement with `/pr`
+- merge handoff with `/merge`
+- safe deploys with `/deploy staging` and `/deploy prod`
+- release diagnostics with `/doctor`
+- rollback with `/rollback`
+- cleanup with `/clean`
+- visual operations with `/pipelane web`
 
-- Node.js `>=22.0.0`
-- npm
-- git
-- a git repo with at least one commit
-- a real base branch, usually `main`
+Pipelane does **not** replace your model, tests, GitHub, CI, deploy provider, or
+human release judgment. It makes those systems visible, ordered, and harder to
+skip accidentally.
 
-Recommended for the full workflow:
+## The Four Core Workflows
 
-- GitHub CLI, `gh`, installed and authenticated
-- an `origin` remote with the base branch pushed
-- CI checks for your repo
-- deploy commands or deploy platform config for staging and production
+### 1. `/pipelane orchestrate`
 
-Optional:
+`/pipelane orchestrate` is the execution layer above normal AI coding. It reads
+an implementation plan, compiles it into slices, gives each slice a worktree and
+handoff prompt, runs worker agents, reviews the slices, and records a durable
+ledger of evidence.
 
-- Claude Code, if you want Claude slash commands
-- Codex, if you want Codex skills
-- gstack, if you want the review workflows Pipelane is designed to pair with
+Bare orchestration runs the main phases in one approved pass:
+
+```text
+/pipelane orchestrate --plan-file docs/plan.md --provider codex --yes
+```
+
+That command currently performs:
+
+1. `plan`: compile the plan into a durable slice ledger.
+2. `prepare`: create task worktrees and locks for slices.
+3. `dispatch`: write provider handoff prompts.
+4. `start`: run configured or native worker commands.
+5. `review`: run the configured review-gate snapshot over completed slices.
+6. bounded review-fix attempts for failed executable gates.
+
+The advanced commands are available when you want step-by-step control:
+
+```text
+/pipelane orchestrate goal-spec --plan-file docs/plan.md
+/pipelane orchestrate plan --plan-file docs/plan.md
+/pipelane orchestrate prepare --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
+/pipelane orchestrate dispatch --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
+/pipelane orchestrate start --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef [--slice-id <id>] [--force]
+/pipelane orchestrate review --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef [--slice-id <id>]
+```
+
+The mental model is compiler plus runner:
+
+```text
+plan -> slices -> worktrees -> workers -> review gates -> evidence ledger -> PR
+```
+
+Important boundaries:
+
+- Orchestration stops before PR creation, merge, deploy, and cleanup.
+- Slice review evidence must be full, fresh, non-dry-run evidence for the slice
+  worktree HEAD.
+- Filtered review evidence is diagnostic only.
+- Remaining failed, pending, or blocked slice reviews keep the orchestration
+  active and return a non-zero exit code.
+- The normal Pipelane release flow still owns `/pr`, `/merge`, `/deploy`, and
+  `/clean`.
+
+Native worker defaults are used when available:
+
+- Codex: `codex exec --full-auto -`
+- Claude: `claude --print` with the best supported non-interactive permission
+  mode
+
+You can override worker launch commands:
+
+```bash
+PIPELANE_ORCHESTRATE_WORKER_COMMAND='your-worker-command'
+PIPELANE_ORCHESTRATE_CODEX_COMMAND='codex-specific-command'
+PIPELANE_ORCHESTRATE_CLAUDE_COMMAND='claude-specific-command'
+PIPELANE_ORCHESTRATE_WORKER_TIMEOUT_MS=3600000
+```
+
+### 2. `/deploy` and Safe Release
+
+Pipelane supports two development modes.
+
+Build mode is the fast lane. Use it when production deploys safely after merge,
+or when you do not need staging to prove the exact merged SHA before production
+moves.
+
+```text
+/devmode build
+/new
+/pipelane review
+/pr --title "PR title"
+/merge
+/clean
+```
+
+Release mode is the protected lane. Use it when staging must verify the exact
+merged SHA before production can move.
+
+```text
+/devmode release
+/new
+/pipelane review
+/pr --title "PR title"
+/merge
+/deploy staging
+/deploy prod
+/clean
+```
+
+Safe release means:
+
+- The PR is reviewed before `/pr` can commit, push, or open the PR.
+- `/merge` records the merged SHA.
+- `/deploy staging` deploys and verifies that SHA in a non-production
+  environment.
+- `/deploy prod` promotes the same verified SHA to production.
+- Deploy records are signed and bound to the expected surfaces.
+- Health checks and configured verification commands produce release evidence.
+- Production deploys and rollback require explicit confirmation.
+- `/rollback prod` provides the recovery path when production regresses.
+
+Release-mode `/deploy prod` fails closed when same-SHA staging evidence is
+missing, stale, or for the wrong surface set. Pipelane currently knows managed
+surfaces such as `frontend`, `edge`, and `sql`, and it supports additional
+configured surfaces.
+
+Useful release commands:
+
+```text
+/devmode status
+/devmode release
+/deploy staging
+/deploy prod
+/doctor
+/doctor --probe
+/rollback prod
+```
+
+Run `pipelane configure` before the first release-mode deploy in a newly
+onboarded repo. Deploy configuration is local by default and normally lives in
+the operator's `CLAUDE.md` deploy configuration block.
+
+### 3. `/pipelane review`
+
+`/pipelane review` is the quality gate between "the agent says done" and "this
+work is allowed to move." It is based on a core belief from vibe coding:
+probabilistic output needs structured, decorrelated review.
+
+The review philosophy:
+
+- Deterministic checks go first. Do not spend model attention on failures that
+  lint, typecheck, tests, format checks, secret scans, dependency audits, or the
+  build can reject.
+- The author should not be the independent reviewer. `/karpathy diff` is useful
+  author self-review, but independent AI review must come from a separate
+  reviewer context.
+- Different blind spots matter more than repeated reviews. Stack machine
+  checks, fresh-context review, and cross-model review.
+- Review evidence must be bound to the branch, HEAD SHA, and worktree state.
+- High-stakes paths need stronger gates: auth, billing, migrations, secrets,
+  SQL, deploy, rollback, and production-impacting changes.
+- Human approval stays explicit for irreversible decisions.
+
+Set up the review stack:
+
+```text
+/pipelane review setup
+/pipelane review setup --yes
+/pipelane review setup --print
+/pipelane review setup --list-gates
+```
+
+Run the review stack:
+
+```text
+/pipelane review
+```
+
+The canonical gate order is:
+
+1. Static gates: lint, typecheck, format check, secret scan, dependency audit.
+2. Behavioral gates: tests, integration checks, build.
+3. AI diff gates: `/karpathy diff`, fresh-context review, gstack `/review`,
+   cross-model review when installed.
+4. Instruction gates: `/karpathy audit` when agent instruction files change.
+5. Runtime gates: browser QA, deploy health checks, staging evidence.
+6. Human gates: approval for schema, auth, billing, secrets, deploy, rollback,
+   and other irreversible work.
+
+`/pr` enforces this evidence. It blocks when review evidence is missing, stale,
+filtered, dry-run only, pending, failed, or recorded for a different HEAD or
+worktree state.
+
+If review or CI finds a real problem, use:
+
+```text
+/fix
+/pipelane review
+/pr
+```
+
+`/fix` is intentionally root-cause oriented. It should explain the failure,
+check repo guidance, scan for sibling bugs, fix the underlying issue, and rerun
+the relevant checks.
+
+### 4. `/pipelane web`
+
+`/pipelane web` opens the local Rocketboard/Pipelane Board. It is the visual
+view over the same repo contract used by `/status`.
+
+```text
+/pipelane web
+```
+
+Or from a terminal:
+
+```bash
+pipelane board
+```
+
+The web view currently shows:
+
+- attention items first
+- current build or release mode
+- branch and worktree state
+- PR state
+- staging and production deploy state
+- release readiness
+- cleanup readiness
+- branch files and patch previews on demand
+- preflighted actions that map back to Pipelane commands
+
+The board is not a separate source of truth. It reads the repo's public
+`pipelane:api` contract and renders what the repo reports.
+
+The next Rocketboard direction is orchestration visibility: active runs, slices,
+worktrees, gate status, blocked reviews, and evidence links from the
+orchestration ledger. The ledger and orchestration commands exist today; the
+full visual orchestration panel is the coming web layer.
 
 ## Quick Start
 
@@ -84,351 +311,140 @@ pipelane install-claude
 This writes durable commands under your local Codex and Claude skill folders. It
 does not write Pipelane files into the current repo.
 
-During install, Pipelane also checks the current repo's repo-local
-`node_modules/pipelane` when one exists. If that repo-local package is behind
-latest `main`, install output tells you to run `pipelane update` before using
-release commands such as `/deploy`.
+Then open a repo and run:
 
-`/pipelane review setup` can install missing Karpathy review skills from
-`https://github.com/jokim1/karpathy-skills.git` into `$CODEX_HOME/skills` after
-you explicitly approve the install prompt.
+```text
+/pipelane setup
+/pipelane review setup
+/status
+/pipelane web
+```
 
-For package-script gates such as lint and format check, automatic dependency
-installation is intentionally conservative: it runs only for npm projects. pnpm,
-Yarn, Bun, conflicting lockfiles, and framework-specific ESLint setups get a
-manual recipe instead of a generated config or package-manager mutation.
+For a first release-mode deploy:
+
+```bash
+pipelane configure
+```
 
 If your task worktrees share `node_modules` through a symlink, install the local
-npm guard too:
+npm guard:
 
 ```bash
 pipelane install-npm-guard
 export PATH="$HOME/.pipelane/bin:$PATH"
 ```
 
-Then open a repo and use:
+## Requirements
 
-```text
-/pipelane setup
-/pipelane status
-/new
-/pipelane review
-/pr
-```
+Hard requirements:
 
-### Clean Repo Setup
+- Node.js `>=22.0.0`
+- npm
+- git
+- a git repo with at least one commit
+- a real base branch, usually `main`
 
-The normal first-run path is clean:
+Recommended for the full workflow:
 
-```bash
-pipelane setup
-```
+- GitHub CLI, `gh`, installed and authenticated
+- an `origin` remote with the base branch pushed
+- CI checks for the repo
+- deploy commands or deploy platform config for staging and production
 
-This uses machine-local commands and default repo inference. It does not create
-tracked Pipelane files unless the repo has explicitly opted into generated
-surfaces.
+Optional:
 
-For the first deploy from a newly onboarded release-mode repo, run:
+- Claude Code, if you want Claude slash commands
+- Codex, if you want Codex skills and worker execution
+- gstack, if you want the broader plan, review, QA, and release workflows
 
-```bash
-pipelane configure
-```
+## Working in This Repo
 
-Use `pipelane configure --json ...` when filling the Deploy Configuration block
-from automation.
-
-Use `git status` first:
+Install dependencies:
 
 ```bash
-git status --short
+npm install
 ```
 
-Stage the Pipelane files you accept. A typical repo will include some or all of
-these:
+Useful development commands:
 
 ```bash
-git add .pipelane.json .claude/commands .agents/skills
-git add docs/RELEASE_WORKFLOW.md pipelane/CLAUDE.template.md REPO_GUIDANCE.md
-git add README.md CONTRIBUTING.md AGENTS.md package.json package-lock.json
-git commit -m "Add pipelane workflow"
-git push
+npm test
+npm run typecheck
+npm run build
+npm run smoke
+npm run board
 ```
 
-If your repo does not have one of those files, skip that `git add` line or leave
-the missing file out.
+Run the CLI directly while developing:
 
-Commit repo-local adapters before using `/new` from a remote-backed repo.
-
-`/new` creates task worktrees from the repo's base branch. If the base branch
-does not contain the Pipelane files yet, new worktrees will not inherit the
-workflow.
-
-## How to Use It
-
-In a Pipelane-enabled repo, start with:
-
-```text
-/pipelane
+```bash
+node ./src/cli.ts --help
+node ./src/cli.ts run status
+node ./src/cli.ts board --repo /absolute/path/to/target/repo
 ```
 
-That shows the workflow guide. Most work follows one of two lanes.
+The package entrypoint is `bin/pipelane`. Source lives under `src/operator` for
+workflow commands and `src/dashboard` for the local web board.
 
-## Build Lane
+## Terminal Usage
 
-Build mode is the fast lane.
+Slash commands are the normal interface inside Claude or Codex. From a
+terminal, use `pipelane run`:
 
-Use it when production already deploys safely after merge, or when you do not
-need staging to prove the exact same merged SHA before production moves.
-
-```text
-/devmode build
-/new
-/pipelane review
-/pr --title "PR title"
-/merge
-/clean
+```bash
+pipelane run status
+pipelane run new --task "checkout recovery"
+pipelane run review
+pipelane run pr --title "Add checkout recovery"
+pipelane run merge
+pipelane run deploy staging
+pipelane run deploy prod
+pipelane run clean
 ```
 
-What each step does:
-
-- `/devmode build` selects the fast lane.
-- `/new` creates a fresh task branch and worktree. The task name is optional;
-  the AI can infer it from the user's request.
-- `/pipelane review` runs configured review gates and records evidence.
-- `/pr` enforces fresh review evidence, runs checks, commits, pushes, and opens
-  or updates the PR.
-- `/merge` merges the PR and records the merged SHA.
-- `/clean` removes finished task state after the work is safe to close.
-
-Build mode is good for normal product iteration, small fixes, and repos where
-the base branch already has a trusted production deploy path.
-
-## Release Lane
-
-Release mode is the protected lane.
-
-Use it when staging must prove the exact same merged SHA before production is
-allowed to move.
-
-```text
-/devmode release
-/new
-/pipelane review
-/pr --title "PR title"
-/merge
-/deploy staging
-/deploy prod
-/clean
-```
-
-Release mode adds the staging gate:
-1. Merge the PR once.
-2. Deploy that merged SHA to staging.
-3. Verify staging.
-4. Promote that same SHA to production.
-5. Verify production.
-
-Release mode is useful for risky changes, database changes, auth, billing,
-customer-facing launches, multi-surface deploys, and any moment where "I think
-prod has the right thing" is not good enough.
-
-## Helpful Anytime
-
-```text
-/pipelane web           Open the local Pipelane Board.
-/status                 Show branch, PR, deploy, and release-gate state.
-/resume                 Reopen or recover an existing task workspace.
-/doctor                 Diagnose deploy config, probes, and release readiness.
-/rollback prod          Roll production back to the last verified-good deploy.
-/fix                    Fix bugs, review findings, CI failures, and code-quality issues.
-/fix rethink            Audit refactor hotspots before changing code.
-```
-
-## The Pipelane Board
-
-Open the board with:
-
-```text
-/pipelane web
-```
-
-Or from a terminal:
+Open the board:
 
 ```bash
 pipelane board
 ```
 
-The board shows:
-
-- attention items first
-- current build or release mode
-- branch and worktree state
-- PR state
-- staging and production deploy state
-- cleanup readiness
-- branch files and patch previews on demand
-- safe actions that map back to Pipelane commands
-
-The board is not a separate source of truth. It reads the repo's public
-`pipelane:api` contract and displays what the repo reports.
-
-## Review Gates
-
-Pipelane has a review-gate runner because AI-generated code should not go
-straight from "the agent says done" to "merge".
-
-Set up the review stack:
-
-```text
-/pipelane review setup
-/pipelane review setup --yes
-/pipelane review setup --print
-/pipelane review setup --list-gates
-```
-
-Run the review stack:
-
-```text
-/pipelane review
-```
-
-The gate order is:
-
-1. **Static gates:** lint, typecheck, format check, secret scan, dependency audit.
-2. **Behavioral gates:** tests, integration checks, build.
-3. **AI diff gates:** `/karpathy diff` as author self-review, `/code-review high`
-   in a fresh reviewer context when available, gstack `/review` as the
-   independent fallback, and cross-model review via Codex `/claude review code`
-   or Claude-side gstack `/codex challenge`.
-4. **Instruction gates:** `/karpathy audit` when agent instruction files change.
-5. **Runtime gates:** browser QA, deploy health checks, staging evidence.
-6. **Human gates:** approval for schema, auth, billing, secrets, deploy, rollback,
-   and other irreversible work.
-
-Static gates run before AI review. There is no reason to spend model attention
-on syntax, type, style, or build errors that deterministic tools can catch.
-Bare setup prints a selector for available, missing, and installable gates.
-The default path is opinionated: save the recommended checklist with `--yes`.
-Users can still opt out with `--disable`, enable available optional gates with
-`--enable`, or install supported gaps with `--install`, but opting out reduces
-review coverage. `--install` uses npm only for package-script gates; unsupported
-package managers and framework-specific lint configs print a manual recipe to
-apply with your project tooling. `--print` and `--list-gates` are read-only and
-cannot be combined with modifying flags.
-
-`/pipelane review` writes evidence for the current branch, HEAD, and worktree
-state. `/pr` checks that evidence before it commits, pushes, or opens a PR.
-In v2 review setups, independent AI evidence must come from a separate reviewer
-session. The authoring session can run `/karpathy diff` as self-review, but it
-cannot attest its own independent review.
-
-`/pr` blocks when review evidence is:
-
-- missing
-- stale
-- filtered
-- dry-run only
-- pending
-- failed
-- for a different HEAD or worktree state
-
-If `/pr` blocks on review evidence, run:
-
-```text
-/pipelane review
-/pr
-```
-
-## `/fix`
-
-Use `/fix` when a review, test, CI run, QA pass, or user report finds a real
-problem.
-
-```text
-/fix
-```
-
-`/fix` is intentionally strict. It looks for the root cause, checks repo guidance,
-scans for sibling bugs, and avoids cheap shims like swallowing errors or adding a
-one-off special case without understanding the caller.
-
-Use this when you want the codebase to get healthier, not just quieter.
-
-Use planning-only refactor mode when the code is too tangled to patch safely:
-
-```text
-/fix rethink
-```
-
-## Orchestration
-
-Pipelane now has an orchestration foundation.
-
-The approved bare command can turn a plan into isolated slices, prepare
-worktrees, dispatch provider prompts, run workers, and review completed slices:
-
-```text
-/pipelane orchestrate --plan-file docs/plan.md --provider codex --yes
-```
-
-It still stops before PR creation, merge, deploy, and cleanup. Failed executable
-review gates get a bounded review-fix worker attempt before Pipelane reruns
-review. Remaining failed, pending, or blocked slice reviews leave the
-orchestration active and return a non-zero exit code; orchestration review
-completion requires at least one effective review gate. The review and
-review-fix phases print progress on stderr, and pending manual/AI gates are
-reported with the slice, gate, command, and worktree to act on.
-The advanced commands below remain available for recovery and step-by-step
-control.
-
-Current orchestration commands:
-
-```text
-/pipelane orchestrate --plan-file docs/plan.md --provider codex --yes
-/pipelane orchestrate goal-spec --plan-file docs/plan.md
-/pipelane orchestrate plan --plan-file docs/plan.md
-/pipelane orchestrate prepare --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
-/pipelane orchestrate dispatch --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
-/pipelane orchestrate start --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef [--slice-id <id>] [--force]
-/pipelane orchestrate review --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef [--slice-id <id>]
-```
-
-What those commands do:
-
-- bare `orchestrate --yes` runs plan, prepare, dispatch, start, review, and bounded review-fix attempts in one durable pass.
-- `goal-spec` drafts a provider-neutral goal from a plan or outcome.
-- `plan` writes a durable slice ledger.
-- `prepare` creates slice worktrees and task locks.
-- `dispatch` writes provider handoff prompts for each slice.
-- `start` runs configured or native worker commands from each slice worktree.
-- `review` runs the run's review-gate snapshot against completed worker slices.
-
-`orchestrate start` can use native defaults when available:
-
-- Codex: `codex exec --full-auto -`
-- Claude: `claude --print` plus the best supported non-interactive permission
-  mode from `claude --help`
-
-You can override worker launch commands:
+Check for updates:
 
 ```bash
-PIPELANE_ORCHESTRATE_WORKER_COMMAND='your-worker-command'
-PIPELANE_ORCHESTRATE_CODEX_COMMAND='codex-specific-command'
-PIPELANE_ORCHESTRATE_CLAUDE_COMMAND='claude-specific-command'
-PIPELANE_ORCHESTRATE_WORKER_TIMEOUT_MS=3600000
+pipelane update --check
 ```
 
-Orchestration review is conservative:
+## Command Reference
 
-- slice-filtered review evidence is diagnostic only
-- gate-filtered review evidence is diagnostic only
-- phase-filtered review evidence is diagnostic only
-- dry-run review evidence is diagnostic only
-- trusted slice review evidence is bound to the slice worktree HEAD SHA
-- the run passes only after every slice has full non-dry-run review evidence
-
-Merge, deploy, rollback, and cleanup still stay outside orchestration. Use the
-normal Pipelane release flow after the orchestration run is reviewed.
+| Command | What it does |
+| --- | --- |
+| `/pipelane` | Show the workflow guide. |
+| `/pipelane setup` | Set up Pipelane for the current repo. |
+| `/pipelane web` | Open the local Rocketboard/Pipelane Board. |
+| `/status` | Show branch, PR, deploy, and release state. |
+| `/devmode build` | Use the fast build lane. |
+| `/devmode release` | Use the protected release lane. |
+| `/new` | Create a task branch and isolated worktree. |
+| `/resume` | Reopen or recover existing task work. |
+| `/repo-guard` | Check that the current checkout is safe. |
+| `/pipelane review setup` | Select review gates. |
+| `/pipelane review` | Run review gates and record evidence. |
+| `/pipelane review pass` | Record a clean manual review gate after running the referenced review or approval. |
+| `/pipelane orchestrate --plan-file docs/plan.md --yes` | Run plan, prepare, dispatch, start, review, and bounded review-fix attempts. |
+| `/pipelane orchestrate goal-spec` | Draft a provider-neutral `GoalSpec` from a plan or outcome. |
+| `/pipelane orchestrate plan` | Compile a plan into a durable slice ledger. |
+| `/pipelane orchestrate prepare` | Create slice worktrees. |
+| `/pipelane orchestrate dispatch` | Write provider handoff prompts. |
+| `/pipelane orchestrate start` | Run or retry slice workers. |
+| `/pipelane orchestrate review` | Run review gates over completed slices. |
+| `/pr` | Run checks, enforce review evidence, commit, push, and open or update a PR. |
+| `/merge` | Merge the PR and record the merged SHA. |
+| `/deploy staging` | Deploy the merged SHA to staging. |
+| `/deploy prod` | Promote the verified merged SHA to production. |
+| `/rollback prod` | Roll production back to the last verified-good deploy. |
+| `/clean` | Clean finished or stale task state when safe. |
+| `/doctor` | Diagnose deploy config, probes, and release readiness. |
+| `/fix` | Fix bugs, failures, and review findings. |
 
 ## What Gets Installed
 
@@ -443,11 +459,12 @@ Machine-local commands are the default install path:
 
 Repo-local adapters are legacy opt-in surfaces:
 
-- created only by repos that explicitly enable `syncDocs`
+- created only by repos that explicitly enable generated surfaces
 - committed with the repo
-- give each repo custom command text, aliases, and workflow docs
+- useful when a repo needs custom command text, aliases, or workflow docs
 
 Those legacy repo-local surfaces can add or manage:
+
 - `.pipelane.json`
 - `.claude/commands/*`
 - `.agents/skills/*`
@@ -458,9 +475,9 @@ Those legacy repo-local surfaces can add or manage:
 - local `CLAUDE.md` templates for deploy configuration
 - `REPO_GUIDANCE.md`
 
-## Configuration and State
+## State and Safety
 
-Tracked repo policy for opt-in repo-local installs usually lives in:
+Tracked repo policy usually lives in:
 
 - `.pipelane.json`
 - `package.json:pipelane`
@@ -474,78 +491,17 @@ Machine-local and operator state usually lives in:
 - the git common-dir, shared across worktrees
 - `~/.pipelane/dashboard/*` for board settings
 
-Pipelane tries to fail closed. For example:
+Pipelane tries to fail closed:
 
-- `/new` fails if the repo has no usable base branch unless you intentionally use
-  offline mode.
+- `/new` fails if the repo has no usable base branch unless offline mode is
+  intentional.
 - `/pr` fails if review evidence is missing or stale.
 - release-mode `/deploy prod` fails without same-SHA staging evidence.
 - `/clean` refuses dirty, too-young, missing-evidence, and unsafe workspaces.
 
-## Terminal Usage
-
-Slash commands are the normal interface inside Claude or Codex.
-
-From a terminal, use `pipelane run`:
-
-```bash
-pipelane run status
-pipelane run new --task "checkout recovery"
-pipelane run review
-pipelane run pr --title "Add checkout recovery"
-pipelane run merge
-pipelane run deploy staging
-pipelane run deploy prod
-pipelane run clean
-```
-
-Open the board from a terminal:
-
-```bash
-pipelane board
-```
-
-Check for updates:
-
-```bash
-pipelane update --check
-```
-
-## Command Reference
-
-Common slash commands:
-
-| Command | What it does |
-| --- | --- |
-| `/pipelane` | Show the workflow guide. |
-| `/pipelane web` | Open the local board. |
-| `/status` | Show branch, PR, deploy, and release state. |
-| `/devmode build` | Use the fast build lane. |
-| `/devmode release` | Use the protected release lane. |
-| `/new` | Create a task branch and worktree. Task name is optional. |
-| `/resume` | Reopen or recover existing task work. |
-| `/repo-guard` | Check that the current checkout is safe. |
-| `/pipelane review setup` | Select review gates. |
-| `/pipelane review` | Run review gates and record evidence. |
-| `/pipelane review pass` | Record a clean manual review gate after running the referenced skill or approval. |
-| `/pr` | Run checks, commit, push, and open or update a PR. |
-| `/merge` | Merge the PR and record the merged SHA. |
-| `/deploy staging` | Deploy the merged SHA to staging. |
-| `/deploy prod` | Promote the verified merged SHA to production. |
-| `/rollback prod` | Roll production back to the last verified-good deploy. |
-| `/clean` | Clean finished or stale task state when safe. |
-| `/doctor` | Diagnose deploy config, probes, and release readiness. |
-| `/fix` | Fix bugs, failures, and review findings. |
-| `/pipelane orchestrate --plan-file docs/plan.md --yes` | Run plan, prepare, dispatch, start, and slice review in one approved pass. |
-| `/pipelane orchestrate plan` | Compile a plan into a durable slice ledger. |
-| `/pipelane orchestrate prepare` | Create slice worktrees. |
-| `/pipelane orchestrate dispatch` | Write provider handoff prompts. |
-| `/pipelane orchestrate start` | Run or retry slice workers. |
-| `/pipelane orchestrate review` | Run review gates over completed slices. |
-
 ## Pipelane and gstack
 
-Pipelane and gstack work well together because they have different jobs.
+Pipelane and gstack are designed to work together.
 
 Use gstack to decide whether the plan and code are good:
 
@@ -561,18 +517,20 @@ Use Pipelane to move the work:
 
 - task branch
 - worktree
+- orchestration ledger
+- review evidence
 - PR
 - merge
 - deploy
 - rollback
 - cleanup
 
-The recommended loop is:
+The recommended loop:
 
 ```text
 /new
 plan review with gstack
-implement
+implement or /pipelane orchestrate
 /pipelane review
 /fix if needed
 /pr
@@ -586,8 +544,6 @@ implement
 Use `/status` first. It tells you the current lane, active task, branch state,
 PR state, release readiness, deploy state, and next safe action.
 
-Common fixes:
-
 | Problem | Command |
 | --- | --- |
 | Lost task context | `/resume` |
@@ -599,24 +555,9 @@ Common fixes:
 | Production regression | `/rollback prod` |
 | Old task state | `/clean --status-only`, then scoped cleanup |
 
-## Npm Install Guard
-
-If your task worktrees share `node_modules` through a symlink, raw `npm install`
-can damage the shared dependency directory. Pipelane ships an optional guard:
-
-```bash
-pipelane install-npm-guard
-export PATH="$HOME/.pipelane/bin:$PATH"
-pipelane run doctor --check-guard
-```
-
-The guard only affects shells where `npm` resolves through
-`~/.pipelane/bin/npm`.
-
 ## More Detail
 
-- [Full release workflow reference](docs/public/RELEASE_WORKFLOW.md)
-- [Orchestration roadmap](docs/public/ORCHESTRATION.md)
-- [Pipelane Board reference design](docs/public/PIPELANE_BOARD.md)
-- [Pipelane API contract](docs/public/PIPELANE_API.md)
-- [Dashboard implementation guide](src/dashboard/README.md)
+- [Release workflow reference](docs/public/RELEASE_WORKFLOW.md)
+- [Orchestration reference](docs/public/ORCHESTRATION.md)
+- [Pipelane Board reference](docs/public/PIPELANE_BOARD.md)
+- [Pipelane API reference](docs/public/PIPELANE_API.md)
