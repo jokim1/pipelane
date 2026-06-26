@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-import type { DeployConfig } from '../release-gate.ts';
+import { getAdditionalDeploySurfaceConfig, type DeployConfig } from '../release-gate.ts';
 import type { ApiStatusCell, LaneState } from '../api/envelope.ts';
 import type { BranchLanes } from '../api/snapshot.ts';
 import type { WorkflowCommand, WorkflowConfig, WorkflowContext } from '../state.ts';
@@ -284,6 +284,11 @@ export function resolveSurfaceHealthcheckUrl(
   if (surface === 'sql') {
     const sql = staging ? deployConfig.sql.staging : deployConfig.sql.production;
     return sql.healthcheckUrl || '';
+  }
+  const additional = getAdditionalDeploySurfaceConfig(deployConfig, surface);
+  if (additional) {
+    const surfaceConfig = staging ? additional.staging : additional.production;
+    return surfaceConfig.healthcheckUrl || '';
   }
   return '';
 }

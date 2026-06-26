@@ -13277,6 +13277,7 @@ function buildFullDeployConfig(_options = {}) {
       staging: { projectRef: 'staging-ref' },
       production: { projectRef: 'production-ref' },
     },
+    surfaces: {},
   };
 }
 
@@ -16647,7 +16648,7 @@ test('deploy fails before dispatch when a requested surface has no configured he
   }
 });
 
-test('build-mode deploy prod keeps default surfaces and skips missing prod health checks before dispatch', () => {
+test('build-mode deploy prod keeps default surfaces and requires their prod health checks', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
   const ghStateFile = path.join(ghBin, 'gh-state.json');
@@ -16668,19 +16669,19 @@ test('build-mode deploy prod keeps default surfaces and skips missing prod healt
 
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Build Prod', '--json'], repoRoot).stdout);
     const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
-    const deployed = JSON.parse(runCli(
+    const blocked = runCli(
       ['run', 'deploy', 'prod', '--sha', sha, '--async', '--json'],
       created.worktreePath,
       env,
-    ).stdout);
+      true,
+    );
 
-    assert.equal(deployed.status, 'requested');
-    assert.equal(deployed.environment, 'prod');
-    assert.deepEqual(deployed.surfaces, ['frontend', 'edge', 'sql']);
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /Deploy blocked: prod/);
+    assert.match(blocked.stderr, /edge production health check/);
+    assert.match(blocked.stderr, /sql production health check/);
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
-    assert.equal(ghState.workflows.length, 1);
-    assert.ok(ghState.workflows[0].args.includes('environment=production'));
-    assert.ok(ghState.workflows[0].args.includes('surfaces=frontend,edge,sql'));
+    assert.equal(ghState.workflows.length, 0, 'deploy should fail before gh workflow dispatch');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -16688,7 +16689,7 @@ test('build-mode deploy prod keeps default surfaces and skips missing prod healt
   }
 });
 
-test('build-mode deploy prod allows explicitly requested non-frontend surfaces without prod healthcheck ceremony', () => {
+test('build-mode deploy prod requires explicitly requested non-frontend health checks', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
   const ghStateFile = path.join(ghBin, 'gh-state.json');
@@ -16708,17 +16709,17 @@ test('build-mode deploy prod allows explicitly requested non-frontend surfaces w
 
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Build Edge Prod', '--json'], repoRoot).stdout);
     const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
-    const deployed = JSON.parse(runCli(
+    const blocked = runCli(
       ['run', 'deploy', 'prod', '--surfaces', 'edge', '--sha', sha, '--async', '--json'],
       created.worktreePath,
       env,
-    ).stdout);
+      true,
+    );
 
-    assert.equal(deployed.status, 'requested');
-    assert.deepEqual(deployed.surfaces, ['edge']);
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /edge production health check/);
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
-    assert.equal(ghState.workflows.length, 1);
-    assert.ok(ghState.workflows[0].args.includes('surfaces=edge'));
+    assert.equal(ghState.workflows.length, 0, 'deploy should fail before gh workflow dispatch');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -16726,7 +16727,44 @@ test('build-mode deploy prod allows explicitly requested non-frontend surfaces w
   }
 });
 
-test('build-mode deploy prod records success when unconfigured surfaces have no healthcheck URL', async () => {
+test('build-mode deploy prod still fails when a configured healthcheck returns non-2xx', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  writeFileSync(ghStateFile, JSON.stringify({ prs: {}, workflows: [] }, null, 2), 'utf8');
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '503',
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    writeSharedDeployConfig(repoRoot, buildFullDeployConfig());
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Build Prod Bad Health', '--json'], repoRoot).stdout);
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
+    const failed = runCli(
+      ['run', 'deploy', 'prod', '--surfaces', 'frontend', '--sha', sha, '--json'],
+      created.worktreePath,
+      env,
+      true,
+    );
+
+    assert.equal(failed.status, 1);
+    assert.match(`${failed.stdout}\n${failed.stderr}`, /Deploy did not verify: prod/);
+    assert.match(`${failed.stdout}\n${failed.stderr}`, /healthcheck returned HTTP 503/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('build-mode deploy prod ignores missing edge and sql health checks when inference selects only frontend', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
   const ghStateFile = path.join(ghBin, 'gh-state.json');
@@ -16750,6 +16788,14 @@ test('build-mode deploy prod records success when unconfigured surfaces have no 
 
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
+    const workflowConfigPath = path.join(repoRoot, '.pipelane.json');
+    const workflowConfig = JSON.parse(readFileSync(workflowConfigPath, 'utf8'));
+    workflowConfig.surfacePathMap = {
+      frontend: ['web/'],
+      edge: ['worker/'],
+      sql: ['supabase/'],
+    };
+    writeFileSync(workflowConfigPath, `${JSON.stringify(workflowConfig, null, 2)}\n`, 'utf8');
     const config = buildFullDeployConfig();
     config.frontend.production.healthcheckUrl = `http://127.0.0.1:${port}/health`;
     config.edge.production.healthcheckUrl = '';
@@ -16758,6 +16804,10 @@ test('build-mode deploy prod records success when unconfigured surfaces have no 
     commitAll(repoRoot, 'Adopt pipelane');
 
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Build Prod Verify', '--json'], repoRoot).stdout);
+    mkdirSync(path.join(created.worktreePath, 'web'), { recursive: true });
+    writeFileSync(path.join(created.worktreePath, 'web', 'app.txt'), 'frontend change\n', 'utf8');
+    execFileSync('git', ['add', 'web/app.txt'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Change frontend'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
     const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
     const result = await runCliAsync(
       ['run', 'deploy', 'prod', '--sha', sha, '--json'],
@@ -16768,15 +16818,12 @@ test('build-mode deploy prod records success when unconfigured surfaces have no 
     assert.equal(result.status, 0, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
     const deployed = JSON.parse(result.stdout);
     assert.equal(deployed.status, 'succeeded');
-    assert.deepEqual(deployed.surfaces, ['frontend', 'edge', 'sql']);
+    assert.deepEqual(deployed.surfaces, ['frontend']);
     assert.equal(deployed.verificationBySurface.frontend.statusCode, 200);
-    assert.equal(deployed.verificationBySurface.edge.healthcheckUrl, '');
-    assert.equal(deployed.verificationBySurface.edge.probes, 0);
-    assert.equal(deployed.verificationBySurface.sql.healthcheckUrl, '');
-    assert.equal(deployed.verificationBySurface.sql.probes, 0);
+    assert.equal(deployed.verificationBySurface.edge, undefined);
+    assert.equal(deployed.verificationBySurface.sql, undefined);
   } finally {
-    healthServer.close();
-    await once(healthServer, 'close').catch(() => undefined);
+    await new Promise((resolve) => healthServer.close(resolve));
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
     rmSync(ghBin, { recursive: true, force: true });
@@ -16822,6 +16869,75 @@ test('release-mode deploy prod still requires requested surface healthcheck URLs
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
     assert.equal(ghState.workflows.length, 0, 'deploy should fail before gh workflow dispatch');
   } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('deploy validates configured mcp surface healthcheck from the additional surfaces map', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  writeFileSync(ghStateFile, JSON.stringify({ prs: {}, workflows: [] }, null, 2), 'utf8');
+  const healthServer = createHttpServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('ok');
+  });
+  healthServer.listen(0, '127.0.0.1');
+  await once(healthServer, 'listening');
+  const address = healthServer.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_INTERVAL_MS: '1',
+    PIPELANE_DEPLOY_HEALTHCHECK_TIMEOUT_MS: '500',
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const workflowConfigPath = path.join(repoRoot, '.pipelane.json');
+    const workflowConfig = JSON.parse(readFileSync(workflowConfigPath, 'utf8'));
+    workflowConfig.surfaces = ['frontend', 'edge', 'sql', 'mcp'];
+    writeFileSync(workflowConfigPath, `${JSON.stringify(workflowConfig, null, 2)}\n`, 'utf8');
+    const config = buildFullDeployConfig();
+    config.surfaces.mcp = {
+      staging: {
+        deployCommand: 'npm run deploy:mcp:staging',
+        verificationCommand: 'npm run verify:mcp',
+        healthcheckUrl: `http://127.0.0.1:${port}/mcp-health`,
+      },
+      production: {
+        deployCommand: 'npm run deploy:mcp',
+        verificationCommand: 'npm run verify:mcp',
+        healthcheckUrl: 'https://app.example.test/mcp-health',
+      },
+    };
+    writeSharedDeployConfig(repoRoot, config);
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'MCP Deploy', '--json'], repoRoot).stdout);
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
+    const result = await runCliAsync(
+      ['run', 'deploy', 'staging', '--surfaces', 'mcp', '--sha', sha, '--json'],
+      created.worktreePath,
+      env,
+    );
+
+    assert.equal(result.status, 0, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+    const deployed = JSON.parse(result.stdout);
+    assert.equal(deployed.status, 'succeeded');
+    assert.deepEqual(deployed.surfaces, ['mcp']);
+    assert.equal(deployed.verificationBySurface.mcp.statusCode, 200);
+    assert.equal(deployed.verificationBySurface.mcp.healthcheckUrl, `http://127.0.0.1:${port}/mcp-health`);
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.workflows.length, 1);
+    assert.ok(ghState.workflows[0].args.includes('surfaces=mcp'));
+  } finally {
+    await new Promise((resolve) => healthServer.close(resolve));
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
     rmSync(ghBin, { recursive: true, force: true });
@@ -22136,6 +22252,35 @@ test('configure --json is idempotent: re-running with the same flags produces id
   }
 });
 
+test('configure writes mcp aliases and generic custom surface flags into DeployConfig.surfaces', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+
+    const result = runCli([
+      'configure',
+      '--json',
+      '--mcp-staging-deploy-command=npm run deploy:mcp:staging',
+      '--mcp-staging-verification-command=npm run verify:mcp',
+      '--mcp-staging-healthcheck=https://staging.example.test/mcp-health',
+      '--mcp-production-deploy-command=npm run deploy:mcp',
+      '--mcp-production-verification-command=npm run verify:mcp',
+      '--mcp-production-healthcheck=https://app.example.test/mcp-health',
+      '--surface-staging-deploy-command=worker:npm run deploy:worker:staging',
+      '--surface-production-healthcheck=worker:https://app.example.test/worker-health',
+    ], repoRoot);
+
+    const config = JSON.parse(result.stdout);
+    assert.equal(config.surfaces.mcp.staging.deployCommand, 'npm run deploy:mcp:staging');
+    assert.equal(config.surfaces.mcp.production.healthcheckUrl, 'https://app.example.test/mcp-health');
+    assert.equal(config.surfaces.worker.staging.deployCommand, 'npm run deploy:worker:staging');
+    assert.equal(config.surfaces.worker.production.healthcheckUrl, 'https://app.example.test/worker-health');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('configure leaves sections outside Deploy Configuration untouched', () => {
   const repoRoot = createRepo();
   try {
@@ -23142,6 +23287,24 @@ test('doctor.collectProbeTargets picks up only configured healthcheck surfaces',
   const targets = doctor.collectProbeTargets(fallback);
   assert.equal(targets.find((t) => t.environment === 'staging' && t.surface === 'frontend').url, 'https://staging.example.test');
   assert.equal(targets.find((t) => t.environment === 'production' && t.surface === 'frontend').url, 'https://app.example.test');
+
+  const withMcp = JSON.parse(JSON.stringify(minimal));
+  withMcp.surfaces.mcp = {
+    staging: {
+      deployCommand: 'npm run deploy:mcp:staging',
+      verificationCommand: 'npm run verify:mcp',
+      healthcheckUrl: 'https://staging.example.test/mcp-health',
+    },
+    production: {
+      deployCommand: 'npm run deploy:mcp',
+      verificationCommand: 'npm run verify:mcp',
+      healthcheckUrl: 'https://app.example.test/mcp-health',
+    },
+  };
+  assert.deepEqual(
+    doctor.collectProbeTargets(withMcp).map((t) => `${t.environment}:${t.surface}`).sort(),
+    ['production:frontend', 'production:mcp', 'staging:frontend', 'staging:mcp'],
+  );
 });
 
 test('doctor.mergeProbeRecords keeps previously-probed surfaces across a partial re-probe', async () => {
@@ -23488,6 +23651,45 @@ test('pipelane:api snapshot surfaces unsupported configured probes explicitly', 
     const issue = envelope.data.attention.find((entry) => entry.code === 'surface.unsupported');
     assert.ok(issue, 'attention[] carries an unsupported surface issue');
     assert.match(issue.message, /worker/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('pipelane:api snapshot treats configured additional surface probes as managed', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const workflowConfigPath = path.join(repoRoot, '.pipelane.json');
+    const workflowConfig = JSON.parse(readFileSync(workflowConfigPath, 'utf8'));
+    workflowConfig.surfaces = [...workflowConfig.surfaces, 'mcp'];
+    writeFileSync(workflowConfigPath, JSON.stringify(workflowConfig, null, 2), 'utf8');
+    const config = buildFullDeployConfig();
+    config.surfaces.mcp = {
+      staging: {
+        deployCommand: 'npm run deploy:mcp:staging',
+        verificationCommand: 'npm run verify:mcp',
+        healthcheckUrl: 'https://staging.example.test/mcp-health',
+      },
+      production: {
+        deployCommand: 'npm run deploy:mcp',
+        verificationCommand: 'npm run verify:mcp',
+        healthcheckUrl: 'https://app.example.test/mcp-health',
+      },
+    };
+    writeSharedDeployConfig(repoRoot, config);
+
+    const result = runCli(['run', 'api', 'snapshot'], repoRoot);
+    const envelope = JSON.parse(result.stdout);
+    const mcpProbe = envelope.data.sourceHealth.find((entry) => entry.name === 'deployProbe.mcp');
+    assert.ok(mcpProbe, 'configured mcp surface gets a probe/sourceHealth row');
+    assert.equal(mcpProbe.state, 'unknown');
+    assert.match(mcpProbe.reason, /no probe recorded yet/);
+    assert.equal(
+      envelope.data.attention.some((entry) => entry.code === 'surface.unsupported' && /mcp/.test(entry.message)),
+      false,
+    );
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -23873,9 +24075,46 @@ test('release-check blocks unsupported configured surfaces with a clear error', 
     assert.equal(output.ready, false);
     assert.deepEqual(output.blockedSurfaces, ['worker']);
     assert.match(output.message, /unsupported surface "worker"/);
-    assert.match(output.message, /release gate only knows frontend, edge, sql/);
+    assert.match(output.message, /deploy config only knows frontend, edge, sql/);
     assert.match(output.message, /update the tracked workflow config/);
     assert.doesNotMatch(output.message, /npm run pipelane:configure/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release-check treats configured additional surfaces as managed release surfaces', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const workflowConfigPath = path.join(repoRoot, '.pipelane.json');
+    const workflowConfig = JSON.parse(readFileSync(workflowConfigPath, 'utf8'));
+    workflowConfig.surfaces = [...workflowConfig.surfaces, 'mcp'];
+    writeFileSync(workflowConfigPath, JSON.stringify(workflowConfig, null, 2), 'utf8');
+    const config = buildFullDeployConfig();
+    config.surfaces.mcp = {
+      staging: {
+        deployCommand: 'npm run deploy:mcp:staging',
+        verificationCommand: 'npm run verify:mcp',
+        healthcheckUrl: '',
+      },
+      production: {
+        deployCommand: 'npm run deploy:mcp',
+        verificationCommand: 'npm run verify:mcp',
+        healthcheckUrl: '',
+      },
+    };
+    writeSharedDeployConfig(repoRoot, config);
+
+    const result = runCli(['run', 'release-check', '--surfaces', 'mcp', '--json'], repoRoot, {}, true);
+    const output = JSON.parse(result.stdout);
+    assert.equal(result.status, 1);
+    assert.equal(output.ready, false);
+    assert.deepEqual(output.blockedSurfaces, ['mcp']);
+    assert.match(output.message, /mcp staging health check/);
+    assert.match(output.message, /mcp production health check/);
+    assert.doesNotMatch(output.message, /unsupported surface "mcp"/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }

@@ -256,14 +256,12 @@ export async function dispatchDeploy(
     fallbackSurfaces: identity.lock?.surfaces ?? [],
     targetSha: target.sha,
   });
-  const requireHealthchecks = shouldRequireDeployHealthchecks(context, environment);
   const missingConfig = listMissingDeployConfiguration({
     config: deployConfig,
     environment,
     surfaces,
     defaultWorkflowName: context.config.deployWorkflowName,
     allowHealthcheckStubBypass,
-    requireHealthchecks,
   });
   if (missingConfig.length > 0) {
     throw new Error(buildDeployConfigurationError({
@@ -512,9 +510,8 @@ export async function dispatchDeploy(
   if (watched.ok) {
     // v1.2: per-surface probing. A multi-surface deploy produces one probe
     // entry per surface so a frontend healthcheck can't credit edge or sql.
-    // If any configured healthcheck returns non-2xx, the whole deploy flips
-    // to failed. Build-mode prod deploys may leave a surface without a probe
-    // URL while the app is still being wired up.
+    // If any selected surface lacks a healthcheck URL or returns non-2xx,
+    // the whole deploy flips to failed.
     verificationBySurface = {};
     const perSurfaceFailures: string[] = [];
     const stubStatus = process.env.PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS;
@@ -524,9 +521,7 @@ export async function dispatchDeploy(
       if (!surfaceUrl && !stubStatus) {
         const empty: DeployVerification = { healthcheckUrl: '', probes: 0 };
         verificationBySurface[surface] = empty;
-        if (requireHealthchecks) {
-          perSurfaceFailures.push(`${surface}: no healthcheck URL configured`);
-        }
+        perSurfaceFailures.push(`${surface}: no healthcheck URL configured`);
         continue;
       }
       const probe = await probeHealthcheck(surfaceUrl);
@@ -664,13 +659,6 @@ function resolveDeploySurfacesForTarget(options: {
   if (inference.surfaces.length > 0) return inference.surfaces;
 
   return surfaces;
-}
-
-function shouldRequireDeployHealthchecks(
-  context: WorkflowContext,
-  environment: 'staging' | 'prod',
-): boolean {
-  return !(context.modeState.mode === 'build' && environment === 'prod');
 }
 
 export function persistRecord(

@@ -19,6 +19,7 @@ import {
   emptyDeployConfig,
   evaluateReleaseReadiness,
   explainSurfaceProbe,
+  getAdditionalDeploySurfaceConfig,
   isReleaseManagedSurface,
   loadDeployConfig,
   resolveDeployStateKey,
@@ -1060,12 +1061,13 @@ function collectSurfaceProbes(options: {
   const { deployConfig, probeState, surfaces } = options;
   const entries: SurfaceProbeEntry[] = [];
   for (const surface of surfaces) {
-    if (!isReleaseManagedSurface(surface)) {
+    const additional = getAdditionalDeploySurfaceConfig(deployConfig, surface);
+    if (!isReleaseManagedSurface(surface) && !additional) {
       entries.push({
         surface,
         result: {
           state: 'unknown',
-          reason: unsupportedSurfaceReason(surface),
+          reason: unsupportedSurfaceReason(surface, deployConfig),
           probe: null,
           ageMs: null,
         },
@@ -1091,6 +1093,16 @@ function collectSurfaceProbes(options: {
         }),
       });
     } else if (surface === 'sql' && deployConfig.sql.staging.healthcheckUrl) {
+      entries.push({
+        surface,
+        result: explainSurfaceProbe({
+          probeState,
+          surface,
+          environment: 'staging',
+          expectedUrl: resolveSurfaceProbeUrl(deployConfig, 'staging', surface),
+        }),
+      });
+    } else if (additional?.staging.healthcheckUrl) {
       entries.push({
         surface,
         result: explainSurfaceProbe({

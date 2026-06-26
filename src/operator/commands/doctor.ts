@@ -4,6 +4,7 @@ import readline from 'node:readline';
 
 import { computeUrlFingerprint, resolveProbeStateKey, signSignedPayload } from '../integrity.ts';
 import {
+  additionalDeploySurfaceNames,
   emptyDeployConfig,
   explainSurfaceProbe,
   loadDeployConfig,
@@ -353,6 +354,15 @@ export function collectProbeTargets(config: DeployConfig): ProbeTarget[] {
   if (config.edge.production.healthcheckUrl) targets.push({ environment: 'production', surface: 'edge', url: config.edge.production.healthcheckUrl });
   if (config.sql.staging.healthcheckUrl) targets.push({ environment: 'staging', surface: 'sql', url: config.sql.staging.healthcheckUrl });
   if (config.sql.production.healthcheckUrl) targets.push({ environment: 'production', surface: 'sql', url: config.sql.production.healthcheckUrl });
+  for (const surface of additionalDeploySurfaceNames(config)) {
+    const surfaceConfig = config.surfaces[surface];
+    if (surfaceConfig.staging.healthcheckUrl) {
+      targets.push({ environment: 'staging', surface, url: surfaceConfig.staging.healthcheckUrl });
+    }
+    if (surfaceConfig.production.healthcheckUrl) {
+      targets.push({ environment: 'production', surface, url: surfaceConfig.production.healthcheckUrl });
+    }
+  }
   return targets;
 }
 

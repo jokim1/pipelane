@@ -4,7 +4,10 @@ import readline from 'node:readline/promises';
 
 import { renderClaudeMdFromTemplate } from '../docs.ts';
 import {
+  additionalDeploySurfaceNames,
+  emptyAdditionalDeploySurfaceConfig,
   emptyDeployConfig,
+  isReleaseManagedSurface,
   parseDeployConfigMarkdown,
   replaceDeployConfigSection,
   saveSharedDeployConfig,
@@ -40,6 +43,18 @@ export interface ConfigureOptions {
   sqlProductionHealthcheck?: string;
   supabaseStagingProjectRef?: string;
   supabaseProductionProjectRef?: string;
+  mcpStagingDeployCommand?: string;
+  mcpStagingVerificationCommand?: string;
+  mcpStagingHealthcheck?: string;
+  mcpProductionDeployCommand?: string;
+  mcpProductionVerificationCommand?: string;
+  mcpProductionHealthcheck?: string;
+  surfaceStagingDeployCommands?: Record<string, string>;
+  surfaceStagingVerificationCommands?: Record<string, string>;
+  surfaceStagingHealthchecks?: Record<string, string>;
+  surfaceProductionDeployCommands?: Record<string, string>;
+  surfaceProductionVerificationCommands?: Record<string, string>;
+  surfaceProductionHealthchecks?: Record<string, string>;
 }
 
 export interface ConfigureResult {
@@ -71,6 +86,29 @@ const STRING_FLAGS: Array<[string, keyof ConfigureOptions]> = [
   ['--sql-production-healthcheck', 'sqlProductionHealthcheck'],
   ['--supabase-staging-project-ref', 'supabaseStagingProjectRef'],
   ['--supabase-production-project-ref', 'supabaseProductionProjectRef'],
+  ['--mcp-staging-deploy-command', 'mcpStagingDeployCommand'],
+  ['--mcp-staging-verification-command', 'mcpStagingVerificationCommand'],
+  ['--mcp-staging-healthcheck', 'mcpStagingHealthcheck'],
+  ['--mcp-production-deploy-command', 'mcpProductionDeployCommand'],
+  ['--mcp-production-verification-command', 'mcpProductionVerificationCommand'],
+  ['--mcp-production-healthcheck', 'mcpProductionHealthcheck'],
+];
+
+type SurfaceOverrideKey =
+  | 'surfaceStagingDeployCommands'
+  | 'surfaceStagingVerificationCommands'
+  | 'surfaceStagingHealthchecks'
+  | 'surfaceProductionDeployCommands'
+  | 'surfaceProductionVerificationCommands'
+  | 'surfaceProductionHealthchecks';
+
+const SURFACE_STRING_FLAGS: Array<[string, SurfaceOverrideKey]> = [
+  ['--surface-staging-deploy-command', 'surfaceStagingDeployCommands'],
+  ['--surface-staging-verification-command', 'surfaceStagingVerificationCommands'],
+  ['--surface-staging-healthcheck', 'surfaceStagingHealthchecks'],
+  ['--surface-production-deploy-command', 'surfaceProductionDeployCommands'],
+  ['--surface-production-verification-command', 'surfaceProductionVerificationCommands'],
+  ['--surface-production-healthcheck', 'surfaceProductionHealthchecks'],
 ];
 
 const BOOLEAN_FLAGS: Array<[string, keyof ConfigureOptions]> = [
@@ -118,6 +156,16 @@ export function parseConfigureArgs(argv: string[]): ConfigureOptions {
       continue;
     }
 
+    const matchedSurfaceStr = SURFACE_STRING_FLAGS.find(([flag]) => token === flag || token.startsWith(`${flag}=`));
+    if (matchedSurfaceStr) {
+      const [flag, key] = matchedSurfaceStr;
+      if (token === flag) {
+        throw new Error(`Flag ${flag} requires a value (use ${flag}=surface:value).`);
+      }
+      setSurfaceOverride(options, key, token.slice(flag.length + 1), flag);
+      continue;
+    }
+
     const matchedStr = STRING_FLAGS.find(([flag]) => token === flag || token.startsWith(`${flag}=`));
     if (matchedStr) {
       const [flag, key] = matchedStr;
@@ -132,6 +180,29 @@ export function parseConfigureArgs(argv: string[]): ConfigureOptions {
   }
 
   return options;
+}
+
+function setSurfaceOverride(
+  options: ConfigureOptions,
+  key: SurfaceOverrideKey,
+  raw: string,
+  flag: string,
+): void {
+  const separator = raw.indexOf(':');
+  if (separator <= 0) {
+    throw new Error(`Flag ${flag} expects surface:value, got: ${raw}`);
+  }
+  const surface = raw.slice(0, separator).trim();
+  const value = raw.slice(separator + 1);
+  if (!surface) {
+    throw new Error(`Flag ${flag} expects a non-empty surface name.`);
+  }
+  if (isReleaseManagedSurface(surface)) {
+    throw new Error(`Flag ${flag} is for custom surfaces. Use the dedicated ${surface} flags instead.`);
+  }
+  const bucket = options[key] ?? {};
+  options[key] = bucket;
+  bucket[surface] = value;
 }
 
 function parseBool(value: string, flag: string): boolean {
@@ -221,7 +292,53 @@ function applyFlagOverrides(base: DeployConfig, options: ConfigureOptions): Depl
   if (options.sqlProductionHealthcheck !== undefined) next.sql.production.healthcheckUrl = options.sqlProductionHealthcheck;
   if (options.supabaseStagingProjectRef !== undefined) next.supabase.staging.projectRef = options.supabaseStagingProjectRef;
   if (options.supabaseProductionProjectRef !== undefined) next.supabase.production.projectRef = options.supabaseProductionProjectRef;
+  const mcp = hasMcpOverrides(options) ? ensureAdditionalDeploySurface(next, 'mcp') : null;
+  if (mcp) {
+    if (options.mcpStagingDeployCommand !== undefined) mcp.staging.deployCommand = options.mcpStagingDeployCommand;
+    if (options.mcpStagingVerificationCommand !== undefined) mcp.staging.verificationCommand = options.mcpStagingVerificationCommand;
+    if (options.mcpStagingHealthcheck !== undefined) mcp.staging.healthcheckUrl = options.mcpStagingHealthcheck;
+    if (options.mcpProductionDeployCommand !== undefined) mcp.production.deployCommand = options.mcpProductionDeployCommand;
+    if (options.mcpProductionVerificationCommand !== undefined) mcp.production.verificationCommand = options.mcpProductionVerificationCommand;
+    if (options.mcpProductionHealthcheck !== undefined) mcp.production.healthcheckUrl = options.mcpProductionHealthcheck;
+  }
+  applySurfaceOverrides(next, options);
   return next;
+}
+
+function hasMcpOverrides(options: ConfigureOptions): boolean {
+  return options.mcpStagingDeployCommand !== undefined
+    || options.mcpStagingVerificationCommand !== undefined
+    || options.mcpStagingHealthcheck !== undefined
+    || options.mcpProductionDeployCommand !== undefined
+    || options.mcpProductionVerificationCommand !== undefined
+    || options.mcpProductionHealthcheck !== undefined;
+}
+
+function ensureAdditionalDeploySurface(config: DeployConfig, surface: string) {
+  config.surfaces ??= {};
+  config.surfaces[surface] ??= emptyAdditionalDeploySurfaceConfig();
+  return config.surfaces[surface];
+}
+
+function applySurfaceOverrides(config: DeployConfig, options: ConfigureOptions): void {
+  for (const [surface, value] of Object.entries(options.surfaceStagingDeployCommands ?? {})) {
+    ensureAdditionalDeploySurface(config, surface).staging.deployCommand = value;
+  }
+  for (const [surface, value] of Object.entries(options.surfaceStagingVerificationCommands ?? {})) {
+    ensureAdditionalDeploySurface(config, surface).staging.verificationCommand = value;
+  }
+  for (const [surface, value] of Object.entries(options.surfaceStagingHealthchecks ?? {})) {
+    ensureAdditionalDeploySurface(config, surface).staging.healthcheckUrl = value;
+  }
+  for (const [surface, value] of Object.entries(options.surfaceProductionDeployCommands ?? {})) {
+    ensureAdditionalDeploySurface(config, surface).production.deployCommand = value;
+  }
+  for (const [surface, value] of Object.entries(options.surfaceProductionVerificationCommands ?? {})) {
+    ensureAdditionalDeploySurface(config, surface).production.verificationCommand = value;
+  }
+  for (const [surface, value] of Object.entries(options.surfaceProductionHealthchecks ?? {})) {
+    ensureAdditionalDeploySurface(config, surface).production.healthcheckUrl = value;
+  }
 }
 
 interface ConfigurePromptSection {
@@ -327,6 +444,7 @@ function configurePromptSections(config: DeployConfig): ConfigurePromptSection[]
         { label: 'healthcheck', flag: '--sql-production-healthcheck=<url>', value: config.sql.production.healthcheckUrl },
       ],
     },
+    ...additionalSurfacePromptSections(config),
     {
       heading: 'Supabase',
       fields: [
@@ -335,6 +453,42 @@ function configurePromptSections(config: DeployConfig): ConfigurePromptSection[]
       ],
     },
   ];
+}
+
+function additionalSurfacePromptSections(config: DeployConfig): ConfigurePromptSection[] {
+  return additionalDeploySurfaceNames(config).flatMap((surface) => {
+    const entry = config.surfaces[surface];
+    return [
+      {
+        heading: `${surface} staging`,
+        fields: [
+          { label: 'deploy command', flag: additionalSurfaceFlag(surface, 'staging', 'deploy-command', '<cmd>'), value: entry.staging.deployCommand },
+          { label: 'verification command', flag: additionalSurfaceFlag(surface, 'staging', 'verification-command', '<cmd>'), value: entry.staging.verificationCommand },
+          { label: 'healthcheck', flag: additionalSurfaceFlag(surface, 'staging', 'healthcheck', '<url>'), value: entry.staging.healthcheckUrl },
+        ],
+      },
+      {
+        heading: `${surface} production`,
+        fields: [
+          { label: 'deploy command', flag: additionalSurfaceFlag(surface, 'production', 'deploy-command', '<cmd>'), value: entry.production.deployCommand },
+          { label: 'verification command', flag: additionalSurfaceFlag(surface, 'production', 'verification-command', '<cmd>'), value: entry.production.verificationCommand },
+          { label: 'healthcheck', flag: additionalSurfaceFlag(surface, 'production', 'healthcheck', '<url>'), value: entry.production.healthcheckUrl },
+        ],
+      },
+    ];
+  });
+}
+
+function additionalSurfaceFlag(
+  surface: string,
+  environment: 'staging' | 'production',
+  field: 'deploy-command' | 'verification-command' | 'healthcheck',
+  placeholder: string,
+): string {
+  if (surface === 'mcp') {
+    return `--mcp-${environment}-${field}=${placeholder}`;
+  }
+  return `--surface-${environment}-${field}=${surface}:${placeholder}`;
 }
 
 function formatConfigurePromptValue(value: string | boolean): string {
@@ -387,6 +541,19 @@ async function promptForValues(base: DeployConfig): Promise<DeployConfig> {
     process.stdout.write('\nSupabase project refs:\n');
     next.supabase.staging.projectRef = await promptString(rl, '  Staging projectRef:', next.supabase.staging.projectRef);
     next.supabase.production.projectRef = await promptString(rl, '  Production projectRef:', next.supabase.production.projectRef);
+
+    for (const surface of additionalDeploySurfaceNames(next)) {
+      const entry = next.surfaces[surface];
+      process.stdout.write(`\n${surface} (staging):\n`);
+      entry.staging.deployCommand = await promptString(rl, '  Deploy command:', entry.staging.deployCommand);
+      entry.staging.verificationCommand = await promptString(rl, '  Verification command:', entry.staging.verificationCommand);
+      entry.staging.healthcheckUrl = await promptString(rl, '  Healthcheck URL:', entry.staging.healthcheckUrl);
+
+      process.stdout.write(`\n${surface} (production):\n`);
+      entry.production.deployCommand = await promptString(rl, '  Deploy command:', entry.production.deployCommand);
+      entry.production.verificationCommand = await promptString(rl, '  Verification command:', entry.production.verificationCommand);
+      entry.production.healthcheckUrl = await promptString(rl, '  Healthcheck URL:', entry.production.healthcheckUrl);
+    }
 
     return next;
   } finally {
@@ -443,6 +610,18 @@ Flags (all optional; any omitted field keeps its current value):
   --sql-production-healthcheck=<url>
   --supabase-staging-project-ref=<ref>
   --supabase-production-project-ref=<ref>
+  --mcp-staging-deploy-command=<cmd>
+  --mcp-staging-verification-command=<cmd>
+  --mcp-staging-healthcheck=<url>
+  --mcp-production-deploy-command=<cmd>
+  --mcp-production-verification-command=<cmd>
+  --mcp-production-healthcheck=<url>
+  --surface-staging-deploy-command=<surface>:<cmd>
+  --surface-staging-verification-command=<surface>:<cmd>
+  --surface-staging-healthcheck=<surface>:<url>
+  --surface-production-deploy-command=<surface>:<cmd>
+  --surface-production-verification-command=<surface>:<cmd>
+  --surface-production-healthcheck=<surface>:<url>
 
 If CLAUDE.md is missing, pipelane configure seeds it from the Pipelane template
 before writing the Deploy Configuration block. Sections outside that block are

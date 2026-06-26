@@ -31,8 +31,24 @@ export function isReleaseManagedSurface(surface: string): surface is ReleaseMana
   return RELEASE_MANAGED_SURFACES.includes(surface as ReleaseManagedSurface);
 }
 
-export function unsupportedSurfaceReason(surface: string): string {
-  return `unsupported surface "${surface}"; release gate only knows ${RELEASE_MANAGED_SURFACES.join(', ')}.`;
+function configuredSurfaceNames(config?: DeployConfig): string[] {
+  return [...RELEASE_MANAGED_SURFACES, ...Object.keys(config?.surfaces ?? {}).sort()];
+}
+
+export function unsupportedSurfaceReason(surface: string, config?: DeployConfig): string {
+  const known = configuredSurfaceNames(config);
+  return `unsupported surface "${surface}"; deploy config only knows ${known.join(', ')}.`;
+}
+
+export interface AdditionalDeploySurfaceEnvironmentConfig {
+  deployCommand: string;
+  verificationCommand: string;
+  healthcheckUrl: string;
+}
+
+export interface AdditionalDeploySurfaceConfig {
+  staging: AdditionalDeploySurfaceEnvironmentConfig;
+  production: AdditionalDeploySurfaceEnvironmentConfig;
 }
 
 export interface DeployConfig {
@@ -89,6 +105,22 @@ export interface DeployConfig {
     production: {
       projectRef: string;
     };
+  };
+  surfaces: Record<string, AdditionalDeploySurfaceConfig>;
+}
+
+export function emptyAdditionalDeploySurfaceConfig(): AdditionalDeploySurfaceConfig {
+  return {
+    staging: {
+      deployCommand: '',
+      verificationCommand: '',
+      healthcheckUrl: '',
+    },
+    production: {
+      deployCommand: '',
+      verificationCommand: '',
+      healthcheckUrl: '',
+    },
   };
 }
 
@@ -148,6 +180,7 @@ export function emptyDeployConfig(): DeployConfig {
         projectRef: '',
       },
     },
+    surfaces: {},
   };
 }
 
@@ -173,6 +206,49 @@ function findDeployConfigSectionRange(markdown: string): { start: number; end: n
 export function extractDeployConfigSection(markdown: string): string | null {
   const range = findDeployConfigSectionRange(markdown);
   return range ? markdown.slice(range.start, range.end).trimEnd() : null;
+}
+
+function hydrateAdditionalDeploySurfaceEnvironment(
+  parsed: Partial<AdditionalDeploySurfaceEnvironmentConfig> | null | undefined,
+): AdditionalDeploySurfaceEnvironmentConfig {
+  return {
+    deployCommand: parsed?.deployCommand ?? '',
+    verificationCommand: parsed?.verificationCommand ?? '',
+    healthcheckUrl: parsed?.healthcheckUrl ?? '',
+  };
+}
+
+function hydrateAdditionalDeploySurfaces(parsed: unknown): Record<string, AdditionalDeploySurfaceConfig> {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return {};
+  }
+
+  const surfaces: Record<string, AdditionalDeploySurfaceConfig> = {};
+  for (const [rawSurface, rawConfig] of Object.entries(parsed)) {
+    const surface = rawSurface.trim();
+    if (!surface || isReleaseManagedSurface(surface)) {
+      continue;
+    }
+    const surfaceConfig = rawConfig && typeof rawConfig === 'object' && !Array.isArray(rawConfig)
+      ? rawConfig as Partial<AdditionalDeploySurfaceConfig>
+      : {};
+    surfaces[surface] = {
+      staging: hydrateAdditionalDeploySurfaceEnvironment(surfaceConfig.staging),
+      production: hydrateAdditionalDeploySurfaceEnvironment(surfaceConfig.production),
+    };
+  }
+  return surfaces;
+}
+
+export function getAdditionalDeploySurfaceConfig(
+  config: DeployConfig,
+  surface: string,
+): AdditionalDeploySurfaceConfig | null {
+  return config.surfaces?.[surface] ?? null;
+}
+
+export function additionalDeploySurfaceNames(config: DeployConfig): string[] {
+  return Object.keys(config.surfaces ?? {}).sort();
 }
 
 function hydrateDeployConfig(parsed: Partial<DeployConfig> | null | undefined): DeployConfig {
@@ -215,6 +291,7 @@ function hydrateDeployConfig(parsed: Partial<DeployConfig> | null | undefined): 
 
   config.supabase.staging.projectRef = parsed.supabase?.staging?.projectRef ?? '';
   config.supabase.production.projectRef = parsed.supabase?.production?.projectRef ?? '';
+  config.surfaces = hydrateAdditionalDeploySurfaces(parsed.surfaces);
   return config;
 }
 
@@ -344,6 +421,18 @@ export function replaceDeployConfigSection(markdown: string, config: DeployConfi
 // for that environment's readiness gate. Environments are fingerprinted
 // separately so rotating a prod-only field does NOT invalidate staging
 // readiness (and vice versa).
+function scopedAdditionalDeploySurfaces(
+  deployConfig: DeployConfig,
+  environment: 'staging' | 'prod',
+): Record<string, AdditionalDeploySurfaceEnvironmentConfig> {
+  const environmentKey = environment === 'staging' ? 'staging' : 'production';
+  const scoped: Record<string, AdditionalDeploySurfaceEnvironmentConfig> = {};
+  for (const surface of additionalDeploySurfaceNames(deployConfig)) {
+    scoped[surface] = deployConfig.surfaces[surface][environmentKey];
+  }
+  return scoped;
+}
+
 export function computeDeployConfigFingerprint(
   deployConfig: DeployConfig,
   environment: 'staging' | 'prod',
@@ -355,6 +444,7 @@ export function computeDeployConfigFingerprint(
       edge: deployConfig.edge.staging,
       sql: deployConfig.sql.staging,
       supabase: deployConfig.supabase.staging,
+      surfaces: scopedAdditionalDeploySurfaces(deployConfig, environment),
     }
     : {
       platform: deployConfig.platform,
@@ -362,6 +452,7 @@ export function computeDeployConfigFingerprint(
       edge: deployConfig.edge.production,
       sql: deployConfig.sql.production,
       supabase: deployConfig.supabase.production,
+      surfaces: scopedAdditionalDeploySurfaces(deployConfig, environment),
     };
   return createHash('sha256').update(canonicalize(scoped)).digest('hex');
 }
@@ -615,6 +706,12 @@ export function resolveSurfaceProbeUrl(
       ? deployConfig.sql.staging.healthcheckUrl
       : deployConfig.sql.production.healthcheckUrl;
   }
+  const additional = getAdditionalDeploySurfaceConfig(deployConfig, surface);
+  if (additional) {
+    return environment === 'staging'
+      ? additional.staging.healthcheckUrl
+      : additional.production.healthcheckUrl;
+  }
   return '';
 }
 
@@ -722,8 +819,9 @@ export function evaluateReleaseReadiness(options: {
       missing.push(message);
     };
 
-    if (!isReleaseManagedSurface(surface)) {
-      addBlocker('unsupported', unsupportedSurfaceReason(surface));
+    const additional = getAdditionalDeploySurfaceConfig(options.deployConfig, surface);
+    if (!isReleaseManagedSurface(surface) && !additional) {
+      addBlocker('unsupported', unsupportedSurfaceReason(surface, options.deployConfig));
       results[surface] = {
         ready: false,
         missing,
@@ -772,14 +870,14 @@ export function evaluateReleaseReadiness(options: {
       if (!options.deployConfig.edge.production.deployCommand) {
         addBlocker('config', 'edge production deploy command');
       }
-      if (!options.deployConfig.edge.staging.verificationCommand && !options.deployConfig.edge.production.verificationCommand && !options.deployConfig.edge.staging.healthcheckUrl && !options.deployConfig.edge.production.healthcheckUrl) {
-        addBlocker('config', 'edge verification command or health check');
+      if (!options.deployConfig.edge.staging.healthcheckUrl) {
+        addBlocker('config', 'edge staging health check');
+      }
+      if (!options.deployConfig.edge.production.healthcheckUrl) {
+        addBlocker('config', 'edge production health check');
       }
       const observed = observedStagingSuccess('edge');
       if (observed) addBlocker('observed', observed);
-      // Edge + sql probes only run when an explicit healthcheckUrl is
-      // configured for them — many consumers don't have one. When unset,
-      // fall back to the observed-staging-success gate alone.
       if (options.deployConfig.edge.staging.healthcheckUrl) {
         const probe = probeFreshness('edge');
         if (probe) addBlocker('probe', probe);
@@ -791,13 +889,35 @@ export function evaluateReleaseReadiness(options: {
       if (!options.deployConfig.sql.production.applyCommand) {
         addBlocker('config', 'sql production apply path');
       }
-      if (!options.deployConfig.sql.staging.verificationCommand && !options.deployConfig.sql.production.verificationCommand && !options.deployConfig.sql.staging.healthcheckUrl && !options.deployConfig.sql.production.healthcheckUrl) {
-        addBlocker('config', 'sql verification step');
+      if (!options.deployConfig.sql.staging.healthcheckUrl) {
+        addBlocker('config', 'sql staging health check');
+      }
+      if (!options.deployConfig.sql.production.healthcheckUrl) {
+        addBlocker('config', 'sql production health check');
       }
       const observed = observedStagingSuccess('sql');
       if (observed) addBlocker('observed', observed);
       if (options.deployConfig.sql.staging.healthcheckUrl) {
         const probe = probeFreshness('sql');
+        if (probe) addBlocker('probe', probe);
+      }
+    } else if (additional) {
+      if (!additional.staging.deployCommand) {
+        addBlocker('config', `${surface} staging deploy command`);
+      }
+      if (!additional.production.deployCommand) {
+        addBlocker('config', `${surface} production deploy command`);
+      }
+      if (!additional.staging.healthcheckUrl) {
+        addBlocker('config', `${surface} staging health check`);
+      }
+      if (!additional.production.healthcheckUrl) {
+        addBlocker('config', `${surface} production health check`);
+      }
+      const observed = observedStagingSuccess(surface);
+      if (observed) addBlocker('observed', observed);
+      if (additional.staging.healthcheckUrl) {
+        const probe = probeFreshness(surface);
         if (probe) addBlocker('probe', probe);
       }
     }
@@ -879,7 +999,7 @@ export function buildReleaseCheckMessage(
       lines.push(`Use \`${formatWorkflowCommand(config, 'status')}\` if you need the current staging state.`);
     } else if (hasUnsupportedSurfaceBlocker) {
       lines.push('Next: update the tracked workflow config (`.pipelane.json`, or `.project-workflow.json` in legacy repos) so');
-      lines.push('it only lists release-managed surfaces (frontend, edge, sql), or extend the release gate before retrying.');
+      lines.push('each listed surface has matching Deploy Configuration. Built-ins are frontend, edge, sql; extra surfaces go under `surfaces`.');
     } else if (onlyPendingStagingOrProbeBlockers) {
       lines.push(`Next: wait for the staging deploy verification to finish, then retry this command.`);
       lines.push(`Use \`${formatWorkflowCommand(config, 'status')}\` if you need the current staging state.`);
