@@ -167,6 +167,13 @@ function maybeReexecRepoLocalPipelane(cwd: string): void {
   process.exit(result.status === null ? 1 : result.status);
 }
 
+function shouldSkipManagedReexec(command: string, rest: string[]): boolean {
+  if (SKIP_MANAGED_REEXEC_COMMANDS.has(command)) {
+    return true;
+  }
+  return command === 'run' && rest[0] === 'review' && rest[1] === 'setup';
+}
+
 function reexecAfterAutoUpdate(cwd: string): void {
   const repoRoot = resolveRepoRoot(cwd, true);
   const localBin = path.join(repoRoot, 'node_modules', '.bin', 'pipelane');
@@ -372,7 +379,7 @@ async function main(): Promise<void> {
       reexecAfterAutoUpdate(process.cwd());
     }
   }
-  if (!SKIP_MANAGED_REEXEC_COMMANDS.has(command)) {
+  if (!shouldSkipManagedReexec(command, rest)) {
     maybeReexecRepoLocalPipelane(process.cwd());
   }
 

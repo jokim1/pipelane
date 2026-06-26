@@ -2097,6 +2097,8 @@ test('install-codex outside a pipelane repo installs durable global default skil
     assert.match(pipelaneSkill, /review setup --install <gate-id>/);
     assert.match(pipelaneSkill, /review setup --yes/);
     assert.match(pipelaneSkill, /code-review-high/);
+    assert.match(pipelaneSkill, /Do not reduce the review setup output to only a category summary/);
+    assert.match(pipelaneSkill, /review setup --install adversarial-review/);
     assert.match(pipelaneSkill, /fresh reviewer session/);
     assert.match(pipelaneSkill, /Same-session evidence will block `\/pr`/);
     assert.doesNotMatch(pipelaneSkill, /review setup --preset/);
@@ -2160,6 +2162,8 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     assert.match(pipelaneSkill, /review setup --install <gate-id>/);
     assert.match(pipelaneSkill, /review setup --yes/);
     assert.match(pipelaneSkill, /code-review-high/);
+    assert.match(pipelaneSkill, /Do not reduce the review setup output to only a category summary/);
+    assert.match(pipelaneSkill, /review setup --install adversarial-review/);
     assert.match(pipelaneSkill, /fresh reviewer session/);
     assert.match(pipelaneSkill, /Same-session evidence will block `\/pr`/);
     assert.doesNotMatch(pipelaneSkill, /review setup --preset/);
@@ -4302,6 +4306,43 @@ test('durable Codex runner routes /pipelane update through the managed runtime',
   }
 });
 
+test('managed runtime keeps review setup off stale repo-local pipelane', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
+
+  try {
+    mkdirSync(path.join(repoRoot, 'node_modules', '.bin'), { recursive: true });
+    writeFileSync(
+      path.join(repoRoot, 'node_modules', '.bin', 'pipelane'),
+      '#!/bin/sh\necho "LOCAL:$*"\n',
+      { mode: 0o755, encoding: 'utf8' },
+    );
+
+    const result = spawnSync('node', [CLI_PATH, 'run', 'review', 'setup', '--list-gates'], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        CODEX_HOME: codexHome,
+        CLAUDE_HOME: claudeHome,
+        PIPELANE_MANAGED_RUNTIME: '1',
+        PIPELANE_MANAGED_RUNTIME_ROOT: '/tmp/pipelane-managed-runtime',
+      },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Pipelane review setup/);
+    assert.match(result.stdout, /Gate catalog:/);
+    assert.doesNotMatch(result.stdout, /LOCAL:run review setup --list-gates/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+  }
+});
+
 test('durable Codex runner enters managed runtime before a stale repo-local pipelane', () => {
   const repoRoot = createRepo();
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-bin-'));
@@ -5395,17 +5436,30 @@ test('review setup list-gates text reports resolved availability', () => {
 
 test('review setup bare command renders a non-interactive selector without writing config', () => {
   const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-claude-'));
   try {
-    const result = runCli(['run', 'review', 'setup'], repoRoot);
+    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+      CODEX_HOME: codexHome,
+      CLAUDE_HOME: claudeHome,
+    });
 
     assert.equal(result.status, 0);
     assert.match(result.stdout, /Review setup/);
+    assert.match(result.stdout, /Claude review support:/);
+    assert.match(result.stdout, /Codex \/claude review bridge:/);
+    assert.match(result.stdout, /Anthropic API env:/);
     assert.match(result.stdout, /AI review gates:/);
+    assert.match(result.stdout, /\/karpathy diff/);
     assert.match(result.stdout, /Cross-model review/);
+    assert.match(result.stdout, /Choose the action to take:/);
+    assert.match(result.stdout, /Install and enable .*adversarial-review.*\/pipelane review setup --install adversarial-review/);
     assert.match(result.stdout, /Install and enable an optional gate: \/pipelane review setup --install <gate-id>/);
     assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
   }
 });
 
@@ -5556,6 +5610,34 @@ test('review setup can install and enable a missing lint gate non-interactively'
   }
 });
 
+test('review setup enable accepts comma-spaced multiple gate values', () => {
+  const repoRoot = createRepo();
+  try {
+    const result = runCli(['run', 'review', 'setup', '--enable', '1,', '3,', '4,', '5', '--json'], repoRoot, {
+      PIPELANE_REVIEW_SETUP_INSTALL_SUCCESS: 'lint,secret-scan,dependency-audit',
+    });
+    const report = JSON.parse(result.stdout);
+    const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+    const gateIds = raw.reviewGates.gates.map((gate) => gate.id);
+
+    assert.equal(report.status, 'configured');
+    assert.ok(report.actions.includes('Enabled typecheck.'));
+    assert.ok(report.actions.includes('Installed lint.'));
+    assert.ok(report.actions.includes('Installed secret-scan.'));
+    assert.ok(report.actions.includes('Installed dependency-audit.'));
+    assert.equal(pkg.scripts.lint, 'eslint .');
+    assert.equal(pkg.scripts['secrets:scan'], 'gitleaks detect --source . --redact');
+    assert.equal(pkg.scripts.audit, 'npm audit');
+    assert.ok(gateIds.includes('typecheck'));
+    assert.ok(gateIds.includes('lint'));
+    assert.ok(gateIds.includes('secret-scan'));
+    assert.ok(gateIds.includes('dependency-audit'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('review setup command installers ignore npm lifecycle scripts', () => {
   const repoRoot = createRepo();
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-npm-'));
@@ -5581,6 +5663,41 @@ test('review setup command installers ignore npm lifecycle scripts', () => {
     assert.ok(npmArgs.includes('--save-dev'));
     assert.ok(npmArgs.includes('--ignore-scripts'));
     assert.ok(npmArgs.includes('prettier'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('review setup secret scan installer installs a local gitleaks wrapper when needed', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-gitleaks-'));
+  const npmArgsFile = path.join(repoRoot, 'npm-args.txt');
+  try {
+    const npmPath = path.join(binDir, 'npm');
+    writeFileSync(npmPath, [
+      '#!/usr/bin/env node',
+      "const fs = require('node:fs');",
+      "fs.writeFileSync(process.env.NPM_ARGS_FILE, process.argv.slice(2).join('\\n'), 'utf8');",
+    ].join('\n') + '\n', 'utf8');
+    chmodSync(npmPath, 0o755);
+
+    const result = runCli(['run', 'review', 'setup', '--install', 'secret-scan', '--json'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
+      NPM_ARGS_FILE: npmArgsFile,
+    });
+    const report = JSON.parse(result.stdout);
+    const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+    const npmArgs = readFileSync(npmArgsFile, 'utf8').split('\n');
+
+    assert.equal(report.status, 'configured');
+    assert.ok(npmArgs.includes('install'));
+    assert.ok(npmArgs.includes('--save-dev'));
+    assert.ok(npmArgs.includes('--ignore-scripts'));
+    assert.ok(npmArgs.includes('@nogoo9/gitleaks'));
+    assert.equal(pkg.scripts['secrets:scan'], 'gitleaks detect --source . --redact');
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'secret-scan' && gate.command === 'npm run secrets:scan'), true);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(binDir, { recursive: true, force: true });
@@ -12321,7 +12438,7 @@ test('review runner adds a pending config-change gate when review config inputs 
             id: 'typecheck',
             phase: 'static',
             type: 'command',
-            command: `${process.execPath} -e "require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, 'ran')"`,
+            command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, 'ran')`)}`,
           }],
         },
       }, null, 2)}\n`,
@@ -12340,6 +12457,73 @@ test('review runner adds a pending config-change gate when review config inputs 
     assert.equal(report.gates[1].status, 'skipped');
     assert.equal(report.gates[1].skipReason, 'review-config-changed');
     assert.equal(existsSync(markerPath), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review config-change approval can be attested and unlocks the next review run', () => {
+  const repoRoot = createRepo();
+  const markerPath = path.join(repoRoot, 'review-config-command-ran.txt');
+  try {
+    writeFileSync(
+      path.join(repoRoot, '.pipelane.json'),
+      `${JSON.stringify({
+        displayName: 'Demo App',
+        reviewGates: {
+          planReview: { gates: [] },
+          gates: [{
+            id: 'typecheck',
+            phase: 'static',
+            type: 'command',
+            command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, 'ran')`)}`,
+          }],
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+
+    const blocked = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      PIPELANE_AGENT_SESSION_ID: 'config-change-review-session',
+    }).stdout);
+    assert.equal(blocked.status, 'pending');
+    assert.equal(blocked.gates[0].gateId, 'review-config-change');
+    assert.equal(blocked.gates[0].status, 'pending');
+    assert.equal(blocked.gates[1].gateId, 'typecheck');
+    assert.equal(blocked.gates[1].status, 'skipped');
+    assert.equal(blocked.gates[1].skipReason, 'review-config-changed');
+    assert.equal(existsSync(markerPath), false);
+
+    const approved = JSON.parse(runCli([
+      'run',
+      'review',
+      'pass',
+      '--gate',
+      'review-config-change',
+      '--message',
+      'Reviewed .pipelane.json gate config and command is trusted',
+      '--json',
+    ], repoRoot, {
+      PIPELANE_AGENT_SESSION_ID: 'config-change-approver-session',
+    }).stdout);
+    const approvedState = JSON.parse(readFileSync(approved.evidencePath, 'utf8')).records[0];
+    const approvedGate = approvedState.gates.find((gate) => gate.gateId === 'review-config-change');
+
+    assert.equal(approved.status, 'attested');
+    assert.equal(approvedState.status, 'pending');
+    assert.equal(approvedGate.status, 'passed');
+    assert.equal(approvedGate.attester.sessionId, hashedSessionId('config-change-approver-session'));
+    assert.match(approved.message, /rerun \/pipelane review/);
+    assert.equal(existsSync(markerPath), false);
+
+    const rerun = JSON.parse(runCli(['run', 'review', '--json'], repoRoot).stdout);
+
+    assert.equal(rerun.status, 'passed');
+    assert.equal(rerun.gates[0].gateId, 'review-config-change');
+    assert.equal(rerun.gates[0].status, 'passed');
+    assert.equal(rerun.gates[1].gateId, 'typecheck');
+    assert.equal(rerun.gates[1].status, 'passed');
+    assert.equal(readFileSync(markerPath, 'utf8'), 'ran');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }

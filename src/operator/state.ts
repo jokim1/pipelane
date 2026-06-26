@@ -2905,6 +2905,15 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       return next;
     };
 
+    const readCsvFlagValues = (flag: string): string[] => {
+      const values = [readFlagValue(flag)];
+      while (shouldConsumeCsvFlagContinuation(values[values.length - 1], argv[index + 1])) {
+        index += 1;
+        values.push(argv[index]);
+      }
+      return splitCsvFlagValue(values.join(' '));
+    };
+
     const rejectInlineValue = (flag: string): void => {
       if (inlineValue !== null) {
         throw new Error(`${flag} does not take a value.`);
@@ -3221,15 +3230,15 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       continue;
     }
     if (flagName === '--enable') {
-      flags.reviewEnable.push(...splitCsvFlagValue(readFlagValue('--enable')));
+      flags.reviewEnable.push(...readCsvFlagValues('--enable'));
       continue;
     }
     if (flagName === '--disable') {
-      flags.reviewDisable.push(...splitCsvFlagValue(readFlagValue('--disable')));
+      flags.reviewDisable.push(...readCsvFlagValues('--disable'));
       continue;
     }
     if (flagName === '--install') {
-      flags.reviewInstall.push(...splitCsvFlagValue(readFlagValue('--install')));
+      flags.reviewInstall.push(...readCsvFlagValues('--install'));
       continue;
     }
     if (flagName === '--dry-run') {
@@ -3319,6 +3328,13 @@ function splitCsvFlagValue(value: string): string[] {
     .split(',')
     .map((entry) => entry.trim())
     .filter(Boolean);
+}
+
+function shouldConsumeCsvFlagContinuation(previousValue: string, nextToken: string | undefined): boolean {
+  if (nextToken === undefined || nextToken.startsWith('--')) return false;
+  const previous = previousValue.trimEnd();
+  const next = nextToken.trimStart();
+  return previous.endsWith(',') || next === ',' || next.startsWith(',');
 }
 
 export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
@@ -3515,7 +3531,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       if (subcommand === 'setup') {
         assertOnlyFlags(parsed, ['reviewPrint', 'reviewListGates', 'reviewEnable', 'reviewDisable', 'reviewInstall', 'yes']);
         if (parsed.positional.length !== 1) {
-          throw new Error('review setup requires exactly: pipelane run review setup [--yes] [--print] [--list-gates] [--enable <gate>] [--disable <gate>] [--install <gate>]');
+          throw new Error('review setup requires exactly: pipelane run review setup [--yes] [--print] [--list-gates] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]');
         }
         return;
       }
@@ -3534,7 +3550,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       }
       assertOnlyFlags(parsed, ['reviewDryRun', 'reviewGate', 'reviewPhase']);
       if (parsed.positional.length > 0) {
-        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review pass --gate <id> --message <text>, or pipelane run review setup [--yes] [--print] [--list-gates] [--enable <gate>] [--disable <gate>] [--install <gate>]');
+        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review pass --gate <id> --message <text>, or pipelane run review setup [--yes] [--print] [--list-gates] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]');
       }
       const phase = parsed.flags.reviewPhase.trim();
       if (phase && !includesString(REVIEW_GATE_PHASES, phase)) {

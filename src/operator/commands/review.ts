@@ -48,6 +48,7 @@ type ReviewCommandStatus = ReviewRunRecord['status'];
 type ReviewAttestStatus = 'attested';
 
 const REVIEW_CONFIG_CHANGE_GATE_ID = 'review-config-change';
+const REVIEW_CONFIG_CHANGE_WHEN = 'review-config-changed';
 const REVIEW_CONFIG_CHANGE_PATHS = ['.pipelane.json', '.project-workflow.json', 'package.json'];
 const REVIEW_PHASE_ORDER = REVIEW_GATE_PHASES;
 const DEFAULT_GATE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -58,6 +59,14 @@ const REVIEW_GATE_SESSION_ENV = 'PIPELANE_REVIEW_GATE_SESSION_ID';
 const CODEX_CLAUDE_REVIEW_REPO = 'https://github.com/jokim1/codexskill-claude-review.git';
 const CODEX_CLAUDE_REVIEW_SKILL_NAME = 'claude';
 const KARPATHY_SKILLS_REPO = 'https://github.com/jokim1/karpathy-skills.git';
+const GITLEAKS_NPM_PACKAGE = '@nogoo9/gitleaks';
+const ANTHROPIC_API_ENV_KEYS = [
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_BEARER_TOKEN',
+  'ANTHROPIC_CONSOLE_API_KEY',
+  'ANTHROPIC_CONSOLE_AUTH_TOKEN',
+];
 
 type GateInstallState = 'installed' | 'not installed' | 'unavailable' | 'not applicable';
 
@@ -115,6 +124,15 @@ interface ReviewSetupGateOption {
   recommended: boolean;
   installState: GateInstallState;
   adversarialProvider?: AdversarialReviewProvider;
+}
+
+interface ClaudeReviewSetupStatus {
+  claudeCliPath: string | null;
+  codeReviewHighAvailable: boolean;
+  codeReviewHighSource: string;
+  codexBridgeInstalled: boolean;
+  codexBridgeTarget: string;
+  apiEnvKeys: string[];
 }
 
 interface ReviewSetupReport {
@@ -177,6 +195,7 @@ export interface BuildReviewRunRecordOptions {
   gateFilter?: string;
   phaseFilter?: ReviewGatePhase | '';
   activeSurfaces: string[];
+  reviewConfigChangeApproval?: ReviewGateRunRecord | null;
   onGateStart?: (gate: ReviewGateConfig) => void;
   onGateFinish?: (gate: ReviewGateRunRecord) => void;
 }
@@ -332,7 +351,8 @@ export function buildReviewPassRecord(options: {
     throw new Error('review pass requires --message <what was run and why it is clean>.');
   }
 
-  const expectedGate = options.config.reviewGates?.gates?.find((gate) => gate.id === gateId);
+  const expectedGate = options.config.reviewGates?.gates?.find((gate) => gate.id === gateId)
+    ?? (gateId === REVIEW_CONFIG_CHANGE_GATE_ID ? reviewConfigChangeGateConfig() : undefined);
   if (!expectedGate) {
     throw new Error(`No configured review gate matches --gate ${gateId}. Run "pipelane run review setup --list-gates" to inspect configured gates.`);
   }
@@ -411,7 +431,9 @@ export function buildReviewPassRecord(options: {
   return {
     ...base,
     id: `review-pass-${new Date(startedAt).toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto.randomUUID().slice(0, 8)}`,
-    status: summarizeRunStatus(nextGates),
+    status: gateId === REVIEW_CONFIG_CHANGE_GATE_ID
+      ? summarizeConfigChangeApprovalStatus(nextGates)
+      : summarizeRunStatus(nextGates),
     startedAt,
     finishedAt: startedAt,
     durationMs: 0,
@@ -491,6 +513,7 @@ function prepareInteractiveReviewSetup(repoRoot: string): {
   packageJson: ReviewSetupReport['packageJson'];
   detectedScripts: string[];
   gates: ReviewSetupGateOption[];
+  claude: ClaudeReviewSetupStatus;
 } {
   const detection = detectPackageScripts(repoRoot);
   const orderedCatalog = orderInteractiveReviewCatalog(resolveReviewGateCatalog({ repoRoot })
@@ -526,6 +549,7 @@ function prepareInteractiveReviewSetup(repoRoot: string): {
     },
     detectedScripts: Object.keys(detection.scripts).sort(),
     gates,
+    claude: buildClaudeReviewSetupStatus(),
   };
 }
 
@@ -565,8 +589,7 @@ function applyReviewSetupSelections(
   }
   for (const id of enableSet) {
     const gate = requirePreparedGate(prepared.gates, id);
-    enablePreparedReviewGate(repoRoot, gate);
-    messages.push(`Enabled ${gate.entry.id}.`);
+    messages.push(enablePreparedReviewGate(repoRoot, prepared.gates, gate));
   }
 
   return {
@@ -614,7 +637,18 @@ function requirePreparedGate(gates: ReviewSetupGateOption[], id: string): Review
   return gate;
 }
 
-function enablePreparedReviewGate(repoRoot: string, gate: ReviewSetupGateOption): void {
+function enablePreparedReviewGate(
+  repoRoot: string,
+  gates: ReviewSetupGateOption[],
+  gate: ReviewSetupGateOption,
+): string {
+  if (
+    (!gate.entry.available || ((gate.entry.type === 'skill' || gate.entry.type === 'agent') && gate.installState !== 'installed'))
+    && hasReviewGateInstaller(gate.entry, repoRoot)
+  ) {
+    return installPreparedReviewGate(repoRoot, gates, gate);
+  }
+
   if (!gate.entry.available) {
     const installHint = hasReviewGateInstaller(gate.entry, repoRoot)
       ? ` Run "pipelane run review setup --install ${gate.entry.id}" to install and enable it.`
@@ -630,6 +664,7 @@ function enablePreparedReviewGate(repoRoot: string, gate: ReviewSetupGateOption)
     gate.adversarialProvider = preferredAdversarialReviewProvider(repoRoot);
   }
   gate.selected = true;
+  return `Enabled ${gate.entry.id}.`;
 }
 
 function installPreparedReviewGate(
@@ -779,6 +814,33 @@ function isCodeReviewHighAvailable(): boolean {
   return Boolean(configuredCommand || isExecutableOnPath('claude'));
 }
 
+function buildClaudeReviewSetupStatus(): ClaudeReviewSetupStatus {
+  const codexHome = codexHomePath();
+  const configuredCommand = firstEnvValue(process.env, [
+    'PIPELANE_REVIEW_CODE_REVIEW_HIGH_COMMAND',
+    'PIPELANE_REVIEW_GATE_CODE_REVIEW_HIGH_COMMAND',
+  ]);
+  const forced = process.env.PIPELANE_REVIEW_CODE_REVIEW_HIGH_PROBE_RESULT?.trim().toLowerCase();
+  const claudeCliPath = executablePathOnPath('claude');
+  const codeReviewHighAvailable = isCodeReviewHighAvailable();
+  const codeReviewHighSource = configuredCommand
+    ? `${configuredCommand.key}`
+    : forced
+      ? `probe override ${forced}`
+      : claudeCliPath
+        ? `Claude Code CLI at ${claudeCliPath}`
+        : 'no configured command or claude executable';
+
+  return {
+    claudeCliPath,
+    codeReviewHighAvailable,
+    codeReviewHighSource,
+    codexBridgeInstalled: isCodexClaudeReviewBridgeInstalled(codexHome),
+    codexBridgeTarget: path.join(codexHome, 'skills', CODEX_CLAUDE_REVIEW_SKILL_NAME),
+    apiEnvKeys: ANTHROPIC_API_ENV_KEYS.filter((key) => Boolean(process.env[key]?.trim())),
+  };
+}
+
 function skillInstallNameVariants(name: string): string[] {
   const trimmed = name.trim();
   if (!trimmed) return [];
@@ -899,11 +961,17 @@ function fileContainsAll(filePath: string, needles: string[]): boolean {
 }
 
 function isExecutableOnPath(command: string): boolean {
+  return executablePathOnPath(command) !== null;
+}
+
+function executablePathOnPath(command: string): string | null {
   const pathValue = process.env.PATH || '';
-  return pathValue.split(path.delimiter).some((dir) => {
-    if (!dir) return false;
-    return isExecutableFile(path.join(dir, command));
-  });
+  for (const dir of pathValue.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, command);
+    if (isExecutableFile(candidate)) return candidate;
+  }
+  return null;
 }
 
 function isExecutableFile(filePath: string): boolean {
@@ -1139,10 +1207,8 @@ function installCommandReviewGate(
 
   if (entry.id === 'secret-scan') {
     if (!isExecutableOnPath('gitleaks')) {
-      return {
-        ok: false,
-        message: 'gitleaks is not installed or not on PATH. Install gitleaks, then rerun review setup --install secret-scan.',
-      };
+      const install = installNpmDevDependencies(repoRoot, [GITLEAKS_NPM_PACKAGE], entry.id, scriptName);
+      if (!install.ok) return install;
     }
     return patchPackageJsonScript(repoRoot, scriptName, defaultPackageScriptForCommandGate(entry.id, scriptName));
   }
@@ -1921,6 +1987,7 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
     gateFilter,
     phaseFilter,
     activeSurfaces,
+    reviewConfigChangeApproval: selectReviewConfigChangeApproval(context.commonDir, context.config, context.repoRoot),
   });
 
   appendReviewRunRecord(context.commonDir, context.config, record);
@@ -1952,6 +2019,8 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
   const changedFiles = collectChangedFiles(options.repoRoot, options.baseBranch);
   const worktreeStatus = readWorktreeStatusSnapshot(options.repoRoot, { includeStatusDigest: true });
   const reviewConfigChanged = changedFiles.some(isReviewConfigPath);
+  const reviewConfigChangeApproval = reviewConfigChanged ? options.reviewConfigChangeApproval ?? null : null;
+  const reviewConfigChangeNeedsApproval = reviewConfigChanged && !reviewConfigChangeApproval;
   const allGates = orderReviewGates(options.gates);
   const selectedGates = maybeAddReviewConfigChangeGate(allGates.filter((gate) =>
     (!phaseFilter || gate.phase === phaseFilter)
@@ -1978,16 +2047,18 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
   const recordByGate = new Map<ReviewGateConfig, ReviewGateRunRecord>();
   const evaluateGate = (gate: ReviewGateConfig, deferAiGate: boolean): ReviewGateRunRecord => {
     options.onGateStart?.(gate);
-    const record = runReviewGate({
-      gate,
-      repoRoot: options.repoRoot,
-      baseBranch: options.baseBranch,
-      dryRun: options.dryRun,
-      reviewConfigChanged,
-      changedFiles,
-      activeSurfaces: options.activeSurfaces,
-      deferAiGate,
-    });
+    const record = gate.id === REVIEW_CONFIG_CHANGE_GATE_ID && reviewConfigChangeApproval
+      ? approvedReviewConfigChangeGateRecord(gate, reviewConfigChangeApproval)
+      : runReviewGate({
+          gate,
+          repoRoot: options.repoRoot,
+          baseBranch: options.baseBranch,
+          dryRun: options.dryRun,
+          reviewConfigChanged: reviewConfigChangeNeedsApproval,
+          changedFiles,
+          activeSurfaces: options.activeSurfaces,
+          deferAiGate,
+        });
     options.onGateFinish?.(record);
     recordByGate.set(gate, record);
     return record;
@@ -2124,7 +2195,7 @@ function runReviewGate(options: {
     return finishGate(base, startMs, {
       status: 'skipped',
       summary: `skipped: review config inputs changed; ${gate.type} gates require trusted approval before execution`,
-      skipReason: 'review-config-changed',
+      skipReason: REVIEW_CONFIG_CHANGE_WHEN,
     });
   }
 
@@ -2197,7 +2268,7 @@ function runAiReviewGate(options: {
     return finishGate({ ...base, command }, startMs, {
       status: 'skipped',
       summary: `skipped: review config inputs changed; ${gate.type} gates require trusted approval before execution`,
-      skipReason: 'review-config-changed',
+      skipReason: REVIEW_CONFIG_CHANGE_WHEN,
     });
   }
 
@@ -2546,6 +2617,13 @@ function manualPassSummary(message: string): string {
   return `manual pass: ${message}`;
 }
 
+function summarizeConfigChangeApprovalStatus(gates: ReviewGateRunRecord[]): ReviewCommandStatus {
+  if (gates.some((gate) => gate.blocking && gate.skipReason === REVIEW_CONFIG_CHANGE_WHEN)) {
+    return 'pending';
+  }
+  return summarizeRunStatus(gates);
+}
+
 function skipReasonForGate(gate: ReviewGateConfig, changedFiles: string[], activeSurfaces: string[]): string | null {
   if (gate.whenChanged && gate.whenChanged.length > 0) {
     const matched = changedFiles.some((file) => gate.whenChanged?.some((pattern) => matchesPathPattern(file, pattern)));
@@ -2624,16 +2702,68 @@ function maybeAddReviewConfigChangeGate(
   },
 ): ReviewGateConfig[] {
   if (!options.reviewConfigChanged || gates.some((gate) => gate.id === REVIEW_CONFIG_CHANGE_GATE_ID)) return gates;
-  return [
-    {
-      id: REVIEW_CONFIG_CHANGE_GATE_ID,
-      phase: 'static',
-      type: 'approval',
-      blocking: true,
-      when: 'review-config-changed',
-    },
-    ...gates,
-  ];
+  return [reviewConfigChangeGateConfig(), ...gates];
+}
+
+function reviewConfigChangeGateConfig(): ReviewGateConfig {
+  return {
+    id: REVIEW_CONFIG_CHANGE_GATE_ID,
+    phase: 'static',
+    type: 'approval',
+    blocking: true,
+    when: REVIEW_CONFIG_CHANGE_WHEN,
+  };
+}
+
+function selectReviewConfigChangeApproval(
+  commonDir: string,
+  config: WorkflowConfig,
+  repoRoot: string,
+): ReviewGateRunRecord | null {
+  const currentBranch = runGit(repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
+  const currentSha = runGit(repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '';
+  const worktreeStatus = readWorktreeStatusSnapshot(repoRoot, { includeStatusDigest: true });
+  if (!worktreeStatus.statusDigestReliable) return null;
+
+  const state = loadReviewState(commonDir, config);
+  for (const record of state.records) {
+    if (
+      record.dryRun
+      || record.gateFilter
+      || record.phaseFilter
+      || record.branchName !== currentBranch
+      || record.sha !== currentSha
+      || record.worktreeStatusDigest !== worktreeStatus.statusDigest
+      || record.worktreeStatusReliable !== true
+    ) {
+      continue;
+    }
+    const approval = record.gates.find(isPassedReviewConfigChangeApprovalGate);
+    if (approval) return approval;
+  }
+  return null;
+}
+
+function isPassedReviewConfigChangeApprovalGate(gate: ReviewGateRunRecord): boolean {
+  return gate.gateId === REVIEW_CONFIG_CHANGE_GATE_ID
+    && gate.type === 'approval'
+    && gate.blocking === true
+    && gate.status === 'passed'
+    && gate.attester !== undefined;
+}
+
+function approvedReviewConfigChangeGateRecord(
+  gate: ReviewGateConfig,
+  approval: ReviewGateRunRecord,
+): ReviewGateRunRecord {
+  return {
+    ...approval,
+    gateId: gate.id,
+    phase: gate.phase,
+    type: gate.type,
+    blocking: gate.blocking !== false,
+    status: 'passed',
+  };
 }
 
 function isReviewConfigPath(file: string): boolean {
@@ -2725,8 +2855,11 @@ function renderReviewRunReport(record: ReviewRunRecord, evidencePath: string): s
     }
   }
 
+  const configChangePending = pending.some((gate) => gate.gateId === REVIEW_CONFIG_CHANGE_GATE_ID);
   if (record.status === 'failed') {
     lines.push('', 'Next: fix failed blocking gates, then rerun /pipelane review.');
+  } else if (configChangePending) {
+    lines.push('', `Next: inspect the review config diff, then record approval with /pipelane review pass --gate ${REVIEW_CONFIG_CHANGE_GATE_ID} --message "<what changed and why it is trusted>".`);
   } else if (record.status === 'pending') {
     lines.push('', 'Next: complete pending AI/manual gates, then rerun or attach their evidence before PR enforcement.');
   } else {
@@ -2761,6 +2894,8 @@ function renderReviewPassReport(record: ReviewRunRecord, gateId: string, evidenc
 
   if (record.status === 'passed') {
     lines.push('', 'Next: continue to /pr when ready.');
+  } else if (gateId === REVIEW_CONFIG_CHANGE_GATE_ID) {
+    lines.push('', 'Next: rerun /pipelane review to execute the configured gates under the approved review config.');
   } else {
     lines.push('', 'Next: complete the remaining pending AI/manual gates, then record each pass.');
   }
@@ -2814,6 +2949,7 @@ function renderReviewSetupReport(
   lines.push('- Enable a gate: /pipelane review setup --enable <gate-id>');
   lines.push('- Disable a gate: /pipelane review setup --disable <gate-id>');
   lines.push('- Install an optional gate: /pipelane review setup --install <gate-id>');
+  lines.push('- Multiple gates: repeat the flag or use comma-separated values such as /pipelane review setup --enable 3, 4, 5, 13.');
   lines.push('- Save defaults plus changes: combine --yes with --enable/--disable/--install as needed.');
   lines.push('- Opinionated default: self-review, deterministic checks, independent AI review, and cross-model review when installed.');
   lines.push('- Opting out trades speed for higher risk of missed correctness, security, or data-loss bugs.');
@@ -2838,15 +2974,20 @@ function renderNonInteractiveReviewSetup(prepared: {
   packageJson: ReviewSetupReport['packageJson'];
   detectedScripts: string[];
   gates: ReviewSetupGateOption[];
+  claude: ClaudeReviewSetupStatus;
 }): string {
   return [
     renderInteractiveReviewSetup(prepared),
     '',
-    'Non-interactive actions:',
+    'Choose the action to take:',
+    ...formatNonInteractiveReviewSetupActions(prepared),
+    '',
+    'Command patterns:',
     '- Save current selection: /pipelane review setup --yes',
     '- Enable a gate: /pipelane review setup --enable <gate-id>',
     '- Disable a gate: /pipelane review setup --disable <gate-id>',
     '- Install and enable an optional gate: /pipelane review setup --install <gate-id>',
+    '- Multiple gates: repeat the flag or use comma-separated values such as /pipelane review setup --enable 3, 4, 5, 13',
     '- Print effective config: /pipelane review setup --print',
   ].join('\n');
 }
@@ -2856,12 +2997,16 @@ function renderInteractiveReviewSetup(prepared: {
   packageJson: ReviewSetupReport['packageJson'];
   detectedScripts: string[];
   gates: ReviewSetupGateOption[];
+  claude: ClaudeReviewSetupStatus;
 }): string {
   const lines = [
     'Review setup',
     '',
     'I found these repo checks:',
     ...formatDetectedRepoChecks(prepared.gates),
+    '',
+    'Claude review support:',
+    ...formatClaudeReviewSetupStatus(prepared.claude),
     '',
     'Recommended review gates are preselected below.',
     'Turn one off only when you accept the coverage tradeoff.',
@@ -2908,6 +3053,71 @@ function renderInteractiveReviewSetupSaved(
   if (byPhase.length === 0) lines.push('- none');
   lines.push('', 'Next: run /pipelane orchestrate');
   return lines.join('\n');
+}
+
+function formatClaudeReviewSetupStatus(status: ClaudeReviewSetupStatus): string[] {
+  const claudeCli = status.claudeCliPath
+    ? `installed at ${status.claudeCliPath}`
+    : 'not found on PATH; subscription setup is install Claude Code, then run `claude auth login --claudeai` in the same environment Codex uses';
+  const codeReviewHigh = status.codeReviewHighAvailable
+    ? `available via ${status.codeReviewHighSource}`
+    : `not available (${status.codeReviewHighSource})`;
+  const bridge = status.codexBridgeInstalled
+    ? `installed at ${status.codexBridgeTarget}`
+    : `not installed; setup: /pipelane review setup --install adversarial-review`;
+  const apiEnv = status.apiEnvKeys.length > 0
+    ? `${status.apiEnvKeys.join(', ')} set; current Codex /claude bridge is subscription-only and does not use API keys`
+    : 'not set; current Codex /claude bridge is subscription-only';
+
+  return [
+    `- Claude Code CLI subscription: ${claudeCli}`,
+    `- /code-review high gate: ${codeReviewHigh}`,
+    `- Codex /claude review bridge: ${bridge}`,
+    `- Anthropic API env: ${apiEnv}`,
+  ];
+}
+
+function formatNonInteractiveReviewSetupActions(prepared: { gates: ReviewSetupGateOption[] }): string[] {
+  const actions: Array<{ label: string; command: string }> = [
+    { label: 'Save the current recommended selection', command: '/pipelane review setup --yes' },
+    { label: 'Show the full gate catalog', command: '/pipelane review setup --list-gates' },
+    { label: 'Print the effective review config', command: '/pipelane review setup --print' },
+  ];
+
+  for (const gate of prepared.gates) {
+    const target = reviewSetupGateActionTarget(gate);
+    if (gate.selected) {
+      actions.push({
+        label: `Disable ${target}`,
+        command: `/pipelane review setup --disable ${gate.entry.id}`,
+      });
+      continue;
+    }
+
+    if (gate.installState === 'not installed') {
+      actions.push({
+        label: `Install and enable ${target}`,
+        command: `/pipelane review setup --install ${gate.entry.id}`,
+      });
+      continue;
+    }
+
+    if (gate.entry.available && (gate.installState === 'installed' || gate.installState === 'not applicable')) {
+      actions.push({
+        label: `Enable ${target}`,
+        command: `/pipelane review setup --enable ${gate.entry.id}`,
+      });
+    }
+  }
+
+  return actions.map((action, index) => `${index + 1}. ${action.label}: ${action.command}`);
+}
+
+function reviewSetupGateActionTarget(gate: ReviewSetupGateOption): string {
+  const aliases = gate.entry.userCommands && gate.entry.userCommands.length > 0
+    ? `, ${gate.entry.userCommands.join(' | ')}`
+    : '';
+  return `${gate.label} [${gate.entry.id}${aliases}]`;
 }
 
 function formatDetectedRepoChecks(gates: ReviewSetupGateOption[]): string[] {
