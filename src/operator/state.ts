@@ -3598,10 +3598,11 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         }
         return;
       }
-      if (subcommand !== 'goal-spec' && subcommand !== 'plan' && subcommand !== 'prepare' && subcommand !== 'dispatch' && subcommand !== 'start' && subcommand !== 'review' && subcommand !== 'scope' && subcommand !== 'outline' && subcommand !== 'finalize') {
-        throw new Error('orchestrate requires exactly: pipelane run orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes], or pipelane run orchestrate <goal-spec|plan|prepare|dispatch|start|review|scope|outline|finalize> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--slices-file <path>] [--run-id <id>] [--through <slice-id>] [--provider codex|claude|generic]');
+      if (subcommand !== 'goal-spec' && subcommand !== 'plan' && subcommand !== 'prepare' && subcommand !== 'dispatch' && subcommand !== 'start' && subcommand !== 'review' && subcommand !== 'scope' && subcommand !== 'outline' && subcommand !== 'finalize' && subcommand !== 'upgrade-ledger') {
+        throw new Error('orchestrate requires exactly: pipelane run orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes], or pipelane run orchestrate <goal-spec|plan|prepare|dispatch|start|review|scope|outline|finalize|upgrade-ledger> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--slices-file <path>] [--run-id <id>] [--through <slice-id>] [--provider codex|claude|generic]');
       }
-      if (subcommand === 'scope' || subcommand === 'outline' || subcommand === 'finalize') {
+      // C2: upgrade-ledger takes only --run-id, like outline/finalize.
+      if (subcommand === 'scope' || subcommand === 'outline' || subcommand === 'finalize' || subcommand === 'upgrade-ledger') {
         assertOnlyFlags(parsed, subcommand === 'scope'
           ? ['orchestrationRunId', 'scopeThrough']
           : ['orchestrationRunId']);

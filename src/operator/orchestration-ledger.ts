@@ -31,6 +31,7 @@ import {
   type ReviewIndependenceLabel,
 } from './review-identity.ts';
 import { readWorktreeStatusSnapshot } from './worktree-status.ts';
+import { resolveReviewStateKey, signSignedPayload, verifySignedPayload } from './integrity.ts';
 
 export type OrchestrationRunStatus = 'planned' | 'prepared' | 'dispatched' | 'running' | 'blocked' | 'paused' | 'completed' | 'failed';
 
@@ -77,6 +78,22 @@ export interface OrchestrationSliceWorkerRecord {
   error: string | null;
 }
 
+// C2 (Decision 4/11): the anti-replay binding for embedded review evidence. The
+// signed payload binds the verdict to the exact run/slice/worker/branch/worktree/
+// commit/tree-state it was produced for, so a legitimately-signed record cannot be
+// replayed into a different context (a different slice, run, or worktree). All
+// fields are reconstructable from the persisted slice + run + reviewRun, so the
+// read path can re-derive and compare them.
+export interface OrchestrationSliceReviewBinding {
+  runId: string;
+  sliceId: string;
+  workerSessionId: string | null;
+  branchName: string | null;
+  worktreePath: string | null;
+  sha: string | null;
+  worktreeStatusDigest: string | null;
+}
+
 export interface OrchestrationSliceReviewRecord {
   status: ReviewRunRecord['status'];
   evidencePath: string;
@@ -85,6 +102,14 @@ export interface OrchestrationSliceReviewRecord {
   independence?: ReviewIndependenceLabel;
   independenceReason?: string;
   run: ReviewRunRecord;
+  // C2: HMAC over this record (minus `signature`) using the review-state key the
+  // worker does not have, with `binding` carrying the anti-replay context. Both are
+  // optional: legacy ledgers predate signing, and signing is off when no key is
+  // configured. The completion read path (`sliceReviewFullySatisfied`) verifies
+  // them only when a key is present (reject-unsigned-when-active); `orchestrate
+  // upgrade-ledger` signs legacy records in place.
+  binding?: OrchestrationSliceReviewBinding;
+  signature?: string;
 }
 
 export interface OrchestrationReviewFixRecord {
@@ -718,9 +743,10 @@ export function isActiveOrchestrationRun(
   options: OrchestrationReviewSatisfactionOptions = {},
 ): boolean {
   if (record.status !== 'completed') return true;
+  const runOptions = { ...options, runId: record.id };
   return record.slices.some((slice) =>
     slice.worker?.status === 'succeeded'
-    && !sliceReviewFullySatisfied(slice, options)
+    && !sliceReviewFullySatisfied(slice, runOptions)
     && sliceWorktreeExists(slice, options),
   );
 }
@@ -729,6 +755,81 @@ export interface OrchestrationReviewSatisfactionOptions {
   headCache?: Map<string, string | null>;
   statusDigestCache?: Map<string, { digest: string; reliable: boolean } | null>;
   worktreeExistsCache?: Map<string, boolean>;
+  // C2: verify the embedded review signature + binding on read. `reviewStateKey`
+  // defaults to the env key (`resolveReviewStateKey`) when omitted; when no key is
+  // configured signing is off and the signature is not enforced. `runId` lets the
+  // read path enforce the run-id half of the binding — callers that have the run
+  // pass it; callers that do not (e.g. unit calls) fall back to the worktree/branch
+  // bindings, which already pin a record to one context.
+  reviewStateKey?: string;
+  runId?: string;
+}
+
+// C2: build the anti-replay binding for an embedded review record from the live
+// run/slice/reviewRun context. Every field is also reconstructable on read, so the
+// verifier can re-derive and compare them.
+export function buildOrchestrationSliceReviewBinding(
+  runId: string,
+  slice: OrchestrationSliceRecord,
+  reviewRun: ReviewRunRecord,
+): OrchestrationSliceReviewBinding {
+  return {
+    runId,
+    sliceId: slice.id,
+    workerSessionId: slice.worker?.identity?.sessionId ?? null,
+    branchName: slice.branchName ?? null,
+    worktreePath: slice.worktreePath ?? null,
+    sha: reviewRun.sha ?? null,
+    worktreeStatusDigest: reviewRun.worktreeStatusDigest ?? null,
+  };
+}
+
+// C2: sign an embedded review record in place, bound to its context. Returns the
+// record unchanged when no review-state key is configured (signing is opt-in via
+// the key, consistent with appendReviewRunRecord). The HMAC covers the whole
+// record (verdict + binding) minus `signature`, so tampering any field is detected.
+export function signOrchestrationSliceReview(
+  record: OrchestrationSliceReviewRecord,
+  runId: string,
+  slice: OrchestrationSliceRecord,
+  key: string | undefined = resolveReviewStateKey(),
+): OrchestrationSliceReviewRecord {
+  if (!key) return record;
+  const bound: OrchestrationSliceReviewRecord = {
+    ...record,
+    binding: buildOrchestrationSliceReviewBinding(runId, slice, record.run),
+  };
+  return { ...bound, signature: signSignedPayload(bound, key) };
+}
+
+// C2: verify the embedded review signature + anti-replay binding. Returns true
+// (block completion) when a review-state key is configured AND: the record is
+// unsigned (reject-unsigned-when-active), the signature does not verify (tamper or
+// forgery — the worker lacks the key), or any bound field no longer matches the
+// live context (replay from another run/slice/worker/branch/worktree/commit/tree).
+// When no key is configured signing is off and this is a no-op, preserving pre-C2
+// behavior and legacy ledgers until the operator opts in (sets the key) and, if
+// needed, runs `orchestrate upgrade-ledger`. The run-id half is enforced only when
+// the caller supplies `options.runId`; the worktree/branch bindings already pin a
+// record to one context for callers that cannot.
+function sliceReviewSignatureBlocker(
+  slice: OrchestrationSliceRecord,
+  reviewRun: ReviewRunRecord,
+  options: OrchestrationReviewSatisfactionOptions,
+): boolean {
+  const key = options.reviewStateKey ?? resolveReviewStateKey();
+  if (!key) return false;
+  const review = slice.review;
+  if (!review?.signature || !review.binding) return true;
+  if (!verifySignedPayload(review, key)) return true;
+  const binding = review.binding;
+  return binding.sliceId !== slice.id
+    || binding.workerSessionId !== (slice.worker?.identity?.sessionId ?? null)
+    || binding.branchName !== (slice.branchName ?? null)
+    || binding.worktreePath !== (slice.worktreePath ?? null)
+    || binding.sha !== (reviewRun.sha ?? null)
+    || binding.worktreeStatusDigest !== (reviewRun.worktreeStatusDigest ?? null)
+    || (options.runId !== undefined && binding.runId !== options.runId);
 }
 
 export function sliceReviewFullySatisfied(
@@ -752,6 +853,11 @@ export function sliceReviewFullySatisfied(
   }
   if (sliceHasRejectedBlockingAiDiagnostic(slice)) return false;
   if (sliceReviewHasUntrustedBlockingAiEvidence(slice)) return false;
+  // C2: the embedded verdict must carry a valid signature bound to this exact
+  // context (when a review-state key is configured). This gates every positive
+  // return below — including the cleaned-worktree branch — so a tampered or
+  // replayed `slice.review` can never satisfy completion.
+  if (sliceReviewSignatureBlocker(slice, reviewRun, options)) return false;
 
   if (!slice.worktreePath || !sliceWorktreeExists(slice, options)) {
     return slice.status === 'completed';
