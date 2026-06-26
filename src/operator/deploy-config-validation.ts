@@ -11,9 +11,11 @@ export function listMissingDeployConfiguration(options: {
   surfaces: string[];
   defaultWorkflowName: string;
   allowHealthcheckStubBypass?: boolean;
+  requireHealthchecks?: boolean;
 }): string[] {
   const missing = new Set<string>();
   const label = deployEnvironmentLabel(options.environment);
+  const requireHealthchecks = options.requireHealthchecks ?? true;
   const frontend = options.environment === 'staging'
     ? options.config.frontend.staging
     : options.config.frontend.production;
@@ -27,13 +29,13 @@ export function listMissingDeployConfiguration(options: {
       if (!frontend.url && !frontend.deployWorkflow && !options.defaultWorkflowName) {
         missing.add(`frontend ${label} URL or deploy workflow`);
       }
-      if (!options.allowHealthcheckStubBypass && !resolveSurfaceHealthcheckUrl(options.config, options.environment, surface)) {
+      if (requireHealthchecks && !options.allowHealthcheckStubBypass && !resolveSurfaceHealthcheckUrl(options.config, options.environment, surface)) {
         missing.add(`frontend ${label} health check`);
       }
       continue;
     }
 
-    if (!options.allowHealthcheckStubBypass && !resolveSurfaceHealthcheckUrl(options.config, options.environment, surface)) {
+    if (requireHealthchecks && !options.allowHealthcheckStubBypass && !resolveSurfaceHealthcheckUrl(options.config, options.environment, surface)) {
       missing.add(`${surface} ${label} health check`);
     }
   }

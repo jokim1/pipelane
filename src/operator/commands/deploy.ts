@@ -252,17 +252,18 @@ export async function dispatchDeploy(
   const asyncRequested = options.async ?? parsed.flags.async;
   const surfaces = resolveDeploySurfacesForTarget({
     context,
-    environment,
     explicitSurfaces,
     fallbackSurfaces: identity.lock?.surfaces ?? [],
     targetSha: target.sha,
   });
+  const requireHealthchecks = shouldRequireDeployHealthchecks(context, environment);
   const missingConfig = listMissingDeployConfiguration({
     config: deployConfig,
     environment,
     surfaces,
     defaultWorkflowName: context.config.deployWorkflowName,
     allowHealthcheckStubBypass,
+    requireHealthchecks,
   });
   if (missingConfig.length > 0) {
     throw new Error(buildDeployConfigurationError({
@@ -511,8 +512,9 @@ export async function dispatchDeploy(
   if (watched.ok) {
     // v1.2: per-surface probing. A multi-surface deploy produces one probe
     // entry per surface so a frontend healthcheck can't credit edge or sql.
-    // If any surface returns non-2xx (or lacks a probe URL entirely), the
-    // whole deploy flips to failed.
+    // If any configured healthcheck returns non-2xx, the whole deploy flips
+    // to failed. Build-mode prod deploys may leave a surface without a probe
+    // URL while the app is still being wired up.
     verificationBySurface = {};
     const perSurfaceFailures: string[] = [];
     const stubStatus = process.env.PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS;
@@ -522,7 +524,9 @@ export async function dispatchDeploy(
       if (!surfaceUrl && !stubStatus) {
         const empty: DeployVerification = { healthcheckUrl: '', probes: 0 };
         verificationBySurface[surface] = empty;
-        perSurfaceFailures.push(`${surface}: no healthcheck URL configured`);
+        if (requireHealthchecks) {
+          perSurfaceFailures.push(`${surface}: no healthcheck URL configured`);
+        }
         continue;
       }
       const probe = await probeHealthcheck(surfaceUrl);
@@ -634,7 +638,6 @@ export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Pro
 
 function resolveDeploySurfacesForTarget(options: {
   context: WorkflowContext;
-  environment: 'staging' | 'prod';
   explicitSurfaces: string[];
   fallbackSurfaces: string[];
   targetSha: string;
@@ -647,7 +650,7 @@ function resolveDeploySurfacesForTarget(options: {
     config: options.context.config,
     targetSha: options.targetSha,
   });
-  if (!inference) return resolveBuildModeProductionDefaultSurfaces(options.context, options.environment, surfaces);
+  if (!inference) return surfaces;
 
   const blockers = targetSurfaceInferenceBlockers(inference);
   if (blockers.length > 0) {
@@ -660,25 +663,14 @@ function resolveDeploySurfacesForTarget(options: {
 
   if (inference.surfaces.length > 0) return inference.surfaces;
 
-  return resolveBuildModeProductionDefaultSurfaces(options.context, options.environment, surfaces);
+  return surfaces;
 }
 
-function resolveBuildModeProductionDefaultSurfaces(
+function shouldRequireDeployHealthchecks(
   context: WorkflowContext,
   environment: 'staging' | 'prod',
-  surfaces: string[],
-): string[] {
-  // Build mode is the fast lane: default all-surfaces config should not turn a
-  // frontend deploy into edge/sql release ceremony unless deploy input narrowed it.
-  if (context.modeState.mode !== 'build' || environment !== 'prod') return surfaces;
-  if (!sameSurfaceSet(surfaces, context.config.surfaces)) return surfaces;
-  return context.config.surfaces.includes('frontend') ? ['frontend'] : surfaces;
-}
-
-function sameSurfaceSet(left: string[], right: string[]): boolean {
-  if (left.length !== right.length) return false;
-  const rightSet = new Set(right);
-  return left.every((surface) => rightSet.has(surface));
+): boolean {
+  return !(context.modeState.mode === 'build' && environment === 'prod');
 }
 
 export function persistRecord(
