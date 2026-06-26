@@ -137,6 +137,9 @@ deterministic command exactly:
 - \`review setup --disable <gate-id>\` to disable a preselected gate.
 - \`review setup --install <gate-id>\` to install and enable an optional gate
   such as \`lint\` or \`adversarial-review\`.
+- \`review setup --enable browser-qa --browser-qa-command "<host command>"\`
+  to opt into browser QA with a host-side Playwright/Cypress command. On macOS,
+  do not let browser QA fall back to nested Codex.
 - Gate values may be repeated or comma-separated, for example
   \`review setup --enable 3, 4, 5, 13\`.
 - \`review setup --list-gates\` to inspect the full catalog.

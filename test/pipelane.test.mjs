@@ -6167,6 +6167,148 @@ test('review setup can explicitly toggle AI review gates non-interactively', () 
   }
 });
 
+test('review setup enables browser QA with an explicit host command', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  try {
+    seedCodexReviewSkills(codexHome, ['qa-only']);
+
+    const result = JSON.parse(runCli([
+      'run',
+      'review',
+      'setup',
+      '--enable',
+      'browser-qa',
+      '--browser-qa-command',
+      'npm run test:e2e',
+      '--json',
+    ], repoRoot, {
+      CODEX_HOME: codexHome,
+    }).stdout);
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+    const browserQa = raw.reviewGates.gates.find((gate) => gate.id === 'browser-qa');
+
+    assert.equal(result.status, 'configured');
+    assert.ok(result.actions.some((action) => /Enabled browser-qa with host command: npm run test:e2e/.test(action)));
+    assert.equal(browserQa.command, 'npm run test:e2e');
+    assert.equal(browserQa.skill, 'qa-only');
+    assert.equal(browserQa.when, 'surface:frontend');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup browser QA command flag enables the gate by itself', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  try {
+    seedCodexReviewSkills(codexHome, ['qa-only']);
+
+    runCli([
+      'run',
+      'review',
+      'setup',
+      '--browser-qa-command',
+      'npm run browser:qa',
+      '--json',
+    ], repoRoot, {
+      CODEX_HOME: codexHome,
+    });
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+    const browserQa = raw.reviewGates.gates.find((gate) => gate.id === 'browser-qa');
+
+    assert.equal(browserQa.command, 'npm run browser:qa');
+    assert.equal(browserQa.blocking, true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup browser QA host command does not require an installed qa-only skill', () => {
+  const repoRoot = createRepo();
+  const homeDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-home-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-claude-'));
+  try {
+    const result = JSON.parse(runCli([
+      'run',
+      'review',
+      'setup',
+      '--browser-qa-command',
+      'npm run browser:qa',
+      '--json',
+    ], repoRoot, {
+      HOME: homeDir,
+      CODEX_HOME: codexHome,
+      CLAUDE_HOME: claudeHome,
+    }).stdout);
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+    const browserQa = raw.reviewGates.gates.find((gate) => gate.id === 'browser-qa');
+
+    assert.equal(result.status, 'configured');
+    assert.ok(result.actions.some((action) => /Enabled browser-qa with host command: npm run browser:qa/.test(action)));
+    assert.equal(browserQa.command, 'npm run browser:qa');
+    assert.equal(browserQa.skill, 'qa-only');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(homeDir, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup auto-fills browser QA from one clear browser package script', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  try {
+    seedCodexReviewSkills(codexHome, ['qa-only']);
+    const pkgPath = path.join(repoRoot, 'package.json');
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+    pkg.scripts['test:e2e'] = 'playwright test --grep @smoke';
+    writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
+
+    const result = JSON.parse(runCli(['run', 'review', 'setup', '--enable', 'browser-qa', '--json'], repoRoot, {
+      CODEX_HOME: codexHome,
+    }).stdout);
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+    const browserQa = raw.reviewGates.gates.find((gate) => gate.id === 'browser-qa');
+
+    assert.equal(browserQa.command, 'npm run test:e2e');
+    assert.ok(result.actions.some((action) => /Enabled browser-qa with host command: npm run test:e2e/.test(action)));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup interactive browser QA prompt can accept detected host command', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  try {
+    seedCodexReviewSkills(codexHome, ['qa-only']);
+    const pkgPath = path.join(repoRoot, 'package.json');
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+    pkg.scripts['browser:qa'] = 'playwright test --project chromium';
+    writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
+
+    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+      CODEX_HOME: codexHome,
+      PIPELANE_REVIEW_SETUP_INPUT: '13\n\ns\n',
+    });
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+    const browserQa = raw.reviewGates.gates.find((gate) => gate.id === 'browser-qa');
+
+    assert.match(result.stdout, /Browser QA launches a real browser/);
+    assert.match(result.stdout, /Detected host command from package\.json script "browser:qa"/);
+    assert.equal(browserQa.command, 'npm run browser:qa');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
 test('review setup targeted flags preserve existing custom review gates', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
@@ -7373,6 +7515,207 @@ test('review leaves code-review high pending instead of auto-running native clau
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
+test('default AI review command requires explicit runtime QA command on macOS', async () => {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'review.ts'));
+  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-fake-codex-'));
+  const codexPath = path.join(fakeBin, 'codex');
+  const previousPath = process.env.PATH;
+  const previousRealNative = process.env.PIPELANE_REVIEW_GATE_USE_REAL_NATIVE;
+
+  try {
+    writeFileSync(codexPath, '#!/usr/bin/env sh\nexit 0\n', 'utf8');
+    chmodSync(codexPath, 0o755);
+    process.env.PATH = `${fakeBin}:${previousPath || ''}`;
+    process.env.PIPELANE_REVIEW_GATE_USE_REAL_NATIVE = '1';
+
+    assert.equal(mod.defaultAiReviewGateCommand({
+      id: 'browser-qa',
+      phase: 'runtime',
+      type: 'skill',
+      skill: 'qa-only',
+    }, 'darwin'), '');
+    assert.equal(mod.defaultAiReviewGateCommand({
+      id: 'browser-qa',
+      phase: 'runtime',
+      type: 'skill',
+      skill: 'qa-only',
+    }, 'linux'), 'codex exec --full-auto -');
+    assert.equal(mod.defaultAiReviewGateCommand({
+      id: 'custom-runtime-browser',
+      phase: 'runtime',
+      type: 'agent',
+      role: 'browser-agent',
+    }, 'darwin'), '');
+    assert.equal(mod.defaultAiReviewGateCommand({
+      id: 'gstack-review',
+      phase: 'ai-diff',
+      type: 'skill',
+      skill: 'review',
+    }, 'darwin'), 'codex exec --full-auto -');
+  } finally {
+    if (previousPath === undefined) {
+      delete process.env.PATH;
+    } else {
+      process.env.PATH = previousPath;
+    }
+    if (previousRealNative === undefined) {
+      delete process.env.PIPELANE_REVIEW_GATE_USE_REAL_NATIVE;
+    } else {
+      process.env.PIPELANE_REVIEW_GATE_USE_REAL_NATIVE = previousRealNative;
+    }
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
+test('review executes browser QA through a gate-specific host command override', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      policyVersion: 2,
+      planReview: { gates: [] },
+      gates: [{
+        id: 'browser-qa',
+        phase: 'runtime',
+        type: 'skill',
+        skill: 'qa-only',
+        when: 'surface:frontend',
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    execFileSync('git', ['add', '-A'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Adopt browser QA gate'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const script = [
+      'let input = \'\';',
+      'process.stdin.on(\'data\', chunk => input += chunk);',
+      'process.stdin.on(\'end\', () => {',
+      'if (!input.includes(\'Gate: browser-qa\')) process.exit(2);',
+      'if (!input.includes(\'Gate phase: runtime\')) process.exit(3);',
+      'if (process.env.PIPELANE_REVIEW_GATE_ID !== \'browser-qa\') process.exit(4);',
+      'console.log(\'browser qa clean\');',
+      'console.log(\'PIPELANE_REVIEW_GATE_RESULT=passed\');',
+      '});',
+    ].join('');
+    const aiReviewCommand = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`;
+    const result = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      PIPELANE_REVIEW_BROWSER_QA_COMMAND: aiReviewCommand,
+      PIPELANE_REVIEW_BROWSER_QA_PROVIDER: 'host-playwright',
+    }).stdout);
+
+    assert.equal(result.status, 'passed');
+    assert.equal(result.gates.length, 1);
+    assert.equal(result.gates[0].gateId, 'browser-qa');
+    assert.equal(result.gates[0].status, 'passed');
+    assert.equal(result.gates[0].command, aiReviewCommand);
+    assert.equal(result.gates[0].summary, 'AI review passed: skill:qa-only');
+    assert.equal(result.gates[0].attester.provider, 'host-playwright');
+    assert.match(result.gates[0].stdoutTail, /PIPELANE_REVIEW_GATE_RESULT=passed/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review leaves browser QA pending instead of auto-running nested Codex on macOS', { skip: process.platform !== 'darwin' }, () => {
+  const repoRoot = createRepo();
+  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-fake-codex-'));
+  const invokedPath = path.join(fakeBin, 'codex-invoked');
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      policyVersion: 2,
+      planReview: { gates: [] },
+      gates: [{
+        id: 'browser-qa',
+        phase: 'runtime',
+        type: 'skill',
+        skill: 'qa-only',
+        when: 'surface:frontend',
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    execFileSync('git', ['add', '-A'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Adopt browser QA gate'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const codexPath = path.join(fakeBin, 'codex');
+    writeFileSync(
+      codexPath,
+      `#!/usr/bin/env sh\nprintf invoked > ${JSON.stringify(invokedPath)}\nprintf 'PIPELANE_REVIEW_GATE_RESULT=passed\\n'\n`,
+      'utf8',
+    );
+    chmodSync(codexPath, 0o755);
+
+    const result = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      PATH: `${fakeBin}:${process.env.PATH || ''}`,
+      PIPELANE_REVIEW_GATE_USE_REAL_NATIVE: '1',
+    }).stdout);
+
+    assert.equal(result.status, 'pending');
+    assert.equal(result.gates.length, 1);
+    assert.equal(result.gates[0].gateId, 'browser-qa');
+    assert.equal(result.gates[0].status, 'pending');
+    assert.equal(result.gates[0].command, undefined);
+    assert.match(result.gates[0].summary, /runtime QA pending/);
+    assert.match(result.gates[0].summary, /PIPELANE_REVIEW_BROWSER_QA_COMMAND/);
+    assert.equal(existsSync(invokedPath), false, 'browser QA should not auto-run nested codex on macOS');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
+test('review ignores generic AI command overrides for browser QA on macOS', { skip: process.platform !== 'darwin' }, () => {
+  const repoRoot = createRepo();
+  const invokedPath = path.join(repoRoot, 'generic-ai-invoked');
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      policyVersion: 2,
+      planReview: { gates: [] },
+      gates: [{
+        id: 'browser-qa',
+        phase: 'runtime',
+        type: 'skill',
+        skill: 'qa-only',
+        when: 'surface:frontend',
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    execFileSync('git', ['add', '-A'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Adopt browser QA gate'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const script = [
+      `require('node:fs').writeFileSync(${JSON.stringify(invokedPath)}, 'invoked');`,
+      'console.log(\'PIPELANE_REVIEW_GATE_RESULT=passed\');',
+    ].join('');
+    const aiReviewCommand = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`;
+    const result = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      PIPELANE_REVIEW_GATE_COMMAND: aiReviewCommand,
+      PIPELANE_REVIEW_GATE_PROVIDER: 'generic-ai',
+    }).stdout);
+
+    assert.equal(result.status, 'pending');
+    assert.equal(result.gates[0].gateId, 'browser-qa');
+    assert.equal(result.gates[0].status, 'pending');
+    assert.equal(result.gates[0].command, undefined);
+    assert.match(result.gates[0].summary, /runtime QA pending/);
+    assert.equal(existsSync(invokedPath), false, 'browser QA should ignore generic AI command overrides on macOS');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
   }
 });
 

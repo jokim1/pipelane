@@ -19,6 +19,7 @@ import {
 import {
   isIndependentAiReviewGate,
   matchesReviewRisk,
+  reviewGatePolicyRole,
   REVIEW_GATES_POLICY_VERSION,
 } from '../review-gate-policy.ts';
 import { readWorktreeStatusSnapshot, type WorktreeStatusSnapshot } from '../worktree-status.ts';
@@ -60,6 +61,11 @@ const CODEX_CLAUDE_REVIEW_REPO = 'https://github.com/jokim1/codexskill-claude-re
 const CODEX_CLAUDE_REVIEW_SKILL_NAME = 'claude';
 const KARPATHY_SKILLS_REPO = 'https://github.com/jokim1/karpathy-skills.git';
 const GITLEAKS_NPM_PACKAGE = '@nogoo9/gitleaks';
+const BROWSER_QA_GATE_ID = 'browser-qa';
+const BROWSER_QA_COMMAND_ENV_KEYS = [
+  'PIPELANE_REVIEW_BROWSER_QA_COMMAND',
+  'PIPELANE_REVIEW_GATE_BROWSER_QA_COMMAND',
+];
 const ANTHROPIC_API_ENV_KEYS = [
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',
@@ -124,6 +130,8 @@ interface ReviewSetupGateOption {
   recommended: boolean;
   installState: GateInstallState;
   adversarialProvider?: AdversarialReviewProvider;
+  browserQaCommand?: string;
+  browserQaCommandSource?: string;
 }
 
 interface ClaudeReviewSetupStatus {
@@ -516,11 +524,13 @@ function prepareInteractiveReviewSetup(repoRoot: string): {
   claude: ClaudeReviewSetupStatus;
 } {
   const detection = detectPackageScripts(repoRoot);
+  const detectedBrowserQaCommand = detectBrowserQaSetupCommand(repoRoot);
   const orderedCatalog = orderInteractiveReviewCatalog(resolveReviewGateCatalog({ repoRoot })
     .filter((entry) => entry.kind === 'review'));
   const gates = orderedCatalog.map((entry, index) => {
     const installState = detectGateInstallState(repoRoot, entry);
     const recommended = isRecommendedInteractiveGate(entry, installState);
+    const browserQaCommand = entry.id === BROWSER_QA_GATE_ID ? detectedBrowserQaCommand : null;
     return {
       number: index + 1,
       entry,
@@ -531,6 +541,8 @@ function prepareInteractiveReviewSetup(repoRoot: string): {
       adversarialProvider: entry.id === 'adversarial-review' && recommended
         ? preferredAdversarialReviewProvider(repoRoot)
         : undefined,
+      browserQaCommand: browserQaCommand?.command,
+      browserQaCommandSource: browserQaCommand?.source,
     };
   });
   const codeReviewHigh = gates.find((gate) => gate.entry.id === 'code-review-high');
@@ -556,7 +568,8 @@ function prepareInteractiveReviewSetup(repoRoot: string): {
 function hasReviewSetupSelectionFlags(parsed: ParsedOperatorArgs): boolean {
   return parsed.flags.reviewEnable.length > 0
     || parsed.flags.reviewDisable.length > 0
-    || parsed.flags.reviewInstall.length > 0;
+    || parsed.flags.reviewInstall.length > 0
+    || parsed.flags.reviewBrowserQaCommand.trim().length > 0;
 }
 
 function applyReviewSetupSelections(
@@ -570,7 +583,14 @@ function applyReviewSetupSelections(
   const installSet = new Set(installIds);
   const enableSet = new Set(enableIds);
   const disableSet = new Set(disableIds);
-  const conflicting = [...new Set([...installIds, ...enableIds])]
+  const browserQaCommand = parsed.flags.reviewBrowserQaCommand.trim();
+  if (browserQaCommand) {
+    if (disableSet.has(BROWSER_QA_GATE_ID)) {
+      throw new Error('review setup cannot disable browser-qa while also configuring --browser-qa-command.');
+    }
+    enableSet.add(BROWSER_QA_GATE_ID);
+  }
+  const conflicting = [...new Set([...installIds, ...enableSet])]
     .filter((id) => disableSet.has(id));
   if (conflicting.length > 0) {
     throw new Error(`review setup cannot both enable/install and disable: ${conflicting.join(', ')}`);
@@ -579,7 +599,7 @@ function applyReviewSetupSelections(
   const messages: string[] = [];
   for (const id of installSet) {
     const gate = requirePreparedGate(prepared.gates, id);
-    messages.push(installPreparedReviewGate(repoRoot, prepared.gates, gate));
+    messages.push(installPreparedReviewGate(repoRoot, prepared.gates, gate, { browserQaCommand }));
   }
   for (const id of disableSet) {
     const gate = requirePreparedGate(prepared.gates, id);
@@ -589,12 +609,12 @@ function applyReviewSetupSelections(
   }
   for (const id of enableSet) {
     const gate = requirePreparedGate(prepared.gates, id);
-    messages.push(enablePreparedReviewGate(repoRoot, prepared.gates, gate));
+    messages.push(enablePreparedReviewGate(repoRoot, prepared.gates, gate, { browserQaCommand }));
   }
 
   return {
     messages,
-    enabledIds: enableIds,
+    enabledIds: [...enableSet],
     disabledIds: disableIds,
     installedIds: installIds,
   };
@@ -641,12 +661,18 @@ function enablePreparedReviewGate(
   repoRoot: string,
   gates: ReviewSetupGateOption[],
   gate: ReviewSetupGateOption,
+  options: { browserQaCommand?: string } = {},
 ): string {
+  if (gate.entry.id === BROWSER_QA_GATE_ID) {
+    gate.selected = true;
+    return configureBrowserQaSetupGate(repoRoot, gate, options.browserQaCommand);
+  }
+
   if (
     (!gate.entry.available || ((gate.entry.type === 'skill' || gate.entry.type === 'agent') && gate.installState !== 'installed'))
     && hasReviewGateInstaller(gate.entry, repoRoot)
   ) {
-    return installPreparedReviewGate(repoRoot, gates, gate);
+    return installPreparedReviewGate(repoRoot, gates, gate, options);
   }
 
   if (!gate.entry.available) {
@@ -671,6 +697,7 @@ function installPreparedReviewGate(
   repoRoot: string,
   gates: ReviewSetupGateOption[],
   gate: ReviewSetupGateOption,
+  options: { browserQaCommand?: string } = {},
 ): string {
   if (gate.entry.type === 'command' && gate.entry.available) {
     gate.installState = 'not applicable';
@@ -702,6 +729,11 @@ function installPreparedReviewGate(
 
   if (gate.entry.id === 'adversarial-review') {
     gate.adversarialProvider = preferredAdversarialReviewProvider(repoRoot);
+  }
+  if (gate.entry.id === BROWSER_QA_GATE_ID) {
+    gate.selected = true;
+    renumberPreparedGates(gates);
+    return configureBrowserQaSetupGate(repoRoot, gate, options.browserQaCommand);
   }
   gate.selected = true;
   renumberPreparedGates(gates);
@@ -996,6 +1028,11 @@ async function toggleInteractiveGate(
     return;
   }
 
+  if (gate.entry.id === BROWSER_QA_GATE_ID) {
+    await configureInteractiveBrowserQaGate(gate, prompter, repoRoot);
+    return;
+  }
+
   if (!gate.entry.available && gate.installState === 'unavailable') {
     process.stdout.write(`${gate.label} cannot be enabled: ${gate.entry.missingReason ?? 'gate unavailable'}.\n`);
     return;
@@ -1065,6 +1102,36 @@ async function toggleInteractiveGate(
     gate.adversarialProvider = preferredAdversarialReviewProvider(repoRoot);
   }
   gate.selected = true;
+}
+
+async function configureInteractiveBrowserQaGate(
+  gate: ReviewSetupGateOption,
+  prompter: { question(prompt: string): Promise<string> },
+  repoRoot: string,
+): Promise<void> {
+  const detected = gate.browserQaCommand
+    ? { command: gate.browserQaCommand, source: gate.browserQaCommandSource ?? 'detected configuration' }
+    : detectBrowserQaSetupCommand(repoRoot);
+  process.stdout.write([
+    'Browser QA launches a real browser and should run from the host process.',
+    'On macOS, Pipelane will not default this gate to nested Codex because Chromium can fail inside the sandbox.',
+    detected
+      ? `Detected host command from ${detected.source}: ${detected.command}`
+      : 'No host browser QA command was detected automatically.',
+    'Press Enter to use the detected command, enter a host command, or type manual to enable the gate without a command.',
+  ].join('\n') + '\n');
+  const answer = (await prompter.question('Browser QA command> ')).trim();
+  gate.selected = true;
+  if (answer.toLowerCase() === 'manual') {
+    gate.browserQaCommand = undefined;
+    gate.browserQaCommandSource = undefined;
+    return;
+  }
+  const command = answer || detected?.command || '';
+  gate.browserQaCommand = command || undefined;
+  gate.browserQaCommandSource = command
+    ? (answer ? 'interactive input' : detected?.source)
+    : undefined;
 }
 
 async function chooseSingleReviewGateInstaller(
@@ -1861,6 +1928,63 @@ function reviewSetupInstallTarget(entry: ResolvedReviewGateCatalogEntry): string
   return entry.skill ?? entry.id;
 }
 
+function configureBrowserQaSetupGate(
+  repoRoot: string,
+  gate: ReviewSetupGateOption,
+  explicitCommand?: string,
+): string {
+  const explicit = explicitCommand?.trim() ?? '';
+  const detected = !explicit && !gate.browserQaCommand ? detectBrowserQaSetupCommand(repoRoot) : null;
+  const command = explicit || gate.browserQaCommand?.trim() || detected?.command || '';
+  gate.selected = true;
+  if (command) {
+    gate.browserQaCommand = command;
+    gate.browserQaCommandSource = explicit
+      ? '--browser-qa-command'
+      : gate.browserQaCommandSource ?? detected?.source;
+    return `Enabled browser-qa with host command: ${command}`;
+  }
+
+  gate.browserQaCommand = undefined;
+  gate.browserQaCommandSource = undefined;
+  return process.platform === 'darwin'
+    ? 'Enabled browser-qa without a host command; on macOS it will stay pending until you run browser QA manually or set PIPELANE_REVIEW_BROWSER_QA_COMMAND.'
+    : 'Enabled browser-qa without a host command; Pipelane will use the native AI reviewer fallback when available.';
+}
+
+function detectBrowserQaSetupCommand(repoRoot: string): { command: string; source: string } | null {
+  const envCommand = firstEnvValue(process.env, BROWSER_QA_COMMAND_ENV_KEYS);
+  if (envCommand) {
+    return {
+      command: envCommand.value,
+      source: envCommand.key,
+    };
+  }
+
+  const detection = detectPackageScripts(repoRoot);
+  if (!detection.found || detection.malformed) return null;
+  const candidates = Object.entries(detection.scripts)
+    .filter(([name, command]) => browserQaScriptCandidate(name, command));
+  if (candidates.length !== 1) return null;
+  const [scriptName] = candidates[0];
+  return {
+    command: `npm run ${formatNpmRunScriptName(scriptName)}`,
+    source: `package.json script "${scriptName}"`,
+  };
+}
+
+function browserQaScriptCandidate(name: string, command: string): boolean {
+  const haystack = `${name}\n${command}`.toLowerCase();
+  if (!/\b(playwright|cypress|webdriver|puppeteer)\b/.test(haystack)) return false;
+  if (/\b(e2e|browser|browsers|qa|smoke|ui)\b/.test(name.toLowerCase())) return true;
+  if (/(--grep|--project|--headed|--browser|\bchromium\b|\bfirefox\b|\bwebkit\b|@smoke|@qa)/i.test(command)) return true;
+  return false;
+}
+
+function formatNpmRunScriptName(name: string): string {
+  return /^[A-Za-z0-9:_-]+$/.test(name) ? name : JSON.stringify(name);
+}
+
 function saveInteractiveReviewSetup(
   repoRoot: string,
   gates: ReviewSetupGateOption[],
@@ -1934,7 +2058,7 @@ function reviewSetupGateToConfig(gate: ReviewSetupGateOption): ReviewGateConfig 
     phase: entry.phase as ReviewGatePhase,
     type: entry.type,
     blocking: true,
-    command: entry.command,
+    command: entry.id === BROWSER_QA_GATE_ID ? gate.browserQaCommand : entry.command,
     skill: entry.skill,
     role: entry.role,
     when: entry.when,
@@ -2391,8 +2515,11 @@ function runAiReviewGate(options: {
 
 function resolveAiReviewGateCommand(gate: ReviewGateConfig): { command: string; provider: string } | null {
   const explicit = gate.command?.trim();
+  const envKeys = requiresExplicitRuntimeQaCommand(gate, process.platform)
+    ? reviewGateSpecificCommandEnvKeys(gate)
+    : reviewGateCommandEnvKeys(gate);
   const command = explicit
-    || firstEnvValue(process.env, reviewGateCommandEnvKeys(gate))?.value
+    || firstEnvValue(process.env, envKeys)?.value
     || defaultAiReviewGateCommand(gate);
   if (!command) return null;
   return {
@@ -2402,12 +2529,18 @@ function resolveAiReviewGateCommand(gate: ReviewGateConfig): { command: string; 
 }
 
 function reviewGateCommandEnvKeys(gate: Pick<ReviewGateConfig, 'id'>): string[] {
+  return [
+    ...reviewGateSpecificCommandEnvKeys(gate),
+    'PIPELANE_REVIEW_AI_COMMAND',
+    'PIPELANE_REVIEW_GATE_COMMAND',
+  ];
+}
+
+function reviewGateSpecificCommandEnvKeys(gate: Pick<ReviewGateConfig, 'id'>): string[] {
   const key = reviewGateEnvKey(gate.id);
   return [
     `PIPELANE_REVIEW_${key}_COMMAND`,
     `PIPELANE_REVIEW_GATE_${key}_COMMAND`,
-    'PIPELANE_REVIEW_AI_COMMAND',
-    'PIPELANE_REVIEW_GATE_COMMAND',
   ];
 }
 
@@ -2433,8 +2566,11 @@ function firstEnvValue(env: NodeJS.ProcessEnv, keys: string[]): { key: string; v
   return null;
 }
 
-function defaultAiReviewGateCommand(gate: ReviewGateConfig): string {
+export function defaultAiReviewGateCommand(gate: ReviewGateConfig, platform: NodeJS.Platform = process.platform): string {
   if (process.env.NODE_ENV === 'test' && process.env.PIPELANE_REVIEW_GATE_USE_REAL_NATIVE !== '1') {
+    return '';
+  }
+  if (requiresExplicitRuntimeQaCommand(gate, platform)) {
     return '';
   }
   if (gate.id === 'code-review-high' || gate.id === 'code-review-ultra') {
@@ -2444,6 +2580,12 @@ function defaultAiReviewGateCommand(gate: ReviewGateConfig): string {
   if (isExecutableOnPath('codex')) return 'codex exec --full-auto -';
   if (isExecutableOnPath('claude')) return defaultClaudeReviewCommand();
   return '';
+}
+
+function requiresExplicitRuntimeQaCommand(gate: ReviewGateConfig, platform: NodeJS.Platform): boolean {
+  if (platform !== 'darwin') return false;
+  if (reviewGatePolicyRole(gate) === 'runtime-qa') return true;
+  return gate.phase === 'runtime' && (gate.type === 'skill' || gate.type === 'agent');
 }
 
 function defaultClaudeReviewCommand(): string {
@@ -2651,6 +2793,9 @@ function manualGateSummary(gate: ReviewGateConfig): string {
   if (isIndependentAiReviewGate(gate)) {
     const command = gate.userCommands?.[0] ?? gate.role ?? gate.skill ?? gate.id;
     return `independent AI review pending: run ${command} from a separate reviewer session`;
+  }
+  if (requiresExplicitRuntimeQaCommand(gate, process.platform)) {
+    return `runtime QA pending: run browser QA manually or set PIPELANE_REVIEW_BROWSER_QA_COMMAND`;
   }
   if (gate.type === 'skill') {
     const command = gate.userCommands?.[0] ?? (gate.skill ? `skill:${gate.skill}` : 'the configured skill');
@@ -2947,6 +3092,7 @@ function renderReviewSetupReport(
 
   lines.push('', 'Setup controls:');
   lines.push('- Enable a gate: /pipelane review setup --enable <gate-id>');
+  lines.push('- Enable browser QA with a host command: /pipelane review setup --enable browser-qa --browser-qa-command "<playwright-or-cypress-command>"');
   lines.push('- Disable a gate: /pipelane review setup --disable <gate-id>');
   lines.push('- Install an optional gate: /pipelane review setup --install <gate-id>');
   lines.push('- Multiple gates: repeat the flag or use comma-separated values such as /pipelane review setup --enable 3, 4, 5, 13.');
@@ -2985,6 +3131,7 @@ function renderNonInteractiveReviewSetup(prepared: {
     'Command patterns:',
     '- Save current selection: /pipelane review setup --yes',
     '- Enable a gate: /pipelane review setup --enable <gate-id>',
+    '- Enable browser QA with a host command: /pipelane review setup --enable browser-qa --browser-qa-command "<playwright-or-cypress-command>"',
     '- Disable a gate: /pipelane review setup --disable <gate-id>',
     '- Install and enable an optional gate: /pipelane review setup --install <gate-id>',
     '- Multiple gates: repeat the flag or use comma-separated values such as /pipelane review setup --enable 3, 4, 5, 13',
@@ -3103,9 +3250,12 @@ function formatNonInteractiveReviewSetupActions(prepared: { gates: ReviewSetupGa
     }
 
     if (gate.entry.available && (gate.installState === 'installed' || gate.installState === 'not applicable')) {
+      const command = gate.entry.id === BROWSER_QA_GATE_ID && gate.browserQaCommand
+        ? `/pipelane review setup --enable ${gate.entry.id} --browser-qa-command ${JSON.stringify(gate.browserQaCommand)}`
+        : `/pipelane review setup --enable ${gate.entry.id}`;
       actions.push({
         label: `Enable ${target}`,
-        command: `/pipelane review setup --enable ${gate.entry.id}`,
+        command,
       });
     }
   }
@@ -3166,6 +3316,17 @@ function reviewSetupGateDetail(gate: ReviewSetupGateOption, repoRoot: string): s
       : entry.userCommands?.[0] ?? entry.role ?? entry.id;
     const install = gate.installState === 'not applicable' ? '' : ` ${gate.installState}`;
     return `${target}${install}`;
+  }
+  if (entry.id === BROWSER_QA_GATE_ID) {
+    const command = gate.browserQaCommand
+      ? `host command: ${gate.browserQaCommand}`
+      : process.platform === 'darwin'
+        ? 'host command required on macOS'
+        : entry.userCommands?.[0] ?? entry.skill ?? entry.id;
+    const source = gate.browserQaCommandSource ? ` (${gate.browserQaCommandSource})` : '';
+    const condition = entry.when ? ` ${entry.when}` : '';
+    const install = gate.installState === 'not applicable' ? '' : ` ${gate.installState}`;
+    return `${command}${source}${condition}${install}`;
   }
   const target = entry.userCommands?.[0]
     ?? entry.skill

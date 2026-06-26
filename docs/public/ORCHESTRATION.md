@@ -56,6 +56,7 @@ Current commands:
 /pipelane review setup --yes
 /pipelane review setup --print
 /pipelane review setup --list-gates
+/pipelane review setup --enable browser-qa --browser-qa-command "npm run test:e2e"
 ```
 
 Custom extensions:
@@ -75,8 +76,13 @@ The setup flow is opinionated by default. It should recommend deterministic
 checks first, `/karpathy diff` as build-time author self-review, `/code-review high`
 in a fresh reviewer context when Claude review support is available, gstack
 `/review` as the independent fallback, and cross-model review when installed.
-High-stakes paths add `/code-review ultra` and human approval. Users may opt out
-of gates, but the UI should make the consequence explicit: less review coverage.
+Conditional runtime gates only turn on when the operator opts in. On macOS,
+opting into `browser-qa` should prompt for a host-side Playwright/Cypress
+command or auto-fill a single clear browser-test package script; without such a
+command, setup must warn that the gate will remain manual/pending instead of
+defaulting to nested Codex. High-stakes paths add `/code-review ultra` and human
+approval. Users may opt out of gates, but the UI should make the consequence
+explicit: less review coverage.
 The authoring session must never attest its own independent AI review.
 
 Known package-script installers are allowed to help, but only conservatively:
@@ -488,6 +494,12 @@ installed native Codex/Claude CLI default. The command receives a review prompt
 on stdin and must print `PIPELANE_REVIEW_GATE_RESULT=passed` or
 `PIPELANE_REVIEW_GATE_RESULT=failed` on its own line. Missing result markers
 fail closed.
+
+On macOS, runtime/browser QA gates such as `browser-qa` do not use the native
+Codex fallback because Chromium may fail inside nested Codex's macOS sandbox.
+Set a gate-specific command such as `PIPELANE_REVIEW_BROWSER_QA_COMMAND` to run
+host-side browser QA, or leave the gate pending and record a manual pass after
+running the browser check.
 
 AI review commands must not modify files. Pipelane snapshots the worktree
 before and after each AI review command; if the digest changes or cannot be

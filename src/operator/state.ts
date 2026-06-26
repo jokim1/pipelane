@@ -729,6 +729,7 @@ export interface OperatorFlags {
   reviewEnable: string[];
   reviewDisable: string[];
   reviewInstall: string[];
+  reviewBrowserQaCommand: string;
   reviewDryRun: boolean;
   reviewGate: string;
   reviewPhase: string;
@@ -2849,6 +2850,7 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     reviewEnable: [],
     reviewDisable: [],
     reviewInstall: [],
+    reviewBrowserQaCommand: '',
     reviewDryRun: false,
     reviewGate: '',
     reviewPhase: '',
@@ -3241,6 +3243,10 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       flags.reviewInstall.push(...readCsvFlagValues('--install'));
       continue;
     }
+    if (flagName === '--browser-qa-command') {
+      flags.reviewBrowserQaCommand = readFlagValue('--browser-qa-command').trim();
+      continue;
+    }
     if (flagName === '--dry-run') {
       rejectInlineValue('--dry-run');
       flags.reviewDryRun = true;
@@ -3529,9 +3535,9 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
     case 'review': {
       const subcommand = parsed.positional[0] ?? '';
       if (subcommand === 'setup') {
-        assertOnlyFlags(parsed, ['reviewPrint', 'reviewListGates', 'reviewEnable', 'reviewDisable', 'reviewInstall', 'yes']);
+        assertOnlyFlags(parsed, ['reviewPrint', 'reviewListGates', 'reviewEnable', 'reviewDisable', 'reviewInstall', 'reviewBrowserQaCommand', 'yes']);
         if (parsed.positional.length !== 1) {
-          throw new Error('review setup requires exactly: pipelane run review setup [--yes] [--print] [--list-gates] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]');
+          throw new Error('review setup requires exactly: pipelane run review setup [--yes] [--print] [--list-gates] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>] [--browser-qa-command <host-command>]');
         }
         return;
       }
@@ -3550,7 +3556,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       }
       assertOnlyFlags(parsed, ['reviewDryRun', 'reviewGate', 'reviewPhase']);
       if (parsed.positional.length > 0) {
-        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review pass --gate <id> --message <text>, or pipelane run review setup [--yes] [--print] [--list-gates] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]');
+        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review pass --gate <id> --message <text>, or pipelane run review setup [--yes] [--print] [--list-gates] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>] [--browser-qa-command <host-command>]');
       }
       const phase = parsed.flags.reviewPhase.trim();
       if (phase && !includesString(REVIEW_GATE_PHASES, phase)) {
@@ -3924,6 +3930,7 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'reviewEnable', label: '--enable', active: (flags) => flags.reviewEnable.length > 0 },
   { key: 'reviewDisable', label: '--disable', active: (flags) => flags.reviewDisable.length > 0 },
   { key: 'reviewInstall', label: '--install', active: (flags) => flags.reviewInstall.length > 0 },
+  { key: 'reviewBrowserQaCommand', label: '--browser-qa-command', active: (flags) => flags.reviewBrowserQaCommand.trim().length > 0 },
   { key: 'reviewDryRun', label: '--dry-run', active: (flags) => flags.reviewDryRun },
   { key: 'reviewGate', label: '--gate', active: (flags) => flags.reviewGate.trim().length > 0 },
   { key: 'reviewPhase', label: '--phase', active: (flags) => flags.reviewPhase.trim().length > 0 },
