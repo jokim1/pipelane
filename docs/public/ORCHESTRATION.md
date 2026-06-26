@@ -544,8 +544,8 @@ The board should eventually show:
 - evidence links
 - human approval requests
 
-Until `/orchestrate` ships, the board remains focused on branch, PR, deploy,
-rollback, and cleanup state.
+Until full board orchestration visibility ships, the board remains focused on
+branch, PR, deploy, rollback, and cleanup state.
 
 ## Non-Goals
 
