@@ -299,6 +299,14 @@ independently of the envelope schema:
   `--edge-staging-ready`, and `--sql-staging-ready` error loudly on
   invocation. Scripts carrying the flags fail fast; there is no
   deprecation window.
+- **Additional deploy surfaces:** custom surfaces live under
+  `surfaces.<name>.staging` and `surfaces.<name>.production`, each with
+  `deployCommand`, `verificationCommand`, and `healthcheckUrl` fields.
+  Built-in names (`frontend`, `edge`, `sql`) keep their dedicated schema and
+  cannot be shadowed through `surfaces`. `mcp` can be configured with the
+  `--mcp-*` aliases; arbitrary surfaces use
+  `--surface-staging-*=<surface>:<value>` and
+  `--surface-production-*=<surface>:<value>`.
 
 Source: `src/operator/api/envelope.ts`, `src/operator/api/actions.ts`,
 `src/operator/api/snapshot.ts`, `src/operator/release-gate.ts`.
