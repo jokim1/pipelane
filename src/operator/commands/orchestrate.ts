@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import path from 'node:path';
@@ -10,7 +10,11 @@ import {
 } from '../goal-spec.ts';
 import { sanitizeForTerminal } from '../text-output.ts';
 import {
+  appendOrchestrationObservation,
+  analysisSourceSha256,
+  assertSafeOrchestrationRunId,
   buildOrchestrationRunRecord,
+  coverageDigest,
   diagnoseOrchestrationRunRecord,
   isActiveOrchestrationRun,
   listOrchestrationRunRecords,
@@ -18,6 +22,7 @@ import {
   missingRelevantSliceWorktreeDiagnostic,
   ORCHESTRATION_CORRUPT_LEDGER_BLOCK_AGE_MS,
   orchestrationRunPath,
+  planReviewGateSnapshotDigest,
   renderSliceWorkerPrompt,
   saveOrchestrationRunRecord,
   scanOrchestrationRunDiagnostics,
@@ -25,9 +30,15 @@ import {
   hasResumableDeferredSlices,
   signOrchestrationSliceReview,
   sliceReviewFullySatisfied,
+  stableJsonDigest,
+  sourceSha256ForAnalysis,
   type BuildOrchestrationSliceInput,
   type OrchestrationCoverageEntry,
   type OrchestrationLedgerDiagnostic,
+  type OrchestrationObservationRecord,
+  type OrchestrationPlanAnalysisRecord,
+  type PlanReviewEvidenceBinding,
+  type PlanReviewGateRunRecord,
   type OrchestrationReviewFixRecord,
   type OrchestrationRunRecord,
   type OrchestrationRunScanDiagnostics,
@@ -36,7 +47,7 @@ import {
   type OrchestrationSliceRecord,
   type OrchestrationSliceWorkerRecord,
 } from '../orchestration-ledger.ts';
-import { resolveReviewStateKey } from '../integrity.ts';
+import { signSignedPayload, verifySignedPayload, resolveReviewStateKey } from '../integrity.ts';
 import {
   blockingAiReviewEvidenceBlocker,
   classifyReviewEvidenceIndependence,
@@ -78,6 +89,7 @@ const MAX_PLAN_SCAN_FILES = 200;
 const ORCHESTRATION_REVIEW_DIAGNOSTIC_MAX = 10;
 const NATIVE_COMMAND_PROBE_TIMEOUT_MS = 5000;
 const DEFAULT_REVIEW_LOOP_LIMIT = 2;
+const ORCHESTRATION_RUN_LOCK_STALE_MS = 10 * 60 * 1000;
 // B2: a slice's review auto-fix stops once its canonical no-progress signature
 // repeats this many consecutive times. Configurable via
 // orchestrate.hardStops.maxStalledIterations.
@@ -211,6 +223,45 @@ interface OrchestratePlanReport {
   confirmationRecommended: boolean;
   run: OrchestrationRunRecord;
   message: string;
+}
+
+interface OrchestrateAnalyzeReport {
+  command: 'orchestrate analyze';
+  status: OrchestrationPlanAnalysisRecord['status'];
+  repoRoot: string;
+  runId: string;
+  ledgerPath: string;
+  planPath: string | null;
+  analysisFile: string;
+  planReviewStatus: OrchestrationPlanAnalysisRecord['planReview']['status'];
+  blockingPendingCount: number;
+  run: OrchestrationRunRecord;
+  message: string;
+}
+
+interface OrchestratePlanReviewReport {
+  command: 'orchestrate plan-review';
+  status: 'passed' | 'bypassed';
+  repoRoot: string;
+  runId: string;
+  ledgerPath: string;
+  gateId: string;
+  run: OrchestrationRunRecord;
+  message: string;
+}
+
+interface OrchestrationAnalysisFile {
+  sourceSha256: string;
+  analyzer: ReturnType<typeof resolveReviewActorIdentity>;
+  identityReliable: boolean;
+  strengths: string[];
+  risks: string[];
+  ambiguities: string[];
+  sensitiveAreas: string[];
+  recommendedScope: {
+    throughSliceId: string | null;
+    reason: string | null;
+  };
 }
 
 interface PreparedSliceReport {
@@ -409,6 +460,14 @@ export async function handleOrchestrate(cwd: string, parsed: ParsedOperatorArgs)
     handlePlan(cwd, parsed);
     return;
   }
+  if (subcommand === 'analyze') {
+    handleAnalyze(cwd, parsed);
+    return;
+  }
+  if (subcommand === 'plan-review') {
+    handlePlanReview(cwd, parsed);
+    return;
+  }
   if (subcommand === 'prepare') {
     handlePrepare(cwd, parsed);
     return;
@@ -442,7 +501,7 @@ export async function handleOrchestrate(cwd: string, parsed: ParsedOperatorArgs)
     return;
   }
 
-  throw new Error('orchestrate requires exactly: pipelane run orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes], or pipelane run orchestrate <goal-spec|plan|prepare|dispatch|start|review|scope|outline|finalize|upgrade-ledger> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--slices-file <path>] [--run-id <id>] [--through <slice-id>] [--provider codex|claude|generic]');
+  throw new Error('orchestrate requires exactly: pipelane run orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes], or pipelane run orchestrate <goal-spec|plan|analyze|prepare|dispatch|start|review|plan-review|scope|outline|finalize|upgrade-ledger> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--slices-file <path>] [--analysis-file <path>] [--run-id <id>] [--through <slice-id>] [--provider codex|claude|generic]');
 }
 
 async function handleOrchestrateEntry(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
@@ -482,13 +541,36 @@ async function handleOrchestrateEntry(cwd: string, parsed: ParsedOperatorArgs): 
     }
     const run = buildEntryRunRecord(context, parsed, planPath, outcome);
     if (parsed.flags.yes) {
+      if (!parsed.flags.orchestrationAnalysisFile.trim()) {
+        throw new Error('orchestrate --yes requires --analysis-file <path> so plan analysis is recorded before worktrees are created.');
+      }
+      const analysisFile = resolveInputFile(cwd, parsed.flags.orchestrationAnalysisFile, '--analysis-file');
+      const analysisResult = attachPlanAnalysisFromFile(context, run, analysisFile, 'orchestrate --yes');
+      if (analysisResult.blockingPendingCount > 0) {
+        const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+        printResult(parsed.flags, {
+          command: 'orchestrate analyze',
+          status: run.planAnalysis?.status ?? 'pending',
+          repoRoot: context.repoRoot,
+          runId: run.id,
+          ledgerPath,
+          planPath,
+          analysisFile,
+          planReviewStatus: analysisResult.planReviewStatus,
+          blockingPendingCount: analysisResult.blockingPendingCount,
+          run,
+          message: renderAnalyzeReport(run, ledgerPath, analysisFile, analysisResult.blockingPendingCount),
+        });
+        process.exitCode = 1;
+        return;
+      }
       const report = await runApprovedOrchestration(context, run, planPath, activeRuns, likelyPlanFiles, parsed.flags.offline, ledgerWarnings, scan, !parsed.flags.json);
       printResult(parsed.flags, report);
       if (approvedOrchestrationStatusRequiresAttention(report.status)) process.exitCode = 1;
       return;
     }
     if (!parsed.flags.preview && !parsed.flags.plan && canRunInteractiveOrchestrate()) {
-      await confirmAndMaybeRunOrchestration(context, parsed, run, planPath, activeRuns, likelyPlanFiles, undefined, ledgerWarnings, scan);
+      await confirmAndMaybeRunOrchestration(context, parsed, run, planPath, likelyPlanFiles, ledgerWarnings, scan);
       return;
     }
     printResult(parsed.flags, buildOrchestratePreviewReport(context, run, planPath, activeRuns, likelyPlanFiles, ledgerWarnings, scan));
@@ -534,6 +616,7 @@ function buildEntryRunRecord(
   if (!planText.trim() && !outcome) {
     throw new Error('orchestrate requires --plan-file <path> or --outcome <text> to preview or start a new run.');
   }
+  const slicesFile = parseSlicesFile(parsed.flags.goalSlicesFile, context.cwd);
   return buildOrchestrationRunRecord({
     repoRoot: context.repoRoot,
     config: context.config,
@@ -544,6 +627,8 @@ function buildEntryRunRecord(
     provider: (parsed.flags.goalProvider.trim() as GoalProvider) || DEFAULT_GOAL_PROVIDER,
     maxTurns: parsePositiveInteger(parsed.flags.goalMaxTurns),
     maxMinutes: parsePositiveInteger(parsed.flags.goalMaxMinutes),
+    slices: slicesFile?.slices,
+    coverage: slicesFile?.coverage,
   });
 }
 
@@ -559,6 +644,7 @@ async function runApprovedOrchestration(
   reprint = false,
 ): Promise<OrchestrateEntryReport> {
   const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+  assertPlanAnalysisReadyForPrepare(context, run);
   prepareSliceWorktrees(context, run, offline);
   dispatchPreparedSlices(context, run);
   // No silent autopilot: even --yes reprints the outline after each slice (text
@@ -1239,29 +1325,12 @@ async function confirmAndMaybeRunOrchestration(
   parsed: ParsedOperatorArgs,
   run: OrchestrationRunRecord,
   planPath: string | null,
-  activeRuns: OrchestrateEntryRunSummary[],
   likelyPlanFiles: LikelyPlanFile[],
-  existingPrompter?: {
-    question(prompt: string): Promise<string>;
-    close(): void;
-  },
   warnings: string[] = [],
   scan?: OrchestrationRunScanDiagnostics,
 ): Promise<void> {
-  const prompter = existingPrompter ?? createOrchestratePrompter();
-  try {
-    process.stdout.write(`${appendOrchestrationDiagnostics(renderOrchestrationPreview(context.repoRoot, run, planPath), warnings, scan)}\n\nStart orchestration now?\n1. Start now\n2. Cancel\n`);
-    const answer = (await prompter.question('> ')).trim().toLowerCase();
-    if (answer !== '1' && answer !== 'y' && answer !== 'yes' && answer !== 'start') {
-      printResult(parsed.flags, buildCancelledOrchestrationReport(context, likelyPlanFiles));
-      return;
-    }
-    const report = await runApprovedOrchestration(context, run, planPath, activeRuns, likelyPlanFiles, parsed.flags.offline, warnings, scan, !parsed.flags.json);
-    printResult(parsed.flags, report);
-    if (approvedOrchestrationStatusRequiresAttention(report.status)) process.exitCode = 1;
-  } finally {
-    if (!existingPrompter) prompter.close();
-  }
+  process.stdout.write(`${appendOrchestrationDiagnostics(renderOrchestrationPreview(context.repoRoot, run, planPath), warnings, scan)}\n\nPlan analysis is required before orchestration can start.\nCreate an analysis JSON file, then run the shown command with --analysis-file <path> --yes, or use orchestrate plan/analyze/plan-review/prepare step by step.\n\n`);
+  printResult(parsed.flags, buildCancelledOrchestrationReport(context, likelyPlanFiles));
 }
 
 async function runInteractiveOrchestrateSetup(
@@ -1303,7 +1372,7 @@ async function runInteractiveOrchestrateSetup(
       outcome,
       provider: DEFAULT_GOAL_PROVIDER,
     });
-    await confirmAndMaybeRunOrchestration(context, parsed, run, planPath, [], likelyPlanFiles, prompter, warnings, scan);
+    await confirmAndMaybeRunOrchestration(context, parsed, run, planPath, likelyPlanFiles, warnings, scan);
   } finally {
     prompter.close();
   }
@@ -1548,7 +1617,7 @@ function renderOrchestrationPreview(repoRoot: string, run: OrchestrationRunRecor
     ].filter(Boolean);
     lines.push(`- ${slice.id}: ${slice.outcome}${flags.length > 0 ? ` (${flags.join(', ')})` : ''}`);
   }
-  lines.push('', `Next: run /pipelane orchestrate ${planPath ? `--plan-file ${displayRepoPath(repoRoot, planPath)}` : `--outcome "${run.plan.title}"`} --yes`);
+  lines.push('', `Next: run /pipelane orchestrate ${planPath ? `--plan-file ${displayRepoPath(repoRoot, planPath)}` : `--outcome "${run.plan.title}"`} --analysis-file <path> --yes`);
   return lines.join('\n');
 }
 
@@ -1716,6 +1785,209 @@ function handleGoalSpec(cwd: string, parsed: ParsedOperatorArgs): void {
   printResult(parsed.flags, report);
 }
 
+function handleAnalyze(cwd: string, parsed: ParsedOperatorArgs): void {
+  const context = resolveWorkflowContext(cwd);
+  const analysisFile = resolveInputFile(cwd, parsed.flags.orchestrationAnalysisFile, '--analysis-file');
+  const { run, planPath } = resolveAnalyzeRun(context, parsed);
+  const result = attachPlanAnalysisFromFile(context, run, analysisFile, 'orchestrate analyze');
+  const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+  const report: OrchestrateAnalyzeReport = {
+    command: 'orchestrate analyze',
+    status: result.record.status,
+    repoRoot: context.repoRoot,
+    runId: run.id,
+    ledgerPath,
+    planPath,
+    analysisFile,
+    planReviewStatus: result.planReviewStatus,
+    blockingPendingCount: result.blockingPendingCount,
+    run,
+    message: renderAnalyzeReport(run, ledgerPath, analysisFile, result.blockingPendingCount),
+  };
+  printResult(parsed.flags, report);
+}
+
+function handlePlanReview(cwd: string, parsed: ParsedOperatorArgs): void {
+  const context = resolveWorkflowContext(cwd);
+  const action = parsed.positional[1] as 'pass' | 'bypass';
+  const runId = parsed.flags.orchestrationRunId.trim();
+  const gateId = parsed.flags.reviewGate.trim();
+  if (action !== 'pass' && action !== 'bypass') {
+    throw new Error('orchestrate plan-review requires action pass or bypass.');
+  }
+  if (!runId) {
+    throw new Error(`orchestrate plan-review ${action} requires --run-id <id>.`);
+  }
+  if (!gateId) {
+    throw new Error(`orchestrate plan-review ${action} requires --gate <id>.`);
+  }
+  if (action === 'pass' && !parsed.flags.message.trim()) {
+    throw new Error('orchestrate plan-review pass requires --message <text>.');
+  }
+  if (action === 'bypass' && !parsed.flags.reason.trim()) {
+    throw new Error('orchestrate plan-review bypass requires --reason <text>.');
+  }
+  assertSafeOrchestrationRunId(runId);
+  const releaseLock = acquireOrchestrationRunMutationLock(context, runId);
+  try {
+    const run = loadOrchestrationRunRecord(context.commonDir, context.config, runId);
+    if (!run) {
+      throw new Error(`No orchestration run ledger found for ${runId}.`);
+    }
+    assertPlanReviewMutationAllowed(run, action);
+    if (!run.planAnalysis) {
+      throw new Error(`orchestrate plan-review ${action} requires run ${runId} to have planAnalysis. Run /pipelane orchestrate analyze first.`);
+    }
+    const gate = run.planAnalysis.planReview.gates.find((entry) => entry.gateId === gateId);
+    if (!gate) {
+      throw new Error(`No plan-review gate ${gateId} found in run ${runId}.`);
+    }
+    const attester = resolveReviewActorIdentity();
+    if (
+      action === 'pass'
+      && (gate.type === 'skill' || gate.type === 'agent')
+    ) {
+      if (!run.planAnalysis.analyzerIdentityReliable || !run.planAnalysis.analyzer.sessionId) {
+        throw new Error(`orchestrate plan-review pass for ${gateId} requires a reliable analyzer session; use plan-review bypass with a reason if independence cannot be proven.`);
+      }
+      if (!attester.sessionId) {
+        throw new Error(`orchestrate plan-review pass for ${gateId} requires a reliable attester session; use plan-review bypass with a reason if independence cannot be proven.`);
+      }
+      if (run.planAnalysis.analyzer.sessionId === attester.sessionId) {
+        throw new Error(`orchestrate plan-review pass for ${gateId} requires an independent attester session; analyzer and attester session match.`);
+      }
+    }
+
+    const at = nowIso();
+    const sourceSha256 = run.planAnalysis.source.textSha256;
+    if (!sourceSha256) {
+      throw new Error(`orchestrate plan-review ${action} cannot bind evidence because run ${runId} has no analyzed source hash.`);
+    }
+    const decompositionDigest = run.planAnalysis.decompositionDigest;
+    if (!decompositionDigest) {
+      throw new Error(`orchestrate plan-review ${action} cannot bind evidence because run ${runId} has no analyzed slice decomposition hash.`);
+    }
+    const binding: PlanReviewEvidenceBinding = {
+      runId,
+      gateId,
+      sourceSha256,
+      decompositionDigest,
+      gateSnapshotDigest: run.planAnalysis.gateSnapshotDigest,
+      analyzerSessionId: run.planAnalysis.analyzer.sessionId,
+      attesterSessionId: attester.sessionId,
+      createdAt: at,
+      action,
+      ...(action === 'pass'
+        ? { messageSha256: hashText(parsed.flags.message.trim()) }
+        : { reasonSha256: hashText(parsed.flags.reason.trim()) }),
+    };
+    gate.status = action === 'pass' ? 'passed' : 'bypassed';
+    gate.attester = attester;
+    gate.summary = action === 'pass'
+      ? parsed.flags.message.trim()
+      : `Bypassed: ${parsed.flags.reason.trim()}`;
+    gate.finishedAt = at;
+    gate.durationMs = 0;
+    gate.binding = binding;
+    gate.gateSnapshotDigest = run.planAnalysis.gateSnapshotDigest;
+    if (action === 'bypass') {
+      gate.bypassReason = parsed.flags.reason.trim();
+    } else {
+      delete gate.bypassReason;
+    }
+    const stateKey = resolveReviewStateKey();
+    if (stateKey) {
+      gate.signature = signSignedPayload(gate, stateKey);
+    } else {
+      delete gate.signature;
+    }
+    run.planAnalysis.planReview.status = summarizePlanReviewStatus(run.planAnalysis.planReview.gates, false);
+    run.planAnalysis.status = analysisStatusFromPlanReviewStatus(run.planAnalysis.planReview.status);
+    run.updatedAt = at;
+    recordPlanObservation(context, run, {
+      kind: action === 'pass' ? 'plan_review_passed' : 'plan_review_bypassed',
+      reasonCode: action === 'pass' ? 'plan_review_attested' : 'manual_bypass',
+      summary: action === 'pass'
+        ? `Plan-review gate ${gateId} passed.`
+        : `Plan-review gate ${gateId} bypassed.`,
+      gateId,
+      terminal: action === 'bypass',
+      details: {
+        sourceSha256,
+        gateSnapshotDigest: run.planAnalysis.gateSnapshotDigest,
+        decompositionDigest,
+        attester,
+        reason: action === 'bypass' ? parsed.flags.reason.trim() : undefined,
+      },
+    });
+    const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+    const report: OrchestratePlanReviewReport = {
+      command: 'orchestrate plan-review',
+      status: action === 'pass' ? 'passed' : 'bypassed',
+      repoRoot: context.repoRoot,
+      runId,
+      ledgerPath,
+      gateId,
+      run,
+      message: renderPlanReviewReport(run, ledgerPath, gate, action),
+    };
+    printResult(parsed.flags, report);
+  } finally {
+    releaseLock();
+  }
+}
+
+function acquireOrchestrationRunMutationLock(context: WorkflowContext, runId: string): () => void {
+  const lockPath = path.join(path.dirname(orchestrationRunPath(context.commonDir, context.config, runId)), 'mutation.lock');
+  mkdirSync(path.dirname(lockPath), { recursive: true });
+  clearStaleOrchestrationRunLock(lockPath);
+  let created = false;
+  try {
+    mkdirSync(lockPath);
+    created = true;
+    writeFileSync(
+      path.join(lockPath, 'owner.json'),
+      `${JSON.stringify({ runId, pid: process.pid, acquiredAt: nowIso() }, null, 2)}\n`,
+      'utf8',
+    );
+    return () => rmSync(lockPath, { recursive: true, force: true });
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (created) rmSync(lockPath, { recursive: true, force: true });
+    if (err.code === 'EEXIST') {
+      throw new Error(`orchestrate run ${runId} is being updated by another Pipelane process; retry after it finishes.`);
+    }
+    throw new Error(`could not acquire orchestration run lock for ${runId}: ${err.message}`);
+  }
+}
+
+function clearStaleOrchestrationRunLock(lockPath: string): void {
+  if (!existsSync(lockPath)) return;
+  try {
+    const ageMs = Date.now() - statSync(lockPath).mtimeMs;
+    if (ageMs > ORCHESTRATION_RUN_LOCK_STALE_MS) {
+      rmSync(lockPath, { recursive: true, force: true });
+    }
+  } catch {}
+}
+
+function assertPlanReviewMutationAllowed(run: OrchestrationRunRecord, action: 'pass' | 'bypass'): void {
+  if (run.status !== 'planned') {
+    throw new Error(`orchestrate plan-review ${action} can only update planned runs before prepare; run ${run.id} is ${run.status}.`);
+  }
+  const startedSlice = run.slices.find((slice) =>
+    slice.status !== 'planned'
+    || Boolean(slice.worktreePath)
+    || Boolean(slice.branchName)
+    || Boolean(slice.dispatch)
+    || Boolean(slice.worker)
+    || Boolean(slice.review)
+  );
+  if (startedSlice) {
+    throw new Error(`orchestrate plan-review ${action} can only update preflight evidence before slice work begins; slice ${startedSlice.id} already has orchestration state.`);
+  }
+}
+
 function handlePrepare(cwd: string, parsed: ParsedOperatorArgs): void {
   const context = resolveWorkflowContext(cwd);
   const runId = parsed.flags.orchestrationRunId.trim();
@@ -1726,6 +1998,7 @@ function handlePrepare(cwd: string, parsed: ParsedOperatorArgs): void {
   if (run.status !== 'planned' && run.status !== 'prepared') {
     throw new Error(`orchestrate prepare cannot modify ${run.status} run ${runId}.`);
   }
+  assertPlanAnalysisReadyForPrepare(context, run);
 
   const result = prepareSliceWorktrees(context, run, parsed.flags.offline);
   const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
@@ -3917,6 +4190,502 @@ function readPlanFile(planPath: string): string {
 
 // The agent's proposed decomposition. It is agent OUTPUT, not the audit source,
 // so it may live outside the repo and is intentionally NOT routed through
+function resolveInputFile(baseDir: string, rawPath: string, flag: string): string {
+  const trimmed = rawPath.trim();
+  if (!trimmed) throw new Error(`${flag} requires a path.`);
+  const resolved = path.isAbsolute(trimmed) ? trimmed : path.resolve(baseDir, trimmed);
+  if (!existsSync(resolved)) throw new Error(`${flag} not found: ${trimmed}`);
+  const stat = statSync(resolved);
+  if (!stat.isFile()) throw new Error(`${flag} must point to a regular file: ${trimmed}`);
+  if (stat.size > MAX_PLAN_FILE_BYTES) {
+    throw new Error(`${flag} is too large: ${stat.size} bytes, max ${MAX_PLAN_FILE_BYTES}.`);
+  }
+  return resolved;
+}
+
+function parseAnalysisFile(analysisFile: string): OrchestrationAnalysisFile {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(analysisFile, 'utf8'));
+  } catch (error) {
+    throw new Error(`--analysis-file is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('--analysis-file must be a JSON object.');
+  }
+  const raw = parsed as Record<string, unknown>;
+  const sourceSha256 = typeof raw.sourceSha256 === 'string' ? raw.sourceSha256.trim() : '';
+  if (!/^[a-f0-9]{64}$/i.test(sourceSha256)) {
+    throw new Error('--analysis-file requires sourceSha256 as a 64-character sha256 hex string.');
+  }
+  const analyzer = parseAnalysisActor(raw.analyzer);
+  if (typeof raw.identityReliable !== 'boolean') {
+    throw new Error('--analysis-file requires boolean identityReliable.');
+  }
+  return {
+    sourceSha256: sourceSha256.toLowerCase(),
+    analyzer,
+    identityReliable: raw.identityReliable,
+    strengths: parseAnalysisStringArray(raw.strengths, 'strengths'),
+    risks: parseAnalysisStringArray(raw.risks, 'risks'),
+    ambiguities: parseAnalysisStringArray(raw.ambiguities, 'ambiguities'),
+    sensitiveAreas: parseAnalysisStringArray(raw.sensitiveAreas, 'sensitiveAreas'),
+    recommendedScope: parseRecommendedScope(raw.recommendedScope),
+  };
+}
+
+function parseAnalysisActor(value: unknown): OrchestrationAnalysisFile['analyzer'] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('--analysis-file requires analyzer object.');
+  }
+  const raw = value as Record<string, unknown>;
+  const provider = typeof raw.provider === 'string' ? raw.provider.trim() : '';
+  const source = typeof raw.source === 'string' ? raw.source.trim() : '';
+  const sessionId: string | null | undefined = raw.sessionId === null
+    ? null
+    : typeof raw.sessionId === 'string'
+      ? raw.sessionId.trim()
+      : undefined;
+  if (!provider) throw new Error('--analysis-file analyzer.provider must be a non-empty string.');
+  if (!source) throw new Error('--analysis-file analyzer.source must be a non-empty string.');
+  if (sessionId === undefined) throw new Error('--analysis-file analyzer.sessionId must be a string or null.');
+  if (sessionId === null) return { provider, source, sessionId };
+  if (!sessionId) throw new Error('--analysis-file analyzer.sessionId must be non-empty when provided.');
+  const identity = createReviewActorIdentity({ provider, source, sessionId });
+  const hashedSession = /^sha256:[a-f0-9]{16}$/i.test(sessionId)
+    ? sessionId.toLowerCase()
+    : identity.sessionId;
+  return { ...identity, sessionId: hashedSession };
+}
+
+function parseAnalysisStringArray(value: unknown, field: string): string[] {
+  if (!Array.isArray(value)) throw new Error(`--analysis-file ${field} must be an array of strings.`);
+  return value.map((entry, index) => {
+    if (typeof entry !== 'string') {
+      throw new Error(`--analysis-file ${field}[${index}] must be a string.`);
+    }
+    return entry.trim();
+  }).filter(Boolean);
+}
+
+function parseRecommendedScope(value: unknown): OrchestrationAnalysisFile['recommendedScope'] {
+  if (value === undefined) return { throughSliceId: null, reason: null };
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('--analysis-file recommendedScope must be an object when provided.');
+  }
+  const raw = value as Record<string, unknown>;
+  const throughSliceId = raw.throughSliceId === null || raw.throughSliceId === undefined
+    ? null
+    : typeof raw.throughSliceId === 'string'
+      ? raw.throughSliceId.trim() || null
+      : undefined;
+  const reason = raw.reason === null || raw.reason === undefined
+    ? null
+    : typeof raw.reason === 'string'
+      ? raw.reason.trim() || null
+      : undefined;
+  if (throughSliceId === undefined) throw new Error('--analysis-file recommendedScope.throughSliceId must be a string or null.');
+  if (reason === undefined) throw new Error('--analysis-file recommendedScope.reason must be a string or null.');
+  return { throughSliceId, reason };
+}
+
+function resolveAnalyzeRun(
+  context: WorkflowContext,
+  parsed: ParsedOperatorArgs,
+): { run: OrchestrationRunRecord; planPath: string | null } {
+  const runId = parsed.flags.orchestrationRunId.trim();
+  if (runId) {
+    const run = loadOrchestrationRunRecord(context.commonDir, context.config, runId);
+    if (!run) throw new Error(`No orchestration run ledger found for ${runId}.`);
+    if (run.status !== 'planned') {
+      throw new Error(`orchestrate analyze can only modify planned runs; ${runId} is ${run.status}.`);
+    }
+    return { run, planPath: run.source.planPath ? path.join(context.repoRoot, run.source.planPath) : null };
+  }
+
+  const planPath = resolvePlanPath(context.repoRoot, parsed.flags.goalPlanFile);
+  if (!planPath) throw new Error('orchestrate analyze requires --plan-file <path> when --run-id is omitted.');
+  const planText = readPlanFile(planPath);
+  const slicesFile = parseSlicesFile(parsed.flags.goalSlicesFile, context.cwd);
+  const draft = buildOrchestrationRunRecord({
+    repoRoot: context.repoRoot,
+    config: context.config,
+    planPath,
+    planText,
+    slices: slicesFile?.slices,
+    coverage: slicesFile?.coverage,
+  });
+  const matches = listOrchestrationRunRecords(context.commonDir, context.config)
+    .filter((candidate) =>
+      candidate.status === 'planned'
+      && candidate.source.planPath === draft.source.planPath
+      && candidate.source.textSha256 === draft.source.textSha256
+      && (candidate.source.prompt ?? null) === (draft.source.prompt ?? null)
+    );
+  if (matches.length > 1) {
+    throw new Error(`orchestrate analyze found ${matches.length} planned runs for ${draft.source.planPath}. Pass --run-id <id> to choose one.`);
+  }
+  const match = matches[0] ?? null;
+  if (
+    match
+    && slicesFile
+    && orchestrationDecompositionDigest(match) !== orchestrationDecompositionDigest(draft)
+  ) {
+    throw new Error(`orchestrate analyze found existing planned run ${match.id} for ${draft.source.planPath}, but --slices-file resolves to a different slice decomposition. Pass --run-id ${match.id} to analyze the existing run, or create a new planned run with the intended slices.`);
+  }
+  return { run: match ?? draft, planPath };
+}
+
+function orchestrationDecompositionDigest(run: OrchestrationRunRecord): string {
+  return stableJsonDigest({
+    coverage: run.coverage ?? null,
+    slices: run.slices.map((slice) => ({
+      id: slice.id,
+      index: slice.index,
+      outcome: slice.outcome,
+      dependsOn: slice.dependsOn,
+      requestedFiles: slice.requestedFiles,
+      forbiddenFiles: slice.forbiddenFiles,
+      goalSpec: slice.goalSpec,
+      provider: slice.provider,
+      requiresConfirmation: slice.requiresConfirmation,
+      critique: slice.critique,
+      phase: slice.phase ?? null,
+    })),
+  });
+}
+
+function attachPlanAnalysisFromFile(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+  analysisFile: string,
+  commandLabel: string,
+): {
+  record: OrchestrationPlanAnalysisRecord;
+  planReviewStatus: OrchestrationPlanAnalysisRecord['planReview']['status'];
+  blockingPendingCount: number;
+} {
+  const analysis = parseAnalysisFile(analysisFile);
+  const sourceSha256 = sourceSha256ForAnalysis(run);
+  if (!sourceSha256) {
+    throw new Error(`${commandLabel} cannot determine a source hash for run ${run.id}.`);
+  }
+  if (analysis.sourceSha256 !== sourceSha256) {
+    throw new Error(`${commandLabel} source hash mismatch: analysis file has ${analysis.sourceSha256}, run source is ${sourceSha256}.`);
+  }
+  const analyzedAt = nowIso();
+  const gateSnapshotDigest = planReviewGateSnapshotDigest(run);
+  const activeSurfaces = planReviewActiveSurfaces(context);
+  const gates = buildInitialPlanReviewGateRuns(run, gateSnapshotDigest, analyzedAt, activeSurfaces);
+  const planReviewStatus = summarizePlanReviewStatus(gates, run.gateSnapshot.planReview.gates.length === 0);
+  const record: OrchestrationPlanAnalysisRecord = {
+    status: analysisStatusFromPlanReviewStatus(planReviewStatus),
+    analyzedAt,
+    analyzer: analysis.analyzer,
+    analyzerIdentityReliable: analysis.identityReliable,
+    source: {
+      kind: run.source.planPath ? 'plan-file' : 'prompt',
+      planPath: run.source.planPath,
+      promptRef: run.source.prompt ? 'run.source.prompt' : null,
+      textSha256: sourceSha256,
+    },
+    strengths: analysis.strengths,
+    risks: analysis.risks,
+    ambiguities: analysis.ambiguities,
+    sensitiveAreas: analysis.sensitiveAreas,
+    recommendedScope: analysis.recommendedScope,
+    coverageRef: 'run.coverage',
+    coverageDigest: coverageDigest(run),
+    decompositionDigest: orchestrationDecompositionDigest(run),
+    activeSurfaces,
+    gateSnapshotDigest,
+    planReview: {
+      status: planReviewStatus,
+      gates,
+      evidencePath: null,
+    },
+    latestObservationId: null,
+  };
+  run.planAnalysisRequired = true;
+  run.planAnalysis = record;
+  run.updatedAt = analyzedAt;
+  if (gates.length === 0 || planReviewStatus === 'skipped') {
+    recordPlanObservation(context, run, {
+      kind: 'plan_review_skipped',
+      reasonCode: gates.length === 0 ? 'no_plan_review_gates' : 'plan_review_not_applicable',
+      summary: gates.length === 0
+        ? 'No plan-review gates are configured; prepare may proceed.'
+        : 'No plan-review gates apply to this run; prepare may proceed.',
+      gateId: null,
+      terminal: false,
+      details: { sourceSha256, gateSnapshotDigest },
+    });
+  } else {
+    for (const gate of gates.filter((entry) => entry.blocking && entry.status === 'pending')) {
+      recordPlanObservation(context, run, {
+        kind: 'plan_review_pending',
+        reasonCode: 'plan_review_waiting',
+        summary: `Blocking plan-review gate ${gate.gateId} is pending.`,
+        gateId: gate.gateId,
+        terminal: false,
+        details: { sourceSha256, gateSnapshotDigest, skill: gate.skill ?? null, role: gate.role ?? null },
+      });
+    }
+  }
+  return {
+    record,
+    planReviewStatus,
+    blockingPendingCount: gates.filter((gate) => gate.blocking && gate.status === 'pending').length,
+  };
+}
+
+function buildInitialPlanReviewGateRuns(
+  run: OrchestrationRunRecord,
+  gateSnapshotDigest: string,
+  at: string,
+  activeSurfaces: string[],
+): PlanReviewGateRunRecord[] {
+  return run.gateSnapshot.planReview.gates.map((gate): PlanReviewGateRunRecord => {
+    const skipReason = planReviewGateSkipReason(gate, activeSurfaces);
+    return {
+      id: `plan-review:${gate.id}`,
+      gateId: gate.id,
+      phase: 'plan',
+      type: gate.type,
+      blocking: gate.blocking !== false,
+      status: skipReason ? 'skipped' : 'pending',
+      skill: gate.skill,
+      role: gate.role,
+      summary: skipReason ?? planReviewPendingSummary(gate),
+      durationMs: 0,
+      startedAt: at,
+      finishedAt: at,
+      gateSnapshotDigest,
+      ...(skipReason ? { skipReason } : {}),
+    };
+  });
+}
+
+function planReviewGateSkipReason(
+  gate: OrchestrationRunRecord['gateSnapshot']['planReview']['gates'][number],
+  activeSurfaces: string[],
+): string | null {
+  if (gate.when?.startsWith('surface:')) {
+    const surface = gate.when.slice('surface:'.length).trim();
+    if (surface && !activeSurfaces.includes(surface)) {
+      return `skipped: surface ${surface} is not active`;
+    }
+  }
+  return null;
+}
+
+function planReviewActiveSurfaces(context: WorkflowContext): string[] {
+  const configured = context.config.surfaces.filter(Boolean);
+  const requested = context.modeState.requestedSurfaces
+    .filter((surface) => configured.includes(surface));
+  return requested.length > 0 ? requested : configured;
+}
+
+function planReviewPendingSummary(gate: { id: string; skill?: string; role?: string; type: string }): string {
+  if (gate.skill) return `Pending independent ${gate.skill} plan review.`;
+  if (gate.role) return `Pending independent ${gate.role} plan review.`;
+  return `Pending ${gate.type} plan review.`;
+}
+
+function summarizePlanReviewStatus(
+  gates: PlanReviewGateRunRecord[],
+  emptySnapshot: boolean,
+): OrchestrationPlanAnalysisRecord['planReview']['status'] {
+  if (emptySnapshot) return 'skipped';
+  if (gates.length > 0 && gates.every((gate) => gate.status === 'skipped')) return 'skipped';
+  const blocking = gates.filter((gate) => gate.blocking);
+  if (blocking.some((gate) => gate.status === 'failed')) return 'failed';
+  if (blocking.some((gate) => gate.status === 'pending')) return 'pending';
+  if (blocking.some((gate) => gate.status === 'bypassed')) return 'bypassed';
+  return 'passed';
+}
+
+function analysisStatusFromPlanReviewStatus(
+  status: OrchestrationPlanAnalysisRecord['planReview']['status'],
+): OrchestrationPlanAnalysisRecord['status'] {
+  if (status === 'skipped') return 'passed';
+  return status;
+}
+
+function recordPlanObservation(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+  input: {
+    kind: OrchestrationObservationRecord['kind'];
+    reasonCode: OrchestrationObservationRecord['reasonCode'];
+    summary: string;
+    gateId: string | null;
+    terminal: boolean;
+    details?: Record<string, unknown>;
+  },
+): void {
+  const result = appendOrchestrationObservation(context.commonDir, context.config, {
+    runId: run.id,
+    sliceId: null,
+    gateId: input.gateId,
+    kind: input.kind,
+    reasonCode: input.reasonCode,
+    summary: input.summary,
+    details: input.details,
+    terminal: input.terminal,
+  });
+  run.observationIndex = result.index;
+  if (run.planAnalysis) run.planAnalysis.latestObservationId = result.observation.id;
+}
+
+function hashText(value: string): string {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function assertPlanAnalysisReadyForPrepare(context: WorkflowContext, run: OrchestrationRunRecord): void {
+  if (run.planAnalysisRequired !== true && !run.planAnalysis) return;
+  const analysis = run.planAnalysis;
+  if (!analysis) {
+    throw new Error(`orchestrate prepare requires plan analysis for new run ${run.id}. Run /pipelane orchestrate analyze --run-id ${run.id} --analysis-file <path>.`);
+  }
+  const currentDecompositionDigest = orchestrationDecompositionDigest(run);
+  if (!analysis.decompositionDigest) {
+    throw new Error(`orchestrate prepare blocked: plan analysis is missing the slice decomposition hash. Run /pipelane orchestrate analyze --run-id ${run.id} --analysis-file <path>.`);
+  }
+  if (currentDecompositionDigest !== analysis.decompositionDigest) {
+    throw new Error(`orchestrate prepare blocked: slice decomposition changed after analysis. Run /pipelane orchestrate analyze --run-id ${run.id} --analysis-file <path>.`);
+  }
+  const currentSourceSha = currentAnalyzedSourceSha(context, run);
+  if (currentSourceSha && currentSourceSha !== analysis.source.textSha256) {
+    throw new Error(`orchestrate prepare blocked: source plan changed after analysis. Run /pipelane orchestrate analyze --run-id ${run.id} --analysis-file <path>.`);
+  }
+  const currentGateDigest = planReviewGateSnapshotDigest(run);
+  if (currentGateDigest !== analysis.gateSnapshotDigest) {
+    throw new Error(`orchestrate prepare blocked: plan-review gate snapshot changed after analysis. Run /pipelane orchestrate analyze --run-id ${run.id} --analysis-file <path>.`);
+  }
+  if (!sameStringSet(planReviewActiveSurfaces(context), analysis.activeSurfaces)) {
+    throw new Error(`orchestrate prepare blocked: active surfaces changed after analysis. Run /pipelane orchestrate analyze --run-id ${run.id} --analysis-file <path>.`);
+  }
+  const planReviewGates = assertPlanReviewGateRecordsMatchSnapshot(run, analysis);
+  const blocking = planReviewGates.filter((entry) => entry.expected.blocking);
+  const failed = blocking.find((entry) => entry.gate.status === 'failed');
+  if (failed) {
+    throw new Error(`orchestrate prepare blocked: plan-review gate ${failed.gate.gateId} failed.`);
+  }
+  const pending = blocking.find((entry) => entry.gate.status === 'pending');
+  if (pending) {
+    throw new Error([
+      `orchestrate prepare blocked: plan-review gate ${pending.gate.gateId} is pending.`,
+      `Run the referenced reviewer, then /pipelane orchestrate plan-review pass --run-id ${run.id} --gate ${pending.gate.gateId} --message <text>.`,
+      `Or record an audited bypass with /pipelane orchestrate plan-review bypass --run-id ${run.id} --gate ${pending.gate.gateId} --reason <text>.`,
+    ].join('\n'));
+  }
+  for (const { gate } of blocking.filter((entry) => entry.gate.status === 'passed' || entry.gate.status === 'bypassed')) {
+    assertPlanReviewEvidenceBound(run, analysis, gate);
+  }
+}
+
+function assertPlanReviewGateRecordsMatchSnapshot(
+  run: OrchestrationRunRecord,
+  analysis: OrchestrationPlanAnalysisRecord,
+): Array<{ gate: PlanReviewGateRunRecord; expected: PlanReviewGateRunRecord }> {
+  const expectedRecords = buildInitialPlanReviewGateRuns(
+    run,
+    analysis.gateSnapshotDigest,
+    analysis.analyzedAt,
+    analysis.activeSurfaces,
+  );
+  const expectedIds = new Set(expectedRecords.map((gate) => gate.gateId));
+  const actualByGateId = new Map<string, PlanReviewGateRunRecord>();
+  for (const gate of analysis.planReview.gates) {
+    if (!expectedIds.has(gate.gateId)) {
+      throw new Error(`orchestrate prepare blocked: plan-review gate ${gate.gateId} is not in the analyzed gate snapshot.`);
+    }
+    if (actualByGateId.has(gate.gateId)) {
+      throw new Error(`orchestrate prepare blocked: duplicate plan-review gate record ${gate.gateId}.`);
+    }
+    actualByGateId.set(gate.gateId, gate);
+  }
+
+  return expectedRecords.map((expected) => {
+    const actual = actualByGateId.get(expected.gateId);
+    if (!actual) {
+      throw new Error(`orchestrate prepare blocked: plan-review gate ${expected.gateId} is missing from plan analysis.`);
+    }
+    if (
+      actual.phase !== 'plan'
+      || actual.type !== expected.type
+      || actual.blocking !== expected.blocking
+      || (actual.skill ?? null) !== (expected.skill ?? null)
+      || (actual.role ?? null) !== (expected.role ?? null)
+      || actual.gateSnapshotDigest !== analysis.gateSnapshotDigest
+    ) {
+      throw new Error(`orchestrate prepare blocked: plan-review gate ${actual.gateId} no longer matches the analyzed gate snapshot.`);
+    }
+    if (expected.status === 'skipped') {
+      if (actual.status !== 'skipped' || (actual.skipReason ?? null) !== (expected.skipReason ?? null)) {
+        throw new Error(`orchestrate prepare blocked: plan-review gate ${actual.gateId} skip state no longer matches the analyzed gate snapshot.`);
+      }
+    } else if (actual.status === 'skipped') {
+      throw new Error(`orchestrate prepare blocked: plan-review gate ${actual.gateId} was not skipped by the analyzed gate snapshot.`);
+    }
+    return { gate: actual, expected };
+  });
+}
+
+function sameStringSet(left: readonly string[] | undefined, right: readonly string[] | undefined): boolean {
+  if (!left || !right) return false;
+  const normalizedLeft = [...new Set(left)].sort();
+  const normalizedRight = [...new Set(right)].sort();
+  if (normalizedLeft.length !== normalizedRight.length) return false;
+  return normalizedLeft.every((entry, index) => entry === normalizedRight[index]);
+}
+
+function currentAnalyzedSourceSha(context: WorkflowContext, run: OrchestrationRunRecord): string | null {
+  const planTextSha256 = run.source.planPath
+    ? hashText(readPlanFile(path.join(context.repoRoot, run.source.planPath)))
+    : null;
+  return analysisSourceSha256({
+    planTextSha256,
+    prompt: run.source.prompt,
+  });
+}
+
+function assertPlanReviewEvidenceBound(
+  run: OrchestrationRunRecord,
+  analysis: OrchestrationPlanAnalysisRecord,
+  gate: PlanReviewGateRunRecord,
+): void {
+  const binding = gate.binding;
+  if (!binding) {
+    throw new Error(`orchestrate prepare blocked: plan-review gate ${gate.gateId} is missing evidence binding.`);
+  }
+  const expectedAction = gate.status === 'bypassed' ? 'bypass' : 'pass';
+  if (
+    binding.runId !== run.id
+    || binding.gateId !== gate.gateId
+    || binding.sourceSha256 !== analysis.source.textSha256
+    || binding.decompositionDigest !== analysis.decompositionDigest
+    || binding.gateSnapshotDigest !== analysis.gateSnapshotDigest
+    || binding.analyzerSessionId !== analysis.analyzer.sessionId
+    || binding.attesterSessionId !== (gate.attester?.sessionId ?? null)
+    || binding.action !== expectedAction
+  ) {
+    throw new Error(`orchestrate prepare blocked: plan-review gate ${gate.gateId} evidence binding does not match this run.`);
+  }
+  if (expectedAction === 'pass' && binding.messageSha256 !== hashText(gate.summary)) {
+    throw new Error(`orchestrate prepare blocked: plan-review gate ${gate.gateId} message hash does not match evidence binding.`);
+  }
+  if (expectedAction === 'bypass' && binding.reasonSha256 !== hashText(gate.bypassReason ?? '')) {
+    throw new Error(`orchestrate prepare blocked: plan-review gate ${gate.gateId} bypass reason hash does not match evidence binding.`);
+  }
+  const stateKey = resolveReviewStateKey();
+  if (!stateKey) return;
+  if (!gate.signature || !verifySignedPayload(gate, stateKey)) {
+    throw new Error(`orchestrate prepare blocked: plan-review gate ${gate.gateId} evidence is unsigned or has an invalid signature. Rerun /pipelane orchestrate plan-review ${expectedAction === 'pass' ? 'pass --message <text>' : 'bypass --reason <text>'} --run-id ${run.id} --gate ${gate.gateId}.`);
+  }
+}
+
 // resolvePlanPath's in-repo containment check. The ledger still binds its source
 // to the real --plan-file.
 function parseSlicesFile(
@@ -4075,9 +4844,75 @@ function renderPlanReport(
 
   lines.push(
     '',
-    'Next: run /pipelane orchestrate prepare --run-id <run-id> to create slice worktrees.',
+    'Next: run /pipelane orchestrate analyze --run-id <run-id> --analysis-file <path> before prepare.',
   );
 
+  return lines.join('\n');
+}
+
+function renderAnalyzeReport(
+  run: OrchestrationRunRecord,
+  ledgerPath: string,
+  analysisFile: string,
+  blockingPendingCount: number,
+): string {
+  const analysis = run.planAnalysis;
+  const lines = [
+    'Pipelane orchestrate analyze',
+    '',
+    `Status: ${analysis?.status ?? 'pending'}`,
+    `Run: ${run.id}`,
+    `Ledger: ${ledgerPath}`,
+    `Analysis: ${analysisFile}`,
+    `Plan review: ${analysis?.planReview.status ?? 'pending'}`,
+  ];
+  if (analysis) {
+    lines.push(`Source hash: ${analysis.source.textSha256 ?? '(none)'}`);
+    lines.push(`Gate snapshot: ${analysis.gateSnapshotDigest}`);
+  }
+  if (blockingPendingCount > 0) {
+    lines.push('', 'Blocking plan-review gates pending:');
+    for (const gate of analysis?.planReview.gates.filter((entry) => entry.blocking && entry.status === 'pending') ?? []) {
+      lines.push(`- ${gate.gateId}: ${gate.summary}`);
+    }
+    lines.push(
+      '',
+      'Recovery:',
+      '- Run the referenced skill or reviewer role outside the CLI.',
+      '- Then record evidence with /pipelane orchestrate plan-review pass --run-id <run-id> --gate <gate-id> --message <text>.',
+      '- Or record a visible bypass with /pipelane orchestrate plan-review bypass --run-id <run-id> --gate <gate-id> --reason <text>.',
+    );
+  } else {
+    lines.push('', 'Next: run /pipelane orchestrate prepare --run-id <run-id>.');
+  }
+  return lines.join('\n');
+}
+
+function renderPlanReviewReport(
+  run: OrchestrationRunRecord,
+  ledgerPath: string,
+  gate: PlanReviewGateRunRecord,
+  action: 'pass' | 'bypass',
+): string {
+  const lines = [
+    'Pipelane orchestrate plan-review',
+    '',
+    `Status: ${action === 'pass' ? 'passed' : 'bypassed'}`,
+    `Run: ${run.id}`,
+    `Ledger: ${ledgerPath}`,
+    `Gate: ${gate.gateId}`,
+    `Plan review: ${run.planAnalysis?.planReview.status ?? 'unknown'}`,
+  ];
+  if (action === 'bypass') {
+    lines.push('Bypass is visible audit evidence, not proof that review passed.');
+  }
+  const pending = run.planAnalysis?.planReview.gates.filter((entry) => entry.blocking && entry.status === 'pending') ?? [];
+  if (pending.length > 0) {
+    lines.push('', 'Still pending:');
+    for (const entry of pending) lines.push(`- ${entry.gateId}: ${entry.summary}`);
+  } else {
+    lines.push('', 'Next: run /pipelane orchestrate prepare --run-id <run-id>.');
+  }
   return lines.join('\n');
 }
 

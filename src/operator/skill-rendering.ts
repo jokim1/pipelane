@@ -155,11 +155,14 @@ slice-by-slice flow and keep the operator oriented at every step:
    risks/gaps. Then print a **coverage map** that accounts for every section of the
    plan as one of: in-scope (maps to a slice), deferred, or excluded (with a
    one-line reason). Nothing is silently dropped.
-2. Decompose the plan into phases and slices. Write a JSON file to a scratch path:
+2. Decompose the plan into phases and slices. Write a slices JSON file to a scratch path:
    \`{ "slices": [ { "id", "title", "phase", "text" } ], "coverage": [ { "section", "disposition": "slice|deferred|excluded", "sliceId", "reason" } ] }\`
-   then compile it WITHOUT starting workers and capture the run id:
-   \`${slashAlias} orchestrate plan --plan-file <real-plan> --slices-file <scratch.json> --json\`
-   The run's audit source stays bound to the real plan file, not the scratch file.
+   Then write an analysis JSON file with the real plan file's SHA-256 as \`sourceSha256\`,
+   your analyzer identity, \`identityReliable\`, strengths, risks, ambiguities,
+   sensitiveAreas, and recommendedScope. Record analysis WITHOUT starting workers
+   and capture the run id:
+   \`${slashAlias} orchestrate analyze --plan-file <real-plan> --analysis-file <analysis.json> --slices-file <scratch.json> --json\`
+   The run's audit source stays bound to the real plan file, not either scratch file.
 3. Relay the CLI outline verbatim (do not hand-format it):
    \`${slashAlias} orchestrate outline --run-id <id>\`
    Then print the **review model** as bullets: static checks, tests, independent AI
@@ -168,7 +171,10 @@ slice-by-slice flow and keep the operator oriented at every step:
    a sensitive schema/RLS phase first because everything depends on it). Offer:
    approve / edit scope / cancel. For a partial scope run
    \`${slashAlias} orchestrate scope --run-id <id> --through <last-slice-id-in-scope>\`.
-5. On approval, drive in order: \`${slashAlias} orchestrate prepare --run-id <id>\`,
+5. Before prepare, complete every pending plan-review gate: run the configured
+   reviewer, then record \`${slashAlias} orchestrate plan-review pass --run-id <id> --gate <gate-id> --message <summary>\`
+   or consciously bypass with \`${slashAlias} orchestrate plan-review bypass --run-id <id> --gate <gate-id> --reason <reason>\`.
+   Then drive in order: \`${slashAlias} orchestrate prepare --run-id <id>\`,
    then \`${slashAlias} orchestrate dispatch --run-id <id>\`, then for each in-scope
    slice \`${slashAlias} orchestrate start --run-id <id> --slice-id <id>\` followed by
    \`${slashAlias} orchestrate review --run-id <id> --slice-id <id>\`. After EACH
@@ -384,11 +390,11 @@ Review gates:
       review, instruction audit, and human approval for high-stakes changes.
 
 Orchestration:
-  /pipelane orchestrate --plan-file <file> --yes
+  /pipelane orchestrate --plan-file <file> --analysis-file <file> --yes
       Turn a plan into reviewed implementation slices with isolated worktrees,
       worker prompts, status tracking, and per-slice review before merge.
 
-  /pipelane orchestrate plan|prepare|dispatch|start|review
+  /pipelane orchestrate plan|analyze|prepare|dispatch|start|review|plan-review
       Run one orchestration phase at a time.
 
   /pipelane orchestrate goal-spec [--plan-file <file>] [--slice-id <id>]

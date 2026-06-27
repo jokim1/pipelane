@@ -39,6 +39,27 @@ const GENERATED_CLAUDE_COMMANDS = [
 process.env.NODE_ENV = 'test';
 process.env.PIPELANE_AUTO_UPDATE = '0';
 
+const HERMETIC_REVIEW_IDENTITY_ENV_KEYS = [
+  'PIPELANE_ORCHESTRATE_WORKER_SESSION_ID',
+  'PIPELANE_REVIEW_GATE_SESSION_ID',
+  'PIPELANE_AGENT_SESSION_ID',
+  'CODEX_SESSION_ID',
+  'CLAUDE_SESSION_ID',
+  'OPENAI_SESSION_ID',
+  'ANTHROPIC_SESSION_ID',
+  'OPENCLAW_SESSION',
+  'PIPELANE_AGENT_PROVIDER',
+  'PIPELANE_REVIEW_PROVIDER',
+  'PIPELANE_ORCHESTRATE_PROVIDER',
+  'PIPELANE_AUTHOR_SESSION_ID',
+  'PIPELANE_WORKER_SESSION_ID',
+  'PIPELANE_AUTHOR_PROVIDER',
+  'PIPELANE_WORKER_PROVIDER',
+  'PIPELANE_REVIEW_GATE_ID',
+  'PIPELANE_REVIEW_GATE_TYPE',
+  'PIPELANE_REVIEW_GATE_PHASE',
+];
+
 function run(command, args, cwd, env = {}) {
   return execFileSync(command, args, {
     cwd,
@@ -59,6 +80,12 @@ function runCli(args, cwd, env = {}, allowFailure = false) {
   for (const stateKey of ['PIPELANE_REVIEW_STATE_KEY', 'PIPELANE_DEPLOY_STATE_KEY', 'PIPELANE_PROBE_STATE_KEY']) {
     if (!(stateKey in env)) delete childEnv[stateKey];
   }
+  // AI review gates run `npm test` from a process that exports reviewer/session
+  // identity. Keep child CLI calls hermetic so tests only see the identities
+  // they intentionally pass.
+  for (const identityKey of HERMETIC_REVIEW_IDENTITY_ENV_KEYS) {
+    if (!(identityKey in env)) delete childEnv[identityKey];
+  }
   const result = spawnSync('node', [CLI_PATH, ...args], {
     cwd,
     env: childEnv,
@@ -75,6 +102,133 @@ function runCli(args, cwd, env = {}, allowFailure = false) {
 
 function hashedSessionId(value) {
   return `sha256:${createHash('sha256').update(value).digest('hex').slice(0, 16)}`;
+}
+
+function sha256Text(value) {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function canonicalizeTestValue(value) {
+  if (value === undefined) return 'undefined';
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => (entry === undefined ? 'null' : canonicalizeTestValue(entry))).join(',')}]`;
+  }
+  return `{${Object.keys(value).sort().filter((key) => value[key] !== undefined).map((key) => `${JSON.stringify(key)}:${canonicalizeTestValue(value[key])}`).join(',')}}`;
+}
+
+function stableJsonDigestTest(value) {
+  return sha256Text(canonicalizeTestValue(value));
+}
+
+function analysisSourceSha256ForParts(planTextSha256, prompt) {
+  const promptSha256 = prompt ? sha256Text(prompt) : null;
+  if (planTextSha256 && promptSha256) {
+    return stableJsonDigestTest({ planTextSha256, promptSha256 });
+  }
+  if (planTextSha256) return planTextSha256;
+  if (promptSha256) return promptSha256;
+  return null;
+}
+
+function analysisSourceSha256ForPlannedRun(repoRoot, planned) {
+  const source = planned.run?.source;
+  if (!source) return null;
+  const planTextSha256 = source.planPath
+    ? sha256Text(readFileSync(path.join(repoRoot, source.planPath), 'utf8'))
+    : source.textSha256 ?? null;
+  return analysisSourceSha256ForParts(planTextSha256, source.prompt ?? null);
+}
+
+function writeOrchestrateAnalysis(repoRoot, sourceText, overrides = {}) {
+  const analysisPath = path.join(repoRoot, `analysis-${sha256Text(sourceText).slice(0, 8)}.json`);
+  writeFileSync(
+    analysisPath,
+    `${JSON.stringify({
+      sourceSha256: sha256Text(sourceText),
+      analyzer: {
+        provider: 'codex',
+        sessionId: null,
+        source: 'test',
+      },
+      identityReliable: false,
+      strengths: ['test analysis'],
+      risks: [],
+      ambiguities: [],
+      sensitiveAreas: [],
+      recommendedScope: {
+        throughSliceId: null,
+        reason: null,
+      },
+      ...overrides,
+    }, null, 2)}\n`,
+    'utf8',
+  );
+  return analysisPath;
+}
+
+function analyzePlannedRun(repoRoot, planned, sourceText, overrides = {}, options = {}) {
+  const autoPassPlanReview = options.passPlanReview !== false;
+  const analysisFile = writeOrchestrateAnalysis(repoRoot, sourceText, {
+    sourceSha256: analysisSourceSha256ForPlannedRun(repoRoot, planned) ?? sha256Text(sourceText),
+    ...(autoPassPlanReview
+      ? {
+          analyzer: {
+            provider: 'codex',
+            sessionId: options.analyzerSessionId ?? 'test-plan-analysis-session',
+            source: 'test',
+          },
+          identityReliable: true,
+        }
+      : {}),
+    ...overrides,
+  });
+  const analyzed = JSON.parse(runCli([
+    'run',
+    'orchestrate',
+    'analyze',
+    '--run-id',
+    planned.runId,
+    '--analysis-file',
+    analysisFile,
+    '--json',
+  ], repoRoot).stdout);
+  if (autoPassPlanReview) {
+    for (const gate of analyzed.run.planAnalysis?.planReview?.gates ?? []) {
+      if (gate.blocking && gate.status === 'pending') {
+        runCli([
+          'run',
+          'orchestrate',
+          'plan-review',
+          'pass',
+          '--run-id',
+          planned.runId,
+          '--gate',
+          gate.gateId,
+          '--message',
+          `Test plan review passed for ${gate.gateId}`,
+        ], repoRoot, { CODEX_SESSION_ID: options.attesterSessionId ?? 'test-plan-review-session' });
+      }
+    }
+  }
+  return analyzed;
+}
+
+function plannedRunSourceText(repoRoot, planned) {
+  const source = planned.run?.source;
+  if (!source) throw new Error('planned report is missing run.source');
+  if (source.planPath) return readFileSync(path.join(repoRoot, source.planPath), 'utf8');
+  if (source.prompt) return source.prompt;
+  throw new Error('planned report has no analyzable source text');
+}
+
+function analyzePlannedRunForPrepare(repoRoot, planned, overrides = {}, options = {}) {
+  return analyzePlannedRun(repoRoot, planned, plannedRunSourceText(repoRoot, planned), overrides, options);
+}
+
+function preparePlannedRun(repoRoot, planned, overrides = {}, options = {}) {
+  analyzePlannedRunForPrepare(repoRoot, planned, overrides, options);
+  return JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
 }
 
 function shouldSeedPassingReviewEvidence(args) {
@@ -2916,6 +3070,9 @@ test('pipelane.md renders a journey-first overview with real slash aliases', () 
     assert.match(pipelane, /\/where\s+See where tasks, PRs, deploys, and release gates stand\./);
     assert.match(pipelane, /\/pipelane web\s+Open the local Pipelane Board\./);
     assert.match(pipelane, /\/pipelane update --check\s+Check whether Pipelane itself has updates\./);
+    assert.match(pipelane, /orchestrate analyze --plan-file <real-plan> --analysis-file <analysis\.json> --slices-file <scratch\.json> --json/);
+    assert.match(pipelane, /orchestrate plan-review pass --run-id <id> --gate <gate-id> --message <summary>/);
+    assert.match(pipelane, /orchestrate plan-review bypass --run-id <id> --gate <gate-id> --reason <reason>/);
     assert.doesNotMatch(pipelane, /Pipelane Board \(default\)/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -2933,6 +3090,10 @@ test('pipelane.md documents exact first-token routing for subcommands', () => {
   assert.match(template, /npm run pipelane:review -- \$REST/);
   assert.match(template, /Exactly equals `orchestrate`/);
   assert.match(template, /npm run pipelane:orchestrate -- \$REST/);
+  assert.match(template, /\/pipelane orchestrate analyze --plan-file <path> --analysis-file <path>/);
+  assert.match(template, /low-level subcommands: `plan`, `analyze`, `plan-review`/);
+  assert.match(template, /orchestrate analyze --plan-file <real-plan> --analysis-file <analysis\.json> --slices-file <scratch\.json> --json/);
+  assert.match(template, /orchestrate plan-review pass --run-id <id> --gate <gate-id> --message <summary>/);
   assert.match(template, /\/pipelane orchestrate plan --plan-file <path>/);
   assert.match(template, /\/pipelane orchestrate prepare --run-id <id>/);
   assert.match(template, /\/pipelane orchestrate dispatch --run-id <id>/);
@@ -4485,7 +4646,7 @@ test('durable Codex runner prints detailed /pipelane help', () => {
     assert.match(helpOutput, /\/pipelane configure \[--json\] \[flags\.\.\.\]/);
     assert.match(helpOutput, /\/pipelane review \[--dry-run\]/);
     assert.match(helpOutput, /\/pipelane review setup/);
-    assert.match(helpOutput, /\/pipelane orchestrate --plan-file <file> --yes/);
+    assert.match(helpOutput, /\/pipelane orchestrate --plan-file <file> --analysis-file <file> --yes/);
     assert.match(helpOutput, /Build and release companion commands:/);
     assert.match(helpOutput, /\/deploy staging\s+Deploy the merged SHA to staging/);
     assert.match(helpOutput, /\/deploy prod\s+Promote a verified staging SHA to production/);
@@ -6588,6 +6749,7 @@ test('orchestrate bare command previews an explicit plan without writing state',
     assert.equal(report.run.slices.length, 1);
     assert.equal(report.run.slices[0].id, 'entry-point');
     assert.ok(report.likelyPlanFiles.some((entry) => entry.path === 'docs/project-plan.md'));
+    assert.match(report.message, /--analysis-file <path> --yes/);
     assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'orchestrate')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -6620,6 +6782,10 @@ test('orchestrate bare command --yes plans, prepares, dispatches, starts workers
       '## Slice 1: High-level orchestrate entry',
       '- Update `src/operator/commands/orchestrate.ts`',
     ].join('\n') + '\n', 'utf8');
+    const analysisFile = writeOrchestrateAnalysis(
+      repoRoot,
+      readFileSync(path.join(repoRoot, 'docs', 'entry-plan.md'), 'utf8'),
+    );
 
     const workerCommand = passWorker("console.log(process.env.PIPELANE_ORCHESTRATE_SLICE_ID)");
     const result = runCli([
@@ -6630,6 +6796,8 @@ test('orchestrate bare command --yes plans, prepares, dispatches, starts workers
       '--provider',
       'generic',
       '--yes',
+      '--analysis-file',
+      analysisFile,
       '--json',
     ], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
@@ -6695,6 +6863,7 @@ test('orchestrate bare command --yes auto-fixes failed executable review gates a
     };
     writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     commitAll(repoRoot, 'Adopt review fix gate');
+    const analysisFile = writeOrchestrateAnalysis(repoRoot, 'Auto-fix failed review gate');
 
     const cliResult = runCli([
       'run',
@@ -6704,6 +6873,8 @@ test('orchestrate bare command --yes auto-fixes failed executable review gates a
       '--provider',
       'generic',
       '--yes',
+      '--analysis-file',
+      analysisFile,
       '--json',
     ], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: `${process.execPath} -e ${JSON.stringify(workerScript)}`,
@@ -6793,6 +6964,7 @@ test('orchestrate bare command --yes does not report fixed when the re-review is
     };
     writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     commitAll(repoRoot, 'Adopt fixable + pending review gates');
+    const analysisFile = writeOrchestrateAnalysis(repoRoot, 'Pending gate must not read as fixed');
 
     const cliResult = runCli([
       'run',
@@ -6802,6 +6974,8 @@ test('orchestrate bare command --yes does not report fixed when the re-review is
       '--provider',
       'generic',
       '--yes',
+      '--analysis-file',
+      analysisFile,
       '--json',
     ], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: `${process.execPath} -e ${JSON.stringify(workerScript)}`,
@@ -6859,6 +7033,7 @@ test('orchestrate bare command --yes stops a no-progress review auto-fix loop wi
     };
     writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     commitAll(repoRoot, 'Adopt an unfixable review gate');
+    const analysisFile = writeOrchestrateAnalysis(repoRoot, 'Stall on a gate the worker cannot fix');
 
     const cliResult = runCli([
       'run',
@@ -6868,6 +7043,8 @@ test('orchestrate bare command --yes stops a no-progress review auto-fix loop wi
       '--provider',
       'generic',
       '--yes',
+      '--analysis-file',
+      analysisFile,
       '--json',
     ], repoRoot, {
       // passWorker rewrites the same marker each iteration: a material change so
@@ -6940,6 +7117,7 @@ test('orchestrate bare command --yes detects a committing no-progress loop as st
     };
     writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     commitAll(repoRoot, 'Adopt an unfixable review gate for a committing loop');
+    const analysisFile = writeOrchestrateAnalysis(repoRoot, 'Stall a committing fix loop');
 
     const cliResult = runCli([
       'run',
@@ -6949,6 +7127,8 @@ test('orchestrate bare command --yes detects a committing no-progress loop as st
       '--provider',
       'generic',
       '--yes',
+      '--analysis-file',
+      analysisFile,
       '--json',
     ], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: `${process.execPath} -e ${JSON.stringify(workerScript)}`,
@@ -6996,6 +7176,7 @@ test('orchestrate bare command --yes honors a configurable maxStalledIterations 
     };
     writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     commitAll(repoRoot, 'Adopt a higher stall threshold');
+    const analysisFile = writeOrchestrateAnalysis(repoRoot, 'Stall only after three repeats');
 
     const cliResult = runCli([
       'run',
@@ -7005,6 +7186,8 @@ test('orchestrate bare command --yes honors a configurable maxStalledIterations 
       '--provider',
       'generic',
       '--yes',
+      '--analysis-file',
+      analysisFile,
       '--json',
     ], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(),
@@ -7047,6 +7230,7 @@ test('orchestrate bare command --yes clamps maxStalledIterations to attempt at l
     };
     writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     commitAll(repoRoot, 'Adopt a degenerate stall threshold');
+    const analysisFile = writeOrchestrateAnalysis(repoRoot, 'Threshold one must still try once');
 
     const cliResult = runCli([
       'run',
@@ -7056,6 +7240,8 @@ test('orchestrate bare command --yes clamps maxStalledIterations to attempt at l
       '--provider',
       'generic',
       '--yes',
+      '--analysis-file',
+      analysisFile,
       '--json',
     ], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(),
@@ -7114,6 +7300,7 @@ test('orchestrate bare command --yes feeds a Tried/Result/Lesson journal into la
     };
     writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     commitAll(repoRoot, 'Adopt a gate that drives multiple fix attempts');
+    const analysisFile = writeOrchestrateAnalysis(repoRoot, 'Feed the attempt journal forward');
 
     const cliResult = runCli([
       'run',
@@ -7123,6 +7310,8 @@ test('orchestrate bare command --yes feeds a Tried/Result/Lesson journal into la
       '--provider',
       'generic',
       '--yes',
+      '--analysis-file',
+      analysisFile,
       '--json',
     ], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: `${process.execPath} -e ${JSON.stringify(workerScript)}`,
@@ -7184,6 +7373,7 @@ test('orchestrate bare command --yes honors maxReviewLoops before review auto-fi
     };
     writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     commitAll(repoRoot, 'Adopt capped review loop gate');
+    const analysisFile = writeOrchestrateAnalysis(repoRoot, 'Do not auto-fix after one review loop');
 
     const cliResult = runCli([
       'run',
@@ -7193,6 +7383,8 @@ test('orchestrate bare command --yes honors maxReviewLoops before review auto-fi
       '--provider',
       'generic',
       '--yes',
+      '--analysis-file',
+      analysisFile,
       '--json',
     ], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: 'node -e "process.exit(0)"',
@@ -7234,6 +7426,7 @@ test('orchestrate bare command --yes records pending manual gates instead of dec
     };
     writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     commitAll(repoRoot, 'Adopt pipelane');
+    const analysisFile = writeOrchestrateAnalysis(repoRoot, 'Keep manual review pending');
 
     const cliResult = runCli([
       'run',
@@ -7243,6 +7436,8 @@ test('orchestrate bare command --yes records pending manual gates instead of dec
       '--provider',
       'generic',
       '--yes',
+      '--analysis-file',
+      analysisFile,
       '--json',
     ], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(),
@@ -7308,7 +7503,9 @@ test('review executes configured AI skill gate command and records attester evid
       'let input = \'\';',
       'process.stdin.on(\'data\', chunk => input += chunk);',
       'process.stdin.on(\'end\', () => {',
+      'if (!input.startsWith(\'/review\\n\\n\')) process.exit(3);',
       'if (!input.includes(\'Gate: gstack-review\') || !input.includes(\'Requested review: /review\')) process.exit(2);',
+      'if (!input.includes(\'End your final response with exactly one standalone result marker line\')) process.exit(4);',
       'console.log(\'review clean\');',
       'console.log(\'PIPELANE_REVIEW_GATE_RESULT=passed\');',
       '});',
@@ -7327,6 +7524,134 @@ test('review executes configured AI skill gate command and records attester evid
     assert.equal(result.gates[0].attester.provider, 'codex');
     assert.equal(result.gates[0].attester.source, 'PIPELANE_REVIEW_GATE_SESSION_ID');
     assert.match(result.gates[0].stdoutTail, /PIPELANE_REVIEW_GATE_RESULT=passed/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('review AI gate parses result marker independently across stdout and stderr', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'gstack-review',
+        phase: 'ai-diff',
+        type: 'skill',
+        skill: 'review',
+        userCommands: ['/review'],
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt AI review gate');
+
+    const script = [
+      "process.stdout.write('unterminated stdout')",
+      "setTimeout(() => process.stderr.write('PIPELANE_REVIEW_GATE_RESULT=passed\\n'), 20)",
+    ].join(';');
+    const result = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      PIPELANE_REVIEW_GATE_COMMAND: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+      PIPELANE_REVIEW_PROVIDER: 'codex',
+    }).stdout);
+    const gate = result.gates.find((entry) => entry.gateId === 'gstack-review');
+
+    assert.equal(result.status, 'passed');
+    assert.equal(gate.status, 'passed');
+    assert.equal(gate.summary, 'AI review passed: /review');
+    assert.match(gate.stdoutTail, /unterminated stdout/);
+    assert.match(gate.stderrTail, /PIPELANE_REVIEW_GATE_RESULT=passed/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('review AI gate parses result marker before large trailing output', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'gstack-review',
+        phase: 'ai-diff',
+        type: 'skill',
+        skill: 'review',
+        userCommands: ['/review'],
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt AI review gate');
+
+    const script = [
+      "console.log('PIPELANE_REVIEW_GATE_RESULT=passed')",
+      "process.stdout.write('x'.repeat(2 * 1024 * 1024 + 8192))",
+      "console.error('ai-large-output-marker')",
+    ].join(';');
+    const result = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      PIPELANE_REVIEW_GATE_COMMAND: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+      PIPELANE_REVIEW_PROVIDER: 'codex',
+    }).stdout);
+    const gate = result.gates.find((entry) => entry.gateId === 'gstack-review');
+
+    assert.equal(result.status, 'passed');
+    assert.equal(gate.status, 'passed');
+    assert.equal(gate.summary, 'AI review passed: /review');
+    assert.match(gate.stderrTail, /ai-large-output-marker/);
+    assert.doesNotMatch(gate.summary, /without PIPELANE_REVIEW_GATE_RESULT/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('review AI gate scrubs author session env from reviewer subprocess', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'gstack-review',
+        phase: 'ai-diff',
+        type: 'skill',
+        skill: 'review',
+        userCommands: ['/review'],
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt AI review gate');
+
+    const script = [
+      "if (process.env.CODEX_SESSION_ID) process.exit(3)",
+      "if (!process.env.PIPELANE_REVIEW_GATE_SESSION_ID) process.exit(4)",
+      "console.log('PIPELANE_REVIEW_GATE_RESULT=passed')",
+    ].join(';');
+    const result = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      CODEX_SESSION_ID: 'author-codex-session',
+      PIPELANE_REVIEW_GATE_COMMAND: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+      PIPELANE_REVIEW_PROVIDER: 'codex',
+    }).stdout);
+    const gate = result.gates.find((entry) => entry.gateId === 'gstack-review');
+    const reviewState = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'review-state.json'), 'utf8'));
+    const onDisk = reviewState.records.find((record) => record.id === result.runId);
+
+    assert.equal(result.status, 'passed');
+    assert.equal(onDisk.authorIdentity.sessionId, hashedSessionId('author-codex-session'));
+    assert.equal(onDisk.authorIdentity.source, 'CODEX_SESSION_ID');
+    assert.equal(gate.status, 'passed');
+    assert.equal(gate.attester.source, 'PIPELANE_REVIEW_GATE_SESSION_ID');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -7553,6 +7878,58 @@ test('review fails configured AI skill gate when command mutates the worktree', 
   }
 });
 
+test('review fails configured AI skill gate when command commits to HEAD', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'gstack-review',
+        phase: 'ai-diff',
+        type: 'skill',
+        skill: 'review',
+        userCommands: ['/review'],
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt AI review gate');
+    const startHead = run('git', ['rev-parse', 'HEAD'], repoRoot);
+
+    const script = [
+      "const fs = require('node:fs');",
+      "const { execFileSync } = require('node:child_process');",
+      'process.stdin.resume();',
+      "process.stdin.on('end', () => {",
+      "fs.writeFileSync('ai-review-commit.txt', 'committed by reviewer\\n');",
+      "execFileSync('git', ['add', 'ai-review-commit.txt']);",
+      "execFileSync('git', ['commit', '-m', 'AI review mutation']);",
+      "console.log('PIPELANE_REVIEW_GATE_RESULT=passed');",
+      '});',
+    ].join('');
+    const aiReviewCommand = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`;
+    const cliResult = runCli(['run', 'review', '--json'], repoRoot, {
+      PIPELANE_REVIEW_GATE_COMMAND: aiReviewCommand,
+      PIPELANE_REVIEW_PROVIDER: 'codex',
+    }, true);
+    const result = JSON.parse(cliResult.stdout);
+
+    assert.equal(cliResult.status, 1);
+    assert.equal(result.status, 'failed');
+    const state = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'review-state.json'), 'utf8'));
+    assert.equal(state.records[0].sha, startHead);
+    assert.equal(result.gates[0].status, 'failed');
+    assert.match(result.gates[0].summary, /changed HEAD/);
+    assert.equal(run('git', ['log', '-1', '--pretty=%s'], repoRoot), 'AI review mutation');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('orchestrate bare command --yes completes when configured AI review gate passes', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];
@@ -7574,6 +7951,7 @@ test('orchestrate bare command --yes completes when configured AI review gate pa
     writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     commitAll(repoRoot, 'Adopt AI review gate');
 
+    const analysisFile = writeOrchestrateAnalysis(repoRoot, 'Run AI review gate automatically');
     const aiReviewCommand = [
       'node -e "',
       'process.stdin.resume();',
@@ -7591,6 +7969,8 @@ test('orchestrate bare command --yes completes when configured AI review gate pa
       '--provider',
       'generic',
       '--yes',
+      '--analysis-file',
+      analysisFile,
       '--json',
     ], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(),
@@ -7639,6 +8019,7 @@ test('orchestrate bare command --yes fails when slice review gates fail', () => 
     };
     writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     commitAll(repoRoot, 'Adopt pipelane');
+    const analysisFile = writeOrchestrateAnalysis(repoRoot, 'Fail static review gate');
 
     const result = runCli([
       'run',
@@ -7648,6 +8029,8 @@ test('orchestrate bare command --yes fails when slice review gates fail', () => 
       '--provider',
       'generic',
       '--yes',
+      '--analysis-file',
+      analysisFile,
       '--json',
     ], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: 'node -e "process.exit(0)"',
@@ -7694,6 +8077,7 @@ test('orchestrate bare command --yes blocks when no effective review gates are c
     };
     writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     commitAll(repoRoot, 'Adopt pipelane');
+    const analysisFile = writeOrchestrateAnalysis(repoRoot, 'Require review gates before completion');
 
     const result = runCli([
       'run',
@@ -7703,6 +8087,8 @@ test('orchestrate bare command --yes blocks when no effective review gates are c
       '--provider',
       'generic',
       '--yes',
+      '--analysis-file',
+      analysisFile,
       '--json',
     ], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: 'node -e "process.exit(0)"',
@@ -7892,7 +8278,7 @@ test('orchestration hardening: missing assigned worktree surfaces through orches
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Detect missing worktree', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     worktreePath = prepared.run.slices[0].worktreePath;
     rmSync(worktreePath, { recursive: true, force: true });
 
@@ -7934,6 +8320,31 @@ test('orchestrate interactive setup suggests likely plan files and can cancel', 
 
     assert.match(result.stdout, /Orchestration setup/);
     assert.match(result.stdout, /docs\/implementation-plan\.md/);
+    assert.match(result.stdout, /Orchestration cancelled\. No changes written\./);
+    assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'orchestrate')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate interactive start requires analysis before writing state', () => {
+  const repoRoot = createRepo();
+  try {
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'implementation-plan.md'), [
+      '# Implementation Plan',
+      '',
+      '## Slice 1: Setup',
+      '- Implement the setup flow',
+    ].join('\n') + '\n', 'utf8');
+
+    const result = runCli(['run', 'orchestrate'], repoRoot, {
+      PIPELANE_ORCHESTRATE_INPUT: '1\n',
+    });
+
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /Plan analysis is required before orchestration can start/);
+    assert.match(result.stdout, /--analysis-file <path> --yes/);
     assert.match(result.stdout, /Orchestration cancelled\. No changes written\./);
     assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'orchestrate')), false);
   } finally {
@@ -8045,8 +8456,15 @@ test('orchestrate goal-spec honors configured budget and sensitive confirmation 
 test('orchestrate goal-spec rejects invalid command forms', () => {
   const repoRoot = createRepo();
   const outsidePlan = path.join(os.tmpdir(), `pipelane-outside-plan-${Date.now()}.md`);
+  const outsideLockRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-plan-review-lock-'));
   try {
     writeFileSync(outsidePlan, '# Outside Plan\n', 'utf8');
+    const outsideLockPath = path.join(outsideLockRoot, 'mutation.lock');
+    mkdirSync(outsideLockPath);
+    const outsideLockSentinel = path.join(outsideLockPath, 'sentinel.txt');
+    writeFileSync(outsideLockSentinel, 'do not remove\n', 'utf8');
+    const staleLockTime = new Date(Date.now() - (11 * 60 * 1000));
+    utimesSync(outsideLockPath, staleLockTime, staleLockTime);
     mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
     mkdirSync(path.join(repoRoot, 'docs', 'plan-dir'));
     writeFileSync(path.join(repoRoot, 'docs', 'large-plan.md'), `${'x'.repeat(256 * 1024 + 1)}\n`, 'utf8');
@@ -8054,7 +8472,7 @@ test('orchestrate goal-spec rejects invalid command forms', () => {
 
     const invalidSubcommand = runCli(['run', 'orchestrate', 'nope'], repoRoot, {}, true);
     assert.notEqual(invalidSubcommand.status, 0);
-    assert.match(invalidSubcommand.stderr, /orchestrate requires exactly: pipelane run orchestrate .*<goal-spec\|plan\|prepare\|dispatch\|start\|review\|scope\|outline\|finalize\|upgrade-ledger>/);
+    assert.match(invalidSubcommand.stderr, /orchestrate requires exactly: pipelane run orchestrate .*<goal-spec\|plan\|analyze\|prepare\|dispatch\|start\|review\|plan-review\|scope\|outline\|finalize\|upgrade-ledger>/);
 
     const extraPositional = runCli(['run', 'orchestrate', 'goal-spec', 'extra'], repoRoot, {}, true);
     assert.notEqual(extraPositional.status, 0);
@@ -8164,6 +8582,27 @@ test('orchestrate goal-spec rejects invalid command forms', () => {
     assert.notEqual(missingReviewLedger.status, 0);
     assert.match(missingReviewLedger.stderr, /No orchestration run ledger found/);
 
+    const missingPlanReviewRunId = runCli(['run', 'orchestrate', 'plan-review', 'pass', '--gate', 'plan-eng-review', '--message', 'ok'], repoRoot, {}, true);
+    assert.notEqual(missingPlanReviewRunId.status, 0);
+    assert.match(missingPlanReviewRunId.stderr, /orchestrate plan-review pass requires --run-id <id>/);
+
+    const maliciousPlanReviewRunId = path.relative(orchestrationRunsRoot(repoRoot), outsideLockRoot).replaceAll(path.sep, '/');
+    const invalidPlanReviewRunId = runCli([
+      'run',
+      'orchestrate',
+      'plan-review',
+      'pass',
+      '--run-id',
+      maliciousPlanReviewRunId,
+      '--gate',
+      'plan-eng-review',
+      '--message',
+      'ok',
+    ], repoRoot, {}, true);
+    assert.notEqual(invalidPlanReviewRunId.status, 0);
+    assert.match(invalidPlanReviewRunId.stderr, /Invalid orchestration run id/);
+    assert.equal(existsSync(outsideLockSentinel), true, 'invalid plan-review run id must not touch external lock paths');
+
     const invalidProvider = runCli(['run', 'orchestrate', 'goal-spec', '--provider', 'openai'], repoRoot, {}, true);
     assert.notEqual(invalidProvider.status, 0);
     assert.match(invalidProvider.stderr, /--provider must be one of: codex, claude, generic/);
@@ -8230,6 +8669,1031 @@ test('orchestrate goal-spec rejects invalid command forms', () => {
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(outsidePlan, { force: true });
+    rmSync(outsideLockRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate analyze records plan analysis and prepare requires it for new ledgers', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt no plan-review gates');
+
+    const outcome = 'Analyze before prepare';
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', outcome, '--json'], repoRoot).stdout);
+    const blocked = runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot, {}, true);
+    assert.equal(blocked.status, 1, `${blocked.stdout}\n${blocked.stderr}`);
+    assert.match(blocked.stderr, /requires plan analysis/);
+
+    const analyzed = analyzePlannedRun(repoRoot, planned, outcome, {}, { passPlanReview: false });
+    assert.equal(analyzed.command, 'orchestrate analyze');
+    assert.equal(analyzed.status, 'passed');
+    assert.equal(analyzed.planReviewStatus, 'skipped');
+    assert.equal(analyzed.run.planAnalysisRequired, true);
+    assert.equal(analyzed.run.planAnalysis.source.promptRef, 'run.source.prompt');
+    assert.equal(analyzed.run.planAnalysis.planReview.status, 'skipped');
+    assert.equal(analyzed.run.observationIndex.latestObservationKind, 'plan_review_skipped');
+
+    const observations = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', analyzed.run.observationIndex.observationsPath), 'utf8'));
+    assert.equal(observations.schemaVersion, 1);
+    assert.equal(observations.runId, planned.runId);
+    assert.equal(observations.observations[0].kind, 'plan_review_skipped');
+
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    assert.equal(prepared.status, 'prepared');
+    assert.equal(prepared.createdCount, 1);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate prepare accepts legacy planned run with gate snapshot and no analysis requirement', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: {
+        gates: [{
+          id: 'legacy-plan-review',
+          phase: 'plan',
+          type: 'skill',
+          skill: '/plan-eng-review',
+          blocking: true,
+        }],
+      },
+      gates: [],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt legacy plan-review gate');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Prepare legacy planned ledger', '--json'], repoRoot).stdout);
+    const legacyLedger = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
+    assert.equal(legacyLedger.planAnalysisRequired, true);
+    assert.equal(legacyLedger.planAnalysis, undefined);
+    assert.equal(legacyLedger.gateSnapshot.planReview.gates[0].id, 'legacy-plan-review');
+    delete legacyLedger.planAnalysisRequired;
+    delete legacyLedger.planAnalysis;
+    writeFileSync(planned.ledgerPath, JSON.stringify(legacyLedger, null, 2) + '\n', 'utf8');
+
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    assert.equal(prepared.status, 'prepared');
+    assert.equal(prepared.createdCount, 1);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate analyze rejects mismatched slices-file for an existing planned run', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const slicesDirs = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt no plan-review gates');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    const planText = '# Analyze Slice Mismatch\n\nShared source text.\n';
+    writeFileSync(path.join(repoRoot, 'docs', 'analyze-slices.md'), planText, 'utf8');
+    const original = writePr1SlicesFile([
+      { id: 'one', title: 'Original slice', phase: 'Phase A', text: 'original work' },
+    ]);
+    slicesDirs.push(original.dir);
+    const planned = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/analyze-slices.md',
+      '--slices-file',
+      original.file,
+      '--provider',
+      'generic',
+      '--json',
+    ], repoRoot).stdout);
+
+    const replacement = writePr1SlicesFile([
+      { id: 'two', title: 'Replacement slice', phase: 'Phase B', text: 'replacement work' },
+    ]);
+    slicesDirs.push(replacement.dir);
+    const analysisFile = writeOrchestrateAnalysis(repoRoot, planText);
+    const result = runCli([
+      'run',
+      'orchestrate',
+      'analyze',
+      '--plan-file',
+      'docs/analyze-slices.md',
+      '--slices-file',
+      replacement.file,
+      '--analysis-file',
+      analysisFile,
+    ], repoRoot, {}, true);
+
+    assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stderr, /different slice decomposition/);
+    const onDisk = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
+    assert.equal(onDisk.slices.length, 1);
+    assert.equal(onDisk.slices[0].id, 'one');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    for (const dir of slicesDirs) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate analyze binds plan-file source to the outcome prompt', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    const planText = '# Shared Plan\n\nDo the same plan-file work.\n';
+    writeFileSync(path.join(repoRoot, 'docs', 'shared-plan.md'), planText, 'utf8');
+    commitAll(repoRoot, 'Adopt shared plan');
+
+    const first = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/shared-plan.md',
+      '--outcome',
+      'First outcome prompt',
+      '--json',
+    ], repoRoot).stdout);
+    const firstAnalysisFile = writeOrchestrateAnalysis(repoRoot, planText, {
+      sourceSha256: analysisSourceSha256ForPlannedRun(repoRoot, first),
+    });
+    const analyzedFirst = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'analyze',
+      '--run-id',
+      first.runId,
+      '--analysis-file',
+      firstAnalysisFile,
+      '--json',
+    ], repoRoot).stdout);
+    assert.equal(analyzedFirst.status, 'passed');
+
+    const second = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/shared-plan.md',
+      '--outcome',
+      'Second outcome prompt',
+      '--json',
+    ], repoRoot).stdout);
+    assert.notEqual(second.runId, first.runId);
+
+    const staleAnalysis = runCli([
+      'run',
+      'orchestrate',
+      'analyze',
+      '--run-id',
+      second.runId,
+      '--analysis-file',
+      firstAnalysisFile,
+    ], repoRoot, {}, true);
+    assert.equal(staleAnalysis.status, 1, `${staleAnalysis.stdout}\n${staleAnalysis.stderr}`);
+    assert.match(staleAnalysis.stderr, /source hash mismatch/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate analyze can create a planned run from plan-file and slices-file', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const slicesDirs = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    const planText = '# Agent Plan\n\n## One\n\nDo one.\n\n## Two\n\nDo two.\n';
+    writeFileSync(path.join(repoRoot, 'docs', 'agent-plan.md'), planText, 'utf8');
+    commitAll(repoRoot, 'Adopt agent plan');
+
+    const slicesFile = writePr1SlicesFile([
+      { id: 'one', title: 'First generated slice', phase: 'Phase A', text: 'Generated one' },
+      { id: 'two', title: 'Second generated slice', phase: 'Phase B', text: 'Generated two' },
+    ], [
+      { section: 'One', disposition: 'slice', sliceId: 'one' },
+      { section: 'Two', disposition: 'slice', sliceId: 'two' },
+    ]);
+    slicesDirs.push(slicesFile.dir);
+    const analysisFile = writeOrchestrateAnalysis(repoRoot, planText);
+
+    const analyzed = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'analyze',
+      '--plan-file',
+      'docs/agent-plan.md',
+      '--slices-file',
+      slicesFile.file,
+      '--analysis-file',
+      analysisFile,
+      '--json',
+    ], repoRoot).stdout);
+
+    assert.equal(analyzed.status, 'passed');
+    assert.equal(analyzed.planPath.endsWith('docs/agent-plan.md'), true);
+    assert.equal(analyzed.run.planAnalysisRequired, true);
+    assert.equal(analyzed.run.planAnalysis.source.kind, 'plan-file');
+    assert.deepEqual(analyzed.run.slices.map((slice) => slice.id), ['one', 'two']);
+    assert.deepEqual(analyzed.run.coverage.map((entry) => [entry.section, entry.sliceId]), [['One', 'one'], ['Two', 'two']]);
+    const onDisk = JSON.parse(readFileSync(analyzed.ledgerPath, 'utf8'));
+    assert.equal(onDisk.planAnalysis.status, 'passed');
+    assert.deepEqual(onDisk.slices.map((slice) => slice.id), ['one', 'two']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    for (const dir of slicesDirs) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate prepare rejects stale analyzed plan source and gate snapshot', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'source-plan.md'), '# Source Plan\n\nDo the original work.\n', 'utf8');
+    commitAll(repoRoot, 'Adopt source plan');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/source-plan.md', '--json'], repoRoot).stdout);
+    analyzePlannedRun(repoRoot, planned, '# Source Plan\n\nDo the original work.\n', {}, { passPlanReview: false });
+    writeFileSync(path.join(repoRoot, 'docs', 'source-plan.md'), '# Source Plan\n\nDo different work.\n', 'utf8');
+    const staleSource = runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot, {}, true);
+    assert.equal(staleSource.status, 1, `${staleSource.stdout}\n${staleSource.stderr}`);
+    assert.match(staleSource.stderr, /source plan changed after analysis/);
+
+    const outcome = 'Tamper gate snapshot after analysis';
+    const snapshotPlanned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', outcome, '--json'], repoRoot).stdout);
+    const analyzed = analyzePlannedRun(repoRoot, snapshotPlanned, outcome, {}, { passPlanReview: false });
+    const ledger = JSON.parse(readFileSync(analyzed.ledgerPath, 'utf8'));
+    ledger.gateSnapshot.planReview.gates.push({
+      id: 'tampered-plan-review',
+      phase: 'plan',
+      type: 'skill',
+      skill: 'plan-eng-review',
+      blocking: true,
+    });
+    writeFileSync(analyzed.ledgerPath, JSON.stringify(ledger, null, 2) + '\n', 'utf8');
+    const staleGates = runCli(['run', 'orchestrate', 'prepare', '--run-id', snapshotPlanned.runId], repoRoot, {}, true);
+    assert.equal(staleGates.status, 1, `${staleGates.stdout}\n${staleGates.stderr}`);
+    assert.match(staleGates.stderr, /plan-review gate snapshot changed after analysis/);
+
+    const decompositionOutcome = 'Tamper slice decomposition after analysis';
+    const decompositionPlanned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', decompositionOutcome, '--json'], repoRoot).stdout);
+    const decompositionAnalyzed = analyzePlannedRun(repoRoot, decompositionPlanned, decompositionOutcome, {}, { passPlanReview: false });
+    const decompositionLedger = JSON.parse(readFileSync(decompositionAnalyzed.ledgerPath, 'utf8'));
+    decompositionLedger.slices[0].outcome = 'Changed slice outcome after analysis';
+    writeFileSync(decompositionAnalyzed.ledgerPath, JSON.stringify(decompositionLedger, null, 2) + '\n', 'utf8');
+    const staleDecomposition = runCli(['run', 'orchestrate', 'prepare', '--run-id', decompositionPlanned.runId], repoRoot, {}, true);
+    assert.equal(staleDecomposition.status, 1, `${staleDecomposition.stdout}\n${staleDecomposition.stderr}`);
+    assert.match(staleDecomposition.stderr, /slice decomposition changed after analysis/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate analysis source hash binds plan-file outcome prompt', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    const planText = '# Source Plan\n\n## One\n\nDo one.\n';
+    writeFileSync(path.join(repoRoot, 'docs', 'source-plan.md'), planText, 'utf8');
+    commitAll(repoRoot, 'Adopt source plan');
+
+    const outcome = 'Original orchestration outcome';
+    const planned = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/source-plan.md',
+      '--outcome',
+      outcome,
+      '--json',
+    ], repoRoot).stdout);
+
+    const textOnlyAnalysis = writeOrchestrateAnalysis(repoRoot, planText);
+    const rejected = runCli([
+      'run',
+      'orchestrate',
+      'analyze',
+      '--run-id',
+      planned.runId,
+      '--analysis-file',
+      textOnlyAnalysis,
+    ], repoRoot, {}, true);
+    assert.equal(rejected.status, 1, `${rejected.stdout}\n${rejected.stderr}`);
+    assert.match(rejected.stderr, /source hash mismatch/);
+
+    const analysisFile = writeOrchestrateAnalysis(repoRoot, `${planText}\n${outcome}`, {
+      sourceSha256: analysisSourceSha256ForPlannedRun(repoRoot, planned),
+    });
+    const analyzed = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'analyze',
+      '--run-id',
+      planned.runId,
+      '--analysis-file',
+      analysisFile,
+      '--json',
+    ], repoRoot).stdout);
+
+    const ledger = JSON.parse(readFileSync(analyzed.ledgerPath, 'utf8'));
+    ledger.source.prompt = 'Changed orchestration outcome';
+    ledger.plan.outcome = 'Changed orchestration outcome';
+    writeFileSync(analyzed.ledgerPath, JSON.stringify(ledger, null, 2) + '\n', 'utf8');
+    const stalePrompt = runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot, {}, true);
+    assert.equal(stalePrompt.status, 1, `${stalePrompt.stdout}\n${stalePrompt.stderr}`);
+    assert.match(stalePrompt.stderr, /source plan changed after analysis/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate prepare accepts audited plan-review bypass', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: {
+        gates: [{
+          id: 'plan-eng-review',
+          phase: 'plan',
+          type: 'skill',
+          skill: 'plan-eng-review',
+          blocking: true,
+        }],
+      },
+      gates: [],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt blocking plan review gate');
+
+    const outcome = 'Bypass plan review and prepare';
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', outcome, '--json'], repoRoot).stdout);
+    analyzePlannedRun(repoRoot, planned, outcome, {}, { passPlanReview: false });
+    const reviewStateKey = 'signed-audited-bypass-key';
+    const bypassed = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan-review',
+      'bypass',
+      '--run-id',
+      planned.runId,
+      '--gate',
+      'plan-eng-review',
+      '--reason',
+      'Operator accepted residual planning risk',
+      '--json',
+    ], repoRoot, { PIPELANE_REVIEW_STATE_KEY: reviewStateKey }).stdout);
+    assert.equal(bypassed.run.planAnalysis.planReview.status, 'bypassed');
+
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+    }).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    assert.equal(prepared.status, 'prepared');
+
+    const latePass = runCli([
+      'run',
+      'orchestrate',
+      'plan-review',
+      'pass',
+      '--run-id',
+      planned.runId,
+      '--gate',
+      'plan-eng-review',
+      '--message',
+      'Too late to mutate preflight evidence',
+    ], repoRoot, { CODEX_SESSION_ID: 'late-review-session' }, true);
+    assert.equal(latePass.status, 1, `${latePass.stdout}\n${latePass.stderr}`);
+    assert.match(latePass.stderr, /can only update planned runs before prepare/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate prepare rejects tampered signed plan-review evidence', () => {
+  const cases = [
+    {
+      name: 'missing binding',
+      action: 'pass',
+      mutate(gate) {
+        delete gate.binding;
+      },
+      pattern: /missing evidence binding/,
+    },
+    {
+      name: 'message hash mismatch',
+      action: 'pass',
+      mutate(gate) {
+        gate.binding.messageSha256 = '0'.repeat(64);
+      },
+      pattern: /message hash does not match/,
+    },
+    {
+      name: 'attester binding mismatch',
+      action: 'pass',
+      mutate(gate) {
+        gate.binding.attesterSessionId = hashedSessionId('someone-else');
+      },
+      pattern: /evidence binding does not match/,
+    },
+    {
+      name: 'decomposition binding mismatch',
+      action: 'pass',
+      mutate(gate) {
+        gate.binding.decompositionDigest = '0'.repeat(64);
+      },
+      pattern: /evidence binding does not match/,
+    },
+    {
+      name: 'invalid signature',
+      action: 'pass',
+      mutate(gate) {
+        gate.signature = '0'.repeat(64);
+      },
+      pattern: /unsigned or has an invalid signature/,
+    },
+    {
+      name: 'mutable blocking flag',
+      action: 'pass',
+      mutate(gate) {
+        gate.blocking = false;
+      },
+      pattern: /no longer matches the analyzed gate snapshot/,
+    },
+    {
+      name: 'mutable skipped status',
+      action: 'pass',
+      mutate(gate) {
+        gate.status = 'skipped';
+      },
+      pattern: /was not skipped by the analyzed gate snapshot/,
+    },
+    {
+      name: 'slice decomposition replay',
+      action: 'pass',
+      mutateLedger(ledger) {
+        ledger.slices[0].outcome = 'Changed after signed plan review';
+      },
+      pattern: /slice decomposition changed after analysis/,
+    },
+    {
+      name: 'bypass reason hash mismatch',
+      action: 'bypass',
+      mutate(gate) {
+        gate.bypassReason = 'changed after signing';
+      },
+      pattern: /bypass reason hash does not match/,
+    },
+  ];
+
+  for (const entry of cases) {
+    const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+    try {
+      runCli(['init', '--project', `Demo App ${entry.name}`], repoRoot);
+      const configPath = path.join(repoRoot, '.pipelane.json');
+      const config = JSON.parse(readFileSync(configPath, 'utf8'));
+      config.reviewGates = {
+        planReview: {
+          gates: [{
+            id: 'plan-eng-review',
+            phase: 'plan',
+            type: 'skill',
+            skill: 'plan-eng-review',
+            blocking: true,
+          }],
+        },
+        gates: [],
+      };
+      writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+      commitAll(repoRoot, `Adopt gate for ${entry.name}`);
+
+      const outcome = `Tamper signed plan-review evidence: ${entry.name}`;
+      const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', outcome, '--json'], repoRoot).stdout);
+      const analysisFile = writeOrchestrateAnalysis(repoRoot, outcome, {
+        analyzer: {
+          provider: 'codex',
+          sessionId: 'trusted-plan-analyzer',
+          source: 'test',
+        },
+        identityReliable: true,
+      });
+      runCli(['run', 'orchestrate', 'analyze', '--run-id', planned.runId, '--analysis-file', analysisFile], repoRoot);
+
+      const reviewStateKey = `review-state-key-${entry.name}`;
+      const evidence = entry.action === 'pass'
+        ? JSON.parse(runCli([
+          'run',
+          'orchestrate',
+          'plan-review',
+          'pass',
+          '--run-id',
+          planned.runId,
+          '--gate',
+          'plan-eng-review',
+          '--message',
+          'Independent plan review passed',
+          '--json',
+        ], repoRoot, {
+          CODEX_SESSION_ID: 'trusted-plan-reviewer',
+          PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+        }).stdout)
+        : JSON.parse(runCli([
+          'run',
+          'orchestrate',
+          'plan-review',
+          'bypass',
+          '--run-id',
+          planned.runId,
+          '--gate',
+          'plan-eng-review',
+          '--reason',
+          'Operator accepted risk after review',
+          '--json',
+        ], repoRoot, {
+          PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+        }).stdout);
+
+      const ledger = JSON.parse(readFileSync(evidence.ledgerPath, 'utf8'));
+      if (entry.mutate) entry.mutate(ledger.planAnalysis.planReview.gates[0]);
+      if (entry.mutateLedger) entry.mutateLedger(ledger);
+      writeFileSync(evidence.ledgerPath, JSON.stringify(ledger, null, 2) + '\n', 'utf8');
+
+      const prepared = runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot, {
+        PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
+      }, true);
+      assert.equal(prepared.status, 1, `${entry.name}\n${prepared.stdout}\n${prepared.stderr}`);
+      assert.match(prepared.stderr, entry.pattern, entry.name);
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(remoteRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test('orchestrate plan-review pending gate blocks prepare until audited bypass', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: {
+        gates: [{
+          id: 'plan-eng-review',
+          phase: 'plan',
+          type: 'skill',
+          skill: '/plan-eng-review',
+          blocking: true,
+        }],
+      },
+      gates: [],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt blocking plan review gate');
+
+    const outcome = 'Bypass plan review before prepare';
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', outcome, '--json'], repoRoot).stdout);
+    const analyzed = analyzePlannedRun(repoRoot, planned, outcome, {}, { passPlanReview: false });
+    assert.equal(analyzed.status, 'pending');
+    assert.equal(analyzed.planReviewStatus, 'pending');
+    assert.equal(analyzed.blockingPendingCount, 1);
+    assert.equal(analyzed.run.planAnalysis.planReview.gates[0].status, 'pending');
+    const afterAnalyze = JSON.parse(readFileSync(analyzed.ledgerPath, 'utf8'));
+    assert.equal(afterAnalyze.planAnalysisRequired, true);
+    assert.equal(afterAnalyze.planAnalysis.planReview.gates[0].status, 'pending');
+
+    const blocked = runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot, {}, true);
+    assert.equal(blocked.status, 1, `${blocked.stdout}\n${blocked.stderr}`);
+    assert.match(blocked.stderr, /plan-review gate plan-eng-review is pending/);
+
+    const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    assert.equal(envelope.data.orchestration.activeRun.nextAction.id, 'orchestrate.plan-review');
+    assert.equal(envelope.data.orchestration.activeRun.state, 'blocked');
+    assert.match(envelope.data.orchestration.activeRun.nextAction.reason, /plan-review gate plan-eng-review is pending/);
+    assert.match(envelope.data.orchestration.activeRun.nextAction.command, new RegExp(`orchestrate plan-review pass --run-id ${planned.runId} --gate plan-eng-review --message <summary>`));
+    const orchestrationHealth = envelope.data.sourceHealth.find((entry) => entry.name === 'orchestration.runs');
+    assert.equal(orchestrationHealth.state, 'blocked');
+    assert.equal(orchestrationHealth.blocking, true);
+    assert.match(orchestrationHealth.reason, /plan-review gate plan-eng-review is pending/);
+
+    const reliableAnalysisFile = writeOrchestrateAnalysis(repoRoot, outcome, {
+      analyzer: {
+        provider: 'codex',
+        sessionId: 'bypass-then-pass-analyzer-session',
+        source: 'test',
+      },
+      identityReliable: true,
+    });
+    runCli([
+      'run',
+      'orchestrate',
+      'analyze',
+      '--run-id',
+      planned.runId,
+      '--analysis-file',
+      reliableAnalysisFile,
+    ], repoRoot);
+
+    const bypassed = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan-review',
+      'bypass',
+      '--run-id',
+      planned.runId,
+      '--gate',
+      'plan-eng-review',
+      '--reason',
+      'Reviewed externally in test',
+      '--json',
+    ], repoRoot).stdout);
+    assert.equal(bypassed.status, 'bypassed');
+    assert.equal(bypassed.run.planAnalysis.planReview.status, 'bypassed');
+    assert.equal(bypassed.run.planAnalysis.planReview.gates[0].status, 'bypassed');
+    assert.equal(bypassed.run.observationIndex.latestObservationKind, 'plan_review_bypassed');
+
+    const passed = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan-review',
+      'pass',
+      '--run-id',
+      planned.runId,
+      '--gate',
+      'plan-eng-review',
+      '--message',
+      'Reviewed externally and approved in test',
+      '--json',
+    ], repoRoot, { CODEX_SESSION_ID: 'bypass-then-pass-reviewer-session' }).stdout);
+    assert.equal(passed.status, 'passed');
+    assert.equal(passed.run.planAnalysis.planReview.status, 'passed');
+    assert.equal(passed.run.planAnalysis.planReview.gates[0].status, 'passed');
+    assert.equal('bypassReason' in passed.run.planAnalysis.planReview.gates[0], false);
+    assert.equal(passed.run.planAnalysis.planReview.gates[0].binding.action, 'pass');
+    assert.equal(passed.run.observationIndex.latestObservationKind, 'plan_review_passed');
+
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    assert.equal(prepared.status, 'prepared');
+    assert.equal(prepared.createdCount, 1);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate plan-review pass rejects raw same-session analyzer identity', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: {
+        gates: [{
+          id: 'plan-eng-review',
+          phase: 'plan',
+          type: 'skill',
+          skill: 'plan-eng-review',
+          blocking: true,
+        }],
+      },
+      gates: [],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt blocking plan review gate');
+
+    const outcome = 'Reject same raw analyzer session';
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', outcome, '--json'], repoRoot).stdout);
+    const analyzed = analyzePlannedRun(repoRoot, planned, outcome, {
+      analyzer: {
+        provider: 'codex',
+        sessionId: 'same-session-raw',
+        source: 'test',
+      },
+      identityReliable: true,
+    }, { passPlanReview: false });
+    assert.equal(analyzed.run.planAnalysis.analyzer.sessionId, hashedSessionId('same-session-raw'));
+
+    const result = runCli([
+      'run',
+      'orchestrate',
+      'plan-review',
+      'pass',
+      '--run-id',
+      planned.runId,
+      '--gate',
+      'plan-eng-review',
+      '--message',
+      'same session should not attest',
+    ], repoRoot, { CODEX_SESSION_ID: 'same-session-raw' }, true);
+
+    assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stderr, /requires an independent attester session/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate plan-review pass rejects unreliable analyzer identity', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: {
+        gates: [{
+          id: 'plan-eng-review',
+          phase: 'plan',
+          type: 'skill',
+          skill: 'plan-eng-review',
+          blocking: true,
+        }],
+      },
+      gates: [],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt blocking plan review gate');
+
+    const outcome = 'Reject unreliable analyzer session';
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', outcome, '--json'], repoRoot).stdout);
+    const analyzed = analyzePlannedRun(repoRoot, planned, outcome, {}, { passPlanReview: false });
+    assert.equal(analyzed.run.planAnalysis.analyzer.sessionId, null);
+    assert.equal(analyzed.run.planAnalysis.analyzerIdentityReliable, false);
+
+    const result = runCli([
+      'run',
+      'orchestrate',
+      'plan-review',
+      'pass',
+      '--run-id',
+      planned.runId,
+      '--gate',
+      'plan-eng-review',
+      '--message',
+      'independent-looking pass should not be enough',
+    ], repoRoot, { CODEX_SESSION_ID: 'different-review-session' }, true);
+
+    assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stderr, /requires a reliable analyzer session/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate analyze leaves risk-gated plan review pending by default', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: {
+        gates: [{
+          id: 'security-data-review',
+          phase: 'plan',
+          type: 'skill',
+          skill: 'security-data-review',
+          blocking: true,
+          when: 'risk:security',
+        }],
+      },
+      gates: [],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt risk plan review gate');
+
+    const outcome = 'Security-sensitive plan review';
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', outcome, '--json'], repoRoot).stdout);
+    const analyzed = analyzePlannedRun(repoRoot, planned, outcome, {}, { passPlanReview: false });
+
+    assert.equal(analyzed.status, 'pending');
+    assert.equal(analyzed.planReviewStatus, 'pending');
+    assert.equal(analyzed.blockingPendingCount, 1);
+    assert.equal(analyzed.run.planAnalysis.planReview.gates[0].status, 'pending');
+
+    const blocked = runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot, {}, true);
+    assert.equal(blocked.status, 1, `${blocked.stdout}\n${blocked.stderr}`);
+    assert.match(blocked.stderr, /plan-review gate security-data-review is pending/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate analyze keeps surface-gated plan review pending for default surfaces', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: {
+        gates: [{
+          id: 'plan-design-review',
+          phase: 'plan',
+          type: 'skill',
+          skill: 'plan-design-review',
+          blocking: true,
+          when: 'surface:frontend',
+        }],
+      },
+      gates: [],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt conditional plan review gate');
+
+    const outcome = 'Default-surface plan review';
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', outcome, '--json'], repoRoot).stdout);
+    const analyzed = analyzePlannedRun(repoRoot, planned, outcome, {}, { passPlanReview: false });
+
+    assert.equal(analyzed.status, 'pending');
+    assert.equal(analyzed.planReviewStatus, 'pending');
+    assert.equal(analyzed.blockingPendingCount, 1);
+    assert.equal(analyzed.run.planAnalysis.planReview.gates[0].status, 'pending');
+
+    const blocked = runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot, {}, true);
+    assert.equal(blocked.status, 1, `${blocked.stdout}\n${blocked.stderr}`);
+    assert.match(blocked.stderr, /plan-review gate plan-design-review is pending/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate analyze skips surface-gated plan review when the surface is inactive', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: {
+        gates: [{
+          id: 'plan-design-review',
+          phase: 'plan',
+          type: 'skill',
+          skill: 'plan-design-review',
+          blocking: true,
+          when: 'surface:frontend',
+        }],
+      },
+      gates: [],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt conditional plan review gate');
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+    stateMod.saveModeState(context.commonDir, context.config, {
+      mode: 'build',
+      requestedSurfaces: ['edge', 'sql'],
+      override: null,
+      updatedAt: null,
+    });
+
+    const outcome = 'Backend-only plan review';
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', outcome, '--json'], repoRoot).stdout);
+    const analyzed = analyzePlannedRun(repoRoot, planned, outcome, {}, { passPlanReview: false });
+
+    assert.equal(analyzed.status, 'passed');
+    assert.equal(analyzed.planReviewStatus, 'skipped');
+    assert.equal(analyzed.blockingPendingCount, 0);
+    assert.deepEqual(analyzed.run.planAnalysis.activeSurfaces, ['edge', 'sql']);
+    assert.equal(analyzed.run.planAnalysis.planReview.gates[0].status, 'skipped');
+    assert.match(analyzed.run.planAnalysis.planReview.gates[0].summary, /surface frontend is not active/);
+
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    assert.equal(prepared.status, 'prepared');
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate prepare blocks when active surfaces changed after analysis', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: {
+        gates: [{
+          id: 'plan-design-review',
+          phase: 'plan',
+          type: 'skill',
+          skill: 'plan-design-review',
+          blocking: true,
+          when: 'surface:frontend',
+        }],
+      },
+      gates: [],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt conditional plan review gate');
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+    stateMod.saveModeState(context.commonDir, context.config, {
+      mode: 'build',
+      requestedSurfaces: ['edge', 'sql'],
+      override: null,
+      updatedAt: null,
+    });
+
+    const outcome = 'Surface drift after plan analysis';
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', outcome, '--json'], repoRoot).stdout);
+    const analyzed = analyzePlannedRun(repoRoot, planned, outcome, {}, { passPlanReview: false });
+    assert.equal(analyzed.planReviewStatus, 'skipped');
+    assert.deepEqual(analyzed.run.planAnalysis.activeSurfaces, ['edge', 'sql']);
+
+    stateMod.saveModeState(context.commonDir, context.config, {
+      mode: 'build',
+      requestedSurfaces: ['frontend'],
+      override: null,
+      updatedAt: null,
+    });
+
+    const blocked = runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot, {}, true);
+    assert.equal(blocked.status, 1, `${blocked.stdout}\n${blocked.stderr}`);
+    assert.match(blocked.stderr, /active surfaces changed after analysis/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
   }
 });
 
@@ -8378,7 +9842,8 @@ test('orchestrate plan writes a durable slice ledger from a plan file', () => {
     assert.equal(worktreeListAfter, worktreeListBefore);
     assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks')), false);
     assert.equal(installMarker.stateFiles.some((entry) => entry.endsWith('/orchestration.json')), true);
-    assert.match(report.message, /Next: run \/pipelane orchestrate prepare --run-id <run-id>/);
+    assert.equal(onDisk.planAnalysisRequired, true);
+    assert.match(report.message, /Next: run \/pipelane orchestrate analyze --run-id <run-id> --analysis-file <path> before prepare/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -8710,7 +10175,7 @@ test('orchestrate prepare creates durable slice worktrees from a planned ledger'
     ].join('\n') + '\n', 'utf8');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/prepare-plan.md', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     const onDisk = JSON.parse(readFileSync(prepared.ledgerPath, 'utf8'));
 
@@ -8771,7 +10236,7 @@ test('orchestrate dispatch writes durable provider handoff prompts from a prepar
     ].join('\n') + '\n', 'utf8');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/dispatch-plan.md', '--provider', 'claude', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     const dispatched = JSON.parse(runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot).stdout);
     const onDisk = JSON.parse(readFileSync(dispatched.ledgerPath, 'utf8'));
@@ -8839,7 +10304,7 @@ test('orchestrate dispatch validates all slices before writing prompts', () => {
     ].join('\n') + '\n', 'utf8');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/partial-dispatch-plan.md', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     const ledger = JSON.parse(readFileSync(prepared.ledgerPath, 'utf8'));
     ledger.slices[1].status = 'planned';
@@ -8885,7 +10350,7 @@ test('orchestrate dispatch rejects missing prepared worktrees', () => {
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject missing dispatch workspace', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     rmSync(prepared.slices[0].worktreePath, { recursive: true, force: true });
 
@@ -8908,7 +10373,7 @@ test('orchestrate dispatch rejects ledger-provided task slugs that could escape 
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject unsafe dispatch task slug', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     const ledger = JSON.parse(readFileSync(prepared.ledgerPath, 'utf8'));
     ledger.slices[0].taskSlug = '../../evil';
@@ -8935,7 +10400,7 @@ test('orchestrate dispatch rejects ledger-assigned worktrees outside the task ro
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject unsafe dispatch workspace assignment', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     const ledger = JSON.parse(readFileSync(prepared.ledgerPath, 'utf8'));
     ledger.slices[0].worktreePath = outsideDir;
@@ -8982,7 +10447,7 @@ test('orchestrate start runs configured workers and records completion evidence'
     ].join('\n') + '\n', 'utf8');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/start-plan.md', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
 
@@ -9044,7 +10509,7 @@ test('C1 orchestrate start does not complete the run; review is the only complet
     writeFileSync(path.join(repoRoot, 'docs', 'c1-start-plan.md'), ['# C1 Start Plan', '', '## Slice 1: Produces a change', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/c1-start-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
 
@@ -9090,7 +10555,7 @@ test('C1 orchestrate finalize re-runs review in-process and will not complete of
     writeFileSync(path.join(repoRoot, 'docs', 'c1-finalize-plan.md'), ['# C1 Finalize Plan', '', '## Slice 1: Produces a change', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/c1-finalize-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker() });
@@ -9135,7 +10600,7 @@ test('C2 orchestrate signs embedded review evidence bound to context; replay fro
     writeFileSync(path.join(repoRoot, 'docs', 'c2-sign-plan.md'), ['# C2 Sign Plan', '', '## Slice 1: Produces a change', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/c2-sign-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(), PIPELANE_REVIEW_STATE_KEY: reviewStateKey });
@@ -9187,7 +10652,7 @@ test('C2 orchestrate rejects unsigned review evidence once the key is active; up
     writeFileSync(path.join(repoRoot, 'docs', 'c2-upgrade-plan.md'), ['# C2 Upgrade Plan', '', '## Slice 1: Produces a change', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/c2-upgrade-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker() });
@@ -9232,7 +10697,7 @@ test('FU1 reviewDiagnostics are advisory negative-only evidence: presence blocks
     writeFileSync(path.join(repoRoot, 'docs', 'fu1-advisory-plan.md'), ['# FU1 Advisory Plan', '', '## Slice 1: Produces a change', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/fu1-advisory-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(), PIPELANE_REVIEW_STATE_KEY: reviewStateKey });
@@ -9303,7 +10768,7 @@ test('FU2 cockpit surfaces a cleaned-worktree legacy run needing ledger migratio
     writeFileSync(path.join(repoRoot, 'docs', 'fu2-migration-plan.md'), ['# FU2 Migration Plan', '', '## Slice 1: Produces a change', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/fu2-migration-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     const sliceWorktrees = prepared.slices.map((slice) => slice.worktreePath).filter(Boolean);
     createdWorktrees.push(...sliceWorktrees);
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
@@ -9352,7 +10817,7 @@ test('FU2 mixed cleaned completed run (legacy-unsigned + tampered sibling) surfa
     writeFileSync(path.join(repoRoot, 'docs', 'fu2-mixed-plan.md'), ['# FU2 Mixed Plan', '', '## Slice 1: Produces a change', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/fu2-mixed-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(), PIPELANE_REVIEW_STATE_KEY: reviewStateKey });
@@ -9410,7 +10875,7 @@ test('C1 orchestrate scope does not downgrade an already-completed run', () => {
     writeFileSync(path.join(repoRoot, 'docs', 'c1-scope-plan.md'), ['# C1 Scope Plan', '', '## Slice 1: Produces a change', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/c1-scope-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
     const sliceId = JSON.parse(readFileSync(planned.ledgerPath, 'utf8')).slices[0].id;
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker() });
@@ -9448,7 +10913,7 @@ test('C2 review gates cannot read the review-state signing key (no signature for
     mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
     writeFileSync(path.join(repoRoot, 'docs', 'c2-gate-plan.md'), ['# C2 Gate Plan', '', '## Slice 1: Produces a change', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/c2-gate-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(), PIPELANE_REVIEW_STATE_KEY: reviewStateKey });
@@ -9484,7 +10949,7 @@ test('orchestrate start B1 marks a no-change slice empty and blocks its dependen
     ].join('\n') + '\n', 'utf8');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/empty-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
@@ -9531,7 +10996,7 @@ test('orchestrate review keeps an empty slice empty and does not complete the ru
     writeFileSync(path.join(repoRoot, 'docs', 'empty-review-plan.md'), ['# Empty Review Plan', '', '## Slice 1: Produces nothing', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/empty-review-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_ORCHESTRATE_WORKER_COMMAND: noopWorker }, true);
@@ -9561,7 +11026,7 @@ test('orchestrate start --force re-runs an empty slice to recover it', () => {
     mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
     writeFileSync(path.join(repoRoot, 'docs', 'recover-plan.md'), ['# Recover Plan', '', '## Slice 1: Initially empty', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/recover-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_ORCHESTRATE_WORKER_COMMAND: noopWorker }, true);
@@ -9604,7 +11069,7 @@ test('orchestrate start A3 pipes the derived worker prompt, not the handoff boil
     ].join('\n') + '\n', 'utf8');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/a3-plan.md', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     const started = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
@@ -9682,7 +11147,7 @@ test('orchestrate start uses native Codex and Claude adapter defaults when avail
     commitAll(repoRoot, 'Adopt pipelane');
 
     const codexPlan = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Use codex native default', '--provider', 'codex', '--json'], repoRoot).stdout);
-    const codexPrepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', codexPlan.runId, '--json'], repoRoot).stdout);
+    const codexPrepared = preparePlannedRun(repoRoot, codexPlan);
     createdWorktrees.push(...codexPrepared.slices.map((slice) => slice.worktreePath));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', codexPlan.runId], repoRoot);
     const codexStarted = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', codexPlan.runId, '--json'], repoRoot, {
@@ -9693,7 +11158,7 @@ test('orchestrate start uses native Codex and Claude adapter defaults when avail
     assert.equal(readFileSync(path.join(codexStarted.run.slices[0].worktreePath, 'codex-default.txt'), 'utf8'), 'exec --full-auto -\ntrue\n');
 
     const claudePlan = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Use claude native default', '--provider', 'claude', '--json'], repoRoot).stdout);
-    const claudePrepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', claudePlan.runId, '--json'], repoRoot).stdout);
+    const claudePrepared = preparePlannedRun(repoRoot, claudePlan);
     createdWorktrees.push(...claudePrepared.slices.map((slice) => slice.worktreePath));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', claudePlan.runId], repoRoot);
     const claudeStarted = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', claudePlan.runId, '--json'], repoRoot, {
@@ -9734,7 +11199,7 @@ test('orchestrate review runs gate snapshot against completed worker slices', ()
     commitAll(repoRoot, 'Adopt custom review gate');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Review completed slice', '--provider', 'generic', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
@@ -9849,7 +11314,7 @@ test('orchestrate review blocks when no effective review gates are configured', 
     commitAll(repoRoot, 'Adopt empty review gates');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Review requires gates', '--provider', 'generic', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
@@ -9895,7 +11360,7 @@ test('orchestrate review progress redacts configured command secrets', () => {
     commitAll(repoRoot, 'Adopt secret-bearing review gate');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Review redacts progress', '--provider', 'generic', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
@@ -9947,7 +11412,7 @@ test('orchestrate review blocks slice-filtered evidence until every slice is ful
     ].join('\n') + '\n', 'utf8');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/partial-review-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     const dispatched = JSON.parse(runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot).stdout);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--slice-id', dispatched.run.slices[0].id], repoRoot, {
@@ -10011,7 +11476,7 @@ test('orchestrate review records pending AI gates and blocks incomplete slice ev
     ].join('\n') + '\n', 'utf8');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/pending-review-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     const dispatched = JSON.parse(runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot).stdout);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--slice-id', dispatched.run.slices[0].id], repoRoot, {
@@ -10517,7 +11982,7 @@ test('orchestrate review keeps pending same-session AI gates incomplete', async 
     commitAll(repoRoot, 'Adopt AI review gate');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject same-session review', '--provider', 'codex', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
@@ -10719,7 +12184,7 @@ test('orchestrate review records config-change evidence when slice config is mal
     commitAll(repoRoot, 'Adopt empty review gate snapshot');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Change review config', '--provider', 'codex', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
@@ -10773,7 +12238,7 @@ test('orchestrate review attaches matching attested manual AI gate evidence', ()
     commitAll(repoRoot, 'Adopt AI review gate');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Attach independent AI review evidence', '--provider', 'codex', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
@@ -10934,7 +12399,7 @@ test('orchestrate review ignores unsigned manual AI gate evidence', () => {
     commitAll(repoRoot, 'Adopt AI review gate');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Ignore unsigned AI review evidence', '--provider', 'codex', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
@@ -11012,7 +12477,7 @@ test('orchestrate review attaches signed manual AI evidence across matching reco
     commitAll(repoRoot, 'Adopt AI review gates');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Attach split AI review evidence', '--provider', 'codex', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
@@ -11100,7 +12565,7 @@ test('orchestrate review refuses attested manual AI evidence for a mismatched ga
     commitAll(repoRoot, 'Adopt AI review gate');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject mismatched AI review evidence', '--provider', 'codex', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
@@ -11182,7 +12647,7 @@ test('orchestrate review refuses attested manual AI evidence for mismatched user
     commitAll(repoRoot, 'Adopt AI review gate');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject mismatched AI review command evidence', '--provider', 'codex', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
@@ -11250,7 +12715,7 @@ test('orchestrate start redacts credential material in worker evidence', () => {
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Redact worker evidence', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
 
@@ -11297,7 +12762,7 @@ test('orchestrate start streams large worker output without buffer failure', () 
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Stream large worker output', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
 
@@ -11331,7 +12796,7 @@ test('orchestrate start succeeds when a worker exits zero after closing stdin ea
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Handle early stdin close', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
 
@@ -11368,7 +12833,7 @@ test('orchestrate start timeout terminates the worker process group', async () =
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Timeout kills process group', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
 
@@ -11411,7 +12876,7 @@ test('orchestrate start records worker failure and blocks dependent slices', () 
     ].join('\n') + '\n', 'utf8');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/failed-start-plan.md', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
 
@@ -11471,7 +12936,7 @@ test('orchestrate start --force retries a stale running worker record', () => {
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Recover stale running worker', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     const dispatched = JSON.parse(runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot).stdout);
     const staleLedger = JSON.parse(readFileSync(dispatched.ledgerPath, 'utf8'));
@@ -11526,7 +12991,7 @@ test('orchestrate start --force terminates a live running worker before retry', 
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Force kills live stale worker', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     const dispatched = JSON.parse(runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot).stdout);
     liveWorker = spawn(process.execPath, [
@@ -11602,7 +13067,7 @@ test('orchestrate start re-evaluates pending slices when ledger order is not dep
     ].join('\n') + '\n', 'utf8');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/reordered-start-plan.md', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     const dispatched = JSON.parse(runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot).stdout);
     const reorderedLedger = JSON.parse(readFileSync(dispatched.ledgerPath, 'utf8'));
@@ -11646,7 +13111,7 @@ test('orchestrate start can run one selected dispatched slice when dependencies 
     ].join('\n') + '\n', 'utf8');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/slice-start-plan.md', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     const dispatched = JSON.parse(runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot).stdout);
 
@@ -11684,7 +13149,7 @@ test('orchestrate start rejects missing launcher and missing dispatch prompt', (
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject missing start inputs', '--provider', 'generic', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
 
     const unprepared = runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
@@ -11726,7 +13191,7 @@ test('orchestrate prepare blocks when a ledger-assigned worktree is missing', ()
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Prepare missing workspace check', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     rmSync(prepared.slices[0].worktreePath, { recursive: true, force: true });
 
@@ -11749,6 +13214,7 @@ test('orchestrate prepare rejects ledger-assigned worktrees outside the task roo
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject unsafe workspace assignment', '--json'], repoRoot).stdout);
+    analyzePlannedRunForPrepare(repoRoot, planned);
     const ledger = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
     ledger.slices[0].taskSlug = 'unsafe-ledger-assignment';
     ledger.slices[0].branchName = 'codex/unsafe-ledger-assignment';
@@ -11772,6 +13238,7 @@ test('orchestrate prepare rejects ledger-provided task slugs that could escape s
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject unsafe task slug', '--json'], repoRoot).stdout);
+    analyzePlannedRunForPrepare(repoRoot, planned);
     const ledger = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
     ledger.slices[0].taskSlug = '../../evil';
     writeFileSync(planned.ledgerPath, JSON.stringify(ledger, null, 2) + '\n', 'utf8');
@@ -11792,6 +13259,7 @@ test('orchestrate prepare cleans up a created worktree when task-lock write fail
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Cleanup failed prepare workspace', '--json'], repoRoot).stdout);
+    analyzePlannedRunForPrepare(repoRoot, planned);
     const worktreesBefore = run('git', ['worktree', 'list', '--porcelain'], repoRoot);
     const taskLocksPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks');
     rmSync(taskLocksPath, { recursive: true, force: true });
@@ -11817,7 +13285,7 @@ test('orchestrate prepare rejects a prepared worktree on a different branch than
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject branch mismatch', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     execFileSync('git', ['switch', '-c', 'codex/mismatched-prepared-branch'], {
       cwd: prepared.slices[0].worktreePath,
@@ -11843,7 +13311,7 @@ test('orchestrate prepare rejects an existing task lock that diverges from the l
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject lock mismatch', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     const taskSlug = prepared.run.slices[0].taskSlug;
     const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${taskSlug}.json`);
@@ -12643,7 +14111,8 @@ test('review runner adds a pending config-change gate when review config inputs 
 
 test('review config-change approval can be attested and unlocks the next review run', () => {
   const repoRoot = createRepo();
-  const markerPath = path.join(repoRoot, 'review-config-command-ran.txt');
+  const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-config-marker-'));
+  const markerPath = path.join(markerRoot, 'review-config-command-ran.txt');
   try {
     writeFileSync(
       path.join(repoRoot, '.pipelane.json'),
@@ -12705,6 +14174,7 @@ test('review config-change approval can be attested and unlocks the next review 
     assert.equal(readFileSync(markerPath, 'utf8'), 'ran');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(markerRoot, { recursive: true, force: true });
   }
 });
 
@@ -12747,6 +14217,130 @@ test('review runner fails when a blocking command gate fails', () => {
     const state = JSON.parse(readFileSync(evidencePath, 'utf8'));
     assert.equal(state.records[0].id, report.runId);
     assert.equal(state.records[0].status, 'failed');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review runner fails when a command gate commits to HEAD', () => {
+  const repoRoot = createRepo();
+  try {
+    const script = [
+      "const fs = require('node:fs');",
+      "const { execFileSync } = require('node:child_process');",
+      "fs.writeFileSync('command-gate-commit.txt', 'committed by gate\\n');",
+      "execFileSync('git', ['add', 'command-gate-commit.txt']);",
+      "execFileSync('git', ['commit', '-m', 'Command gate mutation']);",
+    ].join('');
+    writeFileSync(
+      path.join(repoRoot, '.pipelane.json'),
+      `${JSON.stringify({
+        displayName: 'Demo App',
+        reviewGates: {
+          planReview: { gates: [] },
+          gates: [{
+            id: 'typecheck',
+            phase: 'static',
+            type: 'command',
+            command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+          }],
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+    execFileSync('git', ['add', '.pipelane.json'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Configure committing command gate'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    const startHead = run('git', ['rev-parse', 'HEAD'], repoRoot);
+
+    const result = runCli(['run', 'review', '--phase', 'static', '--json'], repoRoot, {}, true);
+    const report = JSON.parse(result.stdout);
+    const gate = report.gates.find((entry) => entry.gateId === 'typecheck');
+    const state = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'review-state.json'), 'utf8'));
+
+    assert.notEqual(result.status, 0);
+    assert.equal(report.status, 'failed');
+    assert.equal(state.records[0].sha, startHead);
+    assert.equal(gate.status, 'failed');
+    assert.match(gate.summary, /changed HEAD/);
+    assert.equal(run('git', ['log', '-1', '--pretty=%s'], repoRoot), 'Command gate mutation');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review runner preserves large gate output without ENOBUFS', () => {
+  const repoRoot = createRepo();
+  try {
+    const script = [
+      "process.stdout.write('x'.repeat(2 * 1024 * 1024))",
+      "console.error('large-output-marker')",
+      'process.exit(2)',
+    ].join(';');
+    writeFileSync(
+      path.join(repoRoot, '.pipelane.json'),
+      `${JSON.stringify({
+        displayName: 'Demo App',
+        reviewGates: {
+          planReview: { gates: [] },
+          gates: [{
+            id: 'large-output',
+            phase: 'static',
+            type: 'command',
+            command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+          }],
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+    execFileSync('git', ['add', '.pipelane.json'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Configure large-output review gate'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const result = runCli(['run', 'review', '--phase', 'static', '--json'], repoRoot, {}, true);
+    const report = JSON.parse(result.stdout);
+    const gate = report.gates.find((entry) => entry.gateId === 'large-output');
+
+    assert.notEqual(result.status, 0);
+    assert.equal(gate.status, 'failed');
+    assert.equal(gate.exitCode, 2);
+    assert.equal(gate.summary, 'command exited 2');
+    assert.match(gate.stderrTail, /large-output-marker/);
+    assert.doesNotMatch(gate.summary, /ENOBUFS/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review runner fails gates that exceed the output limit', () => {
+  const repoRoot = createRepo();
+  try {
+    const script = "process.stdout.write('x'.repeat(17 * 1024 * 1024));";
+    writeFileSync(
+      path.join(repoRoot, '.pipelane.json'),
+      `${JSON.stringify({
+        displayName: 'Demo App',
+        reviewGates: {
+          planReview: { gates: [] },
+          gates: [{
+            id: 'too-much-output',
+            phase: 'static',
+            type: 'command',
+            command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+          }],
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+    execFileSync('git', ['add', '.pipelane.json'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Configure noisy review gate'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const result = runCli(['run', 'review', '--phase', 'static', '--json'], repoRoot, {}, true);
+    const report = JSON.parse(result.stdout);
+    const gate = report.gates.find((entry) => entry.gateId === 'too-much-output');
+
+    assert.notEqual(result.status, 0);
+    assert.equal(gate.status, 'failed');
+    assert.match(gate.summary, /exceeded output limit/);
+    assert.doesNotMatch(gate.summary, /ENOBUFS/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -12923,8 +14517,8 @@ test('api snapshot exposes active orchestration run summaries', () => {
     assert.equal(envelope.data.orchestration.activeRun.sliceCount, 1);
     assert.equal(envelope.data.orchestration.activeRun.counts.planned, 1);
     assert.equal(envelope.data.orchestration.activeRun.counts.workerSucceeded, 0);
-    assert.equal(envelope.data.orchestration.activeRun.nextAction.id, 'orchestrate.prepare');
-    assert.match(envelope.data.orchestration.activeRun.nextAction.command, new RegExp(`orchestrate prepare --run-id ${planned.runId}`));
+    assert.equal(envelope.data.orchestration.activeRun.nextAction.id, 'orchestrate.analyze');
+    assert.match(envelope.data.orchestration.activeRun.nextAction.command, new RegExp(`orchestrate analyze --run-id ${planned.runId} --analysis-file <path>`));
     assert.deepEqual(envelope.data.orchestration.humanInbox, []);
     assert.equal(orchestrationHealth.state, 'awaiting_preflight');
 
@@ -12944,7 +14538,7 @@ test('status keeps worker-completed orchestration active until trusted review ex
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Review completed workers from status', '--provider', 'generic', '--json'], repoRoot).stdout);
-    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
     runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
     const result = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
@@ -12977,15 +14571,26 @@ test('api snapshot surfaces failed orchestration workers as inbox and attention'
   const createdWorktrees = [];
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: config.reviewGates?.gates ?? [],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     commitAll(repoRoot, 'Adopt pipelane');
+    const outcome = 'Surface failed workers in status';
+    const analysisFile = writeOrchestrateAnalysis(repoRoot, outcome);
     const result = JSON.parse(runCli([
       'run',
       'orchestrate',
       '--outcome',
-      'Surface failed workers in status',
+      outcome,
       '--provider',
       'generic',
       '--yes',
+      '--analysis-file',
+      analysisFile,
       '--json',
     ], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: 'node -e "process.exit(2)"',
@@ -21098,6 +22703,9 @@ test('CLI notifies about updates by default without installing or re-pinning', a
       PATH: `${binDir}:${process.env.PATH}`,
     };
     delete env.PIPELANE_AUTO_UPDATE;
+    delete env.PIPELANE_MANAGED_RUNTIME;
+    delete env.PIPELANE_MANAGED_RUNTIME_ROOT;
+    delete env.PIPELANE_RUNNER_REEXECED;
 
     const first = spawnSync('node', [CLI_PATH, 'board', 'status'], {
       cwd: consumerRoot,
@@ -21176,6 +22784,9 @@ test('CLI notifies from a fresh cached update without re-checking remote status'
       PATH: `${binDir}:${process.env.PATH}`,
     };
     delete env.PIPELANE_AUTO_UPDATE;
+    delete env.PIPELANE_MANAGED_RUNTIME;
+    delete env.PIPELANE_MANAGED_RUNTIME_ROOT;
+    delete env.PIPELANE_RUNNER_REEXECED;
 
     const result = spawnSync('node', [CLI_PATH, 'board', 'status'], {
       cwd: consumerRoot,
@@ -29198,6 +30809,7 @@ test('api route actions forward approved PR title and message into the PR child'
 // --- PR1: communicative orchestrate (slices-file decomposition, scope/deferred, outline) ---
 
 const PR1_PASS_WORKER = passWorker();
+const PR1_PLAN_TEXT = '# Architecture\n\nProse with no slice headings.\n';
 
 function writePr1SlicesFile(slices, coverage) {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-slices-'));
@@ -29208,7 +30820,7 @@ function writePr1SlicesFile(slices, coverage) {
 
 function planPr1ThreeSliceRun(repoRoot) {
   mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
-  writeFileSync(path.join(repoRoot, 'docs', 'arch.md'), '# Architecture\n\nProse with no slice headings.\n', 'utf8');
+  writeFileSync(path.join(repoRoot, 'docs', 'arch.md'), PR1_PLAN_TEXT, 'utf8');
   const written = writePr1SlicesFile([
     { id: 'one', title: 'First slice', phase: 'Phase A', text: 'do one' },
     { id: 'two', title: 'Second slice', phase: 'Phase A', text: 'do two' },
@@ -29217,6 +30829,7 @@ function planPr1ThreeSliceRun(repoRoot) {
   const report = JSON.parse(runCli([
     'run', 'orchestrate', 'plan', '--plan-file', 'docs/arch.md', '--slices-file', written.file, '--provider', 'generic', '--json',
   ], repoRoot).stdout);
+  analyzePlannedRun(repoRoot, report, PR1_PLAN_TEXT);
   return { runId: report.runId, slicesDir: written.dir, run: report.run };
 }
 

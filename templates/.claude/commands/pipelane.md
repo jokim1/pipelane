@@ -62,8 +62,10 @@ Helpful anytime:
   {{ALIAS_ROLLBACK}} prod        Roll back production to the last verified-good deploy.
   /fix                           Fix bugs, review findings, CI failures, and code-quality issues.
   /fix rethink                   Plan a larger codebase restructure before changing code.
+  /pipelane orchestrate analyze --plan-file <path> --analysis-file <path>
+                                  Record plan analysis before any worktree is created.
   /pipelane orchestrate plan --plan-file <path>
-                                  Compile a plan into a durable slice ledger.
+                                  Compile a plan into a durable slice ledger; analyze before prepare.
   /pipelane orchestrate prepare --run-id <id>
                                   Create slice worktrees from a run ledger.
   /pipelane orchestrate dispatch --run-id <id>
@@ -202,8 +204,9 @@ npm run pipelane:orchestrate -- $REST
 ```
 
 where `$REST` is `$ARGUMENTS` with the leading `orchestrate` token stripped. Use this
-direct path for the low-level subcommands: `plan`, `prepare`, `dispatch`, `start`,
-`review`, `scope`, `outline`, `finalize`, and `goal-spec`. Display the output directly.
+direct path for the low-level subcommands: `plan`, `analyze`, `plan-review`,
+`prepare`, `dispatch`, `start`, `review`, `scope`, `outline`, `finalize`, and
+`goal-spec`. Display the output directly.
 
 ### `/pipelane orchestrate <plan-file>` — communicative driven flow
 
@@ -217,16 +220,21 @@ oriented:
    dropped.
 2. **Decompose** into phases and slices. Write a scratch JSON
    `{ "slices": [{ "id", "title", "phase", "text" }], "coverage": [{ "section", "disposition", "sliceId", "reason" }] }`
-   then compile WITHOUT starting workers and capture the run id:
-   `/pipelane orchestrate plan --plan-file <real-plan> --slices-file <scratch.json> --json`.
-   The ledger's audit source stays bound to the real plan, not the scratch file.
+   plus an analysis JSON with the real plan SHA-256, analyzer identity, strengths,
+   risks, ambiguities, sensitiveAreas, and recommendedScope. Record analysis WITHOUT
+   starting workers and capture the run id:
+   `/pipelane orchestrate analyze --plan-file <real-plan> --analysis-file <analysis.json> --slices-file <scratch.json> --json`.
+   The ledger's audit source stays bound to the real plan, not either scratch file.
 3. **Relay the CLI outline verbatim** (`/pipelane orchestrate outline --run-id <id>`),
    then print the **review model** in bullets (static checks, tests, independent AI
    review of each slice diff, human confirm on sensitive slices).
 4. **Recommend a scope** — full, or a justified partial boundary (sensitive phase
    first). Offer approve / edit scope / cancel; for partial run
    `/pipelane orchestrate scope --run-id <id> --through <last-slice-id-in-scope>`.
-5. On approval drive in order: `prepare`, `dispatch`, then per in-scope slice
+5. Before prepare, complete every pending plan-review gate: run the configured
+   reviewer, then record `/pipelane orchestrate plan-review pass --run-id <id> --gate <gate-id> --message <summary>`
+   or consciously bypass with `/pipelane orchestrate plan-review bypass --run-id <id> --gate <gate-id> --reason <reason>`.
+   Then drive in order: `prepare`, `dispatch`, then per in-scope slice
    `start --run-id <id> --slice-id <id>` then `review --run-id <id> --slice-id <id>`,
    and after **each** slice relay `/pipelane orchestrate outline --run-id <id>` so the
    updated outline shows where the run is. Never use `--yes` here.

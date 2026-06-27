@@ -54,8 +54,23 @@ const REVIEW_PHASE_ORDER = REVIEW_GATE_PHASES;
 const DEFAULT_GATE_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_REVIEW_SETUP_NPM_INSTALL_TIMEOUT_MS = 2 * 60 * 1000;
 const OUTPUT_TAIL_CHARS = 4000;
+const REVIEW_GATE_CAPTURE_TAIL_BYTES = 2 * 1024 * 1024;
+const REVIEW_GATE_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
+const REVIEW_GATE_CAPTURE_HELPER_MAX_BUFFER_BYTES = REVIEW_GATE_CAPTURE_TAIL_BYTES * 6;
 const REVIEW_GATE_RESULT_MARKER = 'PIPELANE_REVIEW_GATE_RESULT';
 const REVIEW_GATE_SESSION_ENV = 'PIPELANE_REVIEW_GATE_SESSION_ID';
+const AI_REVIEW_GATE_SCRUBBED_SESSION_ENV_KEYS = [
+  'PIPELANE_AUTHOR_SESSION_ID',
+  'PIPELANE_WORKER_SESSION_ID',
+  'PIPELANE_ORCHESTRATE_WORKER_SESSION_ID',
+  'PIPELANE_AGENT_SESSION_ID',
+  'PIPELANE_REVIEW_GATE_SESSION_ID',
+  'CODEX_SESSION_ID',
+  'OPENAI_SESSION_ID',
+  'CLAUDE_SESSION_ID',
+  'ANTHROPIC_SESSION_ID',
+  'OPENCLAW_SESSION',
+] as const;
 const CODEX_CLAUDE_REVIEW_REPO = 'https://github.com/jokim1/codexskill-claude-review.git';
 const CODEX_CLAUDE_REVIEW_SKILL_NAME = 'claude';
 const KARPATHY_SKILLS_REPO = 'https://github.com/jokim1/karpathy-skills.git';
@@ -2080,7 +2095,7 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
   return {
     id: `review-${new Date(startedAt).toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto.randomUUID().slice(0, 8)}`,
     branchName: runGit(options.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '',
-    sha: runGit(options.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '',
+    sha: worktreeStatus.head,
     status,
     dryRun: options.dryRun,
     gateFilter: gateFilter || undefined,
@@ -2125,6 +2140,270 @@ function gateSubprocessEnv(): NodeJS.ProcessEnv {
   delete env[PROBE_STATE_KEY_ENV];
   return env;
 }
+
+function spawnReviewGateCommand(
+  command: string,
+  options: {
+    cwd: string;
+    timeout: number;
+    env: NodeJS.ProcessEnv;
+    input?: string;
+  },
+): {
+  result: { status: number | null; signal: NodeJS.Signals | null; error?: NodeJS.ErrnoException };
+  stdout: string;
+  stderr: string;
+  aiReviewGateResult: 'passed' | 'failed' | null;
+} {
+  const payload = JSON.stringify({
+    command,
+    cwd: options.cwd,
+    input: options.input ?? '',
+    timeout: options.timeout,
+    tailBytes: REVIEW_GATE_CAPTURE_TAIL_BYTES,
+    maxOutputBytes: REVIEW_GATE_MAX_OUTPUT_BYTES,
+    resultMarker: REVIEW_GATE_RESULT_MARKER,
+  });
+  const helper = spawnSync(process.execPath, ['-e', REVIEW_GATE_CAPTURE_HELPER], {
+    cwd: options.cwd,
+    encoding: 'utf8',
+    input: payload,
+    timeout: options.timeout + 5000,
+    env: options.env,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    maxBuffer: REVIEW_GATE_CAPTURE_HELPER_MAX_BUFFER_BYTES,
+  });
+  if (helper.error) {
+    return {
+      result: {
+        status: null,
+        signal: null,
+        error: makeSpawnError((helper.error as NodeJS.ErrnoException).code ?? 'EHELPER', helper.error.message),
+      },
+      stdout: helper.stdout ?? '',
+      stderr: helper.stderr ?? '',
+      aiReviewGateResult: null,
+    };
+  }
+  try {
+    const parsed = JSON.parse(helper.stdout || '{}') as {
+      status?: number | null;
+      signal?: NodeJS.Signals | null;
+      errorCode?: string | null;
+      errorMessage?: string | null;
+      stdout?: string;
+      stderr?: string;
+      aiReviewGateResult?: 'passed' | 'failed' | null;
+    };
+    const error = parsed.errorCode
+      ? makeSpawnError(parsed.errorCode, parsed.errorMessage ?? parsed.errorCode)
+      : undefined;
+    return {
+      result: {
+        status: typeof parsed.status === 'number' ? parsed.status : null,
+        signal: parsed.signal ?? null,
+        ...(error ? { error } : {}),
+      },
+      stdout: parsed.stdout ?? '',
+      stderr: parsed.stderr ?? '',
+      aiReviewGateResult: parsed.aiReviewGateResult ?? null,
+    };
+  } catch (error) {
+    return {
+      result: {
+        status: null,
+        signal: null,
+        error: makeSpawnError('EHELPER', `review gate capture helper returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`),
+      },
+      stdout: helper.stdout ?? '',
+      stderr: helper.stderr ?? '',
+      aiReviewGateResult: null,
+    };
+  }
+}
+
+function makeSpawnError(code: string, message: string): NodeJS.ErrnoException {
+  const error = new Error(message) as NodeJS.ErrnoException;
+  error.code = code;
+  return error;
+}
+
+const REVIEW_GATE_CAPTURE_HELPER = String.raw`
+const { spawn } = require('node:child_process');
+
+let payloadText = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  payloadText += chunk;
+});
+process.stdin.on('end', () => {
+  let payload;
+  try {
+    payload = JSON.parse(payloadText || '{}');
+  } catch (error) {
+    emit({
+      status: null,
+      signal: null,
+      errorCode: 'EHELPER',
+      errorMessage: 'invalid capture helper payload: ' + (error && error.message ? error.message : String(error)),
+      stdout: '',
+      stderr: '',
+      aiReviewGateResult: null,
+    });
+    return;
+  }
+
+  const tailBytes = Math.max(1, Number(payload.tailBytes) || 2097152);
+  const maxOutputBytes = Math.max(tailBytes, Number(payload.maxOutputBytes) || 16777216);
+  const timeout = Math.max(1, Number(payload.timeout) || 1);
+  const resultMarker = String(payload.resultMarker || 'PIPELANE_REVIEW_GATE_RESULT');
+  const markerRegex = new RegExp('(?:^|\\n)\\s*' + escapeRegExp(resultMarker) + '\\s*[:=]\\s*(passed|failed)\\b', 'gi');
+
+  const stdout = makeTailBuffer();
+  const stderr = makeTailBuffer();
+  let stdoutScanCarry = '';
+  let stderrScanCarry = '';
+  let aiReviewGateResult = null;
+  let outputBytes = 0;
+  let outputLimited = false;
+  let timedOut = false;
+  let childError = null;
+  let finished = false;
+
+  const child = spawn(String(payload.command || ''), {
+    cwd: String(payload.cwd || process.cwd()),
+    shell: true,
+    env: process.env,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+
+  const killHard = () => {
+    try {
+      child.kill('SIGKILL');
+    } catch {}
+  };
+  const terminate = () => {
+    try {
+      child.kill('SIGTERM');
+    } catch {}
+    setTimeout(killHard, 1000).unref();
+  };
+  const timer = setTimeout(() => {
+    timedOut = true;
+    terminate();
+  }, timeout);
+  timer.unref();
+
+  child.on('error', (error) => {
+    childError = {
+      code: error && error.code ? String(error.code) : 'ECHILD',
+      message: error && error.message ? error.message : String(error),
+    };
+    finish(null, null);
+  });
+
+  child.stdout.on('data', (chunk) => {
+    appendTail(stdout, chunk);
+    stdoutScanCarry = observe(stdoutScanCarry, chunk);
+  });
+  child.stderr.on('data', (chunk) => {
+    appendTail(stderr, chunk);
+    stderrScanCarry = observe(stderrScanCarry, chunk);
+  });
+
+  child.on('close', (status, signal) => {
+    finish(status, signal);
+  });
+
+  if (payload.input) {
+    child.stdin.end(String(payload.input));
+  } else {
+    child.stdin.end();
+  }
+
+  function makeTailBuffer() {
+    return { chunks: [], bytes: 0 };
+  }
+
+  function appendTail(tail, chunk) {
+    outputBytes += chunk.length;
+    if (outputBytes > maxOutputBytes && !outputLimited) {
+      outputLimited = true;
+      terminate();
+    }
+    const source = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    if (source.length >= tailBytes) {
+      tail.chunks = [Buffer.from(source.subarray(source.length - tailBytes))];
+      tail.bytes = tailBytes;
+      return;
+    }
+    tail.chunks.push(Buffer.from(source));
+    tail.bytes += source.length;
+    while (tail.bytes > tailBytes && tail.chunks.length > 0) {
+      const excess = tail.bytes - tailBytes;
+      const first = tail.chunks[0];
+      if (first.length <= excess) {
+        tail.chunks.shift();
+        tail.bytes -= first.length;
+      } else {
+        tail.chunks[0] = Buffer.from(first.subarray(excess));
+        tail.bytes -= excess;
+      }
+    }
+  }
+
+  function observe(carry, chunk) {
+    const text = carry + chunk.toString('utf8');
+    markerRegex.lastIndex = 0;
+    let match;
+    while ((match = markerRegex.exec(text)) !== null) {
+      aiReviewGateResult = String(match[1]).toLowerCase() === 'passed' ? 'passed' : 'failed';
+    }
+    return text.slice(-4096);
+  }
+
+  function finish(status, signal) {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timer);
+    let errorCode = null;
+    let errorMessage = null;
+    if (childError) {
+      errorCode = childError.code;
+      errorMessage = childError.message;
+    } else if (outputLimited) {
+      errorCode = 'EOUTPUTLIMIT';
+      errorMessage = 'review gate output exceeded ' + maxOutputBytes + ' bytes';
+    } else if (timedOut) {
+      errorCode = 'ETIMEDOUT';
+      errorMessage = 'review gate timed out after ' + timeout + 'ms';
+    }
+    emit({
+      status: typeof status === 'number' ? status : null,
+      signal: signal || null,
+      errorCode,
+      errorMessage,
+      stdout: tailBufferToString(stdout),
+      stderr: tailBufferToString(stderr),
+      aiReviewGateResult,
+    });
+  }
+});
+
+function tailBufferToString(tail) {
+  return Buffer.concat(tail.chunks, tail.bytes).toString('utf8');
+}
+
+function emit(record) {
+  process.stdout.write(JSON.stringify(record));
+}
+
+function escapeRegExp(value) {
+  return String(value)
+    .replace(/[.*+?^$()|[\]\\]/g, '\\$&')
+    .replace(/[{}]/g, '\\$&');
+}
+`;
 
 function runReviewGate(options: {
   gate: ReviewGateConfig;
@@ -2216,28 +2495,31 @@ function runReviewGate(options: {
   }
 
   const timeoutMs = gate.timeoutMs ?? DEFAULT_GATE_TIMEOUT_MS;
-  const result = spawnSync(gate.command, {
+  const beforeStatus = readWorktreeStatusSnapshot(repoRoot, { includeStatusDigest: true });
+  const { result, stdout, stderr } = spawnReviewGateCommand(gate.command, {
     cwd: repoRoot,
-    encoding: 'utf8',
-    shell: true,
     timeout: timeoutMs,
-    stdio: ['ignore', 'pipe', 'pipe'],
     env: gateSubprocessEnv(),
   });
   const exitCode = typeof result.status === 'number' ? result.status : null;
-  const stdout = typeof result.stdout === 'string' ? result.stdout : '';
-  const stderr = typeof result.stderr === 'string' ? result.stderr : '';
   const timedOut = result.error && (result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT';
+  const outputLimited = result.error && (result.error as NodeJS.ErrnoException).code === 'EOUTPUTLIMIT';
   const ok = exitCode === 0 && !timedOut && !result.error;
+  const afterStatus = readWorktreeStatusSnapshot(repoRoot, { includeStatusDigest: true });
+  const checkoutMutationSummary = reviewGateCheckoutMutationSummary('Review command gate', beforeStatus, afterStatus);
   const errorSummary = result.error && !timedOut
-    ? `command failed to start: ${result.error.message}`
+    ? outputLimited
+      ? `command exceeded output limit ${REVIEW_GATE_MAX_OUTPUT_BYTES} bytes`
+      : `command failed to start: ${result.error.message}`
     : timedOut
       ? `command timed out after ${timeoutMs}ms`
       : `command exited ${exitCode}`;
 
   return finishGate(base, startMs, {
-    status: ok ? 'passed' : 'failed',
-    summary: ok ? `command passed: ${gate.command}` : errorSummary,
+    status: ok && !checkoutMutationSummary ? 'passed' : 'failed',
+    summary: ok && !checkoutMutationSummary
+      ? `command passed: ${gate.command}`
+      : checkoutMutationSummary ?? errorSummary,
     exitCode,
     stdoutTail: tail(redactReviewOutput(stdout)),
     stderrTail: tail(redactReviewOutput(stderr)),
@@ -2290,31 +2572,28 @@ function runAiReviewGate(options: {
     changedFiles,
   });
   const beforeStatus = readWorktreeStatusSnapshot(repoRoot, { includeStatusDigest: true });
-  const result = spawnSync(command, {
+  const { result, stdout, stderr, aiReviewGateResult } = spawnReviewGateCommand(command, {
     cwd: repoRoot,
-    encoding: 'utf8',
-    shell: true,
     input: prompt,
     timeout: timeoutMs,
     env,
-    stdio: ['pipe', 'pipe', 'pipe'],
   });
   const exitCode = typeof result.status === 'number' ? result.status : null;
-  const stdout = typeof result.stdout === 'string' ? result.stdout : '';
-  const stderr = typeof result.stderr === 'string' ? result.stderr : '';
-  const output = `${stdout}\n${stderr}`;
-  const declared = parseAiReviewGateResult(output);
+  const declared = aiReviewGateResult;
   const timedOut = result.error && (result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT';
+  const outputLimited = result.error && (result.error as NodeJS.ErrnoException).code === 'EOUTPUTLIMIT';
   const attester = resolveReviewActorIdentity({ provider: resolved.provider, env });
   const redactedStdout = tail(redactReviewOutput(stdout));
   const redactedStderr = tail(redactReviewOutput(stderr));
   const afterStatus = readWorktreeStatusSnapshot(repoRoot, { includeStatusDigest: true });
-  const worktreeMutationSummary = aiReviewWorktreeMutationSummary(beforeStatus, afterStatus);
+  const worktreeMutationSummary = reviewGateCheckoutMutationSummary('AI review command', beforeStatus, afterStatus);
 
   if (result.error && !timedOut) {
     return finishGate({ ...base, command }, startMs, {
       status: 'failed',
-      summary: `AI review command failed to start: ${result.error.message}`,
+      summary: outputLimited
+        ? `AI review command exceeded output limit ${REVIEW_GATE_MAX_OUTPUT_BYTES} bytes`
+        : `AI review command failed to start: ${result.error.message}`,
       exitCode,
       attester,
       stdoutTail: redactedStdout,
@@ -2489,8 +2768,12 @@ function normalizeReviewProvider(value: string): string {
 }
 
 function buildAiReviewGateEnv(provider: string, sessionId: string, gate: ReviewGateConfig): NodeJS.ProcessEnv {
+  const env = gateSubprocessEnv();
+  for (const key of AI_REVIEW_GATE_SCRUBBED_SESSION_ENV_KEYS) {
+    delete env[key];
+  }
   return {
-    ...gateSubprocessEnv(),
+    ...env,
     [REVIEW_GATE_SESSION_ENV]: sessionId,
     PIPELANE_REVIEW_PROVIDER: provider,
     PIPELANE_AGENT_PROVIDER: provider,
@@ -2514,11 +2797,14 @@ function renderAiReviewGatePrompt(options: {
   const truncated = changedFiles.length > 250
     ? [`- ... ${changedFiles.length - 250} more files omitted`]
     : [];
+  const requestedCommand = gate.userCommands?.map((command) => command.trim()).find(Boolean);
   const prefix = gate.id === 'code-review-high'
     ? ['/code-review high', '']
     : gate.id === 'code-review-ultra'
       ? ['/code-review ultra', '']
-      : [];
+      : requestedCommand
+        ? [requestedCommand, '']
+        : [];
   return [
     ...prefix,
     'You are running as an independent Pipelane AI review gate.',
@@ -2541,31 +2827,34 @@ function renderAiReviewGatePrompt(options: {
     'Required result protocol:',
     `- Print ${REVIEW_GATE_RESULT_MARKER}=failed if you found any blocking issue or could not complete the review.`,
     `- Print ${REVIEW_GATE_RESULT_MARKER}=passed only if the gate is clean.`,
-    '- Put the result marker on its own line after your findings.',
+    '- End your final response with exactly one standalone result marker line.',
+    '- Do not omit the result marker after running tests, even when there are no findings.',
+    '- If you are uncertain whether the review completed, print the failed marker.',
   ].join('\n');
 }
 
-function parseAiReviewGateResult(output: string): 'passed' | 'failed' | null {
-  const matches = [...output.matchAll(new RegExp(`(?:^|\\n)\\s*${REVIEW_GATE_RESULT_MARKER}\\s*[:=]\\s*(passed|failed)\\b`, 'gi'))];
-  const last = matches.at(-1);
-  if (!last) return null;
-  return last[1].toLowerCase() === 'passed' ? 'passed' : 'failed';
-}
-
-function aiReviewWorktreeMutationSummary(
+function reviewGateCheckoutMutationSummary(
+  label: string,
   before: WorktreeStatusSnapshot,
   after: WorktreeStatusSnapshot,
 ): string | null {
+  if (before.head && after.head && before.head !== after.head) {
+    return `${label} changed HEAD; revert gate commit(s) and rerun (${shortSha(before.head)} -> ${shortSha(after.head)})`;
+  }
   if (!before.statusDigestReliable) {
-    return `AI review command could not verify unchanged worktree before execution: ${formatWorktreeStatusWarnings(before)}`;
+    return `${label} could not verify unchanged worktree before execution: ${formatWorktreeStatusWarnings(before)}`;
   }
   if (!after.statusDigestReliable) {
-    return `AI review command could not verify unchanged worktree after execution: ${formatWorktreeStatusWarnings(after)}`;
+    return `${label} could not verify unchanged worktree after execution: ${formatWorktreeStatusWarnings(after)}`;
   }
   if (before.statusDigest !== after.statusDigest) {
-    return `AI review command mutated the worktree; revert reviewer changes and rerun (${formatWorktreeStatusDelta(before, after)})`;
+    return `${label} mutated the worktree; revert gate changes and rerun (${formatWorktreeStatusDelta(before, after)})`;
   }
   return null;
+}
+
+function shortSha(value: string): string {
+  return value.slice(0, 12) || 'unknown';
 }
 
 function formatWorktreeStatusWarnings(snapshot: Pick<WorktreeStatusSnapshot, 'statusDigestWarnings'>): string {

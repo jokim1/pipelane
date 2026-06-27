@@ -183,9 +183,11 @@ Pipelane commands:
   review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human]
   review pass --gate <id> --message <text>
   review setup [--yes] [--print] [--list-gates] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]
-  orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]
+  orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes] [--analysis-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]
   orchestrate goal-spec [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]
   orchestrate plan [--slice-id <id>] (--plan-file <path> | --outcome <text>) [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]
+  orchestrate analyze (--plan-file <path> | --run-id <id>) --analysis-file <path> [--slices-file <path>]
+  orchestrate plan-review <pass|bypass> --run-id <id> --gate <id> (--message <text> | --reason <text>)
   orchestrate prepare --run-id <id> [--offline]
   orchestrate dispatch --run-id <id>
   orchestrate start --run-id <id> [--slice-id <id>] [--force]

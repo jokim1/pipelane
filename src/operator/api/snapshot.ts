@@ -789,10 +789,13 @@ function summarizeOrchestrationRun(
   });
 
   const nextAction = buildOrchestrationNextAction(run, config, trustedReviewBySlice, missingWorktrees, migrationNeededBySlice, reviewableBySlice);
+  const state = missingWorktrees.length > 0 || nextAction?.state === 'blocked'
+    ? 'blocked'
+    : orchestrationLaneStateFromCounts(run.slices.length, counts);
   return {
     id: run.id,
     status: run.status,
-    state: missingWorktrees.length > 0 ? 'blocked' : orchestrationLaneStateFromCounts(run.slices.length, counts),
+    state,
     title: run.plan.title,
     planPath: run.source.planPath,
     createdAt: run.createdAt,
@@ -913,6 +916,27 @@ function buildOrchestrationNextAction(
       state: 'blocked',
       reason: `slice ${emptySlice.id} produced no material change; re-dispatch with a sharper goal, or defer it`,
       command: `${orchestrateCommand} start ${runIdArg} --force`,
+    });
+  }
+  if (needsPrepare && run.planAnalysisRequired && !run.planAnalysis) {
+    return buildOrchestrationAction({
+      id: 'orchestrate.analyze',
+      label: 'Analyze orchestration plan',
+      state: 'awaiting_preflight',
+      reason: 'plan analysis is required before slice worktrees can be prepared',
+      command: `${orchestrateCommand} analyze ${runIdArg} --analysis-file <path>`,
+    });
+  }
+  const pendingPlanReviewGate = needsPrepare
+    ? run.planAnalysis?.planReview.gates.find((gate) => gate.blocking && gate.status === 'pending')
+    : null;
+  if (pendingPlanReviewGate) {
+    return buildOrchestrationAction({
+      id: 'orchestrate.plan-review',
+      label: 'Complete orchestration plan review',
+      state: 'blocked',
+      reason: `plan-review gate ${pendingPlanReviewGate.gateId} is pending`,
+      command: `${orchestrateCommand} plan-review pass ${runIdArg} --gate ${pendingPlanReviewGate.gateId} --message <summary>`,
     });
   }
   if (needsPrepare) {
