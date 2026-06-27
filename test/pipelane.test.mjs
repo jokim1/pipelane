@@ -9337,6 +9337,65 @@ test('FU2 cockpit surfaces a cleaned-worktree legacy run needing ledger migratio
   }
 });
 
+test('FU2 mixed cleaned completed run (legacy-unsigned + tampered sibling) surfaces upgrade-ledger, not a dead-end review', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const reviewStateKey = 'fu2-mixed-cleaned-run-secret';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = { planReview: { gates: [] }, gates: [{ id: 'static-pass', phase: 'static', type: 'command', command: 'node -e "process.exit(0)"', blocking: true }] };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt passing static gate');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'fu2-mixed-plan.md'), ['# FU2 Mixed Plan', '', '## Slice 1: Produces a change', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/fu2-mixed-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(), PIPELANE_REVIEW_STATE_KEY: reviewStateKey });
+    runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_REVIEW_STATE_KEY: reviewStateKey });
+
+    // Synthesize a two-slice ledger from the one real signed slice: slice A is a
+    // legacy-unsigned record (migration-eligible), slice B is a signed-but-tampered
+    // record (untrusted, NOT migration-eligible). Both worktrees are gone. Without the
+    // worktree guard in needsReview, the tampered sibling B would route the cockpit to a
+    // dead-end `orchestrate review` (the gate fails "worktree is missing"); with it, the
+    // run shows the upgrade-ledger migration action instead.
+    const ledger = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
+    const base = ledger.slices[0];
+    const sliceA = {
+      ...base,
+      id: `${base.id}-legacy`,
+      index: 0,
+      worktreePath: path.join(repoRoot, '.pipelane-gone-legacy'),
+      branchName: `${base.branchName}-legacy`,
+      review: { ...base.review, signature: undefined, binding: undefined },
+    };
+    const sliceB = {
+      ...base,
+      id: `${base.id}-tampered`,
+      index: 1,
+      worktreePath: path.join(repoRoot, '.pipelane-gone-tampered'),
+      branchName: `${base.branchName}-tampered`,
+      review: { ...base.review, signature: 'd'.repeat(64) },
+    };
+    ledger.slices = [sliceA, sliceB];
+    writeFileSync(planned.ledgerPath, JSON.stringify(ledger, null, 2) + '\n', 'utf8');
+
+    const migrated = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot, { PIPELANE_REVIEW_STATE_KEY: reviewStateKey }).stdout);
+    assert.equal(migrated.data.orchestration.activeRun.id, planned.runId);
+    assert.equal(migrated.data.orchestration.activeRun.nextAction.id, 'orchestrate.upgrade-ledger');
+    assert.notEqual(migrated.data.orchestration.activeRun.nextAction.id, 'orchestrate.review');
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('C1 orchestrate scope does not downgrade an already-completed run', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];

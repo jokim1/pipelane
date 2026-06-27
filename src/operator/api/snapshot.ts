@@ -45,6 +45,7 @@ import {
   selectActiveSlices,
   sliceReviewFullySatisfied,
   sliceReviewNeedsSignatureMigration,
+  sliceWorktreeExists,
   type OrchestrationMissingWorktreeDiagnostic,
   type OrchestrationReviewSatisfactionOptions,
   type OrchestrationRunRecord,
@@ -753,6 +754,9 @@ function summarizeOrchestrationRun(
   // FU2: per-slice "this completed slice needs upgrade-ledger" (unsigned review evidence
   // + cleaned worktree, once the key is active) — drives the migration next action below.
   const migrationNeededBySlice = new Map<string, boolean>();
+  // FU2: per-slice "the worktree still exists" — a slice cannot be re-reviewed without
+  // its worktree, so it must not drive the `orchestrate review` next action.
+  const reviewableBySlice = new Map<string, boolean>();
   const missingWorktrees: OrchestrationMissingWorktreeSummary[] = [];
   // C2: bind the trusted-review verdict to this run (anti-replay).
   const runReviewOptions = { ...reviewOptions, runId: run.id };
@@ -764,6 +768,7 @@ function summarizeOrchestrationRun(
     trustedReviewBySlice.set(slice.id, trustedReviewComplete);
     if (trustedReviewComplete) counts.trustedReviewComplete += 1;
     migrationNeededBySlice.set(slice.id, sliceReviewNeedsSignatureMigration(slice, runReviewOptions));
+    reviewableBySlice.set(slice.id, sliceWorktreeExists(slice, reviewOptions));
     providerCounts[slice.provider] = (providerCounts[slice.provider] ?? 0) + 1;
     const missingWorktree = missingRelevantSliceWorktreeDiagnostic(slice, reviewOptions);
     if (missingWorktree) missingWorktrees.push(missingWorktree);
@@ -783,7 +788,7 @@ function summarizeOrchestrationRun(
     };
   });
 
-  const nextAction = buildOrchestrationNextAction(run, config, trustedReviewBySlice, missingWorktrees, migrationNeededBySlice);
+  const nextAction = buildOrchestrationNextAction(run, config, trustedReviewBySlice, missingWorktrees, migrationNeededBySlice, reviewableBySlice);
   return {
     id: run.id,
     status: run.status,
@@ -838,6 +843,7 @@ function buildOrchestrationNextAction(
   trustedReviewBySlice: Map<string, boolean>,
   missingWorktrees: OrchestrationMissingWorktreeSummary[] = [],
   migrationNeededBySlice: Map<string, boolean> = new Map(),
+  reviewableBySlice: Map<string, boolean> = new Map(),
 ): OrchestrationActionSummary | null {
   const orchestrateCommand = '/pipelane orchestrate';
   const prCommand = formatWorkflowCommand(config, 'pr');
@@ -864,7 +870,12 @@ function buildOrchestrationNextAction(
     slice.worker?.status === 'succeeded'
     && slice.status !== 'empty'
     && !trustedReviewBySlice.get(slice.id)
-    && !migrationNeededBySlice.get(slice.id),
+    && !migrationNeededBySlice.get(slice.id)
+    // A slice whose worktree was cleaned cannot be re-reviewed; routing it to
+    // `orchestrate review` is a dead end (the gate fails "worktree is missing").
+    // Surfacing a migration-needed run (FU2) can otherwise expose such a sibling
+    // slice, so only count reviewable (worktree-present) slices here.
+    && reviewableBySlice.get(slice.id) !== false,
   );
   const fullyReviewed = active.length > 0 && active.every((slice) => trustedReviewBySlice.get(slice.id));
 

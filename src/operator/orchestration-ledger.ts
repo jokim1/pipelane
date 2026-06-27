@@ -1028,7 +1028,7 @@ function currentSliceStatusDigest(
   return status;
 }
 
-function sliceWorktreeExists(slice: OrchestrationSliceRecord, options: OrchestrationReviewSatisfactionOptions = {}): boolean {
+export function sliceWorktreeExists(slice: OrchestrationSliceRecord, options: OrchestrationReviewSatisfactionOptions = {}): boolean {
   if (!slice.worktreePath) return false;
   if (options.worktreeExistsCache?.has(slice.worktreePath)) return options.worktreeExistsCache.get(slice.worktreePath) ?? false;
   const exists = existsSync(slice.worktreePath);
