@@ -10,9 +10,11 @@ import { installCodexBootstrapSkill } from './codex-install.ts';
 import {
   applyAgentsGuidanceMigrationsWithApproval,
   applyClaudeGuidanceMigrationsWithApproval,
+  applyLessonsMigrationWithApproval,
   detectSetupDrift,
   formatAgentsGuidanceMigrations,
   formatClaudeGuidanceMigrations,
+  formatLessonsMigration,
   formatSetupResult,
   type SetupConsumerRepoResult,
   type SetupDrift,
@@ -349,7 +351,8 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
     emitGlobalSurfaceRefreshHint(globalSurfaces, options);
     if (!options.check) {
       const appliedGuidanceMigration = await maybeApplyGuidanceMigrationsFromDrift(driftResult.drift, options.yes);
-      if (appliedGuidanceMigration) {
+      const appliedLessonsMigration = await maybeApplyLessonsMigrationFromDrift(driftResult.drift, options.yes);
+      if (appliedGuidanceMigration || appliedLessonsMigration) {
         driftResult = tryDetectDrift(repoRoot);
       }
     }
@@ -447,7 +450,8 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
   emitGlobalSurfaceRefreshHint(globalSurfaces, options);
   if (!driftResult.drift?.needsSetup) {
     const appliedGuidanceMigration = await maybeApplyGuidanceMigrationsFromDrift(driftResult.drift, options.yes);
-    if (appliedGuidanceMigration) {
+    const appliedLessonsMigration = await maybeApplyLessonsMigrationFromDrift(driftResult.drift, options.yes);
+    if (appliedGuidanceMigration || appliedLessonsMigration) {
       driftResult = tryDetectDrift(repoRoot);
     }
   }
@@ -456,8 +460,11 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
   let ranSetup = false;
   const drift = driftResult.drift;
   if (drift?.needsSetup && drift.claude.collisions.length === 0) {
-    const setupResult = await maybeApplyGuidanceMigrationsFromSetupResult(
-      setupConsumerRepo(repoRoot),
+    const setupResult = await maybeApplyLessonsMigrationFromSetupResult(
+      await maybeApplyGuidanceMigrationsFromSetupResult(
+        setupConsumerRepo(repoRoot),
+        options.yes,
+      ),
       options.yes,
     );
     writeUpdateOutput(options, '\n' + formatSetupResult(setupResult).join('\n') + '\n');
@@ -693,6 +700,17 @@ async function maybeApplyGuidanceMigrationsFromDrift(
   return appliedAgents.length > 0 || appliedClaude.length > 0;
 }
 
+// Mirror of the AGENTS guidance migration above for the Lessons block, so the
+// up-to-date update path (which never runs full setup) still backfills/refreshes
+// the CLAUDE.md Lessons block with approval instead of only nagging about it.
+async function maybeApplyLessonsMigrationFromDrift(
+  drift: SetupDrift | null,
+  yes: boolean,
+): Promise<boolean> {
+  const applied = await applyLessonsMigrationWithApproval(drift?.lessonsMigration ?? null, { yes });
+  return applied !== null;
+}
+
 async function maybeApplyGuidanceMigrationsFromSetupResult(
   result: SetupConsumerRepoResult,
   yes: boolean,
@@ -714,6 +732,21 @@ async function maybeApplyGuidanceMigrationsFromSetupResult(
       ...result.appliedClaudeGuidanceMigrations,
       ...appliedClaude,
     ],
+  };
+}
+
+async function maybeApplyLessonsMigrationFromSetupResult(
+  result: SetupConsumerRepoResult,
+  yes: boolean,
+): Promise<SetupConsumerRepoResult> {
+  const applied = await applyLessonsMigrationWithApproval(result.lessonsMigration, { yes });
+  if (!applied) {
+    return result;
+  }
+  return {
+    ...result,
+    lessonsMigration: null,
+    appliedLessonsMigration: applied,
   };
 }
 
@@ -899,6 +932,12 @@ function emitDriftHint(result: DriftResult, options: Pick<UpdateOptions, 'output
       writeUpdateOutput(options, 'Run `pipelane setup --yes` to apply these CLAUDE.md changes non-interactively, or run `pipelane setup` in a TTY and approve the prompt.\n');
       emittedGuidanceMigration = true;
     }
+    if (drift.lessonsMigration) {
+      writeUpdateOutput(options, '\nCLAUDE.md Lessons block migration requires approval:\n');
+      writeUpdateOutput(options, formatLessonsMigration(drift.lessonsMigration).join('\n') + '\n');
+      writeUpdateOutput(options, 'Run `pipelane setup --yes` to apply this CLAUDE.md change non-interactively, or run `pipelane setup` in a TTY and approve the prompt.\n');
+      emittedGuidanceMigration = true;
+    }
     if (emittedGuidanceMigration) {
       return;
     }
@@ -960,6 +999,11 @@ export function formatFollowUpSummary(drift: SetupDrift): string {
   }
   if (claudeGuidanceMigrations.length > 0) {
     changes.push('CLAUDE.md guidance migration requires approval');
+  }
+  if (drift.lessonsMigration) {
+    changes.push(drift.lessonsMigration.action === 'insert'
+      ? 'CLAUDE.md Lessons block to add (capture instruction + empty entries region)'
+      : 'CLAUDE.md Lessons instruction prose to refresh (existing entries preserved)');
   }
   if (warnings.length > 0) {
     changes.push(`Readiness warnings: ${warnings.join(' ')}`);

@@ -48,4 +48,6 @@ Key routing rules:
 - Audit refactor hotspots and rethink architecture (plan first) -> `/fix rethink`
 - Refresh repo guidance -> `/fix refresh-guidance`
 
+{{LESSONS_SECTION}}
+
 {{DEPLOY_CONFIG_SECTION}}

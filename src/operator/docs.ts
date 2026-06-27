@@ -39,6 +39,10 @@ const CLAUDE_WORKSPACE_POLICY_MARKER_END = '<!-- pipelane:claude-workspace-polic
 const CLAUDE_COMMAND_MARKER = '<!-- pipelane:command:';
 const CONSUMER_EXTENSION_MARKER_START = '<!-- pipelane:consumer-extension:start -->';
 const CONSUMER_EXTENSION_MARKER_END = '<!-- pipelane:consumer-extension:end -->';
+const LESSONS_MARKER_START = '<!-- pipelane:lessons:start -->';
+const LESSONS_MARKER_END = '<!-- pipelane:lessons:end -->';
+const LESSONS_ENTRIES_MARKER_START = '<!-- pipelane:lessons:entries:start -->';
+const LESSONS_ENTRIES_MARKER_END = '<!-- pipelane:lessons:entries:end -->';
 const MANAGED_CLAUDE_COMMANDS_FILENAME = '.pipelane-managed.json';
 // Two-signature legacy detection: first-line description + a distinctive body
 // string. For workflow commands the body string is usually the npm script
@@ -193,6 +197,30 @@ function renderTemplate(template: string, config: WorkflowConfig): string {
   );
 }
 
+// The pipelane-owned instruction prose for the managed Lessons block. Refreshed
+// on every re-sync; the entries region below it is append-only and preserved.
+const LESSONS_INSTRUCTION = `## Lessons
+
+When the user corrects a mistake you made in this repo, append a one-line, dated
+lesson to the entries region below (newest last), e.g. \`- <YYYY-MM-DD>: <lesson>\`.
+Keep one line per lesson; do not delete or rewrite existing entries (dedup and
+pruning are \`/karpathy audit\`'s job).`;
+
+// Single source of truth for the managed Lessons block written into CLAUDE.md
+// (Change A seeds it via the template placeholder; Change B inserts/refreshes it
+// in existing files). `entriesInner` carries any preserved lesson lines on
+// re-sync; empty for a fresh block.
+function renderLessonsBlock(entriesInner = ''): string {
+  const entriesBody = entriesInner.length > 0 ? `\n${entriesInner}\n` : '\n';
+  return [
+    LESSONS_MARKER_START,
+    LESSONS_INSTRUCTION,
+    '',
+    `${LESSONS_ENTRIES_MARKER_START}${entriesBody}${LESSONS_ENTRIES_MARKER_END}`,
+    LESSONS_MARKER_END,
+  ].join('\n');
+}
+
 // Single source of truth for seeding a fresh CLAUDE.md from the Pipelane template.
 // Used by setupConsumerRepo (creating CLAUDE.md on first init) and handleConfigure
 // (seeding when a consumer ran init long ago and has since deleted CLAUDE.md).
@@ -202,7 +230,9 @@ function renderTemplate(template: string, config: WorkflowConfig): string {
 export function renderClaudeMdFromTemplate(config: WorkflowConfig): string {
   const rendered = renderTemplate(readTemplate('pipelane/CLAUDE.template.md'), config);
   const emptySection = renderDeployConfigSection(emptyDeployConfig()).trimEnd();
-  return rendered.replace('{{DEPLOY_CONFIG_SECTION}}', emptySection);
+  return rendered
+    .replace('{{DEPLOY_CONFIG_SECTION}}', emptySection)
+    .replace('{{LESSONS_SECTION}}', renderLessonsBlock());
 }
 
 function detectLegacyClaudeCommand(content: string, filename?: string): ManagedCommand | null {
@@ -299,25 +329,24 @@ function saveManagedClaudeCommands(commandsDir: string, desiredFiles: Set<string
   });
 }
 
-function extractConsumerExtension(content: string): string | null {
-  const startIndex = content.indexOf(CONSUMER_EXTENSION_MARKER_START);
-  // Use lastIndexOf for the end marker so a consumer who pastes content
-  // that itself contains the literal `:end -->` marker doesn't truncate
-  // their own extension on the next re-sync.
-  const endIndex = content.lastIndexOf(CONSUMER_EXTENSION_MARKER_END);
+// Extract the inner text between a start/end marker pair, or null if the pair is
+// absent or malformed. `lastIndexOf` on the end marker so pasted content that
+// itself contains the literal `:end -->` doesn't truncate on the next re-sync.
+// Strips the one newline immediately after the start marker and before the end
+// marker (they terminate the marker lines themselves); any blank lines placed
+// inside are preserved verbatim. `\r?\n` handles CRLF-saved Windows files.
+function extractMarkedRegionInner(content: string, startMarker: string, endMarker: string): string | null {
+  const startIndex = content.indexOf(startMarker);
+  const endIndex = content.lastIndexOf(endMarker);
   if (startIndex === -1 || endIndex === -1 || endIndex < startIndex) {
     return null;
   }
+  const inner = content.slice(startIndex + startMarker.length, endIndex);
+  return inner.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
+}
 
-  const innerStart = startIndex + CONSUMER_EXTENSION_MARKER_START.length;
-  const inner = content.slice(innerStart, endIndex);
-  // Strip the one newline immediately after the start marker and the one
-  // immediately before the end marker (these terminate the marker lines
-  // themselves). `\r?\n` handles CRLF-saved files from Windows editors.
-  // Any blank lines the consumer intentionally placed inside the extension
-  // are preserved verbatim.
-  const trimmed = inner.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
-  return trimmed;
+function extractConsumerExtension(content: string): string | null {
+  return extractMarkedRegionInner(content, CONSUMER_EXTENSION_MARKER_START, CONSUMER_EXTENSION_MARKER_END);
 }
 
 function injectConsumerExtension(rendered: string, captured: string | null): string {
@@ -683,12 +712,15 @@ export interface SetupConsumerRepoResult {
   appliedAgentsGuidanceMigrations: AgentsGuidanceMigration[];
   claudeGuidanceMigrations: ClaudeGuidanceMigration[];
   appliedClaudeGuidanceMigrations: ClaudeGuidanceMigration[];
+  lessonsMigration: LessonsMigration | null;
+  appliedLessonsMigration: LessonsMigration | null;
   warnings: string[];
 }
 
 export interface SetupConsumerRepoOptions {
   applyAgentsGuidanceMigrations?: boolean;
   applyClaudeGuidanceMigrations?: boolean;
+  applyLessonsMigration?: boolean;
 }
 
 export interface AgentsGuidanceReplacement {
@@ -833,6 +865,113 @@ export async function applyAgentsGuidanceMigrationsWithApproval(
     rl.close();
   }
   return applyAgentsGuidanceMigrations(migrations);
+}
+
+export interface LessonsMigration {
+  file: 'CLAUDE.md';
+  path: string;
+  action: 'insert' | 'resync';
+}
+
+// Returns CLAUDE.md content with the managed Lessons block inserted (when the
+// block is absent) or its instruction prose refreshed while the entries region
+// is preserved verbatim (when present). Returns null when no change is needed,
+// or when the block is malformed (left for a human to resolve).
+function computeLessonsBlockUpdate(content: string): string | null {
+  const startIndex = content.indexOf(LESSONS_MARKER_START);
+  if (startIndex === -1) {
+    const base = content.replace(/\s*$/, '');
+    const next = `${base}\n\n${renderLessonsBlock()}\n`;
+    return next === content ? null : next;
+  }
+  // First end marker AT/AFTER the start (indexOf, NOT lastIndexOf): the block
+  // sits mid-file, so consumer prose below it may legitimately quote the literal
+  // end marker (e.g. docs about these markers). lastIndexOf would latch onto that
+  // quote, and the rebuild below would delete everything between the real
+  // terminator and the quote. The inner entries:end still uses lastIndexOf (those
+  // entries are genuinely terminal within the block). The outer end marker is not
+  // a substring of the entries:end marker, so this never mis-binds to the latter.
+  const endIndex = content.indexOf(LESSONS_MARKER_END, startIndex);
+  if (endIndex === -1) {
+    return null;
+  }
+  // Extract entries strictly from inside the outer block, and bail if the
+  // entries markers are missing or malformed: rebuilding with empty entries
+  // would silently discard accreted lessons, the one thing this must never do.
+  const blockInner = content.slice(startIndex + LESSONS_MARKER_START.length, endIndex);
+  const entriesInner = extractMarkedRegionInner(blockInner, LESSONS_ENTRIES_MARKER_START, LESSONS_ENTRIES_MARKER_END);
+  if (entriesInner === null) {
+    return null;
+  }
+  const rebuilt = renderLessonsBlock(entriesInner);
+  const next = `${content.slice(0, startIndex)}${rebuilt}${content.slice(endIndex + LESSONS_MARKER_END.length)}`;
+  return next === content ? null : next;
+}
+
+// Detect whether an existing CLAUDE.md needs the Lessons block inserted or
+// refreshed. Returns null when there is no CLAUDE.md (the create-from-template
+// path already seeds the block) or the block is already current.
+function detectLessonsMigrationForRepo(repoRoot: string): LessonsMigration | null {
+  const claudePath = path.join(repoRoot, 'CLAUDE.md');
+  if (!existsSync(claudePath)) {
+    return null;
+  }
+  const content = readFileSync(claudePath, 'utf8');
+  if (computeLessonsBlockUpdate(content) === null) {
+    return null;
+  }
+  return {
+    file: 'CLAUDE.md',
+    path: claudePath,
+    action: content.includes(LESSONS_MARKER_START) ? 'resync' : 'insert',
+  };
+}
+
+export function applyLessonsMigration(migration: LessonsMigration | null): LessonsMigration | null {
+  if (!migration) {
+    return null;
+  }
+  const content = readFileSync(migration.path, 'utf8');
+  const next = computeLessonsBlockUpdate(content);
+  if (next === null) {
+    return null;
+  }
+  writeFileSync(migration.path, next, 'utf8');
+  return migration;
+}
+
+export function formatLessonsMigration(migration: LessonsMigration): string[] {
+  return [
+    migration.action === 'insert'
+      ? `- Add the managed \`## Lessons\` block to ${migration.file} (capture instruction + empty entries region).`
+      : `- Refresh the \`## Lessons\` instruction prose in ${migration.file}; existing lesson entries are preserved verbatim.`,
+  ];
+}
+
+export async function applyLessonsMigrationWithApproval(
+  migration: LessonsMigration | null,
+  options: { yes?: boolean } = {},
+): Promise<LessonsMigration | null> {
+  if (!migration) {
+    return null;
+  }
+  if (options.yes) {
+    return applyLessonsMigration(migration);
+  }
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    return null;
+  }
+  process.stdout.write(`${formatLessonsMigration(migration).join('\n')}\n`);
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (await rl.question('Apply this CLAUDE.md Lessons block change? Enter Y to proceed. [Y/n] ')).trim().toLowerCase();
+    if (answer !== '' && answer !== 'y' && answer !== 'yes') {
+      return null;
+    }
+  } finally {
+    rl.close();
+  }
+  return applyLessonsMigration(migration);
 }
 
 export function formatAgentsGuidanceMigrations(migrations: AgentsGuidanceMigration[]): string[] {
@@ -1021,6 +1160,16 @@ export function setupConsumerRepo(cwd: string, options: SetupConsumerRepoOptions
       : [];
   }
 
+  // Backfill/refresh the managed Lessons block in an existing CLAUDE.md. A
+  // freshly created CLAUDE.md already carries the block (template seed), so
+  // detection returns null there. Gated on the CLAUDE.md scaffold opt-out.
+  let lessonsMigration = scaffoldClaudeMd ? detectLessonsMigrationForRepo(repoRoot) : null;
+  let appliedLessonsMigration: LessonsMigration | null = null;
+  if (lessonsMigration && options.applyLessonsMigration) {
+    appliedLessonsMigration = applyLessonsMigration(lessonsMigration);
+    lessonsMigration = scaffoldClaudeMd ? detectLessonsMigrationForRepo(repoRoot) : null;
+  }
+
   return {
     repoRoot,
     createdClaude,
@@ -1036,6 +1185,8 @@ export function setupConsumerRepo(cwd: string, options: SetupConsumerRepoOptions
     appliedAgentsGuidanceMigrations,
     claudeGuidanceMigrations,
     appliedClaudeGuidanceMigrations,
+    lessonsMigration,
+    appliedLessonsMigration,
     warnings: [],
   };
 }
@@ -1069,6 +1220,7 @@ export interface SetupDrift {
   otherSurfaces: string[];
   agentsGuidanceMigrations: AgentsGuidanceMigration[];
   claudeGuidanceMigrations: ClaudeGuidanceMigration[];
+  lessonsMigration: LessonsMigration | null;
   warnings: string[];
 }
 
@@ -1211,6 +1363,9 @@ export function detectSetupDrift(cwd: string): SetupDrift {
   const claudeGuidanceMigrations = shouldScaffoldClaudeMd(syncDocs)
     ? detectClaudeGuidanceMigrationsForConfig(repoRoot, config)
     : [];
+  const lessonsMigration = shouldScaffoldClaudeMd(syncDocs)
+    ? detectLessonsMigrationForRepo(repoRoot)
+    : null;
 
   const claudeDirty =
     claude.addedCommands.length > 0 ||
@@ -1226,6 +1381,12 @@ export function detectSetupDrift(cwd: string): SetupDrift {
 
   return {
     repoRoot,
+    // Approval-gated guidance migrations (AGENTS.md guidance lines, the CLAUDE.md
+    // Lessons block) are intentionally NOT needsSetup triggers: they cannot
+    // auto-apply in a non-TTY run without --yes, so gating needsSetup on them
+    // would force perpetual setup re-runs. They are surfaced via the follow-up
+    // message and applied opportunistically with approval (see runUpdate's
+    // up-to-date / behind-main paths and emitDriftHint).
     needsSetup:
       claudeDirty ||
       codexDirty ||
@@ -1247,6 +1408,7 @@ export function detectSetupDrift(cwd: string): SetupDrift {
     otherSurfaces,
     agentsGuidanceMigrations,
     claudeGuidanceMigrations,
+    lessonsMigration,
     warnings: [],
   };
 }
@@ -1321,6 +1483,16 @@ export function formatSetupResult(result: SetupConsumerRepoResult): string[] {
     lines.push('CLAUDE.md guidance migration requires approval:');
     lines.push(...formatClaudeGuidanceMigrations(result.claudeGuidanceMigrations));
     lines.push('Run `pipelane setup --yes` to apply these CLAUDE.md changes non-interactively, or run `pipelane setup` in a TTY and approve the prompt.');
+  }
+  if (result.appliedLessonsMigration) {
+    lines.push(result.appliedLessonsMigration.action === 'insert'
+      ? 'Added the managed CLAUDE.md Lessons block.'
+      : 'Refreshed the CLAUDE.md Lessons block (existing entries preserved).');
+  }
+  if (result.lessonsMigration) {
+    lines.push('CLAUDE.md Lessons block migration requires approval:');
+    lines.push(...formatLessonsMigration(result.lessonsMigration));
+    lines.push('Run `pipelane setup --yes` to apply this CLAUDE.md change non-interactively, or run `pipelane setup` in a TTY and approve the prompt.');
   }
   if (result.warnings.length > 0) {
     lines.push('Readiness warnings:');

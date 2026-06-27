@@ -7,6 +7,7 @@ export const INIT_PIPELANE_SKILL_NAME = 'init-pipelane';
 export const PIPELANE_DISPATCH_SKILL_NAME = 'pipelane';
 export const PIPELANE_FIX_SKILL_NAME = 'pipelane-fix';
 export const FIX_SKILL_NAME = 'fix';
+export const LESSON_SKILL_NAME = 'lesson';
 
 export const MACHINE_CODEX_SKILL_MARKER_PREFIX = '<!-- pipelane:codex-global-skill:';
 export const MACHINE_CLAUDE_SKILL_MARKER_PREFIX = '<!-- pipelane:claude-global-skill:';
@@ -310,6 +311,21 @@ ${buildSkillMarker(options.markerPrefix, options.name)}
 ${options.body}`;
 }
 
+// Prompt body for the optional /lesson explicit-capture command. Deliberate
+// counterpart to the automatic capture the planted CLAUDE.md instruction drives:
+// /lesson lets the operator log one specific lesson on demand. No CLI call — the
+// agent edits CLAUDE.md directly (Kun Chen's direct-to-CLAUDE.md method).
+const LESSON_PROMPT_BODY = `Append a dated lesson to this repo's local CLAUDE.md so it accretes across sessions (both Claude and Codex read it).
+
+1. Take the lesson text from the arguments after \`/lesson\`. If none was given, ask the user for the one-line lesson and stop.
+2. Open \`CLAUDE.md\` at the repo root. If it has no \`<!-- pipelane:lessons:entries:end -->\` marker, the managed Lessons block is not provisioned yet — tell the user to run \`/pipelane setup\` (\`--yes\` to apply) first, then stop without editing.
+3. Insert a single new line immediately BEFORE the \`<!-- pipelane:lessons:entries:end -->\` marker (entries stay newest-last), formatted exactly:
+   \`- <YYYY-MM-DD>: <lesson>\`
+   Use today's date. Keep it to one line. Do not edit, reorder, or rewrite any existing entries or the instruction prose above the entries region.
+4. Confirm to the user the exact line you added.
+
+Dedup and pruning are \`/karpathy audit\`'s job, not this command's.`;
+
 export function renderBootstrapScript(pipelaneBinPath: string): string {
   return `#!/bin/sh
 set -eu
@@ -603,6 +619,24 @@ export function desiredHostInstall(
       name: FIX_SKILL_NAME,
       description: 'Produce durable, root-cause fixes without running a shell wrapper.',
       body: paths.fixPromptBody,
+      markerPrefix,
+    }),
+  });
+
+  // Optional /lesson — the deliberate, on-demand counterpart to the automatic
+  // capture the planted CLAUDE.md instruction drives. required:false so a
+  // pre-existing unmanaged /lesson is skipped instead of failing the whole
+  // install (a common name, same posture as /fix).
+  entries.push({
+    kind: 'prompt',
+    name: LESSON_SKILL_NAME,
+    slashAlias: `/${LESSON_SKILL_NAME}`,
+    required: false,
+    body: renderPromptSkillBody({
+      host,
+      name: LESSON_SKILL_NAME,
+      description: 'Append a dated lesson to the repo CLAUDE.md ## Lessons block.',
+      body: LESSON_PROMPT_BODY,
       markerPrefix,
     }),
   });
