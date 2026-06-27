@@ -1099,6 +1099,11 @@ test('init writes tracked Pipelane files and setup seeds CLAUDE plus tracked Cod
     const agentsGuidance = readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8');
     assert.match(agentsGuidance, /managed Pipelane runner/);
     assert.match(agentsGuidance, /npm run workflow:\*/);
+    assert.match(agentsGuidance, /For any code-changing task, start in a Pipelane task workspace/);
+    assert.match(agentsGuidance, /Do not edit, commit, run `\/pr`, `\/merge`, or `\/deploy` from a shared checkout/);
+    const claudeGuidance = readFileSync(path.join(repoRoot, 'CLAUDE.md'), 'utf8');
+    assert.match(claudeGuidance, /pipelane:claude-workspace-policy:start/);
+    assert.match(claudeGuidance, /For any code-changing task, start in a Pipelane task workspace/);
 
     const deploySkill = readFileSync(path.join(repoRoot, '.agents', 'skills', 'deploy', 'SKILL.md'), 'utf8');
     assert.match(deploySkill, /Blocked deploy follow-up behavior/);
@@ -14377,6 +14382,41 @@ test('review runner fails timed out command gates', () => {
     assert.equal(report.status, 'failed');
     assert.equal(slowGate.status, 'failed');
     assert.match(slowGate.summary, /timed out/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review command gates do not inherit AI gate command overrides', () => {
+  const repoRoot = createRepo();
+  try {
+    writeFileSync(
+      path.join(repoRoot, '.pipelane.json'),
+      `${JSON.stringify({
+        displayName: 'Demo App',
+        reviewGates: {
+          planReview: { gates: [] },
+          gates: [{
+            id: 'env-clean',
+            phase: 'static',
+            type: 'command',
+            command: `${process.execPath} -e "process.exit(process.env.PIPELANE_REVIEW_GATE_COMMAND ? 1 : 0)"`,
+          }],
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+    execFileSync('git', ['add', '.pipelane.json'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Configure review gate'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const result = runCli(['run', 'review', '--phase', 'static', '--json'], repoRoot, {
+      PIPELANE_REVIEW_GATE_COMMAND: 'codex exec --full-auto --sandbox read-only -',
+    });
+    const report = JSON.parse(result.stdout);
+    const gate = report.gates.find((entry) => entry.gateId === 'env-clean');
+
+    assert.equal(report.status, 'passed');
+    assert.equal(gate.status, 'passed');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -28439,6 +28479,7 @@ test('detectSetupDrift on a freshly-setup repo reports no drift', async () => {
     assert.equal(drift.repoGuidance.willScaffold, false);
     assert.deepEqual(drift.otherSurfaces, []);
     assert.deepEqual(drift.agentsGuidanceMigrations, []);
+    assert.deepEqual(drift.claudeGuidanceMigrations, []);
     assert.deepEqual(drift.warnings, []);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -28602,6 +28643,67 @@ test('setup --yes skips AGENTS.md stale workflow guidance migration when agentsS
     assert.doesNotMatch(result.stdout, /AGENTS\.md guidance migration requires approval/);
     assert.match(agents, /npm run workflow:new/);
     assert.doesNotMatch(agents, /Agent default workflow: `\/new`/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup proposes local CLAUDE.md workspace policy migration without --yes', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const claudePath = path.join(repoRoot, 'CLAUDE.md');
+    writeFileSync(
+      claudePath,
+      [
+        '# Demo App Local Operator Context',
+        '',
+        '## Local Operator Defaults',
+        '',
+        '- Keep this local note.',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+
+    const result = runCli(['setup'], repoRoot);
+    const claude = readFileSync(claudePath, 'utf8');
+    assert.match(result.stdout, /CLAUDE\.md guidance migration requires approval:/);
+    assert.match(result.stdout, /insert after CLAUDE\.md:3/);
+    assert.match(result.stdout, /start code-changing work with \/new/);
+    assert.match(result.stdout, /pipelane setup --yes/);
+    assert.doesNotMatch(claude, /pipelane:claude-workspace-policy:start/);
+    assert.match(claude, /Keep this local note/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup --yes applies local CLAUDE.md workspace policy migration', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const claudePath = path.join(repoRoot, 'CLAUDE.md');
+    writeFileSync(
+      claudePath,
+      [
+        '# Demo App Local Operator Context',
+        '',
+        '## Local Operator Defaults',
+        '',
+        '- Keep this local note.',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+
+    const result = runCli(['setup', '--yes'], repoRoot);
+    const claude = readFileSync(claudePath, 'utf8');
+    assert.match(result.stdout, /Updated CLAUDE\.md with the Pipelane task workspace policy\./);
+    assert.match(claude, /pipelane:claude-workspace-policy:start/);
+    assert.match(claude, /For any code-changing task, start in a Pipelane task workspace/);
+    assert.match(claude, /Use `\/resume --task "<task-name>"` to continue existing work/);
+    assert.match(claude, /Keep this local note/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
