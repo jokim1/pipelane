@@ -9217,6 +9217,126 @@ test('C2 orchestrate rejects unsigned review evidence once the key is active; up
   }
 });
 
+test('FU1 reviewDiagnostics are advisory negative-only evidence: presence blocks an otherwise validly-signed slice, removal reverts to the signed verdict (never fabricates a pass)', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const reviewStateKey = 'fu1-advisory-diagnostics-secret';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = { planReview: { gates: [] }, gates: [{ id: 'static-pass', phase: 'static', type: 'command', command: 'node -e "process.exit(0)"', blocking: true }] };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt passing static gate');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'fu1-advisory-plan.md'), ['# FU1 Advisory Plan', '', '## Slice 1: Produces a change', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/fu1-advisory-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(), PIPELANE_REVIEW_STATE_KEY: reviewStateKey });
+    runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_REVIEW_STATE_KEY: reviewStateKey });
+    const onDisk = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
+    assert.equal(onDisk.status, 'completed');
+    const slice = onDisk.slices[0];
+    assert.equal(typeof slice.review.signature, 'string'); // a validly signed, satisfied slice
+
+    const ledgerMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'orchestration-ledger.ts'));
+    const options = { reviewStateKey, runId: planned.runId };
+    // Baseline: with no diagnostics the signed slice satisfies completion.
+    assert.equal(ledgerMod.sliceReviewFullySatisfied(slice, options), true);
+
+    // A rejected blocking-AI diagnostic recorded AFTER the active review: a passed,
+    // blocking, independent-AI gate (gstack-review) with no attester identity, i.e.
+    // untrusted AI evidence. This is unsigned advisory evidence the read path reads
+    // directly from reviewDiagnostics.
+    const rejectedDiagnostic = {
+      status: 'passed',
+      evidencePath: slice.review.evidencePath,
+      reviewedAt: '2999-01-01T00:00:00.000Z',
+      run: {
+        ...slice.review.run,
+        status: 'passed',
+        gates: [{ gateId: 'gstack-review', type: 'skill', status: 'passed', blocking: true }],
+      },
+    };
+
+    // PRESENCE BLOCKS: diagnostics are negative-only — their presence can withhold
+    // completion even though slice.review is validly signed and otherwise satisfied.
+    assert.equal(
+      ledgerMod.sliceReviewFullySatisfied({ ...slice, reviewDiagnostics: [rejectedDiagnostic] }, options),
+      false,
+    );
+    // REMOVAL REVERTS to the signed verdict — it does NOT fabricate a pass. A
+    // same-UID worker that deletes an advisory diagnostic only reverts to the
+    // already-valid, cryptographically signed slice.review it cannot forge.
+    assert.equal(
+      ledgerMod.sliceReviewFullySatisfied({ ...slice, reviewDiagnostics: [] }, options),
+      true,
+    );
+    // NEVER POSITIVE EVIDENCE: a passed diagnostic cannot stand in for a missing
+    // signed slice.review.
+    assert.equal(
+      ledgerMod.sliceReviewFullySatisfied({ ...slice, review: null, reviewDiagnostics: [rejectedDiagnostic] }, options),
+      false,
+    );
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('FU2 cockpit surfaces a cleaned-worktree legacy run needing ledger migration once the key is active', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const reviewStateKey = 'fu2-migration-visibility-secret';
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = { planReview: { gates: [] }, gates: [{ id: 'static-pass', phase: 'static', type: 'command', command: 'node -e "process.exit(0)"', blocking: true }] };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt passing static gate');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'fu2-migration-plan.md'), ['# FU2 Migration Plan', '', '## Slice 1: Produces a change', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/fu2-migration-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const sliceWorktrees = prepared.slices.map((slice) => slice.worktreePath).filter(Boolean);
+    createdWorktrees.push(...sliceWorktrees);
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    // Complete the run WITHOUT a key: a pre-C2 unsigned legacy ledger.
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker() });
+    runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot);
+    assert.equal(JSON.parse(readFileSync(planned.ledgerPath, 'utf8')).status, 'completed');
+    assert.equal(JSON.parse(readFileSync(planned.ledgerPath, 'utf8')).slices[0].review.signature, undefined);
+
+    // Simulate cleaned worktrees (the common post-run state — re-review is now
+    // impossible, so upgrade-ledger is the only available remedy).
+    for (const worktreePath of sliceWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+
+    // WITHOUT a key: pre-C2 behavior is unchanged — the unsigned verdict is honored,
+    // so the completed run is just done and the cockpit offers a PR (no migration).
+    const baseline = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    assert.equal(baseline.data.orchestration.activeRun.id, planned.runId);
+    assert.equal(baseline.data.orchestration.activeRun.nextAction.id, 'pr');
+
+    // WITH the key active: the unsigned verdict is no longer trusted and the worktree
+    // is gone, so the run must NOT silently vanish from the cockpit — it surfaces an
+    // explicit upgrade-ledger migration blocker instead of dropping out of view.
+    const migrated = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot, { PIPELANE_REVIEW_STATE_KEY: reviewStateKey }).stdout);
+    assert.equal(migrated.data.orchestration.activeRun.id, planned.runId);
+    assert.equal(migrated.data.orchestration.activeRun.nextAction.id, 'orchestrate.upgrade-ledger');
+    assert.match(migrated.data.orchestration.activeRun.nextAction.command, new RegExp(`orchestrate upgrade-ledger --run-id ${planned.runId}`));
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('C1 orchestrate scope does not downgrade an already-completed run', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];

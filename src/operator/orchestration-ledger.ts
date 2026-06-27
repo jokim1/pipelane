@@ -148,6 +148,14 @@ export interface OrchestrationSliceRecord {
   dispatch: OrchestrationSliceDispatchRecord | null;
   worker: OrchestrationSliceWorkerRecord | null;
   review: OrchestrationSliceReviewRecord | null;
+  // Advisory, NEGATIVE-only review evidence: prior/auxiliary review verdicts whose
+  // PRESENCE can block completion (see `sliceHasRejectedBlockingAiDiagnostic`) but which
+  // are never positive completion evidence. Unlike `review`, these are NOT
+  // signature-verified on read (FU1), so a same-UID worker that can write the ledger
+  // could edit or delete an entry to drop a block. That is acceptable: completion's
+  // positive gate is the signed, context-bound `review` (C2) the worker cannot forge,
+  // so suppressing a diagnostic only reverts to that already-valid verdict — it can
+  // never fabricate a pass. Treat their absence as "not evaluated", never as "clean".
   reviewDiagnostics?: OrchestrationSliceReviewRecord[];
   goalSpec: GoalSpec;
   provider: GoalProvider;
@@ -851,6 +859,12 @@ export function sliceReviewFullySatisfied(
   ) {
     return false;
   }
+  // FU1: advisory NEGATIVE-only evidence. These can only WITHHOLD completion; they are
+  // never positive evidence. `reviewDiagnostics` are unsigned and unverified on read, so
+  // the first block is suppressible by a ledger-writing worker — acceptable because the
+  // signed `slice.review` checked below is the unforgeable positive gate (deleting a
+  // diagnostic only reverts to it, never fabricates a pass). The second reads
+  // `slice.review`, which the C2 signature check below independently protects.
   if (sliceHasRejectedBlockingAiDiagnostic(slice)) return false;
   if (sliceReviewHasUntrustedBlockingAiEvidence(slice)) return false;
   // C2: the embedded verdict must carry a valid signature bound to this exact
@@ -872,6 +886,56 @@ export function sliceReviewFullySatisfied(
   return currentStatus !== null
     && currentStatus.reliable
     && reviewRun.worktreeStatusDigest === currentStatus.digest;
+}
+
+// FU2: a once-completed slice that would satisfy completion EXCEPT that its embedded
+// review evidence predates signing, the review-state key is now configured, and its
+// worktree has been cleaned (so a fresh re-review is impossible). `orchestrate
+// upgrade-ledger` signs the persisted verdict in place — the correct remedy here.
+// Scoped deliberately so the cockpit only ever advertises upgrade-ledger when it is
+// both safe and sufficient:
+//   - legacy-UNSIGNED only (`!review.signature`): a record whose signature is PRESENT
+//     but fails verification is tampered/replayed, not legacy. upgrade-ledger re-signs
+//     in place and would launder such a record, so it must never be offered as the fix;
+//     that record stays blocked.
+//   - worktree GONE only: with a worktree present the run is still active and the honest
+//     remedy is re-review (re-runs the gates and re-signs), handled by the review
+//     next-action — not this trust-the-persisted-verdict migration.
+// Every other completion precondition (mirrors `sliceReviewFullySatisfied`) must already
+// hold, so the missing signature is genuinely the sole remaining blocker. Without a key
+// there is no migration concept, so this is a no-op (preserving pre-C2 behavior).
+export function sliceReviewNeedsSignatureMigration(
+  slice: OrchestrationSliceRecord,
+  options: OrchestrationReviewSatisfactionOptions = {},
+): boolean {
+  const key = options.reviewStateKey ?? resolveReviewStateKey();
+  if (!key) return false;
+  const review = slice.review;
+  const reviewRun = review?.run;
+  if (slice.worker?.status !== 'succeeded') return false;
+  if (slice.status !== 'completed') return false;
+  if (!review || !reviewRun) return false;
+  if (review.signature) return false;
+  if (reviewRun.status !== 'passed') return false;
+  if (reviewRun.dryRun || reviewRun.gateFilter || reviewRun.phaseFilter || !reviewRun.sha) {
+    return false;
+  }
+  if (sliceHasRejectedBlockingAiDiagnostic(slice)) return false;
+  if (sliceReviewHasUntrustedBlockingAiEvidence(slice)) return false;
+  if (slice.worktreePath && sliceWorktreeExists(slice, options)) return false;
+  return true;
+}
+
+// FU2: a completed run silently drops out of the cockpit once the key is enabled if
+// every in-scope succeeded slice is unsigned-and-worktree-cleaned (it is then neither
+// active nor PR-ready). Surface such a run so the operator is told to run `orchestrate
+// upgrade-ledger` instead of the run vanishing.
+export function orchestrationRunNeedsLedgerMigration(
+  run: OrchestrationRunRecord,
+  options: OrchestrationReviewSatisfactionOptions = {},
+): boolean {
+  if (run.status !== 'completed') return false;
+  return selectActiveSlices(run).some((slice) => sliceReviewNeedsSignatureMigration(slice, options));
 }
 
 export function missingRelevantSliceWorktreeDiagnostic(
@@ -897,6 +961,12 @@ function sliceWorktreeShouldBeUsable(slice: OrchestrationSliceRecord): boolean {
     || (slice.status === 'planned' && Boolean(slice.worktreePath));
 }
 
+// FU1: reads UNSIGNED, advisory `reviewDiagnostics` (negative-only evidence). A
+// diagnostic recorded after the active review that "passed" yet carries untrusted
+// blocking AI evidence withholds completion. This block is intentionally suppressible
+// (the entries are not signature-verified): a worker deleting one only reverts to the
+// signed `slice.review`, which it cannot forge — so this can subtract trust, never add
+// it. See the `reviewDiagnostics` field doc on `OrchestrationSliceRecord`.
 function sliceHasRejectedBlockingAiDiagnostic(slice: OrchestrationSliceRecord): boolean {
   const activeReviewTime = slice.review?.reviewedAt ?? '';
   return (slice.reviewDiagnostics ?? []).some((diagnostic) =>

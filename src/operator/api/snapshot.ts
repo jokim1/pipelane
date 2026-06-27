@@ -39,10 +39,12 @@ import {
   isActiveOrchestrationRun,
   listOrchestrationRunRecords,
   missingRelevantSliceWorktreeDiagnostic,
+  orchestrationRunNeedsLedgerMigration,
   ORCHESTRATION_CORRUPT_LEDGER_BLOCK_AGE_MS,
   scanOrchestrationRunDiagnostics,
   selectActiveSlices,
   sliceReviewFullySatisfied,
+  sliceReviewNeedsSignatureMigration,
   type OrchestrationMissingWorktreeDiagnostic,
   type OrchestrationReviewSatisfactionOptions,
   type OrchestrationRunRecord,
@@ -673,7 +675,14 @@ function buildOrchestrationSnapshot(
     : records;
   const activeRecord = currentBranchRecords.find((run, index) =>
     run.status !== 'completed'
-    || (index < 10 && (isActiveOrchestrationRun(run, reviewOptions) || isPrReadyOrchestrationRun(run, reviewOptions))),
+    || (index < 10 && (
+      isActiveOrchestrationRun(run, reviewOptions)
+      || isPrReadyOrchestrationRun(run, reviewOptions)
+      // FU2: a completed run whose only blocker is unsigned-and-cleaned review evidence
+      // (after the key is enabled) is neither active nor PR-ready; keep it visible so the
+      // operator can run `orchestrate upgrade-ledger` instead of it silently vanishing.
+      || orchestrationRunNeedsLedgerMigration(run, reviewOptions)
+    )),
   )
     ?? null;
   const summaryRecords = activeRecord
@@ -741,6 +750,9 @@ function summarizeOrchestrationRun(
   };
   const providerCounts: Record<string, number> = {};
   const trustedReviewBySlice = new Map<string, boolean>();
+  // FU2: per-slice "this completed slice needs upgrade-ledger" (unsigned review evidence
+  // + cleaned worktree, once the key is active) — drives the migration next action below.
+  const migrationNeededBySlice = new Map<string, boolean>();
   const missingWorktrees: OrchestrationMissingWorktreeSummary[] = [];
   // C2: bind the trusted-review verdict to this run (anti-replay).
   const runReviewOptions = { ...reviewOptions, runId: run.id };
@@ -751,6 +763,7 @@ function summarizeOrchestrationRun(
     const trustedReviewComplete = sliceReviewFullySatisfied(slice, runReviewOptions);
     trustedReviewBySlice.set(slice.id, trustedReviewComplete);
     if (trustedReviewComplete) counts.trustedReviewComplete += 1;
+    migrationNeededBySlice.set(slice.id, sliceReviewNeedsSignatureMigration(slice, runReviewOptions));
     providerCounts[slice.provider] = (providerCounts[slice.provider] ?? 0) + 1;
     const missingWorktree = missingRelevantSliceWorktreeDiagnostic(slice, reviewOptions);
     if (missingWorktree) missingWorktrees.push(missingWorktree);
@@ -770,7 +783,7 @@ function summarizeOrchestrationRun(
     };
   });
 
-  const nextAction = buildOrchestrationNextAction(run, config, trustedReviewBySlice, missingWorktrees);
+  const nextAction = buildOrchestrationNextAction(run, config, trustedReviewBySlice, missingWorktrees, migrationNeededBySlice);
   return {
     id: run.id,
     status: run.status,
@@ -824,6 +837,7 @@ function buildOrchestrationNextAction(
   config: WorkflowConfig,
   trustedReviewBySlice: Map<string, boolean>,
   missingWorktrees: OrchestrationMissingWorktreeSummary[] = [],
+  migrationNeededBySlice: Map<string, boolean> = new Map(),
 ): OrchestrationActionSummary | null {
   const orchestrateCommand = '/pipelane orchestrate';
   const prCommand = formatWorkflowCommand(config, 'pr');
@@ -842,8 +856,15 @@ function buildOrchestrationNextAction(
   const needsStart = !needsPrepare && !needsDispatch && active.some((slice) =>
     slice.status === 'dispatched' || (slice.status === 'blocked' && !slice.worker),
   );
+  // FU2: a slice needing upgrade-ledger (unsigned review + cleaned worktree) cannot be
+  // re-reviewed (no worktree), so it must NOT drive the review action — the migration
+  // branch below handles it instead.
+  const needsMigration = active.some((slice) => migrationNeededBySlice.get(slice.id) === true);
   const needsReview = active.some((slice) =>
-    slice.worker?.status === 'succeeded' && slice.status !== 'empty' && !trustedReviewBySlice.get(slice.id),
+    slice.worker?.status === 'succeeded'
+    && slice.status !== 'empty'
+    && !trustedReviewBySlice.get(slice.id)
+    && !migrationNeededBySlice.get(slice.id),
   );
   const fullyReviewed = active.length > 0 && active.every((slice) => trustedReviewBySlice.get(slice.id));
 
@@ -917,6 +938,18 @@ function buildOrchestrationNextAction(
       state: 'awaiting_preflight',
       reason: 'worker output exists, but trusted full-slice review evidence is incomplete',
       command: `${orchestrateCommand} review ${runIdArg}`,
+    });
+  }
+  if (needsMigration) {
+    // FU2: completed run whose trusted-review evidence predates signing and whose
+    // worktree is gone. Re-review is impossible; signing the persisted verdict in place
+    // is the remedy. Surfaced (not silently dropped) once a review-state key is active.
+    return buildOrchestrationAction({
+      id: 'orchestrate.upgrade-ledger',
+      label: 'Migrate orchestration ledger to signed review evidence',
+      state: 'blocked',
+      reason: 'review evidence predates signing and its worktree is gone; sign it in place with upgrade-ledger (a review-state key is now configured)',
+      command: `${orchestrateCommand} upgrade-ledger ${runIdArg}`,
     });
   }
   if (fullyReviewed) {
