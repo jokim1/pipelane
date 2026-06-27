@@ -252,8 +252,11 @@ Provider adapters render `GoalSpec` into native `/goal` prompts when available:
 Current implementation surface:
 
 ```text
-/pipelane orchestrate --plan-file docs/plan.md --provider codex --yes
+/pipelane orchestrate --plan-file docs/plan.md --analysis-file /tmp/analysis.json --provider codex --yes
 /pipelane orchestrate plan --plan-file docs/plan.md
+/pipelane orchestrate analyze --plan-file docs/plan.md --analysis-file /tmp/analysis.json
+/pipelane orchestrate plan-review pass --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef --gate plan-eng-review --message "reviewed"
+/pipelane orchestrate plan-review bypass --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef --gate plan-eng-review --reason "manual override"
 /pipelane orchestrate prepare --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
 /pipelane orchestrate dispatch --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
 /pipelane orchestrate start --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef [--slice-id <id>] [--force]
@@ -263,20 +266,59 @@ Current implementation surface:
 /pipelane orchestrate goal-spec --provider codex --json
 ```
 
-The approved bare command runs `plan`, `prepare`, `dispatch`, `start`, full
-slice review, and bounded review-fix attempts in one durable pass. It does not
-create an integrated PR, merge, deploy, or clean worktrees. Failed executable
-review gates are handed back to the slice worker before Pipelane reruns review;
-remaining failed, pending, or blocked review leaves the run active and returns a
-non-zero exit code. Automatic completion requires at least one effective review
-gate; orchestration review blocks zero-gate evidence and asks the operator to
-run `/pipelane review setup`.
+The approved bare command requires a host-authored `--analysis-file` and records
+plan analysis before creating any worktree. It then runs `prepare`, `dispatch`,
+`start`, full slice review, and bounded review-fix attempts in one durable pass.
+It does not create an integrated PR, merge, deploy, or clean worktrees. Failed
+executable review gates are handed back to the slice worker before Pipelane
+reruns review; remaining failed, pending, or blocked review leaves the run
+active and returns a non-zero exit code. Automatic completion requires at least
+one effective review gate; orchestration review blocks zero-gate evidence and
+asks the operator to run `/pipelane review setup`.
+
+The analysis artifact is JSON and must describe the same plan or prompt hash
+that the ledger records:
+
+```json
+{
+  "sourceSha256": "64-character lowercase sha256 of the plan text or outcome prompt",
+  "analyzer": {
+    "provider": "codex",
+    "sessionId": "raw-session-id-or-null",
+    "source": "CODEX_SESSION_ID"
+  },
+  "identityReliable": true,
+  "strengths": ["clear slice boundaries"],
+  "risks": ["review gate setup affects PR readiness"],
+  "ambiguities": [],
+  "sensitiveAreas": ["src/operator/commands/orchestrate.ts"],
+  "recommendedScope": {
+    "throughSliceId": null,
+    "reason": null
+  }
+}
+```
+
+`sourceSha256` must be a 64-character SHA-256 hex string. `analyzer.provider`
+and `analyzer.source` must be non-empty strings; `analyzer.sessionId` must be a
+string or `null`. Set `identityReliable` to `true` only when the host can bind
+the analyzer to a real session identity. Skill or agent plan-review gates can
+only be marked `pass` when analyzer and attester sessions are both reliable and
+different; otherwise use the visible `plan-review bypass --reason <text>` path.
+The four analysis lists must be arrays of strings. `recommendedScope` is
+optional; when present, `throughSliceId` and `reason` must each be a string or
+`null`.
 
 `orchestrate plan` compiles an implementation plan into a durable orchestration
 ledger with slice records, provider-neutral `GoalSpec` prompts, a review-gate
-snapshot, and the source plan fingerprint. `orchestrate prepare` consumes that
-ledger, creates missing slice worktrees using the same task-lock machinery as
-`/new`, and records each task slug, branch, and worktree path. `orchestrate
+snapshot, and the source plan fingerprint. New ledgers must pass
+`orchestrate analyze` before `prepare`; existing ledgers without the
+`planAnalysisRequired` marker remain legacy-compatible. `orchestrate analyze`
+validates a host-authored analysis artifact against the current source hash,
+records configured plan-review gates as skipped or pending, and stores
+structured observations in versioned run state. `orchestrate prepare` consumes
+that ledger, creates missing slice worktrees using the same task-lock machinery
+as `/new`, and records each task slug, branch, and worktree path. `orchestrate
 dispatch` consumes prepared ledgers and writes durable provider handoff prompts
 under the run state directory. It records which prompt belongs to which prepared
 worktree. `orchestrate start` consumes dispatch records, runs a configured
@@ -439,7 +481,7 @@ Each gate has:
     ]
   },
   "orchestrate": {
-    "maxConcurrentSlices": 3,
+    "maxConcurrentSlices": 1,
     "goalMode": {
       "default": "confirm",
       "maxTurns": 20,
@@ -454,6 +496,10 @@ Each gate has:
   }
 }
 ```
+
+`maxConcurrentSlices` is snapshotted for future dependency-aware concurrency.
+Current orchestration still runs slices sequentially; examples use `1` to avoid
+implying active worker fanout.
 
 `maxReviewLoops` caps review/fix cycles per slice during approved orchestration.
 `1` runs only the initial review and stops on failure; `2` permits one

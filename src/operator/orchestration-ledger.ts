@@ -22,6 +22,7 @@ import {
   type OrchestrateConfig,
   type ReviewGateConfig,
   type ReviewActorIdentity,
+  type ReviewGateRunStatus,
   type ReviewRunRecord,
   type ReviewPlanGateConfig,
   type WorkflowConfig,
@@ -31,7 +32,7 @@ import {
   type ReviewIndependenceLabel,
 } from './review-identity.ts';
 import { readWorktreeStatusSnapshot } from './worktree-status.ts';
-import { resolveReviewStateKey, signSignedPayload, verifySignedPayload } from './integrity.ts';
+import { canonicalize, resolveReviewStateKey, signSignedPayload, verifySignedPayload } from './integrity.ts';
 
 export type OrchestrationRunStatus = 'planned' | 'prepared' | 'dispatched' | 'running' | 'blocked' | 'paused' | 'completed' | 'failed';
 
@@ -42,6 +43,179 @@ export interface OrchestrationCoverageEntry {
   disposition: OrchestrationCoverageDisposition;
   sliceId?: string;
   reason?: string;
+}
+
+export type OrchestrationSourceKind = 'plan-file' | 'prompt';
+export type PlanReviewGateRunStatus = ReviewGateRunStatus | 'bypassed';
+export const ORCHESTRATION_OBSERVATION_KINDS = [
+  'plan_review_skipped',
+  'plan_review_pending',
+  'plan_review_passed',
+  'plan_review_failed',
+  'plan_review_bypassed',
+  'worker_failed',
+  'worker_succeeded',
+  'empty_slice',
+  'review_gate_failed',
+  'review_gate_pending',
+  'review_independence_blocked',
+  'review_evidence_stale',
+  'review_signature_blocked',
+  'missing_worktree',
+  'dependency_blocked',
+  'auto_fix_started',
+  'auto_fix_no_progress',
+  'auto_fix_exhausted',
+  'auto_fix_fixed',
+] as const;
+
+export type OrchestrationObservationKind = typeof ORCHESTRATION_OBSERVATION_KINDS[number];
+
+export const ORCHESTRATION_OBSERVATION_REASON_CODES = [
+  'no_plan_review_gates',
+  'plan_review_not_applicable',
+  'plan_review_waiting',
+  'plan_review_attested',
+  'plan_review_gate_failed',
+  'manual_bypass',
+  'worker_exit_nonzero',
+  'material_change_detected',
+  'no_material_change',
+  'blocking_gate_failed',
+  'manual_gate_pending',
+  'same_session_reviewer',
+  'stale_review_evidence',
+  'invalid_or_missing_signature',
+  'assigned_worktree_missing',
+  'predecessor_not_ready',
+  'review_fix_started',
+  'review_fix_no_progress',
+  'review_fix_budget_spent',
+  'review_fix_passed',
+] as const;
+
+export type OrchestrationObservationReasonCode = typeof ORCHESTRATION_OBSERVATION_REASON_CODES[number];
+
+export type OrchestrationStopReason =
+  | 'not-started'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'blocked'
+  | 'empty'
+  | 'review-gate-failed'
+  | 'review-gate-failed-awaiting-auto-fix'
+  | 'review-gate-pending'
+  | 'dependency-blocked'
+  | 'missing-worktree'
+  | 'auto-fix-stalled'
+  | 'auto-fix-exhausted'
+  | 'legacy-no-observation';
+
+export interface OrchestrationLoopSummary {
+  status: 'not-started' | 'running' | 'blocked' | 'failed' | 'stalled' | 'exhausted' | 'completed' | 'legacy';
+  stopReason: OrchestrationStopReason;
+  latestObservationId: string | null;
+  workerAttempts: number;
+  reviewAttempts: number;
+  autoFixAttempts: number;
+  updatedAt: string;
+}
+
+export interface PlanReviewEvidenceBinding {
+  runId: string;
+  gateId: string;
+  sourceSha256: string;
+  decompositionDigest: string;
+  gateSnapshotDigest: string;
+  analyzerSessionId: string | null;
+  attesterSessionId: string | null;
+  createdAt: string;
+  action: 'pass' | 'bypass';
+  reasonSha256?: string;
+  messageSha256?: string;
+}
+
+export interface PlanReviewGateRunRecord {
+  id: string;
+  gateId: string;
+  phase: 'plan';
+  type: ReviewPlanGateConfig['type'];
+  blocking: boolean;
+  status: PlanReviewGateRunStatus;
+  attester?: ReviewActorIdentity;
+  skill?: string;
+  role?: string;
+  summary: string;
+  durationMs: number;
+  startedAt: string;
+  finishedAt: string;
+  skipReason?: string;
+  bypassReason?: string;
+  gateSnapshotDigest: string;
+  binding?: PlanReviewEvidenceBinding;
+  signature?: string;
+}
+
+export interface OrchestrationPlanAnalysisRecord {
+  status: 'passed' | 'pending' | 'failed' | 'bypassed';
+  analyzedAt: string;
+  analyzer: ReviewActorIdentity;
+  analyzerIdentityReliable: boolean;
+  source: {
+    kind: OrchestrationSourceKind;
+    planPath: string | null;
+    promptRef: 'run.source.prompt' | null;
+    textSha256: string | null;
+  };
+  strengths: string[];
+  risks: string[];
+  ambiguities: string[];
+  sensitiveAreas: string[];
+  recommendedScope: {
+    throughSliceId: string | null;
+    reason: string | null;
+  };
+  coverageRef: 'run.coverage';
+  coverageDigest: string | null;
+  decompositionDigest: string;
+  activeSurfaces: string[];
+  gateSnapshotDigest: string;
+  planReview: {
+    status: 'passed' | 'pending' | 'failed' | 'bypassed' | 'skipped';
+    gates: PlanReviewGateRunRecord[];
+    evidencePath: string | null;
+  };
+  latestObservationId: string | null;
+}
+
+export interface OrchestrationObservationRecord {
+  id: string;
+  runId: string;
+  sliceId: string | null;
+  gateId: string | null;
+  kind: OrchestrationObservationKind;
+  reasonCode: OrchestrationObservationReasonCode;
+  summary: string;
+  details?: Record<string, unknown>;
+  terminal: boolean;
+  createdAt: string;
+}
+
+export interface OrchestrationObservationsState {
+  runId: string;
+  observations: OrchestrationObservationRecord[];
+  compactedAt: string | null;
+  droppedObservationCount: number;
+}
+
+export interface OrchestrationObservationIndex {
+  observationsPath: string;
+  latestObservationId: string | null;
+  latestObservationKind: OrchestrationObservationKind | null;
+  observationCount: number;
+  compactedAt: string | null;
+  stale?: boolean;
 }
 // B1: `empty` = the worker exited 0 but produced no material change
 // (`collectChangedFiles` empty). It is conservative — it blocks dependents and
@@ -173,6 +347,7 @@ export interface OrchestrationSliceRecord {
   // is kept (not deleted) so the audit trail survives.
   excludedReason?: string;
   excludedAt?: string;
+  loopSummary?: OrchestrationLoopSummary;
 }
 
 export interface OrchestrationRunRecord {
@@ -206,6 +381,10 @@ export interface OrchestrationRunRecord {
   };
   slices: OrchestrationSliceRecord[];
   reviewFixes?: OrchestrationReviewFixRecord[];
+  planAnalysisRequired?: boolean;
+  planAnalysis?: OrchestrationPlanAnalysisRecord;
+  observationIndex?: OrchestrationObservationIndex;
+  loopSummary?: OrchestrationLoopSummary;
   // PR1: agent-authored coverage map, persisted as durable, inspectable evidence
   // of which plan section maps to which slice / deferred / excluded. Absent on the
   // heading-decomposed path.
@@ -300,6 +479,14 @@ const URL_SCHEME_PATTERN = /^[a-z][a-z0-9+.-]*:\/\//i;
 
 export function orchestrationRunPath(commonDir: string, config: WorkflowConfig, runId: string): string {
   return path.join(resolveStateDir(commonDir, config), 'orchestrate', 'runs', runId, 'orchestration.json');
+}
+
+export function orchestrationObservationsPath(commonDir: string, config: WorkflowConfig, runId: string): string {
+  return path.join(resolveStateDir(commonDir, config), 'orchestrate', 'runs', runId, 'observations.json');
+}
+
+export function orchestrationStateRelativePath(commonDir: string, config: WorkflowConfig, targetPath: string): string {
+  return path.relative(resolveStateDir(commonDir, config), targetPath).replaceAll('\\', '/');
 }
 
 // PR1: the in-scope set for this pass. Deferred slices (set by `orchestrate scope`)
@@ -425,8 +612,42 @@ export function buildOrchestrationRunRecord(input: BuildOrchestrationRunInput): 
     },
     slices,
     reviewFixes: [],
+    planAnalysisRequired: true,
     ...(input.coverage && input.coverage.length > 0 ? { coverage: input.coverage } : {}),
   };
+}
+
+export function stableJsonDigest(value: unknown): string {
+  return sha256(canonicalize(value));
+}
+
+export function planReviewGateSnapshotDigest(run: OrchestrationRunRecord): string {
+  return stableJsonDigest(run.gateSnapshot.planReview.gates);
+}
+
+export function coverageDigest(run: Pick<OrchestrationRunRecord, 'coverage'>): string | null {
+  return run.coverage ? stableJsonDigest(run.coverage) : null;
+}
+
+export function analysisSourceSha256(input: {
+  planTextSha256?: string | null;
+  prompt?: string | null;
+}): string | null {
+  const planTextSha256 = input.planTextSha256 ?? null;
+  const promptSha256 = input.prompt ? sha256(input.prompt) : null;
+  if (planTextSha256 && promptSha256) {
+    return stableJsonDigest({ planTextSha256, promptSha256 });
+  }
+  if (planTextSha256) return planTextSha256;
+  if (promptSha256) return promptSha256;
+  return null;
+}
+
+export function sourceSha256ForAnalysis(run: OrchestrationRunRecord): string | null {
+  return analysisSourceSha256({
+    planTextSha256: run.source.textSha256,
+    prompt: run.source.prompt,
+  });
 }
 
 // G1 / Decision 1 + A3 groundwork: the worker prompt is a function of the
@@ -576,6 +797,186 @@ export function saveOrchestrationRunRecord(
   mkdirSync(path.dirname(targetPath), { recursive: true });
   writeVersionedJsonFile('orchestrationRun', targetPath, record);
   return targetPath;
+}
+
+const ORCHESTRATION_OBSERVATION_RETAIN_LIMIT = 200;
+const ORCHESTRATION_OBSERVATION_SUMMARY_MAX = 500;
+const ORCHESTRATION_OBSERVATION_DETAILS_MAX_BYTES = 8 * 1024;
+
+export function loadOrchestrationObservationsState(
+  commonDir: string,
+  config: WorkflowConfig,
+  runId: string,
+): OrchestrationObservationsState {
+  assertSafeOrchestrationRunId(runId);
+  const targetPath = orchestrationObservationsPath(commonDir, config, runId);
+  const fallback: OrchestrationObservationsState = {
+    runId,
+    observations: [],
+    compactedAt: null,
+    droppedObservationCount: 0,
+  };
+  const raw = readVersionedJsonFile<OrchestrationObservationsState>('orchestrationObservations', commonDir, config, targetPath, fallback);
+  return normalizeOrchestrationObservationsState(raw, runId);
+}
+
+export function saveOrchestrationObservationsState(
+  commonDir: string,
+  config: WorkflowConfig,
+  state: OrchestrationObservationsState,
+): OrchestrationObservationIndex {
+  assertSafeOrchestrationRunId(state.runId);
+  const targetPath = orchestrationObservationsPath(commonDir, config, state.runId);
+  ensureInstallMarker(commonDir, config);
+  mkdirSync(path.dirname(targetPath), { recursive: true });
+  const compacted = compactOrchestrationObservations(state);
+  writeVersionedJsonFile('orchestrationObservations', targetPath, compacted);
+  return observationIndexForState(commonDir, config, compacted);
+}
+
+export function appendOrchestrationObservation(
+  commonDir: string,
+  config: WorkflowConfig,
+  input: Omit<OrchestrationObservationRecord, 'id' | 'createdAt'> & { id?: string; createdAt?: string },
+): { state: OrchestrationObservationsState; index: OrchestrationObservationIndex; observation: OrchestrationObservationRecord } {
+  const state = loadOrchestrationObservationsState(commonDir, config, input.runId);
+  const observation = sanitizeObservationRecord({
+    ...input,
+    id: input.id ?? `obs-${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}`,
+    createdAt: input.createdAt ?? nowIso(),
+  });
+  state.observations = [...state.observations, observation];
+  const index = saveOrchestrationObservationsState(commonDir, config, state);
+  const saved = loadOrchestrationObservationsState(commonDir, config, input.runId);
+  return { state: saved, index, observation };
+}
+
+export function observationIndexForState(
+  commonDir: string,
+  config: WorkflowConfig,
+  state: OrchestrationObservationsState,
+): OrchestrationObservationIndex {
+  const latest = state.observations.at(-1) ?? null;
+  return {
+    observationsPath: orchestrationStateRelativePath(commonDir, config, orchestrationObservationsPath(commonDir, config, state.runId)),
+    latestObservationId: latest?.id ?? null,
+    latestObservationKind: latest?.kind ?? null,
+    observationCount: state.observations.length,
+    compactedAt: state.compactedAt,
+  };
+}
+
+function normalizeOrchestrationObservationsState(
+  raw: OrchestrationObservationsState,
+  runId: string,
+): OrchestrationObservationsState {
+  const observations = Array.isArray(raw?.observations)
+    ? raw.observations.filter(isOrchestrationObservationRecord).map(sanitizeObservationRecord)
+    : [];
+  return {
+    runId,
+    observations,
+    compactedAt: typeof raw?.compactedAt === 'string' ? raw.compactedAt : null,
+    droppedObservationCount: typeof raw?.droppedObservationCount === 'number' && raw.droppedObservationCount > 0
+      ? raw.droppedObservationCount
+      : 0,
+  };
+}
+
+function compactOrchestrationObservations(state: OrchestrationObservationsState): OrchestrationObservationsState {
+  const sanitized = state.observations.filter(isOrchestrationObservationRecord).map(sanitizeObservationRecord);
+  if (sanitized.length <= ORCHESTRATION_OBSERVATION_RETAIN_LIMIT) {
+    return { ...state, observations: sanitized };
+  }
+
+  const selected = new Set<string>();
+  const latestByKey = new Set<string>();
+  const terminalByKey = new Set<string>();
+  const reversed = [...sanitized].reverse();
+  for (const observation of reversed) {
+    const key = observationRetentionKey(observation);
+    if (!latestByKey.has(key)) {
+      latestByKey.add(key);
+      selected.add(observation.id);
+    }
+    if (observation.terminal && !terminalByKey.has(key)) {
+      terminalByKey.add(key);
+      selected.add(observation.id);
+    }
+  }
+  for (const observation of reversed) {
+    if (selected.size >= ORCHESTRATION_OBSERVATION_RETAIN_LIMIT) break;
+    selected.add(observation.id);
+  }
+
+  let retained = sanitized.filter((observation) => selected.has(observation.id));
+  if (retained.length > ORCHESTRATION_OBSERVATION_RETAIN_LIMIT) {
+    retained = retained.slice(-ORCHESTRATION_OBSERVATION_RETAIN_LIMIT);
+  }
+  return {
+    ...state,
+    observations: retained,
+    compactedAt: nowIso(),
+    droppedObservationCount: state.droppedObservationCount + (sanitized.length - retained.length),
+  };
+}
+
+function observationRetentionKey(observation: OrchestrationObservationRecord): string {
+  return [
+    observation.kind,
+    observation.sliceId ?? '',
+    observation.gateId ?? '',
+    observation.reasonCode,
+  ].join('\0');
+}
+
+function sanitizeObservationRecord(record: OrchestrationObservationRecord): OrchestrationObservationRecord {
+  const summary = record.summary.length > ORCHESTRATION_OBSERVATION_SUMMARY_MAX
+    ? `${record.summary.slice(0, ORCHESTRATION_OBSERVATION_SUMMARY_MAX - 3)}...`
+    : record.summary;
+  const details = sanitizeObservationDetails(record.details);
+  return {
+    ...record,
+    summary,
+    ...(details ? { details } : {}),
+  };
+}
+
+function sanitizeObservationDetails(details: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!details || typeof details !== 'object' || Array.isArray(details)) return undefined;
+  let json = JSON.stringify(details);
+  if (Buffer.byteLength(json, 'utf8') <= ORCHESTRATION_OBSERVATION_DETAILS_MAX_BYTES) return details;
+  const truncated = {
+    truncated: true,
+    preview: json.slice(0, ORCHESTRATION_OBSERVATION_DETAILS_MAX_BYTES),
+  };
+  json = JSON.stringify(truncated);
+  return Buffer.byteLength(json, 'utf8') <= ORCHESTRATION_OBSERVATION_DETAILS_MAX_BYTES
+    ? truncated
+    : { truncated: true };
+}
+
+function isOrchestrationObservationRecord(value: unknown): value is OrchestrationObservationRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Partial<OrchestrationObservationRecord>;
+  return typeof raw.id === 'string'
+    && typeof raw.runId === 'string'
+    && (raw.sliceId === null || typeof raw.sliceId === 'string')
+    && (raw.gateId === null || typeof raw.gateId === 'string')
+    && isObservationKind(raw.kind)
+    && isObservationReasonCode(raw.reasonCode)
+    && typeof raw.summary === 'string'
+    && (raw.details === undefined || (typeof raw.details === 'object' && raw.details !== null && !Array.isArray(raw.details)))
+    && typeof raw.terminal === 'boolean'
+    && typeof raw.createdAt === 'string';
+}
+
+function isObservationKind(value: unknown): value is OrchestrationObservationKind {
+  return typeof value === 'string' && ORCHESTRATION_OBSERVATION_KINDS.includes(value as OrchestrationObservationKind);
+}
+
+function isObservationReasonCode(value: unknown): value is OrchestrationObservationReasonCode {
+  return typeof value === 'string' && ORCHESTRATION_OBSERVATION_REASON_CODES.includes(value as OrchestrationObservationReasonCode);
 }
 
 export function loadOrchestrationRunRecord(
@@ -994,7 +1395,7 @@ function sliceReviewHasUntrustedBlockingAiEvidence(slice: OrchestrationSliceReco
   }) !== null;
 }
 
-function assertSafeOrchestrationRunId(runId: string): void {
+export function assertSafeOrchestrationRunId(runId: string): void {
   if (!isSafeOrchestrationRunId(runId)) {
     throw new Error(`Invalid orchestration run id: ${runId}`);
   }

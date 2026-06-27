@@ -740,6 +740,8 @@ export interface OperatorFlags {
   goalMaxMinutes: string;
   orchestrationRunId: string;
   goalSlicesFile: string;
+  orchestrationAnalysisFile: string;
+  orchestrationDrafts: string;
   scopeThrough: string;
 }
 
@@ -819,6 +821,7 @@ export const STATE_SCHEMA_VERSIONS = {
   actionState: 1,
   reviewState: 1,
   orchestrationRun: 2,
+  orchestrationObservations: 1,
   deployConfig: 1,
   taskLock: 1,
 } as const;
@@ -857,6 +860,7 @@ export const STATE_MIGRATIONS: Record<StateKind, Record<number, (raw: Record<str
       return raw;
     },
   },
+  orchestrationObservations: {},
   deployConfig: {},
   taskLock: {},
 };
@@ -2860,6 +2864,8 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     goalMaxMinutes: '',
     orchestrationRunId: '',
     goalSlicesFile: '',
+    orchestrationAnalysisFile: '',
+    orchestrationDrafts: '',
     scopeThrough: '',
   };
 
@@ -3286,6 +3292,14 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       flags.goalSlicesFile = readFlagValue('--slices-file').trim();
       continue;
     }
+    if (flagName === '--analysis-file') {
+      flags.orchestrationAnalysisFile = readFlagValue('--analysis-file').trim();
+      continue;
+    }
+    if (flagName === '--drafts') {
+      flags.orchestrationDrafts = readFlagValue('--drafts').trim();
+      continue;
+    }
     if (flagName === '--through') {
       flags.scopeThrough = readFlagValue('--through').trim();
       continue;
@@ -3573,15 +3587,30 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
           'plan',
           'preview',
           'yes',
+          'goalSlicesFile',
+          'orchestrationAnalysisFile',
+          'orchestrationDrafts',
         ]);
         if (parsed.positional.length > (subcommand === 'run' ? 1 : 0)) {
-          throw new Error('orchestrate requires: pipelane run orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>], or pipelane run orchestrate <goal-spec|plan|prepare|dispatch|start|review> ...');
+          throw new Error('orchestrate requires: pipelane run orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes] [--analysis-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>], or pipelane run orchestrate <goal-spec|plan|analyze|prepare|dispatch|start|review|plan-review|scope|outline|finalize|upgrade-ledger> ...');
         }
         if (parsed.flags.yes && (parsed.flags.preview || parsed.flags.plan)) {
           throw new Error('orchestrate cannot combine --yes with --preview or --plan.');
         }
         if (parsed.flags.yes && !parsed.flags.goalPlanFile.trim() && !parsed.flags.goalOutcome.trim()) {
           throw new Error('orchestrate --yes requires --plan-file <path> or --outcome <text>.');
+        }
+        if (parsed.flags.orchestrationDrafts.trim()) {
+          throw new Error('orchestrate --drafts is not supported in v1.');
+        }
+        if (parsed.flags.goalSlicesFile.trim() && !parsed.flags.goalPlanFile.trim()) {
+          throw new Error('orchestrate --slices-file requires --plan-file <path>.');
+        }
+        if (parsed.flags.goalSlicesFile.trim() && !parsed.flags.yes) {
+          throw new Error('orchestrate --slices-file is only valid with --yes in the bare orchestrate flow, or with orchestrate analyze/plan.');
+        }
+        if (parsed.flags.orchestrationAnalysisFile.trim() && !parsed.flags.yes) {
+          throw new Error('orchestrate --analysis-file is only valid with --yes in the bare orchestrate flow, or with orchestrate analyze.');
         }
         if (parsed.flags.orchestrationRunId.trim()) {
           const newRunFlags = [
@@ -3591,6 +3620,9 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
             ['--provider', parsed.flags.goalProvider],
             ['--max-turns', parsed.flags.goalMaxTurns],
             ['--max-minutes', parsed.flags.goalMaxMinutes],
+            ['--slices-file', parsed.flags.goalSlicesFile],
+            ['--analysis-file', parsed.flags.orchestrationAnalysisFile],
+            ['--drafts', parsed.flags.orchestrationDrafts],
           ].filter(([, value]) => value.trim()).map(([flag]) => flag);
           if (parsed.flags.offline) newRunFlags.push('--offline');
           if (parsed.flags.plan) newRunFlags.push('--plan');
@@ -3614,8 +3646,61 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         }
         return;
       }
+      if (subcommand === 'analyze') {
+        assertOnlyFlags(parsed, [
+          'goalPlanFile',
+          'goalSlicesFile',
+          'orchestrationRunId',
+          'orchestrationAnalysisFile',
+          'orchestrationDrafts',
+        ]);
+        if (parsed.positional.length !== 1) {
+          throw new Error('orchestrate analyze requires exactly: pipelane run orchestrate analyze (--plan-file <path> | --run-id <id>) --analysis-file <path> [--slices-file <path>]');
+        }
+        if (parsed.flags.orchestrationDrafts.trim()) {
+          throw new Error('orchestrate analyze --drafts is not supported in v1.');
+        }
+        if (!parsed.flags.orchestrationAnalysisFile.trim()) {
+          throw new Error('orchestrate analyze requires --analysis-file <path>.');
+        }
+        if (parsed.flags.goalPlanFile.trim() && parsed.flags.orchestrationRunId.trim()) {
+          throw new Error('orchestrate analyze cannot combine --plan-file and --run-id.');
+        }
+        if (!parsed.flags.goalPlanFile.trim() && !parsed.flags.orchestrationRunId.trim()) {
+          throw new Error('orchestrate analyze requires --plan-file <path> or --run-id <id>.');
+        }
+        if (parsed.flags.goalSlicesFile.trim() && !parsed.flags.goalPlanFile.trim()) {
+          throw new Error('orchestrate analyze --slices-file requires --plan-file <path>.');
+        }
+        return;
+      }
+      if (subcommand === 'plan-review') {
+        const action = parsed.positional[1] ?? '';
+        if (action !== 'pass' && action !== 'bypass') {
+          throw new Error('orchestrate plan-review requires exactly: pipelane run orchestrate plan-review <pass|bypass> --run-id <id> --gate <id> (--message <text> | --reason <text>)');
+        }
+        assertOnlyFlags(parsed, action === 'pass'
+          ? ['orchestrationRunId', 'reviewGate', 'message']
+          : ['orchestrationRunId', 'reviewGate', 'reason']);
+        if (parsed.positional.length !== 2) {
+          throw new Error(`orchestrate plan-review ${action} requires exactly: pipelane run orchestrate plan-review ${action} --run-id <id> --gate <id> ${action === 'pass' ? '--message <text>' : '--reason <text>'}`);
+        }
+        if (!parsed.flags.orchestrationRunId.trim()) {
+          throw new Error(`orchestrate plan-review ${action} requires --run-id <id>.`);
+        }
+        if (!parsed.flags.reviewGate.trim()) {
+          throw new Error(`orchestrate plan-review ${action} requires --gate <id>.`);
+        }
+        if (action === 'pass' && !parsed.flags.message.trim()) {
+          throw new Error('orchestrate plan-review pass requires --message <text>.');
+        }
+        if (action === 'bypass' && !parsed.flags.reason.trim()) {
+          throw new Error('orchestrate plan-review bypass requires --reason <text>.');
+        }
+        return;
+      }
       if (subcommand !== 'goal-spec' && subcommand !== 'plan' && subcommand !== 'prepare' && subcommand !== 'dispatch' && subcommand !== 'start' && subcommand !== 'review' && subcommand !== 'scope' && subcommand !== 'outline' && subcommand !== 'finalize' && subcommand !== 'upgrade-ledger') {
-        throw new Error('orchestrate requires exactly: pipelane run orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes], or pipelane run orchestrate <goal-spec|plan|prepare|dispatch|start|review|scope|outline|finalize|upgrade-ledger> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--slices-file <path>] [--run-id <id>] [--through <slice-id>] [--provider codex|claude|generic]');
+        throw new Error('orchestrate requires exactly: pipelane run orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes], or pipelane run orchestrate <goal-spec|plan|analyze|prepare|dispatch|start|review|plan-review|scope|outline|finalize|upgrade-ledger> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--slices-file <path>] [--analysis-file <path>] [--run-id <id>] [--through <slice-id>] [--provider codex|claude|generic]');
       }
       // C2: upgrade-ledger takes only --run-id, like outline/finalize.
       if (subcommand === 'scope' || subcommand === 'outline' || subcommand === 'finalize' || subcommand === 'upgrade-ledger') {
@@ -3662,12 +3747,16 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         'goalMaxTurns',
         'goalMaxMinutes',
         'goalSlicesFile',
+        'orchestrationDrafts',
       ]);
       if (parsed.positional.length !== 1) {
         throw new Error(`orchestrate ${subcommand} requires exactly: pipelane run orchestrate ${subcommand} [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--slices-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]`);
       }
       if (subcommand === 'plan' && !parsed.flags.goalPlanFile.trim() && !parsed.flags.goalOutcome.trim()) {
         throw new Error('orchestrate plan requires --plan-file <path> or --outcome <text>.');
+      }
+      if (parsed.flags.orchestrationDrafts.trim()) {
+        throw new Error(`orchestrate ${subcommand} --drafts is not supported in v1.`);
       }
       if (parsed.flags.goalSlicesFile.trim()) {
         if (subcommand !== 'plan') {
@@ -3935,6 +4024,8 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'goalMaxMinutes', label: '--max-minutes', active: (flags) => flags.goalMaxMinutes.trim().length > 0 },
   { key: 'orchestrationRunId', label: '--run-id', active: (flags) => flags.orchestrationRunId.trim().length > 0 },
   { key: 'goalSlicesFile', label: '--slices-file', active: (flags) => flags.goalSlicesFile.trim().length > 0 },
+  { key: 'orchestrationAnalysisFile', label: '--analysis-file', active: (flags) => flags.orchestrationAnalysisFile.trim().length > 0 },
+  { key: 'orchestrationDrafts', label: '--drafts', active: (flags) => flags.orchestrationDrafts.trim().length > 0 },
   { key: 'scopeThrough', label: '--through', active: (flags) => flags.scopeThrough.trim().length > 0 },
 ];
 

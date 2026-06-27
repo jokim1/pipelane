@@ -1,0 +1,92 @@
+{
+  "reviewGates": {
+    "policyVersion": 2,
+    "planReview": {
+      "gates": [
+        {
+          "id": "plan-eng-review",
+          "phase": "plan",
+          "type": "skill",
+          "blocking": true,
+          "skill": "plan-eng-review"
+        },
+        {
+          "id": "plan-design-review",
+          "phase": "plan",
+          "type": "skill",
+          "blocking": true,
+          "skill": "plan-design-review",
+          "when": "surface:frontend"
+        }
+      ]
+    },
+    "gates": [
+      {
+        "id": "typecheck",
+        "phase": "static",
+        "type": "command",
+        "blocking": true,
+        "command": "npm run typecheck"
+      },
+      {
+        "id": "test",
+        "phase": "behavioral",
+        "type": "command",
+        "blocking": true,
+        "command": "npm run test",
+        "timeoutMs": 1800000
+      },
+      {
+        "id": "build",
+        "phase": "behavioral",
+        "type": "command",
+        "blocking": true,
+        "command": "npm run build"
+      },
+      {
+        "id": "karpathy-diff",
+        "phase": "ai-diff",
+        "type": "skill",
+        "blocking": true,
+        "skill": "karpathy-diff",
+        "timeoutMs": 1800000,
+        "userCommands": [
+          "/karpathy diff",
+          "/karpathy-diff",
+          "/karpathy:diff"
+        ]
+      },
+      {
+        "id": "gstack-review",
+        "phase": "ai-diff",
+        "type": "skill",
+        "blocking": true,
+        "skill": "review",
+        "timeoutMs": 1800000,
+        "userCommands": [
+          "/review",
+          "/gstack review",
+          "/gstack-review"
+        ]
+      },
+      {
+        "id": "karpathy-audit",
+        "phase": "instruction",
+        "type": "skill",
+        "blocking": true,
+        "skill": "karpathy-audit",
+        "whenChanged": [
+          "CLAUDE.md",
+          "AGENTS.md",
+          ".cursor/rules/**",
+          ".codex/skills/**"
+        ],
+        "userCommands": [
+          "/karpathy audit",
+          "/karpathy-audit",
+          "/karpathy:audit"
+        ]
+      }
+    ]
+  }
+}
