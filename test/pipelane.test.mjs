@@ -2256,6 +2256,25 @@ test('install-codex outside a pipelane repo installs durable global default skil
     assert.ok(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')));
     assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md')));
     assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane-fix', 'SKILL.md')));
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'orchestrate', 'SKILL.md')));
+    const orchestrateSkill = readFileSync(path.join(codexHome, 'skills', 'orchestrate', 'SKILL.md'), 'utf8');
+    assert.match(orchestrateSkill, /Orchestration behavior/);
+    assert.match(orchestrateSkill, /Never use `--yes` on this path/);
+    assert.match(orchestrateSkill, /## Argument handling/);
+    // Subcommands use the alias directly (`/orchestrate analyze ...`), never the
+    // doubled `/orchestrate orchestrate ...` that would route to an invalid
+    // `run orchestrate orchestrate ...`.
+    assert.match(orchestrateSkill, /\/orchestrate analyze --plan-file/);
+    assert.doesNotMatch(orchestrateSkill, /\/orchestrate orchestrate/);
+    // F1: the top-level alias must NOT carry the dispatcher-only "first token is
+    // `orchestrate`" framing (for /orchestrate the first token is the plan file).
+    assert.match(orchestrateSkill, /When you invoke `\/orchestrate` with a plan file/);
+    assert.doesNotMatch(orchestrateSkill, /first token is `orchestrate`/);
+    // ...while the /pipelane dispatcher body keeps its "first token" framing and
+    // still renders the subcommand as `/pipelane orchestrate analyze ...` (no regression).
+    const pipelaneSkill = readFileSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
+    assert.match(pipelaneSkill, /first token is `orchestrate`/);
+    assert.match(pipelaneSkill, /\/pipelane orchestrate analyze --plan-file/);
     const newSkill = readFileSync(path.join(codexHome, 'skills', 'new', 'SKILL.md'), 'utf8');
     assert.match(newSkill, /Fresh checkout behavior/);
     assert.match(newSkill, /npm run workflow:new/);
@@ -2268,7 +2287,6 @@ test('install-codex outside a pipelane repo installs durable global default skil
     assert.match(deploySkill, /printed numbered choices/);
     assert.match(deploySkill, /preserve each number, label, and command/);
     assert.match(deploySkill, /1 \(Continue to \/deploy staging\)/);
-    const pipelaneSkill = readFileSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
     assert.match(pipelaneSkill, /normal clean repo setup and repair path/);
     assert.match(pipelaneSkill, /should not be treated as consent to materialize/);
     assert.match(pipelaneSkill, /Choice handoff behavior/);
@@ -2331,6 +2349,17 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     const lessonSkill = readFileSync(path.join(claudeHome, 'skills', 'lesson', 'SKILL.md'), 'utf8');
     assert.match(lessonSkill, /Append a dated lesson/);
     assert.match(lessonSkill, /pipelane:lessons:entries:end/);
+    assert.ok(existsSync(path.join(claudeHome, 'skills', 'orchestrate', 'SKILL.md')));
+    const orchestrateSkill = readFileSync(path.join(claudeHome, 'skills', 'orchestrate', 'SKILL.md'), 'utf8');
+    assert.match(orchestrateSkill, /disable-model-invocation: true/);
+    assert.match(orchestrateSkill, /Orchestration behavior/);
+    assert.match(orchestrateSkill, /Never use `--yes` on this path/);
+    assert.match(orchestrateSkill, /## Argument handling/);
+    assert.match(orchestrateSkill, /\/orchestrate analyze --plan-file/);
+    assert.doesNotMatch(orchestrateSkill, /\/orchestrate orchestrate/);
+    // F1: corrected top-level-alias trigger wording (not the dispatcher's "first token").
+    assert.match(orchestrateSkill, /When you invoke `\/orchestrate` with a plan file/);
+    assert.doesNotMatch(orchestrateSkill, /first token is `orchestrate`/);
     const newSkill = readFileSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md'), 'utf8');
     assert.match(newSkill, /disable-model-invocation: true/);
     assert.match(newSkill, /Fresh checkout behavior/);
@@ -4836,6 +4865,21 @@ test('durable Codex runner dispatches /pipelane orchestrate goal-spec', () => {
 
     assert.equal(planOutput, 'MANAGED:1:run orchestrate plan --outcome Demo plan');
 
+    // F3 pin: the top-level /orchestrate alias routes through the SAME runner with
+    // first arg `orchestrate` (not `pipelane orchestrate`); it must still produce a
+    // single `run orchestrate ...`, never a doubled `run orchestrate orchestrate ...`.
+    const topLevelOrchestrateOutput = execFileSync(
+      path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      ['orchestrate', 'plan', '--outcome', 'Demo plan'],
+      {
+        cwd: repoRoot,
+        env: { ...process.env, CODEX_HOME: codexHome },
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    ).trim();
+    assert.equal(topLevelOrchestrateOutput, 'MANAGED:1:run orchestrate plan --outcome Demo plan');
+
     const prepareOutput = execFileSync(
       path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
       ['pipelane', 'orchestrate', 'prepare', '--run-id', 'orchestrate-20260617000000-deadbeef'],
@@ -5062,9 +5106,35 @@ test('install-codex skips unmanaged /fix without blocking /pipelane-fix', () => 
     writeFileSync(path.join(codexHome, 'skills', 'fix', 'SKILL.md'), 'custom fix skill\n', 'utf8');
 
     const result = runCli(['install-codex'], workspaceRoot, { CODEX_HOME: codexHome });
-    assert.match(result.stdout, /Skipped unmanaged optional skills: \/fix/);
+    assert.match(result.stdout, /Skipped unmanaged optional skills.*\/fix \(use \/pipelane-fix\)/);
     assert.equal(readFileSync(path.join(codexHome, 'skills', 'fix', 'SKILL.md'), 'utf8'), 'custom fix skill\n');
     assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane-fix', 'SKILL.md')));
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')));
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('install-codex skips an unmanaged /orchestrate and points to /pipelane orchestrate', () => {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-install-codex-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+
+  try {
+    // A pre-existing, non-pipelane /orchestrate skill on disk.
+    mkdirSync(path.join(codexHome, 'skills', 'orchestrate'), { recursive: true });
+    writeFileSync(path.join(codexHome, 'skills', 'orchestrate', 'SKILL.md'), 'custom orchestrate skill\n', 'utf8');
+
+    const result = runCli(['install-codex'], workspaceRoot, { CODEX_HOME: codexHome });
+    // required:false -> skipped gracefully (not clobbered, no thrown collision), and
+    // the per-alias fallback points at /pipelane orchestrate (F2), not /pipelane-fix.
+    assert.match(result.stdout, /Skipped unmanaged optional skills.*\/orchestrate \(use \/pipelane orchestrate\)/);
+    assert.equal(
+      readFileSync(path.join(codexHome, 'skills', 'orchestrate', 'SKILL.md'), 'utf8'),
+      'custom orchestrate skill\n',
+    );
+    // The rest of the install still succeeds.
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md')));
     assert.ok(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')));
   } finally {
     rmSync(workspaceRoot, { recursive: true, force: true });

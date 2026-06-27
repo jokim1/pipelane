@@ -8,6 +8,7 @@ export const PIPELANE_DISPATCH_SKILL_NAME = 'pipelane';
 export const PIPELANE_FIX_SKILL_NAME = 'pipelane-fix';
 export const FIX_SKILL_NAME = 'fix';
 export const LESSON_SKILL_NAME = 'lesson';
+export const ORCHESTRATE_SKILL_NAME = 'orchestrate';
 
 export const MACHINE_CODEX_SKILL_MARKER_PREFIX = '<!-- pipelane:codex-global-skill:';
 export const MACHINE_CLAUDE_SKILL_MARKER_PREFIX = '<!-- pipelane:claude-global-skill:';
@@ -20,7 +21,7 @@ export interface DesiredInstallEntry {
   name: string;
   slashAlias: string;
   body: string;
-  command?: WorkflowCommand | 'pipelane';
+  command?: WorkflowCommand | 'pipelane' | 'orchestrate';
   required: boolean;
 }
 
@@ -35,7 +36,7 @@ export interface DesiredInstall {
 export interface WorkflowSkillBodyOptions {
   host: HostInstall;
   scope: HostInstallScope;
-  command: WorkflowCommand | 'pipelane';
+  command: WorkflowCommand | 'pipelane' | 'orchestrate';
   slashAlias: string;
   runnerPath: string;
   markerPrefix: string;
@@ -68,7 +69,62 @@ export function buildSkillMarker(prefix: string, name: string): string {
   return `${prefix}${name} -->`;
 }
 
-function renderWorkflowSkillGuidance(command: WorkflowCommand | 'pipelane', slashAlias: string): string {
+function renderOrchestrationGuidance(invocation: string, trigger: string): string {
+  return `## Orchestration behavior (${invocation} <plan-file>)
+
+${trigger}, do NOT just run \`--yes\` and wait silently. Drive a communicative,
+slice-by-slice flow and keep the operator oriented at every step:
+
+1. Read the plan file yourself. Print **Plan read** as bullets: strengths, then
+   risks/gaps. Then print a **coverage map** that accounts for every section of the
+   plan as one of: in-scope (maps to a slice), deferred, or excluded (with a
+   one-line reason). Nothing is silently dropped.
+2. Decompose the plan into phases and slices. Write a slices JSON file to a scratch path:
+   \`{ "slices": [ { "id", "title", "phase", "text" } ], "coverage": [ { "section", "disposition": "slice|deferred|excluded", "sliceId", "reason" } ] }\`
+   Then write an analysis JSON file with the real plan file's SHA-256 as \`sourceSha256\`,
+   your analyzer identity, \`identityReliable\`, strengths, risks, ambiguities,
+   sensitiveAreas, and recommendedScope. Record analysis WITHOUT starting workers
+   and capture the run id:
+   \`${invocation} analyze --plan-file <real-plan> --analysis-file <analysis.json> --slices-file <scratch.json> --json\`
+   The run's audit source stays bound to the real plan file, not either scratch file.
+3. Relay the CLI outline verbatim (do not hand-format it):
+   \`${invocation} outline --run-id <id>\`
+   Then print the **review model** as bullets: static checks, tests, independent AI
+   review of each slice diff, and human confirm on sensitive slices.
+4. **Recommend a scope**: the full plan, or a justified partial boundary (e.g. land
+   a sensitive schema/RLS phase first because everything depends on it). Offer:
+   approve / edit scope / cancel. For a partial scope run
+   \`${invocation} scope --run-id <id> --through <last-slice-id-in-scope>\`.
+5. Before prepare, complete every pending plan-review gate: run the configured
+   reviewer, then record \`${invocation} plan-review pass --run-id <id> --gate <gate-id> --message <summary>\`
+   or consciously bypass with \`${invocation} plan-review bypass --run-id <id> --gate <gate-id> --reason <reason>\`.
+   Then drive in order: \`${invocation} prepare --run-id <id>\`,
+   then \`${invocation} dispatch --run-id <id>\`, then for each in-scope
+   slice \`${invocation} start --run-id <id> --slice-id <id>\` followed by
+   \`${invocation} review --run-id <id> --slice-id <id>\`. After EACH
+   slice, relay \`${invocation} outline --run-id <id>\` so the operator
+   sees the updated outline and where the run is. Never use \`--yes\` on this path.
+6. When the in-scope slices pass: if the outline shows deferred slices, tell the
+   operator the run is paused and a later \`${invocation}\` resumes it
+   (re-scope with \`--through <next>\`, then continue). Use
+   \`${invocation} finalize --run-id <id>\` only to deliberately abandon
+   the deferred remainder (it is kept in the ledger with a reason for audit).
+
+If the plan compiles to a single unstructured slice, say so and propose a
+phase/slice breakdown before running one long opaque slice.`;
+}
+
+function renderWorkflowSkillGuidance(command: WorkflowCommand | 'pipelane' | 'orchestrate', slashAlias: string): string {
+  if (command === 'orchestrate') {
+    return `${renderOrchestrationGuidance(slashAlias, `When you invoke \`${slashAlias}\` with a plan file (or a goal to implement)`)}
+
+## Argument handling
+
+If the argument looks like a path (it contains \`/\` or ends in \`.md\`) but no
+such file exists, stop and report "plan file not found" instead of treating it as
+a goal to implement. Forward any extra flags (e.g. \`--provider\`, \`--max-minutes\`)
+as separate tokens; never fold them into the plan-file path.`;
+  }
   if (command === 'pipelane') {
     return `
 ## Setup and configure behavior
@@ -146,49 +202,7 @@ deterministic command exactly:
 If the user supplied any setup flag, run the command directly through the
 runner. Do not add shell pipes to setup commands that may need interactivity.
 
-## Orchestration behavior (${slashAlias} orchestrate <plan-file>)
-
-When the first token is \`orchestrate\` and a plan file (or a goal to implement) is
-given, do NOT just run \`--yes\` and wait silently. Drive a communicative,
-slice-by-slice flow and keep the operator oriented at every step:
-
-1. Read the plan file yourself. Print **Plan read** as bullets: strengths, then
-   risks/gaps. Then print a **coverage map** that accounts for every section of the
-   plan as one of: in-scope (maps to a slice), deferred, or excluded (with a
-   one-line reason). Nothing is silently dropped.
-2. Decompose the plan into phases and slices. Write a slices JSON file to a scratch path:
-   \`{ "slices": [ { "id", "title", "phase", "text" } ], "coverage": [ { "section", "disposition": "slice|deferred|excluded", "sliceId", "reason" } ] }\`
-   Then write an analysis JSON file with the real plan file's SHA-256 as \`sourceSha256\`,
-   your analyzer identity, \`identityReliable\`, strengths, risks, ambiguities,
-   sensitiveAreas, and recommendedScope. Record analysis WITHOUT starting workers
-   and capture the run id:
-   \`${slashAlias} orchestrate analyze --plan-file <real-plan> --analysis-file <analysis.json> --slices-file <scratch.json> --json\`
-   The run's audit source stays bound to the real plan file, not either scratch file.
-3. Relay the CLI outline verbatim (do not hand-format it):
-   \`${slashAlias} orchestrate outline --run-id <id>\`
-   Then print the **review model** as bullets: static checks, tests, independent AI
-   review of each slice diff, and human confirm on sensitive slices.
-4. **Recommend a scope**: the full plan, or a justified partial boundary (e.g. land
-   a sensitive schema/RLS phase first because everything depends on it). Offer:
-   approve / edit scope / cancel. For a partial scope run
-   \`${slashAlias} orchestrate scope --run-id <id> --through <last-slice-id-in-scope>\`.
-5. Before prepare, complete every pending plan-review gate: run the configured
-   reviewer, then record \`${slashAlias} orchestrate plan-review pass --run-id <id> --gate <gate-id> --message <summary>\`
-   or consciously bypass with \`${slashAlias} orchestrate plan-review bypass --run-id <id> --gate <gate-id> --reason <reason>\`.
-   Then drive in order: \`${slashAlias} orchestrate prepare --run-id <id>\`,
-   then \`${slashAlias} orchestrate dispatch --run-id <id>\`, then for each in-scope
-   slice \`${slashAlias} orchestrate start --run-id <id> --slice-id <id>\` followed by
-   \`${slashAlias} orchestrate review --run-id <id> --slice-id <id>\`. After EACH
-   slice, relay \`${slashAlias} orchestrate outline --run-id <id>\` so the operator
-   sees the updated outline and where the run is. Never use \`--yes\` on this path.
-6. When the in-scope slices pass: if the outline shows deferred slices, tell the
-   operator the run is paused and a later \`${slashAlias} orchestrate\` resumes it
-   (re-scope with \`--through <next>\`, then continue). Use
-   \`${slashAlias} orchestrate finalize --run-id <id>\` only to deliberately abandon
-   the deferred remainder (it is kept in the ledger with a reason for audit).
-
-If the plan compiles to a single unstructured slice, say so and propose a
-phase/slice breakdown before running one long opaque slice.
+${renderOrchestrationGuidance(`${slashAlias} orchestrate`, 'When the first token is `orchestrate` and a plan file (or a goal to implement) is given')}
 `;
   }
 
@@ -590,6 +604,26 @@ export function desiredHostInstall(
       scope,
       command: 'pipelane',
       slashAlias: `/${PIPELANE_DISPATCH_SKILL_NAME}`,
+      runnerPath: paths.runnerPath,
+      markerPrefix,
+    }),
+  });
+
+  // Top-level /orchestrate alias. Drives the same guided slice-by-slice flow as
+  // `/pipelane orchestrate` (shared renderOrchestrationGuidance), just discoverable
+  // at the top level. required:false so an existing non-pipelane /orchestrate skill
+  // is skipped gracefully instead of failing the whole install.
+  entries.push({
+    kind: 'workflow',
+    name: ORCHESTRATE_SKILL_NAME,
+    slashAlias: `/${ORCHESTRATE_SKILL_NAME}`,
+    command: 'orchestrate',
+    required: false,
+    body: renderWorkflowSkillBody({
+      host,
+      scope,
+      command: 'orchestrate',
+      slashAlias: `/${ORCHESTRATE_SKILL_NAME}`,
       runnerPath: paths.runnerPath,
       markerPrefix,
     }),
