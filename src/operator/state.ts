@@ -2280,7 +2280,7 @@ export function loadModeState(commonDir: string, config: WorkflowConfig): ModeSt
     override: null,
     updatedAt: null,
   });
-  return normalizeModeState(raw);
+  return normalizeModeState(raw, config);
 }
 
 // v1.5: drop malformed fields on load rather than letting them crash
@@ -2290,7 +2290,11 @@ export function loadModeState(commonDir: string, config: WorkflowConfig): ModeSt
 // required subfields gets silently dropped back to `undefined`. Strict:
 // all three strings, all non-empty — partials are as suspicious as
 // fully-malformed entries.
-function normalizeModeState(raw: ModeState): ModeState {
+function normalizeModeState(raw: ModeState, config: WorkflowConfig): ModeState {
+  const normalized: ModeState = {
+    ...raw,
+    requestedSurfaces: normalizeModeStateSurfaces(raw.requestedSurfaces as unknown, config),
+  };
   const last = raw.lastOverride as unknown;
   if (last && typeof last === 'object' && !Array.isArray(last)) {
     const entry = last as Record<string, unknown>;
@@ -2300,15 +2304,26 @@ function normalizeModeState(raw: ModeState): ModeState {
       && typeof entry.setBy === 'string' && entry.setBy.length > 0
     ) {
       return {
-        ...raw,
+        ...normalized,
         lastOverride: { reason: entry.reason, setAt: entry.setAt, setBy: entry.setBy },
       };
     }
   }
   if (raw.lastOverride !== undefined) {
-    return { ...raw, lastOverride: undefined };
+    return { ...normalized, lastOverride: undefined };
   }
-  return raw;
+  return normalized;
+}
+
+function normalizeModeStateSurfaces(raw: unknown, config: WorkflowConfig): string[] {
+  if (!Array.isArray(raw)) return [...config.surfaces];
+  const requested = [...new Set(raw
+    .filter((surface): surface is string => typeof surface === 'string')
+    .map((surface) => surface.trim())
+    .filter(Boolean))];
+  if (requested.length === 0) return [...config.surfaces];
+  const configured = new Set(config.surfaces);
+  return requested.filter((surface) => configured.has(surface));
 }
 
 export function saveModeState(commonDir: string, config: WorkflowConfig, value: ModeState): void {

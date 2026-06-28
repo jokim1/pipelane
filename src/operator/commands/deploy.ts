@@ -266,7 +266,11 @@ export async function dispatchDeploy(
   if (surfaces.length === 0) {
     const timestamp = nowIso();
     const cleanCommand = formatWorkflowCommand(context.config, 'clean', `--apply --task ${taskSlug}`);
-    setNextAction(context.commonDir, context.config, taskSlug, `no deploy surfaces configured at ${target.sha.slice(0, 7)}, run ${cleanCommand}`);
+    const delivered = noDeployTargetIsDelivered(context, target.sha, prRecord);
+    const nextAction = delivered
+      ? `no deploy surfaces configured at ${target.sha.slice(0, 7)}, run ${cleanCommand}`
+      : `no deploy surfaces configured for ${target.sha.slice(0, 7)}; run ${formatWorkflowCommand(context.config, 'merge')} before cleanup`;
+    setNextAction(context.commonDir, context.config, taskSlug, nextAction);
     return {
       environment,
       sha: target.sha,
@@ -274,9 +278,9 @@ export async function dispatchDeploy(
       workflowName: '',
       requestedAt: timestamp,
       finishedAt: timestamp,
-      verifiedAt: timestamp,
+      verifiedAt: delivered ? timestamp : undefined,
       taskSlug,
-      status: 'succeeded',
+      status: delivered ? 'succeeded' : 'unknown',
       dispatchMode: 'skipped',
       message: [
         `Deploy skipped: ${environment}`,
@@ -284,7 +288,9 @@ export async function dispatchDeploy(
         `SHA: ${target.sha}`,
         'No deploy surfaces are configured for this repo.',
         'Merge to the base branch is the delivery step.',
-        `Next: run ${cleanCommand} to close out this workspace.`,
+        delivered
+          ? `Next: run ${cleanCommand} to close out this workspace.`
+          : `Next: run ${formatWorkflowCommand(context.config, 'merge')} before cleaning up this workspace.`,
       ].join('\n'),
     };
   }
@@ -745,6 +751,25 @@ function resolveDeploySurfacesForTarget(options: {
   if (inference.surfaces.length > 0) return inference.surfaces;
 
   return surfaces;
+}
+
+function noDeployTargetIsDelivered(
+  context: WorkflowContext,
+  targetSha: string,
+  prRecord: PrRecord | null,
+): boolean {
+  if (prRecord?.mergedSha?.trim() === targetSha) return true;
+
+  for (const ref of [`origin/${context.config.baseBranch}`, context.config.baseBranch]) {
+    const resolved = runGit(context.repoRoot, ['rev-parse', '--verify', ref], true)?.trim();
+    if (!resolved) continue;
+    const result = runCommandCapture('git', ['merge-base', '--is-ancestor', targetSha, ref], {
+      cwd: context.repoRoot,
+    });
+    if (result.ok) return true;
+  }
+
+  return false;
 }
 
 export function persistRecord(
