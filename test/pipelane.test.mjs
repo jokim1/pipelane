@@ -15,6 +15,18 @@ const CLI_PATH = path.join(KIT_ROOT, 'src', 'cli.ts');
 const FIXTURE_ROOT = path.join(KIT_ROOT, 'test', 'fixtures', 'sample-repo');
 const DEFAULT_CODEX_HOME = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-global-'));
 const DEFAULT_PIPELANE_HOME = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-global-'));
+// Isolate CLAUDE_HOME too, or update/global-surface tests refresh the real
+// ~/.claude (homeClaudeDir falls back to ~/.claude when CLAUDE_HOME is unset,
+// and refreshInstalledGlobalSurfaces re-installs Claude skills there).
+const DEFAULT_CLAUDE_HOME = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-global-'));
+// Export the temp homes into THIS process's env so every path is isolated: both
+// in-process imports (homeClaudeDir/homeCodexDir read process.env) and child
+// spawns that inherit process.env. Without this, any test that installs/refreshes
+// global skills without an explicit CLAUDE_HOME writes to the developer's real
+// ~/.claude. Per-test overrides via runCli's `env` arg still take precedence.
+process.env.CLAUDE_HOME = DEFAULT_CLAUDE_HOME;
+process.env.CODEX_HOME = DEFAULT_CODEX_HOME;
+process.env.PIPELANE_HOME = DEFAULT_PIPELANE_HOME;
 const LOCAL_PIPELANE_INSTALL_SPEC = `file:${KIT_ROOT}`;
 const GENERATED_CLAUDE_COMMANDS = [
   'clean',
@@ -73,7 +85,7 @@ function runCli(args, cwd, env = {}, allowFailure = false) {
   if (!allowFailure && shouldSeedPassingReviewEvidence(args)) {
     writePassingReviewEvidence(cwd);
   }
-  const childEnv = { ...process.env, CODEX_HOME: DEFAULT_CODEX_HOME, PIPELANE_HOME: DEFAULT_PIPELANE_HOME, ...env };
+  const childEnv = { ...process.env, CODEX_HOME: DEFAULT_CODEX_HOME, PIPELANE_HOME: DEFAULT_PIPELANE_HOME, CLAUDE_HOME: DEFAULT_CLAUDE_HOME, ...env };
   // Hermeticity: a developer/CI shell may export pipelane signing keys. Scrub them
   // unless a test explicitly passes one, so C2 signature gating and C1 exact run
   // status assertions do not drift with the ambient environment.
@@ -2286,6 +2298,11 @@ test('install-codex outside a pipelane repo installs durable global default skil
     assert.doesNotMatch(fixSkill, /Continue review anyway/);
     assert.match(fixSkill, /standalone `REPO_GUIDANCE\.md` does not count/);
     assert.match(fixSkill, /Only emit these in Pipelane-enabled repos/);
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'lesson', 'SKILL.md')));
+    const lessonSkill = readFileSync(path.join(codexHome, 'skills', 'lesson', 'SKILL.md'), 'utf8');
+    assert.match(lessonSkill, /Append a dated lesson/);
+    assert.match(lessonSkill, /pipelane:lessons:entries:end/);
+    assert.match(lessonSkill, /run `\/pipelane setup`/);
     assert.ok(existsSync(path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane')));
     assert.ok(existsSync(path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh')));
     assert.match(
@@ -2310,6 +2327,10 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md')));
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane', 'SKILL.md')));
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane-fix', 'SKILL.md')));
+    assert.ok(existsSync(path.join(claudeHome, 'skills', 'lesson', 'SKILL.md')));
+    const lessonSkill = readFileSync(path.join(claudeHome, 'skills', 'lesson', 'SKILL.md'), 'utf8');
+    assert.match(lessonSkill, /Append a dated lesson/);
+    assert.match(lessonSkill, /pipelane:lessons:entries:end/);
     const newSkill = readFileSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md'), 'utf8');
     assert.match(newSkill, /disable-model-invocation: true/);
     assert.match(newSkill, /Fresh checkout behavior/);
@@ -22473,7 +22494,7 @@ test('dashboard branch ledger keeps its headers sticky while rows scroll', () =>
 async function runCliAsync(args, cwd, env = {}) {
   const child = spawn('node', [CLI_PATH, ...args], {
     cwd,
-    env: { ...process.env, CODEX_HOME: DEFAULT_CODEX_HOME, ...env },
+    env: { ...process.env, CODEX_HOME: DEFAULT_CODEX_HOME, PIPELANE_HOME: DEFAULT_PIPELANE_HOME, CLAUDE_HOME: DEFAULT_CLAUDE_HOME, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';
@@ -31723,5 +31744,222 @@ test('orchestrate resume does not abort when a completed slice worktree was clea
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
     if (slicesDir) rmSync(slicesDir, { recursive: true, force: true });
+  }
+});
+
+// Lessons block (Change A: template seed; Change B: backfill/re-sync existing).
+const LESSONS_BLOCK_RE = /<!-- pipelane:lessons:start -->[\s\S]*?<!-- pipelane:lessons:end -->\n?/;
+
+test('setup seeds the Lessons block into a freshly created CLAUDE.md', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const claude = readFileSync(path.join(repoRoot, 'CLAUDE.md'), 'utf8');
+    assert.match(claude, /<!-- pipelane:lessons:start -->/);
+    assert.match(claude, /## Lessons/);
+    assert.match(claude, /<!-- pipelane:lessons:entries:start -->\n<!-- pipelane:lessons:entries:end -->/);
+    assert.match(claude, /<!-- pipelane:lessons:end -->/);
+    assert.equal((claude.match(/pipelane:lessons:start/g) || []).length, 1);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup --yes backfills the Lessons block into an existing block-less CLAUDE.md', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const claudePath = path.join(repoRoot, 'CLAUDE.md');
+    // Simulate a legacy CLAUDE.md that predates the Lessons block.
+    const stripped = readFileSync(claudePath, 'utf8').replace(LESSONS_BLOCK_RE, '');
+    assert.doesNotMatch(stripped, /pipelane:lessons:start/);
+    writeFileSync(claudePath, stripped, 'utf8');
+
+    const result = runCli(['setup', '--yes'], repoRoot);
+    const after = readFileSync(claudePath, 'utf8');
+    assert.match(after, /<!-- pipelane:lessons:start -->/);
+    assert.match(after, /## Lessons/);
+    assert.match(result.stdout, /Added the managed CLAUDE\.md Lessons block\./);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup --yes re-syncs Lessons instruction prose while preserving entries verbatim', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const claudePath = path.join(repoRoot, 'CLAUDE.md');
+    let claude = readFileSync(claudePath, 'utf8');
+    // Record a lesson and drift the pipelane-owned instruction prose.
+    claude = claude.replace(
+      '<!-- pipelane:lessons:entries:start -->\n<!-- pipelane:lessons:entries:end -->',
+      '<!-- pipelane:lessons:entries:start -->\n- 2026-06-25: prefer foo over bar\n<!-- pipelane:lessons:entries:end -->',
+    );
+    claude = claude.replace('When the user corrects a mistake', 'STALE INSTRUCTION TEXT, replace me');
+    writeFileSync(claudePath, claude, 'utf8');
+
+    const result = runCli(['setup', '--yes'], repoRoot);
+    const after = readFileSync(claudePath, 'utf8');
+    assert.match(after, /- 2026-06-25: prefer foo over bar/);   // entry preserved
+    assert.doesNotMatch(after, /STALE INSTRUCTION TEXT/);        // drift removed
+    assert.match(after, /When the user corrects a mistake/);     // canonical prose restored
+    assert.match(result.stdout, /Refreshed the CLAUDE\.md Lessons block \(existing entries preserved\)\./);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup Lessons handling is idempotent (byte-identical re-run, single block)', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup', '--yes'], repoRoot);
+    const claudePath = path.join(repoRoot, 'CLAUDE.md');
+    const first = readFileSync(claudePath, 'utf8');
+    runCli(['setup', '--yes'], repoRoot);
+    const second = readFileSync(claudePath, 'utf8');
+    assert.equal(first, second, 're-run must produce byte-identical CLAUDE.md');
+    assert.equal((second.match(/pipelane:lessons:start/g) || []).length, 1);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup without --yes (non-TTY) leaves an existing block-less CLAUDE.md untouched', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const claudePath = path.join(repoRoot, 'CLAUDE.md');
+    const stripped = readFileSync(claudePath, 'utf8').replace(LESSONS_BLOCK_RE, '');
+    writeFileSync(claudePath, stripped, 'utf8');
+
+    const result = runCli(['setup'], repoRoot); // no --yes; runCli pipes stdio (non-TTY)
+    const after = readFileSync(claudePath, 'utf8');
+    assert.equal(after, stripped, 'non-TTY setup without --yes must not insert the block');
+    assert.match(result.stdout, /CLAUDE\.md Lessons block migration requires approval:/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup writes the lessons capture instruction into the AGENTS.md managed region', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const agents = readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8');
+    assert.match(agents, /### Capturing lessons/);
+    assert.match(agents, /pipelane:lessons:entries/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup --yes leaves a malformed Lessons block (missing entries:end) untouched rather than wiping it', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const claudePath = path.join(repoRoot, 'CLAUDE.md');
+    // Corrupt the block: a lesson exists but the inner entries:end marker is gone.
+    // A naive resync that defaults to empty entries would discard the lesson.
+    const corrupted = readFileSync(claudePath, 'utf8').replace(
+      '<!-- pipelane:lessons:entries:start -->\n<!-- pipelane:lessons:entries:end -->',
+      '<!-- pipelane:lessons:entries:start -->\n- 2026-06-25: precious lesson',
+    );
+    writeFileSync(claudePath, corrupted, 'utf8');
+
+    runCli(['setup', '--yes'], repoRoot);
+    const after = readFileSync(claudePath, 'utf8');
+    assert.equal(after, corrupted, 'malformed block must be left untouched, never silently rebuilt');
+    assert.match(after, /- 2026-06-25: precious lesson/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('detectSetupDrift detects a missing Lessons block as an approval-gated migration, not a needsSetup trigger', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const claudePath = path.join(repoRoot, 'CLAUDE.md');
+    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
+    // Block present after setup → no lessons drift, repo fully in sync.
+    assert.equal(docs.detectSetupDrift(repoRoot).lessonsMigration, null);
+    assert.equal(docs.detectSetupDrift(repoRoot).needsSetup, false);
+    // Strip the block → drift detection flags an insert migration. Like the
+    // AGENTS guidance migration it mirrors, it is approval-gated and surfaced via
+    // the follow-up message, NOT a needsSetup trigger (which would force
+    // perpetual setup re-runs in a non-TTY run without --yes).
+    const stripped = readFileSync(claudePath, 'utf8').replace(LESSONS_BLOCK_RE, '');
+    writeFileSync(claudePath, stripped, 'utf8');
+    const drift = docs.detectSetupDrift(repoRoot);
+    assert.ok(drift.lessonsMigration, 'lessonsMigration is detected');
+    assert.equal(drift.lessonsMigration.action, 'insert');
+    assert.equal(drift.needsSetup, false, 'lessons drift alone must not force needsSetup');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+// Regression: the OUTER lessons:end marker must bind to the first occurrence
+// at/after the start (indexOf), not the last (lastIndexOf). The block sits
+// mid-file, so consumer prose below it can legitimately quote the literal end
+// marker; a lastIndexOf parser latched onto that quote and the re-sync rebuild
+// silently deleted everything between the real terminator and the quote while
+// reporting "existing entries preserved".
+test('setup --yes does not corrupt consumer prose that quotes the outer lessons:end marker', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const claudePath = path.join(repoRoot, 'CLAUDE.md');
+    let claude = readFileSync(claudePath, 'utf8');
+    // Accrete a lesson...
+    claude = claude.replace(
+      '<!-- pipelane:lessons:entries:start -->\n<!-- pipelane:lessons:entries:end -->',
+      '<!-- pipelane:lessons:entries:start -->\n- 2026-06-25: keep this entry\n<!-- pipelane:lessons:entries:end -->',
+    );
+    // ...and add maintainer prose AFTER the block that quotes the literal outer
+    // end marker. This is the bug trigger: a lastIndexOf parser binds here.
+    claude = `${claude}\n## Maintainer Notes\n\nDo not hand-edit between the \`<!-- pipelane:lessons:end -->\` markers.\n`;
+    writeFileSync(claudePath, claude, 'utf8');
+
+    runCli(['setup', '--yes'], repoRoot);
+    const after = readFileSync(claudePath, 'utf8');
+    assert.match(after, /- 2026-06-25: keep this entry/);               // accreted entry preserved
+    assert.match(after, /## Maintainer Notes/);                          // prose heading survives
+    assert.match(after, /Do not hand-edit between the/);                 // prose body survives
+    // Real terminator + the quoted marker both intact. A lastIndexOf rebuild
+    // would have deleted the heading and consumed the quote, leaving only one.
+    assert.equal((after.match(/pipelane:lessons:end -->/g) || []).length, 2);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+// Regression: a pending Lessons block migration must be NAMED in the update
+// follow-up summary, not rendered as an empty "Run setup" bullet list.
+test('update follow-up summary names a pending Lessons block migration', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const claudePath = path.join(repoRoot, 'CLAUDE.md');
+    const stripped = readFileSync(claudePath, 'utf8').replace(LESSONS_BLOCK_RE, '');
+    writeFileSync(claudePath, stripped, 'utf8');
+    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
+    const update = await import(path.join(KIT_ROOT, 'src', 'operator', 'update.ts'));
+    const drift = docs.detectSetupDrift(repoRoot);
+    const summary = update.formatFollowUpSummary(drift);
+    assert.match(summary, /CLAUDE\.md Lessons block to add/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
   }
 });

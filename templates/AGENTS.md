@@ -51,4 +51,12 @@ This repo uses `pipelane` for task workspaces, PR prep, merge handoff, and deplo
 ### Docs
 
 - Use `docs/RELEASE_WORKFLOW.md` for the full operator workflow.
-- Use local `CLAUDE.md` for machine-specific deploy configuration only.
+- Use local `CLAUDE.md` for machine-specific deploy configuration and the managed `## Lessons` entries (see below).
+
+### Capturing lessons
+
+- This repo keeps an append-only `## Lessons` list in `CLAUDE.md`, inside the
+  managed `pipelane:lessons:entries` markers. When the user corrects a mistake
+  you made, read that list and append a one-line dated entry
+  (`- <YYYY-MM-DD>: <lesson>`), newest last. One line per lesson; do not rewrite
+  existing entries. Dedup and pruning are `/karpathy audit`'s job, not yours.

@@ -14,6 +14,7 @@ import { handleConfigure } from './operator/commands/configure.ts';
 import {
   applyAgentsGuidanceMigrationsWithApproval,
   applyClaudeGuidanceMigrationsWithApproval,
+  applyLessonsMigrationWithApproval,
   formatSetupResult,
   initConsumerRepo,
   setupConsumerRepo,
@@ -355,6 +356,21 @@ async function maybeApplyGuidanceMigrationsAfterPrompt(
   };
 }
 
+async function maybeApplyLessonsMigrationAfterPrompt(
+  result: SetupConsumerRepoResult,
+  yes: boolean,
+): Promise<SetupConsumerRepoResult> {
+  const applied = await applyLessonsMigrationWithApproval(result.lessonsMigration, { yes });
+  if (!applied) {
+    return result;
+  }
+  return {
+    ...result,
+    lessonsMigration: null,
+    appliedLessonsMigration: applied,
+  };
+}
+
 async function main(): Promise<void> {
   if (process.env.PIPELANE_REFRESH_UPDATE_CACHE === '1') {
     refreshAutoUpdateCache(process.cwd());
@@ -453,6 +469,7 @@ async function main(): Promise<void> {
     const options = parseSetupArgs(rest);
     let result = setupConsumerRepo(process.cwd());
     result = await maybeApplyGuidanceMigrationsAfterPrompt(result, options.yes);
+    result = await maybeApplyLessonsMigrationAfterPrompt(result, options.yes);
     process.stdout.write(formatSetupResult(result).join('\n') + '\n');
     if (!options.yes) {
       await maybeOfferConfigureAfterBootstrap(result.repoRoot);
