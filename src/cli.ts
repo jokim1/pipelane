@@ -266,6 +266,20 @@ function repoLocalInstallCheckLines(cwd: string): string[] {
   }
 }
 
+// Per-alias guidance for an optional skill whose name collided with a pre-existing
+// unmanaged skill (so install skipped it). /fix and /orchestrate have always-installed
+// pipelane-namespaced equivalents; anything else just needs the conflict resolved.
+function skippedSkillFallback(slashAlias: string): string {
+  if (slashAlias === '/fix') return 'use /pipelane-fix';
+  if (slashAlias === '/orchestrate') return 'use /pipelane orchestrate';
+  return 'rename or remove the conflicting skill and re-run install';
+}
+
+function formatSkippedSkillsLine(skipped: string[]): string {
+  const parts = skipped.map((alias) => `${alias} (${skippedSkillFallback(alias)})`);
+  return `Skipped unmanaged optional skills (a non-pipelane skill of the same name exists): ${parts.join('; ')}.`;
+}
+
 async function prepareRepoLocalPipelaneForBootstrap(repoRoot: string, yes: boolean | undefined): Promise<void> {
   if (!repoLocalPipelanePackageExists(repoRoot)) {
     return;
@@ -509,7 +523,7 @@ async function main(): Promise<void> {
       lines.push(`Removed legacy machine-local wrapper skills: ${result.removedLegacySkills.join(', ')}`);
     }
     if (result.skipped.length > 0) {
-      lines.push(`Skipped unmanaged optional skills: ${result.skipped.join(', ')}. Use /pipelane-fix.`);
+      lines.push(formatSkippedSkillsLine(result.skipped));
     }
     if (verbose) {
       lines.push(`Commands: ${result.installed.join(', ')}`);
@@ -529,7 +543,7 @@ async function main(): Promise<void> {
       lines.push(`Removed legacy machine-local wrapper skills: ${result.removedLegacySkills.join(', ')}`);
     }
     if (result.skipped.length > 0) {
-      lines.push(`Skipped unmanaged optional skills: ${result.skipped.join(', ')}. Use /pipelane-fix.`);
+      lines.push(formatSkippedSkillsLine(result.skipped));
     }
     if (verbose) {
       lines.push(`Commands: ${result.installed.join(', ')}`);
