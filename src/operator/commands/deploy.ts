@@ -61,6 +61,10 @@ import { maybeHandleDestinationCommand } from './destination.ts';
 import { observeFrontendRuntime, toDeployRuntimeObservation } from '../runtime-observation.ts';
 import { DESTINATION_APPROVED_TARGET_SHA_ENV, DESTINATION_INTERNAL_STEP_ENV } from '../destination-executor.ts';
 import { inferTargetSurfacesFromSurfacePathMap, targetSurfaceInferenceBlockers } from '../target-surface-map.ts';
+import {
+  describeCompletedDeployWorkflowRun,
+  observeCompletedDeployWorkflowRun,
+} from '../deploy-workflow-runs.ts';
 
 function surfacesKey(surfaces: string[]): string {
   return [...surfaces].sort().join(',');
@@ -278,13 +282,13 @@ export async function dispatchDeploy(
     throw new Error('--skip-smoke-coverage is no longer supported. Pipelane release deploys use deploy verification and healthchecks; QA smoke coverage belongs in a separate QA workflow.');
   }
 
-  const deployState = loadDeployState(context.commonDir, context.config);
+  let deployState = loadDeployState(context.commonDir, context.config);
   // v1.2: when signing is configured, attacker-planted records (unsigned or
   // bad-sig) are filtered out of every gate consult. They remain on disk and
   // get naturally displaced by persistRecord's slice(-100), but they can't
   // become "latest" for a surface or short-circuit an idempotency check.
   const stateKey = resolveDeployStateKey();
-  const trustedRecords = stateKey
+  let trustedRecords = stateKey
     ? deployState.records.filter((record) => verifyDeployRecord(record, stateKey))
     : deployState.records;
   if (context.modeState.mode === 'release' && environment === 'prod') {
@@ -370,13 +374,26 @@ export async function dispatchDeploy(
       idempotencyKey,
     });
     if (existingRequested) {
-      const requested = describeRequestedDeployRecord(existingRequested);
-      if (requested?.inFlight) {
-        throw new Error([
-          `deploy ${environment} blocked: deploy is already in flight for ${target.sha.slice(0, 7)}.`,
-          requested.reason,
-          'Wait for it to finish before retrying this deploy.',
-        ].join('\n'));
+      const reconciled = await reconcileCompletedRequestedDeploy({
+        context,
+        deployConfig,
+        record: existingRequested,
+        stateKey,
+      });
+      if (reconciled) {
+        deployState = loadDeployState(context.commonDir, context.config);
+        trustedRecords = stateKey
+          ? deployState.records.filter((record) => verifyDeployRecord(record, stateKey))
+          : deployState.records;
+      } else {
+        const requested = describeRequestedDeployRecord(existingRequested);
+        if (requested?.inFlight) {
+          throw new Error([
+            `deploy ${environment} blocked: deploy is already in flight for ${target.sha.slice(0, 7)}.`,
+            requested.reason,
+            'Wait for it to finish before retrying this deploy.',
+          ].join('\n'));
+        }
       }
     }
 
@@ -500,17 +517,84 @@ export async function dispatchDeploy(
       };
     }
 
-  // Watch the run and stamp the final outcome.
-  const watched = watchWorkflowRun(context.repoRoot, run?.id);
+    // Watch the run and stamp the final outcome.
+    const watched = watchWorkflowRun(context.repoRoot, run?.id);
+    record = await finalizeDeployRecord({
+      context,
+      deployConfig,
+      record,
+      workflowSucceeded: watched.ok,
+      workflowFailureReason: watched.reason || 'workflow run reported non-zero exit',
+      dispatchStart,
+      stateKey,
+    });
+
+    const latestState = loadDeployState(context.commonDir, context.config);
+    persistRecord(context.commonDir, context.config, latestState.records, record);
+
+    if (record.status !== 'succeeded') {
+      throw new Error([
+        `Deploy did not verify: ${environment}`,
+        record.failureReason ?? 'unknown failure',
+        run?.url ? `Workflow: ${run.url}` : '',
+      ].filter(Boolean).join('\n'));
+    }
+
+    const shortSha = target.sha.slice(0, 7);
+    const nextStage = environment === 'staging'
+      ? `staging verified at ${shortSha}, run ${formatWorkflowCommand(context.config, 'deploy', 'prod')} when ready to promote`
+      : `prod verified at ${shortSha}, run ${formatWorkflowCommand(context.config, 'clean', `--apply --task ${taskSlug}`)} to close out the workspace`;
+    setNextAction(context.commonDir, context.config, taskSlug, nextStage);
+
+    return {
+      ...record,
+      taskSlug,
+      dispatchMode: workflowInvocation.dispatchMode,
+      message: [
+        `Deploy verified: ${environment}`,
+        `Task: ${taskSlug}`,
+        `SHA: ${target.sha}`,
+        `Surfaces: ${surfaces.join(', ')}`,
+        workflowInvocation.dispatchMode === 'push'
+          ? `Workflow: ${workflowName} (push-triggered on ${context.config.baseBranch})`
+          : `Workflow: ${workflowName}`,
+        run?.url ? `Workflow run: ${run.url}` : '',
+        formatDeployVerificationLine(record.verification),
+        environment === 'staging'
+          ? `Next: ${nextStage}`
+          : `Next: run ${formatWorkflowCommand(context.config, 'clean', `--apply --task ${taskSlug}`)} to close out this workspace (removes lock + worktree + local branch).`,
+      ].filter(Boolean).join('\n'),
+    };
+  } finally {
+    releaseSmokeEnvironmentLock(context.commonDir, environment);
+  }
+}
+
+interface FinalizeDeployRecordOptions {
+  context: WorkflowContext;
+  deployConfig: DeployConfig;
+  record: DeployRecord;
+  workflowSucceeded: boolean;
+  workflowFailureReason?: string;
+  dispatchStart: number;
+  stateKey: string | undefined;
+}
+
+async function finalizeDeployRecord(options: FinalizeDeployRecordOptions): Promise<DeployRecord> {
+  const { context, deployConfig, stateKey } = options;
+  const environment = options.record.environment;
+  const surfaces = options.record.surfaces;
   const finishedAt = nowIso();
-  const durationMs = Date.now() - dispatchStart;
-  let status: DeployStatus = watched.ok ? 'succeeded' : 'failed';
-  let failureReason = watched.ok ? undefined : (watched.reason || 'workflow run reported non-zero exit');
+  const durationMs = Math.max(0, Date.now() - options.dispatchStart);
+  let status: DeployStatus = options.workflowSucceeded ? 'succeeded' : 'failed';
+  let failureReason = options.workflowSucceeded
+    ? undefined
+    : (options.workflowFailureReason || 'workflow run reported non-zero exit');
 
   let verification: DeployVerification | undefined;
   let verificationBySurface: Record<string, DeployVerification> | undefined;
   let runtimeObservation: DeployRecord['runtimeObservation'];
-  if (watched.ok) {
+  if (options.workflowSucceeded) {
     // v1.2: per-surface verification. A multi-surface deploy produces one
     // entry per surface so a frontend healthcheck can't credit edge or sql.
     // Healthcheck URLs are probed directly; command-only surfaces trust the
@@ -530,7 +614,7 @@ export async function dispatchDeploy(
     // Aggregate block kept for compatibility with pre-v1.2 consumers of the
     // DeployRecord shape (dashboard, API readers). Picks frontend when
     // present, otherwise the first surface probed.
-    verification = verificationBySurface['frontend']
+    verification = verificationBySurface.frontend
       ?? verificationBySurface[surfaces[0]]
       ?? { healthcheckUrl: '', probes: 0 };
 
@@ -550,8 +634,8 @@ export async function dispatchDeploy(
   const verifiedAt = status === 'succeeded' ? nowIso() : undefined;
   const configFingerprint = computeDeployConfigFingerprint(deployConfig, environment);
 
-  record = {
-    ...record,
+  let finalized: DeployRecord = {
+    ...options.record,
     status,
     finishedAt,
     durationMs,
@@ -568,48 +652,37 @@ export async function dispatchDeploy(
   // when no key is configured. Reuses the `stateKey` resolved at the top of
   // this function.
   if (stateKey) {
-    record = { ...record, signature: signDeployRecord(record, stateKey) };
+    finalized = { ...finalized, signature: signDeployRecord(finalized, stateKey) };
   }
+  return finalized;
+}
 
-  const latestState = loadDeployState(context.commonDir, context.config);
-  persistRecord(context.commonDir, context.config, latestState.records, record);
+async function reconcileCompletedRequestedDeploy(options: {
+  context: WorkflowContext;
+  deployConfig: DeployConfig;
+  record: DeployRecord;
+  stateKey: string | undefined;
+}): Promise<DeployRecord | null> {
+  const completedRun = observeCompletedDeployWorkflowRun(options.context.repoRoot, options.record);
+  if (!completedRun) return null;
 
-  if (status !== 'succeeded') {
-    throw new Error([
-      `Deploy did not verify: ${environment}`,
-      failureReason ?? 'unknown failure',
-      run?.url ? `Workflow: ${run.url}` : '',
-    ].filter(Boolean).join('\n'));
-  }
-
-  const shortSha = target.sha.slice(0, 7);
-  const nextStage = environment === 'staging'
-    ? `staging verified at ${shortSha}, run ${formatWorkflowCommand(context.config, 'deploy', 'prod')} when ready to promote`
-    : `prod verified at ${shortSha}, run ${formatWorkflowCommand(context.config, 'clean', `--apply --task ${taskSlug}`)} to close out the workspace`;
-  setNextAction(context.commonDir, context.config, taskSlug, nextStage);
-
-    return {
-      ...record,
-      taskSlug,
-      dispatchMode: workflowInvocation.dispatchMode,
-      message: [
-        `Deploy verified: ${environment}`,
-        `Task: ${taskSlug}`,
-        `SHA: ${target.sha}`,
-        `Surfaces: ${surfaces.join(', ')}`,
-        workflowInvocation.dispatchMode === 'push'
-          ? `Workflow: ${workflowName} (push-triggered on ${context.config.baseBranch})`
-          : `Workflow: ${workflowName}`,
-        run?.url ? `Workflow run: ${run.url}` : '',
-        formatDeployVerificationLine(verification),
-        environment === 'staging'
-          ? `Next: ${nextStage}`
-          : `Next: run ${formatWorkflowCommand(context.config, 'clean', `--apply --task ${taskSlug}`)} to close out this workspace (removes lock + worktree + local branch).`,
-      ].filter(Boolean).join('\n'),
-    };
-  } finally {
-    releaseSmokeEnvironmentLock(context.commonDir, environment);
-  }
+  const requestedMs = Date.parse(options.record.requestedAt);
+  const dispatchStart = Number.isFinite(requestedMs) ? requestedMs : Date.now();
+  const record = await finalizeDeployRecord({
+    context: options.context,
+    deployConfig: options.deployConfig,
+    record: {
+      ...options.record,
+      workflowRunUrl: completedRun.url ?? options.record.workflowRunUrl,
+    },
+    workflowSucceeded: completedRun.ok,
+    workflowFailureReason: describeCompletedDeployWorkflowRun(completedRun),
+    dispatchStart,
+    stateKey: options.stateKey,
+  });
+  const latestState = loadDeployState(options.context.commonDir, options.context.config);
+  persistRecord(options.context.commonDir, options.context.config, latestState.records, record);
+  return record;
 }
 
 export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
