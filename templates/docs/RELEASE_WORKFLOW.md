@@ -317,11 +317,18 @@ just stops future syncs from touching the surface.
 ## Required `AGENTS.md`
 
 This repo tracks `AGENTS.md` as the repo policy surface for pipelane.
+The generated Pipelane section tells agents to use `{{ALIAS_NEW}}` before any
+new code-changing task, to resume existing task worktrees with `{{ALIAS_RESUME}}`,
+and to avoid editing or landing from shared, dirty, base-branch, or unrelated
+task checkouts.
 
 ## Required local `CLAUDE.md`
 
 `CLAUDE.md` is machine-local and git-ignored. Setup creates it when Claude-facing
 repo-local surfaces are enabled.
+If an existing local `CLAUDE.md` is missing the Pipelane task workspace policy,
+`pipelane setup` prints an approval-gated migration; `pipelane setup --yes`
+applies it non-interactively.
 
 ## What each user must do
 

@@ -51,7 +51,7 @@ const REVIEW_CONFIG_CHANGE_GATE_ID = 'review-config-change';
 const REVIEW_CONFIG_CHANGE_WHEN = 'review-config-changed';
 const REVIEW_CONFIG_CHANGE_PATHS = ['.pipelane.json', '.project-workflow.json', 'package.json'];
 const REVIEW_PHASE_ORDER = REVIEW_GATE_PHASES;
-const DEFAULT_GATE_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_GATE_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_REVIEW_SETUP_NPM_INSTALL_TIMEOUT_MS = 2 * 60 * 1000;
 const OUTPUT_TAIL_CHARS = 4000;
 const REVIEW_GATE_CAPTURE_TAIL_BYTES = 2 * 1024 * 1024;
@@ -2133,12 +2133,29 @@ function orderReviewGates(gates: ReviewGateConfig[]): ReviewGateConfig[] {
 // the C2 signature whose guarantee is "the worker does not hold the key". The
 // orchestrator PARENT keeps the key (for signing + attestation via
 // appendReviewRunRecord); only the gate child is scrubbed.
-function gateSubprocessEnv(): NodeJS.ProcessEnv {
+function gateSubprocessEnv(options: { stripAiReviewOverrides?: boolean } = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   delete env[REVIEW_STATE_KEY_ENV];
   delete env[DEPLOY_STATE_KEY_ENV];
   delete env[PROBE_STATE_KEY_ENV];
+  if (options.stripAiReviewOverrides) {
+    stripAiReviewOverrideEnv(env);
+  }
   return env;
+}
+
+function stripAiReviewOverrideEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of Object.keys(env)) {
+    if (
+      key === 'PIPELANE_REVIEW_AI_COMMAND'
+      || key === 'PIPELANE_REVIEW_GATE_COMMAND'
+      || key === 'PIPELANE_REVIEW_PROVIDER'
+      || key === 'PIPELANE_REVIEW_GATE_PROVIDER'
+      || /^PIPELANE_REVIEW_(?:GATE_)?[A-Z0-9_]+_(?:COMMAND|PROVIDER)$/.test(key)
+    ) {
+      delete env[key];
+    }
+  }
 }
 
 function spawnReviewGateCommand(
@@ -2499,7 +2516,7 @@ function runReviewGate(options: {
   const { result, stdout, stderr } = spawnReviewGateCommand(gate.command, {
     cwd: repoRoot,
     timeout: timeoutMs,
-    env: gateSubprocessEnv(),
+    env: gateSubprocessEnv({ stripAiReviewOverrides: true }),
   });
   const exitCode = typeof result.status === 'number' ? result.status : null;
   const timedOut = result.error && (result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT';

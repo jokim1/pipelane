@@ -9,8 +9,10 @@ import { installClaudeBootstrapSkill } from './claude-install.ts';
 import { installCodexBootstrapSkill } from './codex-install.ts';
 import {
   applyAgentsGuidanceMigrationsWithApproval,
+  applyClaudeGuidanceMigrationsWithApproval,
   detectSetupDrift,
   formatAgentsGuidanceMigrations,
+  formatClaudeGuidanceMigrations,
   formatSetupResult,
   type SetupConsumerRepoResult,
   type SetupDrift,
@@ -346,8 +348,8 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
     writeUpdateOutput(options, `${summary}\n`);
     emitGlobalSurfaceRefreshHint(globalSurfaces, options);
     if (!options.check) {
-      const appliedAgentsMigration = await maybeApplyAgentsGuidanceMigrationsFromDrift(driftResult.drift, options.yes);
-      if (appliedAgentsMigration) {
+      const appliedGuidanceMigration = await maybeApplyGuidanceMigrationsFromDrift(driftResult.drift, options.yes);
+      if (appliedGuidanceMigration) {
         driftResult = tryDetectDrift(repoRoot);
       }
     }
@@ -444,8 +446,8 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
   }
   emitGlobalSurfaceRefreshHint(globalSurfaces, options);
   if (!driftResult.drift?.needsSetup) {
-    const appliedAgentsMigration = await maybeApplyAgentsGuidanceMigrationsFromDrift(driftResult.drift, options.yes);
-    if (appliedAgentsMigration) {
+    const appliedGuidanceMigration = await maybeApplyGuidanceMigrationsFromDrift(driftResult.drift, options.yes);
+    if (appliedGuidanceMigration) {
       driftResult = tryDetectDrift(repoRoot);
     }
   }
@@ -454,7 +456,7 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
   let ranSetup = false;
   const drift = driftResult.drift;
   if (drift?.needsSetup && drift.claude.collisions.length === 0) {
-    const setupResult = await maybeApplyAgentsGuidanceMigrationsFromSetupResult(
+    const setupResult = await maybeApplyGuidanceMigrationsFromSetupResult(
       setupConsumerRepo(repoRoot),
       options.yes,
     );
@@ -682,29 +684,35 @@ function tryDetectDrift(repoRoot: string): DriftResult {
   }
 }
 
-async function maybeApplyAgentsGuidanceMigrationsFromDrift(
+async function maybeApplyGuidanceMigrationsFromDrift(
   drift: SetupDrift | null,
   yes: boolean,
 ): Promise<boolean> {
-  const migrations = drift?.agentsGuidanceMigrations ?? [];
-  const applied = await applyAgentsGuidanceMigrationsWithApproval(migrations, { yes });
-  return applied.length > 0;
+  const appliedAgents = await applyAgentsGuidanceMigrationsWithApproval(drift?.agentsGuidanceMigrations ?? [], { yes });
+  const appliedClaude = await applyClaudeGuidanceMigrationsWithApproval(drift?.claudeGuidanceMigrations ?? [], { yes });
+  return appliedAgents.length > 0 || appliedClaude.length > 0;
 }
 
-async function maybeApplyAgentsGuidanceMigrationsFromSetupResult(
+async function maybeApplyGuidanceMigrationsFromSetupResult(
   result: SetupConsumerRepoResult,
   yes: boolean,
 ): Promise<SetupConsumerRepoResult> {
-  const applied = await applyAgentsGuidanceMigrationsWithApproval(result.agentsGuidanceMigrations, { yes });
-  if (applied.length === 0) {
+  const appliedAgents = await applyAgentsGuidanceMigrationsWithApproval(result.agentsGuidanceMigrations, { yes });
+  const appliedClaude = await applyClaudeGuidanceMigrationsWithApproval(result.claudeGuidanceMigrations, { yes });
+  if (appliedAgents.length === 0 && appliedClaude.length === 0) {
     return result;
   }
   return {
     ...result,
-    agentsGuidanceMigrations: [],
+    agentsGuidanceMigrations: appliedAgents.length > 0 ? [] : result.agentsGuidanceMigrations,
     appliedAgentsGuidanceMigrations: [
       ...result.appliedAgentsGuidanceMigrations,
-      ...applied,
+      ...appliedAgents,
+    ],
+    claudeGuidanceMigrations: appliedClaude.length > 0 ? [] : result.claudeGuidanceMigrations,
+    appliedClaudeGuidanceMigrations: [
+      ...result.appliedClaudeGuidanceMigrations,
+      ...appliedClaude,
     ],
   };
 }
@@ -876,11 +884,22 @@ function emitDriftHint(result: DriftResult, options: Pick<UpdateOptions, 'output
   if (!drift) return;
   const warnings = drift.warnings ?? [];
   const agentsGuidanceMigrations = drift.agentsGuidanceMigrations ?? [];
+  const claudeGuidanceMigrations = drift.claudeGuidanceMigrations ?? [];
   if (!drift.needsSetup) {
+    let emittedGuidanceMigration = false;
     if (agentsGuidanceMigrations.length > 0) {
       writeUpdateOutput(options, '\nAGENTS.md guidance migration requires approval:\n');
       writeUpdateOutput(options, formatAgentsGuidanceMigrations(agentsGuidanceMigrations).join('\n') + '\n');
       writeUpdateOutput(options, 'Run `pipelane setup --yes` to apply these AGENTS.md changes non-interactively, or run `pipelane setup` in a TTY and approve the prompt.\n');
+      emittedGuidanceMigration = true;
+    }
+    if (claudeGuidanceMigrations.length > 0) {
+      writeUpdateOutput(options, '\nCLAUDE.md guidance migration requires approval:\n');
+      writeUpdateOutput(options, formatClaudeGuidanceMigrations(claudeGuidanceMigrations).join('\n') + '\n');
+      writeUpdateOutput(options, 'Run `pipelane setup --yes` to apply these CLAUDE.md changes non-interactively, or run `pipelane setup` in a TTY and approve the prompt.\n');
+      emittedGuidanceMigration = true;
+    }
+    if (emittedGuidanceMigration) {
       return;
     }
     if (warnings.length > 0) {
@@ -908,6 +927,7 @@ export function formatFollowUpSummary(drift: SetupDrift): string {
   const changes: string[] = [];
   const warnings = drift.warnings ?? [];
   const agentsGuidanceMigrations = drift.agentsGuidanceMigrations ?? [];
+  const claudeGuidanceMigrations = drift.claudeGuidanceMigrations ?? [];
   if (drift.claude.enabled) {
     const added = truncateList(drift.claude.addedCommands);
     const updated = truncateList(drift.claude.updatedCommands);
@@ -937,6 +957,9 @@ export function formatFollowUpSummary(drift: SetupDrift): string {
   if (agentsGuidanceMigrations.length > 0) {
     const count = agentsGuidanceMigrations.reduce((sum, migration) => sum + migration.replacements.length, 0);
     changes.push(`AGENTS.md guidance migration requires approval (${count} line${count === 1 ? '' : 's'})`);
+  }
+  if (claudeGuidanceMigrations.length > 0) {
+    changes.push('CLAUDE.md guidance migration requires approval');
   }
   if (warnings.length > 0) {
     changes.push(`Readiness warnings: ${warnings.join(' ')}`);

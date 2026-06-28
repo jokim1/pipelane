@@ -13,6 +13,7 @@ import { installCodexBootstrapSkill } from './operator/codex-install.ts';
 import { handleConfigure } from './operator/commands/configure.ts';
 import {
   applyAgentsGuidanceMigrationsWithApproval,
+  applyClaudeGuidanceMigrationsWithApproval,
   formatSetupResult,
   initConsumerRepo,
   setupConsumerRepo,
@@ -330,20 +331,26 @@ async function maybeOfferConfigureAfterBootstrap(repoRoot: string): Promise<void
   await handleConfigure(repoRoot, []);
 }
 
-async function maybeApplyAgentsGuidanceMigrationsAfterPrompt(
+async function maybeApplyGuidanceMigrationsAfterPrompt(
   result: SetupConsumerRepoResult,
   yes: boolean,
 ): Promise<SetupConsumerRepoResult> {
-  const applied = await applyAgentsGuidanceMigrationsWithApproval(result.agentsGuidanceMigrations, { yes });
-  if (applied.length === 0) {
+  const appliedAgents = await applyAgentsGuidanceMigrationsWithApproval(result.agentsGuidanceMigrations, { yes });
+  const appliedClaude = await applyClaudeGuidanceMigrationsWithApproval(result.claudeGuidanceMigrations, { yes });
+  if (appliedAgents.length === 0 && appliedClaude.length === 0) {
     return result;
   }
   return {
     ...result,
-    agentsGuidanceMigrations: [],
+    agentsGuidanceMigrations: appliedAgents.length > 0 ? [] : result.agentsGuidanceMigrations,
     appliedAgentsGuidanceMigrations: [
       ...result.appliedAgentsGuidanceMigrations,
-      ...applied,
+      ...appliedAgents,
+    ],
+    claudeGuidanceMigrations: appliedClaude.length > 0 ? [] : result.claudeGuidanceMigrations,
+    appliedClaudeGuidanceMigrations: [
+      ...result.appliedClaudeGuidanceMigrations,
+      ...appliedClaude,
     ],
   };
 }
@@ -445,7 +452,7 @@ async function main(): Promise<void> {
   if (command === 'setup') {
     const options = parseSetupArgs(rest);
     let result = setupConsumerRepo(process.cwd());
-    result = await maybeApplyAgentsGuidanceMigrationsAfterPrompt(result, options.yes);
+    result = await maybeApplyGuidanceMigrationsAfterPrompt(result, options.yes);
     process.stdout.write(formatSetupResult(result).join('\n') + '\n');
     if (!options.yes) {
       await maybeOfferConfigureAfterBootstrap(result.repoRoot);

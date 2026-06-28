@@ -23,6 +23,8 @@ This file is local-only operator state. Keep it git-ignored.
 - If `.pipelane.json` aliases change, rerun setup and reopen Claude/Codex so the new command names appear.
 - `{{DEPLOY_WORKFLOW_NAME}}` is the canonical deploy workflow label for this repo.
 
+{{LOCAL_CLAUDE_WORKSPACE_POLICY}}
+
 ## Skill Routing
 
 When the user's request matches an available skill, invoke it first.

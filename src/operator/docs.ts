@@ -34,6 +34,8 @@ const CONTRIBUTING_MARKER_START = '<!-- pipelane:contributing:start -->';
 const CONTRIBUTING_MARKER_END = '<!-- pipelane:contributing:end -->';
 const AGENTS_MARKER_START = '<!-- pipelane:agents:start -->';
 const AGENTS_MARKER_END = '<!-- pipelane:agents:end -->';
+const CLAUDE_WORKSPACE_POLICY_MARKER_START = '<!-- pipelane:claude-workspace-policy:start -->';
+const CLAUDE_WORKSPACE_POLICY_MARKER_END = '<!-- pipelane:claude-workspace-policy:end -->';
 const CLAUDE_COMMAND_MARKER = '<!-- pipelane:command:';
 const CONSUMER_EXTENSION_MARKER_START = '<!-- pipelane:consumer-extension:start -->';
 const CONSUMER_EXTENSION_MARKER_END = '<!-- pipelane:consumer-extension:end -->';
@@ -142,6 +144,20 @@ function readTemplate(relativePath: string): string {
   return readFileSync(templatePath(relativePath), 'utf8');
 }
 
+function renderLocalClaudeWorkspacePolicy(config: WorkflowConfig): string {
+  const aliases = resolveWorkflowAliases(config.aliases);
+  return [
+    CLAUDE_WORKSPACE_POLICY_MARKER_START,
+    '## Task Workspace Policy',
+    '',
+    `- For any code-changing task, start in a Pipelane task workspace. If the current checkout is not already the matching task workspace, run \`${aliases.new}\` with an inferred \`--task\` label before editing.`,
+    `- Use \`${aliases.resume} --task "<task-name>"\` to continue existing work. Use \`${aliases['repo-guard']} --task "<task-name>"\` when a checkout may be shared, dirty, or bound to another task.`,
+    `- Do not edit, commit, run \`${aliases.pr}\`, \`${aliases.merge}\`, or \`${aliases.deploy}\` from a shared checkout, base branch checkout, dirty unrelated worktree, or another task's worktree unless the user explicitly asks for that checkout.`,
+    '- Exceptions are read-only review, answering questions without file edits, and continuing inside an already-created matching task workspace.',
+    CLAUDE_WORKSPACE_POLICY_MARKER_END,
+  ].join('\n');
+}
+
 function managedClaudeCommandsPath(commandsDir: string): string {
   return path.join(commandsDir, MANAGED_CLAUDE_COMMANDS_FILENAME);
 }
@@ -168,6 +184,7 @@ function renderTemplate(template: string, config: WorkflowConfig): string {
     ALIAS_STATUS: aliases.status,
     ALIAS_DOCTOR: aliases.doctor,
     ALIAS_ROLLBACK: aliases.rollback,
+    LOCAL_CLAUDE_WORKSPACE_POLICY: renderLocalClaudeWorkspacePolicy(config),
   };
 
   return Object.entries(replacements).reduce(
@@ -664,11 +681,14 @@ export interface SetupConsumerRepoResult {
   removedLegacyCodexSkills: string[];
   agentsGuidanceMigrations: AgentsGuidanceMigration[];
   appliedAgentsGuidanceMigrations: AgentsGuidanceMigration[];
+  claudeGuidanceMigrations: ClaudeGuidanceMigration[];
+  appliedClaudeGuidanceMigrations: ClaudeGuidanceMigration[];
   warnings: string[];
 }
 
 export interface SetupConsumerRepoOptions {
   applyAgentsGuidanceMigrations?: boolean;
+  applyClaudeGuidanceMigrations?: boolean;
 }
 
 export interface AgentsGuidanceReplacement {
@@ -681,6 +701,14 @@ export interface AgentsGuidanceMigration {
   file: 'AGENTS.md';
   path: string;
   replacements: AgentsGuidanceReplacement[];
+}
+
+export interface ClaudeGuidanceMigration {
+  file: 'CLAUDE.md';
+  path: string;
+  insertAfterLine: number;
+  anchor: string;
+  block: string;
 }
 
 const AGENTS_GUIDANCE_EXTRA_COMMANDS: Record<string, string> = {
@@ -823,6 +851,119 @@ export function formatAgentsGuidanceMigrations(migrations: AgentsGuidanceMigrati
   ];
 }
 
+function hasLocalClaudeWorkspacePolicy(content: string, config: WorkflowConfig): boolean {
+  if (content.includes(CLAUDE_WORKSPACE_POLICY_MARKER_START)) {
+    return true;
+  }
+
+  const aliases = resolveWorkflowAliases(config.aliases);
+  return content.includes('For any code-changing task')
+    && content.includes('Pipelane task workspace')
+    && content.includes(aliases.new)
+    && content.includes(aliases.resume);
+}
+
+function findClaudePolicyInsertionPoint(lines: string[]): { insertAfterLine: number; anchor: string } {
+  const localDefaultsIndex = lines.findIndex((line) => line.trim() === '## Local Operator Defaults');
+  if (localDefaultsIndex >= 0) {
+    return { insertAfterLine: localDefaultsIndex + 1, anchor: lines[localDefaultsIndex] ?? '' };
+  }
+
+  const firstHeadingIndex = lines.findIndex((line) => /^#\s+/.test(line));
+  if (firstHeadingIndex >= 0) {
+    return { insertAfterLine: firstHeadingIndex + 1, anchor: lines[firstHeadingIndex] ?? '' };
+  }
+
+  return { insertAfterLine: 0, anchor: '' };
+}
+
+function detectClaudeGuidanceMigrationsForConfig(repoRoot: string, config: WorkflowConfig): ClaudeGuidanceMigration[] {
+  const claudePath = path.join(repoRoot, 'CLAUDE.md');
+  if (!existsSync(claudePath)) {
+    return [];
+  }
+
+  const content = readFileSync(claudePath, 'utf8');
+  if (hasLocalClaudeWorkspacePolicy(content, config)) {
+    return [];
+  }
+
+  const lines = content.split('\n');
+  const insertion = findClaudePolicyInsertionPoint(lines);
+  return [{
+    file: 'CLAUDE.md',
+    path: claudePath,
+    insertAfterLine: insertion.insertAfterLine,
+    anchor: insertion.anchor,
+    block: renderLocalClaudeWorkspacePolicy(config),
+  }];
+}
+
+export function applyClaudeGuidanceMigrations(migrations: ClaudeGuidanceMigration[]): ClaudeGuidanceMigration[] {
+  const applied: ClaudeGuidanceMigration[] = [];
+  for (const migration of migrations) {
+    const content = readFileSync(migration.path, 'utf8');
+    if (content.includes(CLAUDE_WORKSPACE_POLICY_MARKER_START)) {
+      continue;
+    }
+    const lines = content.split('\n');
+    if (migration.insertAfterLine > 0 && lines[migration.insertAfterLine - 1] !== migration.anchor) {
+      throw new Error(
+        `${migration.file}:${migration.insertAfterLine} changed while preparing the CLAUDE.md guidance migration. Re-run setup to recompute the proposed edits.`,
+      );
+    }
+    const insertAt = Math.max(0, migration.insertAfterLine);
+    const blockLines = ['', migration.block, ''];
+    lines.splice(insertAt, 0, ...blockLines);
+    writeFileSync(migration.path, lines.join('\n'), 'utf8');
+    applied.push(migration);
+  }
+  return applied;
+}
+
+export async function applyClaudeGuidanceMigrationsWithApproval(
+  migrations: ClaudeGuidanceMigration[],
+  options: { yes?: boolean } = {},
+): Promise<ClaudeGuidanceMigration[]> {
+  if (migrations.length === 0) {
+    return [];
+  }
+  if (options.yes) {
+    return applyClaudeGuidanceMigrations(migrations);
+  }
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    return [];
+  }
+
+  process.stdout.write(`${formatClaudeGuidanceMigrations(migrations).join('\n')}\n`);
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (await rl.question('Apply these CLAUDE.md changes? Enter Y to proceed. [Y/n] ')).trim().toLowerCase();
+    if (answer !== '' && answer !== 'y' && answer !== 'yes') {
+      return [];
+    }
+  } finally {
+    rl.close();
+  }
+  return applyClaudeGuidanceMigrations(migrations);
+}
+
+export function formatClaudeGuidanceMigrations(migrations: ClaudeGuidanceMigration[]): string[] {
+  const lines: string[] = [];
+  for (const migration of migrations) {
+    lines.push(`${migration.file} is missing the Pipelane task workspace policy:`);
+    lines.push(
+      migration.insertAfterLine > 0
+        ? `- insert after ${migration.file}:${migration.insertAfterLine}`
+        : `- insert at the top of ${migration.file}`,
+    );
+  }
+  return [
+    ...lines,
+    'This local guidance tells Claude to start code-changing work with /new, resume existing task worktrees with /resume, and avoid editing from shared or unrelated checkouts.',
+  ];
+}
+
 export function setupConsumerRepo(cwd: string, options: SetupConsumerRepoOptions = {}): SetupConsumerRepoResult {
   const repoRoot = resolveRepoRoot(cwd, true);
   const config = loadWorkflowConfig(repoRoot);
@@ -868,6 +1009,17 @@ export function setupConsumerRepo(cwd: string, options: SetupConsumerRepoOptions
       ? detectAgentsGuidanceMigrationsForConfig(repoRoot, config)
       : [];
   }
+  let claudeGuidanceMigrations = scaffoldClaudeMd && !createdClaude
+    ? detectClaudeGuidanceMigrationsForConfig(repoRoot, config)
+    : [];
+  const appliedClaudeGuidanceMigrations = options.applyClaudeGuidanceMigrations
+    ? applyClaudeGuidanceMigrations(claudeGuidanceMigrations)
+    : [];
+  if (appliedClaudeGuidanceMigrations.length > 0) {
+    claudeGuidanceMigrations = scaffoldClaudeMd
+      ? detectClaudeGuidanceMigrationsForConfig(repoRoot, config)
+      : [];
+  }
 
   return {
     repoRoot,
@@ -882,6 +1034,8 @@ export function setupConsumerRepo(cwd: string, options: SetupConsumerRepoOptions
     removedLegacyCodexSkills,
     agentsGuidanceMigrations,
     appliedAgentsGuidanceMigrations,
+    claudeGuidanceMigrations,
+    appliedClaudeGuidanceMigrations,
     warnings: [],
   };
 }
@@ -914,6 +1068,7 @@ export interface SetupDrift {
   // come from the SyncDocsConfig keys enabled for this consumer.
   otherSurfaces: string[];
   agentsGuidanceMigrations: AgentsGuidanceMigration[];
+  claudeGuidanceMigrations: ClaudeGuidanceMigration[];
   warnings: string[];
 }
 
@@ -1053,6 +1208,9 @@ export function detectSetupDrift(cwd: string): SetupDrift {
   const agentsGuidanceMigrations = syncDocs.agentsSection
     ? detectAgentsGuidanceMigrationsForConfig(repoRoot, config)
     : [];
+  const claudeGuidanceMigrations = shouldScaffoldClaudeMd(syncDocs)
+    ? detectClaudeGuidanceMigrationsForConfig(repoRoot, config)
+    : [];
 
   const claudeDirty =
     claude.addedCommands.length > 0 ||
@@ -1088,6 +1246,7 @@ export function detectSetupDrift(cwd: string): SetupDrift {
     repoGuidance,
     otherSurfaces,
     agentsGuidanceMigrations,
+    claudeGuidanceMigrations,
     warnings: [],
   };
 }
@@ -1150,10 +1309,18 @@ export function formatSetupResult(result: SetupConsumerRepoResult): string[] {
       .reduce((sum, migration) => sum + migration.replacements.length, 0);
     lines.push(`Updated AGENTS.md stale workflow guidance (${count} line${count === 1 ? '' : 's'}).`);
   }
+  if (result.appliedClaudeGuidanceMigrations.length > 0) {
+    lines.push('Updated CLAUDE.md with the Pipelane task workspace policy.');
+  }
   if (result.agentsGuidanceMigrations.length > 0) {
     lines.push('AGENTS.md guidance migration requires approval:');
     lines.push(...formatAgentsGuidanceMigrations(result.agentsGuidanceMigrations));
     lines.push('Run `pipelane setup --yes` to apply these AGENTS.md changes non-interactively, or run `pipelane setup` in a TTY and approve the prompt.');
+  }
+  if (result.claudeGuidanceMigrations.length > 0) {
+    lines.push('CLAUDE.md guidance migration requires approval:');
+    lines.push(...formatClaudeGuidanceMigrations(result.claudeGuidanceMigrations));
+    lines.push('Run `pipelane setup --yes` to apply these CLAUDE.md changes non-interactively, or run `pipelane setup` in a TTY and approve the prompt.');
   }
   if (result.warnings.length > 0) {
     lines.push('Readiness warnings:');

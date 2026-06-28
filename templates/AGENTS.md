@@ -23,6 +23,9 @@ This repo uses `pipelane` for task workspaces, PR prep, merge handoff, and deplo
 ### Repo guard and task locks
 
 - Treat `{{ALIAS_NEW}}` as the canonical task-start command.
+- For any code-changing task, start in a Pipelane task workspace. If the current checkout is not already the matching task workspace, run `{{ALIAS_NEW}}` with an inferred `--task` label before editing.
+- Do not edit, commit, run `{{ALIAS_PR}}`, `{{ALIAS_MERGE}}`, or `{{ALIAS_DEPLOY}}` from a shared checkout, base branch checkout, dirty unrelated worktree, or another task's worktree unless the user explicitly asks for that checkout.
+- Exceptions are read-only review, answering questions without file edits, and continuing inside an already-created matching task workspace.
 - If the user invokes bare `{{ALIAS_NEW}}` after describing an unstarted task, run it with an inferred `--task "<short-name>"`; if the task was already implemented, continue in the reported worktree and do not create another workspace.
 - Only use `{{ALIAS_NEW}} --unnamed` when the operator explicitly wants a generated task slug.
 - Treat `{{ALIAS_RESUME}}` as the recovery command.
