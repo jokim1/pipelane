@@ -19128,6 +19128,60 @@ test('build-mode deploy prod skips cleanly when no surfaces are configured', () 
   }
 });
 
+test('no-surface deploy of an unmerged SHA does not mark delivery complete', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  writeFileSync(ghStateFile, JSON.stringify({ prs: {}, workflows: [] }, null, 2), 'utf8');
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.surfaces = [];
+      config.buildMode.autoDeployOnMerge = false;
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Unmerged No Deploy', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+    execFileSync('git', ['add', 'feature.txt'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'feature commit'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
+
+    const deployed = JSON.parse(runCli(
+      ['run', 'deploy', 'prod', '--sha', sha, '--json'],
+      created.worktreePath,
+      env,
+    ).stdout);
+
+    assert.equal(deployed.dispatchMode, 'skipped');
+    assert.equal(deployed.status, 'unknown');
+    assert.equal(deployed.verifiedAt, undefined);
+    assert.match(deployed.message, /Merge to the base branch is the delivery step/);
+    assert.match(deployed.message, /Next: run \/merge before cleaning up this workspace/);
+    assert.doesNotMatch(deployed.message, /\/clean --apply --task unmerged-no-deploy/);
+
+    const lock = JSON.parse(readFileSync(
+      path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', 'unmerged-no-deploy.json'),
+      'utf8',
+    ));
+    assert.match(lock.nextAction, /run \/merge before cleanup/);
+    assert.doesNotMatch(lock.nextAction, /\/clean --apply/);
+
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.workflows.length, 0, 'deploy should not dispatch a workflow when no surfaces exist');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
 test('build-mode deploy prod keeps default surfaces and requires their prod verification steps', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
@@ -25671,6 +25725,44 @@ test('loadModeState falls back to defaults when mode-state.json contains malform
     assert.equal(loaded.mode, stateMod.DEFAULT_MODE);
     assert.deepEqual(loaded.requestedSurfaces, context.config.surfaces);
     assert.equal(loaded.override, null);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('loadModeState filters stale requested surfaces through current workflow config', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.surfaces = [];
+    config.buildMode.autoDeployOnMerge = false;
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(path.join(stateDir, 'mode-state.json'), JSON.stringify({
+      mode: 'build',
+      requestedSurfaces: ['frontend'],
+      override: null,
+      updatedAt: '2026-06-01T00:00:00.000Z',
+    }, null, 2), 'utf8');
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+    assert.deepEqual(context.modeState.requestedSurfaces, []);
+
+    const releaseCheck = JSON.parse(runCli(['run', 'release-check', '--json'], repoRoot).stdout);
+    assert.equal(releaseCheck.ready, true);
+    assert.deepEqual(releaseCheck.blockedSurfaces, []);
+
+    const status = JSON.parse(runCli(['run', 'status', '--json'], repoRoot).stdout);
+    const readiness = status.data.boardContext.releaseReadiness;
+    assert.equal(readiness.state, 'healthy');
+    assert.deepEqual(readiness.requestedSurfaces, []);
+    assert.deepEqual(readiness.blockedSurfaces, []);
+    assert.doesNotMatch(readiness.reason, /frontend/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
