@@ -261,10 +261,63 @@ Current implementation surface:
 /pipelane orchestrate dispatch --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
 /pipelane orchestrate start --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef [--slice-id <id>] [--force]
 /pipelane orchestrate review --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef [--slice-id <id>]
+/pipelane orchestrate upgrade-ledger --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef
+/pipelane orchestrate upgrade-ledger --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef --reseal-unsigned --reason "why this local ledger is trusted" --i-understand-this-trusts-local-state
 /pipelane orchestrate goal-spec --plan-file docs/plan.md
 /pipelane orchestrate goal-spec --outcome "Implement review gate enforcement"
 /pipelane orchestrate goal-spec --provider codex --json
 ```
+
+## Signed Run Ledgers
+
+Every command that creates or mutates an orchestration run requires
+`PIPELANE_ORCHESTRATION_STATE_KEY`. Set it to a secret value with at least 32
+characters before using `orchestrate plan`, `analyze`, `plan-review`,
+`prepare`, `dispatch`, `start`, `review`, `scope`, `finalize`, or
+`upgrade-ledger`.
+
+```bash
+export PIPELANE_ORCHESTRATION_STATE_KEY='use-a-random-32+-character-local-secret'
+```
+
+Each persisted `orchestration.json` is sealed with HMAC-SHA256 over the exact
+disk envelope, including `schemaVersion`; only the `signature` field is
+excluded from the HMAC. The ledger stores `integrity.version`,
+`integrity.runId`, `integrity.mutationIndex`, and a non-secret key
+fingerprint. Pipelane also writes a signed per-run integrity head outside the
+run directory under orchestration state. The head records the latest mutation
+index and latest ledger signature, so restoring only an older
+`orchestration.json` fails closed as a rollback.
+
+Unsigned pre-hardening ledgers are a clean break. Pipelane does not silently
+migrate or trust them, and signed ledgers are verified before any legacy
+migration/normalization runs. Default diagnostics distinguish missing, blank,
+and too-short keys; wrong keys; malformed JSON; missing ledgers; invalid run
+ids; legacy unsigned ledgers; signature tampering; and ledger-only rollback.
+Wrong-key errors mention the key fingerprint mismatch, never the key value.
+
+The only recovery path for an old unsigned run is explicit resealing:
+
+```bash
+pipelane run orchestrate upgrade-ledger \
+  --run-id orchestrate-YYYYMMDDHHMMSS-deadbeef \
+  --reseal-unsigned \
+  --reason "reviewed local backup from before signing shipped" \
+  --i-understand-this-trusts-local-state
+```
+
+That command intentionally trusts the local unsigned JSON at reseal time, adds
+the reseal reason to the signed ledger, and writes a fresh signed integrity
+head. It is not a tamper repair tool for signed ledgers whose signature fails.
+
+Local threat model: the guard detects accidental edits, wrong-key reads,
+ledger transplants, malformed/torn writes, and restoring an older ledger
+without also restoring Pipelane's integrity head. It does not protect against an
+attacker who can read `PIPELANE_ORCHESTRATION_STATE_KEY`, replace both the
+ledger and all integrity state with a consistent older snapshot, or modify the
+Pipelane executable before it verifies state. Workers never receive
+`PIPELANE_ORCHESTRATION_STATE_KEY`; the deny-list strips it even if
+`PIPELANE_ORCHESTRATE_WORKER_ENV_ALLOW` names it.
 
 The approved bare command requires a host-authored `--analysis-file` and records
 plan analysis before creating any worktree. It then runs `prepare`, `dispatch`,

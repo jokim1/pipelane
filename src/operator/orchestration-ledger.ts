@@ -17,6 +17,8 @@ import {
   resolveStateDir,
   runGit,
   TASK_SLUG_MAX_LENGTH,
+  STATE_SCHEMA_VERSIONS,
+  writeJsonFile,
   writeVersionedJsonFile,
   type GoalProvider,
   type OrchestrateConfig,
@@ -32,7 +34,15 @@ import {
   type ReviewIndependenceLabel,
 } from './review-identity.ts';
 import { readWorktreeStatusSnapshot } from './worktree-status.ts';
-import { canonicalize, resolveReviewStateKey, signSignedPayload, verifySignedPayload } from './integrity.ts';
+import {
+  canonicalize,
+  ORCHESTRATION_STATE_KEY_ENV,
+  resolveOrchestrationStateKey,
+  resolveReviewStateKey,
+  signSignedPayload,
+  stateKeyFingerprint,
+  verifySignedPayload,
+} from './integrity.ts';
 
 export type OrchestrationRunStatus = 'planned' | 'prepared' | 'dispatched' | 'running' | 'blocked' | 'paused' | 'completed' | 'failed';
 
@@ -389,7 +399,34 @@ export interface OrchestrationRunRecord {
   // of which plan section maps to which slice / deferred / excluded. Absent on the
   // heading-decomposed path.
   coverage?: OrchestrationCoverageEntry[];
+  legacyReseal?: {
+    resealedAt: string;
+    reason: string;
+    trustedLocalState: true;
+  };
+  integrity?: OrchestrationRunIntegrity;
+  signature?: string;
 }
+
+export interface OrchestrationRunIntegrity {
+  version: 1;
+  runId: string;
+  mutationIndex: number;
+  keyFingerprint: string;
+}
+
+export interface OrchestrationRunIntegrityHead {
+  version: 1;
+  runId: string;
+  mutationIndex: number;
+  ledgerSignature: string;
+  keyFingerprint: string;
+  signature?: string;
+}
+
+type OrchestrationRunDiskEnvelope = OrchestrationRunRecord & {
+  schemaVersion: number;
+};
 
 export interface BuildOrchestrationSliceInput {
   id?: string;
@@ -479,6 +516,10 @@ const URL_SCHEME_PATTERN = /^[a-z][a-z0-9+.-]*:\/\//i;
 
 export function orchestrationRunPath(commonDir: string, config: WorkflowConfig, runId: string): string {
   return path.join(resolveStateDir(commonDir, config), 'orchestrate', 'runs', runId, 'orchestration.json');
+}
+
+export function orchestrationIntegrityHeadPath(commonDir: string, config: WorkflowConfig, runId: string): string {
+  return path.join(resolveStateDir(commonDir, config), 'orchestrate', 'integrity', `${runId}.json`);
 }
 
 export function orchestrationObservationsPath(commonDir: string, config: WorkflowConfig, runId: string): string {
@@ -792,11 +833,121 @@ export function saveOrchestrationRunRecord(
   config: WorkflowConfig,
   record: OrchestrationRunRecord,
 ): string {
+  const key = resolveOrchestrationStateKey();
+  const fingerprint = stateKeyFingerprint(key);
   const targetPath = orchestrationRunPath(commonDir, config, record.id);
+  assertSafeOrchestrationRunId(record.id);
   ensureInstallMarker(commonDir, config);
   mkdirSync(path.dirname(targetPath), { recursive: true });
+  assertOrchestrationIntegrityHeadAllowsSave(commonDir, config, record, key, fingerprint);
+  const priorMutationIndex = Number.isSafeInteger(record.integrity?.mutationIndex)
+    ? record.integrity.mutationIndex
+    : 0;
+  record.integrity = {
+    version: 1,
+    runId: record.id,
+    mutationIndex: priorMutationIndex + 1,
+    keyFingerprint: fingerprint,
+  };
+  delete record.signature;
+  const envelope: OrchestrationRunDiskEnvelope = {
+    ...record,
+    schemaVersion: STATE_SCHEMA_VERSIONS.orchestrationRun,
+  };
+  record.signature = signSignedPayload(envelope, key);
   writeVersionedJsonFile('orchestrationRun', targetPath, record);
+  saveOrchestrationIntegrityHead(commonDir, config, record, key);
   return targetPath;
+}
+
+function saveOrchestrationIntegrityHead(
+  commonDir: string,
+  config: WorkflowConfig,
+  record: OrchestrationRunRecord,
+  key: string,
+): void {
+  if (!record.integrity || !record.signature) {
+    throw new Error(`Cannot save orchestration integrity head for ${record.id}: signed ledger metadata is missing.`);
+  }
+  const targetPath = orchestrationIntegrityHeadPath(commonDir, config, record.id);
+  const head: OrchestrationRunIntegrityHead = {
+    version: 1,
+    runId: record.id,
+    mutationIndex: record.integrity.mutationIndex,
+    ledgerSignature: record.signature,
+    keyFingerprint: record.integrity.keyFingerprint,
+  };
+  head.signature = signSignedPayload(head, key);
+  writeJsonFile(targetPath, head);
+}
+
+function assertOrchestrationIntegrityHeadAllowsSave(
+  commonDir: string,
+  config: WorkflowConfig,
+  record: OrchestrationRunRecord,
+  key: string,
+  fingerprint: string,
+): void {
+  const headPath = orchestrationIntegrityHeadPath(commonDir, config, record.id);
+  if (!existsSync(headPath)) {
+    if (record.integrity || record.signature) {
+      throw new Error(`Cannot save orchestration ledger for ${record.id}: existing signed metadata has no integrity head; reload the run before mutating it.`);
+    }
+    return;
+  }
+
+  const head = loadVerifiedOrchestrationIntegrityHead(headPath, record.id, key, fingerprint);
+  if (!record.integrity || !record.signature) {
+    throw new Error(`Cannot save orchestration ledger for ${record.id}: existing integrity head cannot be updated from an unsigned record.`);
+  }
+  if (head.mutationIndex !== record.integrity.mutationIndex) {
+    throw new Error(`Cannot save orchestration ledger for ${record.id}: concurrent orchestration mutation detected; integrity head is at mutationIndex ${head.mutationIndex}, record was loaded at ${record.integrity.mutationIndex}.`);
+  }
+  if (head.ledgerSignature !== record.signature) {
+    throw new Error(`Cannot save orchestration ledger for ${record.id}: concurrent orchestration mutation detected; integrity head signature no longer matches the loaded record.`);
+  }
+}
+
+function loadVerifiedOrchestrationIntegrityHead(
+  headPath: string,
+  runId: string,
+  key: string,
+  fingerprint: string,
+): OrchestrationRunIntegrityHead {
+  let parsed: unknown;
+  try {
+    parsed = readRawJsonFile(headPath);
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new Error(`Cannot save orchestration ledger for ${runId}: malformed orchestration integrity head JSON: ${error.message}`);
+    }
+    throw error;
+  }
+  if (!isPlainObject(parsed)) {
+    throw new Error(`Cannot save orchestration ledger for ${runId}: orchestration integrity head JSON does not match the expected schema.`);
+  }
+  const head = parsed as Record<string, unknown>;
+  const signatureReason = malformedSignatureReason(head.signature, 'integrity head signature');
+  if (signatureReason) {
+    throw new Error(`Cannot save orchestration ledger for ${runId}: ${signatureReason}.`);
+  }
+  if (!isOrchestrationRunIntegrityHead(head)) {
+    throw new Error(`Cannot save orchestration ledger for ${runId}: orchestration integrity head JSON does not match the expected schema.`);
+  }
+  if (!verifySignedPayload(head as OrchestrationRunIntegrityHead, key)) {
+    throw new Error(
+      head.keyFingerprint !== fingerprint
+        ? `Cannot save orchestration ledger for ${runId}: wrong ${ORCHESTRATION_STATE_KEY_ENV}; integrity head was sealed with a different key fingerprint.`
+        : `Cannot save orchestration ledger for ${runId}: orchestration integrity head signature verification failed; reload the run before mutating it.`,
+    );
+  }
+  if (head.runId !== runId) {
+    throw new Error(`Cannot save orchestration ledger for ${runId}: orchestration integrity head run id mismatch: expected ${runId}, got ${head.runId}.`);
+  }
+  if (head.keyFingerprint !== fingerprint) {
+    throw new Error(`Cannot save orchestration ledger for ${runId}: wrong ${ORCHESTRATION_STATE_KEY_ENV}; integrity head key fingerprint does not match the configured key.`);
+  }
+  return head as OrchestrationRunIntegrityHead;
 }
 
 const ORCHESTRATION_OBSERVATION_RETAIN_LIMIT = 200;
@@ -984,10 +1135,36 @@ export function loadOrchestrationRunRecord(
   config: WorkflowConfig,
   runId: string,
 ): OrchestrationRunRecord | null {
+  const diagnostic = diagnoseOrchestrationRunRecord(commonDir, config, runId);
+  if (diagnostic.status === 'missing') return null;
+  if (diagnostic.status === 'valid') return diagnostic.record;
+  throw new Error(diagnostic.reason);
+}
+
+export function loadUnsignedLegacyOrchestrationRunRecord(
+  commonDir: string,
+  config: WorkflowConfig,
+  runId: string,
+): OrchestrationRunRecord | null {
   assertSafeOrchestrationRunId(runId);
   const targetPath = orchestrationRunPath(commonDir, config, runId);
   if (!existsSync(targetPath)) return null;
-  return readVersionedJsonFile<OrchestrationRunRecord | null>('orchestrationRun', commonDir, config, targetPath, null);
+  const parsed = readRawJsonFile(targetPath);
+  if (!isPlainObject(parsed)) {
+    throw new Error('legacy unsigned orchestration ledger JSON does not match the orchestration run schema.');
+  }
+  const raw = parsed as Record<string, unknown>;
+  if (raw.signature !== undefined || raw.integrity !== undefined) {
+    throw new Error(`orchestrate upgrade-ledger --reseal-unsigned only trusts legacy unsigned ledgers; ${runId} already has signed ledger metadata.`);
+  }
+  const normalized = normalizeVersionedJsonValue<unknown>('orchestrationRun', raw);
+  if (!isUnsignedLegacyOrchestrationRunRecord(normalized)) {
+    throw new Error('legacy unsigned orchestration ledger JSON does not match the orchestration run schema.');
+  }
+  if (normalized.id !== runId) {
+    throw new Error(`legacy unsigned orchestration ledger run id mismatch: directory is ${runId}, ledger is ${normalized.id}.`);
+  }
+  return normalized;
 }
 
 export function diagnoseOrchestrationRunRecord(
@@ -1060,25 +1237,26 @@ function orchestrationRunsRoot(commonDir: string, config: WorkflowConfig): strin
 }
 
 function diagnoseOrchestrationRunPath(
-  _commonDir: string,
-  _config: WorkflowConfig,
+  commonDir: string,
+  config: WorkflowConfig,
   runId: string,
   targetPath: string,
 ): OrchestrationLedgerDiagnostic {
   if (!existsSync(targetPath)) {
+    const interrupted = interruptedTempFileReason(targetPath, 'orchestration ledger');
     return {
       status: 'missing',
       runId,
       ledgerPath: targetPath,
       mtimeMs: null,
-      reason: 'orchestration ledger file is missing',
+      reason: interrupted ?? 'orchestration ledger file is missing',
     };
   }
 
   const mtimeMs = statMtimeMs(targetPath);
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(targetPath, 'utf8')) as unknown;
+    parsed = readRawJsonFile(targetPath);
   } catch (error) {
     if (error instanceof SyntaxError) {
       return {
@@ -1092,7 +1270,97 @@ function diagnoseOrchestrationRunPath(
     throw error;
   }
 
-  const normalized = normalizeVersionedJsonValue<unknown>('orchestrationRun', parsed);
+  if (!isPlainObject(parsed)) {
+    return {
+      status: 'corrupt',
+      runId,
+      ledgerPath: targetPath,
+      mtimeMs,
+      reason: 'ledger JSON does not match the orchestration run schema',
+    };
+  }
+
+  const envelope = parsed as Record<string, unknown>;
+  const unsignedLegacyReason = legacyUnsignedLedgerReason(envelope);
+  if (unsignedLegacyReason) {
+    return {
+      status: 'corrupt',
+      runId,
+      ledgerPath: targetPath,
+      mtimeMs,
+      reason: unsignedLegacyReason,
+    };
+  }
+
+  const signatureReason = malformedSignatureReason(envelope.signature, 'ledger signature');
+  if (signatureReason) {
+    return {
+      status: 'corrupt',
+      runId,
+      ledgerPath: targetPath,
+      mtimeMs,
+      reason: signatureReason,
+    };
+  }
+
+  if (!isOrchestrationRunIntegrity(envelope.integrity)) {
+    return {
+      status: 'corrupt',
+      runId,
+      ledgerPath: targetPath,
+      mtimeMs,
+      reason: 'ledger integrity metadata is missing or malformed',
+    };
+  }
+  const integrity = envelope.integrity;
+  if (envelope.id !== runId || integrity.runId !== runId) {
+    return {
+      status: 'corrupt',
+      runId,
+      ledgerPath: targetPath,
+      mtimeMs,
+      reason: `orchestration run id mismatch: directory is ${runId}, ledger is ${String(envelope.id)}, integrity is ${integrity.runId}`,
+    };
+  }
+
+  let key: string;
+  let fingerprint: string;
+  try {
+    key = resolveOrchestrationStateKey();
+    fingerprint = stateKeyFingerprint(key);
+  } catch (error) {
+    return {
+      status: 'corrupt',
+      runId,
+      ledgerPath: targetPath,
+      mtimeMs,
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  if (!verifySignedPayload(envelope as unknown as OrchestrationRunDiskEnvelope, key)) {
+    return {
+      status: 'corrupt',
+      runId,
+      ledgerPath: targetPath,
+      mtimeMs,
+      reason: integrity.keyFingerprint !== fingerprint
+        ? `wrong ${ORCHESTRATION_STATE_KEY_ENV}: ledger was sealed with a different key fingerprint`
+        : 'orchestration ledger signature verification failed; ledger contents may have been tampered with',
+    };
+  }
+
+  if (integrity.keyFingerprint !== fingerprint) {
+    return {
+      status: 'corrupt',
+      runId,
+      ledgerPath: targetPath,
+      mtimeMs,
+      reason: `wrong ${ORCHESTRATION_STATE_KEY_ENV}: ledger key fingerprint does not match the configured key`,
+    };
+  }
+
+  const normalized = normalizeVersionedJsonValue<unknown>('orchestrationRun', envelope);
   if (!isOrchestrationRunRecord(normalized)) {
     return {
       status: 'corrupt',
@@ -1102,6 +1370,18 @@ function diagnoseOrchestrationRunPath(
       reason: 'ledger JSON does not match the orchestration run schema',
     };
   }
+
+  const headReason = verifyOrchestrationIntegrityHead(commonDir, config, normalized, key, fingerprint);
+  if (headReason) {
+    return {
+      status: 'corrupt',
+      runId,
+      ledgerPath: targetPath,
+      mtimeMs,
+      reason: headReason,
+    };
+  }
+
   return {
     status: 'valid',
     runId,
@@ -1109,6 +1389,127 @@ function diagnoseOrchestrationRunPath(
     mtimeMs: mtimeMs ?? 0,
     record: normalized,
   };
+}
+
+function readRawJsonFile(targetPath: string): unknown {
+  return JSON.parse(readFileSync(targetPath, 'utf8')) as unknown;
+}
+
+function legacyUnsignedLedgerReason(envelope: Record<string, unknown>): string | null {
+  if (envelope.signature === undefined && envelope.integrity === undefined) {
+    return 'legacy unsigned orchestration ledger is untrusted by default; run orchestrate upgrade-ledger --reseal-unsigned --reason <text> --i-understand-this-trusts-local-state to reseal it explicitly.';
+  }
+  if (envelope.signature === undefined) return 'ledger signature is missing';
+  return null;
+}
+
+const HEX_SIGNATURE_PATTERN = /^[a-f0-9]{64}$/i;
+
+function malformedSignatureReason(value: unknown, label: string): string | null {
+  if (value === undefined) return `${label} is missing`;
+  if (value === null) return `${label} is null`;
+  if (typeof value !== 'string') return `${label} must be a hex string`;
+  if (value.length === 0) return `${label} is empty`;
+  if (value.length !== 64) return `${label} has invalid length ${value.length}; expected 64 hex characters`;
+  if (!HEX_SIGNATURE_PATTERN.test(value)) return `${label} is not hex encoded`;
+  return null;
+}
+
+function verifyOrchestrationIntegrityHead(
+  commonDir: string,
+  config: WorkflowConfig,
+  record: OrchestrationRunRecord,
+  key: string,
+  fingerprint: string,
+): string | null {
+  const targetPath = orchestrationIntegrityHeadPath(commonDir, config, record.id);
+  if (!existsSync(targetPath)) {
+    return interruptedTempFileReason(targetPath, 'orchestration integrity head')
+      ?? `orchestration integrity head is missing for ${record.id}`;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = readRawJsonFile(targetPath);
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      return `malformed orchestration integrity head JSON: ${error.message}`;
+    }
+    throw error;
+  }
+  if (!isPlainObject(parsed)) return 'orchestration integrity head JSON does not match the expected schema';
+  const head = parsed as Record<string, unknown>;
+  const signatureReason = malformedSignatureReason(head.signature, 'integrity head signature');
+  if (signatureReason) return signatureReason;
+  if (!isOrchestrationRunIntegrityHead(head)) {
+    return 'orchestration integrity head JSON does not match the expected schema';
+  }
+  if (!verifySignedPayload(head as OrchestrationRunIntegrityHead, key)) {
+    return head.keyFingerprint !== fingerprint
+      ? `wrong ${ORCHESTRATION_STATE_KEY_ENV}: integrity head was sealed with a different key fingerprint`
+      : 'orchestration integrity head signature verification failed; rollback metadata may have been tampered with';
+  }
+  if (!record.integrity || !record.signature) return 'signed ledger metadata is missing after verification';
+  if (head.runId !== record.id) {
+    return `orchestration integrity head run id mismatch: expected ${record.id}, got ${head.runId}`;
+  }
+  if (head.keyFingerprint !== fingerprint || head.keyFingerprint !== record.integrity.keyFingerprint) {
+    return `wrong ${ORCHESTRATION_STATE_KEY_ENV}: integrity head key fingerprint does not match the ledger and configured key`;
+  }
+  if (head.mutationIndex > record.integrity.mutationIndex) {
+    return `orchestration ledger rollback detected: integrity head expects mutationIndex ${head.mutationIndex}, ledger has ${record.integrity.mutationIndex}`;
+  }
+  if (head.mutationIndex < record.integrity.mutationIndex) {
+    return `interrupted orchestration ledger save detected: ledger mutationIndex ${record.integrity.mutationIndex} is newer than integrity head ${head.mutationIndex}`;
+  }
+  if (head.ledgerSignature !== record.signature) {
+    return 'orchestration ledger rollback or transplant detected: integrity head signature does not match the ledger signature';
+  }
+  return null;
+}
+
+function isOrchestrationRunIntegrity(value: unknown): value is OrchestrationRunIntegrity {
+  if (!isPlainObject(value)) return false;
+  const raw = value as Partial<OrchestrationRunIntegrity>;
+  return raw.version === 1
+    && typeof raw.runId === 'string'
+    && Number.isSafeInteger(raw.mutationIndex)
+    && raw.mutationIndex >= 1
+    && typeof raw.keyFingerprint === 'string'
+    && /^[a-f0-9]{16}$/i.test(raw.keyFingerprint);
+}
+
+function isOrchestrationRunIntegrityHead(value: unknown): value is OrchestrationRunIntegrityHead {
+  if (!isPlainObject(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return raw.version === 1
+    && typeof raw.runId === 'string'
+    && Number.isSafeInteger(raw.mutationIndex)
+    && typeof raw.mutationIndex === 'number'
+    && raw.mutationIndex >= 1
+    && typeof raw.ledgerSignature === 'string'
+    && HEX_SIGNATURE_PATTERN.test(raw.ledgerSignature)
+    && typeof raw.keyFingerprint === 'string'
+    && /^[a-f0-9]{16}$/i.test(raw.keyFingerprint)
+    && typeof raw.signature === 'string'
+    && HEX_SIGNATURE_PATTERN.test(raw.signature);
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function interruptedTempFileReason(targetPath: string, label: string): string | null {
+  const dir = path.dirname(targetPath);
+  const basename = path.basename(targetPath);
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return null;
+  }
+  const temp = entries.find((entry) => entry.startsWith(`.${basename}.tmp-`));
+  return temp ? `interrupted ${label} save detected: temporary file remains at ${path.join(dir, temp)}` : null;
 }
 
 function statMtimeMs(targetPath: string): number | null {
@@ -1120,9 +1521,24 @@ function statMtimeMs(targetPath: string): number | null {
 }
 
 function isOrchestrationRunRecord(value: unknown): value is OrchestrationRunRecord {
+  return isOrchestrationRunRecordShape(value, true);
+}
+
+function isUnsignedLegacyOrchestrationRunRecord(value: unknown): value is OrchestrationRunRecord {
+  return isOrchestrationRunRecordShape(value, false);
+}
+
+function isOrchestrationRunRecordShape(value: unknown, requireSigned: boolean): value is OrchestrationRunRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const record = value as Partial<OrchestrationRunRecord>;
   if (!isSafeOrchestrationRunId(typeof record.id === 'string' ? record.id : '')) return false;
+  if (requireSigned) {
+    if (malformedSignatureReason(record.signature, 'ledger signature')) return false;
+    if (!isOrchestrationRunIntegrity(record.integrity)) return false;
+    if (record.integrity.runId !== record.id) return false;
+  } else if (record.signature !== undefined || record.integrity !== undefined) {
+    return false;
+  }
   if (!['planned', 'prepared', 'dispatched', 'running', 'blocked', 'paused', 'completed', 'failed'].includes(record.status ?? '')) return false;
   if (typeof record.createdAt !== 'string' || typeof record.updatedAt !== 'string') return false;
   if (typeof record.branchName !== 'string' || typeof record.sha !== 'string') return false;
