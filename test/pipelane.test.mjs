@@ -18685,6 +18685,61 @@ test('merge skips auto-deploy in build mode when autoDeployOnMerge is disabled',
   }
 });
 
+test('merge treats empty configured surfaces as no-deploy build delivery', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_FAIL_ON_DELETE_BRANCH: '1',
+    GH_PR_MERGE_PUSH_HEAD: '1',
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'No Deploy', '--json'], repoRoot).stdout);
+    const configPath = path.join(created.worktreePath, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.surfaces = [];
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'No Deploy', '--json'], created.worktreePath, env);
+
+    const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
+    assert.match(merged.mergedSha, /^[a-f0-9]{40}$/);
+    assert.match(merged.message, /No deploy surfaces are configured/);
+    assert.match(merged.message, /Merge to the base branch is the delivery step/);
+    assert.match(merged.message, /Next: run \/clean --apply --task no-deploy/);
+
+    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', 'no-deploy.json');
+    const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+    assert.match(lock.nextAction, /no deploy surfaces configured/);
+    assert.match(lock.nextAction, /\/clean --apply --task no-deploy/);
+
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.prMergeCalls.length, 1);
+    assert.equal(ghState.workflows.length, 0);
+
+    const cleaned = JSON.parse(runCli(['run', 'clean', '--apply', '--task', 'no-deploy', '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    }).stdout);
+    assert.deepEqual(cleaned.removed, ['no-deploy']);
+    assert.equal(cleaned.artifacts[0].worktreeRemoved, true);
+    assert.equal(cleaned.artifacts[0].branchRemoved, true);
+    assert.ok(!existsSync(lockPath), 'no-deploy clean must remove the task lock');
+    assert.ok(!existsSync(created.worktreePath), 'no-deploy clean must remove the worktree');
+    assert.equal(localBranchExists(repoRoot, created.branch), false, 'no-deploy clean must remove the squash-merged branch');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
 test('merge refreshes origin/base and leaves local main untouched', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
@@ -18943,6 +18998,56 @@ test('deploy fails before dispatch when a requested surface has no verification 
     assert.match(blocked.stderr, /edge staging verification command or health check/);
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
     assert.equal(ghState.workflows.length, 0, 'deploy should fail before gh workflow dispatch');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('build-mode deploy prod skips cleanly when no surfaces are configured', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  writeFileSync(ghStateFile, JSON.stringify({ prs: {}, workflows: [] }, null, 2), 'utf8');
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const workflowConfigPath = path.join(repoRoot, '.pipelane.json');
+    const workflowConfig = JSON.parse(readFileSync(workflowConfigPath, 'utf8'));
+    workflowConfig.surfaces = [];
+    workflowConfig.buildMode.autoDeployOnMerge = false;
+    writeFileSync(workflowConfigPath, `${JSON.stringify(workflowConfig, null, 2)}\n`, 'utf8');
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'No Deploy Target', '--json'], repoRoot).stdout);
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
+    const deployed = JSON.parse(runCli(
+      ['run', 'deploy', 'prod', '--sha', sha, '--json'],
+      created.worktreePath,
+      env,
+    ).stdout);
+
+    assert.equal(deployed.status, 'succeeded');
+    assert.equal(deployed.dispatchMode, 'skipped');
+    assert.deepEqual(deployed.surfaces, []);
+    assert.match(deployed.message, /No deploy surfaces are configured/);
+    assert.match(deployed.message, /Next: run \/clean --apply --task no-deploy-target/);
+
+    const lock = JSON.parse(readFileSync(
+      path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', 'no-deploy-target.json'),
+      'utf8',
+    ));
+    assert.match(lock.nextAction, /no deploy surfaces configured/);
+    assert.match(lock.nextAction, /\/clean --apply --task no-deploy-target/);
+
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.workflows.length, 0, 'deploy should not dispatch a workflow when no surfaces exist');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -30518,6 +30623,43 @@ test('destination routes infer a task slug from a dirty lockless branch', () => 
       payload.remainingSteps.map((step) => step.id),
       ['pr', 'review_gate', 'merge', 'deploy_staging'],
     );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('destination routes omit deploy steps when no surfaces are configured', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.surfaces = [];
+    config.buildMode.autoDeployOnMerge = false;
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'configure pipelane'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['checkout', '-b', 'codex/no-deploy-route-abcd'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(repoRoot, 'feature.txt'), 'hello\n', 'utf8');
+
+    const result = runCli(
+      ['run', 'deploy', 'prod', '--title', 'No deploy route', '--plan', '--json'],
+      repoRoot,
+    );
+    const payload = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0);
+    assert.deepEqual(payload.requestedSurfaces, []);
+    assert.deepEqual(payload.surfaces, []);
+    assert.deepEqual(
+      payload.remainingSteps.map((step) => step.id),
+      ['pr', 'review_gate', 'merge'],
+    );
+    assert.equal(payload.remainingSteps.some((step) => step.id === 'deploy_prod'), false);
+    assert.doesNotMatch(payload.blockers.join('\n'), /Deploy blocked|production health check|verification command/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }

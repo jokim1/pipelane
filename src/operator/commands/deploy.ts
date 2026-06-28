@@ -133,7 +133,7 @@ export type DispatchDeployResult = DeployRecord & {
   surfaces: string[];
   workflowName: string;
   taskSlug: string;
-  dispatchMode: 'workflow_dispatch' | 'push' | 'idempotent';
+  dispatchMode: 'workflow_dispatch' | 'push' | 'idempotent' | 'skipped';
   message: string;
 };
 
@@ -259,6 +259,31 @@ export async function dispatchDeploy(
     fallbackSurfaces: identity.lock?.surfaces ?? [],
     targetSha: target.sha,
   });
+  if (surfaces.length === 0) {
+    const timestamp = nowIso();
+    const cleanCommand = formatWorkflowCommand(context.config, 'clean', `--apply --task ${taskSlug}`);
+    setNextAction(context.commonDir, context.config, taskSlug, `no deploy surfaces configured at ${target.sha.slice(0, 7)}, run ${cleanCommand}`);
+    return {
+      environment,
+      sha: target.sha,
+      surfaces,
+      workflowName: '',
+      requestedAt: timestamp,
+      finishedAt: timestamp,
+      verifiedAt: timestamp,
+      taskSlug,
+      status: 'succeeded',
+      dispatchMode: 'skipped',
+      message: [
+        `Deploy skipped: ${environment}`,
+        `Task: ${taskSlug}`,
+        `SHA: ${target.sha}`,
+        'No deploy surfaces are configured for this repo.',
+        'Merge to the base branch is the delivery step.',
+        `Next: run ${cleanCommand} to close out this workspace.`,
+      ].join('\n'),
+    };
+  }
   const missingConfig = listMissingDeployConfiguration({
     config: deployConfig,
     environment,
