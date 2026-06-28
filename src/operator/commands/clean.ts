@@ -933,6 +933,12 @@ function resolveVerifiedProdCleanupRef(
 ): string | null {
   const mergedSha = normalizeGitSha(prRecords[lock.taskSlug]?.mergedSha);
   if (!mergedSha) return null;
+  // No-deploy repos intentionally produce no prod DeployRecord. The recorded
+  // merge SHA is enough evidence, because branch deletion still requires the
+  // task branch tree to match this ref before using `git branch -D`.
+  if (Array.isArray(lock.surfaces) && lock.surfaces.length === 0) {
+    return mergedSha;
+  }
 
   for (let index = deployRecords.length - 1; index >= 0; index -= 1) {
     const record = deployRecords[index] as unknown;

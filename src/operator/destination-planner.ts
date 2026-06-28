@@ -492,12 +492,13 @@ function buildRoute(
     { id: 'review_gate', command: 'review gate', label: 'Review gate', milestone: 'pr_open' },
     { id: 'merge', command: formatWorkflowCommand(config, 'merge'), label: 'Merged', milestone: 'merged' },
   ];
-  const needsStagingStep = target === 'staging_deployed'
-    || (mode === 'release' && target === 'prod_deployed');
+  const hasDeploySurfaces = config.surfaces.length > 0;
+  const needsStagingStep = hasDeploySurfaces
+    && (target === 'staging_deployed' || (mode === 'release' && target === 'prod_deployed'));
   if (needsStagingStep) {
     route.push({ id: 'deploy_staging', command: formatWorkflowCommand(config, 'deploy', 'staging'), label: 'Staging deployed', milestone: 'staging_deployed' });
   }
-  if (target === 'prod_deployed') {
+  if (hasDeploySurfaces && target === 'prod_deployed') {
     route.push({ id: 'deploy_prod', command: formatWorkflowCommand(config, 'deploy', 'prod'), label: 'Production deployed', milestone: 'prod_deployed' });
   }
   return route;

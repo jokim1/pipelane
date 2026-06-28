@@ -93,11 +93,19 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
   ];
 
   const destinationRouteStep = process.env[DESTINATION_INTERNAL_STEP_ENV] === '1';
+  const hasDeploySurfaces = context.config.surfaces.length > 0;
   const autoDeployOnMerge = context.modeState.mode === 'build'
+    && hasDeploySurfaces
     && context.config.buildMode.autoDeployOnMerge
     && !destinationRouteStep;
 
-  if (autoDeployOnMerge) {
+  if (context.modeState.mode === 'build' && !hasDeploySurfaces) {
+    const cleanCommand = formatWorkflowCommand(context.config, 'clean', `--apply --task ${taskSlug}`);
+    setNextAction(context.commonDir, context.config, taskSlug, `merged at ${shortSha}, no deploy surfaces configured; run ${cleanCommand}`);
+    lines.push('No deploy surfaces are configured for this repo.');
+    lines.push('Merge to the base branch is the delivery step.');
+    lines.push(`Next: run ${cleanCommand} to close out this workspace.`);
+  } else if (autoDeployOnMerge) {
     const deploy = await dispatchDeploy(cwd, parsed, {
       environment: 'prod',
       explicitTask: taskSlug,

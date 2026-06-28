@@ -1,4 +1,9 @@
 {
+  "surfaces": [],
+  "buildMode": {
+    "description": "CLI/library lane. Merge to main completes delivery; no production deploy target is configured.",
+    "autoDeployOnMerge": false
+  },
   "reviewGates": {
     "policyVersion": 2,
     "planReview": {
