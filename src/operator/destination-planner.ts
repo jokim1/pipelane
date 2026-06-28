@@ -30,6 +30,7 @@ import {
   type WorkflowConfig,
   type WorkflowContext,
 } from './state.ts';
+import { observeCompletedDeployWorkflowRun } from './deploy-workflow-runs.ts';
 import {
   buildStaleBaseBlockerForRepo,
   deriveTaskSlugFromPr,
@@ -727,6 +728,7 @@ function findPendingDeployRequest(
 ): { record: DeployRecord; reason: string } | null {
   const record = findLatestTrustedDeployRecord(snapshot, environment, surfaces);
   if (record?.status === 'requested') {
+    if (observeCompletedDeployWorkflowRun(snapshot.repoRoot, record)) return null;
     const requested = describeRequestedDeployRecord(record);
     if (requested?.inFlight) return { record, reason: requested.reason };
   }

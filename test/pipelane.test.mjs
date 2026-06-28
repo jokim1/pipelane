@@ -494,6 +494,19 @@ if (args[0] === 'workflow' && args[1] === 'run') {
   writeState();
   process.exit(0);
 }
+if (args[0] === 'run' && args[1] === 'view') {
+  const run = (state.runs || {})[args[2]];
+  if (!run) {
+    process.stderr.write('run not found\\n');
+    process.exit(1);
+  }
+  process.stdout.write(JSON.stringify({
+    status: run.status || 'completed',
+    conclusion: run.conclusion || 'success',
+    url: run.url || 'https://example.test/actions/runs/' + args[2],
+  }));
+  process.exit(0);
+}
 process.exit(0);
 `, { mode: 0o755, encoding: 'utf8' });
 }
@@ -18775,6 +18788,66 @@ test('deploy verifies via gh run watch + healthcheck stubs and records status=su
   }
 });
 
+test('deploy reconciles a completed requested workflow run before blocking retries', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Stale Requested', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Stale Requested', '--json'], created.worktreePath, env);
+    runCli(['run', 'merge', '--json'], created.worktreePath, env);
+
+    const requested = JSON.parse(runCli(['run', 'deploy', 'staging', '--async', '--json'], created.worktreePath, env).stdout);
+    assert.equal(requested.status, 'requested');
+
+    const deployStatePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'deploy-state.json');
+    const deployState = JSON.parse(readFileSync(deployStatePath, 'utf8'));
+    const pending = deployState.records.at(-1);
+    assert.equal(pending.status, 'requested');
+    pending.workflowRunId = '4242';
+    pending.workflowRunUrl = 'https://example.test/actions/runs/4242';
+    writeFileSync(deployStatePath, `${JSON.stringify(deployState, null, 2)}\n`, 'utf8');
+
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    const workflowCountBeforeRetry = ghState.workflows.length;
+    ghState.runs = {
+      4242: {
+        status: 'completed',
+        conclusion: 'success',
+        url: 'https://example.test/actions/runs/4242',
+      },
+    };
+    writeFileSync(ghStateFile, `${JSON.stringify(ghState, null, 2)}\n`, 'utf8');
+
+    const redeployed = JSON.parse(runCli(['run', 'deploy', 'staging', '--json'], created.worktreePath, env).stdout);
+    const afterState = JSON.parse(readFileSync(deployStatePath, 'utf8'));
+    const finalized = afterState.records.at(-1);
+    const afterGhState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+
+    assert.equal(redeployed.status, 'succeeded');
+    assert.equal(redeployed.dispatchMode, 'idempotent');
+    assert.equal(redeployed.workflowRunId, '4242');
+    assert.equal(finalized.status, 'succeeded');
+    assert.equal(finalized.workflowRunId, '4242');
+    assert.equal(finalized.idempotencyKey, requested.idempotencyKey);
+    assert.equal(afterGhState.workflows.length, workflowCountBeforeRetry, 'retry should not dispatch a duplicate workflow');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
 test('deploy in a task worktree falls back to the shared repo-root CLAUDE.md when the worktree has no local CLAUDE.md', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'workflow-kit-gh-'));
@@ -30590,6 +30663,67 @@ test('destination planner treats newer requested deploys as pending before older
     assert.match(payload.blockers.join('\n'), /staging deploy is already in flight/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('destination planner does not treat provider-completed requested deploys as pending', async () => {
+  const repoRoot = createRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'configure pipelane'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    const sha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+    writeTaskLock(repoRoot, 'completed-route', { mode: 'build', surfaces: ['frontend'] });
+    writePrRecord(repoRoot, 'completed-route', sha);
+    await writeSucceededDeployRecord(repoRoot, 'staging', sha, ['frontend'], { taskSlug: 'completed-route' });
+    appendDeployRecord(repoRoot, {
+      environment: 'staging',
+      sha,
+      surfaces: ['frontend'],
+      workflowName: 'Deploy Hosted',
+      requestedAt: new Date().toISOString(),
+      taskSlug: 'completed-route',
+      status: 'requested',
+      workflowRunId: '7777',
+      workflowRunUrl: 'https://example.test/actions/runs/7777',
+      idempotencyKey: 'completed-request',
+      triggeredBy: 'test',
+    });
+    writeFileSync(ghStateFile, JSON.stringify({
+      prs: {},
+      workflows: [],
+      runs: {
+        7777: {
+          status: 'completed',
+          conclusion: 'success',
+          url: 'https://example.test/actions/runs/7777',
+        },
+      },
+    }, null, 2) + '\n', 'utf8');
+
+    const result = runCli(
+      ['run', 'deploy', 'staging', '--task', 'completed-route', '--plan', '--json'],
+      repoRoot,
+      env,
+    );
+    const payload = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0);
+    assert.deepEqual(payload.remainingSteps.map((step) => step.id), ['deploy_staging']);
+    assert.doesNotMatch(payload.blockers.join('\n'), /deploy is already in flight/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
   }
 });
 
