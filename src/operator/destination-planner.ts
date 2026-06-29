@@ -327,6 +327,7 @@ export function planDestination(snapshot: DestinationSnapshot, target: Destinati
     taskSlug: snapshot.taskSlug,
     mode: snapshot.mode,
     target,
+    branchName: snapshot.branchName,
     prNumber: snapshot.livePr?.number ?? snapshot.prRecord?.number ?? null,
     headSha: snapshot.headSha,
     targetSha: snapshot.targetSha,

@@ -15,7 +15,9 @@ import {
 } from '../release-gate.ts';
 import {
   loadWorkflowConfig,
+  normalizeRouteSafetyConfig,
   resolveRepoRoot,
+  type RouteSafetyConfig,
 } from '../state.ts';
 
 export interface ConfigureOptions {
@@ -224,6 +226,7 @@ export async function handleConfigure(cwd: string, argv: string[]): Promise<Conf
   }
 
   const repoRoot = resolveRepoRoot(cwd, true);
+  const workflowConfig = loadWorkflowConfig(repoRoot);
   const claudePath = path.join(repoRoot, 'CLAUDE.md');
   let markdown = '';
   let createdClaude = false;
@@ -233,7 +236,7 @@ export async function handleConfigure(cwd: string, argv: string[]): Promise<Conf
     // `loadWorkflowConfig` self-heals from defaults + `package.json:pipelane`
     // overlay when `.pipelane.json` is absent, so `configure` now works on
     // overlay-only consumers without needing `pipelane init` first.
-    markdown = renderClaudeMdFromTemplate(loadWorkflowConfig(repoRoot));
+    markdown = renderClaudeMdFromTemplate(workflowConfig);
     createdClaude = true;
   }
 
@@ -242,11 +245,11 @@ export async function handleConfigure(cwd: string, argv: string[]): Promise<Conf
   const baseConfig = parseDeployConfigMarkdown(markdown) ?? emptyDeployConfig();
   const flagged = applyFlagOverrides(baseConfig, options);
   if (!options.json && !process.stdin.isTTY) {
-    process.stdout.write(renderNonInteractiveConfigurePrompt(repoRoot, claudePath, createdClaude, flagged));
+    process.stdout.write(renderNonInteractiveConfigurePrompt(repoRoot, claudePath, createdClaude, flagged, workflowConfig.routeSafety));
     process.exitCode = 64;
     return { repoRoot, claudePath, createdClaude, config: flagged };
   }
-  const finalConfig = options.json ? flagged : await promptForValues(flagged);
+  const finalConfig = options.json ? flagged : await promptForValues(flagged, workflowConfig.routeSafety);
 
   // Temp-file-and-rename keeps CLAUDE.md atomic: a crash mid-write can't
   // leave a truncated file that later bricks parseDeployConfigMarkdown for
@@ -262,6 +265,7 @@ export async function handleConfigure(cwd: string, argv: string[]): Promise<Conf
     process.stdout.write([
       `Wrote Deploy Configuration to ${claudePath}`,
       createdClaude ? 'Created new CLAUDE.md from the Pipelane template.' : 'Updated the Deploy Configuration block in place.',
+      ...routeSafetyDefaultLines(workflowConfig.routeSafety),
     ].join('\n') + '\n');
   }
 
@@ -351,6 +355,7 @@ function renderNonInteractiveConfigurePrompt(
   claudePath: string,
   createdClaude: boolean,
   config: DeployConfig,
+  routeSafety: RouteSafetyConfig,
 ): string {
   const sections = configurePromptSections(config);
   const lines = [
@@ -367,6 +372,8 @@ function renderNonInteractiveConfigurePrompt(
       lines.push(`- ${field.label}: ${formatConfigurePromptValue(field.value)} (${field.flag})`);
     }
   }
+
+  lines.push('', 'Delivery loop safety defaults:', ...routeSafetyDefaultLines(routeSafety).map((line) => `- ${line}`));
 
   lines.push(
     '',
@@ -498,12 +505,13 @@ function formatConfigurePromptValue(value: string | boolean): string {
   return value.trim() ? value : '<empty>';
 }
 
-async function promptForValues(base: DeployConfig): Promise<DeployConfig> {
+async function promptForValues(base: DeployConfig, routeSafety: RouteSafetyConfig): Promise<DeployConfig> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
     process.stdout.write(
       'Configuring Deploy Configuration block in CLAUDE.md. Press Enter to keep the current value shown in [brackets].\n\n',
     );
+    process.stdout.write(['Delivery loop safety defaults:', ...routeSafetyDefaultLines(routeSafety).map((line) => `- ${line}`), ''].join('\n') + '\n');
     const next: DeployConfig = JSON.parse(JSON.stringify(base));
     next.platform = await promptString(rl, 'Deploy platform (fly.io, vercel, render, ...):', next.platform);
 
@@ -580,6 +588,16 @@ function ensureTrailingNewline(markdown: string): string {
   return markdown.endsWith('\n') ? markdown : `${markdown}\n`;
 }
 
+function routeSafetyDefaultLines(routeSafety: RouteSafetyConfig): string[] {
+  const resolved = normalizeRouteSafetyConfig(routeSafety);
+  return [
+    `Default fix/review loops: ${resolved.defaultFixReviewLoops}`,
+    `Default time limit: ${resolved.defaultMinutes} minutes`,
+    `Default AI review runs: ${resolved.defaultAiReviewRuns}`,
+    `Stop on major findings: ${resolved.stopOnMajorFindings ? 'yes' : 'no'}`,
+  ];
+}
+
 function printUsage(): void {
   process.stdout.write(`pipelane configure — populate the Deploy Configuration block in CLAUDE.md
 
@@ -622,6 +640,12 @@ Flags (all optional; any omitted field keeps its current value):
   --surface-production-deploy-command=<surface>:<cmd>
   --surface-production-verification-command=<surface>:<cmd>
   --surface-production-healthcheck=<surface>:<url>
+
+Delivery loop safety defaults:
+  Default fix/review loops: 1
+  Default time limit: 90 minutes
+  Default AI review runs: 1
+  Stop on major findings: yes
 
 If CLAUDE.md is missing, pipelane configure seeds it from the Pipelane template
 before writing the Deploy Configuration block. Sections outside that block are

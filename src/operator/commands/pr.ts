@@ -36,6 +36,11 @@ import {
   type TaskLock,
 } from '../state.ts';
 import { evaluateReviewEvidenceForPr } from '../review-enforcement.ts';
+import {
+  evaluateDestinationRouteReviewSafety,
+  routeSafetyAcceptsReviewFindings,
+} from '../route-loop-safety.ts';
+import { buildDestinationPlanForCommand } from '../destination-planner.ts';
 
 export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   if (await maybeHandleDestinationCommand(cwd, parsed)) return;
@@ -118,8 +123,19 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
   }
 
   const reviewEvidence = evaluateReviewEvidenceForPr(context);
-  if (!reviewEvidence.allowed) {
-    throw new Error(reviewEvidence.message);
+  if (!reviewEvidence.allowed && !routeSafetyAcceptsReviewFindings(cwd, parsed, reviewEvidence)) {
+    let acceptedByPrompt = false;
+    if (reviewEvidence.latest) {
+      const routePlan = buildDestinationPlanForCommand(cwd, parsed);
+      if (routePlan) {
+        const pause = await evaluateDestinationRouteReviewSafety(context, routePlan, reviewEvidence);
+        if (pause.action === 'stop') {
+          throw new Error(pause.message || reviewEvidence.message);
+        }
+        acceptedByPrompt = true;
+      }
+    }
+    if (!acceptedByPrompt) throw new Error(reviewEvidence.message);
   }
 
   for (const check of context.config.prePrChecks) {
@@ -127,8 +143,19 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
   }
 
   const postCheckReviewEvidence = evaluateReviewEvidenceForPr(context);
-  if (!postCheckReviewEvidence.allowed) {
-    throw new Error(postCheckReviewEvidence.message);
+  if (!postCheckReviewEvidence.allowed && !routeSafetyAcceptsReviewFindings(cwd, parsed, postCheckReviewEvidence)) {
+    let acceptedByPrompt = false;
+    if (postCheckReviewEvidence.latest) {
+      const routePlan = buildDestinationPlanForCommand(cwd, parsed);
+      if (routePlan) {
+        const pause = await evaluateDestinationRouteReviewSafety(context, routePlan, postCheckReviewEvidence);
+        if (pause.action === 'stop') {
+          throw new Error(pause.message || postCheckReviewEvidence.message);
+        }
+        acceptedByPrompt = true;
+      }
+    }
+    if (!acceptedByPrompt) throw new Error(postCheckReviewEvidence.message);
   }
 
   if (dirty) {

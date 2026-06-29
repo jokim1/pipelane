@@ -42,6 +42,10 @@ import {
   type WorkflowConfig,
   type ReviewPlanGateConfig,
 } from '../state.ts';
+import {
+  guardReviewRunStartForRouteSafety,
+  recordReviewRunForRouteSafety,
+} from '../route-loop-safety.ts';
 
 type ReviewSetupStatus = 'configured' | 'reported' | 'cancelled';
 type ReviewCommandStatus = ReviewRunRecord['status'];
@@ -1993,6 +1997,24 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
   const gateFilter = parsed.flags.reviewGate.trim();
   const dryRun = parsed.flags.reviewDryRun;
   const activeSurfaces = context.modeState.requestedSurfaces ?? context.config.surfaces;
+  const startSafety = guardReviewRunStartForRouteSafety(cwd, parsed);
+  if (startSafety.action === 'stop') {
+    printResult(parsed.flags, {
+      command: 'review',
+      status: 'pending',
+      runId: null,
+      repoRoot: context.repoRoot,
+      evidencePath: reviewStatePath(context.commonDir, context.config),
+      dryRun,
+      gateFilter: gateFilter || null,
+      phaseFilter: phaseFilter || null,
+      changedFiles: [],
+      gates: [],
+      message: startSafety.message,
+    });
+    process.exitCode = 1;
+    return;
+  }
 
   const record = buildReviewRunRecord({
     repoRoot: context.repoRoot,
@@ -2006,6 +2028,7 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
   });
 
   appendReviewRunRecord(context.commonDir, context.config, record);
+  const routeSafety = recordReviewRunForRouteSafety(cwd, parsed, record);
 
   const report = {
     command: 'review',
@@ -2018,12 +2041,15 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
     phaseFilter: phaseFilter || null,
     changedFiles: record.changedFiles,
     gates: record.gates,
-    message: renderReviewRunReport(record, reviewStatePath(context.commonDir, context.config)),
+    message: [
+      renderReviewRunReport(record, reviewStatePath(context.commonDir, context.config)),
+      routeSafety.action === 'stop' ? routeSafety.message : '',
+    ].filter(Boolean).join('\n\n'),
   };
 
   printResult(parsed.flags, report);
 
-  if (record.status === 'failed') {
+  if (record.status === 'failed' || routeSafety.action === 'stop') {
     process.exitCode = 1;
   }
 }
@@ -3236,6 +3262,8 @@ function renderReviewSetupReport(
 
   lines.push('', 'Review gates:');
   lines.push(...formatReviewGates(report.effective.gates));
+  lines.push('', 'Delivery loop safety:');
+  lines.push('- Defaults are configured by /pipelane configure: fix/review loops, minutes, AI review runs, and stop on major findings.');
 
   if (report.missing.length > 0) {
     lines.push('', 'Setup gaps:');
@@ -3296,6 +3324,7 @@ function renderNonInteractiveReviewSetup(prepared: {
     '- Install and enable an optional gate: /pipelane review setup --install <gate-id>',
     '- Multiple gates: repeat the flag or use comma-separated values such as /pipelane review setup --enable 3, 4, 5, 13',
     '- Print effective config: /pipelane review setup --print',
+    '- Delivery loop safety defaults live in /pipelane configure.',
   ].join('\n');
 }
 
