@@ -22,7 +22,7 @@ import {
   REVIEW_GATES_POLICY_VERSION,
 } from '../review-gate-policy.ts';
 import { readWorktreeStatusSnapshot, type WorktreeStatusSnapshot } from '../worktree-status.ts';
-import { DEPLOY_STATE_KEY_ENV, PROBE_STATE_KEY_ENV, REVIEW_STATE_KEY_ENV } from '../integrity.ts';
+import { DEPLOY_STATE_KEY_ENV, ORCHESTRATION_STATE_KEY_ENV, PROBE_STATE_KEY_ENV, REVIEW_STATE_KEY_ENV } from '../integrity.ts';
 import {
   appendReviewRunRecord,
   loadReviewState,
@@ -2129,13 +2129,14 @@ function orderReviewGates(gates: ReviewGateConfig[]): ReviewGateConfig[] {
 // C2: review gates execute worker-influenced code (the slice's own `npm test`,
 // build scripts, AI-reviewer commands) in a subprocess. They must NEVER inherit a
 // pipelane state-signing key — a malicious gate command could otherwise read
-// PIPELANE_REVIEW_STATE_KEY and forge a signed `slice.review` verdict, defeating
-// the C2 signature whose guarantee is "the worker does not hold the key". The
+// a state-signing key and forge signed evidence, defeating the signature
+// guarantees whose trust boundary is "worker-influenced code does not hold keys". The
 // orchestrator PARENT keeps the key (for signing + attestation via
 // appendReviewRunRecord); only the gate child is scrubbed.
 function gateSubprocessEnv(options: { stripAiReviewOverrides?: boolean } = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   delete env[REVIEW_STATE_KEY_ENV];
+  delete env[ORCHESTRATION_STATE_KEY_ENV];
   delete env[DEPLOY_STATE_KEY_ENV];
   delete env[PROBE_STATE_KEY_ENV];
   if (options.stripAiReviewOverrides) {

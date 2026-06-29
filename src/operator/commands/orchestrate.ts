@@ -18,6 +18,7 @@ import {
   diagnoseOrchestrationRunRecord,
   isActiveOrchestrationRun,
   listOrchestrationRunRecords,
+  loadUnsignedLegacyOrchestrationRunRecord,
   loadOrchestrationRunRecord,
   missingRelevantSliceWorktreeDiagnostic,
   ORCHESTRATION_CORRUPT_LEDGER_BLOCK_AGE_MS,
@@ -47,7 +48,7 @@ import {
   type OrchestrationSliceRecord,
   type OrchestrationSliceWorkerRecord,
 } from '../orchestration-ledger.ts';
-import { signSignedPayload, verifySignedPayload, resolveReviewStateKey } from '../integrity.ts';
+import { ORCHESTRATION_STATE_KEY_ENV, resolveOrchestrationStateKey, signSignedPayload, verifySignedPayload, resolveReviewStateKey } from '../integrity.ts';
 import {
   blockingAiReviewEvidenceBlocker,
   classifyReviewEvidenceIndependence,
@@ -90,6 +91,9 @@ const ORCHESTRATION_REVIEW_DIAGNOSTIC_MAX = 10;
 const NATIVE_COMMAND_PROBE_TIMEOUT_MS = 5000;
 const DEFAULT_REVIEW_LOOP_LIMIT = 2;
 const ORCHESTRATION_RUN_LOCK_STALE_MS = 10 * 60 * 1000;
+const ORCHESTRATION_RUN_LOCK_WAIT_TIMEOUT_MS = 30 * 1000;
+const ORCHESTRATION_RUN_LOCK_RETRY_MS = 50;
+const ORCHESTRATION_RUN_LOCK_HEARTBEAT_MS = 30 * 1000;
 // B2: a slice's review auto-fix stops once its canonical no-progress signature
 // repeats this many consecutive times. Configurable via
 // orchestrate.hardStops.maxStalledIterations.
@@ -102,6 +106,7 @@ const INHERITED_AGENT_SESSION_ENV_KEYS = [
   'OPENCLAW_SESSION',
 ] as const;
 const WORKER_SECRET_ENV_KEYS = [
+  ORCHESTRATION_STATE_KEY_ENV,
   'PIPELANE_REVIEW_STATE_KEY',
   'PIPELANE_DEPLOY_STATE_KEY',
   'PIPELANE_PROBE_STATE_KEY',
@@ -545,27 +550,32 @@ async function handleOrchestrateEntry(cwd: string, parsed: ParsedOperatorArgs): 
         throw new Error('orchestrate --yes requires --analysis-file <path> so plan analysis is recorded before worktrees are created.');
       }
       const analysisFile = resolveInputFile(cwd, parsed.flags.orchestrationAnalysisFile, '--analysis-file');
-      const analysisResult = attachPlanAnalysisFromFile(context, run, analysisFile, 'orchestrate --yes');
-      if (analysisResult.blockingPendingCount > 0) {
-        const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
-        printResult(parsed.flags, {
-          command: 'orchestrate analyze',
-          status: run.planAnalysis?.status ?? 'pending',
-          repoRoot: context.repoRoot,
-          runId: run.id,
-          ledgerPath,
-          planPath,
-          analysisFile,
-          planReviewStatus: analysisResult.planReviewStatus,
-          blockingPendingCount: analysisResult.blockingPendingCount,
-          run,
-          message: renderAnalyzeReport(run, ledgerPath, analysisFile, analysisResult.blockingPendingCount),
-        });
+      const report = await withNewOrchestrationRunLockAsync(context, run, async () => {
+        resolveOrchestrationStateKey();
+        const analysisResult = attachPlanAnalysisFromFile(context, run, analysisFile, 'orchestrate --yes');
+        if (analysisResult.blockingPendingCount > 0) {
+          const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+          return {
+            command: 'orchestrate analyze' as const,
+            status: run.planAnalysis?.status ?? 'pending',
+            repoRoot: context.repoRoot,
+            runId: run.id,
+            ledgerPath,
+            planPath,
+            analysisFile,
+            planReviewStatus: analysisResult.planReviewStatus,
+            blockingPendingCount: analysisResult.blockingPendingCount,
+            run,
+            message: renderAnalyzeReport(run, ledgerPath, analysisFile, analysisResult.blockingPendingCount),
+          };
+        }
+        return await runApprovedOrchestration(context, run, planPath, activeRuns, likelyPlanFiles, parsed.flags.offline, ledgerWarnings, scan, !parsed.flags.json);
+      });
+      printResult(parsed.flags, report);
+      if (report.command === 'orchestrate analyze') {
         process.exitCode = 1;
         return;
       }
-      const report = await runApprovedOrchestration(context, run, planPath, activeRuns, likelyPlanFiles, parsed.flags.offline, ledgerWarnings, scan, !parsed.flags.json);
-      printResult(parsed.flags, report);
       if (approvedOrchestrationStatusRequiresAttention(report.status)) process.exitCode = 1;
       return;
     }
@@ -1225,6 +1235,13 @@ function recentCorruptDiagnostics(
   return scan.corrupt.filter(isRecentCorruptLedger);
 }
 
+function assertNoRecentCorruptOrchestrationLedgers(context: WorkflowContext): void {
+  const recent = recentCorruptDiagnostics(scanOrchestrationRunDiagnostics(context.commonDir, context.config));
+  if (recent.length === 0) return;
+  const diagnostic = recent[0];
+  throw new Error(`Cannot mutate orchestration state while unreadable ledger exists: ${diagnostic.ledgerPath}: ${diagnostic.reason}`);
+}
+
 function isRecentCorruptLedger(diagnostic: Pick<OrchestrationCorruptLedgerSummary, 'mtimeMs'>): boolean {
   if (diagnostic.mtimeMs === null) return true;
   return diagnostic.mtimeMs >= Date.now() - ORCHESTRATION_CORRUPT_LEDGER_BLOCK_AGE_MS;
@@ -1788,10 +1805,45 @@ function handleGoalSpec(cwd: string, parsed: ParsedOperatorArgs): void {
 function handleAnalyze(cwd: string, parsed: ParsedOperatorArgs): void {
   const context = resolveWorkflowContext(cwd);
   const analysisFile = resolveInputFile(cwd, parsed.flags.orchestrationAnalysisFile, '--analysis-file');
-  const { run, planPath } = resolveAnalyzeRun(context, parsed);
+  const runId = parsed.flags.orchestrationRunId.trim();
+  if (runId) {
+    withLockedOrchestrationRun(context, runId, (run) => {
+      if (run.status !== 'planned') {
+        throw new Error(`orchestrate analyze can only modify planned runs; ${runId} is ${run.status}.`);
+      }
+      const planPath = run.source.planPath ? path.join(context.repoRoot, run.source.planPath) : null;
+      printResult(parsed.flags, buildAnalyzeMutationReport(context, run, planPath, analysisFile));
+    });
+    return;
+  }
+
+  const { run: resolvedRun, planPath } = resolveAnalyzeRun(context, parsed);
+  if (resolvedRun.signature) {
+    withLockedOrchestrationRun(context, resolvedRun.id, (run) => {
+      if (run.status !== 'planned') {
+        throw new Error(`orchestrate analyze can only modify planned runs; ${run.id} is ${run.status}.`);
+      }
+      printResult(parsed.flags, buildAnalyzeMutationReport(context, run, planPath, analysisFile));
+    });
+    return;
+  }
+
+  withNewOrchestrationRunLock(context, resolvedRun, () => {
+    assertNoRecentCorruptOrchestrationLedgers(context);
+    printResult(parsed.flags, buildAnalyzeMutationReport(context, resolvedRun, planPath, analysisFile));
+  });
+}
+
+function buildAnalyzeMutationReport(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+  planPath: string | null,
+  analysisFile: string,
+): OrchestrateAnalyzeReport {
+  resolveOrchestrationStateKey();
   const result = attachPlanAnalysisFromFile(context, run, analysisFile, 'orchestrate analyze');
   const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
-  const report: OrchestrateAnalyzeReport = {
+  return {
     command: 'orchestrate analyze',
     status: result.record.status,
     repoRoot: context.repoRoot,
@@ -1804,7 +1856,6 @@ function handleAnalyze(cwd: string, parsed: ParsedOperatorArgs): void {
     run,
     message: renderAnalyzeReport(run, ledgerPath, analysisFile, result.blockingPendingCount),
   };
-  printResult(parsed.flags, report);
 }
 
 function handlePlanReview(cwd: string, parsed: ParsedOperatorArgs): void {
@@ -1940,35 +1991,172 @@ function handlePlanReview(cwd: string, parsed: ParsedOperatorArgs): void {
 function acquireOrchestrationRunMutationLock(context: WorkflowContext, runId: string): () => void {
   const lockPath = path.join(path.dirname(orchestrationRunPath(context.commonDir, context.config, runId)), 'mutation.lock');
   mkdirSync(path.dirname(lockPath), { recursive: true });
-  clearStaleOrchestrationRunLock(lockPath);
-  let created = false;
-  try {
-    mkdirSync(lockPath);
-    created = true;
-    writeFileSync(
-      path.join(lockPath, 'owner.json'),
-      `${JSON.stringify({ runId, pid: process.pid, acquiredAt: nowIso() }, null, 2)}\n`,
-      'utf8',
-    );
-    return () => rmSync(lockPath, { recursive: true, force: true });
-  } catch (error) {
-    const err = error as NodeJS.ErrnoException;
-    if (created) rmSync(lockPath, { recursive: true, force: true });
-    if (err.code === 'EEXIST') {
-      throw new Error(`orchestrate run ${runId} is being updated by another Pipelane process; retry after it finishes.`);
+  const deadline = Date.now() + ORCHESTRATION_RUN_LOCK_WAIT_TIMEOUT_MS;
+  while (true) {
+    clearStaleOrchestrationRunLock(lockPath);
+    let created = false;
+    try {
+      mkdirSync(lockPath);
+      created = true;
+      const owner = {
+        runId,
+        pid: process.pid,
+        acquiredAt: nowIso(),
+        heartbeatAt: nowIso(),
+      };
+      writeOrchestrationRunLockOwner(lockPath, owner);
+      const heartbeat = setInterval(() => {
+        try {
+          writeOrchestrationRunLockOwner(lockPath, { ...owner, heartbeatAt: nowIso() });
+        } catch {}
+      }, ORCHESTRATION_RUN_LOCK_HEARTBEAT_MS);
+      heartbeat.unref();
+      return () => {
+        clearInterval(heartbeat);
+        rmSync(lockPath, { recursive: true, force: true });
+      };
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (created) rmSync(lockPath, { recursive: true, force: true });
+      if (err.code !== 'EEXIST') {
+        throw new Error(`could not acquire orchestration run lock for ${runId}: ${err.message}`);
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`orchestrate run ${runId} is being updated by another Pipelane process; timed out waiting for the mutation lock.`);
+      }
+      sleepSync(ORCHESTRATION_RUN_LOCK_RETRY_MS);
     }
-    throw new Error(`could not acquire orchestration run lock for ${runId}: ${err.message}`);
+  }
+}
+
+function sleepSync(ms: number): void {
+  const buffer = new SharedArrayBuffer(4);
+  const view = new Int32Array(buffer);
+  Atomics.wait(view, 0, 0, ms);
+}
+
+function withLockedOrchestrationRun<T>(
+  context: WorkflowContext,
+  runId: string,
+  callback: (run: OrchestrationRunRecord) => T,
+): T {
+  assertSafeOrchestrationRunId(runId);
+  const releaseLock = acquireOrchestrationRunMutationLock(context, runId);
+  try {
+    const run = loadOrchestrationRunRecord(context.commonDir, context.config, runId);
+    if (!run) {
+      throw new Error(`No orchestration run ledger found for ${runId}.`);
+    }
+    return callback(run);
+  } finally {
+    releaseLock();
+  }
+}
+
+async function withLockedOrchestrationRunAsync<T>(
+  context: WorkflowContext,
+  runId: string,
+  callback: (run: OrchestrationRunRecord) => Promise<T>,
+): Promise<T> {
+  assertSafeOrchestrationRunId(runId);
+  const releaseLock = acquireOrchestrationRunMutationLock(context, runId);
+  try {
+    const run = loadOrchestrationRunRecord(context.commonDir, context.config, runId);
+    if (!run) {
+      throw new Error(`No orchestration run ledger found for ${runId}.`);
+    }
+    return await callback(run);
+  } finally {
+    releaseLock();
+  }
+}
+
+function withNewOrchestrationRunLock<T>(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+  callback: () => T,
+): T {
+  assertSafeOrchestrationRunId(run.id);
+  const releaseLock = acquireOrchestrationRunMutationLock(context, run.id);
+  try {
+    const existing = loadOrchestrationRunRecord(context.commonDir, context.config, run.id);
+    if (existing) {
+      throw new Error(`orchestration run ledger already exists for ${run.id}.`);
+    }
+    return callback();
+  } finally {
+    releaseLock();
+  }
+}
+
+async function withNewOrchestrationRunLockAsync<T>(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+  callback: () => Promise<T>,
+): Promise<T> {
+  assertSafeOrchestrationRunId(run.id);
+  const releaseLock = acquireOrchestrationRunMutationLock(context, run.id);
+  try {
+    const existing = loadOrchestrationRunRecord(context.commonDir, context.config, run.id);
+    if (existing) {
+      throw new Error(`orchestration run ledger already exists for ${run.id}.`);
+    }
+    return await callback();
+  } finally {
+    releaseLock();
   }
 }
 
 function clearStaleOrchestrationRunLock(lockPath: string): void {
   if (!existsSync(lockPath)) return;
   try {
-    const ageMs = Date.now() - statSync(lockPath).mtimeMs;
-    if (ageMs > ORCHESTRATION_RUN_LOCK_STALE_MS) {
-      rmSync(lockPath, { recursive: true, force: true });
+    const ownerPath = path.join(lockPath, 'owner.json');
+    const lockMtimeMs = statSync(lockPath).mtimeMs;
+    const ownerMtimeMs = existsSync(ownerPath) ? statSync(ownerPath).mtimeMs : 0;
+    const ageMs = Date.now() - Math.max(lockMtimeMs, ownerMtimeMs);
+    if (ageMs <= ORCHESTRATION_RUN_LOCK_STALE_MS) return;
+    const owner = readOrchestrationRunLockOwner(lockPath);
+    if (owner && processIsAlive(owner.pid)) return;
+    rmSync(lockPath, { recursive: true, force: true });
+  } catch {}
+}
+
+interface OrchestrationRunLockOwner {
+  runId: string;
+  pid: number;
+  acquiredAt: string;
+  heartbeatAt: string;
+}
+
+function writeOrchestrationRunLockOwner(lockPath: string, owner: OrchestrationRunLockOwner): void {
+  writeFileSync(path.join(lockPath, 'owner.json'), `${JSON.stringify(owner, null, 2)}\n`, 'utf8');
+}
+
+function readOrchestrationRunLockOwner(lockPath: string): OrchestrationRunLockOwner | null {
+  try {
+    const parsed = JSON.parse(readFileSync(path.join(lockPath, 'owner.json'), 'utf8')) as Partial<OrchestrationRunLockOwner>;
+    if (
+      typeof parsed.runId === 'string'
+      && Number.isSafeInteger(parsed.pid)
+      && typeof parsed.pid === 'number'
+      && parsed.pid > 0
+      && typeof parsed.acquiredAt === 'string'
+      && typeof parsed.heartbeatAt === 'string'
+    ) {
+      return parsed as OrchestrationRunLockOwner;
     }
   } catch {}
+  return null;
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    return err.code === 'EPERM';
+  }
 }
 
 function assertPlanReviewMutationAllowed(run: OrchestrationRunRecord, action: 'pass' | 'bypass'): void {
@@ -1991,61 +2179,57 @@ function assertPlanReviewMutationAllowed(run: OrchestrationRunRecord, action: 'p
 function handlePrepare(cwd: string, parsed: ParsedOperatorArgs): void {
   const context = resolveWorkflowContext(cwd);
   const runId = parsed.flags.orchestrationRunId.trim();
-  const run = loadOrchestrationRunRecord(context.commonDir, context.config, runId);
-  if (!run) {
-    throw new Error(`No orchestration run ledger found for ${runId}.`);
-  }
-  if (run.status !== 'planned' && run.status !== 'prepared') {
-    throw new Error(`orchestrate prepare cannot modify ${run.status} run ${runId}.`);
-  }
-  assertPlanAnalysisReadyForPrepare(context, run);
+  withLockedOrchestrationRun(context, runId, (run) => {
+    if (run.status !== 'planned' && run.status !== 'prepared') {
+      throw new Error(`orchestrate prepare cannot modify ${run.status} run ${runId}.`);
+    }
+    assertPlanAnalysisReadyForPrepare(context, run);
 
-  const result = prepareSliceWorktrees(context, run, parsed.flags.offline);
-  const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
-  const report: OrchestratePrepareReport = {
-    command: 'orchestrate prepare',
-    status: 'prepared',
-    repoRoot: context.repoRoot,
-    runId: run.id,
-    ledgerPath,
-    createdCount: result.createdCount,
-    existingCount: result.existingCount,
-    slices: result.slices,
-    warnings: result.warnings,
-    run,
-    message: renderPrepareReport(run, ledgerPath, result),
-  };
+    const result = prepareSliceWorktrees(context, run, parsed.flags.offline);
+    const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+    const report: OrchestratePrepareReport = {
+      command: 'orchestrate prepare',
+      status: 'prepared',
+      repoRoot: context.repoRoot,
+      runId: run.id,
+      ledgerPath,
+      createdCount: result.createdCount,
+      existingCount: result.existingCount,
+      slices: result.slices,
+      warnings: result.warnings,
+      run,
+      message: renderPrepareReport(run, ledgerPath, result),
+    };
 
-  printResult(parsed.flags, report);
+    printResult(parsed.flags, report);
+  });
 }
 
 function handleDispatch(cwd: string, parsed: ParsedOperatorArgs): void {
   const context = resolveWorkflowContext(cwd);
   const runId = parsed.flags.orchestrationRunId.trim();
-  const run = loadOrchestrationRunRecord(context.commonDir, context.config, runId);
-  if (!run) {
-    throw new Error(`No orchestration run ledger found for ${runId}.`);
-  }
-  if (run.status !== 'prepared' && run.status !== 'dispatched') {
-    throw new Error(`orchestrate dispatch requires a prepared run; ${runId} is ${run.status}.`);
-  }
+  withLockedOrchestrationRun(context, runId, (run) => {
+    if (run.status !== 'prepared' && run.status !== 'dispatched') {
+      throw new Error(`orchestrate dispatch requires a prepared run; ${runId} is ${run.status}.`);
+    }
 
-  const result = dispatchPreparedSlices(context, run);
-  const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
-  const report: OrchestrateDispatchReport = {
-    command: 'orchestrate dispatch',
-    status: 'dispatched',
-    repoRoot: context.repoRoot,
-    runId: run.id,
-    ledgerPath,
-    writtenCount: result.writtenCount,
-    existingCount: result.existingCount,
-    slices: result.slices,
-    run,
-    message: renderDispatchReport(run, ledgerPath, result),
-  };
+    const result = dispatchPreparedSlices(context, run);
+    const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+    const report: OrchestrateDispatchReport = {
+      command: 'orchestrate dispatch',
+      status: 'dispatched',
+      repoRoot: context.repoRoot,
+      runId: run.id,
+      ledgerPath,
+      writtenCount: result.writtenCount,
+      existingCount: result.existingCount,
+      slices: result.slices,
+      run,
+      message: renderDispatchReport(run, ledgerPath, result),
+    };
 
-  printResult(parsed.flags, report);
+    printResult(parsed.flags, report);
+  });
 }
 
 async function handleStart(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
@@ -2053,35 +2237,33 @@ async function handleStart(cwd: string, parsed: ParsedOperatorArgs): Promise<voi
   const runId = parsed.flags.orchestrationRunId.trim();
   const sliceId = parsed.flags.goalSliceId.trim() || null;
   const force = parsed.flags.force;
-  const run = loadOrchestrationRunRecord(context.commonDir, context.config, runId);
-  if (!run) {
-    throw new Error(`No orchestration run ledger found for ${runId}.`);
-  }
-  if (run.status === 'planned' || run.status === 'prepared') {
-    throw new Error(`orchestrate start requires a dispatched run; ${runId} is ${run.status}.`);
-  }
+  await withLockedOrchestrationRunAsync(context, runId, async (run) => {
+    if (run.status === 'planned' || run.status === 'prepared') {
+      throw new Error(`orchestrate start requires a dispatched run; ${runId} is ${run.status}.`);
+    }
 
-  const result = await startDispatchedSlices(context, run, sliceId, force);
-  const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
-  const report: OrchestrateStartReport = {
-    command: 'orchestrate start',
-    status: result.status,
-    repoRoot: context.repoRoot,
-    runId: run.id,
-    ledgerPath,
-    sliceId,
-    force,
-    startedCount: result.startedCount,
-    restartedCount: result.restartedCount,
-    existingCount: result.existingCount,
-    failedCount: result.failedCount,
-    blockedCount: result.blockedCount,
-    slices: result.slices,
-    run,
-    message: renderStartReport(run, ledgerPath, sliceId, force, result),
-  };
+    const result = await startDispatchedSlices(context, run, sliceId, force);
+    const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+    const report: OrchestrateStartReport = {
+      command: 'orchestrate start',
+      status: result.status,
+      repoRoot: context.repoRoot,
+      runId: run.id,
+      ledgerPath,
+      sliceId,
+      force,
+      startedCount: result.startedCount,
+      restartedCount: result.restartedCount,
+      existingCount: result.existingCount,
+      failedCount: result.failedCount,
+      blockedCount: result.blockedCount,
+      slices: result.slices,
+      run,
+      message: renderStartReport(run, ledgerPath, sliceId, force, result),
+    };
 
-  printResult(parsed.flags, report);
+    printResult(parsed.flags, report);
+  });
 }
 
 function handleOrchestrationReview(cwd: string, parsed: ParsedOperatorArgs): void {
@@ -2090,47 +2272,44 @@ function handleOrchestrationReview(cwd: string, parsed: ParsedOperatorArgs): voi
   const sliceId = parsed.flags.goalSliceId.trim() || null;
   const phaseFilter = parsed.flags.reviewPhase.trim() as ReviewGatePhase | '';
   const gateFilter = parsed.flags.reviewGate.trim();
-  const run = loadOrchestrationRunRecord(context.commonDir, context.config, runId);
-  if (!run) {
-    throw new Error(`No orchestration run ledger found for ${runId}.`);
-  }
-
-  const result = reviewCompletedSlices(context, run, {
-    sliceId,
-    dryRun: parsed.flags.reviewDryRun,
-    gateFilter,
-    phaseFilter,
-    requireGates: true,
-  });
-  const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
-  const report: OrchestrateReviewReport = {
-    command: 'orchestrate review',
-    status: result.status,
-    repoRoot: context.repoRoot,
-    runId: run.id,
-    ledgerPath,
-    sliceId,
-    dryRun: parsed.flags.reviewDryRun,
-    gateFilter: gateFilter || null,
-    phaseFilter: phaseFilter || null,
-    reviewedCount: result.reviewedCount,
-    failedCount: result.failedCount,
-    pendingCount: result.pendingCount,
-    blockedCount: result.blockedCount,
-    slices: result.slices,
-    run,
-    message: renderOrchestrationReviewReport(run, ledgerPath, sliceId, result, {
+  withLockedOrchestrationRun(context, runId, (run) => {
+    const result = reviewCompletedSlices(context, run, {
+      sliceId,
       dryRun: parsed.flags.reviewDryRun,
       gateFilter,
       phaseFilter,
-    }),
-  };
+      requireGates: true,
+    });
+    const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+    const report: OrchestrateReviewReport = {
+      command: 'orchestrate review',
+      status: result.status,
+      repoRoot: context.repoRoot,
+      runId: run.id,
+      ledgerPath,
+      sliceId,
+      dryRun: parsed.flags.reviewDryRun,
+      gateFilter: gateFilter || null,
+      phaseFilter: phaseFilter || null,
+      reviewedCount: result.reviewedCount,
+      failedCount: result.failedCount,
+      pendingCount: result.pendingCount,
+      blockedCount: result.blockedCount,
+      slices: result.slices,
+      run,
+      message: renderOrchestrationReviewReport(run, ledgerPath, sliceId, result, {
+        dryRun: parsed.flags.reviewDryRun,
+        gateFilter,
+        phaseFilter,
+      }),
+    };
 
-  printResult(parsed.flags, report);
+    printResult(parsed.flags, report);
 
-  if (result.status === 'failed') {
-    process.exitCode = 1;
-  }
+    if (result.status === 'failed') {
+      process.exitCode = 1;
+    }
+  });
 }
 
 function dispatchPreparedSlices(
@@ -3737,6 +3916,7 @@ function assertPreparedWorktreeSafe(
 
 function handlePlan(cwd: string, parsed: ParsedOperatorArgs): void {
   const context = resolveWorkflowContext(cwd);
+  assertNoRecentCorruptOrchestrationLedgers(context);
   const planPath = resolvePlanPath(context.repoRoot, parsed.flags.goalPlanFile);
   const planText = planPath ? readPlanFile(planPath) : '';
   const outcome = parsed.flags.goalOutcome.trim();
@@ -3758,22 +3938,24 @@ function handlePlan(cwd: string, parsed: ParsedOperatorArgs): void {
     slices: slicesFile?.slices,
     coverage: slicesFile?.coverage,
   });
-  const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
-  const confirmationRecommended = run.slices.some((slice) => slice.requiresConfirmation || slice.critique.length > 0);
-  const report: OrchestratePlanReport = {
-    command: 'orchestrate plan',
-    status: 'planned',
-    repoRoot: context.repoRoot,
-    runId: run.id,
-    ledgerPath,
-    planPath,
-    sliceCount: run.slices.length,
-    confirmationRecommended,
-    run,
-    message: renderPlanReport(run, ledgerPath, planPath, confirmationRecommended),
-  };
+  withNewOrchestrationRunLock(context, run, () => {
+    const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+    const confirmationRecommended = run.slices.some((slice) => slice.requiresConfirmation || slice.critique.length > 0);
+    const report: OrchestratePlanReport = {
+      command: 'orchestrate plan',
+      status: 'planned',
+      repoRoot: context.repoRoot,
+      runId: run.id,
+      ledgerPath,
+      planPath,
+      sliceCount: run.slices.length,
+      confirmationRecommended,
+      run,
+      message: renderPlanReport(run, ledgerPath, planPath, confirmationRecommended),
+    };
 
-  printResult(parsed.flags, report);
+    printResult(parsed.flags, report);
+  });
 }
 
 interface OrchestrateScopeReport {
@@ -3807,6 +3989,8 @@ interface OrchestrateUpgradeLedgerReport {
   runId: string;
   ledgerPath: string;
   upgradedCount: number;
+  resealedUnsigned: boolean;
+  resealReason: string | null;
   run: OrchestrationRunRecord;
   message: string;
 }
@@ -3843,144 +4027,185 @@ function handleScope(cwd: string, parsed: ParsedOperatorArgs): void {
   const context = resolveWorkflowContext(cwd);
   const runId = parsed.flags.orchestrationRunId.trim();
   const through = parsed.flags.scopeThrough.trim();
-  const run = loadOrchestrationRunRecord(context.commonDir, context.config, runId);
-  if (!run) {
-    throw new Error(`No orchestration run ledger found for ${runId}.`);
-  }
-  const targetIndex = run.slices.findIndex((slice) => slice.id === through);
-  if (targetIndex < 0) {
-    throw new Error(`No slice ${through} found in orchestration run ${runId}.`);
-  }
-  // Resume extends scope forward freely, but deferring a slice whose worker
-  // already started would orphan in-flight or finished work.
-  if (run.slices.some((slice, index) => index > targetIndex && slice.worker)) {
-    throw new Error(`orchestrate scope cannot defer a slice in ${runId} whose worker has already started.`);
-  }
-  let activeCount = 0;
-  let deferredCount = 0;
-  run.slices.forEach((slice, index) => {
-    if (index <= targetIndex) {
-      slice.deferred = false;
-      activeCount += 1;
-    } else {
-      slice.deferred = true;
-      deferredCount += 1;
+  withLockedOrchestrationRun(context, runId, (run) => {
+    const targetIndex = run.slices.findIndex((slice) => slice.id === through);
+    if (targetIndex < 0) {
+      throw new Error(`No slice ${through} found in orchestration run ${runId}.`);
     }
+    // Resume extends scope forward freely, but deferring a slice whose worker
+    // already started would orphan in-flight or finished work.
+    if (run.slices.some((slice, index) => index > targetIndex && slice.worker)) {
+      throw new Error(`orchestrate scope cannot defer a slice in ${runId} whose worker has already started.`);
+    }
+    let activeCount = 0;
+    let deferredCount = 0;
+    run.slices.forEach((slice, index) => {
+      if (index <= targetIndex) {
+        slice.deferred = false;
+        activeCount += 1;
+      } else {
+        slice.deferred = true;
+        deferredCount += 1;
+      }
+    });
+    run.status = summarizeScopeRunStatus(run);
+    run.updatedAt = nowIso();
+    const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+    const report: OrchestrateScopeReport = {
+      command: 'orchestrate scope',
+      status: 'scoped',
+      repoRoot: context.repoRoot,
+      runId: run.id,
+      ledgerPath,
+      throughSliceId: through,
+      activeCount,
+      deferredCount,
+      run,
+      message: [
+        'Pipelane orchestrate scope',
+        '',
+        `Run: ${run.id}`,
+        `Through: ${through}`,
+        `In scope: ${activeCount} slice(s)`,
+        `Deferred: ${deferredCount} slice(s)`,
+        '',
+        renderOrchestrationOutline(run),
+      ].join('\n'),
+    };
+    printResult(parsed.flags, report);
   });
-  run.status = summarizeScopeRunStatus(run);
-  run.updatedAt = nowIso();
-  const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
-  const report: OrchestrateScopeReport = {
-    command: 'orchestrate scope',
-    status: 'scoped',
-    repoRoot: context.repoRoot,
-    runId: run.id,
-    ledgerPath,
-    throughSliceId: through,
-    activeCount,
-    deferredCount,
-    run,
-    message: [
-      'Pipelane orchestrate scope',
-      '',
-      `Run: ${run.id}`,
-      `Through: ${through}`,
-      `In scope: ${activeCount} slice(s)`,
-      `Deferred: ${deferredCount} slice(s)`,
-      '',
-      renderOrchestrationOutline(run),
-    ].join('\n'),
-  };
-  printResult(parsed.flags, report);
 }
 
 function handleFinalize(cwd: string, parsed: ParsedOperatorArgs): void {
   const context = resolveWorkflowContext(cwd);
   const runId = parsed.flags.orchestrationRunId.trim();
-  const run = loadOrchestrationRunRecord(context.commonDir, context.config, runId);
-  if (!run) {
-    throw new Error(`No orchestration run ledger found for ${runId}.`);
-  }
-  const at = nowIso();
-  let excludedCount = 0;
-  for (const slice of run.slices) {
-    if (slice.deferred === true && !slice.excludedReason) {
-      slice.excludedReason = 'abandoned via orchestrate finalize';
-      slice.excludedAt = at;
-      excludedCount += 1;
+  withLockedOrchestrationRun(context, runId, (run) => {
+    const at = nowIso();
+    let excludedCount = 0;
+    for (const slice of run.slices) {
+      if (slice.deferred === true && !slice.excludedReason) {
+        slice.excludedReason = 'abandoned via orchestrate finalize';
+        slice.excludedAt = at;
+        excludedCount += 1;
+      }
     }
-  }
-  // C1 (Decision 9): finalize is recompute-authoritative — re-run review of the
-  // in-scope slices in-process so any transition to `completed` (e.g. a paused run
-  // whose deferred remainder we just abandoned) is backed by a fresh verdict THIS
-  // invocation, not blindly off a persisted one. Two honest caveats:
-  //  - A slice whose worktree was cleaned cannot be re-reviewed: reviewBlocker
-  //    skips it and the persisted verdict stands. That verdict is still trusted via
-  //    its C2 signature when a review-state key is configured; keyless, it is the
-  //    documented opt-in baseline (unsigned ledgers are not tamper-checked).
-  //  - The re-review must not DESTROY a healthy completed slice's evidence. A real
-  //    gate regression yields a `failed` verdict (kept). But a transient
-  //    can't-evaluate (zero gates / independence trip) nulls slice.review; for a
-  //    slice that was already `completed`, restore its prior evidence rather than
-  //    silently downgrading a finished run to `blocked` on a flaky re-review.
-  const priorBySlice = new Map(run.slices.map((slice) => [slice.id, { review: slice.review, status: slice.status }]));
-  reviewCompletedSlices(context, run, {
-    sliceId: null,
-    dryRun: false,
-    gateFilter: '',
-    phaseFilter: '',
-    requireGates: true,
+    // C1 (Decision 9): finalize is recompute-authoritative — re-run review of the
+    // in-scope slices in-process so any transition to `completed` (e.g. a paused run
+    // whose deferred remainder we just abandoned) is backed by a fresh verdict THIS
+    // invocation, not blindly off a persisted one. Two honest caveats:
+    //  - A slice whose worktree was cleaned cannot be re-reviewed: reviewBlocker
+    //    skips it and the persisted verdict stands. That verdict is still trusted via
+    //    its C2 signature when a review-state key is configured; keyless, it is the
+    //    documented opt-in baseline (unsigned ledgers are not tamper-checked).
+    //  - The re-review must not DESTROY a healthy completed slice's evidence. A real
+    //    gate regression yields a `failed` verdict (kept). But a transient
+    //    can't-evaluate (zero gates / independence trip) nulls slice.review; for a
+    //    slice that was already `completed`, restore its prior evidence rather than
+    //    silently downgrading a finished run to `blocked` on a flaky re-review.
+    const priorBySlice = new Map(run.slices.map((slice) => [slice.id, { review: slice.review, status: slice.status }]));
+    reviewCompletedSlices(context, run, {
+      sliceId: null,
+      dryRun: false,
+      gateFilter: '',
+      phaseFilter: '',
+      requireGates: true,
+    });
+    for (const slice of run.slices) {
+      const prior = priorBySlice.get(slice.id);
+      if (prior?.status === 'completed' && prior.review && slice.review === null) {
+        slice.review = prior.review;
+        slice.status = 'completed';
+      }
+    }
+    // Re-summarize after the restore pass so run.status reflects any preserved
+    // evidence (this is NOT a redundant recompute of reviewCompletedSlices' result).
+    run.status = summarizeRunReviewStatus(run);
+    run.updatedAt = nowIso();
+    const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+    const report: OrchestrateFinalizeReport = {
+      command: 'orchestrate finalize',
+      status: run.status,
+      repoRoot: context.repoRoot,
+      runId: run.id,
+      ledgerPath,
+      excludedCount,
+      run,
+      message: [
+        'Pipelane orchestrate finalize',
+        '',
+        `Run: ${run.id}`,
+        `Status: ${run.status}`,
+        `Excluded (abandoned) slices: ${excludedCount}`,
+        'The excluded slices are kept in the ledger with a reason and timestamp for audit.',
+        '',
+        renderOrchestrationOutline(run),
+      ].join('\n'),
+    };
+    printResult(parsed.flags, report);
   });
-  for (const slice of run.slices) {
-    const prior = priorBySlice.get(slice.id);
-    if (prior?.status === 'completed' && prior.review && slice.review === null) {
-      slice.review = prior.review;
-      slice.status = 'completed';
-    }
-  }
-  // Re-summarize after the restore pass so run.status reflects any preserved
-  // evidence (this is NOT a redundant recompute of reviewCompletedSlices' result).
-  run.status = summarizeRunReviewStatus(run);
-  run.updatedAt = nowIso();
-  const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
-  const report: OrchestrateFinalizeReport = {
-    command: 'orchestrate finalize',
-    status: run.status,
-    repoRoot: context.repoRoot,
-    runId: run.id,
-    ledgerPath,
-    excludedCount,
-    run,
-    message: [
-      'Pipelane orchestrate finalize',
-      '',
-      `Run: ${run.id}`,
-      `Status: ${run.status}`,
-      `Excluded (abandoned) slices: ${excludedCount}`,
-      'The excluded slices are kept in the ledger with a reason and timestamp for audit.',
-      '',
-      renderOrchestrationOutline(run),
-    ].join('\n'),
-  };
-  printResult(parsed.flags, report);
 }
 
 function handleUpgradeLedger(cwd: string, parsed: ParsedOperatorArgs): void {
   const context = resolveWorkflowContext(cwd);
   const runId = parsed.flags.orchestrationRunId.trim();
-  const run = loadOrchestrationRunRecord(context.commonDir, context.config, runId);
-  if (!run) {
-    throw new Error(`No orchestration run ledger found for ${runId}.`);
+  if (parsed.flags.orchestrationResealUnsigned) {
+    handleResealUnsignedLedger(context, parsed, runId);
+    return;
   }
-  // C2 migration: sign legacy unsigned embedded review evidence in place so the
-  // signature-aware completion read path accepts it. Requires the review-state key
-  // (signing is impossible without it); trusts the persisted verdict at upgrade
-  // time (no re-review). Already-signed records are left untouched — a tampered
-  // signature is rejected by the read path, not silently re-blessed here.
-  const key = resolveReviewStateKey();
-  if (!key) {
-    throw new Error('orchestrate upgrade-ledger requires PIPELANE_REVIEW_STATE_KEY to sign embedded review evidence.');
+
+  withLockedOrchestrationRun(context, runId, (run) => {
+    const key = resolveReviewStateKey();
+    if (!key) {
+      throw new Error('orchestrate upgrade-ledger requires PIPELANE_REVIEW_STATE_KEY to sign embedded review evidence.');
+    }
+    const upgradedCount = signUnsignedSliceReviews(run, key);
+    run.updatedAt = nowIso();
+    const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+    printResult(parsed.flags, buildUpgradeLedgerReport(context, run, ledgerPath, upgradedCount, false, null));
+  });
+}
+
+function handleResealUnsignedLedger(context: WorkflowContext, parsed: ParsedOperatorArgs, runId: string): void {
+  const reason = parsed.flags.reason.trim();
+  if (!reason) {
+    throw new Error('orchestrate upgrade-ledger --reseal-unsigned requires --reason <text>.');
   }
+  assertSafeOrchestrationRunId(runId);
+  const releaseLock = acquireOrchestrationRunMutationLock(context, runId);
+  try {
+    const diagnostic = diagnoseOrchestrationRunRecord(context.commonDir, context.config, runId);
+    if (diagnostic.status === 'missing') {
+      throw new Error(`No orchestration run ledger found for ${runId}.`);
+    }
+    if (diagnostic.status === 'invalid-run-id') {
+      throw new Error(diagnostic.reason);
+    }
+    if (diagnostic.status === 'valid') {
+      throw new Error(`orchestrate upgrade-ledger --reseal-unsigned refuses signed ledger ${runId}; it is already sealed.`);
+    }
+    if (!diagnostic.reason.includes('legacy unsigned orchestration ledger')) {
+      throw new Error(`orchestrate upgrade-ledger --reseal-unsigned only trusts legacy unsigned ledgers; current diagnostic: ${diagnostic.reason}`);
+    }
+    const run = loadUnsignedLegacyOrchestrationRunRecord(context.commonDir, context.config, runId);
+    if (!run) {
+      throw new Error(`No orchestration run ledger found for ${runId}.`);
+    }
+    const reviewKey = resolveReviewStateKey();
+    const upgradedCount = reviewKey ? signUnsignedSliceReviews(run, reviewKey) : 0;
+    run.legacyReseal = {
+      resealedAt: nowIso(),
+      reason,
+      trustedLocalState: true,
+    };
+    run.updatedAt = nowIso();
+    const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+    printResult(parsed.flags, buildUpgradeLedgerReport(context, run, ledgerPath, upgradedCount, true, reason));
+  } finally {
+    releaseLock();
+  }
+}
+
+function signUnsignedSliceReviews(run: OrchestrationRunRecord, key: string): number {
   // Sign only slice.review — the sole embedded evidence the completion read path
   // verifies. reviewDiagnostics are not signature-checked on read, so signing them
   // would inflate the count and imply a tamper-protection they do not have.
@@ -3991,27 +4216,40 @@ function handleUpgradeLedger(cwd: string, parsed: ParsedOperatorArgs): void {
       upgradedCount += 1;
     }
   }
-  run.updatedAt = nowIso();
-  const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
-  const report: OrchestrateUpgradeLedgerReport = {
+  return upgradedCount;
+}
+
+function buildUpgradeLedgerReport(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+  ledgerPath: string,
+  upgradedCount: number,
+  resealedUnsigned: boolean,
+  resealReason: string | null,
+): OrchestrateUpgradeLedgerReport {
+  return {
     command: 'orchestrate upgrade-ledger',
     status: run.status,
     repoRoot: context.repoRoot,
     runId: run.id,
     ledgerPath,
     upgradedCount,
+    resealedUnsigned,
+    resealReason,
     run,
     message: [
       'Pipelane orchestrate upgrade-ledger',
       '',
       `Run: ${run.id}`,
+      resealedUnsigned
+        ? 'Legacy unsigned orchestration ledger resealed from explicitly trusted local state.'
+        : 'Signed orchestration ledger verified before mutation.',
       `Signed legacy review records: ${upgradedCount}`,
       upgradedCount === 0
-        ? 'No unsigned embedded review evidence found; the ledger is already signed.'
+        ? 'No unsigned embedded review evidence found.'
         : 'Embedded review evidence is now signed and bound to this run/slice/worker context.',
     ].join('\n'),
   };
-  printResult(parsed.flags, report);
 }
 
 function handleOutline(cwd: string, parsed: ParsedOperatorArgs): void {

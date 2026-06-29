@@ -743,6 +743,8 @@ export interface OperatorFlags {
   orchestrationAnalysisFile: string;
   orchestrationDrafts: string;
   scopeThrough: string;
+  orchestrationResealUnsigned: boolean;
+  orchestrationTrustsLocalState: boolean;
 }
 
 export interface ParsedOperatorArgs {
@@ -2882,6 +2884,8 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     orchestrationAnalysisFile: '',
     orchestrationDrafts: '',
     scopeThrough: '',
+    orchestrationResealUnsigned: false,
+    orchestrationTrustsLocalState: false,
   };
 
   const setPrFromShorthand = (raw: string, source: string): void => {
@@ -3319,6 +3323,16 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       flags.scopeThrough = readFlagValue('--through').trim();
       continue;
     }
+    if (flagName === '--reseal-unsigned') {
+      rejectInlineValue('--reseal-unsigned');
+      flags.orchestrationResealUnsigned = true;
+      continue;
+    }
+    if (flagName === '--i-understand-this-trusts-local-state') {
+      rejectInlineValue('--i-understand-this-trusts-local-state');
+      flags.orchestrationTrustsLocalState = true;
+      continue;
+    }
 
     if (token.startsWith('--')) {
       throw new Error(`Unknown flag "${flagName}" for pipelane run. Run "pipelane run --help" for supported commands and flags.`);
@@ -3717,19 +3731,30 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       if (subcommand !== 'goal-spec' && subcommand !== 'plan' && subcommand !== 'prepare' && subcommand !== 'dispatch' && subcommand !== 'start' && subcommand !== 'review' && subcommand !== 'scope' && subcommand !== 'outline' && subcommand !== 'finalize' && subcommand !== 'upgrade-ledger') {
         throw new Error('orchestrate requires exactly: pipelane run orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes], or pipelane run orchestrate <goal-spec|plan|analyze|prepare|dispatch|start|review|plan-review|scope|outline|finalize|upgrade-ledger> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--slices-file <path>] [--analysis-file <path>] [--run-id <id>] [--through <slice-id>] [--provider codex|claude|generic]');
       }
-      // C2: upgrade-ledger takes only --run-id, like outline/finalize.
       if (subcommand === 'scope' || subcommand === 'outline' || subcommand === 'finalize' || subcommand === 'upgrade-ledger') {
         assertOnlyFlags(parsed, subcommand === 'scope'
           ? ['orchestrationRunId', 'scopeThrough']
-          : ['orchestrationRunId']);
+          : subcommand === 'upgrade-ledger'
+            ? ['orchestrationRunId', 'orchestrationResealUnsigned', 'reason', 'orchestrationTrustsLocalState']
+            : ['orchestrationRunId']);
         if (parsed.positional.length !== 1) {
-          throw new Error(`orchestrate ${subcommand} requires exactly: pipelane run orchestrate ${subcommand} --run-id <id>${subcommand === 'scope' ? ' --through <slice-id>' : ''}`);
+          throw new Error(`orchestrate ${subcommand} requires exactly: pipelane run orchestrate ${subcommand} --run-id <id>${subcommand === 'scope' ? ' --through <slice-id>' : subcommand === 'upgrade-ledger' ? ' [--reseal-unsigned --reason <text> --i-understand-this-trusts-local-state]' : ''}`);
         }
         if (!parsed.flags.orchestrationRunId.trim()) {
           throw new Error(`orchestrate ${subcommand} requires --run-id <id>.`);
         }
         if (subcommand === 'scope' && !parsed.flags.scopeThrough.trim()) {
           throw new Error('orchestrate scope requires --through <slice-id>.');
+        }
+        if (subcommand === 'upgrade-ledger') {
+          const resealFlagCount = [
+            parsed.flags.orchestrationResealUnsigned,
+            parsed.flags.reason.trim().length > 0,
+            parsed.flags.orchestrationTrustsLocalState,
+          ].filter(Boolean).length;
+          if (resealFlagCount > 0 && resealFlagCount < 3) {
+            throw new Error('orchestrate upgrade-ledger resealing requires all of: --reseal-unsigned --reason <text> --i-understand-this-trusts-local-state.');
+          }
         }
         return;
       }
@@ -4042,6 +4067,8 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'orchestrationAnalysisFile', label: '--analysis-file', active: (flags) => flags.orchestrationAnalysisFile.trim().length > 0 },
   { key: 'orchestrationDrafts', label: '--drafts', active: (flags) => flags.orchestrationDrafts.trim().length > 0 },
   { key: 'scopeThrough', label: '--through', active: (flags) => flags.scopeThrough.trim().length > 0 },
+  { key: 'orchestrationResealUnsigned', label: '--reseal-unsigned', active: (flags) => flags.orchestrationResealUnsigned },
+  { key: 'orchestrationTrustsLocalState', label: '--i-understand-this-trusts-local-state', active: (flags) => flags.orchestrationTrustsLocalState },
 ];
 
 function assertOnlyFlags(parsed: ParsedOperatorArgs, allowed: OperatorFlagKey[]): void {

@@ -3,6 +3,8 @@ import crypto from 'node:crypto';
 export const DEPLOY_STATE_KEY_ENV = 'PIPELANE_DEPLOY_STATE_KEY';
 export const PROBE_STATE_KEY_ENV = 'PIPELANE_PROBE_STATE_KEY';
 export const REVIEW_STATE_KEY_ENV = 'PIPELANE_REVIEW_STATE_KEY';
+export const ORCHESTRATION_STATE_KEY_ENV = 'PIPELANE_ORCHESTRATION_STATE_KEY';
+export const MIN_STATE_KEY_LENGTH = 32;
 
 export function canonicalize(value: unknown): string {
   if (value === undefined) {
@@ -35,7 +37,7 @@ export function signSignedPayload<T extends { signature?: string }>(record: T, k
 }
 
 export function verifySignedPayload<T extends { signature?: string }>(record: T, key: string): boolean {
-  if (typeof record.signature !== 'string' || record.signature.length !== 64) return false;
+  if (typeof record.signature !== 'string' || record.signature.length !== 64 || !/^[a-f0-9]{64}$/i.test(record.signature)) return false;
   const expected = signSignedPayload(record, key);
   const a = Buffer.from(record.signature, 'hex');
   const b = Buffer.from(expected, 'hex');
@@ -63,4 +65,27 @@ export function resolveProbeStateKey(): string | undefined {
 
 export function resolveReviewStateKey(): string | undefined {
   return resolveStateKey(REVIEW_STATE_KEY_ENV);
+}
+
+export function resolveRequiredStateKey(name: string): string {
+  const raw = process.env[name];
+  if (raw === undefined) {
+    throw new Error(`${name} is missing; set a signing key of at least ${MIN_STATE_KEY_LENGTH} characters before mutating or reading signed orchestration ledgers.`);
+  }
+  if (raw.trim().length === 0) {
+    throw new Error(`${name} is blank; set a signing key of at least ${MIN_STATE_KEY_LENGTH} characters.`);
+  }
+  const trimmed = raw.trim();
+  if (trimmed.length < MIN_STATE_KEY_LENGTH) {
+    throw new Error(`${name} is too short; minimum accepted length is ${MIN_STATE_KEY_LENGTH} characters.`);
+  }
+  return trimmed;
+}
+
+export function resolveOrchestrationStateKey(): string {
+  return resolveRequiredStateKey(ORCHESTRATION_STATE_KEY_ENV);
+}
+
+export function stateKeyFingerprint(key: string): string {
+  return crypto.createHash('sha256').update(key).digest('hex').slice(0, 16);
 }

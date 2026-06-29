@@ -5,7 +5,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer as createNetServer } from 'node:net';
 import { createServer as createHttpServer } from 'node:http';
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,6 +28,7 @@ process.env.CLAUDE_HOME = DEFAULT_CLAUDE_HOME;
 process.env.CODEX_HOME = DEFAULT_CODEX_HOME;
 process.env.PIPELANE_HOME = DEFAULT_PIPELANE_HOME;
 const LOCAL_PIPELANE_INSTALL_SPEC = `file:${KIT_ROOT}`;
+const DEFAULT_ORCHESTRATION_STATE_KEY = 'pipelane-test-orchestration-state-key-0001';
 const GENERATED_CLAUDE_COMMANDS = [
   'clean',
   'deploy',
@@ -72,6 +73,43 @@ const HERMETIC_REVIEW_IDENTITY_ENV_KEYS = [
   'PIPELANE_REVIEW_GATE_PHASE',
 ];
 
+const HERMETIC_DESTINATION_ROUTE_ENV_KEYS = [
+  'PIPELANE_DESTINATION_INTERNAL_STEP',
+  'PIPELANE_DESTINATION_APPROVED_ROUTE_FINGERPRINT',
+  'PIPELANE_DESTINATION_ROUTE_PROD_CONFIRMED',
+  'PIPELANE_DESTINATION_APPROVED_TARGET_SHA',
+];
+
+function buildCliChildEnv(env = {}) {
+  const childEnv = { ...process.env, CODEX_HOME: DEFAULT_CODEX_HOME, PIPELANE_HOME: DEFAULT_PIPELANE_HOME, CLAUDE_HOME: DEFAULT_CLAUDE_HOME, ...env };
+  if ('PIPELANE_ORCHESTRATION_STATE_KEY' in env) {
+    if (env.PIPELANE_ORCHESTRATION_STATE_KEY === undefined) {
+      delete childEnv.PIPELANE_ORCHESTRATION_STATE_KEY;
+    }
+  } else {
+    childEnv.PIPELANE_ORCHESTRATION_STATE_KEY = DEFAULT_ORCHESTRATION_STATE_KEY;
+  }
+  // Hermeticity: a developer/CI shell may export pipelane signing keys. Scrub them
+  // unless a test explicitly passes one, so C2 signature gating and C1 exact run
+  // status assertions do not drift with the ambient environment.
+  for (const stateKey of ['PIPELANE_REVIEW_STATE_KEY', 'PIPELANE_DEPLOY_STATE_KEY', 'PIPELANE_PROBE_STATE_KEY']) {
+    if (!(stateKey in env)) delete childEnv[stateKey];
+  }
+  // AI review gates run `npm test` from a process that exports reviewer/session
+  // identity. Keep child CLI calls hermetic so tests only see the identities
+  // they intentionally pass.
+  for (const identityKey of HERMETIC_REVIEW_IDENTITY_ENV_KEYS) {
+    if (!(identityKey in env)) delete childEnv[identityKey];
+  }
+  // Destination routes execute child commands with internal routing flags. If a
+  // route child runs this test suite, nested test CLI calls must not inherit
+  // those flags unless the individual test opts into that route-internal mode.
+  for (const routeKey of HERMETIC_DESTINATION_ROUTE_ENV_KEYS) {
+    if (!(routeKey in env)) delete childEnv[routeKey];
+  }
+  return childEnv;
+}
+
 function run(command, args, cwd, env = {}) {
   return execFileSync(command, args, {
     cwd,
@@ -85,19 +123,7 @@ function runCli(args, cwd, env = {}, allowFailure = false) {
   if (!allowFailure && shouldSeedPassingReviewEvidence(args)) {
     writePassingReviewEvidence(cwd);
   }
-  const childEnv = { ...process.env, CODEX_HOME: DEFAULT_CODEX_HOME, PIPELANE_HOME: DEFAULT_PIPELANE_HOME, CLAUDE_HOME: DEFAULT_CLAUDE_HOME, ...env };
-  // Hermeticity: a developer/CI shell may export pipelane signing keys. Scrub them
-  // unless a test explicitly passes one, so C2 signature gating and C1 exact run
-  // status assertions do not drift with the ambient environment.
-  for (const stateKey of ['PIPELANE_REVIEW_STATE_KEY', 'PIPELANE_DEPLOY_STATE_KEY', 'PIPELANE_PROBE_STATE_KEY']) {
-    if (!(stateKey in env)) delete childEnv[stateKey];
-  }
-  // AI review gates run `npm test` from a process that exports reviewer/session
-  // identity. Keep child CLI calls hermetic so tests only see the identities
-  // they intentionally pass.
-  for (const identityKey of HERMETIC_REVIEW_IDENTITY_ENV_KEYS) {
-    if (!(identityKey in env)) delete childEnv[identityKey];
-  }
+  const childEnv = buildCliChildEnv(env);
   const result = spawnSync('node', [CLI_PATH, ...args], {
     cwd,
     env: childEnv,
@@ -7745,6 +7771,7 @@ test('review AI gate scrubs author session env from reviewer subprocess', () => 
     const script = [
       "if (process.env.CODEX_SESSION_ID) process.exit(3)",
       "if (!process.env.PIPELANE_REVIEW_GATE_SESSION_ID) process.exit(4)",
+      "if (process.env.PIPELANE_ORCHESTRATION_STATE_KEY) process.exit(5)",
       "console.log('PIPELANE_REVIEW_GATE_RESULT=passed')",
     ].join(';');
     const result = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
@@ -8326,7 +8353,7 @@ test('orchestration ledger treats a slice with the new empty status as valid, no
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Empty status validates', '--provider', 'generic', '--json'], repoRoot).stdout);
     const ledger = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
     ledger.slices[0].status = 'empty';
-    writeFileSync(planned.ledgerPath, JSON.stringify(ledger), 'utf8');
+    writeSignedLedger(repoRoot, planned.runId, ledger);
 
     // The dual-validator must accept `empty`: the run stays openable and is NOT
     // flagged corrupt (the regression class from the paused-status bug).
@@ -8856,7 +8883,7 @@ test('orchestrate prepare accepts legacy planned run with gate snapshot and no a
     assert.equal(legacyLedger.gateSnapshot.planReview.gates[0].id, 'legacy-plan-review');
     delete legacyLedger.planAnalysisRequired;
     delete legacyLedger.planAnalysis;
-    writeFileSync(planned.ledgerPath, JSON.stringify(legacyLedger, null, 2) + '\n', 'utf8');
+    writeSignedLedger(repoRoot, planned.runId, legacyLedger);
 
     const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
@@ -9090,7 +9117,7 @@ test('orchestrate prepare rejects stale analyzed plan source and gate snapshot',
       skill: 'plan-eng-review',
       blocking: true,
     });
-    writeFileSync(analyzed.ledgerPath, JSON.stringify(ledger, null, 2) + '\n', 'utf8');
+    writeSignedLedger(repoRoot, snapshotPlanned.runId, ledger);
     const staleGates = runCli(['run', 'orchestrate', 'prepare', '--run-id', snapshotPlanned.runId], repoRoot, {}, true);
     assert.equal(staleGates.status, 1, `${staleGates.stdout}\n${staleGates.stderr}`);
     assert.match(staleGates.stderr, /plan-review gate snapshot changed after analysis/);
@@ -9100,7 +9127,7 @@ test('orchestrate prepare rejects stale analyzed plan source and gate snapshot',
     const decompositionAnalyzed = analyzePlannedRun(repoRoot, decompositionPlanned, decompositionOutcome, {}, { passPlanReview: false });
     const decompositionLedger = JSON.parse(readFileSync(decompositionAnalyzed.ledgerPath, 'utf8'));
     decompositionLedger.slices[0].outcome = 'Changed slice outcome after analysis';
-    writeFileSync(decompositionAnalyzed.ledgerPath, JSON.stringify(decompositionLedger, null, 2) + '\n', 'utf8');
+    writeSignedLedger(repoRoot, decompositionPlanned.runId, decompositionLedger);
     const staleDecomposition = runCli(['run', 'orchestrate', 'prepare', '--run-id', decompositionPlanned.runId], repoRoot, {}, true);
     assert.equal(staleDecomposition.status, 1, `${staleDecomposition.stdout}\n${staleDecomposition.stderr}`);
     assert.match(staleDecomposition.stderr, /slice decomposition changed after analysis/);
@@ -9168,7 +9195,7 @@ test('orchestrate analysis source hash binds plan-file outcome prompt', () => {
     const ledger = JSON.parse(readFileSync(analyzed.ledgerPath, 'utf8'));
     ledger.source.prompt = 'Changed orchestration outcome';
     ledger.plan.outcome = 'Changed orchestration outcome';
-    writeFileSync(analyzed.ledgerPath, JSON.stringify(ledger, null, 2) + '\n', 'utf8');
+    writeSignedLedger(repoRoot, planned.runId, ledger);
     const stalePrompt = runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot, {}, true);
     assert.equal(stalePrompt.status, 1, `${stalePrompt.stdout}\n${stalePrompt.stderr}`);
     assert.match(stalePrompt.stderr, /source plan changed after analysis/);
@@ -9392,7 +9419,7 @@ test('orchestrate prepare rejects tampered signed plan-review evidence', () => {
       const ledger = JSON.parse(readFileSync(evidence.ledgerPath, 'utf8'));
       if (entry.mutate) entry.mutate(ledger.planAnalysis.planReview.gates[0]);
       if (entry.mutateLedger) entry.mutateLedger(ledger);
-      writeFileSync(evidence.ledgerPath, JSON.stringify(ledger, null, 2) + '\n', 'utf8');
+      writeSignedLedger(repoRoot, planned.runId, ledger);
 
       const prepared = runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot, {
         PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
@@ -10417,7 +10444,7 @@ test('orchestrate dispatch validates all slices before writing prompts', () => {
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     const ledger = JSON.parse(readFileSync(prepared.ledgerPath, 'utf8'));
     ledger.slices[1].status = 'planned';
-    writeFileSync(prepared.ledgerPath, JSON.stringify(ledger, null, 2) + '\n', 'utf8');
+    writeSignedLedger(repoRoot, planned.runId, ledger);
 
     const rejected = runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot, {}, true);
     assert.notEqual(rejected.status, 0);
@@ -10486,7 +10513,7 @@ test('orchestrate dispatch rejects ledger-provided task slugs that could escape 
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     const ledger = JSON.parse(readFileSync(prepared.ledgerPath, 'utf8'));
     ledger.slices[0].taskSlug = '../../evil';
-    writeFileSync(prepared.ledgerPath, JSON.stringify(ledger, null, 2) + '\n', 'utf8');
+    writeSignedLedger(repoRoot, planned.runId, ledger);
 
     const rejected = runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot, {}, true);
     assert.notEqual(rejected.status, 0);
@@ -10513,7 +10540,7 @@ test('orchestrate dispatch rejects ledger-assigned worktrees outside the task ro
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     const ledger = JSON.parse(readFileSync(prepared.ledgerPath, 'utf8'));
     ledger.slices[0].worktreePath = outsideDir;
-    writeFileSync(prepared.ledgerPath, JSON.stringify(ledger, null, 2) + '\n', 'utf8');
+    writeSignedLedger(repoRoot, planned.runId, ledger);
 
     const rejected = runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot, {}, true);
     assert.notEqual(rejected.status, 0);
@@ -10957,7 +10984,7 @@ test('FU2 mixed cleaned completed run (legacy-unsigned + tampered sibling) surfa
       review: { ...base.review, signature: 'd'.repeat(64) },
     };
     ledger.slices = [sliceA, sliceB];
-    writeFileSync(planned.ledgerPath, JSON.stringify(ledger, null, 2) + '\n', 'utf8');
+    writeSignedLedger(repoRoot, planned.runId, ledger);
 
     const migrated = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot, { PIPELANE_REVIEW_STATE_KEY: reviewStateKey }).stdout);
     assert.equal(migrated.data.orchestration.activeRun.id, planned.runId);
@@ -11004,7 +11031,7 @@ test('C1 orchestrate scope does not downgrade an already-completed run', () => {
   }
 });
 
-test('C2 review gates cannot read the review-state signing key (no signature forgery)', () => {
+test('C2 review gates cannot read pipelane state signing keys (no signature forgery)', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];
   const reviewStateKey = 'c2-gate-isolation-secret';
@@ -11012,11 +11039,20 @@ test('C2 review gates cannot read the review-state signing key (no signature for
     runCli(['init', '--project', 'Demo App'], repoRoot);
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    // A blocking gate that FAILS if the gate subprocess can see the signing key.
+    // A blocking gate that FAILS if the gate subprocess can see a state key.
     // A gate that inherits the key could HMAC a forged `passed` verdict; with the
     // key scrubbed from gate envs the gate exits 0 and the run completes. The
     // orchestrator PARENT keeps the key, so slice.review is still signed.
-    config.reviewGates = { planReview: { gates: [] }, gates: [{ id: 'no-key-gate', phase: 'static', type: 'command', command: 'node -e "process.exit(process.env.PIPELANE_REVIEW_STATE_KEY ? 1 : 0)"', blocking: true }] };
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'no-key-gate',
+        phase: 'static',
+        type: 'command',
+        command: 'node -e "process.exit((process.env.PIPELANE_REVIEW_STATE_KEY || process.env.PIPELANE_ORCHESTRATION_STATE_KEY) ? 1 : 0)"',
+        blocking: true,
+      }],
+    };
     writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     commitAll(repoRoot, 'Adopt key-isolation gate');
     mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
@@ -13064,7 +13100,7 @@ test('orchestrate start --force retries a stale running worker record', () => {
       signal: null,
       error: null,
     };
-    writeFileSync(dispatched.ledgerPath, `${JSON.stringify(staleLedger, null, 2)}\n`, 'utf8');
+    writeSignedLedger(repoRoot, planned.runId, staleLedger);
 
     const noForceRetry = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
@@ -13128,7 +13164,7 @@ test('orchestrate start --force terminates a live running worker before retry', 
       signal: null,
       error: null,
     };
-    writeFileSync(dispatched.ledgerPath, `${JSON.stringify(staleLedger, null, 2)}\n`, 'utf8');
+    writeSignedLedger(repoRoot, planned.runId, staleLedger);
 
     const forcedRetry = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--force', '--json'], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
@@ -13181,7 +13217,7 @@ test('orchestrate start re-evaluates pending slices when ledger order is not dep
     const dispatched = JSON.parse(runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot).stdout);
     const reorderedLedger = JSON.parse(readFileSync(dispatched.ledgerPath, 'utf8'));
     reorderedLedger.slices = [reorderedLedger.slices[1], reorderedLedger.slices[0]];
-    writeFileSync(dispatched.ledgerPath, `${JSON.stringify(reorderedLedger, null, 2)}\n`, 'utf8');
+    writeSignedLedger(repoRoot, planned.runId, reorderedLedger);
 
     const started = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
@@ -13328,7 +13364,7 @@ test('orchestrate prepare rejects ledger-assigned worktrees outside the task roo
     ledger.slices[0].taskSlug = 'unsafe-ledger-assignment';
     ledger.slices[0].branchName = 'codex/unsafe-ledger-assignment';
     ledger.slices[0].worktreePath = outsideDir;
-    writeFileSync(planned.ledgerPath, JSON.stringify(ledger, null, 2) + '\n', 'utf8');
+    writeSignedLedger(repoRoot, planned.runId, ledger);
 
     const rejected = runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot, {}, true);
     assert.notEqual(rejected.status, 0);
@@ -13350,7 +13386,7 @@ test('orchestrate prepare rejects ledger-provided task slugs that could escape s
     analyzePlannedRunForPrepare(repoRoot, planned);
     const ledger = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
     ledger.slices[0].taskSlug = '../../evil';
-    writeFileSync(planned.ledgerPath, JSON.stringify(ledger, null, 2) + '\n', 'utf8');
+    writeSignedLedger(repoRoot, planned.runId, ledger);
 
     const rejected = runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot, {}, true);
     assert.notEqual(rejected.status, 0);
@@ -14486,6 +14522,50 @@ test('review runner fails timed out command gates', () => {
     assert.equal(report.status, 'failed');
     assert.equal(slowGate.status, 'failed');
     assert.match(slowGate.summary, /timed out/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review command gates do not inherit pipelane state signing keys', () => {
+  const repoRoot = createRepo();
+  try {
+    const forbiddenKeys = [
+      'PIPELANE_REVIEW_STATE_KEY',
+      'PIPELANE_ORCHESTRATION_STATE_KEY',
+      'PIPELANE_DEPLOY_STATE_KEY',
+      'PIPELANE_PROBE_STATE_KEY',
+    ];
+    const command = `${process.execPath} -e ${JSON.stringify(`for (const key of ${JSON.stringify(forbiddenKeys)}) { if (process.env[key]) process.exit(7); }`)}`;
+    writeFileSync(
+      path.join(repoRoot, '.pipelane.json'),
+      `${JSON.stringify({
+        displayName: 'Demo App',
+        reviewGates: {
+          planReview: { gates: [] },
+          gates: [{
+            id: 'no-state-keys',
+            phase: 'static',
+            type: 'command',
+            command,
+          }],
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+    execFileSync('git', ['add', '.pipelane.json'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Configure state key isolation gate'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const report = JSON.parse(runCli(['run', 'review', '--phase', 'static', '--json'], repoRoot, {
+      PIPELANE_REVIEW_STATE_KEY: 'review-state-key-for-gate-isolation',
+      PIPELANE_ORCHESTRATION_STATE_KEY: DEFAULT_ORCHESTRATION_STATE_KEY,
+      PIPELANE_DEPLOY_STATE_KEY: 'deploy-state-key-for-gate-isolation',
+      PIPELANE_PROBE_STATE_KEY: 'probe-state-key-for-gate-isolation',
+    }).stdout);
+    const gate = report.gates.find((entry) => entry.gateId === 'no-state-keys');
+
+    assert.equal(report.status, 'passed');
+    assert.equal(gate.status, 'passed');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -15786,6 +15866,72 @@ function orchestrationLedgerPath(repoRoot, runId) {
   return path.join(orchestrationRunsRoot(repoRoot), runId, 'orchestration.json');
 }
 
+function orchestrationIntegrityHeadPath(repoRoot, runId) {
+  return path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'orchestrate', 'integrity', `${runId}.json`);
+}
+
+function orchestrationKeyFingerprintForTest(key) {
+  return createHash('sha256').update(key).digest('hex').slice(0, 16);
+}
+
+function signPayloadForTest(payload, key) {
+  const { signature: _signature, ...unsigned } = payload;
+  return createHmac('sha256', key).update(canonicalizeTestValue(unsigned)).digest('hex');
+}
+
+function signIntegrityHeadForTest(head, key) {
+  return signPayloadForTest(head, key);
+}
+
+function assertSignedLedgerValid(repoRoot, runId, key = DEFAULT_ORCHESTRATION_STATE_KEY) {
+  const ledger = JSON.parse(readFileSync(orchestrationLedgerPath(repoRoot, runId), 'utf8'));
+  assert.match(ledger.signature, /^[a-f0-9]{64}$/);
+  assert.equal(ledger.integrity.version, 1);
+  assert.equal(ledger.integrity.runId, runId);
+  assert.equal(ledger.integrity.keyFingerprint, orchestrationKeyFingerprintForTest(key));
+  assert.equal(ledger.signature, signPayloadForTest(ledger, key));
+
+  const head = JSON.parse(readFileSync(orchestrationIntegrityHeadPath(repoRoot, runId), 'utf8'));
+  assert.equal(head.version, 1);
+  assert.equal(head.runId, runId);
+  assert.equal(head.mutationIndex, ledger.integrity.mutationIndex);
+  assert.equal(head.ledgerSignature, ledger.signature);
+  assert.equal(head.keyFingerprint, ledger.integrity.keyFingerprint);
+  assert.equal(head.signature, signIntegrityHeadForTest(head, key));
+  return { ledger, head };
+}
+
+function writeSignedIntegrityHead(repoRoot, runId, ledger, key = DEFAULT_ORCHESTRATION_STATE_KEY) {
+  const headPath = orchestrationIntegrityHeadPath(repoRoot, runId);
+  mkdirSync(path.dirname(headPath), { recursive: true });
+  const head = {
+    version: 1,
+    runId,
+    mutationIndex: ledger.integrity.mutationIndex,
+    ledgerSignature: ledger.signature,
+    keyFingerprint: ledger.integrity.keyFingerprint,
+  };
+  head.signature = signIntegrityHeadForTest(head, key);
+  writeFileSync(headPath, `${JSON.stringify(head, null, 2)}\n`, 'utf8');
+  return head;
+}
+
+function writeSignedLedger(repoRoot, runId, ledger, key = DEFAULT_ORCHESTRATION_STATE_KEY) {
+  ledger.integrity ??= {
+    version: 1,
+    runId,
+    mutationIndex: 1,
+    keyFingerprint: orchestrationKeyFingerprintForTest(key),
+  };
+  ledger.integrity.runId = runId;
+  ledger.integrity.keyFingerprint = orchestrationKeyFingerprintForTest(key);
+  delete ledger.signature;
+  ledger.signature = signPayloadForTest(ledger, key);
+  writeFileSync(orchestrationLedgerPath(repoRoot, runId), `${JSON.stringify(ledger, null, 2)}\n`, 'utf8');
+  writeSignedIntegrityHead(repoRoot, runId, ledger, key);
+  return ledger;
+}
+
 function writeCorruptOrchestrationLedger(repoRoot, runId, options = {}) {
   const ledgerPath = orchestrationLedgerPath(repoRoot, runId);
   mkdirSync(path.dirname(ledgerPath), { recursive: true });
@@ -15802,6 +15948,407 @@ function writeInvalidOrchestrationRunDirectory(repoRoot, name = 'renamed-corrupt
   writeFileSync(ledgerPath, '{ nope', 'utf8');
   return { directoryPath, ledgerPath };
 }
+
+test('orchestration ledger signing has a fixed HMAC answer for the persisted envelope', () => {
+  const key = '0123456789abcdef0123456789abcdef';
+  const runId = 'orchestrate-20260628000000-deadbeef';
+  const envelope = {
+    id: runId,
+    status: 'planned',
+    createdAt: '2026-06-28T00:00:00.000Z',
+    updatedAt: '2026-06-28T00:00:00.000Z',
+    branchName: 'main',
+    sha: 'abc123',
+    source: { planPath: null, prompt: 'ship the thing', textSha256: sha256Text('ship the thing') },
+    plan: { title: 'ship the thing', outcome: 'ship the thing', sliceCount: 1, dependencyPolicy: 'sequential' },
+    configSnapshot: { maxConcurrentSlices: null, goalMode: null, hardStops: null },
+    gateSnapshot: { planReview: { gates: [] }, gates: [] },
+    slices: [{
+      id: 'ship-the-thing',
+      index: 1,
+      status: 'planned',
+      outcome: 'ship the thing',
+      dependsOn: [],
+      requestedFiles: [],
+      forbiddenFiles: [],
+      taskSlug: null,
+      worktreePath: null,
+      branchName: null,
+      provider: 'generic',
+      goalSpec: {
+        sliceId: 'ship-the-thing',
+        outcome: 'ship the thing',
+        finishLine: ['done'],
+        proveIt: ['tests'],
+        showMe: ['summary'],
+        blockedPolicy: ['stop'],
+        budget: { maxTurns: null, maxMinutes: null },
+      },
+      requiresConfirmation: false,
+      critique: [],
+    }],
+    integrity: { version: 1, runId, mutationIndex: 1, keyFingerprint: orchestrationKeyFingerprintForTest(key) },
+    schemaVersion: 2,
+  };
+
+  assert.equal(orchestrationKeyFingerprintForTest(key), '3eb1bd439947eb76');
+  assert.equal(signPayloadForTest(envelope, key), '67798bece1fe4d6f05b4b9f71d2566eff4da60b804c2c2c0a7c7ca6ca3b947ba');
+});
+
+test('orchestration state key validation distinguishes missing, blank, short, valid, and wrong key', () => {
+  const repoRoot = createRepo();
+  try {
+    const missing = runCli(['run', 'orchestrate', 'plan', '--outcome', 'needs key'], repoRoot, {
+      PIPELANE_ORCHESTRATION_STATE_KEY: undefined,
+    }, true);
+    assert.notEqual(missing.status, 0);
+    assert.match(missing.stderr, /PIPELANE_ORCHESTRATION_STATE_KEY is missing/);
+
+    const blank = runCli(['run', 'orchestrate', 'plan', '--outcome', 'blank key'], repoRoot, {
+      PIPELANE_ORCHESTRATION_STATE_KEY: '   ',
+    }, true);
+    assert.notEqual(blank.status, 0);
+    assert.match(blank.stderr, /PIPELANE_ORCHESTRATION_STATE_KEY is blank/);
+
+    const short = runCli(['run', 'orchestrate', 'plan', '--outcome', 'short key'], repoRoot, {
+      PIPELANE_ORCHESTRATION_STATE_KEY: 'too-short',
+    }, true);
+    assert.notEqual(short.status, 0);
+    assert.match(short.stderr, /PIPELANE_ORCHESTRATION_STATE_KEY is too short/);
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'valid key', '--json'], repoRoot).stdout);
+    assertSignedLedgerValid(repoRoot, planned.runId);
+
+    const wrong = runCli(['run', 'orchestrate', 'outline', '--run-id', planned.runId], repoRoot, {
+      PIPELANE_ORCHESTRATION_STATE_KEY: 'wrong-orchestration-state-key-000000',
+    }, true);
+    assert.notEqual(wrong.status, 0);
+    assert.match(wrong.stderr, /wrong PIPELANE_ORCHESTRATION_STATE_KEY/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestration ledger rejects malformed signatures with specific diagnostics', () => {
+  const repoRoot = createRepo();
+  try {
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'signature diagnostics', '--json'], repoRoot).stdout);
+    const ledgerPath = orchestrationLedgerPath(repoRoot, planned.runId);
+    const original = readFileSync(ledgerPath, 'utf8');
+    const cases = [
+      ['missing', (ledger) => { delete ledger.signature; }, /ledger signature is missing/],
+      ['empty', (ledger) => { ledger.signature = ''; }, /ledger signature is empty/],
+      ['null', (ledger) => { ledger.signature = null; }, /ledger signature is null/],
+      ['wrong length', (ledger) => { ledger.signature = 'abc123'; }, /ledger signature has invalid length/],
+      ['non hex', (ledger) => { ledger.signature = `${'z'.repeat(64)}`; }, /ledger signature is not hex encoded/],
+    ];
+
+    for (const [name, mutate, expected] of cases) {
+      const ledger = JSON.parse(original);
+      mutate(ledger);
+      writeFileSync(ledgerPath, `${JSON.stringify(ledger, null, 2)}\n`, 'utf8');
+      const result = runCli(['run', 'orchestrate', 'outline', '--run-id', planned.runId], repoRoot, {}, true);
+      assert.notEqual(result.status, 0, name);
+      assert.match(result.stderr, expected, name);
+      writeFileSync(ledgerPath, original, 'utf8');
+    }
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestration ledger signature covers schemaVersion and run fields', () => {
+  const repoRoot = createRepo();
+  try {
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'tamper fields', '--json'], repoRoot).stdout);
+    const analysisFile = writeOrchestrateAnalysis(repoRoot, 'tamper fields', {
+      sourceSha256: analysisSourceSha256ForPlannedRun(repoRoot, planned),
+    });
+    runCli(['run', 'orchestrate', 'analyze', '--run-id', planned.runId, '--analysis-file', analysisFile], repoRoot);
+    const ledgerPath = orchestrationLedgerPath(repoRoot, planned.runId);
+    const original = readFileSync(ledgerPath, 'utf8');
+    const cases = [
+      ['schemaVersion', (ledger) => { ledger.schemaVersion = 999; }],
+      ['planAnalysisRequired', (ledger) => { ledger.planAnalysisRequired = !ledger.planAnalysisRequired; }],
+      ['planAnalysis', (ledger) => { ledger.planAnalysis.strengths.push('tampered'); }],
+      ['gateSnapshot', (ledger) => { ledger.gateSnapshot.gates = [{ id: 'tampered', phase: 'static', type: 'command', command: 'true' }]; }],
+      ['slice status', (ledger) => { ledger.slices[0].status = 'completed'; }],
+      ['integrity', (ledger) => { ledger.integrity.version = 2; }],
+      ['runId', (ledger) => { ledger.id = 'orchestrate-20260628000100-badbad00'; }],
+      ['mutationIndex', (ledger) => { ledger.integrity.mutationIndex += 1; }],
+    ];
+
+    for (const [name, mutate] of cases) {
+      const ledger = JSON.parse(original);
+      mutate(ledger);
+      writeFileSync(ledgerPath, `${JSON.stringify(ledger, null, 2)}\n`, 'utf8');
+      const result = runCli(['run', 'orchestrate', 'outline', '--run-id', planned.runId], repoRoot, {}, true);
+      assert.notEqual(result.status, 0, name);
+      assert.match(result.stderr, /signature verification failed|run id mismatch|integrity metadata/, name);
+      writeFileSync(ledgerPath, original, 'utf8');
+    }
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestration ledger rejects transplant and ledger-only rollback via integrity head', () => {
+  const repoRoot = createRepo();
+  try {
+    const first = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'first run', '--json'], repoRoot).stdout);
+    const second = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'second run', '--json'], repoRoot).stdout);
+    const firstLedger = readFileSync(orchestrationLedgerPath(repoRoot, first.runId), 'utf8');
+    const secondLedger = readFileSync(orchestrationLedgerPath(repoRoot, second.runId), 'utf8');
+    writeFileSync(orchestrationLedgerPath(repoRoot, second.runId), firstLedger, 'utf8');
+    const transplanted = runCli(['run', 'orchestrate', 'outline', '--run-id', second.runId], repoRoot, {}, true);
+    assert.notEqual(transplanted.status, 0);
+    assert.match(transplanted.stderr, /run id mismatch/);
+    writeFileSync(orchestrationLedgerPath(repoRoot, second.runId), secondLedger, 'utf8');
+
+    const rollbackRun = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'rollback run', '--json'], repoRoot).stdout);
+    const oldLedger = readFileSync(orchestrationLedgerPath(repoRoot, rollbackRun.runId), 'utf8');
+    runCli(['run', 'orchestrate', 'scope', '--run-id', rollbackRun.runId, '--through', rollbackRun.run.slices[0].id], repoRoot);
+    writeFileSync(orchestrationLedgerPath(repoRoot, rollbackRun.runId), oldLedger, 'utf8');
+    const rolledBack = runCli(['run', 'orchestrate', 'outline', '--run-id', rollbackRun.runId], repoRoot, {}, true);
+    assert.notEqual(rolledBack.status, 0);
+    assert.match(rolledBack.stderr, /rollback detected/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestration legacy unsigned ledger blocks by default and reseals only with explicit trust flags', () => {
+  const repoRoot = createRepo();
+  try {
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'legacy reseal', '--json'], repoRoot).stdout);
+    const ledgerPath = orchestrationLedgerPath(repoRoot, planned.runId);
+    const legacy = JSON.parse(readFileSync(ledgerPath, 'utf8'));
+    delete legacy.signature;
+    delete legacy.integrity;
+    writeFileSync(ledgerPath, `${JSON.stringify(legacy, null, 2)}\n`, 'utf8');
+    rmSync(orchestrationIntegrityHeadPath(repoRoot, planned.runId), { force: true });
+
+    const blocked = runCli(['run', 'orchestrate', 'outline', '--run-id', planned.runId], repoRoot, {}, true);
+    assert.notEqual(blocked.status, 0);
+    assert.match(blocked.stderr, /legacy unsigned orchestration ledger is untrusted by default/);
+
+    const partial = runCli(['run', 'orchestrate', 'upgrade-ledger', '--run-id', planned.runId, '--reseal-unsigned'], repoRoot, {}, true);
+    assert.notEqual(partial.status, 0);
+    assert.match(partial.stderr, /requires all of: --reseal-unsigned --reason <text> --i-understand-this-trusts-local-state/);
+
+    const resealed = JSON.parse(runCli([
+      'run', 'orchestrate', 'upgrade-ledger',
+      '--run-id', planned.runId,
+      '--reseal-unsigned',
+      '--reason', 'imported from pre-signing local test state',
+      '--i-understand-this-trusts-local-state',
+      '--json',
+    ], repoRoot).stdout);
+    assert.equal(resealed.resealedUnsigned, true);
+    assert.equal(resealed.run.legacyReseal.reason, 'imported from pre-signing local test state');
+    assertSignedLedgerValid(repoRoot, planned.runId);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestration mutating command matrix verifies and leaves signed ledgers', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [{ id: 'plan-eng-review', phase: 'plan', type: 'skill', blocking: true, skill: 'plan-eng-review' }] },
+      gates: [{ id: 'static-pass', phase: 'static', type: 'command', blocking: true, command: 'node -e "process.exit(0)"' }],
+    };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+    commitAll(repoRoot, 'Configure orchestration gates');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'matrix run', '--provider', 'generic', '--json'], repoRoot).stdout);
+    assertSignedLedgerValid(repoRoot, planned.runId);
+    const analysisFile = writeOrchestrateAnalysis(repoRoot, 'matrix run', {
+      sourceSha256: analysisSourceSha256ForPlannedRun(repoRoot, planned),
+      analyzer: { provider: 'codex', sessionId: 'matrix-analyzer', source: 'test' },
+      identityReliable: true,
+    });
+    runCli(['run', 'orchestrate', 'analyze', '--run-id', planned.runId, '--analysis-file', analysisFile], repoRoot);
+    assertSignedLedgerValid(repoRoot, planned.runId);
+    runCli([
+      'run', 'orchestrate', 'plan-review', 'pass',
+      '--run-id', planned.runId,
+      '--gate', 'plan-eng-review',
+      '--message', 'matrix plan approved',
+    ], repoRoot, { CODEX_SESSION_ID: 'matrix-attester' });
+    assertSignedLedgerValid(repoRoot, planned.runId);
+    runCli(['run', 'orchestrate', 'scope', '--run-id', planned.runId, '--through', planned.run.slices[0].id], repoRoot);
+    assertSignedLedgerValid(repoRoot, planned.runId);
+    const prepared = JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    createdWorktrees.push(...prepared.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    assertSignedLedgerValid(repoRoot, planned.runId);
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    assertSignedLedgerValid(repoRoot, planned.runId);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(),
+    });
+    assertSignedLedgerValid(repoRoot, planned.runId);
+    runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId], repoRoot, {
+      PIPELANE_REVIEW_STATE_KEY: 'review-state-key-for-matrix',
+    });
+    assertSignedLedgerValid(repoRoot, planned.runId);
+    runCli(['run', 'orchestrate', 'finalize', '--run-id', planned.runId], repoRoot, {
+      PIPELANE_REVIEW_STATE_KEY: 'review-state-key-for-matrix',
+    });
+    assertSignedLedgerValid(repoRoot, planned.runId);
+    runCli(['run', 'orchestrate', 'upgrade-ledger', '--run-id', planned.runId], repoRoot, {
+      PIPELANE_REVIEW_STATE_KEY: 'review-state-key-for-matrix',
+    });
+    assertSignedLedgerValid(repoRoot, planned.runId);
+
+    const bypass = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'matrix bypass', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const bypassAnalysis = writeOrchestrateAnalysis(repoRoot, 'matrix bypass', {
+      sourceSha256: analysisSourceSha256ForPlannedRun(repoRoot, bypass),
+      analyzer: { provider: 'codex', sessionId: 'bypass-analyzer', source: 'test' },
+      identityReliable: true,
+    });
+    runCli(['run', 'orchestrate', 'analyze', '--run-id', bypass.runId, '--analysis-file', bypassAnalysis], repoRoot);
+    runCli([
+      'run', 'orchestrate', 'plan-review', 'bypass',
+      '--run-id', bypass.runId,
+      '--gate', 'plan-eng-review',
+      '--reason', 'manual approval recorded for test',
+    ], repoRoot, { CODEX_SESSION_ID: 'bypass-attester' });
+    assertSignedLedgerValid(repoRoot, bypass.runId);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestration workers never receive orchestration key, even when allowlisted', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const key = DEFAULT_ORCHESTRATION_STATE_KEY;
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const runAndCheck = (outcome, extraEnv = {}) => {
+      const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', outcome, '--provider', 'generic', '--json'], repoRoot).stdout);
+      const prepared = preparePlannedRun(repoRoot, planned);
+      createdWorktrees.push(...prepared.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+      runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+      const workerCommand = [
+        'node -e "',
+        "const fs=require('fs');",
+        "fs.writeFileSync('worker-env-key.txt', process.env.PIPELANE_ORCHESTRATION_STATE_KEY || 'missing');",
+        "fs.writeFileSync('pipelane-slice-change.txt', 'change');",
+        '"',
+      ].join('');
+      const startResult = runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
+        PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+        ...extraEnv,
+      });
+      const started = JSON.parse(startResult.stdout);
+      const worktreePath = started.run.slices[0].worktreePath;
+      assert.equal(readFileSync(path.join(worktreePath, 'worker-env-key.txt'), 'utf8'), 'missing');
+      assert.doesNotMatch(startResult.stdout, new RegExp(key));
+      assert.doesNotMatch(startResult.stderr, new RegExp(key));
+      assert.doesNotMatch(readFileSync(orchestrationLedgerPath(repoRoot, planned.runId), 'utf8'), new RegExp(key));
+      assertSignedLedgerValid(repoRoot, planned.runId);
+    };
+
+    runAndCheck('worker key stripped normally');
+    runAndCheck('worker key stripped from allowlist', {
+      PIPELANE_ORCHESTRATE_WORKER_ENV_ALLOW: 'PIPELANE_ORCHESTRATION_STATE_KEY',
+    });
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestration interrupted integrity-head write reports clear diagnostic', () => {
+  const repoRoot = createRepo();
+  try {
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'interrupted head', '--json'], repoRoot).stdout);
+    const headPath = orchestrationIntegrityHeadPath(repoRoot, planned.runId);
+    rmSync(headPath, { force: true });
+    writeFileSync(path.join(path.dirname(headPath), `.${path.basename(headPath)}.tmp-test`), '{"partial":true}', 'utf8');
+    const result = runCli(['run', 'orchestrate', 'outline', '--run-id', planned.runId], repoRoot, {}, true);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /interrupted orchestration integrity head save detected/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestration concurrent mutations serialize under the run lock without losing updates', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  let slicesDir;
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const planned = planPr1ThreeSliceRun(repoRoot);
+    slicesDir = planned.slicesDir;
+    runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+
+    const slowWorker = 'node -e "setTimeout(()=>{require(\\"fs\\").writeFileSync(\\"pipelane-slice-change.txt\\", \\"change\\")}, 1000)"';
+    const childEnv = {
+      ...process.env,
+      CODEX_HOME: DEFAULT_CODEX_HOME,
+      PIPELANE_HOME: DEFAULT_PIPELANE_HOME,
+      PIPELANE_ORCHESTRATION_STATE_KEY: DEFAULT_ORCHESTRATION_STATE_KEY,
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: slowWorker,
+    };
+    const start = spawn('node', [CLI_PATH, 'run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], {
+      cwd: repoRoot,
+      env: childEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let startStdout = '';
+    let startStderr = '';
+    start.stdout.on('data', (chunk) => { startStdout += chunk.toString(); });
+    start.stderr.on('data', (chunk) => { startStderr += chunk.toString(); });
+    const startExit = once(start, 'exit');
+
+    const lockPath = path.join(path.dirname(orchestrationLedgerPath(repoRoot, planned.runId)), 'mutation.lock');
+    const ownerPath = path.join(lockPath, 'owner.json');
+    const deadline = Date.now() + 5000;
+    while ((!existsSync(lockPath) || !existsSync(ownerPath)) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(existsSync(lockPath), true, 'start command should hold the mutation lock before scope starts');
+    assert.equal(existsSync(ownerPath), true, 'start command should publish mutation lock owner metadata');
+
+    const staleLockTime = new Date(Date.now() - 11 * 60 * 1000);
+    utimesSync(lockPath, staleLockTime, staleLockTime);
+    const scopeStartedAt = Date.now();
+    const scoped = runCli(['run', 'orchestrate', 'scope', '--run-id', planned.runId, '--through', 'three', '--json'], repoRoot);
+    assert.ok(
+      Date.now() - scopeStartedAt >= 800,
+      'scope should wait for a live stale-looking mutation lock instead of deleting it',
+    );
+    const [exitCode] = await startExit;
+    assert.equal(exitCode, 0, startStderr);
+    const startReport = JSON.parse(startStdout);
+    createdWorktrees.push(...startReport.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    assert.equal(scoped.status, 0);
+
+    const { ledger } = assertSignedLedgerValid(repoRoot, planned.runId);
+    assert.ok(ledger.integrity.mutationIndex >= 6);
+    assert.ok(ledger.slices.every((slice) => slice.worker?.status === 'succeeded'));
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    if (slicesDir) rmSync(slicesDir, { recursive: true, force: true });
+  }
+});
 
 function resolveSharedSmokeStateRoot(repoRoot) {
   return path.join(path.dirname(resolveCommonDir(repoRoot)), '.pipelane', 'state', 'smoke');
@@ -22564,7 +23111,7 @@ test('dashboard branch ledger keeps its headers sticky while rows scroll', () =>
 async function runCliAsync(args, cwd, env = {}) {
   const child = spawn('node', [CLI_PATH, ...args], {
     cwd,
-    env: { ...process.env, CODEX_HOME: DEFAULT_CODEX_HOME, PIPELANE_HOME: DEFAULT_PIPELANE_HOME, CLAUDE_HOME: DEFAULT_CLAUDE_HOME, ...env },
+    env: buildCliChildEnv(env),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';
