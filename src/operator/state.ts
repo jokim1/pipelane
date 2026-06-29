@@ -161,6 +161,20 @@ export interface OrchestrateConfig {
   };
 }
 
+export interface RouteSafetyConfig {
+  defaultFixReviewLoops?: number;
+  defaultMinutes?: number;
+  defaultAiReviewRuns?: number;
+  stopOnMajorFindings?: boolean;
+}
+
+export const DEFAULT_ROUTE_SAFETY: Required<RouteSafetyConfig> = {
+  defaultFixReviewLoops: 1,
+  defaultMinutes: 90,
+  defaultAiReviewRuns: 1,
+  stopOnMajorFindings: true,
+};
+
 export interface WorkflowConfig {
   version: number;
   projectKey: string;
@@ -196,6 +210,7 @@ export interface WorkflowConfig {
   // land in the "other" bucket with a hint to configure the map.
   surfacePathMap?: Record<string, string[]>;
   reviewGates?: ReviewGatesConfig;
+  routeSafety: RouteSafetyConfig;
   orchestrate?: OrchestrateConfig;
   smoke?: SmokeConfig;
 }
@@ -441,6 +456,49 @@ export interface ReviewRunRecord {
 
 export interface ReviewState {
   records: ReviewRunRecord[];
+}
+
+export type RouteSafetyResumeKind = 'one-more-loop' | 'more-loops-and-minutes' | 'until-review-passes' | 'accept-findings';
+
+export interface RouteSafetyResumeRecord {
+  id: string;
+  kind: RouteSafetyResumeKind;
+  recordedAt: string;
+  source: 'resume' | 'tty';
+  oneMoreLoop?: boolean;
+  moreLoops?: number;
+  moreMinutes?: number;
+  maxMoreLoops?: number;
+  maxMoreMinutes?: number;
+  acceptedFindings?: boolean;
+  confirmation?: string;
+}
+
+export interface RouteSafetyRecord {
+  routeFingerprintDigest: string;
+  routeFingerprint: string;
+  targetCommand: string;
+  taskSlug: string;
+  branchName: string;
+  headSha: string;
+  firstStartedAt: string;
+  updatedAt: string;
+  fixReviewLoops: number;
+  aiReviewRuns: number;
+  countedReviewRunIds: string[];
+  acceptedFindingsAt?: string;
+  acceptedFindingsSource?: string;
+  acceptedReviewRunId?: string;
+  lastReviewRunId?: string;
+  lastReviewStatus?: ReviewRunStatus;
+  pausedAt?: string;
+  pauseReason?: string;
+  resumes?: RouteSafetyResumeRecord[];
+}
+
+export interface RouteSafetyState {
+  routes: Record<string, RouteSafetyRecord>;
+  latestPausedRouteFingerprintDigest?: string;
 }
 
 export type DeployStatus = 'requested' | 'succeeded' | 'failed' | 'unknown';
@@ -745,6 +803,13 @@ export interface OperatorFlags {
   scopeThrough: string;
   orchestrationResealUnsigned: boolean;
   orchestrationTrustsLocalState: boolean;
+  oneMoreLoop: boolean;
+  moreLoops: string;
+  moreMinutes: string;
+  untilReviewPasses: boolean;
+  maxMoreLoops: string;
+  maxMoreMinutes: string;
+  acceptFindings: boolean;
 }
 
 export interface ParsedOperatorArgs {
@@ -771,6 +836,7 @@ const DEPLOY_STATE_FILENAME = 'deploy-state.json';
 const ACTION_STATE_FILENAME = 'action-state.json';
 const REVIEW_STATE_FILENAME = 'review-state.json';
 const REVIEW_STATE_LOCK_FILENAME = 'review-state.lock';
+const ROUTE_SAFETY_STATE_FILENAME = 'route-safety-state.json';
 const REVIEW_STATE_MAX_RECORDS = 20;
 const ACTION_STATE_MAX_DECISIONS = 100;
 const REVIEW_STATE_LOCK_STALE_MS = 2 * 60 * 1000;
@@ -822,6 +888,7 @@ export const STATE_SCHEMA_VERSIONS = {
   prState: 1,
   actionState: 1,
   reviewState: 1,
+  routeSafetyState: 1,
   orchestrationRun: 2,
   orchestrationObservations: 1,
   deployConfig: 1,
@@ -843,6 +910,7 @@ export const STATE_MIGRATIONS: Record<StateKind, Record<number, (raw: Record<str
   prState: {},
   actionState: {},
   reviewState: {},
+  routeSafetyState: {},
   orchestrationRun: {
     // v1 -> v2 (G1): providerPrompt/confirmationPrompt are no longer persisted
     // on the slice record. The worker prompt is derived from the resolved
@@ -934,6 +1002,7 @@ export function defaultWorkflowConfig(
       requireStagingPromotion: true,
     },
     reviewGates: defaultReviewGatesConfig({ repoRoot: options.repoRoot }),
+    routeSafety: { ...DEFAULT_ROUTE_SAFETY },
     smoke: undefined,
   };
 }
@@ -1188,6 +1257,7 @@ function mergeWorkflowLayers(
     next.aliases = { ...(current.aliases ?? {} as Record<WorkflowCommand, string>), ...(overlay.aliases ?? {}) } as Record<WorkflowCommand, string>;
     if (overlay.syncDocs) next.syncDocs = { ...current.syncDocs, ...overlay.syncDocs };
     if (overlay.checks) next.checks = { ...current.checks, ...overlay.checks };
+    if (overlay.routeSafety) next.routeSafety = { ...current.routeSafety, ...overlay.routeSafety };
     if (overlay.smoke) next.smoke = { ...current.smoke, ...overlay.smoke };
     if (overlay.surfacePathMap) next.surfacePathMap = { ...current.surfacePathMap, ...overlay.surfacePathMap };
     if (isRecord(overlay.orchestrate)) {
@@ -1287,6 +1357,7 @@ export function normalizeWorkflowConfig(
     syncDocs: normalizeSyncDocsConfig(raw.syncDocs),
     surfacePathMap: normalizeSurfacePathMap(raw.surfacePathMap),
     reviewGates: normalizeReviewGatesConfig(raw.reviewGates, { repoRoot: options.repoRoot }),
+    routeSafety: normalizeRouteSafetyConfig(raw.routeSafety),
     orchestrate: normalizeOrchestrateConfig(raw.orchestrate),
     smoke: normalizeSmokeConfig(raw.smoke),
   };
@@ -1327,6 +1398,18 @@ function normalizeOrchestrateConfig(raw: OrchestrateConfig | undefined): Orchest
 
 function positiveConfigInteger(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+export function normalizeRouteSafetyConfig(raw: RouteSafetyConfig | undefined): Required<RouteSafetyConfig> {
+  if (!isRecord(raw)) return { ...DEFAULT_ROUTE_SAFETY };
+  return {
+    defaultFixReviewLoops: positiveConfigInteger(raw.defaultFixReviewLoops) ?? DEFAULT_ROUTE_SAFETY.defaultFixReviewLoops,
+    defaultMinutes: positiveConfigInteger(raw.defaultMinutes) ?? DEFAULT_ROUTE_SAFETY.defaultMinutes,
+    defaultAiReviewRuns: positiveConfigInteger(raw.defaultAiReviewRuns) ?? DEFAULT_ROUTE_SAFETY.defaultAiReviewRuns,
+    stopOnMajorFindings: typeof raw.stopOnMajorFindings === 'boolean'
+      ? raw.stopOnMajorFindings
+      : DEFAULT_ROUTE_SAFETY.stopOnMajorFindings,
+  };
 }
 
 export function normalizeReviewGatesConfig(
@@ -1704,6 +1787,10 @@ export function actionStatePath(commonDir: string, config: WorkflowConfig): stri
 
 export function reviewStatePath(commonDir: string, config: WorkflowConfig): string {
   return path.join(resolveStateDir(commonDir, config), REVIEW_STATE_FILENAME);
+}
+
+export function routeSafetyStatePath(commonDir: string, config: WorkflowConfig): string {
+  return path.join(resolveStateDir(commonDir, config), ROUTE_SAFETY_STATE_FILENAME);
 }
 
 function reviewStateLockPath(commonDir: string, config: WorkflowConfig): string {
@@ -2538,6 +2625,123 @@ export function appendReviewRunRecord(commonDir: string, config: WorkflowConfig,
   }
 }
 
+export function loadRouteSafetyState(commonDir: string, config: WorkflowConfig): RouteSafetyState {
+  const raw = readVersionedJsonFile<RouteSafetyState>('routeSafetyState', commonDir, config, routeSafetyStatePath(commonDir, config), { routes: {} });
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { routes: {} };
+  const routes: Record<string, RouteSafetyRecord> = {};
+  const rawRoutes = (raw as { routes?: unknown }).routes;
+  if (rawRoutes && typeof rawRoutes === 'object' && !Array.isArray(rawRoutes)) {
+    for (const [digest, record] of Object.entries(rawRoutes)) {
+      const normalized = normalizeRouteSafetyRecord(record);
+      if (normalized && normalized.routeFingerprintDigest === digest) {
+        routes[digest] = normalized;
+      }
+    }
+  }
+  const latestPausedRouteFingerprintDigest = typeof raw.latestPausedRouteFingerprintDigest === 'string'
+    && routes[raw.latestPausedRouteFingerprintDigest]
+    ? raw.latestPausedRouteFingerprintDigest
+    : undefined;
+  return {
+    routes,
+    ...(latestPausedRouteFingerprintDigest ? { latestPausedRouteFingerprintDigest } : {}),
+  };
+}
+
+export function saveRouteSafetyState(commonDir: string, config: WorkflowConfig, value: RouteSafetyState): void {
+  ensureStateDir(commonDir, config);
+  writeVersionedJsonFile('routeSafetyState', routeSafetyStatePath(commonDir, config), value);
+}
+
+function normalizeRouteSafetyRecord(value: unknown): RouteSafetyRecord | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  if (
+    typeof raw.routeFingerprintDigest !== 'string'
+    || typeof raw.routeFingerprint !== 'string'
+    || typeof raw.targetCommand !== 'string'
+    || typeof raw.taskSlug !== 'string'
+    || typeof raw.branchName !== 'string'
+    || typeof raw.headSha !== 'string'
+    || typeof raw.firstStartedAt !== 'string'
+    || typeof raw.updatedAt !== 'string'
+  ) {
+    return null;
+  }
+  const countedReviewRunIds = Array.isArray(raw.countedReviewRunIds)
+    ? raw.countedReviewRunIds.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+    : [];
+  const record: RouteSafetyRecord = {
+    routeFingerprintDigest: raw.routeFingerprintDigest,
+    routeFingerprint: raw.routeFingerprint,
+    targetCommand: raw.targetCommand,
+    taskSlug: raw.taskSlug,
+    branchName: raw.branchName,
+    headSha: raw.headSha,
+    firstStartedAt: raw.firstStartedAt,
+    updatedAt: raw.updatedAt,
+    fixReviewLoops: nonNegativeInteger(raw.fixReviewLoops),
+    aiReviewRuns: nonNegativeInteger(raw.aiReviewRuns),
+    countedReviewRunIds,
+  };
+  if (typeof raw.acceptedFindingsAt === 'string') record.acceptedFindingsAt = raw.acceptedFindingsAt;
+  if (typeof raw.acceptedFindingsSource === 'string') record.acceptedFindingsSource = raw.acceptedFindingsSource;
+  if (typeof raw.acceptedReviewRunId === 'string') record.acceptedReviewRunId = raw.acceptedReviewRunId;
+  if (typeof raw.lastReviewRunId === 'string') record.lastReviewRunId = raw.lastReviewRunId;
+  if (raw.lastReviewStatus === 'passed' || raw.lastReviewStatus === 'failed' || raw.lastReviewStatus === 'pending') {
+    record.lastReviewStatus = raw.lastReviewStatus;
+  }
+  if (typeof raw.pausedAt === 'string') record.pausedAt = raw.pausedAt;
+  if (typeof raw.pauseReason === 'string') record.pauseReason = raw.pauseReason;
+  if (Array.isArray(raw.resumes)) {
+    const resumes = raw.resumes
+      .map(normalizeRouteSafetyResumeRecord)
+      .filter((entry): entry is RouteSafetyResumeRecord => entry !== null);
+    if (resumes.length > 0) record.resumes = resumes;
+  }
+  return record;
+}
+
+function normalizeRouteSafetyResumeRecord(value: unknown): RouteSafetyResumeRecord | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  if (
+    typeof raw.id !== 'string'
+    || typeof raw.recordedAt !== 'string'
+    || (raw.source !== 'resume' && raw.source !== 'tty')
+    || (
+      raw.kind !== 'one-more-loop'
+      && raw.kind !== 'more-loops-and-minutes'
+      && raw.kind !== 'until-review-passes'
+      && raw.kind !== 'accept-findings'
+    )
+  ) {
+    return null;
+  }
+  const record: RouteSafetyResumeRecord = {
+    id: raw.id,
+    kind: raw.kind,
+    recordedAt: raw.recordedAt,
+    source: raw.source,
+  };
+  if (raw.oneMoreLoop === true) record.oneMoreLoop = true;
+  const moreLoops = positiveConfigInteger(raw.moreLoops);
+  if (moreLoops !== undefined) record.moreLoops = moreLoops;
+  const moreMinutes = positiveConfigInteger(raw.moreMinutes);
+  if (moreMinutes !== undefined) record.moreMinutes = moreMinutes;
+  const maxMoreLoops = positiveConfigInteger(raw.maxMoreLoops);
+  if (maxMoreLoops !== undefined) record.maxMoreLoops = maxMoreLoops;
+  const maxMoreMinutes = positiveConfigInteger(raw.maxMoreMinutes);
+  if (maxMoreMinutes !== undefined) record.maxMoreMinutes = maxMoreMinutes;
+  if (raw.acceptedFindings === true) record.acceptedFindings = true;
+  if (typeof raw.confirmation === 'string') record.confirmation = raw.confirmation;
+  return record;
+}
+
+function nonNegativeInteger(value: unknown): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
 function isReviewRunRecord(value: unknown): value is ReviewRunRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const raw = value as Record<string, unknown>;
@@ -2886,6 +3090,13 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     scopeThrough: '',
     orchestrationResealUnsigned: false,
     orchestrationTrustsLocalState: false,
+    oneMoreLoop: false,
+    moreLoops: '',
+    moreMinutes: '',
+    untilReviewPasses: false,
+    maxMoreLoops: '',
+    maxMoreMinutes: '',
+    acceptFindings: false,
   };
 
   const setPrFromShorthand = (raw: string, source: string): void => {
@@ -3062,6 +3273,37 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
 
     if (flagName === '--task') {
       flags.task = readFlagValue('--task');
+      continue;
+    }
+    if (flagName === '--one-more-loop') {
+      rejectInlineValue('--one-more-loop');
+      flags.oneMoreLoop = true;
+      continue;
+    }
+    if (flagName === '--more-loops') {
+      flags.moreLoops = readFlagValue('--more-loops').trim();
+      continue;
+    }
+    if (flagName === '--more-minutes') {
+      flags.moreMinutes = readFlagValue('--more-minutes').trim();
+      continue;
+    }
+    if (flagName === '--until-review-passes') {
+      rejectInlineValue('--until-review-passes');
+      flags.untilReviewPasses = true;
+      continue;
+    }
+    if (flagName === '--max-more-loops') {
+      flags.maxMoreLoops = readFlagValue('--max-more-loops').trim();
+      continue;
+    }
+    if (flagName === '--max-more-minutes') {
+      flags.maxMoreMinutes = readFlagValue('--max-more-minutes').trim();
+      continue;
+    }
+    if (flagName === '--accept-findings') {
+      rejectInlineValue('--accept-findings');
+      flags.acceptFindings = true;
       continue;
     }
 
@@ -3437,8 +3679,9 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       }
       return;
     case 'resume':
-      assertOnlyFlags(parsed, ['task']);
-      requireNoPositional('pipelane run resume [--task <task-name>]');
+      assertOnlyFlags(parsed, ['task', 'oneMoreLoop', 'moreLoops', 'moreMinutes', 'untilReviewPasses', 'maxMoreLoops', 'maxMoreMinutes', 'acceptFindings']);
+      requireNoPositional('pipelane run resume [--task <task-name>] [--one-more-loop | --more-loops <n> --more-minutes <n> | --until-review-passes --max-more-loops <n> --max-more-minutes <n> | --accept-findings]');
+      validateResumeRouteSafetyFlags(parsed);
       return;
     case 'repo-guard':
       assertOnlyFlags(parsed, ['task', 'mode', 'surfaces', 'offline']);
@@ -3996,6 +4239,44 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
   }
 }
 
+function validateResumeRouteSafetyFlags(parsed: ParsedOperatorArgs): void {
+  const modes = [
+    parsed.flags.oneMoreLoop,
+    parsed.flags.moreLoops.trim().length > 0 || parsed.flags.moreMinutes.trim().length > 0,
+    parsed.flags.untilReviewPasses || parsed.flags.maxMoreLoops.trim().length > 0 || parsed.flags.maxMoreMinutes.trim().length > 0,
+    parsed.flags.acceptFindings,
+  ].filter(Boolean).length;
+  if (modes === 0) return;
+  if (parsed.flags.task.trim()) {
+    throw new Error('resume route-loop overrides do not accept --task; run the printed resume command from the paused checkout.');
+  }
+  if (modes > 1) {
+    throw new Error('resume accepts one route-loop override at a time: --one-more-loop, --more-loops/--more-minutes, --until-review-passes, or --accept-findings.');
+  }
+  const requirePositive = (flag: string, value: string): void => {
+    if (!/^[1-9]\d*$/.test(value.trim()) || !Number.isSafeInteger(Number.parseInt(value.trim(), 10))) {
+      throw new Error(`${flag} requires a safe positive integer.`);
+    }
+  };
+  if (parsed.flags.moreLoops.trim() || parsed.flags.moreMinutes.trim()) {
+    if (!parsed.flags.moreLoops.trim() || !parsed.flags.moreMinutes.trim()) {
+      throw new Error('resume --more-loops must be combined with --more-minutes.');
+    }
+    requirePositive('--more-loops', parsed.flags.moreLoops);
+    requirePositive('--more-minutes', parsed.flags.moreMinutes);
+  }
+  if (parsed.flags.untilReviewPasses || parsed.flags.maxMoreLoops.trim() || parsed.flags.maxMoreMinutes.trim()) {
+    if (!parsed.flags.untilReviewPasses) {
+      throw new Error('resume --max-more-loops and --max-more-minutes require --until-review-passes.');
+    }
+    if (!parsed.flags.maxMoreLoops.trim() || !parsed.flags.maxMoreMinutes.trim()) {
+      throw new Error('resume --until-review-passes requires --max-more-loops and --max-more-minutes.');
+    }
+    requirePositive('--max-more-loops', parsed.flags.maxMoreLoops);
+    requirePositive('--max-more-minutes', parsed.flags.maxMoreMinutes);
+  }
+}
+
 type OperatorFlagKey = keyof OperatorFlags;
 
 const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flags: OperatorFlags) => boolean }> = [
@@ -4018,6 +4299,13 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'sha', label: '--sha', active: (flags) => flags.sha.trim().length > 0 },
   { key: 'pr', label: '--pr', active: (flags) => flags.pr.trim().length > 0 },
   { key: 'task', label: '--task', active: (flags) => flags.task.trim().length > 0 },
+  { key: 'oneMoreLoop', label: '--one-more-loop', active: (flags) => flags.oneMoreLoop },
+  { key: 'moreLoops', label: '--more-loops', active: (flags) => flags.moreLoops.trim().length > 0 },
+  { key: 'moreMinutes', label: '--more-minutes', active: (flags) => flags.moreMinutes.trim().length > 0 },
+  { key: 'untilReviewPasses', label: '--until-review-passes', active: (flags) => flags.untilReviewPasses },
+  { key: 'maxMoreLoops', label: '--max-more-loops', active: (flags) => flags.maxMoreLoops.trim().length > 0 },
+  { key: 'maxMoreMinutes', label: '--max-more-minutes', active: (flags) => flags.maxMoreMinutes.trim().length > 0 },
+  { key: 'acceptFindings', label: '--accept-findings', active: (flags) => flags.acceptFindings },
   { key: 'branch', label: '--branch', active: (flags) => flags.branch.trim().length > 0 },
   { key: 'file', label: '--file', active: (flags) => flags.file.trim().length > 0 },
   { key: 'title', label: '--title', active: (flags) => flags.title.trim().length > 0 },

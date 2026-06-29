@@ -8,9 +8,23 @@ import {
   resolveTaskCommandIdentity,
 } from '../task-workspaces.ts';
 import { loadTaskLock } from '../state.ts';
+import {
+  applyRouteSafetyResumeOverride,
+  hasRouteSafetyResumeOverride,
+} from '../route-loop-safety.ts';
 
 export async function handleResume(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const context = resolveWorkflowContext(cwd);
+  if (hasRouteSafetyResumeOverride(parsed.flags)) {
+    const result = applyRouteSafetyResumeOverride(cwd, parsed);
+    printResult(parsed.flags, {
+      command: 'resume',
+      routeFingerprintDigest: result.record.routeFingerprintDigest,
+      targetCommand: result.record.targetCommand,
+      message: result.message,
+    });
+    return;
+  }
   // Implicit prune on resume keeps the no-arg flow working even if a prior
   // session left half-written locks. The 5-min floor is /clean --apply's job.
   const { removed: removedLocks } = pruneDeadTaskLocks(context.commonDir, context.config, { minAgeMs: 0 });

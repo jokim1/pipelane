@@ -7,12 +7,19 @@ import { fileURLToPath } from 'node:url';
 import {
   buildDestinationPlanForCommand,
   canonicalizeDestinationFingerprint,
+  destinationPlanFingerprintDigest,
   type DestinationMilestone,
   type DestinationPlan,
   type DestinationStep,
 } from './destination-planner.ts';
 import { sanitizeForTerminal } from './commands/helpers.ts';
 import type { ParsedOperatorArgs } from './state.ts';
+import { evaluateReviewEvidenceForPr } from './review-enforcement.ts';
+import {
+  ROUTE_SAFETY_FINGERPRINT_ENV,
+  evaluateDestinationRouteReviewSafety,
+} from './route-loop-safety.ts';
+import { resolveWorkflowContext } from './state.ts';
 
 export const DESTINATION_INTERNAL_STEP_ENV = 'PIPELANE_DESTINATION_INTERNAL_STEP';
 export const DESTINATION_APPROVED_ROUTE_FINGERPRINT_ENV = 'PIPELANE_DESTINATION_APPROVED_ROUTE_FINGERPRINT';
@@ -69,12 +76,12 @@ export function nonTtyConfirmationMessageForParsed(plan: DestinationPlan, parsed
   ].join('\n');
 }
 
-export function executeDestinationRoute(
+export async function executeDestinationRoute(
   cwd: string,
   parsed: ParsedOperatorArgs,
   plan: DestinationPlan,
   options: DestinationRouteExecutionOptions = {},
-): DestinationRouteExecution {
+): Promise<DestinationRouteExecution> {
   const execution: DestinationRouteExecution = {
     completed: true,
     failedStep: null,
@@ -94,6 +101,16 @@ export function executeDestinationRoute(
     const stepBlocker = validateStepStart(plan, currentPlan, step);
     if (stepBlocker) {
       return failRouteGuard(execution, step.command, stepBlocker);
+    }
+    if (step.id === 'pr') {
+      const context = resolveWorkflowContext(cwd);
+      const reviewEvidence = evaluateReviewEvidenceForPr(context);
+      if (!reviewEvidence.allowed) {
+        const pause = await evaluateDestinationRouteReviewSafety(context, currentPlan, reviewEvidence);
+        if (pause.action === 'stop') {
+          return failRouteGuard(execution, step.command, pause.message);
+        }
+      }
     }
 
     const args = buildStepArgs(step, parsed, currentPlan);
@@ -258,6 +275,7 @@ function buildStepEnv(step: DestinationStep, plan: DestinationPlan): NodeJS.Proc
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     [DESTINATION_INTERNAL_STEP_ENV]: '1',
+    [ROUTE_SAFETY_FINGERPRINT_ENV]: destinationPlanFingerprintDigest(plan),
   };
   delete env.PIPELANE_DEPLOY_PROD_API_CONFIRMED;
   delete env[DESTINATION_ROUTE_PROD_CONFIRMED_ENV];

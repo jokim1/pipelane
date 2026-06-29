@@ -16490,6 +16490,20 @@ function appendDeployRecord(repoRoot, record) {
   writeFileSync(existingPath, `${JSON.stringify(existing, null, 2)}\n`, 'utf8');
 }
 
+function readRouteSafetyState(repoRoot) {
+  const statePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'route-safety-state.json');
+  return existsSync(statePath)
+    ? JSON.parse(readFileSync(statePath, 'utf8'))
+    : { routes: {} };
+}
+
+function latestRouteSafetyRecord(repoRoot) {
+  const state = readRouteSafetyState(repoRoot);
+  const digest = state.latestPausedRouteFingerprintDigest;
+  if (digest && state.routes[digest]) return state.routes[digest];
+  return Object.values(state.routes ?? {}).sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)))[0] ?? null;
+}
+
 async function writeSucceededDeployRecord(repoRoot, environment, sha, surfaces = ['frontend'], options = {}) {
   const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
   mkdirSync(stateDir, { recursive: true });
@@ -19066,6 +19080,472 @@ test('pr blocks clean already-pushed open PRs without review evidence', () => {
     assert.equal(result.status, 1);
     assert.match(result.stderr, /review gate evidence is not ready/);
     assert.match(result.stderr, /no review run has been recorded/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('route safety renders the TTY pause menu with explicit loop choices', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const safety = await import(path.join(KIT_ROOT, 'src', 'operator', 'route-loop-safety.ts'));
+    const context = state.resolveWorkflowContext(repoRoot);
+    const record = {
+      routeFingerprintDigest: 'abcdef1234567890',
+      routeFingerprint: '{}',
+      targetCommand: '/pr',
+      taskSlug: 'route-safety',
+      branchName: 'main',
+      headSha: run('git', ['rev-parse', 'HEAD'], repoRoot),
+      firstStartedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      fixReviewLoops: 1,
+      aiReviewRuns: 1,
+      countedReviewRunIds: ['review-1'],
+    };
+    const menu = safety.renderRouteSafetyInteractiveMenu(context, record, {
+      reason: 'blocking/major review findings are present',
+      issues: [{
+        status: 'failed',
+        message: 'blocking gate ai-review failed: major finding',
+        blocking: true,
+      }],
+      latest: null,
+    });
+
+    assert.match(menu, /1\. Stop here and show review findings/);
+    assert.match(menu, /2\. Allow one more fix\/review loop/);
+    assert.match(menu, /3\. Choose how many more loops and minutes to allow/);
+    assert.match(menu, /4\. Continue without fixing these findings/);
+    assert.match(menu, /5\. Keep going until review passes, with explicit limits/);
+    assert.match(menu, /fix\/review loops/i);
+    assert.match(menu, /minutes/i);
+    assert.match(menu, /AI review runs/i);
+    assert.doesNotMatch(menu, /\bbudget\b|\bcap\b/i);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('route safety pauses non-TTY PR flow on blocking review findings and reuses evidence', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.reviewGates = {
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: [{
+          id: 'always-fails',
+          phase: 'static',
+          type: 'command',
+          blocking: true,
+          command: 'node -e "process.exit(1)"',
+        }],
+      };
+    });
+    commitAll(repoRoot, 'Adopt route safety');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Route Safety Pause', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'route safety\n', 'utf8');
+
+    const review = runCli(['run', 'review', '--json'], created.worktreePath, {}, true);
+    assert.equal(review.status, 1);
+    const reviewPayload = JSON.parse(review.stdout);
+    assert.equal(reviewPayload.status, 'failed');
+
+    const first = runCli(['run', 'pr', '--title', 'Route Safety Pause', '--json'], created.worktreePath, env, true);
+    const second = runCli(['run', 'pr', '--title', 'Route Safety Pause', '--json'], created.worktreePath, env, true);
+    for (const result of [first, second]) {
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /Route-bound delivery paused before \/pr/);
+      assert.match(result.stderr, /blocking\/major review findings/);
+      assert.match(result.stderr, /pipelane resume --one-more-loop/);
+      assert.match(result.stderr, /pipelane resume --more-loops=2 --more-minutes=45/);
+      assert.match(result.stderr, /pipelane resume --until-review-passes --max-more-loops=3 --max-more-minutes=120/);
+      assert.match(result.stderr, /pipelane resume --accept-findings/);
+      assert.doesNotMatch(result.stderr, /\bbudget\b|\bcap\b/i);
+    }
+
+    const routeRecord = latestRouteSafetyRecord(created.worktreePath);
+    assert.ok(routeRecord);
+    assert.equal(routeRecord.fixReviewLoops, 1, 'same review evidence should count once');
+    assert.equal(routeRecord.lastReviewRunId, reviewPayload.runId);
+    assert.equal(existsSync(ghStateFile), false, 'paused route should not call gh');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('route safety explicit resume overrides can accept findings and continue', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.reviewGates = {
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: [{
+          id: 'always-fails',
+          phase: 'static',
+          type: 'command',
+          blocking: true,
+          command: 'node -e "process.exit(1)"',
+        }],
+      };
+    });
+    commitAll(repoRoot, 'Adopt route safety resume');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Route Safety Resume', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'route safety resume\n', 'utf8');
+    runCli(['run', 'review', '--json'], created.worktreePath, {}, true);
+    const paused = runCli(['run', 'pr', '--title', 'Route Safety Resume', '--json'], created.worktreePath, env, true);
+    assert.equal(paused.status, 1);
+
+    const oneMore = JSON.parse(runCli(['run', 'resume', '--one-more-loop', '--json'], created.worktreePath).stdout);
+    assert.match(oneMore.message, /Allowed one more fix\/review loop/);
+    const accepted = JSON.parse(runCli(['run', 'resume', '--accept-findings', '--json'], created.worktreePath).stdout);
+    assert.match(accepted.message, /Accepted current review findings/);
+
+    const pr = JSON.parse(runCli(['run', 'pr', '--title', 'Route Safety Resume', '--json'], created.worktreePath, env).stdout);
+    assert.match(pr.url, /example\.test\/pr/);
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(Object.keys(ghState.prs).length, 1);
+    const routeRecord = latestRouteSafetyRecord(created.worktreePath);
+    assert.equal(routeRecord.acceptedFindingsSource, 'resume --accept-findings');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('route safety accept-findings does not bypass incomplete review evidence', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.reviewGates = {
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: [{
+          id: 'must-run',
+          phase: 'static',
+          type: 'command',
+          blocking: true,
+          command: 'node -e "process.exit(0)"',
+        }],
+      };
+    });
+    commitAll(repoRoot, 'Adopt route safety dry-run evidence');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Route Safety Dry Run', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'dry run evidence\n', 'utf8');
+    const review = JSON.parse(runCli(['run', 'review', '--dry-run', '--json'], created.worktreePath).stdout);
+    assert.equal(review.status, 'passed');
+
+    const blocked = runCli(['run', 'pr', '--title', 'Route Safety Dry Run', '--json'], created.worktreePath, env, true);
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /review gate evidence is not ready/);
+    assert.match(blocked.stderr, /dry run/);
+    assert.doesNotMatch(blocked.stderr, /Route-bound delivery paused/);
+
+    const resume = runCli(['run', 'resume', '--accept-findings', '--json'], created.worktreePath, {}, true);
+    assert.equal(resume.status, 1);
+    assert.match(resume.stderr, /No paused route-bound fix\/review loop/);
+    assert.equal(existsSync(ghStateFile), false, 'incomplete review evidence must not open PR after accept-findings');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('route safety accept-findings is bound to the accepted review run id', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.reviewGates = {
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: [{
+          id: 'always-fails',
+          phase: 'static',
+          type: 'command',
+          blocking: true,
+          command: 'node -e "process.exit(1)"',
+        }],
+      };
+    });
+    commitAll(repoRoot, 'Adopt route safety review id binding');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Route Safety Review Id', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'review id binding\n', 'utf8');
+    const firstReview = JSON.parse(runCli(['run', 'review', '--json'], created.worktreePath, {}, true).stdout);
+    const paused = runCli(['run', 'pr', '--title', 'Route Safety Review Id', '--json'], created.worktreePath, env, true);
+    assert.equal(paused.status, 1);
+    runCli(['run', 'resume', '--one-more-loop', '--json'], created.worktreePath);
+    runCli(['run', 'resume', '--accept-findings', '--json'], created.worktreePath);
+
+    const secondReview = JSON.parse(runCli(['run', 'review', '--json'], created.worktreePath, {}, true).stdout);
+    assert.notEqual(secondReview.runId, firstReview.runId);
+    const blocked = runCli(['run', 'pr', '--title', 'Route Safety Review Id', '--json'], created.worktreePath, env, true);
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /Route-bound delivery paused before \/pr/);
+    assert.equal(existsSync(ghStateFile), false, 'accepted findings for an older review run must not open PR');
+    const routeRecord = latestRouteSafetyRecord(created.worktreePath);
+    assert.equal(routeRecord.acceptedReviewRunId, firstReview.runId);
+    assert.equal(routeRecord.lastReviewRunId, secondReview.runId);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('route safety pending review stop exits non-zero', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const ageRouteSafetyState = [
+      'const fs = require("node:fs");',
+      'const statePath = ".git/pipelane-state/route-safety-state.json";',
+      'const state = JSON.parse(fs.readFileSync(statePath, "utf8"));',
+      'for (const route of Object.values(state.routes || {})) route.firstStartedAt = "2000-01-01T00:00:00.000Z";',
+      'fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\\n");',
+    ].join(' ');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.routeSafety = {
+        defaultFixReviewLoops: 1,
+        defaultMinutes: 1,
+        defaultAiReviewRuns: 1,
+        stopOnMajorFindings: true,
+      };
+      config.reviewGates = {
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: [
+          {
+            id: 'age-route-safety',
+            phase: 'static',
+            type: 'command',
+            blocking: true,
+            command: `node -e ${JSON.stringify(ageRouteSafetyState)}`,
+          },
+          {
+            id: 'manual-check',
+            phase: 'human',
+            type: 'approval',
+            blocking: true,
+          },
+        ],
+      };
+    });
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Adopt route safety pending exit'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    writeFileSync(path.join(repoRoot, 'feature.txt'), 'pending review stop\n', 'utf8');
+
+    const review = runCli(['run', 'review', '--json'], repoRoot, {}, true);
+    assert.equal(review.status, 1);
+    const payload = JSON.parse(review.stdout);
+    assert.equal(payload.status, 'pending');
+    assert.match(payload.message, /Route-bound delivery paused before \/pr/);
+    assert.match(payload.message, /minutes reached 1/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('route safety resume approvals are isolated by route fingerprint changes', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.reviewGates = {
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: [{
+          id: 'always-fails',
+          phase: 'static',
+          type: 'command',
+          blocking: true,
+          command: 'node -e "process.exit(1)"',
+        }],
+      };
+    });
+    commitAll(repoRoot, 'Adopt route safety isolation');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Route Safety Isolation', '--json'], repoRoot).stdout);
+    const featurePath = path.join(created.worktreePath, 'feature.txt');
+    writeFileSync(featurePath, 'reviewed version\n', 'utf8');
+    runCli(['run', 'review', '--json'], created.worktreePath, {}, true);
+    const paused = runCli(['run', 'pr', '--title', 'Route Safety Isolation', '--json'], created.worktreePath, env, true);
+    assert.equal(paused.status, 1);
+    runCli(['run', 'resume', '--accept-findings', '--json'], created.worktreePath);
+
+    execFileSync('git', ['add', '.'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Change after accepted findings'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const changedRoute = runCli(['run', 'pr', '--title', 'Route Safety Isolation', '--json'], created.worktreePath, env, true);
+    assert.equal(changedRoute.status, 1);
+    assert.match(changedRoute.stderr, /Route-bound delivery paused before \/pr/);
+    assert.match(changedRoute.stderr, /current HEAD|different worktree state|blocking\/major review findings/);
+    assert.equal(existsSync(ghStateFile), false, 'accepted findings for old route fingerprint must not open PR after HEAD changes');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('route safety counts deterministic review failure without spending an AI review run', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.reviewGates = {
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: [
+          {
+            id: 'deterministic-fails',
+            phase: 'runtime',
+            type: 'command',
+            blocking: true,
+            command: 'node -e "process.exit(1)"',
+          },
+          {
+            id: 'ai-review',
+            phase: 'ai-diff',
+            type: 'skill',
+            blocking: true,
+            skill: 'review',
+            command: 'node -e "require(\\"node:fs\\").writeFileSync(\\"ai-called.txt\\", \\"yes\\"); console.log(\\"PIPELANE_REVIEW_GATE_RESULT=passed\\")"',
+          },
+        ],
+      };
+    });
+    commitAll(repoRoot, 'Adopt deterministic route safety review');
+    writeFileSync(path.join(repoRoot, 'feature.txt'), 'deterministic failure\n', 'utf8');
+
+    const review = runCli(['run', 'review', '--json'], repoRoot, {}, true);
+    assert.equal(review.status, 1);
+    const payload = JSON.parse(review.stdout);
+    const aiGate = payload.gates.find((gate) => gate.gateId === 'ai-review');
+    assert.equal(aiGate.status, 'pending');
+    assert.match(aiGate.summary, /deferred: a blocking deterministic gate failed/);
+    assert.equal(existsSync(path.join(repoRoot, 'ai-called.txt')), false);
+    const routeRecord = latestRouteSafetyRecord(repoRoot);
+    assert.equal(routeRecord.fixReviewLoops, 1);
+    assert.equal(routeRecord.aiReviewRuns, 0);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('route safety pauses on blocking AI findings and counts the AI review run', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.reviewGates = {
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: [{
+          id: 'ai-review',
+          phase: 'ai-diff',
+          type: 'skill',
+          blocking: true,
+          skill: 'review',
+          command: 'node -e "console.log(\\"PIPELANE_REVIEW_GATE_RESULT=failed\\")"',
+        }],
+      };
+    });
+    commitAll(repoRoot, 'Adopt AI finding route safety');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'AI Finding Pause', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'ai finding\n', 'utf8');
+    const review = runCli(['run', 'review', '--json'], created.worktreePath, {
+      CODEX_SESSION_ID: 'route-safety-author',
+    }, true);
+    assert.equal(review.status, 1);
+
+    const blocked = runCli(['run', 'pr', '--title', 'AI Finding Pause', '--json'], created.worktreePath, env, true);
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /blocking\/major review findings/);
+    assert.match(blocked.stderr, /AI review reported failed/);
+    const routeRecord = latestRouteSafetyRecord(created.worktreePath);
+    assert.equal(routeRecord.aiReviewRuns, 1);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });

@@ -62,7 +62,7 @@ export async function maybeHandleDestinationCommand(cwd: string, parsed: ParsedO
     return true;
   }
 
-  const execution = executeDestinationRoute(cwd, parsed, plan, {
+  const execution = await executeDestinationRoute(cwd, parsed, plan, {
     stopAfterFirstExecutableStep: confirmation === 'run_next',
   });
   if (!execution.completed) {
