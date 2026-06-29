@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node
 import path from 'node:path';
 
 import { readFixPromptBody } from './fix-prompt.ts';
+import { readLessonPromptBody } from './lesson-prompt.ts';
 import { installGlobalRuntime } from './global-runtime.ts';
 import { defaultWorkflowConfig, homeClaudeDir, readJsonFile, writeJsonFile } from './state.ts';
 import {
@@ -169,10 +170,10 @@ export function installClaudeBootstrapSkill(
   const binDir = path.join(pipelaneRoot, 'bin');
   const install = desiredHostInstall('claude', 'machine-local', defaultWorkflowConfig('pipelane', 'Pipelane'), {
     runnerPath: path.join(binDir, 'run-pipelane.sh'),
-    bootstrapScriptPath: path.join(binDir, 'bootstrap-pipelane.sh'),
     managedRuntimeRoot: pipelaneRoot,
     managedPipelaneBin: path.join(binDir, 'pipelane'),
     fixPromptBody: readFixPromptBody(),
+    lessonPromptBody: readLessonPromptBody(),
   });
 
   mkdirSync(skillsRoot, { recursive: true });
