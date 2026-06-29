@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import path from 'node:path';
 
 import { readFixPromptBody } from './fix-prompt.ts';
+import { readLessonPromptBody } from './lesson-prompt.ts';
 import { aliasCommandName, MANAGED_WORKFLOW_COMMANDS, readJsonFile, resolveWorkflowAliases, type WorkflowCommand, type WorkflowConfig, writeJsonFile } from './state.ts';
 import { REPO_CODEX_SKILL_MARKER_PREFIX } from './skill-rendering.ts';
 
@@ -11,12 +12,17 @@ const MANAGED_CODEX_RUNNER = path.join(MANAGED_CODEX_RUNTIME_DIR, 'bin', 'run-pi
 const INIT_PIPELANE_SKILL_NAME = 'init-pipelane';
 const PIPELANE_CODEX_SKILL_MARKER = REPO_CODEX_SKILL_MARKER_PREFIX;
 
-// Fixed-name Codex skills that are NOT workflow-command wrappers. `fix` is a
-// behavioral-discipline prompt, not a shell passthrough — its body is the
-// shared /fix prompt from templates/.claude/commands/fix.md, wrapped with
-// Codex frontmatter so the same /fix discipline fires in Codex too.
+// Fixed-name Codex skills that are NOT workflow-command wrappers. `fix` and
+// `lesson` are behavioral-discipline prompts, not shell passthroughs — each
+// body is the shared Claude-side prompt (templates/.claude/commands/{fix,lesson}.md),
+// wrapped with Codex frontmatter so the same /fix and /lesson discipline fires
+// in Codex too. These give repo-local Codex parity with the machine-local
+// host-install skills; `lesson` deliberately gets Codex parity here WITHOUT
+// being added to MANAGED_COMMANDS, so no repo-local .claude/commands/lesson.md
+// Claude command surface is minted (it stays a host-install Claude skill only).
 const FIX_CODEX_SKILL_NAME = 'fix';
-const MANAGED_EXTRA_CODEX_SKILLS = [FIX_CODEX_SKILL_NAME] as const;
+const LESSON_CODEX_SKILL_NAME = 'lesson';
+const MANAGED_EXTRA_CODEX_SKILLS = [FIX_CODEX_SKILL_NAME, LESSON_CODEX_SKILL_NAME] as const;
 
 // Generate the Codex-side /fix skill from the shared Claude-side prompt body.
 // Single source of truth for the /fix prompt lives in
@@ -44,13 +50,39 @@ ${PIPELANE_CODEX_SKILL_MARKER}${FIX_CODEX_SKILL_NAME} -->
 ${body}`;
 }
 
+// Codex-side /lesson, mirroring buildFixCodexSkill. Single source of truth for
+// the prompt body is templates/.claude/commands/lesson.md (shared with the
+// machine-local host-install /lesson skill via readLessonPromptBody). The body
+// is stored trimmed, so re-add a trailing newline for a clean SKILL.md file.
+function buildLessonCodexSkill(): string {
+  const body = readLessonPromptBody();
+  return `---
+name: ${LESSON_CODEX_SKILL_NAME}
+version: 1.0.0
+description: Append a dated lesson to the repo CLAUDE.md ## Lessons block.
+allowed-tools:
+  - Read
+  - Edit
+  - Write
+  - Grep
+  - Glob
+  - Bash
+---
+${PIPELANE_CODEX_SKILL_MARKER}${LESSON_CODEX_SKILL_NAME} -->
+
+${body}
+`;
+}
+
 // Map from desired-skill-name to the body builder. Workflow skills (populated
-// inline in syncCodexSkills) and extras (fix) share the same desired / managed
-// / prune / collision machinery; only the builder differs.
+// inline in syncCodexSkills) and extras (fix, lesson) share the same desired /
+// managed / prune / collision machinery; only the builder differs.
 function buildManagedExtraCodexSkill(name: (typeof MANAGED_EXTRA_CODEX_SKILLS)[number]): string {
   switch (name) {
     case FIX_CODEX_SKILL_NAME:
       return buildFixCodexSkill();
+    case LESSON_CODEX_SKILL_NAME:
+      return buildLessonCodexSkill();
   }
 }
 
@@ -349,8 +381,8 @@ export function syncCodexSkills(
     desiredSkills.add(skillName);
     desiredBodies.set(skillName, buildSkill(command, slashAlias));
   }
-  // Extras (fix) — fixed-name skills with full prompt bodies rather than
-  // shell wrappers. Participate in the same collision / prune / manifest
+  // Extras (fix, lesson) — fixed-name skills with full prompt bodies rather
+  // than shell wrappers. Participate in the same collision / prune / manifest
   // machinery as workflow skills.
   for (const name of MANAGED_EXTRA_CODEX_SKILLS) {
     if (desiredSkills.has(name)) {

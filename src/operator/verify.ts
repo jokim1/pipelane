@@ -4,6 +4,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 import { readFixPromptBody } from './fix-prompt.ts';
+import { readLessonPromptBody } from './lesson-prompt.ts';
 import { npmGuardStatus, runNpmGuardSelfCheck } from './npm-guard-install.ts';
 import { CONFIG_FILENAME, defaultWorkflowConfig, homeClaudeDir, homeCodexDir, writeJsonFile } from './state.ts';
 import {
@@ -79,10 +80,10 @@ function desiredMachineInstall(host: HostInstall, home: string): DesiredInstall 
   const binDir = path.join(root, 'bin');
   return desiredHostInstall(host, 'machine-local', defaultWorkflowConfig('pipelane', 'Pipelane'), {
     runnerPath: path.join(binDir, 'run-pipelane.sh'),
-    bootstrapScriptPath: path.join(binDir, 'bootstrap-pipelane.sh'),
     managedRuntimeRoot: root,
     managedPipelaneBin: path.join(binDir, 'pipelane'),
     fixPromptBody: readFixPromptBody(),
+    lessonPromptBody: readLessonPromptBody(),
   });
 }
 

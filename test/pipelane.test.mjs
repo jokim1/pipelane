@@ -30281,6 +30281,77 @@ test('detectSetupDrift flags a deleted fix Codex skill as addedSkills', async ()
   }
 });
 
+test('setup writes .agents/skills/lesson/SKILL.md with Codex frontmatter and shared prompt body', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    const lessonSkillPath = path.join(repoRoot, '.agents', 'skills', 'lesson', 'SKILL.md');
+    assert.ok(existsSync(lessonSkillPath), 'lesson Codex skill must be written by setup');
+    const content = readFileSync(lessonSkillPath, 'utf8');
+
+    // Frontmatter: name, version, and the file-editing tools /lesson needs.
+    assert.match(content, /^---\nname: lesson\n/);
+    assert.match(content, /\nversion: 1\.0\.0\n/);
+    assert.match(content, /\nallowed-tools:\n(?:[\s\S]*?  - Read\n)/);
+    assert.match(content, /  - Edit\n/);
+    assert.match(content, /  - Write\n/);
+    // Marker for managed detection (survives prune / drift).
+    assert.match(content, /<!-- pipelane:codex-skill:lesson -->/);
+    // Shared body with the Claude-side host-install /lesson skill — anchor phrases.
+    assert.match(content, /Append a dated lesson/);
+    assert.match(content, /<!-- pipelane:lessons:entries:end -->/);
+    assert.match(content, /run `\/pipelane setup`/);
+    assert.match(content, /Dedup and pruning are `\/karpathy audit`/);
+    // No Claude command / consumer-extension markers — lesson.md is a shared
+    // prompt-body source, not a managed Claude command template.
+    assert.doesNotMatch(content, /<!-- pipelane:command:lesson -->/);
+    assert.doesNotMatch(content, /<!-- pipelane:consumer-extension:/);
+
+    // The caveat guard: lesson gets repo-local *Codex* parity only. It must NOT
+    // be minted as a repo-local Claude command. fix.md proves claudeCommands
+    // sync is active here, so lesson.md's absence is a real negative.
+    assert.ok(
+      existsSync(path.join(repoRoot, '.claude', 'commands', 'fix.md')),
+      'fix.md should be synced (claudeCommands active), making the lesson.md negative non-vacuous',
+    );
+    assert.equal(
+      existsSync(path.join(repoRoot, '.claude', 'commands', 'lesson.md')),
+      false,
+      'lesson must not be installed as a repo-local .claude/commands surface',
+    );
+
+    // Managed manifest lists lesson alongside fix and the workflow skills.
+    const manifest = JSON.parse(
+      readFileSync(path.join(repoRoot, '.agents', 'skills', '.pipelane-managed.json'), 'utf8'),
+    );
+    assert.ok(manifest.skills.includes('lesson'), `manifest.skills missing "lesson": ${manifest.skills.join(',')}`);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('detectSetupDrift flags a deleted lesson Codex skill as addedSkills', async () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    runCli(['setup'], repoRoot);
+    // Simulate a consumer that upgraded pipelane before the lesson Codex skill
+    // shipped, or that pruned the skill dir.
+    rmSync(path.join(repoRoot, '.agents', 'skills', 'lesson'), { recursive: true, force: true });
+    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
+    const drift = docs.detectSetupDrift(repoRoot);
+    assert.ok(
+      drift.codex.addedSkills.includes('lesson'),
+      `expected 'lesson' in addedSkills, got ${drift.codex.addedSkills.join(',')}`,
+    );
+    assert.equal(drift.needsSetup, true);
+    assert.equal(drift.needsReopenCodex, true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('detectSetupDrift reports a collision when a non-pipelane fix.md is present', async () => {
   const repoRoot = createRepo();
   try {
@@ -32952,6 +33023,10 @@ test('setup writes the lessons capture instruction into the AGENTS.md managed re
     const agents = readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8');
     assert.match(agents, /### Capturing lessons/);
     assert.match(agents, /pipelane:lessons:entries/);
+    // Guard (mirrors the /lesson skill): if the entries:end marker is absent,
+    // the managed block was never provisioned — provision it before appending.
+    assert.match(agents, /entries:end -->` marker is present/);
+    assert.match(agents, /run `\/pipelane setup --yes` first, then stop/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
