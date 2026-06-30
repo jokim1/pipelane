@@ -168,9 +168,10 @@ or \`2 (Take one step only: run /merge)\`.
 Agent Bash tools commonly run commands without an interactive TTY, and shell
 pipes make stdout non-TTY. When the user invokes bare
 \`${slashAlias} review setup\` with no flags, run the setup command directly
-through the runner command above. The CLI prints a non-interactive selector
-with gate numbers, Claude setup status, installable gaps, and exact follow-up
-commands.
+through the runner command above. Bare review setup is read-only: the CLI prints
+the saved grouped gate state when config exists, or inferred recommended
+defaults when it does not. It must not be reduced to a request to rerun with
+\`--yes\`.
 
 Relay the opinionated review shape to the user. The recommended AI stack is
 \`karpathy-diff\` as author self-review, \`code-review-high\` when Claude review
@@ -180,24 +181,25 @@ can add \`code-review-ultra\` and human approval. Independent AI gates must be
 run from a fresh reviewer session; do not let the authoring session attest its
 own independent review. Same-session evidence will block \`/pr\`.
 
-Do not reduce the review setup output to only a category summary or only
-\`review setup --yes\`. Preserve the printed selector choices and exact commands,
-especially \`/karpathy diff\`, \`/code-review high\`, \`/claude review code\`, and
-\`review setup --install adversarial-review\` when they appear. After relaying the
-choices, it is fine to recommend saving the current selection. If the user opts
-out of a recommended gate, say that the consequence is less review coverage
-before you save the change. When the user chooses gates, run the matching
-deterministic command exactly:
+Do not reduce the review setup output to only a category summary. Preserve the
+grouped rows, stable ids such as \`C3\`, and exact commands, especially
+\`/karpathy diff\`, \`/code-review high\`, \`/gstack review\`,
+\`/claude review code\`, \`code-review-ultra\`, and \`/karpathy-audit\` when they
+appear. When the user chooses gates, run the matching deterministic command
+exactly; every mutation writes immediately and reprints the grouped state:
 
-- \`review setup --yes\` to save the current recommended selection.
+- \`review setup --toggle <display-id-or-gate-id>\` to flip a displayed row.
 - \`review setup --enable <gate-id>\` to enable an available gate.
 - \`review setup --disable <gate-id>\` to disable a preselected gate.
 - \`review setup --install <gate-id>\` to install and enable an optional gate
   such as \`lint\` or \`adversarial-review\`.
+- \`review setup --reset\` to restore recommended defaults.
 - Gate values may be repeated or comma-separated, for example
-  \`review setup --enable 3, 4, 5, 13\`.
+  \`review setup --toggle C3,H1\`.
 - \`review setup --list-gates\` to inspect the full catalog.
 - \`review setup --print\` to print the effective config.
+\`review setup --yes\` is legacy-compatible and acts like intentional reset to
+recommended defaults, but it is not the normal path to advertise.
 
 If the user supplied any setup flag, run the command directly through the
 runner. Do not add shell pipes to setup commands that may need interactivity.
@@ -402,8 +404,8 @@ Review gates:
       Run configured review gates for the current diff and write evidence that
       /pr and orchestrated slice review can trust.
 
-  /pipelane review setup [--yes] [--print] [--list-gates]
-                         [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]
+  /pipelane review setup [--yes] [--reset] [--print] [--list-gates]
+                         [--toggle <gate[,gate...]>] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]
       Choose the pre-PR review model. This is different from /pipelane setup;
       it configures quality gates such as tests, self-review, independent AI
       review, instruction audit, and human approval for high-stakes changes.
