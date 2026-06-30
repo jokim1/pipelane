@@ -3714,10 +3714,12 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
     case 'deploy':
       assertOnlyFlags(parsed, ['task', 'pr', 'sha', 'surfaces', 'async', 'skipSmokeCoverage', 'reason', 'title', 'message', 'forceInclude', 'plan', 'yes']);
       requirePositivePrNumber();
-      if (parsed.positional.length === 0) {
-        throw new Error('deploy requires an environment: staging or prod.');
-      }
-      if (parsed.positional[0] !== 'staging' && parsed.positional[0] !== 'prod' && parsed.positional[0] !== 'production') {
+      if (
+        parsed.positional.length > 0
+        && parsed.positional[0] !== 'staging'
+        && parsed.positional[0] !== 'prod'
+        && parsed.positional[0] !== 'production'
+      ) {
         throw new Error('deploy requires an environment: staging or prod.');
       }
       if (parsed.flags.reason && !parsed.flags.skipSmokeCoverage) {

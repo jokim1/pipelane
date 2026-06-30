@@ -20246,6 +20246,44 @@ test('build-mode deploy prod skips cleanly when no surfaces are configured', () 
   }
 });
 
+test('build-mode bare deploy defaults to production', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  writeFileSync(ghStateFile, JSON.stringify({ prs: {}, workflows: [] }, null, 2), 'utf8');
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.surfaces = [];
+      config.buildMode.autoDeployOnMerge = false;
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Bare Deploy', '--json'], repoRoot).stdout);
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
+    const deployed = JSON.parse(runCli(
+      ['run', 'deploy', '--sha', sha, '--json'],
+      created.worktreePath,
+      env,
+    ).stdout);
+
+    assert.equal(deployed.environment, 'prod');
+    assert.equal(deployed.status, 'succeeded');
+    assert.equal(deployed.dispatchMode, 'skipped');
+    assert.match(deployed.message, /Deploy skipped: prod/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
 test('no-surface deploy of an unmerged SHA does not mark delivery complete', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
@@ -20482,6 +20520,24 @@ test('build-mode deploy prod ignores missing edge and sql health checks when inf
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
     rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('release-mode bare deploy requires an explicit environment', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    runCli(['run', 'devmode', 'release', '--override', '--reason', 'explicit deploy target test'], repoRoot);
+
+    const blocked = runCli(['run', 'deploy', '--json'], repoRoot, {}, true);
+
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /release mode requires an explicit deploy environment: staging or prod/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
   }
 });
 
@@ -31982,7 +32038,7 @@ test('destination routes infer a task slug from a dirty lockless branch', () => 
   }
 });
 
-test('destination routes omit deploy steps when no surfaces are configured', () => {
+test('destination routes treat build-mode bare deploy as production and omit deploy steps when no surfaces are configured', () => {
   const repoRoot = createRepo();
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
@@ -31999,13 +32055,12 @@ test('destination routes omit deploy steps when no surfaces are configured', () 
     });
     writeFileSync(path.join(repoRoot, 'feature.txt'), 'hello\n', 'utf8');
 
-    const result = runCli(
-      ['run', 'deploy', 'prod', '--title', 'No deploy route', '--plan', '--json'],
-      repoRoot,
-    );
+    const result = runCli(['run', 'deploy', '--title', 'No deploy route', '--plan', '--json'], repoRoot);
     const payload = JSON.parse(result.stdout);
 
     assert.equal(result.status, 0);
+    assert.equal(payload.target, 'prod_deployed');
+    assert.equal(payload.targetCommand, '/deploy prod');
     assert.deepEqual(payload.requestedSurfaces, []);
     assert.deepEqual(payload.surfaces, []);
     assert.deepEqual(

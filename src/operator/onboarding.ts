@@ -18,7 +18,7 @@ export function buildMissingDeployOnboardingMessage(
     return null;
   }
 
-  const environment = options.environment?.trim() || 'staging';
+  const environment = options.environment?.trim() ?? '';
   const retry = [
     '/deploy',
     environment,

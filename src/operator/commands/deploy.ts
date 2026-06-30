@@ -9,7 +9,7 @@ import {
   emptyDeployConfig,
   evaluateReleaseReadiness,
   loadDeployConfig,
-  normalizeDeployEnvironment,
+  resolveDeployEnvironmentForMode,
   resolveDeployStateKey,
   signDeployRecord,
   verificationPassed,
@@ -234,8 +234,9 @@ export async function dispatchDeploy(
   options: DispatchDeployOptions = {},
 ): Promise<DispatchDeployResult> {
   const context = resolveWorkflowContext(cwd);
-  const environment = options.environment ?? normalizeDeployEnvironment(parsed.positional[0] ?? '');
-  const explicitSurfaces = options.explicitSurfaces ?? [...parsed.flags.surfaces, ...parsed.positional.slice(1)];
+  const environment = options.environment ?? resolveDeployEnvironmentForMode(parsed.positional[0], context.modeState.mode);
+  const surfacePositionals = parsed.positional.length > 0 ? parsed.positional.slice(1) : [];
+  const explicitSurfaces = options.explicitSurfaces ?? [...parsed.flags.surfaces, ...surfacePositionals];
   const identity = resolveDeployCommandIdentity(context, parsed, options);
   const { taskSlug } = identity;
   const prRecord = resolveDeployPrRecord(context, identity, environment);
