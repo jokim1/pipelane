@@ -7,7 +7,7 @@ This repo uses `pipelane` for task workspaces, PR prep, merge handoff, and deplo
 - Default slash aliases are `{{ALIAS_DEVMODE}}`, `{{ALIAS_NEW}}`, `{{ALIAS_RESUME}}`, `{{ALIAS_PR}}`, `{{ALIAS_MERGE}}`, `{{ALIAS_DEPLOY}}`, `{{ALIAS_CLEAN}}`, `{{ALIAS_STATUS}}`, `{{ALIAS_DOCTOR}}`, and `{{ALIAS_ROLLBACK}}`.
 - Fixed helper commands include `/fix`, `/fix rethink`, and `/fix refresh-guidance`.
 - Prefer the slash aliases above. They use the managed Pipelane runner and work before a fresh checkout has `node_modules`. Repo-local `npm run pipelane:*` or `npm run workflow:*` scripts are fallback paths and require `node_modules/.bin/pipelane` to exist.
-- For code changes, ensure work is in a Pipelane task workspace before editing. If the user describes a new task from a non-task checkout, run `{{ALIAS_NEW}}` with an inferred `--task` label before implementation.
+- For code changes, ensure work is in a Pipelane task workspace before editing. If the user describes a new task from a non-task checkout, run `{{ALIAS_NEW}}` with an inferred `--task` label before implementation. Do not edit in the starting checkout while planning to create the workspace later.
 - Use `{{ALIAS_NEW}}` to start new work after the user describes the task; use an explicit task name if the user provided one, otherwise infer a concise `--task` label instead of making the user repeat it.
 - Use `{{ALIAS_RESUME}} --task "<task-name>"` to return to an existing task workspace.
 - Use `{{ALIAS_DEVMODE}} status|build|release` to inspect or switch lanes.
@@ -24,6 +24,8 @@ This repo uses `pipelane` for task workspaces, PR prep, merge handoff, and deplo
 
 - Treat `{{ALIAS_NEW}}` as the canonical task-start command.
 - For any code-changing task, start in a Pipelane task workspace. If the current checkout is not already the matching task workspace, run `{{ALIAS_NEW}}` with an inferred `--task` label before editing.
+- If `{{ALIAS_NEW}}` or `{{ALIAS_RESUME}}` reports `Chat has not moved`, switch the shell/workspace to the reported path before reading or editing task files. If you cannot switch the workspace, stop and report the path instead of continuing in the shared checkout.
+- If `{{ALIAS_NEW}}` fails, do not continue implementation in the current checkout. Fix the task-start failure, run `{{ALIAS_RESUME}}` for existing work, or ask the operator how to proceed.
 - Do not edit, commit, run `{{ALIAS_PR}}`, `{{ALIAS_MERGE}}`, or `{{ALIAS_DEPLOY}}` from a shared checkout, base branch checkout, dirty unrelated worktree, or another task's worktree unless the user explicitly asks for that checkout.
 - Exceptions are read-only review, answering questions without file edits, and continuing inside an already-created matching task workspace.
 - If the user invokes bare `{{ALIAS_NEW}}` after describing an unstarted task, run it with an inferred `--task "<short-name>"`; if the task was already implemented, continue in the reported worktree and do not create another workspace.

@@ -16,6 +16,8 @@ Before work that may lead to a commit:
 4. Use `{{ALIAS_RESUME}} --task "<task-name>"` only when returning to existing work
 5. Prepare the PR with `{{ALIAS_PR}} --title "<pr title>"`
 
+If `{{ALIAS_NEW}}` fails, stop instead of editing in the shared checkout.
+
 If the repo changes slash aliases, rerun setup locally and reopen Claude/Codex so the updated command names appear.
 
 Use `docs/RELEASE_WORKFLOW.md` for the full operator contract.

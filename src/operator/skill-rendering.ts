@@ -269,6 +269,10 @@ workspace. Continue in the reported worktree and use the PR flow there.
 If no task context is available, ask one short question for the task
 description. Only use \`--unnamed\` when the operator explicitly wants a
 generated task slug.
+
+If ${slashAlias} fails, stop instead of editing in the current checkout. If it
+succeeds and reports that the chat/workspace has not moved, switch to the
+reported worktree before reading or editing task files.
 `;
 }
 

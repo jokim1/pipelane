@@ -7,6 +7,8 @@ This file is local-only operator state. Keep it git-ignored.
 - Treat `release` as the standard shipping mode.
 - Use `build` only for fallback, recovery, or an explicit user request.
 - Use `{{ALIAS_NEW}}`, not manual branch creation, for normal task starts.
+- For code-changing work, run `{{ALIAS_NEW}}` before editing unless this chat is already in the matching task worktree.
+- If `{{ALIAS_NEW}}` fails, stop instead of editing in the current checkout.
 - When the user describes a task and then invokes `{{ALIAS_NEW}}`, infer a concise task label and pass it as `--task`; if the user provides a task name, use that.
 - If recent context says the task is already implemented in a worktree, do not run `{{ALIAS_NEW}}`; continue there and use `{{ALIAS_PR}}`.
 - Preferred operator path:

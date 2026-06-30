@@ -18,6 +18,25 @@ Parse `$ARGUMENTS` by whitespace. Evaluate only the first token.
 
 No prefix matching. `/pipelane update-this-thing` routes to UNKNOWN MODE, not UPDATE MODE.
 
+## Runner Selection
+
+For setup, configure, update, and task-start flows, prefer the managed runner
+before any repo-local npm script:
+
+```bash
+claude_home="${CLAUDE_HOME:-$HOME/.claude}"
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+claude_runner="$claude_home/skills/pipelane/bin/run-pipelane.sh"
+claude_bin="$claude_home/skills/pipelane/bin/pipelane"
+codex_runner="$codex_home/skills/.pipelane/bin/run-pipelane.sh"
+codex_bin="$codex_home/skills/.pipelane/bin/pipelane"
+```
+
+Use `"$claude_runner" pipelane <subcommand> ...` when both the runner and its
+managed `pipelane` binary exist, then use the Codex runner with the same check.
+Use `npm run pipelane:*` only as a fallback after managed runners are missing or
+incomplete.
+
 ---
 
 ## JOURNEY OVERVIEW
@@ -87,7 +106,19 @@ Helpful anytime:
 Run:
 
 ```bash
-npm run pipelane:setup -- $REST
+claude_home="${CLAUDE_HOME:-$HOME/.claude}"
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+claude_runner="$claude_home/skills/pipelane/bin/run-pipelane.sh"
+claude_bin="$claude_home/skills/pipelane/bin/pipelane"
+codex_runner="$codex_home/skills/.pipelane/bin/run-pipelane.sh"
+codex_bin="$codex_home/skills/.pipelane/bin/pipelane"
+if [ -x "$claude_runner" ] && [ -x "$claude_bin" ]; then
+  "$claude_runner" pipelane setup $REST
+elif [ -x "$codex_runner" ] && [ -x "$codex_bin" ]; then
+  "$codex_runner" pipelane setup $REST
+else
+  npm run pipelane:setup -- $REST
+fi
 ```
 
 where `$REST` is `$ARGUMENTS` with the leading `setup` token stripped.
@@ -103,14 +134,28 @@ If setup offers to configure deploy targets, ask the user for the deploy values 
 Run:
 
 ```bash
-npm run pipelane:configure -- $REST
+claude_home="${CLAUDE_HOME:-$HOME/.claude}"
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+claude_runner="$claude_home/skills/pipelane/bin/run-pipelane.sh"
+claude_bin="$claude_home/skills/pipelane/bin/pipelane"
+codex_runner="$codex_home/skills/.pipelane/bin/run-pipelane.sh"
+codex_bin="$codex_home/skills/.pipelane/bin/pipelane"
+if [ -x "$claude_runner" ] && [ -x "$claude_bin" ]; then
+  "$claude_runner" pipelane configure $REST
+elif [ -x "$codex_runner" ] && [ -x "$codex_bin" ]; then
+  "$codex_runner" pipelane configure $REST
+else
+  npm run pipelane:configure -- $REST
+fi
 ```
 
 where `$REST` is `$ARGUMENTS` with the leading `configure` token stripped.
 
 Use this path for `/pipelane configure`, `/pipelane configure --json ...`, and deploy-config updates. Display the output directly.
 
-When configure prints "Choose the action to take:", ask the user for deploy values in chat, then run the matching `npm run pipelane:configure -- --json ...` command with the provided flags.
+When configure prints "Choose the action to take:", ask the user for deploy
+values in chat, then run the matching `/pipelane configure --json ...` command
+with the provided flags through the managed runner when available.
 
 ---
 
@@ -175,7 +220,19 @@ example `1 (Continue to /deploy staging: run /merge, then /deploy staging)` or
 Run:
 
 ```bash
-npm run pipelane:review -- $REST
+claude_home="${CLAUDE_HOME:-$HOME/.claude}"
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+claude_runner="$claude_home/skills/pipelane/bin/run-pipelane.sh"
+claude_bin="$claude_home/skills/pipelane/bin/pipelane"
+codex_runner="$codex_home/skills/.pipelane/bin/run-pipelane.sh"
+codex_bin="$codex_home/skills/.pipelane/bin/pipelane"
+if [ -x "$claude_runner" ] && [ -x "$claude_bin" ]; then
+  "$claude_runner" pipelane review $REST
+elif [ -x "$codex_runner" ] && [ -x "$codex_bin" ]; then
+  "$codex_runner" pipelane review $REST
+else
+  npm run pipelane:review -- $REST
+fi
 ```
 
 where `$REST` is `$ARGUMENTS` with the leading `review` token stripped.
@@ -184,10 +241,10 @@ Use this path for `/pipelane review`, `/pipelane review --json`, `/pipelane revi
 
 Special case: when `$REST` is exactly `setup`, do not run the interactive setup command first. Agent Bash tools commonly run without an interactive TTY, and shell pipes make stdout non-TTY.
 
-1. Run `npm run pipelane:review -- setup --print` to inspect the current effective gate config.
-2. If the user needs the available gate catalog, run `npm run pipelane:review -- setup --list-gates`.
+1. Run `/pipelane review setup --print` through the managed runner when available to inspect the current effective gate config.
+2. If the user needs the available gate catalog, run `/pipelane review setup --list-gates` through the managed runner when available.
 3. Present deterministic choices in chat:
-   - `1. Save recommended gates: npm run pipelane:review -- setup --yes`
+   - `1. Save recommended gates: /pipelane review setup --yes`
    - `2. Cancel`
 4. After the user chooses, run the matching command exactly.
 
@@ -253,7 +310,19 @@ breakdown before running one long opaque slice.
 Run:
 
 ```bash
-npm run pipelane:update -- $REST
+claude_home="${CLAUDE_HOME:-$HOME/.claude}"
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+claude_runner="$claude_home/skills/pipelane/bin/run-pipelane.sh"
+claude_bin="$claude_home/skills/pipelane/bin/pipelane"
+codex_runner="$codex_home/skills/.pipelane/bin/run-pipelane.sh"
+codex_bin="$codex_home/skills/.pipelane/bin/pipelane"
+if [ -x "$claude_runner" ] && [ -x "$claude_bin" ]; then
+  "$claude_runner" pipelane update $REST
+elif [ -x "$codex_runner" ] && [ -x "$codex_bin" ]; then
+  "$codex_runner" pipelane update $REST
+else
+  npm run pipelane:update -- $REST
+fi
 ```
 
 where `$REST` is `$ARGUMENTS` with the leading `update` token stripped. Use this path to check for and install the latest Pipelane from `jokim1/pipelane#main`.
@@ -261,10 +330,10 @@ where `$REST` is `$ARGUMENTS` with the leading `update` token stripped. Use this
 Common forms:
 
 ```bash
-npm run pipelane:update              # check, install if behind, auto-run setup
-npm run pipelane:update -- --check   # report upstream + local drift; no mutation
-npm run pipelane:update -- --json    # structured output; installs but never auto-runs setup
-npm run pipelane:update -- --yes     # apply setup guidance migrations without prompting
+/pipelane update          # check, install if behind, auto-run setup
+/pipelane update --check  # report upstream + local drift; no mutation
+/pipelane update --json   # structured output; installs but never auto-runs setup
+/pipelane update --yes    # apply setup guidance migrations without prompting
 ```
 
 This command:

@@ -15,6 +15,10 @@ Start with:
 
 That prints the build and release journeys for this repo.
 
+For code-changing work, start with `{{ALIAS_NEW}}` before editing and switch to
+the reported task worktree. If `{{ALIAS_NEW}}` fails, do not continue in the
+shared checkout.
+
 ### Build Journey
 
 Build mode is the fast lane. Use it when you want the shortest route from merge

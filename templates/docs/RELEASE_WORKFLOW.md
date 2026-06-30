@@ -108,6 +108,8 @@ Properties:
 - fails closed when a matching orphan worktree exists without a task lock, so finished manual work is not accidentally abandoned
 - agents should infer `--task "<task-name>"` from the described work when the user invokes bare `{{ALIAS_NEW}}`; if the user provides a task name, use it
 - a generated `task-<hex>` slug requires explicit `--unnamed`
+- agents must not edit in the starting checkout while planning to run `{{ALIAS_NEW}}` later; the task workspace must exist first
+- if `{{ALIAS_NEW}}` fails, agents must stop instead of continuing implementation in the current checkout
 
 `{{ALIAS_RESUME}}` is the recovery path, not the normal happy path.
 
@@ -119,7 +121,7 @@ Properties:
 - redirects back to `{{ALIAS_NEW}}` if the saved workspace is gone
 - lists active tasks when called without `--task`
 
-The chat/workspace does not move automatically. Switch into the reported path before editing.
+The chat/workspace does not move automatically. Switch into the reported path before reading or editing task files. If the tool cannot switch workspaces, stop and report the path instead of continuing in the shared checkout.
 
 ## `{{ALIAS_NEW}}` behavior
 
@@ -308,8 +310,8 @@ in `syncDocs`. Missing flags default to `false`; `true` = sync that surface,
 | `packageScripts` | `pipelane:*` script entries in `package.json`. Setting this to `false` while `claudeCommands` is `true` requires the consumer's `package.json` to already define the full managed `pipelane:*` workflow script set for that Pipelane version, plus `pipelane:configure`. Setup fails fast with guidance if any are missing. |
 
 Enabling `claudeCommands` means the generated `.claude/commands/*.md` files will
-invoke `npm run pipelane:<cmd>`, so also enable `packageScripts` unless the repo
-already owns equivalent scripts.
+prefer machine-local managed runners and fall back to `npm run pipelane:<cmd>`,
+so also enable `packageScripts` unless the repo already owns equivalent scripts.
 
 Disabling a surface never removes content that a previous sync already wrote; it
 just stops future syncs from touching the surface.

@@ -1133,6 +1133,7 @@ test('init writes tracked Pipelane files and setup seeds CLAUDE plus tracked Cod
 
     const setupResult = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
     assert.match(setupResult.stdout, /[Pp]ipelane setup complete/);
+    assert.match(setupResult.stdout, /Task start rule: for new code-changing work, run `\/new`/);
     assert.match(setupResult.stdout, /Synced Codex skills in/);
     assert.match(setupResult.stdout, /Removed legacy machine-local wrapper skills: new, pr, resume/);
     assert.ok(existsSync(path.join(repoRoot, 'CLAUDE.md')));
@@ -1147,14 +1148,18 @@ test('init writes tracked Pipelane files and setup seeds CLAUDE plus tracked Cod
     assert.match(newSkill, /npm run workflow:new/);
     assert.match(newSkill, /Bare invocation behavior/);
     assert.match(newSkill, /infer a\s+concise task label/);
+    assert.match(newSkill, /If \/new fails, stop instead of editing in the current checkout/);
     const agentsGuidance = readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8');
     assert.match(agentsGuidance, /managed Pipelane runner/);
     assert.match(agentsGuidance, /npm run workflow:\*/);
     assert.match(agentsGuidance, /For any code-changing task, start in a Pipelane task workspace/);
+    assert.match(agentsGuidance, /Chat has not moved/);
+    assert.match(agentsGuidance, /If `\/new` fails, do not continue implementation in the current checkout/);
     assert.match(agentsGuidance, /Do not edit, commit, run `\/pr`, `\/merge`, or `\/deploy` from a shared checkout/);
     const claudeGuidance = readFileSync(path.join(repoRoot, 'CLAUDE.md'), 'utf8');
     assert.match(claudeGuidance, /pipelane:claude-workspace-policy:start/);
     assert.match(claudeGuidance, /For any code-changing task, start in a Pipelane task workspace/);
+    assert.match(claudeGuidance, /Chat has not moved/);
 
     const deploySkill = readFileSync(path.join(repoRoot, '.agents', 'skills', 'deploy', 'SKILL.md'), 'utf8');
     assert.match(deploySkill, /Blocked deploy follow-up behavior/);
@@ -1171,11 +1176,22 @@ test('init writes tracked Pipelane files and setup seeds CLAUDE plus tracked Cod
     assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'repo-guard.md')));
     assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'smoke.md')), false);
     const newCommand = readFileSync(path.join(repoRoot, '.claude', 'commands', 'new.md'), 'utf8');
+    assert.match(newCommand, /repo_runner=.*run-pipelane\.sh/);
+    assert.match(newCommand, /claude_bin=.*bin\/pipelane/);
+    assert.match(newCommand, /Use the host managed runner path first/);
+    assert.ok(
+      newCommand.indexOf('"$claude_runner" new $ARGUMENTS') < newCommand.indexOf('"$repo_runner" new $ARGUMENTS'),
+      'Claude host runner should be tried before repo-local runner in a fresh Claude-only checkout',
+    );
     assert.match(newCommand, /infer a concise task label/);
+    assert.match(newCommand, /If it fails, stop instead of editing in the current/);
     const pipelaneCommand = readFileSync(path.join(repoRoot, '.claude', 'commands', 'pipelane.md'), 'utf8');
+    assert.match(pipelaneCommand, /Runner Selection/);
+    assert.match(pipelaneCommand, /managed `pipelane` binary/);
     assert.match(pipelaneCommand, /when `\$REST` is exactly `setup`/);
-    assert.match(pipelaneCommand, /npm run pipelane:review -- setup --print/);
-    assert.match(pipelaneCommand, /npm run pipelane:review -- setup --yes/);
+    assert.match(pipelaneCommand, /\/pipelane review setup --print/);
+    assert.match(pipelaneCommand, /\/pipelane review setup --yes/);
+    assert.doesNotMatch(pipelaneCommand, /npm run pipelane:review -- setup --print/);
     assert.doesNotMatch(pipelaneCommand, /setup --preset/);
     assert.doesNotMatch(pipelaneCommand, /lean\|standard\|strict-production/);
   } finally {
@@ -30117,6 +30133,75 @@ test('setup proposes local CLAUDE.md workspace policy migration without --yes', 
     assert.match(result.stdout, /start code-changing work with \/new/);
     assert.match(result.stdout, /pipelane setup --yes/);
     assert.doesNotMatch(claude, /pipelane:claude-workspace-policy:start/);
+    assert.match(claude, /Keep this local note/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup migrates weak local CLAUDE.md workspace guidance that lacks stop conditions', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const claudePath = path.join(repoRoot, 'CLAUDE.md');
+    writeFileSync(
+      claudePath,
+      [
+        '# Demo App Local Operator Context',
+        '',
+        '## Local Operator Defaults',
+        '',
+        '- For any code-changing task, start in a Pipelane task workspace with `/new` and use `/resume` later.',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+
+    const result = runCli(['setup', '--yes'], repoRoot);
+    const claude = readFileSync(claudePath, 'utf8');
+    assert.match(result.stdout, /Updated CLAUDE\.md with the Pipelane task workspace policy\./);
+    assert.match(claude, /pipelane:claude-workspace-policy:start/);
+    assert.match(claude, /Chat has not moved/);
+    assert.match(claude, /If `\/new` fails, do not continue implementation in the current checkout/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup refreshes stale managed local CLAUDE.md workspace policy guidance', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const claudePath = path.join(repoRoot, 'CLAUDE.md');
+    writeFileSync(
+      claudePath,
+      [
+        '# Demo App Local Operator Context',
+        '',
+        '<!-- pipelane:claude-workspace-policy:start -->',
+        '## Task Workspace Policy',
+        '',
+        '- For any code-changing task, start in a Pipelane task workspace. If the current checkout is not already the matching task workspace, run `/new` with an inferred `--task` label before editing.',
+        '- Use `/resume --task "<task-name>"` to continue existing work. Use `/repo-guard --task "<task-name>"` when a checkout may be shared, dirty, or bound to another task.',
+        "- Do not edit, commit, run `/pr`, `/merge`, or `/deploy` from a shared checkout, base branch checkout, dirty unrelated worktree, or another task's worktree unless the user explicitly asks for that checkout.",
+        '- Exceptions are read-only review, answering questions without file edits, and continuing inside an already-created matching task workspace.',
+        '<!-- pipelane:claude-workspace-policy:end -->',
+        '',
+        '## Local Notes',
+        '',
+        '- Keep this local note.',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+
+    const result = runCli(['setup', '--yes'], repoRoot);
+    const claude = readFileSync(claudePath, 'utf8');
+    const markerCount = (claude.match(/pipelane:claude-workspace-policy:start/g) ?? []).length;
+    assert.match(result.stdout, /Updated CLAUDE\.md with the Pipelane task workspace policy\./);
+    assert.equal(markerCount, 1);
+    assert.match(claude, /Chat has not moved/);
+    assert.match(claude, /If `\/new` fails, do not continue implementation in the current checkout/);
     assert.match(claude, /Keep this local note/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });

@@ -154,7 +154,9 @@ function renderLocalClaudeWorkspacePolicy(config: WorkflowConfig): string {
     CLAUDE_WORKSPACE_POLICY_MARKER_START,
     '## Task Workspace Policy',
     '',
-    `- For any code-changing task, start in a Pipelane task workspace. If the current checkout is not already the matching task workspace, run \`${aliases.new}\` with an inferred \`--task\` label before editing.`,
+    `- For any code-changing task, start in a Pipelane task workspace. If the current checkout is not already the matching task workspace, run \`${aliases.new}\` with an inferred \`--task\` label before editing. Do not edit in the starting checkout while planning to create the workspace later.`,
+    `- If \`${aliases.new}\` or \`${aliases.resume}\` reports \`Chat has not moved\`, switch the shell/workspace to the reported path before reading or editing task files. If you cannot switch the workspace, stop and report the path instead of continuing in the shared checkout.`,
+    `- If \`${aliases.new}\` fails, do not continue implementation in the current checkout. Fix the task-start failure, run \`${aliases.resume}\` for existing work, or ask the operator how to proceed.`,
     `- Use \`${aliases.resume} --task "<task-name>"\` to continue existing work. Use \`${aliases['repo-guard']} --task "<task-name>"\` when a checkout may be shared, dirty, or bound to another task.`,
     `- Do not edit, commit, run \`${aliases.pr}\`, \`${aliases.merge}\`, or \`${aliases.deploy}\` from a shared checkout, base branch checkout, dirty unrelated worktree, or another task's worktree unless the user explicitly asks for that checkout.`,
     '- Exceptions are read-only review, answering questions without file edits, and continuing inside an already-created matching task workspace.',
@@ -549,9 +551,10 @@ export function ensurePackageScripts(repoRoot: string): void {
   writeFileSync(targetPath, nextRaw, 'utf8');
 }
 
-// Generated Claude slash-command templates invoke `npm run pipelane:<cmd>`.
-// Tracked Codex skills use a repo-managed wrapper instead, so packageScripts
-// are only a hard requirement when Claude commands are being generated.
+// Generated Claude slash-command templates prefer machine-local managed
+// runners, then fall back to `npm run pipelane:<cmd>`. Keep packageScripts as
+// a hard requirement when Claude commands are generated so project commands
+// still have a local fallback on machines without durable host skills.
 function assertPackageScriptConsistency(repoRoot: string, syncDocs: Required<SyncDocsConfig>): void {
   if (syncDocs.packageScripts || !syncDocs.claudeCommands) {
     return;
@@ -569,7 +572,7 @@ function assertPackageScriptConsistency(repoRoot: string, syncDocs: Required<Syn
 
   throw new Error(
     `syncDocs.packageScripts is false but package.json is missing required npm scripts: ${missing.join(', ')}. ` +
-      `The generated .claude/commands/*.md templates invoke these via \`npm run pipelane:<cmd>\`. ` +
+      `The generated .claude/commands/*.md templates use these as the fallback when no managed runner is installed. ` +
       `Fix it one of three ways: ` +
       `(a) add the missing scripts to package.json yourself, ` +
       `(b) set syncDocs.packageScripts to true (required when generating Claude commands unless those scripts already exist), or ` +
@@ -715,6 +718,7 @@ export interface SetupConsumerRepoResult {
   lessonsMigration: LessonsMigration | null;
   appliedLessonsMigration: LessonsMigration | null;
   warnings: string[];
+  taskStartCommand: string;
 }
 
 export interface SetupConsumerRepoOptions {
@@ -738,8 +742,11 @@ export interface AgentsGuidanceMigration {
 export interface ClaudeGuidanceMigration {
   file: 'CLAUDE.md';
   path: string;
+  action: 'insert' | 'replace';
   insertAfterLine: number;
   anchor: string;
+  replaceStartLine?: number;
+  replaceEndLine?: number;
   block: string;
 }
 
@@ -991,15 +998,15 @@ export function formatAgentsGuidanceMigrations(migrations: AgentsGuidanceMigrati
 }
 
 function hasLocalClaudeWorkspacePolicy(content: string, config: WorkflowConfig): boolean {
-  if (content.includes(CLAUDE_WORKSPACE_POLICY_MARKER_START)) {
-    return true;
-  }
-
   const aliases = resolveWorkflowAliases(config.aliases);
   return content.includes('For any code-changing task')
     && content.includes('Pipelane task workspace')
+    && content.includes('before editing')
+    && content.includes('Chat has not moved')
+    && content.includes('shared checkout')
     && content.includes(aliases.new)
-    && content.includes(aliases.resume);
+    && content.includes(aliases.resume)
+    && content.includes(aliases['repo-guard']);
 }
 
 function findClaudePolicyInsertionPoint(lines: string[]): { insertAfterLine: number; anchor: string } {
@@ -1016,6 +1023,23 @@ function findClaudePolicyInsertionPoint(lines: string[]): { insertAfterLine: num
   return { insertAfterLine: 0, anchor: '' };
 }
 
+function findClaudeWorkspacePolicyBlock(lines: string[]): { startIndex: number; endIndex: number } | null {
+  const startIndex = lines.findIndex((line) => line.includes(CLAUDE_WORKSPACE_POLICY_MARKER_START));
+  if (startIndex < 0) {
+    return null;
+  }
+  const relativeEndIndex = lines
+    .slice(startIndex + 1)
+    .findIndex((line) => line.includes(CLAUDE_WORKSPACE_POLICY_MARKER_END));
+  if (relativeEndIndex < 0) {
+    return null;
+  }
+  return {
+    startIndex,
+    endIndex: startIndex + 1 + relativeEndIndex,
+  };
+}
+
 function detectClaudeGuidanceMigrationsForConfig(repoRoot: string, config: WorkflowConfig): ClaudeGuidanceMigration[] {
   const claudePath = path.join(repoRoot, 'CLAUDE.md');
   if (!existsSync(claudePath)) {
@@ -1028,10 +1052,25 @@ function detectClaudeGuidanceMigrationsForConfig(repoRoot: string, config: Workf
   }
 
   const lines = content.split('\n');
+  const existingBlock = findClaudeWorkspacePolicyBlock(lines);
+  if (existingBlock) {
+    return [{
+      file: 'CLAUDE.md',
+      path: claudePath,
+      action: 'replace',
+      insertAfterLine: 0,
+      anchor: '',
+      replaceStartLine: existingBlock.startIndex + 1,
+      replaceEndLine: existingBlock.endIndex + 1,
+      block: renderLocalClaudeWorkspacePolicy(config),
+    }];
+  }
+
   const insertion = findClaudePolicyInsertionPoint(lines);
   return [{
     file: 'CLAUDE.md',
     path: claudePath,
+    action: 'insert',
     insertAfterLine: insertion.insertAfterLine,
     anchor: insertion.anchor,
     block: renderLocalClaudeWorkspacePolicy(config),
@@ -1042,10 +1081,22 @@ export function applyClaudeGuidanceMigrations(migrations: ClaudeGuidanceMigratio
   const applied: ClaudeGuidanceMigration[] = [];
   for (const migration of migrations) {
     const content = readFileSync(migration.path, 'utf8');
+    const lines = content.split('\n');
+    if (migration.action === 'replace') {
+      const existingBlock = findClaudeWorkspacePolicyBlock(lines);
+      if (!existingBlock) {
+        throw new Error(
+          `${migration.file} changed while preparing the CLAUDE.md guidance migration. Re-run setup to recompute the proposed edits.`,
+        );
+      }
+      lines.splice(existingBlock.startIndex, existingBlock.endIndex - existingBlock.startIndex + 1, ...migration.block.split('\n'));
+      writeFileSync(migration.path, lines.join('\n'), 'utf8');
+      applied.push(migration);
+      continue;
+    }
     if (content.includes(CLAUDE_WORKSPACE_POLICY_MARKER_START)) {
       continue;
     }
-    const lines = content.split('\n');
     if (migration.insertAfterLine > 0 && lines[migration.insertAfterLine - 1] !== migration.anchor) {
       throw new Error(
         `${migration.file}:${migration.insertAfterLine} changed while preparing the CLAUDE.md guidance migration. Re-run setup to recompute the proposed edits.`,
@@ -1090,12 +1141,17 @@ export async function applyClaudeGuidanceMigrationsWithApproval(
 export function formatClaudeGuidanceMigrations(migrations: ClaudeGuidanceMigration[]): string[] {
   const lines: string[] = [];
   for (const migration of migrations) {
-    lines.push(`${migration.file} is missing the Pipelane task workspace policy:`);
-    lines.push(
-      migration.insertAfterLine > 0
-        ? `- insert after ${migration.file}:${migration.insertAfterLine}`
-        : `- insert at the top of ${migration.file}`,
-    );
+    if (migration.action === 'replace') {
+      lines.push(`${migration.file} has stale Pipelane task workspace policy guidance:`);
+      lines.push(`- replace ${migration.file}:${migration.replaceStartLine}-${migration.replaceEndLine}`);
+    } else {
+      lines.push(`${migration.file} is missing the Pipelane task workspace policy:`);
+      lines.push(
+        migration.insertAfterLine > 0
+          ? `- insert after ${migration.file}:${migration.insertAfterLine}`
+          : `- insert at the top of ${migration.file}`,
+      );
+    }
   }
   return [
     ...lines,
@@ -1188,6 +1244,7 @@ export function setupConsumerRepo(cwd: string, options: SetupConsumerRepoOptions
     lessonsMigration,
     appliedLessonsMigration,
     warnings: [],
+    taskStartCommand: resolveWorkflowAliases(config.aliases).new,
   };
 }
 
@@ -1452,6 +1509,7 @@ export function formatSetupResult(result: SetupConsumerRepoResult): string[] {
       : result.skippedRepoGuidanceScaffold
         ? 'Skipped REPO_GUIDANCE.md scaffold because local guidance scaffolds are disabled.'
         : 'Preserved existing REPO_GUIDANCE.md.',
+    `Task start rule: for new code-changing work, run \`${result.taskStartCommand}\` with an inferred task label, then switch to the reported worktree before editing.`,
     setupDeployConfigMessage(result.repoRoot),
   ];
   if (result.installedCodexSkills.length > 0) {
