@@ -7,6 +7,7 @@ import {
   disqualifyDeployRecord,
   emptyDeployConfig,
   loadDeployConfig,
+  resolveDeployEnvironmentForMode,
   resolveDeployStateKey,
   type DeployConfig,
   verifyDeployRecord,
@@ -132,11 +133,11 @@ export interface DestinationPlan {
   message: string;
 }
 
-export function destinationTargetForParsed(parsed: ParsedOperatorArgs): DestinationMilestone | null {
+export function destinationTargetForParsed(parsed: ParsedOperatorArgs, mode: 'build' | 'release'): DestinationMilestone | null {
   if (parsed.command === 'pr') return 'pr_open';
   if (parsed.command === 'merge') return 'merged';
   if (parsed.command === 'deploy') {
-    const env = parsed.positional[0] === 'production' ? 'prod' : parsed.positional[0];
+    const env = resolveDeployEnvironmentForMode(parsed.positional[0], mode);
     if (env === 'staging') return 'staging_deployed';
     if (env === 'prod') return 'prod_deployed';
   }
@@ -144,9 +145,9 @@ export function destinationTargetForParsed(parsed: ParsedOperatorArgs): Destinat
 }
 
 export function buildDestinationPlanForCommand(cwd: string, parsed: ParsedOperatorArgs): DestinationPlan | null {
-  const target = destinationTargetForParsed(parsed);
-  if (!target) return null;
   const context = resolveWorkflowContext(cwd);
+  const target = destinationTargetForParsed(parsed, context.modeState.mode);
+  if (!target) return null;
   const snapshot = resolveDestinationSnapshot(context, parsed, target);
   return planDestination(snapshot, target);
 }
@@ -443,20 +444,17 @@ function sortDestinationFingerprintValue(value: unknown): unknown {
 export function shouldInterceptDestinationPlan(plan: DestinationPlan, parsed: ParsedOperatorArgs): boolean {
   if (parsed.flags.plan || parsed.flags.yes) return true;
   const executableSteps = plan.remainingSteps.filter((step) => step.id !== 'review_gate');
-  if (hasAutomaticDestinationJump(parsed, executableSteps)) return true;
+  if (hasAutomaticDestinationJump(plan.target, parsed, executableSteps)) return true;
   if (parsed.flags.json) return false;
   return false;
 }
 
-function hasAutomaticDestinationJump(parsed: ParsedOperatorArgs, executableSteps: DestinationStep[]): boolean {
+function hasAutomaticDestinationJump(target: DestinationMilestone, parsed: ParsedOperatorArgs, executableSteps: DestinationStep[]): boolean {
   if (executableSteps.length <= 1) return false;
 
-  if (parsed.command === 'deploy') {
-    const env = parsed.positional[0] === 'production' ? 'prod' : parsed.positional[0];
-    if (env === 'prod') {
-      const prereqs = executableSteps.slice(0, -1).map((step) => step.id);
-      return prereqs.some((stepId) => stepId === 'pr' || stepId === 'merge' || stepId === 'deploy_staging');
-    }
+  if (parsed.command === 'deploy' && target === 'prod_deployed') {
+    const prereqs = executableSteps.slice(0, -1).map((step) => step.id);
+    return prereqs.some((stepId) => stepId === 'pr' || stepId === 'merge' || stepId === 'deploy_staging');
   }
 
   return true;

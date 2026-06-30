@@ -1042,3 +1042,10 @@ export function normalizeDeployEnvironment(value: string): 'staging' | 'prod' {
   if (normalized === 'prod' || normalized === 'production') return 'prod';
   throw new Error('deploy requires an environment: staging or prod.');
 }
+
+export function resolveDeployEnvironmentForMode(value: string | undefined, mode: 'build' | 'release'): 'staging' | 'prod' {
+  const normalized = value?.trim() ?? '';
+  if (normalized) return normalizeDeployEnvironment(normalized);
+  if (mode === 'build') return 'prod';
+  throw new Error('release mode requires an explicit deploy environment: staging or prod.');
+}
