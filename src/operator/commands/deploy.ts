@@ -1052,15 +1052,35 @@ function collectDirectYamlChildKeys(lines: string[], startIndex: number, parentI
 
 function collectYamlListItems(lines: string[], startIndex: number, parentIndent: number): string[] {
   const items: string[] = [];
+  let childIndent: number | null = null;
+  let childKind: 'list' | 'mapping' | null = null;
+
   for (let index = startIndex; index < lines.length; index += 1) {
     const keyEntry = parseYamlKeyLine(lines[index], index);
     if (keyEntry && keyEntry.indent <= parentIndent) break;
 
     const withoutComment = lines[index].replace(/\s+#.*$/u, '').trimEnd();
     const match = /^(\s*)-\s+(.+)$/u.exec(withoutComment);
+    const listIndent = match ? match[1].replace(/\t/gu, '  ').length : null;
+    if (listIndent !== null && listIndent <= parentIndent) break;
+
+    const contentIndent = keyEntry?.indent ?? listIndent;
+    if (contentIndent === null) continue;
+    if (contentIndent <= parentIndent) break;
+    if (childIndent === null || contentIndent < childIndent) {
+      childIndent = contentIndent;
+      childKind = null;
+      items.length = 0;
+    }
+    if (contentIndent !== childIndent) continue;
+
+    if (keyEntry) {
+      childKind ??= 'mapping';
+      continue;
+    }
     if (!match) continue;
-    const indent = match[1].replace(/\t/gu, '  ').length;
-    if (indent <= parentIndent) break;
+    childKind ??= 'list';
+    if (childKind !== 'list') continue;
     items.push(unquoteYamlKey(match[2].trim()));
   }
   return items;
