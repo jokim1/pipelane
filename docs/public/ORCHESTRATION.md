@@ -270,11 +270,18 @@ Current implementation surface:
 
 ## Signed Run Ledgers
 
-Every command that creates or mutates an orchestration run requires
-`PIPELANE_ORCHESTRATION_STATE_KEY`. Set it to a secret value with at least 32
-characters before using `orchestrate plan`, `analyze`, `plan-review`,
-`prepare`, `dispatch`, `start`, `review`, `scope`, `finalize`, or
-`upgrade-ledger`.
+Every command that creates or mutates an orchestration run signs the run ledger
+with `PIPELANE_ORCHESTRATION_STATE_KEY`. If the environment variable is unset,
+Pipelane creates and reuses a machine-local key at
+`~/.pipelane/keys/orchestration-state.key` (or
+`$PIPELANE_HOME/keys/orchestration-state.key`) so fresh Codex/Claude chats can
+continue without re-exporting a key. The file is written with `0600`
+permissions where the platform supports POSIX modes.
+
+Set `PIPELANE_ORCHESTRATION_STATE_KEY` explicitly when you want to supply or
+rotate the operator key yourself. Explicit values must have at least 32
+characters. `PIPELANE_ORCHESTRATION_STATE_KEY_FILE` may point at an alternate
+machine-local key file.
 
 ```bash
 export PIPELANE_ORCHESTRATION_STATE_KEY='use-a-random-32+-character-local-secret'
@@ -291,10 +298,12 @@ index and latest ledger signature, so restoring only an older
 
 Unsigned pre-hardening ledgers are a clean break. Pipelane does not silently
 migrate or trust them, and signed ledgers are verified before any legacy
-migration/normalization runs. Default diagnostics distinguish missing, blank,
-and too-short keys; wrong keys; malformed JSON; missing ledgers; invalid run
-ids; legacy unsigned ledgers; signature tampering; and ledger-only rollback.
+migration/normalization runs. Default diagnostics distinguish blank and
+too-short keys; wrong keys; malformed JSON; missing ledgers; invalid run ids;
+legacy unsigned ledgers; signature tampering; and ledger-only rollback.
 Wrong-key errors mention the key fingerprint mismatch, never the key value.
+Key-mismatched prior ledgers are shown as warnings during new-run discovery and
+still fail closed when opened by explicit run id.
 
 The only recovery path for an old unsigned run is explicit resealing:
 
@@ -313,11 +322,14 @@ head. It is not a tamper repair tool for signed ledgers whose signature fails.
 Local threat model: the guard detects accidental edits, wrong-key reads,
 ledger transplants, malformed/torn writes, and restoring an older ledger
 without also restoring Pipelane's integrity head. It does not protect against an
-attacker who can read `PIPELANE_ORCHESTRATION_STATE_KEY`, replace both the
-ledger and all integrity state with a consistent older snapshot, or modify the
-Pipelane executable before it verifies state. Workers never receive
-`PIPELANE_ORCHESTRATION_STATE_KEY`; the deny-list strips it even if
-`PIPELANE_ORCHESTRATE_WORKER_ENV_ALLOW` names it.
+attacker who can read the operator signing key or its machine-local key file,
+replace both the ledger and all integrity state with a consistent older
+snapshot, or modify the Pipelane executable before it verifies state. Pipelane
+does not pass workers `PIPELANE_ORCHESTRATION_STATE_KEY`,
+`PIPELANE_ORCHESTRATION_STATE_KEY_FILE`, or `PIPELANE_HOME`; the deny-list
+strips them even if `PIPELANE_ORCHESTRATE_WORKER_ENV_ALLOW` names them. This
+prevents accidental env disclosure, but it is not a same-user filesystem
+sandbox.
 
 The approved bare command requires a host-authored `--analysis-file` and records
 plan analysis before creating any worktree. It then runs `prepare`, `dispatch`,

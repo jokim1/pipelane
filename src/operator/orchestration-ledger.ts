@@ -472,6 +472,7 @@ export type OrchestrationLedgerDiagnostic =
     ledgerPath: string;
     mtimeMs: number | null;
     reason: string;
+    reasonCode?: 'orchestration-key-unavailable' | 'orchestration-key-mismatch';
   }
   | {
     status: 'invalid-run-id';
@@ -1335,18 +1336,30 @@ function diagnoseOrchestrationRunPath(
       ledgerPath: targetPath,
       mtimeMs,
       reason: error instanceof Error ? error.message : String(error),
+      reasonCode: 'orchestration-key-unavailable',
     };
   }
 
   if (!verifySignedPayload(envelope as unknown as OrchestrationRunDiskEnvelope, key)) {
+    const corroboratedWrongKey = integrity.keyFingerprint !== fingerprint
+      && isWrongKeyFingerprintCorroboratedByIntegrityHead(
+        commonDir,
+        config,
+        runId,
+        integrity,
+        envelope.signature as string,
+      );
     return {
       status: 'corrupt',
       runId,
       ledgerPath: targetPath,
       mtimeMs,
-      reason: integrity.keyFingerprint !== fingerprint
+      reason: corroboratedWrongKey
         ? `wrong ${ORCHESTRATION_STATE_KEY_ENV}: ledger was sealed with a different key fingerprint`
         : 'orchestration ledger signature verification failed; ledger contents may have been tampered with',
+      reasonCode: corroboratedWrongKey
+        ? 'orchestration-key-mismatch'
+        : undefined,
     };
   }
 
@@ -1357,6 +1370,7 @@ function diagnoseOrchestrationRunPath(
       ledgerPath: targetPath,
       mtimeMs,
       reason: `wrong ${ORCHESTRATION_STATE_KEY_ENV}: ledger key fingerprint does not match the configured key`,
+      reasonCode: 'orchestration-key-mismatch',
     };
   }
 
@@ -1379,6 +1393,9 @@ function diagnoseOrchestrationRunPath(
       ledgerPath: targetPath,
       mtimeMs,
       reason: headReason,
+      reasonCode: headReason.startsWith(`wrong ${ORCHESTRATION_STATE_KEY_ENV}`)
+        ? 'orchestration-key-mismatch'
+        : undefined,
     };
   }
 
@@ -1445,9 +1462,7 @@ function verifyOrchestrationIntegrityHead(
     return 'orchestration integrity head JSON does not match the expected schema';
   }
   if (!verifySignedPayload(head as OrchestrationRunIntegrityHead, key)) {
-    return head.keyFingerprint !== fingerprint
-      ? `wrong ${ORCHESTRATION_STATE_KEY_ENV}: integrity head was sealed with a different key fingerprint`
-      : 'orchestration integrity head signature verification failed; rollback metadata may have been tampered with';
+    return 'orchestration integrity head signature verification failed; rollback metadata may have been tampered with';
   }
   if (!record.integrity || !record.signature) return 'signed ledger metadata is missing after verification';
   if (head.runId !== record.id) {
@@ -1466,6 +1481,31 @@ function verifyOrchestrationIntegrityHead(
     return 'orchestration ledger rollback or transplant detected: integrity head signature does not match the ledger signature';
   }
   return null;
+}
+
+function isWrongKeyFingerprintCorroboratedByIntegrityHead(
+  commonDir: string,
+  config: WorkflowConfig,
+  runId: string,
+  integrity: OrchestrationRunIntegrity,
+  ledgerSignature: string,
+): boolean {
+  const targetPath = orchestrationIntegrityHeadPath(commonDir, config, runId);
+  if (!existsSync(targetPath)) return false;
+  let parsed: unknown;
+  try {
+    parsed = readRawJsonFile(targetPath);
+  } catch {
+    return false;
+  }
+  if (!isPlainObject(parsed)) return false;
+  const head = parsed as Record<string, unknown>;
+  if (malformedSignatureReason(head.signature, 'integrity head signature')) return false;
+  if (!isOrchestrationRunIntegrityHead(head)) return false;
+  return head.runId === runId
+    && head.mutationIndex === integrity.mutationIndex
+    && head.ledgerSignature === ledgerSignature
+    && head.keyFingerprint === integrity.keyFingerprint;
 }
 
 function isOrchestrationRunIntegrity(value: unknown): value is OrchestrationRunIntegrity {

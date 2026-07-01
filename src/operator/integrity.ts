@@ -1,9 +1,13 @@
 import crypto from 'node:crypto';
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 export const DEPLOY_STATE_KEY_ENV = 'PIPELANE_DEPLOY_STATE_KEY';
 export const PROBE_STATE_KEY_ENV = 'PIPELANE_PROBE_STATE_KEY';
 export const REVIEW_STATE_KEY_ENV = 'PIPELANE_REVIEW_STATE_KEY';
 export const ORCHESTRATION_STATE_KEY_ENV = 'PIPELANE_ORCHESTRATION_STATE_KEY';
+export const ORCHESTRATION_STATE_KEY_FILE_ENV = 'PIPELANE_ORCHESTRATION_STATE_KEY_FILE';
 export const MIN_STATE_KEY_LENGTH = 32;
 
 export function canonicalize(value: unknown): string {
@@ -67,23 +71,76 @@ export function resolveReviewStateKey(): string | undefined {
   return resolveStateKey(REVIEW_STATE_KEY_ENV);
 }
 
-export function resolveRequiredStateKey(name: string): string {
-  const raw = process.env[name];
+function validateRequiredStateKey(name: string, raw: string | undefined, sourceLabel = name): string {
   if (raw === undefined) {
     throw new Error(`${name} is missing; set a signing key of at least ${MIN_STATE_KEY_LENGTH} characters before mutating or reading signed orchestration ledgers.`);
   }
   if (raw.trim().length === 0) {
-    throw new Error(`${name} is blank; set a signing key of at least ${MIN_STATE_KEY_LENGTH} characters.`);
+    throw new Error(`${sourceLabel} is blank; set a signing key of at least ${MIN_STATE_KEY_LENGTH} characters.`);
   }
   const trimmed = raw.trim();
   if (trimmed.length < MIN_STATE_KEY_LENGTH) {
-    throw new Error(`${name} is too short; minimum accepted length is ${MIN_STATE_KEY_LENGTH} characters.`);
+    throw new Error(`${sourceLabel} is too short; minimum accepted length is ${MIN_STATE_KEY_LENGTH} characters.`);
   }
   return trimmed;
 }
 
+export function resolveRequiredStateKey(name: string): string {
+  return validateRequiredStateKey(name, process.env[name]);
+}
+
+function pipelaneHomeDir(): string {
+  const override = process.env.PIPELANE_HOME?.trim();
+  return override ? path.resolve(override) : path.join(os.homedir(), '.pipelane');
+}
+
+export function orchestrationStateKeyPath(): string {
+  const override = process.env[ORCHESTRATION_STATE_KEY_FILE_ENV]?.trim();
+  return override ? path.resolve(override) : path.join(pipelaneHomeDir(), 'keys', 'orchestration-state.key');
+}
+
+function readOrCreatePersistedOrchestrationStateKey(): string {
+  const keyPath = orchestrationStateKeyPath();
+  try {
+    return validateRequiredStateKey(
+      ORCHESTRATION_STATE_KEY_ENV,
+      readFileSync(keyPath, 'utf8'),
+      `${ORCHESTRATION_STATE_KEY_FILE_ENV} ${keyPath}`,
+    );
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code !== 'ENOENT') throw error;
+  }
+
+  const key = crypto.randomBytes(32).toString('base64url');
+  mkdirSync(path.dirname(keyPath), { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(path.dirname(keyPath), 0o700);
+  } catch {
+    // Best effort: Windows and some network filesystems may not honor POSIX modes.
+  }
+  try {
+    writeFileSync(keyPath, `${key}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    try {
+      chmodSync(keyPath, 0o600);
+    } catch {}
+    return key;
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code !== 'EEXIST') throw error;
+    return validateRequiredStateKey(
+      ORCHESTRATION_STATE_KEY_ENV,
+      readFileSync(keyPath, 'utf8'),
+      `${ORCHESTRATION_STATE_KEY_FILE_ENV} ${keyPath}`,
+    );
+  }
+}
+
 export function resolveOrchestrationStateKey(): string {
-  return resolveRequiredStateKey(ORCHESTRATION_STATE_KEY_ENV);
+  if (process.env[ORCHESTRATION_STATE_KEY_ENV] !== undefined) {
+    return resolveRequiredStateKey(ORCHESTRATION_STATE_KEY_ENV);
+  }
+  return readOrCreatePersistedOrchestrationStateKey();
 }
 
 export function stateKeyFingerprint(key: string): string {

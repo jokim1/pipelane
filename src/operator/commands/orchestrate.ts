@@ -48,7 +48,7 @@ import {
   type OrchestrationSliceRecord,
   type OrchestrationSliceWorkerRecord,
 } from '../orchestration-ledger.ts';
-import { ORCHESTRATION_STATE_KEY_ENV, resolveOrchestrationStateKey, signSignedPayload, verifySignedPayload, resolveReviewStateKey } from '../integrity.ts';
+import { ORCHESTRATION_STATE_KEY_ENV, ORCHESTRATION_STATE_KEY_FILE_ENV, resolveOrchestrationStateKey, signSignedPayload, verifySignedPayload, resolveReviewStateKey } from '../integrity.ts';
 import {
   blockingAiReviewEvidenceBlocker,
   classifyReviewEvidenceIndependence,
@@ -107,6 +107,8 @@ const INHERITED_AGENT_SESSION_ENV_KEYS = [
 ] as const;
 const WORKER_SECRET_ENV_KEYS = [
   ORCHESTRATION_STATE_KEY_ENV,
+  ORCHESTRATION_STATE_KEY_FILE_ENV,
+  'PIPELANE_HOME',
   'PIPELANE_REVIEW_STATE_KEY',
   'PIPELANE_DEPLOY_STATE_KEY',
   'PIPELANE_PROBE_STATE_KEY',
@@ -190,6 +192,7 @@ interface OrchestrationCorruptLedgerSummary {
   runId: string;
   ledgerPath: string;
   reason: string;
+  reasonCode?: string;
   mtimeMs: number | null;
   recent: boolean;
 }
@@ -566,7 +569,7 @@ async function handleOrchestrateEntry(cwd: string, parsed: ParsedOperatorArgs): 
             planReviewStatus: analysisResult.planReviewStatus,
             blockingPendingCount: analysisResult.blockingPendingCount,
             run,
-            message: renderAnalyzeReport(run, ledgerPath, analysisFile, analysisResult.blockingPendingCount),
+            message: appendOrchestrationDiagnostics(renderAnalyzeReport(run, ledgerPath, analysisFile, analysisResult.blockingPendingCount), ledgerWarnings, scan),
           };
         }
         return await runApprovedOrchestration(context, run, planPath, activeRuns, likelyPlanFiles, parsed.flags.offline, ledgerWarnings, scan, !parsed.flags.json);
@@ -1232,7 +1235,7 @@ function buildCorruptLedgerBlockReport(
 function recentCorruptDiagnostics(
   scan: OrchestrationRunScanDiagnostics,
 ): Extract<OrchestrationLedgerDiagnostic, { status: 'corrupt' }>[] {
-  return scan.corrupt.filter(isRecentCorruptLedger);
+  return scan.corrupt.filter((diagnostic) => !isKeyRelatedCorruptLedger(diagnostic) && isRecentCorruptLedger(diagnostic));
 }
 
 function assertNoRecentCorruptOrchestrationLedgers(context: WorkflowContext): void {
@@ -1247,9 +1250,20 @@ function isRecentCorruptLedger(diagnostic: Pick<OrchestrationCorruptLedgerSummar
   return diagnostic.mtimeMs >= Date.now() - ORCHESTRATION_CORRUPT_LEDGER_BLOCK_AGE_MS;
 }
 
+function isKeyRelatedCorruptLedger(
+  diagnostic: Pick<Extract<OrchestrationLedgerDiagnostic, { status: 'corrupt' }>, 'reasonCode'>,
+): boolean {
+  return diagnostic.reasonCode === 'orchestration-key-unavailable'
+    || diagnostic.reasonCode === 'orchestration-key-mismatch';
+}
+
 function buildOrchestrationScanWarnings(scan: OrchestrationRunScanDiagnostics): string[] {
   const warnings: string[] = [];
   for (const diagnostic of scan.corrupt) {
+    if (isKeyRelatedCorruptLedger(diagnostic)) {
+      warnings.push(`Ignored signed orchestration ledger unreadable with the current ${ORCHESTRATION_STATE_KEY_ENV} ${diagnostic.ledgerPath}: ${diagnostic.reason}. Load the original key to resume that run.`);
+      continue;
+    }
     if (isRecentCorruptLedger(diagnostic)) continue;
     warnings.push(`Ignored older corrupt orchestration ledger ${diagnostic.ledgerPath}: ${diagnostic.reason}`);
   }
@@ -1261,7 +1275,7 @@ function buildOrchestrationScanWarnings(scan: OrchestrationRunScanDiagnostics): 
 
 function buildOrchestrationScanAttention(scan: OrchestrationRunScanDiagnostics): string[] {
   return scan.corrupt
-    .filter(isRecentCorruptLedger)
+    .filter((diagnostic) => !isKeyRelatedCorruptLedger(diagnostic) && isRecentCorruptLedger(diagnostic))
     .map((diagnostic) => `Repair or move aside unreadable orchestration ledger ${diagnostic.ledgerPath}`);
 }
 
@@ -1278,6 +1292,7 @@ function summarizeCorruptLedger(
     runId: diagnostic.runId,
     ledgerPath: diagnostic.ledgerPath,
     reason: diagnostic.reason,
+    reasonCode: diagnostic.reasonCode,
     mtimeMs: diagnostic.mtimeMs,
     recent: isRecentCorruptLedger(diagnostic),
   };
@@ -1318,6 +1333,19 @@ function renderCorruptLedgerBlock(
   diagnostic: Extract<OrchestrationLedgerDiagnostic, { status: 'corrupt' }>,
 ): string {
   const abandonedPath = path.join(path.dirname(path.dirname(path.dirname(diagnostic.ledgerPath))), 'abandoned', diagnostic.runId);
+  const next = isKeyRelatedCorruptLedger(diagnostic)
+    ? [
+        `1. Load the ${ORCHESTRATION_STATE_KEY_ENV} that matches this run, then retry.`,
+        '2. If the run is abandoned, move its run directory outside .pipelane/state/orchestrate/runs/, for example to:',
+        `   ${abandonedPath}`,
+        '3. Start a new run after deciding the old run can be ignored.',
+      ]
+    : [
+        '1. Restore the ledger from a known-good backup/local copy if this run matters.',
+        '2. Move the corrupt run directory outside .pipelane/state/orchestrate/runs/ if the run is abandoned, for example to:',
+        `   ${abandonedPath}`,
+        '3. Re-run /pipelane orchestrate after repair.',
+      ];
   return [
     'Pipelane orchestrate',
     '',
@@ -1330,10 +1358,7 @@ function renderCorruptLedgerBlock(
     'No state was changed.',
     '',
     'Next:',
-    '1. Restore the ledger from a known-good backup/local copy if this run matters.',
-    '2. Move the corrupt run directory outside .pipelane/state/orchestrate/runs/ if the run is abandoned, for example to:',
-    `   ${abandonedPath}`,
-    '3. Re-run /pipelane orchestrate after repair.',
+    ...next,
   ].join('\n');
 }
 
@@ -1843,6 +1868,8 @@ function buildAnalyzeMutationReport(
   resolveOrchestrationStateKey();
   const result = attachPlanAnalysisFromFile(context, run, analysisFile, 'orchestrate analyze');
   const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+  const scan = scanOrchestrationRunDiagnostics(context.commonDir, context.config);
+  const warnings = buildOrchestrationScanWarnings(scan);
   return {
     command: 'orchestrate analyze',
     status: result.record.status,
@@ -1854,7 +1881,7 @@ function buildAnalyzeMutationReport(
     planReviewStatus: result.planReviewStatus,
     blockingPendingCount: result.blockingPendingCount,
     run,
-    message: renderAnalyzeReport(run, ledgerPath, analysisFile, result.blockingPendingCount),
+    message: appendOrchestrationDiagnostics(renderAnalyzeReport(run, ledgerPath, analysisFile, result.blockingPendingCount), warnings, scan),
   };
 }
 

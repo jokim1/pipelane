@@ -206,6 +206,7 @@ function writeOrchestrateAnalysis(repoRoot, sourceText, overrides = {}) {
 }
 
 function analyzePlannedRun(repoRoot, planned, sourceText, overrides = {}, options = {}) {
+  const operatorEnv = options.env ?? {};
   const autoPassPlanReview = options.passPlanReview !== false;
   const analysisFile = writeOrchestrateAnalysis(repoRoot, sourceText, {
     sourceSha256: analysisSourceSha256ForPlannedRun(repoRoot, planned) ?? sha256Text(sourceText),
@@ -230,7 +231,7 @@ function analyzePlannedRun(repoRoot, planned, sourceText, overrides = {}, option
     '--analysis-file',
     analysisFile,
     '--json',
-  ], repoRoot).stdout);
+  ], repoRoot, operatorEnv).stdout);
   if (autoPassPlanReview) {
     for (const gate of analyzed.run.planAnalysis?.planReview?.gates ?? []) {
       if (gate.blocking && gate.status === 'pending') {
@@ -245,7 +246,7 @@ function analyzePlannedRun(repoRoot, planned, sourceText, overrides = {}, option
           gate.gateId,
           '--message',
           `Test plan review passed for ${gate.gateId}`,
-        ], repoRoot, { CODEX_SESSION_ID: options.attesterSessionId ?? 'test-plan-review-session' });
+        ], repoRoot, { ...operatorEnv, CODEX_SESSION_ID: options.attesterSessionId ?? 'test-plan-review-session' });
       }
     }
   }
@@ -266,7 +267,7 @@ function analyzePlannedRunForPrepare(repoRoot, planned, overrides = {}, options 
 
 function preparePlannedRun(repoRoot, planned, overrides = {}, options = {}) {
   analyzePlannedRunForPrepare(repoRoot, planned, overrides, options);
-  return JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+  return JSON.parse(runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId, '--json'], repoRoot, options.env ?? {}).stdout);
 }
 
 function shouldSeedPassingReviewEvidence(args) {
@@ -15886,6 +15887,10 @@ function orchestrationIntegrityHeadPath(repoRoot, runId) {
   return path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'orchestrate', 'integrity', `${runId}.json`);
 }
 
+function persistedOrchestrationStateKeyPath(pipelaneHome) {
+  return path.join(pipelaneHome, 'keys', 'orchestration-state.key');
+}
+
 function orchestrationKeyFingerprintForTest(key) {
   return createHash('sha256').update(key).digest('hex').slice(0, 16);
 }
@@ -16011,14 +16016,17 @@ test('orchestration ledger signing has a fixed HMAC answer for the persisted env
   assert.equal(signPayloadForTest(envelope, key), '67798bece1fe4d6f05b4b9f71d2566eff4da60b804c2c2c0a7c7ca6ca3b947ba');
 });
 
-test('orchestration state key validation distinguishes missing, blank, short, valid, and wrong key', () => {
+test('orchestration state key validation persists missing env keys and distinguishes blank, short, valid, and wrong key', () => {
   const repoRoot = createRepo();
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
   try {
-    const missing = runCli(['run', 'orchestrate', 'plan', '--outcome', 'needs key'], repoRoot, {
+    const generated = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'needs generated key', '--json'], repoRoot, {
       PIPELANE_ORCHESTRATION_STATE_KEY: undefined,
-    }, true);
-    assert.notEqual(missing.status, 0);
-    assert.match(missing.stderr, /PIPELANE_ORCHESTRATION_STATE_KEY is missing/);
+      PIPELANE_HOME: pipelaneHome,
+    }).stdout);
+    const generatedKey = readFileSync(persistedOrchestrationStateKeyPath(pipelaneHome), 'utf8').trim();
+    assert.ok(generatedKey.length >= 32);
+    assertSignedLedgerValid(repoRoot, generated.runId, generatedKey);
 
     const blank = runCli(['run', 'orchestrate', 'plan', '--outcome', 'blank key'], repoRoot, {
       PIPELANE_ORCHESTRATION_STATE_KEY: '   ',
@@ -16040,6 +16048,76 @@ test('orchestration state key validation distinguishes missing, blank, short, va
     }, true);
     assert.notEqual(wrong.status, 0);
     assert.match(wrong.stderr, /wrong PIPELANE_ORCHESTRATION_STATE_KEY/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate analyze creates a fresh run when prior signed ledgers need a different key', () => {
+  const repoRoot = createRepo();
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  try {
+    const oldKey = 'old-orchestration-state-key-000000000000';
+    const old = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'old signed run', '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATION_STATE_KEY: oldKey,
+    }).stdout);
+    assertSignedLedgerValid(repoRoot, old.runId, oldKey);
+
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    const planText = ['# Fresh Key Plan', '', '## Slice 1', '- Touch src/index.js'].join('\n') + '\n';
+    writeFileSync(path.join(repoRoot, 'docs', 'fresh-key-plan.md'), planText, 'utf8');
+    const analysisFile = writeOrchestrateAnalysis(repoRoot, planText);
+    const analyzed = JSON.parse(runCli([
+      'run', 'orchestrate', 'analyze',
+      '--plan-file', 'docs/fresh-key-plan.md',
+      '--analysis-file', analysisFile,
+      '--json',
+    ], repoRoot, {
+      PIPELANE_ORCHESTRATION_STATE_KEY: undefined,
+      PIPELANE_HOME: pipelaneHome,
+    }).stdout);
+
+    assert.notEqual(analyzed.runId, old.runId);
+    assert.match(analyzed.message, /Ignored signed orchestration ledger unreadable with the current PIPELANE_ORCHESTRATION_STATE_KEY/);
+    const generatedKey = readFileSync(persistedOrchestrationStateKeyPath(pipelaneHome), 'utf8').trim();
+    assertSignedLedgerValid(repoRoot, analyzed.runId, generatedKey);
+
+    const oldOutline = runCli(['run', 'orchestrate', 'outline', '--run-id', old.runId], repoRoot, {
+      PIPELANE_ORCHESTRATION_STATE_KEY: undefined,
+      PIPELANE_HOME: pipelaneHome,
+    }, true);
+    assert.notEqual(oldOutline.status, 0);
+    assert.match(oldOutline.stderr, /wrong PIPELANE_ORCHESTRATION_STATE_KEY/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate analyze blocks recent ledgers with tampered key fingerprints', () => {
+  const repoRoot = createRepo();
+  try {
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'tampered fingerprint', '--json'], repoRoot).stdout);
+    const { ledger } = assertSignedLedgerValid(repoRoot, planned.runId);
+    ledger.integrity.keyFingerprint = orchestrationKeyFingerprintForTest('other-orchestration-state-key-000000');
+    writeFileSync(orchestrationLedgerPath(repoRoot, planned.runId), `${JSON.stringify(ledger, null, 2)}\n`, 'utf8');
+
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    const planText = ['# Fingerprint Tamper Plan', '', '## Slice 1', '- Touch src/index.js'].join('\n') + '\n';
+    writeFileSync(path.join(repoRoot, 'docs', 'fingerprint-tamper-plan.md'), planText, 'utf8');
+    const analysisFile = writeOrchestrateAnalysis(repoRoot, planText);
+    const result = runCli([
+      'run', 'orchestrate', 'analyze',
+      '--plan-file', 'docs/fingerprint-tamper-plan.md',
+      '--analysis-file', analysisFile,
+      '--json',
+    ], repoRoot, {}, true);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Cannot mutate orchestration state while unreadable ledger exists/);
+    assert.match(result.stderr, /signature verification failed|tampered/);
+    assert.doesNotMatch(result.stderr, /wrong PIPELANE_ORCHESTRATION_STATE_KEY/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -16245,20 +16323,29 @@ test('orchestration mutating command matrix verifies and leaves signed ledgers',
 
 test('orchestration workers never receive orchestration key, even when allowlisted', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const fallbackHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-worker-'));
   const createdWorktrees = [];
   const key = DEFAULT_ORCHESTRATION_STATE_KEY;
   try {
     runCli(['init', '--project', 'Demo App'], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
     const runAndCheck = (outcome, extraEnv = {}) => {
-      const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', outcome, '--provider', 'generic', '--json'], repoRoot).stdout);
-      const prepared = preparePlannedRun(repoRoot, planned);
+      const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', outcome, '--provider', 'generic', '--json'], repoRoot, extraEnv).stdout);
+      const prepared = preparePlannedRun(repoRoot, planned, {}, { env: extraEnv });
       createdWorktrees.push(...prepared.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
-      runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+      runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot, extraEnv);
       const workerCommand = [
         'node -e "',
         "const fs=require('fs');",
+        "const path=require('path');",
+        "const home=process.env.PIPELANE_HOME || '';",
+        "const keyPath=home ? path.join(home, 'keys', 'orchestration-state.key') : '';",
+        "let persisted='missing';",
+        "if (keyPath) { try { persisted=fs.readFileSync(keyPath, 'utf8').trim(); } catch {} }",
         "fs.writeFileSync('worker-env-key.txt', process.env.PIPELANE_ORCHESTRATION_STATE_KEY || 'missing');",
+        "fs.writeFileSync('worker-env-key-file.txt', process.env.PIPELANE_ORCHESTRATION_STATE_KEY_FILE || 'missing');",
+        "fs.writeFileSync('worker-env-pipelane-home.txt', process.env.PIPELANE_HOME || 'missing');",
+        "fs.writeFileSync('worker-persisted-key-read.txt', persisted);",
         "fs.writeFileSync('pipelane-slice-change.txt', 'change');",
         '"',
       ].join('');
@@ -16269,18 +16356,34 @@ test('orchestration workers never receive orchestration key, even when allowlist
       const started = JSON.parse(startResult.stdout);
       const worktreePath = started.run.slices[0].worktreePath;
       assert.equal(readFileSync(path.join(worktreePath, 'worker-env-key.txt'), 'utf8'), 'missing');
-      assert.doesNotMatch(startResult.stdout, new RegExp(key));
-      assert.doesNotMatch(startResult.stderr, new RegExp(key));
-      assert.doesNotMatch(readFileSync(orchestrationLedgerPath(repoRoot, planned.runId), 'utf8'), new RegExp(key));
-      assertSignedLedgerValid(repoRoot, planned.runId);
+      assert.equal(readFileSync(path.join(worktreePath, 'worker-env-key-file.txt'), 'utf8'), 'missing');
+      assert.equal(readFileSync(path.join(worktreePath, 'worker-env-pipelane-home.txt'), 'utf8'), 'missing');
+      assert.equal(readFileSync(path.join(worktreePath, 'worker-persisted-key-read.txt'), 'utf8'), 'missing');
+      const signingKey = Object.hasOwn(extraEnv, 'PIPELANE_ORCHESTRATION_STATE_KEY') && extraEnv.PIPELANE_ORCHESTRATION_STATE_KEY === undefined
+        ? readFileSync(persistedOrchestrationStateKeyPath(extraEnv.PIPELANE_HOME ?? DEFAULT_PIPELANE_HOME), 'utf8').trim()
+        : key;
+      assert.doesNotMatch(startResult.stdout, new RegExp(signingKey));
+      assert.doesNotMatch(startResult.stderr, new RegExp(signingKey));
+      assert.doesNotMatch(readFileSync(orchestrationLedgerPath(repoRoot, planned.runId), 'utf8'), new RegExp(signingKey));
+      assertSignedLedgerValid(repoRoot, planned.runId, signingKey);
     };
 
     runAndCheck('worker key stripped normally');
     runAndCheck('worker key stripped from allowlist', {
       PIPELANE_ORCHESTRATE_WORKER_ENV_ALLOW: 'PIPELANE_ORCHESTRATION_STATE_KEY',
     });
+    runAndCheck('worker key file stripped from allowlist', {
+      PIPELANE_ORCHESTRATE_WORKER_ENV_ALLOW: 'PIPELANE_ORCHESTRATION_STATE_KEY_FILE',
+      PIPELANE_ORCHESTRATION_STATE_KEY_FILE: path.join(repoRoot, 'operator-key.txt'),
+    });
+    runAndCheck('worker persisted key home stripped from allowlist', {
+      PIPELANE_ORCHESTRATION_STATE_KEY: undefined,
+      PIPELANE_HOME: fallbackHome,
+      PIPELANE_ORCHESTRATE_WORKER_ENV_ALLOW: 'PIPELANE_HOME',
+    });
   } finally {
     for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(fallbackHome, { recursive: true, force: true });
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
   }
