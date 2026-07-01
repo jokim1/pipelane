@@ -102,6 +102,13 @@ interface ReviewGateInstallOption {
 }
 
 type PackageManagerId = 'npm' | 'pnpm' | 'yarn' | 'bun' | 'unknown' | 'unsupported' | 'conflict';
+type ReviewSetupSectionId = 'M' | 'T' | 'C' | 'I' | 'H' | 'X';
+
+interface ReviewSetupSection {
+  id: ReviewSetupSectionId;
+  title: string;
+  ids: string[];
+}
 
 interface DetectedPackageManager {
   id: PackageManagerId;
@@ -116,6 +123,8 @@ interface ReviewSetupSelectionResult {
   enabledIds: string[];
   disabledIds: string[];
   installedIds: string[];
+  toggledOnIds: string[];
+  toggledOffIds: string[];
 }
 
 interface ReviewSetupSaveOptions {
@@ -137,11 +146,14 @@ interface AdversarialReviewProvider {
 
 interface ReviewSetupGateOption {
   number: number;
+  displayId: string;
+  section: ReviewSetupSection;
   entry: ResolvedReviewGateCatalogEntry;
   label: string;
   selected: boolean;
   recommended: boolean;
   installState: GateInstallState;
+  hydratedFromSavedConfig: boolean;
   adversarialProvider?: AdversarialReviewProvider;
 }
 
@@ -237,39 +249,55 @@ async function handleReviewSetup(cwd: string, parsed: ParsedOperatorArgs): Promi
   let context = resolveWorkflowContext(cwd);
   let writeResult: { configPath: string; isLegacy: boolean } | null = null;
   const actionMessages: string[] = [];
-  const selectionFlags = hasReviewSetupSelectionFlags(parsed);
-  if (selectionFlags && (parsed.flags.reviewPrint || parsed.flags.reviewListGates)) {
-    throw new Error('review setup cannot combine modifying flags (--enable, --disable, --install) with read-only flags (--print, --list-gates). Run the modifying command first, then inspect with --print or --list-gates.');
+  const mutationFlags = hasReviewSetupMutationFlags(parsed);
+  const hasSavedConfig = resolveReadableConfigPath(context.repoRoot) !== null;
+  if (mutationFlags && (parsed.flags.reviewPrint || parsed.flags.reviewListGates)) {
+    throw new Error('review setup cannot combine modifying flags (--toggle, --enable, --disable, --install, --reset) with read-only flags (--print, --list-gates). Run the modifying command first, then inspect with --print or --list-gates.');
   }
 
-  if (parsed.flags.yes || selectionFlags) {
-    const prepared = prepareInteractiveReviewSetup(context.repoRoot);
+  if (mutationFlags) {
+    const resetToDefaults = parsed.flags.yes || parsed.flags.reviewReset;
+    const prepared = prepareInteractiveReviewSetup(context.repoRoot, context.config, { resetToDefaults });
     const selectionResult = applyReviewSetupSelections(context.repoRoot, prepared, parsed);
+    if (resetToDefaults) {
+      actionMessages.push('Reset review gates to recommended defaults.');
+    }
     actionMessages.push(...selectionResult.messages);
-    const existingReviewGates = context.config.reviewGates?.gates ?? [];
+    const existingReviewGates = hasSavedConfig ? context.config.reviewGates?.gates ?? [] : [];
     writeResult = saveInteractiveReviewSetup(context.repoRoot, prepared.gates, {
       existingReviewGates,
-      preserveExistingReviewGates: selectionFlags,
-      useSelectedDefaults: parsed.flags.yes,
-      changedGateIds: new Set([...selectionResult.enabledIds, ...selectionResult.installedIds]),
-      disabledGateIds: new Set(selectionResult.disabledIds),
+      preserveExistingReviewGates: hasSavedConfig && !resetToDefaults,
+      useSelectedDefaults: resetToDefaults,
+      changedGateIds: new Set([...selectionResult.enabledIds, ...selectionResult.installedIds, ...selectionResult.toggledOnIds]),
+      disabledGateIds: new Set([...selectionResult.disabledIds, ...selectionResult.toggledOffIds]),
     });
     context = resolveWorkflowContext(cwd);
+    if (!parsed.flags.json) {
+      const preparedAfterWrite = prepareInteractiveReviewSetup(context.repoRoot, context.config);
+      process.stdout.write(`${renderReviewSetupState(preparedAfterWrite, {
+        status: 'configured',
+        configPath: writeResult.configPath,
+        actions: actionMessages,
+      })}\n`);
+      return;
+    }
   }
 
   if (
-    !parsed.flags.yes
-    && !selectionFlags
+    !mutationFlags
     && !parsed.flags.reviewPrint
     && !parsed.flags.reviewListGates
     && !parsed.flags.json
   ) {
-    if (!canRunInteractiveReviewSetup()) {
-      const prepared = prepareInteractiveReviewSetup(context.repoRoot);
-      process.stdout.write(`${renderNonInteractiveReviewSetup(prepared)}\n`);
+    const prepared = prepareInteractiveReviewSetup(context.repoRoot, context.config);
+    if (canRunInteractiveReviewSetup()) {
+      await runInteractiveReviewSetup(cwd, parsed);
       return;
     }
-    await runInteractiveReviewSetup(cwd, parsed);
+    process.stdout.write(`${renderReviewSetupState(prepared, {
+      status: 'reported',
+      configPath: resolveReadableConfigPath(context.repoRoot),
+    })}\n`);
     return;
   }
 
@@ -472,62 +500,67 @@ function canRunInteractiveReviewSetup(): boolean {
 }
 
 async function runInteractiveReviewSetup(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
-  const context = resolveWorkflowContext(cwd);
-  const prepared = prepareInteractiveReviewSetup(context.repoRoot);
+  let context = resolveWorkflowContext(cwd);
+  let prepared = prepareInteractiveReviewSetup(context.repoRoot, context.config);
   const prompter = createReviewSetupPrompter();
 
   try {
-    process.stdout.write(`${renderInteractiveReviewSetup(prepared)}\n`);
+    process.stdout.write(`${renderReviewSetupState(prepared, {
+      status: 'reported',
+      configPath: resolveReadableConfigPath(context.repoRoot),
+      interactive: true,
+    })}\n`);
     for (;;) {
-      const answer = (await prompter.question('> ')).trim().toLowerCase();
-      if (answer === 's' || answer === 'save') {
-        const writeResult = saveInteractiveReviewSetup(context.repoRoot, prepared.gates);
-        process.stdout.write(`${renderInteractiveReviewSetupSaved(context.repoRoot, writeResult, prepared.gates)}\n`);
-        return;
-      }
-      if (answer === 'c' || answer === 'cancel') {
-        const report: ReviewSetupReport = {
-          command: 'review setup',
-          status: 'cancelled',
-          repoRoot: context.repoRoot,
-          configPath: resolveReadableConfigPath(context.repoRoot),
-          configPathIsLegacy: false,
-          packageJson: {
-            path: prepared.packageJson.path,
-            found: prepared.packageJson.found,
-            malformed: prepared.packageJson.malformed,
-            parseError: prepared.packageJson.parseError,
-          },
-          detectedScripts: prepared.detectedScripts,
-          effective: {
-            planReview: { gates: context.config.reviewGates?.planReview?.gates ?? [] },
-            gates: context.config.reviewGates?.gates ?? [],
-          },
-          missing: [],
-          message: 'Review setup cancelled. No changes written.',
-        };
-        printResult(parsed.flags, report);
+      const answer = (await prompter.question('> ')).trim();
+      const normalizedAnswer = answer.toLowerCase();
+      if (answer === '' || normalizedAnswer === 'q' || normalizedAnswer === 'quit' || normalizedAnswer === 'done' || normalizedAnswer === 'c' || normalizedAnswer === 'cancel') {
+        process.stdout.write('Review setup closed.\n');
         return;
       }
 
-      const gateNumber = Number.parseInt(answer, 10);
-      const gate = Number.isSafeInteger(gateNumber)
-        ? prepared.gates.find((candidate) => candidate.number === gateNumber)
-        : undefined;
-      if (!gate) {
-        process.stdout.write('Choose a gate number, s to save, or c to cancel.\n');
+      let gateId: string;
+      try {
+        gateId = resolveReviewSetupGateInput(prepared.gates, answer, 'input');
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        process.stdout.write(`${detail}\n`);
         continue;
       }
 
+      const gate = requirePreparedGate(prepared.gates, gateId);
+      const wasSelected = gate.selected;
       await toggleInteractiveGate(gate, prompter, context.repoRoot);
-      process.stdout.write(`\n${renderInteractiveReviewSetup(prepared)}\n`);
+      if (gate.selected === wasSelected) {
+        process.stdout.write(`\n${renderReviewSetupState(prepared, {
+          status: 'reported',
+          configPath: resolveReadableConfigPath(context.repoRoot),
+          interactive: true,
+        })}\n`);
+        continue;
+      }
+
+      const hasSavedConfig = resolveReadableConfigPath(context.repoRoot) !== null;
+      const writeResult = saveInteractiveReviewSetup(context.repoRoot, prepared.gates, {
+        existingReviewGates: hasSavedConfig ? context.config.reviewGates?.gates ?? [] : [],
+        preserveExistingReviewGates: hasSavedConfig,
+        changedGateIds: gate.selected ? new Set([gate.entry.id]) : new Set(),
+        disabledGateIds: gate.selected ? new Set() : new Set([gate.entry.id]),
+      });
+      context = resolveWorkflowContext(cwd);
+      prepared = prepareInteractiveReviewSetup(context.repoRoot, context.config);
+      process.stdout.write(`\n${renderReviewSetupState(prepared, {
+        status: 'configured',
+        configPath: writeResult.configPath,
+        actions: [`Toggled ${gate.displayId} ${gate.entry.id} ${gate.selected ? 'on' : 'off'}.`],
+        interactive: true,
+      })}\n`);
     }
   } finally {
     prompter.close();
   }
 }
 
-function prepareInteractiveReviewSetup(repoRoot: string): {
+function prepareInteractiveReviewSetup(repoRoot: string, config: WorkflowConfig, options: { resetToDefaults?: boolean } = {}): {
   repoRoot: string;
   packageJson: ReviewSetupReport['packageJson'];
   detectedScripts: string[];
@@ -535,29 +568,58 @@ function prepareInteractiveReviewSetup(repoRoot: string): {
   claude: ClaudeReviewSetupStatus;
 } {
   const detection = detectPackageScripts(repoRoot);
+  const hydrateFromSavedConfig = !options.resetToDefaults && resolveReadableConfigPath(repoRoot) !== null;
+  const savedGateById = new Map<string, ReviewGateConfig>();
+  if (hydrateFromSavedConfig) {
+    for (const gate of config.reviewGates?.gates ?? []) {
+      savedGateById.set(gate.id, gate);
+    }
+  }
   const orderedCatalog = orderInteractiveReviewCatalog(resolveReviewGateCatalog({ repoRoot })
     .filter((entry) => entry.kind === 'review'));
-  const gates = orderedCatalog.map((entry, index) => {
+  const gates: ReviewSetupGateOption[] = orderedCatalog.map((entry, index) => {
+    const savedGate = savedGateById.get(entry.id);
+    const displayEntry = savedGate ? hydrateReviewSetupEntryFromSavedGate(entry, savedGate) : entry;
     const installState = detectGateInstallState(repoRoot, entry);
     const recommended = isRecommendedInteractiveGate(entry, installState);
+    const section = reviewSetupSectionForGate(entry.id);
     return {
       number: index + 1,
-      entry,
-      label: reviewSetupGateLabel(entry),
-      selected: recommended,
+      displayId: '',
+      section,
+      entry: displayEntry,
+      label: reviewSetupGateLabel(displayEntry),
+      selected: hydrateFromSavedConfig ? Boolean(savedGate) : recommended,
       recommended,
       installState,
-      adversarialProvider: entry.id === 'adversarial-review' && recommended
+      hydratedFromSavedConfig: Boolean(savedGate),
+      adversarialProvider: entry.id === 'adversarial-review' && !savedGate && !hydrateFromSavedConfig && recommended
         ? preferredAdversarialReviewProvider(repoRoot)
         : undefined,
     };
   });
+  for (const savedGate of savedGateById.values()) {
+    if (gates.some((gate) => gate.entry.id === savedGate.id)) continue;
+    const section = customReviewSetupSection();
+    gates.push({
+      number: gates.length + 1,
+      displayId: '',
+      section,
+      entry: reviewSetupEntryFromCustomSavedGate(savedGate),
+      label: savedGate.id,
+      selected: true,
+      recommended: false,
+      installState: 'not applicable',
+      hydratedFromSavedConfig: true,
+    });
+  }
   const codeReviewHigh = gates.find((gate) => gate.entry.id === 'code-review-high');
   const gstackReview = gates.find((gate) => gate.entry.id === 'gstack-review');
-  if (codeReviewHigh?.selected && gstackReview?.selected) {
+  if (!hydrateFromSavedConfig && codeReviewHigh?.selected && gstackReview?.selected) {
     gstackReview.selected = false;
     gstackReview.recommended = false;
   }
+  assignReviewSetupDisplayIds(gates);
   return {
     repoRoot,
     packageJson: {
@@ -572,10 +634,66 @@ function prepareInteractiveReviewSetup(repoRoot: string): {
   };
 }
 
-function hasReviewSetupSelectionFlags(parsed: ParsedOperatorArgs): boolean {
+function hydrateReviewSetupEntryFromSavedGate(
+  entry: ResolvedReviewGateCatalogEntry,
+  savedGate: ReviewGateConfig,
+): ResolvedReviewGateCatalogEntry {
+  return {
+    ...entry,
+    phase: savedGate.phase,
+    type: savedGate.type,
+    available: true,
+    command: savedGate.command ?? entry.command,
+    skill: savedGate.skill ?? entry.skill,
+    role: savedGate.role ?? entry.role,
+    when: savedGate.when ?? entry.when,
+    whenChanged: savedGate.whenChanged ?? entry.whenChanged,
+    userCommands: savedGate.userCommands ?? entry.userCommands,
+  };
+}
+
+function reviewSetupEntryFromCustomSavedGate(gate: ReviewGateConfig): ResolvedReviewGateCatalogEntry {
+  return {
+    id: gate.id,
+    kind: 'review',
+    phase: gate.phase,
+    type: gate.type,
+    available: true,
+    command: gate.command,
+    skill: gate.skill,
+    role: gate.role,
+    when: gate.when,
+    whenChanged: gate.whenChanged,
+    userCommands: gate.userCommands,
+    recommended: false,
+  };
+}
+
+function assignReviewSetupDisplayIds(gates: ReviewSetupGateOption[]): void {
+  const counters = new Map<ReviewSetupSectionId, number>();
+  gates.forEach((gate, index) => {
+    gate.number = index + 1;
+    const next = (counters.get(gate.section.id) ?? 0) + 1;
+    counters.set(gate.section.id, next);
+    gate.displayId = `${gate.section.id}${next}`;
+  });
+}
+
+function reviewSetupSectionForGate(gateId: string): ReviewSetupSection {
+  return reviewSetupSections().find((section) => section.ids.includes(gateId)) ?? customReviewSetupSection();
+}
+
+function customReviewSetupSection(): ReviewSetupSection {
+  return { id: 'X', title: 'Custom gates', ids: [] };
+}
+
+function hasReviewSetupMutationFlags(parsed: ParsedOperatorArgs): boolean {
   return parsed.flags.reviewEnable.length > 0
     || parsed.flags.reviewDisable.length > 0
-    || parsed.flags.reviewInstall.length > 0;
+    || parsed.flags.reviewInstall.length > 0
+    || parsed.flags.reviewToggle.length > 0
+    || parsed.flags.reviewReset
+    || parsed.flags.yes;
 }
 
 function applyReviewSetupSelections(
@@ -586,16 +704,24 @@ function applyReviewSetupSelections(
   const installIds = resolveReviewSetupGateInputs(prepared.gates, parsed.flags.reviewInstall, '--install');
   const enableIds = resolveReviewSetupGateInputs(prepared.gates, parsed.flags.reviewEnable, '--enable');
   const disableIds = resolveReviewSetupGateInputs(prepared.gates, parsed.flags.reviewDisable, '--disable');
+  const toggleIds = resolveReviewSetupGateInputs(prepared.gates, parsed.flags.reviewToggle, '--toggle');
   const installSet = new Set(installIds);
   const enableSet = new Set(enableIds);
   const disableSet = new Set(disableIds);
+  const toggleSet = new Set(toggleIds);
   const conflicting = [...new Set([...installIds, ...enableIds])]
     .filter((id) => disableSet.has(id));
   if (conflicting.length > 0) {
     throw new Error(`review setup cannot both enable/install and disable: ${conflicting.join(', ')}`);
   }
+  const toggleConflicts = [...toggleSet].filter((id) => installSet.has(id) || enableSet.has(id) || disableSet.has(id));
+  if (toggleConflicts.length > 0) {
+    throw new Error(`review setup cannot both toggle and explicitly set: ${toggleConflicts.join(', ')}`);
+  }
 
   const messages: string[] = [];
+  const toggledOnIds: string[] = [];
+  const toggledOffIds: string[] = [];
   for (const id of installSet) {
     const gate = requirePreparedGate(prepared.gates, id);
     messages.push(installPreparedReviewGate(repoRoot, prepared.gates, gate));
@@ -610,12 +736,26 @@ function applyReviewSetupSelections(
     const gate = requirePreparedGate(prepared.gates, id);
     messages.push(enablePreparedReviewGate(repoRoot, prepared.gates, gate));
   }
+  for (const id of toggleSet) {
+    const gate = requirePreparedGate(prepared.gates, id);
+    if (gate.selected) {
+      gate.selected = false;
+      gate.adversarialProvider = undefined;
+      toggledOffIds.push(gate.entry.id);
+      messages.push(`Toggled ${gate.displayId} ${gate.entry.id} off.`);
+      continue;
+    }
+    messages.push(enablePreparedReviewGate(repoRoot, prepared.gates, gate).replace(/^Enabled /, `Toggled ${gate.displayId} `));
+    toggledOnIds.push(gate.entry.id);
+  }
 
   return {
     messages,
     enabledIds: enableIds,
     disabledIds: disableIds,
     installedIds: installIds,
+    toggledOnIds,
+    toggledOffIds,
   };
 }
 
@@ -639,11 +779,15 @@ function resolveReviewSetupGateInput(
     if (gate) return gate.entry.id;
   }
 
+  const displayId = trimmed.toUpperCase();
+  const displayGate = gates.find((candidate) => candidate.displayId.toUpperCase() === displayId);
+  if (displayGate) return displayGate.entry.id;
+
   const alias = resolveReviewGateAlias(trimmed);
   const normalized = (alias ?? trimmed).toLowerCase();
   const gate = gates.find((candidate) => candidate.entry.id === normalized);
   if (!gate) {
-    throw new Error(`${flagName} received unknown review gate "${input}". Run "pipelane run review setup --list-gates" to inspect available gate ids.`);
+    throw new Error(`${flagName} received unknown review gate or display id "${input}". Run "pipelane run review setup" to inspect stable ids, or "pipelane run review setup --list-gates" to inspect gate ids.`);
   }
   return gate.entry.id;
 }
@@ -679,7 +823,7 @@ function enablePreparedReviewGate(
     throw new Error(`${gate.entry.id} needs an installed reviewer before it can be enabled. Run "pipelane run review setup --install ${gate.entry.id}" to install and enable it.`);
   }
 
-  if (gate.entry.id === 'adversarial-review') {
+  if (gate.entry.id === 'adversarial-review' && !gate.selected) {
     gate.adversarialProvider = preferredAdversarialReviewProvider(repoRoot);
   }
   gate.selected = true;
@@ -728,9 +872,7 @@ function installPreparedReviewGate(
 }
 
 function renumberPreparedGates(gates: ReviewSetupGateOption[]): void {
-  gates.forEach((gate, index) => {
-    gate.number = index + 1;
-  });
+  assignReviewSetupDisplayIds(gates);
 }
 
 function orderInteractiveReviewCatalog(entries: ResolvedReviewGateCatalogEntry[]): ResolvedReviewGateCatalogEntry[] {
@@ -3281,11 +3423,12 @@ function renderReviewSetupReport(
   }
 
   lines.push('', 'Setup controls:');
+  lines.push('- Toggle a gate: /pipelane review setup --toggle <display-id-or-gate-id>');
   lines.push('- Enable a gate: /pipelane review setup --enable <gate-id>');
   lines.push('- Disable a gate: /pipelane review setup --disable <gate-id>');
   lines.push('- Install an optional gate: /pipelane review setup --install <gate-id>');
-  lines.push('- Multiple gates: repeat the flag or use comma-separated values such as /pipelane review setup --enable 3, 4, 5, 13.');
-  lines.push('- Save defaults plus changes: combine --yes with --enable/--disable/--install as needed.');
+  lines.push('- Reset to recommended defaults: /pipelane review setup --reset');
+  lines.push('- Multiple gates: repeat the flag or use comma-separated values such as /pipelane review setup --toggle C3,H1.');
   lines.push('- Opinionated default: self-review, deterministic checks, independent AI review, and cross-model review when installed.');
   lines.push('- Opting out trades speed for higher risk of missed correctness, security, or data-loss bugs.');
 
@@ -3304,91 +3447,77 @@ function renderReviewSetupReport(
   return lines.join('\n');
 }
 
-function renderNonInteractiveReviewSetup(prepared: {
-  repoRoot: string;
-  packageJson: ReviewSetupReport['packageJson'];
-  detectedScripts: string[];
-  gates: ReviewSetupGateOption[];
-  claude: ClaudeReviewSetupStatus;
-}): string {
-  return [
-    renderInteractiveReviewSetup(prepared),
-    '',
-    'Choose the action to take:',
-    ...formatNonInteractiveReviewSetupActions(prepared),
-    '',
-    'Command patterns:',
-    '- Save current selection: /pipelane review setup --yes',
-    '- Enable a gate: /pipelane review setup --enable <gate-id>',
-    '- Disable a gate: /pipelane review setup --disable <gate-id>',
-    '- Install and enable an optional gate: /pipelane review setup --install <gate-id>',
-    '- Multiple gates: repeat the flag or use comma-separated values such as /pipelane review setup --enable 3, 4, 5, 13',
-    '- Print effective config: /pipelane review setup --print',
-    '- Delivery loop safety defaults live in /pipelane configure.',
-  ].join('\n');
-}
-
-function renderInteractiveReviewSetup(prepared: {
-  repoRoot: string;
-  packageJson: ReviewSetupReport['packageJson'];
-  detectedScripts: string[];
-  gates: ReviewSetupGateOption[];
-  claude: ClaudeReviewSetupStatus;
-}): string {
+function renderReviewSetupState(
+  prepared: {
+    repoRoot: string;
+    packageJson: ReviewSetupReport['packageJson'];
+    detectedScripts: string[];
+    gates: ReviewSetupGateOption[];
+    claude: ClaudeReviewSetupStatus;
+  },
+  options: {
+    status: ReviewSetupStatus;
+    configPath: string | null;
+    actions?: string[];
+    interactive?: boolean;
+  },
+): string {
   const lines = [
     'Review setup',
+    `Status: ${options.status}`,
+    `Config: ${options.configPath ? displayRepoPath(prepared.repoRoot, options.configPath) : 'not saved; showing inferred recommended defaults'}`,
     '',
-    'I found these repo checks:',
-    ...formatDetectedRepoChecks(prepared.gates),
+    packageScriptsSummary(prepared.packageJson, prepared.detectedScripts),
     '',
     'Claude review support:',
     ...formatClaudeReviewSetupStatus(prepared.claude),
-    '',
-    'Recommended review gates are preselected below.',
-    'Turn one off only when you accept the coverage tradeoff.',
-    'Type a gate number to toggle it. Type s to save, or c to cancel.',
   ];
 
+  if (options.actions && options.actions.length > 0) {
+    lines.push('', 'Setup actions:', ...options.actions.map((entry) => `- ${entry}`));
+  }
+
+  lines.push('', 'Review gates:');
   for (const section of reviewSetupSections()) {
-    const gates = prepared.gates.filter((gate) => section.ids.includes(gate.entry.id));
+    const gates = prepared.gates.filter((gate) => gate.section.id === section.id);
     if (gates.length === 0) continue;
-    lines.push('', `${section.title}:`);
+    lines.push('', `${section.id}. ${section.title}:`);
     for (const gate of gates) {
-      lines.push(formatInteractiveGate(gate, prepared.repoRoot));
+      lines.push(formatReviewSetupRow(gate, prepared.repoRoot));
     }
   }
 
-  lines.push('', 'Actions:', 's. Save and continue', 'c. Cancel');
+  const customGates = prepared.gates.filter((gate) => gate.section.id === 'X');
+  if (customGates.length > 0) {
+    lines.push('', 'X. Custom gates:');
+    for (const gate of customGates) {
+      lines.push(formatReviewSetupRow(gate, prepared.repoRoot));
+    }
+  }
+
+  lines.push('', 'Controls:');
+  if (options.interactive) {
+    lines.push('- Type a row id such as C3 to toggle it immediately.');
+    lines.push('- Press Enter or q to exit.');
+  } else {
+    lines.push('- Toggle a row: /pipelane review setup --toggle C3');
+    lines.push('- Toggle by gate id: /pipelane review setup --toggle gstack-review');
+    lines.push('- Enable/disable: /pipelane review setup --enable gstack-review | --disable typecheck');
+    lines.push('- Install optional support: /pipelane review setup --install secret-scan');
+    lines.push('- Reset to recommended defaults: /pipelane review setup --reset');
+  }
   return lines.join('\n');
 }
 
-function renderInteractiveReviewSetupSaved(
-  repoRoot: string,
-  writeResult: { configPath: string; isLegacy: boolean },
-  gates: ReviewSetupGateOption[],
-): string {
-  const enabled = gates
-    .filter((gate) => gate.selected)
-    .map((gate) => gate.entry.id);
-  const byPhase = REVIEW_PHASE_ORDER
-    .map((phase) => ({
-      phase,
-      ids: enabled.filter((id) => gates.find((gate) => gate.entry.id === id)?.entry.phase === phase),
-    }))
-    .filter((entry) => entry.ids.length > 0);
-  const lines = [
-    '',
-    'Review gates configured.',
-    `Config: ${path.relative(repoRoot, writeResult.configPath) || writeResult.configPath}`,
-    '',
-    'Enabled:',
-  ];
-  for (const entry of byPhase) {
-    lines.push(`- ${entry.phase}: ${entry.ids.join(', ')}`);
-  }
-  if (byPhase.length === 0) lines.push('- none');
-  lines.push('', 'Next: run /pipelane orchestrate');
-  return lines.join('\n');
+function packageScriptsSummary(packageJson: ReviewSetupReport['packageJson'], detectedScripts: string[]): string {
+  if (!packageJson.found) return `Package scripts: no package.json found at ${packageJson.path}`;
+  if (packageJson.malformed) return `Package scripts: package.json is malformed - ${packageJson.parseError ?? 'unknown parse error'}`;
+  return `Package scripts: ${detectedScripts.length > 0 ? detectedScripts.join(', ') : 'none detected'}`;
+}
+
+function displayRepoPath(repoRoot: string, targetPath: string): string {
+  const relative = path.relative(repoRoot, targetPath);
+  return relative && !relative.startsWith('..') && !path.isAbsolute(relative) ? relative : targetPath;
 }
 
 function formatClaudeReviewSetupStatus(status: ClaudeReviewSetupStatus): string[] {
@@ -3413,75 +3542,25 @@ function formatClaudeReviewSetupStatus(status: ClaudeReviewSetupStatus): string[
   ];
 }
 
-function formatNonInteractiveReviewSetupActions(prepared: { gates: ReviewSetupGateOption[] }): string[] {
-  const actions: Array<{ label: string; command: string }> = [
-    { label: 'Save the current recommended selection', command: '/pipelane review setup --yes' },
-    { label: 'Show the full gate catalog', command: '/pipelane review setup --list-gates' },
-    { label: 'Print the effective review config', command: '/pipelane review setup --print' },
-  ];
-
-  for (const gate of prepared.gates) {
-    const target = reviewSetupGateActionTarget(gate);
-    if (gate.selected) {
-      actions.push({
-        label: `Disable ${target}`,
-        command: `/pipelane review setup --disable ${gate.entry.id}`,
-      });
-      continue;
-    }
-
-    if (gate.installState === 'not installed') {
-      actions.push({
-        label: `Install and enable ${target}`,
-        command: `/pipelane review setup --install ${gate.entry.id}`,
-      });
-      continue;
-    }
-
-    if (gate.entry.available && (gate.installState === 'installed' || gate.installState === 'not applicable')) {
-      actions.push({
-        label: `Enable ${target}`,
-        command: `/pipelane review setup --enable ${gate.entry.id}`,
-      });
-    }
-  }
-
-  return actions.map((action, index) => `${index + 1}. ${action.label}: ${action.command}`);
-}
-
-function reviewSetupGateActionTarget(gate: ReviewSetupGateOption): string {
-  const aliases = gate.entry.userCommands && gate.entry.userCommands.length > 0
-    ? `, ${gate.entry.userCommands.join(' | ')}`
-    : '';
-  return `${gate.label} [${gate.entry.id}${aliases}]`;
-}
-
-function formatDetectedRepoChecks(gates: ReviewSetupGateOption[]): string[] {
-  const checks = gates
-    .filter((gate) => gate.entry.type === 'command' && gate.entry.command)
-    .map((gate) => `- ${gate.entry.command}`);
-  return checks.length > 0 ? checks : ['- none'];
-}
-
-function reviewSetupSections(): Array<{ title: string; ids: string[] }> {
+function reviewSetupSections(): ReviewSetupSection[] {
   return [
-    { title: 'Static gates', ids: ['typecheck', 'format-check', 'lint', 'secret-scan', 'dependency-audit'] },
-    { title: 'Behavioral gates', ids: ['test', 'build'] },
-    { title: 'AI review gates', ids: ['karpathy-diff', 'code-review-high', 'gstack-review', 'adversarial-review', 'code-review-ultra'] },
-    { title: 'Conditional gates', ids: ['browser-qa', 'karpathy-audit'] },
-    { title: 'Human approval gates', ids: ['high-stakes-human-approval', 'human-merge-approval', 'human-prod-deploy-approval', 'human-rollback-approval'] },
+    { id: 'M', title: 'Mechanical gates', ids: ['typecheck', 'format-check', 'lint', 'secret-scan', 'dependency-audit'] },
+    { id: 'T', title: 'Test gates', ids: ['test', 'build'] },
+    { id: 'C', title: 'Code review gates', ids: ['karpathy-diff', 'code-review-high', 'gstack-review', 'adversarial-review', 'code-review-ultra'] },
+    { id: 'I', title: 'Instruction and runtime gates', ids: ['karpathy-audit', 'browser-qa'] },
+    { id: 'H', title: 'Human approval gates', ids: ['high-stakes-human-approval', 'human-merge-approval', 'human-prod-deploy-approval', 'human-rollback-approval'] },
   ];
 }
 
-function formatInteractiveGate(gate: ReviewSetupGateOption, repoRoot: string): string {
-  const selected = gate.selected ? '[on] ' : '[off]';
-  const number = `${gate.number}.`.padEnd(4, ' ');
-  const label = gate.label.padEnd(27, ' ');
+function formatReviewSetupRow(gate: ReviewSetupGateOption, repoRoot: string): string {
+  const selected = gate.selected ? 'on ' : 'off';
+  const id = gate.displayId.padEnd(3, ' ');
+  const gateId = gate.entry.id.padEnd(27, ' ');
   const detail = reviewSetupGateDetail(gate, repoRoot);
   const consequence = !gate.selected && gate.recommended
-    ? ' (opted out: less review coverage)'
+    ? ' | opted out: less review coverage'
     : '';
-  return `${number}${selected} ${label}${detail}${consequence}`;
+  return `${id} ${selected} ${gateId} ${gate.label} | ${detail}${consequence}`;
 }
 
 function reviewSetupGateDetail(gate: ReviewSetupGateOption, repoRoot: string): string {
@@ -3496,14 +3575,15 @@ function reviewSetupGateDetail(gate: ReviewSetupGateOption, repoRoot: string): s
     return `${noScriptFoundLabel(entry)}${install}`;
   }
   if (entry.id === 'adversarial-review') {
-    const provider = preferredAdversarialReviewProvider(repoRoot);
+    const savedCommand = gate.hydratedFromSavedConfig ? entry.userCommands?.[0] : undefined;
+    const provider = gate.adversarialProvider ?? (savedCommand ? undefined : preferredAdversarialReviewProvider(repoRoot));
     const target = provider
       ? `${provider.command} (${provider.label})`
-      : entry.userCommands?.[0] ?? entry.role ?? entry.id;
+      : savedCommand ?? preferredReviewSetupCommand(entry) ?? entry.role ?? entry.id;
     const install = gate.installState === 'not applicable' ? '' : ` ${gate.installState}`;
     return `${target}${install}`;
   }
-  const target = entry.userCommands?.[0]
+  const target = preferredReviewSetupCommand(entry)
     ?? entry.skill
     ?? entry.role
     ?? (entry.type === 'approval' ? 'approval' : entry.when)
@@ -3515,6 +3595,20 @@ function reviewSetupGateDetail(gate: ReviewSetupGateOption, repoRoot: string): s
       ? ` ${entry.when}`
       : '';
   return `${target}${condition}${install}`;
+}
+
+function preferredReviewSetupCommand(entry: ResolvedReviewGateCatalogEntry): string | undefined {
+  const preferredById: Record<string, string> = {
+    'karpathy-diff': '/karpathy diff',
+    'code-review-high': '/code-review high',
+    'gstack-review': '/gstack review',
+    'adversarial-review': '/claude review code',
+    'code-review-ultra': '/code-review ultra',
+    'karpathy-audit': '/karpathy-audit',
+  };
+  const preferred = preferredById[entry.id];
+  if (preferred) return preferred;
+  return entry.userCommands?.[0];
 }
 
 function noScriptFoundLabel(entry: ResolvedReviewGateCatalogEntry): string {

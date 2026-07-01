@@ -53,7 +53,11 @@ Current commands:
 
 ```text
 /pipelane review setup
-/pipelane review setup --yes
+/pipelane review setup --toggle C3
+/pipelane review setup --enable gstack-review
+/pipelane review setup --disable typecheck
+/pipelane review setup --install secret-scan
+/pipelane review setup --reset
 /pipelane review setup --print
 /pipelane review setup --list-gates
 ```
@@ -140,10 +144,11 @@ User-facing commands:
 /pr
 ```
 
-`/pipelane review setup` configures the gate stack. The implementation
-supports an interactive checklist, saving the recommended checklist with
-`--yes`, printing the effective config, and listing the gate catalog with
-detected or missing scripts. `/pipelane review` runs the
+`/pipelane review setup` configures the gate stack. Bare setup is read-only:
+it shows the saved grouped gate state or inferred recommended defaults without
+rewriting config. Mutating flags such as `--toggle`, `--enable`, `--disable`,
+`--install`, and `--reset` write immediately and reprint the grouped state.
+`/pipelane review` runs the
 configured gates against the current diff and writes evidence. `/pr` enforces
 fresh, unfiltered evidence for the current branch, HEAD, and worktree state
 before commit, push, or PR handoff.
@@ -676,7 +681,7 @@ Do not add:
 
 ## Acceptance Criteria
 
-- `/pipelane review setup` can print the effective gate config, list available gates, and persist the selected gate checklist.
+- `/pipelane review setup` can print the effective gate config, list available gates, inspect grouped rows without writing, and persist explicit gate mutations immediately.
 - Later setup extensions can add or remove individual plan-review gates independently from implementation review gates.
 - Static gates run before AI gates.
 - Missing optional scripts or skills produce warnings, not crashes.
