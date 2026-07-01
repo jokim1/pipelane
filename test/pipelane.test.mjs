@@ -21082,6 +21082,10 @@ test('deploy filters workflow_dispatch inputs to the deploy workflow schema', ()
       '    inputs:',
       '      environment:',
       '        required: false',
+      '        type: choice',
+      '        options:',
+      '          - staging',
+      '          - production',
     ].join('\n'),
   };
 
