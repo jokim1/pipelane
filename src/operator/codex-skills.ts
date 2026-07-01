@@ -114,9 +114,9 @@ stop before side effects.
 ## Fresh checkout behavior
 
 Use this slash command through the managed runner when starting a task from a
-fresh checkout. Do not substitute repo-local \`npm run pipelane:new\` or
-\`npm run workflow:new\` before \`node_modules/.bin/pipelane\` exists; npm will
-fail before Pipelane can create the task worktree or link dependencies.
+fresh checkout. Do not substitute repo-local npm scripts or repo-local binaries;
+durable commands use the machine-local runtime before Pipelane creates the task
+worktree or links dependencies.
 
 ## Bare invocation behavior
 
@@ -185,7 +185,6 @@ fi
 shift
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-local_bin="$repo_root/node_modules/.bin/pipelane"
 codex_home="\${CODEX_HOME:-\${HOME:-}/.codex}"
 global_bin="$codex_home/skills/.pipelane/bin/pipelane"
 if [ -x "$global_bin" ]; then
@@ -195,17 +194,10 @@ if [ -x "$global_bin" ]; then
   exec "$global_bin" run "$command" "$@"
 fi
 
-if [ -x "$local_bin" ]; then
-  cd "$repo_root"
-  exec "$local_bin" run "$command" "$@"
-fi
-
 echo "pipelane is unavailable for this repo." >&2
 echo "Checked:" >&2
-echo "  - $local_bin" >&2
 echo "  - $global_bin" >&2
 echo "Restore one of these runtimes and retry:" >&2
-echo "  - run npm install in the repo to restore node_modules/.bin/pipelane" >&2
 echo "  - run pipelane install-codex (or reinstall Codex skills) to restore the managed Codex runtime" >&2
 exit 1
 `;

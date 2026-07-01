@@ -232,24 +232,13 @@ Surfaces:
 
 ## Supporting Files
 
-Tracked for repo-local adapter installs (choose one shape for the workflow contract):
+Pipelane no longer supports tracked repo-local adapter opt-in. The supported
+command surface is installed once per machine with `pipelane install-claude`
+and/or `pipelane install-codex`.
 
-- `.pipelane.json` — the default. Full workflow contract in one file.
-- `package.json` `"pipelane"` overlay — for consumers that gitignore
-  `.pipelane.json` and want customizations (aliases, deploy settings,
-  `syncDocs`) to survive fresh checkouts without a re-bootstrap.
-
-Tracked when this repo intentionally opts into generated adapters:
-
-- `AGENTS.md`
-- `.claude/commands/*`
-- `.agents/skills/*`
-- `pipelane/CLAUDE.template.md`
-- `docs/RELEASE_WORKFLOW.md`
-
-Local-only:
-
-- `CLAUDE.md`
+Runtime configuration may still live in `.pipelane.json` when a command needs
+to persist deploy, smoke, or review settings. Repos that do not want Pipelane
+config committed should gitignore `.pipelane.json`.
 
 ## Workflow contract: `.pipelane.json` or `package.json:pipelane`
 
@@ -261,128 +250,38 @@ Pipelane resolves the workflow contract by layering:
 
 The file wins field-by-field over the overlay, which wins over defaults. If
 neither file nor overlay is present, `pipelane setup` self-heals by
-synthesizing a config from the repo name plus defaults — no `pipelane
-bootstrap` re-run required on fresh worktrees.
+synthesizing a config from the repo name plus defaults.
 
 Runtime mutations from `pipelane configure` write to `.pipelane.json`. If it
 doesn't exist yet, the mutator materializes it from the synthesized config at
 write time.
 
-### Optional `syncDocs` opt-ins
-
-Machine-local and synthesized configs default every `syncDocs` surface to
-`false`, so `pipelane setup` and `pipelane sync-docs` do not write generated
-repo surfaces unless the repo opts in.
-
-`pipelane init` and `pipelane bootstrap` are the explicit repo-local opt-in
-path: they write a `.pipelane.json` with the generated adapter surfaces enabled.
-Existing repo-local installs that still have old partial `syncDocs` maps keep
-their previous default-on behavior until the map is made explicit for every
-surface.
-Consumers that want partial regeneration can enable only the surfaces they want
-in `syncDocs`. Missing flags default to `false`; `true` = sync that surface,
-`false` = leave it alone.
-
-```json
-{
-  "syncDocs": {
-    "claudeCommands": true,
-    "codexSkills": true,
-    "readmeSection": false,
-    "contributingSection": false,
-    "agentsSection": false,
-    "docsReleaseWorkflow": false,
-    "pipelaneClaudeTemplate": false,
-    "packageScripts": true
-  }
-}
-```
-
-| Flag | Controls |
-| --- | --- |
-| `claudeCommands` | `.claude/commands/*.md` regeneration, including `pipelane.md` and the managed manifest. |
-| `codexSkills` | `.agents/skills/*` regeneration, including the managed manifest for tracked Codex skills. |
-| `readmeSection` | Marker-wrapped `README.md` section. |
-| `contributingSection` | Marker-wrapped `CONTRIBUTING.md` section. |
-| `agentsSection` | Marker-wrapped `AGENTS.md` section. |
-| `docsReleaseWorkflow` | `docs/RELEASE_WORKFLOW.md` file write. |
-| `pipelaneClaudeTemplate` | `pipelane/CLAUDE.template.md` file write. |
-| `packageScripts` | `pipelane:*` script entries in `package.json`. Setting this to `false` while `claudeCommands` is `true` requires the consumer's `package.json` to already define the full managed `pipelane:*` workflow script set for that Pipelane version, plus `pipelane:configure`. Setup fails fast with guidance if any are missing. |
-
-Enabling `claudeCommands` means the generated `.claude/commands/*.md` files will
-prefer machine-local managed runners and fall back to `npm run pipelane:<cmd>`,
-so also enable `packageScripts` unless the repo already owns equivalent scripts.
-
-Disabling a surface never removes content that a previous sync already wrote; it
-just stops future syncs from touching the surface.
-
-## Required `AGENTS.md`
-
-This repo tracks `AGENTS.md` as the repo policy surface for pipelane.
-The generated Pipelane section tells agents to use `{{ALIAS_NEW}}` before any
-new code-changing task, to resume existing task worktrees with `{{ALIAS_RESUME}}`,
-and to avoid editing or landing from shared, dirty, base-branch, or unrelated
-task checkouts.
-
-## Required local `CLAUDE.md`
-
-`CLAUDE.md` is machine-local and git-ignored. Setup creates it when Claude-facing
-repo-local surfaces are enabled.
-If an existing local `CLAUDE.md` is missing the Pipelane task workspace policy,
-`pipelane setup` prints an approval-gated migration; `pipelane setup --yes`
-applies it non-interactively.
-
 ## What each user must do
-
-### One repo maintainer
-
-1. run `pipelane bootstrap --yes --project "{{DISPLAY_NAME}}"` or `npx -y pipelane@github:jokim1/pipelane#main bootstrap --yes --project "{{DISPLAY_NAME}}"`
-2. review `.pipelane.json`, especially `aliases` (or the `pipelane` block in
-   `package.json` if using the gitignored-config flow)
-3. run `pipelane configure` before the first deploy
-4. commit the tracked Pipelane files
 
 ### Each Claude user
 
 1. once per machine: run `pipelane install-claude` for durable default personal skills under `~/.claude/skills`
-2. pull the committed workflow files
-3. open the repo in Claude
-4. reopen or restart Claude if aliases changed or the command files were added while it was already open
+2. open the repo in Claude
+3. reopen or restart Claude if newly installed commands are not visible
 
 ### Each Codex user
 
 1. once per machine: run `pipelane install-codex` for durable default skills under `~/.codex/skills`
-2. pull the committed workflow files
-3. if this machine previously used pipelane's machine-local Codex wrappers, rerun setup once to prune them
-4. open the repo in Codex
-5. reopen or restart Codex if tracked skills or aliases changed while it was already open
+2. open the repo in Codex
+3. reopen or restart Codex if newly installed commands are not visible
 
-### Repos that do not commit Pipelane adapters
+### Each repo
 
-Use the machine-local commands from `pipelane install-claude` and
-`pipelane install-codex` only. Do not run `bootstrap` or `/init-pipelane` unless
-you intentionally want generated repo config/adapters/docs. To protect raw npm
-in symlinked worktrees, run `pipelane install-npm-guard`, put `~/.pipelane/bin`
-first in `PATH`, and verify with `pipelane run doctor --check-guard`.
+1. run `pipelane setup`
+2. run `pipelane review setup`
+3. optionally run `pipelane install-npm-guard`, put `~/.pipelane/bin` first in
+   `PATH`, and verify with `pipelane run doctor --check-guard`
 
 ### Each release operator
 
-1. run setup
-2. run `pipelane configure`
-3. run `{{ALIAS_DOCTOR}} --probe`
-4. verify with `{{ALIAS_DEVMODE}} release`
-
-## Install In A New Repo
-
-```bash
-npx -y pipelane@github:jokim1/pipelane#main bootstrap --yes --project "{{DISPLAY_NAME}}"
-# or, if pipelane is already on PATH:
-pipelane bootstrap --yes --project "{{DISPLAY_NAME}}"
-```
-
-For first-time adoption in an existing remote-backed repo, commit the tracked Pipelane files
-before using `{{ALIAS_NEW}}`. New task worktrees are created from `{{BASE_BRANCH}}`, so the
-workflow contract needs to exist there first.
+1. run `pipelane configure`
+2. run `{{ALIAS_DOCTOR}} --probe`
+3. verify with `{{ALIAS_DEVMODE}} release`
 
 ## Day-One Operator Journey
 
@@ -395,7 +294,7 @@ workflow contract needs to exist there first.
 ## Troubleshooting and Common Failures
 
 - missing `.pipelane.json`
-  - run `pipelane bootstrap --yes --project "{{DISPLAY_NAME}}"` or `pipelane init`
+  - run `pipelane setup`; commands that need persisted config will materialize `.pipelane.json`
 - task already active
   - use `{{ALIAS_RESUME}} --task "<task-name>"`
 - release mode blocked

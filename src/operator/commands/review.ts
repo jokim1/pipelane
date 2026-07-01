@@ -3423,12 +3423,13 @@ function renderReviewSetupReport(
   }
 
   lines.push('', 'Setup controls:');
-  lines.push('- Toggle a gate: /pipelane review setup --toggle <display-id-or-gate-id>');
+  lines.push('- Toggle a gate: /pipelane review setup <display-id-or-gate-id>');
+  lines.push('- Explicit toggle flag: /pipelane review setup --toggle <display-id-or-gate-id>');
   lines.push('- Enable a gate: /pipelane review setup --enable <gate-id>');
   lines.push('- Disable a gate: /pipelane review setup --disable <gate-id>');
   lines.push('- Install an optional gate: /pipelane review setup --install <gate-id>');
   lines.push('- Reset to recommended defaults: /pipelane review setup --reset');
-  lines.push('- Multiple gates: repeat the flag or use comma-separated values such as /pipelane review setup --toggle C3,H1.');
+  lines.push('- Multiple gates: /pipelane review setup C3,H1 or repeat the --toggle flag.');
   lines.push('- Opinionated default: self-review, deterministic checks, independent AI review, and cross-model review when installed.');
   lines.push('- Opting out trades speed for higher risk of missed correctness, security, or data-loss bugs.');
 
@@ -3500,7 +3501,8 @@ function renderReviewSetupState(
     lines.push('- Type a row id such as C3 to toggle it immediately.');
     lines.push('- Press Enter or q to exit.');
   } else {
-    lines.push('- Toggle a row: /pipelane review setup --toggle C3');
+    lines.push('- Toggle a row: /pipelane review setup C3');
+    lines.push('- Explicit toggle flag: /pipelane review setup --toggle C3');
     lines.push('- Toggle by gate id: /pipelane review setup --toggle gstack-review');
     lines.push('- Enable/disable: /pipelane review setup --enable gstack-review | --disable typecheck');
     lines.push('- Install optional support: /pipelane review setup --install secret-scan');

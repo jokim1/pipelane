@@ -4,7 +4,7 @@ This folder contains `pipelane`'s local Pipelane Board reference implementation.
 
 Files:
 
-- `server.ts`: local HTTP adapter over a target repo's `pipelane:api`
+- `server.ts`: local HTTP adapter over a target repo's `pipelane run api`
 - `public/index.html`: zero-dependency dashboard UI
 
 ## Quick start
@@ -21,13 +21,13 @@ Open the reported local URL, typically:
 http://127.0.0.1:3033
 ```
 
-The target repo must expose:
+The dashboard uses the active Pipelane runtime directly:
 
-- `npm run pipelane:api -- snapshot --json`
-- `npm run pipelane:api -- branch --branch <branch> --json`
-- `npm run pipelane:api -- branch --branch <branch> --file <path> --patch --json`
-- `npm run pipelane:api -- action <id> --json`
-- `npm run pipelane:api -- action <id> --execute --confirm-token <token> --json`
+- `pipelane run api snapshot --json`
+- `pipelane run api branch --branch <branch> --json`
+- `pipelane run api branch --branch <branch> --file <path> --patch --json`
+- `pipelane run api action <id> --json`
+- `pipelane run api action <id> --execute --confirm-token <token> --json`
 
 ## Architecture
 
@@ -37,7 +37,7 @@ The dashboard is a thin local adapter.
 
 `server.ts` is responsible for:
 
-- spawning `pipelane:api` commands in the target repo
+- spawning `pipelane run api` commands in the target repo
 - forwarding JSON envelopes unchanged
 - caching snapshots briefly
 - managing action execution streams

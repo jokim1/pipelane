@@ -248,7 +248,7 @@ export async function handleRollback(cwd: string, parsed: ParsedOperatorArgs): P
 
   // Prod rollbacks join the risky set — same typed-SHA prefix gate as
   // deploy.prod. Confirmation is required regardless of mode: build
-  // mode is the default after `pipelane init`, and without this gate
+  // mode is the default in synthesized config, and without this gate
   // `/rollback prod` in build mode would dispatch with zero human
   // confirmation (no staging gate, no release-readiness gate, and
   // Codex caught the mode-only guard as a P1). API path still bypasses

@@ -2013,7 +2013,7 @@
         <div class="hero">
           <div>
             <h1 class="hero-title" id="hero-title">Pipelane</h1>
-            <p class="hero-copy" id="hero-copy">This view is driven directly from your repo's public pipelane:api contract. Click any branch to inspect lane reasons, row actions, changed files, and lazy patch previews.</p>
+            <p class="hero-copy" id="hero-copy">This view is driven directly from your repo's public Pipelane API contract. Click any branch to inspect lane reasons, row actions, changed files, and lazy patch previews.</p>
             <div class="pill-row" id="hero-pills"></div>
           </div>
           <div class="hero-actions">
@@ -3246,7 +3246,7 @@
       const repoName = basenameFromPath(health.repoRoot) || 'repo';
       const apiStatus = health.pipelaneApiConfigured
         ? '<span>api ready</span>'
-        : '<span class="hero-statusline-bad" title="Set a pipelane:api script in package.json">api not-configured</span>';
+        : '<span class="hero-statusline-bad" title="Reinstall the machine-local Pipelane runtime">api unavailable</span>';
       const schemaVersion = snapshot?.schemaVersion ? `<span>v${escapeHtml(snapshot.schemaVersion)}</span>` : '';
       const checkedAt = snapshot?.data?.boardContext?.overallFreshness?.checkedAt;
       const refreshed = checkedAt ? `<span>${escapeHtml(relativeTime(checkedAt))}</span>` : '';
@@ -4171,7 +4171,7 @@
 
         <div>
           <div class="panel-title">Row Actions</div>
-          <p class="section-copy">Action buttons use <span class="inline-code">branch.availableActions</span>, then call <span class="inline-code">pipelane:api action</span> for exact preflight before execution.</p>
+          <p class="section-copy">Action buttons use <span class="inline-code">branch.availableActions</span>, then call <span class="inline-code">pipelane run api action</span> for exact preflight before execution.</p>
           <div class="action-grid">
             ${availableActions.length ? availableActions.map((action) => actionButtonMarkup(action, 'branch', detailBranch.name)).join('') : '<div class="empty-state">No row-scoped actions are available for this branch in the current snapshot.</div>'}
           </div>

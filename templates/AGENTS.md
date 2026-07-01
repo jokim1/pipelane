@@ -6,8 +6,7 @@ This repo uses `pipelane` for task workspaces, PR prep, merge handoff, and deplo
 
 - Default slash aliases are `{{ALIAS_DEVMODE}}`, `{{ALIAS_NEW}}`, `{{ALIAS_RESUME}}`, `{{ALIAS_PR}}`, `{{ALIAS_MERGE}}`, `{{ALIAS_DEPLOY}}`, `{{ALIAS_CLEAN}}`, `{{ALIAS_STATUS}}`, `{{ALIAS_DOCTOR}}`, and `{{ALIAS_ROLLBACK}}`.
 - Fixed helper commands include `/fix`, `/fix rethink`, and `/fix refresh-guidance`.
-- Prefer the slash aliases above. They use the managed Pipelane runner and work before a fresh checkout has `node_modules`. Repo-local `npm run pipelane:*` or `npm run workflow:*` scripts are fallback paths and require `node_modules/.bin/pipelane` to exist.
-- For code changes, ensure work is in a Pipelane task workspace before editing. If the user describes a new task from a non-task checkout, run `{{ALIAS_NEW}}` with an inferred `--task` label before implementation. Do not edit in the starting checkout while planning to create the workspace later.
+- Prefer the slash aliases above. They use the managed Pipelane runner and work before a fresh checkout has `node_modules`; do not substitute repo-local npm scripts or repo-local binaries.
 - Use `{{ALIAS_NEW}}` to start new work after the user describes the task; use an explicit task name if the user provided one, otherwise infer a concise `--task` label instead of making the user repeat it.
 - Use `{{ALIAS_RESUME}} --task "<task-name>"` to return to an existing task workspace.
 - Use `{{ALIAS_DEVMODE}} status|build|release` to inspect or switch lanes.
@@ -39,7 +38,7 @@ This repo uses `pipelane` for task workspaces, PR prep, merge handoff, and deplo
 ### Worktree deps setup
 
 - `{{ALIAS_NEW}}` and `{{ALIAS_RESUME}}` symlink the task worktree's `node_modules` into the shared repo's `node_modules` so deps are instantly available without re-installing per worktree.
-- **A pipelane npm guard blocks `npm ci` / `npm install` in any worktree where `node_modules` is a symlink** — the install aborts with a clear error before npm's reify step can wipe the shared deps. Prefer the machine-local guard from `pipelane install-npm-guard` with `~/.pipelane/bin` first on `PATH`; repo-local setups that enable `syncDocs.packageScripts` may also wire the guard through `package.json:scripts.preinstall`.
+- **A pipelane npm guard blocks `npm ci` / `npm install` in any worktree where `node_modules` is a symlink** — the install aborts with a clear error before npm's reify step can wipe the shared deps. Use the machine-local guard from `pipelane install-npm-guard` with `~/.pipelane/bin` first on `PATH`.
 - Safe pattern for reinstalling deps in a task worktree (the guard accepts this because removing the symlink first turns the path into "no node_modules"):
 
   ```bash

@@ -148,8 +148,8 @@ export function buildDiagnoseReport(context: WorkflowContext): DiagnoseReport {
   }
   const versionSkew = detectManagedLocalVersionSkew(context.repoRoot);
   if (versionSkew) {
-    lines.push(`  Runtime versions: managed ${versionSkew.managedVersion}, repo-local ${versionSkew.localVersion}`);
-    lines.push('  Warning: this command started from a managed runtime but a different repo-local pipelane version is available; renamed flags can fail after re-exec.');
+    lines.push(`  Runtime versions: managed ${versionSkew.managedVersion}, ignored repo-local ${versionSkew.localVersion}`);
+    lines.push('  Warning: durable commands use the machine-local runtime; remove or update the repo-local install only if legacy tooling still calls it.');
   }
   const latestStaging = latestProbeRecordsBySurface(probeState.records, 'staging');
   if (latestStaging.length === 0) {

@@ -1,13 +1,11 @@
 #!/usr/bin/env node
 
-import { accessSync, constants, existsSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline/promises';
 
 import { handlePipelane } from './dashboard/launcher.ts';
 import { getDashboardOptions, startDashboardServer } from './dashboard/server.ts';
-import { collectBootstrapWarnings, parseBootstrapArgs, runBootstrap } from './operator/bootstrap.ts';
 import { installClaudeBootstrapSkill } from './operator/claude-install.ts';
 import { installCodexBootstrapSkill } from './operator/codex-install.ts';
 import { handleConfigure } from './operator/commands/configure.ts';
@@ -16,9 +14,7 @@ import {
   applyClaudeGuidanceMigrationsWithApproval,
   applyLessonsMigrationWithApproval,
   formatSetupResult,
-  initConsumerRepo,
   setupConsumerRepo,
-  syncDocsOnly,
   type SetupConsumerRepoResult,
 } from './operator/docs.ts';
 import { runOperator } from './operator/index.ts';
@@ -26,7 +22,7 @@ import { installNpmGuard } from './operator/npm-guard-install.ts';
 import { loadDeployConfig } from './operator/release-gate.ts';
 import { resolveRepoRoot } from './operator/state.ts';
 import { bootstrapWorktreeNodeModulesIfNeeded } from './operator/task-workspaces.ts';
-import { collectUpdateStatus, maybeAutoUpdate, parseUpdateArgs, refreshAutoUpdateCache, runUpdate, type UpdateStatus } from './operator/update.ts';
+import { parseUpdateArgs, runUpdate } from './operator/update.ts';
 import { runVerify } from './operator/verify.ts';
 
 function printTopLevelHelp(): void {
@@ -42,6 +38,7 @@ Commands:
   verify
   dashboard [--repo <repo-root>] [--host <host>] [--port <port>]
   board [stop|status] [--repo <repo-root>] [--port <port>] [--no-open]
+  review [review args...]
   run <operator command...>
 
 Examples:
@@ -54,31 +51,10 @@ Examples:
   pipelane board stop
   pipelane update --check
   pipelane dashboard --repo /absolute/path/to/repo
+  pipelane review setup C4
   pipelane run new --task "My Task"
   pipelane run new --unnamed
 `);
-}
-
-function parseProjectArg(args: string[], command: string): string {
-  let projectName = '';
-  for (let index = 0; index < args.length; index += 1) {
-    const token = args[index];
-    if (token === '--help' || token === '-h') {
-      process.stdout.write(`pipelane ${command} --project "Project Name"\n`);
-      process.exit(0);
-    }
-    if (token === '--project' || token.startsWith('--project=')) {
-      const value = token === '--project' ? args[index + 1] ?? '' : token.slice('--project='.length);
-      if (token === '--project') index += 1;
-      if (!value.trim()) {
-        throw new Error(`pipelane ${command} requires --project "Project Name".`);
-      }
-      projectName = value;
-      continue;
-    }
-    throw new Error(`Unknown flag for pipelane ${command}: ${token}`);
-  }
-  return projectName;
 }
 
 function assertNoArgs(args: string[], command: string): void {
@@ -119,136 +95,15 @@ function parseVerboseArg(args: string[], command: string): boolean {
   return verbose;
 }
 
-// Commands that own pipelane setup themselves; auto-bootstrap is irrelevant
-// (init/bootstrap) or operates outside the worktree (install-claude/codex
-// write to ~/.claude or ~/.codex). Skip the worktree symlink for these so
-// we don't surprise users running them in unusual locations.
+// Commands that operate outside the worktree. Skip the worktree symlink for
+// these so we don't surprise users running them in unusual locations.
 const SKIP_WORKTREE_BOOTSTRAP_COMMANDS = new Set(['init', 'bootstrap', 'install-claude', 'install-codex', 'install-npm-guard', 'verify']);
-
-// `update` must not re-exec into the repo-local pipelane binary when invoked
-// from a managed runtime: a stale repo-local install is the thing update is
-// repairing. It still participates in worktree node_modules bootstrap above.
-const SKIP_MANAGED_REEXEC_COMMANDS = new Set([...SKIP_WORKTREE_BOOTSTRAP_COMMANDS, 'update']);
-const AUTO_UPDATE_COMMANDS = new Set(['setup', 'sync-docs', 'configure', 'dashboard', 'board', 'run']);
-
-function isExecutablePath(targetPath: string): boolean {
-  try {
-    accessSync(targetPath, constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function maybeReexecRepoLocalPipelane(cwd: string): void {
-  if (process.env.PIPELANE_MANAGED_RUNTIME !== '1' || process.env.PIPELANE_RUNNER_REEXECED === '1') {
-    return;
-  }
-
-  const repoRoot = resolveRepoRoot(cwd, true);
-  const localBin = `${repoRoot}/node_modules/.bin/pipelane`;
-  if (!existsSync(localBin) || !isExecutablePath(localBin)) {
-    return;
-  }
-
-  const reexecEnv: NodeJS.ProcessEnv = {
-    ...process.env,
-    PIPELANE_RUNNER_REEXECED: '1',
-  };
-  delete reexecEnv.PIPELANE_MANAGED_RUNTIME;
-  delete reexecEnv.PIPELANE_MANAGED_RUNTIME_ROOT;
-
-  const result = spawnSync(localBin, process.argv.slice(2), {
-    cwd: repoRoot,
-    env: reexecEnv,
-    stdio: 'inherit',
-  });
-  if (result.error) {
-    throw result.error;
-  }
-  process.exit(result.status === null ? 1 : result.status);
-}
-
-function shouldSkipManagedReexec(command: string, rest: string[]): boolean {
-  if (SKIP_MANAGED_REEXEC_COMMANDS.has(command)) {
-    return true;
-  }
-  if (command !== 'run') return false;
-  if (rest[0] === 'review' && rest[1] === 'setup') return true;
-  return rest[0] === 'orchestrate';
-}
-
-function reexecAfterAutoUpdate(cwd: string): void {
-  const repoRoot = resolveRepoRoot(cwd, true);
-  const localBin = path.join(repoRoot, 'node_modules', '.bin', 'pipelane');
-  if (!existsSync(localBin) || !isExecutablePath(localBin)) {
-    throw new Error(
-      `pipelane auto-update completed, but the updated local executable is unavailable at ${localBin}. ` +
-      'Run `npm install` in this repo to restore node_modules/.bin/pipelane, then retry.',
-    );
-  }
-
-  const reexecEnv: NodeJS.ProcessEnv = {
-    ...process.env,
-    PIPELANE_AUTO_UPDATE_REEXECED: '1',
-    PIPELANE_RUNNER_REEXECED: '1',
-  };
-  delete reexecEnv.PIPELANE_MANAGED_RUNTIME;
-  delete reexecEnv.PIPELANE_MANAGED_RUNTIME_ROOT;
-
-  const result = spawnSync(localBin, process.argv.slice(2), {
-    cwd,
-    env: reexecEnv,
-    stdio: 'inherit',
-  });
-  if (result.error) {
-    throw result.error;
-  }
-  process.exit(result.status === null ? 1 : result.status);
-}
-
-async function confirmBootstrapWrites(yes: boolean | undefined): Promise<void> {
-  if (yes) {
-    return;
-  }
-
-  if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    throw new Error('pipelane bootstrap can write .pipelane.json, .claude/, .agents/, package.json scripts, docs, and other generated repo files. Re-run with --yes after confirming those changes are intended.');
-  }
-
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    const answer = (await rl.question('pipelane bootstrap can write .pipelane.json, .claude/, .agents/, package.json scripts, docs, and other generated repo files. Continue? [y/N] ')).trim().toLowerCase();
-    if (answer !== 'y' && answer !== 'yes') {
-      throw new Error('pipelane bootstrap cancelled.');
-    }
-  } finally {
-    rl.close();
-  }
-}
-
-function installUpdateCheckTimeoutMs(): number {
-  const raw = process.env.PIPELANE_INSTALL_UPDATE_CHECK_TIMEOUT_MS?.trim();
-  if (!raw) return 5000;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 5000;
-}
 
 function repoLocalPipelanePackageExists(repoRoot: string): boolean {
   return existsSync(path.join(repoRoot, 'node_modules', 'pipelane', 'package.json'));
 }
 
-function formatRepoLocalUpdateWarning(status: UpdateStatus): string[] {
-  if (status.upToDate) {
-    return [`Repo-local pipelane is up to date (${status.installedShaShort}).`];
-  }
-  return [
-    `Repo-local pipelane is behind: ${status.installedShaShort || '(unknown)'} -> ${status.latestShaShort}.`,
-    `Run \`pipelane update\` in ${status.repoRoot} before deploying, or set PIPELANE_AUTO_UPDATE=1 to opt into automatic workflow-command updates.`,
-  ];
-}
-
-function repoLocalInstallCheckLines(cwd: string): string[] {
+function legacyRepoLocalInstallNoticeLines(cwd: string): string[] {
   let repoRoot: string;
   try {
     repoRoot = resolveRepoRoot(cwd, true);
@@ -258,14 +113,7 @@ function repoLocalInstallCheckLines(cwd: string): string[] {
   if (!repoLocalPipelanePackageExists(repoRoot)) {
     return [];
   }
-  try {
-    return formatRepoLocalUpdateWarning(collectUpdateStatus(repoRoot, { timeoutMs: installUpdateCheckTimeoutMs() }));
-  } catch (error) {
-    return [
-      `Repo-local pipelane update check failed: ${error instanceof Error ? error.message : String(error)}`,
-      `Run \`pipelane update --check\` in ${repoRoot} before deploying.`,
-    ];
-  }
+  return [`Ignored legacy repo-local Pipelane install in ${repoRoot}/node_modules; durable commands use the machine-local runtime.`];
 }
 
 // Per-alias guidance for an optional skill whose name collided with a pre-existing
@@ -282,53 +130,22 @@ function formatSkippedSkillsLine(skipped: string[]): string {
   return `Skipped unmanaged optional skills (a non-pipelane skill of the same name exists): ${parts.join('; ')}.`;
 }
 
-async function prepareRepoLocalPipelaneForBootstrap(repoRoot: string, yes: boolean | undefined): Promise<void> {
-  if (!repoLocalPipelanePackageExists(repoRoot)) {
+function repoLocalAdapterUnsupportedMessage(command: string): string {
+  return [
+    `pipelane ${command} is no longer supported.`,
+    'Pipelane has one supported setup path: durable machine-local commands plus local runtime config.',
+    'Run `pipelane install-codex` or `pipelane install-claude` once per machine.',
+    'Then run `pipelane setup`, `pipelane review setup`, and `pipelane configure` from each repo as needed.',
+    'Pipelane no longer scaffolds tracked repo-local adapters or package.json workflow scripts.',
+  ].join('\n');
+}
+
+function handleUnsupportedRepoLocalAdapterCommand(command: string, args: string[]): void {
+  if (args.length === 1 && (args[0] === '--help' || args[0] === '-h')) {
+    process.stdout.write(`${repoLocalAdapterUnsupportedMessage(command)}\n`);
     return;
   }
-
-  let status: UpdateStatus;
-  try {
-    status = collectUpdateStatus(repoRoot, { timeoutMs: installUpdateCheckTimeoutMs() });
-  } catch (error) {
-    process.stderr.write(`[pipelane] Could not check repo-local pipelane before bootstrap: ${error instanceof Error ? error.message : String(error)}\n`);
-    process.stderr.write('[pipelane] Continuing with the installed repo-local pipelane. Run `pipelane update --check` if bootstrap behaves unexpectedly.\n');
-    return;
-  }
-
-  if (status.upToDate) {
-    return;
-  }
-
-  if (!yes) {
-    if (!process.stdin.isTTY || !process.stdout.isTTY) {
-      throw new Error(
-        `Repo-local pipelane is behind (${status.installedShaShort || '(unknown)'} -> ${status.latestShaShort}). ` +
-        'Re-run bootstrap with --yes to update repo-local pipelane before setup, or run `pipelane update` manually first.',
-      );
-    }
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    try {
-      const answer = (await rl.question(
-        `Repo-local pipelane is behind (${status.installedShaShort || '(unknown)'} -> ${status.latestShaShort}). Update it before bootstrap? [Y/n] `,
-      )).trim().toLowerCase();
-      if (answer === 'n' || answer === 'no') {
-        throw new Error('pipelane bootstrap cancelled; update repo-local pipelane first with `pipelane update`.');
-      }
-    } finally {
-      rl.close();
-    }
-  }
-
-  await runUpdate(repoRoot, {
-    check: false,
-    yes: true,
-    json: false,
-    output: 'stderr',
-    initialStatus: status,
-    stopBoard: false,
-    followUp: false,
-  });
+  throw new Error(repoLocalAdapterUnsupportedMessage(command));
 }
 
 async function maybeOfferConfigureAfterBootstrap(repoRoot: string): Promise<void> {
@@ -388,15 +205,15 @@ async function maybeApplyLessonsMigrationAfterPrompt(
 }
 
 async function main(): Promise<void> {
-  if (process.env.PIPELANE_REFRESH_UPDATE_CACHE === '1') {
-    refreshAutoUpdateCache(process.cwd());
-    return;
-  }
-
   const [command, ...rest] = process.argv.slice(2);
 
   if (!command || command === '--help' || command === '-h') {
     printTopLevelHelp();
+    return;
+  }
+
+  if (command === 'init' || command === 'bootstrap' || command === 'sync-docs') {
+    handleUnsupportedRepoLocalAdapterCommand(command, rest);
     return;
   }
 
@@ -412,75 +229,6 @@ async function main(): Promise<void> {
       process.stderr.write(`${bootstrap.message}\n`);
     }
   }
-  if (AUTO_UPDATE_COMMANDS.has(command)) {
-    const autoUpdate = await maybeAutoUpdate(process.cwd());
-    if (autoUpdate.updated) {
-      reexecAfterAutoUpdate(process.cwd());
-    }
-  }
-  if (!shouldSkipManagedReexec(command, rest)) {
-    maybeReexecRepoLocalPipelane(process.cwd());
-  }
-
-  if (command === 'init') {
-    const projectName = parseProjectArg(rest, 'init');
-    if (!projectName.trim()) {
-      throw new Error('pipelane init requires --project "Project Name".');
-    }
-
-    const result = initConsumerRepo(process.cwd(), projectName);
-    const lines = [
-      `Initialized pipelane in ${result.repoRoot}`,
-      `Config: ${result.configPath}`,
-      'Commit the tracked Pipelane files before using /new from a remote-backed repo.',
-      'Next: run setup, then reopen Claude/Codex so slash commands are loaded.',
-      'Tracked Codex skills will be written into .agents/skills for the repo.',
-    ];
-    const warnings = collectBootstrapWarnings(result.repoRoot);
-    if (warnings.length > 0) {
-      lines.push('Readiness warnings:');
-      lines.push(...warnings.map((warning) => `- ${warning}`));
-    }
-    process.stdout.write(lines.join('\n') + '\n');
-    return;
-  }
-
-  if (command === 'bootstrap') {
-    const options = parseBootstrapArgs(rest);
-    await confirmBootstrapWrites(options.yes);
-    const bootstrapRepoRoot = resolveRepoRoot(process.cwd(), true);
-    await prepareRepoLocalPipelaneForBootstrap(bootstrapRepoRoot, options.yes);
-    const result = runBootstrap(process.cwd(), options);
-    const lines = [
-      `Bootstrapped pipelane in ${result.repoRoot}`,
-      result.installedPackage ? 'Installed repo-local pipelane dependency.' : 'Reused existing repo-local pipelane dependency.',
-      result.initializedRepo
-        ? `Initialized tracked Pipelane files for ${result.displayName}.`
-        : 'Repo was already pipelane-enabled; refreshed local setup.',
-      result.createdClaude
-        ? 'Created local CLAUDE.md from the Pipelane template.'
-        : result.skippedClaudeScaffold
-          ? 'Skipped local CLAUDE.md scaffold because local guidance scaffolds are disabled.'
-          : 'Preserved existing local CLAUDE.md.',
-      'Commit the tracked Pipelane files before using /new from a remote-backed repo.',
-      'Claude picks up the tracked .claude/commands files after the repo is initialized.',
-    ];
-    if (result.installedCodexSkills.length > 0) {
-      lines.splice(4, 0, `Synced Codex skills in ${result.codexSkillsDir}`, `Slash commands: ${result.installedCodexSkills.join(', ')}`);
-      lines.push('Codex picks up the tracked .agents/skills files after the repo is initialized.');
-    } else {
-      lines.push('Skipped tracked Codex skill sync because syncDocs.codexSkills is false.');
-    }
-    lines.push('If Claude or Codex was already open, reopen the repo or restart the client to refresh commands and skills.');
-    if (result.warnings.length > 0) {
-      lines.push('Readiness warnings:');
-      lines.push(...result.warnings.map((warning) => `- ${warning}`));
-    }
-    process.stdout.write(lines.join('\n') + '\n');
-    await maybeOfferConfigureAfterBootstrap(result.repoRoot);
-    return;
-  }
-
   if (command === 'setup') {
     const options = parseSetupArgs(rest);
     let result = setupConsumerRepo(process.cwd());
@@ -490,16 +238,6 @@ async function main(): Promise<void> {
     if (!options.yes) {
       await maybeOfferConfigureAfterBootstrap(result.repoRoot);
     }
-    return;
-  }
-
-  if (command === 'sync-docs') {
-    assertNoArgs(rest, 'sync-docs');
-    const result = syncDocsOnly(process.cwd());
-    process.stdout.write([
-      `Synced Pipelane docs for ${result.repoRoot}`,
-      'If command files or Codex skills changed, reopen Claude/Codex so the refreshed commands are visible.',
-    ].join('\n') + '\n');
     return;
   }
 
@@ -514,13 +252,18 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === 'review') {
+    await runOperator(process.cwd(), ['review', ...rest]);
+    return;
+  }
+
   if (command === 'install-codex') {
     const verbose = parseVerboseArg(rest, 'install-codex');
     const result = installCodexBootstrapSkill();
     const lines = [
       `Installed ${result.installed.length} durable Pipelane Codex commands in ${result.codexHome}.`,
     ];
-    lines.push(...repoLocalInstallCheckLines(process.cwd()));
+    lines.push(...legacyRepoLocalInstallNoticeLines(process.cwd()));
     if (result.removedLegacySkills.length > 0) {
       lines.push(`Removed legacy machine-local wrapper skills: ${result.removedLegacySkills.join(', ')}`);
     }
@@ -540,7 +283,7 @@ async function main(): Promise<void> {
     const verbose = parseVerboseArg(rest, 'install-claude');
     const result = installClaudeBootstrapSkill();
     const lines = [`Installed ${result.installed.length} durable Pipelane Claude commands in ${result.claudeHome}.`];
-    lines.push(...repoLocalInstallCheckLines(process.cwd()));
+    lines.push(...legacyRepoLocalInstallNoticeLines(process.cwd()));
     if (result.removedLegacySkills.length > 0) {
       lines.push(`Removed legacy machine-local wrapper skills: ${result.removedLegacySkills.join(', ')}`);
     }

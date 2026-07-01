@@ -235,7 +235,7 @@ export async function handleConfigure(cwd: string, argv: string[]): Promise<Conf
   } else {
     // `loadWorkflowConfig` self-heals from defaults + `package.json:pipelane`
     // overlay when `.pipelane.json` is absent, so `configure` now works on
-    // overlay-only consumers without needing `pipelane init` first.
+    // overlay-only consumers without needing a repo-local bootstrap first.
     markdown = renderClaudeMdFromTemplate(workflowConfig);
     createdClaude = true;
   }

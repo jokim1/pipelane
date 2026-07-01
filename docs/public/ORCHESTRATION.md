@@ -53,7 +53,7 @@ Current commands:
 
 ```text
 /pipelane review setup
-/pipelane review setup --toggle C3
+/pipelane review setup C3
 /pipelane review setup --enable gstack-review
 /pipelane review setup --disable typecheck
 /pipelane review setup --install secret-scan
@@ -153,7 +153,7 @@ configured gates against the current diff and writes evidence. `/pr` enforces
 fresh, unfiltered evidence for the current branch, HEAD, and worktree state
 before commit, push, or PR handoff.
 
-Plain `/pipelane setup` remains repo/bootstrap setup. Do not use
+Plain `/pipelane setup` remains the machine-local repo setup and repair path. Do not use
 `/pipelane setup review-gates`.
 
 Gate order is canonical:

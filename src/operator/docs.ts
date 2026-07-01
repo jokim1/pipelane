@@ -13,7 +13,6 @@ import {
   MANAGED_COMMANDS,
   MANAGED_EXTRA_COMMANDS,
   MANAGED_WORKFLOW_COMMANDS,
-  REPO_LOCAL_SYNC_DOCS,
   type ManagedCommand,
   readJsonFile,
   resolveReadableConfigPath,
@@ -88,7 +87,7 @@ export const LEGACY_CLAUDE_SIGNATURES: Record<ManagedCommand, string[]> = {
     'npm run pipelane:repo-guard',
   ],
   status: [
-    'Render a one-screen terminal cockpit of the pipelane:api snapshot.',
+    'Render a one-screen terminal cockpit of the Pipelane API snapshot.',
     'npm run pipelane:status',
   ],
   doctor: [
@@ -551,33 +550,11 @@ export function ensurePackageScripts(repoRoot: string): void {
   writeFileSync(targetPath, nextRaw, 'utf8');
 }
 
-// Generated Claude slash-command templates prefer machine-local managed
-// runners, then fall back to `npm run pipelane:<cmd>`. Keep packageScripts as
-// a hard requirement when Claude commands are generated so project commands
-// still have a local fallback on machines without durable host skills.
+// Legacy package-script consistency check. Repo-local command generation is no
+// longer supported, so there is no package-script fallback to enforce.
 function assertPackageScriptConsistency(repoRoot: string, syncDocs: Required<SyncDocsConfig>): void {
-  if (syncDocs.packageScripts || !syncDocs.claudeCommands) {
-    return;
-  }
-
-  const packageJsonPath = path.join(repoRoot, 'package.json');
-  const pkg = existsSync(packageJsonPath)
-    ? (JSON.parse(readFileSync(packageJsonPath, 'utf8')) as { scripts?: Record<string, string> })
-    : {};
-  const scripts = pkg.scripts ?? {};
-  const missing = CLAUDE_COMMAND_PACKAGE_SCRIPTS.filter((script) => typeof scripts[script] !== 'string');
-  if (missing.length === 0) {
-    return;
-  }
-
-  throw new Error(
-    `syncDocs.packageScripts is false but package.json is missing required npm scripts: ${missing.join(', ')}. ` +
-      `The generated .claude/commands/*.md templates use these as the fallback when no managed runner is installed. ` +
-      `Fix it one of three ways: ` +
-      `(a) add the missing scripts to package.json yourself, ` +
-      `(b) set syncDocs.packageScripts to true (required when generating Claude commands unless those scripts already exist), or ` +
-      `(c) set syncDocs.claudeCommands to false so the command files aren't generated.`,
-  );
+  void repoRoot;
+  void syncDocs;
 }
 
 export function syncConsumerDocs(repoRoot: string, config: WorkflowConfig): void {
@@ -679,27 +656,11 @@ export function syncConsumerDocs(repoRoot: string, config: WorkflowConfig): void
 }
 
 export function initConsumerRepo(cwd: string, projectName: string): { repoRoot: string; configPath: string } {
-  const repoRoot = resolveRepoRoot(cwd, true);
-  const existingConfig = resolveReadableConfigPath(repoRoot);
-  if (existingConfig) {
-    throw new Error([
-      `Pipelane is already initialized in ${repoRoot}.`,
-      `Existing config: ${existingConfig}`,
-      'Run `pipelane setup` to refresh generated files, or edit the existing config intentionally.',
-    ].join('\n'));
-  }
-  const inferredName = projectName.trim() || path.basename(repoRoot);
-  const projectKey = inferProjectKey(inferredName);
-  const config = defaultWorkflowConfig(projectKey, inferredName);
-  config.syncDocs = { ...REPO_LOCAL_SYNC_DOCS };
-
-  writeWorkflowConfig(repoRoot, config);
-  syncConsumerDocs(repoRoot, config);
-
-  return {
-    repoRoot,
-    configPath: path.join(repoRoot, CONFIG_FILENAME),
-  };
+  void cwd;
+  void projectName;
+  throw new Error(
+    'pipelane init is no longer supported. Use `pipelane install-codex` or `pipelane install-claude` once per machine, then run `pipelane setup` in the repo.',
+  );
 }
 
 export interface SetupConsumerRepoResult {
@@ -1249,10 +1210,10 @@ export function setupConsumerRepo(cwd: string, options: SetupConsumerRepoOptions
 }
 
 export function syncDocsOnly(cwd: string): { repoRoot: string } {
-  const repoRoot = resolveRepoRoot(cwd, true);
-  const config = loadWorkflowConfig(repoRoot);
-  syncConsumerDocs(repoRoot, config);
-  return { repoRoot };
+  void cwd;
+  throw new Error(
+    'pipelane sync-docs is no longer supported. Use durable machine-local commands with `pipelane install-codex` or `pipelane install-claude`, then run `pipelane setup` in the repo.',
+  );
 }
 
 export interface ClaudeCommandDrift {
@@ -1502,25 +1463,17 @@ export function formatSetupResult(result: SetupConsumerRepoResult): string[] {
     result.createdClaude
       ? 'Created local CLAUDE.md from the Pipelane template.'
       : result.skippedClaudeScaffold
-        ? 'Skipped local CLAUDE.md scaffold because local guidance scaffolds are disabled.'
+        ? 'No local CLAUDE.md scaffold written; Pipelane guidance comes from durable machine-local commands.'
         : 'Preserved existing local CLAUDE.md.',
     result.createdRepoGuidance
       ? 'Created REPO_GUIDANCE.md from the scaffold — run `/fix refresh-guidance` to fill it in.'
       : result.skippedRepoGuidanceScaffold
-        ? 'Skipped REPO_GUIDANCE.md scaffold because local guidance scaffolds are disabled.'
+        ? 'No REPO_GUIDANCE.md scaffold written; Pipelane no longer creates repo-local adapter surfaces.'
         : 'Preserved existing REPO_GUIDANCE.md.',
     `Task start rule: for new code-changing work, run \`${result.taskStartCommand}\` with an inferred task label, then switch to the reported worktree before editing.`,
     setupDeployConfigMessage(result.repoRoot),
   ];
-  if (result.installedCodexSkills.length > 0) {
-    lines.push(
-      `Synced Codex skills in ${result.codexSkillsDir}`,
-      `Slash commands: ${result.installedCodexSkills.join(', ')}`,
-      'Codex picks up the tracked .agents/skills files from the repo.',
-    );
-  } else {
-    lines.push('Skipped tracked Codex skill sync because syncDocs.codexSkills is false.');
-  }
+  lines.push('Using durable machine-local commands; no tracked .agents skills were written.');
   if (result.removedLegacyCodexSkills.length > 0) {
     lines.push(`Removed legacy machine-local wrapper skills: ${result.removedLegacyCodexSkills.join(', ')}`);
   }

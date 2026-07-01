@@ -140,7 +140,7 @@ Inspect the review model, then persist any intentional changes:
 
 ```text
 /pipelane review setup
-/pipelane review setup --toggle C3
+/pipelane review setup C3
 ```
 
 Then run it before PR handoff:

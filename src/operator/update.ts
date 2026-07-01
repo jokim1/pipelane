@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { accessSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync } from 'node:fs';
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -757,15 +757,6 @@ function skippedGlobalSurfaces(reason: string): GlobalSurfaceRefresh {
   };
 }
 
-function isExecutable(targetPath: string): boolean {
-  try {
-    accessSync(targetPath, constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function installedCodexSurfaceSignals(): string[] {
   const skillsRoot = path.join(homeCodexDir(), 'skills');
   return [
@@ -801,24 +792,9 @@ function refreshInstalledGlobalSurfaces(repoRoot: string): GlobalSurfaceRefresh 
 }
 
 function refreshGlobalSurface(repoRoot: string, host: 'codex' | 'claude', signals: string[]): GlobalSurfaceRefreshCheck {
+  void repoRoot;
   if (!signals.some((targetPath) => existsSync(targetPath))) {
     return { status: 'skipped', detail: `not installed (run pipelane install-${host} to add it)` };
-  }
-
-  const installCommand = host === 'codex' ? 'install-codex' : 'install-claude';
-  const localBin = path.join(repoRoot, 'node_modules', '.bin', 'pipelane');
-  if (isExecutable(localBin)) {
-    const result = runCommandCapture(localBin, [installCommand], {
-      cwd: repoRoot,
-      env: process.env,
-    });
-    if (result.ok) {
-      return { status: 'refreshed', detail: `refreshed via ${localBin}` };
-    }
-    return {
-      status: 'failed',
-      detail: result.stderr || result.stdout || `${localBin} ${installCommand} exited ${result.exitCode}`,
-    };
   }
 
   try {

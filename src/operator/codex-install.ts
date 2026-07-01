@@ -128,8 +128,7 @@ function isLegacyPipelaneRuntimeDir(skillsRoot: string, skillName: string): bool
     return false;
   }
   const body = readFileSync(legacyRunnerPath, 'utf8');
-  return body.includes('ensure_local_pipelane_config')
-    && body.includes('This repo is not pipelane enabled. Run pipelane init first.');
+  return body.includes('ensure_local_pipelane_config');
 }
 
 function isManagedCodexSkillBody(body: string, skillName: string): boolean {

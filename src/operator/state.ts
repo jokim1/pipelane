@@ -199,9 +199,9 @@ export interface WorkflowConfig {
   };
   // Optional; absent in default config. See ChecksConfig for semantics.
   checks?: ChecksConfig;
-  // Optional; absent in default config. Per-surface opt-ins for
-  // syncConsumerDocs. Missing entry = default false, so machine-local
-  // installs do not write generated repo surfaces unless the repo opts in.
+  // Legacy field. Repo-local adapter generation is no longer supported; setup
+  // resolves every sync surface to false even if older config still carries
+  // these keys.
   syncDocs?: SyncDocsConfig;
   // v1.4: path-prefix map for `/status --blast <sha>`. Keys are surface
   // names (typically the entries in `surfaces`), values are POSIX
@@ -215,11 +215,8 @@ export interface WorkflowConfig {
   smoke?: SmokeConfig;
 }
 
-// Per-surface opt-in flags for `pipelane setup` / `pipelane sync-docs`.
-// Absent or undefined means "do not sync this surface" (default false).
-// Explicit `pipelane init` writes REPO_LOCAL_SYNC_DOCS below so repo-local
-// adapters remain available, but synthesized configs and old configs that
-// never opted in stay machine-local by default.
+// Legacy per-surface flags. They are preserved while reading older configs,
+// but repo-local adapter generation is no longer a supported setup path.
 export interface SyncDocsConfig {
   claudeCommands?: boolean;
   codexSkills?: boolean;
@@ -242,37 +239,11 @@ export const DEFAULT_SYNC_DOCS: Required<SyncDocsConfig> = {
   packageScripts: false,
 };
 
-export const REPO_LOCAL_SYNC_DOCS: Required<SyncDocsConfig> = {
-  claudeCommands: true,
-  codexSkills: true,
-  readmeSection: true,
-  contributingSection: true,
-  agentsSection: true,
-  docsReleaseWorkflow: true,
-  pipelaneClaudeTemplate: true,
-  packageScripts: true,
-};
-
-export function resolveSyncDocs(raw: SyncDocsConfig | undefined): Required<SyncDocsConfig> {
-  // Defense in depth: setupConsumerRepo and syncDocsOnly call JSON.parse
-  // directly and do NOT route through normalizeWorkflowConfig, so junk
-  // values (string "false", null, arrays, spread-of-a-string) can reach
-  // here unsanitized. Per-key type-check at use time guarantees that
-  // only real booleans flip a surface, and any non-boolean value (or a
-  // non-object `raw`) falls back to the declared default. This prevents
-  // truthy junk such as `{ "readmeSection": "false" }` from enabling a
-  // repo write when the consumer clearly meant to skip it.
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    return { ...DEFAULT_SYNC_DOCS };
-  }
-  const resolved: Required<SyncDocsConfig> = { ...DEFAULT_SYNC_DOCS };
-  for (const key of Object.keys(DEFAULT_SYNC_DOCS) as (keyof SyncDocsConfig)[]) {
-    const value = (raw as Record<string, unknown>)[key];
-    if (typeof value === 'boolean') {
-      resolved[key] = value;
-    }
-  }
-  return resolved;
+export function resolveSyncDocs(_raw: SyncDocsConfig | undefined): Required<SyncDocsConfig> {
+  // Repo-local adapter generation used to be configurable per surface. The
+  // supported path is now machine-local only, so old truthy values must not
+  // trigger writes into consumer repos.
+  return { ...DEFAULT_SYNC_DOCS };
 }
 
 export const DEFAULT_BRANCH_PREFIX = 'codex/';
@@ -1728,8 +1699,7 @@ export function patchReadableWorkflowConfig(
   patcher: (raw: Record<string, unknown>) => Record<string, unknown>,
 ): { configPath: string; isLegacy: boolean } {
   let configPath = resolveReadableConfigPath(repoRoot);
-  // Self-heal: if no file is tracked (consumer gitignored `.pipelane.json`
-  // or never ran `pipelane init`), materialize one from synthesized defaults
+  // Self-heal: if no readable config file exists, materialize one from synthesized defaults
   // + any `package.json:pipelane` overlay before patching. The patcher then
   // sees a complete JSON object and writes its slice on top. This is the
   // only write-to-disk path in the self-heal flow — `loadWorkflowConfig`
@@ -3614,11 +3584,26 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     positional.push(token);
   }
 
+  const command = positional[0] ?? '';
+  const commandPositionals = positional.slice(1);
+  normalizeReviewSetupPositionalToggles(command, commandPositionals, flags);
+
   return {
-    command: positional[0] ?? '',
-    positional: positional.slice(1),
+    command,
+    positional: commandPositionals,
     flags,
   };
+}
+
+function normalizeReviewSetupPositionalToggles(command: string, positional: string[], flags: OperatorFlags): void {
+  if (command !== 'review' || positional[0] !== 'setup' || positional.length <= 1) {
+    return;
+  }
+
+  const selections = positional.splice(1);
+  for (const selection of selections) {
+    flags.reviewToggle.push(...splitCsvFlagValue(selection));
+  }
 }
 
 function splitCsvFlagValue(value: string): string[] {
@@ -3832,7 +3817,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       if (subcommand === 'setup') {
         assertOnlyFlags(parsed, ['reviewPrint', 'reviewListGates', 'reviewEnable', 'reviewDisable', 'reviewInstall', 'reviewToggle', 'reviewReset', 'yes']);
         if (parsed.positional.length !== 1) {
-          throw new Error('review setup requires exactly: pipelane run review setup [--yes] [--reset] [--print] [--list-gates] [--toggle <gate[,gate...]>] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]');
+          throw new Error('review setup requires exactly: pipelane run review setup [gate[,gate...]...] [--yes] [--reset] [--print] [--list-gates] [--toggle <gate[,gate...]>] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]');
         }
         return;
       }
@@ -3851,7 +3836,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       }
       assertOnlyFlags(parsed, ['reviewDryRun', 'reviewGate', 'reviewPhase']);
       if (parsed.positional.length > 0) {
-        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review pass --gate <id> --message <text>, or pipelane run review setup [--yes] [--reset] [--print] [--list-gates] [--toggle <gate[,gate...]>] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]');
+        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review pass --gate <id> --message <text>, or pipelane run review setup [gate[,gate...]...] [--yes] [--reset] [--print] [--list-gates] [--toggle <gate[,gate...]>] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]');
       }
       const phase = parsed.flags.reviewPhase.trim();
       if (phase && !includesString(REVIEW_GATE_PHASES, phase)) {

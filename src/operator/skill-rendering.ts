@@ -133,15 +133,14 @@ Treat \`${slashAlias} setup\` as the normal clean repo setup and repair path and
 \`${slashAlias} configure\` as the normal deploy configuration path. Do not ask
 the user to run \`! pipelane configure\` in a terminal; the durable runner knows
 where the managed pipelane runtime is even when \`pipelane\` is not on PATH.
-Do not substitute repo-local \`npm run pipelane:*\` or \`npm run workflow:*\`
-scripts for bootstrap/task-start flows in a fresh checkout; npm resolves those
-through \`node_modules/.bin/pipelane\` and can fail before Pipelane links or
-installs dependencies.
+Do not substitute repo-local npm scripts or repo-local binaries for
+setup/task-start flows in a fresh checkout; durable commands use the
+machine-local runtime only.
 
-Plain \`${slashAlias} setup\` should not be treated as consent to materialize
-tracked repo-local adapters. It uses the machine-local Pipelane runtime and
-only syncs repo-local files for repos that have explicitly opted into those
-surfaces. Plain
+Plain \`${slashAlias} setup\` is the only supported setup and repair path. It
+uses the machine-local Pipelane runtime and must not materialize tracked
+repo-local adapters, command files, Codex skills, package scripts, or docs.
+Plain
 \`${slashAlias} review setup\` configures the pre-PR review gates. Keep those
 two setup flows distinct.
 
@@ -185,9 +184,13 @@ Do not reduce the review setup output to only a category summary. Preserve the
 grouped rows, stable ids such as \`C3\`, and exact commands, especially
 \`/karpathy diff\`, \`/code-review high\`, \`/gstack review\`,
 \`/claude review code\`, \`code-review-ultra\`, and \`/karpathy-audit\` when they
-appear. When the user chooses gates, run the matching deterministic command
-exactly; every mutation writes immediately and reprints the grouped state:
+appear. If the user's next reply is only one or more displayed row ids such as
+\`C4\` or \`C3,H1\`, treat it as a review setup selection. When the user chooses
+gates, run the matching deterministic command exactly; every mutation writes
+immediately and reprints the grouped state:
 
+- \`review setup <display-id-or-gate-id>\` toggles a displayed row directly,
+  for example \`review setup C4\`.
 - \`review setup --toggle <display-id-or-gate-id>\` to flip a displayed row.
 - \`review setup --enable <gate-id>\` to enable an available gate.
 - \`review setup --disable <gate-id>\` to disable a preselected gate.
@@ -195,7 +198,7 @@ exactly; every mutation writes immediately and reprints the grouped state:
   such as \`lint\` or \`adversarial-review\`.
 - \`review setup --reset\` to restore recommended defaults.
 - Gate values may be repeated or comma-separated, for example
-  \`review setup --toggle C3,H1\`.
+  \`review setup C3,H1\` or \`review setup --toggle C3,H1\`.
 - \`review setup --list-gates\` to inspect the full catalog.
 - \`review setup --print\` to print the effective config.
 \`review setup --yes\` is legacy-compatible and acts like intentional reset to
@@ -254,9 +257,9 @@ pass it as \`--pr 625\`. Do not pass a raw unquoted \`#625\` token to a shell;
 ## Fresh checkout behavior
 
 Use this slash command through the managed runner when starting a task from a
-fresh checkout. Do not substitute repo-local \`npm run pipelane:new\` or
-\`npm run workflow:new\` before \`node_modules/.bin/pipelane\` exists; npm will
-fail before Pipelane can create the task worktree or link dependencies.
+fresh checkout. Do not substitute repo-local npm scripts or repo-local binaries;
+durable commands use the machine-local runtime before Pipelane creates the task
+worktree or links dependencies.
 
 ## Bare invocation behavior
 
@@ -331,13 +334,13 @@ ${buildSkillMarker(options.markerPrefix, options.name)}
 ${options.body}`;
 }
 
-export function renderBootstrapScript(pipelaneBinPath: string): string {
+export function renderBootstrapScript(_pipelaneBinPath: string): string {
   return `#!/bin/sh
 set -eu
 
-repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-cd "$repo_root"
-exec "${pipelaneBinPath}" bootstrap "$@"
+echo "pipelane bootstrap and /init-pipelane are no longer supported." >&2
+echo "Run pipelane install-codex or pipelane install-claude once per machine, then run pipelane setup in the repo." >&2
+exit 1
 `;
 }
 
@@ -354,7 +357,6 @@ fi
 shift
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-local_bin="$repo_root/node_modules/.bin/pipelane"
 managed_bin="${options.managedPipelaneBin}"
 if [ ! -x "$managed_bin" ]; then
   managed_bin="${globalBinFallback}"
@@ -368,10 +370,10 @@ rollback, cleanup, and multi-agent implementation work on an explicit path so
 agents do not invent local process or skip release safety.
 
 The normal first-run path is clean: /pipelane setup uses the machine-local
-runtime and should not create tracked repo files unless the repo has explicitly
-opted into repo-local generated surfaces. /pipelane configure is the place to
-add deploy targets, health checks, and release-mode details. /pipelane update
-only updates Pipelane itself.
+runtime and must not create tracked repo-local adapters, command files, Codex
+skills, package scripts, or docs. /pipelane configure is the place to add deploy
+targets, health checks, and release-mode details. /pipelane update only updates
+Pipelane itself.
 
 Usage:
   /pipelane <command> [args...]
@@ -379,8 +381,7 @@ Usage:
 
 Start here:
   /pipelane setup [--yes]
-      Run clean first-time setup or repair. Uses local defaults unless the repo
-      has explicitly opted into generated command/docs/package-script surfaces.
+      Run clean first-time setup or repair with the machine-local runtime.
 
   /pipelane configure [--json] [flags...]
       Fill or update Deploy Configuration values such as staging/prod URLs,
@@ -404,7 +405,7 @@ Review gates:
       Run configured review gates for the current diff and write evidence that
       /pr and orchestrated slice review can trust.
 
-  /pipelane review setup [--yes] [--reset] [--print] [--list-gates]
+  /pipelane review setup [gate[,gate...]...] [--yes] [--reset] [--print] [--list-gates]
                          [--toggle <gate[,gate...]>] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]
       Choose the pre-PR review model. This is different from /pipelane setup;
       it configures quality gates such as tests, self-review, independent AI
@@ -487,43 +488,7 @@ run_pipelane() {
   exec "$bin" run "$subcommand" "$@"
 }
 
-should_use_managed_bootloader() {
-  if [ ! -x "$managed_bin" ]; then
-    return 1
-  fi
-
-  case "$command" in
-    pipelane)
-      if [ "$#" -eq 0 ]; then
-        return 1
-      fi
-      case "$1" in
-        setup|configure|status|review|orchestrate|web|board|update|help|--help|-h)
-          return 0
-          ;;
-      esac
-      return 1
-      ;;
-    *)
-      return 0
-      ;;
-  esac
-}
-
 cd "$repo_root"
-
-# Auto-update-capable commands enter the managed runtime first. The managed
-# CLI checks whether the repo-local install is stale, updates it if needed,
-# then re-execs the repo-local bin for the real command.
-if should_use_managed_bootloader "$@"; then
-  export PIPELANE_MANAGED_RUNTIME=1
-  export PIPELANE_MANAGED_RUNTIME_ROOT="${options.managedRuntimeRoot}"
-  run_pipelane "$managed_bin" "$command" "$@"
-fi
-
-if [ -x "$local_bin" ]; then
-  run_pipelane "$local_bin" "$command" "$@"
-fi
 
 if [ -x "$managed_bin" ]; then
   export PIPELANE_MANAGED_RUNTIME=1
@@ -533,11 +498,9 @@ fi
 
 echo "pipelane is unavailable for this repo." >&2
 echo "Checked:" >&2
-echo "  - $local_bin" >&2
 echo "  - ${options.managedPipelaneBin}" >&2
 echo "  - ${globalBinFallback}" >&2
 echo "Restore one of these runtimes and retry:" >&2
-echo "  - run npm install in the repo to restore node_modules/.bin/pipelane" >&2
 echo "  - reinstall ${options.hostLabel} skills to restore the managed pipelane runtime" >&2
 exit 1
 `;

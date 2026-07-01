@@ -1,4 +1,4 @@
-# `pipelane:api` — Pipelane operator contract
+# `pipelane run api` — Pipelane operator contract
 
 This is the machine-readable surface every Pipelane consumer (CLI `/status`,
 the Pipelane Board, editor integrations, dashboards) reads from. It is the
@@ -8,10 +8,10 @@ board, and the terminal cockpit all derive from the same envelope.
 Four commands:
 
 ```bash
-npm run pipelane:api -- snapshot [--json]
-npm run pipelane:api -- branch --branch <branch> [--json]
-npm run pipelane:api -- branch --branch <branch> --patch --file <path> [--scope branch|workspace] [--json]
-npm run pipelane:api -- action <actionId> [--execute] [--confirm-token <t>] [--json]
+pipelane run api snapshot [--json]
+pipelane run api branch --branch <branch> [--json]
+pipelane run api branch --branch <branch> --patch --file <path> [--scope branch|workspace] [--json]
+pipelane run api action <actionId> [--execute] [--confirm-token <t>] [--json]
 ```
 
 `--json` is assumed by programmatic callers; human-facing renderers also
@@ -149,7 +149,7 @@ or executing a stale route.
 
 `doctor.fix` is intentionally **not** exposed as an API action — it is
 interactive (TTY prompts for platform + URLs) and lives behind
-`npm run pipelane:doctor -- --fix`. Scripted config goes through
+`pipelane run doctor --fix`. Scripted config goes through
 `pipelane configure --json=...` instead.
 
 `rollback.*` are **Pipelane-only** extensions above the base action set.

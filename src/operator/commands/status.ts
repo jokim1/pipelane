@@ -32,13 +32,13 @@ import {
 } from '../state.ts';
 import { renderLaneLine, renderStateGlyph, sanitizeForTerminal } from './helpers.ts';
 
-// v0.6: `/status` terminal cockpit. Shells out to pipelane:api snapshot
+// v0.6: `/status` terminal cockpit. Uses the Pipelane API snapshot
 // via the in-process `buildWorkflowApiSnapshot` builder — same envelope
 // the Pipelane Board consumes, so there's one rendering of truth per
 // lane state. Zero derivation drift by construction.
 //
 // Shape of this handler:
-// 1. Build the envelope (same code path as `pipelane:api snapshot`).
+// 1. Build the envelope (same code path as `pipelane run api snapshot`).
 // 2. If envelope.ok is false, print the envelope error verbatim and
 //    exit non-zero — no silent fallback to raw pr-state.json / etc.
 // 3. Otherwise render the cockpit via renderCockpit(envelope) and print.
@@ -97,11 +97,11 @@ export async function handleStatus(cwd: string, parsed: ParsedOperatorArgs): Pro
   } catch (error) {
     // Fail loud. Never silently read raw state files.
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`pipelane:api snapshot failed: ${message}`);
+    throw new Error(`pipelane api snapshot failed: ${message}`);
   }
 
   if (!envelope.ok) {
-    throw new Error(envelope.message || 'pipelane:api snapshot returned ok=false');
+    throw new Error(envelope.message || 'pipelane api snapshot returned ok=false');
   }
 
   if (json) {

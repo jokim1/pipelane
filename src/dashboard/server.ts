@@ -83,6 +83,11 @@ interface DashboardHelp {
   warning: string;
 }
 
+interface PipelaneApiInvocation {
+  command: string;
+  args: string[];
+}
+
 export interface DashboardRuntimeMetadata {
   packageVersion: string;
   entrypoint: string;
@@ -349,27 +354,24 @@ function buildTransportFailure(message: string, stderr = '', details = ''): Json
   };
 }
 
-function readRepoPackageJson(repoRoot: string): JsonObject | null {
-  const packageJsonPath = path.join(repoRoot, 'package.json');
-  if (!existsSync(packageJsonPath)) {
-    return null;
+function buildPipelaneApiInvocation(args: string[]): PipelaneApiInvocation {
+  const overrideBin = process.env.PIPELANE_DASHBOARD_API_BIN?.trim();
+  if (overrideBin) {
+    return {
+      command: overrideBin,
+      args: ['run', 'api', ...args],
+    };
   }
 
-  try {
-    return JSON.parse(readFileSync(packageJsonPath, 'utf8')) as JsonObject;
-  } catch {
-    return null;
-  }
+  return {
+    command: process.execPath,
+    args: [buildDashboardRuntimeMetadata().entrypoint, 'run', 'api', ...args],
+  };
 }
 
-function pipelaneApiConfigured(repoRoot: string): boolean {
-  const packageJson = readRepoPackageJson(repoRoot);
-  const scripts = packageJson?.scripts;
-  if (!scripts || typeof scripts !== 'object') {
-    return false;
-  }
-
-  return typeof (scripts as Record<string, unknown>)['pipelane:api'] === 'string';
+function pipelaneApiConfigured(): boolean {
+  const overrideBin = process.env.PIPELANE_DASHBOARD_API_BIN?.trim();
+  return Boolean(overrideBin) || existsSync(buildDashboardRuntimeMetadata().entrypoint);
 }
 
 function readBranchAuthors(repoRoot: string): Map<string, BranchAuthor> {
@@ -455,7 +457,8 @@ function enrichEnvelopeWithBranchAuthors(envelope: JsonObject, authors: Map<stri
 
 async function runWorkflowJson(repoRoot: string, args: string[]): Promise<{ status: number; envelope: JsonObject; stderr: string }> {
   const result = await new Promise<{ status: number; stdout: string; stderr: string }>((resolve, reject) => {
-    const child = spawn('npm', ['run', '--silent', 'pipelane:api', '--', ...args], {
+    const invocation = buildPipelaneApiInvocation(args);
+    const child = spawn(invocation.command, invocation.args, {
       cwd: repoRoot,
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -482,7 +485,7 @@ async function runWorkflowJson(repoRoot: string, args: string[]): Promise<{ stat
 
   const trimmed = result.stdout.trim();
   if (!trimmed) {
-    throw new Error(`pipelane:api produced no JSON output.${result.stderr ? ` stderr: ${result.stderr.trim()}` : ''}`);
+    throw new Error(`pipelane api produced no JSON output.${result.stderr ? ` stderr: ${result.stderr.trim()}` : ''}`);
   }
 
   try {
@@ -494,7 +497,7 @@ async function runWorkflowJson(repoRoot: string, args: string[]): Promise<{ stat
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`pipelane:api returned invalid JSON (${message}).`);
+    throw new Error(`pipelane api returned invalid JSON (${message}).`);
   }
 }
 
@@ -667,22 +670,19 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
       },
     });
 
-    const args = [
-      'run',
-      '--silent',
-      'pipelane:api',
-      '--',
+    const apiArgs = [
       'action',
       actionId,
       ...buildWorkflowArgsFromParams(params),
       '--execute',
     ];
     if (confirmToken) {
-      args.push('--confirm-token', confirmToken);
+      apiArgs.push('--confirm-token', confirmToken);
     }
-    args.push('--json');
+    apiArgs.push('--json');
 
-    const child = spawn('npm', args, {
+    const invocation = buildPipelaneApiInvocation(apiArgs);
+    const child = spawn(invocation.command, invocation.args, {
       cwd: actionCwd,
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -723,7 +723,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
       const trimmedStdout = record.stdout.trim();
       if (!trimmedStdout) {
         record.status = 'failed';
-        record.errorMessage = 'pipelane:api execute produced no JSON output.';
+        record.errorMessage = 'pipelane api execute produced no JSON output.';
         appendExecutionEvent(record, {
           type: 'error',
           at: record.completedAt,
@@ -751,7 +751,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         record.status = 'failed';
-        record.errorMessage = `pipelane:api execute returned invalid JSON (${message}).`;
+        record.errorMessage = `pipelane api execute returned invalid JSON (${message}).`;
         appendExecutionEvent(record, {
           type: 'stdout',
           at: record.completedAt,
@@ -797,7 +797,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           repoRoot: options.repoRoot,
           pid: process.pid,
           repoExists: existsSync(options.repoRoot),
-          pipelaneApiConfigured: pipelaneApiConfigured(options.repoRoot),
+          pipelaneApiConfigured: pipelaneApiConfigured(),
           uiFileExists: existsSync(uiFilePath),
           settingsPath: options.settingsPath,
           runtime: buildDashboardRuntimeMetadata(),

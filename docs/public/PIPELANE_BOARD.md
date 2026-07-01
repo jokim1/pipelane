@@ -14,13 +14,13 @@ The board is:
 - local-first
 - developer-facing
 - intentionally opinionated
-- an adapter over a repo's public `pipelane:api` contract
+- an adapter over a repo's public `pipelane run api` contract
 
 The board is **not**:
 
 - the workflow source of truth
 - a project management board
-- a replacement for repo-native `npm run pipelane:*` commands
+- a replacement for machine-local Pipelane commands
 - a place to re-infer state from git internals, `gh` output, or private files
 
 ## Design principles
@@ -212,7 +212,7 @@ repo churn.
 
 If you build a variant on top of this design, preserve these boundaries:
 
-- consume the repo's public `pipelane:api` contract
+- consume the repo's public `pipelane run api` contract
 - do not re-infer workflow state from private files; display-only alias labels may come from the
   repo config for the help guide
 - keep action semantics in the repo contract, not in the UI

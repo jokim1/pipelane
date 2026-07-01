@@ -91,22 +91,15 @@ command.
 
 ### What Each User Still Needs To Do
 
-- One repo maintainer runs `pipelane bootstrap --yes --project "<name>"`, reviews
-  `.pipelane.json` (or a `pipelane` block in `package.json`), and commits the
-  tracked Pipelane files. Consumers who prefer to gitignore `.pipelane.json`
-  can declare the `pipelane` overlay in `package.json` and skip `init` — fresh
-  checkouts synthesize the config from that overlay. `bootstrap`/`/init-pipelane`
-  prompts before writing repo files.
 - Each Claude user can run `pipelane install-claude` once per machine for durable
-  default personal skills under `~/.claude/skills` (`/new`, `/status`,
-  `/pipelane`, `/pipelane-fix`, `/init-pipelane`, and the rest of the default
-  set), then reopens Claude if newly installed skills are not visible.
+  default personal skills under `~/.claude/skills`, then reopens Claude if newly
+  installed skills are not visible.
 - Each Codex user can run `pipelane install-codex` once per machine for durable
   default skills under `~/.codex/skills`, then reopens Codex if newly installed
   commands are not visible.
-- Repos that intentionally refuse committed Pipelane adapters can use only those
-  machine-local commands. Do not run `bootstrap`/`/init-pipelane` there unless
-  you intentionally want generated config/adapters/docs.
+- In each repo, run `pipelane setup`. Pipelane no longer supports tracked
+  repo-local adapter opt-in, so setup does not write `.claude/commands`,
+  `.agents/skills`, package scripts, or docs.
 - Optional raw-npm protection: run `pipelane install-npm-guard`, put
   `~/.pipelane/bin` first in `PATH`, and verify with
   `pipelane run doctor --check-guard`. The guard does not edit shell profiles.

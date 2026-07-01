@@ -20,22 +20,38 @@ No prefix matching. `/pipelane update-this-thing` routes to UNKNOWN MODE, not UP
 
 ## Runner Selection
 
-For setup, configure, update, and task-start flows, prefer the managed runner
-before any repo-local npm script:
+Use the durable machine-local runner only:
 
 ```bash
-claude_home="${CLAUDE_HOME:-$HOME/.claude}"
-codex_home="${CODEX_HOME:-$HOME/.codex}"
-claude_runner="$claude_home/skills/pipelane/bin/run-pipelane.sh"
-claude_bin="$claude_home/skills/pipelane/bin/pipelane"
-codex_runner="$codex_home/skills/.pipelane/bin/run-pipelane.sh"
-codex_bin="$codex_home/skills/.pipelane/bin/pipelane"
+run_pipelane() {
+  subcommand="$1"
+  shift
+
+  claude_home="${CLAUDE_HOME:-$HOME/.claude}"
+  codex_home="${CODEX_HOME:-$HOME/.codex}"
+  claude_runner="$claude_home/skills/pipelane/bin/run-pipelane.sh"
+  claude_bin="$claude_home/skills/pipelane/bin/pipelane"
+  codex_runner="$codex_home/skills/.pipelane/bin/run-pipelane.sh"
+  codex_bin="$codex_home/skills/.pipelane/bin/pipelane"
+
+  if [ -x "$claude_runner" ] && [ -x "$claude_bin" ]; then
+    "$claude_runner" pipelane "$subcommand" "$@"
+  elif [ -x "$codex_runner" ] && [ -x "$codex_bin" ]; then
+    "$codex_runner" pipelane "$subcommand" "$@"
+  else
+    echo "pipelane is unavailable. Reinstall machine-local Pipelane skills with pipelane install-claude or pipelane install-codex." >&2
+    exit 1
+  fi
+}
 ```
 
-Use `"$claude_runner" pipelane <subcommand> ...` when both the runner and its
-managed `pipelane` binary exist, then use the Codex runner with the same check.
-Use `npm run pipelane:*` only as a fallback after managed runners are missing or
-incomplete.
+Define this helper in the same shell invocation as the mode-specific
+`run_pipelane <subcommand> ...` call. It invokes the Claude runner when both
+the runner and its managed `pipelane` binary exist, then uses the Codex runner
+with the same check.
+If neither runtime is present, stop and tell the user to rerun
+`pipelane install-claude` or `pipelane install-codex`. Do not substitute
+repo-local npm scripts or repo-local binaries.
 
 ---
 
@@ -73,7 +89,7 @@ Protected path. Promote the same merged SHA through staging, healthcheck verific
   {{ALIAS_CLEAN}}                Clean up finished task state after production is verified.
 
 Helpful anytime:
-  /pipelane setup                Sync or repair generated Pipelane repo files.
+  /pipelane setup                Check or repair the machine-local Pipelane runtime for this repo.
   /pipelane configure            Fill or update deploy targets and healthchecks.
   {{ALIAS_STATUS}}               See where tasks, PRs, deploys, and release gates stand.
   {{ALIAS_RESUME}}               Reopen or recover an existing task workspace.
@@ -106,19 +122,7 @@ Helpful anytime:
 Run:
 
 ```bash
-claude_home="${CLAUDE_HOME:-$HOME/.claude}"
-codex_home="${CODEX_HOME:-$HOME/.codex}"
-claude_runner="$claude_home/skills/pipelane/bin/run-pipelane.sh"
-claude_bin="$claude_home/skills/pipelane/bin/pipelane"
-codex_runner="$codex_home/skills/.pipelane/bin/run-pipelane.sh"
-codex_bin="$codex_home/skills/.pipelane/bin/pipelane"
-if [ -x "$claude_runner" ] && [ -x "$claude_bin" ]; then
-  "$claude_runner" pipelane setup $REST
-elif [ -x "$codex_runner" ] && [ -x "$codex_bin" ]; then
-  "$codex_runner" pipelane setup $REST
-else
-  npm run pipelane:setup -- $REST
-fi
+run_pipelane setup $REST
 ```
 
 where `$REST` is `$ARGUMENTS` with the leading `setup` token stripped.
@@ -134,19 +138,7 @@ If setup offers to configure deploy targets, ask the user for the deploy values 
 Run:
 
 ```bash
-claude_home="${CLAUDE_HOME:-$HOME/.claude}"
-codex_home="${CODEX_HOME:-$HOME/.codex}"
-claude_runner="$claude_home/skills/pipelane/bin/run-pipelane.sh"
-claude_bin="$claude_home/skills/pipelane/bin/pipelane"
-codex_runner="$codex_home/skills/.pipelane/bin/run-pipelane.sh"
-codex_bin="$codex_home/skills/.pipelane/bin/pipelane"
-if [ -x "$claude_runner" ] && [ -x "$claude_bin" ]; then
-  "$claude_runner" pipelane configure $REST
-elif [ -x "$codex_runner" ] && [ -x "$codex_bin" ]; then
-  "$codex_runner" pipelane configure $REST
-else
-  npm run pipelane:configure -- $REST
-fi
+run_pipelane configure $REST
 ```
 
 where `$REST` is `$ARGUMENTS` with the leading `configure` token stripped.
@@ -155,7 +147,7 @@ Use this path for `/pipelane configure`, `/pipelane configure --json ...`, and d
 
 When configure prints "Choose the action to take:", ask the user for deploy
 values in chat, then run the matching `/pipelane configure --json ...` command
-with the provided flags through the managed runner when available.
+with the provided flags through the managed runner.
 
 ---
 
@@ -164,7 +156,7 @@ with the provided flags through the managed runner when available.
 Run:
 
 ```bash
-npm run pipelane:board -- $REST
+run_pipelane board $REST
 ```
 
 where `$REST` is `$ARGUMENTS` with the leading `web` or `board` token stripped.
@@ -172,9 +164,9 @@ where `$REST` is `$ARGUMENTS` with the leading `web` or `board` token stripped.
 Common forms:
 
 ```bash
-npm run pipelane:board             # start (if not already running) and open the browser
-npm run pipelane:board -- status   # show URL, port, PID, log path
-npm run pipelane:board -- stop     # stop the Pipelane Board for this repo
+/pipelane board          # start (if not already running) and open the browser
+/pipelane board status   # show URL, port, PID, log path
+/pipelane board stop     # stop the Pipelane Board for this repo
 ```
 
 The board checks whether the dashboard is already responding on the configured port (`/api/health`). If it is, it just opens the browser to that URL. Otherwise it spawns the dashboard detached in the background, waits up to 8 seconds for it to become healthy, writes a PID file, and opens the browser.
@@ -200,7 +192,7 @@ Display the command output directly. If the dashboard failed to become healthy w
 Run:
 
 ```bash
-npm run pipelane:status -- $REST
+run_pipelane status $REST
 ```
 
 where `$REST` is `$ARGUMENTS` with the leading `status` token stripped.
@@ -220,19 +212,7 @@ example `1 (Continue to /deploy staging: run /merge, then /deploy staging)` or
 Run:
 
 ```bash
-claude_home="${CLAUDE_HOME:-$HOME/.claude}"
-codex_home="${CODEX_HOME:-$HOME/.codex}"
-claude_runner="$claude_home/skills/pipelane/bin/run-pipelane.sh"
-claude_bin="$claude_home/skills/pipelane/bin/pipelane"
-codex_runner="$codex_home/skills/.pipelane/bin/run-pipelane.sh"
-codex_bin="$codex_home/skills/.pipelane/bin/pipelane"
-if [ -x "$claude_runner" ] && [ -x "$claude_bin" ]; then
-  "$claude_runner" pipelane review $REST
-elif [ -x "$codex_runner" ] && [ -x "$codex_bin" ]; then
-  "$codex_runner" pipelane review $REST
-else
-  npm run pipelane:review -- $REST
-fi
+run_pipelane review $REST
 ```
 
 where `$REST` is `$ARGUMENTS` with the leading `review` token stripped.
@@ -241,8 +221,8 @@ Use this path for `/pipelane review`, `/pipelane review --json`, `/pipelane revi
 
 Special case: when `$REST` is exactly `setup`, do not run the interactive setup command first. Agent Bash tools commonly run without an interactive TTY, and shell pipes make stdout non-TTY.
 
-1. Run `/pipelane review setup --print` through the managed runner when available to inspect the current effective gate config.
-2. If the user needs the available gate catalog, run `/pipelane review setup --list-gates` through the managed runner when available.
+1. Run `/pipelane review setup --print` through the managed runner to inspect the current effective gate config.
+2. If the user needs the available gate catalog, run `/pipelane review setup --list-gates` through the managed runner.
 3. Present deterministic choices in chat:
    - `1. Save recommended gates: /pipelane review setup --yes`
    - `2. Cancel`
@@ -257,7 +237,7 @@ If `$REST` starts with `setup --yes`, `setup --print`, `setup --list-gates`, or 
 Run advanced subcommands directly:
 
 ```bash
-npm run pipelane:orchestrate -- $REST
+run_pipelane orchestrate $REST
 ```
 
 where `$REST` is `$ARGUMENTS` with the leading `orchestrate` token stripped. Use this
@@ -310,19 +290,7 @@ breakdown before running one long opaque slice.
 Run:
 
 ```bash
-claude_home="${CLAUDE_HOME:-$HOME/.claude}"
-codex_home="${CODEX_HOME:-$HOME/.codex}"
-claude_runner="$claude_home/skills/pipelane/bin/run-pipelane.sh"
-claude_bin="$claude_home/skills/pipelane/bin/pipelane"
-codex_runner="$codex_home/skills/.pipelane/bin/run-pipelane.sh"
-codex_bin="$codex_home/skills/.pipelane/bin/pipelane"
-if [ -x "$claude_runner" ] && [ -x "$claude_bin" ]; then
-  "$claude_runner" pipelane update $REST
-elif [ -x "$codex_runner" ] && [ -x "$codex_bin" ]; then
-  "$codex_runner" pipelane update $REST
-else
-  npm run pipelane:update -- $REST
-fi
+run_pipelane update $REST
 ```
 
 where `$REST` is `$ARGUMENTS` with the leading `update` token stripped. Use this path to check for and install the latest Pipelane from `jokim1/pipelane#main`.
