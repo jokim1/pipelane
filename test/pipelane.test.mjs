@@ -2337,13 +2337,20 @@ test('install-codex outside a pipelane repo installs durable global default skil
     assert.match(pipelaneSkill, /Interactive review setup behavior/);
     assert.match(pipelaneSkill, /runner command above/);
     assert.match(pipelaneSkill, /npm run workflow:\*/);
+    assert.match(pipelaneSkill, /Bare review setup is read-only/);
+    assert.match(pipelaneSkill, /stable ids such as `C3`/);
+    assert.match(pipelaneSkill, /review setup --toggle <display-id-or-gate-id>/);
     assert.match(pipelaneSkill, /review setup --enable <gate-id>/);
     assert.match(pipelaneSkill, /review setup --disable <gate-id>/);
     assert.match(pipelaneSkill, /review setup --install <gate-id>/);
+    assert.match(pipelaneSkill, /review setup --reset/);
     assert.match(pipelaneSkill, /review setup --yes/);
     assert.match(pipelaneSkill, /code-review-high/);
     assert.match(pipelaneSkill, /Do not reduce the review setup output to only a category summary/);
-    assert.match(pipelaneSkill, /review setup --install adversarial-review/);
+    assert.match(pipelaneSkill, /\/gstack review/);
+    assert.match(pipelaneSkill, /code-review-ultra/);
+    assert.match(pipelaneSkill, /\/karpathy-audit/);
+    assert.match(pipelaneSkill, /legacy-compatible/);
     assert.match(pipelaneSkill, /fresh reviewer session/);
     assert.match(pipelaneSkill, /Same-session evidence will block `\/pr`/);
     assert.doesNotMatch(pipelaneSkill, /review setup --preset/);
@@ -2422,13 +2429,20 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     assert.match(pipelaneSkill, /Interactive review setup behavior/);
     assert.match(pipelaneSkill, /runner command above/);
     assert.match(pipelaneSkill, /npm run workflow:\*/);
+    assert.match(pipelaneSkill, /Bare review setup is read-only/);
+    assert.match(pipelaneSkill, /stable ids such as `C3`/);
+    assert.match(pipelaneSkill, /review setup --toggle <display-id-or-gate-id>/);
     assert.match(pipelaneSkill, /review setup --enable <gate-id>/);
     assert.match(pipelaneSkill, /review setup --disable <gate-id>/);
     assert.match(pipelaneSkill, /review setup --install <gate-id>/);
+    assert.match(pipelaneSkill, /review setup --reset/);
     assert.match(pipelaneSkill, /review setup --yes/);
     assert.match(pipelaneSkill, /code-review-high/);
     assert.match(pipelaneSkill, /Do not reduce the review setup output to only a category summary/);
-    assert.match(pipelaneSkill, /review setup --install adversarial-review/);
+    assert.match(pipelaneSkill, /\/gstack review/);
+    assert.match(pipelaneSkill, /code-review-ultra/);
+    assert.match(pipelaneSkill, /\/karpathy-audit/);
+    assert.match(pipelaneSkill, /legacy-compatible/);
     assert.match(pipelaneSkill, /fresh reviewer session/);
     assert.match(pipelaneSkill, /Same-session evidence will block `\/pr`/);
     assert.doesNotMatch(pipelaneSkill, /review setup --preset/);
@@ -5681,10 +5695,10 @@ test('review setup interactive lists adversarial review as an option', () => {
   const repoRoot = createRepo();
   try {
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
-      PIPELANE_REVIEW_SETUP_INPUT: 'c\n',
+      PIPELANE_REVIEW_SETUP_INPUT: 'q\n',
     });
 
-    assert.match(result.stdout, /AI review gates:/);
+    assert.match(result.stdout, /C\. Code review gates:/);
     assert.match(result.stdout, /Cross-model review/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -5747,7 +5761,7 @@ test('review setup list-gates text reports resolved availability', () => {
   }
 });
 
-test('review setup bare command renders a non-interactive selector without writing config', () => {
+test('review setup bare command renders grouped rows without writing config', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
   const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-claude-'));
@@ -5762,17 +5776,203 @@ test('review setup bare command renders a non-interactive selector without writi
     assert.match(result.stdout, /Claude review support:/);
     assert.match(result.stdout, /Codex \/claude review bridge:/);
     assert.match(result.stdout, /Anthropic API env:/);
-    assert.match(result.stdout, /AI review gates:/);
+    assert.match(result.stdout, /M\. Mechanical gates:/);
+    assert.match(result.stdout, /T\. Test gates:/);
+    assert.match(result.stdout, /C\. Code review gates:/);
+    assert.match(result.stdout, /I\. Instruction and runtime gates:/);
+    assert.match(result.stdout, /H\. Human approval gates:/);
+    assert.match(result.stdout, /C3\s+(on |off)\s+gstack-review/);
+    assert.match(result.stdout, /M1\s+on\s+typecheck\s+Typecheck \| npm run typecheck/);
+    assert.match(result.stdout, /T1\s+on\s+test\s+Tests \| npm run test/);
     assert.match(result.stdout, /\/karpathy diff/);
+    assert.match(result.stdout, /\/code-review high/);
+    assert.match(result.stdout, /\/gstack review/);
+    assert.match(result.stdout, /\/claude review code/);
+    assert.match(result.stdout, /code-review-ultra/);
+    assert.match(result.stdout, /\/karpathy-audit/);
     assert.match(result.stdout, /Cross-model review/);
-    assert.match(result.stdout, /Choose the action to take:/);
-    assert.match(result.stdout, /Install and enable .*adversarial-review.*\/pipelane review setup --install adversarial-review/);
-    assert.match(result.stdout, /Install and enable an optional gate: \/pipelane review setup --install <gate-id>/);
+    assert.match(result.stdout, /Toggle a row: \/pipelane review setup --toggle C3/);
+    assert.doesNotMatch(result.stdout, /Choose the action to take:/);
+    assert.doesNotMatch(result.stdout, /Save current selection/);
+    assert.doesNotMatch(result.stdout, /Show full gate catalog/);
+    assert.doesNotMatch(result.stdout, /Print effective config/);
     assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
     rmSync(claudeHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup bare command hydrates on off state from saved config', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [
+        {
+          id: 'typecheck',
+          phase: 'static',
+          type: 'command',
+          command: 'npm run typecheck:strict',
+          blocking: true,
+        },
+      ],
+    };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+    const before = readFileSync(configPath, 'utf8');
+
+    const result = runCli(['run', 'review', 'setup'], repoRoot);
+
+    assert.match(result.stdout, /Config: \.pipelane\.json/);
+    assert.match(result.stdout, /M1\s+on\s+typecheck\s+Typecheck \| npm run typecheck:strict/);
+    assert.match(result.stdout, /T1\s+off\s+test\s+Tests \| npm run test/);
+    assert.match(result.stdout, /C3\s+off\s+gstack-review/);
+    assert.equal(readFileSync(configPath, 'utf8'), before);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review setup bare command shows saved adversarial review command', () => {
+  const repoRoot = createRepo();
+  try {
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [
+        {
+          id: 'adversarial-review',
+          phase: 'ai-diff',
+          type: 'agent',
+          role: 'adversarial-code-reviewer',
+          blocking: true,
+          userCommands: ['/codex challenge'],
+        },
+      ],
+    };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+    const before = readFileSync(configPath, 'utf8');
+
+    const result = runCli(['run', 'review', 'setup'], repoRoot);
+
+    assert.match(result.stdout, /C4\s+on\s+adversarial-review\s+Cross-model review \| \/codex challenge/);
+    assert.doesNotMatch(result.stdout, /C4[^\n]*\/claude review code/);
+    assert.equal(readFileSync(configPath, 'utf8'), before);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review setup --toggle C3 writes config and reprints grouped state', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  try {
+    seedCodexReviewSkills(codexHome);
+
+    const result = runCli(['run', 'review', 'setup', '--toggle', 'C3'], repoRoot, {
+      CODEX_HOME: codexHome,
+    });
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+
+    assert.match(result.stdout, /Setup actions:/);
+    assert.match(result.stdout, /Toggled C3 gstack-review off/);
+    assert.match(result.stdout, /C3\s+off\s+gstack-review/);
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'), false);
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup --toggle accepts canonical gate ids', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  try {
+    seedCodexReviewSkills(codexHome);
+
+    const result = runCli(['run', 'review', 'setup', '--toggle', 'gstack-review'], repoRoot, {
+      CODEX_HOME: codexHome,
+    });
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+
+    assert.match(result.stdout, /Toggled C3 gstack-review off/);
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup TTY input C3 writes immediately', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  try {
+    seedCodexReviewSkills(codexHome);
+
+    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+      CODEX_HOME: codexHome,
+      PIPELANE_REVIEW_SETUP_INPUT: 'C3\nq\n',
+    });
+    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+
+    assert.match(result.stdout, /Toggled C3 gstack-review off/);
+    assert.match(result.stdout, /C3\s+off\s+gstack-review/);
+    assert.doesNotMatch(result.stdout, /Save and continue/);
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup --reset restores recommended defaults', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
+  try {
+    seedCodexReviewSkills(codexHome);
+    runCli(['init', '--project', 'Demo App'], repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [],
+    };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    const result = runCli(['run', 'review', 'setup', '--reset'], repoRoot, {
+      CODEX_HOME: codexHome,
+    });
+    const raw = JSON.parse(readFileSync(configPath, 'utf8'));
+
+    assert.match(result.stdout, /Reset review gates to recommended defaults/);
+    assert.match(result.stdout, /C3\s+on\s+gstack-review/);
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'typecheck'), true);
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'test'), true);
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'), true);
+    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('review setup unknown display id errors clearly', () => {
+  const repoRoot = createRepo();
+  try {
+    const result = runCli(['run', 'review', 'setup', '--toggle', 'Z9'], repoRoot, {}, true);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /--toggle received unknown review gate or display id "Z9"/);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
   }
 });
 
@@ -5878,7 +6078,7 @@ test('review setup --yes recommends installed cross-model review', () => {
   }
 });
 
-test('review setup interactive save writes recommended gates', () => {
+test('review setup interactive exit writes no config without a row mutation', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
   try {
@@ -5886,18 +6086,14 @@ test('review setup interactive save writes recommended gates', () => {
 
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
-      PIPELANE_REVIEW_SETUP_INPUT: 's\n',
+      PIPELANE_REVIEW_SETUP_INPUT: '\n',
     });
-    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
 
     assert.match(result.stdout, /Review setup/);
-    assert.match(result.stdout, /Actions:/);
-    assert.match(result.stdout, /s\. Save and continue/);
-    assert.match(result.stdout, /Review gates configured/);
-    assert.deepEqual(Object.keys(raw.reviewGates).sort(), ['gates', 'planReview', 'policyVersion']);
-    assert.equal(raw.reviewGates.policyVersion, 2);
-    assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'));
-    assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'));
+    assert.match(result.stdout, /Type a row id such as C3/);
+    assert.match(result.stdout, /Review setup closed/);
+    assert.doesNotMatch(result.stdout, /Save and continue/);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -6404,7 +6600,7 @@ test('review setup selection flags reject unknown gates', () => {
     const result = runCli(['run', 'review', 'setup', '--enable', 'not-a-gate', '--json'], repoRoot, {}, true);
 
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /--enable received unknown review gate "not-a-gate"/);
+    assert.match(result.stderr, /--enable received unknown review gate or display id "not-a-gate"/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -6543,7 +6739,7 @@ test('review setup interactive cancel writes no config', () => {
       PIPELANE_REVIEW_SETUP_INPUT: 'c\n',
     });
 
-    assert.match(result.stdout, /Review setup cancelled\. No changes written\./);
+    assert.match(result.stdout, /Review setup closed\./);
     assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -6558,7 +6754,7 @@ test('review setup interactive toggle of installed AI gate writes explicit gate 
 
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
-      PIPELANE_REVIEW_SETUP_INPUT: '8\ns\n',
+      PIPELANE_REVIEW_SETUP_INPUT: 'C1\nq\n',
     });
     const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
 
@@ -6582,7 +6778,7 @@ test('review setup detects provider-prefixed Karpathy skills as installed', () =
 
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
-      PIPELANE_REVIEW_SETUP_INPUT: '8\ns\n',
+      PIPELANE_REVIEW_SETUP_INPUT: 'C1\nq\n',
     });
     const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
 
@@ -6602,10 +6798,9 @@ test('review setup interactive can enable installed adversarial review', () => {
     seedCodexReviewSkills(codexHome, ['karpathy-diff', 'review', 'karpathy-audit']);
     seedCodexClaudeReviewBridge(codexHome);
 
-    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+    const result = runCli(['run', 'review', 'setup', '--reset'], repoRoot, {
       CODEX_HOME: codexHome,
       CLAUDE_HOME: claudeHome,
-      PIPELANE_REVIEW_SETUP_INPUT: 's\n',
     });
     const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
     const gate = raw.reviewGates.gates.find((entry) => entry.id === 'adversarial-review');
@@ -6627,10 +6822,9 @@ test('review setup detects the Codex /claude review bridge as adversarial review
     seedCodexReviewSkills(codexHome, ['karpathy-diff', 'review', 'karpathy-audit']);
     seedCodexClaudeReviewBridge(codexHome);
 
-    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+    const result = runCli(['run', 'review', 'setup', '--reset'], repoRoot, {
       CODEX_HOME: codexHome,
       CLAUDE_HOME: claudeHome,
-      PIPELANE_REVIEW_SETUP_INPUT: 's\n',
     });
     const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
 
@@ -6662,11 +6856,10 @@ test('review setup saves Claude-side gstack /codex challenge as the adversarial 
       'utf8',
     );
 
-    const result = runCli(['run', 'review', 'setup'], repoRoot, {
+    const result = runCli(['run', 'review', 'setup', '--reset'], repoRoot, {
       CODEX_HOME: codexHome,
       CLAUDE_HOME: claudeHome,
       PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
-      PIPELANE_REVIEW_SETUP_INPUT: 's\n',
     });
     const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
     const gate = raw.reviewGates.gates.find((entry) => entry.id === 'adversarial-review');
@@ -6692,13 +6885,12 @@ test('review setup does not treat a broken Codex /claude bridge as installed', (
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
       CLAUDE_HOME: claudeHome,
-      PIPELANE_REVIEW_SETUP_INPUT: '11\n2\ns\n',
+      PIPELANE_REVIEW_SETUP_INPUT: 'C4\n2\nq\n',
     });
-    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
 
     assert.match(result.stdout, /Cross-model review is not installed/);
     assert.match(result.stdout, /Install and enable/);
-    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'adversarial-review'), false);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -6716,7 +6908,7 @@ test('review setup interactive install approval can enable missing adversarial r
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
       CLAUDE_HOME: claudeHome,
-      PIPELANE_REVIEW_SETUP_INPUT: '11\n1\ns\n',
+      PIPELANE_REVIEW_SETUP_INPUT: 'C4\n1\nq\n',
       PIPELANE_REVIEW_SETUP_INSTALL_SUCCESS: 'adversarial-review',
     });
     const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
@@ -6742,14 +6934,13 @@ test('review setup interactive failed adversarial install leaves the gate disabl
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
       CLAUDE_HOME: claudeHome,
-      PIPELANE_REVIEW_SETUP_INPUT: '11\n1\ns\n',
+      PIPELANE_REVIEW_SETUP_INPUT: 'C4\n1\nq\n',
     });
-    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
 
     assert.match(result.stdout, /Cross-model review is not installed/);
     assert.match(result.stdout, /No test installer succeeded for adversarial-review/);
     assert.match(result.stdout, /Cross-model review remains disabled/);
-    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'adversarial-review'), false);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -6765,14 +6956,13 @@ test('review setup interactive install decline leaves known missing AI gate disa
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
       CLAUDE_HOME: claudeHome,
-      PIPELANE_REVIEW_SETUP_INPUT: '8\n2\ns\n',
+      PIPELANE_REVIEW_SETUP_INPUT: 'C1\n2\nq\n',
       PIPELANE_REVIEW_SETUP_INSTALL_SUCCESS: 'karpathy-diff',
     });
-    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
 
     assert.match(result.stdout, /Author self-review is not installed/);
     assert.match(result.stdout, /2\. Leave disabled/);
-    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'), false);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -6788,14 +6978,13 @@ test('review setup interactive missing Karpathy gate offers installer', () => {
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
       CLAUDE_HOME: claudeHome,
-      PIPELANE_REVIEW_SETUP_INPUT: '8\n2\ns\n',
+      PIPELANE_REVIEW_SETUP_INPUT: 'C1\n2\nq\n',
     });
-    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
 
     assert.match(result.stdout, /Author self-review is not installed/);
     assert.match(result.stdout, /Install karpathy-diff skill now/);
     assert.match(result.stdout, /Install and enable/);
-    assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'), false);
+    assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -6815,7 +7004,7 @@ test('review setup interactive installs Karpathy from a configured local source'
       CODEX_HOME: codexHome,
       CLAUDE_HOME: claudeHome,
       PIPELANE_KARPATHY_SKILLS_SOURCE: karpathySource,
-      PIPELANE_REVIEW_SETUP_INPUT: '8\n1\ns\n',
+      PIPELANE_REVIEW_SETUP_INPUT: 'C1\n1\nq\n',
     });
     const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
 
@@ -6838,7 +7027,7 @@ test('review setup interactive install approval can enable known missing AI gate
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
       CLAUDE_HOME: claudeHome,
-      PIPELANE_REVIEW_SETUP_INPUT: '8\n1\ns\n',
+      PIPELANE_REVIEW_SETUP_INPUT: 'C1\n1\nq\n',
       PIPELANE_REVIEW_SETUP_INSTALL_SUCCESS: 'karpathy-diff',
     });
     const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));

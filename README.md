@@ -136,10 +136,11 @@ The philosophy is decorrelated review:
 This is the key difference between an eyeball pass and a real eval: a real eval
 emits evidence that another tool can enforce later.
 
-Set the review model once:
+Inspect the review model, then persist any intentional changes:
 
 ```text
 /pipelane review setup
+/pipelane review setup --toggle C3
 ```
 
 Then run it before PR handoff:
@@ -204,6 +205,7 @@ Set up a repo:
 ```text
 /pipelane setup
 /pipelane review setup
+/pipelane review setup --reset
 /pipelane web
 ```
 
