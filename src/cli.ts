@@ -173,7 +173,9 @@ function shouldSkipManagedReexec(command: string, rest: string[]): boolean {
   if (SKIP_MANAGED_REEXEC_COMMANDS.has(command)) {
     return true;
   }
-  return command === 'run' && rest[0] === 'review' && rest[1] === 'setup';
+  if (command !== 'run') return false;
+  if (rest[0] === 'review' && rest[1] === 'setup') return true;
+  return rest[0] === 'orchestrate';
 }
 
 function reexecAfterAutoUpdate(cwd: string): void {

@@ -4629,6 +4629,50 @@ test('managed runtime keeps review setup off stale repo-local pipelane', () => {
   }
 });
 
+test('managed runtime keeps orchestrate off stale repo-local pipelane', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+
+  try {
+    mkdirSync(path.join(repoRoot, 'node_modules', '.bin'), { recursive: true });
+    writeFileSync(
+      path.join(repoRoot, 'node_modules', '.bin', 'pipelane'),
+      '#!/bin/sh\necho "LOCAL:$*"\nexit 17\n',
+      { mode: 0o755, encoding: 'utf8' },
+    );
+
+    const env = {
+      ...process.env,
+      CODEX_HOME: codexHome,
+      CLAUDE_HOME: claudeHome,
+      PIPELANE_HOME: pipelaneHome,
+      PIPELANE_MANAGED_RUNTIME: '1',
+      PIPELANE_MANAGED_RUNTIME_ROOT: '/tmp/pipelane-managed-runtime',
+    };
+    delete env.PIPELANE_ORCHESTRATION_STATE_KEY;
+    const result = spawnSync('node', [CLI_PATH, 'run', 'orchestrate', 'plan', '--outcome', 'managed orchestrate', '--json'], {
+      cwd: repoRoot,
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, /LOCAL:run orchestrate/);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.status, 'planned');
+    assert.ok(parsed.run.signature);
+    assert.ok(existsSync(persistedOrchestrationStateKeyPath(pipelaneHome)));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
 test('durable Codex runner enters managed runtime before a stale repo-local pipelane', () => {
   const repoRoot = createRepo();
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-bin-'));
