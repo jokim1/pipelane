@@ -29,6 +29,7 @@ export const DESTINATION_APPROVED_TARGET_SHA_ENV = 'PIPELANE_DESTINATION_APPROVE
 export interface DestinationRouteStepExecution {
   id: DestinationStep['id'];
   command: string;
+  cwd: string;
   exitCode: number;
   stdout: string;
   stderr: string;
@@ -88,7 +89,8 @@ export async function executeDestinationRoute(
     steps: [],
   };
   const captureOutput = parsed.flags.json;
-  let currentPlan = replanDestination(cwd, parsed);
+  let routeCwd = routeExecutionCwd(plan, cwd);
+  let currentPlan = replanDestination(routeCwd, parsed);
   const initialDrift = routeApprovalDrift(plan, currentPlan);
   if (initialDrift) {
     return failRouteGuard(execution, nextExecutableStep(currentPlan)?.command ?? plan.targetCommand, initialDrift);
@@ -103,7 +105,7 @@ export async function executeDestinationRoute(
       return failRouteGuard(execution, step.command, stepBlocker);
     }
     if (step.id === 'pr') {
-      const context = resolveWorkflowContext(cwd);
+      const context = resolveWorkflowContext(routeCwd);
       const reviewEvidence = evaluateReviewEvidenceForPr(context);
       if (!reviewEvidence.allowed) {
         const pause = await evaluateDestinationRouteReviewSafety(context, currentPlan, reviewEvidence);
@@ -115,7 +117,7 @@ export async function executeDestinationRoute(
 
     const args = buildStepArgs(step, parsed, currentPlan);
     const result = spawnSync(process.execPath, [cliPath(), 'run', ...args], {
-      cwd,
+      cwd: routeCwd,
       env: buildStepEnv(step, currentPlan),
       encoding: 'utf8',
       stdio: captureOutput ? ['ignore', 'pipe', 'pipe'] : ['inherit', 'inherit', 'inherit'],
@@ -127,6 +129,7 @@ export async function executeDestinationRoute(
     execution.steps.push({
       id: step.id,
       command: step.command,
+      cwd: routeCwd,
       exitCode,
       stdout,
       stderr,
@@ -137,16 +140,21 @@ export async function executeDestinationRoute(
       execution.failedStep = step.command;
       return execution;
     }
-    const nextPlan = replanDestination(cwd, parsed);
+    const nextPlan = replanDestination(routeCwd, parsed);
     const progressBlocker = validateStepProgress(plan, currentPlan, nextPlan, step);
     if (progressBlocker) {
       return failRouteGuard(execution, step.command, progressBlocker);
     }
     currentPlan = nextPlan;
+    routeCwd = routeExecutionCwd(currentPlan, routeCwd);
     if (options.stopAfterFirstExecutableStep) {
       return execution;
     }
   }
+}
+
+function routeExecutionCwd(plan: DestinationPlan, fallbackCwd: string): string {
+  return plan.worktreePath?.trim() || fallbackCwd;
 }
 
 function routeActionChoicesMessage(plan: DestinationPlan, parsed: ParsedOperatorArgs | null): string {
@@ -413,6 +421,7 @@ function routeStaticFingerprint(plan: DestinationPlan): Record<string, unknown> 
   const fp = routeFingerprint(plan);
   return {
     taskSlug: fp.taskSlug,
+    worktreePath: fp.worktreePath,
     mode: fp.mode,
     target: fp.target,
     explicitDeploySha: fp.explicitDeploySha,
@@ -424,6 +433,7 @@ function routeStaticFingerprint(plan: DestinationPlan): Record<string, unknown> 
 
 function routeFingerprint(plan: DestinationPlan): {
   taskSlug: string;
+  worktreePath: unknown;
   mode: string;
   target: string;
   prNumber: unknown;
@@ -436,6 +446,7 @@ function routeFingerprint(plan: DestinationPlan): {
 } {
   const fp = plan.fingerprintInputs as {
     taskSlug?: string;
+    worktreePath?: unknown;
     mode?: string;
     target?: string;
     prNumber?: unknown;
@@ -448,6 +459,7 @@ function routeFingerprint(plan: DestinationPlan): {
   };
   return {
     taskSlug: fp.taskSlug ?? '',
+    worktreePath: fp.worktreePath,
     mode: fp.mode ?? '',
     target: fp.target ?? '',
     prNumber: fp.prNumber,

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
 
 import { listMissingDeployConfiguration } from './deploy-config-validation.ts';
 import {
@@ -32,6 +33,10 @@ import {
   type WorkflowContext,
 } from './state.ts';
 import { observeCompletedDeployWorkflowRun } from './deploy-workflow-runs.ts';
+import {
+  scanOrchestrationRunDiagnostics,
+  selectActiveSlices,
+} from './orchestration-ledger.ts';
 import {
   buildStaleBaseBlockerForRepo,
   deriveTaskSlugFromPr,
@@ -79,6 +84,8 @@ export interface DestinationSnapshot {
   target: DestinationMilestone;
   targetCommand: string;
   repoRoot: string;
+  invocationRepoRoot: string;
+  worktreePath: string;
   commonDir: string;
   config: WorkflowConfig;
   mode: 'build' | 'release';
@@ -119,6 +126,7 @@ export interface DestinationPlan {
   mode: 'build' | 'release';
   target: DestinationMilestone;
   targetCommand: string;
+  worktreePath: string;
   currentMilestone: DestinationMilestone;
   currentStatus: string;
   taskName: string;
@@ -162,14 +170,19 @@ export function resolveDestinationSnapshot(
   parsed: ParsedOperatorArgs,
   target: DestinationMilestone,
 ): DestinationSnapshot {
-  const targetCommand = formatDestinationCommand(context, parsed, target);
-  const worktree = readWorktreeStatusSnapshot(context.repoRoot, { includeStatusDigest: true });
-  const branchName = worktree.branchName || runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() || '';
-  const headSha = worktree.head || runGit(context.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() || '';
+  const explicitTaskSlug = parsed.flags.task.trim() ? slugifyTaskName(parsed.flags.task) : '';
+  const explicitTaskLock = explicitTaskSlug ? loadTaskLock(context.commonDir, context.config, explicitTaskSlug) : null;
+  const routeContext = explicitTaskLock?.worktreePath && existsSync(explicitTaskLock.worktreePath)
+    ? resolveWorkflowContext(explicitTaskLock.worktreePath)
+    : context;
+  const targetCommand = formatDestinationCommand(routeContext, parsed, target);
+  const worktree = readWorktreeStatusSnapshot(routeContext.repoRoot, { includeStatusDigest: true });
+  const branchName = worktree.branchName || runGit(routeContext.repoRoot, ['branch', '--show-current'], true)?.trim() || '';
+  const headSha = worktree.head || runGit(routeContext.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() || '';
   const rawChangedPaths = worktree.dirty ? worktree.changedPaths : [];
   const changedPaths = rawChangedPaths.filter(isDestinationRelevantChangedPath);
   const dirty = worktree.dirty && (changedPaths.length > 0 || !worktree.statusDigestReliable);
-  const { surfaces: changedBySurface, other: changedOther } = bucketPathsBySurface(changedPaths, context.config.surfacePathMap ?? {});
+  const { surfaces: changedBySurface, other: changedOther } = bucketPathsBySurface(changedPaths, routeContext.config.surfacePathMap ?? {});
 
   let livePr: LivePr | null = null;
   let livePrError = '';
@@ -180,11 +193,11 @@ export function resolveDestinationSnapshot(
   const explicitPr = parsed.flags.pr.trim();
   if (explicitPr) {
     try {
-      livePr = loadPrByNumber(context.repoRoot, Number.parseInt(explicitPr, 10));
+      livePr = loadPrByNumber(routeContext.repoRoot, Number.parseInt(explicitPr, 10));
       taskSlug = parsed.flags.task.trim()
         ? slugifyTaskName(parsed.flags.task)
-        : deriveTaskSlugFromPr(context.config, livePr, livePr.headRefName ?? branchName);
-      lock = taskSlug ? loadTaskLock(context.commonDir, context.config, taskSlug) : null;
+        : deriveTaskSlugFromPr(routeContext.config, livePr, livePr.headRefName ?? branchName);
+      lock = taskSlug ? loadTaskLock(routeContext.commonDir, routeContext.config, taskSlug) : null;
       taskName = lock?.taskName ?? taskSlug;
     } catch (error) {
       livePrError = error instanceof Error ? error.message : String(error);
@@ -193,7 +206,7 @@ export function resolveDestinationSnapshot(
 
   if (!taskSlug) {
     try {
-      const inferred = inferActiveTaskLock(context, parsed.flags.task);
+      const inferred = inferActiveTaskLock(routeContext, parsed.flags.task);
       taskSlug = inferred.taskSlug;
       lock = inferred.lock;
       taskName = inferred.lock.taskName ?? inferred.taskSlug;
@@ -205,19 +218,18 @@ export function resolveDestinationSnapshot(
 
   if (!livePr && branchName) {
     try {
-      livePr = loadOpenPrForBranch(context.repoRoot, branchName);
+      livePr = loadOpenPrForBranch(routeContext.repoRoot, branchName);
     } catch (error) {
       if (!livePrError) livePrError = error instanceof Error ? error.message : String(error);
     }
   }
 
   if (!taskSlug && livePr) {
-    taskSlug = deriveTaskSlugFromPr(context.config, livePr, livePr.headRefName ?? branchName);
+    taskSlug = deriveTaskSlugFromPr(routeContext.config, livePr, livePr.headRefName ?? branchName);
   }
 
-  const explicitTaskSlug = parsed.flags.task.trim() ? slugifyTaskName(parsed.flags.task) : '';
-  const locklessBranchSlug = branchName && !isBaseBranchName(context.config, branchName)
-    ? inferTaskSlugFromBranchName(context.config, branchName) || slugifyTaskName(branchName)
+  const locklessBranchSlug = branchName && !isBaseBranchName(routeContext.config, branchName)
+    ? inferTaskSlugFromBranchName(routeContext.config, branchName) || slugifyTaskName(branchName)
     : '';
   let taskSlugInferredFromLocklessBranch = false;
   if (
@@ -233,25 +245,25 @@ export function resolveDestinationSnapshot(
   }
   if (!taskName && !taskSlugInferredFromLocklessBranch) taskName = taskSlug;
 
-  const prRecord = taskSlug ? loadPrRecord(context.commonDir, context.config, taskSlug) : null;
-  const deployState = loadDeployState(context.commonDir, context.config);
-  const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
+  const prRecord = taskSlug ? loadPrRecord(routeContext.commonDir, routeContext.config, taskSlug) : null;
+  const deployState = loadDeployState(routeContext.commonDir, routeContext.config);
+  const deployConfig = loadDeployConfig(routeContext.repoRoot) ?? emptyDeployConfig();
   const explicitDeploySha = parsed.command === 'deploy'
     ? parsed.flags.sha.trim()
     : '';
   const resolvedExplicitDeploySha = explicitDeploySha
-    ? runGit(context.repoRoot, ['rev-parse', '--verify', explicitDeploySha], true)?.trim() ?? ''
+    ? runGit(routeContext.repoRoot, ['rev-parse', '--verify', explicitDeploySha], true)?.trim() ?? ''
     : '';
   const explicitDeployShaError = explicitDeploySha && !resolvedExplicitDeploySha
     ? `Could not resolve ${explicitDeploySha}.`
     : '';
   const targetSha = resolvedExplicitDeploySha || (explicitDeploySha ? explicitDeploySha : resolveReleaseSha(livePr, prRecord, headSha));
   const explicitSurfaces = [...parsed.flags.surfaces, ...deploySurfacePositionals(parsed)];
-  const baseRequestedSurfaces = resolveCommandSurfaces(context, explicitSurfaces, lock?.surfaces ?? []);
+  const baseRequestedSurfaces = resolveCommandSurfaces(routeContext, explicitSurfaces, lock?.surfaces ?? []);
   const surfaceInference = explicitSurfaces.length === 0
     ? inferTargetSurfacesFromSurfacePathMap({
-      repoRoot: context.repoRoot,
-      config: context.config,
+      repoRoot: routeContext.repoRoot,
+      config: routeContext.config,
       targetSha,
     })
     : null;
@@ -265,10 +277,12 @@ export function resolveDestinationSnapshot(
   return {
     target,
     targetCommand,
-    repoRoot: context.repoRoot,
-    commonDir: context.commonDir,
-    config: context.config,
-    mode: context.modeState.mode,
+    repoRoot: routeContext.repoRoot,
+    invocationRepoRoot: context.repoRoot,
+    worktreePath: routeContext.repoRoot,
+    commonDir: routeContext.commonDir,
+    config: routeContext.config,
+    mode: routeContext.modeState.mode,
     branchName,
     headSha,
     targetSha,
@@ -296,9 +310,9 @@ export function resolveDestinationSnapshot(
       staging: computeDeployConfigFingerprint(deployConfig, 'staging'),
       prod: computeDeployConfigFingerprint(deployConfig, 'prod'),
     },
-    defaultDeployWorkflowName: context.config.deployWorkflowName,
+    defaultDeployWorkflowName: routeContext.config.deployWorkflowName,
     requestedSurfaces,
-    configuredSurfaces: [...context.config.surfaces],
+    configuredSurfaces: [...routeContext.config.surfaces],
     explicitSurfaces: explicitSurfaces.length > 0,
     surfacePathMapBlockers,
     titleProvided: parsed.flags.title.trim().length > 0,
@@ -333,6 +347,7 @@ export function planDestination(snapshot: DestinationSnapshot, target: Destinati
     taskSlug: snapshot.taskSlug,
     mode: snapshot.mode,
     target,
+    worktreePath: snapshot.worktreePath,
     branchName: snapshot.branchName,
     prNumber: snapshot.livePr?.number ?? snapshot.prRecord?.number ?? null,
     headSha: snapshot.headSha,
@@ -355,6 +370,7 @@ export function planDestination(snapshot: DestinationSnapshot, target: Destinati
     mode: snapshot.mode,
     target,
     targetCommand: snapshot.targetCommand,
+    worktreePath: snapshot.worktreePath,
     currentMilestone,
     currentStatus: currentStatusLine(snapshot, currentMilestone, releaseSha),
     taskName: snapshot.taskName,
@@ -377,6 +393,7 @@ export function renderDestinationPlan(plan: DestinationPlan): string {
     `Task: ${sanitizeForTerminal(plan.taskSlug)}`,
     `Mode: ${plan.mode}`,
     `Target: ${plan.targetCommand}`,
+    `Worktree: ${sanitizeForTerminal(plan.worktreePath)}`,
     `Status: ${sanitizeForTerminal(plan.currentStatus)}`,
     '',
     'Surfaces:',
@@ -579,6 +596,7 @@ function buildDestinationBlockers(snapshot: DestinationSnapshot, target: Destina
   const needsDeploySideEffect = needsStagingDeploy || needsProdDeploy;
 
   if (!snapshot.taskSlug) blockers.push('no active task could be inferred');
+  blockers.push(...activeOrchestrationWorktreeBlockers(snapshot));
   if (snapshot.livePrError && !snapshot.livePr && !snapshot.prRecord?.number) blockers.push(snapshot.livePrError);
   if (snapshot.explicitDeployShaError) blockers.push(snapshot.explicitDeployShaError);
   const staleBaseBlocker = destinationStaleBaseBlocker(snapshot, steps);
@@ -673,6 +691,38 @@ function buildDestinationBlockers(snapshot: DestinationSnapshot, target: Destina
     blockers.push(...listPendingDeployBlockers(snapshot, 'prod', snapshot.requestedSurfaces));
   }
   return [...new Set(blockers)];
+}
+
+function activeOrchestrationWorktreeBlockers(snapshot: DestinationSnapshot): string[] {
+  if (snapshot.taskSlug) return [];
+  if (!isBaseBranchName(snapshot.config, snapshot.branchName)) return [];
+
+  const scan = scanOrchestrationRunDiagnostics(snapshot.commonDir, snapshot.config);
+  const hints = scan.records.filter((run) => run.status !== 'completed').flatMap((run) =>
+    selectActiveSlices(run)
+      .filter((slice) => slice.taskSlug && slice.worktreePath && !slice.excludedReason)
+      .map((slice) => ({
+        runId: run.id,
+        sliceId: slice.id,
+        taskSlug: slice.taskSlug ?? '',
+        worktreePath: slice.worktreePath ?? '',
+      })),
+  );
+  if (hints.length === 0) return [];
+
+  const first = hints[0];
+  const command = `${snapshot.targetCommand} --task ${first.taskSlug}`;
+  return [[
+    `active orchestration run ${first.runId} owns slice ${first.sliceId} in task worktree ${first.worktreePath};`,
+    `do not run ${snapshot.targetCommand} from ${snapshot.branchName}.`,
+    `Run: cd ${shellQuote(first.worktreePath)} && ${command}`,
+    hints.length > 1 ? `(${hints.length - 1} additional orchestration task worktree(s) also exist.)` : '',
+  ].filter(Boolean).join(' ')];
+}
+
+function shellQuote(value: string): string {
+  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(value)) return value;
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 function destinationStaleBaseBlocker(snapshot: DestinationSnapshot, steps: DestinationStep[]): string {
