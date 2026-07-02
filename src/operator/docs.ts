@@ -545,8 +545,32 @@ function buildEnsuredPackageJson(repoRoot: string): { targetPath: string; curren
   return { targetPath, currentRaw, nextRaw };
 }
 
+function buildEnsuredPreinstallGuardPackageJson(repoRoot: string): { targetPath: string; currentRaw: string; nextRaw: string } {
+  const targetPath = path.join(repoRoot, 'package.json');
+  const existed = existsSync(targetPath);
+  const currentRaw = existed ? readFileSync(targetPath, 'utf8') : '';
+  const current: Record<string, unknown> = existed
+    ? JSON.parse(currentRaw) as Record<string, unknown>
+    : { name: path.basename(repoRoot), private: true, type: 'module', scripts: {} };
+  const existingScripts = typeof current.scripts === 'object' && current.scripts
+    ? current.scripts as Record<string, string>
+    : {};
+  const scripts: Record<string, string> = {
+    ...existingScripts,
+    preinstall: mergePreinstallScript(existingScripts.preinstall),
+  };
+  const next = { ...current, scripts };
+  const nextRaw = `${JSON.stringify(next, null, 2)}\n`;
+  return { targetPath, currentRaw, nextRaw };
+}
+
 export function ensurePackageScripts(repoRoot: string): void {
   const { targetPath, nextRaw } = buildEnsuredPackageJson(repoRoot);
+  writeFileSync(targetPath, nextRaw, 'utf8');
+}
+
+export function ensurePreinstallGuard(repoRoot: string): void {
+  const { targetPath, nextRaw } = buildEnsuredPreinstallGuardPackageJson(repoRoot);
   writeFileSync(targetPath, nextRaw, 'utf8');
 }
 
@@ -560,6 +584,7 @@ function assertPackageScriptConsistency(repoRoot: string, syncDocs: Required<Syn
 export function syncConsumerDocs(repoRoot: string, config: WorkflowConfig): void {
   const syncDocs = resolveEffectiveSyncDocs(repoRoot, config);
   assertPackageScriptConsistency(repoRoot, syncDocs);
+  ensurePreinstallGuard(repoRoot);
 
   if (syncDocs.claudeCommands) {
     const commandsDir = path.join(repoRoot, '.claude', 'commands');
@@ -1369,7 +1394,10 @@ export function detectSetupDrift(cwd: string): SetupDrift {
   )) {
     otherSurfaces.push('agentsSection');
   }
-  if (syncDocs.packageScripts) {
+  const preinstallPackageJson = buildEnsuredPreinstallGuardPackageJson(repoRoot);
+  if (preinstallPackageJson.currentRaw !== preinstallPackageJson.nextRaw) {
+    otherSurfaces.push('packageScripts');
+  } else if (syncDocs.packageScripts) {
     const { currentRaw, nextRaw } = buildEnsuredPackageJson(repoRoot);
     if (currentRaw !== nextRaw) {
       otherSurfaces.push('packageScripts');
