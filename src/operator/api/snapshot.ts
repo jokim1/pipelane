@@ -6,6 +6,7 @@ import {
   formatWorkflowCommand,
   loadAllTaskLocks,
   loadDeployState,
+  loadPrRecord,
   loadReviewState,
   loadPrState,
   loadProbeState,
@@ -689,7 +690,7 @@ function buildOrchestrationSnapshot(
   const summaryRecords = activeRecord
     ? [activeRecord, ...recentRecords.filter((run) => run.id !== activeRecord.id)].slice(0, 10)
     : recentRecords;
-  const summaries = summaryRecords.map((run) => summarizeOrchestrationRun(run, config, reviewOptions));
+  const summaries = summaryRecords.map((run) => summarizeOrchestrationRun(run, commonDir, config, reviewOptions));
   const activeRun = activeRecord ? summaries.find((run) => run.id === activeRecord.id) ?? null : null;
   const humanInbox = activeRun ? buildOrchestrationInbox(activeRun) : [];
   return {
@@ -733,6 +734,7 @@ function isPrReadyOrchestrationRun(
 
 function summarizeOrchestrationRun(
   run: OrchestrationRunRecord,
+  commonDir: string,
   config: WorkflowConfig,
   reviewOptions: OrchestrationReviewSatisfactionOptions,
 ): OrchestrationRunSummary {
@@ -788,7 +790,7 @@ function summarizeOrchestrationRun(
     };
   });
 
-  const nextAction = buildOrchestrationNextAction(run, config, trustedReviewBySlice, missingWorktrees, migrationNeededBySlice, reviewableBySlice);
+  const nextAction = buildOrchestrationNextAction(run, commonDir, config, trustedReviewBySlice, missingWorktrees, migrationNeededBySlice, reviewableBySlice);
   const state = missingWorktrees.length > 0 || nextAction?.state === 'blocked'
     ? 'blocked'
     : orchestrationLaneStateFromCounts(run.slices.length, counts);
@@ -842,6 +844,7 @@ function latestRejectedReviewEvidenceLabel(slice: OrchestrationSliceRecord): str
 
 function buildOrchestrationNextAction(
   run: OrchestrationRunRecord,
+  commonDir: string,
   config: WorkflowConfig,
   trustedReviewBySlice: Map<string, boolean>,
   missingWorktrees: OrchestrationMissingWorktreeSummary[] = [],
@@ -1000,15 +1003,38 @@ function buildOrchestrationNextAction(
         command: orchestrateCommand,
       });
     }
+    const prSlice = nextSliceWithoutPrRecord(active, commonDir, config);
+    if (!prSlice && active.every((slice) => slice.taskSlug && loadPrRecord(commonDir, config, slice.taskSlug))) {
+      return null;
+    }
     return buildOrchestrationAction({
       id: 'pr',
       label: 'Open PR for reviewed orchestration work',
       state: 'awaiting_preflight',
       reason: 'all slices have trusted review evidence',
-      command: prCommand,
+      command: prSlice
+        ? `cd ${shellQuote(prSlice.worktreePath ?? '')} && ${prCommand} --task ${prSlice.taskSlug}`
+        : prCommand,
     });
   }
   return null;
+}
+
+function nextSliceWithoutPrRecord(
+  active: OrchestrationSliceRecord[],
+  commonDir: string,
+  config: WorkflowConfig,
+): OrchestrationSliceRecord | null {
+  return active.find((slice) =>
+    slice.taskSlug
+    && slice.worktreePath
+    && !loadPrRecord(commonDir, config, slice.taskSlug)
+  ) ?? null;
+}
+
+function shellQuote(value: string): string {
+  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(value)) return value;
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 function buildOrchestrationAction(options: {

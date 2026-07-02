@@ -11625,6 +11625,97 @@ test('orchestrate review runs gate snapshot against completed worker slices', ()
   }
 });
 
+test('orchestration PR next action advances to reviewed slices without PR records', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{ id: 'static-pass', phase: 'static', type: 'command', command: 'node -e "process.exit(0)"', blocking: true }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt passing static gate');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(
+      path.join(repoRoot, 'docs', 'multi-pr-routing-plan.md'),
+      [
+        '# Multi PR Routing Plan',
+        '',
+        '## Slice 1: First agent',
+        '- Touch `src/first.ts`',
+        '',
+        '## Slice 2: Second agent',
+        '- Touch `src/second.ts`',
+      ].join('\n') + '\n',
+      'utf8',
+    );
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/multi-pr-routing-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, { PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker() });
+    runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot);
+
+    const ledger = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
+    const active = ledger.slices.filter((slice) => !slice.excludedReason);
+    assert.equal(active.length, 2);
+    assert.equal(ledger.status, 'completed');
+    assert.ok(active.every((slice) => slice.taskSlug && slice.worktreePath));
+
+    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(
+      path.join(stateDir, 'pr-state.json'),
+      `${JSON.stringify({
+        records: {
+          [active[0].taskSlug]: {
+            taskSlug: active[0].taskSlug,
+            branchName: active[0].branchName,
+            title: 'First agent',
+            number: 1,
+            url: 'https://example.test/pr/1',
+            updatedAt: '2026-04-22T00:00:00Z',
+          },
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+
+    const firstSnapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    const nextAction = firstSnapshot.data.orchestration.activeRun.nextAction;
+    assert.equal(nextAction.id, 'pr');
+    assert.ok(nextAction.command.includes(`cd ${active[1].worktreePath}`));
+    assert.ok(nextAction.command.includes(`/pr --task ${active[1].taskSlug}`));
+    assert.ok(!nextAction.command.includes(`/pr --task ${active[0].taskSlug}`));
+
+    writeFileSync(
+      path.join(stateDir, 'pr-state.json'),
+      `${JSON.stringify({
+        records: Object.fromEntries(active.map((slice, index) => [slice.taskSlug, {
+          taskSlug: slice.taskSlug,
+          branchName: slice.branchName,
+          title: `Agent ${index + 1}`,
+          number: index + 1,
+          url: `https://example.test/pr/${index + 1}`,
+          updatedAt: '2026-04-22T00:00:00Z',
+        }])),
+      }, null, 2)}\n`,
+      'utf8',
+    );
+
+    const exhaustedSnapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    assert.equal(exhaustedSnapshot.data.orchestration.activeRun.nextAction, null);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('orchestrate review blocks when no effective review gates are configured', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];
@@ -32359,6 +32450,78 @@ test('destination routes block opaque dirty approvals before local PR side effec
   }
 });
 
+test('destination routes with explicit task plan against the attached worktree from parent checkout', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    commitAll(repoRoot, 'configure pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Attached Route', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(repoRoot, 'parent-only.txt'), 'parent dirty state must not affect task route\n', 'utf8');
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'task route dirty state\n', 'utf8');
+
+    const result = runCli(
+      ['run', 'deploy', 'staging', '--task', 'Attached Route', '--plan', '--json'],
+      repoRoot,
+      { PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200' },
+    );
+    const payload = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0);
+    assert.equal(payload.taskSlug, 'attached-route');
+    assert.equal(payload.worktreePath, created.worktreePath);
+    assert.equal(payload.fingerprintInputs.worktreePath, created.worktreePath);
+    assert.match(payload.currentStatus, new RegExp(created.branch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.deepEqual(payload.blockers, []);
+    assert.doesNotMatch(payload.message, /parent-only\.txt|No task lock matches branch main|no active task could be inferred/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('destination route execution runs explicit task PR step inside the attached worktree', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(fakeBin, 'gh-state.json');
+  writeFakeGh(fakeBin, ghStateFile);
+  const env = { PATH: `${fakeBin}:${process.env.PATH}`, GH_STATE_FILE: ghStateFile };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    runCli(['setup'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'configure pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Attached Execute', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(repoRoot, 'parent-only.txt'), 'parent dirty state must not be committed\n', 'utf8');
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'task route execution dirty state\n', 'utf8');
+    writePassingReviewEvidence(created.worktreePath);
+
+    const result = runCli(
+      ['run', 'pr', '--task', 'Attached Execute', '--title', 'Attached Execute', '--yes', '--json'],
+      repoRoot,
+      env,
+    );
+    const payload = JSON.parse(result.stdout);
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    const pr = Object.values(ghState.prs).find((entry) => entry.title === 'Attached Execute');
+
+    assert.equal(result.status, 0);
+    assert.equal(payload.execution.steps[0].cwd, created.worktreePath);
+    assert.ok(pr, 'route-created PR should be created from the task worktree');
+    assert.equal(pr.headRefName, created.branch);
+    assert.match(run('git', ['status', '--short'], repoRoot), /parent-only\.txt/);
+    assert.equal(run('git', ['log', '-1', '--pretty=%s'], created.worktreePath), 'Attached Execute');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
 test('destination routes infer a task slug from a dirty lockless branch', () => {
   const repoRoot = createRepo();
   try {
@@ -33286,6 +33449,13 @@ test('orchestrate paused run reviews as passed (not blocked) and the next action
     // #1b: the next action for a reviewed paused run is resume, not pr.
     const snapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
     assert.equal(snapshot.data.orchestration.activeRun.nextAction.id, 'orchestrate.resume');
+
+    const deployFromParent = runCli(['run', 'deploy', 'staging', '--plan', '--json'], repoRoot, {}, true);
+    const deployPlan = JSON.parse(deployFromParent.stdout);
+    assert.equal(deployFromParent.status, 1);
+    assert.match(deployPlan.blockers.join('\n'), /active orchestration run/);
+    assert.match(deployPlan.blockers.join('\n'), /do not run \/deploy staging from main/);
+    assert.match(deployPlan.blockers.join('\n'), /cd .* && \/deploy staging --task/);
   } finally {
     for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
     rmSync(repoRoot, { recursive: true, force: true });
