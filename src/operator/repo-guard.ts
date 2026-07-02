@@ -1,5 +1,5 @@
 import type { WorkflowConfig } from './state.ts';
-import { normalizePath } from './state.ts';
+import { normalizeExistingPath } from './state.ts';
 
 export function taskBranchMatches(config: WorkflowConfig, taskSlug: string, branchName: string): boolean {
   const prefixes = [config.branchPrefix, ...config.legacyBranchPrefixes];
@@ -35,7 +35,7 @@ export function computeRepoGuardUnsafeReasons(options: {
     reasons.push(`task ${options.taskSlug} is locked to branch ${options.existingTaskBranch}`);
   }
 
-  if (options.existingTaskWorktree && normalizePath(options.existingTaskWorktree) !== normalizePath(options.repoRoot)) {
+  if (options.existingTaskWorktree && !sameExistingPath(options.existingTaskWorktree, options.repoRoot)) {
     reasons.push(`task ${options.taskSlug} is locked to worktree ${options.existingTaskWorktree}`);
   }
 
@@ -46,7 +46,7 @@ export function computeRepoGuardUnsafeReasons(options: {
     if (lock.branchName === options.branchName) {
       reasons.push(`branch ${options.branchName} is already locked by task ${lock.taskSlug}`);
     }
-    if (normalizePath(lock.worktreePath) === normalizePath(options.repoRoot)) {
+    if (sameExistingPath(lock.worktreePath, options.repoRoot)) {
       reasons.push(`worktree ${options.repoRoot} is already locked by task ${lock.taskSlug}`);
     }
   }
@@ -71,7 +71,7 @@ export function verifyTaskLockState(options: {
     mismatches.push(`expected branch ${options.lock.branchName}, found ${options.branchName}`);
   }
 
-  if (normalizePath(options.lock.worktreePath) !== normalizePath(options.repoRoot)) {
+  if (!sameExistingPath(options.lock.worktreePath, options.repoRoot)) {
     mismatches.push(`expected worktree ${options.lock.worktreePath}, found ${options.repoRoot}`);
   }
 
@@ -82,6 +82,10 @@ export function verifyTaskLockState(options: {
   }
 
   return mismatches;
+}
+
+function sameExistingPath(left: string, right: string): boolean {
+  return normalizeExistingPath(left) === normalizeExistingPath(right);
 }
 
 export function resolveRequestedDeploySurfaces(config: WorkflowConfig, candidates: string[][]): string[] {
