@@ -20437,7 +20437,7 @@ test('build-mode deploy prod skips cleanly when no surfaces are configured', () 
     const workflowConfigPath = path.join(repoRoot, '.pipelane.json');
     const workflowConfig = JSON.parse(readFileSync(workflowConfigPath, 'utf8'));
     workflowConfig.surfaces = [];
-    workflowConfig.buildMode.autoDeployOnMerge = false;
+    workflowConfig.buildMode = { ...(workflowConfig.buildMode ?? {}), autoDeployOnMerge: false };
     writeFileSync(workflowConfigPath, `${JSON.stringify(workflowConfig, null, 2)}\n`, 'utf8');
     commitAll(repoRoot, 'Adopt pipelane');
 
@@ -20525,7 +20525,7 @@ test('no-surface deploy of an unmerged SHA does not mark delivery complete', () 
     writePipelaneConfig(repoRoot, 'Demo App');
     updateWorkflowConfig(repoRoot, (config) => {
       config.surfaces = [];
-      config.buildMode.autoDeployOnMerge = false;
+      config.buildMode = { ...(config.buildMode ?? {}), autoDeployOnMerge: false };
     });
     commitAll(repoRoot, 'Adopt pipelane');
 
