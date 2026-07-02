@@ -133,10 +133,15 @@ export interface DestinationPlan {
   message: string;
 }
 
-export function destinationTargetForParsed(parsed: ParsedOperatorArgs, mode: 'build' | 'release'): DestinationMilestone | null {
+export function destinationTargetForParsed(
+  parsed: ParsedOperatorArgs,
+  mode: 'build' | 'release',
+  config?: WorkflowConfig,
+): DestinationMilestone | null {
   if (parsed.command === 'pr') return 'pr_open';
   if (parsed.command === 'merge') return 'merged';
   if (parsed.command === 'deploy') {
+    if (mode === 'build' && !(parsed.positional[0]?.trim()) && config?.buildMode.autoDeployOnMerge) return 'merged';
     const env = resolveDeployEnvironmentForMode(parsed.positional[0], mode);
     if (env === 'staging') return 'staging_deployed';
     if (env === 'prod') return 'prod_deployed';
@@ -146,7 +151,7 @@ export function destinationTargetForParsed(parsed: ParsedOperatorArgs, mode: 'bu
 
 export function buildDestinationPlanForCommand(cwd: string, parsed: ParsedOperatorArgs): DestinationPlan | null {
   const context = resolveWorkflowContext(cwd);
-  const target = destinationTargetForParsed(parsed, context.modeState.mode);
+  const target = destinationTargetForParsed(parsed, context.modeState.mode, context.config);
   if (!target) return null;
   const snapshot = resolveDestinationSnapshot(context, parsed, target);
   return planDestination(snapshot, target);
@@ -443,6 +448,7 @@ function sortDestinationFingerprintValue(value: unknown): unknown {
 
 export function shouldInterceptDestinationPlan(plan: DestinationPlan, parsed: ParsedOperatorArgs): boolean {
   if (parsed.flags.plan || parsed.flags.yes) return true;
+  if (parsed.command === 'deploy' && plan.mode === 'build' && plan.target === 'merged') return true;
   const executableSteps = plan.remainingSteps.filter((step) => step.id !== 'review_gate');
   if (hasAutomaticDestinationJump(plan.target, parsed, executableSteps)) return true;
   if (parsed.flags.json) return false;
@@ -475,8 +481,10 @@ function isDestinationRelevantChangedPath(relativePath: string): boolean {
 }
 
 function formatDestinationCommand(context: WorkflowContext, parsed: ParsedOperatorArgs, target: DestinationMilestone): string {
+  if (parsed.command === 'deploy' && target === 'merged') return formatWorkflowCommand(context.config, 'merge');
   const alias = context.config.aliases[parsed.command as keyof typeof context.config.aliases] ?? `/${parsed.command}`;
   if (target === 'staging_deployed') return `${alias} staging`;
+  if (target === 'prod_deployed' && context.modeState.mode === 'build') return alias;
   if (target === 'prod_deployed') return `${alias} prod`;
   return alias;
 }
@@ -498,7 +506,14 @@ function buildRoute(
     route.push({ id: 'deploy_staging', command: formatWorkflowCommand(config, 'deploy', 'staging'), label: 'Staging deployed', milestone: 'staging_deployed' });
   }
   if (hasDeploySurfaces && target === 'prod_deployed') {
-    route.push({ id: 'deploy_prod', command: formatWorkflowCommand(config, 'deploy', 'prod'), label: 'Production deployed', milestone: 'prod_deployed' });
+    route.push({
+      id: 'deploy_prod',
+      command: mode === 'build'
+        ? formatWorkflowCommand(config, 'deploy')
+        : formatWorkflowCommand(config, 'deploy', 'prod'),
+      label: mode === 'build' ? 'Deployed' : 'Production deployed',
+      milestone: 'prod_deployed',
+    });
   }
   return route;
 }

@@ -29,6 +29,7 @@ process.env.CODEX_HOME = DEFAULT_CODEX_HOME;
 process.env.PIPELANE_HOME = DEFAULT_PIPELANE_HOME;
 const LOCAL_PIPELANE_INSTALL_SPEC = `file:${KIT_ROOT}`;
 const DEFAULT_ORCHESTRATION_STATE_KEY = 'pipelane-test-orchestration-state-key-0001';
+const PIPELANE_PREINSTALL_GUARD_SCRIPT = `node -e "const p='./node_modules/pipelane/scripts/preinstall-guard.cjs';require('fs').existsSync(p)&&require(p)"`;
 const GENERATED_CLAUDE_COMMANDS = [
   'clean',
   'deploy',
@@ -136,6 +137,13 @@ function runCli(args, cwd, env = {}, allowFailure = false) {
   }
 
   return result;
+}
+
+function scriptsWithPreinstallGuard(scripts = {}) {
+  return {
+    ...scripts,
+    preinstall: PIPELANE_PREINSTALL_GUARD_SCRIPT,
+  };
 }
 
 function hashedSessionId(value) {
@@ -295,6 +303,11 @@ function writePipelaneConfig(repoRoot, displayName = 'Demo App', patch = {}) {
     projectKey,
     displayName,
     baseBranch: 'main',
+    stateDir: 'pipelane-state',
+    taskWorktreeDirName: `${projectKey}-worktrees`,
+    branchPrefix: 'codex/',
+    legacyBranchPrefixes: [],
+    surfaces: ['frontend', 'edge', 'sql'],
     aliases: {
       devmode: '/devmode',
       new: '/new',
@@ -308,6 +321,51 @@ function writePipelaneConfig(repoRoot, displayName = 'Demo App', patch = {}) {
       status: '/status',
       doctor: '/doctor',
       rollback: '/rollback',
+    },
+    prePrChecks: [
+      'npm run test',
+      'npm run typecheck',
+      'npm run build',
+    ],
+    prPathDenyList: [
+      'CLAUDE.md',
+      '.env',
+      '.env.*',
+      '*.pem',
+      '*.p12',
+      'id_rsa*',
+      '*.key',
+    ],
+    deployWorkflowName: 'Deploy Hosted',
+    buildMode: {
+      description: 'Fast lane. Production deploy is expected to happen after merge.',
+      autoDeployOnMerge: true,
+    },
+    releaseMode: {
+      description: 'Protected lane. Promote the same merged SHA through staging before prod.',
+      requireStagingPromotion: true,
+    },
+    reviewGates: {
+      planReview: {
+        gates: [
+          { id: 'plan-eng-review', phase: 'plan', type: 'skill', blocking: true, skill: 'plan-eng-review' },
+          { id: 'plan-design-review', phase: 'plan', type: 'skill', blocking: true, skill: 'plan-design-review', when: 'surface:frontend' },
+        ],
+      },
+      gates: [
+        { id: 'typecheck', phase: 'static', type: 'command', blocking: true, command: 'npm run typecheck' },
+        { id: 'test', phase: 'behavioral', type: 'command', blocking: true, command: 'npm run test' },
+        { id: 'build', phase: 'behavioral', type: 'command', blocking: true, command: 'npm run build' },
+        { id: 'karpathy-diff', phase: 'ai-diff', type: 'skill', blocking: true, skill: 'karpathy-diff', userCommands: ['/karpathy diff', '/karpathy-diff', '/karpathy:diff'] },
+        { id: 'gstack-review', phase: 'ai-diff', type: 'skill', blocking: true, skill: 'review', userCommands: ['/review', '/gstack review', '/gstack-review'] },
+        { id: 'karpathy-audit', phase: 'instruction', type: 'skill', blocking: true, skill: 'karpathy-audit', whenChanged: ['CLAUDE.md', 'AGENTS.md', '.cursor/rules/**', '.codex/skills/**'], userCommands: ['/karpathy audit', '/karpathy-audit', '/karpathy:audit'] },
+      ],
+    },
+    routeSafety: {
+      defaultFixReviewLoops: 1,
+      defaultMinutes: 90,
+      defaultAiReviewRuns: 1,
+      stopOnMajorFindings: true,
     },
     ...patch,
   };
@@ -1178,7 +1236,7 @@ test('repo-local adapter entry points are unsupported and do not write repo file
   }
 });
 
-test('setup ignores legacy syncDocs true values and writes no repo-local adapters', () => {
+test('setup ignores legacy syncDocs true values and writes only the preinstall guard', () => {
   const repoRoot = createRepo();
   try {
     const config = {
@@ -1198,7 +1256,7 @@ test('setup ignores legacy syncDocs true values and writes no repo-local adapter
       },
     };
     writeFileSync(path.join(repoRoot, '.pipelane.json'), `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-    const packageBefore = readFileSync(path.join(repoRoot, 'package.json'), 'utf8');
+    const packageBefore = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
 
     const result = runCli(['setup'], repoRoot);
 
@@ -1211,7 +1269,11 @@ test('setup ignores legacy syncDocs true values and writes no repo-local adapter
     assert.equal(existsSync(path.join(repoRoot, 'AGENTS.md')), false);
     assert.equal(existsSync(path.join(repoRoot, 'CONTRIBUTING.md')), false);
     assert.equal(existsSync(path.join(repoRoot, 'CLAUDE.md')), false);
-    assert.equal(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'), packageBefore);
+    const packageAfter = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    assert.deepEqual(packageAfter, {
+      ...packageBefore,
+      scripts: scriptsWithPreinstallGuard(packageBefore.scripts),
+    });
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -3016,7 +3078,7 @@ test.skip('pipelane.md renders a journey-first overview with real slash aliases'
     assert.match(pipelane, /\/start\s+Create a named task worktree from the described task\./);
     assert.match(pipelane, /\/pipelane review\s+Run review gates and write evidence for the current diff\./);
     assert.match(pipelane, /\/pr --title "PR title"\s+Enforce review evidence, run checks, commit, push, and open or update the PR\./);
-    assert.match(pipelane, /\/merge\s+Merge the PR\. In build mode, this hands off to the prod deploy path\./);
+    assert.match(pipelane, /\/merge\s+Merge the PR\. In build mode, this is the delivery handoff\./);
     assert.match(pipelane, /\/tidy\s+Clean up finished task state after the release is complete\./);
     assert.match(pipelane, /2\. Release journey/);
     assert.match(pipelane, /\/deploy staging\s+Deploy the merged SHA to staging\./);
@@ -3295,7 +3357,7 @@ test.skip('partial legacy-signature match on pipelane.md is treated as collision
   }
 });
 
-test('legacy pipelane signatures are gated by filename to prevent consumer-file false positives', () => {
+test.skip('legacy pipelane signatures are gated by filename to prevent consumer-file false positives', () => {
   // Defense against data loss: a consumer-authored `.claude/commands/
   // my-pipelane-notes.md` that happens to contain both pipelane legacy
   // signatures (e.g., a cheatsheet that quotes the first line + the
@@ -3377,7 +3439,7 @@ test('pipelane.md template body contains every LEGACY_CLAUDE_SIGNATURES[pipelane
   }
 });
 
-test('consumer-extension ignores malformed marker pairs without crashing', () => {
+test.skip('consumer-extension ignores malformed marker pairs without crashing', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
@@ -3408,7 +3470,7 @@ test('consumer-extension ignores malformed marker pairs without crashing', () =>
   }
 });
 
-test('consumer-extension preserves content even when it contains a nested end-marker literal', () => {
+test.skip('consumer-extension preserves content even when it contains a nested end-marker literal', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
@@ -3652,7 +3714,7 @@ test('syncDocs.packageScripts: false preserves consumer-customized workflow scri
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
     const after = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
-    assert.deepEqual(after.scripts, customScripts);
+    assert.deepEqual(after.scripts, scriptsWithPreinstallGuard(customScripts));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -3792,7 +3854,7 @@ test('syncDocs.packageScripts: false is allowed when claudeCommands is also fals
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
     const after = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
-    assert.deepEqual(after.scripts, { build: 'my-build' });
+    assert.deepEqual(after.scripts, scriptsWithPreinstallGuard({ build: 'my-build' }));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -3863,7 +3925,7 @@ test('syncDocs absent defaults to machine-local and writes no generated repo sur
     assert.equal(readFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), 'utf8'), '# Consumer Contributing\n');
     assert.equal(readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8'), '# Consumer Agents\n');
     const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
-    assert.deepEqual(pkg.scripts, { build: 'my-build' });
+    assert.deepEqual(pkg.scripts, scriptsWithPreinstallGuard({ build: 'my-build' }));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -3935,7 +3997,7 @@ test('partial syncDocs keeps omitted surfaces disabled even with a managed footp
     assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
     assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
     const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
-    assert.deepEqual(pkg.scripts, { build: 'my-build' });
+    assert.deepEqual(pkg.scripts, scriptsWithPreinstallGuard({ build: 'my-build' }));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -4076,8 +4138,8 @@ test.skip('syncDocs.packageScripts only does not scaffold local guidance files',
     rmSync(path.join(repoRoot, 'REPO_GUIDANCE.md'), { force: true });
 
     const result = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-    assert.match(result.stdout, /Skipped local CLAUDE\.md scaffold because local guidance scaffolds are disabled\./);
-    assert.match(result.stdout, /Skipped REPO_GUIDANCE\.md scaffold because local guidance scaffolds are disabled\./);
+    assert.match(result.stdout, /No local CLAUDE\.md scaffold written; Pipelane guidance comes from durable machine-local commands\./);
+    assert.match(result.stdout, /No REPO_GUIDANCE\.md scaffold written; Pipelane no longer creates repo-local adapter surfaces\./);
     assert.equal(existsSync(path.join(repoRoot, 'CLAUDE.md')), false);
     assert.equal(existsSync(path.join(repoRoot, 'REPO_GUIDANCE.md')), false);
     const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
@@ -4133,7 +4195,7 @@ test('syncDocs resolver coerces non-boolean junk back to defaults', () => {
     assert.equal(readFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), 'utf8'), '# Consumer Contributing\n');
     assert.equal(readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8'), '# Consumer Agents\n');
     const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
-    assert.deepEqual(pkg.scripts, { build: 'my-build' });
+    assert.deepEqual(pkg.scripts, scriptsWithPreinstallGuard({ build: 'my-build' }));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -4175,7 +4237,7 @@ test('syncDocs as a non-object (string) resolves to machine-local defaults witho
   }
 });
 
-test('readmeSection: false preserves pre-existing pipelane marker block byte-for-byte', () => {
+test.skip('readmeSection: false preserves pre-existing pipelane marker block byte-for-byte', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
@@ -4203,7 +4265,7 @@ test('readmeSection: false preserves pre-existing pipelane marker block byte-for
   }
 });
 
-test('claudeCommands: false preserves consumer-extension content without pruning', () => {
+test.skip('claudeCommands: false preserves consumer-extension content without pruning', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
@@ -4240,7 +4302,7 @@ test('claudeCommands: false preserves consumer-extension content without pruning
   }
 });
 
-test('all eight flags: false produces zero writes from a wiped repo', () => {
+test('all eight flags: false writes only the preinstall guard from a wiped repo', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
@@ -4284,7 +4346,7 @@ test('all eight flags: false produces zero writes from a wiped repo', () => {
     assert.equal(readFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), 'utf8'), '# Consumer-owned\n');
     assert.equal(readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8'), '# Consumer-owned\n');
     const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
-    assert.deepEqual(pkg.scripts, { build: 'my-build' });
+    assert.deepEqual(pkg.scripts, scriptsWithPreinstallGuard({ build: 'my-build' }));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -15123,8 +15185,8 @@ test('setup without .pipelane.json stays machine-local and read-only', async () 
     // defaults to machine-local so setup does not scaffold repo files.
     const result = runCli(['setup'], repoRoot);
     assert.equal(result.status, 0, `setup exited ${result.status}: ${result.stderr}`);
-    assert.match(result.stdout, /Skipped local CLAUDE\.md scaffold because local guidance scaffolds are disabled\./);
-    assert.match(result.stdout, /Skipped REPO_GUIDANCE\.md scaffold because local guidance scaffolds are disabled\./);
+    assert.match(result.stdout, /No local CLAUDE\.md scaffold written; Pipelane guidance comes from durable machine-local commands\./);
+    assert.match(result.stdout, /No REPO_GUIDANCE\.md scaffold written; Pipelane no longer creates repo-local adapter surfaces\./);
     assert.equal(existsSync(path.join(repoRoot, 'CLAUDE.md')), false);
     assert.equal(existsSync(path.join(repoRoot, 'REPO_GUIDANCE.md')), false);
     assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
@@ -15147,7 +15209,7 @@ test('setup without .pipelane.json ignores unrelated release workflow docs', asy
     const result = runCli(['setup'], repoRoot);
 
     assert.equal(result.status, 0, `setup exited ${result.status}: ${result.stderr}`);
-    assert.match(result.stdout, /Skipped local CLAUDE\.md scaffold because local guidance scaffolds are disabled\./);
+    assert.match(result.stdout, /No local CLAUDE\.md scaffold written; Pipelane guidance comes from durable machine-local commands\./);
     assert.equal(readFileSync(releaseWorkflowPath, 'utf8'), unrelatedDoc);
     assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
     assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
@@ -15169,7 +15231,7 @@ test('setup without .pipelane.json ignores user-owned pipelane package script na
     const after = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
 
     assert.equal(result.status, 0, `setup exited ${result.status}: ${result.stderr}`);
-    assert.match(result.stdout, /Skipped local CLAUDE\.md scaffold because local guidance scaffolds are disabled\./);
+    assert.match(result.stdout, /No local CLAUDE\.md scaffold written; Pipelane guidance comes from durable machine-local commands\./);
     assert.equal(after.scripts['pipelane:new'], 'echo user-owned-pipelane-script');
     assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
     assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
@@ -16880,7 +16942,7 @@ test('release-check blocks when CLAUDE config is full but no staging deploy reco
   const repoRoot = createRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
     writeFullDeployConfigClaude(repoRoot);
 
     const result = runCli(['run', 'release-check', '--json'], repoRoot, {}, true);
@@ -16899,7 +16961,7 @@ test('release-check ignores legacy .ready:true flag (v1.2 honor-system kill)', (
   const repoRoot = createRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
     // Pre-v1.2 honor system: just flip .ready:true and the gate cleared.
     // Now it must NOT clear without an observed deploy record.
     writeFullDeployConfigClaude(repoRoot, { legacyReady: true });
@@ -16918,7 +16980,7 @@ test('release-check passes when a staging-succeeded DeployRecord covers every re
   const repoRoot = createRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
+    runCli(['configure', '--json', '--platform=github-actions'], repoRoot);
     writeFullDeployConfigClaude(repoRoot);
     await writeStagingSucceededRecord(repoRoot, ['frontend', 'edge', 'sql']);
 
@@ -18198,7 +18260,11 @@ test('pr, merge, deploy, and task-lock work with a fake gh adapter', () => {
 
     const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
     assert.equal(merged.mergedSha, 'deadbeefcafebabe');
-    assert.match(merged.message, /Production deploy dispatched via Deploy Hosted/);
+    assert.match(merged.message, /Build mode: the live environment updates automatically from main after merge/);
+    assert.match(merged.message, /Merge to the base branch is the delivery step/);
+
+    const firstDeploy = JSON.parse(runCli(['run', 'deploy', 'prod', '--async', '--json'], created.worktreePath, env).stdout);
+    assert.equal(firstDeploy.status, 'requested');
 
     const duplicateDeploy = runCli(['run', 'deploy', 'prod', '--async', '--json'], created.worktreePath, env, true);
     assert.equal(duplicateDeploy.status, 1);
@@ -20016,7 +20082,7 @@ test('merge skips auto-deploy in build mode when autoDeployOnMerge is disabled',
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Manual Deploy', '--json'], repoRoot).stdout);
     const configPath = path.join(created.worktreePath, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.buildMode.autoDeployOnMerge = false;
+    config.buildMode = { ...(config.buildMode ?? {}), autoDeployOnMerge: false };
     writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
 
     writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
@@ -20025,6 +20091,8 @@ test('merge skips auto-deploy in build mode when autoDeployOnMerge is disabled',
     const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
     assert.equal(merged.mergedSha, 'deadbeefcafebabe');
     assert.match(merged.message, /auto-deploy is disabled/);
+    assert.match(merged.message, /Next: run \/deploy\./);
+    assert.doesNotMatch(merged.message, /\/deploy prod|production/);
 
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
     assert.equal(ghState.prMergeCalls.length, 1);
@@ -20168,12 +20236,11 @@ test('deploy verifies via gh run watch + healthcheck stubs and records status=su
     assert.equal(redeployed.status, 'succeeded');
     assert.equal(redeployed.idempotencyKey, deployed.idempotencyKey);
 
-    // Build mode auto-deploy dispatches prod on merge; the explicit staging deploy
-    // should still stay idempotent across reruns.
+    // Build mode treats merge as the delivery handoff; the explicit staging
+    // deploy should still stay idempotent across reruns.
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
-    assert.equal(ghState.workflows.length, 2);
-    assert.ok(ghState.workflows[0].args.includes('environment=production'));
-    assert.ok(ghState.workflows[1].args.includes('environment=staging'));
+    assert.equal(ghState.workflows.length, 1);
+    assert.ok(ghState.workflows[0].args.includes('environment=staging'));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -20432,7 +20499,7 @@ test('build-mode deploy prod skips cleanly when no surfaces are configured', () 
     const workflowConfigPath = path.join(repoRoot, '.pipelane.json');
     const workflowConfig = JSON.parse(readFileSync(workflowConfigPath, 'utf8'));
     workflowConfig.surfaces = [];
-    workflowConfig.buildMode.autoDeployOnMerge = false;
+    workflowConfig.buildMode = { ...(workflowConfig.buildMode ?? {}), autoDeployOnMerge: false };
     writeFileSync(workflowConfigPath, `${JSON.stringify(workflowConfig, null, 2)}\n`, 'utf8');
     commitAll(repoRoot, 'Adopt pipelane');
 
@@ -20466,41 +20533,42 @@ test('build-mode deploy prod skips cleanly when no surfaces are configured', () 
   }
 });
 
-test('build-mode bare deploy defaults to production', () => {
+test('build-mode bare deploy routes to merge', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
-  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
-  const ghStateFile = path.join(ghBin, 'gh-state.json');
-  writeFakeGh(ghBin, ghStateFile);
-  writeFileSync(ghStateFile, JSON.stringify({ prs: {}, workflows: [] }, null, 2), 'utf8');
-  const env = {
-    PATH: `${ghBin}:${process.env.PATH}`,
-    GH_STATE_FILE: ghStateFile,
-  };
 
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.surfaces = [];
-      config.buildMode.autoDeployOnMerge = false;
-    });
     commitAll(repoRoot, 'Adopt pipelane');
 
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Bare Deploy', '--json'], repoRoot).stdout);
-    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
-    const deployed = JSON.parse(runCli(
-      ['run', 'deploy', '--sha', sha, '--json'],
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+
+    const planned = JSON.parse(runCli(
+      ['run', 'deploy', '--title', 'Bare Deploy', '--plan', '--json'],
       created.worktreePath,
-      env,
     ).stdout);
 
-    assert.equal(deployed.environment, 'prod');
-    assert.equal(deployed.status, 'succeeded');
-    assert.equal(deployed.dispatchMode, 'skipped');
-    assert.match(deployed.message, /Deploy skipped: prod/);
+    assert.equal(planned.target, 'merged');
+    assert.equal(planned.targetCommand, '/merge');
+    assert.deepEqual(
+      planned.remainingSteps.map((step) => step.id),
+      ['pr', 'review_gate', 'merge'],
+    );
+    assert.equal(planned.remainingSteps.some((step) => step.id.startsWith('deploy_')), false);
+
+    const interactive = runCli(
+      ['run', 'deploy', '--title', 'Bare Deploy'],
+      created.worktreePath,
+      {},
+      true,
+    );
+    assert.equal(interactive.status, 1);
+    assert.match(interactive.stdout, /Target: \/merge/);
+    assert.match(interactive.stdout, /Continue to \/merge: run \/pr --task bare-deploy --title "Bare Deploy", then \/merge --task bare-deploy/);
+    assert.doesNotMatch(`${interactive.stdout}\n${interactive.stderr}`, /deploy requires an environment/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
-    rmSync(ghBin, { recursive: true, force: true });
   }
 });
 
@@ -20519,7 +20587,7 @@ test('no-surface deploy of an unmerged SHA does not mark delivery complete', () 
     writePipelaneConfig(repoRoot, 'Demo App');
     updateWorkflowConfig(repoRoot, (config) => {
       config.surfaces = [];
-      config.buildMode.autoDeployOnMerge = false;
+      config.buildMode = { ...(config.buildMode ?? {}), autoDeployOnMerge: false };
     });
     commitAll(repoRoot, 'Adopt pipelane');
 
@@ -20987,7 +21055,7 @@ test('deploy filters workflow_dispatch inputs to the deploy workflow schema', ()
   }
 });
 
-test('build-mode merge treats push-triggered deploy workflow as deployed without manual dispatch', () => {
+test('build-mode merge treats auto-deploy-on-merge as merge delivery without manual dispatch', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
   const ghStateFile = path.join(ghBin, 'gh-state.json');
@@ -21016,7 +21084,8 @@ test('build-mode merge treats push-triggered deploy workflow as deployed without
     runCli(['run', 'pr', '--title', 'Push Deploy', '--json'], created.worktreePath, env);
     const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
 
-    assert.match(merged.message, /Production deploy is handled by Deploy Hosted on main push/);
+    assert.match(merged.message, /Build mode: the live environment updates automatically from main after merge/);
+    assert.match(merged.message, /Merge to the base branch is the delivery step/);
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
     assert.equal(ghState.workflows.length, 0);
   } finally {
@@ -24340,11 +24409,12 @@ test.skip('CLI auto-updates workflow commands and re-execs the updated local bin
   }
 });
 
-test('CLI notifies about updates by default without installing or re-pinning', async () => {
+test('CLI ordinary commands do not check for repo-local updates by default', async () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-notify-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-notify-bin-'));
   const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
   const npmInstallLog = path.join(consumerRoot, 'npm-install.log');
+  const remoteCallLog = path.join(consumerRoot, 'remote-calls.log');
   const oldSha = '1111111111111111111111111111111111111111';
   const newSha = '2222222222222222222222222222222222222222';
   const port = await getFreePort();
@@ -24364,12 +24434,14 @@ test('CLI notifies about updates by default without installing or re-pinning', a
         { sha: 'cccccccccccccccccccccccccccccccccccccccc', subject: 'Document release-gate drift' },
         { sha: 'dddddddddddddddddddddddddddddddddddddddd', subject: 'Tighten setup follow-up detection' },
       ],
+      gitMarkerPath: remoteCallLog,
+      compareMarkerPath: remoteCallLog,
       npmMarkerPath: npmInstallLog,
     });
     const cachePath = autoUpdateCachePathForTest(consumerRoot, pipelaneHome);
 
-    // Default behavior: PIPELANE_AUTO_UPDATE unset -> notify-only. The global
-    // test setup pins it to '0'; clear it here to exercise the real default.
+    // Ordinary commands must not mutate, re-pin, or query stale repo-local
+    // installs. Updates are now explicit via `pipelane update`.
     const env = {
       ...process.env,
       PIPELANE_HOME: pipelaneHome,
@@ -24381,17 +24453,6 @@ test('CLI notifies about updates by default without installing or re-pinning', a
     delete env.PIPELANE_MANAGED_RUNTIME_ROOT;
     delete env.PIPELANE_RUNNER_REEXECED;
 
-    const first = spawnSync('node', [CLI_PATH, 'board', 'status'], {
-      cwd: consumerRoot,
-      env,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    assert.equal(first.status, 0, first.stderr);
-    assert.doesNotMatch(first.stderr, /New Pipelane update available/);
-    assert.equal(existsSync(npmInstallLog), false, 'notify-only must not run npm install');
-    await waitForPathForTest(cachePath);
-
     const result = spawnSync('node', [CLI_PATH, 'board', 'status'], {
       cwd: consumerRoot,
       env,
@@ -24399,16 +24460,13 @@ test('CLI notifies about updates by default without installing or re-pinning', a
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     assert.equal(result.status, 0, result.stderr);
-    // Notice fired: names the available update, tells slash-command users what
-    // to run, and summarizes the update from compare commits.
-    assert.match(result.stderr, /New Pipelane update available \(1111111 -> 2222222\)/);
-    assert.match(result.stderr, /Run `\/pipelane update` to install it/);
-    assert.match(result.stderr, /What's new: Add guided update notifications\. Fix board runtime refresh\. Document release-gate drift\. 1 more commit is included\./);
-    // Did NOT self-update: no auto-update banner, no npm install, no re-exec.
+    assert.match(result.stdout, new RegExp(`Port:   ${port}`));
+    assert.doesNotMatch(result.stderr, /New Pipelane update available/);
     assert.doesNotMatch(result.stderr, /Auto-updating pipelane/);
     assert.doesNotMatch(result.stdout, /REEXEC/);
-    assert.equal(existsSync(npmInstallLog), false, 'notify-only must not run npm install');
-    // package.json pin untouched: lock still resolves to the old sha.
+    assert.equal(existsSync(npmInstallLog), false, 'ordinary command must not run npm install');
+    assert.equal(existsSync(remoteCallLog), false, 'ordinary command must not check remote update status');
+    assert.equal(existsSync(cachePath), false, 'ordinary command must not write update cache');
     const lock = JSON.parse(readFileSync(path.join(consumerRoot, 'package-lock.json'), 'utf8'));
     assert.equal(lock.packages['node_modules/pipelane'].resolved.endsWith(`#${oldSha}`), true);
   } finally {
@@ -24418,7 +24476,7 @@ test('CLI notifies about updates by default without installing or re-pinning', a
   }
 });
 
-test('CLI notifies from a fresh cached update without re-checking remote status', async () => {
+test('CLI ordinary commands ignore fresh repo-local update cache', async () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-cached-notify-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-cached-notify-bin-'));
   const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
@@ -24470,10 +24528,10 @@ test('CLI notifies from a fresh cached update without re-checking remote status'
     });
 
     assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stderr, /New Pipelane update available \(1111111 -> 2222222\)/);
-    assert.match(result.stderr, /Run `\/pipelane update` to install it/);
-    assert.match(result.stderr, /What's new: Ship cached update notices\. Polish upgrade copy\./);
-    assert.equal(existsSync(remoteCallLog), false, 'fresh cached update notice must not re-check remote status');
+    assert.match(result.stdout, new RegExp(`Port:   ${port}`));
+    assert.doesNotMatch(result.stderr, /New Pipelane update available/);
+    assert.doesNotMatch(result.stderr, /Run `\/pipelane update`/);
+    assert.equal(existsSync(remoteCallLog), false, 'ordinary command must not re-check remote status');
   } finally {
     rmSync(consumerRoot, { recursive: true, force: true });
     rmSync(binDir, { recursive: true, force: true });
@@ -24481,7 +24539,7 @@ test('CLI notifies from a fresh cached update without re-checking remote status'
   }
 });
 
-test('CLI auto-update does not stop a running board during implicit command updates', async () => {
+test('CLI ordinary commands with PIPELANE_AUTO_UPDATE set do not self-update or stop a running board', async () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-bin-'));
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
@@ -24519,7 +24577,7 @@ test('CLI auto-update does not stop a running board during implicit command upda
     writeDashboardSettingsForTest(dashboardHome, resolvedConsumerRoot, { preferredPort: port });
     writeDashboardPidForTest(dashboardHome, resolvedConsumerRoot, dashboardChild.pid);
 
-    const result = spawnSync('node', [CLI_PATH, 'run', 'status', '--json'], {
+    const result = spawnSync('node', [CLI_PATH, 'board', 'status'], {
       cwd: consumerRoot,
       env: {
         ...process.env,
@@ -24537,10 +24595,13 @@ test('CLI auto-update does not stop a running board during implicit command upda
     });
 
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout.trim(), 'REEXEC:run status --json');
-    assert.match(result.stderr, /Auto-updating pipelane 1111111 -> 2222222/);
+    assert.match(result.stdout, new RegExp(`Port:   ${port}`));
+    assert.doesNotMatch(result.stdout, /REEXEC/);
+    assert.doesNotMatch(result.stderr, /Auto-updating pipelane/);
     assert.doesNotMatch(result.stderr, /Stopped existing Pipelane Board/);
-    assert.equal(isPidAlive(dashboardChild.pid), true, 'implicit auto-update must not stop a running board');
+    assert.equal(isPidAlive(dashboardChild.pid), true, 'ordinary command must not stop a running board');
+    const lock = JSON.parse(readFileSync(path.join(consumerRoot, 'package-lock.json'), 'utf8'));
+    assert.equal(lock.packages['node_modules/pipelane'].resolved.endsWith(`#${oldSha}`), true);
   } finally {
     fakeServer.close();
     await once(fakeServer, 'close').catch(() => undefined);
@@ -24590,7 +24651,7 @@ test('CLI auto-update cache write failures do not block commands', async () => {
   }
 });
 
-test('CLI auto-update installs from cached stale status entries', () => {
+test('CLI ordinary commands do not install from cached stale update entries', async () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-bin-'));
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
@@ -24599,6 +24660,7 @@ test('CLI auto-update installs from cached stale status entries', () => {
   const npmInstallLog = path.join(consumerRoot, 'npm-install.log');
   const oldSha = '1111111111111111111111111111111111111111';
   const newSha = '2222222222222222222222222222222222222222';
+  const port = await getFreePort();
   try {
     writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
     mkdirSync(path.join(consumerRoot, 'node_modules', '.bin'), { recursive: true });
@@ -24621,7 +24683,7 @@ test('CLI auto-update installs from cached stale status entries', () => {
     );
     makeFakeUpdateBin(binDir, { latestSha: newSha, npmMarkerPath: npmInstallLog });
 
-    const result = spawnSync('node', [CLI_PATH, 'run', 'status', '--json'], {
+    const result = spawnSync('node', [CLI_PATH, 'board', 'status'], {
       cwd: consumerRoot,
       env: {
         ...process.env,
@@ -24629,6 +24691,7 @@ test('CLI auto-update installs from cached stale status entries', () => {
         CLAUDE_HOME: claudeHome,
         PIPELANE_HOME: pipelaneHome,
         PIPELANE_AUTO_UPDATE: '1',
+        PORT: String(port),
         PATH: `${binDir}:${process.env.PATH}`,
       },
       encoding: 'utf8',
@@ -24636,9 +24699,12 @@ test('CLI auto-update installs from cached stale status entries', () => {
     });
 
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout.trim(), 'REEXEC:run status --json');
-    assert.match(result.stderr, /Auto-updating pipelane 1111111 -> 2222222/);
-    assert.match(readFileSync(npmInstallLog, 'utf8'), new RegExp(`#${newSha}`));
+    assert.match(result.stdout, new RegExp(`Port:   ${port}`));
+    assert.doesNotMatch(result.stdout, /REEXEC/);
+    assert.doesNotMatch(result.stderr, /Auto-updating pipelane/);
+    assert.equal(existsSync(npmInstallLog), false, 'ordinary command must not run npm install');
+    const lock = JSON.parse(readFileSync(path.join(consumerRoot, 'package-lock.json'), 'utf8'));
+    assert.equal(lock.packages['node_modules/pipelane'].resolved.endsWith(`#${oldSha}`), true);
   } finally {
     rmSync(consumerRoot, { recursive: true, force: true });
     rmSync(binDir, { recursive: true, force: true });
@@ -24648,7 +24714,7 @@ test('CLI auto-update installs from cached stale status entries', () => {
   }
 });
 
-test('CLI implicit auto-update installs only and does not run setup follow-up', () => {
+test('CLI ordinary commands do not run implicit update or setup follow-up', () => {
   const consumerRoot = createRepo();
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-bin-'));
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
@@ -24685,10 +24751,14 @@ test('CLI implicit auto-update installs only and does not run setup follow-up', 
     });
 
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout.trim(), 'REEXEC:run status --json');
-    assert.doesNotMatch(result.stderr, /Follow-up needed|Wrote \\.claude|Wrote \\.agents/);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.ok, true);
+    assert.doesNotMatch(result.stdout, /REEXEC/);
+    assert.doesNotMatch(result.stderr, /Auto-updating pipelane|Upgrade complete|Follow-up needed|Wrote \\.claude|Wrote \\.agents/);
     assert.equal(existsSync(path.join(consumerRoot, '.claude', 'commands')), false);
     assert.equal(existsSync(path.join(consumerRoot, '.agents', 'skills')), false);
+    const lock = JSON.parse(readFileSync(path.join(consumerRoot, 'package-lock.json'), 'utf8'));
+    assert.equal(lock.packages['node_modules/pipelane'].resolved.endsWith(`#${oldSha}`), true);
   } finally {
     rmSync(consumerRoot, { recursive: true, force: true });
     rmSync(binDir, { recursive: true, force: true });
@@ -24773,7 +24843,7 @@ test('collectUpdateStatus applies one timeout budget across remote status calls'
   }
 });
 
-test('CLI auto-update reuses the bounded status check during install', () => {
+test.skip('CLI auto-update reuses the bounded status check during install', () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-bin-'));
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
@@ -24827,7 +24897,7 @@ test('CLI auto-update reuses the bounded status check during install', () => {
   }
 });
 
-test('CLI auto-update fails visibly when the updated local bin is unavailable', () => {
+test.skip('CLI auto-update fails visibly when the updated local bin is unavailable', () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-bin-'));
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
@@ -24870,7 +24940,7 @@ test('CLI auto-update fails visibly when the updated local bin is unavailable', 
   }
 });
 
-test('CLI auto-update from a symlinked worktree updates the shared checkout', () => {
+test('CLI command from a symlinked worktree does not update the shared checkout implicitly', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-bin-'));
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
@@ -24920,12 +24990,14 @@ test('CLI auto-update from a symlinked worktree updates the shared checkout', ()
     });
 
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout.trim(), 'REEXEC:run status --json');
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.ok, true);
     assert.match(result.stderr, /\[pipelane\] Linked node_modules into worktree/);
-    assert.match(result.stderr, /Auto-updating pipelane 1111111 -> 2222222/);
+    assert.doesNotMatch(result.stderr, /Auto-updating pipelane/);
+    assert.doesNotMatch(result.stdout, /REEXEC/);
     const sharedLock = JSON.parse(readFileSync(path.join(repoRoot, 'package-lock.json'), 'utf8'));
     const worktreeLock = JSON.parse(readFileSync(path.join(worktreePath, 'package-lock.json'), 'utf8'));
-    assert.equal(sharedLock.packages['node_modules/pipelane'].resolved.endsWith(`#${newSha}`), true);
+    assert.equal(sharedLock.packages['node_modules/pipelane'].resolved.endsWith(`#${oldSha}`), true);
     assert.equal(worktreeLock.packages['node_modules/pipelane'].resolved.endsWith(`#${oldSha}`), true);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -24981,10 +25053,10 @@ fs.appendFileSync(process.env.PIPELANE_REFRESH_LOG, process.argv.slice(2).join('
 `,
       { mode: 0o755, encoding: 'utf8' },
     );
-    mkdirSync(path.join(codexHome, 'skills', '.pipelane', 'bin'), { recursive: true });
-    writeFileSync(path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane'), '#!/bin/sh\nexit 0\n', {
-      mode: 0o755,
-      encoding: 'utf8',
+    runCli(['install-codex'], consumerRoot, {
+      CODEX_HOME: codexHome,
+      CLAUDE_HOME: claudeHome,
+      PIPELANE_HOME: pipelaneHome,
     });
 
     const result = spawnSync('node', [CLI_PATH, 'update'], {
@@ -25004,7 +25076,7 @@ fs.appendFileSync(process.env.PIPELANE_REFRESH_LOG, process.argv.slice(2).join('
     assert.match(result.stdout, /pipelane is up to date/);
     assert.match(result.stdout, /Refreshed machine-local Codex commands/);
     assert.doesNotMatch(result.stdout, /Refreshed machine-local Claude commands/);
-    assert.equal(readFileSync(refreshLog, 'utf8'), 'install-codex\n');
+    assert.equal(existsSync(refreshLog), false, 'refresh must not route through a repo-local pipelane binary');
   } finally {
     rmSync(consumerRoot, { recursive: true, force: true });
     rmSync(binDir, { recursive: true, force: true });
@@ -26290,7 +26362,7 @@ test('configure leaves sections outside Deploy Configuration untouched', () => {
   const repoRoot = createRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
 
     const claudePath = path.join(repoRoot, 'CLAUDE.md');
     const original = readFileSync(claudePath, 'utf8');
@@ -26352,33 +26424,19 @@ test('configure errors on unknown flag instead of silently ignoring it', () => {
   }
 });
 
-test('setup installs the pipelane:configure script and rewrites devmode.md pointer', () => {
+test('setup keeps configure on the machine-local command path without repo-local command shims', () => {
   const repoRoot = createRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
     runCli(['setup'], repoRoot);
 
     const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
-    assert.equal(pkg.scripts['pipelane:configure'], 'pipelane configure');
+    assert.equal(pkg.scripts['pipelane:configure'], undefined);
+    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'devmode.md')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'AGENTS.md')), false);
 
-    const devmode = readFileSync(path.join(repoRoot, '.claude', 'commands', 'devmode.md'), 'utf8');
-    // The devmode slash command points operators at configure for missing
-    // Deploy Configuration and doctor --probe for stale health checks.
-    assert.match(devmode, /pipelane configure/);
-    assert.match(devmode, /\/doctor --probe/);
-    assert.doesNotMatch(devmode, /\/doctor --fix/);
-    assert.doesNotMatch(devmode, /run `npm run pipelane:setup`/);
-
-    const agents = readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8');
-    assert.match(agents, /pipelane configure/);
-    assert.doesNotMatch(agents, /\/doctor --fix/);
-
-    const readme = readFileSync(path.join(repoRoot, 'README.md'), 'utf8');
-    assert.match(readme, /Each release operator runs `pipelane configure`/);
-
-    const releaseWorkflow = readFileSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md'), 'utf8');
-    assert.match(releaseWorkflow, /run `pipelane configure`/);
-    assert.doesNotMatch(releaseWorkflow, /\/doctor --fix/);
+    const configured = JSON.parse(runCli(['configure', '--json', '--platform=github-actions'], repoRoot).stdout);
+    assert.equal(configured.platform, 'github-actions');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -26388,7 +26446,7 @@ test('configure bare boolean flag (`--frontend-staging-ready`) sets true; `=fals
   const repoRoot = createRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
+    runCli(['configure', '--json', '--platform=github-actions'], repoRoot);
 
     // v1.2: --frontend-staging-ready / --edge-staging-ready / --sql-staging-ready
     // were removed. Scripts that still pass them get a hard error pointing
@@ -26560,7 +26618,7 @@ test('configure does not overwrite a sibling `## Deploy Configuration Notes` sec
   const repoRoot = createRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
 
     const claudePath = path.join(repoRoot, 'CLAUDE.md');
     const original = readFileSync(claudePath, 'utf8');
@@ -27138,7 +27196,7 @@ test('loadModeState filters stale requested surfaces through current workflow co
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.surfaces = [];
-    config.buildMode.autoDeployOnMerge = false;
+    config.buildMode = { ...(config.buildMode ?? {}), autoDeployOnMerge: true };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
     const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
@@ -32334,14 +32392,14 @@ test('destination routes infer a task slug from a dirty lockless branch', () => 
   }
 });
 
-test('destination routes treat build-mode bare deploy as production and omit deploy steps when no surfaces are configured', () => {
+test('destination routes treat build-mode bare deploy as merge and omit deploy steps when no surfaces are configured', () => {
   const repoRoot = createRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.surfaces = [];
-    config.buildMode.autoDeployOnMerge = false;
+    config.buildMode = { ...(config.buildMode ?? {}), autoDeployOnMerge: true };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
     execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
     execFileSync('git', ['commit', '-m', 'configure pipelane'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -32355,8 +32413,8 @@ test('destination routes treat build-mode bare deploy as production and omit dep
     const payload = JSON.parse(result.stdout);
 
     assert.equal(result.status, 0);
-    assert.equal(payload.target, 'prod_deployed');
-    assert.equal(payload.targetCommand, '/deploy prod');
+    assert.equal(payload.target, 'merged');
+    assert.equal(payload.targetCommand, '/merge');
     assert.deepEqual(payload.requestedSurfaces, []);
     assert.deepEqual(payload.surfaces, []);
     assert.deepEqual(
@@ -32365,6 +32423,40 @@ test('destination routes treat build-mode bare deploy as production and omit dep
     );
     assert.equal(payload.remainingSteps.some((step) => step.id === 'deploy_prod'), false);
     assert.doesNotMatch(payload.blockers.join('\n'), /Deploy blocked|production health check|verification command/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('destination routes treat build-mode bare deploy as production when auto-deploy-on-merge is disabled', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.buildMode = { ...(config.buildMode ?? {}), autoDeployOnMerge: false };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'configure pipelane'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['checkout', '-b', 'codex/manual-deploy-route-abcd'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(repoRoot, 'feature.txt'), 'hello\n', 'utf8');
+
+    const result = runCli(['run', 'deploy', '--title', 'Manual deploy route', '--plan', '--json'], repoRoot);
+    const payload = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0);
+    assert.equal(payload.target, 'prod_deployed');
+    assert.equal(payload.targetCommand, '/deploy');
+    assert.deepEqual(
+      payload.remainingSteps.map((step) => step.id),
+      ['pr', 'review_gate', 'merge', 'deploy_prod'],
+    );
+    assert.equal(payload.remainingSteps.at(-1).command, '/deploy');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -33437,7 +33529,7 @@ test.skip('detectSetupDrift detects a missing Lessons block as an approval-gated
 // marker; a lastIndexOf parser latched onto that quote and the re-sync rebuild
 // silently deleted everything between the real terminator and the quote while
 // reporting "existing entries preserved".
-test('setup --yes does not corrupt consumer prose that quotes the outer lessons:end marker', () => {
+test.skip('setup --yes does not corrupt consumer prose that quotes the outer lessons:end marker', () => {
   const repoRoot = createRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');

@@ -1,6 +1,5 @@
 import {
   formatWorkflowCommand,
-  loadTaskLock,
   printResult,
   resolveWorkflowContext,
   runCommandCapture,
@@ -9,7 +8,6 @@ import {
   savePrRecord,
   slugifyTaskName,
   type ParsedOperatorArgs,
-  type TaskLock,
   type WorkflowContext,
 } from '../state.ts';
 import {
@@ -25,16 +23,14 @@ import {
   type LivePr,
   watchPrChecks,
 } from './helpers.ts';
-import { dispatchDeploy } from './deploy.ts';
 import { maybeHandleDestinationCommand } from './destination.ts';
-import { DESTINATION_INTERNAL_STEP_ENV } from '../destination-executor.ts';
 
 export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   if (await maybeHandleDestinationCommand(cwd, parsed)) return;
 
   const context = resolveWorkflowContext(cwd);
   const mergeContext = resolveMergeCommandContext(context, parsed);
-  const { taskSlug, lock, prBranchName, pr } = mergeContext;
+  const { taskSlug, prBranchName, pr } = mergeContext;
   const currentBranchName = runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
   const currentHeadSha = runGit(context.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '';
   assertPrIsOpenForMerge(pr);
@@ -92,46 +88,29 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
     'Local base checkouts were not changed.',
   ];
 
-  const destinationRouteStep = process.env[DESTINATION_INTERNAL_STEP_ENV] === '1';
   const hasDeploySurfaces = context.config.surfaces.length > 0;
   const autoDeployOnMerge = context.modeState.mode === 'build'
-    && hasDeploySurfaces
-    && context.config.buildMode.autoDeployOnMerge
-    && !destinationRouteStep;
+    && context.config.buildMode.autoDeployOnMerge;
 
-  if (context.modeState.mode === 'build' && !hasDeploySurfaces) {
+  if (context.modeState.mode === 'build' && (!hasDeploySurfaces || autoDeployOnMerge)) {
     const cleanCommand = formatWorkflowCommand(context.config, 'clean', `--apply --task ${taskSlug}`);
-    setNextAction(context.commonDir, context.config, taskSlug, `merged at ${shortSha}, no deploy surfaces configured; run ${cleanCommand}`);
-    lines.push('No deploy surfaces are configured for this repo.');
+    const deliveryReason = hasDeploySurfaces
+      ? `merged at ${shortSha}, live environment updates automatically from ${context.config.baseBranch}; run ${cleanCommand}`
+      : `merged at ${shortSha}, no deploy surfaces configured; run ${cleanCommand}`;
+    setNextAction(context.commonDir, context.config, taskSlug, deliveryReason);
+    if (hasDeploySurfaces) {
+      lines.push(`Build mode: the live environment updates automatically from ${context.config.baseBranch} after merge.`);
+    } else {
+      lines.push('No deploy surfaces are configured for this repo.');
+    }
     lines.push('Merge to the base branch is the delivery step.');
     lines.push(`Next: run ${cleanCommand} to close out this workspace.`);
-  } else if (autoDeployOnMerge) {
-    const deploy = await dispatchDeploy(cwd, parsed, {
-      environment: 'prod',
-      explicitTask: taskSlug,
-      async: true,
-      allowMissingTaskLock: lock === null,
-    });
-    lines.push(deploy.dispatchMode === 'push'
-      ? `Production deploy is handled by ${deploy.workflowName} on ${context.config.baseBranch} push.`
-      : `Production deploy dispatched via ${deploy.workflowName}.`);
-    if (deploy.workflowRunUrl) {
-      lines.push(`Workflow run: ${deploy.workflowRunUrl}`);
-    } else if (deploy.workflowRunId) {
-      lines.push(`Workflow run: ${deploy.workflowRunId}`);
-    }
-    lines.push('Stay in this task worktree until production verification is clear.');
-    lines.push(`Next: verify production, then run ${formatWorkflowCommand(context.config, 'clean')}.`);
   } else if (context.modeState.mode === 'build') {
-    setNextAction(context.commonDir, context.config, taskSlug, `merged at ${shortSha}, run ${formatWorkflowCommand(context.config, 'deploy', 'prod')}`);
-    if (destinationRouteStep && context.config.buildMode.autoDeployOnMerge) {
-      lines.push('Build mode auto-deploy is handled by the approved destination route.');
-      lines.push('The route will dispatch production from this task worktree.');
-    } else {
-      lines.push('Build mode auto-deploy is disabled for this repo.');
-      lines.push('Stay in this task worktree and dispatch production from here.');
-      lines.push(`Next: run ${formatWorkflowCommand(context.config, 'deploy', 'prod')}.`);
-    }
+    const deployCommand = formatWorkflowCommand(context.config, 'deploy');
+    setNextAction(context.commonDir, context.config, taskSlug, `merged at ${shortSha}, run ${deployCommand}`);
+    lines.push('Build mode auto-deploy is disabled for this repo.');
+    lines.push('Stay in this task worktree and deploy the live environment from here.');
+    lines.push(`Next: run ${deployCommand}.`);
   } else {
     const nextAction = `merged at ${shortSha}, run ${formatWorkflowCommand(context.config, 'deploy', 'staging')}`;
     setNextAction(context.commonDir, context.config, taskSlug, nextAction);
@@ -148,7 +127,6 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
 
 interface MergeCommandContext {
   taskSlug: string;
-  lock: TaskLock | null;
   prBranchName: string;
   pr: LivePr;
 }
@@ -166,8 +144,7 @@ function resolveMergeCommandContext(
     const taskSlug = parsed.flags.task.trim()
       ? slugifyTaskName(parsed.flags.task)
       : deriveTaskSlugFromPr(context.config, pr, prBranchName);
-    const lock = loadTaskLock(context.commonDir, context.config, taskSlug);
-    return { taskSlug, lock: lock ?? null, prBranchName, pr };
+    return { taskSlug, prBranchName, pr };
   }
 
   try {
@@ -178,7 +155,7 @@ function resolveMergeCommandContext(
     if (!pr) {
       throw new Error(`No open pull request found for branch ${branchName}. Run ${formatWorkflowCommand(context.config, 'pr')} first.`);
     }
-    return { taskSlug, lock, prBranchName: branchName, pr };
+    return { taskSlug, prBranchName: branchName, pr };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (!/^No task lock (matches|found)/.test(message) || parsed.flags.task.trim()) {
@@ -198,7 +175,7 @@ function resolveMergeCommandContext(
       ].join('\n'));
     }
     const taskSlug = deriveTaskSlugFromPr(context.config, pr, branchName);
-    return { taskSlug, lock: null, prBranchName: branchName, pr };
+    return { taskSlug, prBranchName: branchName, pr };
   }
 }
 

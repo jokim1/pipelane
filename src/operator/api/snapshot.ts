@@ -485,7 +485,7 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
 
   const boardMessage = mode === 'release'
     ? 'Release mode: promote merged SHA through staging before prod.'
-    : 'Build mode: production deploys run automatically after merge.';
+    : 'Build mode: the live environment updates automatically after merge.';
   const releaseReadiness = buildBoardReleaseReadiness({
     checkedAt,
     mode,

@@ -247,19 +247,20 @@ function formatRunnableStepCommand(
   plan: DestinationPlan,
 ): string {
   if (!parsed) return sanitizeForTerminal(step.command);
-  const args = buildStepArgs(step, parsed, plan).slice(stepCommandPrefixLength(step));
+  const args = buildStepArgs(step, parsed, plan).slice(stepCommandPrefixLength(step, plan));
   if (args.length === 0) return sanitizeForTerminal(step.command);
   return `${sanitizeForTerminal(step.command)} ${args.map(formatCommandArgument).join(' ')}`;
 }
 
-function stepCommandPrefixLength(step: DestinationStep): number {
+function stepCommandPrefixLength(step: DestinationStep, plan: DestinationPlan): number {
   switch (step.id) {
     case 'pr':
     case 'merge':
       return 1;
     case 'deploy_staging':
-    case 'deploy_prod':
       return 2;
+    case 'deploy_prod':
+      return plan.mode === 'build' ? 1 : 2;
     case 'review_gate':
       return 0;
   }
@@ -515,7 +516,11 @@ function buildStepArgs(step: DestinationStep, parsed: ParsedOperatorArgs, plan: 
     return args;
   }
   if (step.id === 'deploy_prod') {
-    args.push('deploy', 'prod');
+    if (plan.mode === 'build') {
+      args.push('deploy');
+    } else {
+      args.push('deploy', 'prod');
+    }
     pushTaskOrPr();
     pushApprovedDeploySha();
     pushSurfaces();

@@ -1317,22 +1317,28 @@ export function normalizeWorkflowConfig(
   raw: Partial<WorkflowConfig>,
   options: { repoRoot?: string } = {},
 ): WorkflowConfig {
-  const branchPrefix = normalizeBranchPrefix(raw.branchPrefix);
-  const legacyBranchPrefixes = normalizeLegacyBranchPrefixes(raw.legacyBranchPrefixes)
+  const displayName = cleanString(raw.displayName) ?? 'Project';
+  const projectKey = cleanString(raw.projectKey) ?? inferProjectKey(displayName);
+  const withDefaults = mergeWorkflowLayers(
+    defaultWorkflowConfig(projectKey, displayName, { repoRoot: options.repoRoot }),
+    raw,
+  );
+  const branchPrefix = normalizeBranchPrefix(withDefaults.branchPrefix);
+  const legacyBranchPrefixes = normalizeLegacyBranchPrefixes(withDefaults.legacyBranchPrefixes)
     .filter((prefix, index, all) => prefix !== branchPrefix && all.indexOf(prefix) === index);
   return {
-    ...(raw as WorkflowConfig),
+    ...(withDefaults as WorkflowConfig),
     branchPrefix,
     legacyBranchPrefixes,
-    prPathDenyList: raw.prPathDenyList ?? [...DEFAULT_PR_PATH_DENY_LIST],
-    aliases: resolveWorkflowAliases(raw.aliases),
-    checks: normalizeChecksConfig(raw.checks),
-    syncDocs: normalizeSyncDocsConfig(raw.syncDocs),
-    surfacePathMap: normalizeSurfacePathMap(raw.surfacePathMap),
-    reviewGates: normalizeReviewGatesConfig(raw.reviewGates, { repoRoot: options.repoRoot }),
-    routeSafety: normalizeRouteSafetyConfig(raw.routeSafety),
-    orchestrate: normalizeOrchestrateConfig(raw.orchestrate),
-    smoke: normalizeSmokeConfig(raw.smoke),
+    prPathDenyList: withDefaults.prPathDenyList ?? [...DEFAULT_PR_PATH_DENY_LIST],
+    aliases: resolveWorkflowAliases(withDefaults.aliases),
+    checks: normalizeChecksConfig(withDefaults.checks),
+    syncDocs: normalizeSyncDocsConfig(withDefaults.syncDocs),
+    surfacePathMap: normalizeSurfacePathMap(withDefaults.surfacePathMap),
+    reviewGates: normalizeReviewGatesConfig(withDefaults.reviewGates, { repoRoot: options.repoRoot }),
+    routeSafety: normalizeRouteSafetyConfig(withDefaults.routeSafety),
+    orchestrate: normalizeOrchestrateConfig(withDefaults.orchestrate),
+    smoke: normalizeSmokeConfig(withDefaults.smoke),
   };
 }
 
