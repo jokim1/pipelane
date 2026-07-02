@@ -3016,7 +3016,7 @@ test.skip('pipelane.md renders a journey-first overview with real slash aliases'
     assert.match(pipelane, /\/start\s+Create a named task worktree from the described task\./);
     assert.match(pipelane, /\/pipelane review\s+Run review gates and write evidence for the current diff\./);
     assert.match(pipelane, /\/pr --title "PR title"\s+Enforce review evidence, run checks, commit, push, and open or update the PR\./);
-    assert.match(pipelane, /\/merge\s+Merge the PR\. In build mode, this hands off to the prod deploy path\./);
+    assert.match(pipelane, /\/merge\s+Merge the PR\. In build mode, this is the delivery handoff\./);
     assert.match(pipelane, /\/tidy\s+Clean up finished task state after the release is complete\./);
     assert.match(pipelane, /2\. Release journey/);
     assert.match(pipelane, /\/deploy staging\s+Deploy the merged SHA to staging\./);
@@ -18198,7 +18198,11 @@ test('pr, merge, deploy, and task-lock work with a fake gh adapter', () => {
 
     const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
     assert.equal(merged.mergedSha, 'deadbeefcafebabe');
-    assert.match(merged.message, /Production deploy dispatched via Deploy Hosted/);
+    assert.match(merged.message, /Build mode: the live environment updates automatically from main after merge/);
+    assert.match(merged.message, /Merge to the base branch is the delivery step/);
+
+    const firstDeploy = JSON.parse(runCli(['run', 'deploy', 'prod', '--async', '--json'], created.worktreePath, env).stdout);
+    assert.equal(firstDeploy.status, 'requested');
 
     const duplicateDeploy = runCli(['run', 'deploy', 'prod', '--async', '--json'], created.worktreePath, env, true);
     assert.equal(duplicateDeploy.status, 1);
@@ -20016,7 +20020,7 @@ test('merge skips auto-deploy in build mode when autoDeployOnMerge is disabled',
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Manual Deploy', '--json'], repoRoot).stdout);
     const configPath = path.join(created.worktreePath, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.buildMode.autoDeployOnMerge = false;
+    config.buildMode = { ...(config.buildMode ?? {}), autoDeployOnMerge: false };
     writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
 
     writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
@@ -20025,6 +20029,8 @@ test('merge skips auto-deploy in build mode when autoDeployOnMerge is disabled',
     const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
     assert.equal(merged.mergedSha, 'deadbeefcafebabe');
     assert.match(merged.message, /auto-deploy is disabled/);
+    assert.match(merged.message, /Next: run \/deploy\./);
+    assert.doesNotMatch(merged.message, /\/deploy prod|production/);
 
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
     assert.equal(ghState.prMergeCalls.length, 1);
@@ -20168,12 +20174,11 @@ test('deploy verifies via gh run watch + healthcheck stubs and records status=su
     assert.equal(redeployed.status, 'succeeded');
     assert.equal(redeployed.idempotencyKey, deployed.idempotencyKey);
 
-    // Build mode auto-deploy dispatches prod on merge; the explicit staging deploy
-    // should still stay idempotent across reruns.
+    // Build mode treats merge as the delivery handoff; the explicit staging
+    // deploy should still stay idempotent across reruns.
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
-    assert.equal(ghState.workflows.length, 2);
-    assert.ok(ghState.workflows[0].args.includes('environment=production'));
-    assert.ok(ghState.workflows[1].args.includes('environment=staging'));
+    assert.equal(ghState.workflows.length, 1);
+    assert.ok(ghState.workflows[0].args.includes('environment=staging'));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -20466,41 +20471,42 @@ test('build-mode deploy prod skips cleanly when no surfaces are configured', () 
   }
 });
 
-test('build-mode bare deploy defaults to production', () => {
+test('build-mode bare deploy routes to merge', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
-  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
-  const ghStateFile = path.join(ghBin, 'gh-state.json');
-  writeFakeGh(ghBin, ghStateFile);
-  writeFileSync(ghStateFile, JSON.stringify({ prs: {}, workflows: [] }, null, 2), 'utf8');
-  const env = {
-    PATH: `${ghBin}:${process.env.PATH}`,
-    GH_STATE_FILE: ghStateFile,
-  };
 
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.surfaces = [];
-      config.buildMode.autoDeployOnMerge = false;
-    });
     commitAll(repoRoot, 'Adopt pipelane');
 
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Bare Deploy', '--json'], repoRoot).stdout);
-    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
-    const deployed = JSON.parse(runCli(
-      ['run', 'deploy', '--sha', sha, '--json'],
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+
+    const planned = JSON.parse(runCli(
+      ['run', 'deploy', '--title', 'Bare Deploy', '--plan', '--json'],
       created.worktreePath,
-      env,
     ).stdout);
 
-    assert.equal(deployed.environment, 'prod');
-    assert.equal(deployed.status, 'succeeded');
-    assert.equal(deployed.dispatchMode, 'skipped');
-    assert.match(deployed.message, /Deploy skipped: prod/);
+    assert.equal(planned.target, 'merged');
+    assert.equal(planned.targetCommand, '/merge');
+    assert.deepEqual(
+      planned.remainingSteps.map((step) => step.id),
+      ['pr', 'review_gate', 'merge'],
+    );
+    assert.equal(planned.remainingSteps.some((step) => step.id.startsWith('deploy_')), false);
+
+    const interactive = runCli(
+      ['run', 'deploy', '--title', 'Bare Deploy'],
+      created.worktreePath,
+      {},
+      true,
+    );
+    assert.equal(interactive.status, 1);
+    assert.match(interactive.stdout, /Target: \/merge/);
+    assert.match(interactive.stdout, /Continue to \/merge: run \/pr --task bare-deploy --title "Bare Deploy", then \/merge --task bare-deploy/);
+    assert.doesNotMatch(`${interactive.stdout}\n${interactive.stderr}`, /deploy requires an environment/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
-    rmSync(ghBin, { recursive: true, force: true });
   }
 });
 
@@ -20987,7 +20993,7 @@ test('deploy filters workflow_dispatch inputs to the deploy workflow schema', ()
   }
 });
 
-test('build-mode merge treats push-triggered deploy workflow as deployed without manual dispatch', () => {
+test('build-mode merge treats auto-deploy-on-merge as merge delivery without manual dispatch', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
   const ghStateFile = path.join(ghBin, 'gh-state.json');
@@ -21016,7 +21022,8 @@ test('build-mode merge treats push-triggered deploy workflow as deployed without
     runCli(['run', 'pr', '--title', 'Push Deploy', '--json'], created.worktreePath, env);
     const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
 
-    assert.match(merged.message, /Production deploy is handled by Deploy Hosted on main push/);
+    assert.match(merged.message, /Build mode: the live environment updates automatically from main after merge/);
+    assert.match(merged.message, /Merge to the base branch is the delivery step/);
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
     assert.equal(ghState.workflows.length, 0);
   } finally {
@@ -27138,7 +27145,7 @@ test('loadModeState filters stale requested surfaces through current workflow co
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.surfaces = [];
-    config.buildMode.autoDeployOnMerge = false;
+    config.buildMode = { ...(config.buildMode ?? {}), autoDeployOnMerge: true };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
     const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
@@ -32334,14 +32341,14 @@ test('destination routes infer a task slug from a dirty lockless branch', () => 
   }
 });
 
-test('destination routes treat build-mode bare deploy as production and omit deploy steps when no surfaces are configured', () => {
+test('destination routes treat build-mode bare deploy as merge and omit deploy steps when no surfaces are configured', () => {
   const repoRoot = createRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
     const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.surfaces = [];
-    config.buildMode.autoDeployOnMerge = false;
+    config.buildMode = { ...(config.buildMode ?? {}), autoDeployOnMerge: true };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
     execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
     execFileSync('git', ['commit', '-m', 'configure pipelane'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -32355,8 +32362,8 @@ test('destination routes treat build-mode bare deploy as production and omit dep
     const payload = JSON.parse(result.stdout);
 
     assert.equal(result.status, 0);
-    assert.equal(payload.target, 'prod_deployed');
-    assert.equal(payload.targetCommand, '/deploy prod');
+    assert.equal(payload.target, 'merged');
+    assert.equal(payload.targetCommand, '/merge');
     assert.deepEqual(payload.requestedSurfaces, []);
     assert.deepEqual(payload.surfaces, []);
     assert.deepEqual(
@@ -32365,6 +32372,40 @@ test('destination routes treat build-mode bare deploy as production and omit dep
     );
     assert.equal(payload.remainingSteps.some((step) => step.id === 'deploy_prod'), false);
     assert.doesNotMatch(payload.blockers.join('\n'), /Deploy blocked|production health check|verification command/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('destination routes treat build-mode bare deploy as production when auto-deploy-on-merge is disabled', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.buildMode = { ...(config.buildMode ?? {}), autoDeployOnMerge: false };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'configure pipelane'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['checkout', '-b', 'codex/manual-deploy-route-abcd'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(repoRoot, 'feature.txt'), 'hello\n', 'utf8');
+
+    const result = runCli(['run', 'deploy', '--title', 'Manual deploy route', '--plan', '--json'], repoRoot);
+    const payload = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0);
+    assert.equal(payload.target, 'prod_deployed');
+    assert.equal(payload.targetCommand, '/deploy');
+    assert.deepEqual(
+      payload.remainingSteps.map((step) => step.id),
+      ['pr', 'review_gate', 'merge', 'deploy_prod'],
+    );
+    assert.equal(payload.remainingSteps.at(-1).command, '/deploy');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }

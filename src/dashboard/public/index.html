@@ -2380,7 +2380,7 @@
         { command: `${aliases.devmode} build`, description: 'Set the repo to build mode. Usually set once, until you switch lanes.' },
         { command: aliases.new, description: 'Let the AI infer the task name, or provide one if you want to choose it.' },
         { command: aliases.pr, description: 'Run pre-PR checks, commit, push, and open or update the PR.' },
-        { command: aliases.merge, description: 'Merge the PR. In build mode, this hands off to the prod deploy path.' },
+        { command: aliases.merge, description: 'Merge the PR. In build mode, this is the delivery handoff.' },
         { command: aliases.clean, description: 'Clean up finished task state after the release is complete.' },
       ];
       const releaseRows = [
