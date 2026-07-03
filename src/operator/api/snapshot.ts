@@ -668,6 +668,7 @@ function buildOrchestrationSnapshot(
   const records = scan.records;
   const reviewOptions: OrchestrationReviewSatisfactionOptions = {
     headCache: new Map(),
+    headTreeCache: new Map(),
     statusDigestCache: new Map(),
     worktreeExistsCache: new Map(),
   };

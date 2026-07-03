@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { closeSync, existsSync, lstatSync, openSync, readlinkSync, readSync } from 'node:fs';
+import { closeSync, existsSync, lstatSync, mkdtempSync, openSync, readlinkSync, readSync, rmSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 import { normalizePath, runGit } from './state.ts';
@@ -11,6 +12,7 @@ const STATUS_DIGEST_MAX_GIT_OUTPUT_BYTES = 1024 * 1024;
 
 export interface ReadWorktreeStatusSnapshotOptions {
   includeStatusDigest?: boolean;
+  includeMaterialTreeHash?: boolean;
 }
 
 export interface WorktreeStatusSnapshot {
@@ -25,6 +27,9 @@ export interface WorktreeStatusSnapshot {
   changedPaths: string[];
   statusDigestReliable: boolean;
   statusDigestWarnings: string[];
+  materialTreeHash?: string;
+  materialTreeReliable?: boolean;
+  materialTreeWarnings?: string[];
 }
 
 export function readWorktreeStatusSnapshot(
@@ -45,6 +50,13 @@ export function readWorktreeStatusSnapshot(
       changedPaths: [],
       statusDigestReliable: false,
       statusDigestWarnings: ['repository path does not exist'],
+      ...(options.includeMaterialTreeHash
+        ? {
+            materialTreeHash: '',
+            materialTreeReliable: false,
+            materialTreeWarnings: ['repository path does not exist'],
+          }
+        : {}),
     };
   }
 
@@ -63,6 +75,9 @@ export function readWorktreeStatusSnapshot(
       reliable: status.ok,
       warnings: status.ok ? [] : [`git status failed: ${status.error}`],
     };
+  const materialTree = options.includeMaterialTreeHash
+    ? computeMaterialTreeHash(normalizedRoot)
+    : null;
 
   return {
     repoRoot: normalizedRoot,
@@ -76,6 +91,13 @@ export function readWorktreeStatusSnapshot(
     changedPaths,
     statusDigestReliable: digest.reliable,
     statusDigestWarnings: digest.warnings,
+    ...(materialTree
+      ? {
+          materialTreeHash: materialTree.hash,
+          materialTreeReliable: materialTree.reliable,
+          materialTreeWarnings: materialTree.warnings,
+        }
+      : {}),
   };
 }
 
@@ -96,9 +118,14 @@ interface WorktreeStatusDigestResult {
   warnings: string[];
 }
 
-function captureGitBytes(repoRoot: string, args: string[]): GitBytesCapture {
+interface GitCaptureOptions {
+  env?: NodeJS.ProcessEnv;
+}
+
+function captureGitBytes(repoRoot: string, args: string[], options: GitCaptureOptions = {}): GitBytesCapture {
   const result = spawnSync('git', args, {
     cwd: repoRoot,
+    env: options.env ? { ...process.env, ...options.env } : process.env,
     encoding: 'buffer',
     maxBuffer: STATUS_DIGEST_MAX_GIT_OUTPUT_BYTES,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -113,6 +140,54 @@ function captureGitBytes(repoRoot: string, args: string[]): GitBytesCapture {
     return { ok: false, output: stdout, error: detail };
   }
   return { ok: true, output: stdout, error: '' };
+}
+
+function captureGitText(repoRoot: string, args: string[], options: GitCaptureOptions = {}): { ok: boolean; output: string; error: string } {
+  const captured = captureGitBytes(repoRoot, args, options);
+  return {
+    ok: captured.ok,
+    output: captured.output.toString('utf8'),
+    error: captured.error,
+  };
+}
+
+interface MaterialTreeHashResult {
+  hash: string;
+  reliable: boolean;
+  warnings: string[];
+}
+
+function computeMaterialTreeHash(repoRoot: string): MaterialTreeHashResult {
+  const tempRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-material-tree-'));
+  const indexPath = path.join(tempRoot, 'index');
+  const env = { GIT_INDEX_FILE: indexPath };
+  const warnings: string[] = [];
+  try {
+    const readTree = captureGitText(repoRoot, ['read-tree', 'HEAD'], { env });
+    if (!readTree.ok) warnings.push(`git read-tree failed: ${readTree.error}`);
+
+    if (warnings.length === 0) {
+      const add = captureGitText(repoRoot, ['add', '-A', '--', '.'], { env });
+      if (!add.ok) warnings.push(`git add -A failed: ${add.error}`);
+    }
+
+    const writeTree = warnings.length === 0
+      ? captureGitText(repoRoot, ['write-tree'], { env })
+      : { ok: false, output: '', error: '' };
+    if (!writeTree.ok && warnings.length === 0) warnings.push(`git write-tree failed: ${writeTree.error}`);
+
+    const hash = writeTree.output.trim();
+    if (warnings.length === 0 && !/^[a-f0-9]{40,64}$/i.test(hash)) {
+      warnings.push('git write-tree returned an invalid tree hash');
+    }
+    return {
+      hash: warnings.length === 0 ? hash : '',
+      reliable: warnings.length === 0,
+      warnings,
+    };
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
 }
 
 function computeWorktreeStatusDigest(

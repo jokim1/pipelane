@@ -419,6 +419,9 @@ export interface ReviewRunRecord {
   worktreeStatusDigest?: string;
   worktreeStatusReliable?: boolean;
   worktreeStatusWarnings?: string[];
+  worktreeMaterialTreeHash?: string;
+  worktreeMaterialTreeReliable?: boolean;
+  worktreeMaterialTreeWarnings?: string[];
   authorIdentity?: ReviewActorIdentity | null;
   reviewer?: ReviewActorIdentity;
   gates: ReviewGateRunRecord[];
@@ -2739,6 +2742,8 @@ function isReviewRunRecord(value: unknown): value is ReviewRunRecord {
     && changedFiles.every((entry) => typeof entry === 'string')
     && (raw.worktreeStatusDigest === undefined || typeof raw.worktreeStatusDigest === 'string')
     && (raw.worktreeStatusReliable === undefined || typeof raw.worktreeStatusReliable === 'boolean')
+    && (raw.worktreeMaterialTreeHash === undefined || typeof raw.worktreeMaterialTreeHash === 'string')
+    && (raw.worktreeMaterialTreeReliable === undefined || typeof raw.worktreeMaterialTreeReliable === 'boolean')
     && (raw.authorIdentity === undefined || raw.authorIdentity === null || isReviewActorIdentity(raw.authorIdentity))
     && (raw.reviewer === undefined || isReviewActorIdentity(raw.reviewer))
     && (raw.signature === undefined || typeof raw.signature === 'string')
@@ -2747,6 +2752,13 @@ function isReviewRunRecord(value: unknown): value is ReviewRunRecord {
       || (
         Array.isArray(raw.worktreeStatusWarnings)
         && raw.worktreeStatusWarnings.every((entry) => typeof entry === 'string')
+      )
+    )
+    && (
+      raw.worktreeMaterialTreeWarnings === undefined
+      || (
+        Array.isArray(raw.worktreeMaterialTreeWarnings)
+        && raw.worktreeMaterialTreeWarnings.every((entry) => typeof entry === 'string')
       )
     )
     && Array.isArray(gates)
