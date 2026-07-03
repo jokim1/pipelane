@@ -20284,6 +20284,35 @@ test('deploy --pr blocks in the shared checkout when the PR task is leased elsew
   }
 });
 
+test('task lock validation treats symlinked worktree paths as the same checkout', async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'pipelane-realpath-lock-'));
+  try {
+    const actualWorktree = path.join(root, 'actual-worktree');
+    const aliasWorktree = path.join(root, 'alias-worktree');
+    mkdirSync(actualWorktree, { recursive: true });
+    symlinkSync(actualWorktree, aliasWorktree, process.platform === 'win32' ? 'junction' : 'dir');
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const repoGuard = await import(path.join(KIT_ROOT, 'src', 'operator', 'repo-guard.ts'));
+
+    assert.notEqual(stateMod.normalizePath(aliasWorktree), stateMod.normalizePath(actualWorktree));
+    assert.equal(stateMod.normalizeExistingPath(aliasWorktree), stateMod.normalizeExistingPath(actualWorktree));
+    assert.deepEqual(repoGuard.verifyTaskLockState({
+      branchName: 'codex/alias-safe',
+      repoRoot: aliasWorktree,
+      requestedMode: '',
+      currentMode: 'build',
+      lock: {
+        branchName: 'codex/alias-safe',
+        worktreePath: actualWorktree,
+        mode: 'build',
+      },
+    }), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('merge skips auto-deploy in build mode when autoDeployOnMerge is disabled', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
