@@ -276,6 +276,7 @@ export interface OrchestrationSliceReviewBinding {
   worktreePath: string | null;
   sha: string | null;
   worktreeStatusDigest: string | null;
+  worktreeMaterialTreeHash?: string | null;
 }
 
 export interface OrchestrationSliceReviewRecord {
@@ -1618,7 +1619,8 @@ export function isActiveOrchestrationRun(
 
 export interface OrchestrationReviewSatisfactionOptions {
   headCache?: Map<string, string | null>;
-  statusDigestCache?: Map<string, { digest: string; reliable: boolean } | null>;
+  headTreeCache?: Map<string, string | null>;
+  statusDigestCache?: Map<string, { digest: string; reliable: boolean; dirty?: boolean } | null>;
   worktreeExistsCache?: Map<string, boolean>;
   // C2: verify the embedded review signature + binding on read. `reviewStateKey`
   // defaults to the env key (`resolveReviewStateKey`) when omitted; when no key is
@@ -1646,6 +1648,7 @@ export function buildOrchestrationSliceReviewBinding(
     worktreePath: slice.worktreePath ?? null,
     sha: reviewRun.sha ?? null,
     worktreeStatusDigest: reviewRun.worktreeStatusDigest ?? null,
+    worktreeMaterialTreeHash: reviewRun.worktreeMaterialTreeHash ?? null,
   };
 }
 
@@ -1694,6 +1697,10 @@ function sliceReviewSignatureBlocker(
     || binding.worktreePath !== (slice.worktreePath ?? null)
     || binding.sha !== (reviewRun.sha ?? null)
     || binding.worktreeStatusDigest !== (reviewRun.worktreeStatusDigest ?? null)
+    || (
+      (binding.worktreeMaterialTreeHash !== undefined || reviewRun.worktreeMaterialTreeHash !== undefined)
+      && binding.worktreeMaterialTreeHash !== (reviewRun.worktreeMaterialTreeHash ?? null)
+    )
     || (options.runId !== undefined && binding.runId !== options.runId);
 }
 
@@ -1738,11 +1745,16 @@ export function sliceReviewFullySatisfied(
   }
   const currentHead = currentSliceHead(slice, options);
   if (!currentHead) return false;
-  if (reviewRun.sha !== currentHead) return false;
   const currentStatus = currentSliceStatusDigest(slice, options);
-  return currentStatus !== null
+  if (
+    reviewRun.sha === currentHead
+    && currentStatus !== null
     && currentStatus.reliable
-    && reviewRun.worktreeStatusDigest === currentStatus.digest;
+    && reviewRun.worktreeStatusDigest === currentStatus.digest
+  ) {
+    return true;
+  }
+  return materialTreeMatchesReviewedTree(slice, reviewRun, currentStatus, options);
 }
 
 // FU2: a once-completed slice that would satisfy completion EXCEPT that its embedded
@@ -1872,17 +1884,45 @@ function currentSliceHead(slice: OrchestrationSliceRecord, options: Orchestratio
 function currentSliceStatusDigest(
   slice: OrchestrationSliceRecord,
   options: OrchestrationReviewSatisfactionOptions,
-): { digest: string; reliable: boolean } | null {
+): { digest: string; reliable: boolean; dirty?: boolean } | null {
   if (!slice.worktreePath || !sliceWorktreeExists(slice, options)) return null;
   if (options.statusDigestCache?.has(slice.worktreePath)) {
     return options.statusDigestCache.get(slice.worktreePath) ?? null;
   }
   const snapshot = readWorktreeStatusSnapshot(slice.worktreePath, { includeStatusDigest: true });
   const status = snapshot.exists
-    ? { digest: snapshot.statusDigest, reliable: snapshot.statusDigestReliable }
+    ? { digest: snapshot.statusDigest, reliable: snapshot.statusDigestReliable, dirty: snapshot.dirty }
     : null;
   options.statusDigestCache?.set(slice.worktreePath, status);
   return status;
+}
+
+function currentSliceHeadTree(slice: OrchestrationSliceRecord, options: OrchestrationReviewSatisfactionOptions): string | null {
+  if (!slice.worktreePath || !sliceWorktreeExists(slice, options)) return null;
+  if (options.headTreeCache?.has(slice.worktreePath)) {
+    return options.headTreeCache.get(slice.worktreePath) ?? null;
+  }
+  const tree = runGit(slice.worktreePath, ['rev-parse', '--verify', 'HEAD^{tree}'], true)?.trim() || null;
+  options.headTreeCache?.set(slice.worktreePath, tree);
+  return tree;
+}
+
+function materialTreeMatchesReviewedTree(
+  slice: OrchestrationSliceRecord,
+  reviewRun: ReviewRunRecord,
+  currentStatus: { digest: string; reliable: boolean; dirty?: boolean } | null,
+  options: OrchestrationReviewSatisfactionOptions,
+): boolean {
+  if (
+    !reviewRun.worktreeMaterialTreeHash
+    || reviewRun.worktreeMaterialTreeReliable !== true
+    || currentStatus === null
+    || !currentStatus.reliable
+    || currentStatus.dirty !== false
+  ) {
+    return false;
+  }
+  return currentSliceHeadTree(slice, options) === reviewRun.worktreeMaterialTreeHash;
 }
 
 export function sliceWorktreeExists(slice: OrchestrationSliceRecord, options: OrchestrationReviewSatisfactionOptions = {}): boolean {

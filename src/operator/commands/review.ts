@@ -409,7 +409,10 @@ export function buildReviewPassRecord(options: {
 
   const currentBranch = runGit(options.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
   const currentSha = runGit(options.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '';
-  const worktreeStatus = readWorktreeStatusSnapshot(options.repoRoot, { includeStatusDigest: true });
+  const worktreeStatus = readWorktreeStatusSnapshot(options.repoRoot, {
+    includeStatusDigest: true,
+    includeMaterialTreeHash: true,
+  });
   if (!worktreeStatus.statusDigestReliable) {
     throw new Error(`review pass cannot attest an unreliable worktree digest: ${worktreeStatus.statusDigestWarnings.join('; ') || 'status digest is incomplete'}`);
   }
@@ -487,6 +490,9 @@ export function buildReviewPassRecord(options: {
     worktreeStatusDigest: worktreeStatus.statusDigest,
     worktreeStatusReliable: worktreeStatus.statusDigestReliable,
     worktreeStatusWarnings: worktreeStatus.statusDigestWarnings,
+    worktreeMaterialTreeHash: worktreeStatus.materialTreeHash,
+    worktreeMaterialTreeReliable: worktreeStatus.materialTreeReliable,
+    worktreeMaterialTreeWarnings: worktreeStatus.materialTreeWarnings,
     authorIdentity: base.authorIdentity,
     reviewer: base.reviewer,
     gates: nextGates,
@@ -2200,7 +2206,10 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
   const phaseFilter = options.phaseFilter ?? '';
   const gateFilter = options.gateFilter?.trim() ?? '';
   const changedFiles = collectChangedFiles(options.repoRoot, options.baseBranch);
-  const worktreeStatus = readWorktreeStatusSnapshot(options.repoRoot, { includeStatusDigest: true });
+  const worktreeStatus = readWorktreeStatusSnapshot(options.repoRoot, {
+    includeStatusDigest: true,
+    includeMaterialTreeHash: true,
+  });
   const reviewConfigChanged = changedFiles.some(isReviewConfigPath);
   const reviewConfigChangeApproval = reviewConfigChanged ? options.reviewConfigChangeApproval ?? null : null;
   const reviewConfigChangeNeedsApproval = reviewConfigChanged && !reviewConfigChangeApproval;
@@ -2275,6 +2284,9 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
     worktreeStatusDigest: worktreeStatus.statusDigest,
     worktreeStatusReliable: worktreeStatus.statusDigestReliable,
     worktreeStatusWarnings: worktreeStatus.statusDigestWarnings,
+    worktreeMaterialTreeHash: worktreeStatus.materialTreeHash,
+    worktreeMaterialTreeReliable: worktreeStatus.materialTreeReliable,
+    worktreeMaterialTreeWarnings: worktreeStatus.materialTreeWarnings,
     authorIdentity: resolveReviewAuthorIdentity(),
     reviewer: resolveReviewActorIdentity(),
     gates: gateRecords,
