@@ -1,5 +1,6 @@
 import {
   formatWorkflowCommand,
+  loadTaskLock,
   printResult,
   resolveWorkflowContext,
   runCommandCapture,
@@ -11,6 +12,7 @@ import {
   type WorkflowContext,
 } from '../state.ts';
 import {
+  buildSharedCheckoutLeaseBlocker,
   buildStaleBaseBlocker,
   deriveTaskSlugFromPr,
   ensureTaskLockMatchesCurrent,
@@ -144,6 +146,7 @@ function resolveMergeCommandContext(
     const taskSlug = parsed.flags.task.trim()
       ? slugifyTaskName(parsed.flags.task)
       : deriveTaskSlugFromPr(context.config, pr, prBranchName);
+    ensureMergeLeaseForPr(context, taskSlug, prBranchName);
     return { taskSlug, prBranchName, pr };
   }
 
@@ -166,6 +169,10 @@ function resolveMergeCommandContext(
     if (!branchName) {
       throw error;
     }
+    const sharedCheckoutBlocker = buildSharedCheckoutLeaseBlocker(context, 'merge', { branchName });
+    if (sharedCheckoutBlocker) {
+      throw new Error(sharedCheckoutBlocker);
+    }
     const pr = loadOpenPrForBranch(context.repoRoot, branchName);
     if (!pr) {
       throw new Error([
@@ -176,6 +183,19 @@ function resolveMergeCommandContext(
     }
     const taskSlug = deriveTaskSlugFromPr(context.config, pr, branchName);
     return { taskSlug, prBranchName: branchName, pr };
+  }
+}
+
+function ensureMergeLeaseForPr(context: WorkflowContext, taskSlug: string, branchName: string): void {
+  const lock = loadTaskLock(context.commonDir, context.config, taskSlug);
+  if (lock) {
+    ensureTaskLockMatchesCurrent(context, lock);
+    return;
+  }
+
+  const sharedCheckoutBlocker = buildSharedCheckoutLeaseBlocker(context, 'merge', { branchName, taskSlug });
+  if (sharedCheckoutBlocker) {
+    throw new Error(sharedCheckoutBlocker);
   }
 }
 

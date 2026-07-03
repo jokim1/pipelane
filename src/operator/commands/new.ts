@@ -3,7 +3,7 @@ import path from 'node:path';
 
 import {
   formatWorkflowCommand,
-  normalizePath,
+  normalizeExistingPath,
   loadTaskLock,
   printResult,
   resolveWorkflowContext,
@@ -166,9 +166,9 @@ function assertNewTaskStartIsSafe(options: {
   }
 
   const status = readWorktreeStatus(options.repoRoot);
-  const repoPath = normalizePath(options.repoRoot);
+  const repoPath = normalizeExistingPath(options.repoRoot);
   const currentLock = options.activeLocks.find((lock) =>
-    lock.branchName === status.branchName || normalizePath(lock.worktreePath) === repoPath
+    lock.branchName === status.branchName || normalizeExistingPath(lock.worktreePath) === repoPath
   );
 
   if (currentLock) {

@@ -11,6 +11,7 @@ import {
   loadAllTaskLocks,
   loadPrRecord,
   loadTaskLock,
+  normalizeExistingPath,
   normalizePath,
   nowIso,
   runGit,
@@ -331,7 +332,7 @@ export function applyTaskBindingRecovery(
   }
   if (
     latestLock.branchName !== diagnosis.lock.branchName
-    || normalizePath(latestLock.worktreePath) !== normalizePath(diagnosis.lock.worktreePath)
+    || normalizeExistingPath(latestLock.worktreePath) !== normalizeExistingPath(diagnosis.lock.worktreePath)
     || latestLock.mode !== diagnosis.lock.mode
     || (latestLock.updatedAt ?? '') !== (diagnosis.lock.updatedAt ?? '')
   ) {
@@ -469,12 +470,12 @@ function findCurrentCheckoutOwners(
   taskSlug: string,
   current: TaskBindingWorktreeSnapshot,
 ): TaskLock[] {
-  const currentRepoRoot = normalizePath(current.repoRoot);
+  const currentRepoRoot = normalizeExistingPath(current.repoRoot);
   return loadAllTaskLocks(context.commonDir, context.config).filter((lock) => {
     if (lock.taskSlug === taskSlug) {
       return false;
     }
-    return lock.branchName === current.branchName || normalizePath(lock.worktreePath) === currentRepoRoot;
+    return lock.branchName === current.branchName || normalizeExistingPath(lock.worktreePath) === currentRepoRoot;
   });
 }
 

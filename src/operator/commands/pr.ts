@@ -1,5 +1,6 @@
 import {
   buildPrBody,
+  buildSharedCheckoutLeaseBlocker,
   buildStaleBaseBlocker,
   collectChangedPaths,
   ensureTaskLockMatchesCurrent,
@@ -298,7 +299,10 @@ function resolveLocklessPrFromCurrentBranch(
   context: ReturnType<typeof resolveWorkflowContext>,
   explicitTask: string,
   blockedReason: string,
-): { status: 'resolved'; taskSlug: string; lock: null; livePr: LivePr | null } | null {
+):
+  | { status: 'resolved'; taskSlug: string; lock: null; livePr: LivePr | null }
+  | { status: 'blocked'; reason: string }
+  | null {
   if (!/^No task lock (matches|found)/.test(blockedReason)) {
     return null;
   }
@@ -317,9 +321,15 @@ function resolveLocklessPrFromCurrentBranch(
     return null;
   }
 
+  const taskSlug = explicitSlug || derivedTaskSlug;
+  const sharedCheckoutBlocker = buildSharedCheckoutLeaseBlocker(context, 'pr', { branchName, taskSlug });
+  if (sharedCheckoutBlocker) {
+    return { status: 'blocked', reason: sharedCheckoutBlocker };
+  }
+
   return {
     status: 'resolved',
-    taskSlug: explicitSlug || derivedTaskSlug,
+    taskSlug,
     lock: null,
     livePr,
   };

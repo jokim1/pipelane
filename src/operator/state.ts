@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -982,6 +982,14 @@ export function defaultWorkflowConfig(
 
 export function normalizePath(targetPath: string): string {
   return path.resolve(targetPath);
+}
+
+export function normalizeExistingPath(targetPath: string): string {
+  try {
+    return normalizePath(realpathSync(targetPath));
+  } catch {
+    return normalizePath(targetPath);
+  }
 }
 
 export function nowIso(): string {

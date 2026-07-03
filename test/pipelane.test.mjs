@@ -20165,6 +20165,154 @@ test('pr can create a new PR from a manual task branch without a task lock', () 
   }
 });
 
+test('pr blocks lockless shared-checkout commits while task worktree locks are active', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    runCli(['setup'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const active = JSON.parse(runCli(['run', 'new', '--task', 'Active Isolated Task', '--json'], repoRoot).stdout);
+    execFileSync('git', ['checkout', '-b', 'codex/manual-shared-lease-1234'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(repoRoot, 'shared-change.txt'), 'must not stage from shared checkout\n', 'utf8');
+
+    const blocked = runCli(['run', 'pr', '--title', 'Manual Shared Lease', '--json'], repoRoot, env, true);
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /\/pr blocked because this is the shared checkout while task worktree locks are active/);
+    assert.match(blocked.stderr, /Mutating workflow commands must run from a task-owned worktree lease/);
+    assert.match(blocked.stderr, new RegExp(active.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.match(run('git', ['status', '--short'], repoRoot), /\?\? shared-change\.txt/);
+    assert.equal(existsSync(ghStateFile), false, 'blocked shared-checkout PR must not call gh');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('merge --pr blocks in the shared checkout when the PR task is leased elsewhere', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    runCli(['setup'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Lease Merge', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'lease merge\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Lease Merge', '--json'], created.worktreePath, env);
+
+    const blocked = runCli(['run', 'merge', '--pr', '1', '--json'], repoRoot, env, true);
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /Task lock mismatch/);
+    assert.match(blocked.stderr, /expected branch codex\/lease-merge-/);
+    assert.match(blocked.stderr, new RegExp(`expected worktree ${created.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.prMergeCalls.length, 0, 'shared-checkout merge must not call gh pr merge');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('deploy --pr blocks in the shared checkout when the PR task is leased elsewhere', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigClaude(repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.buildMode.autoDeployOnMerge = false;
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Lease Deploy', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'lease deploy\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Lease Deploy', '--json'], created.worktreePath, env);
+    runCli(['run', 'merge', '--json'], created.worktreePath, env);
+
+    const blocked = runCli(['run', 'deploy', 'staging', '--pr', '1', '--json'], repoRoot, env, true);
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /Task lock mismatch/);
+    assert.match(blocked.stderr, /expected branch codex\/lease-deploy-/);
+    assert.match(blocked.stderr, new RegExp(`expected worktree ${created.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.prMergeCalls.length, 1);
+    assert.equal(ghState.workflows.length, 0, 'shared-checkout deploy must not dispatch a workflow');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('task lock validation treats symlinked worktree paths as the same checkout', async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'pipelane-realpath-lock-'));
+  try {
+    const actualWorktree = path.join(root, 'actual-worktree');
+    const aliasWorktree = path.join(root, 'alias-worktree');
+    mkdirSync(actualWorktree, { recursive: true });
+    symlinkSync(actualWorktree, aliasWorktree, process.platform === 'win32' ? 'junction' : 'dir');
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const repoGuard = await import(path.join(KIT_ROOT, 'src', 'operator', 'repo-guard.ts'));
+
+    assert.notEqual(stateMod.normalizePath(aliasWorktree), stateMod.normalizePath(actualWorktree));
+    assert.equal(stateMod.normalizeExistingPath(aliasWorktree), stateMod.normalizeExistingPath(actualWorktree));
+    assert.deepEqual(repoGuard.verifyTaskLockState({
+      branchName: 'codex/alias-safe',
+      repoRoot: aliasWorktree,
+      requestedMode: '',
+      currentMode: 'build',
+      lock: {
+        branchName: 'codex/alias-safe',
+        worktreePath: actualWorktree,
+        mode: 'build',
+      },
+    }), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('merge skips auto-deploy in build mode when autoDeployOnMerge is disabled', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));

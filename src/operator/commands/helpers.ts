@@ -9,9 +9,11 @@ import {
   formatWorkflowCommand,
   loadAllTaskLocks,
   loadTaskLock,
+  normalizeExistingPath,
   normalizePath,
   nowIso,
   parseSurfaceList,
+  resolveSharedRepoRoot,
   runCommandCapture,
   runGh,
   runGit,
@@ -67,9 +69,9 @@ export function inferActiveTaskLock(context: WorkflowContext, explicitTask = '')
   }
 
   const branchName = runGit(context.repoRoot, ['branch', '--show-current']) ?? '';
-  const repoPath = normalizePath(context.repoRoot);
+  const repoPath = normalizeExistingPath(context.repoRoot);
   const matches = loadAllTaskLocks(context.commonDir, context.config).filter((lock) =>
-    lock.branchName === branchName && normalizePath(lock.worktreePath) === repoPath
+    lock.branchName === branchName && normalizeExistingPath(lock.worktreePath) === repoPath
   );
 
   if (matches.length === 1) {
@@ -102,6 +104,39 @@ export function ensureTaskLockMatchesCurrent(context: WorkflowContext, lock: Tas
       ...mismatches.map((mismatch) => `- ${mismatch}`),
     ].join('\n'));
   }
+}
+
+export function buildSharedCheckoutLeaseBlocker(
+  context: WorkflowContext,
+  command: Extract<WorkflowCommand, 'pr' | 'merge' | 'deploy'>,
+  options: { branchName?: string; taskSlug?: string } = {},
+): string | null {
+  const sharedRepoRoot = resolveSharedRepoRoot(context.commonDir);
+  if (normalizeExistingPath(context.repoRoot) !== normalizeExistingPath(sharedRepoRoot)) {
+    return null;
+  }
+
+  const locks = loadAllTaskLocks(context.commonDir, context.config);
+  if (locks.length === 0) {
+    return null;
+  }
+
+  const taskSlug = options.taskSlug?.trim() ?? '';
+  const branchName = options.branchName?.trim() || runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() || '';
+  const taskResume = taskSlug ? formatWorkflowCommand(context.config, 'resume', `--task "${taskSlug}"`) : formatWorkflowCommand(context.config, 'resume');
+  const taskGuard = taskSlug ? formatWorkflowCommand(context.config, 'repo-guard', `--task "${taskSlug}"`) : formatWorkflowCommand(context.config, 'repo-guard', '--task "<task-name>"');
+
+  return [
+    `${formatWorkflowCommand(context.config, command)} blocked because this is the shared checkout while task worktree locks are active.`,
+    `Shared checkout: ${context.repoRoot}`,
+    `Current branch: ${branchName || '(detached)'}`,
+    'Mutating workflow commands must run from a task-owned worktree lease, not from the shared checkout.',
+    'Active task locks:',
+    ...locks.slice(0, 10).map((lock) => `- ${lock.taskName || lock.taskSlug}: ${lock.branchName} @ ${lock.worktreePath}`),
+    locks.length > 10 ? `- ... ${locks.length - 10} more` : '',
+    `Next: run ${taskResume} and rerun this command from the reported worktree.`,
+    `If this checkout is intentionally becoming the task workspace, run ${taskGuard} first so Pipelane records the lease explicitly.`,
+  ].filter(Boolean).join('\n');
 }
 
 export function latestCommitSubject(repoRoot: string): string {

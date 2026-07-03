@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import type { Mode, TaskLock, WorkflowConfig } from './state.ts';
 import {
   normalizePath,
+  normalizeExistingPath,
   nowIso,
   runGit,
   runCommandCapture,
@@ -379,10 +380,10 @@ export function buildCurrentWorkspaceReasons(options: {
     reasons.push('current worktree has uncommitted changes');
   }
 
-  const repoPath = normalizePath(options.repoRoot);
+  const repoPath = normalizeExistingPath(options.repoRoot);
   const currentLock = loadAllTaskLocks(options.commonDir, options.config).find((lock) =>
     lock.taskSlug !== options.taskSlug
-    && (lock.branchName === branchName || normalizePath(lock.worktreePath) === repoPath)
+    && (lock.branchName === branchName || normalizeExistingPath(lock.worktreePath) === repoPath)
   );
 
   if (currentLock) {

@@ -42,7 +42,9 @@ import {
   type WorkflowContext,
 } from '../state.ts';
 import {
+  buildSharedCheckoutLeaseBlocker,
   deriveTaskSlugFromPr,
+  ensureTaskLockMatchesCurrent,
   inferActiveTaskLock,
   loadPrByNumber,
   loadPrForBranch,
@@ -159,10 +161,11 @@ function resolveDeployCommandIdentity(
     const currentBranch = runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
     const branchName = pr.headRefName?.trim() || currentBranch;
     const taskSlug = deriveTaskSlugFromPr(context.config, pr, branchName);
+    const lock = loadTaskLock(context.commonDir, context.config, taskSlug);
     return {
       taskSlug,
       branchName,
-      lock: loadTaskLock(context.commonDir, context.config, taskSlug),
+      lock,
       livePr: pr,
     };
   }
@@ -239,6 +242,7 @@ export async function dispatchDeploy(
   const explicitSurfaces = options.explicitSurfaces ?? [...parsed.flags.surfaces, ...surfacePositionals];
   const identity = resolveDeployCommandIdentity(context, parsed, options);
   const { taskSlug } = identity;
+  ensureDeployCommandLease(context, identity);
   const prRecord = resolveDeployPrRecord(context, identity, environment);
   const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
   const allowHealthcheckStubBypass = process.env.NODE_ENV === 'test'
@@ -599,6 +603,21 @@ export async function dispatchDeploy(
     };
   } finally {
     releaseSmokeEnvironmentLock(context.commonDir, environment);
+  }
+}
+
+function ensureDeployCommandLease(context: WorkflowContext, identity: DeployCommandIdentity): void {
+  if (identity.lock) {
+    ensureTaskLockMatchesCurrent(context, identity.lock);
+    return;
+  }
+
+  const sharedCheckoutBlocker = buildSharedCheckoutLeaseBlocker(context, 'deploy', {
+    branchName: identity.branchName,
+    taskSlug: identity.taskSlug,
+  });
+  if (sharedCheckoutBlocker) {
+    throw new Error(sharedCheckoutBlocker);
   }
 }
 
