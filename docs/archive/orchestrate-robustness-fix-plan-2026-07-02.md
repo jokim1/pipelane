@@ -10,8 +10,8 @@ Primary reviewed artifact:
 
 This implementation plan covers v1a and v1a2 only.
 
-- v1a unblocks the traced docs-only baseline failure with clean-source preflight metadata, run-level baseline profile inference, strict docs-only rules, profile-aware gate skipping, analyzer write-scope emission, and operator-visible skip reasons.
-- v1a2 adds the implementation-baseline audit path: baseline command execution, dependency provisioning, manual `baseline accept`, targeted replacement gates, per-slice `bypass-baseline-red`, docs-only escape reruns, and interrupted-baseline recovery.
+- v1a unblocks the traced docs-only baseline failure with clean-source preflight metadata, run-level baseline profile inference, strict docs-only rules, and profile-aware gate skipping.
+- v1a2 adds the implementation-baseline audit path: baseline command execution, manual `baseline accept`, targeted replacement gates, per-slice `bypass-baseline-red`, and docs-only escape reruns.
 - v1b dirty-source snapshots, source refs, worker leases, orphan-ref cleanup, schema markers, rollback drains, ignored-output telemetry, watched-output cleanup, and command isolation are deferred to a separate accepted plan.
 - Until v1b exists, dirty parent worktrees hard-block before planning or dispatch with a commit/stash message. `/orchestrate` must not advertise `--acknowledge-dirty-source`.
 
@@ -26,7 +26,7 @@ The run `orchestrate-20260701230712-c0eeeb0f` exposed brittle behavior in `/orch
 3. The repository full `npm test` suite was already red, and build output could change later test behavior.
 4. The resulting failure looked like a slice failure even though the real issue was orchestration semantics.
 
-The fix is to make source state, baseline evidence, docs-only classification, and baseline-red handling explicit. It is not to hide the red suite.
+The fix is not to hide the red suite. The fix is to make source state, baseline evidence, docs-only classification, and baseline-red handling explicit.
 
 ## What Already Exists
 
@@ -34,7 +34,7 @@ The fix is to make source state, baseline evidence, docs-only classification, an
 - Reuse `buildReviewRunRecord`, `collectChangedFiles`, `skipReasonForGate`, `whenChanged`, and the shared review-gate catalog/order plumbing.
 - Reuse current worktree creation, status/analyze output, finalize/cleanup flows, and run mutation locking.
 - Reuse `slices[].requestedFiles` only as a conservative fallback input. Add persisted `slices[].plannedPathScope` because the current ledger has no canonical pre-dispatch write-scope field.
-- Current ledger reader behavior is already additive-field tolerant: `isOrchestrationRunRecordShape` validates required run fields and slice shape but does not reject unknown run/slice keys. Add read and read-mutate-write regression coverage before relying on new fields.
+- Current ledger reader behavior is already additive-field tolerant: `isOrchestrationRunRecordShape` validates required run fields and slice shape but does not reject unknown run/slice keys. Add regression coverage to lock this behavior before writing new fields; no separate reader-tolerance release is required.
 - Reuse the existing `gstack-review` gate for docs-only AI review by annotating it with docs-safe profile/path metadata. Do not add a new reviewer role, prompt, model behavior, or worker.
 
 ## Not In Scope
@@ -71,7 +71,7 @@ Lock scope:
 - Run creation/source preflight holds the run mutation lock while writing `sourceSnapshot`.
 - Approval writes approved slices and `plannedPathScope`.
 - Gate snapshot capture writes `reviewGateSnapshot`.
-- Baseline preflight holds the run mutation lock only while mutating baseline state. V1a2 command execution releases the lock while the command runs and reacquires it to append evidence.
+- Baseline preflight holds the run mutation lock while writing `baselinePreflight`.
 - Review holds the run mutation lock while computing profiles and appending gate evidence.
 - Finalize holds the run mutation lock while changing terminal state.
 
@@ -83,10 +83,11 @@ Lock scope:
 - Legacy or in-flight runs without `sourceSnapshot.reviewBaseRef` use the shared base resolver and `implementation` profile. Prefer `origin/<baseBranch>`, fall back to local `<baseBranch>` with a warning when a merge-base exists, and block when neither ref resolves.
 - `baseBranch` is persisted at run creation. Resolution order is explicit CLI `--base-branch`, `orchestrate.baseBranch`, `review.baseBranch`, successful `gh pr view --json baseRefName`, `origin/HEAD`, `main`, then `master`. Later review/baseline steps use only the persisted value.
 - Slice `reviewProfile` inference computes the slice worktree diff relative to `sourceSnapshot.reviewBaseRef`.
-- Baseline profile source/base delta does not use `sourceSnapshot.reviewBaseRef`; it computes paths changed from `merge-base(sourceSnapshot.headSha, resolvedBaseRef)` to `sourceSnapshot.headSha`. Base refs are used as-is without implicit fetch.
+- Baseline profile source/base delta does not use `sourceSnapshot.reviewBaseRef`; it computes `sourceSnapshot.headSha` versus the resolved base ref. For clean source, using `reviewBaseRef=headSha` would produce an empty delta and could skip full-suite gates incorrectly.
 - `slices[].plannedPathScope` means paths the slice intends to create, modify, delete, or rename. Read-only context files are excluded.
-- Analyzer-provided `slices[].plannedPathScope[]` is authoritative when valid and non-empty. Existing `slices[].requestedFiles[]` is only a conservative fallback. Because `requestedFiles[]` has no write/read signal, every requested file is treated as a write target; a requested code path forces `implementation`.
+- Analyzer-provided `slices[].plannedPathScope[]` is authoritative when present. Existing `slices[].requestedFiles[]` is only a conservative fallback. Because `requestedFiles[]` has no write/read signal, every requested file is treated as a write target; a requested code path forces `implementation`.
 - Analyzer write-scope separation lands before docs-only baseline inference. The analyzer must either emit valid `plannedPathScope[]` for write targets or omit it and accept conservative `requestedFiles[]` fallback behavior; it must not mix read-only context paths into `plannedPathScope[]`.
+- Planned path entries must be repo-relative POSIX paths after stripping a leading `./`. Absolute paths, URLs, parent traversal, empty strings, glob-only values, and invalid types make that slice's planned scope `unknown`.
 - If any approved slice has missing, empty, invalid, or unknown `plannedPathScope`, baseline preflight uses `implementation`.
 
 ## Docs-Only Classification
@@ -120,26 +121,27 @@ The same `classifyDocsSafePathRecords()` helper must feed both `baselinePrefligh
 - Gates whose `whenChanged` matches docs paths still run.
 - Non-command AI/code gates run for docs-only only when they declare `profiles: ['docs-only']` or have matching docs `whenChanged`; otherwise skip with reason `docs-only profile, AI/code gate not scoped to docs`.
 - Gate `profiles` are additive, not an allowlist. Adding docs-only metadata to `gstack-review` must not narrow or disable its existing implementation-slice behavior.
-- Status/analyze output and the finalize summary must list skipped full-suite gate ids/commands with their skip reasons for docs-only runs.
+- Status/analyze output and the finalize summary must list skipped full-suite gate ids/commands with their skip reasons for docs-only runs. A green docs-only review must be auditable from normal CLI surfaces.
 - If `baselinePreflight.profile='implementation'` from the start, v1a preserves the existing implementation dispatch/review path. It does not apply docs-only skips and does not block just because implementation baseline execution is v1a2.
 - If a run starts docs-only and later a slice diff escapes docs-safe paths, v1a hard-blocks review before per-slice gates with `implementation-baseline-required`.
-- A run blocked at review with `implementation-baseline-required` is considered inactive for `finalize --abandon` once no slice worker is running. Default abandon/finalize preserves escaped slice worktrees and prints their paths.
-- Escaped worktree reclamation is explicit opt-in after paths are visible. `finalize --abandon --purge-worktrees --reason <text>` may remove listed escaped slice worktrees only after the abandon report includes their paths and records the purge reason/result.
+- The v1a escape message must tell the operator to abandon/fail the current run or re-plan/annotate `plannedPathScope` with code paths so a new run starts as implementation. V1a does not automatically reuse escaped slice worktrees or commits.
+- A run blocked at review with `implementation-baseline-required` is considered inactive for `finalize --abandon` once no slice worker is running. Abandon/finalize must preserve escaped slice worktrees by default and print their paths before returning; no cleanup step may delete those worktrees before the operator has received the paths.
 
 ## v1a2 Rules
 
 - Implementation baseline commands run in a dedicated baseline temp worktree checked out at `sourceSnapshot.reviewBaseRef` (`headSha` for clean source), never in the parent checkout.
-- Baseline command execution must not hold the run mutation lock across the whole command. The coordinator acquires the lock to mark command/run state, releases it while the command runs, then reacquires it to append evidence and choose the next command.
-- Interrupted baseline preflight is recoverable. If re-invocation sees `baselinePreflight.status='running'` with no active run mutation lock and no completed evidence for the running command, it records an interrupted-attempt note and reruns the incomplete command idempotently from the same `sourceSnapshot.reviewBaseRef` and `reviewGateSnapshot`.
 - Baseline dependency provisioning reuses the existing shared `node_modules` link path. If dependencies are unavailable, baseline preflight records `dependency_provisioning_failed` rather than a fake test failure.
 - Baseline command failures block dispatch by default.
 - `orchestrate baseline accept --run-id <id> --command-id <id> --reason <text>` requires a nonblank reason and records `acceptedFailure`. Accepted baseline failures set status `accepted_failed`, not `passed`; original exit code, timing, timeout flag, and summary path remain unchanged.
 - Baseline acceptance is per-run/per-command only. A new run must accept or fix the failure again.
 - A review command gate matches an accepted baseline command only when `(reviewGateSnapshot.gates[].baselineCommandId ?? reviewGateSnapshot.gates[].id)` exactly equals `baselinePreflight.commands[].id`.
 - Matching implementation-slice command gates become baseline-red `pending` unless a targeted replacement gate passes or the operator records an audited per-slice baseline-red bypass.
+- A targeted replacement gate clears baseline-red only when its passing gate declares `replacesBaselineCommandId` equal to the accepted baseline command id.
+- `orchestrate review bypass-baseline-red --run-id <id> --slice-id <id> --gate-id <id> --baseline-command-id <id> --reason <text>` records a reason, local identity, and timestamp. It is not command-pass evidence.
 - V1a2 is retained as a separate implementation-slice workflow, not as a prerequisite for the traced docs-only unblock. Decision: keep it because implementation-profile orchestration otherwise has no auditable way to proceed while the suite is known-red without falsely marking matching full-suite gates as passed.
 - Replacement and bypass are mutually exclusive resolution modes under one `baselineRedResolution` schema: `replacementGateId` is preferred when alternate passing evidence exists; `bypass` is the explicit human risk-acceptance fallback when no targeted replacement can prove the slice clean.
 - Docs-only to implementation baseline reruns are owned by `/pipelane orchestrate review` under the run mutation lock. The coordinator appends one idempotent `baselinePreflight.profileHistory[]` transition and reuses the frozen `reviewGateSnapshot`.
+- Concurrent review invocations re-read the ledger after acquiring the lock. A second invocation must not launch another full-suite rerun if another invocation already recorded the transition.
 
 ## Persisted Evidence
 
@@ -150,13 +152,14 @@ The same `classifyDocsSafePathRecords()` helper must feed both `baselinePrefligh
 | Planned path scope | `slices[].plannedPathScope[]` | v1a |
 | Slice review profile | `slices[].reviewProfile` | v1a |
 | Gate snapshot | `reviewGateSnapshot.gates[]`, `profiles[]`, `baselineCommandId`, `replacesBaselineCommandId` | v1a/v1a2 |
-| Baseline command evidence | `id`, `command`, `exitCode`, `timedOut`, `durationMs`, `summaryPath`, interrupted-attempt notes | v1a2 |
+| Baseline command evidence | `id`, `command`, `exitCode`, `timedOut`, `durationMs`, `summaryPath` | v1a2 |
 | Accepted baseline failure | `reason`, `acceptedBy`, `acceptedAt` | v1a2 |
-| Baseline-red resolution | one of `replacementGateId` or `bypass.reason`, plus audit fields for bypass | v1a2 |
+| Baseline-red resolution | `baselineCommandId`, `replacementGateId` or `bypass.reason`, `bypass.acceptedBy`, `bypass.acceptedAt` | v1a2 |
 
 ## Fail-Closed Outcomes
 
-- New v1a/v1a2 additive fields rely on the current reader's unknown-key tolerance; regression coverage must lock read and read-mutate-write preservation before consumers depend on the new fields.
+- New v1a/v1a2 additive fields rely on the current reader's unknown-key tolerance; regression coverage must lock this behavior before consumers depend on the new fields.
+- Rollback compatibility must cover read-mutate-write, not just read. A coordinator using the current reader behavior must load a ledger with v1a/v1a2 fields, perform a normal legacy mutation, save it, and preserve unknown additive fields. If any normal save path drops those fields, v1a must first change that path or document that downgrade as a destructive rollback requiring operator confirmation; silent dropping is not accepted.
 - Malformed `sourceSnapshot` blocks dispatch/review and reports the run ledger as corrupt.
 - Malformed `baselinePreflight` or command evidence blocks dispatch.
 - Malformed accepted-failure evidence is not treated as accepted; the command remains failed and dispatch remains blocked.
@@ -170,25 +173,25 @@ The same `classifyDocsSafePathRecords()` helper must feed both `baselinePrefligh
 | [v1a] Dirty parent | Nonzero result; actionable dirty-source commit/stash message; no dispatch. | No snapshot ref, no source bundle, no prepared worktree. |
 | [v1a] Ignored parent file only | Source preflight can be clean. | Ignored paths do not count in the dirty predicate. |
 | [v1a] Clean parent source | Source preflight succeeds. | `sourceSnapshot.status='clean'`, `headSha=HEAD`, `reviewBaseRef=headSha`, `changedFiles=[]`. |
-| [v1a] Analyzer planned path scope emission | Read-only context can be excluded from docs-only classification. | Analysis/slices-file ingestion emits write-target `plannedPathScope[]`; read-only context fields do not populate it. |
 | [v1a] Docs-only baseline preflight | Dispatch is not blocked by unrelated full-suite gates. | `baselinePreflight.profile='docs-only'`; unscoped `npm test`, `npm run build`, and `npm run typecheck` are skipped with docs-only reasons. |
 | [v1a] Operator skipped-gate visibility | A green docs-only review is auditable from normal CLI surfaces. | Status/analyze output and finalize summary list skipped full-suite gate ids/commands and the docs-only skip reasons. |
-| [v1a] Base delta merge-base semantics | Docs-only classification is stable when base diverges. | Source/base delta uses `git diff --name-status <merge-base>..sourceSnapshot.headSha` equivalent paths; no implicit fetch refreshes origin refs during classification. |
 | [v1a] Traced regression | The `docs/ARCHITECTURE_REFACTOR_PLAN.md` run shape no longer runs unrelated full-suite gates. | Baseline and slice profiles are docs-only; full-suite gates are skipped with explicit reasons. |
+| [v1a] Analyzer planned path scope emission | Read-only context can be excluded from docs-only classification. | Orchestration analysis/slices-file ingestion emits write-target `plannedPathScope[]` before docs-only baseline inference; read-only context fields do not populate it. |
 | [v1a] Docs slice with code context | Read-only code context does not defeat docs-only classification. | Analyzer `plannedPathScope` contains only docs write paths; context paths are excluded. |
 | [v1a] RequestedFiles-only code fallback | Missing analyzer write-scope stays conservative. | Any code path in `requestedFiles[]` forces `baselinePreflight.profile='implementation'`. |
 | [v1a] Code path in write scope | Code write target forces implementation. | No docs-only skip is recorded. |
+| [v1a] Local code commit with docs-only slice | Existing implementation gates run. | Source/base delta has non-doc path, so `baselinePreflight.profile='implementation'`. |
 | [v1a] Docs-only run escapes to code | Review hard-blocks before per-slice gates. | `implementation-baseline-required` block and remediation guidance. |
-| [v1a] Escape abandon preserves worker output | Review-hard-blocked escaped runs are abandonable without silent data loss. | `finalize --abandon` lists escaped slice worktree paths and preserves contents by default. |
-| [v1a] Escape worktree purge is opt-in | Abandoned escaped worktrees do not leak forever. | `finalize --abandon --purge-worktrees --reason <text>` removes only listed escaped worktrees after paths are reported and records purge results. |
 | [v1a2] Baseline command fails | Dispatch blocked. | Baseline status `failed`; original exit code, timeout flag, duration, and summary path retained. |
-| [v1a2] Interrupted baseline running state | Stale running baseline does not block forever. | Re-invocation records interrupted-attempt evidence and reruns the incomplete command from the same source/gate snapshots. |
 | [v1a2] Baseline failure accepted | Dispatch may proceed, but baseline is not passed. | Status `accepted_failed`; reason/user/time stored; original failure evidence unchanged. |
 | [v1a2] Known-red implementation review | Matching full-suite gate is not greenwashed. | Gate is baseline-red `pending` until linked replacement evidence or audited bypass exists. |
-| [v1a2] Baseline-red resolution mode exclusivity | Known-red resolution has one schema and one active mode. | A gate may record either `replacementGateId` or `bypass`, not both. |
+| [v1a2] Baseline-red resolution mode exclusivity | Known-red resolution has one schema and one active mode. | A gate may record either `replacementGateId` or `bypass`, not both; replacement is preferred when linked passing evidence exists, while bypass requires an explicit human reason. |
 | [v1a/v1a2] Frozen gate snapshot | Baseline accept and review use stable ids. | `reviewGateSnapshot` captured before baseline preflight; live catalog changes do not alter matching. |
+| [v1a] No-dist CLI fallback proof | Traced source-mode seam is covered without reordering the suite. | Fresh worktree with absent `dist/`; targeted `node --test --test-name-pattern 'orchestrate bare command refuses non-interactive setup without an active run' test/pipelane.test.mjs` passes. |
+| [v1a] Ignored output created or inherited | V1a adds no telemetry, cleanup, isolation, or command reorder. | Existing command status is preserved; no watched-output evidence required. |
+| [v1a] Escape abandon preserves worker output | Review-hard-blocked escaped runs are abandonable without silent data loss. | `finalize --abandon` is allowed after no worker is running; output lists escaped slice worktree paths; worktree contents are preserved by default and are not deleted before the operator sees the paths. |
 | [v1a/v1a2] Legacy reader tolerance | Rollback compatibility claim is tested before relying on additive fields. | Current reader behavior ignores additive v1a/v1a2 fields without corrupting the run. |
-| [v1a/v1a2] Legacy read-mutate-write preservation | Rollback does not silently erase additive evidence. | Current reader behavior performs a normal legacy mutation/save and reloads with additive fields still present. |
+| [v1a/v1a2] Legacy read-mutate-write preservation | Rollback does not silently erase additive evidence. | Current reader behavior loads a ledger with v1a/v1a2 additive fields, performs a normal legacy mutation/save, and reloads with those additive fields still present. |
 
 ## Deferred v1b Plan Requirements
 
@@ -200,10 +203,10 @@ A future v1b plan must make these decisions and tests explicit before dirty-sour
 - Orphan snapshot refs are recoverable only when the run is inactive and the ref namespace exactly matches the run id.
 - Concurrent runs use isolated refs and never delete another run's source ref.
 - Worker lease cleanup is fail-closed and does not delete refs for active, unknown, or fresh workers.
-- V1b schema/capability markers and rollback drain rules are required because v1b introduces refs, leases, and destructive cleanup obligations.
+- v1b schema/capability markers and rollback drain rules are required because v1b introduces refs, leases, and destructive cleanup obligations.
 
 ## Validation
 
 - Rerun `/claude-review plan` against the primary eng-review test-plan artifact.
 - Acceptance criterion: the same verified findings do not repeat.
-- Sanity-check both plan files agree on docs-only inference, gate skipping, baseline-red semantics, interrupted baseline recovery, no v1a command reorder, and v1b deferral.
+- Sanity-check both plan files agree on docs-only inference, gate skipping, baseline-red semantics, no v1a command reorder, and v1b deferral.
