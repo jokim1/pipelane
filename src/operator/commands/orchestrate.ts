@@ -2299,44 +2299,248 @@ function handleOrchestrationReview(cwd: string, parsed: ParsedOperatorArgs): voi
   const sliceId = parsed.flags.goalSliceId.trim() || null;
   const phaseFilter = parsed.flags.reviewPhase.trim() as ReviewGatePhase | '';
   const gateFilter = parsed.flags.reviewGate.trim();
+  const prepared = withLockedOrchestrationRun(context, runId, (run) => ({
+    run: cloneOrchestrationRunForReview(run),
+    snapshots: captureOrchestrationReviewSliceSnapshots(run, sliceId),
+  }));
+  let result = reviewCompletedSlices(context, prepared.run, {
+    sliceId,
+    dryRun: parsed.flags.reviewDryRun,
+    gateFilter,
+    phaseFilter,
+    requireGates: true,
+    persistProgress: false,
+  });
+  let reportRun = prepared.run;
+  let ledgerPath = orchestrationRunPath(context.commonDir, context.config, runId);
+
   withLockedOrchestrationRun(context, runId, (run) => {
-    const result = reviewCompletedSlices(context, run, {
-      sliceId,
-      dryRun: parsed.flags.reviewDryRun,
-      gateFilter,
-      phaseFilter,
-      requireGates: true,
-    });
-    const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
-    const report: OrchestrateReviewReport = {
-      command: 'orchestrate review',
-      status: result.status,
-      repoRoot: context.repoRoot,
-      runId: run.id,
-      ledgerPath,
-      sliceId,
-      dryRun: parsed.flags.reviewDryRun,
-      gateFilter: gateFilter || null,
-      phaseFilter: phaseFilter || null,
-      reviewedCount: result.reviewedCount,
-      failedCount: result.failedCount,
-      pendingCount: result.pendingCount,
-      blockedCount: result.blockedCount,
-      slices: result.slices,
-      run,
-      message: renderOrchestrationReviewReport(run, ledgerPath, sliceId, result, {
+    const staleBlocker = staleOrchestrationReviewSnapshotBlocker(run, prepared.snapshots);
+    if (staleBlocker) {
+      reportRun = run;
+      result = peerOrchestrationReviewResult(run, prepared.run, prepared.snapshots, {
         dryRun: parsed.flags.reviewDryRun,
         gateFilter,
         phaseFilter,
-      }),
-    };
-
-    printResult(parsed.flags, report);
-
-    if (result.status === 'failed') {
-      process.exitCode = 1;
+      }) ?? staleOrchestrationReviewResult(run, prepared.snapshots, staleBlocker);
+      return;
     }
+    attachOrchestrationReviewResult(run, prepared.run, prepared.snapshots);
+    ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+    reportRun = run;
   });
+
+  const report: OrchestrateReviewReport = {
+    command: 'orchestrate review',
+    status: result.status,
+    repoRoot: context.repoRoot,
+    runId: reportRun.id,
+    ledgerPath,
+    sliceId,
+    dryRun: parsed.flags.reviewDryRun,
+    gateFilter: gateFilter || null,
+    phaseFilter: phaseFilter || null,
+    reviewedCount: result.reviewedCount,
+    failedCount: result.failedCount,
+    pendingCount: result.pendingCount,
+    blockedCount: result.blockedCount,
+    slices: result.slices,
+    run: reportRun,
+    message: renderOrchestrationReviewReport(reportRun, ledgerPath, sliceId, result, {
+      dryRun: parsed.flags.reviewDryRun,
+      gateFilter,
+      phaseFilter,
+    }),
+  };
+
+  printResult(parsed.flags, report);
+
+  if (result.status === 'failed') {
+    process.exitCode = 1;
+  }
+}
+
+interface OrchestrationReviewSliceSnapshot {
+  sliceId: string;
+  digest: string;
+  reviewInputDigest: string;
+}
+
+function cloneOrchestrationRunForReview(run: OrchestrationRunRecord): OrchestrationRunRecord {
+  return JSON.parse(JSON.stringify(run)) as OrchestrationRunRecord;
+}
+
+function captureOrchestrationReviewSliceSnapshots(
+  run: OrchestrationRunRecord,
+  sliceId: string | null,
+): OrchestrationReviewSliceSnapshot[] {
+  return resolveReviewSlices(run, sliceId).map((slice) => ({
+    sliceId: slice.id,
+    digest: orchestrationReviewSliceSnapshotDigest(slice),
+    reviewInputDigest: orchestrationReviewSliceInputDigest(slice),
+  }));
+}
+
+function orchestrationReviewSliceSnapshotDigest(slice: OrchestrationSliceRecord): string {
+  return hashText(JSON.stringify({
+    id: slice.id,
+    index: slice.index,
+    status: slice.status,
+    branchName: slice.branchName ?? null,
+    worktreePath: slice.worktreePath ?? null,
+    taskSlug: slice.taskSlug ?? null,
+    worker: slice.worker ?? null,
+    review: slice.review ?? null,
+    reviewDiagnostics: slice.reviewDiagnostics ?? [],
+  }));
+}
+
+function orchestrationReviewSliceInputDigest(slice: OrchestrationSliceRecord): string {
+  return hashText(JSON.stringify({
+    id: slice.id,
+    index: slice.index,
+    branchName: slice.branchName ?? null,
+    worktreePath: slice.worktreePath ?? null,
+    taskSlug: slice.taskSlug ?? null,
+    worker: slice.worker ?? null,
+  }));
+}
+
+function staleOrchestrationReviewSnapshotBlocker(
+  run: OrchestrationRunRecord,
+  snapshots: OrchestrationReviewSliceSnapshot[],
+): string | null {
+  for (const snapshot of snapshots) {
+    const current = run.slices.find((slice) => slice.id === snapshot.sliceId);
+    if (!current) return `stale review result: slice ${snapshot.sliceId} no longer exists; review evidence was not attached`;
+    const currentDigest = orchestrationReviewSliceSnapshotDigest(current);
+    if (currentDigest !== snapshot.digest) {
+      return `stale review result: slice ${snapshot.sliceId} changed while gates were running; review evidence was not attached`;
+    }
+  }
+  return null;
+}
+
+function staleOrchestrationReviewResult(
+  run: OrchestrationRunRecord,
+  snapshots: OrchestrationReviewSliceSnapshot[],
+  blocker: string,
+): ReviewCompletedSlicesResult {
+  const slices = snapshots.map((snapshot): ReviewedSliceReport => {
+    const slice = run.slices.find((candidate) => candidate.id === snapshot.sliceId);
+    if (slice) return buildBlockedReviewReport(slice, blocker);
+    return {
+      id: snapshot.sliceId,
+      status: 'blocked',
+      reviewStatus: null,
+      branchName: '',
+      worktreePath: '',
+      runId: null,
+      gateCount: 0,
+      action: 'blocked',
+      blocker,
+    };
+  });
+  return {
+    status: 'failed',
+    reviewedCount: 0,
+    failedCount: snapshots.length > 0 ? snapshots.length : 1,
+    pendingCount: 0,
+    blockedCount: slices.length,
+    slices,
+  };
+}
+
+function peerOrchestrationReviewResult(
+  run: OrchestrationRunRecord,
+  reviewedRun: OrchestrationRunRecord,
+  snapshots: OrchestrationReviewSliceSnapshot[],
+  options: {
+    dryRun: boolean;
+    gateFilter: string;
+    phaseFilter: ReviewGatePhase | '';
+  },
+): ReviewCompletedSlicesResult | null {
+  const slices: ReviewedSliceReport[] = [];
+  let reviewedCount = 0;
+  let failedCount = 0;
+  let pendingCount = 0;
+
+  for (const snapshot of snapshots) {
+    const current = run.slices.find((slice) => slice.id === snapshot.sliceId);
+    const reviewed = reviewedRun.slices.find((slice) => slice.id === snapshot.sliceId);
+    if (!current || !reviewed) return null;
+    if (orchestrationReviewSliceInputDigest(current) !== snapshot.reviewInputDigest) return null;
+    if (!current.review || !reviewed.review) return null;
+    if (!reviewRunCoversPeerReview(current.review.run, reviewed.review.run)) return null;
+
+    reviewedCount += 1;
+    if (current.review.run.status === 'failed') failedCount += 1;
+    if (current.review.run.status === 'pending') pendingCount += 1;
+    slices.push({
+      id: current.id,
+      status: current.status,
+      reviewStatus: current.review.run.status,
+      branchName: current.branchName ?? '',
+      worktreePath: current.worktreePath ?? '',
+      runId: current.review.run.id,
+      gateCount: current.review.run.gates.length,
+      action: 'reviewed',
+      blocker: null,
+    });
+  }
+
+  return {
+    status: reportStatusForOrchestrationReview(summarizeRunReviewStatus(run), reviewedCount, failedCount, pendingCount, 0, {
+      incompleteEvidence: options.dryRun || Boolean(options.gateFilter) || Boolean(options.phaseFilter),
+    }),
+    reviewedCount,
+    failedCount,
+    pendingCount,
+    blockedCount: 0,
+    slices,
+  };
+}
+
+function reviewRunCoversPeerReview(current: ReviewRunRecord, requested: ReviewRunRecord): boolean {
+  if (!reviewRunRequestCovers(current, requested)) return false;
+  return requested.gates.every((gate) => current.gates.some((candidate) => reviewGateRunIdentityMatches(candidate, gate)));
+}
+
+function reviewRunRequestCovers(current: ReviewRunRecord, requested: ReviewRunRecord): boolean {
+  if (!requested.dryRun && current.dryRun) return false;
+  if (!current.dryRun && !current.gateFilter && !current.phaseFilter) return true;
+  return current.dryRun === requested.dryRun
+    && normalizeOptionalGateField(current.gateFilter) === normalizeOptionalGateField(requested.gateFilter)
+    && normalizeOptionalGateField(current.phaseFilter) === normalizeOptionalGateField(requested.phaseFilter);
+}
+
+function reviewGateRunIdentityMatches(left: ReviewGateRunRecord, right: ReviewGateRunRecord): boolean {
+  return left.gateId === right.gateId
+    && left.type === right.type
+    && left.phase === right.phase
+    && left.blocking === right.blocking
+    && normalizeOptionalGateField(left.command) === normalizeOptionalGateField(right.command)
+    && normalizeOptionalGateField(left.skill) === normalizeOptionalGateField(right.skill)
+    && normalizeOptionalGateField(left.role) === normalizeOptionalGateField(right.role)
+    && normalizeOptionalGateList(left.userCommands) === normalizeOptionalGateList(right.userCommands);
+}
+
+function attachOrchestrationReviewResult(
+  run: OrchestrationRunRecord,
+  reviewedRun: OrchestrationRunRecord,
+  snapshots: OrchestrationReviewSliceSnapshot[],
+): void {
+  for (const snapshot of snapshots) {
+    const current = run.slices.find((slice) => slice.id === snapshot.sliceId);
+    const reviewed = reviewedRun.slices.find((slice) => slice.id === snapshot.sliceId);
+    if (!current || !reviewed) continue;
+    current.status = reviewed.status;
+    current.review = reviewed.review;
+    current.reviewDiagnostics = reviewed.reviewDiagnostics ?? [];
+  }
+  run.status = summarizeRunReviewStatus(run);
+  run.updatedAt = nowIso();
 }
 
 function dispatchPreparedSlices(
@@ -2547,6 +2751,7 @@ function reviewCompletedSlices(
     gateFilter: string;
     phaseFilter: ReviewGatePhase | '';
     requireGates: boolean;
+    persistProgress?: boolean;
   },
 ): ReviewCompletedSlicesResult {
   const selectedSlices = resolveReviewSlices(run, options.sliceId);
@@ -2574,6 +2779,8 @@ function reviewCompletedSlices(
     const sliceContext = buildSliceReviewContext(context, sliceRepoRoot);
     const reviewRun = attachAttestedManualGateEvidence(sliceContext, buildReviewRunRecord({
       repoRoot: sliceRepoRoot,
+      commonDir: sliceContext.commonDir,
+      config: sliceContext.config,
       baseBranch: context.config.baseBranch,
       gates: run.gateSnapshot.gates,
       dryRun: options.dryRun,
@@ -2604,7 +2811,7 @@ function reviewCompletedSlices(
         action: 'blocked',
         blocker: 'no effective review gates configured for automatic orchestration; run /pipelane review setup, then rerun /pipelane orchestrate review',
       });
-      persistOrchestrationReviewProgress(context, run);
+      if (options.persistProgress !== false) persistOrchestrationReviewProgress(context, run);
       continue;
     }
     const independenceBlocker = sliceReviewIndependenceBlocker(slice, reviewRecord);
@@ -2624,7 +2831,7 @@ function reviewCompletedSlices(
         action: 'blocked',
         blocker: independenceBlocker,
       });
-      persistOrchestrationReviewProgress(context, run);
+      if (options.persistProgress !== false) persistOrchestrationReviewProgress(context, run);
       continue;
     }
     if (reviewRunCoversFullGateSet(reviewRun)) {
@@ -2651,7 +2858,7 @@ function reviewCompletedSlices(
       action: 'reviewed',
       blocker: null,
     });
-    persistOrchestrationReviewProgress(context, run);
+    if (options.persistProgress !== false) persistOrchestrationReviewProgress(context, run);
   }
 
   run.status = summarizeRunReviewStatus(run);

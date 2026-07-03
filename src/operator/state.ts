@@ -390,6 +390,7 @@ export interface ReviewGateRunRecord {
   userCommands?: string[];
   summary: string;
   exitCode?: number | null;
+  errorCode?: string | null;
   durationMs: number;
   startedAt: string;
   finishedAt: string;
@@ -2803,6 +2804,7 @@ function isReviewGateRunRecord(value: unknown): value is ReviewGateRunRecord {
     )
     && typeof raw.summary === 'string'
     && (raw.exitCode === undefined || raw.exitCode === null || typeof raw.exitCode === 'number')
+    && (raw.errorCode === undefined || raw.errorCode === null || typeof raw.errorCode === 'string')
     && typeof raw.durationMs === 'number'
     && typeof raw.startedAt === 'string'
     && typeof raw.finishedAt === 'string'

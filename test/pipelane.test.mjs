@@ -72,6 +72,11 @@ const HERMETIC_REVIEW_IDENTITY_ENV_KEYS = [
   'PIPELANE_REVIEW_GATE_ID',
   'PIPELANE_REVIEW_GATE_TYPE',
   'PIPELANE_REVIEW_GATE_PHASE',
+  'PIPELANE_REVIEW_GATE_DEPTH',
+  'PIPELANE_REVIEW_GATE_PARENT_PID',
+  'PIPELANE_REVIEW_GATE_REPO_ROOT',
+  'PIPELANE_REVIEW_GATE_RUN_ID',
+  'PIPELANE_UNSAFE_ALLOW_NESTED_REVIEW_GATES',
 ];
 
 const HERMETIC_DESTINATION_ROUTE_ENV_KEYS = [
@@ -110,6 +115,42 @@ function buildCliChildEnv(env = {}) {
   }
   return childEnv;
 }
+
+test('buildCliChildEnv scrubs inherited review-gate context unless explicitly supplied', () => {
+  const keys = [
+    'PIPELANE_REVIEW_GATE_DEPTH',
+    'PIPELANE_REVIEW_GATE_PARENT_PID',
+    'PIPELANE_REVIEW_GATE_REPO_ROOT',
+    'PIPELANE_REVIEW_GATE_RUN_ID',
+    'PIPELANE_UNSAFE_ALLOW_NESTED_REVIEW_GATES',
+  ];
+  const previous = new Map(keys.map((key) => [key, process.env[key]]));
+  try {
+    for (const key of keys) process.env[key] = `ambient-${key}`;
+    const scrubbed = buildCliChildEnv();
+    for (const key of keys) {
+      assert.equal(scrubbed[key], undefined, `${key} should be scrubbed by default`);
+    }
+
+    const explicit = buildCliChildEnv({
+      PIPELANE_REVIEW_GATE_DEPTH: '2',
+      PIPELANE_REVIEW_GATE_PARENT_PID: '123',
+      PIPELANE_REVIEW_GATE_REPO_ROOT: '/tmp/repo',
+      PIPELANE_REVIEW_GATE_RUN_ID: 'review-explicit',
+      PIPELANE_UNSAFE_ALLOW_NESTED_REVIEW_GATES: '1',
+    });
+    assert.equal(explicit.PIPELANE_REVIEW_GATE_DEPTH, '2');
+    assert.equal(explicit.PIPELANE_REVIEW_GATE_PARENT_PID, '123');
+    assert.equal(explicit.PIPELANE_REVIEW_GATE_REPO_ROOT, '/tmp/repo');
+    assert.equal(explicit.PIPELANE_REVIEW_GATE_RUN_ID, 'review-explicit');
+    assert.equal(explicit.PIPELANE_UNSAFE_ALLOW_NESTED_REVIEW_GATES, '1');
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
 
 function run(command, args, cwd, env = {}) {
   return execFileSync(command, args, {
@@ -371,6 +412,23 @@ function writePipelaneConfig(repoRoot, displayName = 'Demo App', patch = {}) {
   };
   writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
   return configPath;
+}
+
+function writeSingleCommandReviewGate(repoRoot, gate) {
+  writePipelaneConfig(repoRoot, 'Demo App', {
+    reviewGates: {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'typecheck',
+        phase: 'static',
+        type: 'command',
+        blocking: true,
+        ...gate,
+      }],
+    },
+  });
+  execFileSync('git', ['add', '.pipelane.json'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+  execFileSync('git', ['commit', '-m', 'Configure single review gate'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
 function seedLegacyRepoLocalFootprint(repoRoot) {
@@ -11648,6 +11706,197 @@ test('orchestrate review runs gate snapshot against completed worker slices', ()
   }
 });
 
+test('orchestrate review runs executable gates outside the orchestration mutation lock', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    const script = [
+      "const fs = require('node:fs');",
+      "const path = require('node:path');",
+      "const cp = require('node:child_process');",
+      "const common = cp.execFileSync('git', ['rev-parse', '--git-common-dir'], { encoding: 'utf8' }).trim();",
+      "const runsRoot = path.resolve(process.cwd(), common, 'pipelane-state', 'orchestrate', 'runs');",
+      "const locks = [];",
+      "if (fs.existsSync(runsRoot)) {",
+      "  for (const runId of fs.readdirSync(runsRoot)) {",
+      "    const lockPath = path.join(runsRoot, runId, 'mutation.lock');",
+      "    if (fs.existsSync(lockPath)) locks.push(lockPath);",
+      "  }",
+      "}",
+      "if (locks.length > 0) { console.error(locks.join('\\n')); process.exit(23); }",
+      "console.log('outside mutation lock');",
+    ].join('');
+    writePipelaneConfig(repoRoot, 'Demo App', {
+      reviewGates: {
+        planReview: { gates: [] },
+        gates: [{
+          id: 'lock-boundary',
+          phase: 'static',
+          type: 'command',
+          command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+          blocking: true,
+        }],
+      },
+    });
+    commitAll(repoRoot, 'Adopt lock-boundary review gate');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Review outside lock', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(),
+    });
+
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+
+    assert.equal(reviewed.status, 'passed');
+    assert.match(reviewed.run.slices[0].review.run.gates[0].stdoutTail, /outside mutation lock/);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate review refuses to attach stale slice evidence after concurrent mutation', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const markerPath = path.join(repoRoot, 'slow-review-started.txt');
+  try {
+    const script = [
+      "const fs = require('node:fs');",
+      `fs.writeFileSync(${JSON.stringify(markerPath)}, 'started');`,
+      "setTimeout(() => { console.log('slow review done'); }, 600);",
+    ].join('');
+    writePipelaneConfig(repoRoot, 'Demo App', {
+      reviewGates: {
+        planReview: { gates: [] },
+        gates: [{
+          id: 'slow-static',
+          phase: 'static',
+          type: 'command',
+          command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+          blocking: true,
+          timeoutMs: 2000,
+        }],
+      },
+    });
+    commitAll(repoRoot, 'Adopt slow review gate');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject stale review attach', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(),
+    });
+
+    const reviewPromise = runCliAsync(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot);
+    const markerDeadline = Date.now() + 15_000;
+    while (!existsSync(markerPath) && Date.now() < markerDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    if (!existsSync(markerPath)) {
+      const earlyResult = await reviewPromise;
+      assert.fail(`review gate should have started before mutating ledger\nstdout:\n${earlyResult.stdout}\nstderr:\n${earlyResult.stderr}`);
+    }
+    const ledgerPath = orchestrationLedgerPath(repoRoot, planned.runId);
+    const previousStateKey = process.env.PIPELANE_ORCHESTRATION_STATE_KEY;
+    process.env.PIPELANE_ORCHESTRATION_STATE_KEY = DEFAULT_ORCHESTRATION_STATE_KEY;
+    try {
+      const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+      const ledgerMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'orchestration-ledger.ts'));
+      const context = stateMod.resolveWorkflowContext(repoRoot);
+      const mutated = ledgerMod.loadOrchestrationRunRecord(context.commonDir, context.config, planned.runId);
+      assert.ok(mutated, 'orchestration ledger should load for concurrent mutation');
+      mutated.slices[0].status = 'blocked';
+      mutated.updatedAt = new Date().toISOString();
+      ledgerMod.saveOrchestrationRunRecord(context.commonDir, context.config, mutated);
+    } finally {
+      if (previousStateKey === undefined) delete process.env.PIPELANE_ORCHESTRATION_STATE_KEY;
+      else process.env.PIPELANE_ORCHESTRATION_STATE_KEY = previousStateKey;
+    }
+
+    const result = await reviewPromise;
+    const report = JSON.parse(result.stdout);
+    const onDisk = JSON.parse(readFileSync(ledgerPath, 'utf8'));
+
+    assert.notEqual(result.status, 0);
+    assert.equal(report.status, 'failed');
+    assert.match(report.slices[0].blocker, /stale review result/);
+    assert.equal(onDisk.slices[0].status, 'blocked');
+    assert.equal(onDisk.slices[0].review, null);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('overlapping orchestrate review treats peer-attached evidence as idempotent success', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  const markerPath = path.join(repoRoot, 'overlap-review-started.txt');
+  try {
+    const script = [
+      "const fs = require('node:fs');",
+      `fs.appendFileSync(${JSON.stringify(markerPath)}, 'started\\n');`,
+      "setTimeout(() => { console.log('overlap review done'); }, 500);",
+    ].join('');
+    writePipelaneConfig(repoRoot, 'Demo App', {
+      reviewGates: {
+        planReview: { gates: [] },
+        gates: [{
+          id: 'overlap-static',
+          phase: 'static',
+          type: 'command',
+          command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+          blocking: true,
+          timeoutMs: 4000,
+        }],
+      },
+    });
+    commitAll(repoRoot, 'Adopt overlapping review gate');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Review overlap idempotently', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(),
+    });
+
+    const firstReview = runCliAsync(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot);
+    const markerDeadline = Date.now() + 15_000;
+    while (!existsSync(markerPath) && Date.now() < markerDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    if (!existsSync(markerPath)) {
+      const earlyResult = await firstReview;
+      assert.fail(`first review gate should have started before launching overlap\nstdout:\n${earlyResult.stdout}\nstderr:\n${earlyResult.stderr}`);
+    }
+
+    const secondReview = runCliAsync(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot);
+    const [firstResult, secondResult] = await Promise.all([firstReview, secondReview]);
+    const firstReport = JSON.parse(firstResult.stdout);
+    const secondReport = JSON.parse(secondResult.stdout);
+    const onDisk = JSON.parse(readFileSync(orchestrationLedgerPath(repoRoot, planned.runId), 'utf8'));
+
+    assert.equal(firstResult.status, 0);
+    assert.equal(firstReport.status, 'passed');
+    assert.equal(secondResult.status, 0);
+    assert.equal(secondReport.status, 'passed');
+    assert.equal(onDisk.status, 'completed');
+    assert.equal(secondReport.slices[0].runId, onDisk.slices[0].review.run.id);
+    assert.equal(secondReport.slices[0].blocker, null);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('orchestration PR next action advances to reviewed slices without PR records', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];
@@ -14901,6 +15150,334 @@ test('review command gates do not inherit AI gate command overrides', () => {
   }
 });
 
+test('review command gates fail closed before spawning with a live inherited parent context', () => {
+  const repoRoot = createRepo();
+  const markerPath = path.join(repoRoot, 'nested-ran.txt');
+  try {
+    writeSingleCommandReviewGate(repoRoot, {
+      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, 'ran')`)}`,
+    });
+
+    const result = runCli(['run', 'review', '--phase', 'static', '--json'], repoRoot, {
+      PIPELANE_REVIEW_GATE_DEPTH: '1',
+      PIPELANE_REVIEW_GATE_PARENT_PID: String(process.pid),
+      PIPELANE_REVIEW_GATE_REPO_ROOT: repoRoot,
+      PIPELANE_REVIEW_GATE_ID: 'parent-gate',
+      PIPELANE_REVIEW_GATE_RUN_ID: 'review-parent',
+    }, true);
+    const report = JSON.parse(result.stdout);
+    const gate = report.gates[0];
+
+    assert.notEqual(result.status, 0);
+    assert.equal(report.status, 'failed');
+    assert.equal(gate.status, 'failed');
+    assert.equal(gate.errorCode, 'ENESTEDREVIEWGATE');
+    assert.equal(gate.exitCode, null);
+    assert.match(gate.summary, new RegExp(`live parent pid ${process.pid}`));
+    assert.match(gate.summary, /parent-gate/);
+    assert.match(gate.summary, /review-parent/);
+    assert.match(gate.summary, new RegExp(repoRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.match(gate.summary, /PIPELANE_UNSAFE_ALLOW_NESTED_REVIEW_GATES=1/);
+    assert.equal(existsSync(markerPath), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review command gates treat dead inherited parent pid as stale top-level context', () => {
+  const repoRoot = createRepo();
+  const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-marker-'));
+  const markerPath = path.join(markerRoot, 'stale-ran.txt');
+  try {
+    writeSingleCommandReviewGate(repoRoot, {
+      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, 'ran')`)}`,
+    });
+
+    const report = JSON.parse(runCli(['run', 'review', '--phase', 'static', '--json'], repoRoot, {
+      PIPELANE_REVIEW_GATE_DEPTH: '1',
+      PIPELANE_REVIEW_GATE_PARENT_PID: '99999999',
+      PIPELANE_REVIEW_GATE_REPO_ROOT: repoRoot,
+      PIPELANE_REVIEW_GATE_ID: 'dead-parent-gate',
+    }).stdout);
+
+    assert.equal(report.status, 'passed');
+    assert.equal(report.gates[0].status, 'passed');
+    assert.equal(readFileSync(markerPath, 'utf8'), 'ran');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(markerRoot, { recursive: true, force: true });
+  }
+});
+
+test('review command gates fail closed on malformed inherited context', () => {
+  const repoRoot = createRepo();
+  const markerPath = path.join(repoRoot, 'malformed-ran.txt');
+  try {
+    writeSingleCommandReviewGate(repoRoot, {
+      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, 'ran')`)}`,
+    });
+
+    const result = runCli(['run', 'review', '--phase', 'static', '--json'], repoRoot, {
+      PIPELANE_REVIEW_GATE_DEPTH: '1',
+    }, true);
+    const report = JSON.parse(result.stdout);
+
+    assert.notEqual(result.status, 0);
+    assert.equal(report.gates[0].errorCode, 'ENESTEDREVIEWGATE');
+    assert.match(report.gates[0].summary, /malformed inherited review-gate context/);
+    assert.equal(existsSync(markerPath), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review command gates allow explicit unsafe nested override', () => {
+  const repoRoot = createRepo();
+  const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-marker-'));
+  const markerPath = path.join(markerRoot, 'unsafe-ran.txt');
+  try {
+    writeSingleCommandReviewGate(repoRoot, {
+      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, 'ran')`)}`,
+    });
+
+    const report = JSON.parse(runCli(['run', 'review', '--phase', 'static', '--json'], repoRoot, {
+      PIPELANE_REVIEW_GATE_DEPTH: '1',
+      PIPELANE_REVIEW_GATE_PARENT_PID: String(process.pid),
+      PIPELANE_REVIEW_GATE_REPO_ROOT: repoRoot,
+      PIPELANE_REVIEW_GATE_ID: 'parent-gate',
+      PIPELANE_UNSAFE_ALLOW_NESTED_REVIEW_GATES: '1',
+    }).stdout);
+
+    assert.equal(report.status, 'passed');
+    assert.equal(report.gates[0].status, 'passed');
+    assert.equal(readFileSync(markerPath, 'utf8'), 'ran');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(markerRoot, { recursive: true, force: true });
+  }
+});
+
+test('review command gates stamp child processes with review-gate context env', () => {
+  const repoRoot = createRepo();
+  const realRepoRoot = realpathSync(repoRoot);
+  try {
+    const script = [
+      "const assert = require('node:assert/strict');",
+      "assert.equal(process.env.PIPELANE_REVIEW_GATE_DEPTH, '1');",
+      "assert.match(process.env.PIPELANE_REVIEW_GATE_PARENT_PID || '', /^\\d+$/);",
+      `assert.equal(process.env.PIPELANE_REVIEW_GATE_REPO_ROOT, ${JSON.stringify(realRepoRoot)});`,
+      "assert.equal(process.env.PIPELANE_REVIEW_GATE_ID, 'typecheck');",
+      "assert.match(process.env.PIPELANE_REVIEW_GATE_RUN_ID || '', /^review-/);",
+      "console.log('context stamped');",
+    ].join('');
+    writeSingleCommandReviewGate(repoRoot, {
+      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+    });
+
+    const report = JSON.parse(runCli(['run', 'review', '--phase', 'static', '--json'], repoRoot).stdout);
+
+    assert.equal(report.status, 'passed');
+    assert.match(report.gates[0].stdoutTail, /context stamped/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review command gate dry-run creates no command-gate lock', () => {
+  const repoRoot = createRepo();
+  try {
+    writeSingleCommandReviewGate(repoRoot, {
+      command: `${JSON.stringify(process.execPath)} -e "process.exit(9)"`,
+    });
+
+    const report = JSON.parse(runCli(['run', 'review', '--phase', 'static', '--dry-run', '--json'], repoRoot).stdout);
+
+    assert.equal(report.status, 'passed');
+    assert.equal(report.gates[0].status, 'skipped');
+    assert.deepEqual(listReviewCommandGateLocks(repoRoot), []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review command gate acquires and releases the worktree command-gate lock', () => {
+  const repoRoot = createRepo();
+  try {
+    const script = [
+      "const fs = require('node:fs');",
+      "const path = require('node:path');",
+      "const cp = require('node:child_process');",
+      "const common = cp.execFileSync('git', ['rev-parse', '--git-common-dir'], { encoding: 'utf8' }).trim();",
+      "const root = path.resolve(process.cwd(), common, 'pipelane-state', 'review-gates', 'command-gate-locks');",
+      "const locks = fs.existsSync(root) ? fs.readdirSync(root).filter((entry) => entry.endsWith('.lock')) : [];",
+      "if (locks.length !== 1) { console.error(`locks=${locks.length}`); process.exit(8); }",
+      "console.log('lock seen');",
+    ].join('');
+    writeSingleCommandReviewGate(repoRoot, {
+      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+    });
+
+    const report = JSON.parse(runCli(['run', 'review', '--phase', 'static', '--json'], repoRoot).stdout);
+
+    assert.equal(report.status, 'passed');
+    assert.match(report.gates[0].stdoutTail, /lock seen/);
+    assert.deepEqual(listReviewCommandGateLocks(repoRoot), []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review command gate waits for an external live lock and runs after release', async () => {
+  const repoRoot = createRepo();
+  const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-marker-'));
+  const markerPath = path.join(markerRoot, 'wait-release-ran.txt');
+  try {
+    writeSingleCommandReviewGate(repoRoot, {
+      timeoutMs: 2000,
+      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, 'ran')`)}`,
+    });
+    const lockPath = writeReviewCommandGateLock(repoRoot, {
+      leaseExpiresAt: new Date(Date.now() + 5000).toISOString(),
+    });
+
+    const startedAt = Date.now();
+    const reviewPromise = runCliAsync(['run', 'review', '--phase', 'static', '--json'], repoRoot);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    rmSync(lockPath, { recursive: true, force: true });
+    const result = await reviewPromise;
+    const elapsedMs = Date.now() - startedAt;
+    const report = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0);
+    assert.equal(report.status, 'passed');
+    assert.ok(elapsedMs >= 150, `expected lock wait, got ${elapsedMs}ms`);
+    assert.equal(readFileSync(markerPath, 'utf8'), 'ran');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(markerRoot, { recursive: true, force: true });
+  }
+});
+
+test('review command gate does not reap a live owner after lease expiry', () => {
+  const repoRoot = createRepo();
+  const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-marker-'));
+  const markerPath = path.join(markerRoot, 'lease-expiry-ran.txt');
+  try {
+    writeSingleCommandReviewGate(repoRoot, {
+      timeoutMs: 100,
+      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, 'ran')`)}`,
+    });
+    const lockPath = writeReviewCommandGateLock(repoRoot, {
+      pid: process.pid,
+      acquiredAt: new Date(Date.now() - 1000).toISOString(),
+      leaseExpiresAt: new Date(Date.now() - 200).toISOString(),
+    });
+
+    const result = runCli(['run', 'review', '--phase', 'static', '--json'], repoRoot, {}, true);
+    const report = JSON.parse(result.stdout);
+
+    assert.notEqual(result.status, 0);
+    assert.equal(report.status, 'failed');
+    assert.equal(report.gates[0].errorCode, 'EREVIEWGATELOCKTIMEOUT');
+    assert.equal(existsSync(markerPath), false);
+    assert.equal(existsSync(lockPath), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(markerRoot, { recursive: true, force: true });
+  }
+});
+
+test('review command gate lock timeout returns a failed gate record with owner details', () => {
+  const repoRoot = createRepo();
+  const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-marker-'));
+  const markerPath = path.join(markerRoot, 'timeout-ran.txt');
+  try {
+    writeSingleCommandReviewGate(repoRoot, {
+      timeoutMs: 100,
+      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, 'ran')`)}`,
+    });
+    const lockPath = writeReviewCommandGateLock(repoRoot, {
+      pid: process.pid,
+      gateId: 'external-owner',
+      repoRoot,
+      leaseExpiresAt: new Date(Date.now() + 5000).toISOString(),
+    });
+
+    const result = runCli(['run', 'review', '--phase', 'static', '--json'], repoRoot, {}, true);
+    const report = JSON.parse(result.stdout);
+    const gate = report.gates[0];
+
+    assert.notEqual(result.status, 0);
+    assert.equal(report.status, 'failed');
+    assert.equal(gate.status, 'failed');
+    assert.equal(gate.errorCode, 'EREVIEWGATELOCKTIMEOUT');
+    assert.equal(gate.exitCode, null);
+    assert.match(gate.summary, /Owner pid/);
+    assert.match(gate.summary, /external-owner/);
+    assert.match(gate.summary, /review-external-lock/);
+    assert.match(gate.summary, new RegExp(lockPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.equal(existsSync(markerPath), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(markerRoot, { recursive: true, force: true });
+  }
+});
+
+test('review command gate reaps a dead owner after crash grace', () => {
+  const repoRoot = createRepo();
+  const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-marker-'));
+  const markerPath = path.join(markerRoot, 'dead-owner-ran.txt');
+  try {
+    writeSingleCommandReviewGate(repoRoot, {
+      timeoutMs: 2000,
+      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, 'ran')`)}`,
+    });
+    writeReviewCommandGateLock(repoRoot, {
+      pid: 99999999,
+      acquiredAt: new Date(Date.now() - 1000).toISOString(),
+      leaseExpiresAt: new Date(Date.now() + 5000).toISOString(),
+    });
+
+    const report = JSON.parse(runCli(['run', 'review', '--phase', 'static', '--json'], repoRoot).stdout);
+
+    assert.equal(report.status, 'passed');
+    assert.equal(readFileSync(markerPath, 'utf8'), 'ran');
+    assert.deepEqual(listReviewCommandGateLocks(repoRoot), []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(markerRoot, { recursive: true, force: true });
+  }
+});
+
+test('review command gate lock key is shared by symlinked and real worktree paths', () => {
+  const repoRoot = createRepo();
+  const linkRoot = `${repoRoot}-link`;
+  try {
+    symlinkSync(repoRoot, linkRoot, 'dir');
+    assert.equal(path.basename(reviewCommandGateLockPath(repoRoot)), path.basename(reviewCommandGateLockPath(linkRoot)));
+    writeSingleCommandReviewGate(repoRoot, {
+      timeoutMs: 100,
+      command: `${JSON.stringify(process.execPath)} -e "process.exit(0)"`,
+    });
+    writeReviewCommandGateLock(repoRoot, {
+      pid: process.pid,
+      gateId: 'realpath-owner',
+      leaseExpiresAt: new Date(Date.now() + 5000).toISOString(),
+    });
+    assert.equal(realpathSync(reviewCommandGateLocksRoot(repoRoot)), realpathSync(reviewCommandGateLocksRoot(linkRoot)));
+
+    const result = runCli(['run', 'review', '--phase', 'static', '--json'], linkRoot, {}, true);
+    const report = JSON.parse(result.stdout);
+
+    assert.notEqual(result.status, 0);
+    assert.equal(report.gates[0].errorCode, 'EREVIEWGATELOCKTIMEOUT');
+    assert.match(report.gates[0].summary, /realpath-owner/);
+  } finally {
+    rmSync(linkRoot, { force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('review runner supports gate dry-run filtering', () => {
   const repoRoot = createRepo();
   try {
@@ -16150,6 +16727,44 @@ function inferSmokeExitCode(checks) {
 
 function resolveCommonDir(repoRoot) {
   return path.resolve(repoRoot, run('git', ['rev-parse', '--git-common-dir'], repoRoot));
+}
+
+function reviewCommandGateLocksRoot(repoRoot) {
+  return path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'review-gates', 'command-gate-locks');
+}
+
+function reviewCommandGateLockPath(repoRoot) {
+  const realRepoRoot = path.resolve(realpathSync(repoRoot));
+  const key = createHash('sha256').update(realRepoRoot).digest('hex');
+  return path.join(reviewCommandGateLocksRoot(repoRoot), `${key}.lock`);
+}
+
+function writeReviewCommandGateLock(repoRoot, owner = {}) {
+  const lockPath = reviewCommandGateLockPath(repoRoot);
+  const realRepoRoot = path.resolve(realpathSync(repoRoot));
+  mkdirSync(lockPath, { recursive: true });
+  writeFileSync(path.join(lockPath, 'owner.json'), `${JSON.stringify({
+    ownerId: 'external-owner',
+    pid: process.pid,
+    ppid: process.ppid,
+    repoRoot,
+    realRepoRoot,
+    gateId: 'external-lock',
+    command: 'external command',
+    runId: 'review-external-lock',
+    acquiredAt: new Date().toISOString(),
+    timeoutMs: 30_000,
+    leaseExpiresAt: new Date(Date.now() + 30_000).toISOString(),
+    depth: 1,
+    ...owner,
+  }, null, 2)}\n`, 'utf8');
+  return lockPath;
+}
+
+function listReviewCommandGateLocks(repoRoot) {
+  const root = reviewCommandGateLocksRoot(repoRoot);
+  if (!existsSync(root)) return [];
+  return readdirSync(root).filter((entry) => entry.endsWith('.lock'));
 }
 
 function orchestrationRunsRoot(repoRoot) {

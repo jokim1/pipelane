@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
-import { accessSync, chmodSync, constants, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { accessSync, chmodSync, constants, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline/promises';
@@ -26,14 +26,17 @@ import { DEPLOY_STATE_KEY_ENV, ORCHESTRATION_STATE_KEY_ENV, PROBE_STATE_KEY_ENV,
 import {
   appendReviewRunRecord,
   loadReviewState,
+  normalizePath,
   nowIso,
   patchReadableWorkflowConfig,
   printResult,
   REVIEW_GATE_PHASES,
+  resolveStateDir,
   resolveReadableConfigPath,
   reviewStatePath,
   resolveWorkflowContext,
   runGit,
+  writeJsonFile,
   type ParsedOperatorArgs,
   type ReviewGateConfig,
   type ReviewGatePhase,
@@ -63,6 +66,28 @@ const REVIEW_GATE_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 const REVIEW_GATE_CAPTURE_HELPER_MAX_BUFFER_BYTES = REVIEW_GATE_CAPTURE_TAIL_BYTES * 6;
 const REVIEW_GATE_RESULT_MARKER = 'PIPELANE_REVIEW_GATE_RESULT';
 const REVIEW_GATE_SESSION_ENV = 'PIPELANE_REVIEW_GATE_SESSION_ID';
+const REVIEW_GATE_DEPTH_ENV = 'PIPELANE_REVIEW_GATE_DEPTH';
+const REVIEW_GATE_PARENT_PID_ENV = 'PIPELANE_REVIEW_GATE_PARENT_PID';
+const REVIEW_GATE_REPO_ROOT_ENV = 'PIPELANE_REVIEW_GATE_REPO_ROOT';
+const REVIEW_GATE_ID_ENV = 'PIPELANE_REVIEW_GATE_ID';
+const REVIEW_GATE_RUN_ID_ENV = 'PIPELANE_REVIEW_GATE_RUN_ID';
+const REVIEW_GATE_CONTEXT_ENV_KEYS = [
+  REVIEW_GATE_DEPTH_ENV,
+  REVIEW_GATE_PARENT_PID_ENV,
+  REVIEW_GATE_REPO_ROOT_ENV,
+  REVIEW_GATE_ID_ENV,
+  REVIEW_GATE_RUN_ID_ENV,
+] as const;
+const UNSAFE_ALLOW_NESTED_REVIEW_GATES_ENV = 'PIPELANE_UNSAFE_ALLOW_NESTED_REVIEW_GATES';
+const NESTED_REVIEW_GATE_ERROR_CODE = 'ENESTEDREVIEWGATE';
+const REVIEW_GATE_LOCK_TIMEOUT_ERROR_CODE = 'EREVIEWGATELOCKTIMEOUT';
+const REVIEW_GATE_LOCK_ERROR_CODE = 'EREVIEWGATELOCK';
+const REVIEW_GATE_COMMAND_LOCK_DIRNAME = 'review-gates';
+const REVIEW_GATE_COMMAND_LOCKS_DIRNAME = 'command-gate-locks';
+const REVIEW_GATE_COMMAND_LOCK_RETRY_MS = 50;
+const REVIEW_GATE_COMMAND_LOCK_GRACE_MS = 250;
+const REVIEW_GATE_COMMAND_LOCK_RELEASE_GRACE_MS = 100;
+const REVIEW_GATE_COMMAND_LOCK_CRASH_GRACE_MS = 150;
 const AI_REVIEW_GATE_SCRUBBED_SESSION_ENV_KEYS = [
   'PIPELANE_AUTHOR_SESSION_ID',
   'PIPELANE_WORKER_SESSION_ID',
@@ -220,6 +245,8 @@ interface ReviewAttestReport {
 
 export interface BuildReviewRunRecordOptions {
   repoRoot: string;
+  commonDir?: string;
+  config?: WorkflowConfig;
   baseBranch: string;
   gates: ReviewGateConfig[];
   dryRun: boolean;
@@ -2166,6 +2193,8 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
 
   const record = buildReviewRunRecord({
     repoRoot: context.repoRoot,
+    commonDir: context.commonDir,
+    config: context.config,
     baseBranch: context.config.baseBranch,
     gates: context.config.reviewGates?.gates ?? [],
     dryRun,
@@ -2203,6 +2232,9 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
 }
 
 export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): ReviewRunRecord {
+  const stateContext = options.commonDir && options.config
+    ? { commonDir: options.commonDir, config: options.config }
+    : resolveWorkflowContext(options.repoRoot);
   const phaseFilter = options.phaseFilter ?? '';
   const gateFilter = options.gateFilter?.trim() ?? '';
   const changedFiles = collectChangedFiles(options.repoRoot, options.baseBranch);
@@ -2227,6 +2259,7 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
 
   const startedAt = nowIso();
   const runStartMs = Date.now();
+  const runId = `review-${new Date(startedAt).toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto.randomUUID().slice(0, 8)}`;
   // B4 (programmatic-before-judge): evaluate ALL deterministic (command/pipelane)
   // gates before any AI judge (skill/agent), independent of phase authoring order —
   // gate type is not bound to phase, so a blocking command gate authored in a phase
@@ -2241,9 +2274,12 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
     options.onGateStart?.(gate);
     const record = gate.id === REVIEW_CONFIG_CHANGE_GATE_ID && reviewConfigChangeApproval
       ? approvedReviewConfigChangeGateRecord(gate, reviewConfigChangeApproval)
-      : runReviewGate({
+        : runReviewGate({
           gate,
           repoRoot: options.repoRoot,
+          commonDir: stateContext.commonDir,
+          config: stateContext.config,
+          runId,
           baseBranch: options.baseBranch,
           dryRun: options.dryRun,
           reviewConfigChanged: reviewConfigChangeNeedsApproval,
@@ -2270,7 +2306,7 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
   const status = summarizeRunStatus(gateRecords);
 
   return {
-    id: `review-${new Date(startedAt).toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto.randomUUID().slice(0, 8)}`,
+    id: runId,
     branchName: runGit(options.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '',
     sha: worktreeStatus.head,
     status,
@@ -2313,7 +2349,98 @@ function orderReviewGates(gates: ReviewGateConfig[]): ReviewGateConfig[] {
 // guarantees whose trust boundary is "worker-influenced code does not hold keys". The
 // orchestrator PARENT keeps the key (for signing + attestation via
 // appendReviewRunRecord); only the gate child is scrubbed.
-function gateSubprocessEnv(options: { stripAiReviewOverrides?: boolean } = {}): NodeJS.ProcessEnv {
+type ReviewGateInheritedContext =
+  | { status: 'top-level'; depth: 0 }
+  | { status: 'stale'; depth: 0; parentPid: number }
+  | { status: 'live'; depth: number; parentPid: number; repoRoot: string; gateId: string; runId: string | null }
+  | { status: 'malformed'; summary: string };
+
+interface ReviewCommandGateLockOwner {
+  ownerId?: string;
+  pid: number;
+  ppid: number;
+  repoRoot: string;
+  realRepoRoot: string;
+  gateId: string;
+  command: string;
+  runId: string;
+  acquiredAt: string;
+  timeoutMs: number;
+  leaseExpiresAt: string;
+  depth: number;
+}
+
+type ReviewCommandGateLockResult =
+  | { status: 'acquired'; lockPath: string; owner: ReviewCommandGateLockOwner; release: () => void }
+  | { status: 'bypassed'; reason: string }
+  | { status: 'failed'; errorCode: string; summary: string; lockPath?: string; owner?: ReviewCommandGateLockOwner | null };
+
+function evaluateInheritedReviewGateContext(env: NodeJS.ProcessEnv = process.env): ReviewGateInheritedContext {
+  const rawDepth = env[REVIEW_GATE_DEPTH_ENV]?.trim();
+  if (!rawDepth) return { status: 'top-level', depth: 0 };
+  if (!/^\d+$/.test(rawDepth)) {
+    return { status: 'malformed', summary: `malformed inherited review-gate context: ${REVIEW_GATE_DEPTH_ENV} must be a non-negative integer` };
+  }
+  const depth = Number(rawDepth);
+  if (!Number.isSafeInteger(depth)) {
+    return { status: 'malformed', summary: `malformed inherited review-gate context: ${REVIEW_GATE_DEPTH_ENV} is too large` };
+  }
+  if (depth === 0) return { status: 'top-level', depth: 0 };
+
+  const rawParentPid = env[REVIEW_GATE_PARENT_PID_ENV]?.trim();
+  if (!rawParentPid || !/^\d+$/.test(rawParentPid)) {
+    return { status: 'malformed', summary: `malformed inherited review-gate context: ${REVIEW_GATE_PARENT_PID_ENV} is missing or invalid` };
+  }
+  const parentPid = Number(rawParentPid);
+  if (!Number.isSafeInteger(parentPid) || parentPid <= 0) {
+    return { status: 'malformed', summary: `malformed inherited review-gate context: ${REVIEW_GATE_PARENT_PID_ENV} is missing or invalid` };
+  }
+  if (!processIsAlive(parentPid)) {
+    return { status: 'stale', depth: 0, parentPid };
+  }
+
+  const repoRoot = env[REVIEW_GATE_REPO_ROOT_ENV]?.trim() ?? '';
+  const gateId = env[REVIEW_GATE_ID_ENV]?.trim() ?? '';
+  if (!repoRoot || !path.isAbsolute(repoRoot)) {
+    return { status: 'malformed', summary: `malformed inherited review-gate context: ${REVIEW_GATE_REPO_ROOT_ENV} is missing or invalid` };
+  }
+  if (!gateId) {
+    return { status: 'malformed', summary: `malformed inherited review-gate context: ${REVIEW_GATE_ID_ENV} is missing or invalid` };
+  }
+  const rawRunId = env[REVIEW_GATE_RUN_ID_ENV]?.trim();
+  return { status: 'live', depth, parentPid, repoRoot, gateId, runId: rawRunId || null };
+}
+
+function unsafeNestedReviewGateOverrideEnabled(): boolean {
+  return process.env[UNSAFE_ALLOW_NESTED_REVIEW_GATES_ENV] === '1';
+}
+
+function inheritedReviewGateDepthForChild(context: ReviewGateInheritedContext): number {
+  if (context.status === 'live') return context.depth + 1;
+  return 1;
+}
+
+function nestedReviewGateFailureSummary(context: ReviewGateInheritedContext): string | null {
+  if (context.status === 'malformed') {
+    return `${context.summary}; refusing to spawn executable review gate. Set ${UNSAFE_ALLOW_NESTED_REVIEW_GATES_ENV}=1 only for debugging if nested gates are intentional.`;
+  }
+  if (context.status !== 'live' || unsafeNestedReviewGateOverrideEnabled()) return null;
+  const parentRun = context.runId ? ` run ${context.runId}` : '';
+  return [
+    `nested review gate execution blocked: inherited ${REVIEW_GATE_DEPTH_ENV}=${context.depth} from live parent pid ${context.parentPid}`,
+    `gate ${context.gateId}${parentRun} in ${context.repoRoot}.`,
+    `A review gate attempted to invoke another Pipelane review/orchestrate review executable gate path while already inside a review gate.`,
+    `Set ${UNSAFE_ALLOW_NESTED_REVIEW_GATES_ENV}=1 only for debugging to bypass this fail-closed guard.`,
+  ].join(' ');
+}
+
+function gateSubprocessEnv(options: {
+  stripAiReviewOverrides?: boolean;
+  gate?: Pick<ReviewGateConfig, 'id' | 'type' | 'phase'>;
+  repoRoot?: string;
+  runId?: string;
+  inheritedContext?: ReviewGateInheritedContext;
+} = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   delete env[REVIEW_STATE_KEY_ENV];
   delete env[ORCHESTRATION_STATE_KEY_ENV];
@@ -2322,7 +2449,232 @@ function gateSubprocessEnv(options: { stripAiReviewOverrides?: boolean } = {}): 
   if (options.stripAiReviewOverrides) {
     stripAiReviewOverrideEnv(env);
   }
+  if (options.gate && options.repoRoot) {
+    const inheritedContext = options.inheritedContext ?? evaluateInheritedReviewGateContext();
+    env[REVIEW_GATE_DEPTH_ENV] = String(inheritedReviewGateDepthForChild(inheritedContext));
+    env[REVIEW_GATE_PARENT_PID_ENV] = String(process.pid);
+    env[REVIEW_GATE_REPO_ROOT_ENV] = options.repoRoot;
+    env[REVIEW_GATE_ID_ENV] = options.gate.id;
+    if (options.runId) env[REVIEW_GATE_RUN_ID_ENV] = options.runId;
+    else delete env[REVIEW_GATE_RUN_ID_ENV];
+  }
   return env;
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    return err.code === 'EPERM';
+  }
+}
+
+function sleepSync(ms: number): void {
+  if (ms <= 0) return;
+  const buffer = new SharedArrayBuffer(4);
+  const view = new Int32Array(buffer);
+  Atomics.wait(view, 0, 0, ms);
+}
+
+function reviewCommandGateLocksRoot(commonDir: string, config: WorkflowConfig): string {
+  return path.join(resolveStateDir(commonDir, config), REVIEW_GATE_COMMAND_LOCK_DIRNAME, REVIEW_GATE_COMMAND_LOCKS_DIRNAME);
+}
+
+function reviewCommandGateLockPath(commonDir: string, config: WorkflowConfig, realRepoRoot: string): string {
+  const key = crypto.createHash('sha256').update(normalizePath(realRepoRoot)).digest('hex');
+  return path.join(reviewCommandGateLocksRoot(commonDir, config), `${key}.lock`);
+}
+
+function acquireReviewCommandGateLock(options: {
+  commonDir: string;
+  config: WorkflowConfig;
+  repoRoot: string;
+  gateId: string;
+  command: string;
+  runId: string;
+  timeoutMs: number;
+  depth: number;
+  inheritedContext: ReviewGateInheritedContext;
+}): ReviewCommandGateLockResult {
+  let realRepoRoot: string;
+  try {
+    realRepoRoot = normalizePath(realpathSync(options.repoRoot));
+  } catch (error) {
+    return {
+      status: 'failed',
+      errorCode: REVIEW_GATE_LOCK_ERROR_CODE,
+      summary: `could not canonicalize review gate worktree path ${options.repoRoot}: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+
+  const lockPath = reviewCommandGateLockPath(options.commonDir, options.config, realRepoRoot);
+  const owner: ReviewCommandGateLockOwner = {
+    ownerId: crypto.randomUUID(),
+    pid: process.pid,
+    ppid: process.ppid,
+    repoRoot: options.repoRoot,
+    realRepoRoot,
+    gateId: options.gateId,
+    command: options.command,
+    runId: options.runId,
+    acquiredAt: nowIso(),
+    timeoutMs: options.timeoutMs,
+    leaseExpiresAt: new Date(Date.now() + options.timeoutMs + REVIEW_GATE_COMMAND_LOCK_GRACE_MS).toISOString(),
+    depth: options.depth,
+  };
+  const waitDeadlineMs = Date.now() + options.timeoutMs + REVIEW_GATE_COMMAND_LOCK_GRACE_MS;
+  mkdirSync(path.dirname(lockPath), { recursive: true });
+
+  while (true) {
+    let created = false;
+    try {
+      mkdirSync(lockPath);
+      created = true;
+      writeJsonFile(path.join(lockPath, 'owner.json'), owner);
+      return {
+        status: 'acquired',
+        lockPath,
+        owner,
+        release: () => releaseReviewCommandGateLock(lockPath, owner),
+      };
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (created) rmSync(lockPath, { recursive: true, force: true });
+      if (err.code !== 'EEXIST') {
+        return {
+          status: 'failed',
+          errorCode: REVIEW_GATE_LOCK_ERROR_CODE,
+          summary: `could not acquire review command-gate lock at ${lockPath}: ${err.message}`,
+          lockPath,
+        };
+      }
+    }
+
+    const now = Date.now();
+    const currentOwner = readReviewCommandGateLockOwner(lockPath);
+    if (options.inheritedContext.status === 'live' && unsafeNestedReviewGateOverrideEnabled() && currentOwner?.pid === options.inheritedContext.parentPid) {
+      return {
+        status: 'bypassed',
+        reason: `${UNSAFE_ALLOW_NESTED_REVIEW_GATES_ENV}=1 bypassed nested parent command-gate lock at ${lockPath}`,
+      };
+    }
+    if (reviewCommandGateLockIsReapable(lockPath, currentOwner, now)) {
+      try {
+        rmSync(lockPath, { recursive: true, force: true });
+      } catch {
+        return {
+          status: 'failed',
+          errorCode: REVIEW_GATE_LOCK_TIMEOUT_ERROR_CODE,
+          summary: reviewCommandGateLockTimeoutSummary(lockPath, currentOwner),
+          lockPath,
+          owner: currentOwner,
+        };
+      }
+      continue;
+    }
+
+    const ownerWaitUntilMs = currentOwner
+      ? Date.parse(currentOwner.leaseExpiresAt) + REVIEW_GATE_COMMAND_LOCK_RELEASE_GRACE_MS
+      : statMtimeMs(lockPath) + REVIEW_GATE_COMMAND_LOCK_CRASH_GRACE_MS;
+    const waitUntilMs = Math.min(ownerWaitUntilMs, waitDeadlineMs);
+    if (now >= waitUntilMs) {
+      return {
+        status: 'failed',
+        errorCode: REVIEW_GATE_LOCK_TIMEOUT_ERROR_CODE,
+        summary: reviewCommandGateLockTimeoutSummary(lockPath, currentOwner),
+        lockPath,
+        owner: currentOwner,
+      };
+    }
+    sleepSync(Math.min(REVIEW_GATE_COMMAND_LOCK_RETRY_MS, Math.max(1, waitUntilMs - now)));
+  }
+}
+
+function reviewCommandGateLockIsReapable(
+  lockPath: string,
+  owner: ReviewCommandGateLockOwner | null,
+  nowMs: number,
+): boolean {
+  if (!owner) {
+    return nowMs - statMtimeMs(lockPath) >= REVIEW_GATE_COMMAND_LOCK_CRASH_GRACE_MS;
+  }
+  const leaseExpiresAtMs = Date.parse(owner.leaseExpiresAt);
+  if (Number.isFinite(leaseExpiresAtMs) && nowMs >= leaseExpiresAtMs && !processIsAlive(owner.pid)) return true;
+  const acquiredAtMs = Date.parse(owner.acquiredAt);
+  const oldEnoughForCrashReap = Number.isFinite(acquiredAtMs)
+    ? nowMs - acquiredAtMs >= REVIEW_GATE_COMMAND_LOCK_CRASH_GRACE_MS
+    : nowMs - statMtimeMs(lockPath) >= REVIEW_GATE_COMMAND_LOCK_CRASH_GRACE_MS;
+  return oldEnoughForCrashReap && !processIsAlive(owner.pid);
+}
+
+function releaseReviewCommandGateLock(lockPath: string, owner: ReviewCommandGateLockOwner): void {
+  const currentOwner = readReviewCommandGateLockOwner(lockPath);
+  if (!currentOwner || !reviewCommandGateLockOwnerMatches(currentOwner, owner)) return;
+  rmSync(lockPath, { recursive: true, force: true });
+}
+
+function reviewCommandGateLockOwnerMatches(left: ReviewCommandGateLockOwner, right: ReviewCommandGateLockOwner): boolean {
+  if (left.ownerId || right.ownerId) {
+    return Boolean(left.ownerId && right.ownerId && left.ownerId === right.ownerId);
+  }
+  return left.pid === right.pid
+    && left.ppid === right.ppid
+    && left.runId === right.runId
+    && left.gateId === right.gateId
+    && left.realRepoRoot === right.realRepoRoot
+    && left.acquiredAt === right.acquiredAt;
+}
+
+function statMtimeMs(targetPath: string): number {
+  try {
+    return statSync(targetPath).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+function readReviewCommandGateLockOwner(lockPath: string): ReviewCommandGateLockOwner | null {
+  try {
+    const raw = JSON.parse(readFileSync(path.join(lockPath, 'owner.json'), 'utf8')) as Partial<ReviewCommandGateLockOwner>;
+    if (
+      (raw.ownerId === undefined || typeof raw.ownerId === 'string')
+      && Number.isSafeInteger(raw.pid)
+      && typeof raw.pid === 'number'
+      && raw.pid > 0
+      && Number.isSafeInteger(raw.ppid)
+      && typeof raw.ppid === 'number'
+      && raw.ppid >= 0
+      && typeof raw.repoRoot === 'string'
+      && typeof raw.realRepoRoot === 'string'
+      && typeof raw.gateId === 'string'
+      && typeof raw.command === 'string'
+      && typeof raw.runId === 'string'
+      && typeof raw.acquiredAt === 'string'
+      && Number.isFinite(Date.parse(raw.acquiredAt))
+      && typeof raw.timeoutMs === 'number'
+      && Number.isFinite(raw.timeoutMs)
+      && raw.timeoutMs >= 0
+      && typeof raw.leaseExpiresAt === 'string'
+      && Number.isFinite(Date.parse(raw.leaseExpiresAt))
+      && typeof raw.depth === 'number'
+      && Number.isFinite(raw.depth)
+    ) {
+      return raw as ReviewCommandGateLockOwner;
+    }
+  } catch {}
+  return null;
+}
+
+function reviewCommandGateLockTimeoutSummary(lockPath: string, owner: ReviewCommandGateLockOwner | null): string {
+  if (!owner) {
+    return `timed out waiting for review command-gate lock at ${lockPath}; owner details were missing or malformed`;
+  }
+  return [
+    `timed out waiting for review command-gate lock at ${lockPath}.`,
+    `Owner pid ${owner.pid}, gate ${owner.gateId}, run ${owner.runId}, repo ${owner.repoRoot}, lease expires ${owner.leaseExpiresAt}.`,
+  ].join(' ');
 }
 
 function stripAiReviewOverrideEnv(env: NodeJS.ProcessEnv): void {
@@ -2606,6 +2958,9 @@ function escapeRegExp(value) {
 function runReviewGate(options: {
   gate: ReviewGateConfig;
   repoRoot: string;
+  commonDir: string;
+  config: WorkflowConfig;
+  runId: string;
   baseBranch: string;
   dryRun: boolean;
   reviewConfigChanged: boolean;
@@ -2615,7 +2970,7 @@ function runReviewGate(options: {
   // expensive AI judge to `pending` instead of invoking it.
   deferAiGate?: boolean;
 }): ReviewGateRunRecord {
-  const { gate, repoRoot, baseBranch, dryRun, reviewConfigChanged, changedFiles, activeSurfaces } = options;
+  const { gate, repoRoot, commonDir, config, runId, baseBranch, dryRun, reviewConfigChanged, changedFiles, activeSurfaces } = options;
   const startedAt = nowIso();
   const startMs = Date.now();
   const base: Omit<ReviewGateRunRecord, 'status' | 'summary' | 'finishedAt' | 'durationMs'> = {
@@ -2654,6 +3009,9 @@ function runReviewGate(options: {
       startMs,
       gate,
       repoRoot,
+      commonDir,
+      config,
+      runId,
       baseBranch,
       dryRun,
       reviewConfigChanged,
@@ -2693,17 +3051,59 @@ function runReviewGate(options: {
   }
 
   const timeoutMs = gate.timeoutMs ?? DEFAULT_GATE_TIMEOUT_MS;
-  const beforeStatus = readWorktreeStatusSnapshot(repoRoot, { includeStatusDigest: true });
-  const { result, stdout, stderr } = spawnReviewGateCommand(gate.command, {
-    cwd: repoRoot,
-    timeout: timeoutMs,
-    env: gateSubprocessEnv({ stripAiReviewOverrides: true }),
+  const inheritedContext = evaluateInheritedReviewGateContext();
+  const nestedFailure = nestedReviewGateFailureSummary(inheritedContext);
+  if (nestedFailure) {
+    return finishGate(base, startMs, {
+      status: 'failed',
+      summary: nestedFailure,
+      exitCode: null,
+      errorCode: NESTED_REVIEW_GATE_ERROR_CODE,
+    });
+  }
+  const childDepth = inheritedReviewGateDepthForChild(inheritedContext);
+  const lock = acquireReviewCommandGateLock({
+    commonDir,
+    config,
+    repoRoot,
+    gateId: gate.id,
+    command: gate.command,
+    runId,
+    timeoutMs,
+    depth: childDepth,
+    inheritedContext,
   });
+  if (lock.status === 'failed') {
+    return finishGate(base, startMs, {
+      status: 'failed',
+      summary: lock.summary,
+      exitCode: null,
+      errorCode: lock.errorCode,
+    });
+  }
+  let beforeStatus: WorktreeStatusSnapshot;
+  let afterStatus: WorktreeStatusSnapshot;
+  let commandResult: ReturnType<typeof spawnReviewGateCommand>;
+  try {
+    beforeStatus = readWorktreeStatusSnapshot(repoRoot, { includeStatusDigest: true });
+    commandResult = spawnReviewGateCommand(gate.command, {
+      cwd: repoRoot,
+      timeout: timeoutMs,
+      env: gateSubprocessEnv({ stripAiReviewOverrides: true, gate, repoRoot, runId, inheritedContext }),
+    });
+    afterStatus = readWorktreeStatusSnapshot(repoRoot, { includeStatusDigest: true });
+  } finally {
+    if (lock.status === 'acquired') {
+      try {
+        lock.release();
+      } catch {}
+    }
+  }
+  const { result, stdout, stderr } = commandResult;
   const exitCode = typeof result.status === 'number' ? result.status : null;
   const timedOut = result.error && (result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT';
   const outputLimited = result.error && (result.error as NodeJS.ErrnoException).code === 'EOUTPUTLIMIT';
   const ok = exitCode === 0 && !timedOut && !result.error;
-  const afterStatus = readWorktreeStatusSnapshot(repoRoot, { includeStatusDigest: true });
   const checkoutMutationSummary = reviewGateCheckoutMutationSummary('Review command gate', beforeStatus, afterStatus);
   const errorSummary = result.error && !timedOut
     ? outputLimited
@@ -2719,6 +3119,7 @@ function runReviewGate(options: {
       ? `command passed: ${gate.command}`
       : checkoutMutationSummary ?? errorSummary,
     exitCode,
+    errorCode: result.error ? (result.error as NodeJS.ErrnoException).code ?? null : undefined,
     stdoutTail: tail(redactReviewOutput(stdout)),
     stderrTail: tail(redactReviewOutput(stderr)),
   });
@@ -2729,12 +3130,15 @@ function runAiReviewGate(options: {
   startMs: number;
   gate: ReviewGateConfig;
   repoRoot: string;
+  commonDir: string;
+  config: WorkflowConfig;
+  runId: string;
   baseBranch: string;
   dryRun: boolean;
   reviewConfigChanged: boolean;
   changedFiles: string[];
 }): ReviewGateRunRecord {
-  const { base, startMs, gate, repoRoot, baseBranch, dryRun, reviewConfigChanged, changedFiles } = options;
+  const { base, startMs, gate, repoRoot, commonDir, config, runId, baseBranch, dryRun, reviewConfigChanged, changedFiles } = options;
   const resolved = resolveAiReviewGateCommand(gate);
   if (!resolved) {
     return finishGate(base, startMs, {
@@ -2762,20 +3166,67 @@ function runAiReviewGate(options: {
 
   const timeoutMs = gate.timeoutMs ?? DEFAULT_GATE_TIMEOUT_MS;
   const sessionId = `review-gate:${gate.id}:${crypto.randomUUID()}`;
-  const env = buildAiReviewGateEnv(resolved.provider, sessionId, gate);
+  const inheritedContext = evaluateInheritedReviewGateContext();
+  const nestedFailure = nestedReviewGateFailureSummary(inheritedContext);
+  if (nestedFailure) {
+    return finishGate({ ...base, command }, startMs, {
+      status: 'failed',
+      summary: nestedFailure,
+      exitCode: null,
+      errorCode: NESTED_REVIEW_GATE_ERROR_CODE,
+    });
+  }
+  const childDepth = inheritedReviewGateDepthForChild(inheritedContext);
+  const lock = acquireReviewCommandGateLock({
+    commonDir,
+    config,
+    repoRoot,
+    gateId: gate.id,
+    command,
+    runId,
+    timeoutMs,
+    depth: childDepth,
+    inheritedContext,
+  });
+  if (lock.status === 'failed') {
+    return finishGate({ ...base, command }, startMs, {
+      status: 'failed',
+      summary: lock.summary,
+      exitCode: null,
+      errorCode: lock.errorCode,
+    });
+  }
+  const env = buildAiReviewGateEnv(resolved.provider, sessionId, gate, {
+    repoRoot,
+    runId,
+    inheritedContext,
+  });
   const prompt = renderAiReviewGatePrompt({
     gate,
     repoRoot,
     baseBranch,
     changedFiles,
   });
-  const beforeStatus = readWorktreeStatusSnapshot(repoRoot, { includeStatusDigest: true });
-  const { result, stdout, stderr, aiReviewGateResult } = spawnReviewGateCommand(command, {
-    cwd: repoRoot,
-    input: prompt,
-    timeout: timeoutMs,
-    env,
-  });
+  let beforeStatus: WorktreeStatusSnapshot;
+  let afterStatus: WorktreeStatusSnapshot;
+  let commandResult: ReturnType<typeof spawnReviewGateCommand>;
+  try {
+    beforeStatus = readWorktreeStatusSnapshot(repoRoot, { includeStatusDigest: true });
+    commandResult = spawnReviewGateCommand(command, {
+      cwd: repoRoot,
+      input: prompt,
+      timeout: timeoutMs,
+      env,
+    });
+    afterStatus = readWorktreeStatusSnapshot(repoRoot, { includeStatusDigest: true });
+  } finally {
+    if (lock.status === 'acquired') {
+      try {
+        lock.release();
+      } catch {}
+    }
+  }
+  const { result, stdout, stderr, aiReviewGateResult } = commandResult;
   const exitCode = typeof result.status === 'number' ? result.status : null;
   const declared = aiReviewGateResult;
   const timedOut = result.error && (result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT';
@@ -2783,7 +3234,6 @@ function runAiReviewGate(options: {
   const attester = resolveReviewActorIdentity({ provider: resolved.provider, env });
   const redactedStdout = tail(redactReviewOutput(stdout));
   const redactedStderr = tail(redactReviewOutput(stderr));
-  const afterStatus = readWorktreeStatusSnapshot(repoRoot, { includeStatusDigest: true });
   const worktreeMutationSummary = reviewGateCheckoutMutationSummary('AI review command', beforeStatus, afterStatus);
 
   if (result.error && !timedOut) {
@@ -2965,8 +3415,22 @@ function normalizeReviewProvider(value: string): string {
     .slice(0, 96) || 'unknown';
 }
 
-function buildAiReviewGateEnv(provider: string, sessionId: string, gate: ReviewGateConfig): NodeJS.ProcessEnv {
-  const env = gateSubprocessEnv();
+function buildAiReviewGateEnv(
+  provider: string,
+  sessionId: string,
+  gate: ReviewGateConfig,
+  options: {
+    repoRoot: string;
+    runId: string;
+    inheritedContext: ReviewGateInheritedContext;
+  },
+): NodeJS.ProcessEnv {
+  const env = gateSubprocessEnv({
+    gate,
+    repoRoot: options.repoRoot,
+    runId: options.runId,
+    inheritedContext: options.inheritedContext,
+  });
   for (const key of AI_REVIEW_GATE_SCRUBBED_SESSION_ENV_KEYS) {
     delete env[key];
   }
