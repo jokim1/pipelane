@@ -104,6 +104,11 @@ export interface SmokeConfig {
 export type ReviewPlanGatePhase = 'plan';
 export type ReviewGatePhase = 'static' | 'behavioral' | 'ai-diff' | 'instruction' | 'runtime' | 'human';
 export type ReviewGateType = 'command' | 'skill' | 'agent' | 'approval' | 'pipelane';
+export type ReviewProfile = 'docs-only' | 'implementation';
+
+export function isStableEvidenceId(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(value);
+}
 
 export interface ReviewPlanGateConfig {
   id: string;
@@ -127,6 +132,9 @@ export interface ReviewGateConfig {
   whenChanged?: string[];
   timeoutMs?: number;
   userCommands?: string[];
+  profiles?: ReviewProfile[];
+  baselineCommandId?: string;
+  replacesBaselineCommandId?: string;
 }
 
 export interface ReviewGatesConfig {
@@ -143,6 +151,7 @@ export type GoalProvider = (typeof GOAL_PROVIDERS)[number];
 export const DEFAULT_GOAL_PROVIDER: GoalProvider = 'codex';
 
 export interface OrchestrateConfig {
+  baseBranch?: string;
   maxConcurrentSlices?: number;
   goalMode?: {
     default?: OrchestrateGoalConfirmationMode;
@@ -390,7 +399,9 @@ export interface ReviewGateRunRecord {
   userCommands?: string[];
   summary: string;
   exitCode?: number | null;
+  signal?: string | null;
   errorCode?: string | null;
+  errorMessage?: string | null;
   durationMs: number;
   startedAt: string;
   finishedAt: string;
@@ -778,6 +789,9 @@ export interface OperatorFlags {
   orchestrationAnalysisFile: string;
   orchestrationDrafts: string;
   scopeThrough: string;
+  orchestrationBaseBranch: string;
+  orchestrationAbandon: boolean;
+  orchestrationPurgeWorktrees: boolean;
   orchestrationResealUnsigned: boolean;
   orchestrationTrustsLocalState: boolean;
   oneMoreLoop: boolean;
@@ -1364,7 +1378,9 @@ function normalizeOrchestrateConfig(raw: OrchestrateConfig | undefined): Orchest
 
   const goalMode = isRecord(raw.goalMode) ? raw.goalMode : undefined;
   const hardStops = isRecord(raw.hardStops) ? raw.hardStops : undefined;
+  const baseBranch = cleanString(raw.baseBranch);
   return {
+    ...(baseBranch ? { baseBranch } : {}),
     maxConcurrentSlices: positiveConfigInteger(raw.maxConcurrentSlices),
     goalMode: goalMode
       ? {
@@ -1495,6 +1511,9 @@ function normalizeReviewGateList(raw: unknown[]): ReviewGateConfig[] {
       whenChanged: cleanStringList(entry.whenChanged),
       timeoutMs,
       userCommands: cleanStringList(entry.userCommands),
+      profiles: cleanReviewProfiles(entry.profiles),
+      baselineCommandId: cleanStableId(entry.baselineCommandId),
+      replacesBaselineCommandId: cleanStableId(entry.replacesBaselineCommandId),
     });
   }
   return out;
@@ -1522,6 +1541,23 @@ function cleanStringList(value: unknown): string[] | undefined {
     if (cleaned && !out.includes(cleaned)) out.push(cleaned);
   }
   return out.length > 0 ? out : undefined;
+}
+
+function cleanReviewProfiles(value: unknown): ReviewProfile[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: ReviewProfile[] = [];
+  for (const entry of value) {
+    if ((entry === 'docs-only' || entry === 'implementation') && !out.includes(entry)) {
+      out.push(entry);
+    }
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+function cleanStableId(value: unknown): string | undefined {
+  const clean = cleanString(value);
+  if (!isStableEvidenceId(clean)) return undefined;
+  return clean;
 }
 
 function normalizeSmokeConfig(raw: SmokeConfig | undefined): SmokeConfig | undefined {
@@ -2804,7 +2840,9 @@ function isReviewGateRunRecord(value: unknown): value is ReviewGateRunRecord {
     )
     && typeof raw.summary === 'string'
     && (raw.exitCode === undefined || raw.exitCode === null || typeof raw.exitCode === 'number')
+    && (raw.signal === undefined || raw.signal === null || typeof raw.signal === 'string')
     && (raw.errorCode === undefined || raw.errorCode === null || typeof raw.errorCode === 'string')
+    && (raw.errorMessage === undefined || raw.errorMessage === null || typeof raw.errorMessage === 'string')
     && typeof raw.durationMs === 'number'
     && typeof raw.startedAt === 'string'
     && typeof raw.finishedAt === 'string'
@@ -3090,6 +3128,9 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     orchestrationAnalysisFile: '',
     orchestrationDrafts: '',
     scopeThrough: '',
+    orchestrationBaseBranch: '',
+    orchestrationAbandon: false,
+    orchestrationPurgeWorktrees: false,
     orchestrationResealUnsigned: false,
     orchestrationTrustsLocalState: false,
     oneMoreLoop: false,
@@ -3576,6 +3617,20 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       flags.scopeThrough = readFlagValue('--through').trim();
       continue;
     }
+    if (flagName === '--base-branch') {
+      flags.orchestrationBaseBranch = readFlagValue('--base-branch').trim();
+      continue;
+    }
+    if (flagName === '--abandon') {
+      rejectInlineValue('--abandon');
+      flags.orchestrationAbandon = true;
+      continue;
+    }
+    if (flagName === '--purge-worktrees') {
+      rejectInlineValue('--purge-worktrees');
+      flags.orchestrationPurgeWorktrees = true;
+      continue;
+    }
     if (flagName === '--reseal-unsigned') {
       rejectInlineValue('--reseal-unsigned');
       flags.orchestrationResealUnsigned = true;
@@ -3890,6 +3945,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
           'goalSlicesFile',
           'orchestrationAnalysisFile',
           'orchestrationDrafts',
+          'orchestrationBaseBranch',
         ]);
         if (parsed.positional.length > (subcommand === 'run' ? 1 : 0)) {
           throw new Error('orchestrate requires: pipelane run orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes] [--analysis-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>], or pipelane run orchestrate <goal-spec|plan|analyze|prepare|dispatch|start|review|plan-review|scope|outline|finalize|upgrade-ledger> ...');
@@ -3923,6 +3979,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
             ['--slices-file', parsed.flags.goalSlicesFile],
             ['--analysis-file', parsed.flags.orchestrationAnalysisFile],
             ['--drafts', parsed.flags.orchestrationDrafts],
+            ['--base-branch', parsed.flags.orchestrationBaseBranch],
           ].filter(([, value]) => value.trim()).map(([flag]) => flag);
           if (parsed.flags.offline) newRunFlags.push('--offline');
           if (parsed.flags.plan) newRunFlags.push('--plan');
@@ -4007,7 +4064,9 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
           ? ['orchestrationRunId', 'scopeThrough']
           : subcommand === 'upgrade-ledger'
             ? ['orchestrationRunId', 'orchestrationResealUnsigned', 'reason', 'orchestrationTrustsLocalState']
-            : ['orchestrationRunId']);
+            : subcommand === 'finalize'
+              ? ['orchestrationRunId', 'orchestrationAbandon', 'orchestrationPurgeWorktrees', 'reason']
+              : ['orchestrationRunId']);
         if (parsed.positional.length !== 1) {
           throw new Error(`orchestrate ${subcommand} requires exactly: pipelane run orchestrate ${subcommand} --run-id <id>${subcommand === 'scope' ? ' --through <slice-id>' : subcommand === 'upgrade-ledger' ? ' [--reseal-unsigned --reason <text> --i-understand-this-trusts-local-state]' : ''}`);
         }
@@ -4016,6 +4075,12 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         }
         if (subcommand === 'scope' && !parsed.flags.scopeThrough.trim()) {
           throw new Error('orchestrate scope requires --through <slice-id>.');
+        }
+        if (subcommand === 'finalize' && parsed.flags.orchestrationPurgeWorktrees && !parsed.flags.orchestrationAbandon) {
+          throw new Error('orchestrate finalize --purge-worktrees requires --abandon.');
+        }
+        if (subcommand === 'finalize' && parsed.flags.orchestrationPurgeWorktrees && !parsed.flags.reason.trim()) {
+          throw new Error('orchestrate finalize --purge-worktrees requires --reason <text>.');
         }
         if (subcommand === 'upgrade-ledger') {
           const resealFlagCount = [
@@ -4059,6 +4124,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         'goalMaxMinutes',
         'goalSlicesFile',
         'orchestrationDrafts',
+        'orchestrationBaseBranch',
       ]);
       if (parsed.positional.length !== 1) {
         throw new Error(`orchestrate ${subcommand} requires exactly: pipelane run orchestrate ${subcommand} [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--slices-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]`);
@@ -4385,6 +4451,9 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'orchestrationAnalysisFile', label: '--analysis-file', active: (flags) => flags.orchestrationAnalysisFile.trim().length > 0 },
   { key: 'orchestrationDrafts', label: '--drafts', active: (flags) => flags.orchestrationDrafts.trim().length > 0 },
   { key: 'scopeThrough', label: '--through', active: (flags) => flags.scopeThrough.trim().length > 0 },
+  { key: 'orchestrationBaseBranch', label: '--base-branch', active: (flags) => flags.orchestrationBaseBranch.trim().length > 0 },
+  { key: 'orchestrationAbandon', label: '--abandon', active: (flags) => flags.orchestrationAbandon },
+  { key: 'orchestrationPurgeWorktrees', label: '--purge-worktrees', active: (flags) => flags.orchestrationPurgeWorktrees },
   { key: 'orchestrationResealUnsigned', label: '--reseal-unsigned', active: (flags) => flags.orchestrationResealUnsigned },
   { key: 'orchestrationTrustsLocalState', label: '--i-understand-this-trusts-local-state', active: (flags) => flags.orchestrationTrustsLocalState },
 ];

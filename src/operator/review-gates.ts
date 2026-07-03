@@ -1,12 +1,14 @@
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import type {
-  ReviewGateConfig,
-  ReviewGatePhase,
-  ReviewGateType,
-  ReviewGatesConfig,
-  ReviewPlanGateConfig,
+import {
+  isStableEvidenceId,
+  type ReviewGateConfig,
+  type ReviewGatePhase,
+  type ReviewProfile,
+  type ReviewGateType,
+  type ReviewGatesConfig,
+  type ReviewPlanGateConfig,
 } from './state.ts';
 
 export type ReviewGateCatalogKind = 'plan' | 'review';
@@ -24,6 +26,9 @@ export interface ReviewGateCatalogEntry {
   when?: string;
   whenChanged?: string[];
   userCommands?: string[];
+  profiles?: ReviewProfile[];
+  baselineCommandId?: string;
+  replacesBaselineCommandId?: string;
   optional?: boolean;
 }
 
@@ -196,6 +201,8 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     phase: 'ai-diff',
     type: 'skill',
     skill: 'review',
+    profiles: ['docs-only'],
+    whenChanged: ['docs/**', 'README.md', 'CHANGELOG.md', '*.md', '*.mdx'],
     userCommands: ['/review', '/gstack review', '/gstack-review'],
     recommended: true,
   },
@@ -449,5 +456,8 @@ function toReviewGateConfig(entry: ResolvedReviewGateCatalogEntry): ReviewGateCo
     when: entry.when,
     whenChanged: entry.whenChanged,
     userCommands: entry.userCommands,
+    profiles: entry.profiles,
+    baselineCommandId: entry.baselineCommandId ?? (entry.type === 'command' && isStableEvidenceId(entry.id) ? entry.id : undefined),
+    replacesBaselineCommandId: entry.replacesBaselineCommandId,
   };
 }

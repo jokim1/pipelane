@@ -8,7 +8,7 @@ import { createServer as createHttpServer } from 'node:http';
 import { createHash, createHmac } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const KIT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CLI_PATH = path.join(KIT_ROOT, 'src', 'cli.ts');
@@ -345,6 +345,7 @@ function analyzePlannedRun(repoRoot, planned, sourceText, overrides = {}, option
     analysisFile,
     '--json',
   ], repoRoot, operatorEnv).stdout);
+  rmSync(analysisFile, { force: true });
   if (autoPassPlanReview) {
     for (const gate of analyzed.run.planAnalysis?.planReview?.gates ?? []) {
       if (gate.blocking && gate.status === 'pending') {
@@ -654,6 +655,11 @@ function commitAll(repoRoot, message) {
   execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
   execFileSync('git', ['commit', '-m', message], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
   execFileSync('git', ['push'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+}
+
+function commitLocal(repoRoot, message) {
+  execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+  execFileSync('git', ['commit', '-m', message], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
 function advanceRemoteMain(remoteRoot, fileName, content = 'advance main\n') {
@@ -2311,6 +2317,9 @@ test('install-codex outside a pipelane repo installs durable global default skil
     const orchestrateSkill = readFileSync(path.join(codexHome, 'skills', 'orchestrate', 'SKILL.md'), 'utf8');
     assert.match(orchestrateSkill, /Orchestration behavior/);
     assert.match(orchestrateSkill, /Never use `--yes` on this path/);
+    assert.match(orchestrateSkill, /Host-visible slice checklist/);
+    assert.match(orchestrateSkill, /Claude Code, use TodoWrite/);
+    assert.match(orchestrateSkill, /Codex App, use\s+update_plan/);
     assert.match(orchestrateSkill, /## Argument handling/);
     // Subcommands use the alias directly (`/orchestrate analyze ...`), never the
     // doubled `/orchestrate orchestrate ...` that would route to an invalid
@@ -2415,6 +2424,9 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     assert.match(orchestrateSkill, /disable-model-invocation: true/);
     assert.match(orchestrateSkill, /Orchestration behavior/);
     assert.match(orchestrateSkill, /Never use `--yes` on this path/);
+    assert.match(orchestrateSkill, /Host-visible slice checklist/);
+    assert.match(orchestrateSkill, /Claude Code, use TodoWrite/);
+    assert.match(orchestrateSkill, /Codex App, use\s+update_plan/);
     assert.match(orchestrateSkill, /## Argument handling/);
     assert.match(orchestrateSkill, /\/orchestrate analyze --plan-file/);
     assert.doesNotMatch(orchestrateSkill, /\/orchestrate orchestrate/);
@@ -3213,6 +3225,9 @@ test.skip('pipelane.md renders a journey-first overview with real slash aliases'
     assert.match(pipelane, /orchestrate analyze --plan-file <real-plan> --analysis-file <analysis\.json> --slices-file <scratch\.json> --json/);
     assert.match(pipelane, /orchestrate plan-review pass --run-id <id> --gate <gate-id> --message <summary>/);
     assert.match(pipelane, /orchestrate plan-review bypass --run-id <id> --gate <gate-id> --reason <reason>/);
+    assert.match(pipelane, /Host-visible slice checklist/);
+    assert.match(pipelane, /Claude Code, use TodoWrite/);
+    assert.match(pipelane, /Codex App, use\s+update_plan/);
     assert.doesNotMatch(pipelane, /Pipelane Board \(default\)/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -4662,6 +4677,8 @@ test('managed runtime keeps orchestrate off stale repo-local pipelane', () => {
   const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
 
   try {
+    writeFileSync(path.join(repoRoot, '.gitignore'), 'node_modules/\n', 'utf8');
+    commitLocal(repoRoot, 'Ignore node modules');
     mkdirSync(path.join(repoRoot, 'node_modules', '.bin'), { recursive: true });
     writeFileSync(
       path.join(repoRoot, 'node_modules', '.bin', 'pipelane'),
@@ -8578,6 +8595,8 @@ test('orchestrate bare command opens a single active run', () => {
     assert.equal(report.runId, planned.runId);
     assert.equal(report.activeRuns.length, 1);
     assert.match(report.message, /Open active run/);
+    assert.match(report.message, /Current: Slice 1\/1 — Open active run/);
+    assert.match(report.message, /Plan — 1 slice/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -9310,6 +9329,7 @@ test('orchestrate analyze binds plan-file source to the outcome prompt', () => {
       '--json',
     ], repoRoot).stdout);
     assert.equal(analyzedFirst.status, 'passed');
+    commitLocal(repoRoot, 'Track stale analysis fixture');
 
     const second = JSON.parse(runCli([
       'run',
@@ -9408,15 +9428,18 @@ test('orchestrate prepare rejects stale analyzed plan source and gate snapshot',
     };
     writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'docs', 'source-plan.md'), '# Source Plan\n\nDo the original work.\n', 'utf8');
+    const sourcePlanPath = path.join(repoRoot, 'docs', 'source-plan.md');
+    const originalSourcePlan = '# Source Plan\n\nDo the original work.\n';
+    writeFileSync(sourcePlanPath, originalSourcePlan, 'utf8');
     commitAll(repoRoot, 'Adopt source plan');
 
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/source-plan.md', '--json'], repoRoot).stdout);
     analyzePlannedRun(repoRoot, planned, '# Source Plan\n\nDo the original work.\n', {}, { passPlanReview: false });
-    writeFileSync(path.join(repoRoot, 'docs', 'source-plan.md'), '# Source Plan\n\nDo different work.\n', 'utf8');
+    writeFileSync(sourcePlanPath, '# Source Plan\n\nDo different work.\n', 'utf8');
     const staleSource = runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot, {}, true);
     assert.equal(staleSource.status, 1, `${staleSource.stdout}\n${staleSource.stderr}`);
     assert.match(staleSource.stderr, /source plan changed after analysis/);
+    writeFileSync(sourcePlanPath, originalSourcePlan, 'utf8');
 
     const outcome = 'Tamper gate snapshot after analysis';
     const snapshotPlanned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', outcome, '--json'], repoRoot).stdout);
@@ -10145,6 +10168,501 @@ test('orchestrate prepare blocks when active surfaces changed after analysis', a
   }
 });
 
+test('orchestrate v1a validators and docs path classifier fail closed', async () => {
+  const mod = await import(pathToFileURL(path.join(KIT_ROOT, 'src', 'operator', 'orchestration-ledger.ts')).href);
+
+  assert.equal(mod.validateSourceSnapshot({
+    status: 'clean',
+    headSha: 'a'.repeat(40),
+    reviewBaseRef: 'a'.repeat(40),
+    changedFiles: [],
+  }), null);
+  assert.match(mod.validateSourceSnapshot({ status: 'dirty' }), /status/);
+
+  assert.equal(mod.validateBaselinePreflight({
+    profile: 'docs-only',
+    status: 'passed',
+    baseResolution: { status: 'origin', ref: 'origin/main' },
+    skippedCommands: [{ id: 'test', command: 'npm test', skipReason: 'docs-only profile, baseline command has no matching whenChanged path' }],
+  }), null);
+  assert.match(mod.validateBaselinePreflight({
+    profile: 'docs-only',
+    status: 'skipped',
+    baseResolution: { status: 'origin', ref: 'origin/main' },
+    skippedCommands: [],
+  }), /status/);
+
+  assert.equal(mod.validateAcceptedFailure({
+    reason: 'known red',
+    acceptedBy: { provider: 'local', sessionId: null, source: 'test' },
+    acceptedAt: new Date('2026-07-03T00:00:00.000Z').toISOString(),
+  }), null);
+  assert.match(mod.validateAcceptedFailure({ reason: '' }), /reason/);
+
+  assert.equal(mod.validateReviewProfile('docs-only'), null);
+  assert.match(mod.validateReviewProfile('docs'), /reviewProfile/);
+  assert.equal(mod.validateReviewGateLinks([{ id: 'gstack-review', profiles: ['docs-only'], baselineCommandId: 'review' }]), null);
+  assert.equal(mod.validateReviewGateLinks([{ id: 'custom static gate', profiles: ['docs-only'], baselineCommandId: 'custom-static' }]), null);
+  assert.match(mod.validateReviewGateLinks([{ id: 'bad', profiles: ['docs'] }]), /reviewProfile/);
+  assert.match(mod.validateReviewGateLinks([{ id: 'bad', baselineCommandId: 'custom static gate' }]), /baselineCommandId/);
+
+  assert.equal(mod.classifyDocsSafePathRecords(['docs/ARCHITECTURE.md']).profile, 'docs-only');
+  assert.equal(mod.classifyDocsSafePathRecords(['README.md']).profile, 'docs-only');
+  assert.equal(mod.classifyDocsSafePathRecords(['CLAUDE.md']).profile, 'implementation');
+  assert.equal(mod.classifyDocsSafePathRecords(['AGENTS.md']).profile, 'implementation');
+  assert.equal(mod.classifyDocsSafePathRecords(['REPO_GUIDANCE.md']).profile, 'implementation');
+  assert.equal(mod.classifyDocsSafePathRecords([{ oldPath: 'docs/old.md', newPath: 'docs/new.md' }]).profile, 'docs-only');
+  assert.equal(mod.classifyDocsSafePathRecords([{ oldPath: 'docs/old.md', newPath: 'src/new.ts' }]).profile, 'implementation');
+  assert.equal(mod.classifyDocsSafePathRecords(['docs/build.js']).profile, 'implementation');
+  assert.equal(mod.classifyDocsSafePathRecords([]).profile, 'implementation');
+});
+
+test('orchestrate plan omits derived baselineCommandId for unstable custom command gate ids', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Unstable Gate Id App', {
+      reviewGates: {
+        planReview: { gates: [] },
+        gates: [
+          { id: 'custom static gate', phase: 'static', type: 'command', blocking: true, command: 'npm test' },
+        ],
+      },
+    });
+    commitLocal(repoRoot, 'Adopt unstable gate id config');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Plan with custom gate id', '--json'], repoRoot).stdout);
+    const onDisk = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
+    const shown = JSON.parse(runCli(['run', 'orchestrate', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+
+    assert.equal(onDisk.gateSnapshot.gates[0].id, 'custom static gate');
+    assert.equal(onDisk.gateSnapshot.gates[0].baselineCommandId, undefined);
+    assert.equal(shown.run.gateSnapshot.gates[0].baselineCommandId, undefined);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate docs-only baseline omits unstable skipped command ids from persisted evidence', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Unstable Skipped Baseline App', {
+      reviewGates: {
+        planReview: { gates: [] },
+        gates: [
+          { id: 'custom static gate', phase: 'behavioral', type: 'command', blocking: true, command: 'npm test' },
+        ],
+      },
+    });
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'unstable-baseline-plan.md'), '# Unstable Baseline\n\nUpdate docs.\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'slices.json'), JSON.stringify({
+      slices: [
+        { id: 'docs-only', title: 'Docs only', plannedPathScope: ['docs/ARCHITECTURE.md'] },
+      ],
+    }, null, 2), 'utf8');
+    commitLocal(repoRoot, 'Add unstable skipped baseline inputs');
+
+    const planned = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/unstable-baseline-plan.md',
+      '--slices-file',
+      'slices.json',
+      '--provider',
+      'generic',
+      '--json',
+    ], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
+    const shown = JSON.parse(runCli(['run', 'orchestrate', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+
+    assert.equal(prepared.run.baselinePreflight.profile, 'docs-only');
+    assert.deepEqual(prepared.run.baselinePreflight.skippedCommands, []);
+    assert.deepEqual(shown.run.baselinePreflight.skippedCommands, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate plan persists plannedPathScope from slices file and marks invalid scope unknown', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Docs Scope App');
+    const planPath = path.join(repoRoot, 'docs', 'scope-plan.md');
+    mkdirSync(path.dirname(planPath), { recursive: true });
+    writeFileSync(planPath, '# Scope Plan\n\nImplement the docs slices.\n', 'utf8');
+    const slicesPath = path.join(repoRoot, 'slices.json');
+    writeFileSync(slicesPath, JSON.stringify({
+      slices: [
+        { id: 'docs-slice', title: 'Docs slice', plannedPathScope: ['./docs/ARCHITECTURE.md'] },
+        { id: 'unknown-slice', title: 'Unknown slice', plannedPathScope: ['../src/bad.ts'] },
+      ],
+    }, null, 2), 'utf8');
+    commitLocal(repoRoot, 'Add scope orchestration inputs');
+
+    const report = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/scope-plan.md',
+      '--slices-file',
+      'slices.json',
+      '--provider',
+      'generic',
+      '--json',
+    ], repoRoot).stdout);
+
+    assert.deepEqual(report.run.slices[0].plannedPathScope, ['docs/ARCHITECTURE.md']);
+    assert.deepEqual(report.run.slices[1].plannedPathScope, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate plan blocks dirty parent source before creating a run', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Dirty Plan App');
+    const planPath = path.join(repoRoot, 'docs', 'dirty-plan.md');
+    mkdirSync(path.dirname(planPath), { recursive: true });
+    writeFileSync(planPath, '# Dirty Plan\n\nChange docs only.\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'docs', 'ARCHITECTURE.md'), 'unrelated dirty docs\n', 'utf8');
+
+    const result = runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/dirty-plan.md',
+      '--json',
+    ], repoRoot, {}, true);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /dirty parent worktree/);
+    assert.match(result.stderr, /\.pipelane\.json/);
+    assert.match(result.stderr, /docs\/ARCHITECTURE\.md/);
+    assert.doesNotMatch(result.stderr, /docs\/dirty-plan\.md/);
+    assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'orchestrate', 'runs')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate --yes blocks dirty parent source before creating worktrees', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Dirty Source App');
+    const planPath = path.join(repoRoot, 'docs', 'dirty-plan.md');
+    mkdirSync(path.dirname(planPath), { recursive: true });
+    const planText = '# Dirty Plan\n\nChange docs only.\n';
+    writeFileSync(planPath, planText, 'utf8');
+    const analysisFile = writeOrchestrateAnalysis(repoRoot, planText);
+    mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'src', 'dirty-source.ts'), 'export const dirty = true;\n', 'utf8');
+
+    const result = runCli([
+      'run',
+      'orchestrate',
+      '--plan-file',
+      'docs/dirty-plan.md',
+      '--analysis-file',
+      path.relative(repoRoot, analysisFile),
+      '--yes',
+      '--json',
+    ], repoRoot, {}, true);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /dirty parent worktree/);
+    assert.match(result.stderr, /src\/dirty-source\.ts/);
+    assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'orchestrate', 'runs')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate prepare blocks parent source drift after planning', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Prepare Drift App');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'prepare-drift-plan.md'), '# Prepare Drift\n\nChange docs only.\n', 'utf8');
+    commitAll(repoRoot, 'Adopt prepare drift inputs');
+
+    const planned = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/prepare-drift-plan.md',
+      '--json',
+    ], repoRoot).stdout);
+    analyzePlannedRunForPrepare(repoRoot, planned);
+    mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'src', 'late-drift.ts'), 'export const late = true;\n', 'utf8');
+
+    const result = runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot, {}, true);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /parent worktree changed after the run was planned/);
+    assert.match(result.stderr, /src\/late-drift\.ts/);
+    assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate persists origin HEAD base when config only has the generic main fallback', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Origin Head Base App');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'base-plan.md'), '# Base Plan\n\nUpdate docs.\n', 'utf8');
+    commitAll(repoRoot, 'Add base orchestration inputs');
+    execFileSync('git', ['branch', 'release'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['push', 'origin', 'release'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/release'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const planned = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/base-plan.md',
+      '--provider',
+      'generic',
+      '--json',
+    ], repoRoot).stdout);
+
+    assert.equal(planned.run.baseBranch, 'release');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate base resolution falls through when gh pr view hangs', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-hang-'));
+  try {
+    writePipelaneConfig(repoRoot, 'Gh Timeout Base App');
+    commitAll(repoRoot, 'Adopt pipelane');
+    writeFileSync(
+      path.join(binDir, 'gh'),
+      `#!/usr/bin/env node\nsetTimeout(() => process.stdout.write(JSON.stringify({ baseRefName: 'release' })), 10000);\n`,
+      'utf8',
+    );
+    chmodSync(path.join(binDir, 'gh'), 0o755);
+
+    const startedAt = Date.now();
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Bound gh base probe', '--json'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+    }).stdout);
+
+    assert.equal(planned.run.baseBranch, 'main');
+    assert.ok(Date.now() - startedAt < 8000, 'gh base probe should time out and fall through');
+  } finally {
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate v1a docs-only baseline skips unscoped full-suite review gates', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Docs Only App', {
+      reviewGates: {
+        planReview: { gates: [] },
+        gates: [
+          { id: 'typecheck', phase: 'static', type: 'command', blocking: true, command: 'npm run typecheck' },
+          { id: 'test', phase: 'behavioral', type: 'command', blocking: true, command: 'npm run test' },
+          { id: 'build', phase: 'behavioral', type: 'command', blocking: true, command: 'npm run build' },
+        ],
+      },
+    });
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    const planText = '# Docs Only Plan\n\nUpdate the architecture docs.\n';
+    writeFileSync(path.join(repoRoot, 'docs', 'docs-only-plan.md'), planText, 'utf8');
+    writeFileSync(path.join(repoRoot, 'slices.json'), JSON.stringify({
+      slices: [
+        { id: 'docs-only', title: 'Docs only', plannedPathScope: ['docs/ARCHITECTURE.md'] },
+      ],
+    }, null, 2), 'utf8');
+    commitAll(repoRoot, 'Add docs-only orchestration plan');
+
+    const planned = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/docs-only-plan.md',
+      '--slices-file',
+      'slices.json',
+      '--provider',
+      'generic',
+      '--json',
+    ], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
+    assert.equal(prepared.run.baselinePreflight.profile, 'docs-only');
+    assert.deepEqual(prepared.run.baselinePreflight.skippedCommands.map((entry) => entry.id).sort(), ['build', 'test', 'typecheck']);
+
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot);
+    const workerCommand = 'node -e "require(\'fs\').mkdirSync(\'docs\',{recursive:true});require(\'fs\').writeFileSync(\'docs/ARCHITECTURE.md\',\'updated docs\\n\')"';
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    });
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+
+    assert.equal(reviewed.status, 'passed');
+    assert.equal(reviewed.run.baselinePreflight.profile, 'docs-only');
+    assert.equal(reviewed.run.slices[0].reviewProfile, 'docs-only');
+    const gates = reviewed.run.slices[0].review.run.gates;
+    assert.deepEqual(gates.map((gate) => [gate.gateId, gate.status, gate.skipReason]), [
+      ['typecheck', 'skipped', 'docs-only profile, gate has no matching whenChanged path'],
+      ['build', 'skipped', 'docs-only profile, gate has no matching whenChanged path'],
+      ['test', 'skipped', 'docs-only profile, gate has no matching whenChanged path'],
+    ]);
+    assert.match(reviewed.message, /Profile and skipped gates:/);
+    assert.match(reviewed.message, /baseline\/test/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate v1a docs-only partial review does not escape on empty sibling slice', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Docs Partial App', {
+      reviewGates: {
+        planReview: { gates: [] },
+        gates: [
+          { id: 'test', phase: 'behavioral', type: 'command', blocking: true, command: 'npm run test' },
+        ],
+      },
+    });
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'partial-docs-plan.md'), '# Partial Docs Plan\n\nUpdate two docs files.\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'slices.json'), JSON.stringify({
+      slices: [
+        { id: 'docs-one', title: 'Docs one', plannedPathScope: ['docs/ONE.md'] },
+        { id: 'docs-two', title: 'Docs two', plannedPathScope: ['docs/TWO.md'] },
+      ],
+    }, null, 2), 'utf8');
+    commitAll(repoRoot, 'Add partial docs orchestration plan');
+
+    const planned = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/partial-docs-plan.md',
+      '--slices-file',
+      'slices.json',
+      '--provider',
+      'generic',
+      '--json',
+    ], repoRoot).stdout);
+    preparePlannedRun(repoRoot, planned);
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot);
+    const workerCommand = 'node -e "require(\'fs\').mkdirSync(\'docs\',{recursive:true});require(\'fs\').writeFileSync(\'docs/ONE.md\',\'updated docs one\\n\')"';
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--slice-id', 'docs-one', '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    });
+
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--slice-id', 'docs-one', '--json'], repoRoot).stdout);
+
+    assert.equal(reviewed.reviewedCount, 1);
+    assert.equal(reviewed.blockedCount, 0);
+    assert.equal(reviewed.slices[0].action, 'reviewed');
+    assert.doesNotMatch(reviewed.message, /implementation-baseline-required/);
+    assert.equal(reviewed.run.slices[0].reviewProfile, 'docs-only');
+    assert.equal(reviewed.run.slices[0].reviewProfileEscapedDocsSafeScope, false);
+    assert.equal(reviewed.run.slices[1].reviewProfile, 'implementation');
+    assert.equal(reviewed.run.slices[1].reviewProfileEscapedDocsSafeScope, false);
+    assert.match(reviewed.run.slices[1].reviewProfileReason, /empty diff/);
+    assert.equal(reviewed.run.slices[1].status, 'dispatched');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate v1a docs-only escape blocks review and finalize abandon preserves worktree', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Docs Escape App', {
+      reviewGates: {
+        planReview: { gates: [] },
+        gates: [
+          { id: 'test', phase: 'behavioral', type: 'command', blocking: true, command: 'npm run test' },
+        ],
+      },
+    });
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'escape-plan.md'), '# Escape Plan\n\nUpdate docs.\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'slices.json'), JSON.stringify({
+      slices: [
+        { id: 'docs-escape', title: 'Docs escape', plannedPathScope: ['docs/ARCHITECTURE.md'] },
+      ],
+    }, null, 2), 'utf8');
+    commitAll(repoRoot, 'Add docs escape orchestration plan');
+
+    const planned = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/escape-plan.md',
+      '--slices-file',
+      'slices.json',
+      '--provider',
+      'generic',
+      '--json',
+    ], repoRoot).stdout);
+    preparePlannedRun(repoRoot, planned);
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot);
+    const workerCommand = 'node -e "require(\'fs\').mkdirSync(\'src\',{recursive:true});require(\'fs\').writeFileSync(\'src/escape.ts\',\'export const escape = true;\\n\')"';
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    });
+
+    const dryRunReview = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--dry-run', '--json'], repoRoot).stdout);
+    const afterDryRun = JSON.parse(readFileSync(dryRunReview.ledgerPath, 'utf8'));
+    assert.equal(dryRunReview.status, 'blocked');
+    assert.notEqual(afterDryRun.status, 'blocked');
+    assert.notEqual(afterDryRun.slices[0].status, 'blocked');
+
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    const worktreePath = reviewed.run.slices[0].worktreePath;
+    assert.equal(reviewed.status, 'blocked');
+    assert.equal(reviewed.run.slices[0].reviewProfile, 'implementation');
+    assert.equal(reviewed.run.slices[0].reviewProfileEscapedDocsSafeScope, true);
+    assert.match(reviewed.slices[0].blocker, /implementation-baseline-required/);
+    assert.equal(reviewed.run.slices[0].review, null);
+    assert.equal(existsSync(worktreePath), true);
+
+    const purgeWithoutReason = runCli(['run', 'orchestrate', 'finalize', '--run-id', planned.runId, '--abandon', '--purge-worktrees', '--json'], repoRoot, {}, true);
+    assert.notEqual(purgeWithoutReason.status, 0);
+    assert.match(purgeWithoutReason.stderr, /--purge-worktrees requires --reason/);
+    assert.equal(existsSync(worktreePath), true);
+
+    const finalized = JSON.parse(runCli(['run', 'orchestrate', 'finalize', '--run-id', planned.runId, '--abandon', '--json'], repoRoot).stdout);
+    assert.equal(finalized.status, 'failed');
+    assert.deepEqual(finalized.escapedWorktreePaths, [worktreePath]);
+    assert.deepEqual(finalized.purgedWorktreePaths, []);
+    assert.equal(existsSync(worktreePath), true);
+    assert.match(finalized.message, /Escaped slice worktrees:/);
+    assert.match(finalized.message, /Escaped worktrees were preserved/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('orchestrate plan writes a durable slice ledger from a plan file', () => {
   const repoRoot = createRepo();
   try {
@@ -10168,6 +10686,7 @@ test('orchestrate plan writes a durable slice ledger from a plan file', () => {
         type: 'command',
         blocking: true,
         command: 'npm run custom-static',
+        baselineCommandId: 'custom-static',
         timeoutMs: 1234,
         whenChanged: ['src/**'],
       },
@@ -10191,6 +10710,7 @@ test('orchestrate plan writes a durable slice ledger from a plan file', () => {
       gates: customGates,
     };
     writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitLocal(repoRoot, 'Adopt custom orchestrate config');
 
     const planPath = path.join(repoRoot, 'docs', 'orchestrate-plan.md');
     mkdirSync(path.dirname(planPath), { recursive: true });
@@ -10666,6 +11186,48 @@ test('orchestrate prepare creates durable slice worktrees from a planned ledger'
   }
 });
 
+test('orchestrate prepare creates slice worktrees from the captured source snapshot', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    writePipelaneConfig(repoRoot, 'Source Snapshot App');
+    commitAll(repoRoot, 'Adopt pipelane');
+    mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'src', 'local-only.ts'), 'export const localOnly = true;\n', 'utf8');
+    commitLocal(repoRoot, 'Add local-only source baseline');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'source-snapshot-plan.md'), [
+      '# Source Snapshot Plan',
+      '',
+      '## Slice 1: Source snapshot',
+      '- Touch `src/local-only.ts`',
+    ].join('\n') + '\n', 'utf8');
+
+    const planned = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/source-snapshot-plan.md',
+      '--json',
+    ], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
+
+    assert.equal(prepared.run.sourceSnapshot.reviewBaseRef, planned.run.sourceSnapshot.headSha);
+    for (const slice of prepared.slices) {
+      assert.equal(run('git', ['rev-parse', 'HEAD'], slice.worktreePath), planned.run.sourceSnapshot.headSha);
+      assert.equal(readFileSync(path.join(slice.worktreePath, 'src', 'local-only.ts'), 'utf8'), 'export const localOnly = true;\n');
+    }
+  } finally {
+    for (const worktreePath of createdWorktrees) {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('orchestrate dispatch writes durable provider handoff prompts from a prepared ledger', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];
@@ -10781,6 +11343,7 @@ test('orchestrate dispatch requires a prepared run', () => {
   const repoRoot = createRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
+    commitLocal(repoRoot, 'Adopt pipelane');
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Reject unprepared dispatch', '--json'], repoRoot).stdout);
 
     const rejected = runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot, {}, true);
@@ -11667,7 +12230,7 @@ test('orchestrate review runs gate snapshot against completed worker slices', ()
     const filtered = JSON.parse(filteredResult.stdout);
     assert.equal(filtered.status, 'blocked');
     assert.equal(filtered.run.status, 'blocked');
-    assert.match(filtered.message, /gate-filtered, phase-filtered, or dry-run review evidence/);
+    assert.match(filtered.message, /Slice-filtered, gate-filtered, or phase-filtered review evidence/);
     assert.match(filteredResult.stderr, /\[pipelane\] orchestrate review: reviewing slice/);
     assert.match(filteredResult.stderr, /starting gate slice-static \[static\]/);
     assert.match(filteredResult.stderr, /gate slice-static passed after \d+ms - command passed:/);
@@ -11740,27 +12303,32 @@ test('orchestrate review runs gate snapshot against completed worker slices', ()
     const diagnostic = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--dry-run', '--json'], repoRoot).stdout);
     const afterDiagnostic = JSON.parse(readFileSync(diagnostic.ledgerPath, 'utf8'));
     const afterDiagnosticSlice = afterDiagnostic.slices[0];
-    const latestDiagnostic = afterDiagnosticSlice.reviewDiagnostics[afterDiagnosticSlice.reviewDiagnostics.length - 1];
+    const latestDiagnostic = diagnostic.run.slices[0].reviewDiagnostics.at(-1);
 
     assert.equal(diagnostic.status, 'blocked');
+    assert.equal(diagnostic.run.status, 'completed');
     assert.equal(afterDiagnostic.status, 'completed');
     assert.equal(afterDiagnosticSlice.status, 'completed');
     assert.equal(afterDiagnosticSlice.review.run.id, trustedReviewId);
     assert.equal(afterDiagnosticSlice.review.run.dryRun, false);
+    assert.deepEqual(afterDiagnosticSlice.reviewDiagnostics, []);
     assert.equal(latestDiagnostic.run.dryRun, true);
 
     writeFileSync(path.join(slice.worktreePath, 'post-review-change.txt'), 'changed after review\n', 'utf8');
     execFileSync('git', ['add', 'post-review-change.txt'], { cwd: slice.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
     execFileSync('git', ['commit', '-m', 'Change after review'], { cwd: slice.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
 
+    const beforeStaleCheck = JSON.parse(readFileSync(diagnostic.ledgerPath, 'utf8'));
     const staleCheck = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--dry-run', '--json'], repoRoot).stdout);
     const afterStaleCheck = JSON.parse(readFileSync(staleCheck.ledgerPath, 'utf8'));
+    const latestStaleDiagnostic = staleCheck.run.slices[0].reviewDiagnostics.at(-1);
 
     assert.equal(staleCheck.status, 'blocked');
-    assert.equal(afterStaleCheck.status, 'blocked');
-    assert.equal(afterStaleCheck.slices[0].status, 'blocked');
+    assert.equal(staleCheck.run.status, 'blocked');
+    assert.deepEqual(afterStaleCheck, beforeStaleCheck);
     assert.equal(afterStaleCheck.slices[0].review.run.id, trustedReviewId);
     assert.equal(afterStaleCheck.slices[0].review.run.sha, trustedReviewSha);
+    assert.equal(latestStaleDiagnostic.run.dryRun, true);
   } finally {
     for (const worktreePath of createdWorktrees) {
       rmSync(worktreePath, { recursive: true, force: true });
@@ -14640,6 +15208,84 @@ test('review runner records pending AI gates without failing the process', () =>
   }
 });
 
+test('review command gates use material tree identity when dirty file exceeds route digest budget', async () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'oversized-noop',
+        phase: 'static',
+        type: 'command',
+        command: `${JSON.stringify(process.execPath)} -e "process.exit(0)"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'large-fixture.txt'), 'tracked before dirty edit\n', 'utf8');
+    commitLocal(repoRoot, 'Configure oversized review fixture');
+
+    writeFileSync(path.join(repoRoot, 'large-fixture.txt'), 'x'.repeat(1024 * 1024 + 1), 'utf8');
+    const result = runCli(['run', 'review', '--json'], repoRoot);
+    const report = JSON.parse(result.stdout);
+    const record = JSON.parse(readFileSync(report.evidencePath, 'utf8')).records[0];
+    const { resolveWorkflowContext } = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const { evaluateReviewEvidenceForPr } = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-enforcement.ts'));
+    const evidence = evaluateReviewEvidenceForPr(resolveWorkflowContext(repoRoot));
+
+    assert.equal(result.status, 0);
+    assert.equal(report.status, 'passed');
+    assert.equal(report.gates[0].gateId, 'oversized-noop');
+    assert.equal(report.gates[0].status, 'passed');
+    assert.doesNotMatch(report.gates[0].summary, /could not verify unchanged worktree/);
+    assert.equal(record.worktreeStatusReliable, false);
+    assert.match(record.worktreeStatusWarnings.join('\n'), /dirty file exceeds route approval size budget: large-fixture\.txt/);
+    assert.equal(record.worktreeMaterialTreeReliable, true);
+    assert.equal(typeof record.worktreeMaterialTreeHash, 'string');
+    assert.equal(evidence.allowed, true, evidence.message);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review command gates still detect mutations when dirty file exceeds route digest budget', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'oversized-mutates',
+        phase: 'static',
+        type: 'command',
+        command: `${JSON.stringify(process.execPath)} -e "require('node:fs').writeFileSync('gate-mutation.txt', 'mutated', 'utf8')"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'large-fixture.txt'), 'tracked before dirty edit\n', 'utf8');
+    commitLocal(repoRoot, 'Configure mutating oversized review fixture');
+
+    writeFileSync(path.join(repoRoot, 'large-fixture.txt'), 'x'.repeat(1024 * 1024 + 1), 'utf8');
+    const result = runCli(['run', 'review', '--json'], repoRoot, {}, true);
+    const report = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 1);
+    assert.equal(report.status, 'failed');
+    assert.equal(report.gates[0].gateId, 'oversized-mutates');
+    assert.equal(report.gates[0].status, 'failed');
+    assert.match(report.gates[0].summary, /mutated the worktree/);
+    assert.doesNotMatch(report.gates[0].summary, /could not verify unchanged worktree/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('review pass records clean manual gates against current review evidence', () => {
   const repoRoot = createRepo();
   const npmShim = createNpmShimEnv();
@@ -14750,6 +15396,45 @@ test('review runner includes staged-only files for whenChanged gates', () => {
     assert.deepEqual(report.gates.map((gate) => gate.gateId), ['karpathy-audit']);
     assert.equal(report.gates[0].status, 'pending');
     assert.match(report.gates[0].summary, /karpathy audit/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review runner still applies whenChanged to docs-profile gates outside docs-only orchestration', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Docs Scoped Review App', {
+      reviewGates: {
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: [{
+          id: 'docs-ai',
+          phase: 'ai-diff',
+          type: 'skill',
+          skill: 'review',
+          blocking: true,
+          profiles: ['docs-only'],
+          whenChanged: ['docs/**'],
+        }],
+      },
+    });
+    commitLocal(repoRoot, 'Adopt docs-scoped review gate');
+
+    mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'src', 'app.ts'), 'export const app = true;\n', 'utf8');
+    const sourceOnly = JSON.parse(runCli(['run', 'review', '--json'], repoRoot).stdout);
+    assert.equal(sourceOnly.status, 'passed');
+    assert.equal(sourceOnly.gates[0].status, 'skipped');
+    assert.match(sourceOnly.gates[0].skipReason, /no changed files matched docs\/\*\*/);
+
+    rmSync(path.join(repoRoot, 'src', 'app.ts'), { force: true });
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'guide.md'), 'Docs update\n', 'utf8');
+    const docsChange = JSON.parse(runCli(['run', 'review', '--json'], repoRoot).stdout);
+    assert.equal(docsChange.status, 'pending');
+    assert.equal(docsChange.gates[0].status, 'pending');
+    assert.match(docsChange.gates[0].summary, /independent AI review pending/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -17224,6 +17909,7 @@ test('orchestration mutating command matrix verifies and leaves signed ledgers',
       identityReliable: true,
     });
     runCli(['run', 'orchestrate', 'analyze', '--run-id', planned.runId, '--analysis-file', analysisFile], repoRoot);
+    rmSync(analysisFile, { force: true });
     assertSignedLedgerValid(repoRoot, planned.runId);
     runCli([
       'run', 'orchestrate', 'plan-review', 'pass',
@@ -17263,6 +17949,7 @@ test('orchestration mutating command matrix verifies and leaves signed ledgers',
       identityReliable: true,
     });
     runCli(['run', 'orchestrate', 'analyze', '--run-id', bypass.runId, '--analysis-file', bypassAnalysis], repoRoot);
+    rmSync(bypassAnalysis, { force: true });
     runCli([
       'run', 'orchestrate', 'plan-review', 'bypass',
       '--run-id', bypass.runId,
@@ -29722,6 +30409,9 @@ test('normalizeReviewGatesConfig keeps defaults and filters malformed gate entri
     whenChanged: undefined,
     timeoutMs: 1250,
     userCommands: undefined,
+    profiles: undefined,
+    baselineCommandId: undefined,
+    replacesBaselineCommandId: undefined,
   });
   assert.deepEqual(normalized.gates[1].userCommands, ['/karpathy diff']);
   assert.deepEqual(normalized.gates[2].whenChanged, ['CLAUDE.md']);
@@ -33935,6 +34625,11 @@ function writePr1SlicesFile(slices, coverage) {
 function planPr1ThreeSliceRun(repoRoot) {
   mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
   writeFileSync(path.join(repoRoot, 'docs', 'arch.md'), PR1_PLAN_TEXT, 'utf8');
+  execFileSync('git', ['add', 'docs/arch.md'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+  execFileSync('git', ['commit', '-m', 'Add orchestration plan'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+  if (spawnSync('git', ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] }).status === 0) {
+    execFileSync('git', ['push'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+  }
   const written = writePr1SlicesFile([
     { id: 'one', title: 'First slice', phase: 'Phase A', text: 'do one' },
     { id: 'two', title: 'Second slice', phase: 'Phase A', text: 'do two' },
@@ -34191,7 +34886,7 @@ test('orchestrate pass with deferred slices pauses, then resume un-defers and co
   }
 });
 
-test('orchestrate finalize marks the deferred remainder excluded and keeps the record', () => {
+test('orchestrate finalize --abandon marks the deferred remainder excluded and keeps the record', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];
   let slicesDir;
@@ -34211,7 +34906,7 @@ test('orchestrate finalize marks the deferred remainder excluded and keeps the r
     createdWorktrees.push(...started.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
     assert.equal(started.run.status, 'dispatched'); // C1: bare start awaits review, not paused
 
-    const finalized = JSON.parse(runCli(['run', 'orchestrate', 'finalize', '--run-id', runId, '--json'], repoRoot).stdout);
+    const finalized = JSON.parse(runCli(['run', 'orchestrate', 'finalize', '--run-id', runId, '--abandon', '--json'], repoRoot).stdout);
     // Excluded slices are KEPT (not deleted), with a reason + timestamp.
     assert.equal(finalized.run.slices.length, 3);
     assert.equal(finalized.excludedCount, 2);
@@ -34242,13 +34937,20 @@ test('orchestrate outline --json snapshots phases, slice glyphs, and deferral', 
     assert.equal(outline.deferred, 0);
     assert.equal(outline.slices[0].glyph, '◻');
     assert.equal(outline.slices[0].state, 'queued');
+    assert.equal(outline.slices[0].title, 'First slice');
     assert.equal(outline.slices[0].deferred, false);
+    assert.equal(outline.current.id, 'one');
+    assert.equal(outline.current.phase, 'Phase A');
+    assert.equal(outline.current.title, 'First slice');
     assert.match(outline.message, /Plan — 2 phases, 3 slices/);
+    assert.match(outline.message, /Current: Phase A · Slice 1\/3 — First slice \[one\] — queued/);
+    assert.match(outline.message, /Slice 1 — First slice \[one\] — queued/);
 
     runCli(['run', 'orchestrate', 'scope', '--run-id', runId, '--through', 'one'], repoRoot);
     const scopedOutline = JSON.parse(runCli(['run', 'orchestrate', 'outline', '--run-id', runId, '--json'], repoRoot).stdout);
     assert.equal(scopedOutline.deferred, 2);
     assert.equal(scopedOutline.slices[1].deferred, true);
+    assert.equal(scopedOutline.current.id, 'one');
     assert.match(scopedOutline.message, /deferred/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });

@@ -44,11 +44,17 @@ export function evaluateReviewEvidenceForPr(
   }
   const currentBranch = runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
   const currentSha = runGit(context.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '';
-  const worktreeStatus = readWorktreeStatusSnapshot(context.repoRoot, { includeStatusDigest: true });
+  const worktreeStatus = readWorktreeStatusSnapshot(context.repoRoot, {
+    includeStatusDigest: true,
+    includeMaterialTreeHash: true,
+  });
   const latest = options.latestOverride ?? selectReviewEvidenceRecord(reviewState.records, {
     currentBranch,
     currentSha,
     currentWorktreeStatusDigest: worktreeStatus.statusDigest,
+    currentWorktreeStatusReliable: worktreeStatus.statusDigestReliable,
+    currentWorktreeMaterialTreeHash: worktreeStatus.materialTreeHash ?? '',
+    currentWorktreeMaterialTreeReliable: worktreeStatus.materialTreeReliable === true,
   });
   const issues = collectReviewEvidenceIssues({
     latest,
@@ -59,6 +65,9 @@ export function evaluateReviewEvidenceForPr(
     currentWorktreeStatusDigest: worktreeStatus.statusDigest,
     currentWorktreeStatusReliable: worktreeStatus.statusDigestReliable,
     currentWorktreeStatusWarnings: worktreeStatus.statusDigestWarnings,
+    currentWorktreeMaterialTreeHash: worktreeStatus.materialTreeHash ?? '',
+    currentWorktreeMaterialTreeReliable: worktreeStatus.materialTreeReliable === true,
+    currentWorktreeMaterialTreeWarnings: worktreeStatus.materialTreeWarnings ?? [],
   });
 
   return {
@@ -75,13 +84,16 @@ export function selectReviewEvidenceRecord(
     currentBranch: string;
     currentSha: string;
     currentWorktreeStatusDigest: string;
+    currentWorktreeStatusReliable?: boolean;
+    currentWorktreeMaterialTreeHash?: string;
+    currentWorktreeMaterialTreeReliable?: boolean;
   },
 ): ReviewRunRecord | null {
-  const { currentBranch, currentSha, currentWorktreeStatusDigest } = options;
+  const { currentBranch, currentSha } = options;
   return records.find((record) =>
     record.branchName === currentBranch
     && record.sha === currentSha
-    && record.worktreeStatusDigest === currentWorktreeStatusDigest
+    && reviewRecordMatchesCurrentWorktree(record, options)
   )
     ?? records.find((record) => record.branchName === currentBranch && record.sha === currentSha)
     ?? records.find((record) => record.branchName === currentBranch)
@@ -105,6 +117,9 @@ function collectReviewEvidenceIssues(options: {
   currentWorktreeStatusDigest: string;
   currentWorktreeStatusReliable: boolean;
   currentWorktreeStatusWarnings: string[];
+  currentWorktreeMaterialTreeHash: string;
+  currentWorktreeMaterialTreeReliable: boolean;
+  currentWorktreeMaterialTreeWarnings: string[];
 }): ReviewEvidenceIssue[] {
   const {
     latest,
@@ -115,6 +130,9 @@ function collectReviewEvidenceIssues(options: {
     currentWorktreeStatusDigest,
     currentWorktreeStatusReliable,
     currentWorktreeStatusWarnings,
+    currentWorktreeMaterialTreeHash,
+    currentWorktreeMaterialTreeReliable,
+    currentWorktreeMaterialTreeWarnings,
   } = options;
   if (!latest) {
     return [{
@@ -153,30 +171,36 @@ function collectReviewEvidenceIssues(options: {
       blocking: true,
     });
   }
-  if (latest.worktreeStatusDigest === undefined) {
+  const worktreeIdentityMatches = reviewRecordMatchesCurrentWorktree(latest, {
+    currentWorktreeStatusDigest,
+    currentWorktreeStatusReliable,
+    currentWorktreeMaterialTreeHash,
+    currentWorktreeMaterialTreeReliable,
+  });
+  if (latest.worktreeStatusDigest === undefined && latest.worktreeMaterialTreeHash === undefined) {
     issues.push({
       status: 'incomplete',
-      message: `latest review ${latest.id} does not include a worktree status digest`,
+      message: `latest review ${latest.id} does not include a worktree identity`,
       blocking: true,
     });
-  } else if (latest.worktreeStatusDigest !== currentWorktreeStatusDigest) {
+  } else if (!worktreeIdentityMatches) {
     issues.push({
       status: 'incomplete',
       message: `latest review ${latest.id} is for a different worktree state`,
       blocking: true,
     });
   }
-  if (latest.worktreeStatusReliable === false) {
+  if (latest.worktreeStatusReliable === false && latest.worktreeMaterialTreeReliable !== true) {
     issues.push({
       status: 'incomplete',
-      message: `latest review ${latest.id} recorded an unreliable worktree digest: ${(latest.worktreeStatusWarnings ?? []).join('; ') || 'status digest was unreliable'}`,
+      message: `latest review ${latest.id} recorded an unreliable worktree identity: ${formatWorktreeIdentityWarnings(latest.worktreeStatusWarnings ?? [], latest.worktreeMaterialTreeWarnings ?? [])}`,
       blocking: true,
     });
   }
-  if (!currentWorktreeStatusReliable) {
+  if (!currentWorktreeStatusReliable && !currentWorktreeMaterialTreeReliable) {
     issues.push({
       status: 'incomplete',
-      message: `current worktree digest is unreliable: ${currentWorktreeStatusWarnings.join('; ') || 'status digest is incomplete'}`,
+      message: `current worktree identity is unreliable: ${formatWorktreeIdentityWarnings(currentWorktreeStatusWarnings, currentWorktreeMaterialTreeWarnings)}`,
       blocking: true,
     });
   }
@@ -249,6 +273,42 @@ function collectReviewEvidenceIssues(options: {
   }
 
   return issues.filter((issue) => issue.blocking);
+}
+
+function reviewRecordMatchesCurrentWorktree(
+  record: Pick<ReviewRunRecord, 'worktreeStatusDigest' | 'worktreeStatusReliable' | 'worktreeMaterialTreeHash' | 'worktreeMaterialTreeReliable'>,
+  options: {
+    currentWorktreeStatusDigest: string;
+    currentWorktreeStatusReliable?: boolean;
+    currentWorktreeMaterialTreeHash?: string;
+    currentWorktreeMaterialTreeReliable?: boolean;
+  },
+): boolean {
+  if (
+    options.currentWorktreeStatusReliable !== false
+    && record.worktreeStatusReliable !== false
+    && record.worktreeStatusDigest === options.currentWorktreeStatusDigest
+  ) {
+    return true;
+  }
+  return reviewRecordMaterialTreeMatchesCurrentWorktree(record, options);
+}
+
+function reviewRecordMaterialTreeMatchesCurrentWorktree(
+  record: Pick<ReviewRunRecord, 'worktreeMaterialTreeHash' | 'worktreeMaterialTreeReliable'>,
+  options: {
+    currentWorktreeMaterialTreeHash?: string;
+    currentWorktreeMaterialTreeReliable?: boolean;
+  },
+): boolean {
+  return record.worktreeMaterialTreeReliable === true
+    && options.currentWorktreeMaterialTreeReliable === true
+    && Boolean(record.worktreeMaterialTreeHash)
+    && record.worktreeMaterialTreeHash === options.currentWorktreeMaterialTreeHash;
+}
+
+function formatWorktreeIdentityWarnings(statusWarnings: string[], materialTreeWarnings: string[]): string {
+  return [...statusWarnings, ...materialTreeWarnings].join('; ') || 'worktree identity was unreliable';
 }
 
 function shortSha(value: string): string {

@@ -37,9 +37,11 @@ import {
   resolveWorkflowContext,
   runGit,
   writeJsonFile,
+  isStableEvidenceId,
   type ParsedOperatorArgs,
   type ReviewGateConfig,
   type ReviewGatePhase,
+  type ReviewProfile,
   type ReviewGateRunRecord,
   type ReviewRunRecord,
   type WorkflowConfig,
@@ -254,8 +256,14 @@ export interface BuildReviewRunRecordOptions {
   phaseFilter?: ReviewGatePhase | '';
   activeSurfaces: string[];
   reviewConfigChangeApproval?: ReviewGateRunRecord | null;
+  profileContext?: ReviewProfileContext;
   onGateStart?: (gate: ReviewGateConfig) => void;
   onGateFinish?: (gate: ReviewGateRunRecord) => void;
+}
+
+export interface ReviewProfileContext {
+  runProfile?: ReviewProfile | null;
+  sliceProfile?: ReviewProfile | null;
 }
 
 export async function handleReview(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
@@ -440,8 +448,8 @@ export function buildReviewPassRecord(options: {
     includeStatusDigest: true,
     includeMaterialTreeHash: true,
   });
-  if (!worktreeStatus.statusDigestReliable) {
-    throw new Error(`review pass cannot attest an unreliable worktree digest: ${worktreeStatus.statusDigestWarnings.join('; ') || 'status digest is incomplete'}`);
+  if (!worktreeSnapshotHasReviewIdentity(worktreeStatus)) {
+    throw new Error(`review pass cannot attest an unreliable worktree state: ${formatReviewWorktreeIdentityWarnings(worktreeStatus)}`);
   }
 
   const state = loadReviewState(options.commonDir, options.config);
@@ -451,7 +459,7 @@ export function buildReviewPassRecord(options: {
     && !record.phaseFilter
     && record.branchName === currentBranch
     && record.sha === currentSha
-    && record.worktreeStatusDigest === worktreeStatus.statusDigest
+    && reviewRecordMatchesWorktreeSnapshot(record, worktreeStatus)
   );
   if (!base) {
     throw new Error('review pass requires a full, non-dry-run /pipelane review for the current branch, HEAD, and worktree state.');
@@ -682,6 +690,9 @@ function hydrateReviewSetupEntryFromSavedGate(
     when: savedGate.when ?? entry.when,
     whenChanged: savedGate.whenChanged ?? entry.whenChanged,
     userCommands: savedGate.userCommands ?? entry.userCommands,
+    profiles: savedGate.profiles ?? entry.profiles,
+    baselineCommandId: savedGate.baselineCommandId ?? entry.baselineCommandId,
+    replacesBaselineCommandId: savedGate.replacesBaselineCommandId ?? entry.replacesBaselineCommandId,
   };
 }
 
@@ -698,6 +709,9 @@ function reviewSetupEntryFromCustomSavedGate(gate: ReviewGateConfig): ResolvedRe
     when: gate.when,
     whenChanged: gate.whenChanged,
     userCommands: gate.userCommands,
+    profiles: gate.profiles,
+    baselineCommandId: gate.baselineCommandId,
+    replacesBaselineCommandId: gate.replacesBaselineCommandId,
     recommended: false,
   };
 }
@@ -2134,6 +2148,9 @@ function reviewSetupGateToConfig(gate: ReviewSetupGateOption): ReviewGateConfig 
     when: entry.when,
     whenChanged: entry.whenChanged,
     userCommands,
+    profiles: entry.profiles,
+    baselineCommandId: entry.baselineCommandId ?? (entry.type === 'command' && isStableEvidenceId(entry.id) ? entry.id : undefined),
+    replacesBaselineCommandId: entry.replacesBaselineCommandId,
   };
 }
 
@@ -2285,6 +2302,7 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
           reviewConfigChanged: reviewConfigChangeNeedsApproval,
           changedFiles,
           activeSurfaces: options.activeSurfaces,
+          profileContext: options.profileContext,
           deferAiGate,
         });
     options.onGateFinish?.(record);
@@ -2966,6 +2984,7 @@ function runReviewGate(options: {
   reviewConfigChanged: boolean;
   changedFiles: string[];
   activeSurfaces: string[];
+  profileContext?: ReviewProfileContext;
   // B4: when a blocking deterministic gate has already failed this run, defer the
   // expensive AI judge to `pending` instead of invoking it.
   deferAiGate?: boolean;
@@ -2985,7 +3004,7 @@ function runReviewGate(options: {
     userCommands: gate.userCommands,
     startedAt,
   };
-  const skipReason = skipReasonForGate(gate, changedFiles, activeSurfaces);
+  const skipReason = skipReasonForGate(gate, changedFiles, activeSurfaces, options.profileContext);
   if (skipReason) {
     return finishGate(base, startMs, {
       status: 'skipped',
@@ -3085,13 +3104,13 @@ function runReviewGate(options: {
   let afterStatus: WorktreeStatusSnapshot;
   let commandResult: ReturnType<typeof spawnReviewGateCommand>;
   try {
-    beforeStatus = readWorktreeStatusSnapshot(repoRoot, { includeStatusDigest: true });
+    beforeStatus = readReviewGateWorktreeStatus(repoRoot);
     commandResult = spawnReviewGateCommand(gate.command, {
       cwd: repoRoot,
       timeout: timeoutMs,
       env: gateSubprocessEnv({ stripAiReviewOverrides: true, gate, repoRoot, runId, inheritedContext }),
     });
-    afterStatus = readWorktreeStatusSnapshot(repoRoot, { includeStatusDigest: true });
+    afterStatus = readReviewGateWorktreeStatus(repoRoot);
   } finally {
     if (lock.status === 'acquired') {
       try {
@@ -3101,9 +3120,12 @@ function runReviewGate(options: {
   }
   const { result, stdout, stderr } = commandResult;
   const exitCode = typeof result.status === 'number' ? result.status : null;
+  const signal = result.signal ?? null;
+  const errorCode = result.error ? (result.error as NodeJS.ErrnoException).code ?? 'EUNKNOWN' : null;
+  const errorMessage = result.error?.message ?? null;
   const timedOut = result.error && (result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT';
   const outputLimited = result.error && (result.error as NodeJS.ErrnoException).code === 'EOUTPUTLIMIT';
-  const ok = exitCode === 0 && !timedOut && !result.error;
+  const ok = exitCode === 0 && !signal && !timedOut && !result.error;
   const checkoutMutationSummary = reviewGateCheckoutMutationSummary('Review command gate', beforeStatus, afterStatus);
   const errorSummary = result.error && !timedOut
     ? outputLimited
@@ -3111,7 +3133,9 @@ function runReviewGate(options: {
       : `command failed to start: ${result.error.message}`
     : timedOut
       ? `command timed out after ${timeoutMs}ms`
-      : `command exited ${exitCode}`;
+      : signal
+        ? `command terminated by ${signal}`
+        : `command exited ${exitCode}`;
 
   return finishGate(base, startMs, {
     status: ok && !checkoutMutationSummary ? 'passed' : 'failed',
@@ -3119,7 +3143,9 @@ function runReviewGate(options: {
       ? `command passed: ${gate.command}`
       : checkoutMutationSummary ?? errorSummary,
     exitCode,
-    errorCode: result.error ? (result.error as NodeJS.ErrnoException).code ?? null : undefined,
+    ...(signal ? { signal } : {}),
+    ...(errorCode ? { errorCode } : {}),
+    ...(errorMessage ? { errorMessage } : {}),
     stdoutTail: tail(redactReviewOutput(stdout)),
     stderrTail: tail(redactReviewOutput(stderr)),
   });
@@ -3211,14 +3237,14 @@ function runAiReviewGate(options: {
   let afterStatus: WorktreeStatusSnapshot;
   let commandResult: ReturnType<typeof spawnReviewGateCommand>;
   try {
-    beforeStatus = readWorktreeStatusSnapshot(repoRoot, { includeStatusDigest: true });
+    beforeStatus = readReviewGateWorktreeStatus(repoRoot);
     commandResult = spawnReviewGateCommand(command, {
       cwd: repoRoot,
       input: prompt,
       timeout: timeoutMs,
       env,
     });
-    afterStatus = readWorktreeStatusSnapshot(repoRoot, { includeStatusDigest: true });
+    afterStatus = readReviewGateWorktreeStatus(repoRoot);
   } finally {
     if (lock.status === 'acquired') {
       try {
@@ -3503,6 +3529,14 @@ function reviewGateCheckoutMutationSummary(
   if (before.head && after.head && before.head !== after.head) {
     return `${label} changed HEAD; revert gate commit(s) and rerun (${shortSha(before.head)} -> ${shortSha(after.head)})`;
   }
+  if (before.materialTreeReliable === true && after.materialTreeReliable === true) {
+    if (before.materialTreeHash && after.materialTreeHash && before.materialTreeHash !== after.materialTreeHash) {
+      return `${label} mutated the worktree; revert gate changes and rerun (${formatWorktreeStatusDelta(before, after)})`;
+    }
+    if (!before.statusDigestReliable || !after.statusDigestReliable) {
+      return null;
+    }
+  }
   if (!before.statusDigestReliable) {
     return `${label} could not verify unchanged worktree before execution: ${formatWorktreeStatusWarnings(before)}`;
   }
@@ -3515,12 +3549,50 @@ function reviewGateCheckoutMutationSummary(
   return null;
 }
 
+function readReviewGateWorktreeStatus(repoRoot: string): WorktreeStatusSnapshot {
+  return readWorktreeStatusSnapshot(repoRoot, {
+    includeStatusDigest: true,
+    includeMaterialTreeHash: true,
+  });
+}
+
+function worktreeSnapshotHasReviewIdentity(snapshot: WorktreeStatusSnapshot): boolean {
+  return snapshot.statusDigestReliable || snapshot.materialTreeReliable === true;
+}
+
+function reviewRecordMatchesWorktreeSnapshot(
+  record: Pick<ReviewRunRecord, 'worktreeStatusDigest' | 'worktreeStatusReliable' | 'worktreeMaterialTreeHash' | 'worktreeMaterialTreeReliable'>,
+  snapshot: WorktreeStatusSnapshot,
+): boolean {
+  if (
+    snapshot.statusDigestReliable
+    && record.worktreeStatusReliable !== false
+    && record.worktreeStatusDigest === snapshot.statusDigest
+  ) {
+    return true;
+  }
+  return record.worktreeMaterialTreeReliable === true
+    && snapshot.materialTreeReliable === true
+    && Boolean(record.worktreeMaterialTreeHash)
+    && record.worktreeMaterialTreeHash === snapshot.materialTreeHash;
+}
+
 function shortSha(value: string): string {
   return value.slice(0, 12) || 'unknown';
 }
 
 function formatWorktreeStatusWarnings(snapshot: Pick<WorktreeStatusSnapshot, 'statusDigestWarnings'>): string {
   return snapshot.statusDigestWarnings.join('; ') || 'status digest was unreliable';
+}
+
+function formatReviewWorktreeIdentityWarnings(
+  snapshot: Pick<WorktreeStatusSnapshot, 'statusDigestWarnings' | 'materialTreeWarnings'>,
+): string {
+  const warnings = [
+    ...snapshot.statusDigestWarnings,
+    ...(snapshot.materialTreeWarnings ?? []),
+  ];
+  return warnings.join('; ') || 'worktree identity was unreliable';
 }
 
 function formatWorktreeStatusDelta(
@@ -3575,11 +3647,29 @@ function summarizeConfigChangeApprovalStatus(gates: ReviewGateRunRecord[]): Revi
   return summarizeRunStatus(gates);
 }
 
-function skipReasonForGate(gate: ReviewGateConfig, changedFiles: string[], activeSurfaces: string[]): string | null {
-  if (gate.whenChanged && gate.whenChanged.length > 0) {
+function skipReasonForGate(
+  gate: ReviewGateConfig,
+  changedFiles: string[],
+  activeSurfaces: string[],
+  profileContext?: ReviewProfileContext,
+): string | null {
+  const docsOnly = profileContext?.runProfile === 'docs-only' && profileContext.sliceProfile === 'docs-only';
+  const docsOnlyScopedGate = gate.profiles?.includes('docs-only') === true;
+  const shouldApplyWhenChanged = gate.whenChanged && gate.whenChanged.length > 0;
+  let matchedWhenChanged = false;
+  if (shouldApplyWhenChanged) {
     const matched = changedFiles.some((file) => gate.whenChanged?.some((pattern) => matchesPathPattern(file, pattern)));
+    matchedWhenChanged = matched;
     if (!matched) {
       return `skipped: no changed files matched ${gate.whenChanged.join(', ')}`;
+    }
+  }
+  if (docsOnly) {
+    if (isUnscopedFullSuiteGate(gate)) {
+      return 'docs-only profile, gate has no matching whenChanged path';
+    }
+    if (isAiOrCodeReviewGate(gate) && !docsOnlyScopedGate && !matchedWhenChanged) {
+      return 'docs-only profile, AI/code gate not scoped to docs';
     }
   }
   if (gate.when?.startsWith('surface:')) {
@@ -3592,6 +3682,20 @@ function skipReasonForGate(gate: ReviewGateConfig, changedFiles: string[], activ
     return `skipped: no changed files matched ${gate.when}`;
   }
   return null;
+}
+
+function isUnscopedFullSuiteGate(gate: ReviewGateConfig): boolean {
+  if (gate.whenChanged && gate.whenChanged.length > 0) return false;
+  if (gate.type !== 'command' && gate.type !== 'pipelane') return false;
+  const id = gate.id.toLowerCase();
+  const command = (gate.command ?? '').toLowerCase();
+  return ['test', 'build', 'typecheck'].includes(id)
+    || /\bnpm\s+(?:run\s+)?(?:test|build|typecheck)\b/.test(command)
+    || /\b(?:pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|typecheck)\b/.test(command);
+}
+
+function isAiOrCodeReviewGate(gate: ReviewGateConfig): boolean {
+  return gate.type === 'skill' || gate.type === 'agent';
 }
 
 function manualGateSummary(gate: ReviewGateConfig): string {
@@ -3673,8 +3777,11 @@ function selectReviewConfigChangeApproval(
 ): ReviewGateRunRecord | null {
   const currentBranch = runGit(repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
   const currentSha = runGit(repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '';
-  const worktreeStatus = readWorktreeStatusSnapshot(repoRoot, { includeStatusDigest: true });
-  if (!worktreeStatus.statusDigestReliable) return null;
+  const worktreeStatus = readWorktreeStatusSnapshot(repoRoot, {
+    includeStatusDigest: true,
+    includeMaterialTreeHash: true,
+  });
+  if (!worktreeSnapshotHasReviewIdentity(worktreeStatus)) return null;
 
   const state = loadReviewState(commonDir, config);
   for (const record of state.records) {
@@ -3684,8 +3791,7 @@ function selectReviewConfigChangeApproval(
       || record.phaseFilter
       || record.branchName !== currentBranch
       || record.sha !== currentSha
-      || record.worktreeStatusDigest !== worktreeStatus.statusDigest
-      || record.worktreeStatusReliable !== true
+      || !reviewRecordMatchesWorktreeSnapshot(record, worktreeStatus)
     ) {
       continue;
     }

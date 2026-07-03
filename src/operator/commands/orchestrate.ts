@@ -14,6 +14,7 @@ import {
   analysisSourceSha256,
   assertSafeOrchestrationRunId,
   buildOrchestrationRunRecord,
+  classifyDocsSafePathRecords,
   coverageDigest,
   diagnoseOrchestrationRunRecord,
   isActiveOrchestrationRun,
@@ -21,6 +22,7 @@ import {
   loadUnsignedLegacyOrchestrationRunRecord,
   loadOrchestrationRunRecord,
   missingRelevantSliceWorktreeDiagnostic,
+  normalizeRepoRelativePath,
   ORCHESTRATION_CORRUPT_LEDGER_BLOCK_AGE_MS,
   orchestrationRunPath,
   planReviewGateSnapshotDigest,
@@ -37,7 +39,9 @@ import {
   type OrchestrationCoverageEntry,
   type OrchestrationLedgerDiagnostic,
   type OrchestrationObservationRecord,
+  type OrchestrationPathRecord,
   type OrchestrationPlanAnalysisRecord,
+  type OrchestrationReviewProfile,
   type PlanReviewEvidenceBinding,
   type PlanReviewGateRunRecord,
   type OrchestrationReviewFixRecord,
@@ -47,6 +51,7 @@ import {
   type OrchestrationSliceReviewRecord,
   type OrchestrationSliceRecord,
   type OrchestrationSliceWorkerRecord,
+  type OrchestrationSourceSnapshot,
 } from '../orchestration-ledger.ts';
 import { ORCHESTRATION_STATE_KEY_ENV, ORCHESTRATION_STATE_KEY_FILE_ENV, resolveOrchestrationStateKey, signSignedPayload, verifySignedPayload, resolveReviewStateKey } from '../integrity.ts';
 import {
@@ -68,6 +73,7 @@ import {
   resolveWorkflowContext,
   runGit,
   loadReviewState,
+  isStableEvidenceId,
   type ParsedOperatorArgs,
   type ReviewGateConfig,
   type ReviewGateRunRecord,
@@ -89,6 +95,7 @@ const MAX_LIKELY_PLAN_FILES = 5;
 const MAX_PLAN_SCAN_FILES = 200;
 const ORCHESTRATION_REVIEW_DIAGNOSTIC_MAX = 10;
 const NATIVE_COMMAND_PROBE_TIMEOUT_MS = 5000;
+const GH_PR_VIEW_BASE_TIMEOUT_MS = 2000;
 const DEFAULT_REVIEW_LOOP_LIMIT = 2;
 const ORCHESTRATION_RUN_LOCK_STALE_MS = 10 * 60 * 1000;
 const ORCHESTRATION_RUN_LOCK_WAIT_TIMEOUT_MS = 30 * 1000;
@@ -270,6 +277,10 @@ interface OrchestrationAnalysisFile {
     throughSliceId: string | null;
     reason: string | null;
   };
+  slices: Array<{
+    id: string | null;
+    plannedPathScope: string[] | null;
+  }>;
 }
 
 interface PreparedSliceReport {
@@ -547,12 +558,22 @@ async function handleOrchestrateEntry(cwd: string, parsed: ParsedOperatorArgs): 
       process.exitCode = 1;
       return;
     }
-    const run = buildEntryRunRecord(context, parsed, planPath, outcome);
+    let entryAnalysisFile: string | null = null;
     if (parsed.flags.yes) {
       if (!parsed.flags.orchestrationAnalysisFile.trim()) {
         throw new Error('orchestrate --yes requires --analysis-file <path> so plan analysis is recorded before worktrees are created.');
       }
-      const analysisFile = resolveInputFile(cwd, parsed.flags.orchestrationAnalysisFile, '--analysis-file');
+      entryAnalysisFile = resolveInputFile(cwd, parsed.flags.orchestrationAnalysisFile, '--analysis-file');
+    }
+    const run = buildEntryRunRecord(context, parsed, planPath, outcome, {
+      requireCleanSource: !parsed.flags.preview,
+      explicitInputPaths: [entryAnalysisFile],
+    });
+    if (parsed.flags.yes) {
+      const analysisFile = entryAnalysisFile;
+      if (!analysisFile) {
+        throw new Error('orchestrate --yes requires --analysis-file <path> so plan analysis is recorded before worktrees are created.');
+      }
       const report = await withNewOrchestrationRunLockAsync(context, run, async () => {
         resolveOrchestrationStateKey();
         const analysisResult = attachPlanAnalysisFromFile(context, run, analysisFile, 'orchestrate --yes');
@@ -624,12 +645,18 @@ function buildEntryRunRecord(
   parsed: ParsedOperatorArgs,
   planPath: string | null,
   outcome: string,
+  options: { requireCleanSource?: boolean; explicitInputPaths?: Array<string | null> } = {},
 ): OrchestrationRunRecord {
   const planText = planPath ? readPlanFile(planPath) : '';
   if (!planText.trim() && !outcome) {
     throw new Error('orchestrate requires --plan-file <path> or --outcome <text> to preview or start a new run.');
   }
   const slicesFile = parseSlicesFile(parsed.flags.goalSlicesFile, context.cwd);
+  const baseBranch = resolveOrchestrationBaseBranch(context, parsed);
+  const sourceSnapshot = buildCleanSourceSnapshot(context, {
+    requireClean: options.requireCleanSource === true,
+    allowedDirtyPaths: orchestrationInputDirtyPathAllowlist(context, parsed, planPath, options.explicitInputPaths),
+  });
   return buildOrchestrationRunRecord({
     repoRoot: context.repoRoot,
     config: context.config,
@@ -640,9 +667,141 @@ function buildEntryRunRecord(
     provider: (parsed.flags.goalProvider.trim() as GoalProvider) || DEFAULT_GOAL_PROVIDER,
     maxTurns: parsePositiveInteger(parsed.flags.goalMaxTurns),
     maxMinutes: parsePositiveInteger(parsed.flags.goalMaxMinutes),
+    baseBranch,
+    sourceSnapshot: sourceSnapshot ?? undefined,
     slices: slicesFile?.slices,
     coverage: slicesFile?.coverage,
   });
+}
+
+function resolveOrchestrationBaseBranch(context: WorkflowContext, parsed: ParsedOperatorArgs): string {
+  const explicit = parsed.flags.orchestrationBaseBranch.trim();
+  if (explicit) return explicit;
+  const orchestrateBase = context.config.orchestrate?.baseBranch?.trim();
+  if (orchestrateBase) return orchestrateBase;
+  const prBase = resolveGhPrBaseBranch(context.repoRoot);
+  if (prBase) return prBase;
+  const originHead = resolveOriginHeadBranch(context.repoRoot);
+  if (originHead) return originHead;
+  const configuredBase = context.config.baseBranch.trim();
+  if (configuredBase) return configuredBase;
+  if (gitRefExists(context.repoRoot, 'main') || gitRefExists(context.repoRoot, 'origin/main')) return 'main';
+  if (gitRefExists(context.repoRoot, 'master') || gitRefExists(context.repoRoot, 'origin/master')) return 'master';
+  return 'main';
+}
+
+function resolveGhPrBaseBranch(repoRoot: string): string | null {
+  const result = spawnSync('gh', ['pr', 'view', '--json', 'baseRefName'], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: GH_PR_VIEW_BASE_TIMEOUT_MS,
+  });
+  if (result.error || result.status !== 0 || !result.stdout.trim()) return null;
+  try {
+    const parsed = JSON.parse(result.stdout) as { baseRefName?: unknown };
+    return typeof parsed.baseRefName === 'string' && parsed.baseRefName.trim() ? parsed.baseRefName.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveOriginHeadBranch(repoRoot: string): string | null {
+  const symbolic = runGit(repoRoot, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD'], true)?.trim() ?? '';
+  const match = /^origin\/(.+)$/.exec(symbolic);
+  return match?.[1]?.trim() || null;
+}
+
+function gitRefExists(repoRoot: string, ref: string): boolean {
+  return Boolean(runGit(repoRoot, ['rev-parse', '--verify', ref], true)?.trim());
+}
+
+function buildCleanSourceSnapshot(
+  context: WorkflowContext,
+  options: {
+    requireClean: boolean;
+    allowedDirtyPaths?: Set<string>;
+  },
+): OrchestrationSourceSnapshot | null {
+  const allDirtyPaths = collectDirtyParentPaths(context.repoRoot);
+  const allowedDirtyPaths = allDirtyPaths
+    .filter((file) => options.allowedDirtyPaths?.has(file));
+  const dirtyPaths = allDirtyPaths
+    .filter((file) => !options.allowedDirtyPaths?.has(file));
+  if (dirtyPaths.length > 0) {
+    if (!options.requireClean) return null;
+    throw new Error([
+      'orchestrate source preflight blocked: dirty parent worktree.',
+      'Commit or stash local changes before orchestration so slice review can use a clean source baseline.',
+      `Dirty paths: ${dirtyPaths.slice(0, 10).join(', ')}${dirtyPaths.length > 10 ? `, +${dirtyPaths.length - 10} more` : ''}`,
+    ].join('\n'));
+  }
+  const headSha = runGit(context.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '';
+  if (!/^[a-f0-9]{40}$/i.test(headSha)) return null;
+  return {
+    status: 'clean',
+    headSha,
+    reviewBaseRef: headSha,
+    changedFiles: allowedDirtyPaths.sort(),
+  };
+}
+
+function collectDirtyParentPaths(repoRoot: string): string[] {
+  const outputs = [
+    runGit(repoRoot, ['diff', '--cached', '--name-only'], true) ?? '',
+    runGit(repoRoot, ['diff', '--name-only'], true) ?? '',
+    runGit(repoRoot, ['ls-files', '--others', '--exclude-standard'], true) ?? '',
+  ];
+  const seen = new Set<string>();
+  const files: string[] = [];
+  for (const output of outputs) {
+    for (const line of output.split(/\r?\n/)) {
+      const file = normalizeRepoRelativePath(line);
+      if (file && !seen.has(file)) {
+        seen.add(file);
+        files.push(file);
+      }
+    }
+  }
+  return files;
+}
+
+function orchestrationInputDirtyPathAllowlist(
+  context: WorkflowContext,
+  parsed: ParsedOperatorArgs,
+  planPath: string | null,
+  explicitInputPaths: Array<string | null> = [],
+): Set<string> {
+  const allowed = new Set<string>();
+  for (const rawPath of [
+    planPath,
+    ...explicitInputPaths,
+    parsed.flags.orchestrationAnalysisFile,
+    parsed.flags.goalSlicesFile,
+  ]) {
+    const repoPath = repoRelativeInputPath(context.repoRoot, context.cwd, rawPath);
+    if (repoPath) allowed.add(repoPath);
+  }
+  return allowed;
+}
+
+function repoRelativeInputPath(repoRoot: string, cwd: string, rawPath: string | null): string | null {
+  const trimmed = rawPath?.trim();
+  if (!trimmed) return null;
+  const resolved = path.isAbsolute(trimmed) ? trimmed : path.resolve(cwd, trimmed);
+  const repoRootForCompare = canonicalExistingInputPath(repoRoot);
+  const resolvedForCompare = canonicalExistingInputPath(resolved);
+  const canonicalRelative = normalizeRepoRelativePath(path.relative(repoRootForCompare, resolvedForCompare).replaceAll('\\', '/'));
+  if (canonicalRelative) return canonicalRelative;
+  return normalizeRepoRelativePath(path.relative(repoRoot, resolved).replaceAll('\\', '/'));
+}
+
+function canonicalExistingInputPath(targetPath: string): string {
+  try {
+    return realpathSync(targetPath);
+  } catch {
+    return path.resolve(targetPath);
+  }
 }
 
 async function runApprovedOrchestration(
@@ -658,6 +817,7 @@ async function runApprovedOrchestration(
 ): Promise<OrchestrateEntryReport> {
   const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
   assertPlanAnalysisReadyForPrepare(context, run);
+  ensureBaselinePreflight(context, run);
   prepareSliceWorktrees(context, run, offline);
   dispatchPreparedSlices(context, run);
   // No silent autopilot: even --yes reprints the outline after each slice (text
@@ -1650,14 +1810,18 @@ function renderOrchestrationPreview(repoRoot: string, run: OrchestrationRunRecor
     `Review gates: ${run.gateSnapshot.gates.length}`,
     `Slices: ${run.slices.length}`,
     '',
-    'Slice preview:',
+    renderOrchestrationOutline(run),
   ];
-  for (const slice of run.slices) {
+  const flaggedSlices = run.slices.filter((slice) => slice.requiresConfirmation || slice.critique.length > 0);
+  if (flaggedSlices.length > 0) {
+    lines.push('', 'Review notes:');
+  }
+  for (const slice of flaggedSlices) {
     const flags = [
       slice.requiresConfirmation ? 'human decision' : '',
       slice.critique.length > 0 ? 'critique' : '',
     ].filter(Boolean);
-    lines.push(`- ${slice.id}: ${slice.outcome}${flags.length > 0 ? ` (${flags.join(', ')})` : ''}`);
+    lines.push(`- ${formatSliceOutlineName(slice)} (${flags.join(', ')})`);
   }
   lines.push('', `Next: run /pipelane orchestrate ${planPath ? `--plan-file ${displayRepoPath(repoRoot, planPath)}` : `--outcome "${run.plan.title}"`} --analysis-file <path> --yes`);
   return lines.join('\n');
@@ -1697,11 +1861,8 @@ function renderApprovedOrchestrationReport(
     `Auto-fix status: ${autoFixResult?.status ?? 'not-run'}`,
     `Auto-fix attempts: ${autoFixResult?.attemptedCount ?? 0}`,
     '',
-    'Slices:',
+    renderOrchestrationOutline(run),
   ];
-  for (const slice of run.slices) {
-    lines.push(`- ${slice.id}: ${slice.status}${slice.worker ? ` worker=${slice.worker.status}` : ''} review=${slice.review?.status ?? 'none'}`);
-  }
   const pendingGateLines = reviewResult?.pendingCount ? formatPendingReviewGateInstructions(run) : [];
   if (pendingGateLines.length > 0) {
     lines.push('', 'Pending gates:', ...pendingGateLines);
@@ -1737,7 +1898,7 @@ function renderActiveRunReport(context: WorkflowContext, run: OrchestrationRunRe
     `Plan: ${run.source.planPath ?? run.source.prompt ?? '(outcome only)'}`,
     `Slices: ${summary.completedSlices}/${summary.sliceCount} complete, ${summary.failedSlices} failed, ${summary.pendingSlices} pending${summary.deferredSlices > 0 ? `, ${summary.deferredSlices} deferred` : ''}`,
     '',
-    'Slice status:',
+    renderOrchestrationOutline(run),
   ];
   const reviewOptions = { worktreeExistsCache: new Map<string, boolean>() };
   const missingWorktrees = run.slices
@@ -1746,13 +1907,8 @@ function renderActiveRunReport(context: WorkflowContext, run: OrchestrationRunRe
   if (missingWorktrees.length > 0) {
     lines.push('', 'Blocked worktrees:');
     for (const diagnostic of missingWorktrees) {
-      lines.push(`- ${diagnostic.sliceId}: assigned worktree is missing at ${diagnostic.worktreePath}`);
+      lines.push(`- ${diagnostic.sliceId}: assigned worktree is missing at ${diagnostic.worktreePath} (worktree=missing:${diagnostic.worktreePath})`);
     }
-  }
-  for (const slice of run.slices) {
-    const missing = missingWorktrees.find((diagnostic) => diagnostic.sliceId === slice.id);
-    const worktree = missing ? ` worktree=missing:${missing.worktreePath}` : '';
-    lines.push(`- ${slice.id}: ${slice.status}${slice.worker ? ` worker=${slice.worker.status}` : ''} review=${slice.review?.status ?? 'none'}${worktree}`);
   }
   if (missingWorktrees.length > 0) {
     lines.push(
@@ -1842,7 +1998,7 @@ function handleAnalyze(cwd: string, parsed: ParsedOperatorArgs): void {
     return;
   }
 
-  const { run: resolvedRun, planPath } = resolveAnalyzeRun(context, parsed);
+  const { run: resolvedRun, planPath } = resolveAnalyzeRun(context, parsed, analysisFile);
   if (resolvedRun.signature) {
     withLockedOrchestrationRun(context, resolvedRun.id, (run) => {
       if (run.status !== 'planned') {
@@ -2211,6 +2367,7 @@ function handlePrepare(cwd: string, parsed: ParsedOperatorArgs): void {
       throw new Error(`orchestrate prepare cannot modify ${run.status} run ${runId}.`);
     }
     assertPlanAnalysisReadyForPrepare(context, run);
+    ensureBaselinePreflight(context, run);
 
     const result = prepareSliceWorktrees(context, run, parsed.flags.offline);
     const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
@@ -2314,21 +2471,24 @@ function handleOrchestrationReview(cwd: string, parsed: ParsedOperatorArgs): voi
   let reportRun = prepared.run;
   let ledgerPath = orchestrationRunPath(context.commonDir, context.config, runId);
 
-  withLockedOrchestrationRun(context, runId, (run) => {
-    const staleBlocker = staleOrchestrationReviewSnapshotBlocker(run, prepared.snapshots);
-    if (staleBlocker) {
+  if (!parsed.flags.reviewDryRun) {
+    withLockedOrchestrationRun(context, runId, (run) => {
+      refreshSliceReviewProfiles(context, run);
+      const staleBlocker = staleOrchestrationReviewSnapshotBlocker(run, prepared.snapshots);
+      if (staleBlocker) {
+        reportRun = run;
+        result = peerOrchestrationReviewResult(run, prepared.run, prepared.snapshots, {
+          dryRun: parsed.flags.reviewDryRun,
+          gateFilter,
+          phaseFilter,
+        }) ?? staleOrchestrationReviewResult(run, prepared.snapshots, staleBlocker);
+        return;
+      }
+      attachOrchestrationReviewResult(run, prepared.run, prepared.snapshots);
+      ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
       reportRun = run;
-      result = peerOrchestrationReviewResult(run, prepared.run, prepared.snapshots, {
-        dryRun: parsed.flags.reviewDryRun,
-        gateFilter,
-        phaseFilter,
-      }) ?? staleOrchestrationReviewResult(run, prepared.snapshots, staleBlocker);
-      return;
-    }
-    attachOrchestrationReviewResult(run, prepared.run, prepared.snapshots);
-    ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
-    reportRun = run;
-  });
+    });
+  }
 
   const report: OrchestrateReviewReport = {
     command: 'orchestrate review',
@@ -2538,6 +2698,9 @@ function attachOrchestrationReviewResult(
     current.status = reviewed.status;
     current.review = reviewed.review;
     current.reviewDiagnostics = reviewed.reviewDiagnostics ?? [];
+    current.reviewProfile = reviewed.reviewProfile;
+    current.reviewProfileReason = reviewed.reviewProfileReason;
+    current.reviewProfileEscapedDocsSafeScope = reviewed.reviewProfileEscapedDocsSafeScope;
   }
   run.status = summarizeRunReviewStatus(run);
   run.updatedAt = nowIso();
@@ -2755,6 +2918,26 @@ function reviewCompletedSlices(
   },
 ): ReviewCompletedSlicesResult {
   const selectedSlices = resolveReviewSlices(run, options.sliceId);
+  refreshSliceReviewProfiles(context, run);
+  const escapeBlocker = docsOnlyImplementationEscapeBlocker(run);
+  if (escapeBlocker) {
+    const escaped = docsOnlyEscapedSlices(run);
+    if (!options.dryRun) {
+      run.status = 'blocked';
+      run.updatedAt = nowIso();
+      for (const slice of escaped) {
+        if (slice.worker?.status !== 'running') slice.status = 'blocked';
+      }
+    }
+    return {
+      status: 'blocked',
+      reviewedCount: 0,
+      failedCount: 0,
+      pendingCount: 0,
+      blockedCount: escaped.length || selectedSlices.length,
+      slices: (escaped.length > 0 ? escaped : selectedSlices).map((slice) => buildBlockedReviewReport(slice, escapeBlocker)),
+    };
+  }
   // C2: resolve the review-state signing key once per invocation (it is constant
   // for the whole command) rather than re-reading the env for every signed slice.
   const reviewStateKey = resolveReviewStateKey();
@@ -2777,16 +2960,21 @@ function reviewCompletedSlices(
     const sliceRepoRoot = slice.worktreePath ?? context.repoRoot;
     writeOrchestrationReviewProgress(options, `reviewing slice ${slice.id} (${sliceIndex + 1}/${selectedSlices.length}) in ${sliceRepoRoot}`);
     const sliceContext = buildSliceReviewContext(context, sliceRepoRoot);
+    const reviewBaseRef = reviewBaseRefForRun(context, run);
     const reviewRun = attachAttestedManualGateEvidence(sliceContext, buildReviewRunRecord({
       repoRoot: sliceRepoRoot,
       commonDir: sliceContext.commonDir,
       config: sliceContext.config,
-      baseBranch: context.config.baseBranch,
+      baseBranch: reviewBaseRef ?? context.config.baseBranch,
       gates: run.gateSnapshot.gates,
       dryRun: options.dryRun,
       gateFilter: options.gateFilter,
       phaseFilter: options.phaseFilter,
       activeSurfaces: resolveSliceActiveSurfaces(context, run, slice),
+      profileContext: {
+        runProfile: run.baselinePreflight?.profile ?? 'implementation',
+        sliceProfile: slice.reviewProfile ?? 'implementation',
+      },
       onGateStart: (gate) => {
         writeOrchestrationReviewProgress(options, `slice ${slice.id}: starting gate ${gate.id} [${gate.phase}] ${formatReviewGateProgressTarget(gate)}`);
       },
@@ -2873,6 +3061,74 @@ function reviewCompletedSlices(
     blockedCount,
     slices: reports,
   };
+}
+
+function refreshSliceReviewProfiles(context: WorkflowContext, run: OrchestrationRunRecord): void {
+  const reviewBaseRef = reviewBaseRefForRun(context, run);
+  for (const slice of selectActiveSlices(run)) {
+    if (!reviewBaseRef || !slice.worktreePath || !existsSync(slice.worktreePath)) {
+      slice.reviewProfile = 'implementation';
+      slice.reviewProfileReason = 'review base or worktree is unavailable';
+      slice.reviewProfileEscapedDocsSafeScope = false;
+      continue;
+    }
+    const records = collectReviewPathRecords(slice.worktreePath, reviewBaseRef);
+    const classification = classifyDocsSafePathRecords(records);
+    slice.reviewProfile = classification.profile;
+    slice.reviewProfileEscapedDocsSafeScope = false;
+    if (classification.profile === 'docs-only') {
+      slice.reviewProfileReason = `docs-only paths: ${classification.paths.join(', ')}`;
+    } else if (classification.unsafePaths.length > 0 || classification.invalidPaths.length > 0) {
+      const unsafe = [...classification.unsafePaths, ...classification.invalidPaths].join(', ');
+      slice.reviewProfileReason = `implementation paths: ${unsafe}`;
+      slice.reviewProfileEscapedDocsSafeScope = run.baselinePreflight?.profile === 'docs-only';
+    } else {
+      slice.reviewProfileReason = 'implementation profile: empty diff';
+    }
+  }
+}
+
+function reviewBaseRefForRun(context: WorkflowContext, run: OrchestrationRunRecord): string | null {
+  if (run.sourceSnapshot?.reviewBaseRef) return run.sourceSnapshot.reviewBaseRef;
+  return run.baseBranch || context.config.baseBranch;
+}
+
+function collectReviewPathRecords(repoRoot: string, reviewBaseRef: string): OrchestrationPathRecord[] {
+  const mergeBase = runGit(repoRoot, ['merge-base', 'HEAD', reviewBaseRef], true)?.trim() ?? '';
+  const records: OrchestrationPathRecord[] = [];
+  if (mergeBase) {
+    records.push(...collectGitNameStatusPathRecords(repoRoot, ['diff', '--name-status', '-M', '-C', `${mergeBase}...HEAD`]));
+  }
+  records.push(...collectGitNameStatusPathRecords(repoRoot, ['diff', '--cached', '--name-status', '-M', '-C']));
+  records.push(...collectGitNameStatusPathRecords(repoRoot, ['diff', '--name-status', '-M', '-C']));
+  const untracked = runGit(repoRoot, ['ls-files', '--others', '--exclude-standard'], true) ?? '';
+  for (const line of untracked.split(/\r?\n/)) {
+    const file = normalizeRepoRelativePath(line);
+    if (file) records.push({ path: file });
+  }
+  return records;
+}
+
+function docsOnlyImplementationEscapeBlocker(run: OrchestrationRunRecord): string | null {
+  if (run.baselinePreflight?.profile !== 'docs-only') return null;
+  const escaped = docsOnlyEscapedSlices(run);
+  if (escaped.length === 0) return null;
+  const ids = escaped.map((slice) => slice.id).join(', ');
+  return [
+    'implementation-baseline-required: docs-only orchestration escaped its planned docs-safe path scope.',
+    `Escaped slice(s): ${ids}.`,
+    'Abandon or fail this run, or re-plan with code paths in plannedPathScope so a fresh run starts with the implementation profile.',
+    'v1a does not automatically reuse escaped worktrees or commits.',
+  ].join(' ');
+}
+
+function docsOnlyEscapedSlices(run: OrchestrationRunRecord): OrchestrationSliceRecord[] {
+  if (run.baselinePreflight?.profile !== 'docs-only') return [];
+  return selectActiveSlices(run).filter(isDocsOnlyImplementationEscape);
+}
+
+function isDocsOnlyImplementationEscape(slice: OrchestrationSliceRecord): boolean {
+  return slice.reviewProfileEscapedDocsSafeScope === true;
 }
 
 function writeOrchestrationReviewProgress(
@@ -3786,6 +4042,169 @@ function reportStatusForStart(
   return 'dispatched';
 }
 
+function ensureBaselinePreflight(context: WorkflowContext, run: OrchestrationRunRecord): void {
+  assertRunSourceSnapshotStillCurrent(context, run);
+  const baseResolution = resolveBaselineBaseRef(context, run);
+  const plannedRecords: Array<string | OrchestrationPathRecord> = [];
+  let plannedScopeKnown = true;
+  for (const slice of selectActiveSlices(run)) {
+    const scope = effectiveSlicePlannedPathScope(slice);
+    if (!scope.known) {
+      plannedScopeKnown = false;
+      break;
+    }
+    plannedRecords.push(...scope.paths);
+  }
+
+  const sourceRecords = baseResolution.mergeBase && run.sourceSnapshot
+    ? collectGitNameStatusPathRecords(context.repoRoot, ['diff', '--name-status', '-M', '-C', `${baseResolution.mergeBase}..${run.sourceSnapshot.headSha}`])
+    : [];
+  const classification = plannedScopeKnown && baseResolution.status !== 'unresolved'
+    ? classifyDocsSafePathRecords([...plannedRecords, ...sourceRecords])
+    : { profile: 'implementation' as const, paths: [], unsafePaths: [], invalidPaths: [] };
+  const profile: OrchestrationReviewProfile = classification.profile;
+  const skippedCommands = profile === 'docs-only'
+    ? run.gateSnapshot.gates
+        .filter(isUnscopedFullSuiteReviewGate)
+        .flatMap((gate) => {
+          const id = skippedBaselineCommandId(gate);
+          return id
+            ? [{
+                id,
+                ...(gate.command ? { command: gate.command } : {}),
+                skipReason: 'docs-only profile, baseline command has no matching whenChanged path',
+              }]
+            : [];
+        })
+    : [];
+  run.baselinePreflight = {
+    profile,
+    status: profile === 'docs-only' ? 'passed' : 'not_started',
+    baseResolution: {
+      status: baseResolution.status,
+      ...(baseResolution.ref ? { ref: baseResolution.ref } : {}),
+      ...(baseResolution.warning ? { warning: baseResolution.warning } : {}),
+    },
+    skippedCommands,
+  };
+  run.updatedAt = nowIso();
+}
+
+function assertRunSourceSnapshotStillCurrent(context: WorkflowContext, run: OrchestrationRunRecord): void {
+  const source = run.sourceSnapshot;
+  if (!source) return;
+  const currentHead = runGit(context.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '';
+  if (currentHead && currentHead !== source.headSha) {
+    throw new Error([
+      'orchestrate prepare blocked: parent checkout HEAD changed after the run was planned.',
+      `Planned source HEAD: ${source.headSha}`,
+      `Current HEAD: ${currentHead}`,
+      'Recreate the orchestration run from the current checkout before preparing slice worktrees.',
+    ].join('\n'));
+  }
+  if (!currentHead) {
+    throw new Error('orchestrate prepare blocked: could not resolve current parent checkout HEAD.');
+  }
+  const allowedDirtyPaths = new Set(
+    source.changedFiles
+      .map((file) => normalizeRepoRelativePath(file))
+      .filter((file): file is string => Boolean(file)),
+  );
+  const dirtyPaths = collectDirtyParentPaths(context.repoRoot)
+    .filter((file) => !allowedDirtyPaths.has(file));
+  if (dirtyPaths.length > 0) {
+    throw new Error([
+      'orchestrate prepare blocked: parent worktree changed after the run was planned.',
+      'Commit, stash, or remove new local changes before preparing slice worktrees, or recreate the orchestration run.',
+      `Dirty paths: ${dirtyPaths.slice(0, 10).join(', ')}${dirtyPaths.length > 10 ? `, +${dirtyPaths.length - 10} more` : ''}`,
+    ].join('\n'));
+  }
+}
+
+function effectiveSlicePlannedPathScope(slice: OrchestrationSliceRecord): { known: true; paths: string[] } | { known: false; paths: [] } {
+  if (slice.plannedPathScope !== undefined) {
+    const paths = slice.plannedPathScope
+      .map((entry) => normalizeRepoRelativePath(entry))
+      .filter((entry): entry is string => Boolean(entry));
+    return paths.length > 0 ? { known: true, paths } : { known: false, paths: [] };
+  }
+  const fallback = slice.requestedFiles
+    .map((entry) => normalizeRepoRelativePath(entry))
+    .filter((entry): entry is string => Boolean(entry));
+  return fallback.length > 0 ? { known: true, paths: fallback } : { known: false, paths: [] };
+}
+
+function resolveBaselineBaseRef(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+): {
+  status: 'origin' | 'local' | 'unresolved';
+  ref?: string;
+  warning?: string;
+  mergeBase?: string;
+} {
+  const source = run.sourceSnapshot;
+  const baseBranch = run.baseBranch || context.config.baseBranch;
+  if (!source?.headSha) {
+    return {
+      status: 'unresolved',
+      warning: 'sourceSnapshot is missing; using implementation profile until the run is recreated from a clean source checkout',
+    };
+  }
+  const originRef = `origin/${baseBranch}`;
+  const originMergeBase = mergeBaseForRefs(context.repoRoot, source.headSha, originRef);
+  if (originMergeBase) return { status: 'origin', ref: originRef, mergeBase: originMergeBase };
+  const localMergeBase = mergeBaseForRefs(context.repoRoot, source.headSha, baseBranch);
+  if (localMergeBase) {
+    return {
+      status: 'local',
+      ref: baseBranch,
+      mergeBase: localMergeBase,
+      warning: `origin/${baseBranch} is unavailable; using local ${baseBranch} for baseline classification`,
+    };
+  }
+  return {
+    status: 'unresolved',
+    warning: `Could not resolve a merge-base for origin/${baseBranch} or local ${baseBranch}; fetch or pass --base-branch before relying on docs-only skips`,
+  };
+}
+
+function mergeBaseForRefs(repoRoot: string, leftRef: string, rightRef: string): string | null {
+  if (!runGit(repoRoot, ['rev-parse', '--verify', rightRef], true)?.trim()) return null;
+  return runGit(repoRoot, ['merge-base', leftRef, rightRef], true)?.trim() || null;
+}
+
+function skippedBaselineCommandId(gate: ReviewGateConfig): string | null {
+  const candidate = gate.baselineCommandId ?? gate.id;
+  return isStableEvidenceId(candidate) ? candidate : null;
+}
+
+function collectGitNameStatusPathRecords(repoRoot: string, gitArgs: string[]): OrchestrationPathRecord[] {
+  const output = runGit(repoRoot, gitArgs, true) ?? '';
+  const records: OrchestrationPathRecord[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const [status, first, second] = trimmed.split(/\t+/);
+    if (/^[RC]/.test(status) && first && second) {
+      records.push({ oldPath: first, newPath: second });
+    } else if (first) {
+      records.push({ path: first });
+    }
+  }
+  return records;
+}
+
+function isUnscopedFullSuiteReviewGate(gate: ReviewGateConfig): boolean {
+  if (gate.whenChanged && gate.whenChanged.length > 0) return false;
+  if (gate.type !== 'command' && gate.type !== 'pipelane') return false;
+  const id = gate.id.toLowerCase();
+  const command = (gate.command ?? '').toLowerCase();
+  return ['test', 'build', 'typecheck'].includes(id)
+    || /\bnpm\s+(?:run\s+)?(?:test|build|typecheck)\b/.test(command)
+    || /\b(?:pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|typecheck)\b/.test(command);
+}
+
 function prepareSliceWorktrees(
   context: WorkflowContext,
   run: OrchestrationRunRecord,
@@ -3883,7 +4302,7 @@ function prepareSliceWorktrees(
       continue;
     }
 
-    baseRef ??= resolveTaskBaseRef(context.repoRoot, context.config.baseBranch, offline);
+    baseRef ??= resolveOrchestrationTaskBaseRef(context, run, offline);
     if (baseRef.warnings.length > 0 && warnings.length === 0) {
       warnings.push(...baseRef.warnings);
     }
@@ -3929,6 +4348,22 @@ function prepareSliceWorktrees(
   run.status = 'prepared';
   run.updatedAt = nowIso();
   return { createdCount, existingCount, slices: reports, warnings };
+}
+
+function resolveOrchestrationTaskBaseRef(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+  offline: boolean,
+): { sourceRef: string; warnings: string[] } {
+  const sourceRef = run.sourceSnapshot?.reviewBaseRef?.trim();
+  if (sourceRef) {
+    const resolved = runGit(context.repoRoot, ['rev-parse', '--verify', `${sourceRef}^{commit}`], true)?.trim() ?? '';
+    if (!resolved) {
+      throw new Error(`Could not resolve orchestration source snapshot ref ${sourceRef} for run ${run.id}.`);
+    }
+    return { sourceRef: resolved, warnings: [] };
+  }
+  return resolveTaskBaseRef(context.repoRoot, run.baseBranch || context.config.baseBranch, offline);
 }
 
 function persistOrchestrationPrepareProgress(context: WorkflowContext, run: OrchestrationRunRecord): void {
@@ -4159,6 +4594,11 @@ function handlePlan(cwd: string, parsed: ParsedOperatorArgs): void {
   }
 
   const slicesFile = parseSlicesFile(parsed.flags.goalSlicesFile, cwd);
+  const baseBranch = resolveOrchestrationBaseBranch(context, parsed);
+  const sourceSnapshot = buildCleanSourceSnapshot(context, {
+    requireClean: true,
+    allowedDirtyPaths: orchestrationInputDirtyPathAllowlist(context, parsed, planPath),
+  });
   const run = buildOrchestrationRunRecord({
     repoRoot: context.repoRoot,
     config: context.config,
@@ -4169,6 +4609,8 @@ function handlePlan(cwd: string, parsed: ParsedOperatorArgs): void {
     provider: (parsed.flags.goalProvider.trim() as GoalProvider) || DEFAULT_GOAL_PROVIDER,
     maxTurns: parsePositiveInteger(parsed.flags.goalMaxTurns),
     maxMinutes: parsePositiveInteger(parsed.flags.goalMaxMinutes),
+    baseBranch,
+    sourceSnapshot: sourceSnapshot ?? undefined,
     slices: slicesFile?.slices,
     coverage: slicesFile?.coverage,
   });
@@ -4212,6 +4654,8 @@ interface OrchestrateFinalizeReport {
   runId: string;
   ledgerPath: string;
   excludedCount: number;
+  escapedWorktreePaths: string[];
+  purgedWorktreePaths: string[];
   run: OrchestrationRunRecord;
   message: string;
 }
@@ -4231,15 +4675,19 @@ interface OrchestrateUpgradeLedgerReport {
 
 interface OrchestrateOutlineSliceSnapshot {
   id: string;
+  title: string;
   index: number;
   phase: string | null;
   state: string;
+  label: string;
   glyph: string;
   deferred: boolean;
   excluded: boolean;
   reviewSatisfied: boolean;
   sensitive: boolean;
 }
+
+interface OrchestrateOutlineCurrentSnapshot extends OrchestrateOutlineSliceSnapshot {}
 
 interface OrchestrateOutlineReport {
   command: 'orchestrate outline';
@@ -4252,6 +4700,7 @@ interface OrchestrateOutlineReport {
   deferred: number;
   excluded: number;
   phaseCount: number;
+  current: OrchestrateOutlineCurrentSnapshot | null;
   slices: OrchestrateOutlineSliceSnapshot[];
   run: OrchestrationRunRecord;
   message: string;
@@ -4316,12 +4765,70 @@ function handleFinalize(cwd: string, parsed: ParsedOperatorArgs): void {
   withLockedOrchestrationRun(context, runId, (run) => {
     const at = nowIso();
     let excludedCount = 0;
-    for (const slice of run.slices) {
-      if (slice.deferred === true && !slice.excludedReason) {
-        slice.excludedReason = 'abandoned via orchestrate finalize';
-        slice.excludedAt = at;
-        excludedCount += 1;
+    const abandon = parsed.flags.orchestrationAbandon;
+    if (abandon) {
+      for (const slice of run.slices) {
+        if (slice.deferred === true && !slice.excludedReason) {
+          slice.excludedReason = 'abandoned via orchestrate finalize';
+          slice.excludedAt = at;
+          excludedCount += 1;
+        }
       }
+    }
+    refreshSliceReviewProfiles(context, run);
+    const escapedSlices = docsOnlyEscapedSlices(run);
+    if (abandon && escapedSlices.some((slice) => slice.worker?.status === 'running')) {
+      throw new Error('orchestrate finalize --abandon cannot run while an escaped slice worker is still running.');
+    }
+    const escapedWorktreePaths = escapedSlices
+      .map((slice) => slice.worktreePath)
+      .filter((entry): entry is string => Boolean(entry));
+    const purgedWorktreePaths: string[] = [];
+    if (abandon && parsed.flags.orchestrationPurgeWorktrees) {
+      const purgeReason = parsed.flags.reason.trim();
+      if (!purgeReason) {
+        throw new Error('orchestrate finalize --purge-worktrees requires --reason <text>.');
+      }
+      for (const slice of escapedSlices) {
+        if (!slice.worktreePath || !slice.branchName) continue;
+        const cleanup = removeTaskArtifacts({
+          sharedRepoRoot: context.repoRoot,
+          worktreePath: slice.worktreePath,
+          branchName: slice.branchName,
+          callerCwd: context.repoRoot,
+          force: true,
+        });
+        if (cleanup.errors.length > 0) {
+          throw new Error(`orchestrate finalize --purge-worktrees failed for ${slice.id}: ${cleanup.errors.join('; ')}`);
+        }
+        purgedWorktreePaths.push(slice.worktreePath);
+        slice.excludedReason = `abandoned and purged via orchestrate finalize: ${purgeReason}`;
+        slice.excludedAt = at;
+      }
+    }
+    if (abandon && escapedSlices.length > 0) {
+      run.status = 'failed';
+      run.updatedAt = nowIso();
+      const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
+      const report: OrchestrateFinalizeReport = {
+        command: 'orchestrate finalize',
+        status: run.status,
+        repoRoot: context.repoRoot,
+        runId: run.id,
+        ledgerPath,
+        excludedCount,
+        escapedWorktreePaths,
+        purgedWorktreePaths,
+        run,
+        message: renderFinalizeReport(run, ledgerPath, {
+          excludedCount,
+          escapedWorktreePaths,
+          purgedWorktreePaths,
+          abandon,
+        }),
+      };
+      printResult(parsed.flags, report);
+      return;
     }
     // C1 (Decision 9): finalize is recompute-authoritative — re-run review of the
     // in-scope slices in-process so any transition to `completed` (e.g. a paused run
@@ -4363,17 +4870,15 @@ function handleFinalize(cwd: string, parsed: ParsedOperatorArgs): void {
       runId: run.id,
       ledgerPath,
       excludedCount,
+      escapedWorktreePaths,
+      purgedWorktreePaths,
       run,
-      message: [
-        'Pipelane orchestrate finalize',
-        '',
-        `Run: ${run.id}`,
-        `Status: ${run.status}`,
-        `Excluded (abandoned) slices: ${excludedCount}`,
-        'The excluded slices are kept in the ledger with a reason and timestamp for audit.',
-        '',
-        renderOrchestrationOutline(run),
-      ].join('\n'),
+      message: renderFinalizeReport(run, ledgerPath, {
+        excludedCount,
+        escapedWorktreePaths,
+        purgedWorktreePaths,
+        abandon,
+      }),
     };
     printResult(parsed.flags, report);
   });
@@ -4557,6 +5062,7 @@ function buildOrchestrationOutlineSnapshot(run: OrchestrationRunRecord): {
   deferred: number;
   excluded: number;
   phaseCount: number;
+  current: OrchestrateOutlineCurrentSnapshot | null;
   slices: OrchestrateOutlineSliceSnapshot[];
 } {
   const phases = groupSlicesByPhase(run.slices);
@@ -4565,9 +5071,11 @@ function buildOrchestrationOutlineSnapshot(run: OrchestrationRunRecord): {
     const state = sliceOutlineState(slice, run.id);
     return {
       id: slice.id,
+      title: slice.outcome,
       index: slice.index,
       phase: slice.phase ?? null,
       state: state.state,
+      label: state.label,
       glyph: state.glyph,
       deferred: slice.deferred === true && !slice.excludedReason,
       excluded: Boolean(slice.excludedReason),
@@ -4581,13 +5089,53 @@ function buildOrchestrationOutlineSnapshot(run: OrchestrationRunRecord): {
     deferred: run.slices.filter((slice) => slice.deferred === true && !slice.excludedReason).length,
     excluded: run.slices.filter((slice) => Boolean(slice.excludedReason)).length,
     phaseCount: phases.filter((phase) => phase.name).length,
+    current: selectCurrentOutlineSlice(run, slices),
     slices,
   };
 }
 
 function renderSliceHeadline(run: OrchestrationRunRecord, slice: OrchestrationSliceRecord): string {
   const state = sliceOutlineState(slice, run.id);
-  return `${state.glyph} slice ${slice.index}/${run.slices.length} · ${slice.id} — ${state.label}`;
+  return `${state.glyph} slice ${slice.index}/${run.slices.length} · ${formatSliceOutlineName(slice)} — ${state.label}`;
+}
+
+function selectCurrentOutlineSlice(
+  run: OrchestrationRunRecord,
+  slices: OrchestrateOutlineSliceSnapshot[],
+): OrchestrateOutlineCurrentSnapshot | null {
+  const activeIds = new Set(selectActiveSlices(run).map((slice) => slice.id));
+  const activeCandidate = slices
+    .filter((slice) => activeIds.has(slice.id) && !slice.excluded && !slice.deferred && slice.state !== 'done')
+    .sort((left, right) => currentOutlinePriority(left.state) - currentOutlinePriority(right.state))[0];
+  if (activeCandidate) return activeCandidate;
+  return slices.find((slice) => slice.deferred && !slice.excluded) ?? null;
+}
+
+function currentOutlinePriority(state: string): number {
+  if (state === 'running') return 0;
+  if (state === 'failed' || state === 'review-failed' || state === 'blocked' || state === 'empty') return 1;
+  if (state === 'awaiting-review') return 2;
+  if (state === 'queued') return 3;
+  if (state === 'deferred') return 4;
+  return 99;
+}
+
+function formatSliceOutlineName(slice: Pick<OrchestrationSliceRecord, 'id' | 'outcome'>): string {
+  const title = sanitizeForTerminal(slice.outcome || slice.id);
+  const id = sanitizeForTerminal(slice.id);
+  return title && title !== id ? `${title} [${id}]` : id;
+}
+
+function formatCurrentOutlineLine(run: OrchestrationRunRecord, snapshot: ReturnType<typeof buildOrchestrationOutlineSnapshot>): string {
+  const current = snapshot.current;
+  if (!current) {
+    return `Current: ${run.status === 'completed' ? 'complete' : 'no active slice'}`;
+  }
+  const phase = current.phase ? `${sanitizeForTerminal(current.phase)} · ` : '';
+  const title = sanitizeForTerminal(current.title || current.id);
+  const id = sanitizeForTerminal(current.id);
+  const name = title && title !== id ? `${title} [${id}]` : id;
+  return `Current: ${phase}Slice ${current.index}/${snapshot.total} — ${name} — ${sanitizeForTerminal(current.label)}`;
 }
 
 // PR1 terminal output spec: full phase -> slice -> status outline. Deterministic
@@ -4604,14 +5152,20 @@ function renderOrchestrationOutline(run: OrchestrationRunRecord): string {
   if (snapshot.excluded > 0) progress.push(`${snapshot.excluded} excluded`);
   progress.push(`status ${run.status}`);
   lines.push(`Progress: ${progress.join(' · ')}`);
+  lines.push(formatCurrentOutlineLine(run, snapshot));
   lines.push('');
   for (const phase of phases) {
     if (phase.name) lines.push(`  Phase · ${sanitizeForTerminal(phase.name)}`);
     for (const slice of phase.slices) {
       const state = sliceOutlineState(slice, run.id);
+      const runtime = formatSliceOutlineRuntime(slice);
       const sensitive = slice.requiresConfirmation ? '  ⚠ sensitive' : '';
-      lines.push(`    ${state.glyph} ${slice.index}. ${sanitizeForTerminal(slice.id)} — ${state.label}${sensitive}`);
+      lines.push(`    ${state.glyph} Slice ${slice.index} — ${formatSliceOutlineName(slice)} — ${state.label}${runtime}${sensitive}`);
     }
+  }
+  const skippedGateLines = formatSkippedDocsOnlyGateEvidence(run);
+  if (skippedGateLines.length > 0) {
+    lines.push('', 'Profile and skipped gates:', ...skippedGateLines);
   }
 
   // Edge states (pinned, not improvised).
@@ -4631,6 +5185,13 @@ function renderOrchestrationOutline(run: OrchestrationRunRecord): string {
     lines.push('', `Paused — ${snapshot.deferred} slice(s) deferred. Resume with /pipelane orchestrate.`);
   }
   return lines.join('\n');
+}
+
+function formatSliceOutlineRuntime(slice: OrchestrationSliceRecord): string {
+  const details: string[] = [];
+  if (slice.worker?.status) details.push(`worker=${sanitizeForTerminal(slice.worker.status)}`);
+  if (slice.review?.status) details.push(`review=${sanitizeForTerminal(slice.review.status)}`);
+  return details.length > 0 ? ` (${details.join(' ')})` : '';
 }
 
 function resolvePlanPath(repoRoot: string, rawPlanPath: string): string | null {
@@ -4703,7 +5264,31 @@ function parseAnalysisFile(analysisFile: string): OrchestrationAnalysisFile {
     ambiguities: parseAnalysisStringArray(raw.ambiguities, 'ambiguities'),
     sensitiveAreas: parseAnalysisStringArray(raw.sensitiveAreas, 'sensitiveAreas'),
     recommendedScope: parseRecommendedScope(raw.recommendedScope),
+    slices: parseAnalysisSlices(raw.slices),
   };
+}
+
+function parseAnalysisSlices(value: unknown): OrchestrationAnalysisFile['slices'] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new Error('--analysis-file slices must be an array when provided.');
+  }
+  return value.map((entry, index) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error(`--analysis-file slices[${index}] must be an object.`);
+    }
+    const raw = entry as Record<string, unknown>;
+    const id = raw.id === undefined || raw.id === null
+      ? null
+      : typeof raw.id === 'string'
+        ? raw.id.trim() || null
+        : undefined;
+    if (id === undefined) throw new Error(`--analysis-file slices[${index}].id must be a string or null.`);
+    return {
+      id,
+      plannedPathScope: normalizePlannedPathScope(raw.plannedPathScope),
+    };
+  });
 }
 
 function parseAnalysisActor(value: unknown): OrchestrationAnalysisFile['analyzer'] {
@@ -4761,9 +5346,24 @@ function parseRecommendedScope(value: unknown): OrchestrationAnalysisFile['recom
   return { throughSliceId, reason };
 }
 
+function normalizePlannedPathScope(value: unknown): string[] | null {
+  if (value === undefined) return null;
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const paths: string[] = [];
+  for (const entry of value) {
+    const normalized = normalizeRepoRelativePath(entry);
+    if (!normalized || normalized.includes('*') || normalized.includes('?') || normalized.includes('[') || normalized.includes(']')) {
+      return null;
+    }
+    if (!paths.includes(normalized)) paths.push(normalized);
+  }
+  return paths.length > 0 ? paths : null;
+}
+
 function resolveAnalyzeRun(
   context: WorkflowContext,
   parsed: ParsedOperatorArgs,
+  analysisFile: string,
 ): { run: OrchestrationRunRecord; planPath: string | null } {
   const runId = parsed.flags.orchestrationRunId.trim();
   if (runId) {
@@ -4779,11 +5379,18 @@ function resolveAnalyzeRun(
   if (!planPath) throw new Error('orchestrate analyze requires --plan-file <path> when --run-id is omitted.');
   const planText = readPlanFile(planPath);
   const slicesFile = parseSlicesFile(parsed.flags.goalSlicesFile, context.cwd);
+  const baseBranch = resolveOrchestrationBaseBranch(context, parsed);
+  const sourceSnapshot = buildCleanSourceSnapshot(context, {
+    requireClean: true,
+    allowedDirtyPaths: orchestrationInputDirtyPathAllowlist(context, parsed, planPath, [analysisFile]),
+  });
   const draft = buildOrchestrationRunRecord({
     repoRoot: context.repoRoot,
     config: context.config,
     planPath,
     planText,
+    baseBranch,
+    sourceSnapshot: sourceSnapshot ?? undefined,
     slices: slicesFile?.slices,
     coverage: slicesFile?.coverage,
   });
@@ -4817,6 +5424,7 @@ function orchestrationDecompositionDigest(run: OrchestrationRunRecord): string {
       outcome: slice.outcome,
       dependsOn: slice.dependsOn,
       requestedFiles: slice.requestedFiles,
+      plannedPathScope: slice.plannedPathScope ?? null,
       forbiddenFiles: slice.forbiddenFiles,
       goalSpec: slice.goalSpec,
       provider: slice.provider,
@@ -4845,6 +5453,7 @@ function attachPlanAnalysisFromFile(
   if (analysis.sourceSha256 !== sourceSha256) {
     throw new Error(`${commandLabel} source hash mismatch: analysis file has ${analysis.sourceSha256}, run source is ${sourceSha256}.`);
   }
+  attachPlannedPathScopeFromAnalysis(run, analysis);
   const analyzedAt = nowIso();
   const gateSnapshotDigest = planReviewGateSnapshotDigest(run);
   const activeSurfaces = planReviewActiveSurfaces(context);
@@ -4880,6 +5489,7 @@ function attachPlanAnalysisFromFile(
   };
   run.planAnalysisRequired = true;
   run.planAnalysis = record;
+  allowSourceSnapshotInputPath(context, run, analysisFile);
   run.updatedAt = analyzedAt;
   if (gates.length === 0 || planReviewStatus === 'skipped') {
     recordPlanObservation(context, run, {
@@ -4909,6 +5519,33 @@ function attachPlanAnalysisFromFile(
     planReviewStatus,
     blockingPendingCount: gates.filter((gate) => gate.blocking && gate.status === 'pending').length,
   };
+}
+
+function allowSourceSnapshotInputPath(context: WorkflowContext, run: OrchestrationRunRecord, inputPath: string | null): void {
+  if (!run.sourceSnapshot) return;
+  const repoPath = repoRelativeInputPath(context.repoRoot, context.cwd, inputPath);
+  if (!repoPath) return;
+  const allowed = new Set(
+    run.sourceSnapshot.changedFiles
+      .map((file) => normalizeRepoRelativePath(file))
+      .filter((file): file is string => Boolean(file)),
+  );
+  allowed.add(repoPath);
+  run.sourceSnapshot.changedFiles = [...allowed].sort();
+}
+
+function attachPlannedPathScopeFromAnalysis(run: OrchestrationRunRecord, analysis: OrchestrationAnalysisFile): void {
+  if (analysis.slices.length === 0) return;
+  const byId = new Map(run.slices.map((slice) => [slice.id, slice]));
+  for (const [index, sliceAnalysis] of analysis.slices.entries()) {
+    const slice = (sliceAnalysis.id ? byId.get(sliceAnalysis.id) : undefined) ?? run.slices[index];
+    if (!slice) continue;
+    if (sliceAnalysis.plannedPathScope && sliceAnalysis.plannedPathScope.length > 0) {
+      slice.plannedPathScope = [...sliceAnalysis.plannedPathScope];
+    } else if (sliceAnalysis.plannedPathScope === null && slice.plannedPathScope === undefined) {
+      slice.plannedPathScope = [];
+    }
+  }
 }
 
 function buildInitialPlanReviewGateRuns(
@@ -5225,6 +5862,9 @@ function parseSliceEntry(entry: unknown, index: number): BuildOrchestrationSlice
     }
     result.text = record.text;
   }
+  if (record.plannedPathScope !== undefined) {
+    result.plannedPathScope = normalizePlannedPathScope(record.plannedPathScope) ?? [];
+  }
   return result;
 }
 
@@ -5305,14 +5945,7 @@ function renderPlanReport(
     lines.push('Confirmation: recommended before execution');
   }
 
-  lines.push('', 'Slice ledger:');
-  for (const slice of run.slices) {
-    const flags = [
-      slice.requiresConfirmation ? 'confirm' : '',
-      slice.critique.length > 0 ? 'critique' : '',
-    ].filter(Boolean);
-    lines.push(`- ${slice.id}: ${slice.outcome}${flags.length > 0 ? ` (${flags.join(', ')})` : ''}`);
-  }
+  lines.push('', renderOrchestrationOutline(run));
 
   lines.push(
     '',
@@ -5342,6 +5975,7 @@ function renderAnalyzeReport(
     lines.push(`Source hash: ${analysis.source.textSha256 ?? '(none)'}`);
     lines.push(`Gate snapshot: ${analysis.gateSnapshotDigest}`);
   }
+  lines.push('', renderOrchestrationOutline(run));
   if (blockingPendingCount > 0) {
     lines.push('', 'Blocking plan-review gates pending:');
     for (const gate of analysis?.planReview.gates.filter((entry) => entry.blocking && entry.status === 'pending') ?? []) {
@@ -5378,6 +6012,7 @@ function renderPlanReviewReport(
   if (action === 'bypass') {
     lines.push('Bypass is visible audit evidence, not proof that review passed.');
   }
+  lines.push('', renderOrchestrationOutline(run));
   const pending = run.planAnalysis?.planReview.gates.filter((entry) => entry.blocking && entry.status === 'pending') ?? [];
   if (pending.length > 0) {
     lines.push('', 'Still pending:');
@@ -5407,6 +6042,7 @@ function renderPrepareReport(
     lines.push('', 'Warnings:');
     for (const warning of result.warnings) lines.push(`- ${warning}`);
   }
+  lines.push('', renderOrchestrationOutline(run));
 
   lines.push('', 'Slice worktrees:');
   for (const slice of result.slices) {
@@ -5434,6 +6070,8 @@ function renderDispatchReport(
     `Ledger: ${ledgerPath}`,
     `Written prompts: ${result.writtenCount}`,
     `Existing prompts: ${result.existingCount}`,
+    '',
+    renderOrchestrationOutline(run),
     '',
     'Slice handoffs:',
   ];
@@ -5497,6 +6135,8 @@ function renderStartReport(
     );
   }
 
+  lines.push('', renderOrchestrationOutline(run));
+
   lines.push(
     '',
     'Worker completion only. Review gates, merge, deploy, and cleanup were not run by this command.',
@@ -5559,10 +6199,19 @@ function renderOrchestrationReviewReport(
     lines.push('', 'Pending gates:', ...pendingGateLines);
   }
 
-  if (sliceId || options.dryRun || options.gateFilter || options.phaseFilter) {
+  lines.push('', renderOrchestrationOutline(run));
+
+  if (options.dryRun) {
     lines.push(
       '',
-      'Slice-filtered, gate-filtered, phase-filtered, or dry-run review evidence is recorded for diagnosis, but every slice needs a full non-dry-run review before merge/deploy automation can trust the orchestration run.',
+      'Dry-run review evidence was not recorded. Rerun without --dry-run to attach evidence that merge/deploy automation can trust.',
+    );
+  }
+
+  if (sliceId || options.gateFilter || options.phaseFilter) {
+    lines.push(
+      '',
+      'Slice-filtered, gate-filtered, or phase-filtered review evidence is recorded for diagnosis, but every slice needs a full non-dry-run review before merge/deploy automation can trust the orchestration run.',
     );
   }
 
@@ -5580,6 +6229,46 @@ function renderOrchestrationReviewReport(
     lines.push('', 'Review gate execution complete. Merge, deploy, and cleanup were not run by this command.');
   }
 
+  return lines.join('\n');
+}
+
+function renderFinalizeReport(
+  run: OrchestrationRunRecord,
+  ledgerPath: string,
+  result: {
+    excludedCount: number;
+    escapedWorktreePaths: string[];
+    purgedWorktreePaths: string[];
+    abandon: boolean;
+  },
+): string {
+  const lines = [
+    'Pipelane orchestrate finalize',
+    '',
+    `Run: ${run.id}`,
+    `Status: ${run.status}`,
+    `Ledger: ${ledgerPath}`,
+    `Abandon: ${result.abandon ? 'yes' : 'no'}`,
+    `Excluded (abandoned) slices: ${result.excludedCount}`,
+  ];
+  if (result.excludedCount > 0) {
+    lines.push('The excluded slices are kept in the ledger with a reason and timestamp for audit.');
+  }
+  if (result.escapedWorktreePaths.length > 0) {
+    lines.push('', 'Escaped slice worktrees:');
+    for (const worktreePath of result.escapedWorktreePaths) lines.push(`- ${worktreePath}`);
+    if (result.purgedWorktreePaths.length > 0) {
+      lines.push('', 'Purged escaped worktrees:');
+      for (const worktreePath of result.purgedWorktreePaths) lines.push(`- ${worktreePath}`);
+    } else {
+      lines.push('', 'Escaped worktrees were preserved. Purge requires --purge-worktrees --reason <text>.');
+    }
+  }
+  const skippedGateLines = formatSkippedDocsOnlyGateEvidence(run);
+  if (skippedGateLines.length > 0) {
+    lines.push('', 'Profile and skipped gates:', ...skippedGateLines);
+  }
+  lines.push('', renderOrchestrationOutline(run));
   return lines.join('\n');
 }
 
@@ -5601,6 +6290,29 @@ function formatPendingReviewGateInstructions(run: OrchestrationRunRecord): strin
     }
   }
 
+  return lines;
+}
+
+function formatSkippedDocsOnlyGateEvidence(run: OrchestrationRunRecord): string[] {
+  const lines: string[] = [];
+  if (run.baselinePreflight?.profile) {
+    lines.push(`- baseline profile: ${run.baselinePreflight.profile} (${run.baselinePreflight.status})`);
+    for (const command of run.baselinePreflight.skippedCommands ?? []) {
+      lines.push(`- baseline/${command.id}${command.command ? ` (${command.command})` : ''}: ${command.skipReason}`);
+    }
+  }
+  const seen = new Set<string>();
+  for (const slice of run.slices) {
+    const review = latestSliceReviewRecord(slice);
+    if (!review) continue;
+    for (const gate of review.run.gates) {
+      if (gate.status !== 'skipped' || !gate.skipReason) continue;
+      const key = `${slice.id}:${gate.gateId}:${gate.skipReason}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      lines.push(`- ${slice.id}/${gate.gateId}: ${gate.skipReason}`);
+    }
+  }
   return lines;
 }
 

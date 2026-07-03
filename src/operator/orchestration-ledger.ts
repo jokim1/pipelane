@@ -10,6 +10,7 @@ import {
 import {
   DEFAULT_GOAL_PROVIDER,
   ensureInstallMarker,
+  isStableEvidenceId,
   normalizePath,
   nowIso,
   normalizeVersionedJsonValue,
@@ -25,6 +26,7 @@ import {
   type ReviewGateConfig,
   type ReviewActorIdentity,
   type ReviewGateRunStatus,
+  type ReviewProfile,
   type ReviewRunRecord,
   type ReviewPlanGateConfig,
   type WorkflowConfig,
@@ -237,6 +239,70 @@ export type OrchestrationSliceWorkerStatus = 'running' | 'succeeded' | 'failed';
 
 export const ORCHESTRATION_CORRUPT_LEDGER_BLOCK_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 
+export type OrchestrationReviewProfile = ReviewProfile;
+export type OrchestrationBaselinePreflightStatus = 'not_started' | 'running' | 'passed' | 'failed' | 'accepted_failed';
+
+export interface OrchestrationSourceSnapshot {
+  status: 'clean';
+  headSha: string;
+  reviewBaseRef: string;
+  changedFiles: string[];
+}
+
+export interface OrchestrationBaselineBaseResolution {
+  status: 'origin' | 'local' | 'unresolved';
+  ref?: string;
+  warning?: string;
+}
+
+export interface OrchestrationAcceptedFailure {
+  reason: string;
+  acceptedBy: ReviewActorIdentity;
+  acceptedAt: string;
+}
+
+export interface OrchestrationSkippedBaselineCommand {
+  id: string;
+  command?: string;
+  skipReason: string;
+}
+
+export interface OrchestrationBaselinePreflight {
+  profile: OrchestrationReviewProfile;
+  status: OrchestrationBaselinePreflightStatus;
+  baseResolution: OrchestrationBaselineBaseResolution;
+  artifactPath?: string;
+  skippedCommands: OrchestrationSkippedBaselineCommand[];
+  profileHistory?: Array<{
+    from: OrchestrationReviewProfile;
+    to: OrchestrationReviewProfile;
+    reason: string;
+  }>;
+  commands?: Array<{
+    id: string;
+    command: string;
+    exitCode: number | null;
+    timedOut: boolean;
+    durationMs: number;
+    summaryPath: string;
+    acceptedFailure?: OrchestrationAcceptedFailure;
+  }>;
+}
+
+export interface OrchestrationPathRecord {
+  path?: string;
+  oldPath?: string;
+  newPath?: string;
+  paths?: string[];
+}
+
+export interface DocsSafePathClassification {
+  profile: OrchestrationReviewProfile;
+  paths: string[];
+  unsafePaths: string[];
+  invalidPaths: string[];
+}
+
 export interface OrchestrationSliceDispatchRecord {
   status: 'ready';
   provider: GoalProvider;
@@ -326,6 +392,7 @@ export interface OrchestrationSliceRecord {
   outcome: string;
   dependsOn: string[];
   requestedFiles: string[];
+  plannedPathScope?: string[];
   forbiddenFiles: string[];
   taskSlug: string | null;
   worktreePath: string | null;
@@ -359,6 +426,9 @@ export interface OrchestrationSliceRecord {
   excludedReason?: string;
   excludedAt?: string;
   loopSummary?: OrchestrationLoopSummary;
+  reviewProfile?: OrchestrationReviewProfile;
+  reviewProfileReason?: string;
+  reviewProfileEscapedDocsSafeScope?: boolean;
 }
 
 export interface OrchestrationRunRecord {
@@ -368,6 +438,9 @@ export interface OrchestrationRunRecord {
   updatedAt: string;
   branchName: string;
   sha: string;
+  baseBranch?: string;
+  sourceSnapshot?: OrchestrationSourceSnapshot;
+  baselinePreflight?: OrchestrationBaselinePreflight;
   source: {
     planPath: string | null;
     prompt: string | null;
@@ -434,6 +507,7 @@ export interface BuildOrchestrationSliceInput {
   title: string;
   phase?: string;
   text?: string;
+  plannedPathScope?: string[];
 }
 
 export interface BuildOrchestrationRunInput {
@@ -446,6 +520,8 @@ export interface BuildOrchestrationRunInput {
   provider?: GoalProvider;
   maxTurns?: number;
   maxMinutes?: number;
+  baseBranch?: string;
+  sourceSnapshot?: OrchestrationSourceSnapshot;
   // PR1: agent-proposed decomposition. When present it replaces heading-splitting;
   // the ledger still binds source.planPath/textSha256 to the REAL plan text.
   slices?: BuildOrchestrationSliceInput[];
@@ -590,6 +666,7 @@ export function buildOrchestrationRunRecord(input: BuildOrchestrationRunInput): 
       outcome: goalSpec.outcome,
       dependsOn: [],
       requestedFiles: extractPathHints(slice.text),
+      ...(proposed?.plannedPathScope ? { plannedPathScope: [...proposed.plannedPathScope] } : {}),
       forbiddenFiles: [...input.config.prPathDenyList],
       taskSlug: null,
       worktreePath: null,
@@ -631,6 +708,8 @@ export function buildOrchestrationRunRecord(input: BuildOrchestrationRunInput): 
     updatedAt: createdAt,
     branchName: runGit(input.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '',
     sha: runGit(input.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '',
+    baseBranch: input.baseBranch ?? input.config.orchestrate?.baseBranch ?? input.config.baseBranch,
+    ...(input.sourceSnapshot ? { sourceSnapshot: cloneJson(input.sourceSnapshot) } : {}),
     source: {
       planPath: input.planPath ? repoRelativePath(input.repoRoot, input.planPath) : null,
       prompt,
@@ -651,7 +730,10 @@ export function buildOrchestrationRunRecord(input: BuildOrchestrationRunInput): 
       planReview: {
         gates: cloneJson(input.config.reviewGates?.planReview?.gates ?? []),
       },
-      gates: cloneJson(input.config.reviewGates?.gates ?? []),
+      gates: cloneJson(input.config.reviewGates?.gates ?? []).map((gate) => ({
+        ...gate,
+        ...(gate.type === 'command' && !gate.baselineCommandId && isStableEvidenceId(gate.id) ? { baselineCommandId: gate.id } : {}),
+      })),
     },
     slices,
     reviewFixes: [],
@@ -793,6 +875,246 @@ export function validateOrchestrationSpec(input: OrchestrationSpecValidationInpu
 
   assertUniqueGateIds(input.gates ?? [], 'gate');
   assertUniqueGateIds(input.planGates ?? [], 'plan-review gate');
+}
+
+export function validateSourceSnapshot(value: unknown): string | null {
+  if (!isPlainObject(value)) return 'sourceSnapshot must be an object';
+  if (value.status !== 'clean') return 'sourceSnapshot.status must be clean';
+  if (typeof value.headSha !== 'string' || !/^[a-f0-9]{40}$/i.test(value.headSha)) {
+    return 'sourceSnapshot.headSha must be a git SHA';
+  }
+  if (typeof value.reviewBaseRef !== 'string' || !value.reviewBaseRef.trim()) {
+    return 'sourceSnapshot.reviewBaseRef must be a non-empty ref';
+  }
+  if (!Array.isArray(value.changedFiles)) return 'sourceSnapshot.changedFiles must be an array';
+  for (const [index, file] of value.changedFiles.entries()) {
+    if (typeof file !== 'string' || !normalizeRepoRelativePath(file)) {
+      return `sourceSnapshot.changedFiles[${index}] must be a repo-relative path`;
+    }
+  }
+  return null;
+}
+
+export function validateBaselinePreflight(value: unknown): string | null {
+  if (!isPlainObject(value)) return 'baselinePreflight must be an object';
+  if (value.profile !== 'docs-only' && value.profile !== 'implementation') {
+    return 'baselinePreflight.profile must be docs-only or implementation';
+  }
+  if (!['not_started', 'running', 'passed', 'failed', 'accepted_failed'].includes(String(value.status))) {
+    return 'baselinePreflight.status is invalid';
+  }
+  const baseResolution = validateBaselineBaseResolution(value.baseResolution);
+  if (baseResolution) return baseResolution;
+  if (value.artifactPath !== undefined && (typeof value.artifactPath !== 'string' || !value.artifactPath.trim())) {
+    return 'baselinePreflight.artifactPath must be a non-empty string when present';
+  }
+  if (!Array.isArray(value.skippedCommands)) return 'baselinePreflight.skippedCommands must be an array';
+  for (const [index, command] of value.skippedCommands.entries()) {
+    if (!isPlainObject(command)) return `baselinePreflight.skippedCommands[${index}] must be an object`;
+    if (!isStableEvidenceId(command.id)) return `baselinePreflight.skippedCommands[${index}].id is invalid`;
+    if (command.command !== undefined && (typeof command.command !== 'string' || !command.command.trim())) {
+      return `baselinePreflight.skippedCommands[${index}].command must be non-empty when present`;
+    }
+    if (typeof command.skipReason !== 'string' || !command.skipReason.trim()) {
+      return `baselinePreflight.skippedCommands[${index}].skipReason must be non-empty`;
+    }
+  }
+  if (value.commands !== undefined) {
+    if (!Array.isArray(value.commands)) return 'baselinePreflight.commands must be an array when present';
+    for (const [index, command] of value.commands.entries()) {
+      const reason = validateBaselineCommand(command);
+      if (reason) return `baselinePreflight.commands[${index}].${reason}`;
+    }
+  }
+  return null;
+}
+
+export function validateAcceptedFailure(value: unknown): string | null {
+  if (!isPlainObject(value)) return 'acceptedFailure must be an object';
+  if (typeof value.reason !== 'string' || !value.reason.trim()) return 'acceptedFailure.reason must be non-empty';
+  if (!isPlainObject(value.acceptedBy)) return 'acceptedFailure.acceptedBy must be an object';
+  const acceptedBy = value.acceptedBy as Record<string, unknown>;
+  if (typeof acceptedBy.provider !== 'string' || !acceptedBy.provider.trim()) return 'acceptedFailure.acceptedBy.provider must be non-empty';
+  if (acceptedBy.sessionId !== null && typeof acceptedBy.sessionId !== 'string') return 'acceptedFailure.acceptedBy.sessionId must be a string or null';
+  if (typeof acceptedBy.source !== 'string' || !acceptedBy.source.trim()) return 'acceptedFailure.acceptedBy.source must be non-empty';
+  if (!isIsoTimestamp(value.acceptedAt)) return 'acceptedFailure.acceptedAt must be an ISO timestamp';
+  return null;
+}
+
+export function validateReviewProfile(value: unknown): string | null {
+  return value === 'docs-only' || value === 'implementation'
+    ? null
+    : 'reviewProfile must be docs-only or implementation';
+}
+
+export function validateReviewGateLinks(value: unknown): string | null {
+  if (!Array.isArray(value)) return 'review gate snapshot must be an array';
+  for (const [index, gate] of value.entries()) {
+    if (!isPlainObject(gate)) return `review gate ${index + 1} must be an object`;
+    const gateId = typeof gate.id === 'string' && gate.id.trim() ? gate.id.trim() : null;
+    if (!gateId) return `review gate ${index + 1} id must be non-empty`;
+    if (gate.profiles !== undefined) {
+      if (!Array.isArray(gate.profiles)) return `review gate ${gateId} profiles must be an array`;
+      for (const profile of gate.profiles) {
+        const reason = validateReviewProfile(profile);
+        if (reason) return `review gate ${gateId} ${reason}`;
+      }
+    }
+    if (gate.baselineCommandId !== undefined && !isStableEvidenceId(gate.baselineCommandId)) {
+      return `review gate ${gateId} baselineCommandId is invalid`;
+    }
+    if (gate.replacesBaselineCommandId !== undefined && !isStableEvidenceId(gate.replacesBaselineCommandId)) {
+      return `review gate ${gateId} replacesBaselineCommandId is invalid`;
+    }
+  }
+  return null;
+}
+
+export function classifyDocsSafePathRecords(records: Array<string | OrchestrationPathRecord>): DocsSafePathClassification {
+  const paths: string[] = [];
+  const invalidPaths: string[] = [];
+  for (const record of records) {
+    for (const rawPath of classificationPathsForRecord(record)) {
+      const normalized = normalizeRepoRelativePath(rawPath);
+      if (!normalized) {
+        invalidPaths.push(String(rawPath ?? ''));
+        continue;
+      }
+      if (!paths.includes(normalized)) paths.push(normalized);
+    }
+  }
+  const unsafePaths = paths.filter((entry) => !isDocsSafePath(entry));
+  return {
+    profile: paths.length > 0 && invalidPaths.length === 0 && unsafePaths.length === 0 ? 'docs-only' : 'implementation',
+    paths,
+    unsafePaths,
+    invalidPaths,
+  };
+}
+
+function validateBaselineBaseResolution(value: unknown): string | null {
+  if (!isPlainObject(value)) return 'baselinePreflight.baseResolution must be an object';
+  if (value.status !== 'origin' && value.status !== 'local' && value.status !== 'unresolved') {
+    return 'baselinePreflight.baseResolution.status is invalid';
+  }
+  if (value.status === 'unresolved') {
+    if (value.ref !== undefined) return 'baselinePreflight.baseResolution.ref must be absent when unresolved';
+  } else if (typeof value.ref !== 'string' || !value.ref.trim()) {
+    return 'baselinePreflight.baseResolution.ref is required when resolved';
+  }
+  if (value.warning !== undefined && (typeof value.warning !== 'string' || !value.warning.trim())) {
+    return 'baselinePreflight.baseResolution.warning must be non-empty when present';
+  }
+  return null;
+}
+
+function validateBaselineCommand(value: unknown): string | null {
+  if (!isPlainObject(value)) return 'must be an object';
+  if (!isStableEvidenceId(value.id)) return 'id is invalid';
+  if (typeof value.command !== 'string' || !value.command.trim()) return 'command must be non-empty';
+  if (value.exitCode !== null && (!Number.isInteger(value.exitCode) || !Number.isSafeInteger(value.exitCode))) {
+    return 'exitCode must be an integer or null';
+  }
+  if (typeof value.timedOut !== 'boolean') return 'timedOut must be boolean';
+  if (typeof value.durationMs !== 'number' || !Number.isSafeInteger(value.durationMs) || value.durationMs < 0) {
+    return 'durationMs must be a non-negative integer';
+  }
+  if (typeof value.summaryPath !== 'string' || !value.summaryPath.trim()) return 'summaryPath must be non-empty';
+  if (value.acceptedFailure !== undefined) return validateAcceptedFailure(value.acceptedFailure);
+  return null;
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  return typeof value === 'string' && !Number.isNaN(Date.parse(value)) && new Date(value).toISOString() === value;
+}
+
+function classificationPathsForRecord(record: string | OrchestrationPathRecord): unknown[] {
+  if (typeof record === 'string') return [record];
+  if (!isPlainObject(record)) return [record];
+  const paths: unknown[] = [];
+  if (Array.isArray(record.paths)) paths.push(...record.paths);
+  if (record.path !== undefined) paths.push(record.path);
+  if (record.oldPath !== undefined) paths.push(record.oldPath);
+  if (record.newPath !== undefined) paths.push(record.newPath);
+  return paths;
+}
+
+export function normalizeRepoRelativePath(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  let normalized = value.trim().replaceAll('\\', '/');
+  while (normalized.startsWith('./')) normalized = normalized.slice(2);
+  if (
+    !normalized
+    || path.isAbsolute(normalized)
+    || URL_SCHEME_PATTERN.test(normalized)
+    || normalized === '.'
+    || normalized.includes('\0')
+    || normalized.split('/').some((segment) => segment === '' || segment === '.' || segment === '..')
+    || /^[*?[\]{}!()+@|]+$/.test(normalized)
+  ) {
+    return null;
+  }
+  return normalized;
+}
+
+function isDocsSafePath(repoPath: string): boolean {
+  const basename = path.posix.basename(repoPath);
+  const lower = repoPath.toLowerCase();
+  const lowerBase = basename.toLowerCase();
+  if (isAgentInstructionPath(lower)) return false;
+  if (repoPath === 'README.md' || repoPath === 'CHANGELOG.md') return true;
+  if (!repoPath.includes('/') && (lower.endsWith('.md') || lower.endsWith('.mdx'))) return true;
+  if (!lower.startsWith('docs/')) return false;
+  if (isDocsCodeOrConfigPath(lower, lowerBase)) return false;
+  return ['.md', '.mdx', '.txt', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.pdf']
+    .some((extension) => lower.endsWith(extension));
+}
+
+function isAgentInstructionPath(lowerPath: string): boolean {
+  return lowerPath === 'claude.md'
+    || lowerPath === 'agents.md'
+    || lowerPath === 'repo_guidance.md';
+}
+
+function isDocsCodeOrConfigPath(lowerPath: string, lowerBase: string): boolean {
+  if (
+    lowerBase === 'package.json'
+    || lowerBase === 'package-lock.json'
+    || lowerBase === 'pnpm-lock.yaml'
+    || lowerBase === 'yarn.lock'
+    || lowerBase === 'bun.lockb'
+    || lowerBase === 'bun.lock'
+  ) {
+    return true;
+  }
+  return [
+    '.js',
+    '.jsx',
+    '.ts',
+    '.tsx',
+    '.mjs',
+    '.cjs',
+    '.py',
+    '.sh',
+    '.bash',
+    '.zsh',
+    '.fish',
+    '.rb',
+    '.go',
+    '.rs',
+    '.java',
+    '.c',
+    '.cc',
+    '.cpp',
+    '.cs',
+    '.php',
+    '.html',
+    '.css',
+    '.json',
+    '.yaml',
+    '.yml',
+    '.toml',
+  ].some((extension) => lowerPath.endsWith(extension));
 }
 
 function assertNoDependencyCycle(slices: OrchestrationSpecValidationSlice[]): void {
@@ -1583,8 +1905,18 @@ function isOrchestrationRunRecordShape(value: unknown, requireSigned: boolean): 
   if (!['planned', 'prepared', 'dispatched', 'running', 'blocked', 'paused', 'completed', 'failed'].includes(record.status ?? '')) return false;
   if (typeof record.createdAt !== 'string' || typeof record.updatedAt !== 'string') return false;
   if (typeof record.branchName !== 'string' || typeof record.sha !== 'string') return false;
+  if (record.baseBranch !== undefined && (typeof record.baseBranch !== 'string' || !record.baseBranch.trim())) return false;
+  if (record.sourceSnapshot !== undefined && validateSourceSnapshot(record.sourceSnapshot) !== null) return false;
+  if (record.baselinePreflight !== undefined && validateBaselinePreflight(record.baselinePreflight) !== null) return false;
   if (!record.source || typeof record.source !== 'object') return false;
   if (!record.plan || typeof record.plan !== 'object') return false;
+  if (
+    isPlainObject(record.gateSnapshot)
+    && Array.isArray((record.gateSnapshot as { gates?: unknown }).gates)
+    && validateReviewGateLinks((record.gateSnapshot as { gates?: unknown }).gates) !== null
+  ) {
+    return false;
+  }
   if (!Array.isArray(record.slices)) return false;
   return record.slices.every(isOrchestrationSliceRecord);
 }
@@ -1598,10 +1930,13 @@ function isOrchestrationSliceRecord(value: unknown): value is OrchestrationSlice
     && typeof slice.outcome === 'string'
     && Array.isArray(slice.dependsOn)
     && Array.isArray(slice.requestedFiles)
+    && (slice.plannedPathScope === undefined || (Array.isArray(slice.plannedPathScope) && slice.plannedPathScope.every((entry) => typeof entry === 'string')))
     && Array.isArray(slice.forbiddenFiles)
     && (slice.worktreePath === null || typeof slice.worktreePath === 'string' || slice.worktreePath === undefined)
     && (slice.branchName === null || typeof slice.branchName === 'string' || slice.branchName === undefined)
-    && typeof slice.provider === 'string';
+    && typeof slice.provider === 'string'
+    && (slice.reviewProfile === undefined || validateReviewProfile(slice.reviewProfile) === null)
+    && (slice.reviewProfileEscapedDocsSafeScope === undefined || typeof slice.reviewProfileEscapedDocsSafeScope === 'boolean');
 }
 
 export function isActiveOrchestrationRun(

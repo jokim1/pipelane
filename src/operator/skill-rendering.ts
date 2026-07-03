@@ -110,6 +110,19 @@ slice-by-slice flow and keep the operator oriented at every step:
    \`${invocation} finalize --run-id <id>\` only to deliberately abandon
    the deferred remainder (it is kept in the ledger with a reason for audit).
 
+Host-visible slice checklist:
+
+- Mirror the latest CLI outline into the host's visible task list before
+  prepare/dispatch/start and after every slice settles. Use one item per
+  in-scope slice, with the phase and slice title in the item text.
+- In Claude Code, use TodoWrite when it is available. In Codex App, use
+  update_plan when it is available. If the host does not expose a task-list tool,
+  relay the CLI outline verbatim instead.
+- Keep exactly one slice \`in_progress\`: the slice named by the outline's
+  \`Current:\` line. Mark reviewed/done slices \`completed\`; leave queued,
+  blocked, failed, and deferred slices \`pending\` unless the host has a more
+  specific state.
+
 If the plan compiles to a single unstructured slice, say so and propose a
 phase/slice breakdown before running one long opaque slice.`;
 }
