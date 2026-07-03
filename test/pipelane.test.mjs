@@ -86,8 +86,18 @@ const HERMETIC_DESTINATION_ROUTE_ENV_KEYS = [
   'PIPELANE_DESTINATION_APPROVED_TARGET_SHA',
 ];
 
+const REVIEW_GATE_CONTEXT_ENV_KEYS = [
+  'PIPELANE_REVIEW_GATE_DEPTH',
+  'PIPELANE_REVIEW_GATE_PARENT_PID',
+  'PIPELANE_REVIEW_GATE_REPO_ROOT',
+  'PIPELANE_REVIEW_GATE_ID',
+  'PIPELANE_REVIEW_GATE_RUN_ID',
+  'PIPELANE_UNSAFE_ALLOW_NESTED_REVIEW_GATES',
+];
+
 function buildCliChildEnv(env = {}) {
   const childEnv = { ...process.env, CODEX_HOME: DEFAULT_CODEX_HOME, PIPELANE_HOME: DEFAULT_PIPELANE_HOME, CLAUDE_HOME: DEFAULT_CLAUDE_HOME, ...env };
+  const preserveLiveReviewGateContext = inheritedReviewGateContextIsLive(process.env);
   if ('PIPELANE_ORCHESTRATION_STATE_KEY' in env) {
     if (env.PIPELANE_ORCHESTRATION_STATE_KEY === undefined) {
       delete childEnv.PIPELANE_ORCHESTRATION_STATE_KEY;
@@ -103,8 +113,11 @@ function buildCliChildEnv(env = {}) {
   }
   // AI review gates run `npm test` from a process that exports reviewer/session
   // identity. Keep child CLI calls hermetic so tests only see the identities
-  // they intentionally pass.
+  // they intentionally pass. Exception: when this test process itself is running
+  // inside a live review gate, preserve the review-gate context so nested
+  // Pipelane CLIs fail closed instead of recursively running more gates.
   for (const identityKey of HERMETIC_REVIEW_IDENTITY_ENV_KEYS) {
+    if (preserveLiveReviewGateContext && REVIEW_GATE_CONTEXT_ENV_KEYS.includes(identityKey)) continue;
     if (!(identityKey in env)) delete childEnv[identityKey];
   }
   // Destination routes execute child commands with internal routing flags. If a
@@ -116,11 +129,29 @@ function buildCliChildEnv(env = {}) {
   return childEnv;
 }
 
+function inheritedReviewGateContextIsLive(env = process.env) {
+  const depth = env.PIPELANE_REVIEW_GATE_DEPTH?.trim();
+  if (!depth || !/^\d+$/.test(depth) || Number(depth) <= 0) return false;
+  const parentPidText = env.PIPELANE_REVIEW_GATE_PARENT_PID?.trim();
+  if (!parentPidText || !/^\d+$/.test(parentPidText)) return false;
+  const parentPid = Number(parentPidText);
+  if (!Number.isSafeInteger(parentPid) || parentPid <= 0) return false;
+  if (!env.PIPELANE_REVIEW_GATE_REPO_ROOT || !path.isAbsolute(env.PIPELANE_REVIEW_GATE_REPO_ROOT)) return false;
+  if (!env.PIPELANE_REVIEW_GATE_ID?.trim()) return false;
+  try {
+    process.kill(parentPid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
 test('buildCliChildEnv scrubs inherited review-gate context unless explicitly supplied', () => {
   const keys = [
     'PIPELANE_REVIEW_GATE_DEPTH',
     'PIPELANE_REVIEW_GATE_PARENT_PID',
     'PIPELANE_REVIEW_GATE_REPO_ROOT',
+    'PIPELANE_REVIEW_GATE_ID',
     'PIPELANE_REVIEW_GATE_RUN_ID',
     'PIPELANE_UNSAFE_ALLOW_NESTED_REVIEW_GATES',
   ];
@@ -136,14 +167,47 @@ test('buildCliChildEnv scrubs inherited review-gate context unless explicitly su
       PIPELANE_REVIEW_GATE_DEPTH: '2',
       PIPELANE_REVIEW_GATE_PARENT_PID: '123',
       PIPELANE_REVIEW_GATE_REPO_ROOT: '/tmp/repo',
+      PIPELANE_REVIEW_GATE_ID: 'typecheck',
       PIPELANE_REVIEW_GATE_RUN_ID: 'review-explicit',
       PIPELANE_UNSAFE_ALLOW_NESTED_REVIEW_GATES: '1',
     });
     assert.equal(explicit.PIPELANE_REVIEW_GATE_DEPTH, '2');
     assert.equal(explicit.PIPELANE_REVIEW_GATE_PARENT_PID, '123');
     assert.equal(explicit.PIPELANE_REVIEW_GATE_REPO_ROOT, '/tmp/repo');
+    assert.equal(explicit.PIPELANE_REVIEW_GATE_ID, 'typecheck');
     assert.equal(explicit.PIPELANE_REVIEW_GATE_RUN_ID, 'review-explicit');
     assert.equal(explicit.PIPELANE_UNSAFE_ALLOW_NESTED_REVIEW_GATES, '1');
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('buildCliChildEnv preserves live inherited review-gate context', () => {
+  const keys = [
+    'PIPELANE_REVIEW_GATE_DEPTH',
+    'PIPELANE_REVIEW_GATE_PARENT_PID',
+    'PIPELANE_REVIEW_GATE_REPO_ROOT',
+    'PIPELANE_REVIEW_GATE_ID',
+    'PIPELANE_REVIEW_GATE_RUN_ID',
+  ];
+  const previous = new Map(keys.map((key) => [key, process.env[key]]));
+  try {
+    process.env.PIPELANE_REVIEW_GATE_DEPTH = '1';
+    process.env.PIPELANE_REVIEW_GATE_PARENT_PID = String(process.pid);
+    process.env.PIPELANE_REVIEW_GATE_REPO_ROOT = KIT_ROOT;
+    process.env.PIPELANE_REVIEW_GATE_ID = 'parent-review-gate';
+    process.env.PIPELANE_REVIEW_GATE_RUN_ID = 'review-parent';
+
+    const preserved = buildCliChildEnv();
+
+    assert.equal(preserved.PIPELANE_REVIEW_GATE_DEPTH, '1');
+    assert.equal(preserved.PIPELANE_REVIEW_GATE_PARENT_PID, String(process.pid));
+    assert.equal(preserved.PIPELANE_REVIEW_GATE_REPO_ROOT, KIT_ROOT);
+    assert.equal(preserved.PIPELANE_REVIEW_GATE_ID, 'parent-review-gate');
+    assert.equal(preserved.PIPELANE_REVIEW_GATE_RUN_ID, 'review-parent');
   } finally {
     for (const [key, value] of previous) {
       if (value === undefined) delete process.env[key];
