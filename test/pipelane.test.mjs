@@ -11515,7 +11515,7 @@ test('orchestrate start uses native Codex and Claude adapter defaults when avail
 test('orchestrate review runs gate snapshot against completed worker slices', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];
-  const workerCommand = 'node -e "require(\'node:fs\').writeFileSync(\'slice-output.txt\', \'done\\n\', \'utf8\')"';
+  const workerCommand = 'node -e "const fs = require(\'node:fs\'); fs.writeFileSync(\'slice-output.txt\', \'done\\n\', \'utf8\'); fs.writeFileSync(\'slice-extra.txt\', \'extra\\n\', \'utf8\')"';
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
     const configPath = path.join(repoRoot, '.pipelane.json');
@@ -11566,6 +11566,8 @@ test('orchestrate review runs gate snapshot against completed worker slices', ()
     assert.equal(slice.review.run.gates[0].gateId, 'slice-static');
     assert.equal(slice.review.run.gates[0].status, 'passed');
     assert.match(slice.review.run.gates[0].stdoutTail, /slice review ok/);
+    assert.equal(typeof slice.review.run.worktreeMaterialTreeHash, 'string');
+    assert.equal(slice.review.run.worktreeMaterialTreeReliable, true);
     assert.equal(realpathSync(slice.review.evidencePath), realpathSync(reviewed.ledgerPath));
     assert.equal(slice.reviewDiagnostics.length, 0);
     assert.match(reviewed.message, /Review gate execution complete/);
@@ -11575,6 +11577,18 @@ test('orchestrate review runs gate snapshot against completed worker slices', ()
     assert.equal(reviewedSnapshot.data.orchestration.activeRun.state, 'healthy');
     assert.equal(reviewedSnapshot.data.orchestration.activeRun.counts.trustedReviewComplete, 1);
     assert.equal(reviewedSnapshot.data.orchestration.activeRun.nextAction.id, 'pr');
+
+    execFileSync('git', ['add', 'slice-output.txt'], { cwd: slice.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Partially commit reviewed slice output'], { cwd: slice.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    const partialCommitSnapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    assert.equal(partialCommitSnapshot.data.orchestration.activeRun.counts.trustedReviewComplete, 0);
+    assert.equal(partialCommitSnapshot.data.orchestration.activeRun.nextAction.id, 'orchestrate.review');
+
+    execFileSync('git', ['add', '.'], { cwd: slice.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Commit remaining reviewed slice output'], { cwd: slice.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    const committedSameTreeSnapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    assert.equal(committedSameTreeSnapshot.data.orchestration.activeRun.counts.trustedReviewComplete, 1);
+    assert.equal(committedSameTreeSnapshot.data.orchestration.activeRun.nextAction.id, 'pr');
 
     const uncommittedChangePath = path.join(slice.worktreePath, 'uncommitted-after-review.txt');
     writeFileSync(uncommittedChangePath, 'changed after review without commit\n', 'utf8');

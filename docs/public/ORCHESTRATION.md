@@ -427,6 +427,13 @@ passed blocking AI gates. Live slice worktrees reviewed before worktree-status
 digests were recorded may need a fresh full review after upgrade; completed
 slices whose worktrees have already been removed keep their terminal review
 state.
+
+Orchestration review evidence also records the material tree hash of the
+reviewed worktree. This lets a passed review remain trusted when the operator
+commits the exact reviewed dirty tree: the commit changes `HEAD` and the
+porcelain status digest, but a clean checkout whose `HEAD` tree matches the
+reviewed tree is identical. Partial commits, leftover dirty files, and later
+content changes require fresh review again.
 `goal-spec` remains the single-slice draft-only command.
 
 `orchestrate start` launcher configuration is explicit:
