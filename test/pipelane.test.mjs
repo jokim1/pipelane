@@ -3357,23 +3357,18 @@ test.skip('partial legacy-signature match on pipelane.md is treated as collision
   }
 });
 
-test.skip('legacy pipelane signatures are gated by filename to prevent consumer-file false positives', () => {
-  // Defense against data loss: a consumer-authored `.claude/commands/
-  // my-pipelane-notes.md` that happens to contain both pipelane legacy
-  // signatures (e.g., a cheatsheet that quotes the first line + the
-  // board npm script) must NOT be mis-classified as managed. If it
-  // were, the readdirSync scan adds it to managedFiles, desiredFiles
-  // doesn't include that filename, and pruneManagedClaudeCommands
-  // unlinks it. The extras-specific filename gate in
-  // detectLegacyClaudeCommand prevents that clobber.
+test('machine-local setup preserves consumer files that resemble legacy pipelane docs', () => {
+  // Repo-local command sync is no longer supported, but stale or
+  // consumer-authored `.claude/commands/*` files can still exist. Setup must
+  // never classify and prune those files as managed command output.
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    const decoyPath = path.join(repoRoot, '.claude', 'commands', 'my-pipelane-notes.md');
+    const commandsDir = path.join(repoRoot, '.claude', 'commands');
+    mkdirSync(commandsDir, { recursive: true });
+    const decoyPath = path.join(commandsDir, 'my-pipelane-notes.md');
     writeFileSync(
       decoyPath,
       [
@@ -3392,11 +3387,13 @@ test.skip('legacy pipelane signatures are gated by filename to prevent consumer-
       ].join('\n'),
       'utf8',
     );
+    const before = readFileSync(decoyPath, 'utf8');
 
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
     assert.ok(existsSync(decoyPath), 'my-pipelane-notes.md was clobbered by false-positive legacy detection');
-    assert.match(readFileSync(decoyPath, 'utf8'), /Consumer-authored notes — not managed\./);
+    assert.equal(readFileSync(decoyPath, 'utf8'), before);
+    assert.equal(existsSync(path.join(commandsDir, '.pipelane-managed.json')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -3439,17 +3436,24 @@ test('pipelane.md template body contains every LEGACY_CLAUDE_SIGNATURES[pipelane
   }
 });
 
-test.skip('consumer-extension ignores malformed marker pairs without crashing', () => {
+test('machine-local setup leaves malformed consumer-extension marker text byte-for-byte', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
+    const commandsDir = path.join(repoRoot, '.claude', 'commands');
+    mkdirSync(commandsDir, { recursive: true });
     const cleanPath = path.join(repoRoot, '.claude', 'commands', 'clean.md');
     const emptyPair = '<!-- pipelane:consumer-extension:start -->\n<!-- pipelane:consumer-extension:end -->';
-    const base = readFileSync(cleanPath, 'utf8');
+    const base = [
+      '<!-- pipelane:command:clean -->',
+      '# Consumer clean command',
+      '',
+      emptyPair,
+      '',
+    ].join('\n');
 
     const cases = [
       { label: 'start-only', body: base.replace(emptyPair, '<!-- pipelane:consumer-extension:start -->\nSTRAY') },
@@ -3461,8 +3465,7 @@ test.skip('consumer-extension ignores malformed marker pairs without crashing', 
       writeFileSync(cleanPath, body, 'utf8');
       runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
       const after = readFileSync(cleanPath, 'utf8');
-      assert.doesNotMatch(after, /STRAY/, `${label}: stray content should not have been preserved`);
-      assert.match(after, new RegExp('<!-- pipelane:consumer-extension:start -->\\n<!-- pipelane:consumer-extension:end -->'), `${label}: expected canonical empty marker pair`);
+      assert.equal(after, body, `${label}: consumer-owned command file changed`);
     }
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -3470,33 +3473,33 @@ test.skip('consumer-extension ignores malformed marker pairs without crashing', 
   }
 });
 
-test.skip('consumer-extension preserves content even when it contains a nested end-marker literal', () => {
+test('machine-local setup preserves consumer-extension content with a nested end-marker literal', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
+    const commandsDir = path.join(repoRoot, '.claude', 'commands');
+    mkdirSync(commandsDir, { recursive: true });
     const cleanPath = path.join(repoRoot, '.claude', 'commands', 'clean.md');
     // Consumer pastes documentation that references the marker literal.
-    // Using lastIndexOf for the end marker guards against the first
-    // (inner) `:end -->` truncating the extension on the next re-sync.
-    const withNestedMarker = readFileSync(cleanPath, 'utf8').replace(
-      '<!-- pipelane:consumer-extension:start -->\n<!-- pipelane:consumer-extension:end -->',
-      [
-        '<!-- pipelane:consumer-extension:start -->',
-        'Our protocol closes with `<!-- pipelane:consumer-extension:end -->` on its own line.',
-        'KEEP-ME-AFTER-NESTED-MARKER',
-        '<!-- pipelane:consumer-extension:end -->',
-      ].join('\n'),
-    );
+    const withNestedMarker = [
+      '<!-- pipelane:command:clean -->',
+      '# Consumer clean command',
+      '',
+      '<!-- pipelane:consumer-extension:start -->',
+      'Our protocol closes with `<!-- pipelane:consumer-extension:end -->` on its own line.',
+      'KEEP-ME-AFTER-NESTED-MARKER',
+      '<!-- pipelane:consumer-extension:end -->',
+      '',
+    ].join('\n');
     writeFileSync(cleanPath, withNestedMarker, 'utf8');
 
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
     const preserved = readFileSync(cleanPath, 'utf8');
-    assert.match(preserved, /KEEP-ME-AFTER-NESTED-MARKER/);
+    assert.equal(preserved, withNestedMarker);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -4237,16 +4240,22 @@ test('syncDocs as a non-object (string) resolves to machine-local defaults witho
   }
 });
 
-test.skip('readmeSection: false preserves pre-existing pipelane marker block byte-for-byte', () => {
+test('machine-local setup preserves pre-existing pipelane README marker block byte-for-byte', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
     const readmePath = path.join(repoRoot, 'README.md');
-    const syncedBytes = readFileSync(readmePath, 'utf8');
-    assert.match(syncedBytes, /pipelane:readme:start/);
+    const syncedBytes = [
+      '# Consumer README',
+      '',
+      '<!-- pipelane:readme:start -->',
+      'Legacy Pipelane block with consumer-owned edits.',
+      '<!-- pipelane:readme:end -->',
+      '',
+    ].join('\n');
+    writeFileSync(readmePath, syncedBytes, 'utf8');
 
     // Consumer now renames the project AND opts out of README sync.
     // The stale marker block should survive unchanged until they re-enable.
@@ -4265,23 +4274,25 @@ test.skip('readmeSection: false preserves pre-existing pipelane marker block byt
   }
 });
 
-test.skip('claudeCommands: false preserves consumer-extension content without pruning', () => {
+test('machine-local setup preserves consumer-extension content without pruning', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
+    const commandsDir = path.join(repoRoot, '.claude', 'commands');
+    mkdirSync(commandsDir, { recursive: true });
     const cleanPath = path.join(repoRoot, '.claude', 'commands', 'clean.md');
-    const withExtension = readFileSync(cleanPath, 'utf8').replace(
-      '<!-- pipelane:consumer-extension:start -->\n<!-- pipelane:consumer-extension:end -->',
-      [
-        '<!-- pipelane:consumer-extension:start -->',
-        'CONSUMER-CONTENT-UNDER-OPTOUT',
-        '<!-- pipelane:consumer-extension:end -->',
-      ].join('\n'),
-    );
+    const withExtension = [
+      '<!-- pipelane:command:clean -->',
+      '# Consumer clean command',
+      '',
+      '<!-- pipelane:consumer-extension:start -->',
+      'CONSUMER-CONTENT-UNDER-OPTOUT',
+      '<!-- pipelane:consumer-extension:end -->',
+      '',
+    ].join('\n');
     writeFileSync(cleanPath, withExtension, 'utf8');
 
     const configPath = path.join(repoRoot, '.pipelane.json');
@@ -4292,10 +4303,8 @@ test.skip('claudeCommands: false preserves consumer-extension content without pr
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
     const after = readFileSync(cleanPath, 'utf8');
-    assert.match(after, /CONSUMER-CONTENT-UNDER-OPTOUT/);
-    // pipelane.md (gated by the same flag) should not have been touched
-    // or rewritten. Exists from init; mtime won't regress.
-    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'pipelane.md')));
+    assert.equal(after, withExtension);
+    assert.equal(existsSync(path.join(commandsDir, '.pipelane-managed.json')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -24934,15 +24943,15 @@ test('collectUpdateStatus applies one timeout budget across remote status calls'
   }
 });
 
-test.skip('CLI auto-update reuses the bounded status check during install', () => {
+test('CLI ordinary commands with PIPELANE_AUTO_UPDATE set skip update status probes', async () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-bin-'));
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
   const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
   const remoteCallLog = path.join(consumerRoot, 'remote-calls.log');
+  const npmInstallLog = path.join(consumerRoot, 'npm-install.log');
   const oldSha = '1111111111111111111111111111111111111111';
   const newSha = '2222222222222222222222222222222222222222';
+  const port = await getFreePort();
   try {
     writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
     mkdirSync(path.join(consumerRoot, 'node_modules', '.bin'), { recursive: true });
@@ -24956,17 +24965,17 @@ test.skip('CLI auto-update reuses the bounded status check during install', () =
       aheadCommits: [{ sha: newSha, subject: 'newer pipelane' }],
       gitMarkerPath: remoteCallLog,
       compareMarkerPath: remoteCallLog,
+      npmMarkerPath: npmInstallLog,
     });
 
-    const result = spawnSync('node', [CLI_PATH, 'run', 'status', '--json'], {
+    const result = spawnSync('node', [CLI_PATH, 'board', 'status'], {
       cwd: consumerRoot,
       env: {
         ...process.env,
-        CODEX_HOME: codexHome,
-        CLAUDE_HOME: claudeHome,
         PIPELANE_HOME: pipelaneHome,
         PIPELANE_AUTO_UPDATE: '1',
         PIPELANE_AUTO_UPDATE_TTL_MS: '0',
+        PORT: String(port),
         PATH: `${binDir}:${process.env.PATH}`,
       },
       encoding: 'utf8',
@@ -24974,59 +24983,58 @@ test.skip('CLI auto-update reuses the bounded status check during install', () =
     });
 
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout.trim(), 'REEXEC:run status --json');
-    assert.deepEqual(readFileSync(remoteCallLog, 'utf8').trim().split('\n'), [
-      'git ls-remote',
-      'gh compare',
-    ]);
+    assert.match(result.stdout, new RegExp(`Port:   ${port}`));
+    assert.doesNotMatch(result.stdout, /REEXEC/);
+    assert.equal(existsSync(remoteCallLog), false, 'ordinary command must not check remote update status');
+    assert.equal(existsSync(npmInstallLog), false, 'ordinary command must not run npm install');
+    const cacheDir = path.join(pipelaneHome, 'update-checks');
+    assert.equal(existsSync(cacheDir) ? readdirSync(cacheDir).length : 0, 0);
+    const lock = JSON.parse(readFileSync(path.join(consumerRoot, 'package-lock.json'), 'utf8'));
+    assert.equal(lock.packages['node_modules/pipelane'].resolved.endsWith(`#${oldSha}`), true);
   } finally {
     rmSync(consumerRoot, { recursive: true, force: true });
     rmSync(binDir, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-    rmSync(claudeHome, { recursive: true, force: true });
     rmSync(pipelaneHome, { recursive: true, force: true });
   }
 });
 
-test.skip('CLI auto-update fails visibly when the updated local bin is unavailable', () => {
+test('CLI ordinary commands with PIPELANE_AUTO_UPDATE set do not require an updated local bin', async () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-bin-'));
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
   const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  const npmInstallLog = path.join(consumerRoot, 'npm-install.log');
   const oldSha = '1111111111111111111111111111111111111111';
   const newSha = '2222222222222222222222222222222222222222';
+  const port = await getFreePort();
   try {
     writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
-    makeFakeUpdateBin(binDir, { latestSha: newSha });
+    makeFakeUpdateBin(binDir, { latestSha: newSha, npmMarkerPath: npmInstallLog });
 
-    const result = spawnSync('node', [CLI_PATH, 'run', 'status', '--json'], {
+    const result = spawnSync('node', [CLI_PATH, 'board', 'status'], {
       cwd: consumerRoot,
       env: {
         ...process.env,
-        CODEX_HOME: codexHome,
-        CLAUDE_HOME: claudeHome,
         PIPELANE_HOME: pipelaneHome,
         PIPELANE_AUTO_UPDATE: '1',
         PIPELANE_AUTO_UPDATE_TTL_MS: '0',
+        PORT: String(port),
         PATH: `${binDir}:${process.env.PATH}`,
       },
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /auto-update completed, but the updated local executable is unavailable/);
-    assert.doesNotMatch(result.stdout, /status/);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, new RegExp(`Port:   ${port}`));
+    assert.doesNotMatch(result.stderr, /auto-update completed|Auto-updating pipelane|Upgrade complete/);
+    assert.equal(existsSync(npmInstallLog), false, 'ordinary command must not run npm install');
     const cacheDir = path.join(pipelaneHome, 'update-checks');
     assert.equal(existsSync(cacheDir) ? readdirSync(cacheDir).length : 0, 0);
     const lock = JSON.parse(readFileSync(path.join(consumerRoot, 'package-lock.json'), 'utf8'));
-    assert.equal(lock.packages['node_modules/pipelane'].resolved.endsWith(`#${newSha}`), true);
+    assert.equal(lock.packages['node_modules/pipelane'].resolved.endsWith(`#${oldSha}`), true);
   } finally {
     rmSync(consumerRoot, { recursive: true, force: true });
     rmSync(binDir, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-    rmSync(claudeHome, { recursive: true, force: true });
     rmSync(pipelaneHome, { recursive: true, force: true });
   }
 });
@@ -33699,25 +33707,32 @@ test.skip('detectSetupDrift detects a missing Lessons block as an approval-gated
 // marker; a lastIndexOf parser latched onto that quote and the re-sync rebuild
 // silently deleted everything between the real terminator and the quote while
 // reporting "existing entries preserved".
-test.skip('setup --yes does not corrupt consumer prose that quotes the outer lessons:end marker', () => {
+test('machine-local setup preserves consumer prose that quotes the outer lessons:end marker', () => {
   const repoRoot = createRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
     const claudePath = path.join(repoRoot, 'CLAUDE.md');
-    let claude = readFileSync(claudePath, 'utf8');
-    // Accrete a lesson...
-    claude = claude.replace(
-      '<!-- pipelane:lessons:entries:start -->\n<!-- pipelane:lessons:entries:end -->',
-      '<!-- pipelane:lessons:entries:start -->\n- 2026-06-25: keep this entry\n<!-- pipelane:lessons:entries:end -->',
-    );
-    // ...and add maintainer prose AFTER the block that quotes the literal outer
-    // end marker. This is the bug trigger: a lastIndexOf parser binds here.
-    claude = `${claude}\n## Maintainer Notes\n\nDo not hand-edit between the \`<!-- pipelane:lessons:end -->\` markers.\n`;
+    const claude = [
+      '# Demo App Local Operator Context',
+      '',
+      '<!-- pipelane:lessons:start -->',
+      '## Lessons',
+      '',
+      '<!-- pipelane:lessons:entries:start -->',
+      '- 2026-06-25: keep this entry',
+      '<!-- pipelane:lessons:entries:end -->',
+      '<!-- pipelane:lessons:end -->',
+      '',
+      '## Maintainer Notes',
+      '',
+      'Do not hand-edit between the `<!-- pipelane:lessons:end -->` markers.',
+      '',
+    ].join('\n');
     writeFileSync(claudePath, claude, 'utf8');
 
     runCli(['setup', '--yes'], repoRoot);
     const after = readFileSync(claudePath, 'utf8');
+    assert.equal(after, claude);
     assert.match(after, /- 2026-06-25: keep this entry/);               // accreted entry preserved
     assert.match(after, /## Maintainer Notes/);                          // prose heading survives
     assert.match(after, /Do not hand-edit between the/);                 // prose body survives
