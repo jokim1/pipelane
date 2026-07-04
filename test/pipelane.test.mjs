@@ -2318,6 +2318,7 @@ test('install-codex outside a pipelane repo installs durable global default skil
     assert.match(orchestrateSkill, /Orchestration behavior/);
     assert.match(orchestrateSkill, /Never use `--yes` on this path/);
     assert.match(orchestrateSkill, /Host-visible slice checklist/);
+    assert.match(orchestrateSkill, /finalize --run-id <id> --abandon/);
     assert.match(orchestrateSkill, /Claude Code, use TodoWrite/);
     assert.match(orchestrateSkill, /Codex App, use\s+update_plan/);
     assert.match(orchestrateSkill, /## Argument handling/);
@@ -2353,6 +2354,8 @@ test('install-codex outside a pipelane repo installs durable global default skil
     assert.match(pipelaneSkill, /Choice handoff behavior/);
     assert.match(pipelaneSkill, /do not refer back to only\n"option 1" or "option 2"/);
     assert.match(pipelaneSkill, /Interactive review setup behavior/);
+    assert.match(pipelaneSkill, /Review checklist behavior/);
+    assert.match(pipelaneSkill, /Review checklist/);
     assert.match(pipelaneSkill, /runner command above/);
     assert.match(pipelaneSkill, /repo-local npm scripts or repo-local binaries/);
     assert.match(pipelaneSkill, /Bare review setup is read-only/);
@@ -2425,6 +2428,7 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     assert.match(orchestrateSkill, /Orchestration behavior/);
     assert.match(orchestrateSkill, /Never use `--yes` on this path/);
     assert.match(orchestrateSkill, /Host-visible slice checklist/);
+    assert.match(orchestrateSkill, /finalize --run-id <id> --abandon/);
     assert.match(orchestrateSkill, /Claude Code, use TodoWrite/);
     assert.match(orchestrateSkill, /Codex App, use\s+update_plan/);
     assert.match(orchestrateSkill, /## Argument handling/);
@@ -2451,6 +2455,8 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     assert.match(pipelaneSkill, /Choice handoff behavior/);
     assert.match(pipelaneSkill, /do not refer back to only\n"option 1" or "option 2"/);
     assert.match(pipelaneSkill, /Interactive review setup behavior/);
+    assert.match(pipelaneSkill, /Review checklist behavior/);
+    assert.match(pipelaneSkill, /Review checklist/);
     assert.match(pipelaneSkill, /runner command above/);
     assert.match(pipelaneSkill, /repo-local npm scripts or repo-local binaries/);
     assert.match(pipelaneSkill, /Bare review setup is read-only/);
@@ -3226,6 +3232,7 @@ test.skip('pipelane.md renders a journey-first overview with real slash aliases'
     assert.match(pipelane, /orchestrate plan-review pass --run-id <id> --gate <gate-id> --message <summary>/);
     assert.match(pipelane, /orchestrate plan-review bypass --run-id <id> --gate <gate-id> --reason <reason>/);
     assert.match(pipelane, /Host-visible slice checklist/);
+    assert.match(pipelane, /Review checklist/);
     assert.match(pipelane, /Claude Code, use TodoWrite/);
     assert.match(pipelane, /Codex App, use\s+update_plan/);
     assert.doesNotMatch(pipelane, /Pipelane Board \(default\)/);
@@ -3246,6 +3253,8 @@ test('pipelane.md documents exact first-token routing for subcommands', () => {
   assert.match(template, /Do not substitute\s+repo-local npm scripts or repo-local binaries/);
   assert.match(template, /run_pipelane\(\)/);
   assert.match(template, /run_pipelane review \$REST/);
+  assert.match(template, /Review checklist/);
+  assert.match(template, /failed\/blocking/);
   assert.match(template, /run_pipelane orchestrate \$REST/);
   assert.doesNotMatch(template, /npm run pipelane:/);
   assert.match(template, /\/pipelane orchestrate analyze --plan-file <path> --analysis-file <path>/);
@@ -3257,6 +3266,7 @@ test('pipelane.md documents exact first-token routing for subcommands', () => {
   assert.match(template, /\/pipelane orchestrate dispatch --run-id <id>/);
   assert.match(template, /\/pipelane orchestrate start --run-id <id>/);
   assert.match(template, /\/pipelane orchestrate review --run-id <id>/);
+  assert.match(template, /\/pipelane orchestrate finalize --run-id <id> --abandon/);
   assert.match(template, /Exactly equals `update`/);
   assert.match(template, /No prefix matching/);
   assert.match(template, /`\/pipelane update-this-thing` routes to UNKNOWN MODE, not UPDATE MODE/);
@@ -15251,6 +15261,90 @@ test('review runner executes command gates and writes evidence', () => {
   }
 });
 
+test('review runner prints an operator checklist for plain text runs', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Checklist Demo', {
+      reviewGates: {
+        planReview: { gates: [] },
+        gates: [
+          {
+            id: 'typecheck',
+            phase: 'static',
+            type: 'command',
+            command: `${JSON.stringify(process.execPath)} -e "process.exit(0)"`,
+            blocking: true,
+          },
+          {
+            id: 'docs-ai',
+            phase: 'ai-diff',
+            type: 'skill',
+            skill: 'review',
+            userCommands: ['/review'],
+            whenChanged: ['docs/**'],
+            blocking: true,
+          },
+        ],
+      },
+    });
+    commitLocal(repoRoot, 'Configure checklist review gates');
+
+    const result = runCli(['run', 'review'], repoRoot);
+
+    assert.equal((result.stdout.match(/Review checklist/g) ?? []).length, 1);
+    assert.match(result.stdout, /Review checklist/);
+    assert.doesNotMatch(result.stdout, /\[~\]/);
+    assert.match(result.stdout, /\[x\] static - typecheck/);
+    assert.match(result.stdout, /\[-\] ai-diff - docs-ai - skipped: no changed files matched docs\/\*\*/);
+    assert.match(result.stdout, /Current: complete/);
+    assert.match(result.stdout, /Pipelane review/);
+    assert.equal(result.status, 0);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review runner checklist marks failed blocking and pending gates distinctly', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Checklist Failure Demo', {
+      reviewGates: {
+        planReview: { gates: [] },
+        gates: [
+          {
+            id: 'gstack-review',
+            phase: 'ai-diff',
+            type: 'skill',
+            skill: 'review',
+            userCommands: ['/review'],
+            blocking: true,
+          },
+          {
+            id: 'late-fails',
+            phase: 'runtime',
+            type: 'command',
+            command: `${JSON.stringify(process.execPath)} -e "process.exit(7)"`,
+            blocking: true,
+          },
+        ],
+      },
+    });
+    commitLocal(repoRoot, 'Configure failing checklist review gates');
+
+    const result = runCli(['run', 'review'], repoRoot, {}, true);
+
+    assert.notEqual(result.status, 0);
+    assert.equal((result.stdout.match(/Review checklist/g) ?? []).length, 1);
+    assert.match(result.stdout, /Review checklist/);
+    assert.match(result.stdout, /Current: runtime \/ late-fails/);
+    assert.match(result.stdout, /\[!\] runtime - late-fails - BLOCKED: command exited 7/);
+    assert.match(result.stdout, /\[ \] independent review - gstack-review - pending: deferred: a blocking deterministic gate failed/);
+    assert.match(result.stdout, /Current: runtime \/ late-fails \(failed\)/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('review runner records pending AI gates without failing the process', () => {
   const repoRoot = createRepo();
   const npmShim = createNpmShimEnv();
@@ -15550,6 +15644,51 @@ test('review runner still applies whenChanged to docs-profile gates outside docs
     assert.match(docsChange.gates[0].summary, /independent AI review pending/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('docs-only review profile does not skip repurposed full-suite gate ids', async () => {
+  const repoRoot = createRepo();
+  const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-marker-'));
+  const markerPath = path.join(markerRoot, 'repurposed-test-gate-ran.txt');
+  try {
+    writePipelaneConfig(repoRoot, 'Docs Profile Review App', {
+      reviewGates: {
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: [{
+          id: 'test',
+          phase: 'static',
+          type: 'command',
+          command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, 'ran', 'utf8')`)}`,
+          blocking: true,
+        }],
+      },
+    });
+    commitLocal(repoRoot, 'Adopt repurposed test review gate');
+
+    const reviewMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'review.ts'));
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+    const record = reviewMod.buildReviewRunRecord({
+      repoRoot,
+      commonDir: context.commonDir,
+      config: context.config,
+      baseBranch: context.config.baseBranch,
+      gates: context.config.reviewGates.gates,
+      dryRun: false,
+      activeSurfaces: context.config.surfaces,
+      changedFiles: [],
+      profileContext: { runProfile: 'docs-only', sliceProfile: 'docs-only' },
+    });
+
+    assert.equal(record.status, 'passed');
+    assert.equal(record.gates[0].gateId, 'test');
+    assert.equal(record.gates[0].status, 'passed');
+    assert.equal(readFileSync(markerPath, 'utf8'), 'ran');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(markerRoot, { recursive: true, force: true });
   }
 });
 
@@ -35027,6 +35166,44 @@ test('orchestrate finalize --abandon marks the deferred remainder excluded and k
     assert.ok(finalized.run.slices[2].excludedAt);
     // The deferred remainder no longer keeps the run paused/resumable.
     assert.notEqual(finalized.run.status, 'paused');
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    if (slicesDir) rmSync(slicesDir, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate finalize without --abandon does not exclude deferred slices', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  let slicesDir;
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = { planReview: { gates: [] }, gates: [{ id: 'static-pass', phase: 'static', type: 'command', command: 'node -e "process.exit(0)"', blocking: true }] };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt pipelane + passing gate');
+    const planned = planPr1ThreeSliceRun(repoRoot);
+    slicesDir = planned.slicesDir;
+    const runId = planned.runId;
+
+    runCli(['run', 'orchestrate', 'scope', '--run-id', runId, '--through', 'one'], repoRoot);
+    runCli(['run', 'orchestrate', 'prepare', '--run-id', runId], repoRoot);
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', runId], repoRoot);
+    const started = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: PR1_PASS_WORKER,
+    }).stdout);
+    createdWorktrees.push(...started.run.slices.map((slice) => slice.worktreePath).filter(Boolean));
+
+    const finalized = JSON.parse(runCli(['run', 'orchestrate', 'finalize', '--run-id', runId, '--json'], repoRoot).stdout);
+
+    assert.equal(finalized.excludedCount, 0);
+    assert.equal(finalized.run.slices[1].deferred, true);
+    assert.equal(finalized.run.slices[1].excludedReason, undefined);
+    assert.equal(finalized.run.slices[2].deferred, true);
+    assert.equal(finalized.run.slices[2].excludedReason, undefined);
   } finally {
     for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
     rmSync(repoRoot, { recursive: true, force: true });

@@ -51,6 +51,7 @@ import {
   guardReviewRunStartForRouteSafety,
   recordReviewRunForRouteSafety,
 } from '../route-loop-safety.ts';
+import { sanitizeForTerminal } from '../text-output.ts';
 
 type ReviewSetupStatus = 'configured' | 'reported' | 'cancelled';
 type ReviewCommandStatus = ReviewRunRecord['status'];
@@ -245,6 +246,29 @@ interface ReviewAttestReport {
   message: string;
 }
 
+type ReviewChecklistGateStatus = 'pending' | 'running' | ReviewGateRunRecord['status'];
+
+interface ReviewChecklistGateSnapshot {
+  gateId: string;
+  phase: ReviewGatePhase;
+  type: ReviewGateConfig['type'];
+  blocking: boolean;
+  status: ReviewChecklistGateStatus;
+  label: string;
+  summary?: string;
+}
+
+interface ReviewChecklistSnapshot {
+  title: 'Review checklist';
+  current: {
+    phase: ReviewGatePhase;
+    gateId: string;
+    label: string;
+    status: ReviewChecklistGateStatus;
+  } | null;
+  gates: ReviewChecklistGateSnapshot[];
+}
+
 export interface BuildReviewRunRecordOptions {
   repoRoot: string;
   commonDir?: string;
@@ -255,6 +279,7 @@ export interface BuildReviewRunRecordOptions {
   gateFilter?: string;
   phaseFilter?: ReviewGatePhase | '';
   activeSurfaces: string[];
+  changedFiles?: string[];
   reviewConfigChangeApproval?: ReviewGateRunRecord | null;
   profileContext?: ReviewProfileContext;
   onGateStart?: (gate: ReviewGateConfig) => void;
@@ -2183,6 +2208,160 @@ function createReviewSetupPrompter(): {
   };
 }
 
+function createReviewChecklist(gates: ReviewGateConfig[]): {
+  snapshot(): ReviewChecklistSnapshot;
+  start(gate: ReviewGateConfig): void;
+  finish(gate: ReviewGateRunRecord): void;
+} {
+  const executionOrder = reviewGateExecutionOrder(gates);
+  const executionIndexByGateId = new Map(executionOrder.map((gate, index) => [gate.id, index]));
+  const entries = gates.map((gate) => ({
+    gate,
+    status: 'pending' as ReviewChecklistGateStatus,
+    started: false,
+    executionIndex: executionIndexByGateId.get(gate.id) ?? Number.MAX_SAFE_INTEGER,
+    summary: undefined as string | undefined,
+  }));
+
+  return {
+    snapshot() {
+      return buildReviewChecklistSnapshot(entries);
+    },
+    start(gate) {
+      const entry = entries.find((candidate) => candidate.gate.id === gate.id);
+      if (!entry) return;
+      entry.started = true;
+      entry.status = 'running';
+      entry.summary = undefined;
+    },
+    finish(gate) {
+      const entry = entries.find((candidate) => candidate.gate.id === gate.gateId);
+      if (!entry) return;
+      entry.started = true;
+      entry.status = gate.status;
+      entry.summary = gate.summary;
+    },
+  };
+}
+
+function buildReviewChecklistSnapshot(entries: Array<{
+  gate: ReviewGateConfig;
+  status: ReviewChecklistGateStatus;
+  started: boolean;
+  executionIndex: number;
+  summary?: string;
+}>): ReviewChecklistSnapshot {
+  const current = selectCurrentReviewChecklistEntry(entries);
+  return {
+    title: 'Review checklist',
+    current: current
+      ? {
+          phase: current.gate.phase,
+          gateId: current.gate.id,
+          label: reviewChecklistGateLabel(current.gate),
+          status: current.status,
+        }
+      : null,
+    gates: entries.map((entry) => ({
+      gateId: entry.gate.id,
+      phase: entry.gate.phase,
+      type: entry.gate.type,
+      blocking: entry.gate.blocking !== false,
+      status: entry.status,
+      label: reviewChecklistGateLabel(entry.gate),
+      summary: entry.summary,
+    })),
+  };
+}
+
+function selectCurrentReviewChecklistEntry(entries: Array<{
+  gate: ReviewGateConfig;
+  status: ReviewChecklistGateStatus;
+  started: boolean;
+  executionIndex: number;
+}>): { gate: ReviewGateConfig; status: ReviewChecklistGateStatus; started: boolean; executionIndex: number } | null {
+  return entries.find((entry) => entry.status === 'running')
+    ?? [...entries].filter((entry) => !entry.started).sort((left, right) => left.executionIndex - right.executionIndex)[0]
+    ?? entries.find((entry) => entry.gate.blocking !== false && entry.status === 'failed')
+    ?? entries.find((entry) => entry.gate.blocking !== false && entry.status === 'pending')
+    ?? entries.find((entry) => entry.status === 'failed')
+    ?? entries.find((entry) => entry.status === 'pending')
+    ?? null;
+}
+
+function renderReviewChecklist(snapshot: ReviewChecklistSnapshot): string {
+  const lines = [
+    snapshot.title,
+    formatReviewChecklistCurrentLine(snapshot),
+    '',
+  ];
+  if (snapshot.gates.length === 0) {
+    lines.push('[ ] no review gates selected');
+    return lines.join('\n');
+  }
+
+  for (const gate of snapshot.gates) {
+    lines.push(formatReviewChecklistGateLine(gate, gate.gateId === snapshot.current?.gateId));
+  }
+  return lines.join('\n');
+}
+
+function formatReviewChecklistCurrentLine(snapshot: ReviewChecklistSnapshot): string {
+  if (!snapshot.current) {
+    return `Current: ${snapshot.gates.length === 0 ? 'no review gates selected' : 'complete'}`;
+  }
+  const status = snapshot.current.status === 'pending'
+    ? ''
+    : ` (${snapshot.current.status})`;
+  return `Current: ${sanitizeForTerminal(snapshot.current.phase)} / ${sanitizeForTerminal(snapshot.current.gateId)}${status}`;
+}
+
+function formatReviewChecklistGateLine(gate: ReviewChecklistGateSnapshot, current: boolean): string {
+  const marker = reviewChecklistMarker(gate, current);
+  return `${marker} ${sanitizeForTerminal(gate.label)}${reviewChecklistGateDetail(gate)}`;
+}
+
+function reviewChecklistMarker(gate: ReviewChecklistGateSnapshot, current: boolean): string {
+  if (gate.status === 'passed') return '[x]';
+  if (gate.status === 'failed') return '[!]';
+  if (gate.status === 'skipped') return '[-]';
+  if (gate.status === 'running' || current) return '[~]';
+  return '[ ]';
+}
+
+function reviewChecklistGateDetail(gate: ReviewChecklistGateSnapshot): string {
+  const summary = oneLineForChecklist(gate.summary ?? '');
+  if (gate.status === 'failed') return summary ? ` - ${gate.blocking ? 'BLOCKED' : 'failed'}: ${summary}` : ` - ${gate.blocking ? 'BLOCKED' : 'failed'}`;
+  if (gate.status === 'skipped') return summary ? ` - skipped: ${summary.replace(/^skipped:\s*/i, '')}` : ' - skipped';
+  if (gate.status === 'pending' && summary) return ` - pending: ${summary}`;
+  return '';
+}
+
+function reviewChecklistGateLabel(gate: Pick<ReviewGateConfig, 'id' | 'phase'>): string {
+  const labels: Record<string, string> = {
+    'karpathy-diff': 'author self-review - karpathy-diff',
+    'code-review-high': 'independent review - code-review-high',
+    'gstack-review': 'independent review - gstack-review',
+    'adversarial-review': 'cross-model review - adversarial-review',
+    'code-review-ultra': 'independent review - code-review-ultra',
+    'test': 'behavioral - tests',
+    'review-config-change': 'static - review-config-change',
+  };
+  return labels[gate.id] ?? `${gate.phase} - ${gate.id}`;
+}
+
+function oneLineForChecklist(value: string): string {
+  const sanitized = sanitizeForTerminal(value).replace(/\s+/g, ' ').trim();
+  return sanitized.length > 180 ? `${sanitized.slice(0, 177)}...` : sanitized;
+}
+
+function reviewGateExecutionOrder(gates: ReviewGateConfig[]): ReviewGateConfig[] {
+  return [
+    ...gates.filter(isDeterministicReviewGate),
+    ...gates.filter((gate) => !isDeterministicReviewGate(gate)),
+  ];
+}
+
 function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
   const context = resolveWorkflowContext(cwd);
   const phaseFilter = parsed.flags.reviewPhase.trim() as ReviewGatePhase | '';
@@ -2208,6 +2387,22 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
     return;
   }
 
+  const changedFiles = collectChangedFiles(context.repoRoot, context.config.baseBranch);
+  const reviewConfigChanged = changedFiles.some(isReviewConfigPath);
+  const selectedGates = selectReviewGatesForRun({
+    gates: context.config.reviewGates?.gates ?? [],
+    phaseFilter,
+    gateFilter,
+    reviewConfigChanged,
+  });
+  const checklist = parsed.flags.json
+    ? null
+    : createReviewChecklist(selectedGates);
+  const liveChecklist = Boolean(checklist && process.stdout.isTTY);
+  if (checklist && liveChecklist) {
+    process.stdout.write(`${renderReviewChecklist(checklist.snapshot())}\n\n`);
+  }
+
   const record = buildReviewRunRecord({
     repoRoot: context.repoRoot,
     commonDir: context.commonDir,
@@ -2218,7 +2413,16 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
     gateFilter,
     phaseFilter,
     activeSurfaces,
+    changedFiles,
     reviewConfigChangeApproval: selectReviewConfigChangeApproval(context.commonDir, context.config, context.repoRoot),
+    onGateStart: (gate) => {
+      checklist?.start(gate);
+      if (checklist && liveChecklist) process.stdout.write(`${renderReviewChecklist(checklist.snapshot())}\n\n`);
+    },
+    onGateFinish: (gateRecord) => {
+      checklist?.finish(gateRecord);
+      if (checklist && liveChecklist) process.stdout.write(`${renderReviewChecklist(checklist.snapshot())}\n\n`);
+    },
   });
 
   appendReviewRunRecord(context.commonDir, context.config, record);
@@ -2236,6 +2440,7 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
     changedFiles: record.changedFiles,
     gates: record.gates,
     message: [
+      checklist && !liveChecklist ? renderReviewChecklist(checklist.snapshot()) : '',
       renderReviewRunReport(record, reviewStatePath(context.commonDir, context.config)),
       routeSafety.action === 'stop' ? routeSafety.message : '',
     ].filter(Boolean).join('\n\n'),
@@ -2254,7 +2459,7 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
     : resolveWorkflowContext(options.repoRoot);
   const phaseFilter = options.phaseFilter ?? '';
   const gateFilter = options.gateFilter?.trim() ?? '';
-  const changedFiles = collectChangedFiles(options.repoRoot, options.baseBranch);
+  const changedFiles = options.changedFiles ?? collectChangedFiles(options.repoRoot, options.baseBranch);
   const worktreeStatus = readWorktreeStatusSnapshot(options.repoRoot, {
     includeStatusDigest: true,
     includeMaterialTreeHash: true,
@@ -2262,17 +2467,12 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
   const reviewConfigChanged = changedFiles.some(isReviewConfigPath);
   const reviewConfigChangeApproval = reviewConfigChanged ? options.reviewConfigChangeApproval ?? null : null;
   const reviewConfigChangeNeedsApproval = reviewConfigChanged && !reviewConfigChangeApproval;
-  const allGates = orderReviewGates(options.gates);
-  const selectedGates = maybeAddReviewConfigChangeGate(allGates.filter((gate) =>
-    (!phaseFilter || gate.phase === phaseFilter)
-    && (!gateFilter || gate.id === gateFilter)
-  ), {
+  const selectedGates = selectReviewGatesForRun({
+    gates: options.gates,
+    phaseFilter,
+    gateFilter,
     reviewConfigChanged,
   });
-
-  if (gateFilter && selectedGates.length === 0) {
-    throw new Error(`No review gate matches --gate ${gateFilter}. Run "pipelane run review setup --list-gates" to inspect configured gates.`);
-  }
 
   const startedAt = nowIso();
   const runStartMs = Date.now();
@@ -2310,14 +2510,13 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
     return record;
   };
   let blockingDeterministicFailure = false;
-  for (const gate of selectedGates) {
-    if (!isDeterministicReviewGate(gate)) continue;
+  for (const gate of reviewGateExecutionOrder(selectedGates)) {
+    if (!isDeterministicReviewGate(gate)) {
+      evaluateGate(gate, blockingDeterministicFailure);
+      continue;
+    }
     const record = evaluateGate(gate, false);
     if (record.blocking && record.status === 'failed') blockingDeterministicFailure = true;
-  }
-  for (const gate of selectedGates) {
-    if (isDeterministicReviewGate(gate)) continue;
-    evaluateGate(gate, blockingDeterministicFailure);
   }
   const gateRecords = selectedGates.map((gate) => recordByGate.get(gate) as ReviewGateRunRecord);
   const finishedAt = nowIso();
@@ -2351,6 +2550,28 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
 // these run before and gate the expensive skill/agent judges.
 function isDeterministicReviewGate(gate: Pick<ReviewGateConfig, 'type'>): boolean {
   return gate.type === 'command' || gate.type === 'pipelane';
+}
+
+function selectReviewGatesForRun(options: {
+  gates: ReviewGateConfig[];
+  phaseFilter: ReviewGatePhase | '';
+  gateFilter: string;
+  reviewConfigChanged: boolean;
+}): ReviewGateConfig[] {
+  const gateFilter = options.gateFilter.trim();
+  const allGates = orderReviewGates(options.gates);
+  const selectedGates = maybeAddReviewConfigChangeGate(allGates.filter((gate) =>
+    (!options.phaseFilter || gate.phase === options.phaseFilter)
+    && (!gateFilter || gate.id === gateFilter)
+  ), {
+    reviewConfigChanged: options.reviewConfigChanged,
+  });
+
+  if (gateFilter && selectedGates.length === 0) {
+    throw new Error(`No review gate matches --gate ${gateFilter}. Run "pipelane run review setup --list-gates" to inspect configured gates.`);
+  }
+
+  return selectedGates;
 }
 
 function orderReviewGates(gates: ReviewGateConfig[]): ReviewGateConfig[] {
@@ -3687,10 +3908,8 @@ function skipReasonForGate(
 function isUnscopedFullSuiteGate(gate: ReviewGateConfig): boolean {
   if (gate.whenChanged && gate.whenChanged.length > 0) return false;
   if (gate.type !== 'command' && gate.type !== 'pipelane') return false;
-  const id = gate.id.toLowerCase();
   const command = (gate.command ?? '').toLowerCase();
-  return ['test', 'build', 'typecheck'].includes(id)
-    || /\bnpm\s+(?:run\s+)?(?:test|build|typecheck)\b/.test(command)
+  return /\bnpm\s+(?:run\s+)?(?:test|build|typecheck)\b/.test(command)
     || /\b(?:pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|typecheck)\b/.test(command);
 }
 

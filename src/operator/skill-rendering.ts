@@ -107,7 +107,7 @@ slice-by-slice flow and keep the operator oriented at every step:
 6. When the in-scope slices pass: if the outline shows deferred slices, tell the
    operator the run is paused and a later \`${invocation}\` resumes it
    (re-scope with \`--through <next>\`, then continue). Use
-   \`${invocation} finalize --run-id <id>\` only to deliberately abandon
+   \`${invocation} finalize --run-id <id> --abandon\` only to deliberately abandon
    the deferred remainder (it is kept in the ledger with a reason for audit).
 
 Host-visible slice checklist:
@@ -219,6 +219,15 @@ recommended defaults, but it is not the normal path to advertise.
 
 If the user supplied any setup flag, run the command directly through the
 runner. Do not add shell pipes to setup commands that may need interactivity.
+
+## Review checklist behavior
+
+When running \`${slashAlias} review\`, relay the CLI output directly. TTY runs
+print a live \`Review checklist\` before gates start and after gate transitions;
+captured/non-TTY runs print one final checklist snapshot before the review report.
+Markers are \`[~]\` current, \`[x]\` passed, \`[!]\` failed/blocking, \`[-]\`
+skipped, and \`[ ]\` pending/manual gates. \`${slashAlias} review --json\` stays
+machine-readable and does not print the checklist.
 
 ${renderOrchestrationGuidance(`${slashAlias} orchestrate`, 'When the first token is `orchestrate` and a plan file (or a goal to implement) is given')}
 `;

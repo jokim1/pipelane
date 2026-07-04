@@ -4208,10 +4208,8 @@ function collectGitNameStatusPathRecords(repoRoot: string, gitArgs: string[]): O
 function isUnscopedFullSuiteReviewGate(gate: ReviewGateConfig): boolean {
   if (gate.whenChanged && gate.whenChanged.length > 0) return false;
   if (gate.type !== 'command' && gate.type !== 'pipelane') return false;
-  const id = gate.id.toLowerCase();
   const command = (gate.command ?? '').toLowerCase();
-  return ['test', 'build', 'typecheck'].includes(id)
-    || /\bnpm\s+(?:run\s+)?(?:test|build|typecheck)\b/.test(command)
+  return /\bnpm\s+(?:run\s+)?(?:test|build|typecheck)\b/.test(command)
     || /\b(?:pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|typecheck)\b/.test(command);
 }
 

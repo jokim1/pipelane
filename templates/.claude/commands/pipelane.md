@@ -219,6 +219,13 @@ where `$REST` is `$ARGUMENTS` with the leading `review` token stripped.
 
 Use this path for `/pipelane review`, `/pipelane review --json`, `/pipelane review --dry-run`, `/pipelane review --gate <id>`, `/pipelane review --phase <phase>`, and `/pipelane review setup ...`. Display the output directly.
 
+For normal `/pipelane review` output, relay the CLI's `Review checklist`
+directly. TTY runs show live checklist updates; captured/non-TTY runs show one
+final checklist snapshot before the review report. Markers are `[~]` for the
+current gate, `[x]` passed, `[!]` failed/blocking, `[-]` skipped, and `[ ]`
+pending/manual gates. `/pipelane review --json` remains machine-readable and
+does not print the checklist.
+
 Special case: when `$REST` is exactly `setup`, do not run the interactive setup command first. Agent Bash tools commonly run without an interactive TTY, and shell pipes make stdout non-TTY.
 
 1. Run `/pipelane review setup --print` through the managed runner to inspect the current effective gate config.
@@ -277,7 +284,7 @@ oriented:
    updated outline shows where the run is. Never use `--yes` here.
 6. When the in-scope slices pass: if the outline lists deferred slices, the run is
    `paused` — tell the operator a later `/pipelane orchestrate` resumes it (re-scope
-   `--through <next>`, continue). Use `/pipelane orchestrate finalize --run-id <id>`
+   `--through <next>`, continue). Use `/pipelane orchestrate finalize --run-id <id> --abandon`
    only to deliberately abandon the deferred remainder (kept in the ledger for audit).
 
 Host-visible slice checklist:
