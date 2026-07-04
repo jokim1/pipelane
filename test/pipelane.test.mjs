@@ -10663,6 +10663,70 @@ test('orchestrate v1a docs-only escape blocks review and finalize abandon preser
   }
 });
 
+test('orchestrate v1a docs-only review fails closed when slice merge-base is missing', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Docs Missing Merge Base App', {
+      reviewGates: {
+        planReview: { gates: [] },
+        gates: [
+          { id: 'test', phase: 'behavioral', type: 'command', blocking: true, command: 'npm run test' },
+        ],
+      },
+    });
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'missing-merge-base-plan.md'), '# Missing Merge Base Plan\n\nUpdate docs.\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'slices.json'), JSON.stringify({
+      slices: [
+        { id: 'docs-rewritten', title: 'Docs rewritten', plannedPathScope: ['docs/ARCHITECTURE.md'] },
+      ],
+    }, null, 2), 'utf8');
+    commitAll(repoRoot, 'Add missing merge-base orchestration plan');
+
+    const planned = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/missing-merge-base-plan.md',
+      '--slices-file',
+      'slices.json',
+      '--provider',
+      'generic',
+      '--json',
+    ], repoRoot).stdout);
+    preparePlannedRun(repoRoot, planned);
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot);
+    const workerScript = [
+      "const fs = require('fs');",
+      "const cp = require('child_process');",
+      "fs.mkdirSync('src', { recursive: true });",
+      "fs.writeFileSync('src/escape.ts', 'export const escape = true;\\n', 'utf8');",
+      "cp.execFileSync('git', ['add', 'src/escape.ts']);",
+      "const tree = cp.execFileSync('git', ['write-tree'], { encoding: 'utf8' }).trim();",
+      "const commit = cp.execFileSync('git', ['commit-tree', tree, '-m', 'orphan implementation'], { encoding: 'utf8' }).trim();",
+      "cp.execFileSync('git', ['reset', '--hard', commit]);",
+      "fs.mkdirSync('docs', { recursive: true });",
+      "fs.writeFileSync('docs/untracked-note.md', 'docs note\\n', 'utf8');",
+    ].join('');
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(workerScript)}`,
+    });
+
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+
+    assert.equal(reviewed.status, 'blocked');
+    assert.equal(reviewed.run.slices[0].reviewProfile, 'implementation');
+    assert.equal(reviewed.run.slices[0].reviewProfileEscapedDocsSafeScope, true);
+    assert.match(reviewed.run.slices[0].reviewProfileReason, /could not resolve merge-base/);
+    assert.match(reviewed.slices[0].blocker, /implementation-baseline-required/);
+    assert.equal(reviewed.run.slices[0].review, null);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('orchestrate plan writes a durable slice ledger from a plan file', () => {
   const repoRoot = createRepo();
   try {
@@ -15246,6 +15310,55 @@ test('review command gates use material tree identity when dirty file exceeds ro
     assert.equal(record.worktreeMaterialTreeReliable, true);
     assert.equal(typeof record.worktreeMaterialTreeHash, 'string');
     assert.equal(evidence.allowed, true, evidence.message);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review evidence rejects stale material tree identity when oversized dirty status is unreliable', async () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'oversized-noop',
+        phase: 'static',
+        type: 'command',
+        command: `${JSON.stringify(process.execPath)} -e "process.exit(0)"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'large-fixture.txt'), 'tracked before dirty edit\n', 'utf8');
+    commitLocal(repoRoot, 'Configure oversized review fixture');
+
+    writeFileSync(path.join(repoRoot, 'large-fixture.txt'), 'x'.repeat(1024 * 1024 + 1), 'utf8');
+    const result = runCli(['run', 'review', '--json'], repoRoot);
+    const report = JSON.parse(result.stdout);
+    const record = JSON.parse(readFileSync(report.evidencePath, 'utf8')).records[0];
+    const { resolveWorkflowContext } = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const { evaluateReviewEvidenceForPr } = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-enforcement.ts'));
+
+    assert.equal(result.status, 0);
+    assert.equal(record.worktreeStatusReliable, false);
+    assert.equal(record.worktreeMaterialTreeReliable, true);
+    assert.equal(evaluateReviewEvidenceForPr(resolveWorkflowContext(repoRoot)).allowed, true);
+
+    writeFileSync(path.join(repoRoot, 'post-review-untracked.txt'), 'new untracked file\n', 'utf8');
+    const staleUntracked = evaluateReviewEvidenceForPr(resolveWorkflowContext(repoRoot));
+    assert.equal(staleUntracked.allowed, false);
+    assert.match(staleUntracked.message, /different worktree state/);
+
+    rmSync(path.join(repoRoot, 'post-review-untracked.txt'), { force: true });
+    assert.equal(evaluateReviewEvidenceForPr(resolveWorkflowContext(repoRoot)).allowed, true);
+
+    writeFileSync(path.join(repoRoot, 'large-fixture.txt'), 'y'.repeat(1024 * 1024 + 1), 'utf8');
+    const staleTracked = evaluateReviewEvidenceForPr(resolveWorkflowContext(repoRoot));
+    assert.equal(staleTracked.allowed, false);
+    assert.match(staleTracked.message, /different worktree state/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }

@@ -3072,8 +3072,14 @@ function refreshSliceReviewProfiles(context: WorkflowContext, run: Orchestration
       slice.reviewProfileEscapedDocsSafeScope = false;
       continue;
     }
-    const records = collectReviewPathRecords(slice.worktreePath, reviewBaseRef);
-    const classification = classifyDocsSafePathRecords(records);
+    const pathRecords = collectReviewPathRecords(slice.worktreePath, reviewBaseRef);
+    if (pathRecords.mergeBaseMissing) {
+      slice.reviewProfile = 'implementation';
+      slice.reviewProfileReason = `implementation profile: could not resolve merge-base between HEAD and ${reviewBaseRef}`;
+      slice.reviewProfileEscapedDocsSafeScope = run.baselinePreflight?.profile === 'docs-only';
+      continue;
+    }
+    const classification = classifyDocsSafePathRecords(pathRecords.records);
     slice.reviewProfile = classification.profile;
     slice.reviewProfileEscapedDocsSafeScope = false;
     if (classification.profile === 'docs-only') {
@@ -3093,12 +3099,16 @@ function reviewBaseRefForRun(context: WorkflowContext, run: OrchestrationRunReco
   return run.baseBranch || context.config.baseBranch;
 }
 
-function collectReviewPathRecords(repoRoot: string, reviewBaseRef: string): OrchestrationPathRecord[] {
+interface ReviewPathRecordCollection {
+  records: OrchestrationPathRecord[];
+  mergeBaseMissing: boolean;
+}
+
+function collectReviewPathRecords(repoRoot: string, reviewBaseRef: string): ReviewPathRecordCollection {
   const mergeBase = runGit(repoRoot, ['merge-base', 'HEAD', reviewBaseRef], true)?.trim() ?? '';
   const records: OrchestrationPathRecord[] = [];
-  if (mergeBase) {
-    records.push(...collectGitNameStatusPathRecords(repoRoot, ['diff', '--name-status', '-M', '-C', `${mergeBase}...HEAD`]));
-  }
+  if (!mergeBase) return { records, mergeBaseMissing: true };
+  records.push(...collectGitNameStatusPathRecords(repoRoot, ['diff', '--name-status', '-M', '-C', `${mergeBase}...HEAD`]));
   records.push(...collectGitNameStatusPathRecords(repoRoot, ['diff', '--cached', '--name-status', '-M', '-C']));
   records.push(...collectGitNameStatusPathRecords(repoRoot, ['diff', '--name-status', '-M', '-C']));
   const untracked = runGit(repoRoot, ['ls-files', '--others', '--exclude-standard'], true) ?? '';
@@ -3106,7 +3116,7 @@ function collectReviewPathRecords(repoRoot: string, reviewBaseRef: string): Orch
     const file = normalizeRepoRelativePath(line);
     if (file) records.push({ path: file });
   }
-  return records;
+  return { records, mergeBaseMissing: false };
 }
 
 function docsOnlyImplementationEscapeBlocker(run: OrchestrationRunRecord): string | null {
