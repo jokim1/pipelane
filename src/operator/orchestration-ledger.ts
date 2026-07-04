@@ -385,6 +385,23 @@ export interface OrchestrationReviewFixRecord {
   lesson?: string;
 }
 
+export interface OrchestrationAutoCleanupRecord {
+  attemptedAt: string;
+  taskSlugs: string[];
+  closed: Array<{
+    taskSlug: string;
+    worktreeRemoved: boolean;
+    branchRemoved: boolean;
+    warnings: string[];
+    errors: string[];
+  }>;
+  skipped: Array<{
+    taskSlug: string;
+    reason: string;
+    code: string;
+  }>;
+}
+
 export interface OrchestrationSliceRecord {
   id: string;
   index: number;
@@ -465,6 +482,7 @@ export interface OrchestrationRunRecord {
   };
   slices: OrchestrationSliceRecord[];
   reviewFixes?: OrchestrationReviewFixRecord[];
+  autoCleanup?: OrchestrationAutoCleanupRecord;
   planAnalysisRequired?: boolean;
   planAnalysis?: OrchestrationPlanAnalysisRecord;
   observationIndex?: OrchestrationObservationIndex;

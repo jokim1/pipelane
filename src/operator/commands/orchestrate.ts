@@ -39,6 +39,7 @@ import {
   type OrchestrationCoverageEntry,
   type OrchestrationLedgerDiagnostic,
   type OrchestrationObservationRecord,
+  type OrchestrationAutoCleanupRecord,
   type OrchestrationPathRecord,
   type OrchestrationPlanAnalysisRecord,
   type OrchestrationReviewProfile,
@@ -61,6 +62,7 @@ import {
   resolveReviewActorIdentity,
 } from '../review-identity.ts';
 import { buildReviewRunRecord, collectChangedFiles } from './review.ts';
+import { closeSafeCompletedTaskWorkspaces } from './clean.ts';
 import {
   DEFAULT_GOAL_PROVIDER,
   TASK_SLUG_MAX_LENGTH,
@@ -85,6 +87,7 @@ import {
   ensureSharedNodeModulesLink,
   generateUniqueTaskWorkspace,
   removeTaskArtifacts,
+  resolveSharedRepoRoot,
   resolveTaskBaseRef,
   resolveTaskWorktreeRoot,
   saveNewTaskLock,
@@ -397,6 +400,7 @@ interface OrchestrateReviewReport {
   pendingCount: number;
   blockedCount: number;
   slices: ReviewedSliceReport[];
+  autoCleanup: OrchestrationAutoCleanupRecord | null;
   run: OrchestrationRunRecord;
   message: string;
 }
@@ -679,8 +683,10 @@ function resolveOrchestrationBaseBranch(context: WorkflowContext, parsed: Parsed
   if (explicit) return explicit;
   const orchestrateBase = context.config.orchestrate?.baseBranch?.trim();
   if (orchestrateBase) return orchestrateBase;
-  const prBase = resolveGhPrBaseBranch(context.repoRoot);
-  if (prBase) return prBase;
+  if (!parsed.flags.offline) {
+    const prBase = resolveGhPrBaseBranch(context.repoRoot);
+    if (prBase) return prBase;
+  }
   const originHead = resolveOriginHeadBranch(context.repoRoot);
   if (originHead) return originHead;
   const configuredBase = context.config.baseBranch.trim();
@@ -2470,6 +2476,7 @@ function handleOrchestrationReview(cwd: string, parsed: ParsedOperatorArgs): voi
   });
   let reportRun = prepared.run;
   let ledgerPath = orchestrationRunPath(context.commonDir, context.config, runId);
+  let autoCleanup: OrchestrationAutoCleanupRecord | null = null;
 
   if (!parsed.flags.reviewDryRun) {
     withLockedOrchestrationRun(context, runId, (run) => {
@@ -2485,6 +2492,7 @@ function handleOrchestrationReview(cwd: string, parsed: ParsedOperatorArgs): voi
         return;
       }
       attachOrchestrationReviewResult(run, prepared.run, prepared.snapshots);
+      autoCleanup = maybeAutoCleanCompletedOrchestrationRun(context, run);
       ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
       reportRun = run;
     });
@@ -2505,6 +2513,7 @@ function handleOrchestrationReview(cwd: string, parsed: ParsedOperatorArgs): voi
     pendingCount: result.pendingCount,
     blockedCount: result.blockedCount,
     slices: result.slices,
+    autoCleanup,
     run: reportRun,
     message: renderOrchestrationReviewReport(reportRun, ledgerPath, sliceId, result, {
       dryRun: parsed.flags.reviewDryRun,
@@ -2704,6 +2713,133 @@ function attachOrchestrationReviewResult(
   }
   run.status = summarizeRunReviewStatus(run);
   run.updatedAt = nowIso();
+}
+
+function maybeAutoCleanCompletedOrchestrationRun(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+): OrchestrationAutoCleanupRecord | null {
+  if (run.status !== 'completed') return null;
+  const taskSlugs = [...new Set(run.slices
+    .map((slice) => slice.taskSlug)
+    .filter((taskSlug): taskSlug is string => Boolean(taskSlug)))];
+  if (taskSlugs.length === 0) return null;
+  const targetSlugs = taskSlugs.filter((taskSlug) => !autoCleanupHasClosedTask(run.autoCleanup, taskSlug));
+  if (targetSlugs.length === 0) return run.autoCleanup ?? null;
+
+  const intent = mergeOrchestrationAutoCleanupRecords(run.autoCleanup, {
+    attemptedAt: nowIso(),
+    taskSlugs,
+    closed: [],
+    skipped: [],
+  });
+  run.autoCleanup = intent;
+  run.updatedAt = intent.attemptedAt;
+  saveOrchestrationRunRecord(context.commonDir, context.config, run);
+
+  const cleanup = closeSafeCompletedTaskWorkspaces({
+    commonDir: context.commonDir,
+    config: context.config,
+    sharedRepoRoot: resolveSharedRepoRoot(context.commonDir),
+    callerCwd: context.repoRoot,
+    taskSlugs: targetSlugs,
+  });
+  const reconciled = reconcileAutoCleanupResult(context, run, intent, cleanup);
+  const record = mergeOrchestrationAutoCleanupRecords(intent, {
+    attemptedAt: nowIso(),
+    taskSlugs,
+    closed: reconciled.closed.map((entry) => ({
+      taskSlug: entry.taskSlug,
+      worktreeRemoved: entry.worktreeRemoved,
+      branchRemoved: entry.branchRemoved,
+      warnings: [...entry.warnings],
+      errors: [...entry.errors],
+    })),
+    skipped: reconciled.skipped.map((entry) => ({
+      taskSlug: entry.taskSlug,
+      reason: entry.reason,
+      code: entry.code,
+    })),
+  });
+  run.autoCleanup = record;
+  run.updatedAt = record.attemptedAt;
+  return record;
+}
+
+function autoCleanupHasClosedTask(record: OrchestrationAutoCleanupRecord | undefined, taskSlug: string): boolean {
+  return record?.closed.some((entry) => entry.taskSlug === taskSlug) === true;
+}
+
+function mergeOrchestrationAutoCleanupRecords(
+  prior: OrchestrationAutoCleanupRecord | undefined,
+  next: OrchestrationAutoCleanupRecord,
+): OrchestrationAutoCleanupRecord {
+  const taskSlugs = [...new Set([...(prior?.taskSlugs ?? []), ...next.taskSlugs])];
+  const closed = new Map<string, OrchestrationAutoCleanupRecord['closed'][number]>();
+  for (const entry of prior?.closed ?? []) closed.set(entry.taskSlug, entry);
+  for (const entry of next.closed) closed.set(entry.taskSlug, entry);
+
+  const skipped = new Map<string, OrchestrationAutoCleanupRecord['skipped'][number]>();
+  for (const entry of prior?.skipped ?? []) skipped.set(entry.taskSlug, entry);
+  for (const entry of next.skipped) skipped.set(entry.taskSlug, entry);
+  for (const taskSlug of closed.keys()) skipped.delete(taskSlug);
+
+  return {
+    attemptedAt: next.attemptedAt,
+    taskSlugs,
+    closed: [...closed.values()],
+    skipped: [...skipped.values()],
+  };
+}
+
+function reconcileAutoCleanupResult(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+  intent: OrchestrationAutoCleanupRecord,
+  cleanup: ReturnType<typeof closeSafeCompletedTaskWorkspaces>,
+): Pick<OrchestrationAutoCleanupRecord, 'closed' | 'skipped'> {
+  const closed = cleanup.closed.map((entry) => ({
+    taskSlug: entry.taskSlug,
+    worktreeRemoved: entry.worktreeRemoved,
+    branchRemoved: entry.branchRemoved,
+    warnings: [...entry.warnings],
+    errors: [...entry.errors],
+  }));
+  const skipped: OrchestrationAutoCleanupRecord['skipped'] = [];
+  for (const entry of cleanup.skipped) {
+    if (
+      entry.code === 'lock-missing'
+      && intent.taskSlugs.includes(entry.taskSlug)
+      && orchestrationSliceArtifactsGone(context, run, entry.taskSlug)
+    ) {
+      closed.push({
+        taskSlug: entry.taskSlug,
+        worktreeRemoved: true,
+        branchRemoved: true,
+        warnings: ['Cleanup was reconciled from a prior orchestration cleanup intent; task lock, worktree, and branch are already gone.'],
+        errors: [],
+      });
+      continue;
+    }
+    skipped.push({
+      taskSlug: entry.taskSlug,
+      reason: entry.reason,
+      code: entry.code,
+    });
+  }
+  return { closed, skipped };
+}
+
+function orchestrationSliceArtifactsGone(
+  context: WorkflowContext,
+  run: OrchestrationRunRecord,
+  taskSlug: string,
+): boolean {
+  const slice = run.slices.find((candidate) => candidate.taskSlug === taskSlug);
+  if (!slice) return false;
+  const worktreeGone = !slice.worktreePath || !existsSync(slice.worktreePath);
+  const branchGone = !slice.branchName || !gitRefExists(context.repoRoot, `refs/heads/${slice.branchName}`);
+  return worktreeGone && branchGone;
 }
 
 function dispatchPreparedSlices(
@@ -4664,6 +4800,7 @@ interface OrchestrateFinalizeReport {
   excludedCount: number;
   escapedWorktreePaths: string[];
   purgedWorktreePaths: string[];
+  autoCleanup: OrchestrationAutoCleanupRecord | null;
   run: OrchestrationRunRecord;
   message: string;
 }
@@ -4812,6 +4949,9 @@ function handleFinalize(cwd: string, parsed: ParsedOperatorArgs): void {
         purgedWorktreePaths.push(slice.worktreePath);
         slice.excludedReason = `abandoned and purged via orchestrate finalize: ${purgeReason}`;
         slice.excludedAt = at;
+        run.status = 'failed';
+        run.updatedAt = nowIso();
+        saveOrchestrationRunRecord(context.commonDir, context.config, run);
       }
     }
     if (abandon && escapedSlices.length > 0) {
@@ -4827,12 +4967,14 @@ function handleFinalize(cwd: string, parsed: ParsedOperatorArgs): void {
         excludedCount,
         escapedWorktreePaths,
         purgedWorktreePaths,
+        autoCleanup: null,
         run,
         message: renderFinalizeReport(run, ledgerPath, {
           excludedCount,
           escapedWorktreePaths,
           purgedWorktreePaths,
           abandon,
+          autoCleanup: null,
         }),
       };
       printResult(parsed.flags, report);
@@ -4870,6 +5012,7 @@ function handleFinalize(cwd: string, parsed: ParsedOperatorArgs): void {
     // evidence (this is NOT a redundant recompute of reviewCompletedSlices' result).
     run.status = summarizeRunReviewStatus(run);
     run.updatedAt = nowIso();
+    const autoCleanup = maybeAutoCleanCompletedOrchestrationRun(context, run);
     const ledgerPath = saveOrchestrationRunRecord(context.commonDir, context.config, run);
     const report: OrchestrateFinalizeReport = {
       command: 'orchestrate finalize',
@@ -4880,12 +5023,14 @@ function handleFinalize(cwd: string, parsed: ParsedOperatorArgs): void {
       excludedCount,
       escapedWorktreePaths,
       purgedWorktreePaths,
+      autoCleanup,
       run,
       message: renderFinalizeReport(run, ledgerPath, {
         excludedCount,
         escapedWorktreePaths,
         purgedWorktreePaths,
         abandon,
+        autoCleanup,
       }),
     };
     printResult(parsed.flags, report);
@@ -6208,6 +6353,7 @@ function renderOrchestrationReviewReport(
   }
 
   lines.push('', renderOrchestrationOutline(run));
+  lines.push(...renderAutoCleanupReportLines(run.autoCleanup));
 
   if (options.dryRun) {
     lines.push(
@@ -6233,6 +6379,8 @@ function renderOrchestrationReviewReport(
     lines.push('', 'Next: finish or recover blocked workers, then rerun /pipelane orchestrate review.');
   } else if (result.status === 'blocked') {
     lines.push('', 'Next: complete and review the remaining slices, then rerun /pipelane orchestrate review without filters.');
+  } else if (run.autoCleanup) {
+    lines.push('', 'Review gate execution complete. Merge and deploy were not run by this command.');
   } else {
     lines.push('', 'Review gate execution complete. Merge, deploy, and cleanup were not run by this command.');
   }
@@ -6248,6 +6396,7 @@ function renderFinalizeReport(
     escapedWorktreePaths: string[];
     purgedWorktreePaths: string[];
     abandon: boolean;
+    autoCleanup: OrchestrationAutoCleanupRecord | null;
   },
 ): string {
   const lines = [
@@ -6277,7 +6426,30 @@ function renderFinalizeReport(
     lines.push('', 'Profile and skipped gates:', ...skippedGateLines);
   }
   lines.push('', renderOrchestrationOutline(run));
+  lines.push(...renderAutoCleanupReportLines(result.autoCleanup ?? undefined));
   return lines.join('\n');
+}
+
+function renderAutoCleanupReportLines(record: OrchestrationAutoCleanupRecord | undefined): string[] {
+  if (!record) return [];
+  const lines = ['', 'Orchestration cleanup:'];
+  if (record.closed.length === 0) {
+    lines.push('- No slice worktrees were cleaned automatically.');
+  } else {
+    for (const entry of record.closed) {
+      const parts = ['lock'];
+      if (entry.worktreeRemoved) parts.push('worktree');
+      if (entry.branchRemoved) parts.push('branch');
+      lines.push(`- ${entry.taskSlug}: removed ${parts.join(' + ')}`);
+      for (const warning of entry.warnings) lines.push(`  note: ${warning}`);
+      for (const error of entry.errors) lines.push(`  ! ${error}`);
+    }
+  }
+  if (record.skipped.length > 0) {
+    lines.push('Kept for later cleanup:');
+    for (const entry of record.skipped) lines.push(`- ${entry.taskSlug}: ${entry.reason}`);
+  }
+  return lines;
 }
 
 function formatPendingReviewGateInstructions(run: OrchestrationRunRecord): string[] {

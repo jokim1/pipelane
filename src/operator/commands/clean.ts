@@ -736,7 +736,7 @@ function lookupSingleBranchMergedPr(repoRoot: string, branchName: string): Merge
 // Auto-cleanup helpers
 // -----------------------------------------------------------------------------
 
-interface ArtifactRemovalSummary {
+export interface ArtifactRemovalSummary {
   taskSlug: string;
   worktreeRemoved: boolean;
   branchRemoved: boolean;
@@ -770,9 +770,11 @@ function performArtifactRemoval(options: {
   });
 }
 
-type AutoCleanupBlockerCode =
+export type AutoCleanupBlockerCode =
   | 'lock-too-young'
   | 'unparseable-updated-at'
+  | 'lock-missing'
+  | 'not-prod-verified'
   | 'worktree-missing'
   | 'caller-inside'
   | 'branch-missing'
@@ -784,7 +786,7 @@ type AutoCleanupBlockerCode =
   | 'tree-mismatch'
   | 'busy';
 
-interface AutoCleanupSkip {
+export interface AutoCleanupSkip {
   taskSlug: string;
   reason: string;
   // Structured blocker code — drives the action-menu categorization. The
@@ -794,11 +796,12 @@ interface AutoCleanupSkip {
   code: AutoCleanupBlockerCode;
 }
 
-function closeSafeCompletedTaskWorkspaces(options: {
+export function closeSafeCompletedTaskWorkspaces(options: {
   commonDir: string;
   config: WorkflowConfig;
   sharedRepoRoot: string;
   callerCwd: string;
+  taskSlugs?: string[];
   minAgeMs?: number;
   dryRun?: boolean;
   // When true, the "ignored content" blocker is ignored — the rest of the
@@ -807,11 +810,18 @@ function closeSafeCompletedTaskWorkspaces(options: {
 }): { closed: ArtifactRemovalSummary[]; skipped: AutoCleanupSkip[] } {
   const prRecords = loadPrState(options.commonDir, options.config).records;
   const deployRecords = loadTrustedDeployRecords(options.commonDir, options.config);
-  const minAgeMs = options.minAgeMs ?? TASK_LOCK_MIN_PRUNE_AGE_MS;
+  const minAgeMs = options.minAgeMs ?? readMinAgeOverride() ?? TASK_LOCK_MIN_PRUNE_AGE_MS;
+  const requestedTaskSlugs = options.taskSlugs
+    ? [...new Set(options.taskSlugs.map((slug) => slug.trim()).filter(Boolean))]
+    : null;
+  const requested = requestedTaskSlugs ? new Set(requestedTaskSlugs) : null;
+  const observed = new Set<string>();
   const closed: ArtifactRemovalSummary[] = [];
   const skipped: AutoCleanupSkip[] = [];
 
   for (const observedLock of listActiveTaskLocks(options.commonDir, options.config)) {
+    if (requested && !requested.has(observedLock.taskSlug)) continue;
+    observed.add(observedLock.taskSlug);
     let releaseCleanupLock: (() => void) | null = null;
     if (!options.dryRun) {
       const cleanupLock = acquireTaskCleanupLock(options.commonDir, options.config, observedLock.taskSlug);
@@ -836,7 +846,16 @@ function closeSafeCompletedTaskWorkspaces(options: {
       }
 
       const safeDeleteBranchRef = resolveVerifiedProdCleanupRef(lock, prRecords, deployRecords);
-      if (!safeDeleteBranchRef) continue;
+      if (!safeDeleteBranchRef) {
+        if (requested) {
+          skipped.push({
+            taskSlug: lock.taskSlug,
+            reason: 'task has no merged PR SHA plus verified prod deploy evidence yet',
+            code: 'not-prod-verified',
+          });
+        }
+        continue;
+      }
 
       const blocker = explainAutoCleanupBlocker({
         lock,
@@ -901,6 +920,18 @@ function closeSafeCompletedTaskWorkspaces(options: {
       });
     } finally {
       releaseCleanupLock?.();
+    }
+  }
+
+  if (requested) {
+    for (const taskSlug of requested) {
+      if (!observed.has(taskSlug)) {
+        skipped.push({
+          taskSlug,
+          reason: 'no active task lock found; task may already be cleaned',
+          code: 'lock-missing',
+        });
+      }
     }
   }
 

@@ -9778,6 +9778,49 @@ test('orchestrate prepare rejects tampered signed plan-review evidence', () => {
   }
 });
 
+test('bare orchestrate --offline does not query gh for a PR base branch', () => {
+  const repoRoot = createRepo();
+  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-fake-gh-'));
+  const sentinelPath = path.join(fakeBin, 'gh-called.txt');
+  try {
+    writePipelaneConfig(repoRoot, 'Offline Orchestration App', {
+      reviewGates: { planReview: { gates: [] }, gates: [] },
+    });
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'offline-plan.md'), '# Offline Plan\n\nTouch docs.\n', 'utf8');
+    commitLocal(repoRoot, 'Add offline orchestration plan');
+    const ghPath = path.join(fakeBin, 'gh');
+    writeFileSync(ghPath, [
+      '#!/usr/bin/env node',
+      "require('node:fs').writeFileSync(process.env.GH_SENTINEL, 'called\\n', 'utf8');",
+      'process.exit(1);',
+      '',
+    ].join('\n'), 'utf8');
+    chmodSync(ghPath, 0o755);
+
+    const planned = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      '--plan-file',
+      'docs/offline-plan.md',
+      '--provider',
+      'generic',
+      '--offline',
+      '--plan',
+      '--json',
+    ], repoRoot, {
+      GH_SENTINEL: sentinelPath,
+      PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
+    }).stdout);
+
+    assert.equal(planned.run.baseBranch, 'main');
+    assert.equal(existsSync(sentinelPath), false, '--offline should skip gh pr view entirely');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
 test('orchestrate plan-review pending gate blocks prepare until audited bypass', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];
@@ -10660,14 +10703,112 @@ test('orchestrate v1a docs-only escape blocks review and finalize abandon preser
     assert.match(purgeWithoutReason.stderr, /--purge-worktrees requires --reason/);
     assert.equal(existsSync(worktreePath), true);
 
+    const seededLedger = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
+    seededLedger.autoCleanup = {
+      attemptedAt: '2026-06-01T00:00:00.000Z',
+      taskSlugs: ['stale-cleanup-task'],
+      closed: [
+        {
+          taskSlug: 'stale-cleanup-task',
+          worktreeRemoved: true,
+          branchRemoved: true,
+          warnings: [],
+          errors: [],
+        },
+      ],
+      skipped: [],
+    };
+    writeSignedLedger(repoRoot, planned.runId, seededLedger);
+
     const finalized = JSON.parse(runCli(['run', 'orchestrate', 'finalize', '--run-id', planned.runId, '--abandon', '--json'], repoRoot).stdout);
     assert.equal(finalized.status, 'failed');
     assert.deepEqual(finalized.escapedWorktreePaths, [worktreePath]);
     assert.deepEqual(finalized.purgedWorktreePaths, []);
+    assert.equal(finalized.autoCleanup, null);
     assert.equal(existsSync(worktreePath), true);
     assert.match(finalized.message, /Escaped slice worktrees:/);
     assert.match(finalized.message, /Escaped worktrees were preserved/);
+    assert.doesNotMatch(finalized.message, /Orchestration cleanup:/);
   } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate finalize --abandon --purge-worktrees persists each successful purge before later failures', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    writePipelaneConfig(repoRoot, 'Docs Escape Purge App', {
+      reviewGates: {
+        planReview: { gates: [] },
+        gates: [
+          { id: 'test', phase: 'behavioral', type: 'command', blocking: true, command: 'npm run test' },
+        ],
+      },
+    });
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'escape-purge-plan.md'), '# Escape Purge Plan\n\nUpdate docs.\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'slices.json'), JSON.stringify({
+      slices: [
+        { id: 'docs-one', title: 'Docs one', plannedPathScope: ['docs/ONE.md'] },
+        { id: 'docs-two', title: 'Docs two', plannedPathScope: ['docs/TWO.md'] },
+      ],
+    }, null, 2), 'utf8');
+    commitAll(repoRoot, 'Add docs escape purge orchestration plan');
+
+    const planned = JSON.parse(runCli([
+      'run',
+      'orchestrate',
+      'plan',
+      '--plan-file',
+      'docs/escape-purge-plan.md',
+      '--slices-file',
+      'slices.json',
+      '--provider',
+      'generic',
+      '--json',
+    ], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot);
+    const workerCommand = 'node -e "require(\'fs\').mkdirSync(\'src\',{recursive:true});require(\'fs\').writeFileSync(\'src/escape.ts\',\'export const escape = true;\\n\')"';
+    runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
+    });
+
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot).stdout);
+    assert.equal(reviewed.status, 'blocked');
+    assert.equal(reviewed.run.slices.length, 2);
+    assert.equal(reviewed.run.slices.every((slice) => slice.reviewProfileEscapedDocsSafeScope), true);
+
+    const seededLedger = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
+    seededLedger.slices[1].branchName = 'main';
+    writeSignedLedger(repoRoot, planned.runId, seededLedger);
+
+    const failed = runCli([
+      'run',
+      'orchestrate',
+      'finalize',
+      '--run-id',
+      planned.runId,
+      '--abandon',
+      '--purge-worktrees',
+      '--reason',
+      'operator requested purge',
+      '--json',
+    ], repoRoot, {}, true);
+
+    assert.notEqual(failed.status, 0);
+    assert.match(failed.stderr, /orchestrate finalize --purge-worktrees failed for docs-two/);
+    const persisted = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
+    assert.equal(persisted.status, 'failed');
+    assert.match(persisted.slices[0].excludedReason, /abandoned and purged via orchestrate finalize/);
+    assert.equal(persisted.slices[0].excludedAt !== undefined, true);
+    assert.equal(persisted.slices[1].excludedReason, undefined);
+    assert.equal(existsSync(reviewed.run.slices[0].worktreePath), false);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
   }
@@ -18404,6 +18545,26 @@ function writePrRecord(repoRoot, taskSlug, mergedSha) {
     }, null, 2)}\n`,
     'utf8',
   );
+}
+
+function upsertPrRecord(repoRoot, taskSlug, mergedSha, options = {}) {
+  const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+  mkdirSync(stateDir, { recursive: true });
+  const targetPath = path.join(stateDir, 'pr-state.json');
+  const state = existsSync(targetPath)
+    ? JSON.parse(readFileSync(targetPath, 'utf8'))
+    : { records: {} };
+  state.records[taskSlug] = {
+    taskSlug,
+    branchName: options.branchName || run('git', ['branch', '--show-current'], repoRoot),
+    title: options.title || 'Smoke gate test',
+    number: options.number ?? 1,
+    url: options.url || `https://example.test/pr/${options.number ?? 1}`,
+    mergedSha,
+    mergedAt: options.mergedAt || '2026-04-22T00:00:00Z',
+    updatedAt: options.updatedAt || '2026-04-22T00:00:00Z',
+  };
+  writeFileSync(targetPath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
 }
 
 function writePassingReviewEvidence(repoRoot, options = {}) {
@@ -35135,6 +35296,133 @@ test('orchestrate pass with deferred slices pauses, then resume un-defers and co
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
     if (slicesDir) rmSync(slicesDir, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate review auto-cleans only completed verified slice worktrees', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App', {
+      reviewGates: {
+        planReview: { gates: [] },
+        gates: [{ id: 'static-pass', phase: 'static', type: 'command', command: 'node -e "process.exit(0)"', blocking: true }],
+      },
+    });
+    commitAll(repoRoot, 'Adopt pipelane + passing gate');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'cleanup-plan.md'), ['# Cleanup Plan', '', '## Slice 1: Implement cleanup target', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
+    commitAll(repoRoot, 'Add cleanup orchestration plan');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/cleanup-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    const started = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(),
+    }).stdout);
+
+    const slice = started.run.slices[0];
+    execFileSync('git', ['add', '.'], { cwd: slice.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Implement orchestration slice'], { cwd: slice.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    const mergedSha = run('git', ['rev-parse', 'HEAD'], slice.worktreePath);
+    const sliceLockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${slice.taskSlug}.json`);
+    const sliceLock = JSON.parse(readFileSync(sliceLockPath, 'utf8'));
+    sliceLock.updatedAt = '2026-04-17T00:00:00Z';
+    writeFileSync(sliceLockPath, `${JSON.stringify(sliceLock, null, 2)}\n`, 'utf8');
+
+    const unrelated = await createVerifiedAutoCleanCandidate(repoRoot, 'Unrelated Verified Cleanup', 'unrelated-verified-cleanup');
+    createdWorktrees.push(unrelated.created.worktreePath);
+    upsertPrRecord(repoRoot, slice.taskSlug, mergedSha, {
+      branchName: slice.branchName,
+      title: 'Orchestration slice cleanup',
+      number: 77,
+    });
+    await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, sliceLock.surfaces, { taskSlug: slice.taskSlug });
+
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    }).stdout);
+
+    assert.equal(reviewed.run.status, 'completed');
+    assert.deepEqual(reviewed.autoCleanup.closed.map((entry) => entry.taskSlug), [slice.taskSlug]);
+    assert.equal(reviewed.autoCleanup.skipped.length, 0);
+    assert.match(reviewed.message, /Orchestration cleanup:/);
+    assert.match(reviewed.message, new RegExp(`${slice.taskSlug}: removed lock \\+ worktree \\+ branch`));
+    assert.equal(existsSync(sliceLockPath), false, 'verified orchestration slice lock is removed');
+    assert.equal(existsSync(slice.worktreePath), false, 'verified orchestration slice worktree is removed');
+    assert.equal(localBranchExists(repoRoot, slice.branchName), false, 'verified orchestration slice branch is removed');
+
+    assert.equal(existsSync(unrelated.lockPath), true, 'unrelated eligible lock is outside orchestration cleanup scope');
+    assert.equal(existsSync(unrelated.created.worktreePath), true, 'unrelated eligible worktree is outside orchestration cleanup scope');
+    assert.equal(localBranchExists(repoRoot, unrelated.created.branch), true, 'unrelated eligible branch is outside orchestration cleanup scope');
+
+    const onDisk = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
+    assert.deepEqual(onDisk.autoCleanup.closed.map((entry) => entry.taskSlug), [slice.taskSlug]);
+
+    const finalized = JSON.parse(runCli(['run', 'orchestrate', 'finalize', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    }).stdout);
+    assert.equal(finalized.status, 'completed');
+    assert.deepEqual(finalized.autoCleanup.closed.map((entry) => entry.taskSlug), [slice.taskSlug]);
+    assert.equal(finalized.autoCleanup.skipped.length, 0);
+    const afterFinalize = JSON.parse(readFileSync(planned.ledgerPath, 'utf8'));
+    assert.deepEqual(afterFinalize.autoCleanup.closed.map((entry) => entry.taskSlug), [slice.taskSlug]);
+    assert.equal(afterFinalize.autoCleanup.skipped.length, 0);
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('orchestrate review records cleanup skip when merge deploy evidence is not ready', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const createdWorktrees = [];
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App', {
+      reviewGates: {
+        planReview: { gates: [] },
+        gates: [{ id: 'static-pass', phase: 'static', type: 'command', command: 'node -e "process.exit(0)"', blocking: true }],
+      },
+    });
+    commitAll(repoRoot, 'Adopt pipelane + passing gate');
+    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'docs', 'cleanup-skip-plan.md'), ['# Cleanup Skip Plan', '', '## Slice 1: Implement cleanup skip target', '- Touch `src/a.ts`'].join('\n') + '\n', 'utf8');
+    commitAll(repoRoot, 'Add cleanup-skip orchestration plan');
+
+    const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--plan-file', 'docs/cleanup-skip-plan.md', '--provider', 'generic', '--json'], repoRoot).stdout);
+    const prepared = preparePlannedRun(repoRoot, planned);
+    createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath).filter(Boolean));
+    runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot);
+    const started = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_ORCHESTRATE_WORKER_COMMAND: passWorker(),
+    }).stdout);
+
+    const slice = started.run.slices[0];
+    execFileSync('git', ['add', '.'], { cwd: slice.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Implement orchestration slice'], { cwd: slice.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    const sliceLockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${slice.taskSlug}.json`);
+    const sliceLock = JSON.parse(readFileSync(sliceLockPath, 'utf8'));
+    sliceLock.updatedAt = '2026-04-17T00:00:00Z';
+    writeFileSync(sliceLockPath, `${JSON.stringify(sliceLock, null, 2)}\n`, 'utf8');
+
+    const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+    }).stdout);
+
+    assert.equal(reviewed.run.status, 'completed');
+    assert.deepEqual(reviewed.autoCleanup.closed, []);
+    assert.equal(reviewed.autoCleanup.skipped[0].taskSlug, slice.taskSlug);
+    assert.equal(reviewed.autoCleanup.skipped[0].code, 'not-prod-verified');
+    assert.match(reviewed.autoCleanup.skipped[0].reason, /no merged PR SHA plus verified prod deploy evidence/);
+    assert.ok(existsSync(sliceLockPath), 'unverified completed slice lock is kept');
+    assert.ok(existsSync(slice.worktreePath), 'unverified completed slice worktree is kept');
+    assert.equal(localBranchExists(repoRoot, slice.branchName), true, 'unverified completed slice branch is kept');
+  } finally {
+    for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
   }
 });
 
