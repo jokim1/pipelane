@@ -11,6 +11,8 @@ import {
   type ParsedOperatorArgs,
   type WorkflowContext,
 } from '../state.ts';
+import { evaluateReviewEvidenceForPr } from '../review-enforcement.ts';
+import { routeSafetyAcceptsReviewFindings } from '../route-loop-safety.ts';
 import {
   buildSharedCheckoutLeaseBlocker,
   buildStaleBaseBlocker,
@@ -43,7 +45,10 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
     }
   }
 
+  assertReviewEvidenceReadyForMerge(cwd, parsed, context);
+
   watchPrChecks(context.repoRoot, pr.number);
+  assertReviewEvidenceReadyForMerge(cwd, parsed, context);
   runGh(context.repoRoot, ['pr', 'merge', String(pr.number), '--squash']);
 
   // Poll gh until the PR reports state === "MERGED" AND mergeCommit.oid
@@ -125,6 +130,15 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
     mergedSha,
     message: lines.join('\n'),
   });
+}
+
+function assertReviewEvidenceReadyForMerge(cwd: string, parsed: ParsedOperatorArgs, context: WorkflowContext): void {
+  const reviewEvidence = evaluateReviewEvidenceForPr(context, {
+    command: formatWorkflowCommand(context.config, 'merge'),
+  });
+  if (!reviewEvidence.allowed && !routeSafetyAcceptsReviewFindings(cwd, parsed, reviewEvidence)) {
+    throw new Error(reviewEvidence.message);
+  }
 }
 
 interface MergeCommandContext {

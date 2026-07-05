@@ -13,13 +13,12 @@ import {
   type DestinationStep,
 } from './destination-planner.ts';
 import { sanitizeForTerminal } from './commands/helpers.ts';
-import type { ParsedOperatorArgs } from './state.ts';
 import { evaluateReviewEvidenceForPr } from './review-enforcement.ts';
 import {
   ROUTE_SAFETY_FINGERPRINT_ENV,
   evaluateDestinationRouteReviewSafety,
 } from './route-loop-safety.ts';
-import { resolveWorkflowContext } from './state.ts';
+import { resolveWorkflowContext, type ParsedOperatorArgs } from './state.ts';
 
 export const DESTINATION_INTERNAL_STEP_ENV = 'PIPELANE_DESTINATION_INTERNAL_STEP';
 export const DESTINATION_APPROVED_ROUTE_FINGERPRINT_ENV = 'PIPELANE_DESTINATION_APPROVED_ROUTE_FINGERPRINT';
@@ -106,7 +105,7 @@ export async function executeDestinationRoute(
     }
     if (step.id === 'pr') {
       const context = resolveWorkflowContext(routeCwd);
-      const reviewEvidence = evaluateReviewEvidenceForPr(context);
+      const reviewEvidence = evaluateReviewEvidenceForPr(context, { command: step.command });
       if (!reviewEvidence.allowed) {
         const pause = await evaluateDestinationRouteReviewSafety(context, currentPlan, reviewEvidence);
         if (pause.action === 'stop') {

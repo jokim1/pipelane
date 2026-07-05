@@ -22630,15 +22630,21 @@ test('build-mode bare deploy auto-runs a single remaining merge step', () => {
       config.surfaces = [];
       config.reviewGates = {
         planReview: { gates: [] },
-        gates: [],
+        gates: [{
+          id: 'must-pass',
+          phase: 'static',
+          type: 'command',
+          blocking: true,
+          command: 'node -e "process.exit(0)"',
+        }],
       };
     });
     commitAll(repoRoot, 'Adopt pipelane');
 
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Bare Deploy Merge', '--json'], repoRoot).stdout);
     writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
-    const opened = runCli(['run', 'pr', '--title', 'Bare Deploy Merge', '--json'], created.worktreePath, env, true);
-    assert.equal(opened.status, 0, opened.stderr);
+    runCli(['run', 'pr', '--title', 'Bare Deploy Merge', '--json'], created.worktreePath, env);
+    writePassingReviewEvidence(created.worktreePath);
 
     const result = runCli(['run', 'deploy', '--json'], created.worktreePath, env);
     const payload = JSON.parse(result.stdout);
@@ -22654,6 +22660,86 @@ test('build-mode bare deploy auto-runs a single remaining merge step', () => {
     assert.equal(ghState.prMergeCalls.length, 1);
     assert.doesNotMatch(combinedOutput, /Choose the action to take:/);
     assert.doesNotMatch(combinedOutput, /Take one step only/);
+
+    const rerun = runCli(['run', 'deploy', '--json'], created.worktreePath, env);
+    const rerunPayload = JSON.parse(rerun.stdout);
+    const rerunGhState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+
+    assert.equal(rerun.status, 0);
+    assert.equal(rerunPayload.currentMilestone, 'merged');
+    assert.deepEqual(rerunPayload.remainingSteps, []);
+    assert.equal(rerunGhState.prMergeCalls.length, 1);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('build-mode bare deploy auto-merge stops when review evidence is not ready', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.surfaces = [];
+      config.reviewGates = {
+        planReview: { gates: [] },
+        gates: [],
+      };
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Bare Deploy Gate', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+    const opened = runCli(['run', 'pr', '--title', 'Bare Deploy Gate', '--json'], created.worktreePath, env, true);
+    assert.equal(opened.status, 0, opened.stderr);
+
+    updateWorkflowConfig(created.worktreePath, (config) => {
+      config.reviewGates = {
+        planReview: { gates: [] },
+        gates: [{
+          id: 'must-pass',
+          phase: 'static',
+          type: 'command',
+          blocking: true,
+          command: 'node -e "process.exit(1)"',
+        }],
+      };
+    });
+    execFileSync('git', ['add', '.pipelane.json'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Require review gate'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['push'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const blocked = runCli(['run', 'deploy', '--json'], created.worktreePath, env, true);
+    const payload = JSON.parse(blocked.stdout);
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+
+    assert.equal(blocked.status, 1);
+    assert.equal(payload.execution.completed, false);
+    assert.equal(payload.execution.failedStep, '/merge');
+    assert.equal(payload.execution.failureMessage, undefined);
+    assert.match(payload.execution.steps[0].stderr, /^\/merge blocked because review gate evidence is not ready\./);
+    assert.match(payload.execution.steps[0].stderr, /no review run has been recorded/);
+    assert.doesNotMatch(payload.execution.steps[0].stderr, /\/pr\b/);
+    assert.equal(ghState.prMergeCalls.length, 0);
+
+    const directMerge = runCli(['run', 'merge', '--json'], created.worktreePath, env, true);
+    const directMergeOutput = `${directMerge.stdout}\n${directMerge.stderr}`;
+    const directMergeGhState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+
+    assert.equal(directMerge.status, 1);
+    assert.match(directMergeOutput, /\/merge blocked because review gate evidence is not ready\./);
+    assert.doesNotMatch(directMergeOutput, /\/pr\b/);
+    assert.equal(directMergeGhState.prMergeCalls.length, 0);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });

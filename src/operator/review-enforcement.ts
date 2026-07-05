@@ -30,7 +30,7 @@ export interface ReviewEvidenceCheckResult {
 
 export function evaluateReviewEvidenceForPr(
   context: WorkflowContext,
-  options: { latestOverride?: ReviewRunRecord | null } = {},
+  options: { latestOverride?: ReviewRunRecord | null; command?: string } = {},
 ): ReviewEvidenceCheckResult {
   const reviewState = loadReviewState(context.commonDir, context.config);
   const expectedGates = context.config.reviewGates?.gates ?? [];
@@ -74,7 +74,7 @@ export function evaluateReviewEvidenceForPr(
     allowed: issues.length === 0,
     latest,
     issues,
-    message: issues.length === 0 ? '' : formatReviewEvidenceBlocker(context, issues),
+    message: issues.length === 0 ? '' : formatReviewEvidenceBlocker(context, issues, options.command),
   };
 }
 
@@ -100,11 +100,11 @@ export function selectReviewEvidenceRecord(
     ?? null;
 }
 
-export function formatReviewEvidenceBlocker(context: WorkflowContext, issues: ReviewEvidenceIssue[]): string {
+export function formatReviewEvidenceBlocker(context: WorkflowContext, issues: ReviewEvidenceIssue[], command = formatWorkflowCommand(context.config, 'pr')): string {
   return [
-    `${formatWorkflowCommand(context.config, 'pr')} blocked because review gate evidence is not ready.`,
+    `${command} blocked because review gate evidence is not ready.`,
     ...issues.map((issue) => `- ${issue.message}`),
-    `Run /pipelane review and complete any pending AI/manual gates before retrying ${formatWorkflowCommand(context.config, 'pr')}.`,
+    `Run /pipelane review and complete any pending AI/manual gates before retrying ${command}.`,
   ].join('\n');
 }
 
