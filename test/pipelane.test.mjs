@@ -8176,6 +8176,134 @@ test('review leaves code-review high pending instead of auto-running native clau
   }
 });
 
+test('review leaves runtime browser QA pending instead of using the shared AI command', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const markerPath = path.join(repoRoot, 'runtime-qa-invoked.txt');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      policyVersion: 2,
+      planReview: { gates: [] },
+      gates: [{
+        id: 'browser-qa',
+        phase: 'runtime',
+        type: 'skill',
+        skill: 'qa-only',
+        blocking: false,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt browser QA review gate');
+
+    const script = [
+      `require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, 'invoked')`,
+      "console.log('PIPELANE_REVIEW_GATE_RESULT=passed')",
+    ].join(';');
+    const result = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      PIPELANE_REVIEW_GATE_COMMAND: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+      PIPELANE_REVIEW_PROVIDER: 'codex',
+    }).stdout);
+    const gate = result.gates.find((entry) => entry.gateId === 'browser-qa');
+
+    assert.equal(result.status, 'passed');
+    assert.equal(gate.status, 'pending');
+    assert.equal(gate.command, undefined);
+    assert.match(gate.summary, /manual skill gate pending: run skill:qa-only/);
+    assert.equal(existsSync(markerPath), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('review leaves runtime browser QA pending instead of using native Codex fallback', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-fake-codex-'));
+  const invokedPath = path.join(fakeBin, 'codex-invoked');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      policyVersion: 2,
+      planReview: { gates: [] },
+      gates: [{
+        id: 'browser-qa',
+        phase: 'runtime',
+        type: 'skill',
+        skill: 'qa-only',
+        blocking: false,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt browser QA review gate');
+
+    const codexPath = path.join(fakeBin, 'codex');
+    writeFileSync(codexPath, `#!/usr/bin/env sh\nprintf invoked > "${invokedPath}"\nprintf 'PIPELANE_REVIEW_GATE_RESULT=passed\\n'\nexit 0\n`, 'utf8');
+    chmodSync(codexPath, 0o755);
+
+    const result = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      PATH: `${fakeBin}:${process.env.PATH}`,
+      PIPELANE_REVIEW_GATE_USE_REAL_NATIVE: '1',
+    }).stdout);
+    const gate = result.gates.find((entry) => entry.gateId === 'browser-qa');
+
+    assert.equal(result.status, 'passed');
+    assert.equal(gate.status, 'pending');
+    assert.match(gate.summary, /manual skill gate pending: run skill:qa-only/);
+    assert.equal(existsSync(invokedPath), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
+test('review executes runtime browser QA with a gate-specific command override', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-runtime-qa-'));
+  const markerPath = path.join(markerRoot, 'runtime-qa-invoked.txt');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    const configPath = path.join(repoRoot, '.pipelane.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      policyVersion: 2,
+      planReview: { gates: [] },
+      gates: [{
+        id: 'browser-qa',
+        phase: 'runtime',
+        type: 'skill',
+        skill: 'qa-only',
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt browser QA review gate');
+
+    const script = [
+      `require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, process.env.PIPELANE_REVIEW_GATE_PHASE ?? '')`,
+      "console.log('PIPELANE_REVIEW_GATE_RESULT=passed')",
+    ].join(';');
+    const result = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      PIPELANE_REVIEW_BROWSER_QA_COMMAND: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+      PIPELANE_REVIEW_PROVIDER: 'codex',
+    }).stdout);
+    const gate = result.gates.find((entry) => entry.gateId === 'browser-qa');
+
+    assert.equal(result.status, 'passed');
+    assert.equal(gate.status, 'passed');
+    assert.equal(gate.summary, 'AI review passed: skill:qa-only');
+    assert.equal(readFileSync(markerPath, 'utf8'), 'runtime');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(markerRoot, { recursive: true, force: true });
+  }
+});
+
 // B4 (programmatic-before-judge): when a blocking deterministic gate fails, the
 // expensive AI judge that follows is deferred to `pending` (not `skipped`, which
 // can pass) and is NOT invoked — proven by the judge's sentinel file staying
@@ -15490,6 +15618,9 @@ test('review runner records pending AI gates without failing the process', () =>
   const repoRoot = createRepo();
   const npmShim = createNpmShimEnv();
   try {
+    writePipelaneConfig(repoRoot);
+    commitLocal(repoRoot, 'Adopt pipelane');
+
     const result = runCli(['run', 'review', '--json'], repoRoot, npmShim.env);
     const report = JSON.parse(result.stdout);
 
@@ -15638,6 +15769,9 @@ test('review pass records clean manual gates against current review evidence', (
   const repoRoot = createRepo();
   const npmShim = createNpmShimEnv();
   try {
+    writePipelaneConfig(repoRoot);
+    commitLocal(repoRoot, 'Adopt pipelane');
+
     const review = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
       ...npmShim.env,
       PIPELANE_AGENT_SESSION_ID: 'initial-review-session',

@@ -602,13 +602,16 @@ filtered review. A skipped or unavailable optional gate records a warning, not a
 crash. When review evidence records a reviewer session, any passed blocking AI
 gate must also record an attester from a separate trusted session.
 
-Skill and agent gates run automatically when Pipelane can resolve an AI review
-command. Resolution order is gate `command`, gate-specific environment
-override (`PIPELANE_REVIEW_<GATE_ID>_COMMAND` or
+Skill and agent gates run automatically when Pipelane can resolve an executable
+AI review command. Resolution order is gate `command`, gate-specific
+environment override (`PIPELANE_REVIEW_<GATE_ID>_COMMAND` or
 `PIPELANE_REVIEW_GATE_<GATE_ID>_COMMAND`), shared environment override
 (`PIPELANE_REVIEW_AI_COMMAND` or `PIPELANE_REVIEW_GATE_COMMAND`), then the
-installed native Codex/Claude CLI default. The command receives a review prompt
-on stdin and must print `PIPELANE_REVIEW_GATE_RESULT=passed` or
+installed native Codex/Claude CLI default. Runtime skill and agent gates, such
+as `browser-qa`, require a gate `command` or gate-specific environment override;
+they do not consume shared AI-review overrides or native Codex/Claude defaults.
+The command receives a review prompt on stdin and must print
+`PIPELANE_REVIEW_GATE_RESULT=passed` or
 `PIPELANE_REVIEW_GATE_RESULT=failed` on its own line. Missing result markers
 fail closed.
 
