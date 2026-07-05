@@ -3565,8 +3565,13 @@ function runAiReviewGate(options: {
 
 function resolveAiReviewGateCommand(gate: ReviewGateConfig): { command: string; provider: string } | null {
   const explicit = gate.command?.trim();
+  const gateSpecific = firstEnvValue(process.env, reviewGateSpecificCommandEnvKeys(gate))?.value;
+  const shared = allowsSharedAiReviewGateCommand(gate)
+    ? firstEnvValue(process.env, reviewGateSharedCommandEnvKeys())?.value
+    : undefined;
   const command = explicit
-    || firstEnvValue(process.env, reviewGateCommandEnvKeys(gate))?.value
+    || gateSpecific
+    || shared
     || defaultAiReviewGateCommand(gate);
   if (!command) return null;
   return {
@@ -3575,11 +3580,16 @@ function resolveAiReviewGateCommand(gate: ReviewGateConfig): { command: string; 
   };
 }
 
-function reviewGateCommandEnvKeys(gate: Pick<ReviewGateConfig, 'id'>): string[] {
+function reviewGateSpecificCommandEnvKeys(gate: Pick<ReviewGateConfig, 'id'>): string[] {
   const key = reviewGateEnvKey(gate.id);
   return [
     `PIPELANE_REVIEW_${key}_COMMAND`,
     `PIPELANE_REVIEW_GATE_${key}_COMMAND`,
+  ];
+}
+
+function reviewGateSharedCommandEnvKeys(): string[] {
+  return [
     'PIPELANE_REVIEW_AI_COMMAND',
     'PIPELANE_REVIEW_GATE_COMMAND',
   ];
@@ -3608,6 +3618,9 @@ function firstEnvValue(env: NodeJS.ProcessEnv, keys: string[]): { key: string; v
 }
 
 function defaultAiReviewGateCommand(gate: ReviewGateConfig): string {
+  if (!allowsSharedAiReviewGateCommand(gate)) {
+    return '';
+  }
   if (process.env.NODE_ENV === 'test' && process.env.PIPELANE_REVIEW_GATE_USE_REAL_NATIVE !== '1') {
     return '';
   }
@@ -3618,6 +3631,10 @@ function defaultAiReviewGateCommand(gate: ReviewGateConfig): string {
   if (isExecutableOnPath('codex')) return 'codex exec --full-auto -';
   if (isExecutableOnPath('claude')) return defaultClaudeReviewCommand();
   return '';
+}
+
+function allowsSharedAiReviewGateCommand(gate: ReviewGateConfig): boolean {
+  return gate.phase !== 'runtime';
 }
 
 function defaultClaudeReviewCommand(): string {
