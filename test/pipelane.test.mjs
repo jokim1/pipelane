@@ -1552,7 +1552,8 @@ test('legacy smoke staging runs the configured command and stays out of /status'
     assert.equal(latest.staging.sha, '1111111111111111111111111111111111111111');
     assert.match(logText, /staging\|default\|1111111/);
     assert.match(logText, /https:\/\/staging\.example\.test/);
-    assert.match(readFileSync(path.join(repoRoot, 'docs', 'smoke', 'README.md'), 'utf8'), /@smoke-auth/);
+    assert.equal(existsSync(path.join(repoRoot, 'docs', 'smoke', 'README.md')), false);
+    assert.match(readFileSync(path.join(machineRepoDir(repoRoot), 'smoke', 'docs', 'smoke', 'README.md'), 'utf8'), /@smoke-auth/);
     assert.equal(statusOutput.data.smoke, undefined);
     assert.equal(statusOutput.data.sourceHealth.some((entry) => String(entry.name).startsWith('smoke.')), false);
   } finally {
@@ -2841,7 +2842,7 @@ test.skip('setup fails closed when an alias would overwrite an unrelated Claude 
     mkdirSync(path.join(repoRoot, '.claude', 'commands'), { recursive: true });
     writeFileSync(path.join(repoRoot, '.claude', 'commands', 'branch.md'), 'custom branch command\n', 'utf8');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.aliases.new = '/branch';
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -2865,7 +2866,7 @@ test.skip('setup fails closed when an alias would overwrite an unrelated Codex s
     mkdirSync(path.join(repoRoot, '.agents', 'skills', 'branch'), { recursive: true });
     writeFileSync(path.join(repoRoot, '.agents', 'skills', 'branch', 'SKILL.md'), 'custom branch skill\n', 'utf8');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.aliases.new = '/branch';
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -2936,7 +2937,7 @@ test.skip('managed Claude commands and tracked Codex skills are pruned on alias 
       'utf8',
     );
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.aliases.new = '/branch';
     config.aliases.resume = '/back';
@@ -3047,7 +3048,7 @@ test.skip('consumer-extension preserve logic follows aliased filenames', () => {
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.aliases.clean = '/cleanup';
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -3235,7 +3236,7 @@ test.skip('pipelane.md renders a journey-first overview with real slash aliases'
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.aliases.new = '/start';
     config.aliases.clean = '/tidy';
@@ -3351,7 +3352,7 @@ test.skip('setup rejects operator aliases that collide with MANAGED_EXTRA_COMMAN
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.aliases.new = '/pipelane';
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -3382,7 +3383,7 @@ test.skip('setup allows /pipelane operator alias when claudeCommands syncing is 
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.aliases.new = '/pipelane';
     // packageScripts must stay on so `pipelane:*` scripts exist; claudeCommands
@@ -3444,7 +3445,7 @@ test.skip('pipelane.md consumer-extension survives when a different operator com
     );
     writeFileSync(pipelanePath, pipelaneSeeded, 'utf8');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.aliases = { ...(config.aliases ?? {}), clean: '/janitor' };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -3484,7 +3485,7 @@ test.skip('pipelane.md consumer-extension persists when syncDocs.claudeCommands 
     );
     writeFileSync(pipelanePath, seeded, 'utf8');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
 
     config.syncDocs = { ...config.syncDocs, claudeCommands: false };
@@ -3706,7 +3707,7 @@ test.skip('consumer-extension survives an alias rename after the content was add
     );
     writeFileSync(cleanPath, withExtension, 'utf8');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.aliases.clean = '/cleanup';
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -3748,7 +3749,7 @@ test('syncDocs.readmeSection: false leaves README.md untouched', () => {
     // content must survive.
     writeFileSync(readmePath, '# Owned By Consumer\n\nHand-written README.\n', 'utf8');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.syncDocs = { ...config.syncDocs, readmeSection: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -3774,7 +3775,7 @@ test('syncDocs.contributingSection + agentsSection: false leave those files unto
     writeFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), '# Consumer Contributing\n', 'utf8');
     writeFileSync(path.join(repoRoot, 'AGENTS.md'), '# Consumer Agents\n', 'utf8');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.syncDocs = { ...config.syncDocs, contributingSection: false, agentsSection: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -3796,7 +3797,7 @@ test.skip('syncDocs.docsReleaseWorkflow + pipelaneClaudeTemplate: false skip tho
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.syncDocs = { ...config.syncDocs, docsReleaseWorkflow: false, pipelaneClaudeTemplate: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -3825,7 +3826,7 @@ test.skip('syncDocs.claudeCommands: false skips the entire command-regen path', 
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.syncDocs = { ...config.syncDocs, claudeCommands: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -3892,7 +3893,7 @@ test('syncDocs.packageScripts: false preserves consumer-customized workflow scri
     };
     writeFileSync(packageJsonPath, `${JSON.stringify(consumerPackage, null, 2)}\n`, 'utf8');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.syncDocs = { ...config.syncDocs, packageScripts: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -3900,7 +3901,7 @@ test('syncDocs.packageScripts: false preserves consumer-customized workflow scri
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
     const after = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
-    assert.deepEqual(after.scripts, scriptsWithPreinstallGuard(customScripts));
+    assert.deepEqual(after.scripts, customScripts);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -3926,7 +3927,7 @@ test.skip('syncDocs.packageScripts: false without required pipelane:* scripts th
     };
     writeFileSync(packageJsonPath, `${JSON.stringify(consumerPackage, null, 2)}\n`, 'utf8');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.syncDocs = { ...config.syncDocs, packageScripts: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -3978,7 +3979,7 @@ test.skip('setup consistency check requires pipelane:orchestrate when /pipelane 
       scripts,
     }, null, 2)}\n`, 'utf8');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.syncDocs = { ...config.syncDocs, packageScripts: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -4032,7 +4033,7 @@ test('syncDocs.packageScripts: false is allowed when claudeCommands is also fals
     const consumerPackage = { name: 'consumer-app', private: true, type: 'module', scripts: { build: 'my-build' } };
     writeFileSync(packageJsonPath, `${JSON.stringify(consumerPackage, null, 2)}\n`, 'utf8');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.syncDocs = { ...config.syncDocs, packageScripts: false, claudeCommands: false, codexSkills: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -4040,7 +4041,7 @@ test('syncDocs.packageScripts: false is allowed when claudeCommands is also fals
     runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
 
     const after = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
-    assert.deepEqual(after.scripts, scriptsWithPreinstallGuard({ build: 'my-build' }));
+    assert.deepEqual(after.scripts, { build: 'my-build' });
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -4058,7 +4059,7 @@ test.skip('syncDocs.packageScripts: false still allows tracked Codex skills when
     const consumerPackage = { name: 'consumer-app', private: true, type: 'module', scripts: { build: 'my-build' } };
     writeFileSync(packageJsonPath, `${JSON.stringify(consumerPackage, null, 2)}\n`, 'utf8');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.syncDocs = { ...config.syncDocs, packageScripts: false, claudeCommands: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -4082,7 +4083,7 @@ test('syncDocs absent defaults to machine-local and writes no generated repo sur
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     delete config.syncDocs;
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -4111,7 +4112,7 @@ test('syncDocs absent defaults to machine-local and writes no generated repo sur
     assert.equal(readFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), 'utf8'), '# Consumer Contributing\n');
     assert.equal(readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8'), '# Consumer Agents\n');
     const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
-    assert.deepEqual(pkg.scripts, scriptsWithPreinstallGuard({ build: 'my-build' }));
+    assert.deepEqual(pkg.scripts, { build: 'my-build' });
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -4126,7 +4127,7 @@ test('syncDocs absent ignores existing managed footprint and stays machine-local
     writePipelaneConfig(repoRoot, 'Demo App');
     seedLegacyRepoLocalFootprint(repoRoot);
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     delete config.syncDocs;
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -4163,7 +4164,7 @@ test('partial syncDocs keeps omitted surfaces disabled even with a managed footp
     writePipelaneConfig(repoRoot, 'Demo App');
     seedLegacyRepoLocalFootprint(repoRoot);
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.syncDocs = { readmeSection: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -4183,7 +4184,7 @@ test('partial syncDocs keeps omitted surfaces disabled even with a managed footp
     assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
     assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
     const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
-    assert.deepEqual(pkg.scripts, scriptsWithPreinstallGuard({ build: 'my-build' }));
+    assert.deepEqual(pkg.scripts, { build: 'my-build' });
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -4195,7 +4196,7 @@ test('partial true-only syncDocs is ignored by machine-local setup', () => {
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
 
   try {
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = {
       version: 1,
       projectKey: 'demo-app',
@@ -4231,7 +4232,7 @@ test('syncDocs absent ignores a remaining release workflow doc', () => {
     writePipelaneConfig(repoRoot, 'Demo App');
     seedLegacyRepoLocalFootprint(repoRoot);
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     delete config.syncDocs;
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -4269,7 +4270,7 @@ test('syncDocs absent ignores remaining managed package scripts', () => {
     writePipelaneConfig(repoRoot, 'Demo App');
     seedLegacyRepoLocalFootprint(repoRoot);
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     delete config.syncDocs;
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -4306,7 +4307,7 @@ test.skip('syncDocs.packageScripts only does not scaffold local guidance files',
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.syncDocs = {
       claudeCommands: false,
@@ -4343,7 +4344,7 @@ test('syncDocs resolver coerces non-boolean junk back to defaults', () => {
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     // Garbage values: string 'false' is truthy in JS, but the resolver
     // must treat non-booleans as "use the default" or a truthy string
@@ -4381,7 +4382,7 @@ test('syncDocs resolver coerces non-boolean junk back to defaults', () => {
     assert.equal(readFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), 'utf8'), '# Consumer Contributing\n');
     assert.equal(readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8'), '# Consumer Agents\n');
     const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
-    assert.deepEqual(pkg.scripts, scriptsWithPreinstallGuard({ build: 'my-build' }));
+    assert.deepEqual(pkg.scripts, { build: 'my-build' });
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -4395,7 +4396,7 @@ test('syncDocs as a non-object (string) resolves to machine-local defaults witho
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     // Totally malformed: a string instead of an object. Spreading a
     // string over DEFAULT_SYNC_DOCS would introduce numeric-keyed junk;
@@ -4442,7 +4443,7 @@ test('machine-local setup preserves pre-existing pipelane README marker block by
 
     // Consumer now renames the project AND opts out of README sync.
     // The stale marker block should survive unchanged until they re-enable.
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.displayName = 'Renamed App';
     config.syncDocs = { ...config.syncDocs, readmeSection: false };
@@ -4478,7 +4479,7 @@ test('machine-local setup preserves consumer-extension content without pruning',
     ].join('\n');
     writeFileSync(cleanPath, withExtension, 'utf8');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.syncDocs = { ...config.syncDocs, claudeCommands: false };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -4501,7 +4502,7 @@ test('all eight flags: false writes no application-owned files from a wiped repo
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
 
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.syncDocs = {
       claudeCommands: false,
@@ -6267,7 +6268,7 @@ test('review setup --yes recommends installed cross-model review', () => {
       CODEX_HOME: codexHome,
       CLAUDE_HOME: claudeHome,
     });
-    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+    const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
 
     assert.equal(raw.reviewGates.policyVersion, 2);
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'adversarial-review'), true);
@@ -6500,7 +6501,7 @@ test('review setup targeted enable preserves an explicit empty gate list', () =>
   const repoRoot = createRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.reviewGates = {
       planReview: { gates: [] },
@@ -6529,7 +6530,7 @@ test('review setup can explicitly toggle AI review gates non-interactively', () 
       CODEX_HOME: codexHome,
       CLAUDE_HOME: claudeHome,
     });
-    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+    const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
 
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'), true);
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'), false);
@@ -6547,7 +6548,7 @@ test('review setup targeted flags preserve existing custom review gates', () => 
   try {
     seedCodexReviewSkills(codexHome, ['karpathy-diff', 'review', 'karpathy-audit']);
     writePipelaneConfig(repoRoot, 'Demo App');
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.reviewGates = {
       planReview: { gates: [] },
@@ -6621,7 +6622,7 @@ test('review setup interactive toggle of installed AI gate writes explicit gate 
       CODEX_HOME: codexHome,
       PIPELANE_REVIEW_SETUP_INPUT: 'C1\nq\n',
     });
-    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+    const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
 
     assert.doesNotMatch(result.stdout, /Install and enable/);
     assert.deepEqual(Object.keys(raw.reviewGates).sort(), ['gates', 'planReview', 'policyVersion']);
@@ -6645,7 +6646,7 @@ test('review setup detects provider-prefixed Karpathy skills as installed', () =
       CODEX_HOME: codexHome,
       PIPELANE_REVIEW_SETUP_INPUT: 'C1\nq\n',
     });
-    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+    const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
 
     assert.doesNotMatch(result.stdout, /Author self-review is not installed|Author self-review is unavailable/);
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'), false);
@@ -6667,7 +6668,7 @@ test('review setup interactive can enable installed adversarial review', () => {
       CODEX_HOME: codexHome,
       CLAUDE_HOME: claudeHome,
     });
-    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+    const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
     const gate = raw.reviewGates.gates.find((entry) => entry.id === 'adversarial-review');
 
     assert.match(result.stdout, /Cross-model review/);
@@ -6691,7 +6692,7 @@ test('review setup detects the Codex /claude review bridge as adversarial review
       CODEX_HOME: codexHome,
       CLAUDE_HOME: claudeHome,
     });
-    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+    const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
 
     assert.match(result.stdout, /Cross-model review/);
     assert.match(result.stdout, /\/claude review code .*installed/);
@@ -6726,7 +6727,7 @@ test('review setup saves Claude-side gstack /codex challenge as the adversarial 
       CLAUDE_HOME: claudeHome,
       PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
     });
-    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+    const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
     const gate = raw.reviewGates.gates.find((entry) => entry.id === 'adversarial-review');
 
     assert.match(result.stdout, /\/codex challenge .*installed/);
@@ -6776,7 +6777,7 @@ test('review setup interactive install approval can enable missing adversarial r
       PIPELANE_REVIEW_SETUP_INPUT: 'C4\n1\nq\n',
       PIPELANE_REVIEW_SETUP_INSTALL_SUCCESS: 'adversarial-review',
     });
-    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+    const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
 
     assert.match(result.stdout, /Cross-model review is not installed/);
     assert.match(result.stdout, /Install and enable/);
@@ -6871,7 +6872,7 @@ test('review setup interactive installs Karpathy from a configured local source'
       PIPELANE_KARPATHY_SKILLS_SOURCE: karpathySource,
       PIPELANE_REVIEW_SETUP_INPUT: 'C1\n1\nq\n',
     });
-    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+    const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
 
     assert.match(result.stdout, /Installed karpathy-diff from/);
     assert.equal(existsSync(path.join(codexHome, 'skills', 'karpathy-diff', 'SKILL.md')), true);
@@ -6895,7 +6896,7 @@ test('review setup interactive install approval can enable known missing AI gate
       PIPELANE_REVIEW_SETUP_INPUT: 'C1\n1\nq\n',
       PIPELANE_REVIEW_SETUP_INSTALL_SUCCESS: 'karpathy-diff',
     });
-    const raw = JSON.parse(readFileSync(path.join(repoRoot, '.pipelane.json'), 'utf8'));
+    const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
 
     assert.match(result.stdout, /Author self-review is not installed/);
     assert.match(result.stdout, /Install karpathy-diff now/);
