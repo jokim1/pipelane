@@ -1,6 +1,7 @@
 import {
   buildDestinationPlanForCommand,
   destinationPlanFingerprintDigest,
+  type DestinationPlan,
   printDestinationPlan,
   shouldInterceptDestinationPlan,
 } from '../destination-planner.ts';
@@ -42,7 +43,8 @@ export async function maybeHandleDestinationCommand(cwd: string, parsed: ParsedO
     printDestinationPlan(parsed.flags, plan);
     return true;
   }
-  if (!parsed.flags.yes && !process.stdin.isTTY) {
+  const autoRunSingleStepRoute = shouldAutoRunSingleStepRoute(plan, parsed);
+  if (!parsed.flags.yes && !autoRunSingleStepRoute && !process.stdin.isTTY) {
     printDestinationPlan(parsed.flags, {
       ...plan,
       message: `${plan.message}\n\n${nonTtyConfirmationMessageForParsed(plan, parsed)}`,
@@ -57,7 +59,7 @@ export async function maybeHandleDestinationCommand(cwd: string, parsed: ParsedO
     printDestinationPlan(parsed.flags, plan);
   }
 
-  const confirmation = await confirmDestinationRoute(plan, parsed);
+  const confirmation = autoRunSingleStepRoute ? 'run_all' : await confirmDestinationRoute(plan, parsed);
   if (confirmation === 'cancel') {
     return true;
   }
@@ -94,4 +96,12 @@ export async function maybeHandleDestinationCommand(cwd: string, parsed: ParsedO
     });
   }
   return true;
+}
+
+function shouldAutoRunSingleStepRoute(plan: DestinationPlan, parsed: ParsedOperatorArgs): boolean {
+  if (parsed.command !== 'deploy' || plan.mode !== 'build' || plan.target !== 'merged') {
+    return false;
+  }
+  const executableSteps = plan.remainingSteps.filter((step) => step.id !== 'review_gate');
+  return executableSteps.length === 1 && executableSteps[0]?.id === 'merge';
 }

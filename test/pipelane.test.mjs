@@ -22613,6 +22613,54 @@ test('build-mode bare deploy routes to merge', () => {
   }
 });
 
+test('build-mode bare deploy auto-runs a single remaining merge step', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.surfaces = [];
+      config.reviewGates = {
+        planReview: { gates: [] },
+        gates: [],
+      };
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Bare Deploy Merge', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+    const opened = runCli(['run', 'pr', '--title', 'Bare Deploy Merge', '--json'], created.worktreePath, env, true);
+    assert.equal(opened.status, 0, opened.stderr);
+
+    const result = runCli(['run', 'deploy', '--json'], created.worktreePath, env);
+    const payload = JSON.parse(result.stdout);
+    const combinedOutput = `${result.stdout}\n${result.stderr}`;
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+
+    assert.equal(result.status, 0);
+    assert.equal(payload.target, 'merged');
+    assert.equal(payload.targetCommand, '/merge');
+    assert.deepEqual(payload.remainingSteps.map((step) => step.id), ['review_gate', 'merge']);
+    assert.equal(payload.execution.completed, true);
+    assert.deepEqual(payload.execution.steps.map((step) => step.command), ['/merge']);
+    assert.equal(ghState.prMergeCalls.length, 1);
+    assert.doesNotMatch(combinedOutput, /Choose the action to take:/);
+    assert.doesNotMatch(combinedOutput, /Take one step only/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
 test('no-surface deploy of an unmerged SHA does not mark delivery complete', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
