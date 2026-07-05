@@ -15618,6 +15618,9 @@ test('review runner records pending AI gates without failing the process', () =>
   const repoRoot = createRepo();
   const npmShim = createNpmShimEnv();
   try {
+    writePipelaneConfig(repoRoot);
+    commitLocal(repoRoot, 'Adopt pipelane');
+
     const result = runCli(['run', 'review', '--json'], repoRoot, npmShim.env);
     const report = JSON.parse(result.stdout);
 
@@ -15766,6 +15769,9 @@ test('review pass records clean manual gates against current review evidence', (
   const repoRoot = createRepo();
   const npmShim = createNpmShimEnv();
   try {
+    writePipelaneConfig(repoRoot);
+    commitLocal(repoRoot, 'Adopt pipelane');
+
     const review = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
       ...npmShim.env,
       PIPELANE_AGENT_SESSION_ID: 'initial-review-session',
