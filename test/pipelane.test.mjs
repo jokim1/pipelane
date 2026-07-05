@@ -10703,8 +10703,8 @@ test('orchestrate v1a docs-only baseline skips unscoped full-suite review gates'
     const gates = reviewed.run.slices[0].review.run.gates;
     assert.deepEqual(gates.map((gate) => [gate.gateId, gate.status, gate.skipReason]), [
       ['typecheck', 'skipped', 'docs-only profile, gate has no matching whenChanged path'],
-      ['build', 'skipped', 'docs-only profile, gate has no matching whenChanged path'],
       ['test', 'skipped', 'docs-only profile, gate has no matching whenChanged path'],
+      ['build', 'skipped', 'docs-only profile, gate has no matching whenChanged path'],
     ]);
     assert.match(reviewed.message, /Profile and skipped gates:/);
     assert.match(reviewed.message, /baseline\/test/);
@@ -15527,6 +15527,37 @@ test('review runner executes command gates and writes evidence', () => {
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(npmShim.binDir, { recursive: true, force: true });
+  }
+});
+
+test('review runner preserves configured order within a phase', () => {
+  const repoRoot = createRepo();
+  const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-order-'));
+  const markerPath = path.join(markerRoot, 'gate-order.txt');
+  const appendCommand = (label) => `${JSON.stringify(process.execPath)} -e ${JSON.stringify(
+    `require('node:fs').appendFileSync(${JSON.stringify(markerPath)}, ${JSON.stringify(`${label}\n`)}, 'utf8')`,
+  )}`;
+  try {
+    writePipelaneConfig(repoRoot, 'Review Order App', {
+      reviewGates: {
+        planReview: { gates: [] },
+        gates: [
+          { id: 'typecheck', phase: 'static', type: 'command', blocking: true, command: appendCommand('typecheck') },
+          { id: 'test', phase: 'behavioral', type: 'command', blocking: true, command: appendCommand('test') },
+          { id: 'build', phase: 'behavioral', type: 'command', blocking: true, command: appendCommand('build') },
+        ],
+      },
+    });
+    commitLocal(repoRoot, 'Configure ordered review gates');
+
+    const report = JSON.parse(runCli(['run', 'review', '--json'], repoRoot).stdout);
+
+    assert.equal(report.status, 'passed');
+    assert.deepEqual(report.gates.map((gate) => gate.gateId), ['typecheck', 'test', 'build']);
+    assert.equal(readFileSync(markerPath, 'utf8'), 'typecheck\ntest\nbuild\n');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(markerRoot, { recursive: true, force: true });
   }
 });
 
