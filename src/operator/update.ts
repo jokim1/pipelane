@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import { spawn } from 'node:child_process';
 import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -72,11 +71,13 @@ interface AutoUpdateCache {
   upToDate: boolean;
   aheadBy?: number | null;
   commits?: Array<{ sha: string; subject: string }>;
+  failureReason?: string;
 }
 
 const AUTO_UPDATE_DEFAULT_TTL_MS = 60 * 60 * 1000;
 const AUTO_UPDATE_AVAILABLE_DEFAULT_TTL_MS = 12 * 60 * 60 * 1000;
 const AUTO_UPDATE_DEFAULT_TIMEOUT_MS = 5000;
+const AUTO_UPDATE_FAILURE_TTL_MS = 5 * 60 * 1000;
 const AUTO_UPDATE_REFRESH_LOCK_TTL_MS = 30 * 1000;
 
 type GlobalSurfaceRefreshStatus = 'refreshed' | 'skipped' | 'failed';
@@ -107,7 +108,7 @@ export function parseUpdateArgs(argv: string[]): UpdateOptions {
   return options;
 }
 
-export async function maybeAutoUpdate(cwd: string): Promise<AutoUpdateResult> {
+export function maybeNotifyUpdate(cwd: string): AutoUpdateResult {
   if (autoUpdateDisabled()) {
     return { checked: false, updated: false, skippedReason: 'disabled', status: null };
   }
@@ -155,43 +156,15 @@ export async function maybeAutoUpdate(cwd: string): Promise<AutoUpdateResult> {
         status,
       };
     }
-    if (!autoInstallEnabled()) {
-      process.stderr.write(formatAutoUpdateNotice(status));
-      return { checked: false, updated: false, skippedReason: 'notify-only fresh cache', status };
-    }
-    try {
-      process.stderr.write(`[pipelane] Auto-updating pipelane ${status.installedShaShort || '(unknown)'} -> ${status.latestShaShort} before continuing.\n`);
-      const result = await runUpdate(updateRoot, {
-        check: false,
-        yes: true,
-        json: false,
-        output: 'stderr',
-        initialStatus: status,
-        postInstallLatestSha: status.latestSha,
-        stopBoard: false,
-        followUp: false,
-      });
-      return { checked: false, updated: result.action === 'installed', skippedReason: null, status: result.status };
-    } catch (error) {
-      process.stderr.write(`[pipelane] Auto-update skipped: ${error instanceof Error ? error.message : String(error)}\n`);
-      return { checked: false, updated: false, skippedReason: error instanceof Error ? error.message : String(error), status };
-    }
-  }
-
-  if (!autoInstallEnabled()) {
-    const scheduled = startDetachedAutoUpdateRefresh(updateRoot);
-    return {
-      checked: false,
-      updated: false,
-      skippedReason: scheduled ? 'refresh scheduled' : 'refresh already running',
-      status: null,
-    };
+    process.stderr.write(formatAutoUpdateNotice(status));
+    return { checked: false, updated: false, skippedReason: 'notify-only fresh cache', status };
   }
 
   let status: UpdateStatus;
   try {
     status = collectUpdateStatus(updateRoot, { timeoutMs: autoUpdateTimeoutMs() });
   } catch (error) {
+    writeAutoUpdateFailureCache(updateRoot, installedSha, error);
     return { checked: false, updated: false, skippedReason: error instanceof Error ? error.message : String(error), status: null };
   }
 
@@ -200,23 +173,13 @@ export async function maybeAutoUpdate(cwd: string): Promise<AutoUpdateResult> {
     return { checked: true, updated: false, skippedReason: null, status };
   }
 
-  try {
-    process.stderr.write(`[pipelane] Auto-updating pipelane ${status.installedShaShort || '(unknown)'} -> ${status.latestShaShort} before continuing.\n`);
-    const result = await runUpdate(updateRoot, {
-      check: false,
-      yes: true,
-      json: false,
-      output: 'stderr',
-      initialStatus: status,
-      postInstallLatestSha: status.latestSha,
-      stopBoard: false,
-      followUp: false,
-    });
-    return { checked: true, updated: result.action === 'installed', skippedReason: null, status: result.status };
-  } catch (error) {
-    process.stderr.write(`[pipelane] Auto-update skipped: ${error instanceof Error ? error.message : String(error)}\n`);
-    return { checked: true, updated: false, skippedReason: error instanceof Error ? error.message : String(error), status };
-  }
+  writeAutoUpdateCache(updateRoot, status);
+  process.stderr.write(formatAutoUpdateNotice(status));
+  return { checked: true, updated: false, skippedReason: null, status };
+}
+
+export async function maybeAutoUpdate(cwd: string): Promise<AutoUpdateResult> {
+  return maybeNotifyUpdate(cwd);
 }
 
 export function refreshAutoUpdateCache(cwd: string): AutoUpdateResult {
@@ -257,17 +220,7 @@ export function refreshAutoUpdateCache(cwd: string): AutoUpdateResult {
     writeAutoUpdateCache(updateRoot, status);
     return { checked: true, updated: false, skippedReason: null, status };
   } catch (error) {
-    writeAutoUpdateCache(updateRoot, {
-      repoRoot: updateRoot,
-      installedSha,
-      installedShaShort: shortSha(installedSha),
-      latestSha: installedSha,
-      latestShaShort: shortSha(installedSha),
-      installedVersion: readInstalledVersion(packagePath),
-      upToDate: true,
-      aheadBy: null,
-      commits: [],
-    });
+    writeAutoUpdateFailureCache(updateRoot, installedSha, error);
     return { checked: false, updated: false, skippedReason: error instanceof Error ? error.message : String(error), status: null };
   } finally {
     releaseAutoUpdateRefreshLock(lockPath);
@@ -478,16 +431,6 @@ function autoUpdateDisabled(): boolean {
   return raw === '0' || raw === 'false' || raw === 'off' || raw === 'no';
 }
 
-// Self-update (auto-installing the newer main on `run`) is OPT-IN. The default
-// is notify-only: pipelane reports that an update exists and how to apply it,
-// but does not install — auto-installing rewrote the consumer's package.json
-// pipelane pin (github:…#main -> #<sha>) on every run. Opt back into automatic
-// upgrades with PIPELANE_AUTO_UPDATE=1 (or true/on/yes/auto/install).
-function autoInstallEnabled(): boolean {
-  const raw = process.env.PIPELANE_AUTO_UPDATE?.trim().toLowerCase();
-  return raw === '1' || raw === 'true' || raw === 'on' || raw === 'yes' || raw === 'auto' || raw === 'install';
-}
-
 function autoUpdateTtlMs(upToDate = true): number {
   const raw = process.env.PIPELANE_AUTO_UPDATE_TTL_MS?.trim();
   if (!raw) {
@@ -497,6 +440,10 @@ function autoUpdateTtlMs(upToDate = true): number {
   return Number.isFinite(parsed) && parsed >= 0
     ? parsed
     : (upToDate ? AUTO_UPDATE_DEFAULT_TTL_MS : AUTO_UPDATE_AVAILABLE_DEFAULT_TTL_MS);
+}
+
+function autoUpdateFailureTtlMs(): number {
+  return Math.min(AUTO_UPDATE_FAILURE_TTL_MS, autoUpdateTtlMs(true));
 }
 
 function autoUpdateTimeoutMs(): number {
@@ -528,39 +475,6 @@ function autoUpdateCacheKey(repoRoot: string): string {
     // Use the normalized repo root if the path cannot be resolved.
   }
   return createHash('sha256').update(resolved).digest('hex').slice(0, 24);
-}
-
-function startDetachedAutoUpdateRefresh(updateRoot: string): boolean {
-  if (process.env.PIPELANE_REFRESH_UPDATE_CACHE === '1') {
-    return false;
-  }
-  const cliPath = process.argv[1];
-  if (!cliPath) {
-    return false;
-  }
-  const lockPath = tryAcquireAutoUpdateRefreshLock(updateRoot);
-  if (!lockPath) {
-    return false;
-  }
-
-  try {
-    const child = spawn(process.execPath, [cliPath], {
-      cwd: updateRoot,
-      detached: true,
-      stdio: 'ignore',
-      env: {
-        ...process.env,
-        PIPELANE_REFRESH_UPDATE_CACHE: '1',
-        PIPELANE_AUTO_UPDATE_REFRESH_LOCK: lockPath,
-      },
-    });
-    child.on('error', () => releaseAutoUpdateRefreshLock(lockPath));
-    child.unref();
-    return true;
-  } catch {
-    releaseAutoUpdateRefreshLock(lockPath);
-    return false;
-  }
 }
 
 function tryAcquireAutoUpdateRefreshLock(repoRoot: string): string | null {
@@ -615,13 +529,23 @@ function readFreshAutoUpdateCache(repoRoot: string, installedSha: string): AutoU
     if (!Number.isFinite(checkedAt)) {
       return null;
     }
-    if (Date.now() - checkedAt > autoUpdateTtlMs(cache.upToDate)) {
+    if (Date.now() - checkedAt > autoUpdateCacheTtlMs(cache)) {
       return null;
     }
     return cache;
   } catch {
     return null;
   }
+}
+
+function autoUpdateCacheTtlMs(cache: AutoUpdateCache): number {
+  if (cache.failureReason) {
+    return autoUpdateFailureTtlMs();
+  }
+  if (!cache.upToDate && typeof cache.aheadBy !== 'number' && normalizeCachedCommits(cache.commits).length === 0) {
+    return autoUpdateFailureTtlMs();
+  }
+  return autoUpdateTtlMs(cache.upToDate);
 }
 
 function normalizeCachedCommits(value: unknown): Array<{ sha: string; subject: string }> {
@@ -648,6 +572,22 @@ function writeAutoUpdateCache(repoRoot: string, status: UpdateStatus): void {
     } satisfies AutoUpdateCache);
   } catch {
     // Cache failures must never block the actual pipelane command.
+  }
+}
+
+function writeAutoUpdateFailureCache(repoRoot: string, installedSha: string, error: unknown): void {
+  try {
+    writeJsonFile(autoUpdateCachePath(repoRoot), {
+      checkedAt: new Date().toISOString(),
+      installedSha,
+      latestSha: installedSha,
+      upToDate: true,
+      aheadBy: null,
+      commits: [],
+      failureReason: error instanceof Error ? error.message : String(error),
+    } satisfies AutoUpdateCache);
+  } catch {
+    // Failure backoff is best-effort; update notices must never block commands.
   }
 }
 
@@ -1100,42 +1040,42 @@ function installLatest(repoRoot: string, options: { quiet?: boolean; output?: Up
 export function formatAutoUpdateNotice(status: UpdateStatus): string {
   const installed = status.installedShaShort || '(unknown)';
   const lines = [
-    `[pipelane] New Pipelane update available (${installed} -> ${status.latestShaShort}).`,
-    '[pipelane] Run `/pipelane update` to install it, or `pipelane update` from a shell.',
-    `[pipelane] ${formatAutoUpdateHighlights(status)}`,
+    `[pipelane] A new Pipelane update is available: ${installed} -> ${status.latestShaShort}.`,
+    '[pipelane] Run `/pipelane update` to get the latest changes:',
+    ...formatAutoUpdateHighlightLines(status),
   ];
   return `${lines.join('\n')}\n`;
 }
 
-function formatAutoUpdateHighlights(status: UpdateStatus): string {
+function formatAutoUpdateHighlightLines(status: UpdateStatus): string[] {
   const subjects = status.commits
-    .map((commit) => formatCommitSubjectSentence(commit.subject))
+    .map((commit) => formatCommitSubjectBullet(commit.subject))
     .filter(Boolean);
 
   if (subjects.length > 0) {
     const visible = subjects.slice(0, 3);
     const total = status.aheadBy ?? status.commits.length;
     const hidden = total - visible.length;
-    const more = total > visible.length
-      ? ` ${hidden} more commit${hidden === 1 ? '' : 's'} ${hidden === 1 ? 'is' : 'are'} included.`
-      : '';
-    return `What's new: ${visible.join(' ')}${more}`;
+    const lines = visible.map((subject) => `[pipelane] - ${subject}`);
+    if (total > visible.length) {
+      lines.push(`[pipelane] - ${hidden} more commit${hidden === 1 ? '' : 's'} ${hidden === 1 ? 'is' : 'are'} included.`);
+    }
+    return lines;
   }
 
   if (status.aheadBy !== null) {
-    return `This update includes ${status.aheadBy} commit${status.aheadBy === 1 ? '' : 's'} since your installed version. Run \`/pipelane update --check\` to inspect it before installing.`;
+    return [`[pipelane] - ${status.aheadBy} commit${status.aheadBy === 1 ? '' : 's'} since your installed version.`];
   }
 
-  return 'Run `/pipelane update --check` to inspect the update before installing.';
+  return ['[pipelane] - Run `/pipelane update --check` to inspect the update before installing.'];
 }
 
-function formatCommitSubjectSentence(subject: string): string {
+function formatCommitSubjectBullet(subject: string): string {
   const normalized = subject.replace(/\s+/g, ' ').trim();
   if (!normalized) return '';
-  const capped = normalized.length > 140
+  return normalized.length > 140
     ? `${normalized.slice(0, 137).trimEnd()}...`
     : normalized;
-  return /[.!?]$/.test(capped) ? capped : `${capped}.`;
 }
 
 function buildStatusMessage(status: UpdateStatus): string {

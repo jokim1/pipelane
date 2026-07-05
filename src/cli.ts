@@ -22,7 +22,7 @@ import { installNpmGuard } from './operator/npm-guard-install.ts';
 import { loadDeployConfig } from './operator/release-gate.ts';
 import { resolveRepoRoot } from './operator/state.ts';
 import { bootstrapWorktreeNodeModulesIfNeeded } from './operator/task-workspaces.ts';
-import { parseUpdateArgs, runUpdate } from './operator/update.ts';
+import { maybeNotifyUpdate, parseUpdateArgs, runUpdate } from './operator/update.ts';
 import { runVerify } from './operator/verify.ts';
 
 function printTopLevelHelp(): void {
@@ -98,6 +98,30 @@ function parseVerboseArg(args: string[], command: string): boolean {
 // Commands that operate outside the worktree. Skip the worktree symlink for
 // these so we don't surprise users running them in unusual locations.
 const SKIP_WORKTREE_BOOTSTRAP_COMMANDS = new Set(['init', 'bootstrap', 'install-claude', 'install-codex', 'install-npm-guard', 'verify']);
+const UPDATE_NOTICE_COMMANDS = new Set(['setup', 'configure', 'dashboard', 'board', 'review', 'run']);
+
+function valueAfter(args: string[], flag: string): string {
+  const index = args.indexOf(flag);
+  return index === -1 ? '' : args[index + 1] ?? '';
+}
+
+function boardOptionArgs(args: string[]): string[] {
+  const [sub, ...rest] = args;
+  if (!sub || sub.startsWith('--')) return args;
+  if (sub === 'start' || sub === 'stop' || sub === 'status') return rest;
+  return args;
+}
+
+function updateNoticeRoot(command: string, args: string[], cwd: string): string {
+  if (command === 'dashboard') {
+    return path.resolve(valueAfter(args, '--repo') || process.env.ROCKETBOARD_ROOT || cwd);
+  }
+  if (command === 'board') {
+    const options = boardOptionArgs(args);
+    return path.resolve(valueAfter(options, '--repo') || process.env.ROCKETBOARD_ROOT || cwd);
+  }
+  return cwd;
+}
 
 function repoLocalPipelanePackageExists(repoRoot: string): boolean {
   return existsSync(path.join(repoRoot, 'node_modules', 'pipelane', 'package.json'));
@@ -228,6 +252,9 @@ async function main(): Promise<void> {
     if (bootstrap.message) {
       process.stderr.write(`${bootstrap.message}\n`);
     }
+  }
+  if (UPDATE_NOTICE_COMMANDS.has(command)) {
+    maybeNotifyUpdate(updateNoticeRoot(command, rest, process.cwd()));
   }
   if (command === 'setup') {
     const options = parseSetupArgs(rest);

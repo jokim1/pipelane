@@ -26269,7 +26269,9 @@ function makeFakeUpdateBin(
     aheadCommits = [],
     gitMarkerPath = '',
     gitDelayMs = 0,
+    gitExitCode = 0,
     compareDelayMs = 0,
+    compareExitCode = 0,
     compareMarkerPath = '',
     npmMarkerPath = '',
     npmExitCode = 0,
@@ -26284,6 +26286,11 @@ if (args[0] === 'ls-remote' && args[2] === 'main') {
   const emit = () => {
     if (markerPath) {
       require('node:fs').appendFileSync(markerPath, 'git ls-remote\\n', 'utf8');
+    }
+    const exitCode = ${JSON.stringify(gitExitCode)};
+    if (exitCode !== 0) {
+      process.stderr.write('simulated git ls-remote failure\\n');
+      process.exit(exitCode);
     }
     process.stdout.write(${JSON.stringify(latestSha)} + '\\trefs/heads/main\\n');
     process.exit(0);
@@ -26307,6 +26314,11 @@ if (args[0] === 'api' && /compare/.test(args[1] || '')) {
   const emit = () => {
     if (markerPath) {
       require('node:fs').appendFileSync(markerPath, 'gh compare\\n', 'utf8');
+    }
+    const exitCode = ${JSON.stringify(compareExitCode)};
+    if (exitCode !== 0) {
+      process.stderr.write('simulated gh compare failure\\n');
+      process.exit(exitCode);
     }
     process.stdout.write(JSON.stringify({ ahead_by: commits.length, commits: commits.map((c) => ({ sha: c.sha, commit: { message: c.subject } })) }));
     process.exit(0);
@@ -26468,7 +26480,7 @@ test.skip('CLI auto-updates workflow commands and re-execs the updated local bin
   }
 });
 
-test('CLI ordinary commands do not check for repo-local updates by default', async () => {
+test('CLI ordinary commands notify about repo-local updates by default without installing', async () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-notify-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-notify-bin-'));
   const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
@@ -26499,8 +26511,8 @@ test('CLI ordinary commands do not check for repo-local updates by default', asy
     });
     const cachePath = autoUpdateCachePathForTest(consumerRoot, pipelaneHome);
 
-    // Ordinary commands must not mutate, re-pin, or query stale repo-local
-    // installs. Updates are now explicit via `pipelane update`.
+    // Ordinary commands should surface update awareness without mutating,
+    // re-pinning, or handing off to stale repo-local installs.
     const env = {
       ...process.env,
       PIPELANE_HOME: pipelaneHome,
@@ -26520,12 +26532,18 @@ test('CLI ordinary commands do not check for repo-local updates by default', asy
     });
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, new RegExp(`Port:   ${port}`));
-    assert.doesNotMatch(result.stderr, /New Pipelane update available/);
+    assert.match(result.stderr, /A new Pipelane update is available: 1111111 -> 2222222/);
+    assert.match(result.stderr, /Run `\/pipelane update` to get the latest changes:/);
+    assert.match(result.stderr, /- Add guided update notifications/);
+    assert.match(result.stderr, /- Fix board runtime refresh/);
+    assert.match(result.stderr, /- Document release-gate drift/);
+    assert.match(result.stderr, /- 1 more commit is included/);
     assert.doesNotMatch(result.stderr, /Auto-updating pipelane/);
     assert.doesNotMatch(result.stdout, /REEXEC/);
     assert.equal(existsSync(npmInstallLog), false, 'ordinary command must not run npm install');
-    assert.equal(existsSync(remoteCallLog), false, 'ordinary command must not check remote update status');
-    assert.equal(existsSync(cachePath), false, 'ordinary command must not write update cache');
+    assert.match(readFileSync(remoteCallLog, 'utf8'), /git ls-remote/);
+    assert.match(readFileSync(remoteCallLog, 'utf8'), /gh compare/);
+    assert.equal(existsSync(cachePath), true, 'ordinary command should write update cache');
     const lock = JSON.parse(readFileSync(path.join(consumerRoot, 'package-lock.json'), 'utf8'));
     assert.equal(lock.packages['node_modules/pipelane'].resolved.endsWith(`#${oldSha}`), true);
   } finally {
@@ -26535,7 +26553,50 @@ test('CLI ordinary commands do not check for repo-local updates by default', asy
   }
 });
 
-test('CLI ordinary commands ignore fresh repo-local update cache', async () => {
+test('CLI update notices use the explicit board --repo target from another cwd', async () => {
+  const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-target-consumer-'));
+  const callerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-target-caller-'));
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-target-bin-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  const remoteCallLog = path.join(consumerRoot, 'remote-calls.log');
+  const oldSha = '1111111111111111111111111111111111111111';
+  const newSha = '2222222222222222222222222222222222222222';
+  const port = await getFreePort();
+  try {
+    writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    makeFakeUpdateBin(binDir, {
+      latestSha: newSha,
+      aheadCommits: [{ sha: newSha, subject: 'Notify the requested repo' }],
+      gitMarkerPath: remoteCallLog,
+      compareMarkerPath: remoteCallLog,
+    });
+
+    const result = spawnSync('node', [CLI_PATH, 'board', 'status', '--repo', consumerRoot, '--port', String(port)], {
+      cwd: callerRoot,
+      env: {
+        ...process.env,
+        PIPELANE_HOME: pipelaneHome,
+        PIPELANE_AUTO_UPDATE: '1',
+        PATH: `${binDir}:${process.env.PATH}`,
+      },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, new RegExp(`Repo:\\s+${consumerRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.match(result.stderr, /A new Pipelane update is available: 1111111 -> 2222222/);
+    assert.match(result.stderr, /- Notify the requested repo/);
+    assert.match(readFileSync(remoteCallLog, 'utf8'), /git ls-remote/);
+  } finally {
+    rmSync(consumerRoot, { recursive: true, force: true });
+    rmSync(callerRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('CLI ordinary commands use fresh repo-local update cache for notices without rechecking', async () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-cached-notify-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-cached-notify-bin-'));
   const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
@@ -26588,9 +26649,72 @@ test('CLI ordinary commands ignore fresh repo-local update cache', async () => {
 
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, new RegExp(`Port:   ${port}`));
-    assert.doesNotMatch(result.stderr, /New Pipelane update available/);
-    assert.doesNotMatch(result.stderr, /Run `\/pipelane update`/);
+    assert.match(result.stderr, /A new Pipelane update is available: 1111111 -> 2222222/);
+    assert.match(result.stderr, /Run `\/pipelane update` to get the latest changes:/);
+    assert.match(result.stderr, /- Ship cached update notices/);
+    assert.match(result.stderr, /- Polish upgrade copy/);
     assert.equal(existsSync(remoteCallLog), false, 'ordinary command must not re-check remote status');
+  } finally {
+    rmSync(consumerRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('CLI update notice retries soon when compare highlights were incomplete', async () => {
+  const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-compare-retry-consumer-'));
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-compare-retry-bin-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  const remoteCallLog = path.join(consumerRoot, 'remote-calls.log');
+  const oldSha = '1111111111111111111111111111111111111111';
+  const newSha = '2222222222222222222222222222222222222222';
+  const port = await getFreePort();
+  try {
+    writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    makeFakeUpdateBin(binDir, {
+      latestSha: newSha,
+      compareExitCode: 42,
+      gitMarkerPath: remoteCallLog,
+      compareMarkerPath: remoteCallLog,
+    });
+
+    const env = {
+      ...process.env,
+      PIPELANE_HOME: pipelaneHome,
+      PIPELANE_AUTO_UPDATE: '1',
+      PORT: String(port),
+      PATH: `${binDir}:${process.env.PATH}`,
+    };
+
+    const first = spawnSync('node', [CLI_PATH, 'board', 'status'], {
+      cwd: consumerRoot,
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(first.status, 0, first.stderr);
+    assert.match(first.stderr, /Run `\/pipelane update --check` to inspect the update before installing/);
+
+    const cachePath = autoUpdateCachePathForTest(consumerRoot, pipelaneHome);
+    const cache = JSON.parse(readFileSync(cachePath, 'utf8'));
+    cache.checkedAt = new Date(Date.now() - 6 * 60 * 1000).toISOString();
+    writeFileSync(cachePath, JSON.stringify(cache, null, 2) + '\n', 'utf8');
+    makeFakeUpdateBin(binDir, {
+      latestSha: newSha,
+      aheadCommits: [{ sha: newSha, subject: 'Recovered compare highlights' }],
+      gitMarkerPath: remoteCallLog,
+      compareMarkerPath: remoteCallLog,
+    });
+
+    const second = spawnSync('node', [CLI_PATH, 'board', 'status'], {
+      cwd: consumerRoot,
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(second.status, 0, second.stderr);
+    assert.match(second.stderr, /- Recovered compare highlights/);
+    assert.equal((readFileSync(remoteCallLog, 'utf8').match(/git ls-remote/g) ?? []).length, 2);
   } finally {
     rmSync(consumerRoot, { recursive: true, force: true });
     rmSync(binDir, { recursive: true, force: true });
@@ -26632,7 +26756,10 @@ test('CLI ordinary commands with PIPELANE_AUTO_UPDATE set do not self-update or 
       '#!/bin/sh\necho "REEXEC:$*"\n',
       { mode: 0o755, encoding: 'utf8' },
     );
-    makeFakeUpdateBin(binDir, { latestSha: newSha });
+    makeFakeUpdateBin(binDir, {
+      latestSha: newSha,
+      aheadCommits: [{ sha: newSha, subject: 'Keep board running while notifying' }],
+    });
     writeDashboardSettingsForTest(dashboardHome, resolvedConsumerRoot, { preferredPort: port });
     writeDashboardPidForTest(dashboardHome, resolvedConsumerRoot, dashboardChild.pid);
 
@@ -26656,6 +26783,8 @@ test('CLI ordinary commands with PIPELANE_AUTO_UPDATE set do not self-update or 
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, new RegExp(`Port:   ${port}`));
     assert.doesNotMatch(result.stdout, /REEXEC/);
+    assert.match(result.stderr, /A new Pipelane update is available: 1111111 -> 2222222/);
+    assert.match(result.stderr, /- Keep board running while notifying/);
     assert.doesNotMatch(result.stderr, /Auto-updating pipelane/);
     assert.doesNotMatch(result.stderr, /Stopped existing Pipelane Board/);
     assert.equal(isPidAlive(dashboardChild.pid), true, 'ordinary command must not stop a running board');
@@ -26673,6 +26802,53 @@ test('CLI ordinary commands with PIPELANE_AUTO_UPDATE set do not self-update or 
     rmSync(claudeHome, { recursive: true, force: true });
     rmSync(pipelaneHome, { recursive: true, force: true });
     rmSync(dashboardHome, { recursive: true, force: true });
+  }
+});
+
+test('CLI update notice failures use a short backoff cache', async () => {
+  const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-failure-cache-consumer-'));
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-failure-cache-bin-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  const remoteCallLog = path.join(consumerRoot, 'remote-calls.log');
+  const oldSha = '1111111111111111111111111111111111111111';
+  const port = await getFreePort();
+  try {
+    writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    makeFakeUpdateBin(binDir, {
+      latestSha: oldSha,
+      gitExitCode: 42,
+      gitMarkerPath: remoteCallLog,
+    });
+    const env = {
+      ...process.env,
+      PIPELANE_HOME: pipelaneHome,
+      PIPELANE_AUTO_UPDATE: '1',
+      PORT: String(port),
+      PATH: `${binDir}:${process.env.PATH}`,
+    };
+
+    const first = spawnSync('node', [CLI_PATH, 'board', 'status'], {
+      cwd: consumerRoot,
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const second = spawnSync('node', [CLI_PATH, 'board', 'status'], {
+      cwd: consumerRoot,
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    assert.equal(first.status, 0, first.stderr);
+    assert.equal(second.status, 0, second.stderr);
+    assert.equal((readFileSync(remoteCallLog, 'utf8').match(/git ls-remote/g) ?? []).length, 1);
+    const cache = JSON.parse(readFileSync(autoUpdateCachePathForTest(consumerRoot, pipelaneHome), 'utf8'));
+    assert.match(cache.failureReason, /simulated git ls-remote failure/);
+  } finally {
+    rmSync(consumerRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
   }
 });
 
@@ -26760,6 +26936,8 @@ test('CLI ordinary commands do not install from cached stale update entries', as
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, new RegExp(`Port:   ${port}`));
     assert.doesNotMatch(result.stdout, /REEXEC/);
+    assert.match(result.stderr, /A new Pipelane update is available: 1111111 -> 2222222/);
+    assert.match(result.stderr, /Run `\/pipelane update --check` to inspect the update before installing/);
     assert.doesNotMatch(result.stderr, /Auto-updating pipelane/);
     assert.equal(existsSync(npmInstallLog), false, 'ordinary command must not run npm install');
     const lock = JSON.parse(readFileSync(path.join(consumerRoot, 'package-lock.json'), 'utf8'));
@@ -26881,14 +27059,14 @@ test('collectUpdateStatus applies one timeout budget across remote status calls'
     makeFakeUpdateBin(binDir, {
       latestSha: newSha,
       aheadCommits: [{ sha: newSha, subject: 'newer pipelane' }],
-      gitDelayMs: 500,
+      gitDelayMs: 100,
       compareDelayMs: 800,
       compareMarkerPath,
     });
 
     process.env.PATH = `${binDir}:${originalPath}`;
     const update = await import(path.join(KIT_ROOT, 'src', 'operator', 'update.ts'));
-    const status = update.collectUpdateStatus(consumerRoot, { timeoutMs: 900 });
+    const status = update.collectUpdateStatus(consumerRoot, { timeoutMs: 700 });
 
     assert.equal(status.installedSha, oldSha);
     assert.equal(status.latestSha, newSha);
@@ -26902,7 +27080,7 @@ test('collectUpdateStatus applies one timeout budget across remote status calls'
   }
 });
 
-test('CLI ordinary commands with PIPELANE_AUTO_UPDATE set skip update status probes', async () => {
+test('CLI ordinary commands with update notices enabled probe status without installing', async () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-bin-'));
   const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
@@ -26944,10 +27122,13 @@ test('CLI ordinary commands with PIPELANE_AUTO_UPDATE set skip update status pro
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, new RegExp(`Port:   ${port}`));
     assert.doesNotMatch(result.stdout, /REEXEC/);
-    assert.equal(existsSync(remoteCallLog), false, 'ordinary command must not check remote update status');
+    assert.match(result.stderr, /A new Pipelane update is available: 1111111 -> 2222222/);
+    assert.match(result.stderr, /- newer pipelane/);
+    assert.match(readFileSync(remoteCallLog, 'utf8'), /git ls-remote/);
+    assert.match(readFileSync(remoteCallLog, 'utf8'), /gh compare/);
     assert.equal(existsSync(npmInstallLog), false, 'ordinary command must not run npm install');
     const cacheDir = path.join(pipelaneHome, 'update-checks');
-    assert.equal(existsSync(cacheDir) ? readdirSync(cacheDir).length : 0, 0);
+    assert.equal(existsSync(cacheDir) ? readdirSync(cacheDir).length : 0, 1);
     const lock = JSON.parse(readFileSync(path.join(consumerRoot, 'package-lock.json'), 'utf8'));
     assert.equal(lock.packages['node_modules/pipelane'].resolved.endsWith(`#${oldSha}`), true);
   } finally {
@@ -26957,7 +27138,7 @@ test('CLI ordinary commands with PIPELANE_AUTO_UPDATE set skip update status pro
   }
 });
 
-test('CLI ordinary commands with PIPELANE_AUTO_UPDATE set do not require an updated local bin', async () => {
+test('CLI update notices do not require an updated local bin', async () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-bin-'));
   const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
@@ -26967,7 +27148,11 @@ test('CLI ordinary commands with PIPELANE_AUTO_UPDATE set do not require an upda
   const port = await getFreePort();
   try {
     writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
-    makeFakeUpdateBin(binDir, { latestSha: newSha, npmMarkerPath: npmInstallLog });
+    makeFakeUpdateBin(binDir, {
+      latestSha: newSha,
+      aheadCommits: [{ sha: newSha, subject: 'Notify without local bin' }],
+      npmMarkerPath: npmInstallLog,
+    });
 
     const result = spawnSync('node', [CLI_PATH, 'board', 'status'], {
       cwd: consumerRoot,
@@ -26985,10 +27170,12 @@ test('CLI ordinary commands with PIPELANE_AUTO_UPDATE set do not require an upda
 
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, new RegExp(`Port:   ${port}`));
+    assert.match(result.stderr, /A new Pipelane update is available: 1111111 -> 2222222/);
+    assert.match(result.stderr, /- Notify without local bin/);
     assert.doesNotMatch(result.stderr, /auto-update completed|Auto-updating pipelane|Upgrade complete/);
     assert.equal(existsSync(npmInstallLog), false, 'ordinary command must not run npm install');
     const cacheDir = path.join(pipelaneHome, 'update-checks');
-    assert.equal(existsSync(cacheDir) ? readdirSync(cacheDir).length : 0, 0);
+    assert.equal(existsSync(cacheDir) ? readdirSync(cacheDir).length : 0, 1);
     const lock = JSON.parse(readFileSync(path.join(consumerRoot, 'package-lock.json'), 'utf8'));
     assert.equal(lock.packages['node_modules/pipelane'].resolved.endsWith(`#${oldSha}`), true);
   } finally {
