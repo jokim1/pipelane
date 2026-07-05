@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { readFixPromptBody } from './fix-prompt.ts';
 import { readLessonPromptBody } from './lesson-prompt.ts';
 import { npmGuardStatus, runNpmGuardSelfCheck } from './npm-guard-install.ts';
-import { CONFIG_FILENAME, defaultWorkflowConfig, homeClaudeDir, homeCodexDir, writeJsonFile } from './state.ts';
+import { defaultWorkflowConfig, homeClaudeDir, homeCodexDir, resolveConfigPath, writeJsonFile } from './state.ts';
 import {
   desiredHostInstall,
   type DesiredInstall,
@@ -202,7 +202,10 @@ function runTemporaryRunnerCheck(name: string, runnerPath: string): VerifyCheck 
   }
 
   const repoRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-verify-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-verify-home-'));
+  const previousPipelaneHome = process.env.PIPELANE_HOME;
   try {
+    process.env.PIPELANE_HOME = pipelaneHome;
     const init = spawnSync('git', ['init', '-b', 'main'], {
       cwd: repoRoot,
       encoding: 'utf8',
@@ -212,13 +215,13 @@ function runTemporaryRunnerCheck(name: string, runnerPath: string): VerifyCheck 
       return { name, status: 'fail', detail: init.stderr || 'git init failed' };
     }
     writeFileSync(path.join(repoRoot, 'package.json'), '{"name":"pipelane-verify"}\n', 'utf8');
-    const configPath = path.join(repoRoot, CONFIG_FILENAME);
+    const configPath = resolveConfigPath(repoRoot);
     writeJsonFile(configPath, defaultWorkflowConfig('pipelane-verify', 'Pipelane Verify'));
     const packageBefore = readFileSync(path.join(repoRoot, 'package.json'), 'utf8');
     const configBefore = readFileSync(configPath, 'utf8');
     const result = spawnSync(runnerPath, ['status', '--json'], {
       cwd: repoRoot,
-      env: process.env,
+      env: { ...process.env, PIPELANE_HOME: pipelaneHome },
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -240,11 +243,14 @@ function runTemporaryRunnerCheck(name: string, runnerPath: string): VerifyCheck 
       return {
         name,
         status: 'fail',
-        detail: `unexpected repo writes: ${wroteAdapters.join(', ') || (packageChanged ? 'package.json' : CONFIG_FILENAME)}`,
+        detail: `unexpected repo writes: ${wroteAdapters.join(', ') || (packageChanged ? 'package.json' : 'machine-local config')}`,
       };
     }
     return { name, status: 'ok', detail: 'global runner reached Pipelane in a temporary configured repo without adapter writes' };
   } finally {
+    if (previousPipelaneHome === undefined) delete process.env.PIPELANE_HOME;
+    else process.env.PIPELANE_HOME = previousPipelaneHome;
     rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
   }
 }

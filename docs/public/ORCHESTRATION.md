@@ -478,9 +478,9 @@ complete orchestration review gates.
 
 ## Config Contract
 
-Review gates live in `.pipelane.json` under top-level `reviewGates`. They are
-not nested inside `orchestrate`; `/orchestrate` consumes the same review-gate
-config later.
+Review gates live in machine-local Pipelane config under top-level
+`reviewGates`. They are not nested inside `orchestrate`; `/orchestrate`
+consumes the same review-gate config later.
 
 Each gate has:
 

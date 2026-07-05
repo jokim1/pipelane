@@ -21,6 +21,7 @@ import {
   nowIso,
   removeSmokeEnvironmentLock,
   resolveSmokeHistoryDir,
+  resolveSmokeGeneratedSummaryPath,
   resolveSmokeLatestPath,
   resolveSmokeRuntimeRoot,
   saveSmokeEnvironmentLock,
@@ -119,7 +120,7 @@ export interface ResolvedSmokeTarget {
 export function resolveSmokeConfig(config: WorkflowConfig): ResolvedSmokeConfig {
   const smoke = config.smoke ?? {};
   return {
-    registryPath: smoke.registryPath?.trim() || '.pipelane/smoke-checks.json',
+    registryPath: smoke.registryPath?.trim() || 'machine-local smoke-checks.json',
     generatedSummaryPath: smoke.generatedSummaryPath?.trim() || null,
     criticalPathCoverage: smoke.criticalPathCoverage === 'block' ? 'block' : 'warn',
     criticalPaths: (smoke.criticalPaths ?? []).map((entry) => entry.trim()).filter(Boolean),
@@ -127,7 +128,7 @@ export function resolveSmokeConfig(config: WorkflowConfig): ResolvedSmokeConfig 
     staging: resolveSmokeEnvironmentConfig(smoke.staging),
     prod: resolveSmokeEnvironmentConfig(smoke.prod),
     waivers: {
-      path: smoke.waivers?.path?.trim() || '.pipelane/waivers.json',
+      path: smoke.waivers?.path?.trim() || 'machine-local waivers.json',
       maxExtensions: smoke.waivers?.maxExtensions ?? 2,
     },
     history: {
@@ -309,7 +310,7 @@ export function generateSmokeSummary(registry: SmokeRegistryState): string {
   const lines = [
     '# Smoke Summary',
     '',
-    'Generated from `.pipelane/smoke-checks.json`.',
+    'Generated from the machine-local smoke registry.',
     '',
   ];
   const entries = Object.entries(registry.checks).sort(([left], [right]) => left.localeCompare(right));
@@ -356,9 +357,9 @@ export function lintSmokeSetup(options: {
     .sort();
   let generatedSummaryDrift = false;
   if (smokeConfig.generatedSummaryPath) {
-    const targetPath = path.join(options.repoRoot, smokeConfig.generatedSummaryPath);
+    const targetPath = resolveSmokeGeneratedSummaryPath(options.repoRoot, options.config);
     const expected = generateSmokeSummary(options.registry);
-    const actual = existsSync(targetPath) ? readFileSync(targetPath, 'utf8') : '';
+    const actual = targetPath && existsSync(targetPath) ? readFileSync(targetPath, 'utf8') : '';
     generatedSummaryDrift = actual !== expected;
   }
 
@@ -461,16 +462,15 @@ export function buildSmokePlanReport(options: {
     smokeTags: options.discoveredTags,
     candidateTests: promotedCandidates,
     findings: findings.sort((left, right) => left.priority - right.priority).slice(0, 5),
-    summaryPath: smokeConfig.generatedSummaryPath,
+    summaryPath: resolveSmokeGeneratedSummaryPath(options.repoRoot, options.config),
   };
 }
 
 export function writeGeneratedSmokeSummary(repoRoot: string, config: WorkflowConfig, registry: SmokeRegistryState): string | null {
-  const smokeConfig = resolveSmokeConfig(config);
-  if (!smokeConfig.generatedSummaryPath) {
+  const targetPath = resolveSmokeGeneratedSummaryPath(repoRoot, config);
+  if (!targetPath) {
     return null;
   }
-  const targetPath = path.join(repoRoot, smokeConfig.generatedSummaryPath);
   mkdirSync(path.dirname(targetPath), { recursive: true });
   writeFileSync(targetPath, generateSmokeSummary(registry), 'utf8');
   return targetPath;
@@ -871,7 +871,7 @@ export function summarizeSmokeRun(record: SmokeRunRecord, registry?: SmokeRegist
 export function formatSmokePlanReport(report: SmokePlanReport): string {
   const lines = ['Smoke plan:', `- smoke-tagged tests discovered: ${report.smokeTags.length}`];
   if (report.createdRegistry) {
-    lines.push('- scaffolded .pipelane/smoke-checks.json');
+    lines.push('- scaffolded machine-local smoke registry');
   }
   if (report.summaryPath) {
     lines.push(`- generated summary: ${report.summaryPath}`);

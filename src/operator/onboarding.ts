@@ -1,5 +1,5 @@
 import {
-  readPackageJsonOverlay,
+  resolveConfigPath,
   resolveReadableConfigPath,
   resolveRepoRoot,
 } from './state.ts';
@@ -14,7 +14,7 @@ export function buildMissingDeployOnboardingMessage(
   options: DeployOnboardingMessageOptions = {},
 ): string | null {
   const repoRoot = resolveRepoRoot(cwd);
-  if (resolveReadableConfigPath(repoRoot) || readPackageJsonOverlay(repoRoot)) {
+  if (resolveReadableConfigPath(repoRoot)) {
     return null;
   }
 
@@ -27,7 +27,7 @@ export function buildMissingDeployOnboardingMessage(
 
   return [
     `Pipelane is installed on this machine, but this repo is not onboarded yet: ${repoRoot}`,
-    'No .pipelane.json, .project-workflow.json, or package.json:pipelane block was found.',
+    `No machine-local Pipelane config was found at ${resolveConfigPath(repoRoot)}.`,
     'No deploy started.',
     '',
     'Run clean setup and deploy configuration first:',

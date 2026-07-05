@@ -843,7 +843,7 @@ async function handleSmokeSetup(cwd: string, parsed: ParsedOperatorArgs): Promis
     if (stagingAutoSource === 'medium-candidate' && autoWiredCandidate) {
       return `package script ${autoWiredCandidate.name} (medium: ${autoWiredCandidate.reason})`;
     }
-    if (stagingAutoSource === 'preserved') return 'existing .pipelane.json smoke.staging.command';
+    if (stagingAutoSource === 'preserved') return 'existing machine-local smoke.staging.command';
     return 'unknown';
   })();
 
@@ -976,7 +976,7 @@ function emitSetupOutcome(parsed: ParsedOperatorArgs, outcome: SmokeSetupOutcome
     lines.push('', outcome.setupVerification.aiFixPrompt);
   }
   if (outcome.configPathIsLegacy) {
-    lines.push(`Note: wrote updates to legacy .project-workflow.json — consider migrating to .pipelane.json.`);
+    lines.push('Note: wrote updates to machine-local Pipelane config.');
   }
   for (const warning of outcome.warnings) {
     lines.push(`Warning: ${warning}`);
@@ -1055,7 +1055,7 @@ async function handleSmokeRun(
   const smokeConfig = resolveSmokeConfig(context.config);
   const environmentConfig = environment === 'staging' ? smokeConfig.staging : smokeConfig.prod;
   if (!environmentConfig) {
-    throw new Error(`smoke ${environment} blocked: no smoke.${environment}.command configured in .pipelane.json.`);
+    throw new Error(`smoke ${environment} blocked: no smoke.${environment}.command configured in machine-local Pipelane config.`);
   }
 
   const registry = loadSmokeRegistry(context.repoRoot, context.config);

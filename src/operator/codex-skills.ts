@@ -257,7 +257,7 @@ function assertNoCodexSkillCollisions(skillsRoot: string, desiredSkills: Set<str
     const targetDir = path.join(skillsRoot, skillName);
     if (existsSync(targetDir) && !managedSkills.has(skillName)) {
       throw new Error(
-        `Codex skill alias collision: ${targetDir} already exists and is not managed by pipelane. Choose a different alias in .pipelane.json or remove the conflicting skill.`,
+        `Codex skill alias collision: ${targetDir} already exists and is not managed by pipelane. Choose a different alias in machine-local Pipelane config or remove the conflicting skill.`,
       );
     }
   }
@@ -383,7 +383,7 @@ export function syncCodexSkills(
   for (const name of MANAGED_EXTRA_CODEX_SKILLS) {
     if (desiredSkills.has(name)) {
       throw new Error(
-        `Codex skill alias collision: a workflow alias resolves to the reserved extra skill name "${name}". Rename the alias in .pipelane.json.`,
+        `Codex skill alias collision: a workflow alias resolves to the reserved extra skill name "${name}". Rename the alias in machine-local Pipelane config.`,
       );
     }
     desiredSkills.add(name);
