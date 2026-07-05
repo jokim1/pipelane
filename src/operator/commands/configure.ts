@@ -1,15 +1,12 @@
-import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import path from 'node:path';
 import readline from 'node:readline/promises';
 
-import { renderClaudeMdFromTemplate } from '../docs.ts';
 import {
   additionalDeploySurfaceNames,
   emptyAdditionalDeploySurfaceConfig,
   emptyDeployConfig,
   isReleaseManagedSurface,
-  parseDeployConfigMarkdown,
-  replaceDeployConfigSection,
+  loadDeployConfig,
+  resolveSharedDeployConfigPath,
   saveSharedDeployConfig,
   type DeployConfig,
 } from '../release-gate.ts';
@@ -61,8 +58,7 @@ export interface ConfigureOptions {
 
 export interface ConfigureResult {
   repoRoot: string;
-  claudePath: string;
-  createdClaude: boolean;
+  configPath: string;
   config: DeployConfig;
 }
 
@@ -219,57 +215,36 @@ export async function handleConfigure(cwd: string, argv: string[]): Promise<Conf
     printUsage();
     return {
       repoRoot: '',
-      claudePath: '',
-      createdClaude: false,
+      configPath: '',
       config: emptyDeployConfig(),
     };
   }
 
   const repoRoot = resolveRepoRoot(cwd, true);
   const workflowConfig = loadWorkflowConfig(repoRoot);
-  const claudePath = path.join(repoRoot, 'CLAUDE.md');
-  let markdown = '';
-  let createdClaude = false;
-  if (existsSync(claudePath)) {
-    markdown = readFileSync(claudePath, 'utf8');
-  } else {
-    // `loadWorkflowConfig` self-heals from defaults + `package.json:pipelane`
-    // overlay when `.pipelane.json` is absent, so `configure` now works on
-    // overlay-only consumers without needing a repo-local bootstrap first.
-    markdown = renderClaudeMdFromTemplate(workflowConfig);
-    createdClaude = true;
-  }
-
-  // parseDeployConfigMarkdown over the in-memory markdown avoids a second
-  // readFileSync(CLAUDE.md) inside release-gate.loadDeployConfig.
-  const baseConfig = parseDeployConfigMarkdown(markdown) ?? emptyDeployConfig();
+  const configPath = resolveSharedDeployConfigPath(repoRoot);
+  const baseConfig = loadDeployConfig(repoRoot) ?? emptyDeployConfig();
   const flagged = applyFlagOverrides(baseConfig, options);
   if (!options.json && !process.stdin.isTTY) {
-    process.stdout.write(renderNonInteractiveConfigurePrompt(repoRoot, claudePath, createdClaude, flagged, workflowConfig.routeSafety));
+    process.stdout.write(renderNonInteractiveConfigurePrompt(repoRoot, configPath, flagged, workflowConfig.routeSafety));
     process.exitCode = 64;
-    return { repoRoot, claudePath, createdClaude, config: flagged };
+    return { repoRoot, configPath, config: flagged };
   }
   const finalConfig = options.json ? flagged : await promptForValues(flagged, workflowConfig.routeSafety);
 
-  // Temp-file-and-rename keeps CLAUDE.md atomic: a crash mid-write can't
-  // leave a truncated file that later bricks parseDeployConfigMarkdown for
-  // every other command.
-  const tmpPath = `${claudePath}.pipelane.tmp`;
-  writeFileSync(tmpPath, ensureTrailingNewline(replaceDeployConfigSection(markdown, finalConfig)), 'utf8');
-  renameSync(tmpPath, claudePath);
   saveSharedDeployConfig(repoRoot, finalConfig);
 
   if (options.json) {
     process.stdout.write(`${JSON.stringify(finalConfig, null, 2)}\n`);
   } else {
     process.stdout.write([
-      `Wrote Deploy Configuration to ${claudePath}`,
-      createdClaude ? 'Created new CLAUDE.md from the Pipelane template.' : 'Updated the Deploy Configuration block in place.',
+      `Wrote machine-local Deploy Configuration to ${configPath}`,
+      'No application repo files were created or modified.',
       ...routeSafetyDefaultLines(workflowConfig.routeSafety),
     ].join('\n') + '\n');
   }
 
-  return { repoRoot, claudePath, createdClaude, config: finalConfig };
+  return { repoRoot, configPath, config: finalConfig };
 }
 
 function applyFlagOverrides(base: DeployConfig, options: ConfigureOptions): DeployConfig {
@@ -352,8 +327,7 @@ interface ConfigurePromptSection {
 
 function renderNonInteractiveConfigurePrompt(
   repoRoot: string,
-  claudePath: string,
-  createdClaude: boolean,
+  configPath: string,
   config: DeployConfig,
   routeSafety: RouteSafetyConfig,
 ): string {
@@ -361,7 +335,7 @@ function renderNonInteractiveConfigurePrompt(
   const lines = [
     'Pipelane configure needs deploy values, but this shell is non-interactive.',
     `Repo: ${repoRoot}`,
-    `CLAUDE.md: ${claudePath}${createdClaude ? ' (will be created when values are saved)' : ''}`,
+    `Machine-local deploy config: ${configPath}`,
     '',
     'Current Deploy Configuration:',
   ];
@@ -379,7 +353,7 @@ function renderNonInteractiveConfigurePrompt(
     '',
     'Choose the action to take:',
     '1. Reply with deploy values in chat; I will run /pipelane configure --json with the matching flags.',
-    '2. Refresh generated setup files first: /pipelane setup --yes',
+    '2. Inspect current setup separately: /pipelane setup',
     '3. Cancel.',
     '',
     'Command shape for option 1:',
@@ -509,7 +483,7 @@ async function promptForValues(base: DeployConfig, routeSafety: RouteSafetyConfi
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
     process.stdout.write(
-      'Configuring Deploy Configuration block in CLAUDE.md. Press Enter to keep the current value shown in [brackets].\n\n',
+      'Configuring machine-local deploy settings. Press Enter to keep the current value shown in [brackets].\n\n',
     );
     process.stdout.write(['Delivery loop safety defaults:', ...routeSafetyDefaultLines(routeSafety).map((line) => `- ${line}`), ''].join('\n') + '\n');
     const next: DeployConfig = JSON.parse(JSON.stringify(base));
@@ -584,10 +558,6 @@ async function promptBool(rl: readline.Interface, prompt: string, current: boole
   return current;
 }
 
-function ensureTrailingNewline(markdown: string): string {
-  return markdown.endsWith('\n') ? markdown : `${markdown}\n`;
-}
-
 function routeSafetyDefaultLines(routeSafety: RouteSafetyConfig): string[] {
   const resolved = normalizeRouteSafetyConfig(routeSafety);
   return [
@@ -599,7 +569,7 @@ function routeSafetyDefaultLines(routeSafety: RouteSafetyConfig): string[] {
 }
 
 function printUsage(): void {
-  process.stdout.write(`pipelane configure — populate the Deploy Configuration block in CLAUDE.md
+  process.stdout.write(`pipelane configure — save machine-local deploy configuration
 
 Usage:
   pipelane configure                 Interactive prompts for every field
@@ -647,8 +617,7 @@ Delivery loop safety defaults:
   Default AI review runs: 1
   Stop on major findings: yes
 
-If CLAUDE.md is missing, pipelane configure seeds it from the Pipelane template
-before writing the Deploy Configuration block. Sections outside that block are
-left untouched on re-runs.
+Pipelane stores deploy configuration in machine-local Pipelane state and does
+not create or modify application repo files.
 `);
 }

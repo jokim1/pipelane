@@ -240,12 +240,14 @@ below).
   flag-shaped arg (`--json`, `-x`) errors instead of silently
   swallowing it.
 
-### `.pipelane.json:surfacePathMap` (optional, v1.4+)
+### `surfacePathMap` machine-local config (optional, v1.4+)
 
 Opt-in map consumed by `--blast` and by deploy preflight when the
 operator does not pass `--surfaces`. Keys are surface names (typically
 entries from `surfaces`), values are POSIX directory prefixes or exact
-filenames matched against `git diff --name-only` output. Example:
+filenames matched against `git diff --name-only` output. It is stored in
+`$PIPELANE_HOME/repos/<repo-key>/config.json`, not in repo-local config.
+Example:
 
 ```json
 {
@@ -284,17 +286,15 @@ matters for your use case.
   breaking change and bumps the schema version.
 - Lane states in `CANONICAL_LANE_STATES` are append-only.
 
-### Deploy Configuration schema (CLAUDE.md)
+### Deploy Configuration schema
 
-The `## Deploy Configuration` JSON block in each consumer's local
-`CLAUDE.md` is a separate machine-readable surface. It is versioned
-independently of the envelope schema:
+Deploy configuration is saved in machine-local Pipelane state by
+`pipelane configure`. It is versioned independently of the envelope schema:
 
 - **v1.2 removal:** `frontend.staging.ready`, `edge.staging.ready`, and
   `sql.staging.ready` were dropped. Release readiness derives from
   observed staging deploys + `doctor.probe` freshness now.
-  `parseDeployConfigMarkdown` silently strips `.ready` from older blocks
-  on load; `renderDeployConfigSection` never emits it.
+  migrated readers silently strip `.ready` from older payloads on load.
 - **v1.2 CLI flag removals:** `pipelane configure --frontend-staging-ready`,
   `--edge-staging-ready`, and `--sql-staging-ready` error loudly on
   invocation. Scripts carrying the flags fail fast; there is no

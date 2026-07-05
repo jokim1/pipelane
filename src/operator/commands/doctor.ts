@@ -8,7 +8,6 @@ import {
   emptyDeployConfig,
   explainSurfaceProbe,
   loadDeployConfig,
-  replaceDeployConfigSection,
   resolveSurfaceProbeUrl,
   saveSharedDeployConfig,
   type DeployConfig,
@@ -29,13 +28,13 @@ import {
 } from '../state.ts';
 
 // v1.2: /doctor is the guided-config + live-probe command. Three modes:
-// - default (diagnose): read CLAUDE.md, list missing deploy-config fields,
+// - default (diagnose): read machine-local deploy config, list missing fields,
 //   detect platform from well-known config files (fly.toml, vercel.json,
 //   netlify.toml, render.yaml, app.json, .github/workflows/).
 // - `--probe`: hit each configured staging healthcheck URL and record
 //   liveness to probe-state.json. Release-gate reads this.
-// - `--fix`: interactive wizard that prompts for platform + URLs, writes
-//   the Deploy Configuration block in CLAUDE.md, and auto-runs --probe.
+// - `--fix`: interactive wizard that prompts for platform + URLs, saves
+//   machine-local deploy config, and auto-runs --probe.
 //
 // All three write JSON output under `--json` and human text otherwise.
 export async function handleDoctor(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
@@ -297,8 +296,8 @@ export async function executeProbe(context: WorkflowContext, nowFn: () => Date =
   const deployConfig = loadDeployConfig(context.repoRoot);
   if (!deployConfig) {
     throw new Error([
-      'No Deploy Configuration block in CLAUDE.md.',
-      `Run \`${formatWorkflowCommand(context.config, 'doctor', '--fix')}\` to create one.`,
+      'No machine-local deploy configuration saved.',
+      `Run \`${formatWorkflowCommand(context.config, 'doctor', '--fix')}\` to create it.`,
     ].join('\n'));
   }
 
@@ -319,14 +318,14 @@ export async function executeProbe(context: WorkflowContext, nowFn: () => Date =
 
   const lines = ['Doctor probe:'];
   if (records.length === 0) {
-    lines.push('  No probe targets — CLAUDE.md has no configured healthcheck URLs.');
+    lines.push('  No probe targets — machine-local deploy config has no configured healthcheck URLs.');
   } else {
     for (const record of records) {
       const errorText = record.error ? sanitizeForTerminal(record.error) : 'no response';
       const status = record.ok
         ? `OK (HTTP ${record.statusCode ?? '?'}, ${record.latencyMs ?? '?'}ms)`
         : `FAILED (${record.statusCode ? `HTTP ${record.statusCode}` : errorText})`;
-      // URLs come from CLAUDE.md (operator-owned) but probe records are
+      // URLs come from machine-local deploy config but probe records are
       // unsigned state, so scrub before rendering — mirrors the v1.5
       // ANSI-injection defense on override reasons/setBy.
       lines.push(`  ${record.environment}:${record.surface}: ${status} @ ${sanitizeForTerminal(record.url)}`);
@@ -589,14 +588,11 @@ async function runFix(context: WorkflowContext, parsed: ParsedOperatorArgs): Pro
   const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
   const detected = detectPlatform(context.repoRoot, deployConfig);
   const next = await promptFixValues(deployConfig, detected);
-  const claudePath = path.join(context.repoRoot, 'CLAUDE.md');
-  const existing = existsSync(claudePath) ? readFileSync(claudePath, 'utf8') : '';
-  writeFileSync(claudePath, replaceDeployConfigSection(existing, next), 'utf8');
   saveSharedDeployConfig(context.repoRoot, next);
 
   const outcome = await executeProbe(context);
   const lines = [
-    'Doctor fix: wrote Deploy Configuration block to CLAUDE.md.',
+    'Doctor fix: saved machine-local deploy configuration.',
     outcome.message,
   ];
   printResult(parsed.flags, { config: next, probe: outcome.records, message: lines.join('\n') });

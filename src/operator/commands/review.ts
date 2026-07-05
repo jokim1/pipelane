@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
-import { accessSync, chmodSync, constants, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { accessSync, chmodSync, constants, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline/promises';
@@ -31,6 +31,7 @@ import {
   patchReadableWorkflowConfig,
   printResult,
   REVIEW_GATE_PHASES,
+  resolveMachineRepoDir,
   resolveStateDir,
   resolveReadableConfigPath,
   reviewStatePath,
@@ -59,7 +60,7 @@ type ReviewAttestStatus = 'attested';
 
 const REVIEW_CONFIG_CHANGE_GATE_ID = 'review-config-change';
 const REVIEW_CONFIG_CHANGE_WHEN = 'review-config-changed';
-const REVIEW_CONFIG_CHANGE_PATHS = ['.pipelane.json', '.project-workflow.json', 'package.json'];
+const REVIEW_CONFIG_CHANGE_PATHS: string[] = [];
 const REVIEW_PHASE_ORDER = REVIEW_GATE_PHASES;
 const DEFAULT_GATE_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_REVIEW_SETUP_NPM_INSTALL_TIMEOUT_MS = 2 * 60 * 1000;
@@ -120,6 +121,7 @@ type GateInstallState = 'installed' | 'not installed' | 'unavailable' | 'not app
 interface ReviewGateInstallResult {
   ok: boolean;
   message: string;
+  entry?: ResolvedReviewGateCatalogEntry;
 }
 
 interface ReviewGateInstallOption {
@@ -129,21 +131,12 @@ interface ReviewGateInstallOption {
   install(): ReviewGateInstallResult;
 }
 
-type PackageManagerId = 'npm' | 'pnpm' | 'yarn' | 'bun' | 'unknown' | 'unsupported' | 'conflict';
 type ReviewSetupSectionId = 'M' | 'T' | 'C' | 'I' | 'H' | 'X';
 
 interface ReviewSetupSection {
   id: ReviewSetupSectionId;
   title: string;
   ids: string[];
-}
-
-interface DetectedPackageManager {
-  id: PackageManagerId;
-  source: string;
-  packageManager?: string;
-  lockfile?: string;
-  conflicts?: string[];
 }
 
 interface ReviewSetupSelectionResult {
@@ -371,7 +364,7 @@ async function handleReviewSetup(cwd: string, parsed: ParsedOperatorArgs): Promi
     status: writeResult ? 'configured' : 'reported',
     repoRoot: context.repoRoot,
     configPath,
-    configPathIsLegacy: writeResult?.isLegacy ?? (configPath ? path.basename(configPath) !== '.pipelane.json' : false),
+    configPathIsLegacy: writeResult?.isLegacy ?? (configPath ? path.basename(configPath) === '.project-workflow.json' : false),
     packageJson: {
       path: detection.packageJsonPath,
       found: detection.found,
@@ -910,7 +903,9 @@ function installPreparedReviewGate(
   if (gate.entry.type === 'command' && gate.entry.available) {
     gate.installState = 'not applicable';
     gate.selected = true;
-    return `${gate.entry.id} already has a package.json script${gate.entry.matchedScript ? ` (${gate.entry.matchedScript})` : ''}; enabled without install.`;
+    return gate.entry.matchedScript
+      ? `${gate.entry.id} already has a package.json script (${gate.entry.matchedScript}); enabled without install.`
+      : `${gate.entry.id} already has an executable command; enabled without install.`;
   }
 
   const installers = reviewGateInstallOptions(gate.entry, repoRoot);
@@ -924,12 +919,16 @@ function installPreparedReviewGate(
   }
 
   if (gate.entry.type === 'command') {
-    const refreshed = resolveReviewGateCatalog({ repoRoot }).find((entry) => entry.id === gate.entry.id);
-    if (!refreshed?.available) {
-      gate.selected = false;
-      throw new Error(`${result.message} ${gate.entry.id} is still unavailable: ${refreshed?.missingReason ?? 'package.json script not detected'}`);
+    if (result.entry) {
+      gate.entry = result.entry;
+    } else {
+      const refreshed = resolveReviewGateCatalog({ repoRoot }).find((entry) => entry.id === gate.entry.id);
+      if (!refreshed?.available) {
+        gate.selected = false;
+        throw new Error(`${result.message} ${gate.entry.id} is still unavailable: ${refreshed?.missingReason ?? 'package.json script not detected'}`);
+      }
+      gate.entry = refreshed;
     }
-    gate.entry = refreshed;
     gate.installState = 'not applicable';
   } else {
     gate.installState = 'installed';
@@ -1398,12 +1397,11 @@ function testReviewGateInstallOption(entry: ResolvedReviewGateCatalogEntry, repo
 function installTestReviewGate(repoRoot: string | undefined, entry: ResolvedReviewGateCatalogEntry): ReviewGateInstallResult {
   if (entry.type === 'command') {
     if (!repoRoot) return { ok: false, message: `No repo root available for ${entry.id} test install.` };
-    const scriptName = entry.scriptNames?.[0] ?? entry.id;
-    const command = defaultPackageScriptForCommandGate(entry.id, scriptName);
-    const patched = patchPackageJsonScript(repoRoot, scriptName, command);
-    return patched.ok
-      ? { ok: true, message: `Installed ${entry.id}.` }
-      : patched;
+    if (entry.available) return { ok: true, message: `${entry.id} already has an executable command.` };
+    if (entry.id === 'secret-scan') {
+      return installMachineLocalGitleaks(repoRoot, entry, { testMode: true });
+    }
+    return commandGateRecipe(entry);
   }
   return { ok: true, message: `Installed ${entry.id}.` };
 }
@@ -1413,61 +1411,24 @@ function commandReviewGateInstallOption(entry: ResolvedReviewGateCatalogEntry, r
   if (!repoRoot) return null;
   if (!['lint', 'format-check', 'dependency-audit', 'secret-scan'].includes(entry.id)) return null;
 
-  const scriptName = entry.scriptNames?.[0] ?? entry.id;
   return {
-    id: `package-${entry.id}`,
-    label: `${entry.id} package script`,
-    target: path.join(repoRoot, 'package.json'),
-    install: () => installCommandReviewGate(repoRoot, entry, scriptName),
+    id: entry.id === 'secret-scan' ? 'machine-local-gitleaks' : `recipe-${entry.id}`,
+    label: entry.id === 'secret-scan' ? 'machine-local gitleaks' : `${entry.id} setup recipe`,
+    target: entry.id === 'secret-scan' ? machineLocalGitleaksBinPath(repoRoot) : 'application-owned package.json script (manual)',
+    install: () => installCommandReviewGate(repoRoot, entry),
   };
 }
 
 function installCommandReviewGate(
   repoRoot: string,
   entry: ResolvedReviewGateCatalogEntry,
-  scriptName: string,
 ): ReviewGateInstallResult {
-  if (entry.id === 'dependency-audit') {
-    const packageManager = detectPackageManager(repoRoot);
-    if (packageManager.id !== 'npm' && packageManager.id !== 'unknown') {
-      return unsupportedPackageManagerScriptRecipe(packageManager, entry.id, scriptName);
-    }
-    if (!hasNpmAuditLockfile(repoRoot)) {
-      return missingNpmAuditLockfileRecipe(entry.id, scriptName);
-    }
-    return patchPackageJsonScript(repoRoot, scriptName, defaultPackageScriptForCommandGate(entry.id, scriptName));
-  }
-
+  if (entry.available) return { ok: true, message: `${entry.id} already has an executable command.` };
   if (entry.id === 'secret-scan') {
-    if (!isExecutableOnPath('gitleaks')) {
-      const install = installNpmDevDependencies(repoRoot, [GITLEAKS_NPM_PACKAGE], entry.id, scriptName);
-      if (!install.ok) return install;
-    }
-    return patchPackageJsonScript(repoRoot, scriptName, defaultPackageScriptForCommandGate(entry.id, scriptName));
+    return installMachineLocalGitleaks(repoRoot, entry);
   }
 
-  if (entry.id === 'format-check') {
-    const install = installNpmDevDependencies(repoRoot, ['prettier'], entry.id, scriptName);
-    if (!install.ok) return install;
-    return patchPackageJsonScript(repoRoot, scriptName, defaultPackageScriptForCommandGate(entry.id, scriptName));
-  }
-
-  if (entry.id === 'lint') {
-    const devDeps = usesTypeScript(repoRoot)
-      ? ['eslint', '@eslint/js', 'typescript-eslint', 'globals']
-      : ['eslint', '@eslint/js', 'globals'];
-    const installPreflight = preflightNpmDevDependencyInstall(repoRoot, devDeps, entry.id, scriptName);
-    if (!installPreflight.ok) return installPreflight;
-    const configSafety = defaultEslintConfigSafety(repoRoot);
-    if (!configSafety.ok) return configSafety;
-    const install = installNpmDevDependencies(repoRoot, devDeps, entry.id, scriptName);
-    if (!install.ok) return install;
-    const config = writeDefaultEslintConfig(repoRoot, usesTypeScript(repoRoot));
-    if (!config.ok) return config;
-    return patchPackageJsonScript(repoRoot, scriptName, defaultPackageScriptForCommandGate(entry.id, scriptName));
-  }
-
-  return { ok: false, message: `${entry.id} has no automatic installer.` };
+  return commandGateRecipe(entry);
 }
 
 function defaultPackageScriptForCommandGate(gateId: string, scriptName: string): string {
@@ -1478,237 +1439,76 @@ function defaultPackageScriptForCommandGate(gateId: string, scriptName: string):
   return `npm run ${scriptName}`;
 }
 
-function readPackageJsonObject(repoRoot: string): Record<string, unknown> | null {
-  const packageJsonPath = path.join(repoRoot, 'package.json');
-  if (!existsSync(packageJsonPath)) return null;
-  try {
-    const parsed = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function detectPackageManager(repoRoot: string): DetectedPackageManager {
-  const packageJson = readPackageJsonObject(repoRoot);
-  const declared = typeof packageJson?.packageManager === 'string'
-    ? packageJson.packageManager.trim()
-    : '';
-  const foundLockfiles = detectPackageManagerLockfiles(repoRoot);
-  const foundIds = [...new Set(foundLockfiles.map((candidate) => candidate.id))];
-  if (declared) {
-    const declaredId = parsePackageManagerId(declared);
-    if (
-      foundIds.length > 1
-      || (declaredId !== 'unsupported' && foundIds.some((id) => id !== declaredId))
-    ) {
-      return {
-        id: 'conflict',
-        source: `packageManager "${declared}" conflicts with lockfiles: ${foundLockfiles.map((candidate) => candidate.file).join(', ')}`,
-        packageManager: declared,
-        conflicts: foundLockfiles.map((candidate) => candidate.file),
-      };
-    }
-    return {
-      id: declaredId,
-      source: declaredId === 'unsupported'
-        ? `unsupported packageManager "${declared}"`
-        : `packageManager "${declared}"`,
-      packageManager: declared,
-    };
-  }
-
-  const found = foundLockfiles;
-  const ids = foundIds;
-  if (ids.length === 0) {
-    return { id: 'unknown', source: 'no packageManager field or lockfile' };
-  }
-  if (ids.length === 1) {
-    return { id: ids[0], source: `${found[0].file} lockfile`, lockfile: found[0].file };
-  }
+function commandGateRecipe(entry: ResolvedReviewGateCatalogEntry): ReviewGateInstallResult {
+  const scriptName = entry.scriptNames?.[0] ?? entry.id;
+  const command = defaultPackageScriptForCommandGate(entry.id, scriptName);
   return {
-    id: 'conflict',
-    source: `multiple package-manager lockfiles: ${found.map((candidate) => candidate.file).join(', ')}`,
-    conflicts: found.map((candidate) => candidate.file),
+    ok: false,
+    message: `${entry.id} cannot be installed automatically without modifying application-owned files. Add package.json script "${scriptName}": "${command}", then rerun "review setup --enable ${entry.id}".`,
   };
 }
 
-function detectPackageManagerLockfiles(repoRoot: string): Array<{ id: PackageManagerId; file: string }> {
-  const lockfiles: Array<{ id: PackageManagerId; file: string }> = [
-    { id: 'pnpm', file: 'pnpm-lock.yaml' },
-    { id: 'yarn', file: 'yarn.lock' },
-    { id: 'bun', file: 'bun.lockb' },
-    { id: 'bun', file: 'bun.lock' },
-    { id: 'npm', file: 'package-lock.json' },
-    { id: 'npm', file: 'npm-shrinkwrap.json' },
-  ];
-  return lockfiles.filter((candidate) => existsSync(path.join(repoRoot, candidate.file)));
-}
-
-function parsePackageManagerId(value: string): PackageManagerId {
-  const name = value.split('@')[0]?.trim().toLowerCase();
-  if (name === 'npm' || name === 'pnpm' || name === 'yarn' || name === 'bun') return name;
-  return 'unsupported';
-}
-
-function preflightNpmDevDependencyInstall(
+function installMachineLocalGitleaks(
   repoRoot: string,
-  packages: string[],
-  gateId: string,
-  scriptName: string,
+  entry: ResolvedReviewGateCatalogEntry,
+  options: { testMode?: boolean } = {},
 ): ReviewGateInstallResult {
-  if (!existsSync(path.join(repoRoot, 'package.json'))) {
-    const installCommand = `npm install --save-dev --ignore-scripts ${packages.join(' ')}`;
-    return {
-      ok: false,
-      message: `No package.json found; automatic ${gateId} install requires an existing npm project. Recipe: create package.json, run "${installCommand}", add package.json script "${scriptName}": "${defaultPackageScriptForCommandGate(gateId, scriptName)}", then rerun "review setup --enable ${gateId}".`,
-    };
+  const existing = executablePathOnPath('gitleaks');
+  const binPath = existing ?? machineLocalGitleaksBinPath(repoRoot);
+  if (!existing && !isExecutableFile(binPath)) {
+    const install = options.testMode
+      ? installTestMachineLocalGitleaks(binPath)
+      : installNpmPackageIntoMachineLocalTool(repoRoot, GITLEAKS_NPM_PACKAGE, 'gitleaks');
+    if (!install.ok) return install;
   }
 
-  const packageManager = detectPackageManager(repoRoot);
-  if (packageManager.id !== 'npm' && packageManager.id !== 'unknown') {
-    return unsupportedPackageManagerInstallRecipe(packageManager, packages, gateId, scriptName);
+  if (!isExecutableFile(binPath)) {
+    return { ok: false, message: `gitleaks was installed but no executable was found at ${binPath}.` };
   }
 
-  const nodeModulesPath = path.join(repoRoot, 'node_modules');
-  try {
-    if (lstatSync(nodeModulesPath).isSymbolicLink()) {
-      return {
-        ok: false,
-        message: 'node_modules is a symlink; refusing to run npm install through it. Remove the symlink or install dependencies in the real dependency root, then rerun review setup.',
-      };
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      return {
-        ok: false,
-        message: 'Could not inspect node_modules safely; refusing to run npm install.',
-      };
-    }
-  }
+  const command = `${shellQuote(binPath)} detect --source . --redact`;
+  return {
+    ok: true,
+    message: existing
+      ? `Installed ${entry.id} using gitleaks from PATH.`
+      : `Installed ${entry.id} under machine-local Pipelane state.`,
+    entry: {
+      ...entry,
+      available: true,
+      command,
+      matchedScript: undefined,
+      missingReason: undefined,
+    },
+  };
+}
 
+function installTestMachineLocalGitleaks(binPath: string): ReviewGateInstallResult {
+  mkdirSync(path.dirname(binPath), { recursive: true });
+  writeFileSync(
+    binPath,
+    [
+      '#!/usr/bin/env node',
+      'process.exit(0);',
+    ].join('\n') + '\n',
+    'utf8',
+  );
+  chmodSync(binPath, 0o755);
+  return { ok: true, message: 'Installed test gitleaks wrapper.' };
+}
+
+function installNpmPackageIntoMachineLocalTool(repoRoot: string, packageName: string, binaryName: string): ReviewGateInstallResult {
+  const toolRoot = machineLocalReviewToolRoot(repoRoot, binaryName);
+  mkdirSync(toolRoot, { recursive: true });
+  writeFileSync(
+    path.join(toolRoot, 'package.json'),
+    `${JSON.stringify({ private: true, type: 'module' }, null, 2)}\n`,
+    'utf8',
+  );
   if (!isExecutableOnPath('npm')) {
-    return { ok: false, message: 'npm is not installed or not on PATH.' };
+    return { ok: false, message: 'npm is not installed or not on PATH; cannot install machine-local gitleaks automatically.' };
   }
 
-  return { ok: true, message: 'npm install preflight passed.' };
-}
-
-function unsupportedPackageManagerInstallRecipe(
-  packageManager: DetectedPackageManager,
-  packages: string[],
-  gateId: string,
-  scriptName: string,
-): ReviewGateInstallResult {
-  const installCommand = packageManagerDependencyInstallCommand(packageManager.id, packages);
-  const scriptCommand = defaultPackageScriptForCommandGate(gateId, scriptName);
-  const recipe = installCommand
-    ? `Recipe: run "${installCommand}", add package.json script "${scriptName}": "${scriptCommand}", then rerun "review setup --enable ${gateId}".`
-    : `Recipe: install ${packages.join(', ')} with the correct package manager, add package.json script "${scriptName}": "${scriptCommand}", then rerun "review setup --enable ${gateId}".`;
-  return {
-    ok: false,
-    message: `Detected ${packageManager.source}; automatic ${gateId} install currently supports npm projects only. ${recipe}`,
-  };
-}
-
-function unsupportedPackageManagerScriptRecipe(
-  packageManager: DetectedPackageManager,
-  gateId: string,
-  scriptName: string,
-): ReviewGateInstallResult {
-  const scriptCommand = packageManagerScriptCommand(packageManager.id, gateId) ?? defaultPackageScriptForCommandGate(gateId, scriptName);
-  const managerNote = packageManager.id === 'yarn'
-    ? ' For Yarn Classic, use "yarn audit" instead if that is your configured audit command.'
-    : '';
-  return {
-    ok: false,
-    message: `Detected ${packageManager.source}; automatic ${gateId} setup currently supports npm projects only. Recipe: add package.json script "${scriptName}": "${scriptCommand}", then rerun "review setup --enable ${gateId}".${managerNote}`,
-  };
-}
-
-function packageManagerDependencyInstallCommand(id: PackageManagerId, packages: string[]): string | null {
-  const packageList = packages.join(' ');
-  if (id === 'pnpm') return `pnpm add -D ${packageList}`;
-  if (id === 'yarn') return `yarn add -D ${packageList}`;
-  if (id === 'bun') return `bun add -d ${packageList}`;
-  return null;
-}
-
-function packageManagerScriptCommand(id: PackageManagerId, gateId: string): string | null {
-  if (gateId !== 'dependency-audit') return null;
-  if (id === 'pnpm') return 'pnpm audit';
-  if (id === 'yarn') return 'yarn npm audit';
-  if (id === 'bun') return 'bun audit';
-  return null;
-}
-
-function hasNpmAuditLockfile(repoRoot: string): boolean {
-  return existsSync(path.join(repoRoot, 'package-lock.json'))
-    || existsSync(path.join(repoRoot, 'npm-shrinkwrap.json'));
-}
-
-function missingNpmAuditLockfileRecipe(gateId: string, scriptName: string): ReviewGateInstallResult {
-  return {
-    ok: false,
-    message: `No npm lockfile found; automatic ${gateId} setup uses npm audit, which requires package-lock.json or npm-shrinkwrap.json. Recipe: run "npm install --package-lock-only", add package.json script "${scriptName}": "${defaultPackageScriptForCommandGate(gateId, scriptName)}", then rerun "review setup --enable ${gateId}".`,
-  };
-}
-
-function patchPackageJsonScript(repoRoot: string, scriptName: string, command: string): ReviewGateInstallResult {
-  const packageJsonPath = path.join(repoRoot, 'package.json');
-  if (!existsSync(packageJsonPath)) {
-    return { ok: false, message: `No package.json found at ${packageJsonPath}.` };
-  }
-
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as Record<string, unknown>;
-  } catch (error) {
-    return {
-      ok: false,
-      message: `Could not parse ${packageJsonPath}: ${error instanceof Error ? error.message : String(error)}`,
-    };
-  }
-
-  const scripts = parsed.scripts && typeof parsed.scripts === 'object' && !Array.isArray(parsed.scripts)
-    ? parsed.scripts as Record<string, unknown>
-    : {};
-  const existing = scripts[scriptName];
-  if (typeof existing === 'string' && existing.trim().length > 0) {
-    return { ok: true, message: `${scriptName} already exists in package.json.` };
-  }
-
-  parsed.scripts = {
-    ...scripts,
-    [scriptName]: command,
-  };
-  writeJsonFileAtomic(packageJsonPath, parsed);
-  return { ok: true, message: `Added package.json script "${scriptName}": ${command}` };
-}
-
-function writeJsonFileAtomic(filePath: string, value: unknown): void {
-  const tmpPath = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.${Date.now()}.tmp`);
-  try {
-    writeFileSync(tmpPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-    renameSync(tmpPath, filePath);
-  } catch (error) {
-    rmSync(tmpPath, { force: true });
-    throw error;
-  }
-}
-
-function installNpmDevDependencies(
-  repoRoot: string,
-  packages: string[],
-  gateId: string,
-  scriptName: string,
-): ReviewGateInstallResult {
-  const preflight = preflightNpmDevDependencyInstall(repoRoot, packages, gateId, scriptName);
-  if (!preflight.ok) return preflight;
-
-  const result = spawnSync('npm', ['install', '--save-dev', '--ignore-scripts', ...packages], {
+  const result = spawnSync('npm', ['install', '--prefix', toolRoot, '--no-save', packageName], {
     cwd: repoRoot,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -1718,16 +1518,29 @@ function installNpmDevDependencies(
   if (timedOut) {
     return {
       ok: false,
-      message: `Could not install ${packages.join(', ')}: npm install timed out after ${reviewSetupNpmInstallTimeoutMs()}ms.`,
+      message: `Could not install ${packageName}: npm install timed out after ${reviewSetupNpmInstallTimeoutMs()}ms.`,
     };
   }
   if (result.status !== 0) {
     return {
       ok: false,
-      message: `Could not install ${packages.join(', ')}: ${tail(redactReviewOutput(`${result.stderr ?? ''}\n${result.stdout ?? ''}`)) || `npm exited ${result.status}`}`,
+      message: `Could not install ${packageName}: ${tail(redactReviewOutput(`${result.stderr ?? ''}\n${result.stdout ?? ''}`)) || `npm exited ${result.status}`}`,
     };
   }
-  return { ok: true, message: `Installed ${packages.join(', ')}.` };
+  return { ok: true, message: `Installed ${packageName}.` };
+}
+
+function machineLocalReviewToolRoot(repoRoot: string, toolName: string): string {
+  return path.join(resolveMachineRepoDir(repoRoot), 'tools', toolName);
+}
+
+function machineLocalGitleaksBinPath(repoRoot: string): string {
+  return path.join(machineLocalReviewToolRoot(repoRoot, 'gitleaks'), 'node_modules', '.bin', process.platform === 'win32' ? 'gitleaks.cmd' : 'gitleaks');
+}
+
+function shellQuote(value: string): string {
+  if (/^[A-Za-z0-9_/:=.,@%+-]+$/.test(value)) return value;
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 function reviewSetupNpmInstallTimeoutMs(): number {
@@ -1737,169 +1550,6 @@ function reviewSetupNpmInstallTimeoutMs(): number {
   return Number.isSafeInteger(parsed) && parsed > 0
     ? parsed
     : DEFAULT_REVIEW_SETUP_NPM_INSTALL_TIMEOUT_MS;
-}
-
-function usesTypeScript(repoRoot: string): boolean {
-  if (existsSync(path.join(repoRoot, 'tsconfig.json')) || existsSync(path.join(repoRoot, 'tsconfig.build.json'))) {
-    return true;
-  }
-  return containsFileWithExtension(repoRoot, '.ts') || containsFileWithExtension(repoRoot, '.tsx');
-}
-
-function containsFileWithExtension(root: string, extension: string): boolean {
-  const ignored = new Set(['.git', 'node_modules', 'dist', 'build', 'coverage']);
-  try {
-    for (const entry of readdirSync(root, { withFileTypes: true })) {
-      if (ignored.has(entry.name)) continue;
-      const fullPath = path.join(root, entry.name);
-      if (entry.isFile() && entry.name.endsWith(extension)) return true;
-      if (entry.isDirectory() && containsFileWithExtension(fullPath, extension)) return true;
-    }
-  } catch {
-    return false;
-  }
-  return false;
-}
-
-function defaultEslintConfigSafety(repoRoot: string): ReviewGateInstallResult {
-  if (hasExistingFlatEslintConfig(repoRoot)) {
-    return { ok: true, message: 'ESLint flat config already exists.' };
-  }
-
-  if (hasLegacyEslintConfig(repoRoot)) {
-    return {
-      ok: false,
-      message: 'Could not safely use the existing legacy ESLint config with a generic ESLint 9 install. Recipe: add an ESLint flat config and package.json script "lint", or install the ESLint version your legacy config expects, then rerun "review setup --enable lint".',
-    };
-  }
-
-  const blockers = defaultEslintConfigBlockers(repoRoot);
-  if (blockers.length === 0) {
-    return { ok: true, message: 'Default ESLint config can be created.' };
-  }
-
-  return {
-    ok: false,
-    message: `Could not safely create a generic ESLint config because this repo looks project-specific (${blockers.join(', ')}). Recipe: add a project-specific ESLint config and package.json script "lint", then rerun "review setup --enable lint".`,
-  };
-}
-
-function hasExistingEslintConfig(repoRoot: string): boolean {
-  return hasExistingFlatEslintConfig(repoRoot) || hasLegacyEslintConfig(repoRoot);
-}
-
-function hasExistingFlatEslintConfig(repoRoot: string): boolean {
-  const configNames = [
-    'eslint.config.js',
-    'eslint.config.mjs',
-    'eslint.config.cjs',
-    'eslint.config.ts',
-    'eslint.config.mts',
-    'eslint.config.cts',
-  ];
-  return configNames.some((name) => existsSync(path.join(repoRoot, name)));
-}
-
-function hasLegacyEslintConfig(repoRoot: string): boolean {
-  const configNames = [
-    '.eslintrc',
-    '.eslintrc.json',
-    '.eslintrc.js',
-    '.eslintrc.cjs',
-    '.eslintrc.yaml',
-    '.eslintrc.yml',
-  ];
-  if (configNames.some((name) => existsSync(path.join(repoRoot, name)))) {
-    return true;
-  }
-  const packageJson = readPackageJsonObject(repoRoot);
-  return Boolean(packageJson?.eslintConfig && typeof packageJson.eslintConfig === 'object');
-}
-
-function defaultEslintConfigBlockers(repoRoot: string): string[] {
-  const blockers: string[] = [];
-  const packageJson = readPackageJsonObject(repoRoot);
-  if (packageJson?.workspaces) {
-    blockers.push('package.json workspaces');
-  }
-
-  const markerFiles = [
-    'next.config.js',
-    'next.config.mjs',
-    'next.config.ts',
-    'vite.config.js',
-    'vite.config.mjs',
-    'vite.config.ts',
-    'vue.config.js',
-    'svelte.config.js',
-    'svelte.config.ts',
-    'astro.config.js',
-    'astro.config.mjs',
-    'astro.config.ts',
-    'nuxt.config.js',
-    'nuxt.config.ts',
-    'remix.config.js',
-    'angular.json',
-    'pnpm-workspace.yaml',
-    'lerna.json',
-    'turbo.json',
-    'nx.json',
-  ];
-  for (const marker of markerFiles) {
-    if (existsSync(path.join(repoRoot, marker))) blockers.push(marker);
-  }
-
-  for (const workspaceDir of ['apps', 'packages']) {
-    try {
-      if (statSync(path.join(repoRoot, workspaceDir)).isDirectory()) blockers.push(`${workspaceDir}/`);
-    } catch {
-      // Missing workspace marker directories are fine.
-    }
-  }
-
-  const dependencyNames = packageDependencyNames(packageJson);
-  const frameworkDeps = [
-    '@angular/core',
-    '@remix-run/react',
-    'astro',
-    'next',
-    'nuxt',
-    'react',
-    'react-dom',
-    'svelte',
-    'vite',
-    'vue',
-  ];
-  for (const dependency of frameworkDeps) {
-    if (dependencyNames.has(dependency)) blockers.push(`dependency ${dependency}`);
-  }
-
-  return [...new Set(blockers)];
-}
-
-function packageDependencyNames(packageJson: Record<string, unknown> | null): Set<string> {
-  const names = new Set<string>();
-  for (const key of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
-    const dependencies = packageJson?.[key];
-    if (!dependencies || typeof dependencies !== 'object' || Array.isArray(dependencies)) continue;
-    for (const dependencyName of Object.keys(dependencies)) {
-      names.add(dependencyName);
-    }
-  }
-  return names;
-}
-
-function writeDefaultEslintConfig(repoRoot: string, includeTypeScript: boolean): ReviewGateInstallResult {
-  if (hasExistingEslintConfig(repoRoot)) {
-    return { ok: true, message: 'ESLint config already exists.' };
-  }
-
-  const configPath = path.join(repoRoot, 'eslint.config.mjs');
-  const body = includeTypeScript
-    ? `import js from '@eslint/js';\nimport globals from 'globals';\nimport tseslint from 'typescript-eslint';\n\nexport default [\n  { ignores: ['dist/**', 'build/**', 'coverage/**', 'node_modules/**'] },\n  js.configs.recommended,\n  ...tseslint.configs.recommended,\n  {\n    languageOptions: {\n      globals: {\n        ...globals.browser,\n        ...globals.node,\n      },\n    },\n  },\n];\n`
-    : `import js from '@eslint/js';\nimport globals from 'globals';\n\nexport default [\n  { ignores: ['dist/**', 'build/**', 'coverage/**', 'node_modules/**'] },\n  js.configs.recommended,\n  {\n    languageOptions: {\n      globals: {\n        ...globals.browser,\n        ...globals.node,\n      },\n    },\n  },\n];\n`;
-  writeFileSync(configPath, body, 'utf8');
-  return { ok: true, message: `Created ${path.relative(repoRoot, configPath)}.` };
 }
 
 function installCodexClaudeReviewBridge(codexHome: string): ReviewGateInstallResult {
@@ -2575,10 +2225,13 @@ function selectReviewGatesForRun(options: {
 }
 
 function orderReviewGates(gates: ReviewGateConfig[]): ReviewGateConfig[] {
-  return [...gates].sort((left, right) => {
-    const phaseDelta = REVIEW_PHASE_ORDER.indexOf(left.phase) - REVIEW_PHASE_ORDER.indexOf(right.phase);
-    return phaseDelta !== 0 ? phaseDelta : left.id.localeCompare(right.id);
-  });
+  return gates
+    .map((gate, index) => ({ gate, index }))
+    .sort((left, right) => {
+      const phaseDelta = REVIEW_PHASE_ORDER.indexOf(left.gate.phase) - REVIEW_PHASE_ORDER.indexOf(right.gate.phase);
+      return phaseDelta !== 0 ? phaseDelta : left.index - right.index;
+    })
+    .map((entry) => entry.gate);
 }
 
 // C2: review gates execute worker-influenced code (the slice's own `npm test`,
@@ -4206,7 +3859,7 @@ function renderReviewSetupReport(
   const lines = [
     'Pipelane review setup',
     `Status: ${report.status}`,
-    `Config: ${report.configPath ?? 'inferred from defaults/package.json overlay'}`,
+    `Config: ${report.configPath ?? 'inferred from defaults and repo signals'}`,
   ];
 
   if (!report.packageJson.found) {

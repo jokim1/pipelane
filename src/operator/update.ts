@@ -8,15 +8,11 @@ import { stopDashboardForRepo } from '../dashboard/launcher.ts';
 import { installClaudeBootstrapSkill } from './claude-install.ts';
 import { installCodexBootstrapSkill } from './codex-install.ts';
 import {
-  applyAgentsGuidanceMigrationsWithApproval,
-  applyClaudeGuidanceMigrationsWithApproval,
-  applyLessonsMigrationWithApproval,
   detectSetupDrift,
   formatAgentsGuidanceMigrations,
   formatClaudeGuidanceMigrations,
   formatLessonsMigration,
   formatSetupResult,
-  type SetupConsumerRepoResult,
   type SetupDrift,
   setupConsumerRepo,
 } from './docs.ts';
@@ -52,7 +48,7 @@ export interface UpdateResult {
   message: string;
   // Context-aware follow-up: what pipelane:setup would still change on this
   // consumer's disk after the npm install (or right now, for --check). Null
-  // when detection couldn't run (missing .pipelane.json, etc.).
+  // when detection couldn't run (missing machine-local config, etc.).
   followUpSteps: SetupDrift | null;
   // True iff runUpdate actually invoked setupConsumerRepo before returning
   // (inline setup accepted via prompt or --yes).
@@ -349,13 +345,6 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
     }
     writeUpdateOutput(options, `${summary}\n`);
     emitGlobalSurfaceRefreshHint(globalSurfaces, options);
-    if (!options.check) {
-      const appliedGuidanceMigration = await maybeApplyGuidanceMigrationsFromDrift(driftResult.drift, options.yes);
-      const appliedLessonsMigration = await maybeApplyLessonsMigrationFromDrift(driftResult.drift, options.yes);
-      if (appliedGuidanceMigration || appliedLessonsMigration) {
-        driftResult = tryDetectDrift(repoRoot);
-      }
-    }
     emitDriftHint(driftResult, options);
     return {
       status,
@@ -448,25 +437,12 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
     writeUpdateOutput(options, `Stopped existing Pipelane Board (PID ${boardStop.pid}) so the next board start uses the updated package.\n`);
   }
   emitGlobalSurfaceRefreshHint(globalSurfaces, options);
-  if (!driftResult.drift?.needsSetup) {
-    const appliedGuidanceMigration = await maybeApplyGuidanceMigrationsFromDrift(driftResult.drift, options.yes);
-    const appliedLessonsMigration = await maybeApplyLessonsMigrationFromDrift(driftResult.drift, options.yes);
-    if (appliedGuidanceMigration || appliedLessonsMigration) {
-      driftResult = tryDetectDrift(repoRoot);
-    }
-  }
   emitDriftHint(driftResult, options);
 
   let ranSetup = false;
   const drift = driftResult.drift;
   if (drift?.needsSetup && drift.claude.collisions.length === 0) {
-    const setupResult = await maybeApplyLessonsMigrationFromSetupResult(
-      await maybeApplyGuidanceMigrationsFromSetupResult(
-        setupConsumerRepo(repoRoot),
-        options.yes,
-      ),
-      options.yes,
-    );
+    const setupResult = setupConsumerRepo(repoRoot);
     writeUpdateOutput(options, '\n' + formatSetupResult(setupResult).join('\n') + '\n');
     emitReopenHints(drift, options);
     ranSetup = true;
@@ -677,7 +653,7 @@ function writeAutoUpdateCache(repoRoot: string, status: UpdateStatus): void {
 
 interface DriftResult {
   drift: SetupDrift | null;
-  // Set when detection couldn't run (no .pipelane.json, etc.). Non-JSON
+  // Set when detection couldn't run (no machine-local config, etc.). Non-JSON
   // callers surface it; JSON mode keeps the channel clean and carries the
   // null via followUpSteps instead.
   error: string | null;
@@ -689,65 +665,6 @@ function tryDetectDrift(repoRoot: string): DriftResult {
   } catch (error) {
     return { drift: null, error: error instanceof Error ? error.message : String(error) };
   }
-}
-
-async function maybeApplyGuidanceMigrationsFromDrift(
-  drift: SetupDrift | null,
-  yes: boolean,
-): Promise<boolean> {
-  const appliedAgents = await applyAgentsGuidanceMigrationsWithApproval(drift?.agentsGuidanceMigrations ?? [], { yes });
-  const appliedClaude = await applyClaudeGuidanceMigrationsWithApproval(drift?.claudeGuidanceMigrations ?? [], { yes });
-  return appliedAgents.length > 0 || appliedClaude.length > 0;
-}
-
-// Mirror of the AGENTS guidance migration above for the Lessons block, so the
-// up-to-date update path (which never runs full setup) still backfills/refreshes
-// the CLAUDE.md Lessons block with approval instead of only nagging about it.
-async function maybeApplyLessonsMigrationFromDrift(
-  drift: SetupDrift | null,
-  yes: boolean,
-): Promise<boolean> {
-  const applied = await applyLessonsMigrationWithApproval(drift?.lessonsMigration ?? null, { yes });
-  return applied !== null;
-}
-
-async function maybeApplyGuidanceMigrationsFromSetupResult(
-  result: SetupConsumerRepoResult,
-  yes: boolean,
-): Promise<SetupConsumerRepoResult> {
-  const appliedAgents = await applyAgentsGuidanceMigrationsWithApproval(result.agentsGuidanceMigrations, { yes });
-  const appliedClaude = await applyClaudeGuidanceMigrationsWithApproval(result.claudeGuidanceMigrations, { yes });
-  if (appliedAgents.length === 0 && appliedClaude.length === 0) {
-    return result;
-  }
-  return {
-    ...result,
-    agentsGuidanceMigrations: appliedAgents.length > 0 ? [] : result.agentsGuidanceMigrations,
-    appliedAgentsGuidanceMigrations: [
-      ...result.appliedAgentsGuidanceMigrations,
-      ...appliedAgents,
-    ],
-    claudeGuidanceMigrations: appliedClaude.length > 0 ? [] : result.claudeGuidanceMigrations,
-    appliedClaudeGuidanceMigrations: [
-      ...result.appliedClaudeGuidanceMigrations,
-      ...appliedClaude,
-    ],
-  };
-}
-
-async function maybeApplyLessonsMigrationFromSetupResult(
-  result: SetupConsumerRepoResult,
-  yes: boolean,
-): Promise<SetupConsumerRepoResult> {
-  const applied = await applyLessonsMigrationWithApproval(result.lessonsMigration, { yes });
-  if (!applied) {
-    return result;
-  }
-  return {
-    ...result,
-    lessonsMigration: null,
-    appliedLessonsMigration: applied,
-  };
 }
 
 function skippedGlobalSurfaces(reason: string): GlobalSurfaceRefresh {
@@ -990,7 +907,7 @@ export function formatFollowUpSummary(drift: SetupDrift): string {
     return [
       'Setup cannot run — collision with existing non-pipelane files:',
       ...drift.claude.collisions.map((file) => `  - .claude/commands/${file}`),
-      'Resolve these manually (rename, remove, or change the alias in .pipelane.json), then rerun `pipelane update`.',
+      'Resolve these manually (rename, remove, or change the alias in machine-local Pipelane config), then rerun `pipelane update`.',
     ].join('\n');
   }
   lines.push('  1. Run setup to apply template changes:');

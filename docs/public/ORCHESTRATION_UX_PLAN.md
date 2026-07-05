@@ -865,7 +865,8 @@ the no-subcommand entry point.
 
 ### Migration And Compatibility
 
-- Existing `.pipelane.json` review-gate configs remain valid.
+- Existing `.pipelane.json` review-gate configs are legacy inputs and should be
+  migrated to machine-local config.
 - Existing orchestration ledgers without human decision or reviewer identity
   fields load with empty/default fields and a `legacy` evidence label.
 - Existing low-level orchestration commands keep their CLI contracts.
@@ -1113,7 +1114,7 @@ they want the advanced/manual path.
 
 ## Assumptions
 
-- `.pipelane.json` remains the durable repo config for review gates.
+- Machine-local Pipelane config is the durable config for review gates.
 - The existing orchestration ledger remains the durable run memory.
 - The current host provider is the default implementation provider.
 - Cross-provider implementation and review are optional enhancements, not a

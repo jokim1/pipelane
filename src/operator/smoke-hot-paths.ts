@@ -434,163 +434,10 @@ export function generateSmokeHotPathTests(options: {
   scenarios: PlannedSmokeScenario[];
   registry: SmokeRegistryState;
 }): GenerateSmokeHotPathResult {
-  const adapter = pickGeneratorAdapter(options.analysis);
-  const warnings: string[] = [];
-  if (!adapter) {
-    return { changed: false, generated: [], warnings };
-  }
-
-  const relativePath = resolveGeneratedSmokePath(options.repoRoot, adapter);
-  const scenarios = options.scenarios.filter((scenario) => isRunnableGeneratedScenario(scenario, relativePath));
-  if (scenarios.length === 0) {
-    return { changed: false, generated: [], adapter, warnings };
-  }
-
-  const absolutePath = path.join(options.repoRoot, relativePath);
-  const existing = existsSync(absolutePath) ? readFileSync(absolutePath, 'utf8') : generatedSmokeFilePreamble(adapter);
-  let contents = upsertGeneratedSmokeRegion(existing, 'support', renderGeneratedSmokeSupport(adapter));
-  const generated: string[] = [];
-  let registryChanged = false;
-
-  for (const scenario of scenarios) {
-    const marker = scenario.id.replace(/^@smoke-/, '').replace(/[^a-z0-9-]+/g, '-');
-    contents = upsertGeneratedSmokeRegion(contents.contents, marker, renderGeneratedSmokeScenario(adapter, scenario));
-    const entry = options.registry.checks[scenario.id];
-    if (!entry) continue;
-    const nextLifecycle = lifecycleRank(entry.lifecycle ?? 'suggested') >= lifecycleRank('generated')
-      ? entry.lifecycle
-      : 'generated';
-    const nextEntry: SmokeRegistryEntry = {
-      ...entry,
-      lifecycle: nextLifecycle,
-      sourceTests: mergeSorted(entry.sourceTests ?? [], [relativePath]),
-      generated: {
-        ...(entry.generated ?? {}),
-        path: relativePath,
-        marker,
-        adapter,
-        status: entry.generated?.status === 'passed' ? 'passed' : 'unverified',
-      },
-    };
-    if (JSON.stringify(stableComparable(entry)) !== JSON.stringify(stableComparable(nextEntry))) {
-      registryChanged = true;
-    }
-    options.registry.checks[scenario.id] = nextEntry;
-    generated.push(scenario.id);
-  }
-
-  mkdirSync(path.dirname(absolutePath), { recursive: true });
-  const fileChanged = !existsSync(absolutePath) || readFileSync(absolutePath, 'utf8') !== contents.contents;
-  if (fileChanged) {
-    writeFileSync(absolutePath, contents.contents, 'utf8');
-  }
-  return { changed: fileChanged || registryChanged, generated, path: relativePath, adapter, warnings };
-}
-
-function pickGeneratorAdapter(analysis: SmokeRepoAnalysis): 'playwright' | 'cypress' | null {
-  if (analysis.supportedRunners.includes('playwright')) return 'playwright';
-  if (analysis.supportedRunners.includes('cypress')) return 'cypress';
-  return null;
-}
-
-function isRunnableGeneratedScenario(scenario: PlannedSmokeScenario, generatedPath: string): boolean {
-  // V1 only generates flows that can be tested without inventing selectors,
-  // test data, credentials, or app-specific assertions. Other scenarios remain
-  // registry-backed stubs until AI/user feedback provides concrete flows.
-  if (scenario.id !== '@smoke-app-shell') return false;
-  if (scenario.provenance.source !== 'discovered-tag') return true;
-  return scenario.sourceTests.every((sourceTest) => toPosix(sourceTest) === generatedPath);
-}
-
-function resolveGeneratedSmokePath(repoRoot: string, adapter: 'playwright' | 'cypress'): string {
-  if (adapter === 'cypress') {
-    return toPosix(path.join('cypress', 'e2e', 'pipelane-smoke.generated.cy.js'));
-  }
-  if (existsSync(path.join(repoRoot, 'e2e'))) {
-    return toPosix(path.join('e2e', 'pipelane-smoke.generated.spec.ts'));
-  }
-  return toPosix(path.join('tests', 'pipelane-smoke.generated.spec.ts'));
-}
-
-function generatedSmokeFilePreamble(adapter: 'playwright' | 'cypress'): string {
-  const label = adapter === 'playwright' ? 'Playwright' : 'Cypress';
-  return [
-    `/* Pipelane generated ${label} smoke tests.`,
-    ' * User edits outside pipelane:smoke marker regions are preserved.',
-    ' */',
-    '',
-  ].join('\n');
-}
-
-function renderGeneratedSmokeSupport(adapter: 'playwright' | 'cypress'): string {
-  if (adapter === 'cypress') {
-    return [
-      'const pipelaneSmokeChecks = new Map();',
-      '',
-      'function pipelaneSmokeBaseUrl() {',
-      "  return Cypress.env('PIPELANE_SMOKE_BASE_URL') || 'http://127.0.0.1:4173';",
-      '}',
-      '',
-      'function markPipelaneSmokeCheck(tag, status) {',
-      '  pipelaneSmokeChecks.set(tag, status);',
-      '}',
-      '',
-      'after(() => {',
-      "  const resultsPath = Cypress.env('PIPELANE_SMOKE_RESULTS_PATH');",
-      '  if (!resultsPath) return;',
-      '  const checks = Array.from(pipelaneSmokeChecks.entries()).map(([tag, status]) => ({ tag, status }));',
-      '  cy.writeFile(resultsPath, JSON.stringify({ schemaVersion: 1, checks }, null, 2));',
-      '});',
-    ].join('\n');
-  }
-  return [
-    "import { test, expect } from '@playwright/test';",
-    "import { writeFileSync } from 'node:fs';",
-    '',
-    "type SmokeStatus = 'passed' | 'failed';",
-    'const pipelaneSmokeChecks = new Map<string, SmokeStatus>();',
-    "const pipelaneSmokeBaseUrl = process.env.PIPELANE_SMOKE_BASE_URL || 'http://127.0.0.1:4173';",
-    '',
-    'async function recordPipelaneSmokeCheck(tag: string, body: () => Promise<void>): Promise<void> {',
-    "  pipelaneSmokeChecks.set(tag, 'failed');",
-    '  try {',
-    '    await body();',
-    "    pipelaneSmokeChecks.set(tag, 'passed');",
-    '  } catch (error) {',
-    "    pipelaneSmokeChecks.set(tag, 'failed');",
-    '    throw error;',
-    '  }',
-    '}',
-    '',
-    'test.afterAll(() => {',
-    '  const resultsPath = process.env.PIPELANE_SMOKE_RESULTS_PATH;',
-    '  if (!resultsPath) return;',
-    '  const checks = Array.from(pipelaneSmokeChecks.entries()).map(([tag, status]) => ({ tag, status }));',
-    '  writeFileSync(resultsPath, JSON.stringify({ schemaVersion: 1, checks }, null, 2));',
-    '});',
-  ].join('\n');
-}
-
-function renderGeneratedSmokeScenario(adapter: 'playwright' | 'cypress', scenario: PlannedSmokeScenario): string {
-  const title = `${scenario.id} ${scenario.title}`;
-  if (adapter === 'cypress') {
-    return [
-      `it(${jsString(title)}, () => {`,
-      `  markPipelaneSmokeCheck(${jsString(scenario.id)}, 'failed');`,
-      '  cy.visit(pipelaneSmokeBaseUrl());',
-      "  cy.get('body').should('be.visible');",
-      `  cy.then(() => markPipelaneSmokeCheck(${jsString(scenario.id)}, 'passed'));`,
-      '});',
-    ].join('\n');
-  }
-  return [
-    `test(${jsString(title)}, async ({ page }) => {`,
-    `  await recordPipelaneSmokeCheck(${jsString(scenario.id)}, async () => {`,
-    '    await page.goto(pipelaneSmokeBaseUrl, { waitUntil: \'domcontentloaded\' });',
-    "    await expect(page.locator('body')).toBeVisible();",
-    '  });',
-    '});',
-  ].join('\n');
+  // Repo-free setup: hot paths stay in the machine-local registry; Pipelane
+  // no longer writes generated test files into the application repo.
+  void options;
+  return { changed: false, generated: [], warnings: [] };
 }
 
 export function verifySmokeSetupCommand(options: {
@@ -1322,10 +1169,6 @@ function hashText(value: string): string {
     hash = ((hash << 5) - hash + value.charCodeAt(index)) | 0;
   }
   return Math.abs(hash).toString(16);
-}
-
-function jsString(value: string): string {
-  return JSON.stringify(value);
 }
 
 function toPosix(value: string): string {

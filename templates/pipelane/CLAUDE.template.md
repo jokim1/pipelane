@@ -22,7 +22,7 @@ This file is local-only operator state. Keep it git-ignored.
 - Use `{{ALIAS_RESUME}} --task "<task-name>"` only when returning to an existing task workspace.
 - Use `{{ALIAS_STATUS}}` to see the cockpit before acting.
 - Use `{{ALIAS_DOCTOR}}` to diagnose deploy config and probe staging health. Run `{{ALIAS_DOCTOR}} --probe` after a staging deploy to refresh the release gate's freshness check.
-- If `.pipelane.json` aliases change, rerun setup and reopen Claude/Codex so the new command names appear.
+- If aliases change, rerun setup and reopen Claude/Codex so the new command names appear.
 - `{{DEPLOY_WORKFLOW_NAME}}` is the canonical deploy workflow label for this repo.
 
 {{LOCAL_CLAUDE_WORKSPACE_POLICY}}
@@ -51,5 +51,3 @@ Key routing rules:
 - Refresh repo guidance -> `/fix refresh-guidance`
 
 {{LESSONS_SECTION}}
-
-{{DEPLOY_CONFIG_SECTION}}

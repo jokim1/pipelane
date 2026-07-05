@@ -172,7 +172,7 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
         ...denyHits.map(({ path: denyPath, pattern }) => `- ${denyPath} (matched ${pattern})`),
         'These look like secrets or agent-local config. Either gitignore them,',
         'or override on a per-path basis with --force-include <path>.',
-        'Edit .pipelane.json:prPathDenyList to adjust globally.',
+        'Edit machine-local Pipelane config prPathDenyList to adjust globally.',
       ].join('\n'));
     }
 
