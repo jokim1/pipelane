@@ -1,7 +1,7 @@
 import {
   buildDestinationPlanForCommand,
   destinationPlanFingerprintDigest,
-  type DestinationPlan,
+  isSingleExecutableBuildModeDeployMergeRoute,
   printDestinationPlan,
   shouldInterceptDestinationPlan,
 } from '../destination-planner.ts';
@@ -43,7 +43,7 @@ export async function maybeHandleDestinationCommand(cwd: string, parsed: ParsedO
     printDestinationPlan(parsed.flags, plan);
     return true;
   }
-  const autoRunSingleStepRoute = shouldAutoRunSingleStepRoute(plan, parsed);
+  const autoRunSingleStepRoute = isSingleExecutableBuildModeDeployMergeRoute(plan, parsed);
   if (!parsed.flags.yes && !autoRunSingleStepRoute && !process.stdin.isTTY) {
     printDestinationPlan(parsed.flags, {
       ...plan,
@@ -96,12 +96,4 @@ export async function maybeHandleDestinationCommand(cwd: string, parsed: ParsedO
     });
   }
   return true;
-}
-
-function shouldAutoRunSingleStepRoute(plan: DestinationPlan, parsed: ParsedOperatorArgs): boolean {
-  if (parsed.command !== 'deploy' || plan.mode !== 'build' || plan.target !== 'merged') {
-    return false;
-  }
-  const executableSteps = plan.remainingSteps.filter((step) => step.id !== 'review_gate');
-  return executableSteps.length === 1 && executableSteps[0]?.id === 'merge';
 }

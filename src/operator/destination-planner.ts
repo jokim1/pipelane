@@ -465,11 +465,26 @@ function sortDestinationFingerprintValue(value: unknown): unknown {
 
 export function shouldInterceptDestinationPlan(plan: DestinationPlan, parsed: ParsedOperatorArgs): boolean {
   if (parsed.flags.plan || parsed.flags.yes) return true;
-  if (parsed.command === 'deploy' && plan.mode === 'build' && plan.target === 'merged') return true;
-  const executableSteps = plan.remainingSteps.filter((step) => step.id !== 'review_gate');
+  if (isBuildModeDeployMergeRoute(plan, parsed)) return true;
+  const executableSteps = executableDestinationSteps(plan);
   if (hasAutomaticDestinationJump(plan.target, parsed, executableSteps)) return true;
   if (parsed.flags.json) return false;
   return false;
+}
+
+export function executableDestinationSteps(plan: DestinationPlan): DestinationStep[] {
+  return plan.remainingSteps.filter((step) => step.id !== 'review_gate');
+}
+
+export function isBuildModeDeployMergeRoute(plan: DestinationPlan, parsed: ParsedOperatorArgs): boolean {
+  return parsed.command === 'deploy' && plan.mode === 'build' && plan.target === 'merged';
+}
+
+export function isSingleExecutableBuildModeDeployMergeRoute(plan: DestinationPlan, parsed: ParsedOperatorArgs): boolean {
+  const executableSteps = executableDestinationSteps(plan);
+  return isBuildModeDeployMergeRoute(plan, parsed)
+    && executableSteps.length === 1
+    && executableSteps[0]?.id === 'merge';
 }
 
 function hasAutomaticDestinationJump(target: DestinationMilestone, parsed: ParsedOperatorArgs, executableSteps: DestinationStep[]): boolean {
