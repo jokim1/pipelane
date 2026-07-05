@@ -9,17 +9,20 @@ import { buildDefaultReviewGatesConfig } from './review-gates.ts';
 
 export type Mode = 'build' | 'release';
 export type KnownSurface = 'frontend' | 'edge' | 'sql';
-export const WORKFLOW_COMMANDS = ['devmode', 'new', 'resume', 'repo-guard', 'pr', 'merge', 'deploy', 'smoke', 'clean', 'status', 'doctor', 'rollback'] as const;
+export const WORKFLOW_COMMANDS = ['devmode', 'new', 'adopt', 'resume', 'repo-guard', 'pr', 'merge', 'release', 'release-check', 'deploy', 'smoke', 'clean', 'status', 'doctor', 'rollback'] as const;
 export type WorkflowCommand = (typeof WORKFLOW_COMMANDS)[number];
-export const MANAGED_WORKFLOW_COMMANDS = ['devmode', 'new', 'resume', 'repo-guard', 'pr', 'merge', 'deploy', 'clean', 'status', 'doctor', 'rollback'] as const;
+export const MANAGED_WORKFLOW_COMMANDS = ['devmode', 'new', 'adopt', 'resume', 'repo-guard', 'pr', 'merge', 'release', 'deploy', 'clean', 'status', 'doctor', 'rollback'] as const;
 export type ManagedWorkflowCommand = (typeof MANAGED_WORKFLOW_COMMANDS)[number];
 export const DEFAULT_WORKFLOW_ALIASES: Record<WorkflowCommand, string> = {
   devmode: '/devmode',
   new: '/new',
+  adopt: '/adopt',
   resume: '/resume',
   'repo-guard': '/repo-guard',
   pr: '/pr',
   merge: '/merge',
+  release: '/release',
+  'release-check': '/release-check',
   deploy: '/deploy',
   smoke: '/smoke',
   clean: '/clean',
@@ -3759,6 +3762,10 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         throw new Error('new cannot combine --task and --unnamed; provide a task name or explicitly request a generated slug.');
       }
       return;
+    case 'adopt':
+      assertOnlyFlags(parsed, ['task', 'branch', 'surfaces', 'force']);
+      requireNoPositional('pipelane run adopt [--task <task-name>] [--branch <branch>] [--surfaces <csv>] [--force]');
+      return;
     case 'resume':
       assertOnlyFlags(parsed, ['task', 'oneMoreLoop', 'moreLoops', 'moreMinutes', 'untilReviewPasses', 'maxMoreLoops', 'maxMoreMinutes', 'acceptFindings']);
       requireNoPositional('pipelane run resume [--task <task-name>] [--one-more-loop | --more-loops <n> --more-minutes <n> | --until-review-passes --max-more-loops <n> --max-more-minutes <n> | --accept-findings]');
@@ -3786,6 +3793,39 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       assertOnlyFlags(parsed, ['surfaces']);
       requireNoPositional('pipelane run release-check [--surfaces <csv>]');
       return;
+    case 'release': {
+      const subcommand = parsed.positional[0] ?? 'status';
+      if (subcommand === 'status') {
+        assertOnlyFlags(parsed, ['surfaces']);
+        if (parsed.positional.length > 1) failUnexpected('pipelane run release status [--surfaces <csv>]');
+        return;
+      }
+      if (subcommand === 'enable') {
+        assertOnlyFlags(parsed, []);
+        if (parsed.positional.length > 1) failUnexpected('pipelane run release enable');
+        return;
+      }
+      if (subcommand === 'doctor') {
+        assertOnlyFlags(parsed, ['apply']);
+        if (parsed.positional.length > 2) failUnexpected('pipelane run release doctor [diagnose|probe|fix|check-guard|--diagnose|--probe|--fix|--check-guard]');
+        const mode = parsed.positional[1];
+        if (
+          mode
+          && mode !== 'diagnose'
+          && mode !== 'probe'
+          && mode !== 'fix'
+          && mode !== 'check-guard'
+          && mode !== '--diagnose'
+          && mode !== '--probe'
+          && mode !== '--fix'
+          && mode !== '--check-guard'
+        ) {
+          throw new Error(`Unknown release doctor mode "${mode}". Supported modes: diagnose, probe, fix, check-guard.`);
+        }
+        return;
+      }
+      throw new Error('release requires one of: status, enable, doctor.');
+    }
     case 'task-lock':
       assertOnlyFlags(parsed, ['task', 'mode']);
       if (parsed.positional.length !== 1 || parsed.positional[0] !== 'verify') {

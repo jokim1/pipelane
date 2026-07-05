@@ -31,6 +31,7 @@ const LOCAL_PIPELANE_INSTALL_SPEC = `file:${KIT_ROOT}`;
 const DEFAULT_ORCHESTRATION_STATE_KEY = 'pipelane-test-orchestration-state-key-0001';
 const PIPELANE_PREINSTALL_GUARD_SCRIPT = `node -e "const p='./node_modules/pipelane/scripts/preinstall-guard.cjs';require('fs').existsSync(p)&&require(p)"`;
 const GENERATED_CLAUDE_COMMANDS = [
+  'adopt',
   'clean',
   'deploy',
   'devmode',
@@ -40,6 +41,7 @@ const GENERATED_CLAUDE_COMMANDS = [
   'new',
   'pipelane',
   'pr',
+  'release',
   'repo-guard',
   'resume',
   'rollback',
@@ -417,10 +419,13 @@ function writePipelaneConfig(repoRoot, displayName = 'Demo App', patch = {}) {
     aliases: {
       devmode: '/devmode',
       new: '/new',
+      adopt: '/adopt',
       resume: '/resume',
       'repo-guard': '/repo-guard',
       pr: '/pr',
       merge: '/merge',
+      release: '/release',
+      'release-check': '/release-check',
       deploy: '/deploy',
       smoke: '/smoke',
       clean: '/clean',
@@ -3828,10 +3833,12 @@ test('syncDocs.packageScripts: false preserves consumer-customized workflow scri
     const customScripts = {
       build: 'my-build',
       'pipelane:new': 'my-wrapper new',
+      'pipelane:adopt': 'my-wrapper adopt',
       'pipelane:resume': 'my-wrapper resume',
       'pipelane:repo-guard': 'my-wrapper repo-guard',
       'pipelane:pr': 'my-wrapper pr',
       'pipelane:merge': 'my-wrapper merge',
+      'pipelane:release': 'my-wrapper release',
       'pipelane:deploy': 'my-wrapper deploy',
       'pipelane:smoke': 'my-wrapper smoke',
       'pipelane:clean': 'my-wrapper clean',
@@ -5432,6 +5439,57 @@ test('new creates a fresh task workspace and resume restores it', () => {
     assert.equal(duplicate.status, 1);
     assert.match(duplicate.stderr, /already active/);
     assert.match(duplicate.stderr, /\/resume/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('adopt claims an externally-created worktree and resume restores it', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const externalParent = mkdtempSync(path.join(os.tmpdir(), 'pipelane-external-worktree-'));
+  const externalPath = path.join(externalParent, 'external-task');
+
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    commitAll(repoRoot, 'Adopt pipelane');
+    execFileSync('git', ['worktree', 'add', '-b', 'codex/external-task-abcd', externalPath, 'main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const adopted = JSON.parse(runCli(['run', 'adopt', '--json'], externalPath).stdout);
+    assert.equal(adopted.adopted, true);
+    assert.equal(adopted.createdWorktree, false);
+    assert.equal(adopted.resumed, false);
+    assert.equal(adopted.taskSlug, 'external-task');
+    assert.equal(adopted.branch, 'codex/external-task-abcd');
+    assert.equal(realpathSync(adopted.worktreePath), realpathSync(externalPath));
+
+    const resumed = JSON.parse(runCli(['run', 'resume', '--task', 'External Task', '--json'], repoRoot).stdout);
+    assert.equal(resumed.resumed, true);
+    assert.equal(realpathSync(resumed.worktreePath), realpathSync(externalPath));
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', externalPath], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      // Test cleanup should not mask the assertion failure.
+    }
+    rmSync(externalParent, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('adopt blocks a base branch unless force is explicit', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const result = runCli(['run', 'adopt'], repoRoot, {}, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /base branch/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -17854,6 +17912,49 @@ test('release-check fails closed before local CLAUDE is configured', () => {
     assert.equal(result.status, 1);
     assert.equal(output.ready, false);
     assert.deepEqual(output.blockedSurfaces.sort(), ['edge', 'frontend', 'sql']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release status reports missing module without failing nonzero', () => {
+  const repoRoot = createRepo();
+
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    const output = JSON.parse(runCli(['run', 'release', 'status', '--json'], repoRoot).stdout);
+
+    assert.equal(output.enabled, false);
+    assert.equal(output.configured, false);
+    assert.equal(output.ready, false);
+    assert.deepEqual(output.blockedSurfaces.sort(), ['edge', 'frontend', 'sql']);
+    assert.match(output.message, /Release module: not enabled/);
+    assert.match(output.message, /Automation gate: \/release-check/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('release enable scaffolds Deploy Configuration and status reports incomplete values', () => {
+  const repoRoot = createRepo();
+
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    const enabled = JSON.parse(runCli(['run', 'release', 'enable', '--json'], repoRoot).stdout);
+    assert.equal(enabled.enabled, true);
+    assert.equal(enabled.configured, false);
+    assert.equal(existsSync(path.join(repoRoot, 'CLAUDE.md')), true);
+    assert.match(readFileSync(path.join(repoRoot, 'CLAUDE.md'), 'utf8'), /## Deploy Configuration/);
+
+    const status = JSON.parse(runCli(['run', 'release', 'status', '--json'], repoRoot).stdout);
+    assert.equal(status.enabled, true);
+    assert.equal(status.configured, false);
+    assert.equal(status.ready, false);
+    assert.deepEqual(
+      Array.from(new Set(status.configPaths.map((entry) => realpathSync(entry)))),
+      [realpathSync(path.join(repoRoot, 'CLAUDE.md'))],
+    );
+    assert.match(status.message, /Release module: enabled \(missing deploy values\)/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }

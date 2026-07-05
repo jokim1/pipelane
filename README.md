@@ -103,6 +103,7 @@ before production moves:
 /pr
 /merge
 /deploy staging
+/release status
 /deploy prod
 ```
 
@@ -209,10 +210,24 @@ Set up a repo:
 /pipelane web
 ```
 
+Core commands:
+
+| Command | Use it when |
+| --- | --- |
+| `/new` | Start fresh work in a new Pipelane-managed branch and worktree. |
+| `/adopt` | Another model, tool, or human already created the task branch/worktree and Pipelane should track it instead of creating another one. |
+| `/resume` | Return to an existing Pipelane-tracked task workspace. |
+| `/release enable` | Scaffold the optional release module for repos where staging must prove the exact merged SHA before production moves. |
+| `/release status` | Inspect release readiness without failing nonzero. Use this after setup and after staging deploys. |
+| `/release doctor --probe` | Refresh live healthcheck evidence used by release readiness. |
+| `pipelane run release-check` | Automation/CI gate for blocked release readiness; exits nonzero when release is not safe. |
+
 For release-mode deploys, configure deploy targets and health checks:
 
-```bash
+```text
+/release enable
 pipelane configure
+/release status
 ```
 
 Then move work through the normal handoff. In build mode, stop after `/merge`
@@ -225,6 +240,7 @@ continue through staging and production:
 /pr
 /merge
 /deploy staging
+/release status
 /deploy prod
 /pipelane web
 ```

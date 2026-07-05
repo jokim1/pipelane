@@ -36,8 +36,8 @@ The goal is not unlimited autonomy. The goal is auditable autonomy.
 6. produce a ledger of evidence
 7. hand the branch back to existing Pipelane commands
 
-Pipelane still owns `/new`, `/pr`, `/merge`, `/deploy`, `/rollback`, and
-`/clean`.
+Pipelane still owns `/new`, `/adopt`, `/pr`, `/merge`, `/release`, `/deploy`,
+`/rollback`, and `/clean`.
 
 ## `/pipelane review setup`
 

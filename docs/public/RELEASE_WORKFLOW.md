@@ -35,11 +35,13 @@ User-facing slash commands:
 | `/status` | Render the terminal cockpit from the same API as the board. |
 | `/devmode` | Inspect or switch between `build` and `release`. |
 | `/new` | Create a fresh task branch and worktree. The AI can infer the task name, or you can provide one. |
+| `/adopt` | Track an existing task branch/worktree without creating a replacement workspace. |
 | `/resume` | Recover an existing task worktree. |
 | `/repo-guard` | Verify that the checkout is safe for task work. |
 | `/pipelane review` | Run configured review gates and write evidence for the current diff. |
 | `/pr` | Enforce review evidence, run pre-PR checks, commit, push, and open or update a PR. |
 | `/merge` | Merge the PR and record the merged SHA. |
+| `/release` | Enable or inspect the optional release module. |
 | `/deploy` | Deploy the merged SHA to `staging` or `prod`. |
 | `/clean` | Inspect and prune finished or stale task state. |
 | `/doctor` | Diagnose deploy config, probes, and release readiness. |
@@ -57,6 +59,7 @@ safely after merge and same-SHA staging validation is not required.
 ```text
 /devmode build
 /new
+# or: /adopt --task "existing work"
 /pipelane review
 /pr --title "PR title"
 /merge
@@ -79,7 +82,9 @@ merged SHA before production moves.
 
 ```text
 /devmode release
+/release status
 /new
+# or: /adopt --task "existing work"
 /pipelane review
 /pr --title "PR title"
 /merge
@@ -89,8 +94,11 @@ merged SHA before production moves.
 ```
 
 Release mode fails closed when deploy config, staging evidence, or probe health
-is missing. `/doctor` explains what is missing, `/doctor --fix` guides local
-configuration, and `/doctor --probe` refreshes live healthcheck evidence.
+is missing. `/release enable` scaffolds the release module, `/release status`
+explains readiness without failing non-zero, and `/release doctor --probe`
+refreshes live healthcheck evidence. Automation should keep using
+`pipelane run release-check` when blocked readiness must fail a script or CI
+step.
 
 ## Verification Order
 
@@ -114,6 +122,7 @@ See [Orchestration Roadmap](./ORCHESTRATION.md).
 Pipelane is intentionally conservative:
 
 - `/new` creates isolated task worktrees instead of editing the main checkout.
+- `/adopt` claims externally-created worktrees instead of duplicating them.
 - `/pr` runs configured checks before pushing.
 - `/pr` denies common secret/config paths unless explicitly forced.
 - `/merge` records the merged SHA instead of guessing from `origin/main`.
@@ -165,9 +174,11 @@ PR state, release readiness, deploy state, and next safe action.
 Common recovery paths:
 
 - lost task context: `/resume`
+- external branch/worktree already exists: `/adopt`
 - unsafe checkout: `/repo-guard`
-- release blocked: `/doctor`
-- stale probe: `/doctor --probe`
+- release module not enabled: `/release enable`
+- release blocked: `/release status` or `/release doctor`
+- stale probe: `/release doctor --probe`
 - failed review or CI: `/fix`, then `/pr`
 - failed production deploy or regression: `/rollback prod`
 - stale local task metadata: `/clean --status-only`, then scoped cleanup

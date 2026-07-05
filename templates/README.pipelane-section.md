@@ -16,8 +16,9 @@ Start with:
 That prints the build and release journeys for this repo.
 
 For code-changing work, start with `{{ALIAS_NEW}}` before editing and switch to
-the reported task worktree. If `{{ALIAS_NEW}}` fails, do not continue in the
-shared checkout.
+the reported task worktree. If another tool already created the branch or
+worktree, run `{{ALIAS_ADOPT}}` instead so Pipelane can track it. If task
+workspace setup fails, do not continue in the shared checkout.
 
 ### Build Journey
 
@@ -27,6 +28,7 @@ to production and do not need required staging validation for the same SHA.
 ```text
 {{ALIAS_DEVMODE}} build          Use the fast lane.
 {{ALIAS_NEW}}                    Let the AI infer the task name, or provide one if you want.
+{{ALIAS_ADOPT}}                  Track an existing branch/worktree instead of creating another one.
 {{ALIAS_PR}} --title "PR title"  Run pre-PR checks, commit, push, and open or update the PR.
 {{ALIAS_MERGE}}                  Merge the PR and record the merged SHA.
 {{ALIAS_CLEAN}}                  Clean up finished task state after production is verified.
@@ -39,7 +41,9 @@ same merged SHA before production can move.
 
 ```text
 {{ALIAS_DEVMODE}} release        Use the protected lane.
+{{ALIAS_RELEASE}} status         Inspect release module setup and readiness.
 {{ALIAS_NEW}}                    Let the AI infer the task name, or provide one if you want.
+{{ALIAS_ADOPT}}                  Track an existing branch/worktree instead of creating another one.
 {{ALIAS_PR}} --title "PR title"  Run pre-PR checks, commit, push, and open or update the PR.
 {{ALIAS_MERGE}}                  Merge the PR and record the merged SHA.
 {{ALIAS_DEPLOY}} staging         Deploy the merged SHA to staging.
@@ -52,6 +56,8 @@ same merged SHA before production can move.
 ```text
 /pipelane web                    Open the local Pipelane Board.
 {{ALIAS_STATUS}}                 Render the terminal cockpit.
+{{ALIAS_RELEASE}} enable         Scaffold the optional release module.
+{{ALIAS_RELEASE}} doctor --probe Refresh staging healthcheck evidence.
 {{ALIAS_RESUME}}                 Reopen or recover an existing task workspace.
 {{ALIAS_DOCTOR}}                 Diagnose deploy config, probes, and release readiness.
 {{ALIAS_ROLLBACK}} prod          Roll production back to the last verified-good deploy.
@@ -66,9 +72,11 @@ same merged SHA before production can move.
 - `{{ALIAS_STATUS}}`: terminal cockpit from the same API as the board
 - `{{ALIAS_DEVMODE}}`: switch between `build` and `release`
 - `{{ALIAS_NEW}}`: create an isolated task worktree and branch
+- `{{ALIAS_ADOPT}}`: bind an existing branch/worktree to a Pipelane task
 - `{{ALIAS_RESUME}}`: recover an existing task worktree
 - `{{ALIAS_PR}}`: run checks, commit, push, and open or update a PR
 - `{{ALIAS_MERGE}}`: merge the PR and record the merged SHA
+- `{{ALIAS_RELEASE}}`: enable or inspect the optional release module
 - `{{ALIAS_DEPLOY}}`: deploy to `staging` or `prod`
 - `/fix`: make durable root-cause fixes from findings
 - `{{ALIAS_CLEAN}}`: inspect and prune finished or stale task state
@@ -103,7 +111,9 @@ command.
 - Optional raw-npm protection: run `pipelane install-npm-guard`, put
   `~/.pipelane/bin` first in `PATH`, and verify with
   `pipelane run doctor --check-guard`. The guard does not edit shell profiles.
-- Each release operator runs `pipelane configure`, refreshes probes with
-  `{{ALIAS_DOCTOR}} --probe`, and verifies readiness with `{{ALIAS_DEVMODE}} release`.
+- Each release operator runs `{{ALIAS_RELEASE}} enable`, fills values with
+  `pipelane configure`, refreshes probes with `{{ALIAS_RELEASE}} doctor --probe`,
+  and verifies readiness with `{{ALIAS_RELEASE}} status` before switching with
+  `{{ALIAS_DEVMODE}} release`.
 
 Use [docs/RELEASE_WORKFLOW.md](./docs/RELEASE_WORKFLOW.md) for the full operator workflow.

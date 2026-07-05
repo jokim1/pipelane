@@ -18,7 +18,9 @@ follow safely without improvising repo behavior.
 - slash aliases are the operator-facing command surface
 - repo-native scripts are implementation plumbing behind those aliases
 - `{{ALIAS_NEW}}` is the canonical task-start command
+- `{{ALIAS_ADOPT}}` binds external task branches/worktrees without duplicating them
 - `{{ALIAS_RESUME}}` is the recovery command
+- `{{ALIAS_RELEASE}}` is the release-module setup and status command
 - `/fix` is the durable repair loop for bugs, review findings, CI failures, and code-quality repairs
 - `repo-guard` is internal-only
 
@@ -30,9 +32,11 @@ This repo exposes the following user-facing slash commands through Claude/Codex 
 - `/pipelane web` (local web board)
 - `{{ALIAS_DEVMODE}}`
 - `{{ALIAS_NEW}}`
+- `{{ALIAS_ADOPT}}`
 - `{{ALIAS_RESUME}}`
 - `{{ALIAS_PR}}`
 - `{{ALIAS_MERGE}}`
+- `{{ALIAS_RELEASE}}`
 - `{{ALIAS_DEPLOY}}`
 - `{{ALIAS_CLEAN}}`
 - `{{ALIAS_STATUS}}`
@@ -53,9 +57,11 @@ Use both.
 
 - `{{ALIAS_DEVMODE}}`
 - `{{ALIAS_NEW}}`
+- `{{ALIAS_ADOPT}}`
 - `{{ALIAS_RESUME}}`
 - `{{ALIAS_PR}}`
 - `{{ALIAS_MERGE}}`
+- `{{ALIAS_RELEASE}}`
 - `{{ALIAS_DEPLOY}}`
 - `{{ALIAS_CLEAN}}`
 - `{{ALIAS_STATUS}}`
@@ -110,6 +116,20 @@ Properties:
 - a generated `task-<hex>` slug requires explicit `--unnamed`
 - agents must not edit in the starting checkout while planning to run `{{ALIAS_NEW}}` later; the task workspace must exist first
 - if `{{ALIAS_NEW}}` fails, agents must stop instead of continuing implementation in the current checkout
+
+`{{ALIAS_ADOPT}}` is the external-worktree handoff command.
+
+Use it when another model, tool, or human already created a branch/worktree that
+should become the Pipelane task workspace.
+
+Properties:
+
+- does not create a new branch or worktree
+- refuses detached checkouts
+- refuses base branches unless `--force` is explicit
+- infers the task slug from the branch when `--task` is omitted
+- records binding history when `--force` intentionally rebinds a task
+- links shared `node_modules` into the adopted worktree when safe
 
 `{{ALIAS_RESUME}}` is the recovery path, not the normal happy path.
 
@@ -183,12 +203,13 @@ Use it when:
 User-facing journey:
 
 1. `{{ALIAS_DEVMODE}} release`
-2. `{{ALIAS_NEW}}`
-3. `{{ALIAS_PR}} --title "<pr title>"`
-4. `{{ALIAS_MERGE}}`
-5. `{{ALIAS_DEPLOY}} staging`
-6. `{{ALIAS_DEPLOY}} prod`
-7. `{{ALIAS_CLEAN}}`
+2. `{{ALIAS_RELEASE}} status`
+3. `{{ALIAS_NEW}}`
+4. `{{ALIAS_PR}} --title "<pr title>"`
+5. `{{ALIAS_MERGE}}`
+6. `{{ALIAS_DEPLOY}} staging`
+7. `{{ALIAS_DEPLOY}} prod`
+8. `{{ALIAS_CLEAN}}`
 
 ## Build Mode
 
@@ -204,14 +225,18 @@ Release mode is the protected lane.
 - it is fail-closed
 - staging must be configured before the repo switches to release mode
 - production promotion should use the same merged SHA that passed staging
+- `{{ALIAS_RELEASE}} enable` scaffolds the Deploy Configuration block
+- `{{ALIAS_RELEASE}} status` is read-only and explains readiness without exiting non-zero
+- `{{ALIAS_RELEASE}} doctor --probe` delegates to the deploy-config/probe diagnostics
+- `pipelane run release-check` remains the automation gate for CI or scripts that need a non-zero blocked-readiness exit
 
 ## Release Readiness Gate
 
 The gate reads local `CLAUDE.md` and validates the configured surfaces:
 
 - `{{SURFACES_CSV}}`
-- the latest `/doctor --probe` result for each configured surface must be green and fresh
-- cached probe results are tied to the exact configured `healthcheckUrl`, so any staging URL or healthcheck-path change requires rerunning `{{ALIAS_DOCTOR}} --probe`
+- the latest `{{ALIAS_RELEASE}} doctor --probe` result for each configured surface must be green and fresh
+- cached probe results are tied to the exact configured `healthcheckUrl`, so any staging URL or healthcheck-path change requires rerunning `{{ALIAS_RELEASE}} doctor --probe`
 - if `PIPELANE_PROBE_STATE_KEY` is set, only signed probe records count toward release readiness
 
 ## Environment and Surface Names
@@ -279,17 +304,20 @@ write time.
 
 ### Each release operator
 
-1. run `pipelane configure`
-2. run `{{ALIAS_DOCTOR}} --probe`
-3. verify with `{{ALIAS_DEVMODE}} release`
+1. run `{{ALIAS_RELEASE}} enable`
+2. run `pipelane configure`
+3. run `{{ALIAS_RELEASE}} doctor --probe`
+4. inspect with `{{ALIAS_RELEASE}} status`
+5. switch with `{{ALIAS_DEVMODE}} release`
 
 ## Day-One Operator Journey
 
 1. Run setup
 2. `{{ALIAS_DEVMODE}} status`
 3. describe the task, then run `{{ALIAS_NEW}}`
-4. implement and verify
-5. `{{ALIAS_PR}} --title "<pr title>"`
+4. if another tool already created the branch/worktree, run `{{ALIAS_ADOPT}} --task "<task-name>"` instead
+5. implement and verify
+6. `{{ALIAS_PR}} --title "<pr title>"`
 
 ## Troubleshooting and Common Failures
 
@@ -297,7 +325,9 @@ write time.
   - run `pipelane setup`; commands that need persisted config will materialize `.pipelane.json`
 - task already active
   - use `{{ALIAS_RESUME}} --task "<task-name>"`
+- branch/worktree already exists outside Pipelane
+  - run `{{ALIAS_ADOPT}} --task "<task-name>"`
 - release mode blocked
-  - run `pipelane configure` to complete Deploy Configuration
-  - rerun `{{ALIAS_DOCTOR}} --probe` after any staging URL or healthcheck-path change because cached probe results are URL-bound
+  - run `{{ALIAS_RELEASE}} enable`, then `pipelane configure` to complete Deploy Configuration
+  - rerun `{{ALIAS_RELEASE}} doctor --probe` after any staging URL or healthcheck-path change because cached probe results are URL-bound
   - if probe-state signing is enabled, make sure `PIPELANE_PROBE_STATE_KEY` is set on the machine running the probe and then rerun it

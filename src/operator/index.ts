@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { handleApi } from './commands/api.ts';
+import { handleAdopt } from './commands/adopt.ts';
 import { handleClean } from './commands/clean.ts';
 import { handleDevmode } from './commands/devmode.ts';
 import { handleDeploy } from './commands/deploy.ts';
@@ -10,6 +11,7 @@ import { handleMerge } from './commands/merge.ts';
 import { handleNew } from './commands/new.ts';
 import { handleOrchestrate } from './commands/orchestrate.ts';
 import { handlePr } from './commands/pr.ts';
+import { handleRelease } from './commands/release.ts';
 import { handleReleaseCheck } from './commands/release-check.ts';
 import { handleRepoGuard } from './commands/repo-guard.ts';
 import { handleResume } from './commands/resume.ts';
@@ -67,6 +69,11 @@ export async function runOperator(cwd: string, argv: string[]): Promise<void> {
     return;
   }
 
+  if (command === 'adopt') {
+    await handleAdopt(cwd, parsed);
+    return;
+  }
+
   if (command === 'resume') {
     await handleResume(cwd, parsed);
     return;
@@ -89,6 +96,11 @@ export async function runOperator(cwd: string, argv: string[]): Promise<void> {
 
   if (command === 'merge') {
     await handleMerge(cwd, parsed);
+    return;
+  }
+
+  if (command === 'release') {
+    await handleRelease(cwd, parsed);
     return;
   }
 
@@ -171,10 +183,12 @@ Usage:
 Pipelane commands:
   devmode
   new
+  adopt
   resume
   repo-guard
   pr
   merge
+  release [status|enable|doctor]
   release-check
   task-lock
   deploy

@@ -446,8 +446,10 @@ Orchestration:
 
 Build and release companion commands:
   /new              Create an isolated task worktree.
+  /adopt            Track an existing task branch/worktree.
   /pr               Prepare and gate a pull request.
   /merge            Merge an approved PR.
+  /release          Enable or inspect the release module.
   /deploy staging   Deploy the merged SHA to staging.
   /deploy prod      Promote a verified staging SHA to production.
   /clean            Close out merged/deployed task worktrees.
