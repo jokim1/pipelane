@@ -2575,10 +2575,13 @@ function selectReviewGatesForRun(options: {
 }
 
 function orderReviewGates(gates: ReviewGateConfig[]): ReviewGateConfig[] {
-  return [...gates].sort((left, right) => {
-    const phaseDelta = REVIEW_PHASE_ORDER.indexOf(left.phase) - REVIEW_PHASE_ORDER.indexOf(right.phase);
-    return phaseDelta !== 0 ? phaseDelta : left.id.localeCompare(right.id);
-  });
+  return gates
+    .map((gate, index) => ({ gate, index }))
+    .sort((left, right) => {
+      const phaseDelta = REVIEW_PHASE_ORDER.indexOf(left.gate.phase) - REVIEW_PHASE_ORDER.indexOf(right.gate.phase);
+      return phaseDelta !== 0 ? phaseDelta : left.index - right.index;
+    })
+    .map((entry) => entry.gate);
 }
 
 // C2: review gates execute worker-influenced code (the slice's own `npm test`,
