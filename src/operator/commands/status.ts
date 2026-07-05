@@ -1275,7 +1275,7 @@ export function buildBlastView(
 
   const hint =
     Object.keys(map).length === 0
-      ? 'configure `surfacePathMap` in .pipelane.json to group these files by surface.'
+      ? 'configure `surfacePathMap` in machine-local Pipelane config to group these files by surface.'
       : null;
 
   return {

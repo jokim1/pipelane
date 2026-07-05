@@ -263,7 +263,7 @@ export const DEFAULT_BRANCH_PREFIX = 'codex/';
 // Patterns matched against changed-file basenames during `pipelane run pr`
 // before the silent `git add -A`. Keep this list short and unambiguous —
 // the goal is "operator forgot to gitignore their secrets" not general
-// pre-commit hooks. Override in .pipelane.json when a repo legit
+// pre-commit hooks. Override in machine-local Pipelane config when a repo legit
 // tracks one of these (e.g. a docs-only `CLAUDE.md`).
 export const DEFAULT_PR_PATH_DENY_LIST = [
   'CLAUDE.md',
@@ -749,7 +749,7 @@ export interface OperatorFlags {
   revertPr: boolean;
   // `pipelane run smoke setup` flags. Values are stored exactly as provided
   // (trimmed of outer whitespace) so shell command strings with embedded
-  // spaces / quotes / metacharacters roundtrip into .pipelane.json faithfully.
+  // spaces / quotes / metacharacters roundtrip into machine-local config faithfully.
   // `requireStagingSmoke` uses an explicit tri-state empty / 'true' / 'false'
   // rather than a boolean so absence is distinguishable from explicit false —
   // presence means "operator opted in", absence means "leave the existing
@@ -1152,8 +1152,27 @@ export function resolveGitCommonDir(repoRoot: string): string {
   return normalizePath(path.resolve(repoRoot, commonDir));
 }
 
+export function pipelaneHomeDir(): string {
+  return normalizePath(process.env.PIPELANE_HOME || path.join(os.homedir(), '.pipelane'));
+}
+
+export function resolveRepoConfigKey(repoRoot: string): string {
+  const commonDir = runGit(repoRoot, ['rev-parse', '--git-common-dir'], true);
+  const anchor = commonDir ? path.resolve(repoRoot, commonDir) : repoRoot;
+  const canonical = normalizeExistingPath(anchor);
+  return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 24);
+}
+
+export function resolveMachineRepoDir(repoRoot: string): string {
+  return path.join(pipelaneHomeDir(), 'repos', resolveRepoConfigKey(repoRoot));
+}
+
+export function resolveMachineConfigPath(repoRoot: string): string {
+  return path.join(resolveMachineRepoDir(repoRoot), 'config.json');
+}
+
 export function resolveConfigPath(repoRoot: string): string {
-  return path.join(repoRoot, CONFIG_FILENAME);
+  return resolveMachineConfigPath(repoRoot);
 }
 
 export function resolveReadableConfigPath(repoRoot: string): string | null {
@@ -1162,70 +1181,14 @@ export function resolveReadableConfigPath(repoRoot: string): string | null {
     return configPath;
   }
 
-  const legacyConfigPath = path.join(repoRoot, LEGACY_CONFIG_FILENAME);
-  if (existsSync(legacyConfigPath)) {
-    return legacyConfigPath;
-  }
-
-  // Linked task worktrees do not receive ignored machine-local config files.
-  // Borrow only untracked config from the shared checkout; tracked config stays
-  // branch-local so an older worktree does not silently inherit main's config.
-  const sharedLocalConfigPath = resolveSharedLocalConfigPath(repoRoot);
-  if (sharedLocalConfigPath) {
-    return sharedLocalConfigPath;
-  }
-
   return null;
 }
 
-function resolveSharedLocalConfigPath(repoRoot: string): string | null {
-  const commonDir = runGit(repoRoot, ['rev-parse', '--git-common-dir'], true);
-  if (!commonDir) return null;
-
-  const normalizedRepoRoot = normalizePath(repoRoot);
-  const sharedRoot = normalizePath(path.dirname(path.resolve(repoRoot, commonDir)));
-  if (sharedRoot === normalizedRepoRoot) return null;
-
-  const sharedGitRoot = runGit(sharedRoot, ['rev-parse', '--show-toplevel'], true);
-  if (!sharedGitRoot || normalizePath(sharedGitRoot) !== sharedRoot) return null;
-
-  for (const fileName of [CONFIG_FILENAME, LEGACY_CONFIG_FILENAME]) {
-    const candidate = path.join(sharedRoot, fileName);
-    if (!existsSync(candidate)) continue;
-    if (isGitTracked(sharedRoot, fileName)) continue;
-    if (!isGitIgnored(sharedRoot, fileName)) continue;
-    return candidate;
-  }
-
-  return null;
-}
-
-function isGitTracked(repoRoot: string, relativePath: string): boolean {
-  return runCommandCapture('git', ['ls-files', '--error-unmatch', '--', relativePath], { cwd: repoRoot }).ok;
-}
-
-function isGitIgnored(repoRoot: string, relativePath: string): boolean {
-  return runCommandCapture('git', ['check-ignore', '--quiet', '--', relativePath], { cwd: repoRoot }).ok;
-}
-
-// Read a tracked `pipelane` block from the repo's package.json. Consumers who
-// gitignore `.pipelane.json` can persist durable customizations here
-// (aliases, smoke commands, syncDocs opt-ins) so fresh checkouts and new
-// worktrees don't regress to bare defaults. Returns null when package.json
-// is missing, malformed, or has no `pipelane` field.
+// Legacy repo-local config inputs are intentionally ignored. Active Pipelane
+// config is machine-local only.
 export function readPackageJsonOverlay(repoRoot: string): Partial<WorkflowConfig> | null {
-  const packageJsonPath = path.join(repoRoot, 'package.json');
-  if (!existsSync(packageJsonPath)) return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
-  } catch {
-    return null;
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-  const pipelaneField = (parsed as Record<string, unknown>).pipelane;
-  if (!pipelaneField || typeof pipelaneField !== 'object' || Array.isArray(pipelaneField)) return null;
-  return pipelaneField as Partial<WorkflowConfig>;
+  void repoRoot;
+  return null;
 }
 
 function readPackageJsonName(repoRoot: string): string | null {
@@ -1290,29 +1253,21 @@ function mergeWorkflowLayers(
   return current;
 }
 
-// Build a usable WorkflowConfig from repo-derived signals alone, no
-// `.pipelane.json` required. Used for the self-heal path: `pipelane setup`
-// on a fresh checkout of a consumer that gitignores `.pipelane.json`, or
-// that has only a `package.json:pipelane` overlay. projectKey/displayName
-// fall back through: explicit override > package.json name > repo basename.
+// Build a usable WorkflowConfig from repo-derived signals alone. Active config
+// is machine-local only; repo-local package/config overlays are ignored.
 export function synthesizeWorkflowConfig(repoRoot: string): WorkflowConfig {
-  const overlay = readPackageJsonOverlay(repoRoot);
-  const overlayName = typeof overlay?.displayName === 'string' ? overlay.displayName.trim() : '';
-  const inferredName = overlayName || readPackageJsonName(repoRoot) || path.basename(repoRoot);
-  const overlayKey = typeof overlay?.projectKey === 'string' ? overlay.projectKey.trim() : '';
-  const projectKey = overlayKey || inferProjectKey(inferredName);
+  const inferredName = readPackageJsonName(repoRoot) || path.basename(repoRoot);
+  const projectKey = inferProjectKey(inferredName);
   const base = defaultWorkflowConfig(projectKey, inferredName, { repoRoot });
-  const merged = mergeWorkflowLayers(base, overlay);
-  return normalizeWorkflowConfig(merged, { repoRoot });
+  return normalizeWorkflowConfig(base, { repoRoot });
 }
 
 export function loadWorkflowConfig(repoRoot: string): WorkflowConfig {
   const configPath = resolveReadableConfigPath(repoRoot);
 
-  // Self-heal: when neither `.pipelane.json` nor the legacy file is present,
-  // derive a workable config from defaults + optional package.json overlay.
-  // Callers that need to mutate the file (e.g. `smoke setup`) materialize it
-  // via `patchReadableWorkflowConfig`, which writes on first patch.
+  // Self-heal: when no machine-local config exists, derive a workable config
+  // from defaults and repo signals. Mutators materialize the local file through
+  // patchReadableWorkflowConfig/writeWorkflowConfig.
   if (!configPath) {
     return synthesizeWorkflowConfig(repoRoot);
   }
@@ -1325,20 +1280,12 @@ export function loadWorkflowConfig(repoRoot: string): WorkflowConfig {
     throw new Error(`Malformed ${path.basename(configPath)} at ${configPath}: ${detail}. Fix the JSON by hand before rerunning.`);
   }
 
-  // Layer defaults < package.json overlay < tracked file. The file keeps
-  // winning for existing consumers (no behavior change when it's complete),
-  // and a partial file — e.g. after a future `smoke setup --write-to=file`
-  // that only persists the smoke slice — still produces a full config by
-  // pulling the rest from overlay/defaults.
-  const overlay = readPackageJsonOverlay(repoRoot);
-  const overlayName = typeof overlay?.displayName === 'string' ? overlay.displayName.trim() : '';
   const fileName = typeof parsed.displayName === 'string' ? parsed.displayName.trim() : '';
-  const inferredName = fileName || overlayName || readPackageJsonName(repoRoot) || path.basename(repoRoot);
-  const overlayKey = typeof overlay?.projectKey === 'string' ? overlay.projectKey.trim() : '';
+  const inferredName = fileName || readPackageJsonName(repoRoot) || path.basename(repoRoot);
   const fileKey = typeof parsed.projectKey === 'string' ? parsed.projectKey.trim() : '';
-  const projectKey = fileKey || overlayKey || inferProjectKey(inferredName);
+  const projectKey = fileKey || inferProjectKey(inferredName);
   const base = defaultWorkflowConfig(projectKey, inferredName, { repoRoot });
-  const merged = mergeWorkflowLayers(base, overlay, parsed);
+  const merged = mergeWorkflowLayers(base, parsed);
   return normalizeWorkflowConfig(merged, { repoRoot });
 }
 
@@ -1734,34 +1681,22 @@ function isValidBranchPrefix(prefix: string): boolean {
 }
 
 export function writeWorkflowConfig(repoRoot: string, config: WorkflowConfig): void {
-  writeJsonFile(resolveConfigPath(repoRoot), {
+  const configPath = resolveConfigPath(repoRoot);
+  mkdirSync(path.dirname(configPath), { recursive: true });
+  writeJsonFile(configPath, {
     ...config,
     aliases: resolveWorkflowAliases(config.aliases),
   });
 }
 
-// Read the readable workflow config file, run the patcher, atomically write
-// the result back to the same path. Used by `pipelane run smoke setup` to
-// update only the smoke subtree without disturbing unrelated keys.
-//
-// - If no config file exists, throws with the same init-guidance message
-//   `loadWorkflowConfig` uses so the operator sees a consistent hint.
-// - If the existing file is malformed JSON, throws with the parse error
-//   (including line/column when the runtime reports it). Never auto-repairs.
-// - Writes to the same path the config was read from — if the repo is still
-//   on legacy `.project-workflow.json`, the legacy file is updated in place
-//   rather than silently creating a second `.pipelane.json`.
+// Read machine-local workflow config, run the patcher, and write the result
+// back to the same local path. If no config exists yet, materialize one from
+// synthesized defaults before patching.
 export function patchReadableWorkflowConfig(
   repoRoot: string,
   patcher: (raw: Record<string, unknown>) => Record<string, unknown>,
 ): { configPath: string; isLegacy: boolean } {
   let configPath = resolveReadableConfigPath(repoRoot);
-  // Self-heal: if no readable config file exists, materialize one from synthesized defaults
-  // + any `package.json:pipelane` overlay before patching. The patcher then
-  // sees a complete JSON object and writes its slice on top. This is the
-  // only write-to-disk path in the self-heal flow — `loadWorkflowConfig`
-  // intentionally stays read-only so the gitignore promise holds until a
-  // mutation actually needs to persist.
   if (!configPath) {
     writeWorkflowConfig(repoRoot, synthesizeWorkflowConfig(repoRoot));
     configPath = resolveConfigPath(repoRoot);
@@ -1779,7 +1714,7 @@ export function patchReadableWorkflowConfig(
   }
   const next = patcher(parsed);
   writeJsonFile(configPath, next);
-  return { configPath, isLegacy: configPath.endsWith(LEGACY_CONFIG_FILENAME) };
+  return { configPath, isLegacy: false };
 }
 
 export function resolveStateDir(commonDir: string, config: WorkflowConfig): string {
@@ -1838,36 +1773,52 @@ export function probeStatePath(commonDir: string, config: WorkflowConfig): strin
   return path.join(resolveStateDir(commonDir, config), PROBE_STATE_FILENAME);
 }
 
+function resolveMachineSmokeDir(repoRoot: string): string {
+  return path.join(resolveMachineRepoDir(repoRoot), 'smoke');
+}
+
+function resolveMachineSmokePath(repoRoot: string, configuredPath: string | undefined, fallbackName: string): string {
+  const target = configuredPath?.trim() || fallbackName;
+  return path.isAbsolute(target)
+    ? target
+    : path.join(resolveMachineSmokeDir(repoRoot), target);
+}
+
+function resolveSmokeRuntimePath(commonDir: string, configuredPath: string | undefined, fallbackName: string): string {
+  const target = configuredPath?.trim() || fallbackName;
+  return path.isAbsolute(target)
+    ? target
+    : path.join(resolveSmokeRuntimeRoot(commonDir), target);
+}
+
 export function resolveSmokeTrackedDir(repoRoot: string): string {
-  return path.join(repoRoot, '.pipelane');
+  return resolveMachineSmokeDir(repoRoot);
 }
 
 export function resolveSmokeRegistryPath(repoRoot: string, config: WorkflowConfig): string {
-  return path.join(repoRoot, config.smoke?.registryPath ?? '.pipelane/smoke-checks.json');
+  return resolveMachineSmokePath(repoRoot, config.smoke?.registryPath, 'smoke-checks.json');
 }
 
 export function resolveSmokeWaiversPath(repoRoot: string, config: WorkflowConfig): string {
-  return path.join(repoRoot, config.smoke?.waivers?.path ?? '.pipelane/waivers.json');
+  return resolveMachineSmokePath(repoRoot, config.smoke?.waivers?.path, 'waivers.json');
+}
+
+export function resolveSmokeGeneratedSummaryPath(repoRoot: string, config: WorkflowConfig): string | null {
+  const target = config.smoke?.generatedSummaryPath?.trim();
+  if (!target) return null;
+  return resolveMachineSmokePath(repoRoot, target, 'smoke-summary.md');
 }
 
 export function resolveSmokeRuntimeRoot(commonDir: string): string {
-  return path.join(resolveSharedRepoRoot(commonDir), '.pipelane', 'state', 'smoke');
+  return path.join(resolveMachineRepoDir(resolveSharedRepoRoot(commonDir)), 'smoke-runtime');
 }
 
 export function resolveSmokeHistoryDir(commonDir: string, config: WorkflowConfig): string {
-  const relative = config.smoke?.history?.dir?.trim();
-  if (relative) {
-    return path.join(resolveSharedRepoRoot(commonDir), relative);
-  }
-  return path.join(resolveSmokeRuntimeRoot(commonDir), 'history');
+  return resolveSmokeRuntimePath(commonDir, config.smoke?.history?.dir, 'history');
 }
 
 export function resolveSmokeLatestPath(commonDir: string, config: WorkflowConfig): string {
-  const relative = config.smoke?.history?.latestPath?.trim();
-  if (relative) {
-    return path.join(resolveSharedRepoRoot(commonDir), relative);
-  }
-  return path.join(resolveSmokeRuntimeRoot(commonDir), 'latest.json');
+  return resolveSmokeRuntimePath(commonDir, config.smoke?.history?.latestPath, 'latest.json');
 }
 
 export function resolveSmokeHistoryRecordPath(commonDir: string, config: WorkflowConfig, runId: string): string {
@@ -1909,8 +1860,9 @@ export function loadSmokeRegistry(repoRoot: string, config: WorkflowConfig): Smo
 }
 
 export function saveSmokeRegistry(repoRoot: string, config: WorkflowConfig, value: SmokeRegistryState): void {
-  mkdirSync(resolveSmokeTrackedDir(repoRoot), { recursive: true });
-  writeJsonFile(resolveSmokeRegistryPath(repoRoot, config), value);
+  const registryPath = resolveSmokeRegistryPath(repoRoot, config);
+  mkdirSync(path.dirname(registryPath), { recursive: true });
+  writeJsonFile(registryPath, value);
 }
 
 export function loadSmokeWaivers(repoRoot: string, config: WorkflowConfig): SmokeWaiverState {
@@ -1920,8 +1872,9 @@ export function loadSmokeWaivers(repoRoot: string, config: WorkflowConfig): Smok
 }
 
 export function saveSmokeWaivers(repoRoot: string, config: WorkflowConfig, value: SmokeWaiverState): void {
-  mkdirSync(resolveSmokeTrackedDir(repoRoot), { recursive: true });
-  writeJsonFile(resolveSmokeWaiversPath(repoRoot, config), value);
+  const waiversPath = resolveSmokeWaiversPath(repoRoot, config);
+  mkdirSync(path.dirname(waiversPath), { recursive: true });
+  writeJsonFile(waiversPath, value);
 }
 
 export function loadSmokeLatestState(commonDir: string, config: WorkflowConfig): SmokeLatestState {

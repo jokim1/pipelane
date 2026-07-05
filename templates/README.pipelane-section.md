@@ -89,13 +89,10 @@ Slash commands are the normal Claude/Codex interface. Repo-native scripts exist
 under the hood, but workflow guidance should point operators at the slash
 aliases above.
 
-The default alias set can be changed in `.pipelane.json` — or in a tracked
-`pipelane` block in `package.json` if you'd rather gitignore `.pipelane.json`
-and keep customizations with the rest of your project config. When both are
-present, `.pipelane.json` wins field-by-field. If aliases change, rerun setup
-and reopen Claude/Codex so the new names are picked up. Aliases must be
-unique, and setup fails closed if an alias would overwrite an unrelated
-command.
+The default alias set can be changed in machine-local Pipelane config. If
+aliases change, rerun setup and reopen Claude/Codex so the new names are picked
+up. Aliases must be unique, and setup fails closed if an alias would overwrite
+an unrelated command.
 
 ### What Each User Still Needs To Do
 

@@ -1,6 +1,3 @@
-import { existsSync, readFileSync } from 'node:fs';
-import path from 'node:path';
-
 import { handleApi } from './commands/api.ts';
 import { handleAdopt } from './commands/adopt.ts';
 import { handleClean } from './commands/clean.ts';
@@ -21,7 +18,6 @@ import { handleSmoke } from './commands/smoke.ts';
 import { handleStatus } from './commands/status.ts';
 import { handleTaskLock } from './commands/task-lock.ts';
 import { assertRepoOnboardedForDeploy as assertDeployRepoOnboarded } from './onboarding.ts';
-import { loadDeployConfig } from './release-gate.ts';
 import {
   parseOperatorArgs,
   resolveWorkflowContext,
@@ -36,14 +32,10 @@ export interface LoadedContext extends WorkflowContext {
 
 export function loadWorkflowContext(cwd: string): LoadedContext {
   const context = resolveWorkflowContext(cwd);
-  const claudePath = path.join(context.repoRoot, 'CLAUDE.md');
-  const deployConfigText = loadDeployConfig(context.repoRoot) && existsSync(claudePath)
-    ? readFileSync(claudePath, 'utf8')
-    : '';
 
   return {
     ...context,
-    deployConfigText,
+    deployConfigText: '',
   };
 }
 

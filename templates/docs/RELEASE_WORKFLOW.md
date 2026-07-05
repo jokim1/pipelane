@@ -45,7 +45,7 @@ This repo exposes the following user-facing slash commands through Claude/Codex 
 - `/fix`
 - `/fix rethink`
 
-If aliases change in `.pipelane.json`, rerun setup and reopen Claude/Codex so the new command names are picked up.
+If aliases change, rerun setup and reopen Claude/Codex so the new command names are picked up.
 Aliases must be unique, and setup fails closed if an alias would overwrite an unrelated command or skill.
 Codex resolves aliases per repo at runtime, so the same alias name can map to different workflow commands in different pipelane repos on one machine.
 
@@ -225,14 +225,14 @@ Release mode is the protected lane.
 - it is fail-closed
 - staging must be configured before the repo switches to release mode
 - production promotion should use the same merged SHA that passed staging
-- `{{ALIAS_RELEASE}} enable` scaffolds the Deploy Configuration block
+- `{{ALIAS_RELEASE}} enable` scaffolds machine-local deploy config state
 - `{{ALIAS_RELEASE}} status` is read-only and explains readiness without exiting non-zero
 - `{{ALIAS_RELEASE}} doctor --probe` delegates to the deploy-config/probe diagnostics
 - `pipelane run release-check` remains the automation gate for CI or scripts that need a non-zero blocked-readiness exit
 
 ## Release Readiness Gate
 
-The gate reads local `CLAUDE.md` and validates the configured surfaces:
+The gate reads machine-local deploy configuration and validates the configured surfaces:
 
 - `{{SURFACES_CSV}}`
 - the latest `{{ALIAS_RELEASE}} doctor --probe` result for each configured surface must be green and fresh
@@ -261,25 +261,22 @@ Pipelane no longer supports tracked repo-local adapter opt-in. The supported
 command surface is installed once per machine with `pipelane install-claude`
 and/or `pipelane install-codex`.
 
-Runtime configuration may still live in `.pipelane.json` when a command needs
-to persist deploy, smoke, or review settings. Repos that do not want Pipelane
-config committed should gitignore `.pipelane.json`.
+Runtime configuration lives outside the repo at
+`$PIPELANE_HOME/repos/<repo-key>/config.json` (default home:
+`~/.pipelane`). Deploy, smoke, and review setup mutations write there. Pipelane
+does not use `.pipelane.json`, `.project-workflow.json`, or
+`package.json:pipelane` as active config inputs.
 
-## Workflow contract: `.pipelane.json` or `package.json:pipelane`
+## Workflow contract: machine-local only
 
-Pipelane resolves the workflow contract by layering:
+Pipelane resolves the workflow contract from:
 
 1. Built-in defaults (from `defaultWorkflowConfig`).
-2. `package.json:pipelane` overlay (tracked, optional).
-3. `.pipelane.json` (tracked or gitignored, optional).
+2. Machine-local repo config at `$PIPELANE_HOME/repos/<repo-key>/config.json`.
 
-The file wins field-by-field over the overlay, which wins over defaults. If
-neither file nor overlay is present, `pipelane setup` self-heals by
-synthesizing a config from the repo name plus defaults.
-
-Runtime mutations from `pipelane configure` write to `.pipelane.json`. If it
-doesn't exist yet, the mutator materializes it from the synthesized config at
-write time.
+If no machine-local config exists, Pipelane self-heals by synthesizing a config
+from the repo name plus defaults. Runtime mutations materialize the
+machine-local file at write time.
 
 ## What each user must do
 
@@ -321,8 +318,8 @@ write time.
 
 ## Troubleshooting and Common Failures
 
-- missing `.pipelane.json`
-  - run `pipelane setup`; commands that need persisted config will materialize `.pipelane.json`
+- missing local config
+  - run `pipelane setup`; commands that need persisted config will materialize machine-local config
 - task already active
   - use `{{ALIAS_RESUME}} --task "<task-name>"`
 - branch/worktree already exists outside Pipelane

@@ -121,7 +121,7 @@ function buildDeployConfigurationError(options: {
     `Requested surfaces: ${options.surfaces.join(', ')}`,
     'Missing deploy configuration:',
     ...options.missing.map((entry) => `- ${entry}`),
-    `Fix the Deploy Configuration block in CLAUDE.md before running ${options.deployCommand} again.`,
+    `Run /pipelane configure to save machine-local deploy configuration before running ${options.deployCommand} again.`,
   ].join('\n');
 }
 
@@ -764,7 +764,7 @@ function resolveDeploySurfacesForTarget(options: {
     throw new Error([
       'Deploy blocked: target changes do not match surfacePathMap.',
       ...blockers,
-      'Add missing paths to .pipelane.json:surfacePathMap or re-run with --surfaces <csv> if this deployment is intentionally manual.',
+      'Add missing paths to machine-local surfacePathMap config or re-run with --surfaces <csv> if this deployment is intentionally manual.',
     ].join('\n'));
   }
 

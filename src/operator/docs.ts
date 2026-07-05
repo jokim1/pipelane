@@ -6,24 +6,19 @@ import { fileURLToPath } from 'node:url';
 import type { SyncDocsConfig, WorkflowCommand, WorkflowConfig } from './state.ts';
 import {
   aliasCommandName,
-  CONFIG_FILENAME,
-  defaultWorkflowConfig,
-  inferProjectKey,
   loadWorkflowConfig,
   MANAGED_COMMANDS,
   MANAGED_EXTRA_COMMANDS,
   MANAGED_WORKFLOW_COMMANDS,
   type ManagedCommand,
   readJsonFile,
-  resolveReadableConfigPath,
   resolveRepoRoot,
   resolveSyncDocs,
   resolveWorkflowAliases,
   runGit,
   writeJsonFile,
-  writeWorkflowConfig,
 } from './state.ts';
-import { emptyDeployConfig, loadDeployConfig, renderDeployConfigSection } from './release-gate.ts';
+import { loadDeployConfig } from './release-gate.ts';
 import { pruneLegacyCodexWrapperSkills } from './codex-install.ts';
 import { type CodexSkillDrift, detectCodexSkillDrift, syncCodexSkills } from './codex-skills.ts';
 
@@ -241,9 +236,7 @@ function renderLessonsBlock(entriesInner = ''): string {
 // keep in sync.
 export function renderClaudeMdFromTemplate(config: WorkflowConfig): string {
   const rendered = renderTemplate(readTemplate('pipelane/CLAUDE.template.md'), config);
-  const emptySection = renderDeployConfigSection(emptyDeployConfig()).trimEnd();
   return rendered
-    .replace('{{DEPLOY_CONFIG_SECTION}}', emptySection)
     .replace('{{LESSONS_SECTION}}', renderLessonsBlock());
 }
 
@@ -318,7 +311,7 @@ function assertNoClaudeCollisions(commandsDir: string, desiredFiles: Set<string>
     const targetPath = path.join(commandsDir, entry);
     if (existsSync(targetPath) && !managedFiles.has(entry)) {
       throw new Error(
-        `Claude command alias collision: ${targetPath} already exists and is not managed by pipelane. Choose a different alias in .pipelane.json or rename the conflicting command.`,
+        `Claude command alias collision: ${targetPath} already exists and is not managed by pipelane. Choose a different alias in machine-local Pipelane config or rename the conflicting command.`,
       );
     }
   }
@@ -597,100 +590,6 @@ function assertPackageScriptConsistency(repoRoot: string, syncDocs: Required<Syn
 export function syncConsumerDocs(repoRoot: string, config: WorkflowConfig): void {
   const syncDocs = resolveEffectiveSyncDocs(repoRoot, config);
   assertPackageScriptConsistency(repoRoot, syncDocs);
-  ensurePreinstallGuard(repoRoot);
-
-  if (syncDocs.claudeCommands) {
-    const commandsDir = path.join(repoRoot, '.claude', 'commands');
-    mkdirSync(commandsDir, { recursive: true });
-
-    const aliases = resolveWorkflowAliases(config.aliases);
-    // Enforce operator/extras filename uniqueness only when claudeCommands
-    // is actually syncing. A consumer who opts out entirely can legitimately
-    // keep an `aliases.new = '/pipelane'` in their config without triggering
-    // the two-writer collision this guard prevents — the collision only
-    // materializes when both loops below would write to the same file.
-    for (const [command, alias] of Object.entries(aliases)) {
-      for (const extra of MANAGED_EXTRA_COMMANDS) {
-        if (alias === `/${extra}`) {
-          throw new Error(
-            `Workflow aliases must be unique. ${extra} and ${command} both resolve to ${alias}.`,
-          );
-        }
-      }
-    }
-    const managedCommandFiles = loadManagedClaudeCommands(commandsDir);
-    // Capture before prune so the extension follows the command through
-    // alias renames (old filename gets pruned but its content survives).
-    const capturedExtensions = captureManagedExtensionsByCommand(commandsDir, managedCommandFiles);
-    const desiredCommandFiles = new Set<string>();
-    for (const name of MANAGED_COMMANDS) {
-      desiredCommandFiles.add(managedClaudeCommandFilename(name, aliases));
-    }
-    assertNoClaudeCollisions(commandsDir, desiredCommandFiles, managedCommandFiles);
-    pruneManagedClaudeCommands(commandsDir, desiredCommandFiles, managedCommandFiles);
-    for (const name of MANAGED_COMMANDS) {
-      const filename = managedClaudeCommandFilename(name, aliases);
-      const content = renderManagedClaudeCommand(name, config, capturedExtensions.get(name) ?? null);
-      writeFileSync(path.join(commandsDir, filename), content, 'utf8');
-    }
-    saveManagedClaudeCommands(commandsDir, desiredCommandFiles);
-  }
-
-  if (syncDocs.codexSkills) {
-    syncCodexSkills(repoRoot, config);
-  }
-
-  if (syncDocs.pipelaneClaudeTemplate) {
-    mkdirSync(path.join(repoRoot, 'pipelane'), { recursive: true });
-    writeFileSync(
-      path.join(repoRoot, 'pipelane', 'CLAUDE.template.md'),
-      renderTemplate(readTemplate('pipelane/CLAUDE.template.md'), config),
-      'utf8',
-    );
-  }
-
-  if (syncDocs.docsReleaseWorkflow) {
-    mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
-    writeFileSync(
-      path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md'),
-      renderTemplate(readTemplate('docs/RELEASE_WORKFLOW.md'), config),
-      'utf8',
-    );
-  }
-
-  if (syncDocs.readmeSection) {
-    replaceMarkedSection(
-      path.join(repoRoot, 'README.md'),
-      README_MARKER_START,
-      README_MARKER_END,
-      renderTemplate(readTemplate('README.pipelane-section.md'), config),
-      `# ${config.displayName}\n\n`,
-    );
-  }
-
-  if (syncDocs.contributingSection) {
-    replaceMarkedSection(
-      path.join(repoRoot, 'CONTRIBUTING.md'),
-      CONTRIBUTING_MARKER_START,
-      CONTRIBUTING_MARKER_END,
-      renderTemplate(readTemplate('CONTRIBUTING.pipelane-section.md'), config),
-      '# Contributing\n\n',
-    );
-  }
-
-  if (syncDocs.agentsSection) {
-    replaceMarkedSection(
-      path.join(repoRoot, 'AGENTS.md'),
-      AGENTS_MARKER_START,
-      AGENTS_MARKER_END,
-      renderTemplate(readTemplate('AGENTS.md'), config),
-      `# ${config.displayName} Repo Context\n\n`,
-    );
-  }
-
-  if (syncDocs.packageScripts) {
-    ensurePackageScripts(repoRoot);
-  }
 }
 
 export function initConsumerRepo(cwd: string, projectName: string): { repoRoot: string; configPath: string } {
@@ -1163,8 +1062,8 @@ export function setupConsumerRepo(cwd: string, options: SetupConsumerRepoOptions
   const config = loadWorkflowConfig(repoRoot);
   const syncDocs = resolveEffectiveSyncDocs(repoRoot, config);
   syncConsumerDocs(repoRoot, config);
-  const scaffoldClaudeMd = shouldScaffoldClaudeMd(syncDocs);
-  const scaffoldRepoGuidance = shouldScaffoldRepoGuidance(syncDocs);
+  const scaffoldClaudeMd = false;
+  const scaffoldRepoGuidance = false;
 
   const claudePath = path.join(repoRoot, 'CLAUDE.md');
   let createdClaude = false;
@@ -1189,41 +1088,14 @@ export function setupConsumerRepo(cwd: string, options: SetupConsumerRepoOptions
     skippedRepoGuidanceScaffold = true;
   }
 
-  const removedLegacyCodexSkills = syncDocs.codexSkills
-    ? pruneLegacyCodexWrapperSkills()
-    : [];
-  let agentsGuidanceMigrations = syncDocs.agentsSection
-    ? detectAgentsGuidanceMigrationsForConfig(repoRoot, config)
-    : [];
-  const appliedAgentsGuidanceMigrations = options.applyAgentsGuidanceMigrations
-    ? applyAgentsGuidanceMigrations(agentsGuidanceMigrations)
-    : [];
-  if (appliedAgentsGuidanceMigrations.length > 0) {
-    agentsGuidanceMigrations = syncDocs.agentsSection
-      ? detectAgentsGuidanceMigrationsForConfig(repoRoot, config)
-      : [];
-  }
-  let claudeGuidanceMigrations = scaffoldClaudeMd && !createdClaude
-    ? detectClaudeGuidanceMigrationsForConfig(repoRoot, config)
-    : [];
-  const appliedClaudeGuidanceMigrations = options.applyClaudeGuidanceMigrations
-    ? applyClaudeGuidanceMigrations(claudeGuidanceMigrations)
-    : [];
-  if (appliedClaudeGuidanceMigrations.length > 0) {
-    claudeGuidanceMigrations = scaffoldClaudeMd
-      ? detectClaudeGuidanceMigrationsForConfig(repoRoot, config)
-      : [];
-  }
-
-  // Backfill/refresh the managed Lessons block in an existing CLAUDE.md. A
-  // freshly created CLAUDE.md already carries the block (template seed), so
-  // detection returns null there. Gated on the CLAUDE.md scaffold opt-out.
-  let lessonsMigration = scaffoldClaudeMd ? detectLessonsMigrationForRepo(repoRoot) : null;
-  let appliedLessonsMigration: LessonsMigration | null = null;
-  if (lessonsMigration && options.applyLessonsMigration) {
-    appliedLessonsMigration = applyLessonsMigration(lessonsMigration);
-    lessonsMigration = scaffoldClaudeMd ? detectLessonsMigrationForRepo(repoRoot) : null;
-  }
+  void options;
+  const removedLegacyCodexSkills: string[] = [];
+  const agentsGuidanceMigrations: AgentsGuidanceMigration[] = [];
+  const appliedAgentsGuidanceMigrations: AgentsGuidanceMigration[] = [];
+  const claudeGuidanceMigrations: ClaudeGuidanceMigration[] = [];
+  const appliedClaudeGuidanceMigrations: ClaudeGuidanceMigration[] = [];
+  const lessonsMigration: LessonsMigration | null = null;
+  const appliedLessonsMigration: LessonsMigration | null = null;
 
   return {
     repoRoot,
@@ -1407,10 +1279,7 @@ export function detectSetupDrift(cwd: string): SetupDrift {
   )) {
     otherSurfaces.push('agentsSection');
   }
-  const preinstallPackageJson = buildEnsuredPreinstallGuardPackageJson(repoRoot);
-  if (preinstallPackageJson.currentRaw !== preinstallPackageJson.nextRaw) {
-    otherSurfaces.push('packageScripts');
-  } else if (syncDocs.packageScripts) {
+  if (syncDocs.packageScripts) {
     const { currentRaw, nextRaw } = buildEnsuredPackageJson(repoRoot);
     if (currentRaw !== nextRaw) {
       otherSurfaces.push('packageScripts');
@@ -1490,9 +1359,9 @@ function markerSectionWouldDrift(
 // path without divergence.
 export function setupDeployConfigMessage(repoRoot: string): string {
   if (loadDeployConfig(repoRoot)) {
-    return 'Release mode can use shared deploy configuration when available. Edit local CLAUDE.md only for worktree-local overrides.';
+    return 'Release mode can use saved machine-local deploy configuration.';
   }
-  return 'Release mode still requires deploy configuration. Run `/pipelane configure` in Claude/Codex, or `pipelane configure --json ...` for scripted setup.';
+  return 'Release mode still requires deploy configuration. Run `/pipelane configure` in Claude/Codex, or `pipelane configure --json ...` for scripted setup; no repo files are written.';
 }
 
 // Canonical setup-complete output. Used by `pipelane setup` (cli.ts) and by
@@ -1505,12 +1374,12 @@ export function formatSetupResult(result: SetupConsumerRepoResult): string[] {
       ? 'Created local CLAUDE.md from the Pipelane template.'
       : result.skippedClaudeScaffold
         ? 'No local CLAUDE.md scaffold written; Pipelane guidance comes from durable machine-local commands.'
-        : 'Preserved existing local CLAUDE.md.',
+        : 'Left existing local CLAUDE.md untouched.',
     result.createdRepoGuidance
       ? 'Created REPO_GUIDANCE.md from the scaffold — run `/fix refresh-guidance` to fill it in.'
       : result.skippedRepoGuidanceScaffold
         ? 'No REPO_GUIDANCE.md scaffold written; Pipelane no longer creates repo-local adapter surfaces.'
-        : 'Preserved existing REPO_GUIDANCE.md.',
+        : 'Left existing REPO_GUIDANCE.md untouched.',
     `Task start rule: for new code-changing work, run \`${result.taskStartCommand}\` with an inferred task label, then switch to the reported worktree before editing.`,
     setupDeployConfigMessage(result.repoRoot),
   ];

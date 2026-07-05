@@ -16,7 +16,7 @@ Common forms:
 Behavior:
 
 1. `status` is read-only and explains staging and production readiness.
-2. `enable` adds the Deploy Configuration block that release safety uses.
+2. `enable` creates the machine-local deploy config state that release safety uses.
 3. `doctor` delegates to the existing deploy-config and probe diagnostics.
 4. CI or automation should keep using `pipelane run release-check` when it needs
    a non-zero exit code on blocked readiness.

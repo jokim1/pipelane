@@ -751,7 +751,7 @@ export function buildSmokeHandoffMessage(input: SmokeHandoffInput): SmokeHandoff
   // required-unconfigured.
   if (status === 'required-unconfigured') {
     return {
-      nextAction: `deploy prod blocked: staging smoke is required but smoke.staging.command is not configured. Run ${setupCmd} --staging-command="<command>" or edit .pipelane.json.`,
+      nextAction: `deploy prod blocked: staging smoke is required but smoke.staging.command is not configured. Run ${setupCmd} --staging-command="<command>" to update machine-local config.`,
       status,
       blocks: true,
     };

@@ -1,6 +1,4 @@
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
-import path from 'node:path';
 
 import type { DeployRecord, ProbeEnvironment, ProbeRecord, ProbeState, WorkflowConfig } from './state.ts';
 import {
@@ -188,26 +186,6 @@ function isLocalUrl(value: string): boolean {
   return /localhost|127\.0\.0\.1|0\.0\.0\.0/i.test(value);
 }
 
-function findDeployConfigSectionRange(markdown: string): { start: number; end: number } | null {
-  // Require end-of-line after the heading text so consumer-authored sections
-  // like `## Deploy Configuration Notes` or `## Deploy Configuration v2` don't
-  // collide with the machine-managed block and get silently overwritten.
-  const start = markdown.search(/^## Deploy Configuration\s*$/m);
-  if (start === -1) {
-    return null;
-  }
-
-  const remainder = markdown.slice(start);
-  const nextHeading = remainder.slice(1).search(/\n##\s/m);
-  const end = nextHeading === -1 ? markdown.length : start + 1 + nextHeading;
-  return { start, end };
-}
-
-export function extractDeployConfigSection(markdown: string): string | null {
-  const range = findDeployConfigSectionRange(markdown);
-  return range ? markdown.slice(range.start, range.end).trimEnd() : null;
-}
-
 function hydrateAdditionalDeploySurfaceEnvironment(
   parsed: Partial<AdditionalDeploySurfaceEnvironmentConfig> | null | undefined,
 ): AdditionalDeploySurfaceEnvironmentConfig {
@@ -295,36 +273,6 @@ function hydrateDeployConfig(parsed: Partial<DeployConfig> | null | undefined): 
   return config;
 }
 
-export function parseDeployConfigMarkdown(markdown: string): DeployConfig | null {
-  const section = extractDeployConfigSection(markdown);
-
-  if (!section) {
-    return null;
-  }
-
-  // Anchor both fences to newlines. JSON.stringify never emits a literal
-  // newline inside a string (they're escaped as \n), so a command value with
-  // embedded backticks — e.g. `deployCommand: "echo \`\`\` hi"` — can't trick
-  // the regex into terminating early and truncating the JSON body. Use
-  // `\r?\n` so CRLF-checked-out CLAUDE.md (Windows, core.autocrlf=true)
-  // still parses.
-  const jsonMatch = section.match(/```json\r?\n([\s\S]*?)\r?\n```/i);
-  if (!jsonMatch) {
-    return null;
-  }
-
-  const parsed = JSON.parse(jsonMatch[1]) as Partial<DeployConfig>;
-  return hydrateDeployConfig(parsed);
-}
-
-function loadDeployConfigFromClaude(targetPath: string): DeployConfig | null {
-  if (!existsSync(targetPath)) {
-    return null;
-  }
-
-  return parseDeployConfigMarkdown(readFileSync(targetPath, 'utf8'));
-}
-
 function deployConfigHasMeaningfulValue(value: unknown): boolean {
   if (typeof value === 'string') {
     return value.trim().length > 0;
@@ -346,27 +294,8 @@ function isConfiguredDeployConfig(config: DeployConfig | null): config is Deploy
 }
 
 export function loadDeployConfig(repoRoot: string): DeployConfig | null {
-  const claudePath = path.join(repoRoot, 'CLAUDE.md');
-  const localConfig = loadDeployConfigFromClaude(claudePath);
-  // `setup` seeds a template CLAUDE.md containing an empty Deploy Configuration
-  // block. Treat that default block as "unset" so a worktree-local CLAUDE.md
-  // does not shadow the shared deploy-config.json or shared-root CLAUDE.md.
-  if (isConfiguredDeployConfig(localConfig)) {
-    return localConfig;
-  }
-
   try {
     const commonDir = resolveGitCommonDir(repoRoot);
-    const sharedRepoRoot = path.dirname(commonDir);
-    const sharedClaudePath = path.join(sharedRepoRoot, 'CLAUDE.md');
-
-    if (path.resolve(sharedClaudePath) !== path.resolve(claudePath)) {
-      const sharedRootConfig = loadDeployConfigFromClaude(sharedClaudePath);
-      if (isConfiguredDeployConfig(sharedRootConfig)) {
-        return sharedRootConfig;
-      }
-    }
-
     const config = loadWorkflowConfig(repoRoot);
     const sharedState = readVersionedJsonFile<Partial<DeployConfig> | null>('deployConfig', commonDir, config, deployConfigPath(commonDir, config), null);
     const hydratedSharedState = sharedState ? hydrateDeployConfig(sharedState) : null;
@@ -376,43 +305,17 @@ export function loadDeployConfig(repoRoot: string): DeployConfig | null {
   }
 }
 
+export function resolveSharedDeployConfigPath(repoRoot: string): string {
+  const commonDir = resolveGitCommonDir(repoRoot);
+  const config = loadWorkflowConfig(repoRoot);
+  return deployConfigPath(commonDir, config);
+}
+
 export function saveSharedDeployConfig(repoRoot: string, deployConfig: DeployConfig): void {
   const commonDir = resolveGitCommonDir(repoRoot);
   const config = loadWorkflowConfig(repoRoot);
   ensureStateDir(commonDir, config);
   writeVersionedJsonFile('deployConfig', deployConfigPath(commonDir, config), deployConfig);
-}
-
-export function renderDeployConfigSection(config: DeployConfig): string {
-  return `## Deploy Configuration
-
-This section is machine-readable. Keep the JSON valid.
-Release readiness is derived from (a) observed staging deploy records and (b) a
-fresh \`/doctor --probe\` that healthchecks the configured staging URLs. Run
-\`/deploy staging <surface>\` once per surface to register a succeeded
-deploy, then \`/doctor --probe\` to register liveness. Probes older than
-24h flip the release lane fail-closed.
-
-\`\`\`json
-${JSON.stringify(config, null, 2)}
-\`\`\`
-`;
-}
-
-// Swap only the `## Deploy Configuration` block inside a CLAUDE.md body,
-// preserving everything before and after. When the block is missing, append
-// it at the end separated by a blank line. `configure` uses this to target
-// exactly the deploy block without disturbing operator notes or skill routing
-// rules the consumer has hand-edited above/below it.
-export function replaceDeployConfigSection(markdown: string, config: DeployConfig): string {
-  const rendered = renderDeployConfigSection(config);
-  const range = findDeployConfigSectionRange(markdown);
-  if (range) {
-    return `${markdown.slice(0, range.start)}${rendered}${markdown.slice(range.end)}`;
-  }
-  const trimmed = markdown.replace(/\s+$/u, '');
-  const separator = trimmed ? '\n\n' : '';
-  return `${trimmed}${separator}${rendered}`;
 }
 
 // v1.2: canonicalize then hash. Any semantic change to the environment-scoped
@@ -977,7 +880,7 @@ export function buildReleaseCheckMessage(
     }
     // v1.2: split remediation. If every blocker is "no succeeded deploy
     // observed" (a bootstrap state), point the operator at the deploy-first
-    // path; otherwise the CLAUDE.md config still needs completing.
+    // path; otherwise the machine-local deploy config still needs completing.
     const allObserveBlockers = readiness.blockedSurfaces.every((surface) =>
       readiness.results[surface].missing.length > 0
       && readiness.results[surface].missing.every((reason) => reason.includes('no succeeded deploy observed')),
@@ -1017,7 +920,7 @@ export function buildReleaseCheckMessage(
       lines.push(`Next: wait for the staging deploy verification to finish, then retry this command.`);
       lines.push(`Use \`${formatWorkflowCommand(config, 'status')}\` if you need the current staging state.`);
     } else if (hasUnsupportedSurfaceBlocker) {
-      lines.push('Next: update the tracked workflow config (`.pipelane.json`, or `.project-workflow.json` in legacy repos) so');
+      lines.push('Next: run setup to update the machine-local Pipelane config so');
       lines.push('each listed surface has matching Deploy Configuration. Built-ins are frontend, edge, sql; extra surfaces go under `surfaces`.');
     } else if (onlyPendingStagingOrProbeBlockers) {
       lines.push(`Next: wait for the staging deploy verification to finish, then retry this command.`);
@@ -1028,7 +931,7 @@ export function buildReleaseCheckMessage(
     } else if (onlyObservedOrProbeBlockers && hasDeployActionObservedBlocker) {
       lines.push(`Next: re-run \`${formatWorkflowCommand(config, 'deploy', 'staging')}\` for the blocked surface(s), then retry this command.`);
     } else {
-      lines.push('Next: run `/pipelane configure` to fill in the Deploy Configuration block in CLAUDE.md, then');
+      lines.push('Next: run `/pipelane configure` to save machine-local deploy configuration, then');
       lines.push(`\`${formatWorkflowCommand(config, 'devmode', 'build')}\` and \`${formatWorkflowCommand(config, 'deploy', 'staging')}\` to register a staging success.`);
     }
   }

@@ -1,15 +1,12 @@
-import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import path from 'node:path';
+import { existsSync } from 'node:fs';
 
 import { formatChecksReport, runChecks } from '../checks/runner.ts';
-import { renderClaudeMdFromTemplate } from '../docs.ts';
 import {
   buildReleaseCheckMessage,
   emptyDeployConfig,
   evaluateReleaseReadiness,
   loadDeployConfig,
-  parseDeployConfigMarkdown,
-  replaceDeployConfigSection,
+  resolveSharedDeployConfigPath,
   saveSharedDeployConfig,
 } from '../release-gate.ts';
 import {
@@ -42,26 +39,17 @@ export async function handleRelease(cwd: string, parsed: ParsedOperatorArgs): Pr
 
 function handleReleaseEnable(cwd: string, parsed: ParsedOperatorArgs): void {
   const context = resolveWorkflowContext(cwd);
-  const claudePath = path.join(context.repoRoot, 'CLAUDE.md');
-  const currentMarkdown = existsSync(claudePath)
-    ? readFileSync(claudePath, 'utf8')
-    : renderClaudeMdFromTemplate(context.config);
-  const existingConfig = parseDeployConfigMarkdown(currentMarkdown)
-    ?? loadDeployConfig(context.repoRoot)
-    ?? emptyDeployConfig();
-  const nextMarkdown = replaceDeployConfigSection(currentMarkdown, existingConfig);
-  const createdClaude = !existsSync(claudePath);
-
-  const tmpPath = `${claudePath}.pipelane.tmp`;
-  writeFileSync(tmpPath, ensureTrailingNewline(nextMarkdown), 'utf8');
-  renameSync(tmpPath, claudePath);
+  const configPath = resolveSharedDeployConfigPath(context.repoRoot);
+  const createdConfig = !existsSync(configPath);
+  const existingConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
   saveSharedDeployConfig(context.repoRoot, existingConfig);
   const configured = loadDeployConfig(context.repoRoot) !== null;
 
   const lines = [
     `Release module: ${configured ? 'enabled and configured' : 'enabled (deploy values still required)'}`,
-    `CLAUDE.md: ${createdClaude ? 'created' : 'updated'} at ${claudePath}`,
-    'Deploy Configuration: present',
+    `Machine-local deploy config: ${createdConfig ? 'created' : 'updated'} at ${configPath}`,
+    'Deploy Configuration: present in Pipelane state',
+    'No application repo files were created or modified.',
     '',
     `Next: run ${formatWorkflowCommand(context.config, 'release', 'status')} to inspect readiness.`,
     `If values are empty, run /pipelane configure to fill staging and production deploy settings.`,
@@ -71,8 +59,8 @@ function handleReleaseEnable(cwd: string, parsed: ParsedOperatorArgs): void {
   printResult(parsed.flags, {
     enabled: true,
     configured,
-    createdClaude,
-    claudePath,
+    createdConfig,
+    configPath,
     message: lines.join('\n'),
   });
 }
@@ -81,7 +69,7 @@ async function handleReleaseStatus(cwd: string, parsed: ParsedOperatorArgs): Pro
   const context = resolveWorkflowContext(cwd);
   const surfaces = resolveCommandSurfaces(context, parsed.flags.surfaces);
   const configuredDeployConfig = loadDeployConfig(context.repoRoot);
-  const moduleState = detectReleaseModuleState(context.repoRoot, context.commonDir);
+  const moduleState = detectReleaseModuleState(context.repoRoot);
   const deployConfig = configuredDeployConfig ?? emptyDeployConfig();
   const deployState = loadDeployState(context.commonDir, context.config);
   const probeState = loadProbeState(context.commonDir, context.config);
@@ -143,23 +131,8 @@ async function handleReleaseStatus(cwd: string, parsed: ParsedOperatorArgs): Pro
   });
 }
 
-function detectReleaseModuleState(repoRoot: string, commonDir: string): { enabled: boolean; configPaths: string[] } {
-  const candidatePaths = [
-    path.join(repoRoot, 'CLAUDE.md'),
-    path.join(path.dirname(commonDir), 'CLAUDE.md'),
-  ];
-  const configPaths = Array.from(new Set(candidatePaths.map((candidate) => path.resolve(candidate))))
-    .filter((candidate) => {
-      if (!existsSync(candidate)) return false;
-      try {
-        return parseDeployConfigMarkdown(readFileSync(candidate, 'utf8')) !== null;
-      } catch {
-        return true;
-      }
-    });
+function detectReleaseModuleState(repoRoot: string): { enabled: boolean; configPaths: string[] } {
+  const configPath = resolveSharedDeployConfigPath(repoRoot);
+  const configPaths = existsSync(configPath) ? [configPath] : [];
   return { enabled: configPaths.length > 0, configPaths };
-}
-
-function ensureTrailingNewline(value: string): string {
-  return value.endsWith('\n') ? value : `${value}\n`;
 }
