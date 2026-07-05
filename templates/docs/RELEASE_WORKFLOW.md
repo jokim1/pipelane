@@ -87,8 +87,8 @@ Run deterministic checks before AI review whenever this repo has them:
 
 1. lint, typecheck, format check, and secret scan when configured
 2. tests and build
-3. traceability review such as `karpathy-diff`
-4. structural review such as gstack `/review`
+3. fix-first structural review such as gstack `/review`
+4. read-only traceability review such as `karpathy-diff`
 5. specialist review when needed: security, design, QA, docs drift
 
 For manual review gates, run the referenced skill, fix any findings, then

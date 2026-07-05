@@ -155,8 +155,8 @@ Recommended review order before merge:
 
 1. static checks: lint, typecheck, format check, secret scan when configured
 2. behavioral checks: tests and build
-3. traceability review: `karpathy-diff`
-4. structural review: gstack `/review`
+3. fix-first structural review: gstack `/review`
+4. read-only traceability review: `karpathy-diff`
 5. specialist review when needed: security, design, browser QA, docs drift
 
 For manual review gates, run the referenced skill, fix any findings, then

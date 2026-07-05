@@ -500,8 +500,8 @@ function writePipelaneConfig(repoRoot, displayName = 'Demo App', patch = {}) {
         { id: 'typecheck', phase: 'static', type: 'command', blocking: true, command: 'npm run typecheck' },
         { id: 'test', phase: 'behavioral', type: 'command', blocking: true, command: 'npm run test' },
         { id: 'build', phase: 'behavioral', type: 'command', blocking: true, command: 'npm run build' },
-        { id: 'karpathy-diff', phase: 'ai-diff', type: 'skill', blocking: true, skill: 'karpathy-diff', userCommands: ['/karpathy diff', '/karpathy-diff', '/karpathy:diff'] },
         { id: 'gstack-review', phase: 'ai-diff', type: 'skill', blocking: true, skill: 'review', userCommands: ['/review', '/gstack review', '/gstack-review'] },
+        { id: 'karpathy-diff', phase: 'ai-diff', type: 'skill', blocking: true, skill: 'karpathy-diff', userCommands: ['/karpathy diff', '/karpathy-diff', '/karpathy:diff'] },
         { id: 'karpathy-audit', phase: 'instruction', type: 'skill', blocking: true, skill: 'karpathy-audit', whenChanged: ['CLAUDE.md', 'AGENTS.md', '.cursor/rules/**', '.codex/skills/**'], userCommands: ['/karpathy audit', '/karpathy-audit', '/karpathy:audit'] },
       ],
     },
@@ -596,6 +596,40 @@ process.exit(typeof result.status === 'number' ? result.status : 1);
     binDir,
     env: {
       PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+    },
+  };
+}
+
+function createAiReviewShimEnv() {
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-ai-review-shim-'));
+  const shimPath = path.join(binDir, 'ai-review.mjs');
+  writeFileSync(
+    shimPath,
+    `import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+
+readFileSync(0, 'utf8');
+const gate = process.env.PIPELANE_REVIEW_GATE_ID || 'unknown';
+const logPath = process.env.PIPELANE_TEST_AI_REVIEW_LOG || '';
+if (logPath) appendFileSync(logPath, gate + '\\n', 'utf8');
+
+const mutateGate = process.env.PIPELANE_TEST_AI_REVIEW_MUTATE_GATE || '';
+const marker = process.env.PIPELANE_TEST_AI_REVIEW_MUTATION_MARKER || 'ai-review-mutated.txt';
+if (mutateGate && gate === mutateGate && (process.env.PIPELANE_TEST_AI_REVIEW_MUTATE_ALWAYS === '1' || !existsSync(marker))) {
+  writeFileSync(marker, 'mutated by ai review ' + process.hrtime.bigint() + '\\n', 'utf8');
+}
+
+const statusMap = JSON.parse(process.env.PIPELANE_TEST_AI_REVIEW_STATUS_MAP || '{}');
+const status = statusMap[gate] || process.env.PIPELANE_TEST_AI_REVIEW_STATUS || 'passed';
+console.log('AI review shim gate=' + gate);
+console.log('PIPELANE_REVIEW_GATE_RESULT=' + status);
+process.exit(Number(process.env.PIPELANE_TEST_AI_REVIEW_EXIT || '0'));
+`,
+    'utf8',
+  );
+  return {
+    binDir,
+    env: {
+      PIPELANE_REVIEW_AI_COMMAND: `${JSON.stringify(process.execPath)} ${JSON.stringify(shimPath)}`,
     },
   };
 }
@@ -5953,7 +5987,7 @@ test('review setup bare command renders grouped rows without writing config', ()
     assert.match(result.stdout, /C\. Code review gates:/);
     assert.match(result.stdout, /I\. Instruction and runtime gates:/);
     assert.match(result.stdout, /H\. Human approval gates:/);
-    assert.match(result.stdout, /C3\s+(on |off)\s+gstack-review/);
+    assert.match(result.stdout, /C1\s+(on |off)\s+gstack-review/);
     assert.match(result.stdout, /M1\s+on\s+typecheck\s+Typecheck \| npm run typecheck/);
     assert.match(result.stdout, /T1\s+on\s+test\s+Tests \| npm run test/);
     assert.match(result.stdout, /\/karpathy diff/);
@@ -6015,7 +6049,7 @@ test('review setup bare command hydrates on off state from saved config', () => 
     assert.match(result.stdout, /Config: .*config\.json/);
     assert.match(result.stdout, /M1\s+on\s+typecheck\s+Typecheck \| npm run typecheck:strict/);
     assert.match(result.stdout, /T1\s+off\s+test\s+Tests \| npm run test/);
-    assert.match(result.stdout, /C3\s+off\s+gstack-review/);
+    assert.match(result.stdout, /C1\s+off\s+gstack-review/);
     assert.equal(readFileSync(configPath, 'utf8'), before);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -6053,20 +6087,20 @@ test('review setup bare command shows saved adversarial review command', () => {
   }
 });
 
-test('review setup --toggle C3 writes config and reprints grouped state', () => {
+test('review setup --toggle C1 writes config and reprints grouped state', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
   try {
     seedCodexReviewSkills(codexHome);
 
-    const result = runCli(['run', 'review', 'setup', '--toggle', 'C3'], repoRoot, {
+    const result = runCli(['run', 'review', 'setup', '--toggle', 'C1'], repoRoot, {
       CODEX_HOME: codexHome,
     });
     const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
 
     assert.match(result.stdout, /Setup actions:/);
-    assert.match(result.stdout, /Toggled C3 gstack-review off/);
-    assert.match(result.stdout, /C3\s+off\s+gstack-review/);
+    assert.match(result.stdout, /Toggled C1 gstack-review off/);
+    assert.match(result.stdout, /C1\s+off\s+gstack-review/);
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'), false);
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'), true);
   } finally {
@@ -6081,14 +6115,14 @@ test('review setup positional row id toggles the matching gate', () => {
   try {
     seedCodexReviewSkills(codexHome);
 
-    const result = runCli(['run', 'review', 'setup', 'C3'], repoRoot, {
+    const result = runCli(['run', 'review', 'setup', 'C1'], repoRoot, {
       CODEX_HOME: codexHome,
     });
     const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
 
     assert.match(result.stdout, /Setup actions:/);
-    assert.match(result.stdout, /Toggled C3 gstack-review off/);
-    assert.match(result.stdout, /C3\s+off\s+gstack-review/);
+    assert.match(result.stdout, /Toggled C1 gstack-review off/);
+    assert.match(result.stdout, /C1\s+off\s+gstack-review/);
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -6107,7 +6141,7 @@ test('review setup --toggle accepts canonical gate ids', () => {
     });
     const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
 
-    assert.match(result.stdout, /Toggled C3 gstack-review off/);
+    assert.match(result.stdout, /Toggled C1 gstack-review off/);
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -6115,7 +6149,7 @@ test('review setup --toggle accepts canonical gate ids', () => {
   }
 });
 
-test('review setup TTY input C3 writes immediately', () => {
+test('review setup TTY input C1 writes immediately', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
   try {
@@ -6123,12 +6157,12 @@ test('review setup TTY input C3 writes immediately', () => {
 
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
-      PIPELANE_REVIEW_SETUP_INPUT: 'C3\nq\n',
+      PIPELANE_REVIEW_SETUP_INPUT: 'C1\nq\n',
     });
     const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
 
-    assert.match(result.stdout, /Toggled C3 gstack-review off/);
-    assert.match(result.stdout, /C3\s+off\s+gstack-review/);
+    assert.match(result.stdout, /Toggled C1 gstack-review off/);
+    assert.match(result.stdout, /C1\s+off\s+gstack-review/);
     assert.doesNotMatch(result.stdout, /Save and continue/);
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'), false);
   } finally {
@@ -6157,7 +6191,7 @@ test('review setup --reset restores recommended defaults', () => {
     const raw = JSON.parse(readFileSync(configPath, 'utf8'));
 
     assert.match(result.stdout, /Reset review gates to recommended defaults/);
-    assert.match(result.stdout, /C3\s+on\s+gstack-review/);
+    assert.match(result.stdout, /C1\s+on\s+gstack-review/);
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'typecheck'), true);
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'test'), true);
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'), true);
@@ -6503,8 +6537,7 @@ test('review setup selection flags cannot mutate through read-only reporting fla
 test('review setup targeted enable preserves an explicit empty gate list', () => {
   const repoRoot = createRepo();
   try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    const configPath = machinePipelaneConfigPath(repoRoot);
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.reviewGates = {
       planReview: { gates: [] },
@@ -6550,8 +6583,7 @@ test('review setup targeted flags preserve existing custom review gates', () => 
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
   try {
     seedCodexReviewSkills(codexHome, ['karpathy-diff', 'review', 'karpathy-audit']);
-    writePipelaneConfig(repoRoot, 'Demo App');
-    const configPath = machinePipelaneConfigPath(repoRoot);
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.reviewGates = {
       planReview: { gates: [] },
@@ -6623,7 +6655,7 @@ test('review setup interactive toggle of installed AI gate writes explicit gate 
 
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
-      PIPELANE_REVIEW_SETUP_INPUT: 'C1\nq\n',
+      PIPELANE_REVIEW_SETUP_INPUT: 'C2\nq\n',
     });
     const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
 
@@ -6647,7 +6679,7 @@ test('review setup detects provider-prefixed Karpathy skills as installed', () =
 
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
-      PIPELANE_REVIEW_SETUP_INPUT: 'C1\nq\n',
+      PIPELANE_REVIEW_SETUP_INPUT: 'C2\nq\n',
     });
     const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
 
@@ -6825,7 +6857,7 @@ test('review setup interactive install decline leaves known missing AI gate disa
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
       CLAUDE_HOME: claudeHome,
-      PIPELANE_REVIEW_SETUP_INPUT: 'C1\n2\nq\n',
+      PIPELANE_REVIEW_SETUP_INPUT: 'C2\n2\nq\n',
       PIPELANE_REVIEW_SETUP_INSTALL_SUCCESS: 'karpathy-diff',
     });
 
@@ -6847,7 +6879,7 @@ test('review setup interactive missing Karpathy gate offers installer', () => {
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
       CLAUDE_HOME: claudeHome,
-      PIPELANE_REVIEW_SETUP_INPUT: 'C1\n2\nq\n',
+      PIPELANE_REVIEW_SETUP_INPUT: 'C2\n2\nq\n',
     });
 
     assert.match(result.stdout, /Author self-review is not installed/);
@@ -6873,7 +6905,7 @@ test('review setup interactive installs Karpathy from a configured local source'
       CODEX_HOME: codexHome,
       CLAUDE_HOME: claudeHome,
       PIPELANE_KARPATHY_SKILLS_SOURCE: karpathySource,
-      PIPELANE_REVIEW_SETUP_INPUT: 'C1\n1\nq\n',
+      PIPELANE_REVIEW_SETUP_INPUT: 'C2\n1\nq\n',
     });
     const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
 
@@ -6896,7 +6928,7 @@ test('review setup interactive install approval can enable known missing AI gate
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
       CODEX_HOME: codexHome,
       CLAUDE_HOME: claudeHome,
-      PIPELANE_REVIEW_SETUP_INPUT: 'C1\n1\nq\n',
+      PIPELANE_REVIEW_SETUP_INPUT: 'C2\n1\nq\n',
       PIPELANE_REVIEW_SETUP_INSTALL_SUCCESS: 'karpathy-diff',
     });
     const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
@@ -7691,8 +7723,7 @@ test('orchestrate bare command --yes records pending manual gates instead of dec
 test('review executes configured AI skill gate command and records attester evidence', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.reviewGates = {
       planReview: { gates: [] },
@@ -7743,8 +7774,7 @@ test('review executes configured AI skill gate command and records attester evid
 test('review AI gate parses result marker independently across stdout and stderr', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.reviewGates = {
       planReview: { gates: [] },
@@ -7784,8 +7814,7 @@ test('review AI gate parses result marker independently across stdout and stderr
 test('review AI gate parses result marker before large trailing output', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.reviewGates = {
       planReview: { gates: [] },
@@ -7826,8 +7855,7 @@ test('review AI gate parses result marker before large trailing output', () => {
 test('review AI gate scrubs author session env from reviewer subprocess', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.reviewGates = {
       planReview: { gates: [] },
@@ -7875,8 +7903,7 @@ test('review leaves code-review high pending instead of auto-running native clau
   const invokedPath = path.join(fakeBin, 'claude-invoked');
 
   try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.reviewGates = {
       policyVersion: 2,
@@ -7916,8 +7943,7 @@ test('review leaves runtime browser QA pending instead of using the shared AI co
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const markerPath = path.join(repoRoot, 'runtime-qa-invoked.txt');
   try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.reviewGates = {
       policyVersion: 2,
@@ -7959,8 +7985,7 @@ test('review leaves runtime browser QA pending instead of using native Codex fal
   const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-fake-codex-'));
   const invokedPath = path.join(fakeBin, 'codex-invoked');
   try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.reviewGates = {
       policyVersion: 2,
@@ -8002,8 +8027,7 @@ test('review executes runtime browser QA with a gate-specific command override',
   const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-runtime-qa-'));
   const markerPath = path.join(markerRoot, 'runtime-qa-invoked.txt');
   try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.reviewGates = {
       policyVersion: 2,
@@ -8047,8 +8071,7 @@ test('review executes runtime browser QA with a gate-specific command override',
 test('review defers the AI judge to pending when a blocking deterministic gate fails', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.reviewGates = {
       planReview: { gates: [] },
@@ -8113,8 +8136,7 @@ test('review defers the AI judge to pending when a blocking deterministic gate f
 test('review defers the AI judge even when the failing deterministic gate is in a later phase', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.reviewGates = {
       planReview: { gates: [] },
@@ -8170,20 +8192,152 @@ test('review defers the AI judge even when the failing deterministic gate is in 
   }
 });
 
-test('review fails configured AI skill gate when command mutates the worktree', () => {
+test('review restarts fix-first gstack gate when it mutates the worktree', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const aiShim = createAiReviewShimEnv();
+  const logPath = path.join(aiShim.binDir, 'ai-review-log.txt');
+  const commandLogPath = path.join(aiShim.binDir, 'command-gate-log.txt');
+  const markerFile = 'ai-review-mutated.txt';
+  try {
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [
+        {
+          id: 'typecheck',
+          phase: 'static',
+          type: 'command',
+          command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('node:fs').appendFileSync(${JSON.stringify(commandLogPath)}, 'typecheck\\n', 'utf8')`)}`,
+          blocking: true,
+        },
+        {
+          id: 'gstack-review',
+          phase: 'ai-diff',
+          type: 'skill',
+          skill: 'review',
+          userCommands: ['/review'],
+          blocking: true,
+        },
+        {
+          id: 'karpathy-diff',
+          phase: 'ai-diff',
+          type: 'skill',
+          skill: 'karpathy-diff',
+          userCommands: ['/karpathy diff'],
+          blocking: true,
+        },
+      ],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt fix-first review gates');
+
+    const cliResult = runCli(['run', 'review', '--json'], repoRoot, {
+      ...aiShim.env,
+      PIPELANE_TEST_AI_REVIEW_LOG: logPath,
+      PIPELANE_TEST_AI_REVIEW_MUTATE_GATE: 'gstack-review',
+      PIPELANE_TEST_AI_REVIEW_MUTATION_MARKER: markerFile,
+      PIPELANE_REVIEW_PROVIDER: 'codex',
+    });
+    const review = JSON.parse(cliResult.stdout);
+    const evidence = JSON.parse(readFileSync(review.evidencePath, 'utf8')).records[0];
+
+    assert.equal(cliResult.status, 0);
+    assert.equal(review.status, 'passed');
+    assert.ok(review.changedFiles.includes(markerFile));
+    assert.deepEqual(evidence.changedFiles, review.changedFiles);
+    assert.equal(typeof evidence.worktreeStatusDigest, 'string');
+    assert.equal(typeof evidence.worktreeMaterialTreeHash, 'string');
+    assert.deepEqual(review.gates.map((gate) => [gate.gateId, gate.status]), [
+      ['typecheck', 'passed'],
+      ['gstack-review', 'passed'],
+      ['karpathy-diff', 'passed'],
+    ]);
+    assert.equal(readFileSync(commandLogPath, 'utf8'), 'typecheck\ntypecheck\n');
+    assert.deepEqual(readFileSync(logPath, 'utf8').trim().split(/\r?\n/), ['gstack-review', 'gstack-review', 'karpathy-diff']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(aiShim.binDir, { recursive: true, force: true });
+  }
+});
+
+test('review fails when fix-first gstack gate never settles the tree', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const aiShim = createAiReviewShimEnv();
+  const logPath = path.join(aiShim.binDir, 'ai-review-log.txt');
+  const markerFile = 'ai-review-mutated.txt';
+  try {
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [
+        {
+          id: 'gstack-review',
+          phase: 'ai-diff',
+          type: 'skill',
+          skill: 'review',
+          userCommands: ['/review'],
+          blocking: false,
+        },
+        {
+          id: 'karpathy-diff',
+          phase: 'ai-diff',
+          type: 'skill',
+          skill: 'karpathy-diff',
+          userCommands: ['/karpathy diff'],
+          blocking: true,
+        },
+      ],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt unsettled fix-first review gates');
+
+    const cliResult = runCli(['run', 'review', '--json'], repoRoot, {
+      ...aiShim.env,
+      PIPELANE_TEST_AI_REVIEW_LOG: logPath,
+      PIPELANE_TEST_AI_REVIEW_MUTATE_GATE: 'gstack-review',
+      PIPELANE_TEST_AI_REVIEW_MUTATION_MARKER: markerFile,
+      PIPELANE_TEST_AI_REVIEW_MUTATE_ALWAYS: '1',
+      PIPELANE_REVIEW_PROVIDER: 'codex',
+    }, true);
+    const review = JSON.parse(cliResult.stdout);
+    const evidence = JSON.parse(readFileSync(review.evidencePath, 'utf8')).records[0];
+    const gstackGate = review.gates.find((gate) => gate.gateId === 'gstack-review');
+    const karpathyGate = review.gates.find((gate) => gate.gateId === 'karpathy-diff');
+
+    assert.equal(cliResult.status, 1);
+    assert.equal(review.status, 'failed');
+    assert.equal(gstackGate.status, 'failed');
+    assert.equal(gstackGate.blocking, true);
+    assert.match(gstackGate.summary, /fix-first gate changed the tree after 3 review attempts/);
+    assert.equal(karpathyGate.status, 'skipped');
+    assert.equal(karpathyGate.skipReason, 'restart-exhausted');
+    assert.ok(review.changedFiles.includes(markerFile));
+    assert.deepEqual(evidence.changedFiles, review.changedFiles);
+    assert.equal(typeof evidence.worktreeStatusDigest, 'string');
+    assert.deepEqual(readFileSync(logPath, 'utf8').trim().split(/\r?\n/), ['gstack-review', 'gstack-review', 'gstack-review']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(aiShim.binDir, { recursive: true, force: true });
+  }
+});
+
+test('review fails read-only AI skill gate when command mutates the worktree', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.reviewGates = {
       planReview: { gates: [] },
       gates: [{
-        id: 'gstack-review',
+        id: 'karpathy-diff',
         phase: 'ai-diff',
         type: 'skill',
-        skill: 'review',
-        userCommands: ['/review'],
+        skill: 'karpathy-diff',
+        userCommands: ['/karpathy diff'],
         blocking: true,
       }],
     };
@@ -8217,20 +8371,19 @@ test('review fails configured AI skill gate when command mutates the worktree', 
   }
 });
 
-test('review fails configured AI skill gate when command commits to HEAD', () => {
+test('review fails read-only AI skill gate when command commits to HEAD', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    const configPath = path.join(repoRoot, '.pipelane.json');
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.reviewGates = {
       planReview: { gates: [] },
       gates: [{
-        id: 'gstack-review',
+        id: 'karpathy-diff',
         phase: 'ai-diff',
         type: 'skill',
-        skill: 'review',
-        userCommands: ['/review'],
+        skill: 'karpathy-diff',
+        userCommands: ['/karpathy diff'],
         blocking: true,
       }],
     };
@@ -31244,8 +31397,8 @@ test('default review gate resolution uses detected scripts and reports unavailab
     'format-check',
     'test',
     'build',
-    'karpathy-diff',
     'gstack-review',
+    'karpathy-diff',
     'karpathy-audit',
   ]);
   assert.equal(standard.gates.find((gate) => gate.id === 'lint').command, 'npm run lint');
@@ -31260,8 +31413,8 @@ test('default review gate resolution uses detected scripts and reports unavailab
   });
   assert.deepEqual(missingScripts.gates.map((gate) => gate.id), [
     'test',
-    'karpathy-diff',
     'gstack-review',
+    'karpathy-diff',
     'karpathy-audit',
   ]);
   assert.deepEqual(missingScripts.missing.map((entry) => entry.id), [
@@ -31276,8 +31429,8 @@ test('default review gates are built from the canonical catalog without frontend
   const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
   const defaults = stateMod.defaultReviewGatesConfig();
   assert.deepEqual(defaults.gates.map((gate) => gate.id), [
-    'karpathy-diff',
     'gstack-review',
+    'karpathy-diff',
     'karpathy-audit',
   ]);
   assert.ok(defaults.planReview.gates.some((gate) => gate.id === 'plan-eng-review'));

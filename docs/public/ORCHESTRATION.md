@@ -76,9 +76,9 @@ a script is missing, suggest it as a setup gap instead of silently inventing a
 toolchain.
 
 The setup flow is opinionated by default. It should recommend deterministic
-checks first, `/karpathy diff` as build-time author self-review, `/code-review high`
-in a fresh reviewer context when Claude review support is available, gstack
-`/review` as the independent fallback, and cross-model review when installed.
+checks first, gstack `/review` as the fix-first structural pass, `/karpathy diff`
+as read-only traceability review, `/code-review high` in a fresh reviewer
+context when Claude review support is available, and cross-model review when installed.
 High-stakes paths add `/code-review ultra` and human approval. Users may opt out
 of gates, but the UI should make the consequence explicit: less review coverage.
 The authoring session must never attest its own independent AI review.
@@ -121,7 +121,7 @@ Review gates run after implementation:
 
 - static gates: lint, typecheck, format check, secret scan, dependency audit
 - behavioral gates: tests, integration checks, build
-- AI diff gates: `/karpathy diff`, gstack `/review`, adversarial review via
+- AI diff gates: gstack `/review`, `/karpathy diff`, adversarial review via
   Codex `/claude review code` or Claude-side gstack `/codex challenge`
 - instruction gates: `/karpathy audit` when agent instruction files change
 - runtime gates: browser QA, deploy health checks, staging evidence
@@ -509,6 +509,7 @@ Each gate has:
       { "id": "format-check", "phase": "static", "type": "command", "command": "npm run format:check", "blocking": true },
       { "id": "test", "phase": "behavioral", "type": "command", "command": "npm run test", "blocking": true },
       { "id": "build", "phase": "behavioral", "type": "command", "command": "npm run build", "blocking": true },
+      { "id": "gstack-review", "phase": "ai-diff", "type": "skill", "skill": "review", "blocking": true },
       {
         "id": "karpathy-diff",
         "phase": "ai-diff",
@@ -525,7 +526,6 @@ Each gate has:
         "userCommands": ["/code-review high"],
         "blocking": true
       },
-      { "id": "gstack-review", "phase": "ai-diff", "type": "skill", "skill": "review", "blocking": true },
       {
         "id": "adversarial-review",
         "phase": "ai-diff",
@@ -615,10 +615,13 @@ The command receives a review prompt on stdin and must print
 `PIPELANE_REVIEW_GATE_RESULT=failed` on its own line. Missing result markers
 fail closed.
 
-AI review commands must not modify files. Pipelane snapshots the worktree
-before and after each AI review command; if the digest changes or cannot be
-verified, the gate fails and the operator must revert reviewer changes before
-rerunning review.
+Read-only AI review commands must not modify files. Pipelane snapshots the
+worktree before and after each AI review command; if a read-only gate changes
+the digest or cannot be verified, the gate fails and the operator must revert
+reviewer changes before rerunning review. The `gstack-review` gate is the
+intentional fix-first exception: if it changes `HEAD` or the worktree, Pipelane
+reruns review gates and records evidence only for the final settled tree. If
+the gate keeps changing the tree after bounded retries, review fails closed.
 
 If no AI command resolves, skill, agent, and approval gates remain manual. After
 the operator runs the referenced command, fixes any findings, and determines

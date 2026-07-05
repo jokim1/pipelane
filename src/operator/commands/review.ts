@@ -63,6 +63,7 @@ const REVIEW_CONFIG_CHANGE_WHEN = 'review-config-changed';
 const REVIEW_CONFIG_CHANGE_PATHS: string[] = [];
 const REVIEW_PHASE_ORDER = REVIEW_GATE_PHASES;
 const DEFAULT_GATE_TIMEOUT_MS = 30 * 60 * 1000;
+const MAX_FIX_FIRST_REVIEW_RESTARTS = 2;
 const DEFAULT_REVIEW_SETUP_NPM_INSTALL_TIMEOUT_MS = 2 * 60 * 1000;
 const OUTPUT_TAIL_CHARS = 4000;
 const REVIEW_GATE_CAPTURE_TAIL_BYTES = 2 * 1024 * 1024;
@@ -131,6 +132,22 @@ interface ReviewGateInstallOption {
   install(): ReviewGateInstallResult;
 }
 
+interface ReviewGateMutation {
+  gate: ReviewGateRunRecord;
+  before: WorktreeStatusSnapshot;
+  after: WorktreeStatusSnapshot;
+}
+
+interface ReviewRunAttemptInput {
+  changedFiles: string[];
+  worktreeStatus: WorktreeStatusSnapshot;
+  reviewConfigChanged: boolean;
+  reviewConfigChangeApproval: ReviewGateRunRecord | null;
+  reviewConfigChangeNeedsApproval: boolean;
+  selectedGates: ReviewGateConfig[];
+}
+
+type PackageManagerId = 'npm' | 'pnpm' | 'yarn' | 'bun' | 'unknown' | 'unsupported' | 'conflict';
 type ReviewSetupSectionId = 'M' | 'T' | 'C' | 'I' | 'H' | 'X';
 
 interface ReviewSetupSection {
@@ -955,9 +972,9 @@ function orderInteractiveReviewCatalog(entries: ResolvedReviewGateCatalogEntry[]
     ['dependency-audit', 50],
     ['test', 60],
     ['build', 70],
-    ['karpathy-diff', 80],
-    ['code-review-high', 90],
-    ['gstack-review', 100],
+    ['gstack-review', 80],
+    ['karpathy-diff', 90],
+    ['code-review-high', 100],
     ['adversarial-review', 110],
     ['code-review-ultra', 120],
     ['browser-qa', 130],
@@ -2109,48 +2126,167 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
     : resolveWorkflowContext(options.repoRoot);
   const phaseFilter = options.phaseFilter ?? '';
   const gateFilter = options.gateFilter?.trim() ?? '';
-  const changedFiles = options.changedFiles ?? collectChangedFiles(options.repoRoot, options.baseBranch);
+
+  const startedAt = nowIso();
+  const runStartMs = Date.now();
+  const runId = `review-${new Date(startedAt).toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto.randomUUID().slice(0, 8)}`;
+  let attemptNumber = 0;
+  let attempt = buildReviewRunAttemptInput({
+    repoRoot: options.repoRoot,
+    commonDir: stateContext.commonDir,
+    config: stateContext.config,
+    baseBranch: options.baseBranch,
+    gates: options.gates,
+    phaseFilter,
+    gateFilter,
+    changedFiles: options.changedFiles,
+    reviewConfigChangeApproval: options.reviewConfigChangeApproval,
+    attemptNumber,
+  });
+  let gateRecords: ReviewGateRunRecord[] = [];
+
+  for (;;) {
+    const result = runReviewAttempt({
+      repoRoot: options.repoRoot,
+      commonDir: stateContext.commonDir,
+      config: stateContext.config,
+      runId,
+      baseBranch: options.baseBranch,
+      dryRun: options.dryRun,
+      activeSurfaces: options.activeSurfaces,
+      profileContext: options.profileContext,
+      attempt,
+      onGateStart: options.onGateStart,
+      onGateFinish: options.onGateFinish,
+    });
+    gateRecords = result.gates;
+
+    if (!result.mutation) break;
+
+    attempt = buildReviewRunAttemptInput({
+      repoRoot: options.repoRoot,
+      commonDir: stateContext.commonDir,
+      config: stateContext.config,
+      baseBranch: options.baseBranch,
+      gates: options.gates,
+      phaseFilter,
+      gateFilter,
+      attemptNumber: attemptNumber + 1,
+    });
+
+    if (attemptNumber >= MAX_FIX_FIRST_REVIEW_RESTARTS) {
+      gateRecords = markFixFirstMutationRestartExhausted(gateRecords, result.mutation, attemptNumber, attempt.selectedGates);
+      const completedIds = new Set(result.gates.map((gate) => gate.gateId));
+      for (const gate of gateRecords) {
+        if (!completedIds.has(gate.gateId)) options.onGateFinish?.(gate);
+      }
+      break;
+    }
+
+    attemptNumber += 1;
+  }
+
+  const finishedAt = nowIso();
+  const status = summarizeRunStatus(gateRecords);
+
+  return {
+    id: runId,
+    branchName: runGit(options.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '',
+    sha: attempt.worktreeStatus.head,
+    status,
+    dryRun: options.dryRun,
+    gateFilter: gateFilter || undefined,
+    phaseFilter: phaseFilter || undefined,
+    startedAt,
+    finishedAt,
+    durationMs: Math.max(0, Date.now() - runStartMs),
+    changedFiles: attempt.changedFiles,
+    worktreeStatusDigest: attempt.worktreeStatus.statusDigest,
+    worktreeStatusReliable: attempt.worktreeStatus.statusDigestReliable,
+    worktreeStatusWarnings: attempt.worktreeStatus.statusDigestWarnings,
+    worktreeMaterialTreeHash: attempt.worktreeStatus.materialTreeHash,
+    worktreeMaterialTreeReliable: attempt.worktreeStatus.materialTreeReliable,
+    worktreeMaterialTreeWarnings: attempt.worktreeStatus.materialTreeWarnings,
+    authorIdentity: resolveReviewAuthorIdentity(),
+    reviewer: resolveReviewActorIdentity(),
+    gates: gateRecords,
+  };
+}
+
+function buildReviewRunAttemptInput(options: {
+  repoRoot: string;
+  commonDir: string;
+  config: WorkflowConfig;
+  baseBranch: string;
+  gates: ReviewGateConfig[];
+  phaseFilter: ReviewGatePhase | '';
+  gateFilter: string;
+  changedFiles?: string[];
+  reviewConfigChangeApproval?: ReviewGateRunRecord | null;
+  attemptNumber: number;
+}): ReviewRunAttemptInput {
+  const changedFiles = options.attemptNumber === 0 && options.changedFiles
+    ? options.changedFiles
+    : collectChangedFiles(options.repoRoot, options.baseBranch);
   const worktreeStatus = readWorktreeStatusSnapshot(options.repoRoot, {
     includeStatusDigest: true,
     includeMaterialTreeHash: true,
   });
   const reviewConfigChanged = changedFiles.some(isReviewConfigPath);
-  const reviewConfigChangeApproval = reviewConfigChanged ? options.reviewConfigChangeApproval ?? null : null;
-  const reviewConfigChangeNeedsApproval = reviewConfigChanged && !reviewConfigChangeApproval;
+  const reviewConfigChangeApproval = reviewConfigChanged
+    ? options.attemptNumber === 0 && options.reviewConfigChangeApproval !== undefined
+      ? options.reviewConfigChangeApproval
+      : selectReviewConfigChangeApproval(options.commonDir, options.config, options.repoRoot)
+    : null;
   const selectedGates = selectReviewGatesForRun({
     gates: options.gates,
-    phaseFilter,
-    gateFilter,
+    phaseFilter: options.phaseFilter,
+    gateFilter: options.gateFilter,
     reviewConfigChanged,
   });
 
-  const startedAt = nowIso();
-  const runStartMs = Date.now();
-  const runId = `review-${new Date(startedAt).toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto.randomUUID().slice(0, 8)}`;
+  return {
+    changedFiles,
+    worktreeStatus,
+    reviewConfigChanged,
+    reviewConfigChangeApproval,
+    reviewConfigChangeNeedsApproval: reviewConfigChanged && !reviewConfigChangeApproval,
+    selectedGates,
+  };
+}
+
+function runReviewAttempt(options: {
+  repoRoot: string;
+  commonDir: string;
+  config: WorkflowConfig;
+  runId: string;
+  baseBranch: string;
+  dryRun: boolean;
+  activeSurfaces: string[];
+  profileContext?: ReviewProfileContext;
+  attempt: ReviewRunAttemptInput;
+  onGateStart?: (gate: ReviewGateConfig) => void;
+  onGateFinish?: (gate: ReviewGateRunRecord) => void;
+}): { gates: ReviewGateRunRecord[]; mutation: ReviewGateMutation | null } {
   // B4 (programmatic-before-judge): evaluate ALL deterministic (command/pipelane)
-  // gates before any AI judge (skill/agent), independent of phase authoring order —
-  // gate type is not bound to phase, so a blocking command gate authored in a phase
-  // that sorts after ai-diff must still gate the judges. If a blocking deterministic
-  // gate fails, defer the expensive AI judge gates to `pending` instead of invoking
-  // them. The review fails on the deterministic gate regardless, so this saves
-  // tokens and fails closed (`pending`, never `skipped`). Records are assembled back
-  // in the original gate order, so reordering only affects the deferral decision —
-  // not the persisted/displayed gate order (e.g. a prepended config-change gate).
+  // gates before any AI judge (skill/agent), independent of phase authoring order.
+  // Records are assembled back in configured order; reordering only affects the
+  // deferral decision and fix-first restart behavior.
   const recordByGate = new Map<ReviewGateConfig, ReviewGateRunRecord>();
   const evaluateGate = (gate: ReviewGateConfig, deferAiGate: boolean): ReviewGateRunRecord => {
     options.onGateStart?.(gate);
-    const record = gate.id === REVIEW_CONFIG_CHANGE_GATE_ID && reviewConfigChangeApproval
-      ? approvedReviewConfigChangeGateRecord(gate, reviewConfigChangeApproval)
+    const record = gate.id === REVIEW_CONFIG_CHANGE_GATE_ID && options.attempt.reviewConfigChangeApproval
+      ? approvedReviewConfigChangeGateRecord(gate, options.attempt.reviewConfigChangeApproval)
         : runReviewGate({
           gate,
           repoRoot: options.repoRoot,
-          commonDir: stateContext.commonDir,
-          config: stateContext.config,
-          runId,
+          commonDir: options.commonDir,
+          config: options.config,
+          runId: options.runId,
           baseBranch: options.baseBranch,
           dryRun: options.dryRun,
-          reviewConfigChanged: reviewConfigChangeNeedsApproval,
-          changedFiles,
+          reviewConfigChanged: options.attempt.reviewConfigChangeNeedsApproval,
+          changedFiles: options.attempt.changedFiles,
           activeSurfaces: options.activeSurfaces,
           profileContext: options.profileContext,
           deferAiGate,
@@ -2160,39 +2296,27 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
     return record;
   };
   let blockingDeterministicFailure = false;
-  for (const gate of reviewGateExecutionOrder(selectedGates)) {
+  for (const gate of reviewGateExecutionOrder(options.attempt.selectedGates)) {
+    const before = isFixFirstReviewGate(gate) && !options.dryRun
+      ? readReviewGateWorktreeStatus(options.repoRoot)
+      : null;
     if (!isDeterministicReviewGate(gate)) {
-      evaluateGate(gate, blockingDeterministicFailure);
+      const record = evaluateGate(gate, blockingDeterministicFailure);
+      const after = before ? readReviewGateWorktreeStatus(options.repoRoot) : null;
+      if (before && after && reviewGateWorktreeMutated(before, after)) {
+        return {
+          gates: reviewAttemptRecordsInConfiguredOrder(options.attempt.selectedGates, recordByGate),
+          mutation: { gate: record, before, after },
+        };
+      }
       continue;
     }
     const record = evaluateGate(gate, false);
     if (record.blocking && record.status === 'failed') blockingDeterministicFailure = true;
   }
-  const gateRecords = selectedGates.map((gate) => recordByGate.get(gate) as ReviewGateRunRecord);
-  const finishedAt = nowIso();
-  const status = summarizeRunStatus(gateRecords);
-
   return {
-    id: runId,
-    branchName: runGit(options.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '',
-    sha: worktreeStatus.head,
-    status,
-    dryRun: options.dryRun,
-    gateFilter: gateFilter || undefined,
-    phaseFilter: phaseFilter || undefined,
-    startedAt,
-    finishedAt,
-    durationMs: Math.max(0, Date.now() - runStartMs),
-    changedFiles,
-    worktreeStatusDigest: worktreeStatus.statusDigest,
-    worktreeStatusReliable: worktreeStatus.statusDigestReliable,
-    worktreeStatusWarnings: worktreeStatus.statusDigestWarnings,
-    worktreeMaterialTreeHash: worktreeStatus.materialTreeHash,
-    worktreeMaterialTreeReliable: worktreeStatus.materialTreeReliable,
-    worktreeMaterialTreeWarnings: worktreeStatus.materialTreeWarnings,
-    authorIdentity: resolveReviewAuthorIdentity(),
-    reviewer: resolveReviewActorIdentity(),
-    gates: gateRecords,
+    gates: reviewAttemptRecordsInConfiguredOrder(options.attempt.selectedGates, recordByGate),
+    mutation: null,
   };
 }
 
@@ -2200,6 +2324,93 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
 // these run before and gate the expensive skill/agent judges.
 function isDeterministicReviewGate(gate: Pick<ReviewGateConfig, 'type'>): boolean {
   return gate.type === 'command' || gate.type === 'pipelane';
+}
+
+function isFixFirstReviewGate(gate: Pick<ReviewGateConfig, 'id'>): boolean {
+  return gate.id === 'gstack-review';
+}
+
+function reviewAttemptRecordsInConfiguredOrder(
+  selectedGates: ReviewGateConfig[],
+  recordByGate: Map<ReviewGateConfig, ReviewGateRunRecord>,
+): ReviewGateRunRecord[] {
+  return selectedGates
+    .map((gate) => recordByGate.get(gate))
+    .filter((gate): gate is ReviewGateRunRecord => Boolean(gate));
+}
+
+function reviewGateWorktreeMutated(before: WorktreeStatusSnapshot, after: WorktreeStatusSnapshot): boolean {
+  if (before.head && after.head && before.head !== after.head) return true;
+  if (
+    before.materialTreeReliable === true
+    && after.materialTreeReliable === true
+    && before.materialTreeHash
+    && after.materialTreeHash
+    && before.materialTreeHash !== after.materialTreeHash
+  ) {
+    return true;
+  }
+  if (before.statusDigestReliable && after.statusDigestReliable) {
+    return before.statusDigest !== after.statusDigest;
+  }
+  return false;
+}
+
+function markFixFirstMutationRestartExhausted(
+  gates: ReviewGateRunRecord[],
+  mutation: ReviewGateMutation,
+  restartAttempt: number,
+  selectedGates: ReviewGateConfig[],
+): ReviewGateRunRecord[] {
+  const markedGates = gates.map((gate) => {
+    if (gate.gateId !== mutation.gate.gateId) return gate;
+    const headChanged = mutation.before.head !== mutation.after.head
+      ? `HEAD ${shortSha(mutation.before.head)} -> ${shortSha(mutation.after.head)}`
+      : 'HEAD unchanged';
+    const digestChanged = mutation.before.statusDigest !== mutation.after.statusDigest
+      ? 'worktree digest changed'
+      : 'worktree digest unchanged';
+    return {
+      ...gate,
+      blocking: true,
+      status: 'failed' as const,
+      summary: `${gate.summary}; fix-first gate changed the tree after ${restartAttempt + 1} review attempts (${headChanged}, ${digestChanged}); rerun /pipelane review after the tree settles`,
+    };
+  });
+  const seenGateIds = new Set(markedGates.map((gate) => gate.gateId));
+  const mutationIndex = selectedGates.findIndex((gate) => gate.id === mutation.gate.gateId);
+  const remainingGates = mutationIndex >= 0 ? selectedGates.slice(mutationIndex + 1) : [];
+  return [
+    ...markedGates,
+    ...remainingGates
+      .filter((gate) => !seenGateIds.has(gate.id))
+      .map((gate) => skippedReviewGateRecord(
+        gate,
+        'skipped: fix-first review restart exhausted before this gate could run',
+        'restart-exhausted',
+      )),
+  ];
+}
+
+function skippedReviewGateRecord(gate: ReviewGateConfig, summary: string, skipReason: string): ReviewGateRunRecord {
+  const startedAt = nowIso();
+  return {
+    id: `${gate.id}-${crypto.randomUUID().slice(0, 8)}`,
+    gateId: gate.id,
+    phase: gate.phase,
+    type: gate.type,
+    blocking: gate.blocking !== false,
+    command: gate.command,
+    skill: gate.skill,
+    role: gate.role,
+    userCommands: gate.userCommands,
+    status: 'skipped',
+    summary,
+    startedAt,
+    finishedAt: startedAt,
+    durationMs: 0,
+    skipReason,
+  };
 }
 
 function selectReviewGatesForRun(options: {
@@ -3184,7 +3395,7 @@ function runAiReviewGate(options: {
     });
   }
 
-  if (worktreeMutationSummary) {
+  if (worktreeMutationSummary && !isFixFirstReviewGate(gate)) {
     return finishGate({ ...base, command }, startMs, {
       status: 'failed',
       summary: worktreeMutationSummary,
@@ -3384,6 +3595,13 @@ function renderAiReviewGatePrompt(options: {
       : requestedCommand
         ? [requestedCommand, '']
         : [];
+  const mutationPolicy = isFixFirstReviewGate(gate)
+    ? [
+        'This is the fix-first gstack review gate. You may apply mechanical auto-fixes that the review workflow normally applies.',
+        'Do not commit, push, merge, deploy, or ask for new human approval inside this gate.',
+        'If you changed files, leave them in the worktree. Pipelane will restart review gates and record evidence only after the tree settles.',
+      ]
+    : ['Review the current checkout against the base branch. Do not modify files.'];
   return [
     ...prefix,
     'You are running as an independent Pipelane AI review gate.',
@@ -3399,7 +3617,7 @@ function renderAiReviewGatePrompt(options: {
     ...changedFileLines,
     ...truncated,
     '',
-    'Review the current checkout against the base branch. Do not modify files.',
+    ...mutationPolicy,
     'Report blocking correctness, security, data-loss, regression, or test-coverage issues.',
     'If the requested skill or slash command is unavailable, perform the closest equivalent review yourself.',
     '',
@@ -4019,7 +4237,7 @@ function reviewSetupSections(): ReviewSetupSection[] {
   return [
     { id: 'M', title: 'Mechanical gates', ids: ['typecheck', 'format-check', 'lint', 'secret-scan', 'dependency-audit'] },
     { id: 'T', title: 'Test gates', ids: ['test', 'build'] },
-    { id: 'C', title: 'Code review gates', ids: ['karpathy-diff', 'code-review-high', 'gstack-review', 'adversarial-review', 'code-review-ultra'] },
+    { id: 'C', title: 'Code review gates', ids: ['gstack-review', 'karpathy-diff', 'code-review-high', 'adversarial-review', 'code-review-ultra'] },
     { id: 'I', title: 'Instruction and runtime gates', ids: ['karpathy-audit', 'browser-qa'] },
     { id: 'H', title: 'Human approval gates', ids: ['high-stakes-human-approval', 'human-merge-approval', 'human-prod-deploy-approval', 'human-rollback-approval'] },
   ];
