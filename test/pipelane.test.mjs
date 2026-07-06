@@ -779,7 +779,12 @@ if (args[0] === 'pr' && args[1] === 'create') {
   const base = findFlag('--base') || 'main';
   const title = findFlag('--title');
   const number = Object.keys(state.prs).length + 1;
-  const pr = { number, title, url: 'https://example.test/pr/' + number, state: 'OPEN', baseRefName: base, headRefName: head, mergeCommit: null, mergedAt: null };
+  const headRefOid = execFileSync('git', ['rev-parse', 'HEAD'], {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+  const pr = { number, title, url: 'https://example.test/pr/' + number, state: 'OPEN', baseRefName: base, headRefName: head, headRefOid, mergeCommit: null, mergedAt: null };
   state.prs[head] = pr;
   writeState();
   process.stdout.write(pr.url + '\\n');
@@ -20016,6 +20021,7 @@ test('pr, merge, deploy, and task-lock work with a fake gh adapter', () => {
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
     assert.equal(ghState.prMergeCalls.length, 1);
     assert.ok(!ghState.prMergeCalls[0].includes('--delete-branch'));
+    assert.ok(ghState.prMergeCalls[0].includes('--match-head-commit'));
     assert.equal(ghState.workflows.length, 1);
     assert.equal(ghState.workflows[0].name, 'Deploy Hosted');
     assert.ok(ghState.workflows[0].args.includes('environment=production'));
@@ -21757,6 +21763,131 @@ test('lockless PR branch can report, merge by PR number, and deploy the merged P
     assert.equal(ghState.workflows.length, 1);
     assert.ok(ghState.workflows[0].args.includes('environment=staging'));
     assert.ok(ghState.workflows[0].args.includes('sha=deadbeefcafebabe'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('merge blocks when the remote PR head no longer matches reviewed evidence', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  const updaterRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-pr-updater-'));
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    runCli(['setup'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.buildMode.autoDeployOnMerge = false;
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Remote Head Drift', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'reviewed version\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Remote Head Drift', '--json'], created.worktreePath, env);
+
+    execFileSync('git', ['clone', remoteRoot, updaterRoot], { stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['config', 'user.email', 'codex@example.com'], { cwd: updaterRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['config', 'user.name', 'Codex'], { cwd: updaterRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['checkout', '-b', created.branch, `origin/${created.branch}`], { cwd: updaterRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    writeFileSync(path.join(updaterRoot, 'feature.txt'), 'changed after review on remote\n', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: updaterRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Advance PR head after review'], { cwd: updaterRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    const remoteHead = run('git', ['rev-parse', 'HEAD'], updaterRoot);
+    execFileSync('git', ['push', 'origin', `HEAD:refs/heads/${created.branch}`], { cwd: updaterRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    ghState.prs[created.branch].headRefOid = remoteHead;
+    writeFileSync(ghStateFile, `${JSON.stringify(ghState, null, 2)}\n`, 'utf8');
+
+    const blocked = runCli(['run', 'merge', '--json'], created.worktreePath, env, true);
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /\/merge blocked because review gate evidence is not ready/);
+    assert.match(blocked.stderr, /different worktree state/);
+
+    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`);
+    rmSync(lockPath, { force: true });
+    const locklessBlocked = runCli(['run', 'merge', '--pr', '1', '--json'], repoRoot, env, true);
+    assert.equal(locklessBlocked.status, 1);
+    assert.match(locklessBlocked.stderr, /\/merge blocked because review gate evidence is not ready/);
+    assert.match(locklessBlocked.stderr, /different worktree state/);
+
+    const afterGhState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(afterGhState.prMergeCalls.length, 0, 'stale reviewed evidence must not merge a newer remote PR head');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(updaterRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('merge accepts a force-pushed PR head after fresh review evidence', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    runCli(['setup'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.buildMode.autoDeployOnMerge = false;
+      config.reviewGates = {
+        planReview: { gates: [] },
+        gates: [{
+          id: 'static-pass',
+          phase: 'static',
+          type: 'command',
+          command: `${JSON.stringify(process.execPath)} -e "process.exit(0)"`,
+          blocking: true,
+        }],
+      };
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Remote Head Rebase', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'reviewed before rebase\n', 'utf8');
+    writePassingReviewEvidence(created.worktreePath);
+    runCli(['run', 'pr', '--title', 'Remote Head Rebase', '--json'], created.worktreePath, env);
+    const staleHead = run('git', ['rev-parse', 'HEAD'], created.worktreePath);
+
+    run('git', ['reset', '--hard', 'origin/main'], created.worktreePath);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'reviewed after rebase\n', 'utf8');
+    commitLocal(created.worktreePath, 'Rebase reviewed PR branch');
+    const freshHead = run('git', ['rev-parse', 'HEAD'], created.worktreePath);
+    execFileSync('git', ['push', '--force', 'origin', `HEAD:refs/heads/${created.branch}`], {
+      cwd: created.worktreePath,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    run('git', ['update-ref', `refs/remotes/origin/${created.branch}`, staleHead], repoRoot);
+
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    ghState.prs[created.branch].headRefOid = freshHead;
+    writeFileSync(ghStateFile, `${JSON.stringify(ghState, null, 2)}\n`, 'utf8');
+    writePassingReviewEvidence(created.worktreePath);
+
+    const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
+    assert.equal(merged.mergedSha, 'deadbeefcafebabe');
+
+    const afterGhState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(afterGhState.prMergeCalls.length, 1);
+    assert.ok(afterGhState.prMergeCalls[0].includes('--match-head-commit'));
+    assert.ok(afterGhState.prMergeCalls[0].includes(freshHead));
+    assert.equal(run('git', ['rev-parse', `refs/remotes/origin/${created.branch}`], repoRoot), freshHead);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });

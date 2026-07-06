@@ -34,6 +34,7 @@ export interface LivePr {
   state?: string | null;
   baseRefName?: string | null;
   headRefName?: string | null;
+  headRefOid?: string | null;
   mergeCommit?: { oid?: string | null } | null;
   mergedAt?: string | null;
 }
@@ -463,7 +464,7 @@ export function loadPrsForBranch(repoRoot: string, branchName: string): LivePr[]
     '--head',
     branchName,
     '--json',
-    'number,title,url,state,baseRefName,headRefName,mergeCommit,mergedAt',
+    'number,title,url,state,baseRefName,headRefName,headRefOid,mergeCommit,mergedAt',
   ], true);
 
   if (!output) {
@@ -518,6 +519,7 @@ export function loadPrDetails(repoRoot: string, prNumber: number): {
   state?: string | null;
   baseRefName?: string | null;
   headRefName?: string | null;
+  headRefOid?: string | null;
   mergeCommit?: { oid: string } | null;
   mergedAt?: string | null;
 } {
@@ -526,7 +528,7 @@ export function loadPrDetails(repoRoot: string, prNumber: number): {
     'view',
     String(prNumber),
     '--json',
-    'number,title,url,state,baseRefName,headRefName,mergeCommit,mergedAt',
+    'number,title,url,state,baseRefName,headRefName,headRefOid,mergeCommit,mergedAt',
   ]);
   return parseJsonOrThrow(output, `Could not parse PR details for #${prNumber}.`);
 }

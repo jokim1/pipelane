@@ -45,14 +45,22 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
     }
   }
 
-  const reviewTarget = currentBranchName === prBranchName
-    ? undefined
-    : resolveReviewEvidenceTargetForBranch(context, prBranchName);
+  const reviewTarget = resolveReviewEvidenceTargetForPr(context, pr);
   assertReviewEvidenceReadyForMerge(cwd, parsed, context, reviewTarget);
 
   watchPrChecks(context.repoRoot, pr.number);
-  assertReviewEvidenceReadyForMerge(cwd, parsed, context, reviewTarget);
-  runGh(context.repoRoot, ['pr', 'merge', String(pr.number), '--squash']);
+  const checkedPr = loadPrByNumber(context.repoRoot, pr.number);
+  assertPrIsOpenForMerge(checkedPr);
+  const checkedReviewTarget = resolveReviewEvidenceTargetForPr(context, checkedPr);
+  assertReviewEvidenceReadyForMerge(cwd, parsed, context, checkedReviewTarget);
+  runGh(context.repoRoot, [
+    'pr',
+    'merge',
+    String(pr.number),
+    '--squash',
+    '--match-head-commit',
+    checkedReviewTarget.sha,
+  ]);
 
   // Poll gh until the PR reports state === "MERGED" AND mergeCommit.oid
   // is present. Fail closed on timeout. Never fall back to
@@ -150,8 +158,10 @@ function assertReviewEvidenceReadyForMerge(
   }
 }
 
-function resolveReviewEvidenceTargetForBranch(context: WorkflowContext, branchName: string): ReviewEvidenceTarget {
-  const sha = resolveBranchSha(context.repoRoot, branchName);
+function resolveReviewEvidenceTargetForPr(context: WorkflowContext, pr: LivePr): ReviewEvidenceTarget {
+  const branchName = pr.headRefName?.trim() ?? '';
+  fetchPrBranch(context.repoRoot, branchName);
+  const sha = resolvePrHeadSha(context.repoRoot, branchName, pr.headRefOid?.trim() ?? '');
   if (!sha) {
     throw new Error([
       `${formatWorkflowCommand(context.config, 'merge')} blocked because PR branch ${branchName} could not be resolved locally.`,
@@ -179,16 +189,29 @@ function resolveReviewEvidenceTargetForBranch(context: WorkflowContext, branchNa
   };
 }
 
-function resolveBranchSha(repoRoot: string, branchName: string): string {
-  const refs = [
-    `refs/heads/${branchName}`,
-    `refs/remotes/origin/${branchName}`,
-  ];
-  for (const ref of refs) {
-    const sha = runGit(repoRoot, ['rev-parse', '--verify', ref], true)?.trim() ?? '';
-    if (/^[a-f0-9]{40,64}$/i.test(sha)) return sha;
+function fetchPrBranch(repoRoot: string, branchName: string): void {
+  if (!branchName) return;
+  runCommandCapture('git', ['fetch', 'origin', `+refs/heads/${branchName}:refs/remotes/origin/${branchName}`, '--no-tags'], {
+    cwd: repoRoot,
+  });
+}
+
+function resolvePrHeadSha(repoRoot: string, branchName: string, expectedSha: string): string {
+  const remoteSha = runGit(repoRoot, ['rev-parse', '--verify', `refs/remotes/origin/${branchName}`], true)?.trim() ?? '';
+  const localSha = runGit(repoRoot, ['rev-parse', '--verify', `refs/heads/${branchName}`], true)?.trim() ?? '';
+
+  if (isGitSha(expectedSha)) {
+    if (isGitSha(remoteSha) && remoteSha !== expectedSha) {
+      return '';
+    }
+    return expectedSha;
   }
-  return '';
+
+  return isGitSha(remoteSha) ? remoteSha : isGitSha(localSha) ? localSha : '';
+}
+
+function isGitSha(value: string): boolean {
+  return /^[a-f0-9]{40,64}$/i.test(value);
 }
 
 interface MergeCommandContext {
