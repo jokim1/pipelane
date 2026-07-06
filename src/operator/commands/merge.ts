@@ -11,7 +11,7 @@ import {
   type ParsedOperatorArgs,
   type WorkflowContext,
 } from '../state.ts';
-import { evaluateReviewEvidenceForPr } from '../review-enforcement.ts';
+import { evaluateReviewEvidenceForPr, type ReviewEvidenceTarget } from '../review-enforcement.ts';
 import { routeSafetyAcceptsReviewFindings } from '../route-loop-safety.ts';
 import {
   buildSharedCheckoutLeaseBlocker,
@@ -45,10 +45,13 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
     }
   }
 
-  assertReviewEvidenceReadyForMerge(cwd, parsed, context);
+  const reviewTarget = currentBranchName === prBranchName
+    ? undefined
+    : resolveReviewEvidenceTargetForBranch(context, prBranchName);
+  assertReviewEvidenceReadyForMerge(cwd, parsed, context, reviewTarget);
 
   watchPrChecks(context.repoRoot, pr.number);
-  assertReviewEvidenceReadyForMerge(cwd, parsed, context);
+  assertReviewEvidenceReadyForMerge(cwd, parsed, context, reviewTarget);
   runGh(context.repoRoot, ['pr', 'merge', String(pr.number), '--squash']);
 
   // Poll gh until the PR reports state === "MERGED" AND mergeCommit.oid
@@ -132,13 +135,60 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
   });
 }
 
-function assertReviewEvidenceReadyForMerge(cwd: string, parsed: ParsedOperatorArgs, context: WorkflowContext): void {
+function assertReviewEvidenceReadyForMerge(
+  cwd: string,
+  parsed: ParsedOperatorArgs,
+  context: WorkflowContext,
+  target?: ReviewEvidenceTarget,
+): void {
   const reviewEvidence = evaluateReviewEvidenceForPr(context, {
     command: formatWorkflowCommand(context.config, 'merge'),
+    target,
   });
   if (!reviewEvidence.allowed && !routeSafetyAcceptsReviewFindings(cwd, parsed, reviewEvidence)) {
     throw new Error(reviewEvidence.message);
   }
+}
+
+function resolveReviewEvidenceTargetForBranch(context: WorkflowContext, branchName: string): ReviewEvidenceTarget {
+  const sha = resolveBranchSha(context.repoRoot, branchName);
+  if (!sha) {
+    throw new Error([
+      `${formatWorkflowCommand(context.config, 'merge')} blocked because PR branch ${branchName} could not be resolved locally.`,
+      `Fetch the PR branch or rerun ${formatWorkflowCommand(context.config, 'pr')} from the task worktree, then retry ${formatWorkflowCommand(context.config, 'merge')}.`,
+    ].join('\n'));
+  }
+  const treeHash = runGit(context.repoRoot, ['rev-parse', '--verify', `${sha}^{tree}`], true)?.trim() ?? '';
+  if (!treeHash) {
+    throw new Error([
+      `${formatWorkflowCommand(context.config, 'merge')} blocked because PR branch ${branchName} tree could not be resolved.`,
+      `Fetch the PR branch, then retry ${formatWorkflowCommand(context.config, 'merge')}.`,
+    ].join('\n'));
+  }
+
+  return {
+    branchName,
+    sha,
+    worktreeStatusDigest: '',
+    worktreeStatusReliable: false,
+    worktreeStatusWarnings: [`review target is PR branch ${branchName}, not the current checkout`],
+    worktreeMaterialTreeHash: treeHash,
+    worktreeMaterialTreeReliable: true,
+    worktreeMaterialTreeWarnings: [],
+    headLabel: `PR branch ${branchName} HEAD`,
+  };
+}
+
+function resolveBranchSha(repoRoot: string, branchName: string): string {
+  const refs = [
+    `refs/heads/${branchName}`,
+    `refs/remotes/origin/${branchName}`,
+  ];
+  for (const ref of refs) {
+    const sha = runGit(repoRoot, ['rev-parse', '--verify', ref], true)?.trim() ?? '';
+    if (/^[a-f0-9]{40,64}$/i.test(sha)) return sha;
+  }
+  return '';
 }
 
 interface MergeCommandContext {

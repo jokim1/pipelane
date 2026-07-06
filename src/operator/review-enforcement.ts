@@ -1,7 +1,6 @@
 import {
   formatWorkflowCommand,
   loadReviewState,
-  runGit,
   type ReviewGateConfig,
   type ReviewGateRunRecord,
   type ReviewRunRecord,
@@ -28,9 +27,21 @@ export interface ReviewEvidenceCheckResult {
   message: string;
 }
 
+export interface ReviewEvidenceTarget {
+  branchName: string;
+  sha: string;
+  worktreeStatusDigest: string;
+  worktreeStatusReliable: boolean;
+  worktreeStatusWarnings: string[];
+  worktreeMaterialTreeHash: string;
+  worktreeMaterialTreeReliable: boolean;
+  worktreeMaterialTreeWarnings: string[];
+  headLabel?: string;
+}
+
 export function evaluateReviewEvidenceForPr(
   context: WorkflowContext,
-  options: { latestOverride?: ReviewRunRecord | null; command?: string } = {},
+  options: { latestOverride?: ReviewRunRecord | null; command?: string; target?: ReviewEvidenceTarget } = {},
 ): ReviewEvidenceCheckResult {
   const reviewState = loadReviewState(context.commonDir, context.config);
   const expectedGates = context.config.reviewGates?.gates ?? [];
@@ -42,32 +53,28 @@ export function evaluateReviewEvidenceForPr(
       message: '',
     };
   }
-  const currentBranch = runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
-  const currentSha = runGit(context.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '';
-  const worktreeStatus = readWorktreeStatusSnapshot(context.repoRoot, {
-    includeStatusDigest: true,
-    includeMaterialTreeHash: true,
-  });
+  const target = options.target ?? currentCheckoutReviewEvidenceTarget(context.repoRoot);
   const latest = options.latestOverride ?? selectReviewEvidenceRecord(reviewState.records, {
-    currentBranch,
-    currentSha,
-    currentWorktreeStatusDigest: worktreeStatus.statusDigest,
-    currentWorktreeStatusReliable: worktreeStatus.statusDigestReliable,
-    currentWorktreeMaterialTreeHash: worktreeStatus.materialTreeHash ?? '',
-    currentWorktreeMaterialTreeReliable: worktreeStatus.materialTreeReliable === true,
+    currentBranch: target.branchName,
+    currentSha: target.sha,
+    currentWorktreeStatusDigest: target.worktreeStatusDigest,
+    currentWorktreeStatusReliable: target.worktreeStatusReliable,
+    currentWorktreeMaterialTreeHash: target.worktreeMaterialTreeHash,
+    currentWorktreeMaterialTreeReliable: target.worktreeMaterialTreeReliable,
   });
   const issues = collectReviewEvidenceIssues({
     latest,
     expectedGates,
     strictIndependentAi: context.config.reviewGates?.policyVersion === REVIEW_GATES_POLICY_VERSION,
-    currentBranch,
-    currentSha,
-    currentWorktreeStatusDigest: worktreeStatus.statusDigest,
-    currentWorktreeStatusReliable: worktreeStatus.statusDigestReliable,
-    currentWorktreeStatusWarnings: worktreeStatus.statusDigestWarnings,
-    currentWorktreeMaterialTreeHash: worktreeStatus.materialTreeHash ?? '',
-    currentWorktreeMaterialTreeReliable: worktreeStatus.materialTreeReliable === true,
-    currentWorktreeMaterialTreeWarnings: worktreeStatus.materialTreeWarnings ?? [],
+    currentBranch: target.branchName,
+    currentSha: target.sha,
+    currentHeadLabel: target.headLabel ?? 'current HEAD',
+    currentWorktreeStatusDigest: target.worktreeStatusDigest,
+    currentWorktreeStatusReliable: target.worktreeStatusReliable,
+    currentWorktreeStatusWarnings: target.worktreeStatusWarnings,
+    currentWorktreeMaterialTreeHash: target.worktreeMaterialTreeHash,
+    currentWorktreeMaterialTreeReliable: target.worktreeMaterialTreeReliable,
+    currentWorktreeMaterialTreeWarnings: target.worktreeMaterialTreeWarnings,
   });
 
   return {
@@ -75,6 +82,23 @@ export function evaluateReviewEvidenceForPr(
     latest,
     issues,
     message: issues.length === 0 ? '' : formatReviewEvidenceBlocker(context, issues, options.command),
+  };
+}
+
+function currentCheckoutReviewEvidenceTarget(repoRoot: string): ReviewEvidenceTarget {
+  const worktreeStatus = readWorktreeStatusSnapshot(repoRoot, {
+    includeStatusDigest: true,
+    includeMaterialTreeHash: true,
+  });
+  return {
+    branchName: worktreeStatus.branchName,
+    sha: worktreeStatus.head,
+    worktreeStatusDigest: worktreeStatus.statusDigest,
+    worktreeStatusReliable: worktreeStatus.statusDigestReliable,
+    worktreeStatusWarnings: worktreeStatus.statusDigestWarnings,
+    worktreeMaterialTreeHash: worktreeStatus.materialTreeHash ?? '',
+    worktreeMaterialTreeReliable: worktreeStatus.materialTreeReliable === true,
+    worktreeMaterialTreeWarnings: worktreeStatus.materialTreeWarnings ?? [],
   };
 }
 
@@ -96,6 +120,10 @@ export function selectReviewEvidenceRecord(
     && reviewRecordMatchesCurrentWorktree(record, options)
   )
     ?? records.find((record) => record.branchName === currentBranch && record.sha === currentSha)
+    ?? records.find((record) =>
+      record.branchName === currentBranch
+      && reviewRecordMatchesCurrentWorktree(record, options)
+    )
     ?? records.find((record) => record.branchName === currentBranch)
     ?? null;
 }
@@ -114,6 +142,7 @@ function collectReviewEvidenceIssues(options: {
   strictIndependentAi: boolean;
   currentBranch: string;
   currentSha: string;
+  currentHeadLabel: string;
   currentWorktreeStatusDigest: string;
   currentWorktreeStatusReliable: boolean;
   currentWorktreeStatusWarnings: string[];
@@ -127,6 +156,7 @@ function collectReviewEvidenceIssues(options: {
     strictIndependentAi,
     currentBranch,
     currentSha,
+    currentHeadLabel,
     currentWorktreeStatusDigest,
     currentWorktreeStatusReliable,
     currentWorktreeStatusWarnings,
@@ -164,10 +194,14 @@ function collectReviewEvidenceIssues(options: {
       blocking: true,
     });
   }
-  if (latest.sha !== currentSha) {
+  const materialTreeMatches = reviewRecordMaterialTreeMatchesCurrentWorktree(latest, {
+    currentWorktreeMaterialTreeHash,
+    currentWorktreeMaterialTreeReliable,
+  });
+  if (latest.sha !== currentSha && !materialTreeMatches) {
     issues.push({
       status: 'incomplete',
-      message: `latest review ${latest.id} is for ${shortSha(latest.sha)}, not current HEAD ${shortSha(currentSha)}`,
+      message: `latest review ${latest.id} is for ${shortSha(latest.sha)}, not ${currentHeadLabel} ${shortSha(currentSha)}`,
       blocking: true,
     });
   }

@@ -15508,6 +15508,43 @@ test('review runner records pending AI gates without failing the process', () =>
   }
 });
 
+test('review evidence remains valid after committing the reviewed dirty tree', async () => {
+  const repoRoot = createRepo();
+  try {
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'static-pass',
+        phase: 'static',
+        type: 'command',
+        command: `${JSON.stringify(process.execPath)} -e "process.exit(0)"`,
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitLocal(repoRoot, 'Configure review gate');
+
+    writeFileSync(path.join(repoRoot, 'feature.txt'), 'reviewed before commit\n', 'utf8');
+    const record = writePassingReviewEvidence(repoRoot);
+    const reviewedSha = record.sha;
+
+    commitLocal(repoRoot, 'Commit reviewed tree');
+    const currentSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+    const currentTree = run('git', ['rev-parse', 'HEAD^{tree}'], repoRoot);
+    const { resolveWorkflowContext } = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const { evaluateReviewEvidenceForPr } = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-enforcement.ts'));
+    const evidence = evaluateReviewEvidenceForPr(resolveWorkflowContext(repoRoot));
+
+    assert.notEqual(currentSha, reviewedSha);
+    assert.equal(record.worktreeMaterialTreeHash, currentTree);
+    assert.equal(evidence.allowed, true, evidence.message);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('review command gates use material tree identity when dirty file exceeds route digest budget', async () => {
   const repoRoot = createRepo();
   try {
