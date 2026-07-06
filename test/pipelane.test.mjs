@@ -2861,6 +2861,35 @@ test('pipelane.md documents exact first-token routing for subcommands', () => {
   assert.match(template, /`\/pipelane update-this-thing` routes to UNKNOWN MODE, not UPDATE MODE/);
 });
 
+test('fix.md template locks parser grammar fields and verbatim hint strings', () => {
+  // Locked-surface assertion, scoped to locked-by-definition strings only:
+  // the parser-grammar field formats and the hint strings fix.md orders
+  // emitted verbatim. Update alongside deliberate wording changes.
+  const templatePath = path.join(KIT_ROOT, 'templates', '.claude', 'commands', 'fix.md');
+  const template = readFileSync(templatePath, 'utf8');
+
+  const grammarLines = [
+    '- **`Last reviewed:`** — exact casing, colon, ISO `YYYY-MM-DD`.',
+    '- **`Refresh cadence:`** — exact casing, colon, one of `<N> days` | `<N> commits` | `<N> days or <N> commits`.',
+    '- **`Drift-hint threshold:`** — exact casing, colon, `<N> commits / <N> days`.',
+    '- **`Last rethink:`** — exact casing, colon, `YYYY-MM-DD <repo-relative-plan-path|none>`.',
+  ];
+  for (const line of grammarLines) {
+    assert.ok(template.includes(line), `fix.md template missing locked grammar line: ${line}`);
+  }
+
+  const hintStrings = [
+    '&lt;file&gt; has &lt;N&gt; commits in 30 days. Consider `/fix rethink`.',
+    '&lt;N&gt; findings in this batch landed in `&lt;module&gt;`. Consider `/fix rethink &lt;module&gt;`.',
+    'No REPO_GUIDANCE.md at the repo root. Run `/fix refresh-guidance` to start building invariants.',
+    'REPO_GUIDANCE.md still contains template placeholders (`<...>`) in most sections, so /fix ran without repo-specific invariants. Run `/fix refresh-guidance` to replace them with real project rules — future /fix runs will follow them.',
+    'This fix exposed a pattern worth adding to REPO_GUIDANCE.md: &lt;one-sentence description&gt;. Run `/fix refresh-guidance` to capture it.',
+  ];
+  for (const hint of hintStrings) {
+    assert.ok(template.includes(hint), `fix.md template missing locked hint string: ${hint}`);
+  }
+});
+
 test('resolveWorkflowAliases still rejects unknown aliases (pipelane is not a WorkflowCommand key)', async () => {
   // The strict-validator for unknown keys is unchanged — `aliases.pipelane`
   // is not a valid consumer config because pipelane isn't a WorkflowCommand
