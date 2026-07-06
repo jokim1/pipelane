@@ -128,7 +128,7 @@ consumed atomically. Other non-risky actions complete in one call.
 | `route.deploy.prod` | **yes** | Run the remaining destination route steps through production deploy. |
 | `clean.plan` | no | Preview workspace cleanup. |
 | `clean.apply` | **yes** | Apply stale workspace cleanup with an explicit scope such as `allStale`. |
-| `doctor.diagnose` | no | Read CLAUDE.md, detect platform, list missing config + probe status. |
+| `doctor.diagnose` | no | Read machine-local deploy config, detect platform, list missing config + probe status. |
 | `doctor.probe` | no | Hit every configured staging healthcheck URL and persist the result to `probe-state.json`. |
 | `rollback.staging` | no | Redeploy the last verified-good SHA to staging (Pipelane-only). |
 | `rollback.prod` | **yes** | Redeploy the last verified-good SHA to production (Pipelane-only). |

@@ -748,11 +748,9 @@ function advanceRemoteMain(remoteRoot, fileName, content = 'advance main\n') {
   }
 }
 
-function switchToLegacyProjectWorkflowConfig(repoRoot) {
-  const configPath = machinePipelaneConfigPath(repoRoot);
+function writeIgnoredLegacyProjectWorkflowConfig(repoRoot, config = { displayName: 'Legacy App', baseBranch: 'trunk' }) {
   const legacyConfigPath = path.join(repoRoot, '.project-workflow.json');
-  cpSync(configPath, legacyConfigPath);
-  rmSync(configPath, { force: true });
+  writeFileSync(legacyConfigPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
 }
 
 function writeFakeGh(binDir, stateFile) {
@@ -2445,7 +2443,7 @@ test('install-codex outside a pipelane repo installs durable global default skil
     assert.match(pipelaneSkill, /\/karpathy-audit/);
     assert.match(pipelaneSkill, /legacy-compatible/);
     assert.match(pipelaneSkill, /fresh reviewer session/);
-    assert.match(pipelaneSkill, /Same-session evidence will block `\/pr`/);
+    assert.match(pipelaneSkill, /Same-session evidence will block\s+`\/pr`/);
     assert.doesNotMatch(pipelaneSkill, /review setup --preset/);
     assert.doesNotMatch(pipelaneSkill, /lean\|standard\|strict-production/);
     const fixSkill = readFileSync(path.join(codexHome, 'skills', 'fix', 'SKILL.md'), 'utf8');
@@ -2546,7 +2544,7 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     assert.match(pipelaneSkill, /\/karpathy-audit/);
     assert.match(pipelaneSkill, /legacy-compatible/);
     assert.match(pipelaneSkill, /fresh reviewer session/);
-    assert.match(pipelaneSkill, /Same-session evidence will block `\/pr`/);
+    assert.match(pipelaneSkill, /Same-session evidence will block\s+`\/pr`/);
     assert.doesNotMatch(pipelaneSkill, /review setup --preset/);
     assert.doesNotMatch(pipelaneSkill, /lean\|standard\|strict-production/);
     assert.match(
@@ -10378,7 +10376,7 @@ test('orchestrate plan blocks dirty parent source before creating a run', () => 
 
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /dirty parent worktree/);
-    assert.match(result.stderr, /\.pipelane\.json/);
+    assert.doesNotMatch(result.stderr, /\.pipelane\.json/);
     assert.match(result.stderr, /docs\/ARCHITECTURE\.md/);
     assert.doesNotMatch(result.stderr, /docs\/dirty-plan\.md/);
     assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'orchestrate', 'runs')), false);
@@ -13660,12 +13658,15 @@ test('orchestrate review keeps pending same-session AI gates incomplete', async 
   }
 });
 
-test('orchestrate review ignores malformed repo-local slice config under machine-local config', () => {
+test('orchestrate review ignores malformed repo-local slice config files', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];
   const workerScript = [
     'const fs = require("node:fs");',
+    'const cp = require("node:child_process");',
     'fs.writeFileSync(".pipelane.json", "{ malformed", "utf8");',
+    'cp.execSync("git add .pipelane.json", { stdio: "ignore" });',
+    'cp.execSync("git -c user.email=ci@example.com -c user.name=CI commit -m \\"commit malformed repo-local config\\"", { stdio: "ignore" });',
     'console.log("malformed slice config written");',
   ].join('');
   const workerCommand = [
@@ -13674,12 +13675,19 @@ test('orchestrate review ignores malformed repo-local slice config under machine
     JSON.stringify(workerScript),
   ].join(' ');
   try {
-    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
+    writePipelaneConfig(repoRoot, 'Demo App');
+    const configPath = machinePipelaneConfigPath(repoRoot);
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.reviewGates = {
       preset: 'standard',
       planReview: { gates: [] },
-      gates: [],
+      gates: [{
+        id: 'static-pass',
+        phase: 'static',
+        type: 'command',
+        command: 'node -e "process.exit(0)"',
+        blocking: true,
+      }],
     };
     writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
     commitAll(repoRoot, 'Adopt empty review gate snapshot');
@@ -13695,15 +13703,15 @@ test('orchestrate review ignores malformed repo-local slice config under machine
     const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot).stdout);
     const onDisk = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
 
-    assert.equal(readFileSync(path.join(prepared.slices[0].worktreePath, '.pipelane.json'), 'utf8'), '{ malformed');
-    assert.equal(reviewed.status, 'blocked');
-    assert.equal(reviewed.reviewedCount, 0);
-    assert.equal(reviewed.blockedCount, 1);
-    assert.equal(onDisk.status, 'blocked');
-    assert.equal(onDisk.slices[0].status, 'blocked');
-    assert.equal(onDisk.slices[0].review, null);
-    assert.equal(onDisk.slices[0].reviewDiagnostics[0].run.gates.length, 0);
-    assert.match(reviewed.slices[0].blocker, /no effective review gates configured/);
+    assert.equal(reviewed.status, 'passed');
+    assert.equal(reviewed.reviewedCount, 1);
+    assert.equal(reviewed.pendingCount, 0);
+    assert.equal(reviewed.blockedCount, 0);
+    assert.equal(onDisk.status, 'completed');
+    assert.equal(onDisk.slices[0].review.run.status, 'passed');
+    assert.equal(onDisk.slices[0].review.run.gates.length, 1);
+    assert.equal(onDisk.slices[0].review.run.gates[0].gateId, 'static-pass');
+    assert.equal(onDisk.slices[0].review.run.gates[0].status, 'passed');
   } finally {
     for (const worktreePath of createdWorktrees) {
       rmSync(worktreePath, { recursive: true, force: true });
@@ -15843,7 +15851,6 @@ test('review runner activates risk gates only for matching high-stakes paths', (
       }],
     };
     writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
-    commitLocal(repoRoot, 'Adopt high-stakes review gate');
 
     writeFileSync(path.join(repoRoot, 'notes.txt'), 'low risk\n', 'utf8');
     const lowRisk = JSON.parse(runCli(['run', 'review', '--json'], repoRoot).stdout);
@@ -16924,14 +16931,15 @@ test('patchReadableWorkflowConfig materializes machine-local config when it is m
   }
 });
 
-test('new and repo-guard work from repos that track only .project-workflow.json', () => {
+test('new and repo-guard ignore repo-local .project-workflow.json', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
-    switchToLegacyProjectWorkflowConfig(repoRoot);
+    writeIgnoredLegacyProjectWorkflowConfig(repoRoot);
     commitAll(repoRoot, 'Adopt legacy workflow config');
 
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Legacy Config', '--json'], repoRoot).stdout);
+    assert.match(created.branch, /^codex\/legacy-config-/);
     assert.equal(existsSync(path.join(created.worktreePath, '.pipelane.json')), false);
     assert.equal(existsSync(path.join(created.worktreePath, '.project-workflow.json')), true);
 
@@ -19227,16 +19235,12 @@ test('release-check re-blocks when the deploy config fingerprint drifts', async 
     const baseline = JSON.parse(runCli(['run', 'release-check', '--json'], repoRoot).stdout);
     assert.equal(baseline.ready, true);
 
-    // Now rotate the staging URL in CLAUDE.md. The record's stored
+    // Now rotate the machine-local staging URL. The record's stored
     // configFingerprint no longer matches → gate re-blocks, operator must
     // re-run staging to re-register against the new config shape.
-    const claudeMdPath = path.join(repoRoot, 'CLAUDE.md');
-    const existing = readFileSync(claudeMdPath, 'utf8');
-    writeFileSync(
-      claudeMdPath,
-      existing.replace('staging.example.test', 'staging-v2.example.test'),
-      'utf8',
-    );
+    const deployConfig = JSON.parse(readFileSync(sharedDeployConfigPath(repoRoot), 'utf8'));
+    deployConfig.frontend.staging.url = 'https://staging-v2.example.test';
+    writeSharedDeployConfig(repoRoot, deployConfig);
 
     const drifted = runCli(['run', 'release-check', '--json'], repoRoot, {}, true);
     const output = JSON.parse(drifted.stdout);
@@ -19268,13 +19272,9 @@ test('release-check: rotating prod-only config does NOT invalidate staging recor
 
     // Rotate ONLY production fields. Staging-side config is untouched, so
     // the staging fingerprint must remain stable and the gate must stay open.
-    const claudeMdPath = path.join(repoRoot, 'CLAUDE.md');
-    const existing = readFileSync(claudeMdPath, 'utf8');
-    writeFileSync(
-      claudeMdPath,
-      existing.replace('https://app.example.test', 'https://app-v2.example.test'),
-      'utf8',
-    );
+    const deployConfig = JSON.parse(readFileSync(sharedDeployConfigPath(repoRoot), 'utf8'));
+    deployConfig.frontend.production.url = 'https://app-v2.example.test';
+    writeSharedDeployConfig(repoRoot, deployConfig);
 
     const after = JSON.parse(runCli(['run', 'release-check', '--json'], repoRoot).stdout);
     assert.equal(after.ready, true, 'prod-only config rotation must not re-block staging');
@@ -21381,8 +21381,6 @@ test('route safety pending review stop exits non-zero', () => {
         ],
       };
     });
-    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
-    execFileSync('git', ['commit', '-m', 'Adopt route safety pending exit'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
     writeFileSync(path.join(repoRoot, 'feature.txt'), 'pending review stop\n', 'utf8');
 
     const review = runCli(['run', 'review', '--json'], repoRoot, {}, true);
@@ -30385,7 +30383,7 @@ test('deploy in an un-onboarded repo fails with guided setup before dispatch', (
 
     assert.equal(result.status, 1);
     assert.match(result.stderr, /repo is not onboarded yet/);
-    assert.match(result.stderr, /No \.pipelane\.json, \.project-workflow\.json, or package\.json:pipelane block/);
+    assert.match(result.stderr, /No machine-local Pipelane config was found/);
     assert.match(result.stderr, /\/pipelane setup/);
     assert.match(result.stderr, /pipelane configure/);
     assert.match(result.stderr, /Then retry: \/deploy staging --pr 625/);

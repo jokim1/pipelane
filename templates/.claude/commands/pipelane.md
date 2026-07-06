@@ -231,16 +231,20 @@ current gate, `[x]` passed, `[!]` failed/blocking, `[-]` skipped, and `[ ]`
 pending/manual gates. `/pipelane review --json` remains machine-readable and
 does not print the checklist.
 
-Special case: when `$REST` is exactly `setup`, do not run the interactive setup command first. Agent Bash tools commonly run without an interactive TTY, and shell pipes make stdout non-TTY.
+Special case: when `$REST` is exactly `setup`, run the setup command directly
+through the managed runner and relay the output. Bare review setup is read-only:
+it prints the saved grouped gate state when config exists, or inferred
+recommended defaults when it does not. Do not reduce it to a request to rerun
+with `--yes`.
 
-1. Run `/pipelane review setup --print` through the managed runner to inspect the current effective gate config.
-2. If the user needs the available gate catalog, run `/pipelane review setup --list-gates` through the managed runner.
-3. Present deterministic choices in chat:
-   - `1. Save recommended gates: /pipelane review setup --yes`
-   - `2. Cancel`
-4. After the user chooses, run the matching command exactly.
+If the user's next reply is one or more displayed row ids such as `C4` or
+`C3,H1`, treat it as a review setup selection and run the matching command
+exactly. Gate values may be repeated or comma-separated, for example
+`review setup C3,H1` or `review setup --enable typecheck,test,build`.
 
-If `$REST` starts with `setup --yes`, `setup --print`, `setup --list-gates`, or `setup --json`, run the command directly. Do not add shell pipes to setup commands that may need interactivity.
+If `$REST` starts with `setup` and includes any flag or selection, run the
+command directly. Do not add shell pipes to setup commands that may need
+interactivity.
 
 ---
 
@@ -332,12 +336,12 @@ This command:
 
 1. Reads the installed Pipelane version from `node_modules/pipelane/package.json` and the resolved commit from `package-lock.json`.
 2. Fetches the latest `main` commit from `github:jokim1/pipelane` via `git ls-remote`.
-3. If behind, summarizes the commits between (via `gh api repos/jokim1/pipelane/compare`, best effort) and runs `npm install pipelane@github:jokim1/pipelane#main` in the consumer repo. The user invoked `update` — that is the consent; no confirmation prompt.
-4. Runs template-drift detection against the consumer repo. Surfaces the minimum follow-up needed — new/renamed slash commands, scaffold writes, Codex skill changes, other template re-renders — and runs setup inline automatically when there are no collisions. Prints reopen-Claude / reopen-Codex hints only when the affected surface actually changed. In `--check` mode this same detection runs without installing, so you can answer "is this consumer in sync?" any time.
+3. If behind, summarizes the commits between (via `gh api repos/jokim1/pipelane/compare`, best effort) and runs `npm install pipelane@github:jokim1/pipelane#main` only when this repo has a pinned Pipelane install. The user invoked `update` — that is the consent; no confirmation prompt.
+4. Refreshes durable machine-local Claude/Codex surfaces when installed and runs setup repair when needed. Setup/update must not create tracked repo-local adapters, docs, package scripts, or Codex skills. In `--check` mode this same detection runs without installing, so you can answer "is this consumer in sync?" any time.
 
 Use `--check` to inspect without mutating. Use `--json` for structured output; JSON mode installs but does not auto-run setup — the caller decides via the `followUpSteps` field, which describes exactly which surfaces would change.
 
-Collisions (existing non-pipelane files where managed files would land) are reported but NOT auto-resolved — setup is skipped and the operator must rename, remove, or adjust aliases before retrying.
+Configuration or alias collisions are reported but NOT auto-resolved — setup is skipped and the operator must rename, remove, or adjust aliases before retrying.
 
 <!-- pipelane:consumer-extension:start -->
 <!-- pipelane:consumer-extension:end -->

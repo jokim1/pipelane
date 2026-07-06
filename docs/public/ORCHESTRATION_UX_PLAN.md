@@ -799,22 +799,24 @@ Each slice should land with focused tests before the next slice starts.
 - Convert bare `/pipelane review setup` from report-only to an interactive
   wizard when stdout is a TTY.
 - Keep existing flags for automation: `--yes`, `--print`, `--list-gates`,
-  and future advanced/custom-gate flags.
+  `--enable`, `--disable`, `--install`, `--reset`, and comma-separated or
+  repeated gate values. Custom gate-authoring flags are not part of the current
+  CLI.
 - Detect package scripts and known skills/tools before rendering the gate list.
 - Add install-state detection for AI gates.
 - Add install approval flow for known missing AI gates.
-- Keep package-script installers conservative: use npm only when the repo looks
-  npm-managed, and return manual recipes for pnpm, Yarn, Bun, mixed lockfiles,
-  or framework-specific ESLint setup.
+- Keep installers out of application-owned files. `secret-scan` may install
+  machine-local gitleaks; package-script gates return manual recipes instead of
+  editing `package.json`.
 - Save explicit selected gate config.
 - In non-TTY mode, do not hang and do not silently accept defaults. Either
   require explicit flags such as `--yes` or `--print`, or print the available
   choices with exact follow-up commands and exit without writing config.
 - Automation examples:
   - `/pipelane review setup --yes`
-  - `/pipelane review setup --enable adversarial-review`
+  - `/pipelane review setup --enable typecheck,test,build`
   - `/pipelane review setup --disable gstack-review`
-  - `/pipelane review setup --install lint`
+  - `/pipelane review setup --install secret-scan`
   - `/pipelane review setup --print --json`
   - `/pipelane review setup --list-gates --json`
 
@@ -865,8 +867,9 @@ the no-subcommand entry point.
 
 ### Migration And Compatibility
 
-- Existing `.pipelane.json` review-gate configs are legacy inputs and should be
-  migrated to machine-local config.
+- Existing `.pipelane.json`, `.project-workflow.json`, and
+  `package.json:pipelane` configs are ignored by active setup. Operators who
+  want those choices must copy them into machine-local config intentionally.
 - Existing orchestration ledgers without human decision or reviewer identity
   fields load with empty/default fields and a `legacy` evidence label.
 - Existing low-level orchestration commands keep their CLI contracts.

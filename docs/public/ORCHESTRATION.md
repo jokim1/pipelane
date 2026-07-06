@@ -54,23 +54,21 @@ Current commands:
 ```text
 /pipelane review setup
 /pipelane review setup C3
-/pipelane review setup --enable gstack-review
-/pipelane review setup --disable typecheck
+/pipelane review setup C3,H1
+/pipelane review setup --enable typecheck,test,build
+/pipelane review setup --disable gstack-review
 /pipelane review setup --install secret-scan
 /pipelane review setup --reset
 /pipelane review setup --print
 /pipelane review setup --list-gates
 ```
 
-Custom extensions:
+Gate values may be repeated or comma-separated. Custom gate-authoring commands
+such as `--add-plan-gate` are not part of the current CLI.
 
-```text
-/pipelane review setup --add-plan-gate plan-eng-review
-/pipelane review setup --add-static-gate "npm run lint"
-/pipelane review setup --add-ai-gate "/karpathy diff"
-```
-
-Setup should detect existing scripts before suggesting new gates. If a repo has
+Setup writes machine-local Pipelane config; it must not create or modify
+repo-local adapters, docs, or package scripts. Setup should detect existing
+scripts before suggesting new gates. If a repo has
 `lint`, `typecheck`, `test`, `build`, or `format:check`, use those commands. If
 a script is missing, suggest it as a setup gap instead of silently inventing a
 toolchain.
@@ -83,15 +81,15 @@ High-stakes paths add `/code-review ultra` and human approval. Users may opt out
 of gates, but the UI should make the consequence explicit: less review coverage.
 The authoring session must never attest its own independent AI review.
 
-Known package-script installers are allowed to help, but only conservatively:
-npm projects can install standard dev dependencies for lint and format-check;
-pnpm, Yarn, Bun, mixed lockfiles, and framework-specific ESLint setups should
-receive a concrete manual recipe rather than a generic generated config or an
-unexpected package-manager mutation.
+Installers are allowed only when they do not mutate application-owned files.
+`secret-scan` can install gitleaks under machine-local Pipelane state. Gates
+that require package scripts, such as lint, format-check, or dependency-audit,
+should print a concrete manual recipe rather than editing package.json or
+inventing a toolchain.
 
 `--print` and `--list-gates` are read-only inspection modes. Do not combine
-them with `--enable`, `--disable`, or `--install`; run the modifying command
-first, then inspect the saved config.
+them with `--toggle`, `--enable`, `--disable`, `--install`, or `--reset`; run
+the modifying command first, then inspect the saved config.
 
 Karpathy gates should use the names humans naturally type:
 

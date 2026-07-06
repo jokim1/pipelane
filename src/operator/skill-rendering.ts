@@ -191,12 +191,13 @@ defaults when it does not. It must not be reduced to a request to rerun with
 \`--yes\`.
 
 Relay the opinionated review shape to the user. The recommended AI stack is
-\`karpathy-diff\` as author self-review, \`code-review-high\` when Claude review
-support is available, \`gstack-review\` as the independent fallback, and
-\`adversarial-review\` for a cross-model pass when installed. High-stakes diffs
-can add \`code-review-ultra\` and human approval. Independent AI gates must be
-run from a fresh reviewer session; do not let the authoring session attest its
-own independent review. Same-session evidence will block \`/pr\`.
+\`gstack-review\` as the fix-first structural pass, \`karpathy-diff\` as
+read-only traceability review, \`code-review-high\` when Claude review support
+is available, and \`adversarial-review\` for a cross-model pass when installed.
+High-stakes diffs can add \`code-review-ultra\` and human approval. Independent
+AI gates must be run from a fresh reviewer session; do not let the authoring
+session attest its own independent review. Same-session evidence will block
+\`/pr\`.
 
 Do not reduce the review setup output to only a category summary. Preserve the
 grouped rows, stable ids such as \`C3\`, and exact commands, especially
@@ -212,8 +213,9 @@ immediately and reprints the grouped state:
 - \`review setup --toggle <display-id-or-gate-id>\` to flip a displayed row.
 - \`review setup --enable <gate-id>\` to enable an available gate.
 - \`review setup --disable <gate-id>\` to disable a preselected gate.
-- \`review setup --install <gate-id>\` to install and enable an optional gate
-  such as \`lint\` or \`adversarial-review\`.
+- \`review setup --install <gate-id>\` to install and enable optional support.
+  \`secret-scan\` may install machine-local gitleaks; app-owned package-script
+  gates such as \`lint\` print manual recipes instead of editing the repo.
 - \`review setup --reset\` to restore recommended defaults.
 - Gate values may be repeated or comma-separated, for example
   \`review setup C3,H1\` or \`review setup --toggle C3,H1\`.

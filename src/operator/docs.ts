@@ -228,12 +228,9 @@ function renderLessonsBlock(entriesInner = ''): string {
   ].join('\n');
 }
 
-// Single source of truth for seeding a fresh CLAUDE.md from the Pipelane template.
-// Used by setupConsumerRepo (creating CLAUDE.md on first init) and handleConfigure
-// (seeding when a consumer ran init long ago and has since deleted CLAUDE.md).
-// Keeping this in docs.ts means any new {{TEMPLATE_VAR}} added to renderTemplate
-// above automatically flows through both callers — no parallel implementation to
-// keep in sync.
+// Legacy template renderer retained for compatibility helpers and tests.
+// `pipelane setup` and `pipelane configure` must not create repo-local
+// CLAUDE.md files.
 export function renderClaudeMdFromTemplate(config: WorkflowConfig): string {
   const rendered = renderTemplate(readTemplate('pipelane/CLAUDE.template.md'), config);
   return rendered
@@ -407,10 +404,10 @@ function captureManagedExtensionsByCommand(
   return extensions;
 }
 
-// Compute the on-disk filename pipelane:setup will write for a managed command.
-// Extras (pipelane.md, fix.md) keep fixed filenames; workflow commands follow
-// the consumer's alias map. Shared by the sync loop and by detectSetupDrift so
-// both agree on which file represents each command.
+// Compute the legacy on-disk filename for a managed command. Extras
+// (pipelane.md, fix.md) keep fixed filenames; workflow commands follow the
+// consumer's alias map. Active setup no longer writes these files into consumer
+// repos.
 function managedClaudeCommandFilename(
   name: ManagedCommand,
   aliases: Record<WorkflowCommand, string>,
@@ -421,10 +418,8 @@ function managedClaudeCommandFilename(
   return `${aliasCommandName(aliases[name as WorkflowCommand])}.md`;
 }
 
-// Render the final content pipelane:setup will write for a managed command,
-// including any preserved consumer-extension block. Used by the sync loop to
-// emit bytes and by detectSetupDrift to compare against what's already on
-// disk — one render path, one answer.
+// Render legacy managed-command content, including any preserved
+// consumer-extension block.
 function renderManagedClaudeCommand(
   name: ManagedCommand,
   config: WorkflowConfig,
@@ -439,11 +434,13 @@ function resolveEffectiveSyncDocs(_repoRoot: string, config: WorkflowConfig): Re
 }
 
 function shouldScaffoldClaudeMd(syncDocs: Required<SyncDocsConfig>): boolean {
-  return syncDocs.claudeCommands || syncDocs.pipelaneClaudeTemplate;
+  void syncDocs;
+  return false;
 }
 
 function shouldScaffoldRepoGuidance(syncDocs: Required<SyncDocsConfig>): boolean {
-  return syncDocs.agentsSection || syncDocs.codexSkills;
+  void syncDocs;
+  return false;
 }
 
 // Pure computation of what replaceMarkedSection would write. Shared by the
@@ -514,9 +511,10 @@ export const PREINSTALL_GUARD_FINGERPRINT = 'pipelane/scripts/preinstall-guard.c
 export const PIPELANE_PREINSTALL_GUARD =
   `node -e "const p='./node_modules/${PREINSTALL_GUARD_FINGERPRINT}';require('fs').existsSync(p)&&require(p)"`;
 
-// Special-case merge for the `preinstall` script slot. The default
-// REQUIRED_PACKAGE_SCRIPTS merge is last-write-wins; clobbering a consumer's
-// existing preinstall would silently break their CI hooks. Instead:
+// Legacy package-script helper. Active setup no longer wires a preinstall guard
+// into consumer package.json, but the merge behavior remains covered for old
+// helpers/tests. Clobbering a consumer's existing preinstall would silently
+// break their CI hooks. Instead:
 // - no existing preinstall → write ours
 // - existing already contains the guard fingerprint → leave alone (idempotent)
 // - existing is something else → chain ours first so the worktree-symlink
@@ -1075,9 +1073,8 @@ export function setupConsumerRepo(cwd: string, options: SetupConsumerRepoOptions
     skippedClaudeScaffold = true;
   }
 
-  // REPO_GUIDANCE.md is consumer-owned forever: pipelane writes the scaffold
-  // once on setup, never re-syncs. Idempotent — skip if the file already
-  // exists, preserving whatever the consumer has customized.
+  // REPO_GUIDANCE.md is consumer-owned forever. Active setup does not create or
+  // re-sync it; if the file exists, preserve whatever the consumer customized.
   const repoGuidancePath = path.join(repoRoot, 'REPO_GUIDANCE.md');
   let createdRepoGuidance = false;
   let skippedRepoGuidanceScaffold = false;
@@ -1143,8 +1140,9 @@ export interface SetupDrift {
   codex: CodexSkillDrift & { enabled: boolean };
   claudeGuidance: { willScaffold: boolean };
   repoGuidance: { willScaffold: boolean };
-  // Names of other syncConsumerDocs surfaces setup would re-render. Values
-  // come from the SyncDocsConfig keys enabled for this consumer.
+  // Legacy sync surfaces setup would have re-rendered. Active setup forces
+  // these off via resolveSyncDocs(), so this should stay empty for normal
+  // consumers.
   otherSurfaces: string[];
   agentsGuidanceMigrations: AgentsGuidanceMigration[];
   claudeGuidanceMigrations: ClaudeGuidanceMigration[];
@@ -1152,11 +1150,10 @@ export interface SetupDrift {
   warnings: string[];
 }
 
-// Pure-detection mirror of syncConsumerDocs + setupConsumerRepo's file writes.
-// Answers "what would pipelane:setup change right now?" without touching disk.
-// Used by /pipelane update to surface the minimum follow-up steps when
-// templates drift between installed node_modules and the consumer's working
-// tree.
+// Pure-detection mirror of legacy syncConsumerDocs/setup writes. Active setup is
+// machine-local only, so repo-local adapter/doc/script drift should not become a
+// setup trigger. Used by /pipelane update for compatibility reporting and
+// machine-local host refresh hints.
 export function detectSetupDrift(cwd: string): SetupDrift {
   const repoRoot = resolveRepoRoot(cwd, true);
   const config = loadWorkflowConfig(repoRoot);
@@ -1228,7 +1225,7 @@ export function detectSetupDrift(cwd: string): SetupDrift {
       };
   const codex = { ...codexDrift, enabled: syncDocs.codexSkills };
 
-  // Local guidance scaffolds — write-once, never re-sync.
+  // Local guidance scaffolds are no longer created by setup.
   const claudeGuidance = {
     willScaffold: shouldScaffoldClaudeMd(syncDocs) && !existsSync(path.join(repoRoot, 'CLAUDE.md')),
   };
@@ -1236,7 +1233,8 @@ export function detectSetupDrift(cwd: string): SetupDrift {
     willScaffold: shouldScaffoldRepoGuidance(syncDocs) && !existsSync(path.join(repoRoot, 'REPO_GUIDANCE.md')),
   };
 
-  // Other re-rendered surfaces — each conditional block in syncConsumerDocs.
+  // Other legacy re-rendered surfaces — each conditional block in the old
+  // syncConsumerDocs path.
   const otherSurfaces: string[] = [];
   if (syncDocs.pipelaneClaudeTemplate) {
     const target = path.join(repoRoot, 'pipelane', 'CLAUDE.template.md');
@@ -1371,12 +1369,12 @@ export function formatSetupResult(result: SetupConsumerRepoResult): string[] {
   const lines: string[] = [
     `Pipelane setup complete in ${result.repoRoot}`,
     result.createdClaude
-      ? 'Created local CLAUDE.md from the Pipelane template.'
+      ? 'Created local CLAUDE.md from a legacy scaffold.'
       : result.skippedClaudeScaffold
         ? 'No local CLAUDE.md scaffold written; Pipelane guidance comes from durable machine-local commands.'
         : 'Left existing local CLAUDE.md untouched.',
     result.createdRepoGuidance
-      ? 'Created REPO_GUIDANCE.md from the scaffold — run `/fix refresh-guidance` to fill it in.'
+      ? 'Created REPO_GUIDANCE.md from a legacy scaffold — run `/fix refresh-guidance` to fill it in.'
       : result.skippedRepoGuidanceScaffold
         ? 'No REPO_GUIDANCE.md scaffold written; Pipelane no longer creates repo-local adapter surfaces.'
         : 'Left existing REPO_GUIDANCE.md untouched.',
@@ -1390,30 +1388,30 @@ export function formatSetupResult(result: SetupConsumerRepoResult): string[] {
   if (result.appliedAgentsGuidanceMigrations.length > 0) {
     const count = result.appliedAgentsGuidanceMigrations
       .reduce((sum, migration) => sum + migration.replacements.length, 0);
-    lines.push(`Updated AGENTS.md stale workflow guidance (${count} line${count === 1 ? '' : 's'}).`);
+    lines.push(`Legacy setup updated AGENTS.md stale workflow guidance (${count} line${count === 1 ? '' : 's'}).`);
   }
   if (result.appliedClaudeGuidanceMigrations.length > 0) {
-    lines.push('Updated CLAUDE.md with the Pipelane task workspace policy.');
+    lines.push('Legacy setup updated CLAUDE.md with the Pipelane task workspace policy.');
   }
   if (result.agentsGuidanceMigrations.length > 0) {
-    lines.push('AGENTS.md guidance migration requires approval:');
+    lines.push('AGENTS.md consumer-owned guidance note:');
     lines.push(...formatAgentsGuidanceMigrations(result.agentsGuidanceMigrations));
-    lines.push('Run `pipelane setup --yes` to apply these AGENTS.md changes non-interactively, or run `pipelane setup` in a TTY and approve the prompt.');
+    lines.push('Pipelane setup will not rewrite AGENTS.md. Apply any wanted guidance edits manually in the application repo.');
   }
   if (result.claudeGuidanceMigrations.length > 0) {
-    lines.push('CLAUDE.md guidance migration requires approval:');
+    lines.push('CLAUDE.md consumer-owned guidance note:');
     lines.push(...formatClaudeGuidanceMigrations(result.claudeGuidanceMigrations));
-    lines.push('Run `pipelane setup --yes` to apply these CLAUDE.md changes non-interactively, or run `pipelane setup` in a TTY and approve the prompt.');
+    lines.push('Pipelane setup will not rewrite CLAUDE.md. Apply any wanted guidance edits manually in the application repo.');
   }
   if (result.appliedLessonsMigration) {
     lines.push(result.appliedLessonsMigration.action === 'insert'
-      ? 'Added the managed CLAUDE.md Lessons block.'
-      : 'Refreshed the CLAUDE.md Lessons block (existing entries preserved).');
+      ? 'Legacy setup added the managed CLAUDE.md Lessons block.'
+      : 'Legacy setup refreshed the CLAUDE.md Lessons block (existing entries preserved).');
   }
   if (result.lessonsMigration) {
-    lines.push('CLAUDE.md Lessons block migration requires approval:');
+    lines.push('CLAUDE.md Lessons block guidance note:');
     lines.push(...formatLessonsMigration(result.lessonsMigration));
-    lines.push('Run `pipelane setup --yes` to apply this CLAUDE.md change non-interactively, or run `pipelane setup` in a TTY and approve the prompt.');
+    lines.push('Pipelane setup will not rewrite CLAUDE.md. Add the Lessons block manually if this repo wants it.');
   }
   if (result.warnings.length > 0) {
     lines.push('Readiness warnings:');

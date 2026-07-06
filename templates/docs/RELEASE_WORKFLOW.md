@@ -225,7 +225,7 @@ Release mode is the protected lane.
 - it is fail-closed
 - staging must be configured before the repo switches to release mode
 - production promotion should use the same merged SHA that passed staging
-- `{{ALIAS_RELEASE}} enable` scaffolds machine-local deploy config state
+- `{{ALIAS_RELEASE}} enable` initializes machine-local deploy config state
 - `{{ALIAS_RELEASE}} status` is read-only and explains readiness without exiting non-zero
 - `{{ALIAS_RELEASE}} doctor --probe` delegates to the deploy-config/probe diagnostics
 - `pipelane run release-check` remains the automation gate for CI or scripts that need a non-zero blocked-readiness exit

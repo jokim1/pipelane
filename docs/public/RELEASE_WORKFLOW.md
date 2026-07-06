@@ -94,11 +94,11 @@ merged SHA before production moves.
 ```
 
 Release mode fails closed when deploy config, staging evidence, or probe health
-is missing. `/release enable` scaffolds the release module, `/release status`
-explains readiness without failing non-zero, and `/release doctor --probe`
-refreshes live healthcheck evidence. Automation should keep using
-`pipelane run release-check` when blocked readiness must fail a script or CI
-step.
+is missing. `/release enable` initializes machine-local release module state,
+`/release status` explains readiness without failing non-zero, and
+`/release doctor --probe` refreshes live healthcheck evidence. Automation
+should keep using `pipelane run release-check` when blocked readiness must fail
+a script or CI step.
 
 ## Verification Order
 

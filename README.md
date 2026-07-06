@@ -210,6 +210,10 @@ Set up a repo:
 /pipelane web
 ```
 
+Setup is machine-local: it writes runtime config under `$PIPELANE_HOME` and does
+not create tracked `.claude/commands`, `.agents/skills`, package scripts, or
+Pipelane docs in the application repo.
+
 Core commands:
 
 | Command | Use it when |
@@ -217,7 +221,7 @@ Core commands:
 | `/new` | Start fresh work in a new Pipelane-managed branch and worktree. |
 | `/adopt` | Another model, tool, or human already created the task branch/worktree and Pipelane should track it instead of creating another one. |
 | `/resume` | Return to an existing Pipelane-tracked task workspace. |
-| `/release enable` | Scaffold the optional release module for repos where staging must prove the exact merged SHA before production moves. |
+| `/release enable` | Initialize the optional machine-local release module for repos where staging must prove the exact merged SHA before production moves. |
 | `/release status` | Inspect release readiness without failing nonzero. Use this after setup and after staging deploys. |
 | `/release doctor --probe` | Refresh live healthcheck evidence used by release readiness. |
 | `pipelane run release-check` | Automation/CI gate for blocked release readiness; exits nonzero when release is not safe. |

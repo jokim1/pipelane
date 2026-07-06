@@ -466,8 +466,8 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
       code: corruptLedger.recent ? 'orchestration.ledger_corrupt' : 'orchestration.ledger_corrupt_stale',
       severity: corruptLedger.recent ? 'error' : 'warning',
       message: corruptLedger.recent
-        ? `Orchestration ledger is unreadable at ${corruptLedger.ledgerPath}. Restore it or move the run directory outside .pipelane/state/orchestrate/runs/.`
-        : `Older corrupt orchestration ledger ignored at ${corruptLedger.ledgerPath}. Move it outside .pipelane/state/orchestrate/runs/ if abandoned.`,
+        ? `Orchestration ledger is unreadable at ${corruptLedger.ledgerPath}. Restore it or move the run directory outside the active orchestrate/runs state directory.`
+        : `Older corrupt orchestration ledger ignored at ${corruptLedger.ledgerPath}. Move it outside the active orchestrate/runs state directory if abandoned.`,
       source: 'orchestration',
       blocking: corruptLedger.recent,
       action: 'orchestrate',
@@ -477,7 +477,7 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
     attention.push(buildApiIssue({
       code: 'orchestration.invalid_run_directory',
       severity: 'warning',
-      message: `Invalid orchestration run directory ignored at ${invalidDirectory.directoryPath}. Move abandoned state outside .pipelane/state/orchestrate/runs/.`,
+      message: `Invalid orchestration run directory ignored at ${invalidDirectory.directoryPath}. Move abandoned state outside the active orchestrate/runs state directory.`,
       source: 'orchestration',
       blocking: false,
       action: 'orchestrate',

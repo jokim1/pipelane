@@ -69,4 +69,5 @@ post-fix drift hints. Config files, generated files, lock files, etc.
 - `package-lock.json`
 - `*.generated.*`
 - `CHANGELOG.md`
+- `pipelane-state/**`
 - `.pipelane/state/**`

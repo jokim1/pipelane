@@ -1502,13 +1502,13 @@ function renderCorruptLedgerBlock(
   const next = isKeyRelatedCorruptLedger(diagnostic)
     ? [
         `1. Load the ${ORCHESTRATION_STATE_KEY_ENV} that matches this run, then retry.`,
-        '2. If the run is abandoned, move its run directory outside .pipelane/state/orchestrate/runs/, for example to:',
+        '2. If the run is abandoned, move its run directory outside the active orchestrate/runs state directory, for example to:',
         `   ${abandonedPath}`,
         '3. Start a new run after deciding the old run can be ignored.',
       ]
     : [
         '1. Restore the ledger from a known-good backup/local copy if this run matters.',
-        '2. Move the corrupt run directory outside .pipelane/state/orchestrate/runs/ if the run is abandoned, for example to:',
+        '2. Move the corrupt run directory outside the active orchestrate/runs state directory if the run is abandoned, for example to:',
         `   ${abandonedPath}`,
         '3. Re-run /pipelane orchestrate after repair.',
       ];

@@ -18,7 +18,7 @@ This repo uses `pipelane` for task workspaces, PR prep, merge handoff, and deplo
 - Use `{{ALIAS_ROLLBACK}} staging|prod` to roll back the last deploy to the last-good SHA.
 - Use `{{ALIAS_CLEAN}}` for workflow cleanup status.
 - Use `{{ALIAS_STATUS}}` for the one-screen cockpit of task + lane state.
-- Use `{{ALIAS_RELEASE}} enable` to scaffold release config, `pipelane configure` to fill deploy values, and `{{ALIAS_RELEASE}} status` or `{{ALIAS_RELEASE}} doctor --probe` to inspect release readiness.
+- Use `{{ALIAS_RELEASE}} enable` to initialize machine-local release config, `pipelane configure` to fill deploy values, and `{{ALIAS_RELEASE}} status` or `{{ALIAS_RELEASE}} doctor --probe` to inspect release readiness.
 - Use `/fix` for review findings, CI failures, bugs, and code-quality repairs.
 
 ### Repo guard and task locks

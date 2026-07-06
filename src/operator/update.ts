@@ -45,9 +45,9 @@ export interface UpdateResult {
   status: UpdateStatus;
   action: 'up-to-date' | 'checked' | 'skipped' | 'installed';
   message: string;
-  // Context-aware follow-up: what pipelane:setup would still change on this
-  // consumer's disk after the npm install (or right now, for --check). Null
-  // when detection couldn't run (missing machine-local config, etc.).
+  // Context-aware follow-up after update/check. Active setup is machine-local,
+  // so repo-local adapter/doc/script drift should not become a setup trigger.
+  // Null when detection couldn't run (missing machine-local config, etc.).
   followUpSteps: SetupDrift | null;
   // True iff runUpdate actually invoked setupConsumerRepo before returning
   // (inline setup accepted via prompt or --yes).
@@ -754,21 +754,21 @@ function emitDriftHint(result: DriftResult, options: Pick<UpdateOptions, 'output
   if (!drift.needsSetup) {
     let emittedGuidanceMigration = false;
     if (agentsGuidanceMigrations.length > 0) {
-      writeUpdateOutput(options, '\nAGENTS.md guidance migration requires approval:\n');
+      writeUpdateOutput(options, '\nAGENTS.md consumer-owned guidance note:\n');
       writeUpdateOutput(options, formatAgentsGuidanceMigrations(agentsGuidanceMigrations).join('\n') + '\n');
-      writeUpdateOutput(options, 'Run `pipelane setup --yes` to apply these AGENTS.md changes non-interactively, or run `pipelane setup` in a TTY and approve the prompt.\n');
+      writeUpdateOutput(options, 'Pipelane setup will not rewrite AGENTS.md. Apply any wanted guidance edits manually in the application repo.\n');
       emittedGuidanceMigration = true;
     }
     if (claudeGuidanceMigrations.length > 0) {
-      writeUpdateOutput(options, '\nCLAUDE.md guidance migration requires approval:\n');
+      writeUpdateOutput(options, '\nCLAUDE.md consumer-owned guidance note:\n');
       writeUpdateOutput(options, formatClaudeGuidanceMigrations(claudeGuidanceMigrations).join('\n') + '\n');
-      writeUpdateOutput(options, 'Run `pipelane setup --yes` to apply these CLAUDE.md changes non-interactively, or run `pipelane setup` in a TTY and approve the prompt.\n');
+      writeUpdateOutput(options, 'Pipelane setup will not rewrite CLAUDE.md. Apply any wanted guidance edits manually in the application repo.\n');
       emittedGuidanceMigration = true;
     }
     if (drift.lessonsMigration) {
-      writeUpdateOutput(options, '\nCLAUDE.md Lessons block migration requires approval:\n');
+      writeUpdateOutput(options, '\nCLAUDE.md Lessons block guidance note:\n');
       writeUpdateOutput(options, formatLessonsMigration(drift.lessonsMigration).join('\n') + '\n');
-      writeUpdateOutput(options, 'Run `pipelane setup --yes` to apply this CLAUDE.md change non-interactively, or run `pipelane setup` in a TTY and approve the prompt.\n');
+      writeUpdateOutput(options, 'Pipelane setup will not rewrite CLAUDE.md. Add the Lessons block manually if this repo wants it.\n');
       emittedGuidanceMigration = true;
     }
     if (emittedGuidanceMigration) {
@@ -779,7 +779,7 @@ function emitDriftHint(result: DriftResult, options: Pick<UpdateOptions, 'output
       writeUpdateOutput(options, warnings.map((warning) => `- ${warning}`).join('\n') + '\n');
       return;
     }
-    writeUpdateOutput(options, '\nNo additional steps required — templates are in sync.\n');
+    writeUpdateOutput(options, '\nNo additional steps required — machine-local setup is in sync.\n');
     return;
   }
   writeUpdateOutput(options, '\n' + formatFollowUpSummary(drift) + '\n');
@@ -790,7 +790,7 @@ function emitReopenHints(drift: SetupDrift, options: Pick<UpdateOptions, 'output
     writeUpdateOutput(options, 'Reopen Claude so the new or renamed slash commands appear.\n');
   }
   if (drift.needsReopenCodex) {
-    writeUpdateOutput(options, 'Reopen Codex to pick up .agents/skills changes.\n');
+    writeUpdateOutput(options, 'Reopen Codex to pick up machine-local command changes.\n');
   }
 }
 
@@ -809,10 +809,10 @@ export function formatFollowUpSummary(drift: SetupDrift): string {
     if (removed) changes.push(`Legacy commands to prune: ${removed}`);
   }
   if (drift.repoGuidance.willScaffold) {
-    changes.push('REPO_GUIDANCE.md scaffold available');
+    changes.push('REPO_GUIDANCE.md is absent; setup will not create a scaffold automatically');
   }
   if (drift.claudeGuidance?.willScaffold) {
-    changes.push('CLAUDE.md scaffold available');
+    changes.push('CLAUDE.md is absent; setup will not create a scaffold automatically');
   }
   if (drift.codex.enabled) {
     const added = truncateList(drift.codex.addedSkills);
@@ -824,19 +824,19 @@ export function formatFollowUpSummary(drift: SetupDrift): string {
     if (drift.codex.runnerDrift) changes.push('Codex runner script updated');
   }
   if (drift.otherSurfaces.length > 0) {
-    changes.push(`Other surfaces to re-render: ${drift.otherSurfaces.join(', ')}`);
+    changes.push(`Legacy repo-local surfaces detected: ${drift.otherSurfaces.join(', ')}`);
   }
   if (agentsGuidanceMigrations.length > 0) {
     const count = agentsGuidanceMigrations.reduce((sum, migration) => sum + migration.replacements.length, 0);
-    changes.push(`AGENTS.md guidance migration requires approval (${count} line${count === 1 ? '' : 's'})`);
+    changes.push(`AGENTS.md consumer-owned guidance note (${count} line${count === 1 ? '' : 's'})`);
   }
   if (claudeGuidanceMigrations.length > 0) {
-    changes.push('CLAUDE.md guidance migration requires approval');
+    changes.push('CLAUDE.md consumer-owned guidance note');
   }
   if (drift.lessonsMigration) {
     changes.push(drift.lessonsMigration.action === 'insert'
-      ? 'CLAUDE.md Lessons block to add (capture instruction + empty entries region)'
-      : 'CLAUDE.md Lessons instruction prose to refresh (existing entries preserved)');
+      ? 'CLAUDE.md Lessons block guidance available (capture instruction + empty entries region)'
+      : 'CLAUDE.md Lessons instruction guidance available (existing entries preserved)');
   }
   if (warnings.length > 0) {
     changes.push(`Readiness warnings: ${warnings.join(' ')}`);
@@ -845,12 +845,12 @@ export function formatFollowUpSummary(drift: SetupDrift): string {
     // Collisions block setup. Surface them prominently; no "run setup"
     // step, no reopen hint.
     return [
-      'Setup cannot run — collision with existing non-pipelane files:',
+      'Legacy repo-local setup cannot run — collision with existing non-pipelane files:',
       ...drift.claude.collisions.map((file) => `  - .claude/commands/${file}`),
       'Resolve these manually (rename, remove, or change the alias in machine-local Pipelane config), then rerun `pipelane update`.',
     ].join('\n');
   }
-  lines.push('  1. Run setup to apply template changes:');
+  lines.push('  1. Run setup to repair machine-local state:');
   for (const change of changes) {
     lines.push(`     - ${change}`);
   }
@@ -859,7 +859,7 @@ export function formatFollowUpSummary(drift: SetupDrift): string {
     lines.push(`  ${step++}. Reopen Claude so the new or renamed slash commands appear.`);
   }
   if (drift.needsReopenCodex) {
-    lines.push(`  ${step++}. Reopen Codex to pick up .agents/skills changes.`);
+    lines.push(`  ${step++}. Reopen Codex to pick up machine-local command changes.`);
   }
   return lines.join('\n');
 }
