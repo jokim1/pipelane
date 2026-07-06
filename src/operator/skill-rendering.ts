@@ -157,9 +157,14 @@ Plain
 \`${slashAlias} review setup\` configures the pre-PR review gates. Keep those
 two setup flows distinct.
 
-When \`${slashAlias} configure\` prints "Choose the action to take:", ask the
-user for the deploy values in chat, then run the matching
-\`${slashAlias} configure --json ...\` command with the provided flags.
+When \`${slashAlias} configure\` prints "Choose the action to take:", preserve
+the printed numbered choices and any detected-value command exactly. If the
+operator chooses to save detected values, run the printed
+\`${slashAlias} configure --json ...\` command. If they choose to add
+release-mode values, ask only for the specific missing values named by the CLI;
+do not imply staging or production environments must exist before the repo moves
+out of build mode. If they choose to stay in build mode, do not run configure
+again.
 
 ## Help behavior
 

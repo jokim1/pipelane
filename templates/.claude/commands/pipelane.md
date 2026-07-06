@@ -129,7 +129,8 @@ where `$REST` is `$ARGUMENTS` with the leading `setup` token stripped.
 
 Use this path for `/pipelane setup` and `/pipelane setup --yes`. Display the output directly.
 
-If setup offers to configure deploy targets, ask the user for the deploy values in chat, then run the matching `/pipelane configure --json ...` command.
+If setup prints "Choose the action to take:", preserve the printed numbered
+choices and any detected-value command exactly.
 
 ---
 
@@ -145,9 +146,13 @@ where `$REST` is `$ARGUMENTS` with the leading `configure` token stripped.
 
 Use this path for `/pipelane configure`, `/pipelane configure --json ...`, and deploy-config updates. Display the output directly.
 
-When configure prints "Choose the action to take:", ask the user for deploy
-values in chat, then run the matching `/pipelane configure --json ...` command
-with the provided flags through the managed runner.
+When configure prints "Choose the action to take:", preserve the printed
+numbered choices and any detected-value command exactly. If the operator chooses
+to save detected values, run the printed `/pipelane configure --json ...`
+command. If they choose to add release-mode values, ask only for the specific
+missing values named by the CLI; do not imply staging or production environments
+must exist before the repo moves out of build mode. If they choose to stay in
+build mode, do not run configure again.
 
 ---
 

@@ -3291,6 +3291,9 @@ test('pipelane.md documents exact first-token routing for subcommands', () => {
   assert.match(template, /Review checklist/);
   assert.match(template, /failed\/blocking/);
   assert.match(template, /run_pipelane orchestrate \$REST/);
+  assert.match(template, /preserve the printed\s+numbered choices/);
+  assert.match(template, /do not imply staging or production environments\s+must exist before the repo moves out of build mode/);
+  assert.doesNotMatch(template, /ask the user for deploy\s+values in chat/);
   assert.doesNotMatch(template, /npm run pipelane:/);
   assert.match(template, /\/pipelane orchestrate analyze --plan-file <path> --analysis-file <path>/);
   assert.match(template, /low-level subcommands: `plan`, `analyze`, `plan-review`/);
@@ -28851,8 +28854,152 @@ test('configure without --json prints an agent-actionable selector when stdin is
     assert.equal(result.stderr, '');
     assert.match(result.stdout, /Choose the action to take:/);
     assert.match(result.stdout, /\/pipelane configure --json/);
-    assert.match(result.stdout, /--frontend-staging-url=<url>/);
+    assert.match(result.stdout, /--frontend-production-url=<url>/);
+    assert.match(result.stdout, /Stay in build mode for now/);
     assert.doesNotMatch(result.stdout, /requires a TTY|use `--json`/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure without --json detects Cloudflare and database repo signals without saving config', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    runCli(['setup'], repoRoot);
+
+    mkdirSync(path.join(repoRoot, 'web', 'db', 'migrations'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'web', 'package.json'), `${JSON.stringify({
+      name: '@demo/web',
+      private: true,
+      type: 'module',
+      scripts: {
+        deploy: 'npm run bundle && wrangler deploy',
+      },
+      dependencies: {
+        '@neondatabase/serverless': '^1.0.0',
+      },
+      devDependencies: {
+        wrangler: '^4.0.0',
+      },
+    }, null, 2)}\n`, 'utf8');
+    writeFileSync(path.join(repoRoot, 'web', 'wrangler.jsonc'), `{
+      // JSONC comments and trailing commas are accepted.
+      "name": "demo-worker",
+      "routes": [
+        { "pattern": "app.example.test", "custom_domain": true },
+        { "pattern": "www.app.example.test", "custom_domain": true },
+      ],
+      "workers_dev": false,
+    }\n`, 'utf8');
+    writeFileSync(path.join(repoRoot, 'web', '.env'), 'CLOUDFLARE_API_TOKEN=redacted\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'web', 'db', 'migrations', '0001.sql'), 'select 1;\n', 'utf8');
+    rmSync(sharedDeployConfigPath(repoRoot), { force: true });
+
+    const result = spawnSync('node', [CLI_PATH, 'configure'], {
+      cwd: repoRoot,
+      env: { ...process.env, NODE_ENV: 'test' },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.equal(result.stderr, '');
+    assert.match(result.stdout, /Cloudflare Workers:/);
+    assert.match(result.stdout, /web\/wrangler\.jsonc/);
+    assert.match(result.stdout, /Neon\/Postgres:/);
+    assert.match(result.stdout, /frontend production URL: https:\/\/app\.example\.test/);
+    assert.match(result.stdout, /--platform=cloudflare-workers/);
+    assert.match(result.stdout, /--frontend-production-url=https:\/\/app\.example\.test/);
+    assert.match(result.stdout, /--edge-production-deploy-command="cd web && npm run deploy"/);
+    assert.match(result.stdout, /Cloudflare staging:/);
+    assert.match(result.stdout, /Stay in build mode for now/);
+    assert.equal(existsSync(sharedDeployConfigPath(repoRoot)), false, 'non-interactive prompt must not save detected values');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure without --json treats Cloudflare env keys as weak deploy evidence', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    runCli(['setup'], repoRoot);
+    writeFileSync(path.join(repoRoot, '.env'), 'CLOUDFLARE_API_TOKEN=redacted\n', 'utf8');
+
+    const result = spawnSync('node', [CLI_PATH, 'configure'], {
+      cwd: repoRoot,
+      env: { ...process.env, NODE_ENV: 'test' },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.equal(result.stderr, '');
+    assert.match(result.stdout, /Cloudflare account keys:/);
+    assert.match(result.stdout, /no Worker config or wrangler deploy script was detected/);
+    assert.doesNotMatch(result.stdout, /--platform=cloudflare-workers/);
+    assert.doesNotMatch(result.stdout, /Save the detected values now/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure without --json does not label generic db migrations as Neon', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    runCli(['setup'], repoRoot);
+    mkdirSync(path.join(repoRoot, 'db', 'migrations'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'db', 'migrations', '0001.sql'), 'select 1;\n', 'utf8');
+
+    const result = spawnSync('node', [CLI_PATH, 'configure'], {
+      cwd: repoRoot,
+      env: { ...process.env, NODE_ENV: 'test' },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.equal(result.stderr, '');
+    assert.doesNotMatch(result.stdout, /Neon\/Postgres:/);
+    assert.doesNotMatch(result.stdout, /Neon\/Postgres migrations:/);
+    assert.match(result.stdout, /No deploy platform was detected from common config files/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure without --json asks Supabase-specific release questions when Supabase is detected', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    runCli(['setup'], repoRoot);
+
+    mkdirSync(path.join(repoRoot, 'supabase', 'functions', 'hello'), { recursive: true });
+    mkdirSync(path.join(repoRoot, 'supabase', 'migrations'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'supabase', 'functions', 'hello', 'index.ts'), 'export default {};\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'supabase', 'migrations', '0001.sql'), 'select 1;\n', 'utf8');
+    const packageJsonPath = path.join(repoRoot, 'package.json');
+    const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+    pkg.dependencies = { ...(pkg.dependencies ?? {}), '@supabase/supabase-js': '^2.0.0' };
+    pkg.scripts = { ...(pkg.scripts ?? {}), 'deploy:functions': 'supabase functions deploy' };
+    writeFileSync(packageJsonPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+
+    const result = spawnSync('node', [CLI_PATH, 'configure'], {
+      cwd: repoRoot,
+      env: { ...process.env, NODE_ENV: 'test' },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.equal(result.stderr, '');
+    assert.match(result.stdout, /Supabase:/);
+    assert.match(result.stdout, /Supabase project refs:/);
+    assert.match(result.stdout, /Supabase edge functions:/);
+    assert.match(result.stdout, /Supabase database migrations:/);
+    assert.doesNotMatch(result.stdout, /SUPABASE_SERVICE_ROLE_KEY=.*[A-Za-z0-9]/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }

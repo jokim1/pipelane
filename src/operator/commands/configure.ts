@@ -1,3 +1,5 @@
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 import readline from 'node:readline/promises';
 
 import {
@@ -225,12 +227,15 @@ export async function handleConfigure(cwd: string, argv: string[]): Promise<Conf
   const configPath = resolveSharedDeployConfigPath(repoRoot);
   const baseConfig = loadDeployConfig(repoRoot) ?? emptyDeployConfig();
   const flagged = applyFlagOverrides(baseConfig, options);
+  const detection = options.json
+    ? { signals: [], values: [], questions: [] }
+    : detectConfigureHints(repoRoot, flagged);
   if (!options.json && !process.stdin.isTTY) {
-    process.stdout.write(renderNonInteractiveConfigurePrompt(repoRoot, configPath, flagged, workflowConfig.routeSafety));
+    process.stdout.write(renderNonInteractiveConfigurePrompt(repoRoot, configPath, flagged, workflowConfig.routeSafety, detection));
     process.exitCode = 64;
     return { repoRoot, configPath, config: flagged };
   }
-  const finalConfig = options.json ? flagged : await promptForValues(flagged, workflowConfig.routeSafety);
+  const finalConfig = options.json ? flagged : await promptForValues(applyDetectedConfigureValues(flagged, detection), workflowConfig.routeSafety);
 
   saveSharedDeployConfig(repoRoot, finalConfig);
 
@@ -325,11 +330,25 @@ interface ConfigurePromptSection {
   fields: Array<{ label: string; flag: string; value: string | boolean }>;
 }
 
+interface DetectedConfigureValue {
+  label: string;
+  flag: string;
+  value: string;
+  reason: string;
+}
+
+interface ConfigureDetection {
+  signals: string[];
+  values: DetectedConfigureValue[];
+  questions: string[];
+}
+
 function renderNonInteractiveConfigurePrompt(
   repoRoot: string,
   configPath: string,
   config: DeployConfig,
   routeSafety: RouteSafetyConfig,
+  detection: ConfigureDetection,
 ): string {
   const sections = configurePromptSections(config);
   const lines = [
@@ -347,25 +366,576 @@ function renderNonInteractiveConfigurePrompt(
     }
   }
 
+  if (detection.signals.length > 0) {
+    lines.push('', 'Detected repo signals:');
+    for (const signal of detection.signals) {
+      lines.push(`- ${signal}`);
+    }
+  }
+
+  if (detection.values.length > 0) {
+    lines.push('', 'Detected values Pipelane can save now:');
+    for (const value of detection.values) {
+      lines.push(`- ${value.label}: ${formatConfigurePromptValue(value.value)} (${formatFlagAssignment(value.flag, value.value)}; ${value.reason})`);
+    }
+  }
+
+  if (detection.questions.length > 0) {
+    lines.push('', 'Release-mode questions still needing an operator answer:');
+    for (const question of detection.questions) {
+      lines.push(`- ${question}`);
+    }
+  }
+
   lines.push('', 'Delivery loop safety defaults:', ...routeSafetyDefaultLines(routeSafety).map((line) => `- ${line}`));
 
   lines.push(
     '',
     'Choose the action to take:',
-    '1. Reply with deploy values in chat; I will run /pipelane configure --json with the matching flags.',
-    '2. Inspect current setup separately: /pipelane setup',
-    '3. Cancel.',
+    detection.values.length > 0
+      ? '1. Save the detected values now with /pipelane configure --json and the flags shown below.'
+      : '1. Reply with only the deploy values you have; I will run /pipelane configure --json with matching flags.',
+    '2. Add release-mode values such as staging/prod URLs, deploy workflows, or project refs.',
+    '3. Stay in build mode for now; staging and production values can be added later.',
+    '4. Inspect current setup separately: /pipelane setup',
+    '5. Cancel.',
     '',
-    'Command shape for option 1:',
-    '/pipelane configure --json \\',
-    '  --platform=<value> \\',
-    '  --frontend-staging-url=<url> \\',
-    '  --frontend-production-url=<url>',
-    '',
+    ...formatSuggestedConfigureCommand(detection.values),
+    detection.values.length > 0 ? '' : 'Example command shape:',
+    detection.values.length > 0 ? '' : '/pipelane configure --json \\',
+    detection.values.length > 0 ? '' : '  --platform=<value> \\',
+    detection.values.length > 0 ? '' : '  --frontend-production-url=<url>',
     'Any omitted field keeps its current value.',
   );
 
-  return `${lines.join('\n')}\n`;
+  return `${lines.filter((line, index, all) => line !== '' || all[index - 1] !== '').join('\n')}\n`;
+}
+
+function detectConfigureHints(repoRoot: string, config: DeployConfig): ConfigureDetection {
+  const packages = readPackageInfos(repoRoot);
+  const signals: string[] = [];
+  const values: DetectedConfigureValue[] = [];
+  const questions: string[] = [];
+
+  const addValue = (label: string, flag: string, value: string, current: string, reason: string) => {
+    if (!value.trim() || current.trim()) return;
+    if (values.some((entry) => entry.flag === flag)) return;
+    values.push({ label, flag, value, reason });
+  };
+
+  const cloudflare = detectCloudflare(repoRoot, packages);
+  if (cloudflare.detected) {
+    if (cloudflare.workerDetected) {
+      signals.push(`Cloudflare Workers: ${summarizeSources(cloudflare.sources)}`);
+      addValue('platform', '--platform', 'cloudflare-workers', config.platform, 'Cloudflare Worker config or tooling detected');
+      const productionUrl = choosePrimaryDetectedUrl(cloudflare.productionUrls);
+      const stagingUrl = choosePrimaryDetectedUrl(cloudflare.stagingUrls);
+      if (productionUrl) {
+        addValue('frontend production URL', '--frontend-production-url', productionUrl.url, config.frontend.production.url, `from ${productionUrl.source}`);
+      }
+      if (stagingUrl) {
+        addValue('frontend staging URL', '--frontend-staging-url', stagingUrl.url, config.frontend.staging.url, `from ${stagingUrl.source}`);
+      }
+      if (productionUrl && !config.edge.production.healthcheckUrl.trim()) {
+        addValue('edge production healthcheck', '--edge-production-healthcheck', productionUrl.url, config.edge.production.healthcheckUrl, 'Cloudflare Worker serves the public route');
+      }
+      if (stagingUrl && !config.edge.staging.healthcheckUrl.trim()) {
+        addValue('edge staging healthcheck', '--edge-staging-healthcheck', stagingUrl.url, config.edge.staging.healthcheckUrl, 'Cloudflare Worker serves the staging route');
+      }
+      const productionDeploy = findPackageScriptCommand(packages, cloudflare.packageDirs, ['deploy:production', 'deploy:prod', 'deploy'], /wrangler\s+deploy/);
+      const stagingDeploy = findPackageScriptCommand(packages, cloudflare.packageDirs, ['deploy:staging', 'deploy:stage', 'deploy:preview'], /wrangler\s+deploy/);
+      if (productionDeploy) {
+        addValue('edge production deploy command', '--edge-production-deploy-command', productionDeploy, config.edge.production.deployCommand, 'wrangler deploy script detected');
+      }
+      if (stagingDeploy) {
+        addValue('edge staging deploy command', '--edge-staging-deploy-command', stagingDeploy, config.edge.staging.deployCommand, 'staging wrangler deploy script detected');
+      }
+
+      if (!config.frontend.staging.url.trim() && !stagingUrl) {
+        questions.push('Cloudflare staging: do you already have a staging Worker route or preview URL? If not, stay in build mode and add it when release mode starts.');
+      }
+      if (!config.frontend.production.url.trim() && !productionUrl) {
+        questions.push('Cloudflare production: which custom domain or workers.dev URL should Pipelane probe after deploy?');
+      }
+      if (!config.edge.staging.deployCommand.trim() && !stagingDeploy) {
+        questions.push('Cloudflare staging deploy: which workflow or wrangler command deploys the staging Worker, once staging exists?');
+      }
+    } else {
+      signals.push(`Cloudflare account keys: ${summarizeSources(cloudflare.sources)}`);
+      questions.push('Cloudflare account keys: env keys were found, but no Worker config or wrangler deploy script was detected. If release mode uses Cloudflare, provide the deploy platform and URLs when ready.');
+    }
+  }
+
+  const supabase = detectSupabase(repoRoot, packages);
+  if (supabase.detected) {
+    signals.push(`Supabase: ${summarizeSources(supabase.sources)}`);
+    if (!config.supabase.staging.projectRef.trim() || !config.supabase.production.projectRef.trim()) {
+      questions.push('Supabase project refs: which project ref is staging, and which is production?');
+    }
+    if (supabase.hasFunctions && (!config.edge.staging.deployCommand.trim() || !config.edge.production.deployCommand.trim())) {
+      questions.push('Supabase edge functions: which CLI commands deploy staging and production functions?');
+    }
+    if (supabase.hasMigrations && (!config.sql.staging.applyCommand.trim() || !config.sql.production.applyCommand.trim())) {
+      questions.push('Supabase database migrations: which commands apply staging and production schema changes?');
+    }
+  }
+
+  const neon = detectNeon(repoRoot, packages);
+  if (neon.detected) {
+    signals.push(`Neon/Postgres: ${summarizeSources(neon.sources)}`);
+    if (neon.hasMigrations && (!config.sql.staging.applyCommand.trim() || !config.sql.production.applyCommand.trim())) {
+      questions.push('Neon/Postgres migrations: if SQL is a release-managed surface, what commands apply staging and production migrations?');
+    }
+  }
+
+  if (signals.length === 0) {
+    questions.push('No deploy platform was detected from common config files. Provide the platform and URLs/workflows when you are ready to configure release mode.');
+  }
+
+  return {
+    signals: dedupeStrings(signals),
+    values,
+    questions: dedupeStrings(questions),
+  };
+}
+
+function applyDetectedConfigureValues(base: DeployConfig, detection: ConfigureDetection): DeployConfig {
+  const next: DeployConfig = JSON.parse(JSON.stringify(base));
+  for (const value of detection.values) {
+    if (value.flag === '--platform') next.platform = value.value;
+    else if (value.flag === '--frontend-production-url') next.frontend.production.url = value.value;
+    else if (value.flag === '--frontend-staging-url') next.frontend.staging.url = value.value;
+    else if (value.flag === '--edge-production-healthcheck') next.edge.production.healthcheckUrl = value.value;
+    else if (value.flag === '--edge-staging-healthcheck') next.edge.staging.healthcheckUrl = value.value;
+    else if (value.flag === '--edge-production-deploy-command') next.edge.production.deployCommand = value.value;
+    else if (value.flag === '--edge-staging-deploy-command') next.edge.staging.deployCommand = value.value;
+  }
+  return next;
+}
+
+interface PackageInfo {
+  dir: string;
+  relativeDir: string;
+  relativePath: string;
+  scripts: Record<string, string>;
+  dependencies: Record<string, string>;
+}
+
+interface DetectedUrl {
+  url: string;
+  source: string;
+}
+
+interface CloudflareDetection {
+  detected: boolean;
+  workerDetected: boolean;
+  sources: string[];
+  packageDirs: string[];
+  productionUrls: DetectedUrl[];
+  stagingUrls: DetectedUrl[];
+}
+
+function detectCloudflare(repoRoot: string, packages: PackageInfo[]): CloudflareDetection {
+  const wranglerFiles = findRepoFiles(repoRoot, (name) =>
+    name === 'wrangler.toml' || name === 'wrangler.json' || name === 'wrangler.jsonc'
+  );
+  const envSignals = findEnvKeySignals(repoRoot, /^CLOUDFLARE_/);
+  const packageSignals = packages.flatMap((info) => {
+    const hasCloudflareDep = Object.keys(info.dependencies).some((name) =>
+      name === 'wrangler' || name.startsWith('@cloudflare/')
+    );
+    const hasWranglerScript = Object.values(info.scripts).some((script) => /\bwrangler\b/.test(script));
+    return hasCloudflareDep || hasWranglerScript ? [info.relativePath] : [];
+  });
+  const productionUrls: DetectedUrl[] = [];
+  const stagingUrls: DetectedUrl[] = [];
+  const packageDirs = new Set<string>();
+
+  for (const file of wranglerFiles) {
+    const relativePath = displayPath(repoRoot, file);
+    packageDirs.add(path.dirname(file));
+    const routes = readWranglerRoutes(repoRoot, file);
+    for (const route of routes) {
+      if (route.environment === 'staging') {
+        stagingUrls.push({ url: route.url, source: relativePath });
+      } else {
+        productionUrls.push({ url: route.url, source: relativePath });
+      }
+    }
+  }
+
+  const workerSources = [
+    ...wranglerFiles.map((file) => displayPath(repoRoot, file)),
+    ...packageSignals,
+  ];
+  const sources = [
+    ...workerSources,
+    ...envSignals,
+  ];
+  return {
+    detected: sources.length > 0,
+    workerDetected: workerSources.length > 0,
+    sources: dedupeStrings(sources),
+    packageDirs: [...packageDirs],
+    productionUrls,
+    stagingUrls,
+  };
+}
+
+interface ProviderDetection {
+  detected: boolean;
+  sources: string[];
+  hasFunctions?: boolean;
+  hasMigrations?: boolean;
+}
+
+function detectSupabase(repoRoot: string, packages: PackageInfo[]): ProviderDetection {
+  const supabaseFiles = findRepoFiles(repoRoot, (_name, file) => file.split(path.sep).includes('supabase'));
+  const envSignals = findEnvKeySignals(repoRoot, /^SUPABASE_/);
+  const packageSignals = packages.flatMap((info) => {
+    const hasSupabaseDep = Object.keys(info.dependencies).some((name) => name.startsWith('@supabase/'));
+    const hasSupabaseScript = Object.values(info.scripts).some((script) => /\bsupabase\b/.test(script));
+    return hasSupabaseDep || hasSupabaseScript ? [info.relativePath] : [];
+  });
+  const hasFunctions = existsSync(path.join(repoRoot, 'supabase', 'functions'))
+    || supabaseFiles.some((file) => file.includes(`${path.sep}supabase${path.sep}functions${path.sep}`));
+  const hasMigrations = existsSync(path.join(repoRoot, 'supabase', 'migrations'))
+    || supabaseFiles.some((file) => file.includes(`${path.sep}supabase${path.sep}migrations${path.sep}`));
+  const sources = [
+    ...supabaseFiles.slice(0, 4).map((file) => displayPath(repoRoot, file)),
+    ...packageSignals,
+    ...envSignals,
+  ];
+  return {
+    detected: sources.length > 0,
+    sources: dedupeStrings(sources),
+    hasFunctions,
+    hasMigrations,
+  };
+}
+
+function detectNeon(repoRoot: string, packages: PackageInfo[]): ProviderDetection {
+  const envSignals = findEnvKeySignals(repoRoot, /^(DATABASE_URL|NEON_)/);
+  const packageSignals = packages.flatMap((info) =>
+    Object.keys(info.dependencies).some((name) => name === '@neondatabase/serverless')
+      ? [info.relativePath]
+      : []
+  );
+  const migrationFiles = findRepoFiles(repoRoot, (_name, file) =>
+    file.includes(`${path.sep}db${path.sep}migrations${path.sep}`)
+  );
+  const providerSources = [
+    ...packageSignals,
+    ...envSignals,
+  ];
+  const migrationSources = migrationFiles.slice(0, 3).map((file) => displayPath(repoRoot, file));
+  const sources = [
+    ...providerSources,
+    ...(providerSources.length > 0 ? migrationSources : []),
+  ];
+  return {
+    detected: providerSources.length > 0,
+    sources: dedupeStrings(sources),
+    hasMigrations: migrationFiles.length > 0,
+  };
+}
+
+function readPackageInfos(repoRoot: string): PackageInfo[] {
+  return findRepoFiles(repoRoot, (name) => name === 'package.json')
+    .map((file): PackageInfo | null => {
+      try {
+        const parsed = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
+        const scripts = stringRecord(parsed.scripts);
+        const dependencies = {
+          ...stringRecord(parsed.dependencies),
+          ...stringRecord(parsed.devDependencies),
+          ...stringRecord(parsed.optionalDependencies),
+        };
+        return {
+          dir: path.dirname(file),
+          relativeDir: displayPath(repoRoot, path.dirname(file)),
+          relativePath: displayPath(repoRoot, file),
+          scripts,
+          dependencies,
+        };
+      } catch {
+        return null;
+      }
+    })
+    .filter((entry): entry is PackageInfo => Boolean(entry));
+}
+
+function findPackageScriptCommand(
+  packages: PackageInfo[],
+  preferredDirs: string[],
+  scriptNames: string[],
+  commandPattern: RegExp,
+): string {
+  const preferred = new Set(preferredDirs.map((entry) => path.resolve(entry)));
+  const ordered = [...packages].sort((a, b) => {
+    const aPreferred = preferred.has(path.resolve(a.dir)) ? 0 : 1;
+    const bPreferred = preferred.has(path.resolve(b.dir)) ? 0 : 1;
+    return aPreferred - bPreferred || a.relativePath.localeCompare(b.relativePath);
+  });
+  for (const scriptName of scriptNames) {
+    for (const info of ordered) {
+      const script = info.scripts[scriptName];
+      if (!script || !commandPattern.test(script)) continue;
+      const prefix = info.relativeDir === '.' ? '' : `cd ${quoteShellWord(info.relativeDir)} && `;
+      return `${prefix}npm run ${scriptName}`;
+    }
+  }
+  return '';
+}
+
+function readWranglerRoutes(repoRoot: string, file: string): Array<{ url: string; environment: 'production' | 'staging' }> {
+  try {
+    const text = readFileSync(file, 'utf8');
+    if (file.endsWith('.json') || file.endsWith('.jsonc')) {
+      const parsed = parseJsonLike(text);
+      if (isRecord(parsed)) return collectWranglerRoutesFromObject(parsed);
+    }
+    return collectWranglerRoutesFromText(repoRoot, file, text);
+  } catch {
+    return [];
+  }
+}
+
+function collectWranglerRoutesFromObject(
+  raw: Record<string, unknown>,
+  envName = '',
+): Array<{ url: string; environment: 'production' | 'staging' }> {
+  const routes: Array<{ url: string; environment: 'production' | 'staging' }> = [];
+  const addRoute = (pattern: string) => {
+    const url = normalizeRoutePatternToUrl(pattern);
+    if (!url) return;
+    routes.push({
+      url,
+      environment: isStagingName(envName) || isStagingName(pattern) ? 'staging' : 'production',
+    });
+  };
+
+  if (typeof raw.route === 'string') addRoute(raw.route);
+  if (typeof raw.routes === 'string') addRoute(raw.routes);
+  if (Array.isArray(raw.routes)) {
+    for (const entry of raw.routes) {
+      if (typeof entry === 'string') addRoute(entry);
+      else if (isRecord(entry) && typeof entry.pattern === 'string') addRoute(entry.pattern);
+    }
+  }
+
+  if (isRecord(raw.env)) {
+    for (const [name, envConfig] of Object.entries(raw.env)) {
+      if (isRecord(envConfig)) {
+        routes.push(...collectWranglerRoutesFromObject(envConfig, name));
+      }
+    }
+  }
+  return routes;
+}
+
+function collectWranglerRoutesFromText(
+  repoRoot: string,
+  file: string,
+  text: string,
+): Array<{ url: string; environment: 'production' | 'staging' }> {
+  const routes: Array<{ url: string; environment: 'production' | 'staging' }> = [];
+  const routePattern = /^\s*(?:route|pattern)\s*=\s*["']([^"']+)["']/gm;
+  for (const match of text.matchAll(routePattern)) {
+    const url = normalizeRoutePatternToUrl(match[1]);
+    if (!url) continue;
+    routes.push({
+      url,
+      environment: isStagingName(match[1]) || isStagingName(displayPath(repoRoot, file)) ? 'staging' : 'production',
+    });
+  }
+  return routes;
+}
+
+function parseJsonLike(text: string): unknown {
+  const withoutComments = stripJsonComments(text);
+  const withoutTrailingCommas = withoutComments.replace(/,\s*([}\]])/g, '$1');
+  return JSON.parse(withoutTrailingCommas);
+}
+
+function stripJsonComments(text: string): string {
+  let output = '';
+  let inString = false;
+  let escape = false;
+  let lineComment = false;
+  let blockComment = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    const next = text[index + 1] ?? '';
+
+    if (lineComment) {
+      if (char === '\n') {
+        lineComment = false;
+        output += char;
+      }
+      continue;
+    }
+    if (blockComment) {
+      if (char === '*' && next === '/') {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (inString) {
+      output += char;
+      if (escape) {
+        escape = false;
+      } else if (char === '\\') {
+        escape = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      output += char;
+      continue;
+    }
+    if (char === '/' && next === '/') {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    output += char;
+  }
+  return output;
+}
+
+function normalizeRoutePatternToUrl(pattern: string): string {
+  let cleaned = pattern.trim();
+  if (!cleaned) return '';
+  cleaned = cleaned.replace(/^https?:\/\//i, '');
+  cleaned = cleaned.replace(/\/.*$/, '');
+  cleaned = cleaned.replace(/^\*\./, '');
+  cleaned = cleaned.replace(/\*.*$/, '');
+  cleaned = cleaned.replace(/\.$/, '');
+  if (!cleaned || cleaned.includes('*') || cleaned.includes('{')) return '';
+  return `https://${cleaned}`;
+}
+
+function choosePrimaryDetectedUrl(values: DetectedUrl[]): DetectedUrl | null {
+  const unique = new Map<string, DetectedUrl>();
+  for (const value of values) {
+    if (!unique.has(value.url)) unique.set(value.url, value);
+  }
+  return [...unique.values()].sort((a, b) => {
+    const aWww = a.url.includes('://www.') ? 1 : 0;
+    const bWww = b.url.includes('://www.') ? 1 : 0;
+    return aWww - bWww || a.url.length - b.url.length || a.url.localeCompare(b.url);
+  })[0] ?? null;
+}
+
+function findEnvKeySignals(repoRoot: string, pattern: RegExp): string[] {
+  return findRepoFiles(repoRoot, (name) => name === '.env' || name.startsWith('.env.'))
+    .flatMap((file) => {
+      try {
+        const keys = readFileSync(file, 'utf8')
+          .split(/\r?\n/)
+          .map((line) => line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=/)?.[1] ?? '')
+          .filter((key) => key && pattern.test(key))
+          .sort();
+        return keys.length > 0 ? [`${displayPath(repoRoot, file)} keys ${keys.join(', ')}`] : [];
+      } catch {
+        return [];
+      }
+    });
+}
+
+function findRepoFiles(
+  repoRoot: string,
+  predicate: (name: string, file: string) => boolean,
+  maxDepth = 4,
+): string[] {
+  const results: string[] = [];
+  const ignored = new Set(['.git', 'node_modules', 'dist', 'coverage', '.next', 'build', '.turbo']);
+  const walk = (dir: string, depth: number) => {
+    if (depth > maxDepth) return;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (ignored.has(entry.name)) continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full, depth + 1);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (predicate(entry.name, full)) results.push(full);
+    }
+  };
+  walk(repoRoot, 0);
+  return results.sort();
+}
+
+function stringRecord(value: unknown): Record<string, string> {
+  if (!isRecord(value)) return {};
+  const out: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === 'string') out[key] = entry;
+  }
+  return out;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isStagingName(value: string): boolean {
+  return /(^|[.\-_/])(staging|stage|preview|dev)([.\-_/]|$)/i.test(value);
+}
+
+function displayPath(repoRoot: string, targetPath: string): string {
+  const relative = path.relative(repoRoot, targetPath) || '.';
+  return relative.split(path.sep).join('/');
+}
+
+function summarizeSources(sources: string[]): string {
+  const unique = dedupeStrings(sources);
+  if (unique.length <= 4) return unique.join(', ');
+  return `${unique.slice(0, 4).join(', ')}, +${unique.length - 4} more`;
+}
+
+function dedupeStrings(values: string[]): string[] {
+  return [...new Set(values.filter((value) => value.trim()))];
+}
+
+function formatSuggestedConfigureCommand(values: DetectedConfigureValue[]): string[] {
+  if (values.length === 0) return [];
+  const lines = ['Suggested command for option 1:', '/pipelane configure --json \\'];
+  values.forEach((value, index) => {
+    const suffix = index === values.length - 1 ? '' : ' \\';
+    lines.push(`  ${formatFlagAssignment(value.flag, value.value)}${suffix}`);
+  });
+  return lines;
+}
+
+function formatFlagAssignment(flag: string, value: string): string {
+  return `${flag}=${quoteConfigureFlagValue(value)}`;
+}
+
+function quoteConfigureFlagValue(value: string): string {
+  return /^[A-Za-z0-9_./:@-]+$/.test(value) ? value : JSON.stringify(value);
+}
+
+function quoteShellWord(value: string): string {
+  return /^[A-Za-z0-9_./:@-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 function configurePromptSections(config: DeployConfig): ConfigurePromptSection[] {
