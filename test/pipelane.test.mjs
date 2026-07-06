@@ -22684,6 +22684,8 @@ test('build-mode bare deploy auto-merge stops when review evidence is not ready'
     const opened = runCli(['run', 'pr', '--title', 'Bare Deploy Gate', '--json'], created.worktreePath, env, true);
     assert.equal(opened.status, 0, opened.stderr);
 
+    // Machine-local config change only: no tree commit/push, so the PR head
+    // recorded at `run pr` time still matches the branch when /merge verifies it.
     updateWorkflowConfig(created.worktreePath, (config) => {
       config.reviewGates = {
         planReview: { gates: [] },
@@ -22696,8 +22698,6 @@ test('build-mode bare deploy auto-merge stops when review evidence is not ready'
         }],
       };
     });
-    commitLocal(created.worktreePath, 'Require review gate');
-    execFileSync('git', ['push'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
 
     const blocked = runCli(['run', 'deploy', '--json'], created.worktreePath, env, true);
     const payload = JSON.parse(blocked.stdout);
@@ -26040,7 +26040,7 @@ test('dashboard help endpoint exposes configured slash aliases', async () => {
     assert.equal(help.aliases.new, '/start');
     assert.equal(help.aliases.clean, '/tidy');
     assert.equal(help.aliases.status, '/where');
-    assert.ok(help.configPath.endsWith('.pipelane.json'));
+    assert.equal(help.configPath, machinePipelaneConfigPath(repoRoot));
   } finally {
     if (server?.processHandle) {
       server.processHandle.kill('SIGTERM');
@@ -33284,7 +33284,7 @@ test('formatFollowUpSummary on collisions replaces the run-setup step with a res
     otherSurfaces: [],
   };
   const summary = update.formatFollowUpSummary(drift);
-  assert.match(summary, /Setup cannot run — collision/);
+  assert.match(summary, /Legacy repo-local setup cannot run — collision/);
   assert.match(summary, /\.claude\/commands\/fix\.md/);
   assert.match(summary, /Resolve these manually/);
   assert.doesNotMatch(summary, /Run setup/);
@@ -34757,8 +34757,7 @@ test('destination routes block opaque dirty approvals before local PR side effec
     writePipelaneConfig(repoRoot, 'Demo App');
     runCli(['setup'], repoRoot);
     writeFullDeployConfigState(repoRoot);
-    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
-    execFileSync('git', ['commit', '-m', 'configure pipelane'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    commitLocal(repoRoot, 'configure pipelane');
     writeTaskLock(repoRoot, 'opaque-route', { mode: 'build', surfaces: ['frontend'] });
     mkdirSync(path.join(repoRoot, 'generated'), { recursive: true });
     writeFileSync(path.join(repoRoot, 'generated', 'artifact.txt'), 'opaque generated output\n', 'utf8');
@@ -34857,8 +34856,7 @@ test('destination routes infer a task slug from a dirty lockless branch', () => 
     writePipelaneConfig(repoRoot, 'Demo App');
     runCli(['setup'], repoRoot);
     writeFullDeployConfigState(repoRoot);
-    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
-    execFileSync('git', ['commit', '-m', 'configure pipelane'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    commitLocal(repoRoot, 'configure pipelane');
     execFileSync('git', ['checkout', '-b', 'codex/add-custom-column-grouping-abcd'], {
       cwd: repoRoot,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -34957,8 +34955,7 @@ test('destination routes require a title for dirty lockless branch PR creation',
     writePipelaneConfig(repoRoot, 'Demo App');
     runCli(['setup'], repoRoot);
     writeFullDeployConfigState(repoRoot);
-    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
-    execFileSync('git', ['commit', '-m', 'configure pipelane'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    commitLocal(repoRoot, 'configure pipelane');
     execFileSync('git', ['checkout', '-b', 'codex/add-custom-column-grouping-abcd'], {
       cwd: repoRoot,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -34988,8 +34985,7 @@ test('destination planner treats newer requested deploys as pending before older
     writePipelaneConfig(repoRoot, 'Demo App');
     runCli(['setup'], repoRoot);
     writeFullDeployConfigState(repoRoot);
-    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
-    execFileSync('git', ['commit', '-m', 'configure pipelane'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    commitLocal(repoRoot, 'configure pipelane');
     const sha = run('git', ['rev-parse', 'HEAD'], repoRoot);
     writeTaskLock(repoRoot, 'pending-route', { mode: 'build', surfaces: ['frontend'] });
     writePrRecord(repoRoot, 'pending-route', sha);
@@ -35035,8 +35031,7 @@ test('destination planner does not treat provider-completed requested deploys as
     writePipelaneConfig(repoRoot, 'Demo App');
     runCli(['setup'], repoRoot);
     writeFullDeployConfigState(repoRoot);
-    execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
-    execFileSync('git', ['commit', '-m', 'configure pipelane'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    commitLocal(repoRoot, 'configure pipelane');
     const sha = run('git', ['rev-parse', 'HEAD'], repoRoot);
     writeTaskLock(repoRoot, 'completed-route', { mode: 'build', surfaces: ['frontend'] });
     writePrRecord(repoRoot, 'completed-route', sha);
