@@ -13482,7 +13482,6 @@ test('orchestrate start --force retries a stale running worker record', () => {
 test('orchestrate start --force terminates a live running worker before retry', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];
-  const markerPath = path.join(repoRoot, 'live-running-worker-marker.txt');
   let liveWorker = null;
   const workerCommand = passWorker("console.log('replacement worker')");
   try {
@@ -13494,8 +13493,9 @@ test('orchestrate start --force terminates a live running worker before retry', 
     const dispatched = JSON.parse(runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot).stdout);
     liveWorker = spawn(process.execPath, [
       '-e',
-      "setTimeout(() => require('node:fs').writeFileSync(process.argv[1], 'still-running'), 1200); setTimeout(() => {}, 5000);",
-      markerPath,
+      // Stay alive well beyond the test run so the only thing that can end this
+      // process is --force terminating it; a self-exit would manufacture a pass.
+      'setTimeout(() => {}, 30000);',
     ], {
       detached: true,
       stdio: 'ignore',
@@ -13522,13 +13522,19 @@ test('orchestrate start --force terminates a live running worker before retry', 
     const forcedRetry = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--force', '--json'], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
     }).stdout);
-    await new Promise((resolve) => setTimeout(resolve, 1_500));
-
     assert.equal(forcedRetry.status, 'dispatched'); // C1: live worker replaced; run awaits review
     assert.equal(forcedRetry.restartedCount, 1);
     assert.equal(forcedRetry.run.slices[0].worker.status, 'succeeded');
     assert.notEqual(forcedRetry.run.slices[0].worker.pid, liveWorker.pid ?? null);
-    assert.equal(existsSync(markerPath), false);
+    // --force must terminate the live stale worker before starting the replacement.
+    // Assert the process is actually gone rather than racing a fixed-delay marker
+    // file: the previous marker check flaked under load when the `node src/cli.ts`
+    // cold-start out-raced the 1200ms marker write, not because termination failed.
+    const staleWorkerDeadline = Date.now() + 5_000;
+    while (isPidAlive(liveWorker.pid) && Date.now() < staleWorkerDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(isPidAlive(liveWorker.pid), false);
   } finally {
     if (liveWorker?.pid) {
       try {
