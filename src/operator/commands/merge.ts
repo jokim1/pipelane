@@ -11,7 +11,13 @@ import {
   type ParsedOperatorArgs,
   type WorkflowContext,
 } from '../state.ts';
-import { evaluateReviewEvidenceForPr, type ReviewEvidenceTarget } from '../review-enforcement.ts';
+import {
+  evaluateReviewEvidenceForPr,
+  formatReviewEvidenceOverrideMessage,
+  recordReviewEvidenceOverride,
+  reviewEvidenceOverrideReason,
+  type ReviewEvidenceTarget,
+} from '../review-enforcement.ts';
 import { routeSafetyAcceptsReviewFindings } from '../route-loop-safety.ts';
 import {
   buildSharedCheckoutLeaseBlocker,
@@ -46,13 +52,22 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
   }
 
   const reviewTarget = resolveReviewEvidenceTargetForPr(context, pr);
-  assertReviewEvidenceReadyForMerge(cwd, parsed, context, reviewTarget);
+  const reviewOverrideReason = reviewEvidenceOverrideReason(parsed.flags);
+  let reviewOverrideApplied = Boolean(reviewOverrideReason);
+  reviewOverrideApplied = assertReviewEvidenceReadyForMerge(cwd, parsed, context, reviewTarget) || reviewOverrideApplied;
 
   watchPrChecks(context.repoRoot, pr.number);
   const checkedPr = loadPrByNumber(context.repoRoot, pr.number);
   assertPrIsOpenForMerge(checkedPr);
   const checkedReviewTarget = resolveReviewEvidenceTargetForPr(context, checkedPr);
-  assertReviewEvidenceReadyForMerge(cwd, parsed, context, checkedReviewTarget);
+  reviewOverrideApplied = assertReviewEvidenceReadyForMerge(cwd, parsed, context, checkedReviewTarget) || reviewOverrideApplied;
+  if (reviewOverrideApplied) {
+    recordReviewEvidenceOverride(context, formatWorkflowCommand(context.config, 'merge'), reviewOverrideReason);
+  }
+  const reviewOverrideMessage = reviewOverrideApplied
+    ? formatReviewEvidenceOverrideMessage(formatWorkflowCommand(context.config, 'merge'), reviewOverrideReason)
+    : '';
+  const reviewOverrideMessages = reviewOverrideMessage ? [reviewOverrideMessage] : [];
   runGh(context.repoRoot, [
     'pr',
     'merge',
@@ -103,6 +118,7 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
     currentHeadSha
       ? `Current worktree HEAD remains ${currentHeadSha}.`
       : 'Current worktree HEAD could not be resolved.',
+    ...reviewOverrideMessages,
     'Local base checkouts were not changed.',
   ];
 
@@ -148,14 +164,19 @@ function assertReviewEvidenceReadyForMerge(
   parsed: ParsedOperatorArgs,
   context: WorkflowContext,
   target?: ReviewEvidenceTarget,
-): void {
+): boolean {
   const reviewEvidence = evaluateReviewEvidenceForPr(context, {
     command: formatWorkflowCommand(context.config, 'merge'),
     target,
   });
+  const overrideReason = reviewEvidenceOverrideReason(parsed.flags);
+  if (!reviewEvidence.allowed && overrideReason) {
+    return true;
+  }
   if (!reviewEvidence.allowed && !routeSafetyAcceptsReviewFindings(cwd, parsed, reviewEvidence)) {
     throw new Error(reviewEvidence.message);
   }
+  return false;
 }
 
 function resolveReviewEvidenceTargetForPr(context: WorkflowContext, pr: LivePr): ReviewEvidenceTarget {

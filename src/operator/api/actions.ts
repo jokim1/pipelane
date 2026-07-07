@@ -54,7 +54,7 @@ import {
   DESTINATION_APPROVED_ROUTE_FINGERPRINT_ENV,
   DESTINATION_ROUTE_PROD_CONFIRMED_ENV,
 } from '../destination-executor.ts';
-import { evaluateReviewEvidenceForPr } from '../review-enforcement.ts';
+import { evaluateReviewEvidenceForPr, reviewEvidenceOverrideReason } from '../review-enforcement.ts';
 
 export const STABLE_ACTION_IDS = [
   'new',
@@ -262,6 +262,26 @@ interface PreflightGateBlocked {
 }
 
 function evaluatePreflightGate(context: WorkflowContext, actionId: StableActionId, inputs: Record<string, unknown>): PreflightGateResult {
+  if (reviewOverrideAppliesToAction(actionId) && inputs.override === true) {
+    const reason = typeof inputs.reason === 'string' ? inputs.reason.trim() : '';
+    if (!reason) {
+      return {
+        allowed: false,
+        reason: 'Review gate override requires a reason.',
+        needsInput: true,
+        missingInputs: ['reason'],
+        inputs: [{
+          name: 'reason',
+          label: 'Review override reason',
+          type: 'text',
+          required: true,
+          placeholder: 'Why it is acceptable to skip review gate evidence',
+        }],
+        defaultParams: { override: true },
+      };
+    }
+  }
+
   if (isRouteActionId(actionId)) {
     const routeSteps = routeStepsFromInputs(inputs);
     const blockers = Array.isArray(inputs.routeBlockers)
@@ -282,7 +302,11 @@ function evaluatePreflightGate(context: WorkflowContext, actionId: StableActionI
     }
     if (routeSteps.includes('pr')) {
       const reviewEvidence = evaluateReviewEvidenceForPr(context);
-      if (!reviewEvidence.allowed) {
+      const overrideReason = reviewEvidenceOverrideReason({
+        override: inputs.override === true,
+        reason: typeof inputs.reason === 'string' ? inputs.reason : '',
+      });
+      if (!reviewEvidence.allowed && !overrideReason) {
         return {
           allowed: false,
           reason: reviewEvidence.message,
@@ -353,6 +377,10 @@ function evaluatePreflightGate(context: WorkflowContext, actionId: StableActionI
   return { allowed: true };
 }
 
+function reviewOverrideAppliesToAction(actionId: StableActionId): boolean {
+  return actionId === 'pr' || actionId === 'merge' || isRouteActionId(actionId);
+}
+
 function routeStepsFromInputs(inputs: Record<string, unknown>): string[] {
   const route = inputs.route && typeof inputs.route === 'object'
     ? inputs.route as { routeSteps?: unknown }
@@ -377,6 +405,10 @@ function evaluatePrPreflightGate(context: WorkflowContext, inputs: Record<string
   const title = typeof inputs.title === 'string' ? inputs.title : '';
   const recover = typeof inputs.recover === 'string' ? inputs.recover.trim() : '';
   const bindingFingerprint = typeof inputs.bindingFingerprint === 'string' ? inputs.bindingFingerprint.trim() : '';
+  const overrideReason = reviewEvidenceOverrideReason({
+    override: inputs.override === true,
+    reason: typeof inputs.reason === 'string' ? inputs.reason : '',
+  });
 
   if (recover) {
     if (!isTaskBindingRecovery(recover)) {
@@ -417,7 +449,7 @@ function evaluatePrPreflightGate(context: WorkflowContext, inputs: Record<string
     }
     if (recover === 'use-current-checkout') {
       const reviewEvidence = evaluateReviewEvidenceForPr(context);
-      if (!reviewEvidence.allowed) {
+      if (!reviewEvidence.allowed && !overrideReason) {
         return {
           allowed: false,
           reason: reviewEvidence.message,
@@ -453,7 +485,7 @@ function evaluatePrPreflightGate(context: WorkflowContext, inputs: Record<string
       );
     }
     const reviewEvidence = evaluateReviewEvidenceForPr(context);
-    if (!reviewEvidence.allowed) {
+    if (!reviewEvidence.allowed && !overrideReason) {
       return {
         allowed: false,
         reason: reviewEvidence.message,
@@ -879,9 +911,11 @@ function normalizeInputs(
         message: flags.message,
         recover: flags.recover,
         bindingFingerprint: flags.bindingFingerprint,
+        override: flags.override,
+        reason: flags.reason,
       };
     case 'merge':
-      return { task: flags.task, pr: flags.pr };
+      return { task: flags.task, pr: flags.pr, override: flags.override, reason: flags.reason };
     case 'deploy.staging':
       return { task: flags.task, pr: flags.pr, sha: flags.sha, surfaces: flags.surfaces };
     case 'deploy.prod':
@@ -902,6 +936,7 @@ function normalizeInputs(
         surfaces: flags.surfaces,
         title: flags.title,
         message: flags.message,
+        override: flags.override,
         reason: flags.reason,
         route: destinationPlan?.fingerprintInputs,
         routeBlockers: destinationPlan?.blockers ?? ['route could not be planned'],
@@ -1085,11 +1120,15 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
       pushOpt('--message', flags.message);
       pushOpt('--recover', flags.recover);
       pushOpt('--binding-fingerprint', flags.bindingFingerprint);
+      if (flags.override) args.push('--override');
+      pushOpt('--reason', flags.reason);
       break;
     case 'merge':
       args.push('merge');
       pushOpt('--task', flags.task);
       pushOpt('--pr', flags.pr);
+      if (flags.override) args.push('--override');
+      pushOpt('--reason', flags.reason);
       break;
     case 'deploy.staging':
       args.push('deploy', 'staging');
@@ -1110,6 +1149,8 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
       args.push('merge', '--yes');
       pushRouteTaskOrPr();
       pushRoutePrMetadata();
+      if (flags.override) args.push('--override');
+      pushOpt('--reason', flags.reason);
       break;
     case 'route.deploy.staging':
       args.push('deploy', 'staging', '--yes');

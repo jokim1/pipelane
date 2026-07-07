@@ -1,12 +1,18 @@
+import crypto from 'node:crypto';
+
 import {
+  appendReviewOverrideRecord,
   formatWorkflowCommand,
   loadReviewState,
+  nowIso,
+  runGit,
+  type OperatorFlags,
   type ReviewGateConfig,
   type ReviewGateRunRecord,
   type ReviewRunRecord,
   type WorkflowContext,
 } from './state.ts';
-import { blockingAiReviewEvidenceBlocker } from './review-identity.ts';
+import { blockingAiReviewEvidenceBlocker, resolveReviewActorIdentity } from './review-identity.ts';
 import { REVIEW_GATES_POLICY_VERSION } from './review-gate-policy.ts';
 import { readWorktreeStatusSnapshot } from './worktree-status.ts';
 
@@ -39,6 +45,28 @@ export interface ReviewEvidenceTarget {
   headLabel?: string;
 }
 
+export function reviewEvidenceOverrideReason(flags: Pick<OperatorFlags, 'override' | 'reason'>): string {
+  if (!flags.override) return '';
+  return flags.reason.trim();
+}
+
+export function formatReviewEvidenceOverrideMessage(command: string, reason: string): string {
+  return `${command} review gate override accepted: ${reason}`;
+}
+
+export function recordReviewEvidenceOverride(context: WorkflowContext, command: string, reason: string): void {
+  const recordedAt = nowIso();
+  appendReviewOverrideRecord(context.commonDir, context.config, {
+    id: `review-override-${new Date(recordedAt).toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto.randomUUID().slice(0, 8)}`,
+    command,
+    reason,
+    recordedAt,
+    actor: resolveReviewActorIdentity(),
+    branchName: runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '',
+    sha: runGit(context.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '',
+  });
+}
+
 export function evaluateReviewEvidenceForPr(
   context: WorkflowContext,
   options: { latestOverride?: ReviewRunRecord | null; command?: string; target?: ReviewEvidenceTarget } = {},
@@ -54,7 +82,7 @@ export function evaluateReviewEvidenceForPr(
     };
   }
   const target = options.target ?? currentCheckoutReviewEvidenceTarget(context.repoRoot);
-  const latest = options.latestOverride ?? selectReviewEvidenceRecord(reviewState.records, {
+  const selectedLatest = options.latestOverride ?? selectReviewEvidenceRecord(reviewState.records, {
     currentBranch: target.branchName,
     currentSha: target.sha,
     currentWorktreeStatusDigest: target.worktreeStatusDigest,
@@ -62,6 +90,19 @@ export function evaluateReviewEvidenceForPr(
     currentWorktreeMaterialTreeHash: target.worktreeMaterialTreeHash,
     currentWorktreeMaterialTreeReliable: target.worktreeMaterialTreeReliable,
   });
+  const latest = selectedLatest
+    ? attachEquivalentReviewGateEvidence({
+        context,
+        reviewRun: selectedLatest,
+        allRecords: reviewState.records,
+        currentBranch: target.branchName,
+        currentSha: target.sha,
+        currentWorktreeStatusDigest: target.worktreeStatusDigest,
+        currentWorktreeStatusReliable: target.worktreeStatusReliable,
+        currentWorktreeMaterialTreeHash: target.worktreeMaterialTreeHash,
+        currentWorktreeMaterialTreeReliable: target.worktreeMaterialTreeReliable,
+      })
+    : null;
   const issues = collectReviewEvidenceIssues({
     latest,
     expectedGates,
@@ -307,6 +348,118 @@ function collectReviewEvidenceIssues(options: {
   }
 
   return issues.filter((issue) => issue.blocking);
+}
+
+function attachEquivalentReviewGateEvidence(options: {
+  context: WorkflowContext;
+  reviewRun: ReviewRunRecord;
+  allRecords: ReviewRunRecord[];
+  currentBranch: string;
+  currentSha: string;
+  currentWorktreeStatusDigest: string;
+  currentWorktreeStatusReliable: boolean;
+  currentWorktreeMaterialTreeHash: string;
+  currentWorktreeMaterialTreeReliable: boolean;
+}): ReviewRunRecord {
+  const { reviewRun } = options;
+  if (!reviewRunCoversFullGateSet(reviewRun)) return reviewRun;
+  if (
+    reviewRun.branchName !== options.currentBranch
+    || reviewRun.sha !== options.currentSha
+    || !reviewRecordMatchesCurrentWorktree(reviewRun, options)
+  ) {
+    return reviewRun;
+  }
+  const pendingManualGates = reviewRun.gates.filter((gate) =>
+    gate.status === 'pending'
+    && gate.blocking !== false
+    && isManualReviewGateRun(gate)
+  );
+  if (pendingManualGates.length === 0) return reviewRun;
+
+  const passedByGateId = new Map<string, ReviewGateRunRecord>();
+  for (const record of options.allRecords) {
+    if (!reviewRunMatchesEquivalentGateEvidence(reviewRun, record)) continue;
+    for (const gate of record.gates) {
+      if (isPassedManualReviewGate(gate) && !passedByGateId.has(gate.gateId)) {
+        passedByGateId.set(gate.gateId, gate);
+      }
+    }
+  }
+
+  if (passedByGateId.size === 0) return reviewRun;
+  let attached = false;
+  const gates = reviewRun.gates.map((gate): ReviewGateRunRecord => {
+    if (gate.status !== 'pending' || !isManualReviewGateRun(gate)) return gate;
+    const passed = passedByGateId.get(gate.gateId);
+    if (!passed || !manualReviewGateEvidenceMatches(gate, passed)) return gate;
+    attached = true;
+    const attachedGate: ReviewGateRunRecord = {
+      ...gate,
+      status: 'passed',
+      summary: passed.summary,
+      startedAt: passed.startedAt,
+      finishedAt: passed.finishedAt,
+      durationMs: passed.durationMs,
+    };
+    if (passed.attester) attachedGate.attester = passed.attester;
+    return attachedGate;
+  });
+
+  return attached
+    ? { ...reviewRun, status: summarizeReviewRunStatus(gates), gates }
+    : reviewRun;
+}
+
+function reviewRunCoversFullGateSet(reviewRun: ReviewRunRecord): boolean {
+  return reviewRun.dryRun === false && !reviewRun.gateFilter && !reviewRun.phaseFilter;
+}
+
+function reviewRunMatchesEquivalentGateEvidence(expected: ReviewRunRecord, evidence: ReviewRunRecord): boolean {
+  return reviewRunCoversFullGateSet(evidence)
+    && evidence.branchName === expected.branchName
+    && evidence.sha === expected.sha
+    && reviewRecordMatchesCurrentWorktree(evidence, {
+      currentWorktreeStatusDigest: expected.worktreeStatusDigest ?? '',
+      currentWorktreeStatusReliable: expected.worktreeStatusReliable,
+      currentWorktreeMaterialTreeHash: expected.worktreeMaterialTreeHash ?? '',
+      currentWorktreeMaterialTreeReliable: expected.worktreeMaterialTreeReliable,
+    });
+}
+
+function isPassedManualReviewGate(gate: ReviewGateRunRecord): boolean {
+  return gate.status === 'passed' && isManualReviewGateRun(gate);
+}
+
+function manualReviewGateEvidenceMatches(expected: ReviewGateRunRecord, evidence: ReviewGateRunRecord): boolean {
+  return isManualReviewGateRun(expected)
+    && isManualReviewGateRun(evidence)
+    && expected.gateId === evidence.gateId
+    && expected.type === evidence.type
+    && expected.phase === evidence.phase
+    && expected.blocking === evidence.blocking
+    && normalizeOptionalGateField(expected.skill) === normalizeOptionalGateField(evidence.skill)
+    && normalizeOptionalGateField(expected.role) === normalizeOptionalGateField(evidence.role)
+    && normalizeOptionalGateField(expected.command) === normalizeOptionalGateField(evidence.command)
+    && normalizeOptionalGateList(expected.userCommands) === normalizeOptionalGateList(evidence.userCommands);
+}
+
+function isManualReviewGateRun(gate: Pick<ReviewGateRunRecord, 'type'>): boolean {
+  return gate.type === 'skill' || gate.type === 'agent' || gate.type === 'approval';
+}
+
+function normalizeOptionalGateField(value: string | undefined): string {
+  return value ?? '';
+}
+
+function normalizeOptionalGateList(value: string[] | undefined): string {
+  return JSON.stringify(value ?? []);
+}
+
+function summarizeReviewRunStatus(gates: ReviewGateRunRecord[]): ReviewRunRecord['status'] {
+  if (gates.some((gate) => gate.blocking && gate.status === 'failed')) return 'failed';
+  if (gates.some((gate) => gate.blocking && gate.status === 'pending')) return 'pending';
+  return 'passed';
 }
 
 function reviewRecordMatchesCurrentWorktree(

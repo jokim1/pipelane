@@ -36,7 +36,12 @@ import {
   type ParsedOperatorArgs,
   type TaskLock,
 } from '../state.ts';
-import { evaluateReviewEvidenceForPr } from '../review-enforcement.ts';
+import {
+  evaluateReviewEvidenceForPr,
+  formatReviewEvidenceOverrideMessage,
+  recordReviewEvidenceOverride,
+  reviewEvidenceOverrideReason,
+} from '../review-enforcement.ts';
 import {
   evaluateDestinationRouteReviewSafety,
   routeSafetyAcceptsReviewFindings,
@@ -123,8 +128,12 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
     prTitle = existingPr?.title || latestCommitSubject(context.repoRoot);
   }
 
+  const reviewOverrideReason = reviewEvidenceOverrideReason(parsed.flags);
+  let reviewOverrideApplied = Boolean(reviewOverrideReason);
   const reviewEvidence = evaluateReviewEvidenceForPr(context);
-  if (!reviewEvidence.allowed && !routeSafetyAcceptsReviewFindings(cwd, parsed, reviewEvidence)) {
+  if (!reviewEvidence.allowed && reviewOverrideReason) {
+    reviewOverrideApplied = true;
+  } else if (!reviewEvidence.allowed && !routeSafetyAcceptsReviewFindings(cwd, parsed, reviewEvidence)) {
     let acceptedByPrompt = false;
     if (reviewEvidence.latest) {
       const routePlan = buildDestinationPlanForCommand(cwd, parsed);
@@ -144,7 +153,9 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
   }
 
   const postCheckReviewEvidence = evaluateReviewEvidenceForPr(context);
-  if (!postCheckReviewEvidence.allowed && !routeSafetyAcceptsReviewFindings(cwd, parsed, postCheckReviewEvidence)) {
+  if (!postCheckReviewEvidence.allowed && reviewOverrideReason) {
+    reviewOverrideApplied = true;
+  } else if (!postCheckReviewEvidence.allowed && !routeSafetyAcceptsReviewFindings(cwd, parsed, postCheckReviewEvidence)) {
     let acceptedByPrompt = false;
     if (postCheckReviewEvidence.latest) {
       const routePlan = buildDestinationPlanForCommand(cwd, parsed);
@@ -229,6 +240,13 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
     taskSlug,
     prNumber ? `PR #${prNumber} open, awaiting CI` : 'PR created, awaiting CI',
   );
+  if (reviewOverrideApplied) {
+    recordReviewEvidenceOverride(context, formatWorkflowCommand(context.config, 'pr'), reviewOverrideReason);
+  }
+  const reviewOverrideMessage = reviewOverrideApplied
+    ? formatReviewEvidenceOverrideMessage(formatWorkflowCommand(context.config, 'pr'), reviewOverrideReason)
+    : '';
+  const reviewOverrideMessages = reviewOverrideMessage ? [reviewOverrideMessage] : [];
 
   printResult(parsed.flags, {
     taskSlug,
@@ -240,6 +258,7 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
       `Task: ${taskSlug}`,
       `Branch: ${branchName}`,
       `PR: ${prUrl || 'created'}`,
+      ...reviewOverrideMessages,
       `Next: run ${formatWorkflowCommand(context.config, 'merge')}.`,
     ].join('\n'),
   });
