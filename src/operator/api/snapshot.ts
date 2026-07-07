@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs';
 
-import type { DeployRecord, PrRecord, ProbeState, ReviewRunRecord, TaskLock, WorkflowConfig } from '../state.ts';
+import type { DeployRecord, PrRecord, ProbeState, ReviewOverrideRecord, ReviewRunRecord, TaskLock, WorkflowConfig } from '../state.ts';
 import {
   DEFAULT_MODE,
   formatWorkflowCommand,
@@ -283,6 +283,7 @@ export interface SnapshotData {
   };
   review: {
     latest: ReviewRunRecord | null;
+    latestOverride: ReviewOverrideRecord | null;
   };
   orchestration: OrchestrationSnapshot;
   sourceHealth: SourceHealthEntry[];
@@ -527,6 +528,7 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
       },
       review: {
         latest: reviewEvidence.latest ?? reviewState.records[0] ?? null,
+        latestOverride: reviewState.overrides[0] ?? null,
       },
       orchestration,
       sourceHealth,

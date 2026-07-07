@@ -530,6 +530,14 @@ export function renderCockpit(
     lines.push(`  at: ${sanitizeForTerminal(lastOverride.setAt)} by ${sanitizeForTerminal(lastOverride.setBy)}`);
     lines.push('');
   }
+  const reviewOverride = envelope.data.review?.latestOverride ?? null;
+  if (reviewOverride) {
+    lines.push(colorize('ℹ REVIEW GATE PREVIOUSLY BYPASSED', color, 'yellow'));
+    lines.push(`  command: ${sanitizeForTerminal(reviewOverride.command)}`);
+    lines.push(`  reason: ${sanitizeForTerminal(reviewOverride.reason)}`);
+    lines.push(`  at: ${sanitizeForTerminal(reviewOverride.recordedAt)} by ${sanitizeForTerminal(reviewOverride.actor.provider)}:${sanitizeForTerminal(reviewOverride.actor.source)}`);
+    lines.push('');
+  }
 
   // v1.2: probe banner mirrors the override banner pattern. Red for
   // degraded (a probe actively failed), yellow for stale (a probe exists

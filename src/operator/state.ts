@@ -443,8 +443,20 @@ export interface ReviewRunRecord {
   signature?: string;
 }
 
+export interface ReviewOverrideRecord {
+  id: string;
+  command: string;
+  reason: string;
+  recordedAt: string;
+  actor: ReviewActorIdentity;
+  branchName: string;
+  sha: string;
+  signature?: string;
+}
+
 export interface ReviewState {
   records: ReviewRunRecord[];
+  overrides: ReviewOverrideRecord[];
 }
 
 export type RouteSafetyResumeKind = 'one-more-loop' | 'more-loops-and-minutes' | 'until-review-passes' | 'accept-findings';
@@ -832,6 +844,7 @@ const REVIEW_STATE_FILENAME = 'review-state.json';
 const REVIEW_STATE_LOCK_FILENAME = 'review-state.lock';
 const ROUTE_SAFETY_STATE_FILENAME = 'route-safety-state.json';
 const REVIEW_STATE_MAX_RECORDS = 20;
+const REVIEW_OVERRIDE_MAX_RECORDS = 50;
 const ACTION_STATE_MAX_DECISIONS = 100;
 const REVIEW_STATE_LOCK_STALE_MS = 2 * 60 * 1000;
 const DEPLOY_CONFIG_FILENAME = 'deploy-config.json';
@@ -2575,19 +2588,24 @@ function isStatusDecisionStatus(value: unknown): value is StatusDecisionStatus {
 }
 
 export function loadReviewState(commonDir: string, config: WorkflowConfig): ReviewState {
-  const raw = readVersionedJsonFile<ReviewState>('reviewState', commonDir, config, reviewStatePath(commonDir, config), { records: [] });
+  const raw = readVersionedJsonFile<ReviewState>('reviewState', commonDir, config, reviewStatePath(commonDir, config), { records: [], overrides: [] });
   const stateKey = resolveReviewStateKey();
   const records = Array.isArray(raw?.records)
     ? raw.records.filter(isReviewRunRecord).slice(0, REVIEW_STATE_MAX_RECORDS)
       .filter((record) => !stateKey || verifySignedPayload(record, stateKey))
     : [];
-  return { records };
+  const overrides = Array.isArray(raw?.overrides)
+    ? raw.overrides.filter(isReviewOverrideRecord).slice(0, REVIEW_OVERRIDE_MAX_RECORDS)
+      .filter((record) => !stateKey || verifySignedPayload(record, stateKey))
+    : [];
+  return { records, overrides };
 }
 
 export function saveReviewState(commonDir: string, config: WorkflowConfig, value: ReviewState): void {
   ensureStateDir(commonDir, config);
   writeVersionedJsonFile('reviewState', reviewStatePath(commonDir, config), {
     records: value.records.slice(0, REVIEW_STATE_MAX_RECORDS),
+    overrides: (value.overrides ?? []).slice(0, REVIEW_OVERRIDE_MAX_RECORDS),
   });
 }
 
@@ -2600,6 +2618,22 @@ export function appendReviewRunRecord(commonDir: string, config: WorkflowConfig,
       ? { ...record, signature: signSignedPayload(record, stateKey) }
       : record;
     state.records = [persisted, ...state.records].slice(0, REVIEW_STATE_MAX_RECORDS);
+    saveReviewState(commonDir, config, state);
+    return persisted;
+  } finally {
+    lock.release();
+  }
+}
+
+export function appendReviewOverrideRecord(commonDir: string, config: WorkflowConfig, record: ReviewOverrideRecord): ReviewOverrideRecord {
+  const lock = acquireReviewStateLock(commonDir, config);
+  try {
+    const state = loadReviewState(commonDir, config);
+    const stateKey = resolveReviewStateKey();
+    const persisted = stateKey
+      ? { ...record, signature: signSignedPayload(record, stateKey) }
+      : record;
+    state.overrides = [persisted, ...(state.overrides ?? [])].slice(0, REVIEW_OVERRIDE_MAX_RECORDS);
     saveReviewState(commonDir, config, state);
     return persisted;
   } finally {
@@ -2772,6 +2806,19 @@ function isReviewActorIdentity(value: unknown): value is ReviewActorIdentity {
   return typeof raw.provider === 'string'
     && (raw.sessionId === null || typeof raw.sessionId === 'string')
     && typeof raw.source === 'string';
+}
+
+function isReviewOverrideRecord(value: unknown): value is ReviewOverrideRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return typeof raw.id === 'string'
+    && typeof raw.command === 'string'
+    && typeof raw.reason === 'string'
+    && typeof raw.recordedAt === 'string'
+    && isReviewActorIdentity(raw.actor)
+    && typeof raw.branchName === 'string'
+    && typeof raw.sha === 'string'
+    && (raw.signature === undefined || typeof raw.signature === 'string');
 }
 
 function isReviewGateRunRecord(value: unknown): value is ReviewGateRunRecord {
@@ -3729,18 +3776,30 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       requireNoPositional('pipelane run repo-guard --task <task-name> [--mode build|release] [--surfaces <csv>] [--offline]');
       return;
     case 'pr':
-      assertOnlyFlags(parsed, ['task', 'title', 'message', 'forceInclude', 'recover', 'bindingFingerprint', 'plan', 'yes']);
+      assertOnlyFlags(parsed, ['task', 'title', 'message', 'forceInclude', 'recover', 'bindingFingerprint', 'override', 'reason', 'plan', 'yes']);
+      if (parsed.flags.reason && !parsed.flags.override) {
+        throw new Error('pr only accepts --reason together with --override.');
+      }
+      if (parsed.flags.override && !parsed.flags.reason.trim()) {
+        throw new Error('pr --override requires --reason <why review gate evidence is being skipped>.');
+      }
       rejectPlanAndYes('pr');
-      requireNoPositional('pipelane run pr [--task <task-name>] [--title <title>] [--message <message>] [--force-include <path>] [--plan|--yes]');
+      requireNoPositional('pipelane run pr [--task <task-name>] [--title <title>] [--message <message>] [--force-include <path>] [--override --reason <text>] [--plan|--yes]');
       return;
     case 'merge':
-      assertOnlyFlags(parsed, ['task', 'pr', 'title', 'message', 'forceInclude', 'plan', 'yes']);
+      assertOnlyFlags(parsed, ['task', 'pr', 'title', 'message', 'forceInclude', 'override', 'reason', 'plan', 'yes']);
       requirePositivePrNumber();
       if (parsed.flags.task.trim() && parsed.flags.pr.trim()) {
         throw new Error('merge cannot combine --task and --pr; choose one PR/task identity.');
       }
+      if (parsed.flags.reason && !parsed.flags.override) {
+        throw new Error('merge only accepts --reason together with --override.');
+      }
+      if (parsed.flags.override && !parsed.flags.reason.trim()) {
+        throw new Error('merge --override requires --reason <why review gate evidence is being skipped>.');
+      }
       rejectPlanAndYes('merge');
-      requireNoPositional('pipelane run merge [--task <task-name> | --pr <number>] [--title <title>] [--message <message>] [--force-include <path>] [--plan|--yes]');
+      requireNoPositional('pipelane run merge [--task <task-name> | --pr <number>] [--title <title>] [--message <message>] [--force-include <path>] [--override --reason <text>] [--plan|--yes]');
       return;
     case 'release-check':
       assertOnlyFlags(parsed, ['surfaces']);

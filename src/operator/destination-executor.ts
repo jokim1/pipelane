@@ -13,7 +13,7 @@ import {
   type DestinationStep,
 } from './destination-planner.ts';
 import { sanitizeForTerminal } from './commands/helpers.ts';
-import { evaluateReviewEvidenceForPr } from './review-enforcement.ts';
+import { evaluateReviewEvidenceForPr, reviewEvidenceOverrideReason } from './review-enforcement.ts';
 import {
   ROUTE_SAFETY_FINGERPRINT_ENV,
   evaluateDestinationRouteReviewSafety,
@@ -106,7 +106,8 @@ export async function executeDestinationRoute(
     if (step.id === 'pr') {
       const context = resolveWorkflowContext(routeCwd);
       const reviewEvidence = evaluateReviewEvidenceForPr(context, { command: step.command });
-      if (!reviewEvidence.allowed) {
+      const overrideReason = reviewEvidenceOverrideReason(parsed.flags);
+      if (!reviewEvidence.allowed && !overrideReason) {
         const pause = await evaluateDestinationRouteReviewSafety(context, currentPlan, reviewEvidence);
         if (pause.action === 'stop') {
           return failRouteGuard(execution, step.command, pause.message);
@@ -511,12 +512,16 @@ function buildStepArgs(step: DestinationStep, parsed: ParsedOperatorArgs, plan: 
     pushOpt('--task', parsed.flags.task || plan.taskSlug);
     pushOpt('--title', parsed.flags.title || plan.taskName || plan.taskSlug);
     pushOpt('--message', parsed.flags.message);
+    if (parsed.flags.override) args.push('--override');
+    pushOpt('--reason', parsed.flags.reason);
     for (const force of parsed.flags.forceInclude) args.push('--force-include', force);
     return args;
   }
   if (step.id === 'merge') {
     args.push('merge');
     pushTaskOrPr();
+    if (parsed.flags.override) args.push('--override');
+    pushOpt('--reason', parsed.flags.reason);
     return args;
   }
   if (step.id === 'deploy_staging') {

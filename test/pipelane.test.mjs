@@ -2820,7 +2820,7 @@ test.skip('custom aliases drive generated Claude commands, docs, and tracked Cod
     assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'new.md')));
     assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'new', 'SKILL.md')));
 
-    const configPath = machinePipelaneConfigPath(repoRoot);
+    const configPath = path.join(repoRoot, '.pipelane.json');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.aliases.new = '/branch';
     config.aliases.resume = '/back';
@@ -15737,6 +15737,102 @@ test('review pass records clean manual gates against current review evidence', (
   }
 });
 
+test('review evidence accepts matching separately recorded review pass records', async () => {
+  const repoRoot = createRepo();
+  const npmShim = createNpmShimEnv();
+  try {
+    writePipelaneConfig(repoRoot);
+    commitLocal(repoRoot, 'Adopt pipelane');
+
+    const review = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, npmShim.env).stdout);
+    assert.equal(review.status, 'pending');
+    const pass = JSON.parse(runCli([
+      'run',
+      'review',
+      'pass',
+      '--gate',
+      'karpathy-diff',
+      '--message',
+      'Ran /karpathy diff clean',
+      '--json',
+    ], repoRoot, {
+      PIPELANE_AGENT_SESSION_ID: 'separate-karpathy-session',
+    }).stdout);
+    const state = JSON.parse(readFileSync(pass.evidencePath, 'utf8'));
+    const passRecord = state.records[0];
+    const pendingRecord = state.records.find((record) => record.id === review.runId);
+    state.records = [
+      pendingRecord,
+      passRecord,
+      ...state.records.filter((record) => record.id !== pendingRecord.id && record.id !== passRecord.id),
+    ];
+    writeFileSync(pass.evidencePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+
+    const { resolveWorkflowContext } = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const { evaluateReviewEvidenceForPr } = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-enforcement.ts'));
+    const evidence = evaluateReviewEvidenceForPr(resolveWorkflowContext(repoRoot));
+
+    assert.equal(evidence.allowed, false);
+    assert.doesNotMatch(evidence.message, /karpathy-diff is pending/);
+    assert.match(evidence.message, /gstack-review is pending/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(npmShim.binDir, { recursive: true, force: true });
+  }
+});
+
+test('review evidence rejects unauthenticated gstack review log entries for blocking gates', async () => {
+  const repoRoot = createRepo();
+  const gstackHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gstack-home-'));
+  const previousGstackHome = process.env.GSTACK_HOME;
+  try {
+    process.env.GSTACK_HOME = gstackHome;
+    writePipelaneConfig(repoRoot, 'External Review Demo', {
+      reviewGates: {
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: [{
+          id: 'karpathy-diff',
+          phase: 'ai-diff',
+          type: 'skill',
+          skill: 'karpathy-diff',
+          userCommands: ['/karpathy diff'],
+          blocking: true,
+        }],
+      },
+    });
+    commitLocal(repoRoot, 'Adopt external self-review gate');
+
+    const review = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      GSTACK_HOME: gstackHome,
+    }).stdout);
+    assert.equal(review.status, 'pending');
+    assert.equal(review.gates[0].status, 'pending');
+    writeGstackReviewLogEntry(repoRoot, gstackHome, {
+      skill: 'karpathy-diff',
+      timestamp: new Date().toISOString(),
+      status: 'clean',
+      commit: run('git', ['rev-parse', '--short', 'HEAD'], repoRoot),
+    });
+
+    const { resolveWorkflowContext } = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const { evaluateReviewEvidenceForPr } = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-enforcement.ts'));
+    const evidence = evaluateReviewEvidenceForPr(resolveWorkflowContext(repoRoot));
+
+    assert.equal(evidence.allowed, false);
+    assert.equal(evidence.latest.gates[0].status, 'pending');
+    assert.match(evidence.message, /karpathy-diff is pending/);
+  } finally {
+    if (previousGstackHome === undefined) {
+      delete process.env.GSTACK_HOME;
+    } else {
+      process.env.GSTACK_HOME = previousGstackHome;
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(gstackHome, { recursive: true, force: true });
+  }
+});
+
 test('review pass refuses stale or executable gate evidence', () => {
   const repoRoot = createRepo();
   const npmShim = createNpmShimEnv();
@@ -18573,6 +18669,17 @@ function writePassingReviewEvidence(repoRoot, options = {}) {
   return record;
 }
 
+function writeGstackReviewLogEntry(repoRoot, gstackHome, entry) {
+  const slug = path.basename(repoRoot).replace(/[^a-zA-Z0-9._-]/g, '');
+  const branch = run('git', ['branch', '--show-current'], repoRoot).replace(/[^a-zA-Z0-9._-]/g, '') || 'unknown';
+  const logDir = path.join(gstackHome, 'projects', slug);
+  mkdirSync(logDir, { recursive: true });
+  const logPath = path.join(logDir, `${branch}-reviews.jsonl`);
+  const existing = existsSync(logPath) ? readFileSync(logPath, 'utf8') : '';
+  writeFileSync(logPath, `${existing}${JSON.stringify(entry)}\n`, 'utf8');
+  return logPath;
+}
+
 function localBranchExists(repoRoot, branchName) {
   return spawnSync('git', ['rev-parse', '--verify', `refs/heads/${branchName}`], {
     cwd: repoRoot,
@@ -20035,6 +20142,80 @@ test('pr, merge, deploy, and task-lock work with a fake gh adapter', () => {
   }
 });
 
+test('merge can explicitly override missing review evidence with a reason', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    runCli(['setup'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.reviewGates = {
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: [{
+          id: 'must-review',
+          phase: 'human',
+          type: 'approval',
+          blocking: true,
+        }],
+      };
+    });
+    commitAll(repoRoot, 'Adopt merge review override gate');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Merge Review Override', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'merge override\n', 'utf8');
+    runCli([
+      'run',
+      'pr',
+      '--title',
+      'Merge Review Override',
+      '--override',
+      '--reason',
+      'review accepted outside Pipelane',
+      '--json',
+    ], created.worktreePath, env);
+
+    const evidencePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'review-state.json');
+    writeFileSync(evidencePath, `${JSON.stringify({ schemaVersion: 1, records: [] }, null, 2)}\n`, 'utf8');
+    const blocked = runCli(['run', 'merge', '--json'], created.worktreePath, env, true);
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /review gate evidence is not ready/);
+
+    const merged = JSON.parse(runCli([
+      'run',
+      'merge',
+      '--override',
+      '--reason',
+      'review accepted outside Pipelane',
+      '--json',
+    ], created.worktreePath, env).stdout);
+    assert.equal(merged.mergedSha, 'deadbeefcafebabe');
+    assert.match(merged.message, /review gate override accepted: review accepted outside Pipelane/);
+    const reviewState = JSON.parse(readFileSync(evidencePath, 'utf8'));
+    assert.equal(reviewState.overrides.length, 1);
+    assert.equal(reviewState.overrides[0].command, '/merge');
+    assert.equal(reviewState.overrides[0].reason, 'review accepted outside Pipelane');
+    assert.equal(reviewState.overrides[0].branchName, run('git', ['branch', '--show-current'], created.worktreePath));
+    assert.equal(reviewState.overrides[0].sha, run('git', ['rev-parse', '--verify', 'HEAD'], created.worktreePath));
+    assert.ok(reviewState.overrides[0].actor);
+    assert.ok(reviewState.overrides[0].recordedAt);
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.prMergeCalls.length, 1);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
 test('deploy infers target surfaces from surfacePathMap instead of stale task lock surfaces', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
@@ -20316,6 +20497,69 @@ test('pr blocks before commit or gh when review evidence is missing', () => {
     assert.match(run('git', ['status', '--short'], created.worktreePath), /feature\.txt/);
     assert.match(run('git', ['log', '--oneline', '-1'], created.worktreePath), /Adopt pipelane/);
     assert.equal(existsSync(ghStateFile), false, 'missing review evidence should block before gh is called');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('pr can explicitly override missing review evidence with a reason', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.reviewGates = {
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: [{
+          id: 'must-review',
+          phase: 'human',
+          type: 'approval',
+          blocking: true,
+        }],
+      };
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Review Override', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'override review gate\n', 'utf8');
+    const review = JSON.parse(runCli(['run', 'review', '--json'], created.worktreePath).stdout);
+    assert.equal(review.status, 'pending');
+
+    const result = runCli([
+      'run',
+      'pr',
+      '--title',
+      'Review Override',
+      '--override',
+      '--reason',
+      'external review gates already passed',
+      '--json',
+    ], created.worktreePath, env);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(result.status, 0);
+    assert.match(payload.message, /review gate override accepted: external review gates already passed/);
+    assert.match(payload.url, /example\.test\/pr/);
+    const reviewState = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'review-state.json'), 'utf8'));
+    assert.equal(reviewState.overrides.length, 1);
+    assert.equal(reviewState.overrides[0].command, '/pr');
+    assert.equal(reviewState.overrides[0].reason, 'external review gates already passed');
+    assert.equal(reviewState.overrides[0].branchName, run('git', ['branch', '--show-current'], created.worktreePath));
+    assert.equal(reviewState.overrides[0].sha, run('git', ['rev-parse', '--verify', 'HEAD'], created.worktreePath));
+    assert.ok(reviewState.overrides[0].actor);
+    assert.ok(reviewState.overrides[0].recordedAt);
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(Object.keys(ghState.prs).length, 1);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -29714,6 +29958,55 @@ test('renderCockpit shows RELEASE GATE PREVIOUSLY BYPASSED banner when override 
     'previous-bypass banner must appear before ATTENTION header');
   // Not the red active banner (override is null).
   assert.ok(!/OVERRIDE ACTIVE/.test(rendered));
+});
+
+test('renderCockpit shows REVIEW GATE PREVIOUSLY BYPASSED banner when review override audit exists', async () => {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'status.ts'));
+  const envelope = {
+    schemaVersion: '2026-04-18',
+    command: 'pipelane.api.snapshot',
+    ok: true, message: '', warnings: [], issues: [],
+    data: {
+      boardContext: {
+        mode: 'build', baseBranch: 'main',
+        laneOrder: [],
+        releaseReadiness: {
+          state: 'unknown', reason: '', requestedSurfaces: [], blockedSurfaces: [],
+          effectiveOverride: null,
+          lastOverride: null,
+          localReady: false, hostedReady: false,
+          freshness: { checkedAt: '', observedAt: '', state: 'fresh' },
+          message: '',
+        },
+        activeTask: null,
+        overallFreshness: { checkedAt: '', observedAt: '', state: 'fresh' },
+      },
+      review: {
+        latest: null,
+        latestOverride: {
+          id: 'review-override-1',
+          command: '/merge',
+          reason: 'review accepted outside Pipelane',
+          recordedAt: '2026-07-06T20:00:00.000Z',
+          actor: { provider: 'codex', source: 'CODEX_SESSION_ID', sessionId: 'sha256:abc' },
+          branchName: 'pipelane/demo',
+          sha: 'deadbeefcafebabe',
+        },
+      },
+      sourceHealth: [],
+      attention: [],
+      availableActions: [],
+      branches: [],
+    },
+  };
+
+  const rendered = mod.renderCockpit(envelope, { color: false });
+  assert.match(rendered, /REVIEW GATE PREVIOUSLY BYPASSED/);
+  assert.match(rendered, /command: \/merge/);
+  assert.match(rendered, /review accepted outside Pipelane/);
+  assert.match(rendered, /by codex:CODEX_SESSION_ID/);
+  assert.ok(rendered.indexOf('REVIEW GATE PREVIOUSLY BYPASSED') < rendered.indexOf('ATTENTION'),
+    'review previous-bypass banner must appear before ATTENTION header');
 });
 
 test('WIP warn message describes post-save count so operator sees "about to start Nth"', () => {
