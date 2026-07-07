@@ -2861,6 +2861,35 @@ test('pipelane.md documents exact first-token routing for subcommands', () => {
   assert.match(template, /`\/pipelane update-this-thing` routes to UNKNOWN MODE, not UPDATE MODE/);
 });
 
+test('fix.md template locks parser grammar fields and verbatim hint strings', () => {
+  // Locked-surface assertion, scoped to locked-by-definition strings only:
+  // the parser-grammar field formats and the hint strings fix.md orders
+  // emitted verbatim. Update alongside deliberate wording changes.
+  const templatePath = path.join(KIT_ROOT, 'templates', '.claude', 'commands', 'fix.md');
+  const template = readFileSync(templatePath, 'utf8');
+
+  const grammarLines = [
+    '- **`Last reviewed:`** — exact casing, colon, ISO `YYYY-MM-DD`.',
+    '- **`Refresh cadence:`** — exact casing, colon, one of `<N> days` | `<N> commits` | `<N> days or <N> commits`.',
+    '- **`Drift-hint threshold:`** — exact casing, colon, `<N> commits / <N> days`.',
+    '- **`Last rethink:`** — exact casing, colon, `YYYY-MM-DD <repo-relative-plan-path|none>`.',
+  ];
+  for (const line of grammarLines) {
+    assert.ok(template.includes(line), `fix.md template missing locked grammar line: ${line}`);
+  }
+
+  const hintStrings = [
+    '&lt;file&gt; has &lt;N&gt; commits in 30 days. Consider `/fix rethink`.',
+    '&lt;N&gt; findings in this batch landed in `&lt;module&gt;`. Consider `/fix rethink &lt;module&gt;`.',
+    'No REPO_GUIDANCE.md at the repo root. Run `/fix refresh-guidance` to start building invariants.',
+    'REPO_GUIDANCE.md still contains template placeholders (`<...>`) in most sections, so /fix ran without repo-specific invariants. Run `/fix refresh-guidance` to replace them with real project rules — future /fix runs will follow them.',
+    'This fix exposed a pattern worth adding to REPO_GUIDANCE.md: &lt;one-sentence description&gt;. Run `/fix refresh-guidance` to capture it.',
+  ];
+  for (const hint of hintStrings) {
+    assert.ok(template.includes(hint), `fix.md template missing locked hint string: ${hint}`);
+  }
+});
+
 test('resolveWorkflowAliases still rejects unknown aliases (pipelane is not a WorkflowCommand key)', async () => {
   // The strict-validator for unknown keys is unchanged — `aliases.pipelane`
   // is not a valid consumer config because pipelane isn't a WorkflowCommand
@@ -13453,7 +13482,6 @@ test('orchestrate start --force retries a stale running worker record', () => {
 test('orchestrate start --force terminates a live running worker before retry', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];
-  const markerPath = path.join(repoRoot, 'live-running-worker-marker.txt');
   let liveWorker = null;
   const workerCommand = passWorker("console.log('replacement worker')");
   try {
@@ -13465,8 +13493,9 @@ test('orchestrate start --force terminates a live running worker before retry', 
     const dispatched = JSON.parse(runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId, '--json'], repoRoot).stdout);
     liveWorker = spawn(process.execPath, [
       '-e',
-      "setTimeout(() => require('node:fs').writeFileSync(process.argv[1], 'still-running'), 1200); setTimeout(() => {}, 5000);",
-      markerPath,
+      // Stay alive well beyond the test run so the only thing that can end this
+      // process is --force terminating it; a self-exit would manufacture a pass.
+      'setTimeout(() => {}, 30000);',
     ], {
       detached: true,
       stdio: 'ignore',
@@ -13493,13 +13522,19 @@ test('orchestrate start --force terminates a live running worker before retry', 
     const forcedRetry = JSON.parse(runCli(['run', 'orchestrate', 'start', '--run-id', planned.runId, '--force', '--json'], repoRoot, {
       PIPELANE_ORCHESTRATE_WORKER_COMMAND: workerCommand,
     }).stdout);
-    await new Promise((resolve) => setTimeout(resolve, 1_500));
-
     assert.equal(forcedRetry.status, 'dispatched'); // C1: live worker replaced; run awaits review
     assert.equal(forcedRetry.restartedCount, 1);
     assert.equal(forcedRetry.run.slices[0].worker.status, 'succeeded');
     assert.notEqual(forcedRetry.run.slices[0].worker.pid, liveWorker.pid ?? null);
-    assert.equal(existsSync(markerPath), false);
+    // --force must terminate the live stale worker before starting the replacement.
+    // Assert the process is actually gone rather than racing a fixed-delay marker
+    // file: the previous marker check flaked under load when the `node src/cli.ts`
+    // cold-start out-raced the 1200ms marker write, not because termination failed.
+    const staleWorkerDeadline = Date.now() + 5_000;
+    while (isPidAlive(liveWorker.pid) && Date.now() < staleWorkerDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(isPidAlive(liveWorker.pid), false);
   } finally {
     if (liveWorker?.pid) {
       try {

@@ -3,13 +3,13 @@ Produce durable, root-cause fixes. Not shims, not speculative refactors.
 
 Findings may come from `/review`, `/qa`, a PR comment, a human reviewer, CI, or be pasted inline. If you cannot locate findings for a default `/fix` invocation, ask.
 
-Last reviewed: 2026-04-24
+Last reviewed: 2026-07-05
 
 ## Mode routing
 
 Parse `$ARGUMENTS` by whitespace. Evaluate the first token:
 
-- Exactly equals `rethink` → **RETHINK MODE**.
+- Exactly equals `rethink` → **RETHINK MODE**. Remaining tokens, if any, are an optional path scope.
 - Exactly equals `refresh-guidance` → **REFRESH GUIDANCE MODE**.
 - Comma-separated integers `1,3,5` (no spaces) → **FINDINGS MODE**, subset. Out-of-range index → `[warn]` naming it; proceed with valid ones.
 - Starts with `./`, `/`, or names an existing file → **FINDINGS MODE** with that file as source.
@@ -151,7 +151,8 @@ Prefix each load-bearing decision in the diff explanation. Emit at least `[fix] 
 
 Informational. No confirm, no block. Only emit these in Pipelane-enabled repos. Rate-limit: one per category per session. **Emit the hint string verbatim** — do not paraphrase, shorten, or summarize. The wording is load-bearing because it explains what happened and what to do next.
 
-- **Drift.** For each modified file, run `git log --since="30 days ago" --oneline -- <file>` and count. Read `Drift-hint threshold` from `REPO_GUIDANCE.md` (default: `20 commits / 30 days`). If any touched file exceeds, is not in `Drift-hint ignore`, and is not in `Deferred / don't-touch`, emit: "&lt;file&gt; has &lt;N&gt; commits in 30 days. Consider `/fix rethink`." Skip if `REPO_GUIDANCE.md` is missing entirely; scaffold-only still allows it.
+- **Drift.** For each modified file, run `git log --since="30 days ago" --oneline -- <file>` and count. Read `Drift-hint threshold` from `REPO_GUIDANCE.md` (default: `20 commits / 30 days`). If any touched file exceeds, is not in `Drift-hint ignore`, and is not in `Deferred / don't-touch`, emit: "&lt;file&gt; has &lt;N&gt; commits in 30 days. Consider `/fix rethink`." When 2+ flagged files share a module, name the module: emit the cluster hint for that module instead of the per-file lines. Skip if `REPO_GUIDANCE.md` is missing entirely; scaffold-only still allows it.
+- **Cluster.** Session-local; no new state. Fires when a single `/fix` batch lands 3+ findings in the same module, or the drift hint fires for 2+ files sharing a module. A module is the nearest common directory of the flagged files, at least one level below the repo root. Emit: "&lt;N&gt; findings in this batch landed in `&lt;module&gt;`. Consider `/fix rethink &lt;module&gt;`." Once the cluster hint fires for a module, suppress the drift hint for files in that module for the rest of the session — cluster is the stronger signal; one cause, one hint.
 - **Missing-file** (no REPO_GUIDANCE.md): "No REPO_GUIDANCE.md at the repo root. Run `/fix refresh-guidance` to start building invariants."
 - **Scaffold-only** (template-shape detection tripped): "REPO_GUIDANCE.md still contains template placeholders (`<...>`) in most sections, so /fix ran without repo-specific invariants. Run `/fix refresh-guidance` to replace them with real project rules — future /fix runs will follow them."
 - **Guidance-gap.** Fire only when the fix exposed a concrete, specific, novel invariant worth documenting (e.g. same pattern in 3+ places not documented, or a non-obvious repo rule that would have saved the fix). Format: "This fix exposed a pattern worth adding to REPO_GUIDANCE.md: &lt;one-sentence description&gt;. Run `/fix refresh-guidance` to capture it." Suppress vague ("codebase is complex") or duplicative observations.
@@ -160,29 +161,102 @@ Informational. No confirm, no block. Only emit these in Pipelane-enabled repos. 
 
 ## RETHINK MODE
 
-Triggered by `/fix rethink`. Scope is whole-codebase architectural audit and restructure planning, not a single finding.
+Triggered by `/fix rethink [scope]`. Remaining tokens after `rethink`, if any,
+are an optional path scope that narrows the audit: each token is a path;
+audit the union of the valid ones. Scope limits hotspot candidates and
+restructure proposals to the scoped paths, but evidence still includes edges
+crossing the scope boundary (co-change pairs, dependencies in/out) as
+context — out-of-scope neighbors are never proposed for restructure. If any
+token names no existing path, ask one clarifying line ("scope `<token>` not
+found — audit whole repo, or fix the path?") before running anything. Scope
+is architectural audit and restructure planning — whole-codebase by
+default — not a single finding.
 
-**Hard gate: produce a written plan, not code. No implementation until the user explicitly approves.**
+**Hard gate: produce a written plan, not code. No implementation until the
+user explicitly approves.**
 
-First run a **hotspot audit**. Ground the audit in repo evidence instead of intuition:
+Before auditing, read `REPO_GUIDANCE.md` if present: listed invariants
+constrain the proposed restructure; deferred items remain deferred unless the
+user unfreezes them. If `Last rethink:` is set and its path resolves, read
+that plan and check its success criteria against fresh evidence: criteria
+unmet → offer to resume it instead of re-auditing; criteria met → report it
+closed and audit fresh. If the path is `none` or does not resolve, emit one
+`[warn]` (dangling ledger path) and audit fresh.
 
-- **Recent churn.** Use `git log --since="30 days ago" --name-only --pretty=format:` and summarize files/modules with repeated commits. If the repo is shallow or has little history, say so and fall back to current-shape evidence.
-- **Feature accretion.** Identify files/modules where unrelated features now share state, branching, config, schemas, UI surfaces, or command flows.
-- **Size and responsibility.** Check large or highly connected files with `wc -l`, import/export references, and nearby tests. Do not treat size alone as proof; explain the responsibility mismatch.
-- **Repeated fixes or sibling patterns.** Search for duplicated logic, parallel conditionals, copied validation, repeated TODOs, and review-fix clusters that indicate the same structural problem keeps returning.
-- **Boundary stress.** Look for APIs, CLI contracts, schemas, auth/session paths, queues, deploy flows, or UI state boundaries that have become pass-through layers or catch-all modules.
+First run a **hotspot audit**. Ground the audit in repo evidence instead of
+intuition. Cap it at the top 3–5 candidates:
 
-Produce:
+- **Churn.** `git log --since="90 days ago" --no-merges --name-only
+  --pretty=format:` as the architecture window, overlaid with the last 30
+  days for recency. Aggregate counts in the shell (`sort | uniq -c |
+  sort -rn`); bring only the top ~20 files into context — never hand-count
+  raw logs. Rank by churn × size, then explain the responsibility
+  mismatch — neither signal alone is proof. If the repo is shallow or has
+  little history, say so and fall back to current-shape evidence.
+- **Co-change coupling.** From the same log, find file pairs that repeatedly
+  change in the same commit across module boundaries. Skip commits touching
+  more than ~20 files (sweep commits manufacture pairs); count pairs in the
+  shell and report only cross-module pairs seen ≥3 times, top ~10 into
+  context; on very large repos pair only among the top-churn files. Note
+  recent renames rather than chasing them. Cross-module co-change is direct
+  evidence a boundary is wrong; cite the top pairs with counts.
+- **Defect attractors.** Count fix-shaped commits per file/module (`git log
+  --grep` on fix/revert terms, `--name-only`, `--regexp-ignore-case`,
+  `--no-merges`). Repeated fixes in one place indicate a structural cause.
+  If fix-shaped commits are near zero while total commits are high (no
+  fix-commit convention), report this axis as no-signal with one `[warn]` —
+  never as evidence of health.
+- **Feature accretion.** Identify files/modules where unrelated features now
+  share state, branching, config, schemas, UI surfaces, or command flows.
+- **Boundary stress.** APIs, CLI contracts, schemas, auth/session paths,
+  queues, deploy flows, or UI state boundaries that have become pass-through
+  layers or catch-all modules.
+- **Cold-code guard.** Do not propose restructuring modules with no churn,
+  coupling, or defect evidence unless the user named the pain.
 
-1. **Hotspot audit** — ranked candidates with evidence: churn counts when available, representative files, repeated patterns, and why each is or is not worth refactoring now.
-2. **Drift observations** — concrete file/module references where new features have accumulated on top of older boundaries or the codebase has pivoted away from its original architecture.
-3. **Root-cause hypotheses** — structural causes (wrong module boundaries, schema that fought every new feature, leaked abstractions), not symptoms.
-4. **Proposed restructure** — new module boundaries, schema, data flow. Specific enough to review; no platitudes.
-5. **Migration path** — incremental or single cut? What stays stable during migration?
-6. **Risks** — what breaks, what might we miss, which files/flows are most affected.
-7. **Open questions** — where you are assuming something that needs user input.
+Produce (the whole plan must be reviewable in one sitting):
 
-Do not edit code. If `REPO_GUIDANCE.md` exists, read it first — listed invariants constrain the proposed restructure; deferred items remain deferred unless the user unfreezes them. If a plan-review skill exists (e.g. `plan-eng-review`), note that running it on the output is a good next step. Code changes follow only after explicit user approval, typically via a fresh `/fix` against the approved plan's findings.
+1. **Hotspot audit** — ranked candidates with evidence: churn counts,
+   co-change pairs, defect density, representative files, and why each is or
+   is not worth restructuring now.
+2. **Current architecture** — compact map of today's shape: modules with
+   one-line ownership each, dependency direction, entrypoints. The proposal
+   must be reviewable as a current → proposed diff.
+3. **Root-cause hypotheses** — structural causes (wrong module boundaries,
+   schema that fought every new feature, leaked abstractions), not symptoms.
+4. **Options** — at least two restructure candidates plus an explicit
+   do-nothing option pricing the cost of keeping the current shape. End with
+   one recommendation, which may be conditional on a named roadmap bet (the
+   bet then appears in open questions). An audit that cannot recommend
+   "don't restructure" is a pitch, not an audit.
+5. **Proposed restructure** — for the recommended option: each new or changed
+   module gets one line of ownership ("owns X, exposes Y, hides Z") and the
+   recurring pain it ends or the future change it makes cheaper. No
+   platitudes.
+6. **Migration path** — staged. Every stage independently shippable and
+   verifiable (tests green at each stage) with a named rollback point.
+   Stage 1 is a steel thread: the smallest end-to-end slice that proves the
+   direction — or, where no vertical slice exists, the smallest
+   independently verifiable extraction that proves it.
+7. **Success criteria** — measurable exit conditions the next rethink can
+   check, preferring isolation and defect metrics: a co-change pair
+   disappears, a feature of type Y touches ≤N modules, defect recurrence
+   stops. Churn-drop thresholds are the weakest form — use only with
+   context, since churn also falls when healthy work stops.
+8. **Risks** — what breaks, what might we miss, which files/flows are most
+   affected.
+9. **Open questions** — assumptions needing user input, including which
+   roadmap bets the restructure optimizes for. Architecture serves upcoming
+   work, not just past pain.
+
+Do not edit code. If a plan-review skill exists (e.g. `plan-eng-review`), note
+that running it on the output is a good next step. After the user approves a
+plan: stamp `Last rethink:` in `REPO_GUIDANCE.md` (on approval, whether or
+not the following offer is accepted), then offer to run REFRESH GUIDANCE MODE
+inline to fold new invariants and deferred items into `REPO_GUIDANCE.md`.
+Execution follows only after explicit approval — stage by stage, via a
+behavior-preserving refactor skill if one exists (e.g. a Karpathy-style
+refactor skill) or a fresh `/fix` against the approved plan's findings.
 
 ---
 
@@ -209,6 +283,7 @@ One exact format per field. On parse failure: one `[warn]` line per field, use t
 - **`Last reviewed:`** — exact casing, colon, ISO `YYYY-MM-DD`. Not `Last Reviewed`, not `last-reviewed`, not markdown-bolded. Line-prefix only. Default: treat as stale.
 - **`Refresh cadence:`** — exact casing, colon, one of `<N> days` | `<N> commits` | `<N> days or <N> commits`. Integers only. Default: `30 days or 50 commits`.
 - **`Drift-hint threshold:`** — exact casing, colon, `<N> commits / <N> days`. Integers only. Default: `20 commits / 30 days`.
+- **`Last rethink:`** — exact casing, colon, `YYYY-MM-DD <repo-relative-plan-path|none>`. The path must contain no whitespace; use `none` when the plan lives only in chat. Default when absent or malformed: treat as never run (one `[warn]` line on malformed, per existing degradation rules).
 
 ## `git log` edge cases
 

@@ -201,6 +201,13 @@ npx -y pipelane@github:jokim1/pipelane#main install-codex
 npx -y pipelane@github:jokim1/pipelane#main install-claude
 ```
 
+Command-surface changes (for example the `/fix` prompt contract) ship with the
+package, which installs from `main`: consumers receive them once the change
+lands on `main` and they run `pipelane update` (it reinstalls from `main` and
+re-renders the installed Claude/Codex skills), or by rerunning the install
+commands above. Until then, installed copies keep serving the previous
+contract.
+
 Set up a repo:
 
 ```text
