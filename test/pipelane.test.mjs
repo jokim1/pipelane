@@ -55,6 +55,12 @@ const GENERATED_CLAUDE_COMMANDS = [
 process.env.NODE_ENV = 'test';
 process.env.PIPELANE_AUTO_UPDATE = '0';
 
+test('test suite has no static skipped tests', () => {
+  const source = readFileSync(fileURLToPath(import.meta.url), 'utf8');
+  const banned = 'test' + '.skip';
+  assert.equal(source.includes(banned), false, 'remove obsolete tests or make them deterministic instead of skipping them');
+});
+
 const HERMETIC_REVIEW_IDENTITY_ENV_KEYS = [
   'PIPELANE_ORCHESTRATE_WORKER_SESSION_ID',
   'PIPELANE_REVIEW_GATE_SESSION_ID',
@@ -949,6 +955,22 @@ async function getFreePort() {
   return port;
 }
 
+async function listenOnRandomLoopbackPort(server) {
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  assert.ok(address && typeof address === 'object', 'server must expose a bound TCP address');
+  return address.port;
+}
+
+function uniqueTmpPath(prefix, suffix = '') {
+  const dir = mkdtempSync(path.join(os.tmpdir(), `${prefix}-`));
+  return {
+    dir,
+    path: path.join(dir, `${prefix}${suffix}`),
+  };
+}
+
 function isPidAlive(pid) {
   if (!pid) return false;
   try {
@@ -960,10 +982,10 @@ function isPidAlive(pid) {
 }
 
 async function waitForChildExit(child, timeoutMs = 2000) {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  await Promise.race([
-    once(child, 'exit'),
-    new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+  if (child.exitCode !== null || child.signalCode !== null) return true;
+  return Promise.race([
+    once(child, 'exit').then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), timeoutMs)),
   ]);
 }
 
@@ -1004,10 +1026,7 @@ async function startRuntimeMarkerServer(handler) {
     hits.push(req.url ?? '');
     handler(req, res, hits);
   });
-  server.listen(0, '127.0.0.1');
-  await once(server, 'listening');
-  const address = server.address();
-  const port = typeof address === 'object' && address ? address.port : 0;
+  const port = await listenOnRandomLoopbackPort(server);
   return {
     server,
     hits,
@@ -2809,512 +2828,6 @@ test('install-claude ignores unsafe managed manifest skill names instead of dele
   }
 });
 
-test.skip('custom aliases drive generated Claude commands, docs, and tracked Codex skills', () => {
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'new.md')));
-    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'new', 'SKILL.md')));
-
-    const configPath = path.join(repoRoot, '.pipelane.json');
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.aliases.new = '/branch';
-    config.aliases.resume = '/back';
-    config.aliases.pr = '/draft-pr';
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-
-    const setupResult = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-    assert.match(setupResult.stdout, /Slash commands: .*\/branch.*\/back.*\/draft-pr/);
-
-    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'branch.md')));
-    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'back.md')));
-    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'draft-pr.md')));
-    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'new.md')), false);
-    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'resume.md')), false);
-    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'pr.md')), false);
-
-    // Cross-reference placeholders must render to the consumer's renamed
-    // slash, not leak literal `{{ALIAS_RESUME}}` into the shipped doc.
-    const branchDoc = readFileSync(path.join(repoRoot, '.claude', 'commands', 'branch.md'), 'utf8');
-    assert.match(branchDoc, /\/back/);
-    assert.equal(branchDoc.includes('{{ALIAS_'), false, 'unresolved alias placeholder in branch.md');
-
-    const readme = readFileSync(path.join(repoRoot, 'README.md'), 'utf8');
-    const workflowDoc = readFileSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md'), 'utf8');
-    assert.match(readme, /\/branch/);
-    assert.match(readme, /pipelane install-claude/);
-    assert.match(readme, /pipelane install-codex/);
-    assert.match(workflowDoc, /\/branch/);
-    assert.match(workflowDoc, /pipelane install-claude/);
-    assert.match(workflowDoc, /\.agents\/skills/);
-
-    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'branch', 'SKILL.md')));
-    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'back', 'SKILL.md')));
-    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'draft-pr', 'SKILL.md')));
-    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', '.pipelane', 'bin', 'run-pipelane.sh')));
-    assert.equal(existsSync(path.join(repoRoot, '.agents', 'skills', 'new', 'SKILL.md')), false);
-    assert.equal(existsSync(path.join(repoRoot, '.agents', 'skills', 'resume', 'SKILL.md')), false);
-    assert.equal(existsSync(path.join(repoRoot, '.agents', 'skills', 'pr', 'SKILL.md')), false);
-    const branchSkill = readFileSync(path.join(repoRoot, '.agents', 'skills', 'branch', 'SKILL.md'), 'utf8');
-    assert.match(branchSkill, /run-pipelane\.sh" new/);
-    assert.match(branchSkill, /preserve each number, label, and command/);
-    const deployCommand = readFileSync(path.join(repoRoot, '.claude', 'commands', 'deploy.md'), 'utf8');
-    assert.match(deployCommand, /printed numbered choices/);
-    assert.match(deployCommand, /preserve each\nnumber, label, and command/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup fails closed when an alias would overwrite an unrelated Claude command', () => {
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    mkdirSync(path.join(repoRoot, '.claude', 'commands'), { recursive: true });
-    writeFileSync(path.join(repoRoot, '.claude', 'commands', 'branch.md'), 'custom branch command\n', 'utf8');
-
-    const configPath = machinePipelaneConfigPath(repoRoot);
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.aliases.new = '/branch';
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-
-    const result = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome }, true);
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /Claude command alias collision/);
-    assert.equal(readFileSync(path.join(repoRoot, '.claude', 'commands', 'branch.md'), 'utf8'), 'custom branch command\n');
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup fails closed when an alias would overwrite an unrelated Codex skill', () => {
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    mkdirSync(path.join(repoRoot, '.agents', 'skills', 'branch'), { recursive: true });
-    writeFileSync(path.join(repoRoot, '.agents', 'skills', 'branch', 'SKILL.md'), 'custom branch skill\n', 'utf8');
-
-    const configPath = machinePipelaneConfigPath(repoRoot);
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.aliases.new = '/branch';
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-
-    const result = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome }, true);
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /Codex skill alias collision/);
-    assert.equal(readFileSync(path.join(repoRoot, '.agents', 'skills', 'branch', 'SKILL.md'), 'utf8'), 'custom branch skill\n');
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test.skip('managed Claude commands and tracked Codex skills are pruned on alias rename', () => {
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-
-    writeFileSync(
-      path.join(repoRoot, '.claude', 'commands', 'new.md'),
-      [
-        'Create a fresh task workspace for this repo.',
-        '',
-        'Run:',
-        '',
-        '```bash',
-        'npm run pipelane:new -- <args-from-user>',
-        '```',
-        '',
-        'Display the output directly. Call out that the chat/workspace has not moved automatically yet.',
-        '',
-      ].join('\n'),
-      'utf8',
-    );
-    writeFileSync(
-      path.join(repoRoot, '.claude', 'commands', 'resume.md'),
-      [
-        'Resume an existing task workspace for this repo.',
-        '',
-        'Run:',
-        '',
-        '```bash',
-        'npm run pipelane:resume -- <args-from-user>',
-        '```',
-        '',
-        'Display the output directly. Call out that the chat/workspace has not moved automatically yet.',
-        '',
-      ].join('\n'),
-      'utf8',
-    );
-    writeFileSync(
-      path.join(repoRoot, '.claude', 'commands', 'pr.md'),
-      [
-        'Prepare and open, or update, a pull request for the current task.',
-        '',
-        'Run:',
-        '',
-        '```bash',
-        'npm run pipelane:pr -- <args-from-user>',
-        '```',
-        '',
-        'Display the output directly.',
-        '',
-      ].join('\n'),
-      'utf8',
-    );
-
-    const configPath = machinePipelaneConfigPath(repoRoot);
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.aliases.new = '/branch';
-    config.aliases.resume = '/back';
-    config.aliases.pr = '/draft-pr';
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'new.md')), false);
-    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'resume.md')), false);
-    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'pr.md')), false);
-    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'branch.md')));
-    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'back.md')));
-    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'draft-pr.md')));
-
-    assert.equal(existsSync(path.join(repoRoot, '.agents', 'skills', 'new', 'SKILL.md')), false);
-    assert.equal(existsSync(path.join(repoRoot, '.agents', 'skills', 'resume', 'SKILL.md')), false);
-    assert.equal(existsSync(path.join(repoRoot, '.agents', 'skills', 'pr', 'SKILL.md')), false);
-    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'branch', 'SKILL.md')));
-    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'back', 'SKILL.md')));
-    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'draft-pr', 'SKILL.md')));
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test.skip('consumer-extension markers preserve inner content across re-sync and template changes', () => {
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    const cleanPath = path.join(repoRoot, '.claude', 'commands', 'clean.md');
-    const firstPass = readFileSync(cleanPath, 'utf8');
-    assert.match(firstPass, /<!-- pipelane:consumer-extension:start -->\n<!-- pipelane:consumer-extension:end -->/);
-
-    const extended = firstPass.replace(
-      '<!-- pipelane:consumer-extension:start -->\n<!-- pipelane:consumer-extension:end -->',
-      [
-        '<!-- pipelane:consumer-extension:start -->',
-        '## ROCKETBOARD GIT-JANITOR SECTION',
-        '',
-        'Run `npm run git:cleanup -- --apply` to prune stale branches.',
-        '<!-- pipelane:consumer-extension:end -->',
-      ].join('\n'),
-    );
-    writeFileSync(cleanPath, extended, 'utf8');
-
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    const preserved = readFileSync(cleanPath, 'utf8');
-    assert.match(preserved, /## ROCKETBOARD GIT-JANITOR SECTION/);
-    assert.match(preserved, /npm run git:cleanup -- --apply/);
-    // The rendered pipelane body is unchanged: first-line marker + the
-    // canonical template opening line still match.
-    assert.match(preserved, /<!-- pipelane:command:clean -->/);
-    assert.match(preserved, /Report workflow cleanup status and prune stale task locks when requested\./);
-
-    // Bonus: mutate the upstream template body inside a throwaway kit copy
-    // and verify the consumer extension survives when pipelane re-renders
-    // with the new body.
-    const tmpKit = mkdtempSync(path.join(os.tmpdir(), 'pipelane-mutated-'));
-    try {
-      cpSync(path.join(KIT_ROOT, 'src'), path.join(tmpKit, 'src'), { recursive: true });
-      cpSync(path.join(KIT_ROOT, 'bin'), path.join(tmpKit, 'bin'), { recursive: true });
-      cpSync(path.join(KIT_ROOT, 'dist'), path.join(tmpKit, 'dist'), { recursive: true });
-      cpSync(path.join(KIT_ROOT, 'docs'), path.join(tmpKit, 'docs'), { recursive: true });
-      cpSync(path.join(KIT_ROOT, 'templates'), path.join(tmpKit, 'templates'), { recursive: true });
-      cpSync(path.join(KIT_ROOT, 'README.md'), path.join(tmpKit, 'README.md'));
-      cpSync(path.join(KIT_ROOT, 'package.json'), path.join(tmpKit, 'package.json'));
-
-      const mutatedTemplatePath = path.join(tmpKit, 'templates', '.claude', 'commands', 'clean.md');
-      const mutatedTemplate = readFileSync(mutatedTemplatePath, 'utf8').replace(
-        'Report workflow cleanup status and prune stale task locks when requested.',
-        'MUTATED BODY SENTINEL — templates can change without losing local extensions.',
-      );
-      writeFileSync(mutatedTemplatePath, mutatedTemplate, 'utf8');
-
-      const mutatedCli = path.join(tmpKit, 'src', 'cli.ts');
-      const result = spawnSync('node', [mutatedCli, 'setup'], {
-        cwd: repoRoot,
-        env: { ...process.env, CODEX_HOME: codexHome },
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      assert.equal(result.status, 0, result.stderr);
-
-      const afterMutation = readFileSync(cleanPath, 'utf8');
-      assert.match(afterMutation, /MUTATED BODY SENTINEL/);
-      assert.match(afterMutation, /## ROCKETBOARD GIT-JANITOR SECTION/);
-      assert.match(afterMutation, /npm run git:cleanup -- --apply/);
-    } finally {
-      rmSync(tmpKit, { recursive: true, force: true });
-    }
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test.skip('consumer-extension preserve logic follows aliased filenames', () => {
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-
-    const configPath = machinePipelaneConfigPath(repoRoot);
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.aliases.clean = '/cleanup';
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    const aliasedPath = path.join(repoRoot, '.claude', 'commands', 'cleanup.md');
-    const firstPass = readFileSync(aliasedPath, 'utf8');
-    assert.match(firstPass, /<!-- pipelane:consumer-extension:start -->\n<!-- pipelane:consumer-extension:end -->/);
-
-    const extended = firstPass.replace(
-      '<!-- pipelane:consumer-extension:start -->\n<!-- pipelane:consumer-extension:end -->',
-      [
-        '<!-- pipelane:consumer-extension:start -->',
-        'ALIASED EXTENSION SENTINEL',
-        '<!-- pipelane:consumer-extension:end -->',
-      ].join('\n'),
-    );
-    writeFileSync(aliasedPath, extended, 'utf8');
-
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    const preserved = readFileSync(aliasedPath, 'utf8');
-    assert.match(preserved, /ALIASED EXTENSION SENTINEL/);
-    assert.match(preserved, /<!-- pipelane:command:clean -->/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test.skip('every managed command template renders with an empty consumer-extension marker pair', () => {
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    // CI invariant: if a future template edit accidentally drops the
-    // empty marker pair, consumer extensions would silently vanish on
-    // the next re-sync. This test catches that at kit-time. pipelane and
-    // fix are in the list even though they're "extras" (fixed filenames,
-    // not aliases) — same marker contract applies.
-    for (const cmd of GENERATED_CLAUDE_COMMANDS) {
-      const contents = readFileSync(path.join(repoRoot, '.claude', 'commands', `${cmd}.md`), 'utf8');
-      assert.match(
-        contents,
-        /<!-- pipelane:consumer-extension:start -->\n<!-- pipelane:consumer-extension:end -->/,
-        `${cmd}.md missing empty consumer-extension marker pair`,
-      );
-      assert.match(
-        contents,
-        new RegExp(`<!-- pipelane:command:${cmd} -->`),
-        `${cmd}.md missing command marker`,
-      );
-    }
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test.skip('consumer-extension preservation works for every managed command', () => {
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    const commands = GENERATED_CLAUDE_COMMANDS;
-    for (const cmd of commands) {
-      const p = path.join(repoRoot, '.claude', 'commands', `${cmd}.md`);
-      const seeded = readFileSync(p, 'utf8').replace(
-        '<!-- pipelane:consumer-extension:start -->\n<!-- pipelane:consumer-extension:end -->',
-        [
-          '<!-- pipelane:consumer-extension:start -->',
-          `SENTINEL-${cmd}`,
-          '<!-- pipelane:consumer-extension:end -->',
-        ].join('\n'),
-      );
-      writeFileSync(p, seeded, 'utf8');
-    }
-
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    for (const cmd of commands) {
-      const after = readFileSync(path.join(repoRoot, '.claude', 'commands', `${cmd}.md`), 'utf8');
-      assert.match(after, new RegExp(`SENTINEL-${cmd}`), `${cmd}.md dropped its sentinel on re-sync`);
-    }
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test.skip('legacy pipelane.md (no marker) is upgraded in place on next setup', () => {
-  // Simulates a consumer that installed pipelane on main before the
-  // pipelane.md marker shipped. Their file has no marker and no
-  // consumer-extension pair; setup must detect it via legacy signatures,
-  // treat it as managed (not a collision), and overwrite with the
-  // marker-bearing template.
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    const pipelanePath = path.join(repoRoot, '.claude', 'commands', 'pipelane.md');
-    writeFileSync(
-      pipelanePath,
-      [
-        'Run a Pipelane subcommand for this repo.',
-        '',
-        'Legacy body that predates the marker pair.',
-        '',
-        '```bash',
-        'npm run pipelane:board',
-        '```',
-        '',
-        '## Pipelane Board (default)',
-        '',
-        'Open the dashboard.',
-        '',
-      ].join('\n'),
-      'utf8',
-    );
-
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    const after = readFileSync(pipelanePath, 'utf8');
-    assert.match(after, /<!-- pipelane:command:pipelane -->/);
-    assert.match(
-      after,
-      /<!-- pipelane:consumer-extension:start -->\n<!-- pipelane:consumer-extension:end -->/,
-    );
-    assert.doesNotMatch(after, /Legacy body that predates the marker pair\./);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test.skip('unmanaged legacy smoke.md is left alone because smoke is no longer generated', () => {
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    const smokePath = path.join(repoRoot, '.claude', 'commands', 'smoke.md');
-    writeFileSync(
-      smokePath,
-      [
-        'Plan smoke coverage or run deterministic smoke against staging or prod.',
-        '',
-        'Legacy body that predates the command marker.',
-        '',
-        '```bash',
-        'npm run pipelane:smoke -- $ARGUMENTS',
-        '```',
-        '',
-      ].join('\n'),
-      'utf8',
-    );
-
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    const after = readFileSync(smokePath, 'utf8');
-    assert.match(after, /Legacy body that predates the command marker\./);
-    assert.doesNotMatch(after, /<!-- pipelane:command:smoke -->/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test.skip('pipelane.md renders a journey-first overview with real slash aliases', () => {
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-
-    const configPath = machinePipelaneConfigPath(repoRoot);
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.aliases.new = '/start';
-    config.aliases.clean = '/tidy';
-    config.aliases.status = '/where';
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    const pipelane = readFileSync(path.join(repoRoot, '.claude', 'commands', 'pipelane.md'), 'utf8');
-    assert.doesNotMatch(pipelane, /\{\{ALIAS_/);
-    assert.match(pipelane, /Pick a lane:/);
-    assert.match(pipelane, /1\. Build journey/);
-    assert.match(pipelane, /\/devmode build\s+Set the repo to build mode\./);
-    assert.match(pipelane, /\/start\s+Create a named task worktree from the described task\./);
-    assert.match(pipelane, /\/pipelane review\s+Run review gates and write evidence for the current diff\./);
-    assert.match(pipelane, /\/pr --title "PR title"\s+Enforce review evidence, run checks, commit, push, and open or update the PR\./);
-    assert.match(pipelane, /\/merge\s+Merge the PR\. In build mode, this is the delivery handoff\./);
-    assert.match(pipelane, /\/tidy\s+Clean up finished task state after the release is complete\./);
-    assert.match(pipelane, /2\. Release journey/);
-    assert.match(pipelane, /\/deploy staging\s+Deploy the merged SHA to staging\./);
-    assert.doesNotMatch(pipelane, /\/smoke\b/);
-    assert.match(pipelane, /healthcheck verification, then prod/);
-    assert.match(pipelane, /\/deploy prod\s+Promote the same merged SHA to production\./);
-    assert.match(pipelane, /\/where\s+See where tasks, PRs, deploys, and release gates stand\./);
-    assert.match(pipelane, /\/pipelane web\s+Open the local Pipelane Board\./);
-    assert.match(pipelane, /\/pipelane update --check\s+Check whether Pipelane itself has updates\./);
-    assert.match(pipelane, /orchestrate analyze --plan-file <real-plan> --analysis-file <analysis\.json> --slices-file <scratch\.json> --json/);
-    assert.match(pipelane, /orchestrate plan-review pass --run-id <id> --gate <gate-id> --message <summary>/);
-    assert.match(pipelane, /orchestrate plan-review bypass --run-id <id> --gate <gate-id> --reason <reason>/);
-    assert.match(pipelane, /Host-visible slice checklist/);
-    assert.match(pipelane, /Review checklist/);
-    assert.match(pipelane, /Claude Code, use TodoWrite/);
-    assert.match(pipelane, /Codex App, use\s+update_plan/);
-    assert.doesNotMatch(pipelane, /Pipelane Board \(default\)/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
 test('pipelane.md documents exact first-token routing for subcommands', () => {
   const templatePath = path.join(KIT_ROOT, 'templates', '.claude', 'commands', 'pipelane.md');
   const template = readFileSync(templatePath, 'utf8');
@@ -3348,106 +2861,6 @@ test('pipelane.md documents exact first-token routing for subcommands', () => {
   assert.match(template, /`\/pipelane update-this-thing` routes to UNKNOWN MODE, not UPDATE MODE/);
 });
 
-test.skip('unrelated pre-existing pipelane.md raises collision instead of silently clobbering', () => {
-  // A consumer who authored their own .claude/commands/pipelane.md
-  // without the legacy signatures shouldn't have it overwritten. This
-  // mirrors the operator-command collision contract.
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    // Nuke the init-generated pipelane.md + its managed manifest entry so
-    // the next setup treats the directory as "consumer-authored."
-    rmSync(path.join(repoRoot, '.claude', 'commands', 'pipelane.md'), { force: true });
-    rmSync(path.join(repoRoot, '.claude', 'commands', '.pipelane-managed.json'), { force: true });
-    writeFileSync(
-      path.join(repoRoot, '.claude', 'commands', 'pipelane.md'),
-      'Custom consumer notes. Not managed by pipelane.\n',
-      'utf8',
-    );
-
-    const result = spawnSync('node', [path.join(KIT_ROOT, 'src', 'cli.ts'), 'setup'], {
-      cwd: repoRoot,
-      env: { ...process.env, CODEX_HOME: codexHome },
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    assert.notEqual(result.status, 0, 'setup should refuse to clobber a non-managed pipelane.md');
-    assert.match(result.stderr, /pipelane\.md/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup rejects operator aliases that collide with MANAGED_EXTRA_COMMANDS filenames when claudeCommands is syncing', () => {
-  // Two writers (operator command + extras loop) would fight for the same
-  // .claude/commands/pipelane.md file on every re-sync. Catch that at the
-  // point where the collision actually materializes, not at config-load
-  // time — a consumer who opts out of claudeCommands never hits the
-  // collision and shouldn't be blocked from aliasing /pipelane.
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-
-    const configPath = machinePipelaneConfigPath(repoRoot);
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.aliases.new = '/pipelane';
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-
-    const result = spawnSync('node', [path.join(KIT_ROOT, 'src', 'cli.ts'), 'setup'], {
-      cwd: repoRoot,
-      env: { ...process.env, CODEX_HOME: codexHome },
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    assert.notEqual(result.status, 0, 'setup should refuse a config where two writers fight for pipelane.md');
-    assert.match(result.stderr, /pipelane and new both resolve to \/pipelane/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup allows /pipelane operator alias when claudeCommands syncing is disabled', () => {
-  // Addresses Codex P2: if a consumer opts out of claudeCommands entirely,
-  // the extras loop never runs — no collision can happen. Blocking that
-  // config at load time (which the old reservation did) would be a soft
-  // regression for repos that just want the state machine, not the .claude/
-  // command files. Only enforce when the collision actually materializes.
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-
-    const configPath = machinePipelaneConfigPath(repoRoot);
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.aliases.new = '/pipelane';
-    // packageScripts must stay on so `pipelane:*` scripts exist; claudeCommands
-    // off is the operative opt-out here.
-    config.syncDocs = { ...config.syncDocs, claudeCommands: false };
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-
-    // Wipe init-written command files so the next setup path exercises the
-    // "claudeCommands false, nothing to regen" branch cleanly.
-    rmSync(path.join(repoRoot, '.claude'), { recursive: true, force: true });
-
-    const result = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-    assert.match(result.stdout, /Pipelane setup complete/);
-    // Non-command surfaces still synced.
-    assert.ok(existsSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md')));
-    // No .claude/commands/ got regenerated, so no collision fired.
-    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands')), false);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
 test('resolveWorkflowAliases still rejects unknown aliases (pipelane is not a WorkflowCommand key)', async () => {
   // The strict-validator for unknown keys is unchanged — `aliases.pipelane`
   // is not a valid consumer config because pipelane isn't a WorkflowCommand
@@ -3459,125 +2872,6 @@ test('resolveWorkflowAliases still rejects unknown aliases (pipelane is not a Wo
   );
   assert.doesNotThrow(() => resolveWorkflowAliases({ new: '/pipelane' }),
     'resolveWorkflowAliases should be purely syntactic; collision detection moved to syncConsumerDocs');
-});
-
-test.skip('pipelane.md consumer-extension survives when a different operator command is aliased', () => {
-  // Cross-contamination guard: renaming `clean → /janitor` prunes clean.md
-  // and writes janitor.md, but pipelane.md sits in MANAGED_EXTRA_COMMANDS
-  // so its fixed filename + consumer-extension content must be untouched.
-  // If the extras-loop capture/write ordering ever drifts (e.g., extras
-  // render before capture, or ManagedCommand keys collide across sets),
-  // this test catches it.
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    const pipelanePath = path.join(repoRoot, '.claude', 'commands', 'pipelane.md');
-    const pipelaneSeeded = readFileSync(pipelanePath, 'utf8').replace(
-      '<!-- pipelane:consumer-extension:start -->\n<!-- pipelane:consumer-extension:end -->',
-      [
-        '<!-- pipelane:consumer-extension:start -->',
-        'PIPELANE-EXT-SENTINEL',
-        '<!-- pipelane:consumer-extension:end -->',
-      ].join('\n'),
-    );
-    writeFileSync(pipelanePath, pipelaneSeeded, 'utf8');
-
-    const configPath = machinePipelaneConfigPath(repoRoot);
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.aliases = { ...(config.aliases ?? {}), clean: '/janitor' };
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'clean.md')), false);
-    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'janitor.md')));
-    const after = readFileSync(pipelanePath, 'utf8');
-    assert.match(after, /PIPELANE-EXT-SENTINEL/);
-    assert.match(after, /<!-- pipelane:command:pipelane -->/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test.skip('pipelane.md consumer-extension persists when syncDocs.claudeCommands flips true -> false -> true', () => {
-  // Opt-out is sticky (content untouched), opt-back-in re-injects captured
-  // extension into the regenerated marker-bearing file. A capture/write
-  // ordering regression in the extras loop would drop the sentinel here.
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    const pipelanePath = path.join(repoRoot, '.claude', 'commands', 'pipelane.md');
-    const seeded = readFileSync(pipelanePath, 'utf8').replace(
-      '<!-- pipelane:consumer-extension:start -->\n<!-- pipelane:consumer-extension:end -->',
-      [
-        '<!-- pipelane:consumer-extension:start -->',
-        'FLIP-SENTINEL',
-        '<!-- pipelane:consumer-extension:end -->',
-      ].join('\n'),
-    );
-    writeFileSync(pipelanePath, seeded, 'utf8');
-
-    const configPath = machinePipelaneConfigPath(repoRoot);
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-
-    config.syncDocs = { ...config.syncDocs, claudeCommands: false };
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-    assert.match(readFileSync(pipelanePath, 'utf8'), /FLIP-SENTINEL/);
-
-    config.syncDocs = { ...config.syncDocs, claudeCommands: true };
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    const after = readFileSync(pipelanePath, 'utf8');
-    assert.match(after, /FLIP-SENTINEL/);
-    assert.match(after, /<!-- pipelane:command:pipelane -->/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test.skip('partial legacy-signature match on pipelane.md is treated as collision, not upgrade', () => {
-  // detectLegacyClaudeCommand requires `every` signature to match. A file
-  // with only the first-line description (no `npm run pipelane:board`)
-  // must NOT be silently upgraded — the AND contract prevents false-
-  // positive clobber. A future change weakening it to OR would break
-  // this test.
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    rmSync(path.join(repoRoot, '.claude', 'commands', 'pipelane.md'), { force: true });
-    rmSync(path.join(repoRoot, '.claude', 'commands', '.pipelane-managed.json'), { force: true });
-    writeFileSync(
-      path.join(repoRoot, '.claude', 'commands', 'pipelane.md'),
-      'Run a Pipelane subcommand for this repo.\n\nCustom consumer body, no npm script mention.\n',
-      'utf8',
-    );
-
-    const result = spawnSync('node', [path.join(KIT_ROOT, 'src', 'cli.ts'), 'setup'], {
-      cwd: repoRoot,
-      env: { ...process.env, CODEX_HOME: codexHome },
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    assert.notEqual(result.status, 0, 'partial signature must not silently upgrade');
-    assert.match(result.stderr, /pipelane\.md/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
 });
 
 test('machine-local setup preserves consumer files that resemble legacy pipelane docs', () => {
@@ -3729,55 +3023,6 @@ test('machine-local setup preserves consumer-extension content with a nested end
   }
 });
 
-test.skip('consumer-extension survives an alias rename after the content was added', () => {
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    const cleanPath = path.join(repoRoot, '.claude', 'commands', 'clean.md');
-    const withExtension = readFileSync(cleanPath, 'utf8').replace(
-      '<!-- pipelane:consumer-extension:start -->\n<!-- pipelane:consumer-extension:end -->',
-      [
-        '<!-- pipelane:consumer-extension:start -->',
-        'RENAME-MIGRATION-SENTINEL',
-        '<!-- pipelane:consumer-extension:end -->',
-      ].join('\n'),
-    );
-    writeFileSync(cleanPath, withExtension, 'utf8');
-
-    const configPath = machinePipelaneConfigPath(repoRoot);
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.aliases.clean = '/cleanup';
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    assert.equal(existsSync(cleanPath), false, 'old clean.md should have been pruned');
-    const renamedPath = path.join(repoRoot, '.claude', 'commands', 'cleanup.md');
-    const migrated = readFileSync(renamedPath, 'utf8');
-    assert.match(migrated, /RENAME-MIGRATION-SENTINEL/);
-    assert.match(migrated, /<!-- pipelane:command:clean -->/);
-
-    // Rename a second time — content should still follow the command.
-    const updatedConfig = JSON.parse(readFileSync(configPath, 'utf8'));
-    updatedConfig.aliases.clean = '/janitor';
-    writeFileSync(configPath, `${JSON.stringify(updatedConfig, null, 2)}\n`, 'utf8');
-
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    assert.equal(existsSync(renamedPath), false, 'intermediate cleanup.md should have been pruned');
-    const finalPath = path.join(repoRoot, '.claude', 'commands', 'janitor.md');
-    const finalContent = readFileSync(finalPath, 'utf8');
-    assert.match(finalContent, /RENAME-MIGRATION-SENTINEL/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
 test('syncDocs.readmeSection: false leaves README.md untouched', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
@@ -3825,65 +3070,6 @@ test('syncDocs.contributingSection + agentsSection: false leave those files unto
 
     assert.equal(readFileSync(path.join(repoRoot, 'CONTRIBUTING.md'), 'utf8'), '# Consumer Contributing\n');
     assert.equal(readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8'), '# Consumer Agents\n');
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test.skip('syncDocs.docsReleaseWorkflow + pipelaneClaudeTemplate: false skip those file writes', () => {
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-
-    const configPath = machinePipelaneConfigPath(repoRoot);
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = { ...config.syncDocs, docsReleaseWorkflow: false, pipelaneClaudeTemplate: false };
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-
-    // Clear files that init already wrote with the default config so the
-    // assertion exercises "setup with opt-out doesn't recreate them."
-    rmSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md'), { force: true });
-    rmSync(path.join(repoRoot, 'pipelane', 'CLAUDE.template.md'), { force: true });
-
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    assert.equal(existsSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md')), false);
-    assert.equal(existsSync(path.join(repoRoot, 'pipelane', 'CLAUDE.template.md')), false);
-    // Opting out of one surface must not suppress others — commands still regen.
-    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'clean.md')));
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test.skip('syncDocs.claudeCommands: false skips the entire command-regen path', () => {
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-
-    const configPath = machinePipelaneConfigPath(repoRoot);
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = { ...config.syncDocs, claudeCommands: false };
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-
-    // Wipe what init pre-created so the assertion exercises "opt-out
-    // skips the write," not "file never existed."
-    rmSync(path.join(repoRoot, '.claude'), { recursive: true, force: true });
-
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'clean.md')), false);
-    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'pipelane.md')), false);
-    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', '.pipelane-managed.json')), false);
-    // Non-command surfaces still land.
-    assert.ok(existsSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md')));
-    assert.ok(existsSync(path.join(repoRoot, 'README.md')));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -3949,98 +3135,6 @@ test('syncDocs.packageScripts: false preserves consumer-customized workflow scri
   }
 });
 
-test.skip('syncDocs.packageScripts: false without required pipelane:* scripts throws with guidance', () => {
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-
-    // Consumer wipes the kit-installed pipelane:* scripts but forgot to
-    // either replace them or also opt out of claudeCommands. Setup must
-    // fail loudly, not silently leave a broken slash-command config.
-    const packageJsonPath = path.join(repoRoot, 'package.json');
-    const consumerPackage = {
-      name: 'consumer-app',
-      private: true,
-      type: 'module',
-      scripts: { build: 'my-build' },
-    };
-    writeFileSync(packageJsonPath, `${JSON.stringify(consumerPackage, null, 2)}\n`, 'utf8');
-
-    const configPath = machinePipelaneConfigPath(repoRoot);
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = { ...config.syncDocs, packageScripts: false };
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-
-    const result = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome }, true);
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /packageScripts is false but package\.json is missing required npm scripts/);
-    assert.match(result.stderr, /pipelane:clean/);
-    assert.match(result.stderr, /pipelane:orchestrate/);
-    // Error message must list the three escape hatches so the consumer
-    // can recover without digging into the codebase.
-    assert.match(result.stderr, /set syncDocs\.packageScripts to true/);
-    assert.match(result.stderr, /set syncDocs\.claudeCommands to false/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup consistency check requires pipelane:orchestrate when /pipelane command is generated', () => {
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-
-    const scripts = {
-      'pipelane:devmode': 'x devmode',
-      'pipelane:new': 'x new',
-      'pipelane:resume': 'x resume',
-      'pipelane:repo-guard': 'x repo-guard',
-      'pipelane:pr': 'x pr',
-      'pipelane:merge': 'x merge',
-      'pipelane:deploy': 'x deploy',
-      'pipelane:smoke': 'x smoke',
-      'pipelane:clean': 'x clean',
-      'pipelane:status': 'x status',
-      'pipelane:doctor': 'x doctor',
-      'pipelane:rollback': 'x rollback',
-      'pipelane:configure': 'x configure',
-      'pipelane:board': 'x board',
-      'pipelane:update': 'x update',
-      'pipelane:review': 'x review',
-      // Deliberately missing pipelane:orchestrate, which pipelane.md invokes.
-    };
-    writeFileSync(path.join(repoRoot, 'package.json'), `${JSON.stringify({
-      name: 'consumer-app',
-      private: true,
-      type: 'module',
-      scripts,
-    }, null, 2)}\n`, 'utf8');
-
-    const configPath = machinePipelaneConfigPath(repoRoot);
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = { ...config.syncDocs, packageScripts: false };
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-
-    const result = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome }, true);
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /pipelane:orchestrate/);
-    assert.doesNotMatch(result.stderr, /pipelane:configure/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test.skip('RELEASE_WORKFLOW packageScripts docs describe the managed script contract generically', () => {
-  const template = readFileSync(path.join(KIT_ROOT, 'templates', 'docs', 'RELEASE_WORKFLOW.md'), 'utf8');
-  assert.match(template, /full managed `pipelane:\*` workflow script set/i);
-  assert.match(template, /`pipelane:configure`/);
-});
-
 test('package files include README-linked public markdown docs', () => {
   const pkg = JSON.parse(readFileSync(path.join(KIT_ROOT, 'package.json'), 'utf8'));
   const packageFiles = new Set(pkg.files);
@@ -4083,34 +3177,6 @@ test('syncDocs.packageScripts: false is allowed when claudeCommands is also fals
 
     const after = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
     assert.deepEqual(after.scripts, { build: 'my-build' });
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test.skip('syncDocs.packageScripts: false still allows tracked Codex skills when Claude commands are disabled', () => {
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-
-    const packageJsonPath = path.join(repoRoot, 'package.json');
-    const consumerPackage = { name: 'consumer-app', private: true, type: 'module', scripts: { build: 'my-build' } };
-    writeFileSync(packageJsonPath, `${JSON.stringify(consumerPackage, null, 2)}\n`, 'utf8');
-
-    const configPath = machinePipelaneConfigPath(repoRoot);
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = { ...config.syncDocs, packageScripts: false, claudeCommands: false };
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    const after = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
-    assert.deepEqual(after.scripts, { build: 'my-build' });
-    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', 'new', 'SKILL.md')));
-    assert.ok(existsSync(path.join(repoRoot, '.agents', 'skills', '.pipelane', 'bin', 'run-pipelane.sh')));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -4341,43 +3407,6 @@ test('syncDocs absent ignores remaining managed package scripts', () => {
   }
 });
 
-test.skip('syncDocs.packageScripts only does not scaffold local guidance files', () => {
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-
-    const configPath = machinePipelaneConfigPath(repoRoot);
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = {
-      claudeCommands: false,
-      codexSkills: false,
-      readmeSection: false,
-      contributingSection: false,
-      agentsSection: false,
-      docsReleaseWorkflow: false,
-      pipelaneClaudeTemplate: false,
-      packageScripts: true,
-    };
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-
-    rmSync(path.join(repoRoot, 'CLAUDE.md'), { force: true });
-    rmSync(path.join(repoRoot, 'REPO_GUIDANCE.md'), { force: true });
-
-    const result = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-    assert.match(result.stdout, /No local CLAUDE\.md scaffold written; Pipelane guidance comes from durable machine-local commands\./);
-    assert.match(result.stdout, /No REPO_GUIDANCE\.md scaffold written; Pipelane no longer creates repo-local adapter surfaces\./);
-    assert.equal(existsSync(path.join(repoRoot, 'CLAUDE.md')), false);
-    assert.equal(existsSync(path.join(repoRoot, 'REPO_GUIDANCE.md')), false);
-    const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
-    assert.equal(pkg.scripts['pipelane:new'], 'pipelane run new');
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
 test('syncDocs resolver coerces non-boolean junk back to defaults', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
@@ -4581,31 +3610,6 @@ test('all eight flags: false writes no application-owned files from a wiped repo
     assert.equal(readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8'), '# Consumer-owned\n');
     const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
     assert.deepEqual(pkg.scripts, { build: 'my-build' });
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test.skip('syncDocs.codexSkills: false preserves legacy machine-local Codex wrappers', () => {
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = { ...config.syncDocs, codexSkills: false };
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-
-    rmSync(path.join(repoRoot, '.agents'), { recursive: true, force: true });
-    seedLegacyCodexWrappers(codexHome, ['new', 'resume']);
-
-    const result = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-    assert.match(result.stdout, /Skipped tracked Codex skill sync because syncDocs\.codexSkills is false\./);
-    assert.doesNotMatch(result.stdout, /Removed legacy machine-local wrapper skills/);
-    assert.ok(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')));
-    assert.ok(existsSync(path.join(codexHome, 'skills', 'resume', 'SKILL.md')));
-    assert.equal(existsSync(path.join(repoRoot, '.agents', 'skills')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -5433,50 +4437,6 @@ test('install-codex replaces legacy pipelane runtime directory that blocks the /
     assert.equal(existsSync(path.join(codexHome, 'skills', 'pipelane', 'bin', 'run-pipelane.sh')), false);
   } finally {
     rmSync(workspaceRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup upgrades pre-marker alias-generated Claude commands and prunes them on rename', () => {
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-
-  try {
-    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.aliases.new = '/branch';
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-
-    writeFileSync(
-      path.join(repoRoot, '.claude', 'commands', 'branch.md'),
-      [
-        'Create a fresh task workspace for this repo.',
-        '',
-        'Run:',
-        '',
-        '```bash',
-        'npm run pipelane:new -- <args-from-user>',
-        '```',
-        '',
-        'Display the output directly. Call out that the chat/workspace has not moved automatically yet.',
-        '',
-      ].join('\n'),
-      'utf8',
-    );
-
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    const upgradedBranch = readFileSync(path.join(repoRoot, '.claude', 'commands', 'branch.md'), 'utf8');
-    assert.match(upgradedBranch, /<!-- pipelane:command:new -->/);
-
-    config.aliases.new = '/fresh';
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-    runCli(['setup'], repoRoot, { CODEX_HOME: codexHome });
-
-    assert.equal(existsSync(path.join(repoRoot, '.claude', 'commands', 'branch.md')), false);
-    assert.ok(existsSync(path.join(repoRoot, '.claude', 'commands', 'fresh.md')));
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
   }
 });
@@ -8935,7 +7895,8 @@ test('orchestrate goal-spec honors configured budget and sensitive confirmation 
 
 test('orchestrate goal-spec rejects invalid command forms', () => {
   const repoRoot = createRepo();
-  const outsidePlan = path.join(os.tmpdir(), `pipelane-outside-plan-${Date.now()}.md`);
+  const outsidePlanTmp = uniqueTmpPath('pipelane-outside-plan', '.md');
+  const outsidePlan = outsidePlanTmp.path;
   const outsideLockRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-plan-review-lock-'));
   try {
     writeFileSync(outsidePlan, '# Outside Plan\n', 'utf8');
@@ -9148,7 +8109,7 @@ test('orchestrate goal-spec rejects invalid command forms', () => {
     assert.match(largePlanForLedger.stderr, /--plan-file is too large/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(outsidePlan, { force: true });
+    rmSync(outsidePlanTmp.dir, { recursive: true, force: true });
     rmSync(outsideLockRoot, { recursive: true, force: true });
   }
 });
@@ -16834,32 +15795,36 @@ test('api snapshot surfaces failed orchestration workers as inbox and attention'
 
 test('completed reviewed orchestration stays inactive after worktree cleanup', async () => {
   const { isActiveOrchestrationRun } = await import(path.join(KIT_ROOT, 'src', 'operator', 'orchestration-ledger.ts'));
-  const missingWorktree = path.join(os.tmpdir(), `pipelane-missing-orchestration-worktree-${Date.now()}`);
+  const missingWorktreeTmp = uniqueTmpPath('pipelane-missing-orchestration-worktree');
+  const missingWorktree = missingWorktreeTmp.path;
   rmSync(missingWorktree, { recursive: true, force: true });
-  const run = {
-    status: 'completed',
-    slices: [{
+  try {
+    const run = {
       status: 'completed',
-      worktreePath: missingWorktree,
-      worker: { status: 'succeeded' },
-      review: {
-        run: {
-          status: 'passed',
-          dryRun: false,
-          gateFilter: null,
-          phaseFilter: null,
-          sha: 'reviewed-sha',
-          gates: [],
+      slices: [{
+        status: 'completed',
+        worktreePath: missingWorktree,
+        worker: { status: 'succeeded' },
+        review: {
+          run: {
+            status: 'passed',
+            dryRun: false,
+            gateFilter: null,
+            phaseFilter: null,
+            sha: 'reviewed-sha',
+            gates: [],
+          },
         },
-      },
-    }],
-  };
+      }],
+    };
 
-  assert.equal(isActiveOrchestrationRun(run), false);
-  mkdirSync(missingWorktree);
-  run.slices[0].review = null;
-  assert.equal(isActiveOrchestrationRun(run), true);
-  rmSync(missingWorktree, { recursive: true, force: true });
+    assert.equal(isActiveOrchestrationRun(run), false);
+    mkdirSync(missingWorktree);
+    run.slices[0].review = null;
+    assert.equal(isActiveOrchestrationRun(run), true);
+  } finally {
+    rmSync(missingWorktreeTmp.dir, { recursive: true, force: true });
+  }
 });
 
 test('loadReviewState rejects malformed nested review gate records', async () => {
@@ -17115,7 +16080,8 @@ test('new requires a task name unless --unnamed is explicit', () => {
 
 test('new blocks current dirty worktree and matching orphan worktrees unless forced', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
-  const externalWorktree = path.join(os.tmpdir(), `pipelane-external-${Date.now()}`);
+  const externalWorktreeTmp = uniqueTmpPath('pipelane-external');
+  const externalWorktree = externalWorktreeTmp.path;
   let forcedWorktree = '';
 
   try {
@@ -17156,6 +16122,7 @@ test('new blocks current dirty worktree and matching orphan worktrees unless for
     } catch {
       rmSync(externalWorktree, { recursive: true, force: true });
     }
+    rmSync(externalWorktreeTmp.dir, { recursive: true, force: true });
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
   }
@@ -17163,7 +16130,8 @@ test('new blocks current dirty worktree and matching orphan worktrees unless for
 
 test('new ignores unrelated orphan worktrees that only contain the requested slug', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
-  const externalWorktree = path.join(os.tmpdir(), `pipelane-external-build-ui-${Date.now()}`);
+  const externalWorktreeTmp = uniqueTmpPath('pipelane-external-build-ui');
+  const externalWorktree = externalWorktreeTmp.path;
   let createdWorktree = '';
 
   try {
@@ -17193,6 +16161,7 @@ test('new ignores unrelated orphan worktrees that only contain the requested slu
     } catch {
       rmSync(externalWorktree, { recursive: true, force: true });
     }
+    rmSync(externalWorktreeTmp.dir, { recursive: true, force: true });
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
   }
@@ -26351,7 +25320,6 @@ async function runCliAsync(args, cwd, env = {}) {
 
 test('board detects a running dashboard and skips spawning a second one', async () => {
   const repoRoot = createRepo();
-  const port = await getFreePort();
   const probeHits = [];
   const dashboardMod = await import(path.join(KIT_ROOT, 'src', 'dashboard', 'server.ts'));
   const runtime = dashboardMod.buildDashboardRuntimeMetadata();
@@ -26366,8 +25334,7 @@ test('board detects a running dashboard and skips spawning a second one', async 
     res.writeHead(404);
     res.end();
   });
-  fakeServer.listen(port, '127.0.0.1');
-  await once(fakeServer, 'listening');
+  const port = await listenOnRandomLoopbackPort(fakeServer);
 
   try {
     const result = await runCliAsync(
@@ -26463,7 +25430,7 @@ process.on('SIGTERM', () => {
     assert.equal(result.status, 0, `unexpected exit.\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
     assert.ok(result.stdout.includes(`Stopped existing Pipelane Board for ${existingRepoRoot}`));
     assert.match(result.stdout, new RegExp(`Pipelane Board ready at http://127\\.0\\.0\\.1:${port}`));
-    await waitForChildExit(existingBoard);
+    assert.equal(await waitForChildExit(existingBoard), true, 'existing board process did not exit after replacement');
     assert.equal(isPidAlive(existingBoard.pid), false, 'expected the existing board process to be stopped');
 
     const health = await fetch(`http://127.0.0.1:${port}/api/health`).then((response) => response.json());
@@ -26486,7 +25453,6 @@ process.on('SIGTERM', () => {
 
 test('board starts on the next open port when another site owns the requested port', async () => {
   const repoRoot = createRepo();
-  const port = await getFreePort();
   const homeDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-board-home-'));
   let boardPort = 0;
 
@@ -26494,8 +25460,7 @@ test('board starts on the next open port when another site owns the requested po
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('not a pipelane board');
   });
-  fakeSite.listen(port, '127.0.0.1');
-  await once(fakeSite, 'listening');
+  const port = await listenOnRandomLoopbackPort(fakeSite);
 
   try {
     const result = await runCliAsync(
@@ -26532,7 +25497,6 @@ test('board starts on the next open port when another site owns the requested po
 
 test('board starts on the next open port when a health endpoint is not Pipelane-owned', async () => {
   const repoRoot = createRepo();
-  const port = await getFreePort();
   const homeDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-board-home-'));
   let boardPort = 0;
 
@@ -26545,8 +25509,7 @@ test('board starts on the next open port when a health endpoint is not Pipelane-
     res.writeHead(404);
     res.end();
   });
-  fakeServer.listen(port, '127.0.0.1');
-  await once(fakeServer, 'listening');
+  const port = await listenOnRandomLoopbackPort(fakeServer);
 
   try {
     const result = await runCliAsync(
@@ -26761,61 +25724,7 @@ async function waitForPathForTest(targetPath, timeoutMs = 5000) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error(`Timed out waiting for ${targetPath}`);
-}
-
-test.skip('CLI auto-updates workflow commands and re-execs the updated local bin without stdout noise', () => {
-  const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-consumer-'));
-  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-bin-'));
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
-  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
-  const npmInstallLog = path.join(consumerRoot, 'npm-install.log');
-  const oldSha = '1111111111111111111111111111111111111111';
-  const newSha = '2222222222222222222222222222222222222222';
-  try {
-    writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
-    mkdirSync(path.join(consumerRoot, 'node_modules', '.bin'), { recursive: true });
-    writeFileSync(
-      path.join(consumerRoot, 'node_modules', '.bin', 'pipelane'),
-      '#!/bin/sh\necho "REEXEC:$*"\n',
-      { mode: 0o755, encoding: 'utf8' },
-    );
-    makeFakeUpdateBin(binDir, { latestSha: newSha, npmMarkerPath: npmInstallLog });
-
-    const result = spawnSync('node', [CLI_PATH, 'run', 'status', '--json'], {
-      cwd: consumerRoot,
-      env: {
-        ...process.env,
-        CODEX_HOME: codexHome,
-        CLAUDE_HOME: claudeHome,
-        PIPELANE_HOME: pipelaneHome,
-        PIPELANE_AUTO_UPDATE: '1',
-        PIPELANE_AUTO_UPDATE_TTL_MS: '0',
-        PATH: `${binDir}:${process.env.PATH}`,
-      },
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout.trim(), 'REEXEC:run status --json');
-    assert.match(result.stderr, /Auto-updating pipelane 1111111 -> 2222222/);
-    assert.match(result.stderr, /Upgrade complete/);
-    assert.doesNotMatch(result.stdout, /Auto-updating|Upgrade complete|pipelane has updates available/);
-    assert.match(readFileSync(npmInstallLog, 'utf8'), new RegExp(`#${newSha}`));
-    assert.doesNotMatch(readFileSync(npmInstallLog, 'utf8'), /#main/);
-    const lock = JSON.parse(readFileSync(path.join(consumerRoot, 'package-lock.json'), 'utf8'));
-    assert.equal(lock.packages['node_modules/pipelane'].resolved.endsWith(`#${newSha}`), true);
-  } finally {
-    rmSync(consumerRoot, { recursive: true, force: true });
-    rmSync(binDir, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
-    rmSync(claudeHome, { recursive: true, force: true });
-    rmSync(pipelaneHome, { recursive: true, force: true });
-  }
-});
-
-test('CLI ordinary commands notify about repo-local updates by default without installing', async () => {
+}test('CLI ordinary commands notify about repo-local updates by default without installing', async () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-notify-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-notify-bin-'));
   const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
@@ -27066,7 +25975,6 @@ test('CLI ordinary commands with PIPELANE_AUTO_UPDATE set do not self-update or 
   const dashboardHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-dashboard-home-'));
   const oldSha = '1111111111111111111111111111111111111111';
   const newSha = '2222222222222222222222222222222222222222';
-  const port = await getFreePort();
   const resolvedConsumerRoot = realpathSync(consumerRoot);
   const dashboardChild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
     stdio: 'ignore',
@@ -27080,8 +25988,7 @@ test('CLI ordinary commands with PIPELANE_AUTO_UPDATE set do not self-update or 
     res.writeHead(404);
     res.end();
   });
-  fakeServer.listen(port, '127.0.0.1');
-  await once(fakeServer, 'listening');
+  const port = await listenOnRandomLoopbackPort(fakeServer);
 
   try {
     writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
@@ -27792,7 +26699,6 @@ test('update stops a running board for the updated repo after install', async ()
   const homeDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-home-'));
   const oldSha = '1111111111111111111111111111111111111111';
   const newSha = '2222222222222222222222222222222222222222';
-  const port = await getFreePort();
   const resolvedConsumerRoot = realpathSync(consumerRoot);
   const dashboardChild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
     stdio: 'ignore',
@@ -27806,8 +26712,7 @@ test('update stops a running board for the updated repo after install', async ()
     res.writeHead(404);
     res.end();
   });
-  fakeServer.listen(port, '127.0.0.1');
-  await once(fakeServer, 'listening');
+  const port = await listenOnRandomLoopbackPort(fakeServer);
 
   try {
     writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
@@ -27823,7 +26728,7 @@ test('update stops a running board for the updated repo after install', async ()
 
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /Stopped existing Pipelane Board/);
-    await waitForChildExit(dashboardChild);
+    assert.equal(await waitForChildExit(dashboardChild), true, 'dashboard process did not exit after update stopped it');
     assert.equal(isPidAlive(dashboardChild.pid), false, 'expected update to stop the existing board process');
   } finally {
     fakeServer.close();
@@ -29333,50 +28238,6 @@ test('configure without --json asks Supabase-specific release questions when Sup
     assert.doesNotMatch(result.stdout, /SUPABASE_SERVICE_ROLE_KEY=.*[A-Za-z0-9]/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup consistency check requires pipelane:configure when opting out of packageScripts', () => {
-  // Regression for Codex #4: the required-scripts list now includes
-  // pipelane:configure because devmode.md points operators at it. A consumer
-  // who defines every pipelane:<cmd> script EXCEPT pipelane:configure would
-  // previously pass setup silently; now they get a clear error.
-  const repoRoot = createRepo();
-  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-
-    const packageJsonPath = path.join(repoRoot, 'package.json');
-    writeFileSync(packageJsonPath, `${JSON.stringify({
-      name: 'consumer-app',
-      private: true,
-      type: 'module',
-      scripts: {
-        'pipelane:new': 'x new',
-        'pipelane:resume': 'x resume',
-        'pipelane:repo-guard': 'x repo-guard',
-        'pipelane:pr': 'x pr',
-        'pipelane:merge': 'x merge',
-        'pipelane:deploy': 'x deploy',
-        'pipelane:clean': 'x clean',
-        'pipelane:devmode': 'x devmode',
-        'pipelane:status': 'x status',
-        'pipelane:doctor': 'x doctor',
-        // Deliberately missing pipelane:configure
-      },
-    }, null, 2)}\n`, 'utf8');
-
-    const configPath = machinePipelaneConfigPath(repoRoot);
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = { ...config.syncDocs, packageScripts: false };
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-
-    const result = runCli(['setup'], repoRoot, { CODEX_HOME: codexHome }, true);
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /pipelane:configure/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
   }
 });
 
@@ -32941,376 +31802,6 @@ test('detectSetupDrift on a freshly-setup repo reports no drift', async () => {
   }
 });
 
-test.skip('detectSetupDrift proposes an AGENTS.md migration when stale workflow guidance uses npm scripts', async () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    const agentsPath = path.join(repoRoot, 'AGENTS.md');
-    const current = readFileSync(agentsPath, 'utf8');
-    writeFileSync(
-      agentsPath,
-      [
-        '# Demo App Repo Context',
-        '',
-        '- Before starting work, run `npm run workflow:new -- --task "task name"`.',
-        '',
-        current,
-      ].join('\n'),
-      'utf8',
-    );
-
-    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
-    const drift = docs.detectSetupDrift(repoRoot);
-    assert.equal(drift.needsSetup, false, 'AGENTS guidance migrations require approval, not automatic setup');
-    assert.deepEqual(drift.warnings, []);
-    assert.equal(drift.agentsGuidanceMigrations.length, 1);
-    assert.equal(drift.agentsGuidanceMigrations[0].file, 'AGENTS.md');
-    assert.deepEqual(drift.agentsGuidanceMigrations[0].replacements, [{
-      line: 3,
-      before: '- Before starting work, run `npm run workflow:new -- --task "task name"`.',
-      after: '- Before starting work, run `/new`.',
-    }]);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('detectSetupDrift proposes an AGENTS.md migration for placeholder /new --task guidance', async () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    const agentsPath = path.join(repoRoot, 'AGENTS.md');
-    const current = readFileSync(agentsPath, 'utf8');
-    writeFileSync(
-      agentsPath,
-      [
-        '# Demo App Repo Context',
-        '',
-        '- Before starting work, run `/new --task "<task-name>"`.',
-        '',
-        current,
-      ].join('\n'),
-      'utf8',
-    );
-
-    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
-    const drift = docs.detectSetupDrift(repoRoot);
-    assert.equal(drift.agentsGuidanceMigrations.length, 1);
-    assert.deepEqual(drift.agentsGuidanceMigrations[0].replacements, [{
-      line: 3,
-      before: '- Before starting work, run `/new --task "<task-name>"`.',
-      after: '- Before starting work, run `/new`.',
-    }]);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup without --yes prints the AGENTS.md migration proposal without rewriting consumer text in non-TTY mode', () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    const agentsPath = path.join(repoRoot, 'AGENTS.md');
-    const current = readFileSync(agentsPath, 'utf8');
-    writeFileSync(
-      agentsPath,
-      [
-        '# Demo App Repo Context',
-        '',
-        '- Agent default workflow: `npm run workflow:new -- --task "task name"`.',
-        '',
-        current,
-      ].join('\n'),
-      'utf8',
-    );
-
-    const result = runCli(['setup'], repoRoot);
-    assert.match(result.stdout, /AGENTS\.md guidance migration requires approval:/);
-    assert.match(result.stdout, /current: - Agent default workflow: `npm run workflow:new -- --task "task name"`\./);
-    assert.match(result.stdout, /proposed: - Agent default workflow: `\/new`\./);
-    assert.match(result.stdout, /AGENTS\.md:3/);
-    assert.match(result.stdout, /avoid npm-script PATH failures before node_modules is linked/);
-    assert.match(result.stdout, /prevent placeholder task names from creating stray worktrees/);
-    assert.match(result.stdout, /pipelane setup --yes/);
-    assert.match(readFileSync(agentsPath, 'utf8'), /npm run workflow:new/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup --yes applies the AGENTS.md stale workflow guidance migration', () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    const agentsPath = path.join(repoRoot, 'AGENTS.md');
-    const current = readFileSync(agentsPath, 'utf8');
-    writeFileSync(
-      agentsPath,
-      [
-        '# Demo App Repo Context',
-        '',
-        '- Agent default workflow: `npm run workflow:new -- --task "task name"`.',
-        '',
-        current,
-      ].join('\n'),
-      'utf8',
-    );
-
-    const result = runCli(['setup', '--yes'], repoRoot);
-    const agents = readFileSync(agentsPath, 'utf8');
-    assert.match(result.stdout, /Updated AGENTS\.md stale workflow guidance \(1 line\)\./);
-    assert.match(agents, /Agent default workflow: `\/new`/);
-    assert.doesNotMatch(agents, /\/new --task "task name"/);
-    assert.doesNotMatch(agents, /npm run workflow:new/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup --yes skips AGENTS.md stale workflow guidance migration when agentsSection is disabled', () => {
-  const repoRoot = createRepo();
-  try {
-    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.syncDocs = { ...config.syncDocs, agentsSection: false };
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-
-    const agentsPath = path.join(repoRoot, 'AGENTS.md');
-    const current = readFileSync(agentsPath, 'utf8');
-    writeFileSync(
-      agentsPath,
-      [
-        '# Demo App Repo Context',
-        '',
-        '- Agent default workflow: `npm run workflow:new -- --task "task name"`.',
-        '',
-        current,
-      ].join('\n'),
-      'utf8',
-    );
-
-    const result = runCli(['setup', '--yes'], repoRoot);
-    const agents = readFileSync(agentsPath, 'utf8');
-    assert.doesNotMatch(result.stdout, /Updated AGENTS\.md stale workflow guidance/);
-    assert.doesNotMatch(result.stdout, /AGENTS\.md guidance migration requires approval/);
-    assert.match(agents, /npm run workflow:new/);
-    assert.doesNotMatch(agents, /Agent default workflow: `\/new`/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup proposes local CLAUDE.md workspace policy migration without --yes', () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    const claudePath = path.join(repoRoot, 'CLAUDE.md');
-    writeFileSync(
-      claudePath,
-      [
-        '# Demo App Local Operator Context',
-        '',
-        '## Local Operator Defaults',
-        '',
-        '- Keep this local note.',
-        '',
-      ].join('\n'),
-      'utf8',
-    );
-
-    const result = runCli(['setup'], repoRoot);
-    const claude = readFileSync(claudePath, 'utf8');
-    assert.match(result.stdout, /CLAUDE\.md guidance migration requires approval:/);
-    assert.match(result.stdout, /insert after CLAUDE\.md:3/);
-    assert.match(result.stdout, /start code-changing work with \/new/);
-    assert.match(result.stdout, /pipelane setup --yes/);
-    assert.doesNotMatch(claude, /pipelane:claude-workspace-policy:start/);
-    assert.match(claude, /Keep this local note/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup migrates weak local CLAUDE.md workspace guidance that lacks stop conditions', () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    const claudePath = path.join(repoRoot, 'CLAUDE.md');
-    writeFileSync(
-      claudePath,
-      [
-        '# Demo App Local Operator Context',
-        '',
-        '## Local Operator Defaults',
-        '',
-        '- For any code-changing task, start in a Pipelane task workspace with `/new` and use `/resume` later.',
-        '',
-      ].join('\n'),
-      'utf8',
-    );
-
-    const result = runCli(['setup', '--yes'], repoRoot);
-    const claude = readFileSync(claudePath, 'utf8');
-    assert.match(result.stdout, /Updated CLAUDE\.md with the Pipelane task workspace policy\./);
-    assert.match(claude, /pipelane:claude-workspace-policy:start/);
-    assert.match(claude, /Chat has not moved/);
-    assert.match(claude, /If `\/new` fails, do not continue implementation in the current checkout/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup refreshes stale managed local CLAUDE.md workspace policy guidance', () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    const claudePath = path.join(repoRoot, 'CLAUDE.md');
-    writeFileSync(
-      claudePath,
-      [
-        '# Demo App Local Operator Context',
-        '',
-        '<!-- pipelane:claude-workspace-policy:start -->',
-        '## Task Workspace Policy',
-        '',
-        '- For any code-changing task, start in a Pipelane task workspace. If the current checkout is not already the matching task workspace, run `/new` with an inferred `--task` label before editing.',
-        '- Use `/resume --task "<task-name>"` to continue existing work. Use `/repo-guard --task "<task-name>"` when a checkout may be shared, dirty, or bound to another task.',
-        "- Do not edit, commit, run `/pr`, `/merge`, or `/deploy` from a shared checkout, base branch checkout, dirty unrelated worktree, or another task's worktree unless the user explicitly asks for that checkout.",
-        '- Exceptions are read-only review, answering questions without file edits, and continuing inside an already-created matching task workspace.',
-        '<!-- pipelane:claude-workspace-policy:end -->',
-        '',
-        '## Local Notes',
-        '',
-        '- Keep this local note.',
-        '',
-      ].join('\n'),
-      'utf8',
-    );
-
-    const result = runCli(['setup', '--yes'], repoRoot);
-    const claude = readFileSync(claudePath, 'utf8');
-    const markerCount = (claude.match(/pipelane:claude-workspace-policy:start/g) ?? []).length;
-    assert.match(result.stdout, /Updated CLAUDE\.md with the Pipelane task workspace policy\./);
-    assert.equal(markerCount, 1);
-    assert.match(claude, /Chat has not moved/);
-    assert.match(claude, /If `\/new` fails, do not continue implementation in the current checkout/);
-    assert.match(claude, /Keep this local note/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup --yes applies local CLAUDE.md workspace policy migration', () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    const claudePath = path.join(repoRoot, 'CLAUDE.md');
-    writeFileSync(
-      claudePath,
-      [
-        '# Demo App Local Operator Context',
-        '',
-        '## Local Operator Defaults',
-        '',
-        '- Keep this local note.',
-        '',
-      ].join('\n'),
-      'utf8',
-    );
-
-    const result = runCli(['setup', '--yes'], repoRoot);
-    const claude = readFileSync(claudePath, 'utf8');
-    assert.match(result.stdout, /Updated CLAUDE\.md with the Pipelane task workspace policy\./);
-    assert.match(claude, /pipelane:claude-workspace-policy:start/);
-    assert.match(claude, /For any code-changing task, start in a Pipelane task workspace/);
-    assert.match(claude, /Use `\/resume --task "<task-name>"` to continue existing work/);
-    assert.match(claude, /Keep this local note/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('detectSetupDrift flags a deleted managed command as addedCommands', async () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    // Simulate what happens after `/pipelane update` ships a new command
-    // (or the consumer never ran setup): the template is present in
-    // node_modules but the consumer's working tree has no matching file.
-    rmSync(path.join(repoRoot, '.claude', 'commands', 'fix.md'), { force: true });
-    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
-    const drift = docs.detectSetupDrift(repoRoot);
-    assert.ok(drift.claude.addedCommands.includes('fix.md'), `expected fix.md in addedCommands, got ${drift.claude.addedCommands.join(',')}`);
-    assert.equal(drift.needsSetup, true);
-    assert.equal(drift.needsReopenClaude, true);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('detectSetupDrift flags edits OUTSIDE consumer-extension markers as updatedCommands', async () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    const targetPath = path.join(repoRoot, '.claude', 'commands', 'fix.md');
-    // Tamper outside the marker pair — prepend a line to the top of the
-    // file. Setup would overwrite this.
-    const original = readFileSync(targetPath, 'utf8');
-    writeFileSync(targetPath, `CONSUMER_TAMPERED_LINE\n${original}`, 'utf8');
-    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
-    const drift = docs.detectSetupDrift(repoRoot);
-    assert.ok(drift.claude.updatedCommands.includes('fix.md'));
-    assert.equal(drift.needsSetup, true);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('detectSetupDrift preserves edits INSIDE consumer-extension markers (no drift reported)', async () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    const targetPath = path.join(repoRoot, '.claude', 'commands', 'fix.md');
-    const original = readFileSync(targetPath, 'utf8');
-    // Inject content between the marker pair — re-sync would preserve it.
-    const withExtension = original.replace(
-      '<!-- pipelane:consumer-extension:start -->\n<!-- pipelane:consumer-extension:end -->',
-      '<!-- pipelane:consumer-extension:start -->\nCONSUMER_HAND_EDIT_OK\n<!-- pipelane:consumer-extension:end -->',
-    );
-    writeFileSync(targetPath, withExtension, 'utf8');
-    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
-    const drift = docs.detectSetupDrift(repoRoot);
-    assert.ok(
-      !drift.claude.updatedCommands.includes('fix.md'),
-      `fix.md should not be flagged when only consumer-extension content changed; got updatedCommands=${drift.claude.updatedCommands.join(',')}`,
-    );
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('detectSetupDrift reports local guidance scaffolds when absent', async () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    rmSync(path.join(repoRoot, 'CLAUDE.md'), { force: true });
-    rmSync(path.join(repoRoot, 'REPO_GUIDANCE.md'), { force: true });
-    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
-    const drift = docs.detectSetupDrift(repoRoot);
-    assert.equal(drift.claudeGuidance.willScaffold, true);
-    assert.equal(drift.repoGuidance.willScaffold, true);
-    assert.equal(drift.needsSetup, true);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
 test('detectSetupDrift respects syncDocs.claudeCommands opt-out', async () => {
   const repoRoot = createRepo();
   try {
@@ -33330,185 +31821,6 @@ test('detectSetupDrift respects syncDocs.claudeCommands opt-out', async () => {
     assert.equal(drift.claude.enabled, false);
     assert.deepEqual(drift.claude.addedCommands, []);
     assert.deepEqual(drift.claude.updatedCommands, []);
-    assert.equal(drift.needsReopenClaude, false);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('detectSetupDrift surfaces Codex skill drift when SKILL.md is stale', async () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    // Tamper with a Codex skill wrapper.
-    const skillPath = path.join(repoRoot, '.agents', 'skills', 'pr', 'SKILL.md');
-    writeFileSync(skillPath, `${readFileSync(skillPath, 'utf8')}\nTAMPERED\n`, 'utf8');
-    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
-    const drift = docs.detectSetupDrift(repoRoot);
-    assert.ok(drift.codex.updatedSkills.includes('pr'), `expected 'pr' in updatedSkills, got ${drift.codex.updatedSkills.join(',')}`);
-    assert.equal(drift.needsSetup, true);
-    assert.equal(drift.needsReopenCodex, true);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup writes .agents/skills/fix/SKILL.md with Codex frontmatter and shared prompt body', () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    const fixSkillPath = path.join(repoRoot, '.agents', 'skills', 'fix', 'SKILL.md');
-    assert.ok(existsSync(fixSkillPath), 'fix Codex skill must be written by setup');
-    const content = readFileSync(fixSkillPath, 'utf8');
-
-    // Frontmatter: must declare name, version, and the extra allowed-tools
-    // /fix needs beyond the workflow wrapper skills' Bash-only list.
-    assert.match(content, /^---\nname: fix\n/);
-    assert.match(content, /\nversion: 1\.0\.0\n/);
-    assert.match(content, /\nallowed-tools:\n(?:[\s\S]*?  - Read\n)/);
-    assert.match(content, /  - Edit\n/);
-    assert.match(content, /  - Grep\n/);
-    assert.match(content, /  - Bash\n/);
-    // Marker for managed detection (survives alias rename / prune / drift).
-    assert.match(content, /<!-- pipelane:codex-skill:fix -->/);
-    // Shared body with the Claude-side template — a few anchor phrases the
-    // /fix prompt is built around.
-    assert.match(content, /Produce durable, root-cause fixes\./);
-    assert.match(content, /## Mode routing/);
-    assert.match(content, /First run a \*\*hotspot audit\*\*/);
-    assert.match(content, /\*\*Feature accretion\.\*\*/);
-    assert.match(content, /### Refuse these shims unconditionally/);
-    // Claude-specific markers must NOT appear — those live only on the Claude
-    // template so re-sync doesn't strip hand-edits there.
-    assert.doesNotMatch(content, /<!-- pipelane:command:fix -->/);
-    assert.doesNotMatch(content, /<!-- pipelane:consumer-extension:/);
-
-    // Managed manifest lists fix alongside the workflow skills.
-    const manifest = JSON.parse(
-      readFileSync(path.join(repoRoot, '.agents', 'skills', '.pipelane-managed.json'), 'utf8'),
-    );
-    assert.ok(manifest.skills.includes('fix'), `manifest.skills missing "fix": ${manifest.skills.join(',')}`);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('detectSetupDrift flags a deleted fix Codex skill as addedSkills', async () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    // Simulate a consumer that upgraded pipelane before the fix Codex skill
-    // shipped, or that pruned the skill dir.
-    rmSync(path.join(repoRoot, '.agents', 'skills', 'fix'), { recursive: true, force: true });
-    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
-    const drift = docs.detectSetupDrift(repoRoot);
-    assert.ok(
-      drift.codex.addedSkills.includes('fix'),
-      `expected 'fix' in addedSkills, got ${drift.codex.addedSkills.join(',')}`,
-    );
-    assert.equal(drift.needsSetup, true);
-    assert.equal(drift.needsReopenCodex, true);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup writes .agents/skills/lesson/SKILL.md with Codex frontmatter and shared prompt body', () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    const lessonSkillPath = path.join(repoRoot, '.agents', 'skills', 'lesson', 'SKILL.md');
-    assert.ok(existsSync(lessonSkillPath), 'lesson Codex skill must be written by setup');
-    const content = readFileSync(lessonSkillPath, 'utf8');
-
-    // Frontmatter: name, version, and the file-editing tools /lesson needs.
-    assert.match(content, /^---\nname: lesson\n/);
-    assert.match(content, /\nversion: 1\.0\.0\n/);
-    assert.match(content, /\nallowed-tools:\n(?:[\s\S]*?  - Read\n)/);
-    assert.match(content, /  - Edit\n/);
-    assert.match(content, /  - Write\n/);
-    // Marker for managed detection (survives prune / drift).
-    assert.match(content, /<!-- pipelane:codex-skill:lesson -->/);
-    // Shared body with the Claude-side host-install /lesson skill — anchor phrases.
-    assert.match(content, /Append a dated lesson/);
-    assert.match(content, /<!-- pipelane:lessons:entries:end -->/);
-    assert.match(content, /run `\/pipelane setup`/);
-    assert.match(content, /Dedup and pruning are `\/karpathy audit`/);
-    // No Claude command / consumer-extension markers — lesson.md is a shared
-    // prompt-body source, not a managed Claude command template.
-    assert.doesNotMatch(content, /<!-- pipelane:command:lesson -->/);
-    assert.doesNotMatch(content, /<!-- pipelane:consumer-extension:/);
-
-    // The caveat guard: lesson gets repo-local *Codex* parity only. It must NOT
-    // be minted as a repo-local Claude command. fix.md proves claudeCommands
-    // sync is active here, so lesson.md's absence is a real negative.
-    assert.ok(
-      existsSync(path.join(repoRoot, '.claude', 'commands', 'fix.md')),
-      'fix.md should be synced (claudeCommands active), making the lesson.md negative non-vacuous',
-    );
-    assert.equal(
-      existsSync(path.join(repoRoot, '.claude', 'commands', 'lesson.md')),
-      false,
-      'lesson must not be installed as a repo-local .claude/commands surface',
-    );
-
-    // Managed manifest lists lesson alongside fix and the workflow skills.
-    const manifest = JSON.parse(
-      readFileSync(path.join(repoRoot, '.agents', 'skills', '.pipelane-managed.json'), 'utf8'),
-    );
-    assert.ok(manifest.skills.includes('lesson'), `manifest.skills missing "lesson": ${manifest.skills.join(',')}`);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('detectSetupDrift flags a deleted lesson Codex skill as addedSkills', async () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    // Simulate a consumer that upgraded pipelane before the lesson Codex skill
-    // shipped, or that pruned the skill dir.
-    rmSync(path.join(repoRoot, '.agents', 'skills', 'lesson'), { recursive: true, force: true });
-    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
-    const drift = docs.detectSetupDrift(repoRoot);
-    assert.ok(
-      drift.codex.addedSkills.includes('lesson'),
-      `expected 'lesson' in addedSkills, got ${drift.codex.addedSkills.join(',')}`,
-    );
-    assert.equal(drift.needsSetup, true);
-    assert.equal(drift.needsReopenCodex, true);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('detectSetupDrift reports a collision when a non-pipelane fix.md is present', async () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    // Run setup first so the managed manifest exists with the expected
-    // pipelane fix.md, then swap the file with a non-marker, non-signature
-    // consumer-authored version so detection sees it as a collision.
-    runCli(['setup'], repoRoot);
-    const commandsDir = path.join(repoRoot, '.claude', 'commands');
-    // Drop the file from the managed manifest so it looks unmanaged.
-    const manifestPath = path.join(commandsDir, '.pipelane-managed.json');
-    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
-    manifest.files = manifest.files.filter((f) => f !== 'fix.md');
-    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-    // Replace the file content with something that carries no pipelane
-    // marker and no legacy signature — a consumer-authored /fix.
-    writeFileSync(path.join(commandsDir, 'fix.md'), '# Consumer-authored fix\n', 'utf8');
-    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
-    const drift = docs.detectSetupDrift(repoRoot);
-    assert.ok(drift.claude.collisions.includes('fix.md'), `expected fix.md collision, got ${drift.claude.collisions.join(',')}`);
-    assert.equal(drift.needsSetup, true);
-    // Collisions must NOT auto-trigger a reopen hint; setup won't run.
     assert.equal(drift.needsReopenClaude, false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -34155,7 +32467,8 @@ test('smoke plan --refresh refuses scenario files outside the repo', () => {
   const repoRoot = createSmokeSetupRepo({
     scripts: { 'test:e2e:smoke': 'playwright test --project=smoke' },
   });
-  const outsidePath = path.join(path.dirname(repoRoot), `outside-scenarios-${Date.now()}.json`);
+  const outsideTmp = uniqueTmpPath('outside-scenarios', '.json');
+  const outsidePath = outsideTmp.path;
   try {
     writeFileSync(outsidePath, JSON.stringify({ scenarios: [{ id: '@smoke-outside', title: 'Outside file' }] }), 'utf8');
 
@@ -34165,7 +32478,7 @@ test('smoke plan --refresh refuses scenario files outside the repo', () => {
     assert.ok(parsed.warnings.some((warning) => /must live inside the repo/.test(warning)));
     assert.equal(parsed.proposedAdds.includes('@smoke-outside'), false);
   } finally {
-    rmSync(outsidePath, { force: true });
+    rmSync(outsideTmp.dir, { recursive: true, force: true });
     rmSync(repoRoot, { recursive: true, force: true });
   }
 });
@@ -36317,171 +34630,7 @@ test('orchestrate resume does not abort when a completed slice worktree was clea
 });
 
 // Lessons block (Change A: template seed; Change B: backfill/re-sync existing).
-const LESSONS_BLOCK_RE = /<!-- pipelane:lessons:start -->[\s\S]*?<!-- pipelane:lessons:end -->\n?/;
-
-test.skip('setup seeds the Lessons block into a freshly created CLAUDE.md', () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    const claude = readFileSync(path.join(repoRoot, 'CLAUDE.md'), 'utf8');
-    assert.match(claude, /<!-- pipelane:lessons:start -->/);
-    assert.match(claude, /## Lessons/);
-    assert.match(claude, /<!-- pipelane:lessons:entries:start -->\n<!-- pipelane:lessons:entries:end -->/);
-    assert.match(claude, /<!-- pipelane:lessons:end -->/);
-    assert.equal((claude.match(/pipelane:lessons:start/g) || []).length, 1);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup --yes backfills the Lessons block into an existing block-less CLAUDE.md', () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    const claudePath = path.join(repoRoot, 'CLAUDE.md');
-    // Simulate a legacy CLAUDE.md that predates the Lessons block.
-    const stripped = readFileSync(claudePath, 'utf8').replace(LESSONS_BLOCK_RE, '');
-    assert.doesNotMatch(stripped, /pipelane:lessons:start/);
-    writeFileSync(claudePath, stripped, 'utf8');
-
-    const result = runCli(['setup', '--yes'], repoRoot);
-    const after = readFileSync(claudePath, 'utf8');
-    assert.match(after, /<!-- pipelane:lessons:start -->/);
-    assert.match(after, /## Lessons/);
-    assert.match(result.stdout, /Added the managed CLAUDE\.md Lessons block\./);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup --yes re-syncs Lessons instruction prose while preserving entries verbatim', () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    const claudePath = path.join(repoRoot, 'CLAUDE.md');
-    let claude = readFileSync(claudePath, 'utf8');
-    // Record a lesson and drift the pipelane-owned instruction prose.
-    claude = claude.replace(
-      '<!-- pipelane:lessons:entries:start -->\n<!-- pipelane:lessons:entries:end -->',
-      '<!-- pipelane:lessons:entries:start -->\n- 2026-06-25: prefer foo over bar\n<!-- pipelane:lessons:entries:end -->',
-    );
-    claude = claude.replace('When the user corrects a mistake', 'STALE INSTRUCTION TEXT, replace me');
-    writeFileSync(claudePath, claude, 'utf8');
-
-    const result = runCli(['setup', '--yes'], repoRoot);
-    const after = readFileSync(claudePath, 'utf8');
-    assert.match(after, /- 2026-06-25: prefer foo over bar/);   // entry preserved
-    assert.doesNotMatch(after, /STALE INSTRUCTION TEXT/);        // drift removed
-    assert.match(after, /When the user corrects a mistake/);     // canonical prose restored
-    assert.match(result.stdout, /Refreshed the CLAUDE\.md Lessons block \(existing entries preserved\)\./);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup Lessons handling is idempotent (byte-identical re-run, single block)', () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup', '--yes'], repoRoot);
-    const claudePath = path.join(repoRoot, 'CLAUDE.md');
-    const first = readFileSync(claudePath, 'utf8');
-    runCli(['setup', '--yes'], repoRoot);
-    const second = readFileSync(claudePath, 'utf8');
-    assert.equal(first, second, 're-run must produce byte-identical CLAUDE.md');
-    assert.equal((second.match(/pipelane:lessons:start/g) || []).length, 1);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup without --yes (non-TTY) leaves an existing block-less CLAUDE.md untouched', () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    const claudePath = path.join(repoRoot, 'CLAUDE.md');
-    const stripped = readFileSync(claudePath, 'utf8').replace(LESSONS_BLOCK_RE, '');
-    writeFileSync(claudePath, stripped, 'utf8');
-
-    const result = runCli(['setup'], repoRoot); // no --yes; runCli pipes stdio (non-TTY)
-    const after = readFileSync(claudePath, 'utf8');
-    assert.equal(after, stripped, 'non-TTY setup without --yes must not insert the block');
-    assert.match(result.stdout, /CLAUDE\.md Lessons block migration requires approval:/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup writes the lessons capture instruction into the AGENTS.md managed region', () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    const agents = readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8');
-    assert.match(agents, /### Capturing lessons/);
-    assert.match(agents, /pipelane:lessons:entries/);
-    // Guard (mirrors the /lesson skill): if the entries:end marker is absent,
-    // the managed block was never provisioned — provision it before appending.
-    assert.match(agents, /entries:end -->` marker is present/);
-    assert.match(agents, /run `\/pipelane setup --yes` first, then stop/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('setup --yes leaves a malformed Lessons block (missing entries:end) untouched rather than wiping it', () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    const claudePath = path.join(repoRoot, 'CLAUDE.md');
-    // Corrupt the block: a lesson exists but the inner entries:end marker is gone.
-    // A naive resync that defaults to empty entries would discard the lesson.
-    const corrupted = readFileSync(claudePath, 'utf8').replace(
-      '<!-- pipelane:lessons:entries:start -->\n<!-- pipelane:lessons:entries:end -->',
-      '<!-- pipelane:lessons:entries:start -->\n- 2026-06-25: precious lesson',
-    );
-    writeFileSync(claudePath, corrupted, 'utf8');
-
-    runCli(['setup', '--yes'], repoRoot);
-    const after = readFileSync(claudePath, 'utf8');
-    assert.equal(after, corrupted, 'malformed block must be left untouched, never silently rebuilt');
-    assert.match(after, /- 2026-06-25: precious lesson/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test.skip('detectSetupDrift detects a missing Lessons block as an approval-gated migration, not a needsSetup trigger', async () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    const claudePath = path.join(repoRoot, 'CLAUDE.md');
-    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
-    // Block present after setup → no lessons drift, repo fully in sync.
-    assert.equal(docs.detectSetupDrift(repoRoot).lessonsMigration, null);
-    assert.equal(docs.detectSetupDrift(repoRoot).needsSetup, false);
-    // Strip the block → drift detection flags an insert migration. Like the
-    // AGENTS guidance migration it mirrors, it is approval-gated and surfaced via
-    // the follow-up message, NOT a needsSetup trigger (which would force
-    // perpetual setup re-runs in a non-TTY run without --yes).
-    const stripped = readFileSync(claudePath, 'utf8').replace(LESSONS_BLOCK_RE, '');
-    writeFileSync(claudePath, stripped, 'utf8');
-    const drift = docs.detectSetupDrift(repoRoot);
-    assert.ok(drift.lessonsMigration, 'lessonsMigration is detected');
-    assert.equal(drift.lessonsMigration.action, 'insert');
-    assert.equal(drift.needsSetup, false, 'lessons drift alone must not force needsSetup');
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-// Regression: the OUTER lessons:end marker must bind to the first occurrence
+const LESSONS_BLOCK_RE = /<!-- pipelane:lessons:start -->[\s\S]*?<!-- pipelane:lessons:end -->\n?/;// Regression: the OUTER lessons:end marker must bind to the first occurrence
 // at/after the start (indexOf), not the last (lastIndexOf). The block sits
 // mid-file, so consumer prose below it can legitimately quote the literal end
 // marker; a lastIndexOf parser latched onto that quote and the re-sync rebuild
@@ -36519,26 +34668,6 @@ test('machine-local setup preserves consumer prose that quotes the outer lessons
     // Real terminator + the quoted marker both intact. A lastIndexOf rebuild
     // would have deleted the heading and consumed the quote, leaving only one.
     assert.equal((after.match(/pipelane:lessons:end -->/g) || []).length, 2);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-// Regression: a pending Lessons block migration must be NAMED in the update
-// follow-up summary, not rendered as an empty "Run setup" bullet list.
-test.skip('update follow-up summary names a pending Lessons block migration', async () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    const claudePath = path.join(repoRoot, 'CLAUDE.md');
-    const stripped = readFileSync(claudePath, 'utf8').replace(LESSONS_BLOCK_RE, '');
-    writeFileSync(claudePath, stripped, 'utf8');
-    const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
-    const update = await import(path.join(KIT_ROOT, 'src', 'operator', 'update.ts'));
-    const drift = docs.detectSetupDrift(repoRoot);
-    const summary = update.formatFollowUpSummary(drift);
-    assert.match(summary, /CLAUDE\.md Lessons block to add/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
