@@ -15981,22 +15981,61 @@ test('loadWorkflowConfig lets .pipelane.json win over a package.json:pipelane ov
   }
 });
 
-test('setup without .pipelane.json stays machine-local and read-only', async () => {
+test('setup without .pipelane.json materializes machine-local config without repo writes', async () => {
   const repoRoot = createRepo();
   try {
     // No `pipelane init` — just run setup directly. With self-heal, this
-    // succeeds from the synthesized config, but the missing syncDocs block
-    // defaults to machine-local so setup does not scaffold repo files.
+    // succeeds from the synthesized config, materializes the machine-local
+    // workflow config, and still does not scaffold repo files.
     const result = runCli(['setup'], repoRoot);
     assert.equal(result.status, 0, `setup exited ${result.status}: ${result.stderr}`);
+    assert.match(result.stdout, /Created machine-local Pipelane config from repo defaults at /);
     assert.match(result.stdout, /No local CLAUDE\.md scaffold written; Pipelane guidance comes from durable machine-local commands\./);
     assert.match(result.stdout, /No REPO_GUIDANCE\.md scaffold written; Pipelane no longer creates repo-local adapter surfaces\./);
+    const configPath = machinePipelaneConfigPath(repoRoot);
+    assert.equal(existsSync(configPath), true);
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    assert.equal(config.displayName, 'sample-repo');
+    assert.equal(config.projectKey, 'sample-repo');
+    const onboardingMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'onboarding.ts'));
+    assert.equal(onboardingMod.buildMissingDeployOnboardingMessage(repoRoot, { environment: 'staging' }), null);
     assert.equal(existsSync(path.join(repoRoot, 'CLAUDE.md')), false);
     assert.equal(existsSync(path.join(repoRoot, 'REPO_GUIDANCE.md')), false);
     assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
     assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
-    // .pipelane.json stays un-materialized because setup only reads.
+    // Application-owned repo-local config stays un-materialized.
     assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup migrates legacy repo-local .pipelane.json into machine-local config', async () => {
+  const repoRoot = createRepo();
+  try {
+    const legacyConfigPath = path.join(repoRoot, '.pipelane.json');
+    const legacyConfig = {
+      version: 1,
+      displayName: 'Legacy Local App',
+      projectKey: 'legacy-local-app',
+      baseBranch: 'trunk',
+      aliases: { pr: '/ship' },
+      prePrChecks: ['npm run lint:legacy'],
+    };
+    writeFileSync(legacyConfigPath, `${JSON.stringify(legacyConfig, null, 2)}\n`, 'utf8');
+
+    const result = runCli(['setup'], repoRoot);
+
+    assert.equal(result.status, 0, `setup exited ${result.status}: ${result.stderr}`);
+    assert.match(result.stdout, /Migrated legacy repo-local \.pipelane\.json into machine-local config at /);
+    assert.equal(existsSync(legacyConfigPath), true);
+    const config = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
+    assert.equal(config.displayName, 'Legacy Local App');
+    assert.equal(config.projectKey, 'legacy-local-app');
+    assert.equal(config.baseBranch, 'trunk');
+    assert.equal(config.aliases.pr, '/ship');
+    assert.deepEqual(config.prePrChecks, ['npm run lint:legacy']);
+    assert.equal(config.aliases.deploy, '/deploy');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -18365,9 +18404,14 @@ test('missing deploy onboarding points at slash setup and configure flows', asyn
       pr: '625',
     });
 
-    assert.match(message, /\/pipelane setup/);
+    assert.match(message, /Pipelane configuration has not been set up properly:/);
+    assert.match(message, /Choose the action to take:/);
+    assert.match(message, /1\. Configure Pipelane for safe \/deploy now \(recommended\)\./);
+    assert.match(message, /\/pipelane setup --yes/);
     assert.match(message, /\/pipelane configure/);
-    assert.match(message, /Then retry: \/deploy staging --pr 625/);
+    assert.match(message, /\/deploy staging --pr 625/);
+    assert.match(message, /2\. Set up workflow config only, then stop before deploy values\./);
+    assert.match(message, /3\. Cancel\./);
     assert.doesNotMatch(message, /\/init-pipelane/);
     assert.doesNotMatch(message, /pipelane bootstrap/);
     assert.doesNotMatch(message, /pipelane run deploy/);

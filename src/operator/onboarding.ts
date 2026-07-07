@@ -26,16 +26,25 @@ export function buildMissingDeployOnboardingMessage(
   ].filter(Boolean).join(' ');
 
   return [
-    `Pipelane is installed on this machine, but this repo is not onboarded yet: ${repoRoot}`,
-    `No machine-local Pipelane config was found at ${resolveConfigPath(repoRoot)}.`,
+    'Pipelane configuration has not been set up properly:',
+    `- Repo: ${repoRoot}`,
+    '- This repo is not onboarded yet with machine-local Pipelane config.',
+    `- Missing machine-local workflow config: ${resolveConfigPath(repoRoot)}`,
     'No deploy started.',
     '',
-    'Run clean setup and deploy configuration first:',
-    '  /pipelane setup',
-    '  /pipelane configure',
-    `Then retry: ${retry}`,
+    'Choose the action to take:',
+    '1. Configure Pipelane for safe /deploy now (recommended).',
+    '   Commands:',
+    '     /pipelane setup --yes',
+    '     /pipelane configure',
+    `     ${retry}`,
+    '2. Set up workflow config only, then stop before deploy values.',
+    '   Commands:',
+    '     /pipelane setup --yes',
+    '3. Cancel.',
+    '   Command: cancel',
     '',
-    'For non-interactive setup, pass deploy values with `/pipelane configure --json ...`.',
+    'Deploy values may need app-specific URLs, workflows, healthchecks, or commands. For non-interactive setup, pass them with `/pipelane configure --json ...`.',
   ].join('\n');
 }
 

@@ -6,16 +6,23 @@ import { fileURLToPath } from 'node:url';
 import type { SyncDocsConfig, WorkflowCommand, WorkflowConfig } from './state.ts';
 import {
   aliasCommandName,
+  CONFIG_FILENAME,
+  LEGACY_CONFIG_FILENAME,
   loadWorkflowConfig,
   MANAGED_COMMANDS,
   MANAGED_EXTRA_COMMANDS,
   MANAGED_WORKFLOW_COMMANDS,
+  normalizeWorkflowConfig,
   type ManagedCommand,
   readJsonFile,
+  resolveConfigPath,
+  resolveReadableConfigPath,
   resolveRepoRoot,
   resolveSyncDocs,
   resolveWorkflowAliases,
   runGit,
+  synthesizeWorkflowConfig,
+  writeWorkflowConfig,
   writeJsonFile,
 } from './state.ts';
 import { loadDeployConfig } from './release-gate.ts';
@@ -600,6 +607,9 @@ export function initConsumerRepo(cwd: string, projectName: string): { repoRoot: 
 
 export interface SetupConsumerRepoResult {
   repoRoot: string;
+  workflowConfigPath: string;
+  workflowConfigCreated: boolean;
+  workflowConfigSource: 'existing-machine' | 'legacy-pipelane-json' | 'legacy-project-workflow-json' | 'synthesized';
   createdClaude: boolean;
   createdRepoGuidance: boolean;
   skippedClaudeScaffold: boolean;
@@ -621,6 +631,66 @@ export interface SetupConsumerRepoOptions {
   applyAgentsGuidanceMigrations?: boolean;
   applyClaudeGuidanceMigrations?: boolean;
   applyLessonsMigration?: boolean;
+}
+
+interface SetupWorkflowConfig {
+  config: WorkflowConfig;
+  configPath: string;
+  created: boolean;
+  source: SetupConsumerRepoResult['workflowConfigSource'];
+}
+
+function readLegacyRepoLocalWorkflowConfig(repoRoot: string): {
+  filename: typeof CONFIG_FILENAME | typeof LEGACY_CONFIG_FILENAME;
+  raw: Partial<WorkflowConfig>;
+} | null {
+  for (const filename of [CONFIG_FILENAME, LEGACY_CONFIG_FILENAME] as const) {
+    const targetPath = path.join(repoRoot, filename);
+    if (!existsSync(targetPath)) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(targetPath, 'utf8'));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`Malformed legacy repo-local ${filename} at ${targetPath}: ${detail}. Fix or remove it, then rerun /pipelane setup.`);
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error(`Malformed legacy repo-local ${filename} at ${targetPath}: expected a JSON object. Fix or remove it, then rerun /pipelane setup.`);
+    }
+    return {
+      filename,
+      raw: parsed as Partial<WorkflowConfig>,
+    };
+  }
+  return null;
+}
+
+function setupWorkflowConfig(repoRoot: string): SetupWorkflowConfig {
+  const readableConfigPath = resolveReadableConfigPath(repoRoot);
+  if (readableConfigPath) {
+    return {
+      config: loadWorkflowConfig(repoRoot),
+      configPath: readableConfigPath,
+      created: false,
+      source: 'existing-machine',
+    };
+  }
+
+  const legacy = readLegacyRepoLocalWorkflowConfig(repoRoot);
+  const config = legacy
+    ? normalizeWorkflowConfig(legacy.raw, { repoRoot })
+    : synthesizeWorkflowConfig(repoRoot);
+  writeWorkflowConfig(repoRoot, config);
+  return {
+    config,
+    configPath: resolveConfigPath(repoRoot),
+    created: true,
+    source: legacy?.filename === LEGACY_CONFIG_FILENAME
+      ? 'legacy-project-workflow-json'
+      : legacy
+        ? 'legacy-pipelane-json'
+        : 'synthesized',
+  };
 }
 
 export interface AgentsGuidanceReplacement {
@@ -1057,7 +1127,8 @@ export function formatClaudeGuidanceMigrations(migrations: ClaudeGuidanceMigrati
 
 export function setupConsumerRepo(cwd: string, options: SetupConsumerRepoOptions = {}): SetupConsumerRepoResult {
   const repoRoot = resolveRepoRoot(cwd, true);
-  const config = loadWorkflowConfig(repoRoot);
+  const workflowConfig = setupWorkflowConfig(repoRoot);
+  const config = workflowConfig.config;
   const syncDocs = resolveEffectiveSyncDocs(repoRoot, config);
   syncConsumerDocs(repoRoot, config);
   const scaffoldClaudeMd = false;
@@ -1096,6 +1167,9 @@ export function setupConsumerRepo(cwd: string, options: SetupConsumerRepoOptions
 
   return {
     repoRoot,
+    workflowConfigPath: workflowConfig.configPath,
+    workflowConfigCreated: workflowConfig.created,
+    workflowConfigSource: workflowConfig.source,
     createdClaude,
     createdRepoGuidance,
     skippedClaudeScaffold,
@@ -1368,6 +1442,7 @@ export function setupDeployConfigMessage(repoRoot: string): string {
 export function formatSetupResult(result: SetupConsumerRepoResult): string[] {
   const lines: string[] = [
     `Pipelane setup complete in ${result.repoRoot}`,
+    formatWorkflowConfigSetupLine(result),
     result.createdClaude
       ? 'Created local CLAUDE.md from a legacy scaffold.'
       : result.skippedClaudeScaffold
@@ -1419,6 +1494,19 @@ export function formatSetupResult(result: SetupConsumerRepoResult): string[] {
   }
   lines.push('If Claude or Codex was already open, reopen the repo or restart the client to refresh commands and skills.');
   return lines;
+}
+
+function formatWorkflowConfigSetupLine(result: SetupConsumerRepoResult): string {
+  if (!result.workflowConfigCreated) {
+    return `Using existing machine-local Pipelane config at ${result.workflowConfigPath}.`;
+  }
+  if (result.workflowConfigSource === 'legacy-pipelane-json') {
+    return `Migrated legacy repo-local .pipelane.json into machine-local config at ${result.workflowConfigPath}.`;
+  }
+  if (result.workflowConfigSource === 'legacy-project-workflow-json') {
+    return `Migrated legacy repo-local .project-workflow.json into machine-local config at ${result.workflowConfigPath}.`;
+  }
+  return `Created machine-local Pipelane config from repo defaults at ${result.workflowConfigPath}.`;
 }
 
 export function maybeInitGitRepo(repoRoot: string): void {
