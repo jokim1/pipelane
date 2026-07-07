@@ -1061,18 +1061,55 @@ export function slugifyTaskName(taskName: string): string {
   return slug;
 }
 
+const TRANSIENT_SPAWN_CODES = new Set(['EAGAIN', 'EMFILE', 'ENFILE', 'ENOMEM']);
+const MAX_TRANSIENT_SPAWN_RETRIES = 4;
+const TRANSIENT_SPAWN_BACKOFF_MS = 20;
+
+// A transient spawn failure (EAGAIN/EMFILE/ENFILE/ENOMEM) means the OS could not
+// create the child process at all, so the command never ran. These surface
+// intermittently under heavy concurrent subprocess load and are safe to retry —
+// unlike a command that ran and exited non-zero.
+export function isTransientSpawnError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === 'string' && TRANSIENT_SPAWN_CODES.has(code);
+}
+
+function sleepSyncMs(ms: number): void {
+  if (ms <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// Runs a subprocess operation, retrying only on transient spawn failures with a
+// short escalating backoff. A retried spawn is safe because the process never
+// started; a real non-zero exit (or after the retry budget) propagates as-is so
+// callers still fail closed. Prevents intermittent EAGAIN under load from
+// crashing long-running work such as an orchestration review pass.
+export function runWithTransientSpawnRetry<T>(operation: () => T): T {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return operation();
+    } catch (error) {
+      if (isTransientSpawnError(error) && attempt < MAX_TRANSIENT_SPAWN_RETRIES) {
+        sleepSyncMs(TRANSIENT_SPAWN_BACKOFF_MS * (attempt + 1));
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
 export function runCommand(
   command: string,
   args: string[],
   options: { cwd?: string; allowFailure?: boolean; env?: NodeJS.ProcessEnv } = {},
 ): string | null {
   try {
-    return execFileSync(command, args, {
+    return runWithTransientSpawnRetry(() => execFileSync(command, args, {
       cwd: options.cwd,
       env: options.env,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
-    }).trimEnd();
+    }).trimEnd());
   } catch (error) {
     if (options.allowFailure) {
       return null;

@@ -2903,6 +2903,45 @@ test('resolveWorkflowAliases still rejects unknown aliases (pipelane is not a Wo
     'resolveWorkflowAliases should be purely syntactic; collision detection moved to syncConsumerDocs');
 });
 
+test('runWithTransientSpawnRetry retries transient spawn failures but not real errors', async () => {
+  // A transient spawn failure (EAGAIN/EMFILE/…) means the OS could not fork the
+  // child, so the command never ran and retrying is safe. Under heavy concurrent
+  // subprocess load these surface intermittently and previously crashed an
+  // orchestration review pass (resolveGitCommonDir → git rev-parse throwing).
+  const { runWithTransientSpawnRetry, isTransientSpawnError } = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+
+  assert.equal(isTransientSpawnError(Object.assign(new Error('EAGAIN'), { code: 'EAGAIN' })), true);
+  assert.equal(isTransientSpawnError(Object.assign(new Error('EMFILE'), { code: 'EMFILE' })), true);
+  assert.equal(isTransientSpawnError(Object.assign(new Error('boom'), { code: 'ENOENT' })), false);
+  assert.equal(isTransientSpawnError(new Error('no code')), false);
+
+  // Absorbs a transient failure that clears within the retry budget.
+  let attempts = 0;
+  const result = runWithTransientSpawnRetry(() => {
+    attempts += 1;
+    if (attempts <= 2) throw Object.assign(new Error('spawnSync git EAGAIN'), { code: 'EAGAIN' });
+    return 'ok';
+  });
+  assert.equal(result, 'ok');
+  assert.equal(attempts, 3, 'should retry twice then succeed');
+
+  // Gives up (fails closed) after the bounded retry budget of 4 (1 + 4 = 5 tries).
+  let persistent = 0;
+  assert.throws(() => runWithTransientSpawnRetry(() => {
+    persistent += 1;
+    throw Object.assign(new Error('spawnSync git EAGAIN'), { code: 'EAGAIN' });
+  }), /EAGAIN/);
+  assert.equal(persistent, 5, 'bounded: 1 initial attempt + 4 retries');
+
+  // Never retries a real (non-spawn) failure — those must fail closed immediately.
+  let real = 0;
+  assert.throws(() => runWithTransientSpawnRetry(() => {
+    real += 1;
+    throw new Error('git exited non-zero: fatal: not a git repository');
+  }), /not a git repository/);
+  assert.equal(real, 1, 'non-transient errors are not retried');
+});
+
 test('machine-local setup preserves consumer files that resemble legacy pipelane docs', () => {
   // Repo-local command sync is no longer supported, but stale or
   // consumer-authored `.claude/commands/*` files can still exist. Setup must
