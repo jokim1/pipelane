@@ -29784,10 +29784,13 @@ test('deploy in an un-onboarded repo fails with guided setup before dispatch', (
 
     assert.equal(result.status, 1);
     assert.match(result.stderr, /repo is not onboarded yet/);
-    assert.match(result.stderr, /No machine-local Pipelane config was found/);
-    assert.match(result.stderr, /\/pipelane setup/);
+    assert.match(result.stderr, /Pipelane configuration has not been set up properly/);
+    assert.match(result.stderr, /Missing machine-local workflow config/);
+    assert.match(result.stderr, /Choose the action to take:/);
+    assert.match(result.stderr, /1\. Configure Pipelane for safe \/deploy now/);
+    assert.match(result.stderr, /\/pipelane setup --yes/);
     assert.match(result.stderr, /pipelane configure/);
-    assert.match(result.stderr, /Then retry: \/deploy staging --pr 625/);
+    assert.match(result.stderr, /\/deploy staging --pr 625/);
     assert.doesNotMatch(result.stderr, /\/init-pipelane/);
     assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
   } finally {
@@ -29807,9 +29810,13 @@ test('api deploy preflight in an un-onboarded repo blocks with guided setup', ()
       assert.match(output.message, /repo is not onboarded yet/);
       assert.equal(output.data.preflight.allowed, false, actionId);
       assert.equal(output.data.preflight.state, 'blocked', actionId);
+      assert.match(output.data.preflight.reason, /Pipelane configuration has not been set up properly/);
+      assert.match(output.data.preflight.reason, /Choose the action to take:/);
+      assert.match(output.data.preflight.reason, /Configure Pipelane for safe \/deploy now/);
+      assert.match(output.data.preflight.reason, /\/pipelane setup --yes/);
       assert.match(output.data.preflight.reason, /pipelane configure/);
       assert.match(output.data.preflight.reason, /No deploy started/);
-      assert.match(output.data.preflight.reason, new RegExp(`Then retry: /deploy ${actionId.endsWith('.prod') ? 'prod' : 'staging'} --pr 625`));
+      assert.match(output.data.preflight.reason, new RegExp(`/deploy ${actionId.endsWith('.prod') ? 'prod' : 'staging'} --pr 625`));
       if (actionId.startsWith('route.')) {
         assert.deepEqual(output.data.preflight.normalizedInputs.routeBlockers, ['repo not onboarded']);
       }
