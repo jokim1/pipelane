@@ -3669,9 +3669,16 @@ function resolveProviderCommand(provider: GoalProvider): string {
 }
 
 function defaultProviderCommand(provider: GoalProvider): string {
-  if (provider === 'codex' && commandExists('codex')) return 'codex exec --full-auto -';
+  if (provider === 'codex' && commandExists('codex')) return defaultCodexProviderCommand();
   if (provider === 'claude' && commandExists('claude')) return defaultClaudeProviderCommand();
   return '';
+}
+
+function defaultCodexProviderCommand(): string {
+  const help = commandHelp('codex', ['exec', '--help']);
+  if (help.includes('--sandbox <SANDBOX_MODE>')) return 'codex exec --sandbox workspace-write -';
+  if (help.includes('--full-auto')) return 'codex exec --full-auto -';
+  return 'codex exec -';
 }
 
 function defaultClaudeProviderCommand(): string {
@@ -3691,8 +3698,8 @@ function commandExists(command: string): boolean {
   return !result.error;
 }
 
-function commandHelp(command: string): string {
-  const result = spawnSync(command, ['--help'], {
+function commandHelp(command: string, args: string[] = ['--help']): string {
+  const result = spawnSync(command, args, {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: NATIVE_COMMAND_PROBE_TIMEOUT_MS,

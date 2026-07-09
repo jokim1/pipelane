@@ -6789,6 +6789,66 @@ test('review executes configured AI skill gate command and records attester evid
   }
 });
 
+test('review uses current native Codex exec default for AI gates', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-bin-'));
+  const argsPath = path.join(binDir, 'codex-review-default.txt');
+  try {
+    const codexPath = path.join(binDir, 'codex');
+    writeFileSync(
+      codexPath,
+      [
+        '#!/usr/bin/env node',
+        "import { readFileSync, writeFileSync } from 'node:fs';",
+        "const args = process.argv.slice(2);",
+        "if (args.join(' ') === 'exec --help' || args.includes('--help')) {",
+        "  console.log('Usage: codex exec [OPTIONS] [PROMPT]');",
+        "  console.log('--sandbox <SANDBOX_MODE>');",
+        "  process.exit(0);",
+        "}",
+        "if (args.join(' ') !== 'exec --sandbox workspace-write -') {",
+        "  console.error(`unexpected codex args: ${args.join(' ')}`);",
+        "  process.exit(2);",
+        "}",
+        "const prompt = readFileSync(0, 'utf8');",
+        "writeFileSync(process.env.PIPELANE_TEST_CODEX_REVIEW_ARGS_PATH, `${args.join(' ')}\\n${prompt.includes('Gate: gstack-review')}\\n`, 'utf8');",
+        "console.log('PIPELANE_REVIEW_GATE_RESULT=passed');",
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    chmodSync(codexPath, 0o755);
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'gstack-review',
+        phase: 'ai-diff',
+        type: 'skill',
+        skill: 'review',
+        userCommands: ['/review'],
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt AI review gate');
+
+    const result = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      PIPELANE_REVIEW_GATE_USE_REAL_NATIVE: '1',
+      PIPELANE_TEST_CODEX_REVIEW_ARGS_PATH: argsPath,
+    }).stdout);
+
+    assert.equal(result.status, 'passed');
+    assert.equal(result.gates[0].command, 'codex exec --sandbox workspace-write -');
+    assert.equal(readFileSync(argsPath, 'utf8'), 'exec --sandbox workspace-write -\ntrue\n');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
 test('review AI gate parses result marker independently across stdout and stderr', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
@@ -11345,11 +11405,12 @@ test('orchestrate start uses native Codex and Claude adapter defaults when avail
         '#!/usr/bin/env node',
         "import { readFileSync, writeFileSync } from 'node:fs';",
         "const args = process.argv.slice(2);",
-        "if (args.includes('--help')) {",
-        "  console.log('Usage: codex exec --full-auto -');",
+        "if (args.join(' ') === 'exec --help' || args.includes('--help')) {",
+        "  console.log('Usage: codex exec [OPTIONS] [PROMPT]');",
+        "  console.log('--sandbox <SANDBOX_MODE>');",
         "  process.exit(0);",
         "}",
-        "if (args.join(' ') !== 'exec --full-auto -') {",
+        "if (args.join(' ') !== 'exec --sandbox workspace-write -') {",
         "  console.error(`unexpected codex args: ${args.join(' ')}`);",
         "  process.exit(2);",
         "}",
@@ -11394,8 +11455,8 @@ test('orchestrate start uses native Codex and Claude adapter defaults when avail
       PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
     }).stdout);
     assert.equal(codexStarted.status, 'dispatched'); // C1: bare start awaits review, not completed
-    assert.equal(codexStarted.run.slices[0].worker.command, 'codex exec --full-auto -');
-    assert.equal(readFileSync(path.join(codexStarted.run.slices[0].worktreePath, 'codex-default.txt'), 'utf8'), 'exec --full-auto -\ntrue\n');
+    assert.equal(codexStarted.run.slices[0].worker.command, 'codex exec --sandbox workspace-write -');
+    assert.equal(readFileSync(path.join(codexStarted.run.slices[0].worktreePath, 'codex-default.txt'), 'utf8'), 'exec --sandbox workspace-write -\ntrue\n');
 
     const claudePlan = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Use claude native default', '--provider', 'claude', '--json'], repoRoot).stdout);
     const claudePrepared = preparePlannedRun(repoRoot, claudePlan);
@@ -14521,6 +14582,74 @@ test('review runner checklist marks failed blocking and pending gates distinctly
     assert.match(result.stdout, /Current: runtime \/ late-fails \(failed\)/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review runner streams non-tty gate progress before captured AI gate completes', async () => {
+  const repoRoot = createRepo();
+  const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-progress-'));
+  try {
+    const completedPath = path.join(markerRoot, 'ai-completed.txt');
+    const script = [
+      "process.stdin.resume()",
+      "process.stdin.on('end', () => {",
+      `  setTimeout(() => { require('node:fs').writeFileSync(${JSON.stringify(completedPath)}, 'done', 'utf8'); console.log('PIPELANE_REVIEW_GATE_RESULT=passed'); }, 500);`,
+      "})",
+    ].join(';');
+    writePipelaneConfig(repoRoot, 'Progress Demo', {
+      reviewGates: {
+        planReview: { gates: [] },
+        gates: [{
+          id: 'gstack-review',
+          phase: 'ai-diff',
+          type: 'skill',
+          skill: 'review',
+          userCommands: ['/review'],
+          command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+          blocking: true,
+        }],
+      },
+    });
+    commitLocal(repoRoot, 'Configure progress review gate');
+
+    const child = spawn('node', [CLI_PATH, 'run', 'review'], {
+      cwd: repoRoot,
+      env: buildCliChildEnv(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    let stdout = '';
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString('utf8');
+    });
+    const sawStart = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timed out waiting for review progress; stderr=${stderr}`)), 2000);
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk.toString('utf8');
+        if (stderr.includes('pipelane review: starting ai-diff/gstack-review')) {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+      child.on('error', reject);
+      child.on('exit', (code) => {
+        if (!stderr.includes('pipelane review: starting ai-diff/gstack-review')) {
+          clearTimeout(timer);
+          reject(new Error(`review exited before progress; code=${code}; stdout=${stdout}; stderr=${stderr}`));
+        }
+      });
+    });
+
+    await sawStart;
+    assert.equal(existsSync(completedPath), false, 'progress should print before the captured AI command completes');
+    const [code] = await once(child, 'exit');
+
+    assert.equal(code, 0, stdout + stderr);
+    assert.match(stderr, /pipelane review: finished ai-diff\/gstack-review: passed/);
+    assert.match(stdout, /Pipelane review/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(markerRoot, { recursive: true, force: true });
   }
 });
 

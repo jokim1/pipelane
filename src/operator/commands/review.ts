@@ -2066,6 +2066,7 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
     ? null
     : createReviewChecklist(selectedGates);
   const liveChecklist = Boolean(checklist && process.stdout.isTTY);
+  const stderrProgress = Boolean(checklist && !liveChecklist && !parsed.flags.json);
   if (checklist && liveChecklist) {
     process.stdout.write(`${renderReviewChecklist(checklist.snapshot())}\n\n`);
   }
@@ -2085,10 +2086,12 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
     onGateStart: (gate) => {
       checklist?.start(gate);
       if (checklist && liveChecklist) process.stdout.write(`${renderReviewChecklist(checklist.snapshot())}\n\n`);
+      if (stderrProgress) process.stderr.write(`${formatReviewGateProgressStart(gate)}\n`);
     },
     onGateFinish: (gateRecord) => {
       checklist?.finish(gateRecord);
       if (checklist && liveChecklist) process.stdout.write(`${renderReviewChecklist(checklist.snapshot())}\n\n`);
+      if (stderrProgress) process.stderr.write(`${formatReviewGateProgressFinish(gateRecord)}\n`);
     },
   });
 
@@ -2118,6 +2121,17 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
   if (record.status === 'failed' || routeSafety.action === 'stop') {
     process.exitCode = 1;
   }
+}
+
+function formatReviewGateProgressStart(gate: ReviewGateConfig): string {
+  const timeoutSeconds = Math.ceil((gate.timeoutMs ?? DEFAULT_GATE_TIMEOUT_MS) / 1000);
+  return `pipelane review: starting ${sanitizeForTerminal(gate.phase)}/${sanitizeForTerminal(gate.id)} (${sanitizeForTerminal(gate.type)}, timeout ${timeoutSeconds}s)`;
+}
+
+function formatReviewGateProgressFinish(gate: ReviewGateRunRecord): string {
+  const summary = oneLineForChecklist(gate.summary ?? '');
+  const detail = summary ? ` - ${summary}` : '';
+  return `pipelane review: finished ${sanitizeForTerminal(gate.phase)}/${sanitizeForTerminal(gate.gateId)}: ${sanitizeForTerminal(gate.status)}${detail}`;
 }
 
 export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): ReviewRunRecord {
@@ -3492,7 +3506,7 @@ function defaultAiReviewGateCommand(gate: ReviewGateConfig): string {
     return '';
   }
   if (gate.type === 'agent' && isExecutableOnPath('claude')) return defaultClaudeReviewCommand();
-  if (isExecutableOnPath('codex')) return 'codex exec --full-auto -';
+  if (isExecutableOnPath('codex')) return defaultCodexReviewCommand();
   if (isExecutableOnPath('claude')) return defaultClaudeReviewCommand();
   return '';
 }
@@ -3509,8 +3523,15 @@ function defaultClaudeReviewCommand(): string {
   return 'claude --print';
 }
 
-function commandHelp(command: string): string {
-  const result = spawnSync(command, ['--help'], {
+function defaultCodexReviewCommand(): string {
+  const help = commandHelp('codex', ['exec', '--help']);
+  if (help.includes('--sandbox <SANDBOX_MODE>')) return 'codex exec --sandbox workspace-write -';
+  if (help.includes('--full-auto')) return 'codex exec --full-auto -';
+  return 'codex exec -';
+}
+
+function commandHelp(command: string, args: string[] = ['--help']): string {
+  const result = spawnSync(command, args, {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: 5000,

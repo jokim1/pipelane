@@ -438,9 +438,11 @@ content changes require fresh review again.
 
 ```bash
 PIPELANE_ORCHESTRATE_WORKER_COMMAND='your-worker-command'
-# Optional overrides. Without these, Codex defaults to `codex exec --full-auto -`
-# when `codex` is installed. Claude defaults to `claude --print` plus the
-# best supported non-interactive permission mode from `claude --help`.
+# Optional overrides. Without these, Codex defaults to
+# `codex exec --sandbox workspace-write -` when supported, falling back to the
+# older `codex exec --full-auto -` form for older CLIs. Claude defaults to
+# `claude --print` plus the best supported non-interactive permission mode from
+# `claude --help`.
 PIPELANE_ORCHESTRATE_CODEX_COMMAND='codex-specific-command'
 PIPELANE_ORCHESTRATE_CLAUDE_COMMAND='claude-specific-command'
 PIPELANE_ORCHESTRATE_WORKER_TIMEOUT_MS=3600000
