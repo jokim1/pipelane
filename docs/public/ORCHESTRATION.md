@@ -588,7 +588,7 @@ Pipelane falls back to `maxIterationsPerSlice` for older configs, then to `2`.
 Every `/pipelane review` run writes evidence under existing Pipelane state:
 
 ```text
-<git-common-dir>/<config.stateDir>/review-state.json
+$PIPELANE_HOME/repos/<repo-key>/state/review-state.json
 ```
 
 The bounded ledger records the latest runs with branch, SHA, changed
@@ -644,7 +644,7 @@ the next run while still rerunning command gates from the slice worktree.
 Every orchestration run should write an evidence ledger under Pipelane state:
 
 ```text
-<git-common-dir>/<config.stateDir>/orchestrate/runs/<run-id>/orchestration.json
+$PIPELANE_HOME/repos/<repo-key>/state/orchestrate/runs/<run-id>/orchestration.json
 ```
 
 The ledger should record:

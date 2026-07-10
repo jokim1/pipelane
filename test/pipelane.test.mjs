@@ -420,8 +420,8 @@ function machineRepoKey(repoRoot) {
   return createHash('sha256').update(canonical).digest('hex').slice(0, 24);
 }
 
-function machineRepoDir(repoRoot) {
-  return path.join(process.env.PIPELANE_HOME || path.join(os.homedir(), '.pipelane'), 'repos', machineRepoKey(repoRoot));
+function machineRepoDir(repoRoot, pipelaneHome = process.env.PIPELANE_HOME || path.join(os.homedir(), '.pipelane')) {
+  return path.join(pipelaneHome, 'repos', machineRepoKey(repoRoot));
 }
 
 function machinePipelaneConfigPath(repoRoot) {
@@ -440,6 +440,18 @@ function machineSmokeWaiversPath(repoRoot) {
   const smokeDir = path.join(machineRepoDir(repoRoot), 'smoke');
   mkdirSync(smokeDir, { recursive: true });
   return path.join(smokeDir, 'waivers.json');
+}
+
+function resolveSharedSmokeStateRoot(repoRoot) {
+  return path.join(machineRepoDir(repoRoot), 'smoke-runtime');
+}
+
+function managedRuntimeRoot(host, pipelaneHome = process.env.PIPELANE_HOME || path.join(os.homedir(), '.pipelane')) {
+  return path.join(pipelaneHome, 'runtimes', host);
+}
+
+function managedRuntimeBin(host, pipelaneHome = process.env.PIPELANE_HOME || path.join(os.homedir(), '.pipelane')) {
+  return path.join(managedRuntimeRoot(host, pipelaneHome), 'bin', 'pipelane');
 }
 
 function writePipelaneConfig(repoRoot, displayName = 'Demo App', patch = {}) {
@@ -646,6 +658,12 @@ function seedLegacyCodexWrappers(codexHome, skills = ['new', 'resume', 'pr']) {
     path.join(codexHome, 'skills', '.pipelane', 'managed-skills.json'),
     `${JSON.stringify({ skills }, null, 2)}\n`,
     'utf8',
+  );
+  mkdirSync(path.join(codexHome, 'skills', '.pipelane', 'bin'), { recursive: true });
+  writeFileSync(
+    path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+    '#!/bin/sh\nexec ~/.codex/skills/.pipelane/bin/pipelane "$@"\n',
+    { mode: 0o755, encoding: 'utf8' },
   );
 
   for (const skill of skills) {
@@ -2147,7 +2165,7 @@ test('deploy prod rejects legacy smoke coverage override flag and otherwise igno
       },
     );
     const output = JSON.parse(result.stdout);
-    const deployState = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'deploy-state.json'), 'utf8'));
+    const deployState = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'deploy-state.json'), 'utf8'));
     const latestRecord = deployState.records.at(-1);
 
     assert.equal(output.environment, 'prod');
@@ -2486,10 +2504,11 @@ test('install-codex outside a pipelane repo installs durable global default skil
     assert.match(lessonSkill, /Append a dated lesson/);
     assert.match(lessonSkill, /pipelane:lessons:entries:end/);
     assert.match(lessonSkill, /run `\/pipelane setup`/);
-    assert.ok(existsSync(path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane')));
-    assert.ok(existsSync(path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh')));
+    assert.equal(existsSync(path.join(codexHome, 'skills', '.pipelane')), false);
+    assert.ok(existsSync(path.join(managedRuntimeRoot('codex'), 'bin', 'pipelane')));
+    assert.ok(existsSync(path.join(managedRuntimeRoot('codex'), 'bin', 'run-pipelane.sh')));
     assert.match(
-      readFileSync(path.join(codexHome, 'skills', '.pipelane', 'bin', 'bootstrap-pipelane.sh'), 'utf8'),
+      readFileSync(path.join(managedRuntimeRoot('codex'), 'bin', 'bootstrap-pipelane.sh'), 'utf8'),
       /bootstrap and \/init-pipelane are no longer supported/,
     );
   } finally {
@@ -2505,7 +2524,8 @@ test('install-claude outside a pipelane repo installs durable personal skills an
   try {
     const result = runCli(['install-claude'], workspaceRoot, { CLAUDE_HOME: claudeHome });
     assert.match(result.stdout, /Installed \d+ durable Pipelane Claude commands/);
-    assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane', 'bin', 'pipelane')));
+    assert.equal(existsSync(path.join(claudeHome, 'skills', 'pipelane', 'bin')), false);
+    assert.ok(existsSync(path.join(managedRuntimeRoot('claude'), 'bin', 'pipelane')));
     assert.equal(existsSync(path.join(claudeHome, 'skills', 'init-pipelane', 'SKILL.md')), false);
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md')));
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane', 'SKILL.md')));
@@ -2572,7 +2592,7 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     assert.doesNotMatch(pipelaneSkill, /review setup --preset/);
     assert.doesNotMatch(pipelaneSkill, /lean\|standard\|strict-production/);
     assert.match(
-      readFileSync(path.join(claudeHome, 'skills', 'pipelane', 'bin', 'bootstrap-pipelane.sh'), 'utf8'),
+      readFileSync(path.join(managedRuntimeRoot('claude'), 'bin', 'bootstrap-pipelane.sh'), 'utf8'),
       /bootstrap and \/init-pipelane are no longer supported/,
     );
   } finally {
@@ -2733,7 +2753,7 @@ test('verify executes the Claude durable runner self-test', () => {
     runCli(['install-codex'], workspaceRoot, { CODEX_HOME: codexHome, PIPELANE_HOME: pipelaneHome });
     runCli(['install-claude'], workspaceRoot, { CLAUDE_HOME: claudeHome, PIPELANE_HOME: pipelaneHome });
     writeFileSync(
-      path.join(claudeHome, 'skills', 'pipelane', 'bin', 'pipelane'),
+      managedRuntimeBin('claude', pipelaneHome),
       '#!/bin/sh\necho claude runner broken >&2\nexit 7\n',
       { mode: 0o755, encoding: 'utf8' },
     );
@@ -3727,15 +3747,14 @@ test('durable Codex runner ignores a repo-local pipelane install', () => {
       { mode: 0o755, encoding: 'utf8' },
     );
 
-    mkdirSync(path.join(codexHome, 'skills', '.pipelane', 'bin'), { recursive: true });
     writeFileSync(
-      path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane'),
+      managedRuntimeBin('codex'),
       '#!/bin/sh\necho "GLOBAL:$*"\n',
       { mode: 0o755, encoding: 'utf8' },
     );
 
     const output = execFileSync(
-      path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      path.join(managedRuntimeRoot('codex'), 'bin', 'run-pipelane.sh'),
       ['status', '--json'],
       {
         cwd: repoRoot,
@@ -3766,7 +3785,7 @@ test('durable Codex runner routes /pipelane update through the managed runtime',
       { mode: 0o755, encoding: 'utf8' },
     );
 
-    const managedBin = path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane');
+    const managedBin = managedRuntimeBin('codex');
     writeFileSync(
       managedBin,
       '#!/bin/sh\necho "GLOBAL:$*"\n',
@@ -3774,7 +3793,7 @@ test('durable Codex runner routes /pipelane update through the managed runtime',
     );
 
     const output = execFileSync(
-      path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      path.join(managedRuntimeRoot('codex'), 'bin', 'run-pipelane.sh'),
       ['pipelane', 'update', '--check'],
       {
         cwd: repoRoot,
@@ -3884,17 +3903,17 @@ test('durable Codex runner ignores stale repo-local pipelane update state', () =
   const newSha = '2222222222222222222222222222222222222222';
 
   try {
-    runCli(['install-codex'], repoRoot, { CODEX_HOME: codexHome });
+    runCli(['install-codex'], repoRoot, { CODEX_HOME: codexHome, PIPELANE_HOME: pipelaneHome });
     writeFakeConsumer(repoRoot, { installedVersion: '0.2.0', installedSha: oldSha });
     writeAutoUpdateAwareLocalBin(repoRoot, { newSha });
     writeFileSync(
-      path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane'),
+      managedRuntimeBin('codex', pipelaneHome),
       `#!/bin/sh\nexec node "${CLI_PATH}" "$@"\n`,
       { mode: 0o755, encoding: 'utf8' },
     );
     makeFakeUpdateBin(binDir, { latestSha: newSha });
 
-    const result = spawnSync(path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'), ['status', '--json'], {
+    const result = spawnSync(path.join(managedRuntimeRoot('codex', pipelaneHome), 'bin', 'run-pipelane.sh'), ['status', '--json'], {
       cwd: repoRoot,
       env: {
         ...process.env,
@@ -3931,7 +3950,7 @@ test('durable Codex runner fails closed when managed runtime is missing even if 
 
   try {
     runCli(['install-codex'], repoRoot, { CODEX_HOME: codexHome });
-    rmSync(path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane'), { force: true });
+    rmSync(managedRuntimeBin('codex'), { force: true });
     mkdirSync(path.join(repoRoot, 'node_modules', '.bin'), { recursive: true });
     writeFileSync(
       path.join(repoRoot, 'node_modules', '.bin', 'pipelane'),
@@ -3940,7 +3959,7 @@ test('durable Codex runner fails closed when managed runtime is missing even if 
     );
 
     const result = spawnSync(
-      path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      path.join(managedRuntimeRoot('codex'), 'bin', 'run-pipelane.sh'),
       ['status', '--json'],
       {
         cwd: repoRoot,
@@ -3966,7 +3985,7 @@ test('durable Codex runner marks managed fallback and dispatches /pipelane statu
 
   try {
     runCli(['install-codex'], repoRoot, { CODEX_HOME: codexHome });
-    const managedBin = path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane');
+    const managedBin = managedRuntimeBin('codex');
     writeFileSync(
       managedBin,
       '#!/bin/sh\necho "MANAGED:$PIPELANE_MANAGED_RUNTIME:$PIPELANE_MANAGED_RUNTIME_ROOT:$*"\n',
@@ -3974,7 +3993,7 @@ test('durable Codex runner marks managed fallback and dispatches /pipelane statu
     );
 
     const output = execFileSync(
-      path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      path.join(managedRuntimeRoot('codex'), 'bin', 'run-pipelane.sh'),
       ['pipelane', 'status', '--json'],
       {
         cwd: repoRoot,
@@ -3984,7 +4003,7 @@ test('durable Codex runner marks managed fallback and dispatches /pipelane statu
       },
     ).trim();
 
-    assert.equal(output, `MANAGED:1:${path.join(codexHome, 'skills', '.pipelane')}:run status --json`);
+    assert.equal(output, `MANAGED:1:${managedRuntimeRoot('codex')}:run status --json`);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -3997,7 +4016,7 @@ test('durable Codex runner prints detailed /pipelane help', () => {
 
   try {
     runCli(['install-codex'], repoRoot, { CODEX_HOME: codexHome });
-    const runner = path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh');
+    const runner = path.join(managedRuntimeRoot('codex'), 'bin', 'run-pipelane.sh');
 
     const bareOutput = execFileSync(runner, ['pipelane'], {
       cwd: repoRoot,
@@ -4039,7 +4058,7 @@ test('durable Codex runner prints /pipelane help after an unknown dispatcher mod
   try {
     runCli(['install-codex'], repoRoot, { CODEX_HOME: codexHome });
     const result = spawnSync(
-      path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      path.join(managedRuntimeRoot('codex'), 'bin', 'run-pipelane.sh'),
       ['pipelane', 'unknown-mode'],
       {
         cwd: repoRoot,
@@ -4066,14 +4085,14 @@ test('durable Codex runner dispatches /pipelane setup and configure', () => {
 
   try {
     runCli(['install-codex'], repoRoot, { CODEX_HOME: codexHome });
-    const managedBin = path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane');
+    const managedBin = managedRuntimeBin('codex');
     writeFileSync(
       managedBin,
       '#!/bin/sh\necho "MANAGED:$PIPELANE_MANAGED_RUNTIME:$*"\n',
       { mode: 0o755, encoding: 'utf8' },
     );
 
-    const runner = path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh');
+    const runner = path.join(managedRuntimeRoot('codex'), 'bin', 'run-pipelane.sh');
     const setupOutput = execFileSync(runner, ['pipelane', 'setup', '--yes'], {
       cwd: repoRoot,
       env: { ...process.env, CODEX_HOME: codexHome },
@@ -4106,7 +4125,7 @@ test('durable Codex runner dispatches /pipelane review setup', () => {
 
   try {
     runCli(['install-codex'], repoRoot, { CODEX_HOME: codexHome });
-    const managedBin = path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane');
+    const managedBin = managedRuntimeBin('codex');
     writeFileSync(
       managedBin,
       '#!/bin/sh\necho "MANAGED:$PIPELANE_MANAGED_RUNTIME:$*"\n',
@@ -4114,7 +4133,7 @@ test('durable Codex runner dispatches /pipelane review setup', () => {
     );
 
     const output = execFileSync(
-      path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      path.join(managedRuntimeRoot('codex'), 'bin', 'run-pipelane.sh'),
       ['pipelane', 'review', 'setup', '--list-gates'],
       {
         cwd: repoRoot,
@@ -4137,7 +4156,7 @@ test('durable Codex runner dispatches /pipelane orchestrate goal-spec', () => {
 
   try {
     runCli(['install-codex'], repoRoot, { CODEX_HOME: codexHome });
-    const managedBin = path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane');
+    const managedBin = managedRuntimeBin('codex');
     writeFileSync(
       managedBin,
       '#!/bin/sh\necho "MANAGED:$PIPELANE_MANAGED_RUNTIME:$*"\n',
@@ -4145,7 +4164,7 @@ test('durable Codex runner dispatches /pipelane orchestrate goal-spec', () => {
     );
 
     const output = execFileSync(
-      path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      path.join(managedRuntimeRoot('codex'), 'bin', 'run-pipelane.sh'),
       ['pipelane', 'orchestrate', 'goal-spec', '--slice-id', 'demo-slice'],
       {
         cwd: repoRoot,
@@ -4158,7 +4177,7 @@ test('durable Codex runner dispatches /pipelane orchestrate goal-spec', () => {
     assert.equal(output, 'MANAGED:1:run orchestrate goal-spec --slice-id demo-slice');
 
     const planOutput = execFileSync(
-      path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      path.join(managedRuntimeRoot('codex'), 'bin', 'run-pipelane.sh'),
       ['pipelane', 'orchestrate', 'plan', '--outcome', 'Demo plan'],
       {
         cwd: repoRoot,
@@ -4174,7 +4193,7 @@ test('durable Codex runner dispatches /pipelane orchestrate goal-spec', () => {
     // first arg `orchestrate` (not `pipelane orchestrate`); it must still produce a
     // single `run orchestrate ...`, never a doubled `run orchestrate orchestrate ...`.
     const topLevelOrchestrateOutput = execFileSync(
-      path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      path.join(managedRuntimeRoot('codex'), 'bin', 'run-pipelane.sh'),
       ['orchestrate', 'plan', '--outcome', 'Demo plan'],
       {
         cwd: repoRoot,
@@ -4186,7 +4205,7 @@ test('durable Codex runner dispatches /pipelane orchestrate goal-spec', () => {
     assert.equal(topLevelOrchestrateOutput, 'MANAGED:1:run orchestrate plan --outcome Demo plan');
 
     const prepareOutput = execFileSync(
-      path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      path.join(managedRuntimeRoot('codex'), 'bin', 'run-pipelane.sh'),
       ['pipelane', 'orchestrate', 'prepare', '--run-id', 'orchestrate-20260617000000-deadbeef'],
       {
         cwd: repoRoot,
@@ -4199,7 +4218,7 @@ test('durable Codex runner dispatches /pipelane orchestrate goal-spec', () => {
     assert.equal(prepareOutput, 'MANAGED:1:run orchestrate prepare --run-id orchestrate-20260617000000-deadbeef');
 
     const dispatchOutput = execFileSync(
-      path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      path.join(managedRuntimeRoot('codex'), 'bin', 'run-pipelane.sh'),
       ['pipelane', 'orchestrate', 'dispatch', '--run-id', 'orchestrate-20260617000000-deadbeef'],
       {
         cwd: repoRoot,
@@ -4212,7 +4231,7 @@ test('durable Codex runner dispatches /pipelane orchestrate goal-spec', () => {
     assert.equal(dispatchOutput, 'MANAGED:1:run orchestrate dispatch --run-id orchestrate-20260617000000-deadbeef');
 
     const startOutput = execFileSync(
-      path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      path.join(managedRuntimeRoot('codex'), 'bin', 'run-pipelane.sh'),
       ['pipelane', 'orchestrate', 'start', '--run-id', 'orchestrate-20260617000000-deadbeef', '--slice-id', 'demo-slice'],
       {
         cwd: repoRoot,
@@ -4284,15 +4303,15 @@ test('durable default command path does not write repo-local adapters in a Rocke
       'utf8',
     );
     const packageBefore = readFileSync(path.join(repoRoot, 'package.json'), 'utf8');
-    runCli(['install-codex'], repoRoot, { CODEX_HOME: codexHome });
+    runCli(['install-codex'], repoRoot, { CODEX_HOME: codexHome, PIPELANE_HOME: pipelaneHome });
     writeFileSync(
-      path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane'),
+      managedRuntimeBin('codex', pipelaneHome),
       `#!/bin/sh\nexec node "${CLI_PATH}" "$@"\n`,
       { mode: 0o755, encoding: 'utf8' },
     );
 
     const output = execFileSync(
-      path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh'),
+      path.join(managedRuntimeRoot('codex', pipelaneHome), 'bin', 'run-pipelane.sh'),
       ['status', '--json'],
       {
         cwd: repoRoot,
@@ -4323,15 +4342,15 @@ test('install-codex upgrades legacy machine-local wrapper skills in place', () =
     seedLegacyCodexWrappers(codexHome);
 
     const result = runCli(['install-codex'], workspaceRoot, { CODEX_HOME: codexHome });
-    assert.match(result.stdout, /Removed legacy machine-local wrapper skills: new, pr, resume/);
+    assert.match(result.stdout, /Removed legacy machine-local wrapper skills: \.pipelane, new, pr, resume/);
 
     assert.ok(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')));
     assert.ok(existsSync(path.join(codexHome, 'skills', 'resume', 'SKILL.md')));
     assert.ok(existsSync(path.join(codexHome, 'skills', 'pr', 'SKILL.md')));
     assert.match(readFileSync(path.join(codexHome, 'skills', 'new', 'SKILL.md'), 'utf8'), /pipelane:codex-global-skill:new/);
     assert.equal(existsSync(path.join(codexHome, 'skills', 'init-pipelane', 'SKILL.md')), false);
-    assert.ok(existsSync(path.join(codexHome, 'skills', '.pipelane', 'managed-skills.json')));
-    assert.ok(existsSync(path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh')));
+    assert.equal(existsSync(path.join(codexHome, 'skills', '.pipelane')), false);
+    assert.ok(existsSync(path.join(managedRuntimeRoot('codex'), 'bin', 'run-pipelane.sh')));
   } finally {
     rmSync(workspaceRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -4344,7 +4363,7 @@ test('setup preserves the durable machine-local Codex runtime runner', () => {
 
   try {
     runCli(['install-codex'], repoRoot, { CODEX_HOME: codexHome });
-    const runnerPath = path.join(codexHome, 'skills', '.pipelane', 'bin', 'run-pipelane.sh');
+    const runnerPath = path.join(managedRuntimeRoot('codex'), 'bin', 'run-pipelane.sh');
     assert.ok(existsSync(runnerPath));
 
     writePipelaneConfig(repoRoot, 'Demo App');
@@ -4450,14 +4469,15 @@ test('install-codex skips an unmanaged /orchestrate and points to /pipelane orch
 test('install-codex ignores unsafe managed manifest skill names instead of deleting outside skills root', () => {
   const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-install-codex-'));
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
   const outsideDir = path.join(codexHome, 'outside-skill');
   const outsideSkill = path.join(outsideDir, 'SKILL.md');
 
   try {
-    mkdirSync(path.join(codexHome, 'skills', '.pipelane'), { recursive: true });
+    mkdirSync(managedRuntimeRoot('codex', pipelaneHome), { recursive: true });
     mkdirSync(outsideDir, { recursive: true });
     writeFileSync(
-      path.join(codexHome, 'skills', '.pipelane', 'managed-skills.json'),
+      path.join(managedRuntimeRoot('codex', pipelaneHome), 'managed-skills.json'),
       `${JSON.stringify({ skills: ['../outside-skill'] }, null, 2)}\n`,
       'utf8',
     );
@@ -4467,7 +4487,7 @@ test('install-codex ignores unsafe managed manifest skill names instead of delet
       'utf8',
     );
 
-    runCli(['install-codex'], workspaceRoot, { CODEX_HOME: codexHome });
+    runCli(['install-codex'], workspaceRoot, { CODEX_HOME: codexHome, PIPELANE_HOME: pipelaneHome });
     assert.equal(
       readFileSync(outsideSkill, 'utf8'),
       '<!-- pipelane:codex-global-skill:new -->\nshould never be deleted\n',
@@ -4475,6 +4495,7 @@ test('install-codex ignores unsafe managed manifest skill names instead of delet
   } finally {
     rmSync(workspaceRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
   }
 });
 
@@ -6020,7 +6041,7 @@ test('orchestrate bare command previews an explicit plan without writing state',
     assert.equal(report.run.slices[0].id, 'entry-point');
     assert.ok(report.likelyPlanFiles.some((entry) => entry.path === 'docs/project-plan.md'));
     assert.match(report.message, /--analysis-file <path> --yes/);
-    assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'orchestrate')), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'orchestrate')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -6961,7 +6982,7 @@ test('review AI gate scrubs author session env from reviewer subprocess', () => 
       PIPELANE_REVIEW_PROVIDER: 'codex',
     }).stdout);
     const gate = result.gates.find((entry) => entry.gateId === 'gstack-review');
-    const reviewState = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'review-state.json'), 'utf8'));
+    const reviewState = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'review-state.json'), 'utf8'));
     const onDisk = reviewState.records.find((record) => record.id === result.runId);
 
     assert.equal(result.status, 'passed');
@@ -7489,7 +7510,7 @@ test('review fails read-only AI skill gate when command commits to HEAD', () => 
 
     assert.equal(cliResult.status, 1);
     assert.equal(result.status, 'failed');
-    const state = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'review-state.json'), 'utf8'));
+    const state = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'review-state.json'), 'utf8'));
     assert.equal(state.records[0].sha, startHead);
     assert.equal(result.gates[0].status, 'failed');
     assert.match(result.gates[0].summary, /changed HEAD/);
@@ -7828,7 +7849,7 @@ test('orchestration hardening: moving corrupt run outside active scan root unblo
     assert.equal(blocked.status, 1);
 
     const sourceDir = path.dirname(orchestrationLedgerPath(repoRoot, runId));
-    const abandonedDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'orchestrate', 'abandoned', runId);
+    const abandonedDir = path.join(sharedStateDir(repoRoot), 'orchestrate', 'abandoned', runId);
     mkdirSync(path.dirname(abandonedDir), { recursive: true });
     renameSync(sourceDir, abandonedDir);
 
@@ -7890,7 +7911,7 @@ test('orchestrate interactive setup suggests likely plan files and can cancel', 
     assert.match(result.stdout, /Orchestration setup/);
     assert.match(result.stdout, /docs\/implementation-plan\.md/);
     assert.match(result.stdout, /Orchestration cancelled\. No changes written\./);
-    assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'orchestrate')), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'orchestrate')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -7915,7 +7936,7 @@ test('orchestrate interactive start requires analysis before writing state', () 
     assert.match(result.stdout, /Plan analysis is required before orchestration can start/);
     assert.match(result.stdout, /--analysis-file <path> --yes/);
     assert.match(result.stdout, /Orchestration cancelled\. No changes written\./);
-    assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'orchestrate')), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'orchestrate')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -8270,7 +8291,7 @@ test('orchestrate analyze records plan analysis and prepare requires it for new 
     assert.equal(analyzed.run.planAnalysis.planReview.status, 'skipped');
     assert.equal(analyzed.run.observationIndex.latestObservationKind, 'plan_review_skipped');
 
-    const observations = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', analyzed.run.observationIndex.observationsPath), 'utf8'));
+    const observations = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), analyzed.run.observationIndex.observationsPath), 'utf8'));
     assert.equal(observations.schemaVersion, 1);
     assert.equal(observations.runId, planned.runId);
     assert.equal(observations.observations[0].kind, 'plan_review_skipped');
@@ -9473,7 +9494,7 @@ test('orchestrate plan blocks dirty parent source before creating a run', () => 
     assert.doesNotMatch(result.stderr, /\.pipelane\.json/);
     assert.match(result.stderr, /docs\/ARCHITECTURE\.md/);
     assert.doesNotMatch(result.stderr, /docs\/dirty-plan\.md/);
-    assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'orchestrate', 'runs')), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'orchestrate', 'runs')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -9505,7 +9526,7 @@ test('orchestrate --yes blocks dirty parent source before creating worktrees', (
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /dirty parent worktree/);
     assert.match(result.stderr, /src\/dirty-source\.ts/);
-    assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'orchestrate', 'runs')), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'orchestrate', 'runs')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -9536,7 +9557,7 @@ test('orchestrate prepare blocks parent source drift after planning', () => {
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /parent worktree changed after the run was planned/);
     assert.match(result.stderr, /src\/late-drift\.ts/);
-    assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks')), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'task-locks')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -10048,7 +10069,7 @@ test('orchestrate plan writes a durable slice ledger from a plan file', () => {
     const report = JSON.parse(result.stdout);
     const ledgerPath = report.ledgerPath;
     const onDisk = JSON.parse(readFileSync(ledgerPath, 'utf8'));
-    const installMarker = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'installed.json'), 'utf8'));
+    const installMarker = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'installed.json'), 'utf8'));
     const worktreeListAfter = run('git', ['worktree', 'list', '--porcelain'], repoRoot);
 
     assert.equal(report.command, 'orchestrate plan');
@@ -10098,7 +10119,7 @@ test('orchestrate plan writes a durable slice ledger from a plan file', () => {
     assert.equal(onDisk.slices[2].requestedFiles.some((entry) => entry.startsWith('.git')), false);
     assert.equal(onDisk.slices.every((slice) => slice.worktreePath === null && slice.branchName === null), true);
     assert.equal(worktreeListAfter, worktreeListBefore);
-    assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks')), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'task-locks')), false);
     assert.equal(installMarker.stateFiles.some((entry) => entry.endsWith('/orchestration.json')), true);
     assert.equal(onDisk.planAnalysisRequired, true);
     assert.match(report.message, /Next: run \/pipelane orchestrate analyze --run-id <run-id> --analysis-file <path> before prepare/);
@@ -10451,7 +10472,7 @@ test('orchestrate prepare creates durable slice worktrees from a planned ledger'
     assert.equal(onDisk.slices.every((slice) => existsSync(slice.worktreePath)), true);
     assert.match(prepared.message, /Next: run \/pipelane orchestrate dispatch --run-id <run-id>/);
 
-    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     for (const slice of onDisk.slices) {
       const lock = JSON.parse(readFileSync(path.join(stateDir, 'task-locks', `${slice.taskSlug}.json`), 'utf8'));
       assert.equal(lock.taskSlug, slice.taskSlug);
@@ -10683,7 +10704,7 @@ test('orchestrate dispatch rejects ledger-provided task slugs that could escape 
     const rejected = runCli(['run', 'orchestrate', 'dispatch', '--run-id', planned.runId], repoRoot, {}, true);
     assert.notEqual(rejected.status, 0);
     assert.match(rejected.stderr, /unsafe orchestration task slug/);
-    assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'orchestrate', 'runs', planned.runId, 'evil.md')), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'orchestrate', 'runs', planned.runId, 'evil.md')), false);
   } finally {
     for (const worktreePath of createdWorktrees) {
       rmSync(worktreePath, { recursive: true, force: true });
@@ -11626,8 +11647,12 @@ test('orchestrate review runs executable gates outside the orchestration mutatio
       "const fs = require('node:fs');",
       "const path = require('node:path');",
       "const cp = require('node:child_process');",
+      "const crypto = require('node:crypto');",
+      "const os = require('node:os');",
       "const common = cp.execFileSync('git', ['rev-parse', '--git-common-dir'], { encoding: 'utf8' }).trim();",
-      "const runsRoot = path.resolve(process.cwd(), common, 'pipelane-state', 'orchestrate', 'runs');",
+      "const commonDir = fs.realpathSync(path.resolve(process.cwd(), common));",
+      "const key = crypto.createHash('sha256').update(commonDir).digest('hex').slice(0, 24);",
+      "const runsRoot = path.join(process.env.PIPELANE_HOME || path.join(os.homedir(), '.pipelane'), 'repos', key, 'state', 'orchestrate', 'runs');",
       "const locks = [];",
       "if (fs.existsSync(runsRoot)) {",
       "  for (const runId of fs.readdirSync(runsRoot)) {",
@@ -11849,7 +11874,7 @@ test('orchestration PR next action advances to reviewed slices without PR record
     assert.equal(ledger.status, 'completed');
     assert.ok(active.every((slice) => slice.taskSlug && slice.worktreePath));
 
-    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     mkdirSync(stateDir, { recursive: true });
     writeFileSync(
       path.join(stateDir, 'pr-state.json'),
@@ -13828,7 +13853,7 @@ test('orchestrate prepare rejects ledger-assigned worktrees outside the task roo
     const rejected = runCli(['run', 'orchestrate', 'prepare', '--run-id', planned.runId], repoRoot, {}, true);
     assert.notEqual(rejected.status, 0);
     assert.match(rejected.stderr, /assigned worktree must stay under/);
-    assert.equal(existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', 'unsafe-ledger-assignment.json')), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'task-locks', 'unsafe-ledger-assignment.json')), false);
   } finally {
     rmSync(outsideDir, { recursive: true, force: true });
     rmSync(repoRoot, { recursive: true, force: true });
@@ -13865,7 +13890,7 @@ test('orchestrate prepare cleans up a created worktree when task-lock write fail
     const planned = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'Cleanup failed prepare workspace', '--json'], repoRoot).stdout);
     analyzePlannedRunForPrepare(repoRoot, planned);
     const worktreesBefore = run('git', ['worktree', 'list', '--porcelain'], repoRoot);
-    const taskLocksPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks');
+    const taskLocksPath = path.join(sharedStateDir(repoRoot), 'task-locks');
     rmSync(taskLocksPath, { recursive: true, force: true });
     writeFileSync(taskLocksPath, 'not a directory\n', 'utf8');
 
@@ -13918,7 +13943,7 @@ test('orchestrate prepare rejects an existing task lock that diverges from the l
     const prepared = preparePlannedRun(repoRoot, planned);
     createdWorktrees.push(...prepared.slices.map((slice) => slice.worktreePath));
     const taskSlug = prepared.run.slices[0].taskSlug;
-    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${taskSlug}.json`);
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', `${taskSlug}.json`);
     const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
     lock.branchName = 'codex/diverged-task-lock';
     writeFileSync(lockPath, JSON.stringify(lock, null, 2) + '\n', 'utf8');
@@ -14448,7 +14473,7 @@ test('review runner executes command gates and writes evidence', () => {
   try {
     const result = runCli(['run', 'review', '--phase', 'static', '--json'], repoRoot, npmShim.env);
     const report = JSON.parse(result.stdout);
-    const evidencePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'review-state.json');
+    const evidencePath = path.join(sharedStateDir(repoRoot), 'review-state.json');
 
     assert.equal(report.command, 'review');
     assert.equal(report.status, 'passed');
@@ -15192,7 +15217,7 @@ test('review runner fails unknown gate filters without writing evidence', () => 
   const repoRoot = createRepo();
   try {
     const result = runCli(['run', 'review', '--gate', 'does-not-exist', '--json'], repoRoot, {}, true);
-    const evidencePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'review-state.json');
+    const evidencePath = path.join(sharedStateDir(repoRoot), 'review-state.json');
 
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /No review gate matches --gate does-not-exist/);
@@ -15284,7 +15309,7 @@ test('review runner fails when a blocking command gate fails', () => {
 
     const result = runCli(['run', 'review', '--phase', 'static', '--json'], repoRoot, {}, true);
     const report = JSON.parse(result.stdout);
-    const evidencePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'review-state.json');
+    const evidencePath = path.join(sharedStateDir(repoRoot), 'review-state.json');
     const typecheckGate = report.gates.find((gate) => gate.gateId === 'typecheck');
 
     assert.notEqual(result.status, 0);
@@ -15322,7 +15347,7 @@ test('review runner fails when a command gate commits to HEAD', () => {
     const result = runCli(['run', 'review', '--phase', 'static', '--json'], repoRoot, {}, true);
     const report = JSON.parse(result.stdout);
     const gate = report.gates.find((entry) => entry.gateId === 'typecheck');
-    const state = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'review-state.json'), 'utf8'));
+    const state = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'review-state.json'), 'utf8'));
 
     assert.notEqual(result.status, 0);
     assert.equal(report.status, 'failed');
@@ -15615,8 +15640,12 @@ test('review command gate acquires and releases the worktree command-gate lock',
       "const fs = require('node:fs');",
       "const path = require('node:path');",
       "const cp = require('node:child_process');",
+      "const crypto = require('node:crypto');",
+      "const os = require('node:os');",
       "const common = cp.execFileSync('git', ['rev-parse', '--git-common-dir'], { encoding: 'utf8' }).trim();",
-      "const root = path.resolve(process.cwd(), common, 'pipelane-state', 'review-gates', 'command-gate-locks');",
+      "const commonDir = fs.realpathSync(path.resolve(process.cwd(), common));",
+      "const key = crypto.createHash('sha256').update(commonDir).digest('hex').slice(0, 24);",
+      "const root = path.join(process.env.PIPELANE_HOME || path.join(os.homedir(), '.pipelane'), 'repos', key, 'state', 'review-gates', 'command-gate-locks');",
       "const locks = fs.existsSync(root) ? fs.readdirSync(root).filter((entry) => entry.endsWith('.lock')) : [];",
       "if (locks.length !== 1) { console.error(`locks=${locks.length}`); process.exit(8); }",
       "console.log('lock seen');",
@@ -16259,14 +16288,14 @@ test('patchReadableWorkflowConfig materializes machine-local config when it is m
     const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
     assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
     const { configPath, isLegacy } = stateMod.patchReadableWorkflowConfig(repoRoot, (raw) => {
-      return { ...raw, smoke: { staging: { command: 'npm run smoke:staging' } } };
+      return { ...raw, surfacePathMap: { frontend: ['src/app/'] } };
     });
     assert.equal(isLegacy, false);
     assert.equal(configPath, machinePipelaneConfigPath(repoRoot));
     assert.equal(existsSync(configPath), true);
     assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
     const written = JSON.parse(readFileSync(configPath, 'utf8'));
-    assert.equal(written.smoke.staging.command, 'npm run smoke:staging');
+    assert.deepEqual(written.surfacePathMap.frontend, ['src/app/']);
     // The materialized file carries the synthesized defaults alongside
     // the patched slice so subsequent loads see a full config.
     assert.equal(written.displayName, 'sample-repo');
@@ -16483,7 +16512,7 @@ test('repo-guard replacement lock clears checkout-local transient state', () => 
     writePipelaneConfig(repoRoot, 'Demo App');
     commitAll(repoRoot, 'Adopt workflow-kit');
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Guarded Rebind', '--json'], repoRoot).stdout);
-    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`);
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`);
     const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
     const bindingHistory = [{
       reboundAt: '2026-04-25T00:00:00.000Z',
@@ -16497,7 +16526,6 @@ test('repo-guard replacement lock clears checkout-local transient state', () => 
     writeFileSync(lockPath, `${JSON.stringify({
       ...lock,
       nextAction: 'stale next action from the old checkout',
-      promotedWithoutStagingSmoke: true,
       bindingHistory,
     }, null, 2)}\n`, 'utf8');
 
@@ -16509,7 +16537,6 @@ test('repo-guard replacement lock clears checkout-local transient state', () => 
     assert.equal(updated.branchName, guarded.lock.branchName);
     assert.equal(updated.worktreePath, guarded.lock.worktreePath);
     assert.equal(updated.nextAction, undefined);
-    assert.equal(updated.promotedWithoutStagingSmoke, undefined);
     assert.deepEqual(updated.bindingHistory, bindingHistory);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -16683,6 +16710,7 @@ test('managed update bootstraps worktree node_modules without re-execing stale l
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     execFileSync('git', ['push'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    installCodexRuntimeForUpdateTest(repoRoot, { codexHome, pipelaneHome, sourceSha: sha });
 
     mkdirSync(path.join(repoRoot, 'node_modules', '.bin'), { recursive: true });
     writeFileSync(
@@ -16731,13 +16759,13 @@ test('managed update bootstraps worktree node_modules without re-execing stale l
   }
 });
 
-test('explicit update from a symlinked worktree installs in the task worktree', () => {
+test('explicit update from a symlinked worktree refreshes the managed runtime without touching worktree deps', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-bin-'));
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
   const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
   const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
-  const npmInstallLog = path.join(repoRoot, 'explicit-update-install.log');
+  const npxInstallLog = path.join(repoRoot, 'explicit-update-install.log');
   const oldSha = '1111111111111111111111111111111111111111';
   const newSha = '2222222222222222222222222222222222222222';
   try {
@@ -16752,13 +16780,14 @@ test('explicit update from a symlinked worktree installs in the task worktree', 
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     execFileSync('git', ['push'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    installCodexRuntimeForUpdateTest(repoRoot, { codexHome, pipelaneHome, sourceSha: oldSha });
 
     const worktreePath = path.join(repoRoot, '.claude', 'worktrees', 'explicit-update-symlink');
     execFileSync('git', ['worktree', 'add', worktreePath, '-b', 'explicit-update-symlink'], {
       cwd: repoRoot,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    makeFakeUpdateBin(binDir, { latestSha: newSha, npmMarkerPath: npmInstallLog });
+    makeFakeUpdateBin(binDir, { latestSha: newSha, npxMarkerPath: npxInstallLog });
 
     const result = spawnSync('node', [CLI_PATH, 'update'], {
       cwd: worktreePath,
@@ -16777,16 +16806,16 @@ test('explicit update from a symlinked worktree installs in the task worktree', 
 
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stderr, /\[pipelane\] Linked node_modules/);
-    assert.match(result.stdout, /Replaced symlinked node_modules with a local directory/);
     assert.match(result.stdout, /Upgrade complete/);
-    assert.match(readFileSync(npmInstallLog, 'utf8'), new RegExp(`#${newSha}`));
-    assert.equal(lstatSync(path.join(worktreePath, 'node_modules')).isSymbolicLink(), false);
-    assert.equal(statSync(path.join(worktreePath, 'node_modules')).isDirectory(), true);
-    assert.ok(existsSync(path.join(worktreePath, 'node_modules', 'pipelane', 'package.json')));
+    assert.match(readFileSync(npxInstallLog, 'utf8'), /install-codex/);
+    assert.equal(lstatSync(path.join(worktreePath, 'node_modules')).isSymbolicLink(), true);
+    assert.equal(realpathSync(path.join(worktreePath, 'node_modules')), realpathSync(path.join(repoRoot, 'node_modules')));
     const sharedLock = JSON.parse(readFileSync(path.join(repoRoot, 'package-lock.json'), 'utf8'));
     const worktreeLock = JSON.parse(readFileSync(path.join(worktreePath, 'package-lock.json'), 'utf8'));
     assert.equal(sharedLock.packages['node_modules/pipelane'].resolved.endsWith(`#${oldSha}`), true);
-    assert.equal(worktreeLock.packages['node_modules/pipelane'].resolved.endsWith(`#${newSha}`), true);
+    assert.equal(worktreeLock.packages['node_modules/pipelane'].resolved.endsWith(`#${oldSha}`), true);
+    const metadata = JSON.parse(readFileSync(path.join(managedRuntimeRoot('codex', pipelaneHome), '.pipelane-runtime.json'), 'utf8'));
+    assert.equal(metadata.sourceSha, newSha);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -16797,13 +16826,13 @@ test('explicit update from a symlinked worktree installs in the task worktree', 
   }
 });
 
-test('explicit update restores symlinked worktree node_modules when npm install fails', () => {
+test('explicit update preserves symlinked worktree node_modules when managed runtime install fails', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-bin-'));
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
   const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
   const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
-  const npmInstallLog = path.join(repoRoot, 'explicit-update-failed-install.log');
+  const npxInstallLog = path.join(repoRoot, 'explicit-update-failed-install.log');
   const oldSha = '1111111111111111111111111111111111111111';
   const newSha = '2222222222222222222222222222222222222222';
   try {
@@ -16818,13 +16847,14 @@ test('explicit update restores symlinked worktree node_modules when npm install 
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     execFileSync('git', ['push'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    installCodexRuntimeForUpdateTest(repoRoot, { codexHome, pipelaneHome, sourceSha: oldSha });
 
     const worktreePath = path.join(repoRoot, '.claude', 'worktrees', 'explicit-update-fails-symlink');
     execFileSync('git', ['worktree', 'add', worktreePath, '-b', 'explicit-update-fails-symlink'], {
       cwd: repoRoot,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    makeFakeUpdateBin(binDir, { latestSha: newSha, npmMarkerPath: npmInstallLog, npmExitCode: 42 });
+    makeFakeUpdateBin(binDir, { latestSha: newSha, npxMarkerPath: npxInstallLog, npxExitCode: 42 });
 
     const result = spawnSync('node', [CLI_PATH, 'update'], {
       cwd: worktreePath,
@@ -16843,8 +16873,8 @@ test('explicit update restores symlinked worktree node_modules when npm install 
 
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /\[pipelane\] Linked node_modules/);
-    assert.match(result.stderr, /simulated npm install failure/);
-    assert.match(readFileSync(npmInstallLog, 'utf8'), new RegExp(`#${newSha}`));
+    assert.match(result.stderr, /simulated managed runtime install failure/);
+    assert.match(readFileSync(npxInstallLog, 'utf8'), /install-codex/);
     const linkedNodeModules = path.join(worktreePath, 'node_modules');
     assert.equal(lstatSync(linkedNodeModules).isSymbolicLink(), true);
     assert.equal(realpathSync(linkedNodeModules), realpathSync(path.join(repoRoot, 'node_modules')));
@@ -16902,7 +16932,7 @@ test('release enable scaffolds Deploy Configuration and status reports incomplet
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
     const enabled = JSON.parse(runCli(['run', 'release', 'enable', '--json'], repoRoot).stdout);
-    const deployConfigPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'deploy-config.json');
+    const deployConfigPath = path.join(sharedStateDir(repoRoot), 'deploy-config.json');
     assert.equal(enabled.enabled, true);
     assert.equal(enabled.configured, false);
     assert.equal(realpathSync(enabled.configPath), realpathSync(deployConfigPath));
@@ -17080,19 +17110,17 @@ function resolveCommonDir(repoRoot) {
   return path.resolve(repoRoot, run('git', ['rev-parse', '--git-common-dir'], repoRoot));
 }
 
-function sharedStateDir(repoRoot) {
-  let stateDir = 'pipelane-state';
-  const configPath = machinePipelaneConfigPath(repoRoot);
-  if (existsSync(configPath)) {
-    try {
-      const config = JSON.parse(readFileSync(configPath, 'utf8'));
-      if (typeof config.stateDir === 'string' && config.stateDir.trim()) {
-        stateDir = config.stateDir.trim();
-      }
-    } catch {
-      // Malformed machine config tests exercise command behavior, not helper setup.
-    }
-  }
+function machineRepoDirForCommonDir(commonDir, pipelaneHome = process.env.PIPELANE_HOME || path.join(os.homedir(), '.pipelane')) {
+  const canonical = realpathSync(commonDir);
+  const key = createHash('sha256').update(canonical).digest('hex').slice(0, 24);
+  return path.join(pipelaneHome, 'repos', key);
+}
+
+function sharedStateDir(repoRoot, pipelaneHome = process.env.PIPELANE_HOME || path.join(os.homedir(), '.pipelane')) {
+  return path.join(machineRepoDirForCommonDir(resolveCommonDir(repoRoot), pipelaneHome), 'state');
+}
+
+function legacyRepoStateDir(repoRoot, stateDir = 'pipelane-state') {
   return path.join(resolveCommonDir(repoRoot), stateDir);
 }
 
@@ -17107,7 +17135,7 @@ function readSharedDeployConfig(repoRoot) {
 }
 
 function reviewCommandGateLocksRoot(repoRoot) {
-  return path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'review-gates', 'command-gate-locks');
+  return path.join(sharedStateDir(repoRoot), 'review-gates', 'command-gate-locks');
 }
 
 function reviewCommandGateLockPath(repoRoot) {
@@ -17144,16 +17172,16 @@ function listReviewCommandGateLocks(repoRoot) {
   return readdirSync(root).filter((entry) => entry.endsWith('.lock'));
 }
 
-function orchestrationRunsRoot(repoRoot) {
-  return path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'orchestrate', 'runs');
+function orchestrationRunsRoot(repoRoot, pipelaneHome = process.env.PIPELANE_HOME || path.join(os.homedir(), '.pipelane')) {
+  return path.join(sharedStateDir(repoRoot, pipelaneHome), 'orchestrate', 'runs');
 }
 
-function orchestrationLedgerPath(repoRoot, runId) {
-  return path.join(orchestrationRunsRoot(repoRoot), runId, 'orchestration.json');
+function orchestrationLedgerPath(repoRoot, runId, pipelaneHome = process.env.PIPELANE_HOME || path.join(os.homedir(), '.pipelane')) {
+  return path.join(orchestrationRunsRoot(repoRoot, pipelaneHome), runId, 'orchestration.json');
 }
 
-function orchestrationIntegrityHeadPath(repoRoot, runId) {
-  return path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'orchestrate', 'integrity', `${runId}.json`);
+function orchestrationIntegrityHeadPath(repoRoot, runId, pipelaneHome = process.env.PIPELANE_HOME || path.join(os.homedir(), '.pipelane')) {
+  return path.join(sharedStateDir(repoRoot, pipelaneHome), 'orchestrate', 'integrity', `${runId}.json`);
 }
 
 function persistedOrchestrationStateKeyPath(pipelaneHome) {
@@ -17173,15 +17201,15 @@ function signIntegrityHeadForTest(head, key) {
   return signPayloadForTest(head, key);
 }
 
-function assertSignedLedgerValid(repoRoot, runId, key = DEFAULT_ORCHESTRATION_STATE_KEY) {
-  const ledger = JSON.parse(readFileSync(orchestrationLedgerPath(repoRoot, runId), 'utf8'));
+function assertSignedLedgerValid(repoRoot, runId, key = DEFAULT_ORCHESTRATION_STATE_KEY, options = {}) {
+  const ledger = JSON.parse(readFileSync(orchestrationLedgerPath(repoRoot, runId, options.pipelaneHome), 'utf8'));
   assert.match(ledger.signature, /^[a-f0-9]{64}$/);
   assert.equal(ledger.integrity.version, 1);
   assert.equal(ledger.integrity.runId, runId);
   assert.equal(ledger.integrity.keyFingerprint, orchestrationKeyFingerprintForTest(key));
   assert.equal(ledger.signature, signPayloadForTest(ledger, key));
 
-  const head = JSON.parse(readFileSync(orchestrationIntegrityHeadPath(repoRoot, runId), 'utf8'));
+  const head = JSON.parse(readFileSync(orchestrationIntegrityHeadPath(repoRoot, runId, options.pipelaneHome), 'utf8'));
   assert.equal(head.version, 1);
   assert.equal(head.runId, runId);
   assert.equal(head.mutationIndex, ledger.integrity.mutationIndex);
@@ -17295,7 +17323,7 @@ test('orchestration state key validation persists missing env keys and distingui
     }).stdout);
     const generatedKey = readFileSync(persistedOrchestrationStateKeyPath(pipelaneHome), 'utf8').trim();
     assert.ok(generatedKey.length >= 32);
-    assertSignedLedgerValid(repoRoot, generated.runId, generatedKey);
+    assertSignedLedgerValid(repoRoot, generated.runId, generatedKey, { pipelaneHome });
 
     const blank = runCli(['run', 'orchestrate', 'plan', '--outcome', 'blank key'], repoRoot, {
       PIPELANE_ORCHESTRATION_STATE_KEY: '   ',
@@ -17330,8 +17358,9 @@ test('orchestrate analyze creates a fresh run when prior signed ledgers need a d
     const oldKey = 'old-orchestration-state-key-000000000000';
     const old = JSON.parse(runCli(['run', 'orchestrate', 'plan', '--outcome', 'old signed run', '--json'], repoRoot, {
       PIPELANE_ORCHESTRATION_STATE_KEY: oldKey,
+      PIPELANE_HOME: pipelaneHome,
     }).stdout);
-    assertSignedLedgerValid(repoRoot, old.runId, oldKey);
+    assertSignedLedgerValid(repoRoot, old.runId, oldKey, { pipelaneHome });
 
     mkdirSync(path.join(repoRoot, 'docs'), { recursive: true });
     const planText = ['# Fresh Key Plan', '', '## Slice 1', '- Touch src/index.js'].join('\n') + '\n';
@@ -17350,7 +17379,7 @@ test('orchestrate analyze creates a fresh run when prior signed ledgers need a d
     assert.notEqual(analyzed.runId, old.runId);
     assert.match(analyzed.message, /Ignored signed orchestration ledger unreadable with the current PIPELANE_ORCHESTRATION_STATE_KEY/);
     const generatedKey = readFileSync(persistedOrchestrationStateKeyPath(pipelaneHome), 'utf8').trim();
-    assertSignedLedgerValid(repoRoot, analyzed.runId, generatedKey);
+    assertSignedLedgerValid(repoRoot, analyzed.runId, generatedKey, { pipelaneHome });
 
     const oldOutline = runCli(['run', 'orchestrate', 'outline', '--run-id', old.runId], repoRoot, {
       PIPELANE_ORCHESTRATION_STATE_KEY: undefined,
@@ -17632,10 +17661,11 @@ test('orchestration workers never receive orchestration key, even when allowlist
       const signingKey = Object.hasOwn(extraEnv, 'PIPELANE_ORCHESTRATION_STATE_KEY') && extraEnv.PIPELANE_ORCHESTRATION_STATE_KEY === undefined
         ? readFileSync(persistedOrchestrationStateKeyPath(extraEnv.PIPELANE_HOME ?? DEFAULT_PIPELANE_HOME), 'utf8').trim()
         : key;
+      const signingHome = extraEnv.PIPELANE_HOME ?? DEFAULT_PIPELANE_HOME;
       assert.doesNotMatch(startResult.stdout, new RegExp(signingKey));
       assert.doesNotMatch(startResult.stderr, new RegExp(signingKey));
-      assert.doesNotMatch(readFileSync(orchestrationLedgerPath(repoRoot, planned.runId), 'utf8'), new RegExp(signingKey));
-      assertSignedLedgerValid(repoRoot, planned.runId, signingKey);
+      assert.doesNotMatch(readFileSync(orchestrationLedgerPath(repoRoot, planned.runId, signingHome), 'utf8'), new RegExp(signingKey));
+      assertSignedLedgerValid(repoRoot, planned.runId, signingKey, { pipelaneHome: signingHome });
     };
 
     runAndCheck('worker key stripped normally');
@@ -17739,12 +17769,8 @@ test('orchestration concurrent mutations serialize under the run lock without lo
   }
 });
 
-function resolveSharedSmokeStateRoot(repoRoot) {
-  return path.join(machineRepoDir(repoRoot), 'smoke-runtime');
-}
-
 function writeTaskLock(repoRoot, taskSlug = 'bootstrap', options = {}) {
-  const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks');
+  const stateDir = path.join(sharedStateDir(repoRoot), 'task-locks');
   mkdirSync(stateDir, { recursive: true });
   writeFileSync(
     path.join(stateDir, `${taskSlug}.json`),
@@ -17761,7 +17787,7 @@ function writeTaskLock(repoRoot, taskSlug = 'bootstrap', options = {}) {
 }
 
 function writePrRecord(repoRoot, taskSlug, mergedSha) {
-  const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+  const stateDir = path.join(sharedStateDir(repoRoot));
   mkdirSync(stateDir, { recursive: true });
   writeFileSync(
     path.join(stateDir, 'pr-state.json'),
@@ -17770,7 +17796,7 @@ function writePrRecord(repoRoot, taskSlug, mergedSha) {
         [taskSlug]: {
           taskSlug,
           branchName: run('git', ['branch', '--show-current'], repoRoot),
-          title: 'Smoke gate test',
+          title: 'Deploy gate test',
           mergedSha,
           mergedAt: '2026-04-22T00:00:00Z',
           updatedAt: '2026-04-22T00:00:00Z',
@@ -17782,7 +17808,7 @@ function writePrRecord(repoRoot, taskSlug, mergedSha) {
 }
 
 function upsertPrRecord(repoRoot, taskSlug, mergedSha, options = {}) {
-  const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+  const stateDir = path.join(sharedStateDir(repoRoot));
   mkdirSync(stateDir, { recursive: true });
   const targetPath = path.join(stateDir, 'pr-state.json');
   const state = existsSync(targetPath)
@@ -17791,7 +17817,7 @@ function upsertPrRecord(repoRoot, taskSlug, mergedSha, options = {}) {
   state.records[taskSlug] = {
     taskSlug,
     branchName: options.branchName || run('git', ['branch', '--show-current'], repoRoot),
-    title: options.title || 'Smoke gate test',
+    title: options.title || 'Deploy gate test',
     number: options.number ?? 1,
     url: options.url || `https://example.test/pr/${options.number ?? 1}`,
     mergedSha,
@@ -17911,7 +17937,7 @@ function appendDeployRecord(repoRoot, record) {
 }
 
 function readRouteSafetyState(repoRoot) {
-  const statePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'route-safety-state.json');
+  const statePath = path.join(sharedStateDir(repoRoot), 'route-safety-state.json');
   return existsSync(statePath)
     ? JSON.parse(readFileSync(statePath, 'utf8'))
     : { routes: {} };
@@ -17963,7 +17989,7 @@ async function createVerifiedAutoCleanCandidate(repoRoot, taskName, taskSlug, op
   const mergedSha = options.mergedSha || run('git', ['rev-parse', 'HEAD'], repoRoot);
   writePrRecord(repoRoot, taskSlug, mergedSha);
 
-  const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+  const stateDir = path.join(sharedStateDir(repoRoot));
   const lockPath = path.join(stateDir, 'task-locks', `${taskSlug}.json`);
   const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
   await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, options.deploySurfaces || lock.surfaces, { taskSlug });
@@ -17983,7 +18009,7 @@ async function createVerifiedAutoCleanCandidate(repoRoot, taskName, taskSlug, op
 }
 
 async function writeStagingSucceededRecord(repoRoot, surfaces, options = {}) {
-  const stateDir = path.join(repoRoot, '.git', 'pipelane-state');
+  const stateDir = path.join(sharedStateDir(repoRoot));
   mkdirSync(stateDir, { recursive: true });
   const fingerprint = await fingerprintForFullConfig();
   const verificationBySurface = Object.fromEntries(surfaces.map((s) => [
@@ -18020,7 +18046,7 @@ async function writeStagingSucceededRecord(repoRoot, surfaces, options = {}) {
 }
 
 function writeStagingRequestedRecord(repoRoot, surfaces, options = {}) {
-  const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+  const stateDir = path.join(sharedStateDir(repoRoot));
   mkdirSync(stateDir, { recursive: true });
   writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({
     records: [{
@@ -18040,7 +18066,7 @@ function writeStagingRequestedRecord(repoRoot, surfaces, options = {}) {
 }
 
 function writeHealthyProbeState(repoRoot, surfaces) {
-  const stateDir = path.join(repoRoot, '.git', 'pipelane-state');
+  const stateDir = path.join(sharedStateDir(repoRoot));
   mkdirSync(stateDir, { recursive: true });
   const probedAt = new Date().toISOString();
   const records = surfaces.map((surface) => ({
@@ -18060,7 +18086,7 @@ function writeHealthyProbeState(repoRoot, surfaces) {
 }
 
 function writeProbeState(repoRoot, records, updatedAt = records.at(-1)?.probedAt ?? '') {
-  const stateDir = path.join(repoRoot, '.git', 'pipelane-state');
+  const stateDir = path.join(sharedStateDir(repoRoot));
   mkdirSync(stateDir, { recursive: true });
   writeFileSync(
     path.join(stateDir, 'probe-state.json'),
@@ -18260,7 +18286,7 @@ test('release-check gives mixed wait-and-rerun guidance for pending plus retryab
     writePipelaneConfig(repoRoot, 'Demo App');
     runCli(['setup'], repoRoot);
     writeFullDeployConfigState(repoRoot);
-    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     mkdirSync(stateDir, { recursive: true });
     const requestedAt = new Date().toISOString();
     writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({
@@ -18334,7 +18360,7 @@ test('release-check treats malformed deploy-state shapes as empty history instea
     writePipelaneConfig(repoRoot, 'Demo App');
     runCli(['setup'], repoRoot);
     writeFullDeployConfigState(repoRoot);
-    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     mkdirSync(stateDir, { recursive: true });
     writeHealthyProbeState(repoRoot, ['frontend']);
 
@@ -18358,7 +18384,7 @@ test('release-check skips malformed deploy record entries and sanitizes malforme
     runCli(['setup'], repoRoot);
     writeFullDeployConfigState(repoRoot);
     const fingerprint = await fingerprintForFullConfig();
-    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     mkdirSync(stateDir, { recursive: true });
     writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({
       records: [
@@ -18422,7 +18448,7 @@ test('release-check: a later staging failure re-blocks a previously-succeeded su
     writeFullDeployConfigState(repoRoot);
     const fingerprint = await fingerprintForFullConfig();
 
-    const stateDir = path.join(repoRoot, '.git', 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     mkdirSync(stateDir, { recursive: true });
     // Records are ordered oldest → newest. A fresh succeeded deploy
     // followed by a failed re-deploy of the same surface must re-block.
@@ -18471,7 +18497,7 @@ test('release-check rejects staging success records without verifiedAt', () => {
     runCli(['setup'], repoRoot);
     writeFullDeployConfigState(repoRoot);
 
-    const stateDir = path.join(repoRoot, '.git', 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     mkdirSync(stateDir, { recursive: true });
     // Hand-forged record with status:'succeeded' but no verifiedAt and no
     // verification block. handleDeploy never produces this shape; only a
@@ -18696,7 +18722,7 @@ test('release-check: an attacker-planted unsigned failed record is invisible whe
       failureReason: 'attacker plant',
       idempotencyKey: 'plant-1',
     };
-    const stateDir = path.join(repoRoot, '.git', 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     mkdirSync(stateDir, { recursive: true });
     writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({
       records: [goodSigned, plantedFailure],
@@ -18746,7 +18772,7 @@ test('release-check accepts HMAC-signed records when PIPELANE_DEPLOY_STATE_KEY i
       triggeredBy: 'test',
     };
     const signed = { ...record, signature: mod.signDeployRecord(record, key) };
-    const stateDir = path.join(repoRoot, '.git', 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     mkdirSync(stateDir, { recursive: true });
     writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({ records: [signed] }, null, 2), 'utf8');
     writeHealthyProbeState(repoRoot, ['frontend', 'edge', 'sql']);
@@ -18829,7 +18855,7 @@ test('release-check: legacy aggregate verification only credits frontend', async
     // Legacy-style record: no verificationBySurface, only the aggregate
     // verification block. Surfaces ['frontend','edge','sql'] — under the
     // new gate edge/sql lack their own probe results and must block.
-    const stateDir = path.join(repoRoot, '.git', 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     mkdirSync(stateDir, { recursive: true });
     writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({
       records: [{
@@ -18866,7 +18892,7 @@ test('release-check does not count failed staging records as observed success', 
     runCli(['setup'], repoRoot);
     writeFullDeployConfigState(repoRoot);
 
-    const stateDir = path.join(repoRoot, '.git', 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     mkdirSync(stateDir, { recursive: true });
     writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({
       records: [{
@@ -19399,7 +19425,7 @@ test('merge can explicitly override missing review evidence with a reason', () =
       '--json',
     ], created.worktreePath, env);
 
-    const evidencePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'review-state.json');
+    const evidencePath = path.join(sharedStateDir(repoRoot), 'review-state.json');
     writeFileSync(evidencePath, `${JSON.stringify({ schemaVersion: 1, records: [] }, null, 2)}\n`, 'utf8');
     const blocked = runCli(['run', 'merge', '--json'], created.worktreePath, env, true);
     assert.equal(blocked.status, 1);
@@ -19766,7 +19792,7 @@ test('pr can explicitly override missing review evidence with a reason', () => {
     assert.equal(result.status, 0);
     assert.match(payload.message, /review gate override accepted: external review gates already passed/);
     assert.match(payload.url, /example\.test\/pr/);
-    const reviewState = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'review-state.json'), 'utf8'));
+    const reviewState = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'review-state.json'), 'utf8'));
     assert.equal(reviewState.overrides.length, 1);
     assert.equal(reviewState.overrides[0].command, '/pr');
     assert.equal(reviewState.overrides[0].reason, 'external review gates already passed');
@@ -20851,7 +20877,7 @@ test('route safety pending review stop exits non-zero', () => {
     writePipelaneConfig(repoRoot, 'Demo App');
     const ageRouteSafetyState = [
       'const fs = require("node:fs");',
-      'const statePath = ".git/pipelane-state/route-safety-state.json";',
+      `const statePath = ${JSON.stringify(path.join(sharedStateDir(repoRoot), 'route-safety-state.json'))};`,
       'const state = JSON.parse(fs.readFileSync(statePath, "utf8"));',
       'for (const route of Object.values(state.routes || {})) route.firstStartedAt = "2000-01-01T00:00:00.000Z";',
       'fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\\n");',
@@ -21109,7 +21135,7 @@ test('pr blocked by release mode reports in-flight staging deploy details before
     });
     commitAll(repoRoot, 'Adopt pipelane');
 
-    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     mkdirSync(stateDir, { recursive: true });
     writeFileSync(path.join(stateDir, 'mode-state.json'), JSON.stringify({
       mode: 'release',
@@ -21178,7 +21204,7 @@ test('lockless PR branch can report, merge by PR number, and deploy the merged P
     const opened = JSON.parse(runCli(['run', 'pr', '--title', 'Canvas Selection Arrows', '--json'], created.worktreePath, env).stdout);
     assert.equal(opened.taskSlug, 'canvas-selection-arrows');
 
-    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`);
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`);
     rmSync(lockPath, { force: true });
 
     const reported = JSON.parse(runCli(['run', 'pr', '--json'], created.worktreePath, env).stdout);
@@ -21214,7 +21240,7 @@ test('lockless PR branch can report, merge by PR number, and deploy the merged P
     assert.equal(deployed.status, 'succeeded');
     assert.equal(existsSync(lockPath), false, 'lockless deploy must not recreate the task lock');
 
-    const prState = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'pr-state.json'), 'utf8'));
+    const prState = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'pr-state.json'), 'utf8'));
     assert.equal(prState.records['canvas-selection-arrows'].number, 1);
     assert.equal(prState.records['canvas-selection-arrows'].mergedSha, 'deadbeefcafebabe');
 
@@ -21273,7 +21299,7 @@ test('merge blocks when the remote PR head no longer matches reviewed evidence',
     assert.match(blocked.stderr, /\/merge blocked because review gate evidence is not ready/);
     assert.match(blocked.stderr, /different worktree state/);
 
-    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`);
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`);
     rmSync(lockPath, { force: true });
     const locklessBlocked = runCli(['run', 'merge', '--pr', '1', '--json'], repoRoot, env, true);
     assert.equal(locklessBlocked.status, 1);
@@ -21384,10 +21410,10 @@ test('pr can create a new PR from a manual task branch without a task lock', () 
     assert.equal(opened.branchName, 'task/fix-priority-sorting-e0ed');
     assert.match(opened.url, /example\.test\/pr\/1/);
 
-    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', 'fix-priority-sorting.json');
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', 'fix-priority-sorting.json');
     assert.equal(existsSync(lockPath), false, 'lockless /pr must not create a task lock for a manual branch');
 
-    const prState = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'pr-state.json'), 'utf8'));
+    const prState = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'pr-state.json'), 'utf8'));
     assert.equal(prState.records['fix-priority-sorting'].number, 1);
     assert.equal(prState.records['fix-priority-sorting'].branchName, 'task/fix-priority-sorting-e0ed');
   } finally {
@@ -21616,7 +21642,7 @@ test('merge treats empty configured surfaces as no-deploy build delivery', () =>
     assert.match(merged.message, /Merge to the base branch is the delivery step/);
     assert.match(merged.message, /Next: run \/clean --apply --task no-deploy/);
 
-    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', 'no-deploy.json');
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', 'no-deploy.json');
     const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
     assert.match(lock.nextAction, /no deploy surfaces configured/);
     assert.match(lock.nextAction, /\/clean --apply --task no-deploy/);
@@ -21752,7 +21778,7 @@ test('deploy reconciles a completed requested workflow run before blocking retri
     const requested = JSON.parse(runCli(['run', 'deploy', 'staging', '--async', '--json'], created.worktreePath, env).stdout);
     assert.equal(requested.status, 'requested');
 
-    const deployStatePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'deploy-state.json');
+    const deployStatePath = path.join(sharedStateDir(repoRoot), 'deploy-state.json');
     const deployState = JSON.parse(readFileSync(deployStatePath, 'utf8'));
     const pending = deployState.records.at(-1);
     assert.equal(pending.status, 'requested');
@@ -21850,7 +21876,7 @@ test('deploy fails closed when healthcheck returns non-2xx', () => {
     assert.equal(failed.status, 1);
     assert.match(failed.stderr, /healthcheck returned HTTP 503/);
 
-    const stateFile = path.join(repoRoot, '.git', 'pipelane-state', 'deploy-state.json');
+    const stateFile = path.join(sharedStateDir(repoRoot), 'deploy-state.json');
     const deployState = JSON.parse(readFileSync(stateFile, 'utf8'));
     const latest = deployState.records.at(-1);
     assert.equal(latest.status, 'failed');
@@ -21885,7 +21911,7 @@ test('release-mode deploy staging can retry after the latest staging record fail
     const sha = run('git', ['rev-parse', 'HEAD'], repoRoot);
     writeTaskLock(repoRoot, 'retry-staging', { mode: 'release', surfaces: ['frontend'] });
     writePrRecord(repoRoot, 'retry-staging', sha);
-    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     writeFileSync(path.join(stateDir, 'mode-state.json'), JSON.stringify({
       mode: 'release',
       requestedSurfaces: ['frontend'],
@@ -22000,7 +22026,7 @@ test('build-mode deploy prod skips cleanly when no surfaces are configured', () 
     assert.match(deployed.message, /Next: run \/clean --apply --task no-deploy-target/);
 
     const lock = JSON.parse(readFileSync(
-      path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', 'no-deploy-target.json'),
+      path.join(sharedStateDir(repoRoot), 'task-locks', 'no-deploy-target.json'),
       'utf8',
     ));
     assert.match(lock.nextAction, /no deploy surfaces configured/);
@@ -22226,7 +22252,7 @@ test('no-surface deploy of an unmerged SHA does not mark delivery complete', () 
     assert.doesNotMatch(deployed.message, /\/clean --apply --task unmerged-no-deploy/);
 
     const lock = JSON.parse(readFileSync(
-      path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', 'unmerged-no-deploy.json'),
+      path.join(sharedStateDir(repoRoot), 'task-locks', 'unmerged-no-deploy.json'),
       'utf8',
     ));
     assert.match(lock.nextAction, /run \/merge before cleanup/);
@@ -22950,7 +22976,7 @@ test('merge fails closed when gh never reports mergeCommit.oid', () => {
     assert.match(failed.stderr, /Timed out waiting for GitHub to report PR #\d+ as MERGED with a merge commit/);
     assert.doesNotMatch(failed.stderr, /rev-parse/);
 
-    const prState = readFileSync(path.join(repoRoot, '.git', 'pipelane-state', 'pr-state.json'), 'utf8');
+    const prState = readFileSync(path.join(sharedStateDir(repoRoot), 'pr-state.json'), 'utf8');
     assert.doesNotMatch(prState, /mergedSha/, 'no mergedSha recorded on failure');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -23004,7 +23030,7 @@ test('merge fails closed when non-required PR checks fail', () => {
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
     assert.equal(ghState.prMergeCalls?.length ?? 0, 0, 'merge command never reaches `gh pr merge`');
 
-    const prState = readFileSync(path.join(repoRoot, '.git', 'pipelane-state', 'pr-state.json'), 'utf8');
+    const prState = readFileSync(path.join(sharedStateDir(repoRoot), 'pr-state.json'), 'utf8');
     assert.doesNotMatch(prState, /mergedSha/, 'no mergedSha recorded on failed checks');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -23095,7 +23121,7 @@ test('pr in an external task-like checkout returns recovery choices instead of /
     assert.match(output.message, /Type which option you would like to proceed with/);
     assert.doesNotMatch(output.message, /\/new|--task/);
 
-    const lock = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`), 'utf8'));
+    const lock = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`), 'utf8'));
     assert.equal(lock.worktreePath, created.worktreePath, 'first preflight must not mutate the existing task lock');
   } finally {
     try {
@@ -23128,7 +23154,7 @@ test('pr recovery use-current-checkout rebinds the task lock with history and co
     });
     commitAll(repoRoot, 'Adopt pipelane');
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Canvas Palette Options', '--json'], repoRoot).stdout);
-    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`);
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`);
     const originalLock = JSON.parse(readFileSync(lockPath, 'utf8'));
     const previousHistory = {
       reboundAt: '2026-04-25T00:00:00.000Z',
@@ -23142,7 +23168,6 @@ test('pr recovery use-current-checkout rebinds the task lock with history and co
     writeFileSync(lockPath, `${JSON.stringify({
       ...originalLock,
       nextAction: 'stale next action from the attached workspace',
-      promotedWithoutStagingSmoke: true,
       bindingHistory: [previousHistory],
     }, null, 2)}\n`, 'utf8');
 
@@ -23170,7 +23195,6 @@ test('pr recovery use-current-checkout rebinds the task lock with history and co
     assert.equal(lock.worktreePath, realpathSync(externalWorktree));
     assert.notEqual(lock.nextAction, 'stale next action from the attached workspace');
     assert.match(lock.nextAction, /PR #1 open, awaiting CI/);
-    assert.equal(lock.promotedWithoutStagingSmoke, undefined);
     assert.equal(lock.bindingHistory.length, 2);
     assert.deepEqual(lock.bindingHistory[0], previousHistory);
     assert.equal(lock.bindingHistory[1].fromBranchName, created.branch);
@@ -23216,7 +23240,7 @@ test('pr recovery continue-attached-workspace returns a handoff and mutates noth
     });
     writeFileSync(path.join(externalWorktree, 'palette.txt'), 'external change\n', 'utf8');
 
-    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`);
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`);
     const beforeLock = readFileSync(lockPath, 'utf8');
     const recoveryPrompt = JSON.parse(runCli(['run', 'pr', '--json'], externalWorktree, env, true).stdout);
     const option = recoveryPrompt.options.find((entry) => entry.value === 'continue-attached-workspace');
@@ -23305,7 +23329,7 @@ test('api action pr recovery confirmation executes and rebinds when fingerprint 
 
     assert.equal(executed.ok, true);
     assert.match(executed.data.execution.result.url, /example\.test\/pr/);
-    const lock = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`), 'utf8'));
+    const lock = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`), 'utf8'));
     assert.equal(lock.branchName, 'codex/canvas-palette-options-4f2a');
     assert.equal(lock.worktreePath, realpathSync(externalWorktree));
     assert.equal(lock.bindingHistory.length, 1);
@@ -23391,7 +23415,7 @@ test('api action pr recovery choice uses a confirmation token and rejects stale 
     assert.equal(executedEnvelope.ok, false);
     assert.match(executedEnvelope.message, /stale|preflight/i);
 
-    const lock = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`), 'utf8'));
+    const lock = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`), 'utf8'));
     assert.equal(lock.worktreePath, created.worktreePath, 'stale recovery must not mutate the lock');
   } finally {
     try {
@@ -23456,7 +23480,7 @@ test('api action pr recovery continue-attached-workspace does not require a PR t
     assert.equal(executed.data.execution.result.handoff, true);
     assert.match(executed.data.execution.result.message, /Continue in the attached task workspace/);
 
-    const lock = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`), 'utf8'));
+    const lock = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`), 'utf8'));
     assert.equal(lock.worktreePath, created.worktreePath);
   } finally {
     try {
@@ -23583,7 +23607,7 @@ test('pr recovery blocks before mutation when task has non-binding mismatches', 
       cwd: repoRoot,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`);
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`);
     const beforeLock = readFileSync(lockPath, 'utf8');
 
     const result = runCli(['run', 'pr', '--json'], externalWorktree, {}, true);
@@ -23620,7 +23644,7 @@ test('pr recovery blocks when current checkout is already locked by another task
       cwd: repoRoot,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    const lockDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks');
+    const lockDir = path.join(sharedStateDir(repoRoot), 'task-locks');
     writeFileSync(path.join(lockDir, 'other-task.json'), `${JSON.stringify({
       taskSlug: 'other-task',
       taskName: 'Other Task',
@@ -23671,7 +23695,7 @@ test('pr recovery blocks detached HEAD before rebinding the task lock', () => {
       cwd: externalWorktree,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`);
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`);
     const beforeLock = readFileSync(lockPath, 'utf8');
 
     const result = runCli(['run', 'pr', '--task', 'Canvas Palette Options', '--json'], externalWorktree, {}, true);
@@ -23700,7 +23724,7 @@ test('pr recovery from base checkout only offers attached workspace and never re
     });
     commitAll(repoRoot, 'Adopt pipelane');
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Canvas Palette Options', '--json'], repoRoot).stdout);
-    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`);
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`);
     const beforeLock = readFileSync(lockPath, 'utf8');
 
     const result = runCli(['run', 'pr', '--task', 'Canvas Palette Options', '--json'], repoRoot, {}, true);
@@ -23838,7 +23862,7 @@ test('api action pr recovery blocks oversized dirty current checkouts', () => {
     assert.equal(option, undefined, 'oversized dirty checkout must not offer a rebind-and-run option');
     assert.match(firstEnvelope.message, /too large or opaque|size budget/i);
 
-    const lock = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`), 'utf8'));
+    const lock = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`), 'utf8'));
     assert.equal(lock.worktreePath, created.worktreePath, 'large-file stale recovery must not mutate the lock');
   } finally {
     try {
@@ -23881,7 +23905,7 @@ test('api action pr recovery blocks dirty path sets beyond approval budget', () 
     assert.equal(option, undefined, 'truncated dirty checkout must not offer a rebind-and-run option');
     assert.match(firstEnvelope.message, /too large or opaque|approval budget/i);
 
-    const lock = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`), 'utf8'));
+    const lock = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`), 'utf8'));
     assert.equal(lock.worktreePath, created.worktreePath, 'overflow-path stale recovery must not mutate the lock');
   } finally {
     try {
@@ -23971,7 +23995,7 @@ test('api snapshot exposes scoped cleanup after production verification and expl
     commitAll(repoRoot, 'Adopt pipelane');
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Verified Cleanup', '--json'], repoRoot).stdout);
     const mergedSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
-    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     mkdirSync(stateDir, { recursive: true });
     writeFileSync(path.join(stateDir, 'pr-state.json'), JSON.stringify({
       records: {
@@ -24110,7 +24134,7 @@ test('clean --apply --task prunes just the named lock', () => {
     assert.deepEqual(envelope.removed, ['drop-me']);
 
     // keep-me's lock file must still exist.
-    const keepLockPath = path.join(repoRoot, '.git', 'pipelane-state', 'task-locks', 'keep-me.json');
+    const keepLockPath = path.join(sharedStateDir(repoRoot), 'task-locks', 'keep-me.json');
     assert.ok(existsSync(keepLockPath), 'targeted prune did not touch keep-me');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -24138,7 +24162,7 @@ test('clean --apply --task closes out the workspace: lock + worktree + merged br
     assert.match(envelope.message, /Closed out task workspaces/);
 
     // Lock file is gone.
-    const dropLockPath = path.join(repoRoot, '.git', 'pipelane-state', 'task-locks', 'drop-live.json');
+    const dropLockPath = path.join(sharedStateDir(repoRoot), 'task-locks', 'drop-live.json');
     assert.ok(!existsSync(dropLockPath), 'closer must remove the lock file');
 
     // Worktree directory is gone.
@@ -24184,7 +24208,7 @@ test('clean auto-closes a prod-verified task when the branch tree matches the de
     const mergedSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
     writePrRecord(repoRoot, 'auto-safe', mergedSha);
 
-    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', 'auto-safe.json');
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', 'auto-safe.json');
     const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
     await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, lock.surfaces, { taskSlug: 'auto-safe' });
     lock.updatedAt = '2026-04-17T00:00:00Z';
@@ -24246,7 +24270,7 @@ test('clean ignores malformed deploy record entries while finding a verified pro
     const mergedSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
     writePrRecord(repoRoot, 'malformed-deploy-history', mergedSha);
 
-    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     const lockPath = path.join(stateDir, 'task-locks', 'malformed-deploy-history.json');
     const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
     await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, lock.surfaces, { taskSlug: 'malformed-deploy-history' });
@@ -24291,7 +24315,7 @@ test('clean requires a trusted signed prod deploy record when deploy-state signi
     assert.ok(existsSync(created.worktreePath), 'unsigned deploy record keeps the worktree');
 
     const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'release-gate.ts'));
-    const deployStatePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'deploy-state.json');
+    const deployStatePath = path.join(sharedStateDir(repoRoot), 'deploy-state.json');
     const deployState = JSON.parse(readFileSync(deployStatePath, 'utf8'));
     deployState.records = deployState.records.map((record) => ({ ...record, signature: mod.signDeployRecord(record, key) }));
     writeFileSync(deployStatePath, `${JSON.stringify(deployState, null, 2)}\n`, 'utf8');
@@ -24319,7 +24343,7 @@ test('clean keeps a prod-verified task when the worktree is dirty', async () => 
     const mergedSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
     writePrRecord(repoRoot, 'dirty-verified', mergedSha);
 
-    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', 'dirty-verified.json');
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', 'dirty-verified.json');
     const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
     await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, lock.surfaces, { taskSlug: 'dirty-verified' });
     lock.updatedAt = '2026-04-17T00:00:00Z';
@@ -24525,7 +24549,7 @@ test('clean keeps a prod-verified task when the prod deploy record lacks health 
     writePipelaneConfig(repoRoot, 'Demo App');
     commitAll(repoRoot, 'Adopt pipelane');
     const { created, lockPath } = await createVerifiedAutoCleanCandidate(repoRoot, 'Unverified Prod Record', 'unverified-prod-record');
-    const deployStatePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'deploy-state.json');
+    const deployStatePath = path.join(sharedStateDir(repoRoot), 'deploy-state.json');
     const deployState = JSON.parse(readFileSync(deployStatePath, 'utf8'));
     delete deployState.records[0].verification;
     delete deployState.records[0].verificationBySurface;
@@ -24699,7 +24723,7 @@ test('clean (no --apply) lists orphan worktrees that have no matching task lock'
     commitAll(repoRoot, 'Adopt pipelane');
     // pipelane-managed orphan: lock removed but worktree + branch left.
     const tracked = JSON.parse(runCli(['run', 'new', '--task', 'Tracked Orphan', '--json'], repoRoot).stdout);
-    rmSync(path.join(repoRoot, '.git', 'pipelane-state', 'task-locks', 'tracked-orphan.json'));
+    rmSync(path.join(sharedStateDir(repoRoot), 'task-locks', 'tracked-orphan.json'));
 
     // External orphan: created with raw `git worktree add`, never seen by
     // pipelane. Path is OUTSIDE the configured pipelane-worktrees/ dir so
@@ -24753,7 +24777,7 @@ test('clean --apply --all-stale skips locks whose worktree + branch are still in
     });
     const envelope = JSON.parse(result.stdout);
     assert.deepEqual(envelope.removed, []);
-    const liveLockPath = path.join(repoRoot, '.git', 'pipelane-state', 'task-locks', 'still-live.json');
+    const liveLockPath = path.join(sharedStateDir(repoRoot), 'task-locks', 'still-live.json');
     assert.ok(existsSync(liveLockPath), '--all-stale should not touch live locks');
     // Silence the unused-variable warning by referencing `live` — the intent
     // is to keep `new` running so the lock/worktree/branch are real.
@@ -24776,7 +24800,7 @@ test('slugifyTaskName preserves task names well beyond the old 32-char cap', () 
     assert.equal(created.taskSlug, 'long-task-name-that-exceeds-the-old-cap');
     assert.match(created.worktreePath, /long-task-name-that-exceeds-the-old-cap-[0-9a-f]{4}$/);
 
-    const lockPath = path.join(repoRoot, '.git', 'pipelane-state', 'task-locks', 'long-task-name-that-exceeds-the-old-cap.json');
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', 'long-task-name-that-exceeds-the-old-cap.json');
     assert.ok(existsSync(lockPath), 'lock filename should preserve the full slug');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -24838,7 +24862,7 @@ test('clean --apply refuses to prune locks with a missing or unparseable updated
 
     // Corrupt the lock: remove updatedAt so lockAge() returns null. The
     // pruner must fail closed and skip, not sweep.
-    const lockPath = path.join(repoRoot, '.git', 'pipelane-state', 'task-locks', 'corrupt-meta.json');
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', 'corrupt-meta.json');
     const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
     delete lock.updatedAt;
     writeFileSync(lockPath, JSON.stringify(lock, null, 2), 'utf8');
@@ -24880,7 +24904,7 @@ test('clean --apply refuses to prune locks younger than 5 minutes', () => {
     assert.equal(envelope.skipped[0].taskSlug, 'too-young');
     assert.match(envelope.skipped[0].reason, /below the 300s prune floor/);
     // The lock file should still exist.
-    const lockPath = path.join(repoRoot, '.git', 'pipelane-state', 'task-locks', 'too-young.json');
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', 'too-young.json');
     assert.ok(existsSync(lockPath), 'young lock kept');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -24935,7 +24959,7 @@ test('clean (no --apply) classifies orphan worktrees and surfaces a numbered act
 
     // Clean orphan: pipelane-managed worktree whose lock was deleted.
     const cleanWt = JSON.parse(runCli(['run', 'new', '--task', 'Clean Orphan', '--json'], repoRoot).stdout);
-    rmSync(path.join(repoRoot, '.git', 'pipelane-state', 'task-locks', 'clean-orphan.json'));
+    rmSync(path.join(sharedStateDir(repoRoot), 'task-locks', 'clean-orphan.json'));
 
     // Dirty orphan with a merged PR: external worktree on a branch that
     // appears in the fake gh's merged-PR list, with an extra modified file.
@@ -25028,7 +25052,7 @@ test('clean --apply --completed-with-ignored bulk-removes prod-verified workspac
     // chain.
     const first = await createVerifiedAutoCleanCandidate(repoRoot, 'Built One', 'built-one');
     const second = await createVerifiedAutoCleanCandidate(repoRoot, 'Built Two', 'built-two');
-    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     const prStatePath = path.join(stateDir, 'pr-state.json');
     writeFileSync(prStatePath, `${JSON.stringify({
       records: {
@@ -25244,7 +25268,7 @@ test('clean --apply --safe-orphans honors per-orphan cleanup lock', () => {
     // Pre-create the orphan cleanup lock to simulate a concurrent /clean run
     // owning this orphan path. The hash matches the function in state.ts:
     // sha256(normalizedPath).slice(0, 16).
-    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     const orphanLockDir = path.join(stateDir, 'orphan-cleanup-locks');
     mkdirSync(orphanLockDir, { recursive: true });
     const hash = createHash('sha256').update(cleanWt).digest('hex').slice(0, 16);
@@ -25451,7 +25475,7 @@ test('dashboard pr preflight resolves the task lock before same-slug current bra
     commitAll(repoRoot, 'Adopt pipelane');
     runCli(['run', 'new', '--task', 'Dashboard Cwd Routing', '--json'], repoRoot);
 
-    const lock = JSON.parse(readFileSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', 'dashboard-cwd-routing.json'), 'utf8'));
+    const lock = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'task-locks', 'dashboard-cwd-routing.json'), 'utf8'));
     writeFileSync(path.join(lock.worktreePath, 'dirty.txt'), 'dirty\n', 'utf8');
     execFileSync('git', ['checkout', '-b', 'codex/dashboard-cwd-routing-d00d'], {
       cwd: repoRoot,
@@ -25820,6 +25844,8 @@ function makeFakeUpdateBin(
     compareMarkerPath = '',
     npmMarkerPath = '',
     npmExitCode = 0,
+    npxMarkerPath = '',
+    npxExitCode = 0,
   },
 ) {
   mkdirSync(binDir, { recursive: true });
@@ -25911,6 +25937,33 @@ if (args[0] === 'install') {
 process.stderr.write('unsupported fake npm call: ' + args.join(' '));
 process.exit(1);
 `, { mode: 0o755, encoding: 'utf8' });
+
+  const npxPath = path.join(binDir, 'npx');
+  writeFileSync(npxPath, `#!/usr/bin/env node
+const { spawnSync } = require('node:child_process');
+const { appendFileSync } = require('node:fs');
+const args = process.argv.slice(2);
+const command = args[2] || '';
+if (args[0] === '-y' && /^install-(codex|claude)$/.test(command)) {
+  const markerPath = ${JSON.stringify(npxMarkerPath)};
+  if (markerPath) appendFileSync(markerPath, args.join(' ') + '\\n', 'utf8');
+  const exitCode = ${JSON.stringify(npxExitCode)};
+  if (exitCode !== 0) {
+    process.stderr.write('simulated managed runtime install failure\\n');
+    process.exit(exitCode);
+  }
+  const res = spawnSync(process.execPath, [${JSON.stringify(CLI_PATH)}, command], {
+    env: process.env,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (res.stdout) process.stdout.write(res.stdout);
+  if (res.stderr) process.stderr.write(res.stderr);
+  process.exit(res.status ?? 1);
+}
+process.stderr.write('unsupported fake npx call: ' + args.join(' '));
+process.exit(1);
+`, { mode: 0o755, encoding: 'utf8' });
 }
 
 function writeAutoUpdateAwareLocalBin(repoRoot, { newSha }) {
@@ -25959,6 +26012,34 @@ function writeFakeConsumer(consumerRoot, { installedVersion, installedSha }) {
   );
 }
 
+function installCodexRuntimeForUpdateTest(cwd, { codexHome, pipelaneHome, sourceSha }) {
+  return runCli(['install-codex'], cwd, {
+    CODEX_HOME: codexHome,
+    PIPELANE_HOME: pipelaneHome,
+    PIPELANE_INSTALL_SOURCE_SHA: sourceSha,
+    PIPELANE_INSTALL_SPEC: LOCAL_PIPELANE_INSTALL_SPEC,
+  });
+}
+
+function seedManagedRuntimeForUpdateNotice(pipelaneHome, sourceSha, host = 'codex') {
+  const root = managedRuntimeRoot(host, pipelaneHome);
+  mkdirSync(path.join(root, 'bin'), { recursive: true });
+  writeFileSync(path.join(root, 'bin', 'pipelane'), '#!/bin/sh\nexit 0\n', { mode: 0o755, encoding: 'utf8' });
+  writeFileSync(
+    path.join(root, '.pipelane-runtime.json'),
+    `${JSON.stringify({
+      version: 1,
+      managedBy: 'pipelane',
+      host,
+      packageVersion: '0.2.0',
+      installedAt: new Date().toISOString(),
+      sourceSha,
+      installSpec: LOCAL_PIPELANE_INSTALL_SPEC,
+    }, null, 2)}\n`,
+    'utf8',
+  );
+}
+
 function autoUpdateCachePathForTest(repoRoot, pipelaneHome) {
   const key = createHash('sha256').update(realpathSync(repoRoot)).digest('hex').slice(0, 24);
   return path.join(pipelaneHome, 'update-checks', `${key}.json`);
@@ -25982,6 +26063,7 @@ async function waitForPathForTest(targetPath, timeoutMs = 5000) {
   const port = await getFreePort();
   try {
     writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    seedManagedRuntimeForUpdateNotice(pipelaneHome, oldSha);
     mkdirSync(path.join(consumerRoot, 'node_modules', '.bin'), { recursive: true });
     writeFileSync(
       path.join(consumerRoot, 'node_modules', '.bin', 'pipelane'),
@@ -26055,6 +26137,7 @@ test('CLI update notices use the explicit board --repo target from another cwd',
   const port = await getFreePort();
   try {
     writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    seedManagedRuntimeForUpdateNotice(pipelaneHome, oldSha);
     makeFakeUpdateBin(binDir, {
       latestSha: newSha,
       aheadCommits: [{ sha: newSha, subject: 'Notify the requested repo' }],
@@ -26097,6 +26180,7 @@ test('CLI ordinary commands use fresh repo-local update cache for notices withou
   const port = await getFreePort();
   try {
     writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    seedManagedRuntimeForUpdateNotice(pipelaneHome, oldSha);
     const cachePath = autoUpdateCachePathForTest(consumerRoot, pipelaneHome);
     mkdirSync(path.dirname(cachePath), { recursive: true });
     writeFileSync(
@@ -26162,6 +26246,7 @@ test('CLI update notice retries soon when compare highlights were incomplete', a
   const port = await getFreePort();
   try {
     writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    seedManagedRuntimeForUpdateNotice(pipelaneHome, oldSha);
     makeFakeUpdateBin(binDir, {
       latestSha: newSha,
       compareExitCode: 42,
@@ -26239,6 +26324,7 @@ test('CLI ordinary commands with PIPELANE_AUTO_UPDATE set do not self-update or 
 
   try {
     writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    seedManagedRuntimeForUpdateNotice(pipelaneHome, oldSha);
     mkdirSync(path.join(consumerRoot, 'node_modules', '.bin'), { recursive: true });
     writeFileSync(
       path.join(consumerRoot, 'node_modules', '.bin', 'pipelane'),
@@ -26303,6 +26389,7 @@ test('CLI update notice failures use a short backoff cache', async () => {
   const port = await getFreePort();
   try {
     writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    seedManagedRuntimeForUpdateNotice(pipelaneHome, oldSha);
     makeFakeUpdateBin(binDir, {
       latestSha: oldSha,
       gitExitCode: 42,
@@ -26387,6 +26474,7 @@ test('CLI ordinary commands do not install from cached stale update entries', as
   const port = await getFreePort();
   try {
     writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    seedManagedRuntimeForUpdateNotice(pipelaneHome, oldSha);
     mkdirSync(path.join(consumerRoot, 'node_modules', '.bin'), { recursive: true });
     writeFileSync(
       path.join(consumerRoot, 'node_modules', '.bin', 'pipelane'),
@@ -26539,12 +26627,17 @@ test('CLI auto-update ignores node_modules symlinks outside the shared checkout'
 test('collectUpdateStatus applies one timeout budget across remote status calls', async () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-bin-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
   const compareMarkerPath = path.join(consumerRoot, 'compare-completed.txt');
   const oldSha = '1111111111111111111111111111111111111111';
   const newSha = '2222222222222222222222222222222222222222';
   const originalPath = process.env.PATH;
+  const originalCodexHome = process.env.CODEX_HOME;
+  const originalPipelaneHome = process.env.PIPELANE_HOME;
   try {
     writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    installCodexRuntimeForUpdateTest(consumerRoot, { codexHome, pipelaneHome, sourceSha: oldSha });
     makeFakeUpdateBin(binDir, {
       latestSha: newSha,
       aheadCommits: [{ sha: newSha, subject: 'newer pipelane' }],
@@ -26554,6 +26647,8 @@ test('collectUpdateStatus applies one timeout budget across remote status calls'
     });
 
     process.env.PATH = `${binDir}:${originalPath}`;
+    process.env.CODEX_HOME = codexHome;
+    process.env.PIPELANE_HOME = pipelaneHome;
     const update = await import(path.join(KIT_ROOT, 'src', 'operator', 'update.ts'));
     const status = update.collectUpdateStatus(consumerRoot, { timeoutMs: 700 });
 
@@ -26564,14 +26659,21 @@ test('collectUpdateStatus applies one timeout budget across remote status calls'
     assert.equal(existsSync(compareMarkerPath), false);
   } finally {
     process.env.PATH = originalPath;
+    if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = originalCodexHome;
+    if (originalPipelaneHome === undefined) delete process.env.PIPELANE_HOME;
+    else process.env.PIPELANE_HOME = originalPipelaneHome;
     rmSync(consumerRoot, { recursive: true, force: true });
     rmSync(binDir, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
   }
 });
 
 test('CLI ordinary commands with update notices enabled probe status without installing', async () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-auto-update-bin-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
   const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
   const remoteCallLog = path.join(consumerRoot, 'remote-calls.log');
   const npmInstallLog = path.join(consumerRoot, 'npm-install.log');
@@ -26580,6 +26682,7 @@ test('CLI ordinary commands with update notices enabled probe status without ins
   const port = await getFreePort();
   try {
     writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    installCodexRuntimeForUpdateTest(consumerRoot, { codexHome, pipelaneHome, sourceSha: oldSha });
     mkdirSync(path.join(consumerRoot, 'node_modules', '.bin'), { recursive: true });
     writeFileSync(
       path.join(consumerRoot, 'node_modules', '.bin', 'pipelane'),
@@ -26598,6 +26701,7 @@ test('CLI ordinary commands with update notices enabled probe status without ins
       cwd: consumerRoot,
       env: {
         ...process.env,
+        CODEX_HOME: codexHome,
         PIPELANE_HOME: pipelaneHome,
         PIPELANE_AUTO_UPDATE: '1',
         PIPELANE_AUTO_UPDATE_TTL_MS: '0',
@@ -26623,6 +26727,7 @@ test('CLI ordinary commands with update notices enabled probe status without ins
   } finally {
     rmSync(consumerRoot, { recursive: true, force: true });
     rmSync(binDir, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
     rmSync(pipelaneHome, { recursive: true, force: true });
   }
 });
@@ -26637,6 +26742,7 @@ test('CLI update notices do not require an updated local bin', async () => {
   const port = await getFreePort();
   try {
     writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    seedManagedRuntimeForUpdateNotice(pipelaneHome, oldSha);
     makeFakeUpdateBin(binDir, {
       latestSha: newSha,
       aheadCommits: [{ sha: newSha, subject: 'Notify without local bin' }],
@@ -26746,14 +26852,17 @@ test('CLI command from a symlinked worktree does not update the shared checkout 
 test('update reports up-to-date when installed sha matches remote main', () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-bin-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
   const sha = '0123456789abcdef0123456789abcdef01234567';
   try {
     writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: sha });
+    installCodexRuntimeForUpdateTest(consumerRoot, { codexHome, pipelaneHome, sourceSha: sha });
     makeFakeUpdateBin(binDir, { latestSha: sha });
 
     const result = spawnSync('node', [CLI_PATH, 'update', '--check', '--json'], {
       cwd: consumerRoot,
-      env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` },
+      env: { ...process.env, CODEX_HOME: codexHome, PIPELANE_HOME: pipelaneHome, PATH: `${binDir}:${process.env.PATH}` },
       encoding: 'utf8',
     });
     assert.equal(result.status, 0, result.stderr);
@@ -26764,6 +26873,8 @@ test('update reports up-to-date when installed sha matches remote main', () => {
   } finally {
     rmSync(consumerRoot, { recursive: true, force: true });
     rmSync(binDir, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
   }
 });
 
@@ -26787,11 +26898,7 @@ fs.appendFileSync(process.env.PIPELANE_REFRESH_LOG, process.argv.slice(2).join('
 `,
       { mode: 0o755, encoding: 'utf8' },
     );
-    runCli(['install-codex'], consumerRoot, {
-      CODEX_HOME: codexHome,
-      CLAUDE_HOME: claudeHome,
-      PIPELANE_HOME: pipelaneHome,
-    });
+    installCodexRuntimeForUpdateTest(consumerRoot, { codexHome, pipelaneHome, sourceSha: sha });
 
     const result = spawnSync('node', [CLI_PATH, 'update'], {
       cwd: consumerRoot,
@@ -26840,11 +26947,7 @@ fs.appendFileSync(process.env.PIPELANE_REFRESH_LOG, process.argv.slice(2).join('
 `,
       { mode: 0o755, encoding: 'utf8' },
     );
-    mkdirSync(path.join(codexHome, 'skills', '.pipelane', 'bin'), { recursive: true });
-    writeFileSync(path.join(codexHome, 'skills', '.pipelane', 'bin', 'pipelane'), '#!/bin/sh\nexit 0\n', {
-      mode: 0o755,
-      encoding: 'utf8',
-    });
+    installCodexRuntimeForUpdateTest(consumerRoot, { codexHome, pipelaneHome, sourceSha: sha });
 
     const result = spawnSync('node', [CLI_PATH, 'update', '--check'], {
       cwd: consumerRoot,
@@ -26874,6 +26977,8 @@ fs.appendFileSync(process.env.PIPELANE_REFRESH_LOG, process.argv.slice(2).join('
 test('update --check reports the commit list when behind', () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-bin-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
   const oldSha = '1111111111111111111111111111111111111111';
   const newSha = '2222222222222222222222222222222222222222';
   const commits = [
@@ -26882,11 +26987,12 @@ test('update --check reports the commit list when behind', () => {
   ];
   try {
     writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    installCodexRuntimeForUpdateTest(consumerRoot, { codexHome, pipelaneHome, sourceSha: oldSha });
     makeFakeUpdateBin(binDir, { latestSha: newSha, aheadCommits: commits });
 
     const result = spawnSync('node', [CLI_PATH, 'update', '--check'], {
       cwd: consumerRoot,
-      env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` },
+      env: { ...process.env, CODEX_HOME: codexHome, PIPELANE_HOME: pipelaneHome, PATH: `${binDir}:${process.env.PATH}` },
       encoding: 'utf8',
     });
     assert.equal(result.status, 0, result.stderr);
@@ -26899,6 +27005,8 @@ test('update --check reports the commit list when behind', () => {
   } finally {
     rmSync(consumerRoot, { recursive: true, force: true });
     rmSync(binDir, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
   }
 });
 
@@ -26912,6 +27020,7 @@ test('update --json remains parseable after installing an update', () => {
   const newSha = '2222222222222222222222222222222222222222';
   try {
     writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: oldSha });
+    installCodexRuntimeForUpdateTest(consumerRoot, { codexHome, pipelaneHome, sourceSha: oldSha });
     makeFakeUpdateBin(binDir, { latestSha: newSha });
 
     const result = spawnSync('node', [CLI_PATH, 'update', '--json'], {
@@ -26930,7 +27039,7 @@ test('update --json remains parseable after installing an update', () => {
     const parsed = JSON.parse(result.stdout);
     assert.equal(parsed.action, 'installed');
     assert.equal(parsed.status.installedSha, newSha);
-    assert.equal(parsed.globalSurfaces.codex.status, 'skipped');
+    assert.equal(parsed.globalSurfaces.codex.status, 'refreshed');
   } finally {
     rmSync(consumerRoot, { recursive: true, force: true });
     rmSync(binDir, { recursive: true, force: true });
@@ -26989,8 +27098,11 @@ test('update stops a running board for the updated repo after install', async ()
   }
 });
 
-test('update fails clearly when pipelane is not installed in consumer', () => {
+test('update fails clearly when no durable pipelane runtime is installed', () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-missing-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
   try {
     writeFileSync(
       path.join(consumerRoot, 'package.json'),
@@ -26999,12 +27111,16 @@ test('update fails clearly when pipelane is not installed in consumer', () => {
     );
     const result = spawnSync('node', [CLI_PATH, 'update', '--check'], {
       cwd: consumerRoot,
+      env: { ...process.env, CODEX_HOME: codexHome, CLAUDE_HOME: claudeHome, PIPELANE_HOME: pipelaneHome },
       encoding: 'utf8',
     });
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /pipelane is not installed/);
+    assert.match(result.stderr, /durable runtime is not installed/);
   } finally {
     rmSync(consumerRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
   }
 });
 
@@ -27086,7 +27202,7 @@ test('api action execute persists task-scoped failure feedback for branch detail
     commitAll(repoRoot, 'Adopt pipelane');
     runCli(['run', 'new', '--task', 'Action Feedback Task', '--json'], repoRoot);
 
-    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', 'action-feedback-task.json');
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', 'action-feedback-task.json');
     const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
     writeFileSync(path.join(lock.worktreePath, 'dirty.txt'), 'dirty\n', 'utf8');
 
@@ -27101,7 +27217,7 @@ test('api action execute persists task-scoped failure feedback for branch detail
     assert.equal(envelope.ok, false);
     assert.match(envelope.data.preflight.reason, /Provide a PR title/);
 
-    const actionStatePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'action-state.json');
+    const actionStatePath = path.join(sharedStateDir(repoRoot), 'action-state.json');
     const actionState = JSON.parse(readFileSync(actionStatePath, 'utf8'));
     assert.equal(actionState.records['action-feedback-task'][0].actionId, 'pr');
     assert.equal(actionState.records['action-feedback-task'][0].status, 'failed');
@@ -27161,102 +27277,8 @@ test('api snapshot distinguishes config readiness from hosted readiness when sta
   }
 });
 
-test('api snapshot does not surface legacy smoke gate config', () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    writeFullDeployConfigState(repoRoot);
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.smoke = {
-        requireStagingSmoke: true,
-        staging: { command: 'node -e "process.exit(0)"' },
-      };
-    });
-    runCli(['run', 'devmode', 'release', '--surfaces', 'frontend', '--override', '--reason', 'snapshot legacy smoke fixture'], repoRoot);
 
-    const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
-    assert.equal(envelope.data.smoke, undefined);
-    assert.equal(envelope.data.attention.some((issue) => String(issue.code).startsWith('smoke.')), false);
-    assert.equal(envelope.data.sourceHealth.some((entry) => String(entry.name).startsWith('smoke.')), false);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
 
-test('api snapshot ignores legacy smoke coverage gaps', async () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    writeFullDeployConfigState(repoRoot);
-    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.smoke = {
-        requireStagingSmoke: true,
-        criticalPathCoverage: 'block',
-        criticalPaths: ['billing'],
-        staging: { command: smokeResultCommand([{ tag: '@smoke-auth', status: 'passed' }]) },
-      };
-    });
-    await writeSucceededDeployRecord(repoRoot, 'staging', '1111111111111111111111111111111111111111', ['frontend']);
-    writeHealthyProbeState(repoRoot, ['frontend']);
-    runCli(['run', 'smoke', 'plan'], repoRoot);
-    updateSmokeRegistry(repoRoot, (registry) => {
-      registry.checks['@smoke-auth'].blocking = true;
-      registry.checks['@smoke-auth'].quarantine = false;
-    });
-    runCli(['run', 'smoke', 'staging'], repoRoot);
-    runCli(['run', 'devmode', 'release', '--surfaces', 'frontend', '--override', '--reason', 'coverage snapshot fixture'], repoRoot);
-
-    const result = await runCliAsync(['run', 'api', 'snapshot'], repoRoot);
-    assert.equal(result.status, 0);
-    const envelope = JSON.parse(result.stdout);
-    assert.equal(envelope.data.smoke, undefined);
-    assert.equal(envelope.data.attention.some((issue) => String(issue.code).startsWith('smoke.')), false);
-    assert.equal(envelope.data.sourceHealth.some((entry) => String(entry.name).startsWith('smoke.')), false);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('api snapshot excludes legacy staging smoke history even when present', async () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    writeFullDeployConfigState(repoRoot);
-    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.smoke = {
-        requireStagingSmoke: true,
-        staging: { command: smokeResultCommand([{ tag: '@smoke-auth', status: 'passed' }]) },
-      };
-    });
-    const smokedSha = '1111111111111111111111111111111111111111';
-    const targetSha = '2222222222222222222222222222222222222222';
-    await writeSucceededDeployRecord(repoRoot, 'staging', smokedSha, ['frontend']);
-    runCli(['run', 'smoke', 'plan'], repoRoot);
-    updateSmokeRegistry(repoRoot, (registry) => {
-      registry.checks['@smoke-auth'].blocking = true;
-      registry.checks['@smoke-auth'].quarantine = false;
-    });
-    runCli(['run', 'smoke', 'staging'], repoRoot);
-    writeTaskLock(repoRoot, 'bootstrap', { mode: 'release', surfaces: ['frontend'] });
-    writePrRecord(repoRoot, 'bootstrap', targetSha);
-    await writeSucceededDeployRecord(repoRoot, 'staging', targetSha, ['frontend']);
-    runCli(['run', 'devmode', 'release', '--surfaces', 'frontend', '--override', '--reason', 'target smoke fixture'], repoRoot);
-
-    const envelope = JSON.parse((await runCliAsync(['run', 'api', 'snapshot'], repoRoot)).stdout);
-    assert.equal(envelope.data.smoke, undefined);
-    assert.equal(envelope.data.sourceHealth.some((entry) => String(entry.name).startsWith('smoke.')), false);
-    assert.equal(envelope.data.attention.some((issue) => String(issue.code).startsWith('smoke.')), false);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
 
 test('api snapshot marks staging as bypassed in build mode', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
@@ -27266,7 +27288,7 @@ test('api snapshot marks staging as bypassed in build mode', async () => {
     // Force a merged PR state so staging/production lanes are computed
     // beyond the "awaiting_preflight" fast-path.
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Bypass Check', '--json'], repoRoot).stdout);
-    const prStatePath = path.join(repoRoot, '.git', 'pipelane-state', 'pr-state.json');
+    const prStatePath = path.join(sharedStateDir(repoRoot), 'pr-state.json');
     mkdirSync(path.dirname(prStatePath), { recursive: true });
     writeFileSync(prStatePath, JSON.stringify({
       records: {
@@ -27295,40 +27317,6 @@ test('api snapshot marks staging as bypassed in build mode', async () => {
   }
 });
 
-test('deploy releases the shared smoke environment lock when the workflow fails after lock acquisition', () => {
-  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
-  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
-  const ghStateFile = path.join(fakeBin, 'gh-state.json');
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    writeFullDeployConfigState(repoRoot);
-    writeTaskLock(repoRoot, 'bootstrap', { mode: 'build', surfaces: ['frontend'] });
-    writeFakeGh(fakeBin, ghStateFile);
-
-    const result = runCli(
-      ['run', 'deploy', 'staging', '--task', 'bootstrap'],
-      repoRoot,
-      {
-        PATH: `${fakeBin}:${process.env.PATH}`,
-        GH_STATE_FILE: ghStateFile,
-        PIPELANE_DEPLOY_WATCH_STUB: 'failed',
-      },
-      true,
-    );
-
-    assert.notEqual(result.status, 0);
-    assert.ok(
-      !existsSync(path.join(resolveSharedSmokeStateRoot(repoRoot), 'locks', 'staging.json')),
-      'staging smoke/deploy lock should be removed on failure',
-    );
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(remoteRoot, { recursive: true, force: true });
-    rmSync(fakeBin, { recursive: true, force: true });
-  }
-});
 
 test('api branch detail and patch commands emit real committed and workspace diffs', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
@@ -27546,7 +27534,7 @@ test('api action execute: non-risky clean.plan runs without a token and does not
     const mergedSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
     writePrRecord(repoRoot, 'plan-only', mergedSha);
 
-    const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', 'plan-only.json');
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', 'plan-only.json');
     const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
     await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, lock.surfaces, { taskSlug: 'plan-only' });
     lock.updatedAt = '2026-04-17T00:00:00Z';
@@ -27572,7 +27560,7 @@ async function seedStatusCleanupCandidate(repoRoot, taskName) {
   const created = JSON.parse(runCli(['run', 'new', '--task', taskName, '--json'], repoRoot).stdout);
   const mergedSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
   writePrRecord(repoRoot, created.taskSlug, mergedSha);
-  const lockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${created.taskSlug}.json`);
+  const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`);
   const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
   await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, lock.surfaces, { taskSlug: created.taskSlug });
   lock.updatedAt = '2026-04-17T00:00:00Z';
@@ -27592,7 +27580,7 @@ test('status interactive action does not prompt for routine clean plan when noth
     assert.equal(result.status, 0, result.stderr);
     assert.doesNotMatch(result.stdout, /NEXT ACTION/);
     assert.equal(
-      existsSync(path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'action-state.json')),
+      existsSync(path.join(sharedStateDir(repoRoot), 'action-state.json')),
       false,
       'status should not persist a decision when no meaningful action is offered',
     );
@@ -27617,7 +27605,7 @@ test('status interactive action cancel persists a human decision without executi
     assert.match(result.stdout, /Clean/);
     assert.match(result.stdout, /Action cancelled/);
 
-    const actionStatePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'action-state.json');
+    const actionStatePath = path.join(sharedStateDir(repoRoot), 'action-state.json');
     const actionState = JSON.parse(readFileSync(actionStatePath, 'utf8'));
     assert.equal(actionState.decisions.length, 1);
     assert.equal(actionState.decisions[0].actionId, 'clean.plan');
@@ -27644,7 +27632,7 @@ test('status interactive action approval executes through api action and records
     assert.match(result.stdout, /NEXT ACTION/);
     assert.match(result.stdout, /Action completed: clean\.plan executed/);
 
-    const actionStatePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'action-state.json');
+    const actionStatePath = path.join(sharedStateDir(repoRoot), 'action-state.json');
     const actionState = JSON.parse(readFileSync(actionStatePath, 'utf8'));
     assert.equal(actionState.decisions.length, 1);
     assert.equal(actionState.decisions[0].actionId, 'clean.plan');
@@ -27673,7 +27661,7 @@ test('status interactive action input errors persist a failed decision', () => {
     assert.match(result.stdout, /NEXT ACTION/);
     assert.match(result.stdout, /Action failed: PR title is required\./);
 
-    const actionStatePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'action-state.json');
+    const actionStatePath = path.join(sharedStateDir(repoRoot), 'action-state.json');
     const actionState = JSON.parse(readFileSync(actionStatePath, 'utf8'));
     assert.equal(actionState.decisions.length, 1);
     assert.equal(actionState.decisions[0].actionId, 'pr');
@@ -27704,7 +27692,7 @@ test('status interactive action exhausted input records failed decision instead 
     assert.match(result.stdout, /NEXT ACTION/);
     assert.match(result.stdout, /Action failed: PIPELANE_STATUS_INPUT exhausted/);
 
-    const actionStatePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'action-state.json');
+    const actionStatePath = path.join(sharedStateDir(repoRoot), 'action-state.json');
     const actionState = JSON.parse(readFileSync(actionStatePath, 'utf8'));
     assert.equal(actionState.decisions.length, 1);
     assert.equal(actionState.decisions[0].actionId, 'pr');
@@ -27735,7 +27723,7 @@ test('status interactive action blocked preflight records blocked decision inste
     assert.match(result.stdout, /NEXT ACTION/);
     assert.match(result.stdout, /Action blocked:/);
 
-    const actionStatePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'action-state.json');
+    const actionStatePath = path.join(sharedStateDir(repoRoot), 'action-state.json');
     const actionState = JSON.parse(readFileSync(actionStatePath, 'utf8'));
     assert.equal(actionState.decisions.length, 1);
     assert.equal(actionState.decisions[0].actionId, 'pr');
@@ -27775,7 +27763,7 @@ test('status interactive action execute failure records failed decision instead 
     assert.match(result.stdout, /NEXT ACTION/);
     assert.match(result.stdout, /Action failed:/);
 
-    const actionStatePath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'action-state.json');
+    const actionStatePath = path.join(sharedStateDir(repoRoot), 'action-state.json');
     const actionState = JSON.parse(readFileSync(actionStatePath, 'utf8'));
     assert.equal(actionState.decisions.length, 1);
     assert.equal(actionState.decisions[0].actionId, 'pr');
@@ -28981,7 +28969,7 @@ test('loadModeState filters stale requested surfaces through current workflow co
     config.buildMode = { ...(config.buildMode ?? {}), autoDeployOnMerge: true };
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
-    const stateDir = path.join(resolveCommonDir(repoRoot), 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     mkdirSync(stateDir, { recursive: true });
     writeFileSync(path.join(stateDir, 'mode-state.json'), JSON.stringify({
       mode: 'build',
@@ -29168,7 +29156,7 @@ test('setBy whitelist allows GitHub bot actors like dependabot[bot]', async () =
 // ---------------------------------------------------------------------------
 
 function writeStaleProbeState(repoRoot, surfaces, { ageMs = 25 * 60 * 60 * 1000, ok = true } = {}) {
-  const stateDir = path.join(repoRoot, '.git', 'pipelane-state');
+  const stateDir = path.join(sharedStateDir(repoRoot));
   mkdirSync(stateDir, { recursive: true });
   const probedAt = new Date(Date.now() - ageMs).toISOString();
   const records = surfaces.map((surface) => ({
@@ -29389,7 +29377,7 @@ test('doctor --fix via PIPELANE_DOCTOR_FIX_STUB writes machine-local deploy conf
     assert.equal(saved.frontend.staging.url, 'https://staging.example.test');
     assert.equal(existsSync(path.join(repoRoot, 'CLAUDE.md')), false);
 
-    const probeStatePath = path.join(repoRoot, '.git', 'pipelane-state', 'probe-state.json');
+    const probeStatePath = path.join(sharedStateDir(repoRoot), 'probe-state.json');
     assert.ok(existsSync(probeStatePath), 'probe-state.json created by --fix auto-probe');
     const probe = JSON.parse(readFileSync(probeStatePath, 'utf8'));
     const frontend = probe.records.find((r) => r.environment === 'staging' && r.surface === 'frontend');
@@ -30136,7 +30124,7 @@ function v14StubConfig() {
 }
 
 function v14SeedState(commonDir, { deployRecords = null, taskLocks = [], prRecords = {} } = {}) {
-  const stateDir = path.join(commonDir, 'pipelane-state');
+  const stateDir = path.join(machineRepoDirForCommonDir(commonDir), 'state');
   mkdirSync(stateDir, { recursive: true });
   if (deployRecords !== null) {
     writeFileSync(path.join(stateDir, 'deploy-state.json'), JSON.stringify({ records: deployRecords }, null, 2), 'utf8');
@@ -30492,7 +30480,7 @@ test('v1.4 /resume surfaces TaskLock.nextAction breadcrumb when set by a prior c
     commitAll(repoRoot, 'post-setup');
     runCli(['run', 'new', '--task', 'Resume Demo'], repoRoot);
     // Simulate a prior /pr that wrote a breadcrumb into the lock.
-    const lockPath = path.join(repoRoot, '.git', 'pipelane-state', 'task-locks', 'resume-demo.json');
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', 'resume-demo.json');
     const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
     lock.nextAction = 'PR #7 open, awaiting CI';
     writeFileSync(lockPath, JSON.stringify(lock, null, 2), 'utf8');
@@ -30889,7 +30877,7 @@ test('v1.4 /resume --json multi-lock emits activeLocks[] with per-lock lockNextA
     commitAll(repoRoot, 'post-setup');
     runCli(['run', 'new', '--task', 'Task A'], repoRoot);
     runCli(['run', 'new', '--task', 'Task B'], repoRoot);
-    const locksDir = path.join(repoRoot, '.git', 'pipelane-state', 'task-locks');
+    const locksDir = path.join(sharedStateDir(repoRoot), 'task-locks');
     const a = JSON.parse(readFileSync(path.join(locksDir, 'task-a.json'), 'utf8'));
     a.nextAction = 'CI running';
     writeFileSync(path.join(locksDir, 'task-a.json'), JSON.stringify(a), 'utf8');
@@ -30990,7 +30978,7 @@ test('v1.1 /rollback staging dispatches + verifies + persists rollbackOfSha', ()
     // committed to the worktree branch so deploy/rollback have real
     // commits to work against.
     const goodSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
-    const prStatePath = path.join(repoRoot, '.git', 'pipelane-state', 'pr-state.json');
+    const prStatePath = path.join(sharedStateDir(repoRoot), 'pr-state.json');
     const prState = JSON.parse(readFileSync(prStatePath, 'utf8'));
     const prKey = Object.keys(prState.records)[0];
     prState.records[prKey].mergedSha = goodSha;
@@ -31020,7 +31008,7 @@ test('v1.1 /rollback staging dispatches + verifies + persists rollbackOfSha', ()
     assert.equal(rollback.rollbackOfSha, brokenSha);
 
     // nextAction breadcrumb should reflect the rollback.
-    const lockPath = path.join(repoRoot, '.git', 'pipelane-state', 'task-locks', created.taskSlug + '.json');
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', created.taskSlug + '.json');
     const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
     assert.match(lock.nextAction, /staging rolled back/);
   } finally {
@@ -31143,7 +31131,7 @@ test('v1.1 /rollback --revert-pr opens a gh PR without pushing to main', () => {
     writeFileSync(path.join(repoRoot, 'squash.txt'), 'v1\n', 'utf8');
     commitAll(repoRoot, 'squash: Revert Me');
     const realMergeSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim();
-    const prStatePath = path.join(repoRoot, '.git', 'pipelane-state', 'pr-state.json');
+    const prStatePath = path.join(sharedStateDir(repoRoot), 'pr-state.json');
     const prState = JSON.parse(readFileSync(prStatePath, 'utf8'));
     const key = Object.keys(prState.records)[0];
     prState.records[key].mergedSha = realMergeSha;
@@ -31258,7 +31246,7 @@ test('v1.1 fixup: re-running /rollback after a successful rollback refuses (casc
     runCli(['run', 'merge', '--json'], created.worktreePath, env);
     // Swap fake-gh's deadbeef merge for a real sha so the R4 gate passes.
     const goodSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
-    const prStatePath = path.join(repoRoot, '.git', 'pipelane-state', 'pr-state.json');
+    const prStatePath = path.join(sharedStateDir(repoRoot), 'pr-state.json');
     const prState = JSON.parse(readFileSync(prStatePath, 'utf8'));
     prState.records[Object.keys(prState.records)[0]].mergedSha = goodSha;
     writeFileSync(prStatePath, JSON.stringify(prState, null, 2), 'utf8');
@@ -31307,7 +31295,7 @@ test('v1.1 fixup: --revert-pr rejects a malformed mergedSha before any git op', 
     runCli(['run', 'devmode', 'release', '--override', '--reason', 'revert-pr-sha-test', '--json'], created.worktreePath);
 
     // Plant a flag-shaped "sha" to simulate pr-state.json tampering.
-    const prStatePath = path.join(repoRoot, '.git', 'pipelane-state', 'pr-state.json');
+    const prStatePath = path.join(sharedStateDir(repoRoot), 'pr-state.json');
     const prState = JSON.parse(readFileSync(prStatePath, 'utf8'));
     prState.records[Object.keys(prState.records)[0]].mergedSha = '--force-with-lease';
     writeFileSync(prStatePath, JSON.stringify(prState, null, 2), 'utf8');
@@ -31387,7 +31375,7 @@ test('v1.1 codex fixup: rollback.* preflight surface fallback matches execute (t
     // (the lock's surfaces) and one matching the full config surfaces.
     // Distinct shas so preflight/execute drift would produce visibly
     // different targetSha in normalizedInputs.
-    const stateDir = path.join(repoRoot, '.git', 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     mkdirSync(stateDir, { recursive: true });
     // Need an OLDER good record + NEWER current record for each surface
     // set so findLastGoodDeploy has something to target (excludeSha skips
@@ -31462,7 +31450,7 @@ test('v1.1 codex fixup: --revert-pr honors --sha when passed explicitly', () => 
     writeFileSync(path.join(repoRoot, 'newer.txt'), 'newer\n', 'utf8');
     commitAll(repoRoot, 'newer change');
     const newerSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim();
-    const prStatePath = path.join(repoRoot, '.git', 'pipelane-state', 'pr-state.json');
+    const prStatePath = path.join(sharedStateDir(repoRoot), 'pr-state.json');
     const prState = JSON.parse(readFileSync(prStatePath, 'utf8'));
     prState.records[Object.keys(prState.records)[0]].mergedSha = newerSha;
     writeFileSync(prStatePath, JSON.stringify(prState, null, 2), 'utf8');
@@ -31510,12 +31498,12 @@ test('v1.1 codex fixup: /rollback prod requires typed-SHA confirmation in build 
     runCli(['run', 'merge', '--json'], created.worktreePath, env);
     // Swap fake-gh's bogus merge for a real sha.
     const goodSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
-    const prStatePath = path.join(repoRoot, '.git', 'pipelane-state', 'pr-state.json');
+    const prStatePath = path.join(sharedStateDir(repoRoot), 'pr-state.json');
     const prState = JSON.parse(readFileSync(prStatePath, 'utf8'));
     prState.records[Object.keys(prState.records)[0]].mergedSha = goodSha;
     writeFileSync(prStatePath, JSON.stringify(prState, null, 2), 'utf8');
     // Seed deploy state with a good prod + a failed prod to roll back FROM.
-    const stateDir = path.join(repoRoot, '.git', 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     const okProbe = { statusCode: 200, latencyMs: 10, probes: 2 };
     // verificationBySurface is required for multi-surface rollbacks
     // per r6 P2 fix (legacy aggregate probes only qualify for
@@ -31749,13 +31737,13 @@ test('v1.1 claude r3 fixup: stale in-flight rollback request bypasses the guard,
     runCli(['run', 'pr', '--title', 'Stale Guard', '--json'], created.worktreePath, baseEnv);
     runCli(['run', 'merge', '--json'], created.worktreePath, baseEnv);
     const goodSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
-    const prStatePath = path.join(repoRoot, '.git', 'pipelane-state', 'pr-state.json');
+    const prStatePath = path.join(sharedStateDir(repoRoot), 'pr-state.json');
     const prState = JSON.parse(readFileSync(prStatePath, 'utf8'));
     prState.records[Object.keys(prState.records)[0]].mergedSha = goodSha;
     writeFileSync(prStatePath, JSON.stringify(prState, null, 2), 'utf8');
     runCli(['run', 'deploy', 'staging', '--json'], created.worktreePath, baseEnv);
 
-    const stateDir = path.join(repoRoot, '.git', 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     const deployStatePath = path.join(stateDir, 'deploy-state.json');
 
     // --- Case 1: FRESH requested record (just now) blocks within 60s threshold.
@@ -31930,14 +31918,14 @@ test('v1.1 codex r8 fixup: in-flight deploy blocks /rollback (not just in-flight
     runCli(['run', 'pr', '--title', 'Deploy In Flight', '--json'], created.worktreePath, env);
     runCli(['run', 'merge', '--json'], created.worktreePath, env);
     const goodSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
-    const prStatePath = path.join(repoRoot, '.git', 'pipelane-state', 'pr-state.json');
+    const prStatePath = path.join(sharedStateDir(repoRoot), 'pr-state.json');
     const prState = JSON.parse(readFileSync(prStatePath, 'utf8'));
     prState.records[Object.keys(prState.records)[0]].mergedSha = goodSha;
     writeFileSync(prStatePath, JSON.stringify(prState, null, 2), 'utf8');
     runCli(['run', 'deploy', 'staging', '--json'], created.worktreePath, env);
 
     // Seed an in-flight DEPLOY record (not a rollback): requested, no rollbackOfSha.
-    const stateDir = path.join(repoRoot, '.git', 'pipelane-state');
+    const stateDir = path.join(sharedStateDir(repoRoot));
     const deployStatePath = path.join(stateDir, 'deploy-state.json');
     const deployState = JSON.parse(readFileSync(deployStatePath, 'utf8'));
     deployState.records.push({
@@ -32147,810 +32135,6 @@ test('formatFollowUpSummary on collisions replaces the run-setup step with a res
   assert.match(summary, /\.claude\/commands\/fix\.md/);
   assert.match(summary, /Resolve these manually/);
   assert.doesNotMatch(summary, /Run setup/);
-});
-
-// ---------------------------------------------------------------------------
-// /smoke setup — configuration + handoff coverage
-// ---------------------------------------------------------------------------
-
-function createSmokeSetupRepo(options = {}) {
-  const repoRoot = createRepo();
-  const extraScripts = options.scripts ?? {};
-  writeFileSync(
-    path.join(repoRoot, 'package.json'),
-    JSON.stringify({
-      name: 'smoke-setup-test',
-      version: '0.0.0',
-      type: 'module',
-      scripts: { ...extraScripts },
-    }, null, 2) + '\n',
-    'utf8',
-  );
-  execFileSync('git', ['add', '-A'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
-  execFileSync('git', ['commit', '-m', 'add package.json'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
-  writePipelaneConfig(repoRoot, 'Smoke Setup Test');
-  return repoRoot;
-}
-
-function readSmokeConfig(repoRoot) {
-  const config = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
-  return config.smoke ?? null;
-}
-
-test('smoke setup auto-wires from a single strong Playwright candidate', () => {
-  const repoRoot = createSmokeSetupRepo({
-    scripts: { 'test:e2e:smoke': 'npx playwright test --project=smoke' },
-  });
-  try {
-    const result = runCli(['run', 'smoke', 'setup', '--json'], repoRoot);
-    const parsed = JSON.parse(result.stdout);
-    assert.equal(parsed.setupMode, 'configured');
-    assert.equal(parsed.stagingCommand, 'npm run test:e2e:smoke');
-    assert.equal(parsed.smokeConfigured, true);
-    assert.equal(parsed.releaseGate, 'optional');
-    const smoke = readSmokeConfig(repoRoot);
-    assert.equal(smoke.staging.command, 'npm run test:e2e:smoke');
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup scores grep-filtered command as strong (plan: @smoke / --grep.*smoke)', () => {
-  const repoRoot = createSmokeSetupRepo({
-    scripts: { 'test:browser': 'vitest run --grep smoke' },
-  });
-  try {
-    const result = runCli(['run', 'smoke', 'setup', '--json'], repoRoot);
-    const parsed = JSON.parse(result.stdout);
-    assert.equal(parsed.setupMode, 'configured');
-    assert.equal(parsed.stagingCommand, 'npm run test:browser');
-    assert.equal(parsed.candidates.strong.length, 1);
-    assert.match(parsed.candidates.strong[0].reason, /@smoke tag or --grep/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup auto-wires a single medium candidate with a warning (relaxed auto-wire rule)', () => {
-  const repoRoot = createSmokeSetupRepo({
-    scripts: { 'test:e2e': 'playwright test' },
-  });
-  try {
-    const result = runCli(['run', 'smoke', 'setup', '--json'], repoRoot);
-    const parsed = JSON.parse(result.stdout);
-    assert.equal(parsed.setupMode, 'configured');
-    assert.equal(parsed.stagingCommand, 'npm run test:e2e');
-    assert.equal(parsed.smokeConfigured, true);
-    // Warning must surface the tradeoff the operator just implicitly made.
-    assert.ok(parsed.warnings.some((w) => /no smoke filter detected/.test(w)));
-    assert.match(parsed.repoSignal, /medium/);
-    // Config written with the medium command.
-    const smoke = readSmokeConfig(repoRoot);
-    assert.equal(smoke.staging.command, 'npm run test:e2e');
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup refuses weak-only "smoke": "node ./src/cli.ts --help"', () => {
-  const repoRoot = createSmokeSetupRepo({
-    scripts: { 'smoke': 'node ./src/cli.ts --help' },
-  });
-  try {
-    const result = runCli(['run', 'smoke', 'setup', '--json'], repoRoot);
-    const parsed = JSON.parse(result.stdout);
-    assert.equal(parsed.setupMode, 'needs input');
-    assert.ok(parsed.candidates.weak.some((c) => c.name === 'smoke'));
-    assert.equal(parsed.candidates.strong.length, 0);
-    assert.equal(readSmokeConfig(repoRoot), null);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup with multiple strong candidates returns needs-input', () => {
-  const repoRoot = createSmokeSetupRepo({
-    scripts: {
-      'test:e2e:smoke': 'playwright test --project=smoke',
-      'test:smoke': 'cypress run --spec "cypress/e2e/smoke/**/*"',
-    },
-  });
-  try {
-    const result = runCli(['run', 'smoke', 'setup', '--json'], repoRoot);
-    const parsed = JSON.parse(result.stdout);
-    assert.equal(parsed.setupMode, 'needs input');
-    assert.ok(parsed.candidates.strong.length >= 2);
-    assert.equal(readSmokeConfig(repoRoot), null);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup accepts explicit --staging-command without package.json candidate', () => {
-  const repoRoot = createSmokeSetupRepo();
-  try {
-    const result = runCli(['run', 'smoke', 'setup', '--staging-command=npm run e2e', '--json'], repoRoot);
-    const parsed = JSON.parse(result.stdout);
-    assert.equal(parsed.setupMode, 'configured');
-    assert.equal(parsed.stagingCommand, 'npm run e2e');
-    assert.equal(readSmokeConfig(repoRoot).staging.command, 'npm run e2e');
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup --staging-command value with shell metacharacters roundtrips intact', () => {
-  const repoRoot = createSmokeSetupRepo();
-  const rawValue = 'npm run test:smoke -- --grep "auth|signup" --workers=2';
-  try {
-    runCli(['run', 'smoke', 'setup', `--staging-command=${rawValue}`], repoRoot);
-    const smoke = readSmokeConfig(repoRoot);
-    assert.equal(smoke.staging.command, rawValue);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup preserves unrelated smoke fields on deep merge', () => {
-  const repoRoot = createSmokeSetupRepo();
-  const configPath = machinePipelaneConfigPath(repoRoot);
-  try {
-    const existing = JSON.parse(readFileSync(configPath, 'utf8'));
-    existing.smoke = {
-      staging: { command: 'npm run old:smoke' },
-      waivers: { path: '.pipelane/waivers.json', maxExtensions: 3 },
-      history: { retentionDays: 14, maxEntries: 50 },
-      criticalPathCoverage: 'warn',
-    };
-    writeFileSync(configPath, JSON.stringify(existing, null, 2) + '\n', 'utf8');
-
-    runCli(['run', 'smoke', 'setup', '--staging-command=npm run new:smoke'], repoRoot);
-
-    const smoke = readSmokeConfig(repoRoot);
-    assert.equal(smoke.staging.command, 'npm run new:smoke');           // overwritten
-    assert.equal(smoke.waivers.maxExtensions, 3);                       // preserved
-    assert.equal(smoke.history.retentionDays, 14);                      // preserved
-    assert.equal(smoke.history.maxEntries, 50);                         // preserved
-    assert.equal(smoke.criticalPathCoverage, 'warn');                   // preserved
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup --require-staging-smoke=true with no staging command is misconfigured and exits 1', () => {
-  const repoRoot = createSmokeSetupRepo();
-  try {
-    const result = runCli(['run', 'smoke', 'setup', '--require-staging-smoke=true'], repoRoot, {}, true);
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /--require-staging-smoke=true but no staging command/);
-    assert.equal(readSmokeConfig(repoRoot), null);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup --require-staging-smoke=true with --staging-command writes required gate', () => {
-  const repoRoot = createSmokeSetupRepo();
-  try {
-    const result = runCli([
-      'run', 'smoke', 'setup',
-      '--staging-command=npm run smoke',
-      '--require-staging-smoke=true',
-      '--json',
-    ], repoRoot);
-    const parsed = JSON.parse(result.stdout);
-    assert.equal(parsed.releaseGate, 'required');
-    const smoke = readSmokeConfig(repoRoot);
-    assert.equal(smoke.requireStagingSmoke, true);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup --json emits exactly one parseable JSON document', () => {
-  const repoRoot = createSmokeSetupRepo({
-    scripts: { 'test:e2e:smoke': 'playwright test --project=smoke' },
-  });
-  try {
-    const result = runCli(['run', 'smoke', 'setup', '--json'], repoRoot);
-    const trimmed = result.stdout.trim();
-    // Must be a single JSON document — not two concatenated (the double-print
-    // risk identified in the plan).
-    const parsed = JSON.parse(trimmed);
-    assert.ok(parsed.setupMode);
-    assert.equal(trimmed.lastIndexOf('}') + 1, trimmed.length);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup fails clearly when machine-local config is malformed JSON', () => {
-  const repoRoot = createSmokeSetupRepo();
-  const configPath = machinePipelaneConfigPath(repoRoot);
-  try {
-    writeFileSync(configPath, '{"broken":', 'utf8');
-    const result = runCli(['run', 'smoke', 'setup', '--staging-command=npm run x'], repoRoot, {}, true);
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /Malformed config\.json/);
-    // The broken content must survive — setup refuses to overwrite.
-    assert.equal(readFileSync(configPath, 'utf8'), '{"broken":');
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup --critical-path repeat dedupes while preserving first-seen order', () => {
-  const repoRoot = createSmokeSetupRepo();
-  try {
-    runCli([
-      'run', 'smoke', 'setup',
-      '--staging-command=npm run smoke',
-      '--critical-path=auth',
-      '--critical-path=checkout',
-      '--critical-path=auth',
-    ], repoRoot);
-    const smoke = readSmokeConfig(repoRoot);
-    assert.deepEqual(smoke.criticalPaths, ['auth', 'checkout']);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup rejects --yes flag (cut from v1)', () => {
-  const repoRoot = createSmokeSetupRepo();
-  try {
-    const result = runCli(['run', 'smoke', 'setup', '--yes'], repoRoot, {}, true);
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /Unknown flag|does not accept flag/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke plan rejects setup-only --staging-command flag', () => {
-  const repoRoot = createSmokeSetupRepo();
-  try {
-    const result = runCli(['run', 'smoke', 'plan', '--staging-command=foo'], repoRoot, {}, true);
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /--staging-command/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup rejects malformed --require-staging-smoke value', () => {
-  const repoRoot = createSmokeSetupRepo();
-  try {
-    const result = runCli(['run', 'smoke', 'setup', '--staging-command=x', '--require-staging-smoke=yes'], repoRoot, {}, true);
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /--require-staging-smoke must be "true" or "false"/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup --staging-script=<name> writes npm run <name> to smoke.staging.command', () => {
-  const repoRoot = createSmokeSetupRepo({
-    scripts: { 'test:e2e:vip': 'playwright test' },
-  });
-  try {
-    const result = runCli(['run', 'smoke', 'setup', '--staging-script=test:e2e:vip', '--json'], repoRoot);
-    const parsed = JSON.parse(result.stdout);
-    assert.equal(parsed.setupMode, 'configured');
-    assert.equal(parsed.stagingCommand, 'npm run test:e2e:vip');
-    assert.match(parsed.repoSignal, /explicit --staging-script=test:e2e:vip/);
-    assert.match(parsed.repoSignal, /resolved to npm run test:e2e:vip/);
-    const smoke = readSmokeConfig(repoRoot);
-    assert.equal(smoke.staging.command, 'npm run test:e2e:vip');
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup --prod-script=<name> writes npm run <name> to smoke.prod.command', () => {
-  const repoRoot = createSmokeSetupRepo({
-    scripts: {
-      'test:e2e:smoke': 'playwright test --project=smoke',
-      'test:e2e:smoke:prod': 'playwright test --project=smoke-prod',
-    },
-  });
-  try {
-    runCli([
-      'run', 'smoke', 'setup',
-      '--staging-script=test:e2e:smoke',
-      '--prod-script=test:e2e:smoke:prod',
-    ], repoRoot);
-    const smoke = readSmokeConfig(repoRoot);
-    assert.equal(smoke.staging.command, 'npm run test:e2e:smoke');
-    assert.equal(smoke.prod.command, 'npm run test:e2e:smoke:prod');
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup --staging-script + --staging-command conflict with a clear error', () => {
-  const repoRoot = createSmokeSetupRepo();
-  try {
-    const result = runCli([
-      'run', 'smoke', 'setup',
-      '--staging-script=foo',
-      '--staging-command=bar',
-    ], repoRoot, {}, true);
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /--staging-script and --staging-command are mutually exclusive/);
-    assert.equal(readSmokeConfig(repoRoot), null);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup with multiple strong candidates emits a numbered Candidates block', () => {
-  const repoRoot = createSmokeSetupRepo({
-    scripts: {
-      'test:e2e:smoke': 'playwright test --project=smoke',
-      'test:smoke': 'cypress run --spec "cypress/smoke/**/*"',
-    },
-  });
-  try {
-    const result = runCli(['run', 'smoke', 'setup'], repoRoot);
-    assert.match(result.stdout, /Smoke setup: needs input/);
-    assert.match(result.stdout, /Candidates:\n/);
-    assert.match(result.stdout, /  1\. test:e2e:smoke \(strong — /);
-    assert.match(result.stdout, /  2\. test:smoke \(strong — /);
-    // "Next" line should point at --staging-script= with a concrete
-    // example from the list.
-    assert.match(result.stdout, /Next: pick one and rerun, e\.g\. \/smoke setup --staging-script=test:e2e:smoke/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup needs-input output recommends --staging-script= form (not --staging-command=)', () => {
-  const repoRoot = createSmokeSetupRepo({
-    scripts: {
-      'test:e2e:smoke': 'playwright test --project=smoke',
-      'test:smoke': 'cypress run --spec cypress/smoke/**/*',
-    },
-  });
-  try {
-    const result = runCli(['run', 'smoke', 'setup'], repoRoot);
-    assert.match(result.stdout, /Smoke setup: needs input/);
-    assert.match(result.stdout, /--staging-script=/);
-    const nextLine = result.stdout.split('\n').find((line) => line.startsWith('Next:')) ?? '';
-    assert.doesNotMatch(nextLine, /--staging-command=/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup stores repo-specific hot paths and plain-language AI feedback', () => {
-  const repoRoot = createSmokeSetupRepo({
-    scripts: { 'test:e2e:smoke': 'playwright test --project=smoke' },
-  });
-  try {
-    mkdirSync(path.join(repoRoot, 'src', 'app', 'projects', '[id]'), { recursive: true });
-    writeFileSync(
-      path.join(repoRoot, 'src', 'app', 'projects', '[id]', 'page.tsx'),
-      [
-        'export default function ProjectBoard() {',
-        '  return <main>Project board wiki AI assistant OpenAI login credentials</main>;',
-        '}',
-      ].join('\n'),
-      'utf8',
-    );
-
-    const result = runCli([
-      'run', 'smoke', 'setup',
-      '--staging-script=test:e2e:smoke',
-      '--feedback=also test AI in project boards and wiki pages, credentials properly auth',
-      '--json',
-    ], repoRoot);
-    const parsed = JSON.parse(result.stdout);
-    const registry = JSON.parse(readFileSync(machineSmokeRegistryPath(repoRoot), 'utf8'));
-
-    assert.equal(parsed.setupVerification.status, 'skipped_missing_base_url');
-    assert.ok(parsed.hotPathScenarios.some((scenario) => scenario.id === '@smoke-ai-project-board'));
-    assert.ok(parsed.hotPathScenarios.some((scenario) => scenario.id === '@smoke-ai-wiki-page'));
-    assert.equal(registry.checks['@smoke-ai-project-board'].lifecycle, 'accepted');
-    assert.equal(registry.checks['@smoke-ai-project-board'].blocking, false);
-    assert.equal(registry.checks['@smoke-ai-project-board'].quarantine, true);
-    assert.deepEqual(registry.checks['@smoke-ai-project-board'].provenance.evidence, ['user feedback supplied during smoke setup']);
-    assert.deepEqual(registry.checks['@smoke-ai-project-board'].requiredEnv, ['OPENAI_API_KEY']);
-    assert.ok(registry.checks['@smoke-auth-credentials'].requiredEnv.includes('PIPELANE_SMOKE_USER_EMAIL'));
-    assert.equal(registry.checks['@smoke-wiki-page-crud'].safetyFlags.includes('requiresSyntheticData'), true);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup feedback promotes existing suggested hot paths to accepted', () => {
-  const repoRoot = createSmokeSetupRepo({
-    scripts: { 'test:e2e:smoke': 'playwright test --project=smoke' },
-  });
-  try {
-    mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'src', 'wiki.ts'), 'export const wiki = "wiki docs page markdown editor";\n', 'utf8');
-
-    runCli(['run', 'smoke', 'setup', '--staging-script=test:e2e:smoke'], repoRoot);
-    let registry = JSON.parse(readFileSync(machineSmokeRegistryPath(repoRoot), 'utf8'));
-    assert.equal(registry.checks['@smoke-wiki-page-crud'].lifecycle, 'suggested');
-
-    runCli([
-      'run', 'smoke', 'setup',
-      '--staging-script=test:e2e:smoke',
-      '--feedback=create rename and delete wiki pages',
-    ], repoRoot);
-    registry = JSON.parse(readFileSync(machineSmokeRegistryPath(repoRoot), 'utf8'));
-    assert.equal(registry.checks['@smoke-wiki-page-crud'].lifecycle, 'accepted');
-    assert.equal(registry.checks['@smoke-wiki-page-crud'].provenance.source, 'user-feedback');
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup records Playwright app-shell hot path without generated repo files', () => {
-  const repoRoot = createSmokeSetupRepo({
-    scripts: { 'test:e2e:smoke': 'playwright test --project=smoke --grep @smoke' },
-  });
-  try {
-    mkdirSync(path.join(repoRoot, 'app'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'app', 'page.tsx'), 'export default function Home() { return <main>Hello</main>; }\n', 'utf8');
-
-    runCli(['run', 'smoke', 'setup', '--staging-script=test:e2e:smoke'], repoRoot);
-
-    const generatedPath = path.join(repoRoot, 'tests', 'pipelane-smoke.generated.spec.ts');
-    const registry = JSON.parse(readFileSync(machineSmokeRegistryPath(repoRoot), 'utf8'));
-
-    assert.equal(existsSync(generatedPath), false);
-    assert.equal(registry.checks['@smoke-app-shell'].lifecycle, 'suggested');
-    assert.equal(registry.checks['@smoke-app-shell'].generated, undefined);
-    assert.equal(registry.checks['@smoke-app-shell'].sourceTests.includes('tests/pipelane-smoke.generated.spec.ts'), false);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup records Cypress app-shell hot path without generated repo files', () => {
-  const repoRoot = createSmokeSetupRepo({
-    scripts: { 'test:e2e:smoke': 'cypress run --spec "cypress/e2e/**/*.cy.ts" --env grepTags=@smoke' },
-  });
-  try {
-    mkdirSync(path.join(repoRoot, 'pages'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'pages', 'index.tsx'), 'export default function Home() { return <main>Hello</main>; }\n', 'utf8');
-
-    runCli(['run', 'smoke', 'setup', '--staging-script=test:e2e:smoke'], repoRoot);
-
-    const generatedPath = path.join(repoRoot, 'cypress', 'e2e', 'pipelane-smoke.generated.cy.js');
-    const registry = JSON.parse(readFileSync(machineSmokeRegistryPath(repoRoot), 'utf8'));
-
-    assert.equal(existsSync(generatedPath), false);
-    assert.equal(registry.checks['@smoke-app-shell'].lifecycle, 'suggested');
-    assert.equal(registry.checks['@smoke-app-shell'].generated, undefined);
-    assert.equal(registry.checks['@smoke-app-shell'].sourceTests.includes('cypress/e2e/pipelane-smoke.generated.cy.js'), false);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup preserves accepted registry metadata without generated repo files', () => {
-  const repoRoot = createSmokeSetupRepo({
-    scripts: { 'test:e2e:smoke': 'playwright test --project=smoke --grep @smoke' },
-  });
-  try {
-    mkdirSync(path.join(repoRoot, 'app'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'app', 'page.tsx'), 'export default function Home() { return <main>Hello</main>; }\n', 'utf8');
-
-    runCli(['run', 'smoke', 'setup', '--staging-script=test:e2e:smoke'], repoRoot);
-
-    const registryPath = machineSmokeRegistryPath(repoRoot);
-    const registry = JSON.parse(readFileSync(registryPath, 'utf8'));
-    registry.checks['@smoke-app-shell'].lifecycle = 'accepted';
-    registry.checks['@smoke-app-shell'].sourceTests = [];
-    delete registry.checks['@smoke-app-shell'].generated;
-    writeFileSync(registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
-
-    runCli(['run', 'smoke', 'setup', '--staging-script=test:e2e:smoke'], repoRoot);
-
-    const latest = JSON.parse(readFileSync(registryPath, 'utf8'));
-    assert.equal(latest.checks['@smoke-app-shell'].lifecycle, 'accepted');
-    assert.equal(latest.checks['@smoke-app-shell'].generated, undefined);
-    assert.equal(latest.checks['@smoke-app-shell'].sourceTests.includes('tests/pipelane-smoke.generated.spec.ts'), false);
-    assert.equal(existsSync(path.join(repoRoot, 'tests', 'pipelane-smoke.generated.spec.ts')), false);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup does not generate app-shell test when tagged source test already exists', () => {
-  const repoRoot = createSmokeSetupRepo({
-    scripts: { 'test:e2e:smoke': 'playwright test --project=smoke --grep @smoke' },
-  });
-  try {
-    mkdirSync(path.join(repoRoot, 'app'), { recursive: true });
-    mkdirSync(path.join(repoRoot, 'tests'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'app', 'page.tsx'), 'export default function Home() { return <main>Hello</main>; }\n', 'utf8');
-    writeFileSync(path.join(repoRoot, 'tests', 'existing.spec.ts'), "test('@smoke-app-shell boots', async () => {});\n", 'utf8');
-
-    runCli(['run', 'smoke', 'setup', '--staging-script=test:e2e:smoke'], repoRoot);
-
-    const generatedPath = path.join(repoRoot, 'tests', 'pipelane-smoke.generated.spec.ts');
-    const registry = JSON.parse(readFileSync(machineSmokeRegistryPath(repoRoot), 'utf8'));
-
-    assert.equal(existsSync(generatedPath), false);
-    assert.equal(registry.checks['@smoke-app-shell'].lifecycle, 'accepted');
-    assert.equal(registry.checks['@smoke-app-shell'].provenance.source, 'discovered-tag');
-    assert.deepEqual(registry.checks['@smoke-app-shell'].sourceTests, ['tests/existing.spec.ts']);
-    assert.equal(registry.checks['@smoke-app-shell'].generated, undefined);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke plan --refresh reports proposed hot paths without writing registry files', () => {
-  const repoRoot = createSmokeSetupRepo({
-    scripts: { 'test:e2e:smoke': 'playwright test --project=smoke' },
-  });
-  try {
-    mkdirSync(path.join(repoRoot, 'app'), { recursive: true });
-    mkdirSync(path.join(repoRoot, '.claude'), { recursive: true });
-    mkdirSync(path.join(repoRoot, 'src', 'app', 'projects', '[id]'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'app', 'page.tsx'), 'export default function Home() { return <a href="/pricing">Pricing</a>; }\n', 'utf8');
-    writeFileSync(path.join(repoRoot, '.claude', 'notes.md'), 'login password openai @smoke-auth-credentials\n', 'utf8');
-    writeFileSync(path.join(repoRoot, 'src', 'app', 'projects', '[id]', 'page.tsx'), 'export default function ProjectPage() { return <main />; }\n', 'utf8');
-
-    const registryPath = machineSmokeRegistryPath(repoRoot);
-    assert.equal(existsSync(registryPath), false);
-    const result = runCli(['run', 'smoke', 'plan', '--refresh', '--json'], repoRoot);
-    const parsed = JSON.parse(result.stdout);
-
-    assert.equal(parsed.refresh, true);
-    assert.equal(parsed.changedFiles, 0);
-    assert.equal(parsed.createdRegistry, false);
-    assert.equal(existsSync(registryPath), false);
-    assert.ok(parsed.proposedAdds.includes('@smoke-app-shell'));
-    assert.equal(parsed.proposedAdds.includes('@smoke-auth-credentials'), false);
-    assert.equal(parsed.proposedAdds.includes('@smoke-ai-primary-feature'), false);
-    assert.ok(parsed.analysis.routes.includes('/projects/:id'));
-    assert.match(parsed.message, /files changed: 0/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke plan --refresh refuses scenario files outside the repo', () => {
-  const repoRoot = createSmokeSetupRepo({
-    scripts: { 'test:e2e:smoke': 'playwright test --project=smoke' },
-  });
-  const outsideTmp = uniqueTmpPath('outside-scenarios', '.json');
-  const outsidePath = outsideTmp.path;
-  try {
-    writeFileSync(outsidePath, JSON.stringify({ scenarios: [{ id: '@smoke-outside', title: 'Outside file' }] }), 'utf8');
-
-    const result = runCli(['run', 'smoke', 'plan', '--refresh', `--scenario-file=${outsidePath}`, '--json'], repoRoot);
-    const parsed = JSON.parse(result.stdout);
-
-    assert.ok(parsed.warnings.some((warning) => /must live inside the repo/.test(warning)));
-    assert.equal(parsed.proposedAdds.includes('@smoke-outside'), false);
-  } finally {
-    rmSync(outsideTmp.dir, { recursive: true, force: true });
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup verification can make clean check-level results blocking', () => {
-  const repoRoot = createSmokeSetupRepo();
-  try {
-    mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'src', 'auth.ts'), 'export const login = "auth session password";\n', 'utf8');
-    const command = smokeResultCommand([{ tag: '@smoke-auth-credentials', status: 'passed' }]);
-
-    const result = runCli([
-      'run', 'smoke', 'setup',
-      `--staging-command=${command}`,
-      '--base-url=http://127.0.0.1:4173',
-      '--make-blocking',
-      '--json',
-    ], repoRoot);
-    const parsed = JSON.parse(result.stdout);
-    const registry = JSON.parse(readFileSync(machineSmokeRegistryPath(repoRoot), 'utf8'));
-
-    assert.equal(parsed.setupVerification.status, 'passed');
-    assert.deepEqual(parsed.setupVerification.verifiedTags, ['@smoke-auth-credentials']);
-    assert.deepEqual(parsed.setupVerification.blockingTags, ['@smoke-auth-credentials']);
-    assert.equal(registry.checks['@smoke-auth-credentials'].lifecycle, 'blocking');
-    assert.equal(registry.checks['@smoke-auth-credentials'].blocking, true);
-    assert.equal(registry.checks['@smoke-auth-credentials'].quarantine, false);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke setup does not promote passed-with-retries verification to blocking', () => {
-  const repoRoot = createSmokeSetupRepo();
-  try {
-    mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'src', 'auth.ts'), 'export const login = "auth session password";\n', 'utf8');
-    const command = smokeResultCommand([{ tag: '@smoke-auth-credentials', status: 'passed_with_retries' }]);
-
-    const result = runCli([
-      'run', 'smoke', 'setup',
-      `--staging-command=${command}`,
-      '--base-url=http://127.0.0.1:4173',
-      '--make-blocking',
-      '--json',
-    ], repoRoot);
-    const parsed = JSON.parse(result.stdout);
-    const registry = JSON.parse(readFileSync(machineSmokeRegistryPath(repoRoot), 'utf8'));
-
-    assert.equal(parsed.setupVerification.status, 'passed_with_retries');
-    assert.deepEqual(parsed.setupVerification.verifiedTags, []);
-    assert.equal(registry.checks['@smoke-auth-credentials'].blocking, false);
-    assert.equal(registry.checks['@smoke-auth-credentials'].quarantine, true);
-    assert.notEqual(registry.checks['@smoke-auth-credentials'].lifecycle, 'blocking');
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('generated smoke marker helper preserves user edits and rejects malformed regions', async () => {
-  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'smoke-hot-paths.ts'));
-  const created = mod.upsertGeneratedSmokeRegion('const userEdit = true;\n', 'auth', 'test("auth", async () => {});');
-  assert.equal(created.action, 'created');
-  assert.match(created.contents, /const userEdit = true;/);
-  assert.match(created.contents, /pipelane:smoke:start auth/);
-
-  const updated = mod.upsertGeneratedSmokeRegion(created.contents, 'auth', 'test("auth v2", async () => {});');
-  assert.equal(updated.action, 'updated');
-  assert.match(updated.contents, /const userEdit = true;/);
-  assert.match(updated.contents, /auth v2/);
-  assert.doesNotMatch(updated.contents, /test\("auth", async/);
-
-  assert.throws(
-    () => mod.upsertGeneratedSmokeRegion('/* pipelane:smoke:start auth */\nbody\n', 'auth', 'next'),
-    /malformed markers/,
-  );
-});
-
-test('smoke failure AI fix prompt redacts credential material', async () => {
-  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'smoke-hot-paths.ts'));
-  const prompt = mod.buildSmokeFailureFixPrompt({
-    scenario: 'auth flow',
-    command: 'OPENAI_API_KEY=sk-secret npm run smoke -- --password=hunter2',
-    baseUrl: 'https://example.test/app?token=abc123&ok=1',
-    logPath: '/tmp/smoke.log',
-    resultsPath: '/tmp/results.json',
-    checks: [{ tag: '@smoke-auth', status: 'failed' }],
-  });
-
-  assert.match(prompt, /AI fix prompt:/);
-  assert.doesNotMatch(prompt, /sk-secret/);
-  assert.doesNotMatch(prompt, /abc123/);
-  assert.doesNotMatch(prompt, /hunter2/);
-  assert.match(prompt, /OPENAI_API_KEY=\[REDACTED\]/);
-  assert.match(prompt, /--password=\[REDACTED\]/);
-  assert.match(prompt, /token=\[REDACTED\]/);
-});
-
-// ---------------------------------------------------------------------------
-// buildSmokeHandoffMessage — pure unit tests across all 3 stages × 3 states
-// ---------------------------------------------------------------------------
-
-async function loadBuildSmokeHandoffMessage() {
-  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'helpers.ts'));
-  return mod.buildSmokeHandoffMessage;
-}
-
-function makeSmokeHandoffConfig({ stagingCommand, requireStagingSmoke }) {
-  return {
-    aliases: {
-      devmode: '/devmode',
-      new: '/new',
-      resume: '/resume',
-      'repo-guard': '/repo-guard',
-      pr: '/pr',
-      merge: '/merge',
-      deploy: '/deploy',
-      smoke: '/smoke',
-      clean: '/clean',
-      status: '/status',
-      doctor: '/doctor',
-      rollback: '/rollback',
-    },
-    smoke: stagingCommand
-      ? {
-          staging: { command: stagingCommand },
-          requireStagingSmoke: requireStagingSmoke === true,
-        }
-      : (requireStagingSmoke === true ? { requireStagingSmoke: true } : undefined),
-  };
-}
-
-test('buildSmokeHandoffMessage after-merge-release: configured path recommends staging + smoke + prod', async () => {
-  const build = await loadBuildSmokeHandoffMessage();
-  const msg = build({
-    config: makeSmokeHandoffConfig({ stagingCommand: 'npm run smoke', requireStagingSmoke: false }),
-    stage: 'after-merge-release',
-    shortSha: 'abc1234',
-  });
-  assert.equal(msg.status, 'configured');
-  assert.equal(msg.blocks, false);
-  assert.match(msg.nextAction, /merged at abc1234/);
-  assert.match(msg.nextAction, /run \/deploy staging/);
-  assert.match(msg.nextAction, /\/smoke staging/);
-  assert.match(msg.nextAction, /\/deploy prod/);
-});
-
-test('buildSmokeHandoffMessage after-merge-release: optional+unconfigured offers setup OR promote without smoke', async () => {
-  const build = await loadBuildSmokeHandoffMessage();
-  const msg = build({
-    config: makeSmokeHandoffConfig({ stagingCommand: '', requireStagingSmoke: false }),
-    stage: 'after-merge-release',
-    shortSha: 'abc1234',
-  });
-  assert.equal(msg.status, 'optional-unconfigured');
-  assert.equal(msg.blocks, false);
-  assert.match(msg.nextAction, /\/smoke setup/);
-  assert.match(msg.nextAction, /healthcheck-only evidence/);
-});
-
-test('buildSmokeHandoffMessage after-merge-release: required+unconfigured mandates setup', async () => {
-  const build = await loadBuildSmokeHandoffMessage();
-  const msg = build({
-    config: makeSmokeHandoffConfig({ stagingCommand: '', requireStagingSmoke: true }),
-    stage: 'after-merge-release',
-    shortSha: 'abc1234',
-  });
-  assert.equal(msg.status, 'required-unconfigured');
-  assert.match(msg.nextAction, /Smoke is required but not configured/);
-  assert.match(msg.nextAction, /\/smoke setup/);
-});
-
-test('buildSmokeHandoffMessage after-deploy-staging: configured branch tells operator to run smoke then prod', async () => {
-  const build = await loadBuildSmokeHandoffMessage();
-  const msg = build({
-    config: makeSmokeHandoffConfig({ stagingCommand: 'npm run smoke', requireStagingSmoke: false }),
-    stage: 'after-deploy-staging',
-    shortSha: 'def5678',
-  });
-  assert.equal(msg.status, 'configured');
-  assert.match(msg.nextAction, /staging verified at def5678/);
-  assert.match(msg.nextAction, /run \/smoke staging/);
-  assert.match(msg.nextAction, /\/deploy prod/);
-});
-
-test('buildSmokeHandoffMessage after-deploy-staging: required+unconfigured points at setup (original-bug codepath)', async () => {
-  const build = await loadBuildSmokeHandoffMessage();
-  const msg = build({
-    config: makeSmokeHandoffConfig({ stagingCommand: '', requireStagingSmoke: true }),
-    stage: 'after-deploy-staging',
-    shortSha: 'def5678',
-  });
-  // This is the exact branch that used to tell users "run /smoke staging"
-  // when smoke.staging.command was missing — now it points at /smoke setup.
-  assert.equal(msg.status, 'required-unconfigured');
-  assert.match(msg.nextAction, /blocked until smoke is configured/);
-  assert.match(msg.nextAction, /\/smoke setup/);
-  assert.doesNotMatch(msg.nextAction, /run \/smoke staging\b/);
-});
-
-test('buildSmokeHandoffMessage before-deploy-prod: required+unconfigured blocks', async () => {
-  const build = await loadBuildSmokeHandoffMessage();
-  const msg = build({
-    config: makeSmokeHandoffConfig({ stagingCommand: '', requireStagingSmoke: true }),
-    stage: 'before-deploy-prod',
-  });
-  assert.equal(msg.blocks, true);
-  assert.match(msg.nextAction, /deploy prod blocked/);
-  assert.match(msg.nextAction, /\/smoke setup/);
-});
-
-test('buildSmokeHandoffMessage before-deploy-prod: optional+unconfigured does not block', async () => {
-  const build = await loadBuildSmokeHandoffMessage();
-  const msg = build({
-    config: makeSmokeHandoffConfig({ stagingCommand: '', requireStagingSmoke: false }),
-    stage: 'before-deploy-prod',
-  });
-  assert.equal(msg.blocks, false);
 });
 
 test('npm guard blocks install-like commands when node_modules is a symlink and delegates safe commands', async () => {
@@ -33182,30 +32366,6 @@ test('preinstall-guard warning text matches SHARED_NODE_MODULES_NPMCI_WARNING fr
   }
 });
 
-test('mergePreinstallScript writes pipelane guard when no existing preinstall', async () => {
-  const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
-  assert.equal(docs.mergePreinstallScript(undefined), docs.PIPELANE_PREINSTALL_GUARD);
-  assert.equal(docs.mergePreinstallScript(''), docs.PIPELANE_PREINSTALL_GUARD);
-  assert.equal(docs.mergePreinstallScript('   '), docs.PIPELANE_PREINSTALL_GUARD);
-});
-
-test('mergePreinstallScript chains pipelane guard before existing preinstall', async () => {
-  const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
-  const merged = docs.mergePreinstallScript('echo hello');
-  assert.equal(merged, `${docs.PIPELANE_PREINSTALL_GUARD} && echo hello`);
-  assert.ok(merged.startsWith(docs.PIPELANE_PREINSTALL_GUARD), 'guard must run first');
-});
-
-test('mergePreinstallScript is idempotent when guard fingerprint is already present', async () => {
-  const docs = await import(path.join(KIT_ROOT, 'src', 'operator', 'docs.ts'));
-  // Already-chained: leave alone.
-  const chained = `${docs.PIPELANE_PREINSTALL_GUARD} && echo hello`;
-  assert.equal(docs.mergePreinstallScript(chained), chained);
-  // User put the guard inline some other way (e.g., wrapped in their own script).
-  const wrapped = `bash -c "${docs.PIPELANE_PREINSTALL_GUARD}"`;
-  assert.equal(docs.mergePreinstallScript(wrapped), wrapped);
-});
-
 test('setup leaves a fresh consumer package.json untouched', () => {
   const repoRoot = createRepo();
   try {
@@ -33336,7 +32496,7 @@ test('migrateLegacyStateDir copies orphaned state forward when canonical dir is 
       'utf8',
     );
 
-    const canonicalDir = path.join(commonDir, config.stateDir);
+    const canonicalDir = stateMod.resolveStateDir(commonDir, config);
     assert.equal(existsSync(canonicalDir), false, 'canonical dir should be absent before migration');
 
     const { stderr } = captureStderr(() => stateMod.migrateLegacyStateDir(commonDir, config));
@@ -33411,7 +32571,7 @@ test('migrateLegacyStateDir is idempotent: second call is a no-op', async () => 
     const { stderr } = captureStderr(() => stateMod.migrateLegacyStateDir(commonDir, config));
     assert.equal(stderr, '', 'second migration should be silent');
 
-    const canonicalDir = path.join(commonDir, config.stateDir);
+    const canonicalDir = stateMod.resolveStateDir(commonDir, config);
     const stillReleased = JSON.parse(readFileSync(path.join(canonicalDir, 'mode-state.json'), 'utf8'));
     assert.equal(stillReleased.mode, 'release', 'canonical mode-state should not be overwritten by re-run');
   } finally {
@@ -33425,7 +32585,7 @@ test('migrateLegacyStateDir never clobbers a canonical file that already exists'
   try {
     const config = stateMod.defaultWorkflowConfig('demo', 'Demo');
     const legacyDir = path.join(commonDir, 'rocketboard-workflow');
-    const canonicalDir = path.join(commonDir, config.stateDir);
+    const canonicalDir = stateMod.resolveStateDir(commonDir, config);
     mkdirSync(legacyDir, { recursive: true });
     mkdirSync(canonicalDir, { recursive: true });
     // Canonical wins when both exist — pipelane has been writing
@@ -34021,73 +33181,6 @@ test('destination planner blocks unmapped target files before stale surfaces', (
   }
 });
 
-test('api snapshot ignores legacy smoke records with mismatched surfaces', async () => {
-  const {
-    loadSmokeRegistry,
-    resolveWorkflowContext,
-    saveSmokeRunRecord,
-  } = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
-  const {
-    computeSmokeRequirementsFingerprint,
-    updateSmokeLatest,
-  } = await import(path.join(KIT_ROOT, 'src', 'operator', 'smoke-gate.ts'));
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    writeFullDeployConfigState(repoRoot);
-    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.smoke = {
-        requireStagingSmoke: true,
-        staging: { command: smokeResultCommand([{ tag: '@smoke-auth', status: 'passed' }]) },
-      };
-    });
-    runCli(['run', 'smoke', 'plan'], repoRoot);
-    updateSmokeRegistry(repoRoot, (registry) => {
-      registry.checks['@smoke-auth'].blocking = true;
-      registry.checks['@smoke-auth'].quarantine = false;
-    });
-    runCli(['run', 'devmode', 'release', '--surfaces', 'frontend', '--override', '--reason', 'surface-bound smoke fixture'], repoRoot);
-    const sha = '3333333333333333333333333333333333333333';
-    writeTaskLock(repoRoot, 'bootstrap', { mode: 'release', surfaces: ['frontend'] });
-    writePrRecord(repoRoot, 'bootstrap', sha);
-    await writeSucceededDeployRecord(repoRoot, 'staging', sha, ['frontend'], { taskSlug: 'bootstrap' });
-
-    const context = resolveWorkflowContext(repoRoot);
-    const smokeFingerprint = computeSmokeRequirementsFingerprint(loadSmokeRegistry(repoRoot, context.config), 'staging', context.config);
-    const wrongSurfaceSmoke = {
-      runId: 'wrong-surface-smoke',
-      environment: 'staging',
-      sha,
-      baseUrl: 'https://staging.example.test',
-      taskSlug: 'bootstrap',
-      surfaces: ['edge'],
-      deployIdempotencyKey: `staging-${sha.slice(0, 8)}`,
-      smokeRequirementsFingerprint: smokeFingerprint,
-      status: 'passed',
-      startedAt: '2026-04-22T00:00:00Z',
-      finishedAt: '2026-04-22T00:01:00Z',
-      preflight: [],
-      cohortResults: [],
-      checks: [],
-      waiversApplied: [],
-      lastKnownGoodSha: null,
-      drifted: false,
-      retryCount: 0,
-    };
-    saveSmokeRunRecord(context.commonDir, context.config, wrongSurfaceSmoke);
-    updateSmokeLatest({ commonDir: context.commonDir, config: context.config, record: wrongSurfaceSmoke });
-
-    const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
-    assert.equal(envelope.data.smoke, undefined);
-    assert.equal(envelope.data.sourceHealth.some((entry) => String(entry.name).startsWith('smoke.')), false);
-    assert.equal(envelope.data.attention.some((issue) => String(issue.code).startsWith('smoke.')), false);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
 
 test('api route actions reject conflicting task, pr, and sha identities', () => {
   const repoRoot = createRepo();
@@ -34554,7 +33647,7 @@ test('orchestrate review auto-cleans only completed verified slice worktrees', a
     execFileSync('git', ['add', '.'], { cwd: slice.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
     execFileSync('git', ['commit', '-m', 'Implement orchestration slice'], { cwd: slice.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
     const mergedSha = run('git', ['rev-parse', 'HEAD'], slice.worktreePath);
-    const sliceLockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${slice.taskSlug}.json`);
+    const sliceLockPath = path.join(sharedStateDir(repoRoot), 'task-locks', `${slice.taskSlug}.json`);
     const sliceLock = JSON.parse(readFileSync(sliceLockPath, 'utf8'));
     sliceLock.updatedAt = '2026-04-17T00:00:00Z';
     writeFileSync(sliceLockPath, `${JSON.stringify(sliceLock, null, 2)}\n`, 'utf8');
@@ -34630,7 +33723,7 @@ test('orchestrate review records cleanup skip when merge deploy evidence is not 
     const slice = started.run.slices[0];
     execFileSync('git', ['add', '.'], { cwd: slice.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
     execFileSync('git', ['commit', '-m', 'Implement orchestration slice'], { cwd: slice.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
-    const sliceLockPath = path.join(resolveCommonDir(repoRoot), 'pipelane-state', 'task-locks', `${slice.taskSlug}.json`);
+    const sliceLockPath = path.join(sharedStateDir(repoRoot), 'task-locks', `${slice.taskSlug}.json`);
     const sliceLock = JSON.parse(readFileSync(sliceLockPath, 'utf8'));
     sliceLock.updatedAt = '2026-04-17T00:00:00Z';
     writeFileSync(sliceLockPath, `${JSON.stringify(sliceLock, null, 2)}\n`, 'utf8');

@@ -164,7 +164,7 @@ board/CI shell needs conflict handling that lives behind the TTY today.
 
 ## `probe-state.json` (v1.2)
 
-Location: `<commonDir>/pipelane-state/probe-state.json`.
+Location: `$PIPELANE_HOME/repos/<repo-key>/state/probe-state.json`.
 
 Written by `doctor.probe` and `doctor.fix` (which runs a probe after
 updating the deploy-config block). Read by the release gate as a

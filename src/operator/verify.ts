@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { readFixPromptBody } from './fix-prompt.ts';
 import { readLessonPromptBody } from './lesson-prompt.ts';
 import { npmGuardStatus, runNpmGuardSelfCheck } from './npm-guard-install.ts';
-import { defaultWorkflowConfig, homeClaudeDir, homeCodexDir, resolveConfigPath, writeJsonFile } from './state.ts';
+import { defaultWorkflowConfig, homeClaudeDir, homeCodexDir, pipelaneHomeDir, resolveConfigPath, writeJsonFile } from './state.ts';
 import {
   desiredHostInstall,
   type DesiredInstall,
@@ -70,9 +70,8 @@ function checkOptionalSkill(checks: VerifyCheck[], name: string, targetPath: str
 }
 
 function runtimeRoot(host: HostInstall, home: string): string {
-  return host === 'codex'
-    ? path.join(home, 'skills', '.pipelane')
-    : path.join(home, 'skills', 'pipelane');
+  void home;
+  return path.join(pipelaneHomeDir(), 'runtimes', host);
 }
 
 function desiredMachineInstall(host: HostInstall, home: string): DesiredInstall {
@@ -97,6 +96,10 @@ function hostInstallSignals(host: HostInstall, home: string, install: DesiredIns
     ...install.entries.filter((entry) => entry.required).map((entry) => path.join(skillsRoot, entry.name, 'SKILL.md')),
   ];
   if (host === 'codex') {
+    signals.push(path.join(skillsRoot, 'pipelane', 'bin', 'run-pipelane.sh'));
+    signals.push(path.join(skillsRoot, '.pipelane', 'bin', 'run-pipelane.sh'));
+  }
+  if (host === 'claude') {
     signals.push(path.join(skillsRoot, 'pipelane', 'bin', 'run-pipelane.sh'));
   }
   return signals;

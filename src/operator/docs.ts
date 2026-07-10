@@ -26,8 +26,6 @@ import {
   writeJsonFile,
 } from './state.ts';
 import { loadDeployConfig } from './release-gate.ts';
-import { pruneLegacyCodexWrapperSkills } from './codex-install.ts';
-import { type CodexSkillDrift, detectCodexSkillDrift, syncCodexSkills } from './codex-skills.ts';
 
 const README_MARKER_START = '<!-- pipelane:readme:start -->';
 const README_MARKER_END = '<!-- pipelane:readme:end -->';
@@ -474,117 +472,6 @@ function replaceMarkedSection(targetPath: string, startMarker: string, endMarker
   writeFileSync(targetPath, next, 'utf8');
 }
 
-const REQUIRED_PACKAGE_SCRIPTS: Record<string, string> = {
-  'pipelane:setup': 'pipelane setup',
-  'pipelane:configure': 'pipelane configure',
-  'pipelane:devmode': 'pipelane run devmode',
-  'pipelane:new': 'pipelane run new',
-  'pipelane:adopt': 'pipelane run adopt',
-  'pipelane:resume': 'pipelane run resume',
-  'pipelane:repo-guard': 'pipelane run repo-guard',
-  'pipelane:pr': 'pipelane run pr',
-  'pipelane:merge': 'pipelane run merge',
-  'pipelane:release': 'pipelane run release',
-  'pipelane:release-check': 'pipelane run release-check',
-  'pipelane:task-lock': 'pipelane run task-lock',
-  'pipelane:deploy': 'pipelane run deploy',
-  'pipelane:clean': 'pipelane run clean',
-  'pipelane:status': 'pipelane run status',
-  'pipelane:doctor': 'pipelane run doctor',
-  'pipelane:rollback': 'pipelane run rollback',
-  'pipelane:board': 'pipelane board',
-  'pipelane:update': 'pipelane update',
-  'pipelane:api': 'pipelane run api',
-  'pipelane:review': 'pipelane run review',
-  'pipelane:orchestrate': 'pipelane run orchestrate',
-};
-
-const CLAUDE_COMMAND_PACKAGE_SCRIPTS = [
-  ...MANAGED_WORKFLOW_COMMANDS.map((cmd) => `pipelane:${cmd}`),
-  'pipelane:configure',
-  'pipelane:board',
-  'pipelane:update',
-  'pipelane:review',
-  'pipelane:orchestrate',
-];
-
-// Hard block against the npm-wipes-shared-deps footgun. Loads the standalone
-// CJS guard from pipelane's own published `scripts/` folder if present.
-// Self-no-ops when pipelane isn't installed yet (first-bootstrap), and there
-// can't be a worktree symlink to wipe at that point either. The substring
-// PREINSTALL_GUARD_FINGERPRINT is what mergePreinstallScript looks for to
-// stay idempotent and to recognize an already-chained existing preinstall.
-export const PREINSTALL_GUARD_FINGERPRINT = 'pipelane/scripts/preinstall-guard.cjs';
-export const PIPELANE_PREINSTALL_GUARD =
-  `node -e "const p='./node_modules/${PREINSTALL_GUARD_FINGERPRINT}';require('fs').existsSync(p)&&require(p)"`;
-
-// Legacy package-script helper. Active setup no longer wires a preinstall guard
-// into consumer package.json, but the merge behavior remains covered for old
-// helpers/tests. Clobbering a consumer's existing preinstall would silently
-// break their CI hooks. Instead:
-// - no existing preinstall → write ours
-// - existing already contains the guard fingerprint → leave alone (idempotent)
-// - existing is something else → chain ours first so the worktree-symlink
-//   case fails fast before the consumer's hook runs
-export function mergePreinstallScript(existing: string | undefined): string {
-  const trimmed = (existing ?? '').trim();
-  if (!trimmed) return PIPELANE_PREINSTALL_GUARD;
-  if (trimmed.includes(PREINSTALL_GUARD_FINGERPRINT)) return existing as string;
-  return `${PIPELANE_PREINSTALL_GUARD} && ${existing}`;
-}
-
-// Shared builder: returns the exact bytes pipelane would write to package.json
-// along with the current on-disk bytes. Used by ensurePackageScripts (to
-// write) and by detectSetupDrift (to compare without writing).
-function buildEnsuredPackageJson(repoRoot: string): { targetPath: string; currentRaw: string; nextRaw: string } {
-  const targetPath = path.join(repoRoot, 'package.json');
-  const existed = existsSync(targetPath);
-  const currentRaw = existed ? readFileSync(targetPath, 'utf8') : '';
-  const current: Record<string, unknown> = existed
-    ? JSON.parse(currentRaw) as Record<string, unknown>
-    : { name: path.basename(repoRoot), private: true, type: 'module', scripts: {} };
-  const existingScripts = typeof current.scripts === 'object' && current.scripts
-    ? current.scripts as Record<string, string>
-    : {};
-  const scripts: Record<string, string> = {
-    ...existingScripts,
-    ...REQUIRED_PACKAGE_SCRIPTS,
-    preinstall: mergePreinstallScript(existingScripts.preinstall),
-  };
-  const next = { ...current, scripts };
-  const nextRaw = `${JSON.stringify(next, null, 2)}\n`;
-  return { targetPath, currentRaw, nextRaw };
-}
-
-function buildEnsuredPreinstallGuardPackageJson(repoRoot: string): { targetPath: string; currentRaw: string; nextRaw: string } {
-  const targetPath = path.join(repoRoot, 'package.json');
-  const existed = existsSync(targetPath);
-  const currentRaw = existed ? readFileSync(targetPath, 'utf8') : '';
-  const current: Record<string, unknown> = existed
-    ? JSON.parse(currentRaw) as Record<string, unknown>
-    : { name: path.basename(repoRoot), private: true, type: 'module', scripts: {} };
-  const existingScripts = typeof current.scripts === 'object' && current.scripts
-    ? current.scripts as Record<string, string>
-    : {};
-  const scripts: Record<string, string> = {
-    ...existingScripts,
-    preinstall: mergePreinstallScript(existingScripts.preinstall),
-  };
-  const next = { ...current, scripts };
-  const nextRaw = `${JSON.stringify(next, null, 2)}\n`;
-  return { targetPath, currentRaw, nextRaw };
-}
-
-export function ensurePackageScripts(repoRoot: string): void {
-  const { targetPath, nextRaw } = buildEnsuredPackageJson(repoRoot);
-  writeFileSync(targetPath, nextRaw, 'utf8');
-}
-
-export function ensurePreinstallGuard(repoRoot: string): void {
-  const { targetPath, nextRaw } = buildEnsuredPreinstallGuardPackageJson(repoRoot);
-  writeFileSync(targetPath, nextRaw, 'utf8');
-}
-
 // Legacy package-script consistency check. Repo-local command generation is no
 // longer supported, so there is no package-script fallback to enforce.
 function assertPackageScriptConsistency(repoRoot: string, syncDocs: Required<SyncDocsConfig>): void {
@@ -625,6 +512,14 @@ export interface SetupConsumerRepoResult {
   appliedLessonsMigration: LessonsMigration | null;
   warnings: string[];
   taskStartCommand: string;
+}
+
+export interface CodexSkillDrift {
+  skillsDir: string;
+  addedSkills: string[];
+  updatedSkills: string[];
+  removedLegacySkills: string[];
+  runnerDrift: boolean;
 }
 
 export interface SetupConsumerRepoOptions {
@@ -1129,7 +1024,6 @@ export function setupConsumerRepo(cwd: string, options: SetupConsumerRepoOptions
   const repoRoot = resolveRepoRoot(cwd, true);
   const workflowConfig = setupWorkflowConfig(repoRoot);
   const config = workflowConfig.config;
-  const syncDocs = resolveEffectiveSyncDocs(repoRoot, config);
   syncConsumerDocs(repoRoot, config);
   const scaffoldClaudeMd = false;
   const scaffoldRepoGuidance = false;
@@ -1175,9 +1069,7 @@ export function setupConsumerRepo(cwd: string, options: SetupConsumerRepoOptions
     skippedClaudeScaffold,
     skippedRepoGuidanceScaffold,
     codexSkillsDir: path.join(repoRoot, '.agents', 'skills'),
-    installedCodexSkills: syncDocs.codexSkills
-      ? MANAGED_WORKFLOW_COMMANDS.map((command) => config.aliases[command])
-      : [],
+    installedCodexSkills: [],
     removedLegacyCodexSkills,
     agentsGuidanceMigrations,
     appliedAgentsGuidanceMigrations,
@@ -1287,17 +1179,14 @@ export function detectSetupDrift(cwd: string): SetupDrift {
     claude.collisions.sort();
   }
 
-  // Codex surface
-  const codexDrift = syncDocs.codexSkills
-    ? detectCodexSkillDrift(repoRoot, config)
-    : {
-        skillsDir: path.join(repoRoot, '.agents', 'skills'),
-        addedSkills: [],
-        updatedSkills: [],
-        removedLegacySkills: [],
-        runnerDrift: false,
-      };
-  const codex = { ...codexDrift, enabled: syncDocs.codexSkills };
+  const codex = {
+    skillsDir: path.join(repoRoot, '.agents', 'skills'),
+    addedSkills: [],
+    updatedSkills: [],
+    removedLegacySkills: [],
+    runnerDrift: false,
+    enabled: false,
+  };
 
   // Local guidance scaffolds are no longer created by setup.
   const claudeGuidance = {
@@ -1350,12 +1239,6 @@ export function detectSetupDrift(cwd: string): SetupDrift {
     `# ${config.displayName} Repo Context\n\n`,
   )) {
     otherSurfaces.push('agentsSection');
-  }
-  if (syncDocs.packageScripts) {
-    const { currentRaw, nextRaw } = buildEnsuredPackageJson(repoRoot);
-    if (currentRaw !== nextRaw) {
-      otherSurfaces.push('packageScripts');
-    }
   }
   const agentsGuidanceMigrations = syncDocs.agentsSection
     ? detectAgentsGuidanceMigrationsForConfig(repoRoot, config)

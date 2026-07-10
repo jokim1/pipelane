@@ -3,8 +3,8 @@ import path from 'node:path';
 
 import { readFixPromptBody } from './fix-prompt.ts';
 import { readLessonPromptBody } from './lesson-prompt.ts';
-import { installGlobalRuntime } from './global-runtime.ts';
-import { defaultWorkflowConfig, homeCodexDir, readJsonFile, WORKFLOW_COMMANDS, writeJsonFile } from './state.ts';
+import { installGlobalRuntime, isManagedGlobalRuntime } from './global-runtime.ts';
+import { defaultWorkflowConfig, homeCodexDir, pipelaneHomeDir, readJsonFile, WORKFLOW_COMMANDS, writeJsonFile } from './state.ts';
 import {
   desiredHostInstall,
   INIT_PIPELANE_SKILL_NAME,
@@ -34,7 +34,8 @@ export interface InstallCodexSkillsResult {
 }
 
 function runtimeRoot(codexHome: string): string {
-  return path.join(codexHome, 'skills', MANAGED_PIPELANE_DIR);
+  void codexHome;
+  return path.join(pipelaneHomeDir(), 'runtimes', 'codex');
 }
 
 function isSafeSkillName(skillName: string): boolean {
@@ -65,8 +66,8 @@ function skillDocPath(skillsRoot: string, skillName: string): string {
   return path.join(skillDirPath(skillsRoot, skillName), 'SKILL.md');
 }
 
-function managedSkillsPath(skillsRoot: string): string {
-  return path.join(skillsRoot, MANAGED_PIPELANE_DIR, MANAGED_CODEX_SKILLS_FILENAME);
+function managedSkillsPath(root: string): string {
+  return path.join(root, MANAGED_CODEX_SKILLS_FILENAME);
 }
 
 function readSkillBody(skillsRoot: string, skillName: string): string | null {
@@ -145,13 +146,19 @@ function isManagedCodexSkill(skillsRoot: string, skillName: string): boolean {
   return body !== null && isManagedCodexSkillBody(body, skillName);
 }
 
-function readManagedSkillNames(skillsRoot: string): Set<string> {
-  const manifest = readJsonFile<ManagedSkillsManifest>(managedSkillsPath(skillsRoot), { skills: [] });
+function readManagedSkillNames(skillsRoot: string, runtimeRootPath: string): Set<string> {
+  const manifests = [
+    managedSkillsPath(runtimeRootPath),
+    path.join(skillsRoot, MANAGED_PIPELANE_DIR, MANAGED_CODEX_SKILLS_FILENAME),
+  ];
   const names = new Set<string>();
-  if (Array.isArray(manifest.skills)) {
-    for (const entry of manifest.skills) {
-      if (typeof entry === 'string' && isSafeSkillName(entry)) {
-        names.add(entry);
+  for (const manifestPath of manifests) {
+    const manifest = readJsonFile<ManagedSkillsManifest>(manifestPath, { skills: [] });
+    if (Array.isArray(manifest.skills)) {
+      for (const entry of manifest.skills) {
+        if (typeof entry === 'string' && isSafeSkillName(entry)) {
+          names.add(entry);
+        }
       }
     }
   }
@@ -167,13 +174,25 @@ function knownLegacySkillNames(desired: DesiredInstallEntry[]): Set<string> {
   ]);
 }
 
-function pruneLegacyCodexWrappers(skillsRoot: string, desired: DesiredInstallEntry[]): string[] {
+function removeLegacyCodexRuntimeDir(skillsRoot: string, runtimeRootPath: string): string[] {
+  const legacyRoot = path.join(skillsRoot, MANAGED_PIPELANE_DIR);
+  if (path.resolve(legacyRoot) === path.resolve(runtimeRootPath) || !existsSync(legacyRoot)) {
+    return [];
+  }
+  if (!isManagedGlobalRuntime(legacyRoot, [MANAGED_CODEX_SKILLS_FILENAME, 'bin/run-pipelane.sh'])) {
+    return [];
+  }
+  rmSync(legacyRoot, { recursive: true, force: true });
+  return [MANAGED_PIPELANE_DIR];
+}
+
+function pruneLegacyCodexWrappers(skillsRoot: string, runtimeRootPath: string, desired: DesiredInstallEntry[]): string[] {
   if (!existsSync(skillsRoot)) {
     return [];
   }
 
   const candidates = new Set<string>([
-    ...readManagedSkillNames(skillsRoot),
+    ...readManagedSkillNames(skillsRoot, runtimeRootPath),
     ...knownLegacySkillNames(desired),
   ]);
 
@@ -199,6 +218,7 @@ function pruneLegacyCodexWrappers(skillsRoot: string, desired: DesiredInstallEnt
     }
   }
 
+  removed.push(...removeLegacyCodexRuntimeDir(skillsRoot, runtimeRootPath));
   return removed.sort();
 }
 
@@ -213,7 +233,7 @@ export function pruneLegacyCodexWrapperSkills(
     fixPromptBody: readFixPromptBody(),
     lessonPromptBody: readLessonPromptBody(),
   });
-  return pruneLegacyCodexWrappers(path.join(codexHome, 'skills'), desired.entries);
+  return pruneLegacyCodexWrappers(path.join(codexHome, 'skills'), runtimeRoot(codexHome), desired.entries);
 }
 
 function assertOrSkipCollision(skillsRoot: string, entry: DesiredInstallEntry, skipped: string[]): boolean {
@@ -255,7 +275,7 @@ export function installCodexBootstrapSkill(
   });
 
   mkdirSync(skillsRoot, { recursive: true });
-  const removedLegacySkills = pruneLegacyCodexWrappers(skillsRoot, install.entries);
+  const removedLegacySkills = pruneLegacyCodexWrappers(skillsRoot, pipelaneRoot, install.entries);
   installGlobalRuntime(pipelaneRoot, {
     host: 'codex',
     legacyMarkers: [MANAGED_CODEX_SKILLS_FILENAME],
@@ -277,7 +297,7 @@ export function installCodexBootstrapSkill(
     managedNames.push(entry.name);
   }
 
-  writeJsonFile(managedSkillsPath(skillsRoot), { skills: managedNames.sort() });
+  writeJsonFile(managedSkillsPath(pipelaneRoot), { skills: managedNames.sort() });
 
   return {
     codexHome,

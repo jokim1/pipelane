@@ -87,7 +87,7 @@ Planned behavior:
   - older corrupt run files are reported as non-blocking cleanup warnings, not
     hidden
   - invalid run-id directories under the active
-    `<git-common-dir>/<config.stateDir>/orchestrate/runs/` state directory are
+    `$PIPELANE_HOME/repos/<repo-key>/state/orchestrate/runs/` state directory are
     non-blocking cleanup warnings,
     because they are not addressable Pipelane run records; explicit invalid
     `--run-id` input still fails validation before file access
@@ -97,7 +97,7 @@ Planned behavior:
     still malformed and gets a fresh mtime, Pipelane should keep reporting it
     until the user repairs the JSON or moves the abandoned run directory aside.
 - Move-aside recovery must name a destination outside the active scan root, for
-  example `<git-common-dir>/<config.stateDir>/orchestrate/abandoned/<run-id>`. Do not instruct users
+  example `$PIPELANE_HOME/repos/<repo-key>/state/orchestrate/abandoned/<run-id>`. Do not instruct users
   to rename the directory in-place under `runs/`, because that can turn a corrupt
   run into an invalid run-id directory without proving the recovery path works.
 - `/pipelane orchestrate --run-id <id>` should report the exact ledger path and
@@ -127,15 +127,15 @@ User-facing guidance should be concrete:
 
 ```text
 Orchestration ledger is unreadable:
-  path: <git-common-dir>/<config.stateDir>/orchestrate/runs/orchestrate-.../orchestration.json
+  path: $PIPELANE_HOME/repos/<repo-key>/state/orchestrate/runs/orchestrate-.../orchestration.json
 
 No state was changed.
 
 Next:
 1. Restore the ledger from a known-good backup/local copy if this run matters.
-2. Move the corrupt run directory outside <git-common-dir>/<config.stateDir>/orchestrate/runs/
+2. Move the corrupt run directory outside $PIPELANE_HOME/repos/<repo-key>/state/orchestrate/runs/
    if the run is abandoned, for example to:
-   <git-common-dir>/<config.stateDir>/orchestrate/abandoned/orchestrate-...
+   $PIPELANE_HOME/repos/<repo-key>/state/orchestrate/abandoned/orchestrate-...
 3. Re-run /pipelane orchestrate after repair.
 ```
 

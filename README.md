@@ -217,9 +217,10 @@ Set up a repo:
 /pipelane web
 ```
 
-Setup is machine-local: it writes runtime config under `$PIPELANE_HOME` and does
-not create tracked `.claude/commands`, `.agents/skills`, package scripts, or
-Pipelane docs in the application repo.
+Setup is machine-local: runtime config, durable runtime copies, update caches,
+and workflow state live under `$PIPELANE_HOME` (default `~/.pipelane`). Pipelane
+does not create tracked `.claude/commands`, `.agents/skills`, package scripts,
+package lockfiles, or Pipelane docs in the application repo.
 
 Core commands:
 

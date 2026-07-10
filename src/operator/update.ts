@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto';
-import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, statSync, unlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 import { stopDashboardForRepo } from '../dashboard/launcher.ts';
 import { installClaudeBootstrapSkill } from './claude-install.ts';
 import { installCodexBootstrapSkill } from './codex-install.ts';
+import { readManagedRuntimeMetadata, type ManagedRuntimeMetadata } from './global-runtime.ts';
 import {
   detectSetupDrift,
   formatAgentsGuidanceMigrations,
@@ -15,8 +16,8 @@ import {
   type SetupDrift,
   setupConsumerRepo,
 } from './docs.ts';
-import { PIPELANE_GITHUB_URL, PIPELANE_REPO_SLUG, resolvePipelaneInstallSpec, resolvePipelaneInstallSpecForSha } from './install-source.ts';
-import { homeClaudeDir, homeCodexDir, readJsonFile, resolveRepoRoot, runCommandCapture, runGit, writeJsonFile } from './state.ts';
+import { PIPELANE_GITHUB_URL, PIPELANE_REPO_SLUG, resolvePipelaneInstallSpecForSha } from './install-source.ts';
+import { homeClaudeDir, homeCodexDir, pipelaneHomeDir, readJsonFile, resolveRepoRoot, runCommandCapture, writeJsonFile } from './state.ts';
 
 export interface UpdateOptions {
   check: boolean;
@@ -92,6 +93,15 @@ export interface GlobalSurfaceRefresh {
   claude: GlobalSurfaceRefreshCheck;
 }
 
+type ManagedRuntimeHost = 'codex' | 'claude';
+
+interface ManagedRuntimeInstall {
+  host: ManagedRuntimeHost;
+  root: string;
+  metadata: ManagedRuntimeMetadata | null;
+  installed: boolean;
+}
+
 export function parseUpdateArgs(argv: string[]): UpdateOptions {
   const options: UpdateOptions = { check: false, yes: false, json: false };
   for (const token of argv) {
@@ -108,6 +118,61 @@ export function parseUpdateArgs(argv: string[]): UpdateOptions {
   return options;
 }
 
+function managedRuntimeRoot(host: ManagedRuntimeHost): string {
+  return path.join(pipelaneHomeDir(), 'runtimes', host);
+}
+
+function readManagedRuntimeInstall(host: ManagedRuntimeHost, root = managedRuntimeRoot(host)): ManagedRuntimeInstall {
+  const metadata = readManagedRuntimeMetadata(root);
+  const installed = Boolean(metadata) || existsSync(path.join(root, 'bin', 'pipelane'));
+  return { host, root, metadata, installed };
+}
+
+function discoverManagedRuntimeInstalls(): ManagedRuntimeInstall[] {
+  return [
+    readManagedRuntimeInstall('codex'),
+    readManagedRuntimeInstall('claude'),
+  ].filter((install) => install.installed);
+}
+
+function currentManagedRuntimeInstall(): ManagedRuntimeInstall | null {
+  const root = process.env.PIPELANE_MANAGED_RUNTIME_ROOT?.trim();
+  if (!root) {
+    return null;
+  }
+  const normalized = path.resolve(root);
+  for (const host of ['codex', 'claude'] as const) {
+    if (path.resolve(managedRuntimeRoot(host)) === normalized) {
+      return readManagedRuntimeInstall(host, normalized);
+    }
+  }
+  const metadata = readManagedRuntimeMetadata(normalized);
+  return {
+    host: metadata?.host === 'claude' ? 'claude' : 'codex',
+    root: normalized,
+    metadata,
+    installed: Boolean(metadata) || existsSync(path.join(normalized, 'bin', 'pipelane')),
+  };
+}
+
+function primaryManagedRuntimeInstall(): ManagedRuntimeInstall | null {
+  const current = currentManagedRuntimeInstall();
+  if (current?.installed) {
+    return current;
+  }
+  return discoverManagedRuntimeInstalls()[0] ?? null;
+}
+
+function managedRuntimeSourceSha(install: ManagedRuntimeInstall | null): string {
+  const sha = install?.metadata?.sourceSha?.trim() ?? '';
+  return /^[a-f0-9]{7,40}$/i.test(sha) ? sha.toLowerCase() : '';
+}
+
+function managedRuntimeVersion(install: ManagedRuntimeInstall | null): string {
+  return install?.metadata?.packageVersion?.trim()
+    || (install ? readInstalledVersion(path.join(install.root, 'package.json')) : '');
+}
+
 export function maybeNotifyUpdate(cwd: string): AutoUpdateResult {
   if (autoUpdateDisabled()) {
     return { checked: false, updated: false, skippedReason: 'disabled', status: null };
@@ -120,30 +185,24 @@ export function maybeNotifyUpdate(cwd: string): AutoUpdateResult {
     return { checked: false, updated: false, skippedReason: error instanceof Error ? error.message : String(error), status: null };
   }
 
-  const updateRoot = resolveAutoUpdateRoot(repoRoot);
-  if (!updateRoot) {
-    return { checked: false, updated: false, skippedReason: 'node_modules symlink target does not identify a shared repo checkout', status: null };
+  const runtime = primaryManagedRuntimeInstall();
+  if (!runtime) {
+    return { checked: false, updated: false, skippedReason: 'durable Pipelane runtime is not installed', status: null };
   }
-
-  const packagePath = path.join(updateRoot, 'node_modules', 'pipelane', 'package.json');
-  if (!existsSync(packagePath)) {
-    return { checked: false, updated: false, skippedReason: 'pipelane is not installed in node_modules', status: null };
-  }
-
-  const installedSha = readInstalledShaFromLock(updateRoot);
+  const installedSha = managedRuntimeSourceSha(runtime);
   if (!installedSha) {
-    return { checked: false, updated: false, skippedReason: 'installed pipelane commit is unknown', status: null };
+    return { checked: false, updated: false, skippedReason: 'installed durable Pipelane commit is unknown', status: null };
   }
 
-  const cached = readFreshAutoUpdateCache(updateRoot, installedSha);
+  const cached = readFreshAutoUpdateCache(repoRoot, installedSha);
   if (cached) {
     const status = {
-      repoRoot: updateRoot,
+      repoRoot,
       installedSha,
       installedShaShort: shortSha(installedSha),
       latestSha: cached.latestSha,
       latestShaShort: shortSha(cached.latestSha),
-      installedVersion: readInstalledVersion(packagePath),
+      installedVersion: managedRuntimeVersion(runtime),
       upToDate: cached.upToDate,
       aheadBy: typeof cached.aheadBy === 'number' ? cached.aheadBy : null,
       commits: normalizeCachedCommits(cached.commits),
@@ -162,18 +221,18 @@ export function maybeNotifyUpdate(cwd: string): AutoUpdateResult {
 
   let status: UpdateStatus;
   try {
-    status = collectUpdateStatus(updateRoot, { timeoutMs: autoUpdateTimeoutMs() });
+    status = collectUpdateStatus(repoRoot, { timeoutMs: autoUpdateTimeoutMs() });
   } catch (error) {
-    writeAutoUpdateFailureCache(updateRoot, installedSha, error);
+    writeAutoUpdateFailureCache(repoRoot, installedSha, error);
     return { checked: false, updated: false, skippedReason: error instanceof Error ? error.message : String(error), status: null };
   }
 
   if (status.upToDate) {
-    writeAutoUpdateCache(updateRoot, status);
+    writeAutoUpdateCache(repoRoot, status);
     return { checked: true, updated: false, skippedReason: null, status };
   }
 
-  writeAutoUpdateCache(updateRoot, status);
+  writeAutoUpdateCache(repoRoot, status);
   process.stderr.write(formatAutoUpdateNotice(status));
   return { checked: true, updated: false, skippedReason: null, status };
 }
@@ -194,75 +253,30 @@ export function refreshAutoUpdateCache(cwd: string): AutoUpdateResult {
     return { checked: false, updated: false, skippedReason: error instanceof Error ? error.message : String(error), status: null };
   }
 
-  const updateRoot = resolveAutoUpdateRoot(repoRoot);
-  if (!updateRoot) {
-    return { checked: false, updated: false, skippedReason: 'node_modules symlink target does not identify a shared repo checkout', status: null };
+  const runtime = primaryManagedRuntimeInstall();
+  if (!runtime) {
+    return { checked: false, updated: false, skippedReason: 'durable Pipelane runtime is not installed', status: null };
   }
-
-  const packagePath = path.join(updateRoot, 'node_modules', 'pipelane', 'package.json');
-  if (!existsSync(packagePath)) {
-    return { checked: false, updated: false, skippedReason: 'pipelane is not installed in node_modules', status: null };
-  }
-
-  const installedSha = readInstalledShaFromLock(updateRoot);
+  const installedSha = managedRuntimeSourceSha(runtime);
   if (!installedSha) {
-    return { checked: false, updated: false, skippedReason: 'installed pipelane commit is unknown', status: null };
+    return { checked: false, updated: false, skippedReason: 'installed durable Pipelane commit is unknown', status: null };
   }
 
   const inheritedLock = process.env.PIPELANE_AUTO_UPDATE_REFRESH_LOCK?.trim();
-  const lockPath = inheritedLock || tryAcquireAutoUpdateRefreshLock(updateRoot);
+  const lockPath = inheritedLock || tryAcquireAutoUpdateRefreshLock(repoRoot);
   if (!lockPath) {
     return { checked: false, updated: false, skippedReason: 'refresh already running', status: null };
   }
 
   try {
-    const status = collectUpdateStatus(updateRoot, { timeoutMs: autoUpdateTimeoutMs() });
-    writeAutoUpdateCache(updateRoot, status);
+    const status = collectUpdateStatus(repoRoot, { timeoutMs: autoUpdateTimeoutMs() });
+    writeAutoUpdateCache(repoRoot, status);
     return { checked: true, updated: false, skippedReason: null, status };
   } catch (error) {
-    writeAutoUpdateFailureCache(updateRoot, installedSha, error);
+    writeAutoUpdateFailureCache(repoRoot, installedSha, error);
     return { checked: false, updated: false, skippedReason: error instanceof Error ? error.message : String(error), status: null };
   } finally {
     releaseAutoUpdateRefreshLock(lockPath);
-  }
-}
-
-function resolveAutoUpdateRoot(repoRoot: string): string | null {
-  const symlinkTarget = symlinkedNodeModulesTarget(repoRoot);
-  if (!symlinkTarget) {
-    return repoRoot;
-  }
-  if (path.basename(symlinkTarget) !== 'node_modules') {
-    return null;
-  }
-  const sharedRepoRoot = path.dirname(symlinkTarget);
-  const expectedSharedRoot = expectedSharedRepoRoot(repoRoot);
-  if (!expectedSharedRoot || normalizeAutoUpdatePath(sharedRepoRoot) !== normalizeAutoUpdatePath(expectedSharedRoot)) {
-    return null;
-  }
-  if (!existsSync(path.join(sharedRepoRoot, 'package-lock.json'))) {
-    return null;
-  }
-  return sharedRepoRoot;
-}
-
-function expectedSharedRepoRoot(repoRoot: string): string | null {
-  const commonDir = runGit(repoRoot, ['rev-parse', '--git-common-dir'], true);
-  if (!commonDir) {
-    return null;
-  }
-  const normalizedCommonDir = normalizeAutoUpdatePath(path.isAbsolute(commonDir) ? commonDir : path.join(repoRoot, commonDir));
-  if (normalizedCommonDir.includes(`${path.sep}.git${path.sep}modules${path.sep}`)) {
-    return null;
-  }
-  return path.dirname(normalizedCommonDir);
-}
-
-function normalizeAutoUpdatePath(targetPath: string): string {
-  try {
-    return realpathSync(targetPath);
-  } catch {
-    return path.resolve(targetPath);
   }
 }
 
@@ -309,35 +323,13 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
     };
   }
 
-  // Behind main path: print the commit delta, install, detect drift, run
-  // setup inline if needed. The user invoked `pipelane update` — that is
-  // the consent. For read-only inspection, use `--check`.
+  // Behind main path: print the commit delta, refresh durable runtimes, detect
+  // drift, run setup inline if needed. The user invoked `pipelane update` —
+  // that is the consent. For read-only inspection, use `--check`.
   const summary = buildStatusMessage(status);
   if (!options.json) writeUpdateOutput(options, `${summary}\n`);
 
-  const npmInstallTarget = prepareSafeNpmInstallTarget(repoRoot, options);
-  try {
-    installLatest(repoRoot, {
-      quiet: options.json,
-      output: options.output,
-      installSpec: resolvePipelaneInstallSpecForSha(status.latestSha),
-    });
-  } catch (error) {
-    try {
-      npmInstallTarget.restoreOnFailure();
-    } catch (restoreError) {
-      const installDetail = error instanceof Error ? error.message : String(error);
-      const restoreDetail = restoreError instanceof Error ? restoreError.message : String(restoreError);
-      throw new Error([
-        'npm install failed after replacing symlinked node_modules, and restoring the original symlink also failed:',
-        installDetail,
-        '',
-        'node_modules restore failed:',
-        restoreDetail,
-      ].join('\n'));
-    }
-    throw error;
-  }
+  const installRefresh = installLatestManagedRuntimes(status.latestSha, options);
   const boardStop = options.stopBoard === false
     ? { stopped: false, pid: null, reason: 'dashboard stop skipped' }
     : await stopDashboardForRepo(repoRoot);
@@ -370,7 +362,7 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
   }
 
   let driftResult = tryDetectDrift(repoRoot);
-  const globalSurfaces = refreshInstalledGlobalSurfaces(repoRoot);
+  const globalSurfaces = installRefresh;
 
   if (options.json) {
     const result: UpdateResult = {
@@ -453,10 +445,6 @@ function autoUpdateTimeoutMs(): number {
   }
   const parsed = Number(raw);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : AUTO_UPDATE_DEFAULT_TIMEOUT_MS;
-}
-
-function pipelaneHomeDir(): string {
-  return process.env.PIPELANE_HOME || path.join(os.homedir(), '.pipelane');
 }
 
 function autoUpdateCachePath(repoRoot: string): string {
@@ -616,28 +604,33 @@ function skippedGlobalSurfaces(reason: string): GlobalSurfaceRefresh {
 
 function installedCodexSurfaceSignals(): string[] {
   const skillsRoot = path.join(homeCodexDir(), 'skills');
+  const runtimeRoot = managedRuntimeRoot('codex');
   return [
-    path.join(skillsRoot, '.pipelane', 'bin', 'pipelane'),
-    path.join(skillsRoot, '.pipelane', 'bin', 'run-pipelane.sh'),
-    path.join(skillsRoot, '.pipelane', 'managed-skills.json'),
+    path.join(runtimeRoot, 'bin', 'pipelane'),
+    path.join(runtimeRoot, 'bin', 'run-pipelane.sh'),
+    path.join(runtimeRoot, 'managed-skills.json'),
     path.join(skillsRoot, 'pipelane', 'SKILL.md'),
     path.join(skillsRoot, 'init-pipelane', 'SKILL.md'),
     path.join(skillsRoot, 'new', 'SKILL.md'),
-    // Legacy pre-durable installs used this path as a runtime directory. Its
-    // presence should still trigger a refresh so update can repair it.
+    // Legacy durable installs used these host-local runtime directories. Their
+    // presence should still trigger a refresh so update can move them.
+    path.join(skillsRoot, '.pipelane', 'bin', 'run-pipelane.sh'),
     path.join(skillsRoot, 'pipelane', 'bin', 'run-pipelane.sh'),
   ];
 }
 
 function installedClaudeSurfaceSignals(): string[] {
   const skillsRoot = path.join(homeClaudeDir(), 'skills');
+  const runtimeRoot = managedRuntimeRoot('claude');
   return [
-    path.join(skillsRoot, 'pipelane', 'bin', 'pipelane'),
-    path.join(skillsRoot, 'pipelane', 'bin', 'run-pipelane.sh'),
-    path.join(skillsRoot, 'pipelane', 'managed-skills.json'),
+    path.join(runtimeRoot, 'bin', 'pipelane'),
+    path.join(runtimeRoot, 'bin', 'run-pipelane.sh'),
+    path.join(runtimeRoot, 'managed-skills.json'),
     path.join(skillsRoot, 'pipelane', 'SKILL.md'),
     path.join(skillsRoot, 'init-pipelane', 'SKILL.md'),
     path.join(skillsRoot, 'new', 'SKILL.md'),
+    // Legacy durable installs used the same path as the /pipelane skill.
+    path.join(skillsRoot, 'pipelane', 'bin', 'run-pipelane.sh'),
   ];
 }
 
@@ -669,56 +662,59 @@ function refreshGlobalSurface(repoRoot: string, host: 'codex' | 'claude', signal
   }
 }
 
-function symlinkedNodeModulesTarget(repoRoot: string): string | null {
-  const nodeModulesPath = path.join(repoRoot, 'node_modules');
-  try {
-    const stat = lstatSync(nodeModulesPath);
-    if (!stat.isSymbolicLink()) {
-      return null;
-    }
-    try {
-      return realpathSync(nodeModulesPath);
-    } catch {
-      return nodeModulesPath;
-    }
-  } catch {
-    return null;
+function installLatestManagedRuntimes(latestSha: string, options: Pick<UpdateOptions, 'json' | 'output'>): GlobalSurfaceRefresh {
+  const byHost = new Map<ManagedRuntimeHost, ManagedRuntimeInstall>();
+  for (const install of discoverManagedRuntimeInstalls()) {
+    byHost.set(install.host, install);
   }
-}
-
-interface PreparedNpmInstallTarget {
-  restoreOnFailure(): void;
-}
-
-function prepareSafeNpmInstallTarget(repoRoot: string, options: UpdateOptions): PreparedNpmInstallTarget {
-  const target = symlinkedNodeModulesTarget(repoRoot);
-  if (!target) {
-    return { restoreOnFailure() {} };
+  const current = currentManagedRuntimeInstall();
+  if (current?.installed) {
+    byHost.set(current.host, current);
   }
-  if (path.basename(target) !== 'node_modules') {
-    throw new Error([
-      `Refusing to run npm install for pipelane update in ${repoRoot} because node_modules is a symlink to ${target}.`,
-      'Run `pipelane update` from a checkout whose node_modules is a real directory, not a symlink.',
-    ].join('\n'));
-  }
-
-  const nodeModulesPath = path.join(repoRoot, 'node_modules');
-  unlinkSync(nodeModulesPath);
-  mkdirSync(nodeModulesPath, { recursive: true });
-
-  if (!options.json) {
-    writeUpdateOutput(
-      options,
-      `[pipelane] Replaced symlinked node_modules with a local directory before running npm install; shared dependencies at ${target} were left untouched.\n`,
+  if (byHost.size === 0) {
+    throw new Error(
+      'No durable Pipelane runtime is installed. Run `pipelane install-codex` or `pipelane install-claude` before updating.',
     );
   }
 
-  return {
-    restoreOnFailure() {
-      rmSync(nodeModulesPath, { recursive: true, force: true });
-      symlinkSync(target, nodeModulesPath, 'dir');
-    },
+  const spec = resolvePipelaneInstallSpecForSha(latestSha);
+  const results: Record<ManagedRuntimeHost, GlobalSurfaceRefreshCheck> = {
+    codex: { status: 'skipped', detail: 'not installed' },
+    claude: { status: 'skipped', detail: 'not installed' },
   };
+
+  for (const host of ['codex', 'claude'] as const) {
+    if (!byHost.has(host)) {
+      continue;
+    }
+    const result = runCommandCapture('npx', ['-y', spec, `install-${host}`], {
+      env: {
+        ...process.env,
+        PIPELANE_INSTALL_SOURCE_SHA: latestSha,
+        PIPELANE_INSTALL_SPEC: spec,
+      },
+    });
+    if (!result.ok) {
+      results[host] = { status: 'failed', detail: result.stderr || result.stdout || `npx exited ${result.exitCode}` };
+      continue;
+    }
+    if (!options.json && result.stdout && options.output !== 'silent') {
+      writeUpdateOutput(options, `${result.stdout}\n`);
+    }
+    if (!options.json && result.stderr && options.output !== 'silent') {
+      writeUpdateOutput({ output: 'stderr' }, `${result.stderr}\n`);
+    }
+    results[host] = { status: 'refreshed', detail: `installed ${shortSha(latestSha)} via ${spec}` };
+  }
+
+  const failures = Object.entries(results)
+    .filter(([, result]) => result.status === 'failed')
+    .map(([host, result]) => `${host}: ${result.detail}`);
+  if (failures.length > 0) {
+    throw new Error(`Pipelane managed runtime update failed:\n${failures.join('\n')}`);
+  }
+
+  return results;
 }
 
 function emitGlobalSurfaceRefreshHint(result: GlobalSurfaceRefresh, options: Pick<UpdateOptions, 'output'>): void {
@@ -874,7 +870,19 @@ export function collectUpdateStatus(
   repoRoot: string,
   options: { timeoutMs?: number } = {},
 ): UpdateStatus {
-  const { installedSha, installedVersion } = resolveInstalledPipelane(repoRoot);
+  const runtime = primaryManagedRuntimeInstall();
+  if (!runtime) {
+    throw new Error(
+      'Pipelane durable runtime is not installed. Run `pipelane install-codex` or `pipelane install-claude`.',
+    );
+  }
+  const installedSha = managedRuntimeSourceSha(runtime);
+  if (!installedSha) {
+    throw new Error(
+      `Pipelane durable runtime at ${runtime.root} does not record an installed source SHA. Reinstall with \`pipelane install-${runtime.host}\`.`,
+    );
+  }
+  const installedVersion = managedRuntimeVersion(runtime);
   const deadlineMs = options.timeoutMs === undefined ? null : Date.now() + options.timeoutMs;
   const latestSha = fetchLatestMainSha(remainingUpdateTimeoutMs(deadlineMs, options.timeoutMs));
   const upToDate = Boolean(installedSha) && installedSha === latestSha;
@@ -903,7 +911,9 @@ export function collectUpdateStatus(
 }
 
 function collectUpdateStatusFromKnownLatest(repoRoot: string, latestSha: string): UpdateStatus {
-  const { installedSha, installedVersion } = resolveInstalledPipelane(repoRoot);
+  const runtime = primaryManagedRuntimeInstall();
+  const installedSha = managedRuntimeSourceSha(runtime);
+  const installedVersion = managedRuntimeVersion(runtime);
   const normalizedLatestSha = latestSha.toLowerCase();
   return {
     repoRoot,
@@ -929,18 +939,6 @@ function remainingUpdateTimeoutMs(deadlineMs: number | null, originalTimeoutMs: 
   return Math.max(1, Math.floor(remainingMs));
 }
 
-function resolveInstalledPipelane(repoRoot: string): { installedSha: string; installedVersion: string } {
-  const packagePath = path.join(repoRoot, 'node_modules', 'pipelane', 'package.json');
-  if (!existsSync(packagePath)) {
-    throw new Error(
-      `pipelane is not installed in ${repoRoot}. Install it with: npm install --save-dev ${resolvePipelaneInstallSpec()}`,
-    );
-  }
-  const installedVersion = readInstalledVersion(packagePath);
-  const installedSha = readInstalledShaFromLock(repoRoot);
-  return { installedSha, installedVersion };
-}
-
 function readInstalledVersion(packagePath: string): string {
   try {
     const parsed = JSON.parse(readFileSync(packagePath, 'utf8')) as { version?: string };
@@ -948,36 +946,6 @@ function readInstalledVersion(packagePath: string): string {
   } catch {
     return '';
   }
-}
-
-function readInstalledShaFromLock(repoRoot: string): string {
-  const lockPath = path.join(repoRoot, 'package-lock.json');
-  if (!existsSync(lockPath)) return '';
-  try {
-    const parsed = JSON.parse(readFileSync(lockPath, 'utf8')) as {
-      packages?: Record<string, { resolved?: string }>;
-      dependencies?: Record<string, { resolved?: string }>;
-    };
-    const entries: Array<{ resolved?: string } | undefined> = [
-      parsed.packages?.['node_modules/pipelane'],
-      parsed.dependencies?.pipelane,
-    ];
-    for (const entry of entries) {
-      const sha = extractShaFromResolved(entry?.resolved);
-      if (sha) return sha;
-    }
-  } catch {
-    // fall through
-  }
-  return '';
-}
-
-function extractShaFromResolved(resolved: string | undefined): string {
-  if (!resolved) return '';
-  const hashIndex = resolved.lastIndexOf('#');
-  if (hashIndex === -1) return '';
-  const candidate = resolved.slice(hashIndex + 1).trim();
-  return /^[a-f0-9]{7,40}$/i.test(candidate) ? candidate.toLowerCase() : '';
 }
 
 function fetchLatestMainSha(timeoutMs?: number): string {
@@ -1016,24 +984,6 @@ function fetchCompare(
     return { aheadBy: parsed.ahead_by ?? commits.length, commits };
   } catch {
     return null;
-  }
-}
-
-function installLatest(repoRoot: string, options: { quiet?: boolean; output?: UpdateOutputTarget; installSpec?: string } = {}): void {
-  const result = runCommandCapture('npm', ['install', options.installSpec ?? resolvePipelaneInstallSpec()], { cwd: repoRoot });
-  if (!result.ok) {
-    const detail = result.stderr || result.stdout;
-    throw new Error(`npm install failed:\n${detail}`);
-  }
-  if (options.quiet) {
-    return;
-  }
-  if (result.stdout) {
-    writeUpdateOutput({ output: options.output }, `${result.stdout}\n`);
-  }
-  if (result.stderr) {
-    const target = options.output === 'silent' ? 'silent' : 'stderr';
-    writeUpdateOutput({ output: target }, `${result.stderr}\n`);
   }
 }
 

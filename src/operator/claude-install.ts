@@ -4,7 +4,7 @@ import path from 'node:path';
 import { readFixPromptBody } from './fix-prompt.ts';
 import { readLessonPromptBody } from './lesson-prompt.ts';
 import { installGlobalRuntime } from './global-runtime.ts';
-import { defaultWorkflowConfig, homeClaudeDir, readJsonFile, writeJsonFile } from './state.ts';
+import { defaultWorkflowConfig, homeClaudeDir, pipelaneHomeDir, readJsonFile, writeJsonFile } from './state.ts';
 import {
   desiredHostInstall,
   INIT_PIPELANE_SKILL_NAME,
@@ -30,7 +30,8 @@ interface ManagedSkillsManifest {
 }
 
 function runtimeRoot(claudeHome: string): string {
-  return path.join(claudeHome, 'skills', MANAGED_CLAUDE_RUNTIME_DIR);
+  void claudeHome;
+  return path.join(pipelaneHomeDir(), 'runtimes', 'claude');
 }
 
 function isSafeSkillName(skillName: string): boolean {

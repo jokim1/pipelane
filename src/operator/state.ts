@@ -856,19 +856,19 @@ const ORPHAN_CLEANUP_LOCKS_DIRNAME = 'orphan-cleanup-locks';
 const INSTALL_MARKER_FILENAME = 'installed.json';
 const LEGACY_MIGRATION_FILENAME = 'legacy-migration.json';
 
-// State-resilience invariants. Pipelane state lives at
-// `<commonDir>/<config.stateDir>/`, where `config.stateDir` defaults
-// to a value pipelane ships. When that default has been renamed in
-// the past — most recently `rocketboard-workflow` →
-// `pipelane-state` — every existing install silently re-initialized:
-// mode-state defaulted to 'build', probes were "missing" (release
-// gate fail-closed), deploy history looked empty. The fix has three
-// layers, all anchored on the constants below:
+// State-resilience invariants. Pipelane state lives under
+// `$PIPELANE_HOME/repos/<repo-key>/state`, where the repo key is derived from
+// the git common dir. Older releases wrote state at
+// `<commonDir>/<config.stateDir>` and, before that, at
+// `<commonDir>/rocketboard-workflow`. When that default has been renamed in
+// the past, existing installs silently re-initialized: mode-state defaulted to
+// 'build', probes were "missing" (release gate fail-closed), deploy history
+// looked empty. The fix has three layers, all anchored on the constants below:
 //
-//   LEGACY_STATE_DIRS — fallback chain. When the canonical state
-//   dir has no install marker but a known-legacy dir exists with
-//   files, copy the orphaned files forward on first load. New
-//   legacy entries get added here as defaults are renamed.
+//   LEGACY_STATE_DIRS — fallback chain, in addition to config.stateDir. When
+//   the canonical state dir has no install marker but a known-legacy dir exists
+//   with files, copy the orphaned files forward on first load. New legacy
+//   entries get added here as defaults are renamed.
 //
 //   INSTALL_MARKER_FILENAME — written into the canonical dir on
 //   first save (or on completed legacy migration). Distinguishes
@@ -1768,7 +1768,18 @@ export function patchReadableWorkflowConfig(
 }
 
 export function resolveStateDir(commonDir: string, config: WorkflowConfig): string {
-  return path.join(commonDir, config.stateDir);
+  void config;
+  return path.join(resolveMachineRepoDirForCommonDir(commonDir), 'state');
+}
+
+function resolveMachineRepoDirForCommonDir(commonDir: string): string {
+  const canonical = normalizeExistingPath(commonDir);
+  const key = crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 24);
+  return path.join(pipelaneHomeDir(), 'repos', key);
+}
+
+function legacyStateDirPath(commonDir: string, stateDirName: string): string {
+  return path.join(commonDir, stateDirName);
 }
 
 export function resolveSharedRepoRoot(commonDir: string): string {
@@ -2269,9 +2280,9 @@ export function migrateLegacyStateDir(commonDir: string, config: WorkflowConfig)
   if (hasInstallMarker(commonDir, config)) return;
   if (existsSync(legacyMigrationPath(commonDir, config))) return;
 
-  for (const legacyName of LEGACY_STATE_DIRS) {
-    if (legacyName === config.stateDir) continue;
-    const legacyDir = path.join(commonDir, legacyName);
+  const legacyStateDirNames = Array.from(new Set([config.stateDir, ...LEGACY_STATE_DIRS]));
+  for (const legacyName of legacyStateDirNames) {
+    const legacyDir = legacyStateDirPath(commonDir, legacyName);
     if (!existsSync(legacyDir)) continue;
 
     let entries: string[];
@@ -2338,8 +2349,8 @@ export function migrateLegacyStateDir(commonDir: string, config: WorkflowConfig)
 //
 // `commonDir`+`config` are required because the warn-on-missing
 // behavior keys off the install marker, which lives inside the
-// canonical state dir. State files outside that dir (smoke history,
-// repo-tracked configs) should keep using readJsonFile directly.
+// canonical state dir. State files outside that dir, such as smoke history or
+// repo-tracked configs, should keep using readJsonFile directly.
 export function readVersionedJsonFile<T>(
   kind: StateKind,
   commonDir: string,

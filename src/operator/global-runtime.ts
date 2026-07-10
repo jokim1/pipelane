@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,12 +12,14 @@ interface RuntimePackageJson {
   files?: unknown;
 }
 
-interface ManagedRuntimeMetadata {
+export interface ManagedRuntimeMetadata {
   version: number;
   managedBy: 'pipelane';
   host: string;
   packageVersion: string;
   installedAt: string;
+  sourceSha?: string;
+  installSpec?: string;
 }
 
 function packageRoot(): string {
@@ -46,6 +49,35 @@ function ensureInstallableRuntime(root: string): void {
 
 function managedRuntimePath(targetRoot: string): string {
   return path.join(targetRoot, MANAGED_RUNTIME_FILENAME);
+}
+
+export function readManagedRuntimeMetadata(targetRoot: string): ManagedRuntimeMetadata | null {
+  const metadataPath = managedRuntimePath(targetRoot);
+  if (!existsSync(metadataPath)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(readFileSync(metadataPath, 'utf8')) as ManagedRuntimeMetadata;
+    return parsed?.managedBy === 'pipelane' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveRuntimeSourceSha(sourceRoot: string): string {
+  const fromEnv = process.env.PIPELANE_INSTALL_SOURCE_SHA?.trim();
+  if (fromEnv && /^[a-f0-9]{7,40}$/i.test(fromEnv)) {
+    return fromEnv.toLowerCase();
+  }
+  try {
+    return execFileSync('git', ['rev-parse', '--verify', 'HEAD'], {
+      cwd: sourceRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim().toLowerCase();
+  } catch {
+    return '';
+  }
 }
 
 function installLockPath(targetRoot: string): string {
@@ -85,16 +117,8 @@ function acquireInstallLock(targetRoot: string): () => void {
 }
 
 export function isManagedGlobalRuntime(targetRoot: string, legacyMarkers: string[] = []): boolean {
-  const metadataPath = managedRuntimePath(targetRoot);
-  if (existsSync(metadataPath)) {
-    try {
-      const parsed = JSON.parse(readFileSync(metadataPath, 'utf8')) as ManagedRuntimeMetadata;
-      if (parsed.managedBy === 'pipelane') {
-        return true;
-      }
-    } catch {
-      // Fall through to legacy detection.
-    }
+  if (readManagedRuntimeMetadata(targetRoot)) {
+    return true;
   }
 
   return legacyMarkers.length > 0 && legacyMarkers.every((relativePath) => existsSync(path.join(targetRoot, relativePath)));
@@ -137,6 +161,14 @@ export function installGlobalRuntime(
       packageVersion,
       installedAt: new Date().toISOString(),
     };
+    const sourceSha = resolveRuntimeSourceSha(sourceRoot);
+    if (sourceSha) {
+      metadata.sourceSha = sourceSha;
+    }
+    const installSpec = process.env.PIPELANE_INSTALL_SPEC?.trim();
+    if (installSpec) {
+      metadata.installSpec = installSpec;
+    }
     writeFileSync(managedRuntimePath(tempRoot), `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
 
     if (existsSync(targetRoot)) {
