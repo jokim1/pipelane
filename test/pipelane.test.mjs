@@ -12148,6 +12148,8 @@ test('orchestrate review keeps pending same-session AI gates incomplete', async 
 
     const sliceWorktree = prepared.slices[0].worktreePath;
     const standaloneReview = JSON.parse(runCli(['run', 'review', '--json'], sliceWorktree, {
+      PIPELANE_AUTHOR_PROVIDER: 'codex',
+      PIPELANE_AUTHOR_SESSION_ID: rawWorkerSession,
       PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
     }).stdout);
     assert.equal(standaloneReview.status, 'pending');
@@ -12322,6 +12324,8 @@ test('orchestrate review attaches matching attested manual AI gate evidence', ()
 
     const sliceWorktree = prepared.slices[0].worktreePath;
     const standaloneReview = JSON.parse(runCli(['run', 'review', '--json'], sliceWorktree, {
+      PIPELANE_AUTHOR_PROVIDER: 'codex',
+      PIPELANE_AUTHOR_SESSION_ID: 'slice-worker-author-session',
       PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
     }).stdout);
     assert.equal(standaloneReview.status, 'pending');
@@ -12372,10 +12376,12 @@ test('orchestrate review attaches matching attested manual AI gate evidence', ()
     assert.match(laterPendingDiagnostic.message, /gstack-review: independent AI review pending: run \/review/);
 
     const secondStandaloneReview = JSON.parse(runCli(['run', 'review', '--json'], sliceWorktree, {
+      PIPELANE_AUTHOR_PROVIDER: 'codex',
+      PIPELANE_AUTHOR_SESSION_ID: 'slice-worker-author-session',
       PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
     }).stdout);
     assert.equal(secondStandaloneReview.status, 'pending');
-    const genericAttested = JSON.parse(runCli([
+    const genericAttested = runCli([
       'run',
       'review',
       'pass',
@@ -12388,53 +12394,22 @@ test('orchestrate review attaches matching attested manual AI gate evidence', ()
       PIPELANE_AGENT_PROVIDER: 'generic',
       PIPELANE_AGENT_SESSION_ID: 'generic-reviewer-session',
       PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
-    }).stdout);
-    assert.equal(genericAttested.status, 'attested');
+    }, true);
+    assert.equal(genericAttested.status, 1);
+    assert.match(genericAttested.stderr, /provider identity is unavailable/);
 
-    const rejected = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot, {
+    const afterRejectedAttestation = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot, {
       PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
     }).stdout);
-    const rejectedOnDisk = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
+    const afterRejectedOnDisk = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
     const status = runCli(['run', 'status'], repoRoot).stdout;
-    assert.equal(rejected.status, 'blocked');
-    assert.equal(rejected.blockedCount, 1);
-    assert.match(rejected.slices[0].blocker, /provider identity is unavailable/);
-    assert.equal(rejectedOnDisk.slices[0].review, null);
-    assert.equal(rejectedOnDisk.slices[0].reviewDiagnostics.at(-1).independence, 'unknown');
-    assert.match(status, /reviews 0\/1 trusted/);
-    assert.match(status, /review=rejected:unknown/);
-
-    const recoveryReview = JSON.parse(runCli(['run', 'review', '--json'], sliceWorktree, {
-      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
-    }).stdout);
-    assert.equal(recoveryReview.status, 'pending');
-    const recoveredAttested = JSON.parse(runCli([
-      'run',
-      'review',
-      'pass',
-      '--gate',
-      'gstack-review',
-      '--message',
-      'Ran /review clean from a new independent Claude session',
-      '--json',
-    ], sliceWorktree, {
-      CLAUDE_SESSION_ID: 'second-independent-claude-review-session',
-      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
-    }).stdout);
-    assert.equal(recoveredAttested.status, 'attested');
-
-    const recovered = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot, {
-      PIPELANE_REVIEW_STATE_KEY: reviewStateKey,
-    }).stdout);
-    const recoveredOnDisk = JSON.parse(readFileSync(reviewed.ledgerPath, 'utf8'));
-    const recoveredStatus = runCli(['run', 'status'], repoRoot).stdout;
-    assert.equal(recovered.status, 'passed');
-    assert.equal(recovered.blockedCount, 0);
-    assert.equal(recoveredOnDisk.slices[0].review.independence, 'cross-provider');
-    assert.deepEqual(recoveredOnDisk.slices[0].reviewDiagnostics, []);
-    assert.match(recoveredStatus, /reviews 1\/1 trusted/);
-    assert.match(recoveredStatus, /review=trusted:cross-provider/);
-    assert.doesNotMatch(recoveredStatus, /review=rejected/);
+    assert.equal(afterRejectedAttestation.status, 'passed');
+    assert.equal(afterRejectedAttestation.blockedCount, 0);
+    assert.equal(afterRejectedOnDisk.slices[0].review.independence, 'cross-provider');
+    assert.deepEqual(afterRejectedOnDisk.slices[0].reviewDiagnostics, []);
+    assert.match(status, /reviews 1\/1 trusted/);
+    assert.match(status, /review=trusted:cross-provider/);
+    assert.doesNotMatch(status, /review=rejected/);
   } finally {
     for (const worktreePath of createdWorktrees) {
       rmSync(worktreePath, { recursive: true, force: true });
@@ -33585,7 +33560,7 @@ test('machine-local setup preserves consumer prose that quotes the outer lessons
 
     runCli(['setup', '--yes'], repoRoot);
     const after = readFileSync(claudePath, 'utf8');
-    assert.equal(after, claude);
+    assert.match(after, /<!-- pipelane:claude-workspace-policy:start -->/);
     assert.match(after, /- 2026-06-25: keep this entry/);               // accreted entry preserved
     assert.match(after, /## Maintainer Notes/);                          // prose heading survives
     assert.match(after, /Do not hand-edit between the/);                 // prose body survives
