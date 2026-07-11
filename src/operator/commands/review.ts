@@ -516,7 +516,7 @@ export function buildReviewPassRecord(options: {
 
   const startedAt = nowIso();
   const attester = resolveReviewActorIdentity();
-  if (isIndependentAiReviewGate(gate) && base.authorIdentity) {
+  if (isIndependentAiReviewGate(gate)) {
     const candidateGate: ReviewGateRunRecord = {
       ...gate,
       status: 'passed',
@@ -526,10 +526,12 @@ export function buildReviewPassRecord(options: {
       finishedAt: startedAt,
       durationMs: 0,
     };
+    const strictIndependentAi = options.config.reviewGates?.policyVersion === REVIEW_GATES_POLICY_VERSION;
     const blocker = blockingAiReviewEvidenceBlocker({
       reviewRun: { ...base, gates: [candidateGate] },
-      worker: base.authorIdentity ?? null,
-      allowSessionOnlyIndependence: true,
+      worker: strictIndependentAi ? base.authorIdentity ?? null : base.reviewer ?? null,
+      allowSessionOnlyIndependence: strictIndependentAi ? true : undefined,
+      allowTrustedAttesterWithoutWorker: strictIndependentAi ? undefined : true,
     });
     if (blocker) {
       throw new Error(`review pass cannot attest independent AI gate ${gateId}: ${blocker}`);

@@ -14919,7 +14919,7 @@ test('review pass records clean manual gates against current review evidence', (
 
     const review = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
       ...npmShim.env,
-      PIPELANE_AGENT_SESSION_ID: 'initial-review-session',
+      CODEX_SESSION_ID: 'initial-review-session',
     }).stdout);
     assert.equal(review.status, 'pending');
 
@@ -14933,7 +14933,7 @@ test('review pass records clean manual gates against current review evidence', (
       'Ran /review clean',
       '--json',
     ], repoRoot, {
-      PIPELANE_AGENT_SESSION_ID: 'gstack-attester-session',
+      CLAUDE_SESSION_ID: 'gstack-attester-session',
     }).stdout);
     const afterGstack = JSON.parse(readFileSync(gstack.evidencePath, 'utf8')).records[0];
 
@@ -14956,7 +14956,7 @@ test('review pass records clean manual gates against current review evidence', (
       'Ran /karpathy diff clean',
       '--json',
     ], repoRoot, {
-      PIPELANE_AGENT_SESSION_ID: 'karpathy-attester-session',
+      CLAUDE_SESSION_ID: 'karpathy-attester-session',
     }).stdout);
     const afterKarpathy = JSON.parse(readFileSync(karpathy.evidencePath, 'utf8')).records[0];
 
@@ -14970,6 +14970,52 @@ test('review pass records clean manual gates against current review evidence', (
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(npmShim.binDir, { recursive: true, force: true });
+  }
+});
+
+test('review pass rejects v2 independent AI gates when author identity is unavailable', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App', {
+      reviewGates: {
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: [{
+          id: 'code-review-high',
+          phase: 'ai-diff',
+          type: 'agent',
+          blocking: true,
+          role: 'claude-code-review-high',
+          userCommands: ['/code-review high'],
+        }],
+      },
+    });
+    commitLocal(repoRoot, 'Adopt pipelane');
+
+    const review = JSON.parse(runCli(['run', 'review', '--json'], repoRoot).stdout);
+    assert.equal(review.status, 'pending');
+    const reviewState = JSON.parse(readFileSync(review.evidencePath, 'utf8'));
+    assert.equal(reviewState.records[0].authorIdentity ?? null, null);
+
+    const pass = runCli([
+      'run',
+      'review',
+      'pass',
+      '--gate',
+      'code-review-high',
+      '--message',
+      'Ran /code-review high clean',
+      '--json',
+    ], repoRoot, {
+      CLAUDE_SESSION_ID: 'trusted-reviewer-without-author',
+    }, true);
+
+    assert.equal(pass.status, 1);
+    assert.match(pass.stderr, /recorded worker session identity is unavailable/);
+    const afterPass = JSON.parse(readFileSync(review.evidencePath, 'utf8'));
+    assert.equal(afterPass.records.some((record) => record.id.startsWith('review-pass-')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
   }
 });
 
