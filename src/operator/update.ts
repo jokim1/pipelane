@@ -824,7 +824,12 @@ export function formatFollowUpSummary(drift: SetupDrift): string {
   }
   if (agentsGuidanceMigrations.length > 0) {
     const count = agentsGuidanceMigrations.reduce((sum, migration) => sum + migration.replacements.length, 0);
-    changes.push(`AGENTS.md consumer-owned guidance note (${count} line${count === 1 ? '' : 's'})`);
+    const hasSection = agentsGuidanceMigrations.some((migration) => Boolean(migration.sectionAction));
+    const details = [
+      hasSection ? 'workspace policy' : '',
+      count > 0 ? `${count} line${count === 1 ? '' : 's'}` : '',
+    ].filter(Boolean).join(', ');
+    changes.push(`AGENTS.md consumer-owned guidance note${details ? ` (${details})` : ''}`);
   }
   if (claudeGuidanceMigrations.length > 0) {
     changes.push('CLAUDE.md consumer-owned guidance note');

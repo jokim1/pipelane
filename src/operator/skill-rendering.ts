@@ -6,6 +6,7 @@ export type HostInstallScope = 'repo-local' | 'machine-local';
 export const INIT_PIPELANE_SKILL_NAME = 'init-pipelane';
 export const PIPELANE_DISPATCH_SKILL_NAME = 'pipelane';
 export const PIPELANE_FIX_SKILL_NAME = 'pipelane-fix';
+export const PIPELANE_TASK_WORKSPACE_SKILL_NAME = 'pipelane-task-workspace';
 export const FIX_SKILL_NAME = 'fix';
 export const LESSON_SKILL_NAME = 'lesson';
 export const ORCHESTRATE_SKILL_NAME = 'orchestrate';
@@ -363,6 +364,38 @@ ${buildSkillMarker(options.markerPrefix, options.name)}
 ${options.body}`;
 }
 
+function renderTaskWorkspaceGuardPrompt(runnerPath: string): string {
+  return `Use this before code-changing implementation work in a Pipelane-enabled repo.
+Skip it only for read-only review, answering questions without file edits, or when
+the operator explicitly tells you to edit the current checkout.
+
+## Task Workspace Guard
+
+Before reading task files deeply or editing:
+
+1. Check whether the current directory is a git checkout:
+   \`git rev-parse --show-toplevel\`
+   If it is not a git checkout, this skill does not apply.
+2. Check whether Pipelane is available in this checkout:
+   \`"${runnerPath}" pipelane status --json\`
+   If Pipelane reports that it is unavailable for this repo, continue with the
+   host's normal repository rules.
+3. Infer a concise task label from the user's request.
+4. If recent context proves this chat is already in the matching task worktree,
+   continue there. Otherwise run:
+   \`"${runnerPath}" repo-guard --task "<task label>"\`
+5. If the guard reports a different worktree, or says "Chat has not moved",
+   switch the shell/workspace to the reported path before reading or editing task
+   files. If you cannot switch the workspace, stop and report the path instead
+   of continuing in the starting checkout.
+6. If the guard fails, do not continue implementation in the current checkout.
+   Fix the guard failure, resume/adopt the intended task worktree, or ask the
+   operator how to proceed.
+
+Re-run the guard before implementation resumes after an interruption, and before
+\`/pr\`, \`/merge\`, or \`/deploy\` if the checkout might have changed.`;
+}
+
 export function renderBootstrapScript(_pipelaneBinPath: string): string {
   return `#!/bin/sh
 set -eu
@@ -590,6 +623,20 @@ export function desiredHostInstall(
       command: 'pipelane',
       slashAlias: `/${PIPELANE_DISPATCH_SKILL_NAME}`,
       runnerPath: paths.runnerPath,
+      markerPrefix,
+    }),
+  });
+
+  entries.push({
+    kind: 'prompt',
+    name: PIPELANE_TASK_WORKSPACE_SKILL_NAME,
+    slashAlias: `/${PIPELANE_TASK_WORKSPACE_SKILL_NAME}`,
+    required: true,
+    body: renderPromptSkillBody({
+      host,
+      name: PIPELANE_TASK_WORKSPACE_SKILL_NAME,
+      description: 'Use before code-changing work to verify or create a Pipelane task worktree.',
+      body: renderTaskWorkspaceGuardPrompt(paths.runnerPath),
       markerPrefix,
     }),
   });

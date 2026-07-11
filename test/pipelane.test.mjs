@@ -1515,6 +1515,42 @@ test('setup ignores legacy syncDocs true values and writes no application-owned 
   }
 });
 
+test('setup --yes refreshes existing agent guidance without scaffolding repo-local adapters', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeFileSync(path.join(repoRoot, 'AGENTS.md'), '# Demo Agents\n\nKeep this consumer-owned note.\n', 'utf8');
+    writeFileSync(path.join(repoRoot, 'CLAUDE.md'), '# Demo Claude\n\nKeep this local note.\n', 'utf8');
+    const packageBefore = readFileSync(path.join(repoRoot, 'package.json'), 'utf8');
+
+    const result = runCli(['setup', '--yes'], repoRoot);
+
+    assert.match(result.stdout, /Legacy setup updated AGENTS\.md with the Pipelane task workspace policy/);
+    assert.match(result.stdout, /Legacy setup updated CLAUDE\.md with the Pipelane task workspace policy/);
+    assert.equal(existsSync(path.join(repoRoot, '.claude')), false);
+    assert.equal(existsSync(path.join(repoRoot, '.agents')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'docs', 'RELEASE_WORKFLOW.md')), false);
+    assert.equal(existsSync(path.join(repoRoot, 'pipelane', 'CLAUDE.template.md')), false);
+    assert.equal(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'), packageBefore);
+
+    const agents = readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8');
+    assert.match(agents, /Keep this consumer-owned note/);
+    assert.match(agents, /<!-- pipelane:agents:start -->/);
+    assert.match(agents, /For any code-changing task, start in a Pipelane task workspace/);
+    assert.match(agents, /dirty unrelated worktree/);
+    assert.match(agents, /<!-- pipelane:agents:end -->/);
+
+    const claude = readFileSync(path.join(repoRoot, 'CLAUDE.md'), 'utf8');
+    assert.match(claude, /Keep this local note/);
+    assert.match(claude, /<!-- pipelane:claude-workspace-policy:start -->/);
+    assert.match(claude, /For any code-changing task, start in a Pipelane task workspace/);
+    assert.match(claude, /dirty unrelated worktree/);
+    assert.match(claude, /<!-- pipelane:claude-workspace-policy:end -->/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('legacy smoke internals and runtime observation source files stay tracked', () => {
   for (const relativePath of [
     'src/operator/commands/smoke.ts',
@@ -2423,6 +2459,12 @@ test('install-codex outside a pipelane repo installs durable global default skil
     assert.ok(existsSync(path.join(codexHome, 'skills', 'new', 'SKILL.md')));
     assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md')));
     assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane-fix', 'SKILL.md')));
+    assert.ok(existsSync(path.join(codexHome, 'skills', 'pipelane-task-workspace', 'SKILL.md')));
+    const workspaceSkill = readFileSync(path.join(codexHome, 'skills', 'pipelane-task-workspace', 'SKILL.md'), 'utf8');
+    assert.match(workspaceSkill, /Use before code-changing work/);
+    assert.match(workspaceSkill, /repo-guard --task "<task label>"/);
+    assert.match(workspaceSkill, /Chat has not moved/);
+    assert.match(workspaceSkill, /do not continue implementation in the current checkout/);
     assert.ok(existsSync(path.join(codexHome, 'skills', 'orchestrate', 'SKILL.md')));
     const orchestrateSkill = readFileSync(path.join(codexHome, 'skills', 'orchestrate', 'SKILL.md'), 'utf8');
     assert.match(orchestrateSkill, /Orchestration behavior/);
@@ -2530,6 +2572,11 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'new', 'SKILL.md')));
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane', 'SKILL.md')));
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane-fix', 'SKILL.md')));
+    assert.ok(existsSync(path.join(claudeHome, 'skills', 'pipelane-task-workspace', 'SKILL.md')));
+    const workspaceSkill = readFileSync(path.join(claudeHome, 'skills', 'pipelane-task-workspace', 'SKILL.md'), 'utf8');
+    assert.match(workspaceSkill, /Use before code-changing work/);
+    assert.match(workspaceSkill, /repo-guard --task "<task label>"/);
+    assert.match(workspaceSkill, /Chat has not moved/);
     assert.ok(existsSync(path.join(claudeHome, 'skills', 'lesson', 'SKILL.md')));
     const lessonSkill = readFileSync(path.join(claudeHome, 'skills', 'lesson', 'SKILL.md'), 'utf8');
     assert.match(lessonSkill, /Append a dated lesson/);

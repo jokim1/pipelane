@@ -597,6 +597,12 @@ export interface AgentsGuidanceReplacement {
 export interface AgentsGuidanceMigration {
   file: 'AGENTS.md';
   path: string;
+  sectionAction?: 'insert' | 'replace';
+  insertAfterLine?: number;
+  anchor?: string;
+  replaceStartLine?: number;
+  replaceEndLine?: number;
+  block?: string;
   replacements: AgentsGuidanceReplacement[];
 }
 
@@ -639,6 +645,84 @@ function migrateAgentsGuidanceLine(line: string, aliases: Record<WorkflowCommand
   ].reduce((next, placeholder) => next.replaceAll(placeholder, aliases.new), migrated);
 }
 
+function renderAgentsGuidanceBlock(config: WorkflowConfig): string {
+  return renderTemplate(readTemplate('AGENTS.md'), config).trimEnd();
+}
+
+function renderAgentsMarkedSection(block: string): string {
+  return `${AGENTS_MARKER_START}\n${block.trimEnd()}\n${AGENTS_MARKER_END}`;
+}
+
+function findAgentsGuidanceBlock(lines: string[]): { startIndex: number; endIndex: number } | null {
+  const startIndex = lines.findIndex((line) => line.includes(AGENTS_MARKER_START));
+  if (startIndex < 0) {
+    return null;
+  }
+  const relativeEndIndex = lines
+    .slice(startIndex + 1)
+    .findIndex((line) => line.includes(AGENTS_MARKER_END));
+  if (relativeEndIndex < 0) {
+    return null;
+  }
+  return {
+    startIndex,
+    endIndex: startIndex + 1 + relativeEndIndex,
+  };
+}
+
+function hasAgentsWorkspacePolicy(content: string, config: WorkflowConfig): boolean {
+  const aliases = resolveWorkflowAliases(config.aliases);
+  return content.includes('For any code-changing task')
+    && content.includes('Pipelane task workspace')
+    && content.includes('dirty unrelated worktree')
+    && content.includes(aliases.new)
+    && content.includes(aliases.adopt)
+    && content.includes(aliases.resume)
+    && content.includes(aliases['repo-guard']);
+}
+
+function findAgentsPolicyInsertionPoint(lines: string[]): { insertAfterLine: number; anchor: string } {
+  const firstHeadingIndex = lines.findIndex((line) => /^#\s+/.test(line));
+  if (firstHeadingIndex >= 0) {
+    return { insertAfterLine: firstHeadingIndex + 1, anchor: lines[firstHeadingIndex] ?? '' };
+  }
+
+  return { insertAfterLine: 0, anchor: '' };
+}
+
+function detectAgentsSectionMigration(
+  content: string,
+  lines: string[],
+  config: WorkflowConfig,
+): Pick<AgentsGuidanceMigration, 'sectionAction' | 'insertAfterLine' | 'anchor' | 'replaceStartLine' | 'replaceEndLine' | 'block'> | null {
+  const desiredBlock = renderAgentsGuidanceBlock(config);
+  const existingBlock = findAgentsGuidanceBlock(lines);
+  if (existingBlock) {
+    const existingInner = extractMarkedRegionInner(content, AGENTS_MARKER_START, AGENTS_MARKER_END);
+    if (existingInner !== null && existingInner.trimEnd() === desiredBlock) {
+      return null;
+    }
+    return {
+      sectionAction: 'replace',
+      replaceStartLine: existingBlock.startIndex + 1,
+      replaceEndLine: existingBlock.endIndex + 1,
+      block: desiredBlock,
+    };
+  }
+
+  if (hasAgentsWorkspacePolicy(content, config)) {
+    return null;
+  }
+
+  const insertion = findAgentsPolicyInsertionPoint(lines);
+  return {
+    sectionAction: 'insert',
+    insertAfterLine: insertion.insertAfterLine,
+    anchor: insertion.anchor,
+    block: desiredBlock,
+  };
+}
+
 function detectAgentsGuidanceMigrationsForConfig(repoRoot: string, config: WorkflowConfig): AgentsGuidanceMigration[] {
   const agentsPath = path.join(repoRoot, 'AGENTS.md');
   if (!existsSync(agentsPath)) {
@@ -647,8 +731,9 @@ function detectAgentsGuidanceMigrationsForConfig(repoRoot: string, config: Workf
 
   const aliases = resolveWorkflowAliases(config.aliases);
   const replacements: AgentsGuidanceReplacement[] = [];
+  const content = readFileSync(agentsPath, 'utf8');
   let insideManagedSection = false;
-  const lines = readFileSync(agentsPath, 'utf8').split('\n');
+  const lines = content.split('\n');
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
@@ -675,11 +760,12 @@ function detectAgentsGuidanceMigrationsForConfig(repoRoot: string, config: Workf
     });
   }
 
-  if (replacements.length === 0) {
+  const sectionMigration = detectAgentsSectionMigration(content, lines, config);
+  if (replacements.length === 0 && !sectionMigration) {
     return [];
   }
 
-  return [{ file: 'AGENTS.md', path: agentsPath, replacements }];
+  return [{ file: 'AGENTS.md', path: agentsPath, replacements, ...sectionMigration }];
 }
 
 export function detectAgentsGuidanceMigrations(cwd: string): AgentsGuidanceMigration[] {
@@ -701,6 +787,26 @@ export function applyAgentsGuidanceMigrations(migrations: AgentsGuidanceMigratio
         );
       }
       lines[replacement.line - 1] = replacement.after;
+    }
+    if (migration.sectionAction === 'replace') {
+      const existingBlock = findAgentsGuidanceBlock(lines);
+      if (!existingBlock) {
+        throw new Error(
+          `${migration.file} changed while preparing the AGENTS.md guidance migration. Re-run setup to recompute the proposed edits.`,
+        );
+      }
+      lines.splice(existingBlock.startIndex, existingBlock.endIndex - existingBlock.startIndex + 1, ...renderAgentsMarkedSection(migration.block ?? '').split('\n'));
+    } else if (migration.sectionAction === 'insert') {
+      if (content.includes(AGENTS_MARKER_START)) {
+        continue;
+      }
+      if (migration.insertAfterLine && migration.insertAfterLine > 0 && lines[migration.insertAfterLine - 1] !== migration.anchor) {
+        throw new Error(
+          `${migration.file}:${migration.insertAfterLine} changed while preparing the AGENTS.md guidance migration. Re-run setup to recompute the proposed edits.`,
+        );
+      }
+      const insertAt = Math.max(0, migration.insertAfterLine ?? 0);
+      lines.splice(insertAt, 0, '', renderAgentsMarkedSection(migration.block ?? ''), '');
     }
     writeFileSync(migration.path, lines.join('\n'), 'utf8');
     applied.push(migration);
@@ -845,16 +951,29 @@ export async function applyLessonsMigrationWithApproval(
 export function formatAgentsGuidanceMigrations(migrations: AgentsGuidanceMigration[]): string[] {
   const lines: string[] = [];
   for (const migration of migrations) {
-    lines.push(`${migration.file} contains stale Pipelane guidance that should be migrated:`);
-    for (const replacement of migration.replacements) {
-      lines.push(`- ${migration.file}:${replacement.line}`);
-      lines.push(`  current: ${replacement.before}`);
-      lines.push(`  proposed: ${replacement.after}`);
+    if (migration.sectionAction === 'replace') {
+      lines.push(`${migration.file} has stale Pipelane task workspace policy guidance:`);
+      lines.push(`- replace ${migration.file}:${migration.replaceStartLine}-${migration.replaceEndLine}`);
+    } else if (migration.sectionAction === 'insert') {
+      lines.push(`${migration.file} is missing the Pipelane task workspace policy:`);
+      lines.push(
+        migration.insertAfterLine && migration.insertAfterLine > 0
+          ? `- insert after ${migration.file}:${migration.insertAfterLine}`
+          : `- insert at the top of ${migration.file}`,
+      );
+    }
+    if (migration.replacements.length > 0) {
+      lines.push(`${migration.file} contains stale Pipelane command guidance that should be migrated:`);
+      for (const replacement of migration.replacements) {
+        lines.push(`- ${migration.file}:${replacement.line}`);
+        lines.push(`  current: ${replacement.before}`);
+        lines.push(`  proposed: ${replacement.after}`);
+      }
     }
   }
   return [
     ...lines,
-    'These updates keep task starts on the managed slash-command path, avoid npm-script PATH failures before node_modules is linked, and prevent placeholder task names from creating stray worktrees.',
+    'These updates keep task starts on the managed slash-command path, avoid npm-script PATH failures before node_modules is linked, and prevent agents from editing shared or dirty unrelated worktrees.',
   ];
 }
 
@@ -1050,12 +1169,21 @@ export function setupConsumerRepo(cwd: string, options: SetupConsumerRepoOptions
     skippedRepoGuidanceScaffold = true;
   }
 
-  void options;
   const removedLegacyCodexSkills: string[] = [];
-  const agentsGuidanceMigrations: AgentsGuidanceMigration[] = [];
-  const appliedAgentsGuidanceMigrations: AgentsGuidanceMigration[] = [];
-  const claudeGuidanceMigrations: ClaudeGuidanceMigration[] = [];
-  const appliedClaudeGuidanceMigrations: ClaudeGuidanceMigration[] = [];
+  let agentsGuidanceMigrations = detectAgentsGuidanceMigrationsForConfig(repoRoot, config);
+  const appliedAgentsGuidanceMigrations = options.applyAgentsGuidanceMigrations
+    ? applyAgentsGuidanceMigrations(agentsGuidanceMigrations)
+    : [];
+  if (appliedAgentsGuidanceMigrations.length > 0) {
+    agentsGuidanceMigrations = detectAgentsGuidanceMigrationsForConfig(repoRoot, config);
+  }
+  let claudeGuidanceMigrations = detectClaudeGuidanceMigrationsForConfig(repoRoot, config);
+  const appliedClaudeGuidanceMigrations = options.applyClaudeGuidanceMigrations
+    ? applyClaudeGuidanceMigrations(claudeGuidanceMigrations)
+    : [];
+  if (appliedClaudeGuidanceMigrations.length > 0) {
+    claudeGuidanceMigrations = detectClaudeGuidanceMigrationsForConfig(repoRoot, config);
+  }
   const lessonsMigration: LessonsMigration | null = null;
   const appliedLessonsMigration: LessonsMigration | null = null;
 
@@ -1240,12 +1368,8 @@ export function detectSetupDrift(cwd: string): SetupDrift {
   )) {
     otherSurfaces.push('agentsSection');
   }
-  const agentsGuidanceMigrations = syncDocs.agentsSection
-    ? detectAgentsGuidanceMigrationsForConfig(repoRoot, config)
-    : [];
-  const claudeGuidanceMigrations = shouldScaffoldClaudeMd(syncDocs)
-    ? detectClaudeGuidanceMigrationsForConfig(repoRoot, config)
-    : [];
+  const agentsGuidanceMigrations = detectAgentsGuidanceMigrationsForConfig(repoRoot, config);
+  const claudeGuidanceMigrations = detectClaudeGuidanceMigrationsForConfig(repoRoot, config);
   const lessonsMigration = shouldScaffoldClaudeMd(syncDocs)
     ? detectLessonsMigrationForRepo(repoRoot)
     : null;
@@ -1346,7 +1470,14 @@ export function formatSetupResult(result: SetupConsumerRepoResult): string[] {
   if (result.appliedAgentsGuidanceMigrations.length > 0) {
     const count = result.appliedAgentsGuidanceMigrations
       .reduce((sum, migration) => sum + migration.replacements.length, 0);
-    lines.push(`Legacy setup updated AGENTS.md stale workflow guidance (${count} line${count === 1 ? '' : 's'}).`);
+    const updatedSection = result.appliedAgentsGuidanceMigrations
+      .some((migration) => Boolean(migration.sectionAction));
+    if (updatedSection) {
+      lines.push('Legacy setup updated AGENTS.md with the Pipelane task workspace policy.');
+    }
+    if (count > 0) {
+      lines.push(`Legacy setup updated AGENTS.md stale workflow guidance (${count} line${count === 1 ? '' : 's'}).`);
+    }
   }
   if (result.appliedClaudeGuidanceMigrations.length > 0) {
     lines.push('Legacy setup updated CLAUDE.md with the Pipelane task workspace policy.');
