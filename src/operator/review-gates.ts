@@ -82,11 +82,15 @@ export const REVIEW_GATE_ALIAS_MAP: Record<string, string> = {
   '/code-review ultra': 'code-review-ultra',
   'code-review ultra': 'code-review-ultra',
   'claude ultrareview': 'code-review-ultra',
+  '/claude-review': 'adversarial-review',
   '/claude review': 'adversarial-review',
   '/claude review code': 'adversarial-review',
+  '/codex review': 'adversarial-review',
   '/codex challenge': 'adversarial-review',
+  'claude-review': 'adversarial-review',
   'claude review': 'adversarial-review',
   'claude review code': 'adversarial-review',
+  'codex review': 'adversarial-review',
   'codex challenge': 'adversarial-review',
 };
 
@@ -212,7 +216,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     phase: 'ai-diff',
     type: 'agent',
     role: 'adversarial-code-reviewer',
-    userCommands: ['/claude review code', '/codex challenge'],
+    userCommands: ['/claude-review', '/codex review'],
     recommended: false,
   },
   {

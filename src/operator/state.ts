@@ -9,7 +9,7 @@ import { buildDefaultReviewGatesConfig } from './review-gates.ts';
 
 export type Mode = 'build' | 'release';
 export type KnownSurface = 'frontend' | 'edge' | 'sql';
-export const WORKFLOW_COMMANDS = ['devmode', 'new', 'adopt', 'resume', 'repo-guard', 'pr', 'merge', 'release', 'release-check', 'deploy', 'smoke', 'clean', 'status', 'doctor', 'rollback'] as const;
+export const WORKFLOW_COMMANDS = ['devmode', 'new', 'adopt', 'resume', 'repo-guard', 'pr', 'merge', 'release', 'release-check', 'deploy', 'clean', 'status', 'doctor', 'rollback'] as const;
 export type WorkflowCommand = (typeof WORKFLOW_COMMANDS)[number];
 export const MANAGED_WORKFLOW_COMMANDS = ['devmode', 'new', 'adopt', 'resume', 'repo-guard', 'pr', 'merge', 'release', 'deploy', 'clean', 'status', 'doctor', 'rollback'] as const;
 export type ManagedWorkflowCommand = (typeof MANAGED_WORKFLOW_COMMANDS)[number];
@@ -24,7 +24,6 @@ export const DEFAULT_WORKFLOW_ALIASES: Record<WorkflowCommand, string> = {
   release: '/release',
   'release-check': '/release-check',
   deploy: '/deploy',
-  smoke: '/smoke',
   clean: '/clean',
   status: '/status',
   doctor: '/doctor',
@@ -56,52 +55,6 @@ export interface ChecksConfig {
   // GitHub environment-level secrets (staging + production) that must exist.
   // Checked via `gh secret list --env <name>` for each environment.
   requiredEnvironmentSecrets?: string[];
-}
-
-export interface SmokePreflightStepConfig {
-  name: string;
-  command: string;
-  critical?: boolean;
-}
-
-export interface SmokeCohortConfig {
-  name: string;
-  blocking?: boolean;
-}
-
-export interface SmokeEnvironmentConfig {
-  command: string;
-  preflight?: SmokePreflightStepConfig[];
-  cohorts?: SmokeCohortConfig[];
-}
-
-export interface SmokeWaiverConfig {
-  path?: string;
-  maxExtensions?: number;
-}
-
-export interface SmokeHistoryConfig {
-  dir?: string;
-  latestPath?: string;
-  retentionDays?: number;
-  maxEntries?: number;
-}
-
-export interface SmokeConcurrencyConfig {
-  mode?: 'single-flight';
-}
-
-export interface SmokeConfig {
-  registryPath?: string;
-  generatedSummaryPath?: string;
-  criticalPathCoverage?: 'warn' | 'block';
-  criticalPaths?: string[];
-  requireStagingSmoke?: boolean;
-  staging?: SmokeEnvironmentConfig;
-  prod?: SmokeEnvironmentConfig;
-  waivers?: SmokeWaiverConfig;
-  history?: SmokeHistoryConfig;
-  concurrency?: SmokeConcurrencyConfig;
 }
 
 export type ReviewPlanGatePhase = 'plan';
@@ -224,7 +177,6 @@ export interface WorkflowConfig {
   reviewGates?: ReviewGatesConfig;
   routeSafety: RouteSafetyConfig;
   orchestrate?: OrchestrateConfig;
-  smoke?: SmokeConfig;
 }
 
 // Legacy per-surface flags. They are preserved while reading older configs,
@@ -308,13 +260,6 @@ export interface TaskLock {
   // today; /resume render integration is queued for the next slice. Absent
   // on fresh locks until the first mutation writes it.
   nextAction?: string;
-  // Skip-smoke observability. Set to true when `/deploy prod` succeeds with
-  // `smoke.staging.command` unconfigured AND `requireStagingSmoke` is not
-  // true (i.e. the promotion was allowed but without smoke evidence). `/status`
-  // surfaces it so the skip decision is visible instead of silent. A later
-  // `/deploy prod` that DID run with staging smoke clears the flag on next
-  // write.
-  promotedWithoutStagingSmoke?: boolean;
   // Audit trail for task/worktree rebinding recoveries. The current lock
   // branch/path remain authoritative; history explains how they changed.
   bindingHistory?: Array<{
@@ -554,155 +499,20 @@ export interface DeployRecord {
   idempotencyKey?: string;
   triggeredBy?: string;
   failureReason?: string;
-  smokeCoverageOverrideReason?: string;
 }
 
-export type SmokeEnvironment = 'staging' | 'prod';
-export type SmokeRunStatus = 'passed' | 'failed' | 'passed_with_retries';
-export type SmokeScenarioLifecycle = 'suggested' | 'accepted' | 'generated' | 'verified' | 'blocking' | 'quarantined';
-export type SmokeSafetyFlag = 'readonly' | 'stagingOnly' | 'requiresSyntheticData' | 'externalDependency' | 'unsafeForAutomation';
-
-export interface SmokeScenarioProvenance {
-  source: 'discovered-tag' | 'internal-template' | 'user-feedback' | 'scenario-file';
-  confidence: 'high' | 'medium' | 'low';
-  evidence: string[];
-  updatedAt?: string;
-}
-
-export interface SmokeRegistryEntry {
-  description?: string;
-  blocking?: boolean;
-  quarantine?: boolean;
-  owner?: string;
-  escalation?: string;
-  runbook?: string;
-  environments?: SmokeEnvironment[];
-  surfaces?: string[];
-  sourceTests?: string[];
-  reviewBy?: string;
-  reason?: string;
-  lifecycle?: SmokeScenarioLifecycle;
-  safetyFlags?: SmokeSafetyFlag[];
-  requiredEnv?: string[];
-  provenance?: SmokeScenarioProvenance;
-  generated?: {
-    path?: string;
-    marker?: string;
-    adapter?: string;
-    status?: 'unverified' | 'passed' | 'failed' | 'passed_with_retries';
-    verifiedAt?: string;
-  };
-}
-
-export interface SmokeRegistryState {
-  checks: Record<string, SmokeRegistryEntry>;
-}
-
-export interface SmokeWaiverRecord {
-  tag: string;
-  environment: SmokeEnvironment;
-  reason: string;
-  createdAt: string;
-  expiresAt: string;
-  extensions?: number;
-}
-
-export interface SmokeWaiverState {
-  waivers: SmokeWaiverRecord[];
-}
-
-export interface SmokePreflightResult {
-  name: string;
-  critical: boolean;
-  status: 'passed' | 'failed' | 'skipped';
-  logPath: string;
-}
-
-export interface SmokeArtifacts {
-  firstFailureTrace?: string;
-  htmlReport?: string;
-  screenshotDir?: string;
-  logPath?: string;
-}
-
-export interface SmokeRunnerCheckResult {
-  tag: string;
-  status: SmokeRunStatus;
-  attempts?: Array<{ attempt: number; status: SmokeRunStatus }>;
-  artifacts?: SmokeArtifacts;
-  tests?: { passed: number; total: number };
-}
-
-export interface SmokeRunnerResultContract {
-  schemaVersion?: number;
-  checks: SmokeRunnerCheckResult[];
-}
-
-export interface SmokeCohortResult {
-  name: string;
-  blocking: boolean;
-  status: SmokeRunStatus;
-  exitCode: number;
-  artifacts?: SmokeArtifacts;
-  checks?: SmokeRunnerCheckResult[];
-  resultsPath?: string;
-  contractError?: string;
-}
-
-export interface SmokeCheckResult {
-  tag: string;
-  status: SmokeRunStatus;
-  quarantine: boolean;
-  blocking: boolean;
-  effectiveBlocking: boolean;
-  waived?: boolean;
-  waiverReason?: string;
-  owner?: string;
-  attempts: Array<{ attempt: number; status: SmokeRunStatus }>;
-  artifacts?: SmokeArtifacts;
-  cohorts?: string[];
-  tests?: { passed: number; total: number };
-}
-
-export interface SmokeRunRecord {
-  runId: string;
-  environment: SmokeEnvironment;
-  sha: string;
-  baseUrl: string;
-  taskSlug?: string;
-  surfaces?: string[];
-  deployIdempotencyKey?: string;
-  deployWorkflowRunId?: string;
-  deployConfigFingerprint?: string;
-  smokeRequirementsFingerprint?: string;
-  status: SmokeRunStatus;
-  startedAt: string;
-  finishedAt: string;
-  preflight: SmokePreflightResult[];
-  cohortResults: SmokeCohortResult[];
-  checks: SmokeCheckResult[];
-  waiversApplied: SmokeWaiverRecord[];
-  lastKnownGoodSha: string | null;
-  drifted?: boolean;
-  retryCount?: number;
-  signature?: string;
-}
-
-export interface SmokeLatestState {
-  staging: SmokeRunRecord | null;
-  prod: SmokeRunRecord | null;
-  updatedAt: string;
-}
-
-export interface SmokeEnvironmentLock {
-  environment: SmokeEnvironment;
-  operation: 'smoke' | 'deploy';
+export interface DeployEnvironmentLock {
+  environment: DeployRecord['environment'];
   runId: string;
   sha: string;
   createdAt: string;
   pid: number;
   repoRoot: string;
 }
+
+export type DeployEnvironmentLockClaimResult =
+  | { status: 'claimed'; lock: DeployEnvironmentLock }
+  | { status: 'blocked'; existing: DeployEnvironmentLock | null };
 
 export interface OperatorFlags {
   apply: boolean;
@@ -759,30 +569,6 @@ export interface OperatorFlags {
   // `git revert <mergeCommit>` PR via gh instead of dispatching a deploy.
   // Mutually exclusive with the default redeploy flow. Release-mode only.
   revertPr: boolean;
-  // `pipelane run smoke setup` flags. Values are stored exactly as provided
-  // (trimmed of outer whitespace) so shell command strings with embedded
-  // spaces / quotes / metacharacters roundtrip into machine-local config faithfully.
-  // `requireStagingSmoke` uses an explicit tri-state empty / 'true' / 'false'
-  // rather than a boolean so absence is distinguishable from explicit false —
-  // presence means "operator opted in", absence means "leave the existing
-  // value alone in the deep merge."
-  stagingCommand: string;
-  prodCommand: string;
-  // Shorter input form for the common case: pick a package.json script by
-  // name. `handleSmokeSetup` resolves these to `npm run <name>` before
-  // writing config. Mutually exclusive with the matching --*-command flag.
-  // Sidesteps the quoting footgun of the full-shell-command form.
-  stagingScript: string;
-  prodScript: string;
-  requireStagingSmoke: string;
-  generatedSummaryPath: string;
-  criticalPaths: string[];
-  criticalPathCoverage: string;
-  refresh: boolean;
-  baseUrl: string;
-  smokeFeedback: string[];
-  scenarioFile: string;
-  makeBlocking: boolean;
   reviewPrint: boolean;
   reviewListGates: boolean;
   reviewEnable: string[];
@@ -1010,7 +796,6 @@ export function defaultWorkflowConfig(
     },
     reviewGates: defaultReviewGatesConfig({ repoRoot: options.repoRoot }),
     routeSafety: { ...DEFAULT_ROUTE_SAFETY },
-    smoke: undefined,
   };
 }
 
@@ -1256,7 +1041,7 @@ function readPackageJsonName(repoRoot: string): string | null {
 
 // Layer a stack of Partial<WorkflowConfig>s on top of a full base, with deep
 // merge for the nested record-valued fields pipelane treats compositionally
-// (aliases, syncDocs, smoke, etc.). Later overlays win. The output is a
+// (aliases, syncDocs, routeSafety, etc.). Later overlays win. The output is a
 // Partial — pass it through `normalizeWorkflowConfig` to produce a full
 // config. Arrays and primitive fields use last-write-wins; we deliberately
 // don't concatenate `surfaces` / `prePrChecks` / `prPathDenyList` because
@@ -1273,8 +1058,8 @@ function mergeWorkflowLayers(
     if (overlay.syncDocs) next.syncDocs = { ...current.syncDocs, ...overlay.syncDocs };
     if (overlay.checks) next.checks = { ...current.checks, ...overlay.checks };
     if (overlay.routeSafety) next.routeSafety = { ...current.routeSafety, ...overlay.routeSafety };
-    if (overlay.smoke) next.smoke = { ...current.smoke, ...overlay.smoke };
     if (overlay.surfacePathMap) next.surfacePathMap = { ...current.surfacePathMap, ...overlay.surfacePathMap };
+    delete (next as Record<string, unknown>).smoke;
     if (isRecord(overlay.orchestrate)) {
       next.orchestrate = {
         ...current.orchestrate,
@@ -1352,7 +1137,7 @@ export function normalizeWorkflowConfig(
   const branchPrefix = normalizeBranchPrefix(withDefaults.branchPrefix);
   const legacyBranchPrefixes = normalizeLegacyBranchPrefixes(withDefaults.legacyBranchPrefixes)
     .filter((prefix, index, all) => prefix !== branchPrefix && all.indexOf(prefix) === index);
-  return {
+  const normalized = {
     ...(withDefaults as WorkflowConfig),
     branchPrefix,
     legacyBranchPrefixes,
@@ -1364,8 +1149,9 @@ export function normalizeWorkflowConfig(
     reviewGates: normalizeReviewGatesConfig(withDefaults.reviewGates, { repoRoot: options.repoRoot }),
     routeSafety: normalizeRouteSafetyConfig(withDefaults.routeSafety),
     orchestrate: normalizeOrchestrateConfig(withDefaults.orchestrate),
-    smoke: normalizeSmokeConfig(withDefaults.smoke),
-  };
+  } as WorkflowConfig & Record<string, unknown>;
+  delete normalized.smoke;
+  return normalized;
 }
 
 export const REVIEW_GATE_PHASES: readonly ReviewGatePhase[] = ['static', 'behavioral', 'ai-diff', 'instruction', 'runtime', 'human'];
@@ -1558,83 +1344,6 @@ function cleanStableId(value: unknown): string | undefined {
   const clean = cleanString(value);
   if (!isStableEvidenceId(clean)) return undefined;
   return clean;
-}
-
-function normalizeSmokeConfig(raw: SmokeConfig | undefined): SmokeConfig | undefined {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
-  const normalizeEnvironment = (value: SmokeEnvironmentConfig | undefined): SmokeEnvironmentConfig | undefined => {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-    const command = typeof value.command === 'string' ? value.command.trim() : '';
-    if (!command) return undefined;
-    const preflight = Array.isArray(value.preflight)
-      ? value.preflight
-          .filter((step): step is SmokePreflightStepConfig =>
-            Boolean(step)
-            && typeof step.name === 'string'
-            && step.name.trim().length > 0
-            && typeof step.command === 'string'
-            && step.command.trim().length > 0,
-          )
-          .map((step) => ({
-            name: step.name.trim(),
-            command: step.command.trim(),
-            critical: step.critical === true,
-          }))
-      : undefined;
-    const cohorts = Array.isArray(value.cohorts)
-      ? value.cohorts
-          .filter((cohort): cohort is SmokeCohortConfig =>
-            Boolean(cohort)
-            && typeof cohort.name === 'string'
-            && cohort.name.trim().length > 0,
-          )
-          .map((cohort) => ({
-            name: cohort.name.trim(),
-            blocking: cohort.blocking !== false,
-          }))
-      : undefined;
-    return {
-      command,
-      preflight,
-      cohorts,
-    };
-  };
-  const criticalPaths = Array.isArray(raw.criticalPaths)
-    ? raw.criticalPaths.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
-    : undefined;
-  const normalized: SmokeConfig = {
-    registryPath: typeof raw.registryPath === 'string' && raw.registryPath.trim().length > 0 ? raw.registryPath.trim() : undefined,
-    generatedSummaryPath: typeof raw.generatedSummaryPath === 'string' && raw.generatedSummaryPath.trim().length > 0 ? raw.generatedSummaryPath.trim() : undefined,
-    criticalPathCoverage: raw.criticalPathCoverage === 'block' ? 'block' : (raw.criticalPathCoverage === 'warn' ? 'warn' : undefined),
-    criticalPaths,
-    requireStagingSmoke: raw.requireStagingSmoke === true,
-    staging: normalizeEnvironment(raw.staging),
-    prod: normalizeEnvironment(raw.prod),
-    waivers: raw.waivers && typeof raw.waivers === 'object'
-      ? {
-          path: typeof raw.waivers.path === 'string' && raw.waivers.path.trim().length > 0 ? raw.waivers.path.trim() : undefined,
-          maxExtensions: typeof raw.waivers.maxExtensions === 'number' && Number.isFinite(raw.waivers.maxExtensions)
-            ? Math.max(0, Math.trunc(raw.waivers.maxExtensions))
-            : undefined,
-        }
-      : undefined,
-    history: raw.history && typeof raw.history === 'object'
-      ? {
-          dir: typeof raw.history.dir === 'string' && raw.history.dir.trim().length > 0 ? raw.history.dir.trim() : undefined,
-          latestPath: typeof raw.history.latestPath === 'string' && raw.history.latestPath.trim().length > 0 ? raw.history.latestPath.trim() : undefined,
-          retentionDays: typeof raw.history.retentionDays === 'number' && Number.isFinite(raw.history.retentionDays)
-            ? Math.max(1, Math.trunc(raw.history.retentionDays))
-            : undefined,
-          maxEntries: typeof raw.history.maxEntries === 'number' && Number.isFinite(raw.history.maxEntries)
-            ? Math.max(1, Math.trunc(raw.history.maxEntries))
-            : undefined,
-        }
-      : undefined,
-    concurrency: raw.concurrency && raw.concurrency.mode === 'single-flight'
-      ? { mode: 'single-flight' }
-      : undefined,
-  };
-  return Object.values(normalized).some((value) => value !== undefined) ? normalized : undefined;
 }
 
 // Accept a surface→path-list map only when both shape and value types
@@ -1834,64 +1543,15 @@ export function probeStatePath(commonDir: string, config: WorkflowConfig): strin
   return path.join(resolveStateDir(commonDir, config), PROBE_STATE_FILENAME);
 }
 
-function resolveMachineSmokeDir(repoRoot: string): string {
-  return path.join(resolveMachineRepoDir(repoRoot), 'smoke');
-}
-
-function resolveMachineSmokePath(repoRoot: string, configuredPath: string | undefined, fallbackName: string): string {
-  const target = configuredPath?.trim() || fallbackName;
-  return path.isAbsolute(target)
-    ? target
-    : path.join(resolveMachineSmokeDir(repoRoot), target);
-}
-
-function resolveSmokeRuntimePath(commonDir: string, configuredPath: string | undefined, fallbackName: string): string {
-  const target = configuredPath?.trim() || fallbackName;
-  return path.isAbsolute(target)
-    ? target
-    : path.join(resolveSmokeRuntimeRoot(commonDir), target);
-}
-
-export function resolveSmokeTrackedDir(repoRoot: string): string {
-  return resolveMachineSmokeDir(repoRoot);
-}
-
-export function resolveSmokeRegistryPath(repoRoot: string, config: WorkflowConfig): string {
-  return resolveMachineSmokePath(repoRoot, config.smoke?.registryPath, 'smoke-checks.json');
-}
-
-export function resolveSmokeWaiversPath(repoRoot: string, config: WorkflowConfig): string {
-  return resolveMachineSmokePath(repoRoot, config.smoke?.waivers?.path, 'waivers.json');
-}
-
-export function resolveSmokeGeneratedSummaryPath(repoRoot: string, config: WorkflowConfig): string | null {
-  const target = config.smoke?.generatedSummaryPath?.trim();
-  if (!target) return null;
-  return resolveMachineSmokePath(repoRoot, target, 'smoke-summary.md');
-}
-
-export function resolveSmokeRuntimeRoot(commonDir: string): string {
+export function resolveDeployRuntimeRoot(commonDir: string): string {
+  // Keep deploy locks at their historical path for rolling-upgrade safety.
+  // Older Pipelane processes still coordinate deploys through smoke-runtime;
+  // moving the file would let old and new processes deploy concurrently.
   return path.join(resolveMachineRepoDir(resolveSharedRepoRoot(commonDir)), 'smoke-runtime');
 }
 
-export function resolveSmokeHistoryDir(commonDir: string, config: WorkflowConfig): string {
-  return resolveSmokeRuntimePath(commonDir, config.smoke?.history?.dir, 'history');
-}
-
-export function resolveSmokeLatestPath(commonDir: string, config: WorkflowConfig): string {
-  return resolveSmokeRuntimePath(commonDir, config.smoke?.history?.latestPath, 'latest.json');
-}
-
-export function resolveSmokeHistoryRecordPath(commonDir: string, config: WorkflowConfig, runId: string): string {
-  return path.join(resolveSmokeHistoryDir(commonDir, config), `${runId}.json`);
-}
-
-export function resolveSmokeLogsDir(commonDir: string): string {
-  return path.join(resolveSmokeRuntimeRoot(commonDir), 'logs');
-}
-
-export function resolveSmokeLockPath(commonDir: string, environment: SmokeEnvironment): string {
-  return path.join(resolveSmokeRuntimeRoot(commonDir), 'locks', `${environment}.json`);
+export function resolveDeployLockPath(commonDir: string, environment: DeployRecord['environment']): string {
+  return path.join(resolveDeployRuntimeRoot(commonDir), 'locks', `${environment}.json`);
 }
 
 export function loadProbeState(commonDir: string, config: WorkflowConfig): ProbeState {
@@ -1913,76 +1573,131 @@ export function loadProbeState(commonDir: string, config: WorkflowConfig): Probe
   };
 }
 
-export function loadSmokeRegistry(repoRoot: string, config: WorkflowConfig): SmokeRegistryState {
-  const raw = readJsonFile<SmokeRegistryState>(resolveSmokeRegistryPath(repoRoot, config), { checks: {} });
-  const source = raw && typeof raw === 'object' ? raw : { checks: {} };
-  const checks = source.checks && typeof source.checks === 'object' ? source.checks : {};
-  return { checks: checks as Record<string, SmokeRegistryEntry> };
+export function loadDeployEnvironmentLock(commonDir: string, environment: DeployRecord['environment']): DeployEnvironmentLock | null {
+  const raw = readJsonFile<unknown>(resolveDeployLockPath(commonDir, environment), null);
+  return isDeployEnvironmentLock(raw, environment) ? raw : null;
 }
 
-export function saveSmokeRegistry(repoRoot: string, config: WorkflowConfig, value: SmokeRegistryState): void {
-  const registryPath = resolveSmokeRegistryPath(repoRoot, config);
-  mkdirSync(path.dirname(registryPath), { recursive: true });
-  writeJsonFile(registryPath, value);
+function isDeployEnvironmentLock(value: unknown, environment: DeployRecord['environment']): value is DeployEnvironmentLock {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const lock = value as Partial<DeployEnvironmentLock>;
+  return lock.environment === environment
+    && typeof lock.runId === 'string' && lock.runId.length > 0
+    && typeof lock.sha === 'string' && lock.sha.length > 0
+    && typeof lock.createdAt === 'string'
+    && typeof lock.pid === 'number' && Number.isSafeInteger(lock.pid) && lock.pid > 0
+    && typeof lock.repoRoot === 'string' && lock.repoRoot.length > 0;
 }
 
-export function loadSmokeWaivers(repoRoot: string, config: WorkflowConfig): SmokeWaiverState {
-  const raw = readJsonFile<SmokeWaiverState>(resolveSmokeWaiversPath(repoRoot, config), { waivers: [] });
-  const waivers = Array.isArray(raw?.waivers) ? raw.waivers : [];
-  return { waivers: waivers as SmokeWaiverRecord[] };
-}
-
-export function saveSmokeWaivers(repoRoot: string, config: WorkflowConfig, value: SmokeWaiverState): void {
-  const waiversPath = resolveSmokeWaiversPath(repoRoot, config);
-  mkdirSync(path.dirname(waiversPath), { recursive: true });
-  writeJsonFile(waiversPath, value);
-}
-
-export function loadSmokeLatestState(commonDir: string, config: WorkflowConfig): SmokeLatestState {
-  return readJsonFile<SmokeLatestState>(resolveSmokeLatestPath(commonDir, config), {
-    staging: null,
-    prod: null,
-    updatedAt: '',
-  });
-}
-
-export function saveSmokeLatestState(commonDir: string, config: WorkflowConfig, value: SmokeLatestState): void {
-  writeJsonFile(resolveSmokeLatestPath(commonDir, config), value);
-}
-
-export function saveSmokeRunRecord(commonDir: string, config: WorkflowConfig, value: SmokeRunRecord): void {
-  writeJsonFile(resolveSmokeHistoryRecordPath(commonDir, config, value.runId), value);
-}
-
-export function loadSmokeRunRecord(commonDir: string, config: WorkflowConfig, runId: string): SmokeRunRecord | null {
-  return readJsonFile<SmokeRunRecord | null>(resolveSmokeHistoryRecordPath(commonDir, config, runId), null);
-}
-
-export function listSmokeRunRecords(commonDir: string, config: WorkflowConfig): SmokeRunRecord[] {
-  const historyDir = resolveSmokeHistoryDir(commonDir, config);
-  if (!existsSync(historyDir)) {
-    return [];
+export function claimDeployEnvironmentLock(
+  commonDir: string,
+  value: DeployEnvironmentLock,
+  options: { isStale(existing: DeployEnvironmentLock): boolean },
+): DeployEnvironmentLockClaimResult {
+  const targetPath = resolveDeployLockPath(commonDir, value.environment);
+  const reclaimPath = deployLockReclaimPath(targetPath);
+  if (deployLockReclaimInProgress(reclaimPath)) {
+    return { status: 'blocked', existing: loadDeployEnvironmentLock(commonDir, value.environment) };
   }
-  return readdirSync(historyDir)
-    .filter((entry) => entry.endsWith('.json'))
-    .map((entry) => readJsonFile<SmokeRunRecord | null>(path.join(historyDir, entry), null))
-    .filter((entry): entry is SmokeRunRecord => entry !== null)
-    .sort((left, right) => left.startedAt.localeCompare(right.startedAt));
-}
-
-export function loadSmokeEnvironmentLock(commonDir: string, environment: SmokeEnvironment): SmokeEnvironmentLock | null {
-  return readJsonFile<SmokeEnvironmentLock | null>(resolveSmokeLockPath(commonDir, environment), null);
-}
-
-export function saveSmokeEnvironmentLock(commonDir: string, value: SmokeEnvironmentLock): void {
-  writeJsonFile(resolveSmokeLockPath(commonDir, value.environment), value);
-}
-
-export function removeSmokeEnvironmentLock(commonDir: string, environment: SmokeEnvironment): void {
-  const targetPath = resolveSmokeLockPath(commonDir, environment);
-  if (existsSync(targetPath)) {
-    unlinkSync(targetPath);
+  if (writeDeployEnvironmentLockExclusively(targetPath, value)) {
+    return { status: 'claimed', lock: value };
   }
+
+  const existing = loadDeployEnvironmentLock(commonDir, value.environment);
+  if (existing && !options.isStale(existing)) {
+    return { status: 'blocked', existing };
+  }
+
+  if (!acquireDeployLockMutationGuard(reclaimPath)) {
+    return { status: 'blocked', existing };
+  }
+
+  try {
+    const current = loadDeployEnvironmentLock(commonDir, value.environment);
+    if (current && !options.isStale(current)) {
+      return { status: 'blocked', existing: current };
+    }
+    if (current) {
+      removeDeployEnvironmentLockFile(targetPath, current.runId);
+    } else if (existsSync(targetPath)) {
+      // An unreadable or structurally invalid lock cannot identify a live
+      // owner. The mutation guard makes quarantine/removal and re-claim a
+      // single-writer transition instead of permanently wedging deploys.
+      removeDeployEnvironmentLockFile(targetPath);
+    }
+    return writeDeployEnvironmentLockExclusively(targetPath, value)
+      ? { status: 'claimed', lock: value }
+      : { status: 'blocked', existing: loadDeployEnvironmentLock(commonDir, value.environment) };
+  } finally {
+    rmSync(reclaimPath, { recursive: true, force: true });
+  }
+}
+
+function deployLockReclaimPath(targetPath: string): string {
+  return `${targetPath}.reclaim`;
+}
+
+function acquireDeployLockMutationGuard(reclaimPath: string): boolean {
+  if (deployLockReclaimInProgress(reclaimPath)) return false;
+  try {
+    mkdirSync(reclaimPath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw error;
+  }
+}
+
+function deployLockReclaimInProgress(reclaimPath: string): boolean {
+  if (!existsSync(reclaimPath)) return false;
+  try {
+    const stats = statSync(reclaimPath);
+    if (Date.now() - stats.mtimeMs > 5 * 60 * 1000) {
+      rmSync(reclaimPath, { recursive: true, force: true });
+      return false;
+    }
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+function writeDeployEnvironmentLockExclusively(targetPath: string, value: DeployEnvironmentLock): boolean {
+  mkdirSync(path.dirname(targetPath), { recursive: true });
+  try {
+    writeFileSync(targetPath, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' });
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw error;
+  }
+}
+
+export function removeDeployEnvironmentLock(
+  commonDir: string,
+  environment: DeployRecord['environment'],
+  expectedRunId?: string,
+): boolean {
+  const targetPath = resolveDeployLockPath(commonDir, environment);
+  const reclaimPath = deployLockReclaimPath(targetPath);
+  if (!acquireDeployLockMutationGuard(reclaimPath)) return false;
+  try {
+    return removeDeployEnvironmentLockFile(targetPath, expectedRunId);
+  } finally {
+    rmSync(reclaimPath, { recursive: true, force: true });
+  }
+}
+
+function removeDeployEnvironmentLockFile(targetPath: string, expectedRunId?: string): boolean {
+  if (!existsSync(targetPath)) {
+    return false;
+  }
+  if (expectedRunId) {
+    const current = readJsonFile<DeployEnvironmentLock | null>(targetPath, null);
+    if (current?.runId !== expectedRunId) return false;
+  }
+  unlinkSync(targetPath);
+  return true;
 }
 
 // v1.2: mirror `normalizeModeState` — a malformed probe-state.json (valid
@@ -2349,8 +2064,8 @@ export function migrateLegacyStateDir(commonDir: string, config: WorkflowConfig)
 //
 // `commonDir`+`config` are required because the warn-on-missing
 // behavior keys off the install marker, which lives inside the
-// canonical state dir. State files outside that dir, such as smoke history or
-// repo-tracked configs, should keep using readJsonFile directly.
+// canonical state dir. State files outside that dir, such as repo-tracked
+// configs, should keep using readJsonFile directly.
 export function readVersionedJsonFile<T>(
   kind: StateKind,
   commonDir: string,
@@ -3067,7 +2782,8 @@ export function resolveWorkflowAliases(
   // accepts so they can fix the spelling.
   if (aliases && typeof aliases === 'object') {
     const known = new Set<string>(WORKFLOW_COMMANDS);
-    const unknown = Object.keys(aliases).filter((key) => !known.has(key));
+    const legacyIgnoredAliasKeys = new Set(['smoke']);
+    const unknown = Object.keys(aliases).filter((key) => !known.has(key) && !legacyIgnoredAliasKeys.has(key));
     if (unknown.length > 0) {
       throw new Error(
         `Unknown workflow alias key(s): ${unknown.join(', ')}. Known keys: ${WORKFLOW_COMMANDS.join(', ')}.`,
@@ -3145,19 +2861,6 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     stuck: false,
     blastSha: '',
     revertPr: false,
-    stagingCommand: '',
-    prodCommand: '',
-    stagingScript: '',
-    prodScript: '',
-    requireStagingSmoke: '',
-    generatedSummaryPath: '',
-    criticalPaths: [],
-    criticalPathCoverage: '',
-    refresh: false,
-    baseUrl: '',
-    smokeFeedback: [],
-    scenarioFile: '',
-    makeBlocking: false,
     reviewPrint: false,
     reviewListGates: false,
     reviewEnable: [],
@@ -3206,7 +2909,7 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
 
   const commandAcceptsPrShorthand = (): boolean => {
     const command = positional[0] ?? '';
-    if (command === 'merge' || command === 'deploy' || command === 'smoke') return true;
+    if (command === 'merge' || command === 'deploy') return true;
     if (command === 'api') {
       const actionId = positional[1] === 'action' ? positional[2] ?? '' : '';
       return ['merge', 'deploy.staging', 'deploy.prod', 'route.deploy.staging', 'route.deploy.prod'].includes(actionId);
@@ -3504,79 +3207,6 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     if (flagName === '--revert-pr') {
       rejectInlineValue('--revert-pr');
       flags.revertPr = true;
-      continue;
-    }
-
-    // smoke setup flags. Shell command values (staging / prod command) and
-    // path values pass through readFlagValue which preserves embedded
-    // spaces, quotes, and metacharacters intact — parser test covers this.
-    if (flagName === '--staging-command') {
-      flags.stagingCommand = readFlagValue('--staging-command');
-      continue;
-    }
-    if (flagName === '--prod-command') {
-      flags.prodCommand = readFlagValue('--prod-command');
-      continue;
-    }
-    if (flagName === '--staging-script') {
-      flags.stagingScript = readFlagValue('--staging-script');
-      continue;
-    }
-    if (flagName === '--prod-script') {
-      flags.prodScript = readFlagValue('--prod-script');
-      continue;
-    }
-    if (flagName === '--require-staging-smoke') {
-      const raw = readFlagValue('--require-staging-smoke').trim();
-      if (raw !== 'true' && raw !== 'false') {
-        throw new Error(`--require-staging-smoke must be "true" or "false", got "${raw}".`);
-      }
-      flags.requireStagingSmoke = raw;
-      continue;
-    }
-    if (flagName === '--generated-summary-path') {
-      flags.generatedSummaryPath = readFlagValue('--generated-summary-path');
-      continue;
-    }
-    if (flagName === '--critical-path') {
-      // Repeatable. Preserve first-seen order while deduping so operators
-      // listing "--critical-path=auth --critical-path=checkout --critical-path=auth"
-      // get ['auth', 'checkout'].
-      const value = readFlagValue('--critical-path').trim();
-      if (value.length > 0 && !flags.criticalPaths.includes(value)) {
-        flags.criticalPaths.push(value);
-      }
-      continue;
-    }
-    if (flagName === '--critical-path-coverage') {
-      const raw = readFlagValue('--critical-path-coverage').trim();
-      if (raw !== 'warn' && raw !== 'block') {
-        throw new Error(`--critical-path-coverage must be "warn" or "block", got "${raw}".`);
-      }
-      flags.criticalPathCoverage = raw;
-      continue;
-    }
-    if (flagName === '--refresh') {
-      rejectInlineValue('--refresh');
-      flags.refresh = true;
-      continue;
-    }
-    if (flagName === '--base-url') {
-      flags.baseUrl = readFlagValue('--base-url').trim();
-      continue;
-    }
-    if (flagName === '--feedback') {
-      const value = readFlagValue('--feedback').trim();
-      if (value.length > 0) flags.smokeFeedback.push(value);
-      continue;
-    }
-    if (flagName === '--scenario-file') {
-      flags.scenarioFile = readFlagValue('--scenario-file').trim();
-      continue;
-    }
-    if (flagName === '--make-blocking') {
-      rejectInlineValue('--make-blocking');
-      flags.makeBlocking = true;
       continue;
     }
 
@@ -3903,8 +3533,11 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       ) {
         throw new Error('deploy requires an environment: staging or prod.');
       }
-      if (parsed.flags.reason && !parsed.flags.skipSmokeCoverage) {
-        throw new Error('deploy only accepts --reason together with --skip-smoke-coverage.');
+      if (parsed.flags.skipSmokeCoverage) {
+        throw new Error('--skip-smoke-coverage is no longer supported. Pipelane release deploys use deploy verification and healthchecks; QA smoke coverage belongs in a separate QA workflow.');
+      }
+      if (parsed.flags.reason) {
+        throw new Error('deploy does not accept --reason.');
       }
       if (parsed.flags.task.trim() && parsed.flags.pr.trim()) {
         throw new Error('deploy cannot combine --task and --pr; choose one PR/task identity.');
@@ -3912,89 +3545,8 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       if (parsed.flags.pr.trim() && parsed.flags.sha.trim()) {
         throw new Error('deploy cannot combine --pr and --sha; --pr deploys the PR merge commit.');
       }
-      if (parsed.flags.skipSmokeCoverage && parsed.positional[0] === 'staging') {
-        throw new Error('--skip-smoke-coverage only applies to production deploys.');
-      }
       rejectPlanAndYes('deploy');
       return;
-    case 'smoke': {
-      const [subcommand] = parsed.positional;
-      if (!subcommand) {
-        assertOnlyFlags(parsed, []);
-        return;
-      }
-      if (subcommand === 'setup') {
-        // Only setup accepts the setup flags. Other subcommands below still
-        // fall into assertOnlyFlags with their own allowlist so a stray
-        // --staging-command on `smoke plan` raises "Unexpected flag".
-        assertOnlyFlags(parsed, [
-          'stagingCommand',
-          'prodCommand',
-          'stagingScript',
-          'prodScript',
-          'requireStagingSmoke',
-          'generatedSummaryPath',
-          'criticalPaths',
-          'criticalPathCoverage',
-          'baseUrl',
-          'smokeFeedback',
-          'scenarioFile',
-          'makeBlocking',
-        ]);
-        // Script and full-command forms are mutually exclusive — passing
-        // both leaves the operator's intent ambiguous. Reject with both
-        // flag names so the error message tells them what to drop.
-        if (parsed.flags.stagingScript.trim() && parsed.flags.stagingCommand.trim()) {
-          throw new Error('smoke setup: --staging-script and --staging-command are mutually exclusive — pass one.');
-        }
-        if (parsed.flags.prodScript.trim() && parsed.flags.prodCommand.trim()) {
-          throw new Error('smoke setup: --prod-script and --prod-command are mutually exclusive — pass one.');
-        }
-        if (parsed.positional.length > 1) failUnexpected('pipelane run smoke setup [--staging-script <name> | --staging-command <cmd>] [--prod-script <name> | --prod-command <cmd>] [--require-staging-smoke <true|false>] [--generated-summary-path <path>] [--critical-path <path>]... [--critical-path-coverage <warn|block>] [--feedback <text>] [--scenario-file <path>] [--base-url <url>] [--make-blocking]');
-        return;
-      }
-      if (subcommand === 'plan') {
-        assertOnlyFlags(parsed, ['refresh', 'smokeFeedback', 'scenarioFile']);
-        if (parsed.flags.reason) {
-          throw new Error('smoke plan does not accept --reason.');
-        }
-        if (!parsed.flags.refresh && (parsed.flags.smokeFeedback.length > 0 || parsed.flags.scenarioFile.trim().length > 0)) {
-          throw new Error('smoke plan only accepts --feedback or --scenario-file together with --refresh.');
-        }
-        if (parsed.positional.length > 1) failUnexpected('pipelane run smoke plan [--refresh] [--feedback <text>] [--scenario-file <path>]');
-        return;
-      }
-      if (subcommand === 'staging' || subcommand === 'prod') {
-        assertOnlyFlags(parsed, ['task', 'pr', 'sha', 'surfaces', 'reason', 'title', 'message', 'forceInclude', 'plan', 'yes']);
-        requirePositivePrNumber();
-        if (parsed.flags.task.trim() && parsed.flags.pr.trim()) {
-          throw new Error(`smoke ${subcommand} cannot combine --task and --pr; choose one PR/task identity.`);
-        }
-        if (parsed.flags.reason) {
-          throw new Error(`smoke ${subcommand} does not accept --reason.`);
-        }
-        rejectPlanAndYes(`smoke ${subcommand}`);
-        if (parsed.positional.length > 1) failUnexpected('pipelane run smoke <staging|prod> [--task <task-name> | --pr <number>] [--sha <sha>] [--surfaces <csv>] [--title <title>] [--message <message>] [--force-include <path>] [--plan|--yes]');
-        return;
-      }
-      assertOnlyFlags(parsed, ['reason']);
-      if (subcommand === 'waiver') {
-        if (parsed.positional.length !== 4) {
-          throw new Error('Usage: pipelane run smoke waiver <create|extend> <@smoke-tag> <staging|prod> --reason <text>');
-        }
-        return;
-      }
-      if (subcommand === 'quarantine' || subcommand === 'unquarantine') {
-        if (subcommand === 'unquarantine' && parsed.flags.reason) {
-          throw new Error('smoke unquarantine does not accept --reason.');
-        }
-        if (parsed.positional.length !== 2) {
-          throw new Error(`Usage: pipelane run smoke ${subcommand} <@smoke-tag> [--reason <text>]`);
-        }
-        return;
-      }
-      throw new Error('smoke requires one of: plan, setup, staging, prod, waiver, quarantine, unquarantine.');
-    }
     case 'review': {
       const subcommand = parsed.positional[0] ?? '';
       if (subcommand === 'setup') {
@@ -4517,19 +4069,6 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'stuck', label: '--stuck', active: (flags) => flags.stuck },
   { key: 'blastSha', label: '--blast', active: (flags) => flags.blastSha.trim().length > 0 },
   { key: 'revertPr', label: '--revert-pr', active: (flags) => flags.revertPr },
-  { key: 'stagingCommand', label: '--staging-command', active: (flags) => flags.stagingCommand.trim().length > 0 },
-  { key: 'prodCommand', label: '--prod-command', active: (flags) => flags.prodCommand.trim().length > 0 },
-  { key: 'stagingScript', label: '--staging-script', active: (flags) => flags.stagingScript.trim().length > 0 },
-  { key: 'prodScript', label: '--prod-script', active: (flags) => flags.prodScript.trim().length > 0 },
-  { key: 'requireStagingSmoke', label: '--require-staging-smoke', active: (flags) => flags.requireStagingSmoke.length > 0 },
-  { key: 'generatedSummaryPath', label: '--generated-summary-path', active: (flags) => flags.generatedSummaryPath.trim().length > 0 },
-  { key: 'criticalPaths', label: '--critical-path', active: (flags) => flags.criticalPaths.length > 0 },
-  { key: 'criticalPathCoverage', label: '--critical-path-coverage', active: (flags) => flags.criticalPathCoverage.length > 0 },
-  { key: 'refresh', label: '--refresh', active: (flags) => flags.refresh },
-  { key: 'baseUrl', label: '--base-url', active: (flags) => flags.baseUrl.trim().length > 0 },
-  { key: 'smokeFeedback', label: '--feedback', active: (flags) => flags.smokeFeedback.length > 0 },
-  { key: 'scenarioFile', label: '--scenario-file', active: (flags) => flags.scenarioFile.trim().length > 0 },
-  { key: 'makeBlocking', label: '--make-blocking', active: (flags) => flags.makeBlocking },
   { key: 'reviewPrint', label: '--print', active: (flags) => flags.reviewPrint },
   { key: 'reviewListGates', label: '--list-gates', active: (flags) => flags.reviewListGates },
   { key: 'reviewEnable', label: '--enable', active: (flags) => flags.reviewEnable.length > 0 },

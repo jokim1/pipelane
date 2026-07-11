@@ -21,7 +21,6 @@
   "scripts": {
     "test": "node scripts/run-tests.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.build.json",
-    "smoke": "node ./src/cli.ts --help",
     "dashboard": "node ./src/cli.ts dashboard",
     "board": "node ./src/cli.ts board",
     "build": "tsc -p tsconfig.build.json && node -e \"import('node:fs').then(m=>m.cpSync('src/dashboard/public','dist/dashboard/public',{recursive:true}))\"",

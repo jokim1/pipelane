@@ -141,7 +141,7 @@ Behavioral gates:
 AI review gates:
 8.  [on]  Karpathy diff review        /karpathy-diff        installed
 9.  [on]  gstack /review              /review               installed
-10. [off] Adversarial review          /claude review code (Codex /claude review bridge) not installed
+10. [off] Adversarial review          /claude-review (Codex /claude-review bridge) not installed
 
 Conditional gates:
 11. [on]  Browser QA                  when frontend files change
@@ -175,9 +175,9 @@ User:
 Pipelane:
 Adversarial review is not installed.
 
-Install the Codex /claude review bridge now?
+Install the Codex /claude-review bridge now?
 
-Target: https://github.com/jokim1/codexskill-claude-review.git -> ~/.codex/skills/claude
+Target: https://github.com/jokim1/codexskill-claude-review.git -> ~/.codex/skills/claude-review
 
 1. Install and enable
 2. Leave disabled
@@ -185,8 +185,8 @@ Target: https://github.com/jokim1/codexskill-claude-review.git -> ~/.codex/skill
 
 Install is never implicit. The install subflow shows the tool/skill to be
 installed, the source, whether auth is required, and the resulting gate command.
-Adversarial review can be satisfied by Codex `/claude review code`,
-or Claude-side gstack `/codex challenge`. Missing Karpathy review skills can be
+Adversarial review can be satisfied by Codex `/claude-review`,
+or Claude-side gstack `/codex review`. Missing Karpathy review skills can be
 installed from `https://github.com/jokim1/karpathy-skills.git` after approval.
 If install fails or auth is missing, the gate remains disabled.
 
@@ -200,7 +200,7 @@ Enabled:
 - static: typecheck, format-check
 - behavioral: test, build
 - ai-diff: karpathy-diff, gstack /review, adversarial review
-  (/claude review code or /codex challenge)
+  (/claude-review or /codex review)
 - runtime: browser QA for frontend changes
 - instruction: audit when agent instruction files change
 - human: merge approval, production deploy approval
@@ -312,7 +312,7 @@ Human decisions needed before start:
 
 Provider plan:
 - implementation: Codex, because this orchestration was started from Codex
-- AI review: `/claude review code` or `/codex challenge` when available
+- AI review: `/claude-review` or `/codex review` when available
 - note: Pipelane selected this plan automatically to prefer independent review
 
 Actions:
@@ -580,8 +580,8 @@ Implementation:
 - Codex workers
 
 Review:
-- `/claude review code` for Codex-side Claude review when available
-- `/codex challenge` for Claude-side gstack Codex review when available
+- `/claude-review` for Codex-side Claude review when available
+- `/codex review` for Claude-side gstack Codex review when available
 
 Reason:
 Started from Codex, with independent cross-provider review preferred.
@@ -657,13 +657,13 @@ Review setup should expose independence:
 AI review gates:
 8.  [on]  Karpathy diff review        /karpathy-diff        installed, independent session
 9.  [on]  gstack /review              /review               installed, independent session
-10. [on]  Adversarial review          /claude review code   installed, cross-model
+10. [on]  Adversarial review          /claude-review   installed, cross-model
 ```
 
 If no independent reviewer is available:
 
 ```text
-10. [off] Adversarial review          /claude review code   not installed
+10. [off] Adversarial review          /claude-review   not installed
 ```
 
 ## State Machine

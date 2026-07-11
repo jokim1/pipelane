@@ -203,7 +203,7 @@ session attest its own independent review. Same-session evidence will block
 Do not reduce the review setup output to only a category summary. Preserve the
 grouped rows, stable ids such as \`C3\`, and exact commands, especially
 \`/karpathy diff\`, \`/code-review high\`, \`/gstack review\`,
-\`/claude review code\`, \`code-review-ultra\`, and \`/karpathy-audit\` when they
+\`/claude-review\`, \`code-review-ultra\`, and \`/karpathy-audit\` when they
 appear. If the user's next reply is only one or more displayed row ids such as
 \`C4\` or \`C3,H1\`, treat it as a review setup selection. When the user chooses
 gates, run the matching deterministic command exactly; every mutation writes

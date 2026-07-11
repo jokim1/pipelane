@@ -106,7 +106,8 @@ const AI_REVIEW_GATE_SCRUBBED_SESSION_ENV_KEYS = [
   'OPENCLAW_SESSION',
 ] as const;
 const CODEX_CLAUDE_REVIEW_REPO = 'https://github.com/jokim1/codexskill-claude-review.git';
-const CODEX_CLAUDE_REVIEW_SKILL_NAME = 'claude';
+const CODEX_CLAUDE_REVIEW_SKILL_NAME = 'claude-review';
+const CODEX_CLAUDE_REVIEW_LEGACY_SKILL_NAME = 'claude';
 const KARPATHY_SKILLS_REPO = 'https://github.com/jokim1/karpathy-skills.git';
 const GITLEAKS_NPM_PACKAGE = '@nogoo9/gitleaks';
 const ANTHROPIC_API_ENV_KEYS = [
@@ -202,6 +203,12 @@ interface ClaudeReviewSetupStatus {
   codexBridgeInstalled: boolean;
   codexBridgeTarget: string;
   apiEnvKeys: string[];
+}
+
+interface AiReviewGateCommandResolution {
+  command: string;
+  provider: string;
+  promptCommand?: string | null;
 }
 
 interface ReviewSetupReport {
@@ -1067,6 +1074,7 @@ function isCodeReviewHighAvailable(): boolean {
 
 function buildClaudeReviewSetupStatus(): ClaudeReviewSetupStatus {
   const codexHome = codexHomePath();
+  const codexBridgeRoot = installedCodexClaudeReviewSkillRoot(codexHome);
   const configuredCommand = firstEnvValue(process.env, [
     'PIPELANE_REVIEW_CODE_REVIEW_HIGH_COMMAND',
     'PIPELANE_REVIEW_GATE_CODE_REVIEW_HIGH_COMMAND',
@@ -1086,8 +1094,8 @@ function buildClaudeReviewSetupStatus(): ClaudeReviewSetupStatus {
     claudeCliPath,
     codeReviewHighAvailable,
     codeReviewHighSource,
-    codexBridgeInstalled: isCodexClaudeReviewBridgeInstalled(codexHome),
-    codexBridgeTarget: path.join(codexHome, 'skills', CODEX_CLAUDE_REVIEW_SKILL_NAME),
+    codexBridgeInstalled: Boolean(codexBridgeRoot),
+    codexBridgeTarget: codexBridgeRoot ?? path.join(codexHome, 'skills', CODEX_CLAUDE_REVIEW_SKILL_NAME),
     apiEnvKeys: ANTHROPIC_API_ENV_KEYS.filter((key) => Boolean(process.env[key]?.trim())),
   };
 }
@@ -1140,17 +1148,17 @@ function adversarialReviewProviders(repoRoot: string): AdversarialReviewProvider
   return [
     {
       id: 'codex-claude-review',
-      label: 'Codex /claude review bridge',
-      command: '/claude review code',
+      label: 'Codex /claude-review bridge',
+      command: '/claude-review',
       installed: isCodexClaudeReviewBridgeInstalled(codexHome),
       installable: true,
       target: `${CODEX_CLAUDE_REVIEW_REPO} -> ${codexClaudeTarget}`,
     },
     {
-      id: 'claude-side-gstack-codex-challenge',
-      label: 'Claude-side gstack /codex challenge',
-      command: '/codex challenge',
-      installed: isClaudeGstackCodexChallengeInstalled(claudeHome),
+      id: 'claude-side-gstack-codex-review',
+      label: 'Claude-side gstack /codex review',
+      command: '/codex review',
+      installed: isClaudeGstackCodexReviewInstalled(claudeHome),
       installable: false,
     },
   ];
@@ -1165,7 +1173,19 @@ function claudeHomePath(): string {
 }
 
 function isCodexClaudeReviewBridgeInstalled(codexHome: string): boolean {
-  return isCodexClaudeReviewSkillRoot(path.join(codexHome, 'skills', CODEX_CLAUDE_REVIEW_SKILL_NAME));
+  return installedCodexClaudeReviewSkillRoot(codexHome) !== null;
+}
+
+function installedCodexClaudeReviewSkillRoot(codexHome: string): string | null {
+  return codexClaudeReviewSkillRootCandidates(codexHome)
+    .find((skillRoot) => isCodexClaudeReviewSkillRoot(skillRoot)) ?? null;
+}
+
+function codexClaudeReviewSkillRootCandidates(codexHome: string): string[] {
+  return [
+    path.join(codexHome, 'skills', CODEX_CLAUDE_REVIEW_SKILL_NAME),
+    path.join(codexHome, 'skills', CODEX_CLAUDE_REVIEW_LEGACY_SKILL_NAME),
+  ];
 }
 
 function isCodexClaudeReviewSkillRoot(skillRoot: string): boolean {
@@ -1181,14 +1201,17 @@ function isCodexClaudeReviewSkillRoot(skillRoot: string): boolean {
     && isExecutableFile(path.join(skillRoot, 'scripts', 'build-review-artifact.sh'));
 }
 
-function isClaudeGstackCodexChallengeInstalled(claudeHome: string): boolean {
+function isClaudeGstackCodexReviewInstalled(claudeHome: string): boolean {
   if (!isExecutableOnPath('codex')) return false;
   const candidates = [
     path.join(claudeHome, 'skills', 'gstack', 'codex', 'SKILL.md'),
     path.join(claudeHome, 'skills', 'gstack', 'ship', 'sections', 'adversarial.md'),
     ...globalGstackCodexReviewCandidates(),
   ];
-  return candidates.some((candidate) => fileContainsAll(candidate, ['codex', 'adversarial']));
+  return candidates.some((candidate) =>
+    fileContainsAll(candidate, ['codex review'])
+    || fileContainsAll(candidate, ['codex', 'adversarial'])
+  );
 }
 
 function globalGstackCodexReviewCandidates(): string[] {
@@ -1369,7 +1392,7 @@ function reviewGateInstallOptions(entry: ResolvedReviewGateCatalogEntry, repoRoo
     return [
       {
         id: 'codex-claude-review',
-        label: 'Codex /claude review bridge',
+        label: 'Codex /claude-review bridge',
         target: `${CODEX_CLAUDE_REVIEW_REPO} -> ${path.join(codexHome, 'skills', CODEX_CLAUDE_REVIEW_SKILL_NAME)}`,
         install: () => installCodexClaudeReviewBridge(codexHome),
       },
@@ -1572,19 +1595,20 @@ function reviewSetupNpmInstallTimeoutMs(): number {
 }
 
 function installCodexClaudeReviewBridge(codexHome: string): ReviewGateInstallResult {
-  const skillRoot = path.join(codexHome, 'skills', CODEX_CLAUDE_REVIEW_SKILL_NAME);
-  if (isCodexClaudeReviewSkillRoot(skillRoot)) {
-    return { ok: true, message: 'Codex /claude review bridge is already installed.' };
+  const installedSkillRoot = installedCodexClaudeReviewSkillRoot(codexHome);
+  if (installedSkillRoot) {
+    return { ok: true, message: `Codex /claude-review bridge is already installed at ${installedSkillRoot}.` };
   }
+  const skillRoot = path.join(codexHome, 'skills', CODEX_CLAUDE_REVIEW_SKILL_NAME);
 
   if (existsSync(skillRoot)) {
     ensureSkillScriptsExecutable(skillRoot);
     if (isCodexClaudeReviewSkillRoot(skillRoot)) {
-      return { ok: true, message: 'Codex /claude review bridge scripts were repaired.' };
+      return { ok: true, message: 'Codex /claude-review bridge scripts were repaired.' };
     }
     return {
       ok: false,
-      message: `${skillRoot} exists but is not a working /claude review skill. Move it aside or repair SKILL.md and scripts/*.sh, then rerun review setup.`,
+      message: `${skillRoot} exists but is not a working /claude-review skill. Move it aside or repair SKILL.md and scripts/*.sh, then rerun review setup.`,
     };
   }
 
@@ -1601,7 +1625,7 @@ function installCodexClaudeReviewBridge(codexHome: string): ReviewGateInstallRes
       };
     }
     return isCodexClaudeReviewSkillRoot(skillRoot)
-      ? { ok: true, message: `Installed Codex /claude review bridge from ${localSource}. Restart Codex if /claude is not visible yet.` }
+      ? { ok: true, message: `Installed Codex /claude-review bridge from ${localSource}. Restart Codex if /claude-review is not visible yet.` }
       : { ok: false, message: `Linked ${localSource}, but ${skillRoot} is still missing executable review scripts.` };
   }
 
@@ -1618,7 +1642,7 @@ function installCodexClaudeReviewBridge(codexHome: string): ReviewGateInstallRes
 
   ensureSkillScriptsExecutable(skillRoot);
   return isCodexClaudeReviewSkillRoot(skillRoot)
-    ? { ok: true, message: `Installed Codex /claude review bridge at ${skillRoot}. Restart Codex if /claude is not visible yet.` }
+    ? { ok: true, message: `Installed Codex /claude-review bridge at ${skillRoot}. Restart Codex if /claude-review is not visible yet.` }
     : { ok: false, message: `Cloned ${CODEX_CLAUDE_REVIEW_REPO}, but ${skillRoot} is missing executable review scripts.` };
 }
 
@@ -1758,7 +1782,7 @@ function configuredTestReviewGateInstallers(): string[] {
 }
 
 function reviewSetupInstallTarget(entry: ResolvedReviewGateCatalogEntry): string {
-  if (entry.id === 'adversarial-review') return 'Codex /claude review bridge or Claude-side gstack /codex challenge';
+  if (entry.id === 'adversarial-review') return 'Codex /claude-review bridge or Claude-side gstack /codex review';
   if (entry.type === 'agent') return entry.role ?? entry.id;
   return entry.skill ?? entry.id;
 }
@@ -3329,7 +3353,7 @@ function runAiReviewGate(options: {
     inheritedContext,
   });
   const prompt = renderAiReviewGatePrompt({
-    gate,
+    gate: aiReviewPromptGate(gate, resolved.promptCommand),
     repoRoot,
     baseBranch,
     changedFiles,
@@ -3443,17 +3467,22 @@ function runAiReviewGate(options: {
   });
 }
 
-function resolveAiReviewGateCommand(gate: ReviewGateConfig): { command: string; provider: string } | null {
+function aiReviewPromptGate(gate: ReviewGateConfig, promptCommand: string | null | undefined): ReviewGateConfig {
+  if (promptCommand === undefined) return gate;
+  return {
+    ...gate,
+    userCommands: promptCommand ? [promptCommand] : undefined,
+  };
+}
+
+function resolveAiReviewGateCommand(gate: ReviewGateConfig): AiReviewGateCommandResolution | null {
   const explicit = gate.command?.trim();
   const gateSpecific = firstEnvValue(process.env, reviewGateSpecificCommandEnvKeys(gate))?.value;
   const shared = allowsSharedAiReviewGateCommand(gate)
     ? firstEnvValue(process.env, reviewGateSharedCommandEnvKeys())?.value
     : undefined;
-  const command = explicit
-    || gateSpecific
-    || shared
-    || defaultAiReviewGateCommand(gate);
-  if (!command) return null;
+  const command = explicit || gateSpecific || shared;
+  if (!command) return defaultAiReviewGateCommandResolution(gate);
   return {
     command,
     provider: resolveAiReviewGateProvider(gate, command),
@@ -3497,24 +3526,78 @@ function firstEnvValue(env: NodeJS.ProcessEnv, keys: string[]): { key: string; v
   return null;
 }
 
-function defaultAiReviewGateCommand(gate: ReviewGateConfig): string {
+function defaultAiReviewGateCommandResolution(gate: ReviewGateConfig): AiReviewGateCommandResolution | null {
   if (!allowsSharedAiReviewGateCommand(gate)) {
-    return '';
+    return null;
   }
   if (process.env.NODE_ENV === 'test' && process.env.PIPELANE_REVIEW_GATE_USE_REAL_NATIVE !== '1') {
-    return '';
+    return null;
   }
   if (gate.id === 'code-review-high' || gate.id === 'code-review-ultra') {
-    return '';
+    return null;
   }
-  if (gate.type === 'agent' && isExecutableOnPath('claude')) return defaultClaudeReviewCommand();
-  if (isExecutableOnPath('codex')) return defaultCodexReviewCommand();
-  if (isExecutableOnPath('claude')) return defaultClaudeReviewCommand();
-  return '';
+  const adversarialResolution = defaultAdversarialReviewGateCommandResolution(gate);
+  if (adversarialResolution !== undefined) return adversarialResolution;
+  if (gate.type === 'agent' && isExecutableOnPath('claude')) {
+    return { command: defaultClaudeReviewCommand(), provider: 'claude' };
+  }
+  if (isExecutableOnPath('codex')) {
+    return { command: defaultCodexReviewCommand(), provider: 'codex' };
+  }
+  if (isExecutableOnPath('claude')) {
+    return { command: defaultClaudeReviewCommand(), provider: 'claude' };
+  }
+  return null;
 }
 
 function allowsSharedAiReviewGateCommand(gate: ReviewGateConfig): boolean {
   return gate.phase !== 'runtime';
+}
+
+type NativeAiReviewProvider = 'codex' | 'claude';
+
+function defaultAdversarialReviewGateCommandResolution(gate: ReviewGateConfig): AiReviewGateCommandResolution | null | undefined {
+  const commandProviders = nativeAiReviewProvidersForUserCommands(gate.userCommands);
+  if (commandProviders.size === 0) return undefined;
+
+  const codexCommand = isExecutableOnPath('codex') ? defaultCodexReviewCommand() : '';
+  const claudeCommand = isExecutableOnPath('claude') ? defaultClaudeReviewCommand() : '';
+  const hasCodexCommand = commandProviders.has('codex');
+  const hasClaudeCommand = commandProviders.has('claude');
+
+  if (hasCodexCommand && codexCommand && isCodexClaudeReviewBridgeInstalled(codexHomePath())) {
+    return { command: codexCommand, provider: 'codex', promptCommand: '/claude-review' };
+  }
+  if (hasClaudeCommand && claudeCommand && isClaudeGstackCodexReviewInstalled(claudeHomePath())) {
+    return { command: claudeCommand, provider: 'claude', promptCommand: '/codex review' };
+  }
+  if (hasCodexCommand && codexCommand) {
+    return { command: codexCommand, provider: 'codex', promptCommand: null };
+  }
+  if (hasClaudeCommand && claudeCommand) {
+    return { command: claudeCommand, provider: 'claude', promptCommand: null };
+  }
+  return null;
+}
+
+function nativeAiReviewProvidersForUserCommands(userCommands: string[] | undefined): Set<NativeAiReviewProvider> {
+  const providers = new Set<NativeAiReviewProvider>();
+  for (const command of userCommands ?? []) {
+    const provider = nativeAiReviewProviderForUserCommand(command);
+    if (provider) providers.add(provider);
+  }
+  return providers;
+}
+
+function nativeAiReviewProviderForUserCommand(command: string): NativeAiReviewProvider | null {
+  const normalized = command.trim().toLowerCase().replace(/\s+/g, ' ');
+  if (normalized === '/claude-review' || normalized === 'claude-review' || normalized === '/claude review' || normalized === '/claude review code' || normalized === 'claude review' || normalized === 'claude review code') {
+    return 'codex';
+  }
+  if (normalized === '/codex review' || normalized === 'codex review' || normalized === '/codex challenge' || normalized === 'codex challenge') {
+    return 'claude';
+  }
+  return null;
 }
 
 function defaultClaudeReviewCommand(): string {
@@ -4245,13 +4328,13 @@ function formatClaudeReviewSetupStatus(status: ClaudeReviewSetupStatus): string[
     ? `installed at ${status.codexBridgeTarget}`
     : `not installed; setup: /pipelane review setup --install adversarial-review`;
   const apiEnv = status.apiEnvKeys.length > 0
-    ? `${status.apiEnvKeys.join(', ')} set; current Codex /claude bridge is subscription-only and does not use API keys`
-    : 'not set; current Codex /claude bridge is subscription-only';
+    ? `${status.apiEnvKeys.join(', ')} set; current Codex /claude-review bridge is subscription-only and does not use API keys`
+    : 'not set; current Codex /claude-review bridge is subscription-only';
 
   return [
     `- Claude Code CLI subscription: ${claudeCli}`,
     `- /code-review high gate: ${codeReviewHigh}`,
-    `- Codex /claude review bridge: ${bridge}`,
+    `- Codex /claude-review bridge: ${bridge}`,
     `- Anthropic API env: ${apiEnv}`,
   ];
 }
@@ -4316,7 +4399,7 @@ function preferredReviewSetupCommand(entry: ResolvedReviewGateCatalogEntry): str
     'karpathy-diff': '/karpathy diff',
     'code-review-high': '/code-review high',
     'gstack-review': '/gstack review',
-    'adversarial-review': '/claude review code',
+    'adversarial-review': '/claude-review',
     'code-review-ultra': '/code-review ultra',
     'karpathy-audit': '/karpathy-audit',
   };

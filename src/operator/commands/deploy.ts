@@ -1,6 +1,5 @@
 import readline from 'node:readline';
 
-import { acquireSmokeEnvironmentLock, releaseSmokeEnvironmentLock } from '../smoke-gate.ts';
 import {
   buildReleaseCheckMessage,
   computeDeployConfigFingerprint,
@@ -18,6 +17,7 @@ import {
 } from '../release-gate.ts';
 import { listMissingDeployConfiguration } from '../deploy-config-validation.ts';
 import {
+  claimDeployEnvironmentLock,
   formatWorkflowCommand,
   loadDeployState,
   loadPrRecord,
@@ -25,6 +25,7 @@ import {
   loadProbeState,
   nowIso,
   printResult,
+  removeDeployEnvironmentLock,
   resolveWorkflowContext,
   runCommandCapture,
   runGh,
@@ -32,6 +33,7 @@ import {
   saveDeployState,
   savePrRecord,
   slugifyTaskName,
+  type DeployEnvironmentLock,
   type DeployRecord,
   type DeployStatus,
   type DeployVerification,
@@ -70,6 +72,45 @@ import {
 
 function surfacesKey(surfaces: string[]): string {
   return [...surfaces].sort().join(',');
+}
+
+function acquireDeployEnvironmentLock(options: {
+  commonDir: string;
+  repoRoot: string;
+  environment: DeployRecord['environment'];
+  runId: string;
+  sha: string;
+}): DeployEnvironmentLock {
+  const lock: DeployEnvironmentLock = {
+    environment: options.environment,
+    runId: options.runId,
+    sha: options.sha,
+    createdAt: nowIso(),
+    pid: process.pid,
+    repoRoot: options.repoRoot,
+  };
+  const claim = claimDeployEnvironmentLock(options.commonDir, lock, {
+    isStale: isDeployEnvironmentLockStale,
+  });
+  if (claim.status === 'claimed') return claim.lock;
+  throw new Error(`Deploy already running for ${options.environment}: runId=${claim.existing?.runId ?? 'unknown'}`);
+}
+
+function releaseDeployEnvironmentLock(commonDir: string, lock: DeployEnvironmentLock): void {
+  removeDeployEnvironmentLock(commonDir, lock.environment, lock.runId);
+}
+
+function isDeployEnvironmentLockStale(lock: DeployEnvironmentLock): boolean {
+  const createdAt = Date.parse(lock.createdAt);
+  if (Number.isFinite(createdAt) && Date.now() - createdAt > 4 * 60 * 60 * 1000) {
+    return true;
+  }
+  try {
+    process.kill(lock.pid, 0);
+    return false;
+  } catch {
+    return true;
+  }
 }
 
 function findMatchingSucceededDeploy(options: {
@@ -383,11 +424,10 @@ export async function dispatchDeploy(
   }
 
   const deployRunId = `deploy-${environment}-${target.sha.slice(0, 7)}-${Date.now()}`;
-  acquireSmokeEnvironmentLock({
+  const deployEnvironmentLock = acquireDeployEnvironmentLock({
     commonDir: context.commonDir,
     repoRoot: context.repoRoot,
     environment,
-    operation: 'deploy',
     runId: deployRunId,
     sha: target.sha,
   });
@@ -602,7 +642,7 @@ export async function dispatchDeploy(
       ].filter(Boolean).join('\n'),
     };
   } finally {
-    releaseSmokeEnvironmentLock(context.commonDir, environment);
+    releaseDeployEnvironmentLock(context.commonDir, deployEnvironmentLock);
   }
 }
 
