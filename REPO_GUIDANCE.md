@@ -15,7 +15,7 @@ mirror of what we ask every consumer repo to maintain.
 
 Pipelane is a release-cockpit CLI + template kit. It ships as an npm
 package with a zero-runtime-deps design: every consumer repo inherits the
-same slash commands (`/pr`, `/merge`, `/deploy`, `/smoke`, `/fix`, etc.)
+same slash commands (`/pr`, `/merge`, `/deploy`, `/fix`, etc.)
 plus a rendered `CLAUDE.md` operator contract. Consumers are live
 production repos; regressions in the kit propagate everywhere on the next
 `pipelane:setup`. Backwards compatibility for already-installed consumers
@@ -56,7 +56,7 @@ Decisions captured through 2026-06-16:
   instead of inventing a toolchain silently.
 - `/orchestrate` should hand successful work back to the existing Pipelane
   release flow. It must not auto-merge, auto-deploy production, or bypass
-  existing `/pr`, `/merge`, `/deploy`, `/smoke`, `/rollback`, and `/clean`
+  existing `/pr`, `/merge`, `/deploy`, `/rollback`, and `/clean`
   gates.
 
 ## Project invariants

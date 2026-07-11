@@ -1587,7 +1587,10 @@ export function probeStatePath(commonDir: string, config: WorkflowConfig): strin
 }
 
 export function resolveDeployRuntimeRoot(commonDir: string): string {
-  return path.join(resolveMachineRepoDir(resolveSharedRepoRoot(commonDir)), 'deploy-runtime');
+  // Keep deploy locks at their historical path for rolling-upgrade safety.
+  // Older Pipelane processes still coordinate deploys through smoke-runtime;
+  // moving the file would let old and new processes deploy concurrently.
+  return path.join(resolveMachineRepoDir(resolveSharedRepoRoot(commonDir)), 'smoke-runtime');
 }
 
 export function resolveDeployLockPath(commonDir: string, environment: DeployRecord['environment']): string {
@@ -1614,7 +1617,19 @@ export function loadProbeState(commonDir: string, config: WorkflowConfig): Probe
 }
 
 export function loadDeployEnvironmentLock(commonDir: string, environment: DeployRecord['environment']): DeployEnvironmentLock | null {
-  return readJsonFile<DeployEnvironmentLock | null>(resolveDeployLockPath(commonDir, environment), null);
+  const raw = readJsonFile<unknown>(resolveDeployLockPath(commonDir, environment), null);
+  return isDeployEnvironmentLock(raw, environment) ? raw : null;
+}
+
+function isDeployEnvironmentLock(value: unknown, environment: DeployRecord['environment']): value is DeployEnvironmentLock {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const lock = value as Partial<DeployEnvironmentLock>;
+  return lock.environment === environment
+    && typeof lock.runId === 'string' && lock.runId.length > 0
+    && typeof lock.sha === 'string' && lock.sha.length > 0
+    && typeof lock.createdAt === 'string'
+    && typeof lock.pid === 'number' && Number.isSafeInteger(lock.pid) && lock.pid > 0
+    && typeof lock.repoRoot === 'string' && lock.repoRoot.length > 0;
 }
 
 export function claimDeployEnvironmentLock(
@@ -1632,7 +1647,7 @@ export function claimDeployEnvironmentLock(
   }
 
   const existing = loadDeployEnvironmentLock(commonDir, value.environment);
-  if (!existing || !options.isStale(existing)) {
+  if (existing && !options.isStale(existing)) {
     return { status: 'blocked', existing };
   }
 
@@ -1647,6 +1662,11 @@ export function claimDeployEnvironmentLock(
     }
     if (current) {
       removeDeployEnvironmentLockFile(targetPath, current.runId);
+    } else if (existsSync(targetPath)) {
+      // An unreadable or structurally invalid lock cannot identify a live
+      // owner. The mutation guard makes quarantine/removal and re-claim a
+      // single-writer transition instead of permanently wedging deploys.
+      removeDeployEnvironmentLockFile(targetPath);
     }
     return writeDeployEnvironmentLockExclusively(targetPath, value)
       ? { status: 'claimed', lock: value }
