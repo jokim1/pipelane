@@ -27556,7 +27556,7 @@ test('configure --json is idempotent: re-running with the same flags produces id
   }
 });
 
-test('configure writes mcp aliases and generic custom surface flags into DeployConfig.surfaces', () => {
+test('configure writes mcp aliases and generic custom surface flags into DeployConfig.surfaces', async () => {
   const repoRoot = createRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
@@ -27580,6 +27580,12 @@ test('configure writes mcp aliases and generic custom surface flags into DeployC
     assert.equal(config.surfaces.mcp.production.healthcheckUrl, 'https://app.example.test/mcp-health');
     assert.equal(config.surfaces.worker.staging.deployCommand, 'npm run deploy:worker:staging');
     assert.equal(config.surfaces.worker.production.healthcheckUrl, 'https://app.example.test/worker-health');
+    const workflowConfig = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
+    assert.deepEqual(workflowConfig.surfaces, ['frontend', 'edge', 'sql', 'mcp', 'worker']);
+    assert.deepEqual(
+      (await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'))).parseSurfaceList(workflowConfig, ['mcp,worker']),
+      ['mcp', 'worker'],
+    );
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
