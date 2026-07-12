@@ -120,7 +120,7 @@ Review gates run after implementation:
 - static gates: lint, typecheck, format check, secret scan, dependency audit
 - behavioral gates: tests, integration checks, build
 - AI diff gates: gstack `/review`, `/karpathy diff`, adversarial review via
-  Codex `/claude review code` or Claude-side gstack `/codex challenge`
+  Codex `/claude-review` or Claude-side gstack `/codex review`
 - instruction gates: `/karpathy audit` when agent instruction files change
 - runtime gates: browser QA, deploy health checks, staging evidence
 - human gates: approval for schema, auth, billing, secrets, deploy, rollback
@@ -531,7 +531,7 @@ Each gate has:
         "phase": "ai-diff",
         "type": "agent",
         "role": "adversarial-code-reviewer",
-        "userCommands": ["/claude review code", "/codex challenge"],
+        "userCommands": ["/claude-review", "/codex review"],
         "blocking": true
       },
       {
@@ -722,7 +722,7 @@ Do not add:
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
 | CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | not run | Optional for product scope. |
-| Codex Review | `/codex challenge` | Adversarial Codex review | 0 | not run | Optional outside voice not run for this pass. |
+| Codex Review | `/codex review` | Adversarial Codex review | 0 | not run | Optional outside voice not run for this pass. |
 | Eng Review | `/plan-eng-review` | Architecture & tests (required) | 3 | CLEAR | Slices 1 and 2 reviewed clean; Slice 2 fixed catalog/example drift before handoff. |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | not run | Recommended before board UI implementation. |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | not run | Optional; useful before shipping setup UX. |

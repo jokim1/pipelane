@@ -442,7 +442,7 @@ export function disqualifyDeployRecord(options: {
     return 'deploy config has drifted since this record was written; re-run deploy to re-register';
   }
   if (!record.idempotencyKey) {
-    return 'record lacks idempotencyKey and cannot be tied to smoke/deploy route identity';
+    return 'record lacks idempotencyKey and cannot be tied to deploy route identity';
   }
   for (const surface of surfaces) {
     const probe = resolveSurfaceVerification(record, surface);

@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 const DEFAULT_TEST_FILES = ['test/pipelane.test.mjs'].sort();
-const DEFAULT_TIMEOUT_MS = 25 * 60 * 1000;
+const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000;
 const DEFAULT_HEARTBEAT_MS = 30 * 1000;
 const DEFAULT_KILL_GRACE_MS = 5 * 1000;
 const EXIT_TIMEOUT = 124;

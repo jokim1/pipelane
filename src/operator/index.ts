@@ -14,7 +14,6 @@ import { handleRepoGuard } from './commands/repo-guard.ts';
 import { handleResume } from './commands/resume.ts';
 import { handleReview } from './commands/review.ts';
 import { handleRollback } from './commands/rollback.ts';
-import { handleSmoke } from './commands/smoke.ts';
 import { handleStatus } from './commands/status.ts';
 import { handleTaskLock } from './commands/task-lock.ts';
 import { assertRepoOnboardedForDeploy as assertDeployRepoOnboarded } from './onboarding.ts';
@@ -111,11 +110,6 @@ export async function runOperator(cwd: string, argv: string[]): Promise<void> {
     return;
   }
 
-  if (command === 'smoke') {
-    await handleSmoke(cwd, parsed);
-    return;
-  }
-
   if (command === 'review') {
     await handleReview(cwd, parsed);
     return;
@@ -185,7 +179,6 @@ Pipelane commands:
   task-lock
   deploy
   clean
-  smoke
   review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human]
   review pass --gate <id> --message <text>
   review setup [gate[,gate...]...] [--yes] [--reset] [--print] [--list-gates] [--toggle <gate[,gate...]>] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]

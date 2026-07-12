@@ -430,22 +430,6 @@ function machinePipelaneConfigPath(repoRoot) {
   return path.join(configDir, 'config.json');
 }
 
-function machineSmokeRegistryPath(repoRoot) {
-  const smokeDir = path.join(machineRepoDir(repoRoot), 'smoke');
-  mkdirSync(smokeDir, { recursive: true });
-  return path.join(smokeDir, 'smoke-checks.json');
-}
-
-function machineSmokeWaiversPath(repoRoot) {
-  const smokeDir = path.join(machineRepoDir(repoRoot), 'smoke');
-  mkdirSync(smokeDir, { recursive: true });
-  return path.join(smokeDir, 'waivers.json');
-}
-
-function resolveSharedSmokeStateRoot(repoRoot) {
-  return path.join(machineRepoDir(repoRoot), 'smoke-runtime');
-}
-
 function managedRuntimeRoot(host, pipelaneHome = process.env.PIPELANE_HOME || path.join(os.homedir(), '.pipelane')) {
   return path.join(pipelaneHome, 'runtimes', host);
 }
@@ -478,7 +462,6 @@ function writePipelaneConfig(repoRoot, displayName = 'Demo App', patch = {}) {
       release: '/release',
       'release-check': '/release-check',
       deploy: '/deploy',
-      smoke: '/smoke',
       clean: '/clean',
       status: '/status',
       doctor: '/doctor',
@@ -1551,902 +1534,83 @@ test('setup --yes refreshes existing agent guidance without scaffolding repo-loc
   }
 });
 
-test('legacy smoke internals and runtime observation source files stay tracked', () => {
-  for (const relativePath of [
-    'src/operator/commands/smoke.ts',
-    'src/operator/runtime-observation.ts',
-    'src/operator/smoke-gate.ts',
-    'src/operator/smoke-hot-paths.ts',
-    'src/operator/text-output.ts',
-  ]) {
-    const trackedPath = execFileSync('git', ['ls-files', '--error-unmatch', relativePath], {
-      cwd: KIT_ROOT,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    }).trim();
-    assert.equal(trackedPath, relativePath);
-  }
-});
-
 test('skill-rendering module stays pure and placement-free', () => {
   const content = readFileSync(path.join(KIT_ROOT, 'src', 'operator', 'skill-rendering.ts'), 'utf8');
   assert.doesNotMatch(content, /from 'node:(fs|path|os)'/);
   assert.doesNotMatch(content, /from "node:(fs|path|os)"/);
 });
 
-test('smoke plan scaffolds machine-local smoke registry from discovered smoke tags', () => {
+test('retired smoke command is not dispatched', () => {
   const repoRoot = createRepo();
-
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
-    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
-    writeFileSync(
-      path.join(repoRoot, 'e2e', 'auth.spec.ts'),
-      [
-        "test('@smoke-auth sign in', async () => {});",
-        "test('@smoke-app-shell boots', async () => {});",
-      ].join('\n'),
-      'utf8',
-    );
-
-    const result = runCli(['run', 'smoke', 'plan', '--json'], repoRoot);
-    const output = JSON.parse(result.stdout);
-    const registry = JSON.parse(readFileSync(machineSmokeRegistryPath(repoRoot), 'utf8'));
-
-    assert.equal(output.createdRegistry, true);
-    assert.ok(output.findings.length <= 5);
-    assert.ok(registry.checks['@smoke-auth']);
-    assert.equal(registry.checks['@smoke-auth'].blocking, false);
-    assert.equal(registry.checks['@smoke-auth'].quarantine, true);
-    assert.deepEqual(registry.checks['@smoke-auth'].sourceTests, ['e2e/auth.spec.ts']);
+    const result = runCli(['run', 'smoke'], repoRoot, {}, true);
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stdout}\n${result.stderr}`, /unknown .*command|unsupported/i);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
 });
 
-test('smoke plan scaffolds an empty smoke registry before any smoke tags exist', () => {
+test('legacy smoke config and alias are ignored on load', async () => {
   const repoRoot = createRepo();
-
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
-
-    const result = runCli(['run', 'smoke', 'plan', '--json'], repoRoot);
-    const output = JSON.parse(result.stdout);
-    const registryPath = machineSmokeRegistryPath(repoRoot);
-    const registry = JSON.parse(readFileSync(registryPath, 'utf8'));
-
-    assert.equal(output.createdRegistry, true);
-    assert.ok(existsSync(registryPath));
-    assert.deepEqual(registry.checks, {});
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('legacy smoke staging runs the configured command and stays out of /status', async () => {
-  const repoRoot = createRepo();
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    writeFullDeployConfigState(repoRoot);
-    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
     updateWorkflowConfig(repoRoot, (config) => {
+      config.aliases.smoke = '/smoke';
       config.smoke = {
-        generatedSummaryPath: 'docs/smoke/README.md',
-        staging: {
-          command: 'node -e "console.log([process.env.PIPELANE_SMOKE_ENV, process.env.PIPELANE_COHORT, process.env.PIPELANE_SMOKE_SHA, process.env.PIPELANE_SMOKE_BASE_URL].join(\'|\'))"',
-          preflight: [
-            {
-              name: 'env-parity',
-              command: 'node -e "console.log(process.env.PIPELANE_SMOKE_ENV)"',
-              critical: true,
-            },
-          ],
-        },
-      };
-    });
-    await writeSucceededDeployRecord(repoRoot, 'staging', '1111111111111111111111111111111111111111', ['frontend']);
-
-    runCli(['run', 'smoke', 'plan'], repoRoot);
-    const result = runCli(['run', 'smoke', 'staging', '--json'], repoRoot);
-    const output = JSON.parse(result.stdout);
-    const latest = JSON.parse(readFileSync(path.join(resolveSharedSmokeStateRoot(repoRoot), 'latest.json'), 'utf8'));
-    const logDir = path.join(resolveSharedSmokeStateRoot(repoRoot), 'logs');
-    const logFiles = readdirSync(logDir).filter((entry) => entry.includes('default'));
-    const logText = readFileSync(path.join(logDir, logFiles[0]), 'utf8');
-    const statusOutput = JSON.parse(runCli(['run', 'status', '--json'], repoRoot).stdout);
-
-    assert.equal(output.status, 'passed');
-    assert.equal(latest.staging.status, 'passed');
-    assert.equal(latest.staging.sha, '1111111111111111111111111111111111111111');
-    assert.match(logText, /staging\|default\|1111111/);
-    assert.match(logText, /https:\/\/staging\.example\.test/);
-    assert.equal(existsSync(path.join(repoRoot, 'docs', 'smoke', 'README.md')), false);
-    assert.match(readFileSync(path.join(machineRepoDir(repoRoot), 'smoke', 'docs', 'smoke', 'README.md'), 'utf8'), /@smoke-auth/);
-    assert.equal(statusOutput.data.smoke, undefined);
-    assert.equal(statusOutput.data.sourceHealth.some((entry) => String(entry.name).startsWith('smoke.')), false);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke staging treats a newer requested deploy as pending before older successes', async () => {
-  const repoRoot = createRepo();
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    writeFullDeployConfigState(repoRoot);
-    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.smoke = {
-        staging: {
-          command: smokeResultCommand([{ tag: '@smoke-auth', status: 'passed' }]),
-        },
-      };
-    });
-    const sha = '1111111111111111111111111111111111111111';
-    await writeSucceededDeployRecord(repoRoot, 'staging', sha, ['frontend']);
-    appendDeployRecord(repoRoot, {
-      environment: 'staging',
-      sha,
-      surfaces: ['frontend'],
-      workflowName: 'Deploy Hosted',
-      requestedAt: new Date().toISOString(),
-      status: 'requested',
-      idempotencyKey: 'newer-request',
-      triggeredBy: 'test',
-    });
-
-    runCli(['run', 'smoke', 'plan'], repoRoot);
-    const result = runCli(['run', 'smoke', 'staging', '--json'], repoRoot, {}, true);
-
-    assert.equal(result.status, 1);
-    assert.match(`${result.stdout}\n${result.stderr}`, /staging deploy is still in flight/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke staging summary names every registered check with its registry description', async () => {
-  const repoRoot = createRepo();
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    writeFullDeployConfigState(repoRoot);
-    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.smoke = {
-        staging: {
-          command: smokeResultCommand([{ tag: '@smoke-auth', status: 'passed' }]),
-        },
-      };
-    });
-    await writeSucceededDeployRecord(repoRoot, 'staging', '1111111111111111111111111111111111111111', ['frontend']);
-    runCli(['run', 'smoke', 'plan'], repoRoot);
-    updateSmokeRegistry(repoRoot, (registry) => {
-      registry.checks['@smoke-auth'].description = 'Auth login';
-      registry.checks['@smoke-auth'].quarantine = false;
-    });
-
-    const result = runCli(['run', 'smoke', 'staging', '--json'], repoRoot);
-    const output = JSON.parse(result.stdout);
-
-    assert.equal(output.status, 'passed');
-    assert.match(output.message, /Tested:/);
-    assert.match(output.message, /- Auth login \(passed\)/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke staging summary prints per-test counts when the runner contract supplies tests', async () => {
-  const repoRoot = createRepo();
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    writeFullDeployConfigState(repoRoot);
-    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.smoke = {
-        staging: {
-          command: smokeResultCommand([
-            { tag: '@smoke-auth', status: 'passed', tests: { passed: 3, total: 10 } },
-          ]),
-        },
-      };
-    });
-    await writeSucceededDeployRecord(repoRoot, 'staging', '1111111111111111111111111111111111111111', ['frontend']);
-    runCli(['run', 'smoke', 'plan'], repoRoot);
-    updateSmokeRegistry(repoRoot, (registry) => {
-      registry.checks['@smoke-auth'].description = 'Auth login';
-      registry.checks['@smoke-auth'].quarantine = false;
-    });
-
-    const result = runCli(['run', 'smoke', 'staging', '--json'], repoRoot);
-    const output = JSON.parse(result.stdout);
-
-    assert.equal(output.status, 'passed');
-    assert.match(output.message, /- Auth login \(3\/10 tests passed\)/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('bare /smoke lists registered checks, unregistered tags, candidate tests, and the configured runner', () => {
-  const repoRoot = createRepo();
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
-    writeFileSync(path.join(repoRoot, 'e2e', 'checkout.spec.ts'), "test('@smoke-checkout pays', async () => {});\n", 'utf8');
-    writeFileSync(path.join(repoRoot, 'e2e', 'landing.spec.ts'), "test('landing renders', async () => {});\n", 'utf8');
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.smoke = {
-        staging: { command: 'npm run test:e2e:smoke' },
-      };
-    });
-    runCli(['run', 'smoke', 'plan'], repoRoot);
-    updateSmokeRegistry(repoRoot, (registry) => {
-      registry.checks['@smoke-auth'].description = 'Auth login';
-      delete registry.checks['@smoke-checkout'];
-    });
-
-    const result = runCli(['run', 'smoke', '--json'], repoRoot);
-    const output = JSON.parse(result.stdout);
-
-    assert.equal(result.status, 0);
-    assert.match(output.message, /Registered smoke checks/);
-    assert.match(output.message, /@smoke-auth — Auth login/);
-    assert.match(output.message, /Discovered @smoke-\* tags not yet registered:/);
-    assert.match(output.message, /- @smoke-checkout/);
-    assert.match(output.message, /Candidate test files without @smoke tags:/);
-    assert.match(output.message, /- e2e\/landing\.spec\.ts/);
-    assert.match(output.message, /To add a new smoke check:/);
-    assert.match(output.message, /Runner: npm run test:e2e:smoke/);
-    assert.equal(output.stagingCommand, 'npm run test:e2e:smoke');
-    assert.ok(Array.isArray(output.registered));
-    assert.ok(output.registered.some((entry) => entry.tag === '@smoke-auth'));
-    assert.ok(output.unregisteredTags.some((entry) => entry.tag === '@smoke-checkout'));
-    assert.ok(output.orphanCandidates.includes('e2e/landing.spec.ts'));
-    assert.equal(output.emptyState, undefined);
-    assert.doesNotMatch(output.message, /Reply with Y, 1, 2, or 3/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('bare /smoke shows guided empty state when runner is configured but no checks exist', () => {
-  const repoRoot = createRepo();
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'e2e', 'vip-billing.spec.ts'), "test('billing works', async () => {});\n", 'utf8');
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.smoke = {
-        staging: { command: 'npm run test:e2e:vip' },
+        requireStagingSmoke: true,
+        staging: { command: 'npm run e2e' },
       };
     });
 
-    const result = runCli(['run', 'smoke', '--json'], repoRoot);
-    const output = JSON.parse(result.stdout);
-
-    assert.equal(result.status, 0);
-    assert.equal(output.emptyState.kind, 'runner_configured_no_checks');
-    assert.equal(
-      output.emptyState.summary,
-      'Smoke runner is configured, but no hot-path checks are registered yet.',
-    );
-    assert.equal(output.emptyState.recommendedAction, 'start_smoke_interview');
-    assert.match(output.message, /Smoke runner is configured, but no hot-path checks are registered yet\./);
-    assert.match(output.message, /Current state:/);
-    assert.match(output.message, /- Runner: npm run test:e2e:vip/);
-    assert.match(output.message, /- Registered checks: none/);
-    assert.match(output.message, /- Discovered @smoke-\* tags: none/);
-    assert.match(output.message, /- Candidate files:\n  - e2e\/vip-billing\.spec\.ts/);
-    assert.match(output.message, /Y or 1\. Start smoke interview \(recommended\)/);
-    assert.match(output.message, /2\. Generate baseline hot paths/);
-    assert.match(output.message, /3\. Manually tag existing tests/);
-    assert.match(output.message, /Reply with Y, 1, 2, or 3\./);
-    assert.equal(output.emptyState.options[0].key, '1');
-    assert.ok(output.emptyState.options[0].aliases.includes('Y'));
-    assert.equal(output.emptyState.options[0].intent, 'start_smoke_interview');
-    assert.match(output.emptyState.options[1].command, /smoke setup/);
-    assert.match(output.emptyState.options[2].command, /smoke plan/);
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+    assert.equal(context.config.smoke, undefined);
+    assert.equal(context.config.aliases.smoke, undefined);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
 });
 
-test('bare /smoke recommends setup when no runner and no checks exist', () => {
+test('deploy rejects retired coverage override flag', () => {
   const repoRoot = createRepo();
-
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-
-    const result = runCli(['run', 'smoke', '--json'], repoRoot);
-    const output = JSON.parse(result.stdout);
-
-    assert.equal(result.status, 0);
-    assert.equal(output.emptyState.kind, 'no_runner_no_checks');
-    assert.equal(output.emptyState.recommendedAction, 'run_smoke_setup');
-    assert.match(output.message, /Smoke is not configured yet\. No runner or hot-path checks were found\./);
-    assert.match(output.message, /Y or 1\. Configure smoke setup \(recommended\)/);
-    assert.deepEqual(output.emptyState.options.map((option) => option.key), ['1', '2', '3']);
-    assert.match(output.emptyState.options[0].command, /smoke setup/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('bare /smoke classifies candidate tests when no runner is configured', () => {
-  const repoRoot = createRepo();
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'e2e', 'landing.spec.ts'), "test('landing renders', async () => {});\n", 'utf8');
-
-    const result = runCli(['run', 'smoke', '--json'], repoRoot);
-    const output = JSON.parse(result.stdout);
-
-    assert.equal(result.status, 0);
-    assert.equal(output.emptyState.kind, 'candidate_tests_no_checks');
-    assert.equal(output.emptyState.recommendedAction, 'run_smoke_setup');
-    assert.match(output.message, /Smoke candidate tests were found, but no hot-path checks are registered yet\./);
-    assert.match(output.message, /- Runner: not configured/);
-    assert.match(output.message, /- Candidate files:\n  - e2e\/landing\.spec\.ts/);
-    assert.match(output.message, /Y or 1\. Configure smoke setup \(recommended\)/);
-    assert.deepEqual(output.emptyState.options.map((option) => option.key), ['1', '2', '3']);
-    assert.match(output.emptyState.options[0].command, /smoke setup/);
-    assert.equal(output.emptyState.options[1].intent, 'start_smoke_interview');
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('bare /smoke recommends plan when smoke tags exist without registry checks', () => {
-  const repoRoot = createRepo();
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
-
-    const result = runCli(['run', 'smoke', '--json'], repoRoot);
-    const output = JSON.parse(result.stdout);
-
-    assert.equal(result.status, 0);
-    assert.equal(output.emptyState.kind, 'tags_discovered_no_registry');
-    assert.equal(output.emptyState.recommendedAction, 'run_smoke_plan');
-    assert.match(output.message, /Smoke tags were found, but the smoke registry has no checks yet\./);
-    assert.match(output.message, /Y or 1\. Register discovered smoke tags \(recommended\)/);
-    assert.match(output.message, /- @smoke-auth \(e2e\/auth\.spec\.ts\)/);
-    assert.deepEqual(output.emptyState.options.map((option) => option.key), ['1', '2', '3']);
-    assert.match(output.emptyState.options[0].command, /smoke plan/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('release deploy prod does not require smoke unless the repo opts in', async () => {
-  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
-  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
-  const ghStateFile = path.join(fakeBin, 'gh-state.json');
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    writeFullDeployConfigState(repoRoot);
-    const headSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
-    writeTaskLock(repoRoot, 'bootstrap', { mode: 'release', surfaces: ['frontend'] });
-    writePrRecord(repoRoot, 'bootstrap', headSha);
-    await writeSucceededDeployRecord(repoRoot, 'staging', headSha, ['frontend']);
-    writeHealthyProbeState(repoRoot, ['frontend']);
-    runCli(['run', 'devmode', 'release', '--surfaces', 'frontend'], repoRoot);
-
-    writeFakeGh(fakeBin, ghStateFile);
     const result = runCli(
-      ['run', 'deploy', 'prod', '--task', 'bootstrap', '--json'],
-      repoRoot,
-      {
-        PATH: `${fakeBin}:${process.env.PATH}`,
-        GH_STATE_FILE: ghStateFile,
-        PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
-        PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
-        PIPELANE_DEPLOY_PROD_CONFIRM_STUB: headSha.slice(0, 4),
-      },
-    );
-    const output = JSON.parse(result.stdout);
-
-    assert.equal(output.environment, 'prod');
-    assert.equal(output.sha, headSha);
-    assert.match(output.message, /Deploy verified: prod/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(remoteRoot, { recursive: true, force: true });
-    rmSync(fakeBin, { recursive: true, force: true });
-  }
-});
-
-test('release deploy prod ignores legacy staging smoke requirement when staging deploy succeeded', async () => {
-  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
-  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
-  const ghStateFile = path.join(fakeBin, 'gh-state.json');
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    writeFullDeployConfigState(repoRoot);
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.smoke = {
-        requireStagingSmoke: true,
-        staging: { command: 'node -e "process.exit(0)"' },
-        prod: { command: 'node -e "process.exit(0)"' },
-      };
-    });
-    const headSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
-    writeTaskLock(repoRoot, 'bootstrap', { mode: 'release', surfaces: ['frontend'] });
-    writePrRecord(repoRoot, 'bootstrap', headSha);
-    await writeSucceededDeployRecord(repoRoot, 'staging', headSha, ['frontend']);
-    writeHealthyProbeState(repoRoot, ['frontend']);
-    runCli(['run', 'devmode', 'release', '--surfaces', 'frontend'], repoRoot);
-
-    writeFakeGh(fakeBin, ghStateFile);
-    const result = runCli(
-      ['run', 'deploy', 'prod', '--task', 'bootstrap', '--json'],
-      repoRoot,
-      {
-        PATH: `${fakeBin}:${process.env.PATH}`,
-        GH_STATE_FILE: ghStateFile,
-        PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
-        PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
-        PIPELANE_DEPLOY_PROD_CONFIRM_STUB: headSha.slice(0, 4),
-      },
-    );
-    const output = JSON.parse(result.stdout);
-
-    assert.equal(output.environment, 'prod');
-    assert.equal(output.sha, headSha);
-    assert.match(output.message, /Deploy verified: prod/);
-    assert.doesNotMatch(output.message, /Smoke coverage/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(remoteRoot, { recursive: true, force: true });
-    rmSync(fakeBin, { recursive: true, force: true });
-  }
-});
-
-test('release deploy prod accepts a qualifying staging smoke run for the same SHA', async () => {
-  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
-  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
-  const ghStateFile = path.join(fakeBin, 'gh-state.json');
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    writeFullDeployConfigState(repoRoot);
-    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.smoke = {
-        requireStagingSmoke: true,
-        staging: { command: smokeResultCommand([{ tag: '@smoke-auth', status: 'passed' }]) },
-        prod: { command: smokeResultCommand([{ tag: '@smoke-auth', status: 'passed' }]) },
-      };
-    });
-    const headSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
-    writeTaskLock(repoRoot, 'bootstrap', { mode: 'release', surfaces: ['frontend'] });
-    writePrRecord(repoRoot, 'bootstrap', headSha);
-    await writeSucceededDeployRecord(repoRoot, 'staging', headSha, ['frontend']);
-    writeHealthyProbeState(repoRoot, ['frontend']);
-    runCli(['run', 'devmode', 'release', '--surfaces', 'frontend'], repoRoot);
-    runCli(['run', 'smoke', 'plan'], repoRoot);
-    updateSmokeRegistry(repoRoot, (registry) => {
-      registry.checks['@smoke-auth'].blocking = true;
-      registry.checks['@smoke-auth'].quarantine = false;
-    });
-    runCli(['run', 'smoke', 'staging'], repoRoot);
-
-    writeFakeGh(fakeBin, ghStateFile);
-    const result = runCli(
-      ['run', 'deploy', 'prod', '--task', 'bootstrap', '--json'],
-      repoRoot,
-      {
-        PATH: `${fakeBin}:${process.env.PATH}`,
-        GH_STATE_FILE: ghStateFile,
-        PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
-        PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
-        PIPELANE_DEPLOY_PROD_CONFIRM_STUB: headSha.slice(0, 4),
-      },
-    );
-    const output = JSON.parse(result.stdout);
-
-    assert.equal(output.environment, 'prod');
-    assert.equal(output.sha, headSha);
-    assert.match(output.message, /Deploy verified: prod/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(remoteRoot, { recursive: true, force: true });
-    rmSync(fakeBin, { recursive: true, force: true });
-  }
-});
-
-test('latest staging smoke failure does not block production deploy', async () => {
-  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
-  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
-  const ghStateFile = path.join(fakeBin, 'gh-state.json');
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    writeFullDeployConfigState(repoRoot);
-    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.smoke = {
-        requireStagingSmoke: true,
-        staging: { command: smokeResultCommand([{ tag: '@smoke-auth', status: 'passed' }]) },
-        prod: { command: smokeResultCommand([{ tag: '@smoke-auth', status: 'passed' }]) },
-      };
-    });
-    const headSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
-    writeTaskLock(repoRoot, 'bootstrap', { mode: 'release', surfaces: ['frontend'] });
-    writePrRecord(repoRoot, 'bootstrap', headSha);
-    await writeSucceededDeployRecord(repoRoot, 'staging', headSha, ['frontend']);
-    writeHealthyProbeState(repoRoot, ['frontend']);
-    runCli(['run', 'devmode', 'release', '--surfaces', 'frontend'], repoRoot);
-    runCli(['run', 'smoke', 'plan'], repoRoot);
-    updateSmokeRegistry(repoRoot, (registry) => {
-      registry.checks['@smoke-auth'].blocking = true;
-      registry.checks['@smoke-auth'].quarantine = false;
-    });
-    runCli(['run', 'smoke', 'staging'], repoRoot);
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.smoke.staging.command = smokeResultCommand([{ tag: '@smoke-auth', status: 'failed' }], { exitCode: 1 });
-    });
-    runCli(['run', 'smoke', 'staging'], repoRoot, {}, true);
-
-    writeFakeGh(fakeBin, ghStateFile);
-    const result = runCli(
-      ['run', 'deploy', 'prod', '--task', 'bootstrap', '--json'],
-      repoRoot,
-      {
-        PATH: `${fakeBin}:${process.env.PATH}`,
-        GH_STATE_FILE: ghStateFile,
-        PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
-        PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
-        PIPELANE_DEPLOY_PROD_CONFIRM_STUB: headSha.slice(0, 4),
-      },
-    );
-    const output = JSON.parse(result.stdout);
-
-    assert.equal(output.environment, 'prod');
-    assert.equal(output.sha, headSha);
-    assert.match(output.message, /Deploy verified: prod/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(remoteRoot, { recursive: true, force: true });
-    rmSync(fakeBin, { recursive: true, force: true });
-  }
-});
-
-test('deploy prod rejects legacy smoke coverage override flag and otherwise ignores smoke coverage gaps', async () => {
-  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
-  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
-  const ghStateFile = path.join(fakeBin, 'gh-state.json');
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    writeFullDeployConfigState(repoRoot);
-    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.smoke = {
-        requireStagingSmoke: true,
-        criticalPathCoverage: 'block',
-        criticalPaths: ['billing'],
-        staging: { command: smokeResultCommand([{ tag: '@smoke-auth', status: 'passed' }]) },
-        prod: { command: smokeResultCommand([{ tag: '@smoke-auth', status: 'passed' }]) },
-      };
-    });
-    const headSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
-    writeTaskLock(repoRoot, 'bootstrap', { mode: 'release', surfaces: ['frontend'] });
-    writePrRecord(repoRoot, 'bootstrap', headSha);
-    await writeSucceededDeployRecord(repoRoot, 'staging', headSha, ['frontend']);
-    writeHealthyProbeState(repoRoot, ['frontend']);
-    runCli(['run', 'devmode', 'release', '--surfaces', 'frontend', '--override', '--reason', 'release gate bypass'], repoRoot);
-    runCli(['run', 'smoke', 'plan'], repoRoot);
-    updateSmokeRegistry(repoRoot, (registry) => {
-      registry.checks['@smoke-auth'].blocking = true;
-      registry.checks['@smoke-auth'].quarantine = false;
-    });
-    runCli(['run', 'smoke', 'staging'], repoRoot);
-
-    const legacyOverride = runCli(
-      ['run', 'deploy', 'prod', '--task', 'bootstrap', '--skip-smoke-coverage', '--reason', 'billing smoke follow-up'],
-      repoRoot,
-      { PIPELANE_DEPLOY_PROD_CONFIRM_STUB: headSha.slice(0, 4) },
-      true,
-    );
-
-    assert.notEqual(legacyOverride.status, 0);
-    assert.match(legacyOverride.stderr, /--skip-smoke-coverage is no longer supported/);
-
-    writeFakeGh(fakeBin, ghStateFile);
-    const result = runCli(
-      ['run', 'deploy', 'prod', '--task', 'bootstrap', '--json'],
-      repoRoot,
-      {
-        PATH: `${fakeBin}:${process.env.PATH}`,
-        GH_STATE_FILE: ghStateFile,
-        PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
-        PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
-        PIPELANE_DEPLOY_PROD_CONFIRM_STUB: headSha.slice(0, 4),
-      },
-    );
-    const output = JSON.parse(result.stdout);
-    const deployState = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'deploy-state.json'), 'utf8'));
-    const latestRecord = deployState.records.at(-1);
-
-    assert.equal(output.environment, 'prod');
-    assert.doesNotMatch(output.message, /Smoke coverage override/);
-    assert.equal(latestRecord.smokeCoverageOverrideReason, undefined);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(remoteRoot, { recursive: true, force: true });
-    rmSync(fakeBin, { recursive: true, force: true });
-  }
-});
-
-test('smoke waivers turn a failing blocking check into a non-blocking warning when check results are reported', async () => {
-  const repoRoot = createRepo();
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    writeFullDeployConfigState(repoRoot);
-    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.smoke = {
-        requireStagingSmoke: true,
-        staging: {
-          command: smokeResultCommand([{ tag: '@smoke-auth', status: 'failed' }], { exitCode: 1 }),
-        },
-      };
-    });
-    await writeSucceededDeployRecord(repoRoot, 'staging', '1111111111111111111111111111111111111111', ['frontend']);
-    runCli(['run', 'smoke', 'plan'], repoRoot);
-    updateSmokeRegistry(repoRoot, (registry) => {
-      registry.checks['@smoke-auth'].blocking = true;
-      registry.checks['@smoke-auth'].quarantine = false;
-    });
-    runCli(['run', 'smoke', 'waiver', 'create', '@smoke-auth', 'staging', '--reason', 'known flake'], repoRoot);
-
-    const result = runCli(['run', 'smoke', 'staging', '--json'], repoRoot);
-    const output = JSON.parse(result.stdout);
-    const latest = JSON.parse(readFileSync(path.join(resolveSharedSmokeStateRoot(repoRoot), 'latest.json'), 'utf8'));
-
-    assert.equal(output.status, 'passed');
-    assert.equal(latest.staging.status, 'passed');
-    assert.equal(latest.staging.waiversApplied.length, 1);
-    assert.equal(latest.staging.checks[0].waived, true);
-    assert.equal(latest.staging.checks[0].effectiveBlocking, false);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('quarantined blocking smoke checks no longer fail the run when other blocking checks pass', async () => {
-  const repoRoot = createRepo();
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    writeFullDeployConfigState(repoRoot);
-    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
-    writeFileSync(
-      path.join(repoRoot, 'e2e', 'auth.spec.ts'),
-      [
-        "test('@smoke-auth sign in', async () => {});",
-        "test('@smoke-app-shell boots', async () => {});",
-      ].join('\n'),
-      'utf8',
-    );
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.smoke = {
-        requireStagingSmoke: true,
-        staging: {
-          command: smokeResultCommand([
-            { tag: '@smoke-auth', status: 'failed' },
-            { tag: '@smoke-app-shell', status: 'passed' },
-          ], { exitCode: 1 }),
-        },
-      };
-    });
-    await writeSucceededDeployRecord(repoRoot, 'staging', '1111111111111111111111111111111111111111', ['frontend']);
-    runCli(['run', 'smoke', 'plan'], repoRoot);
-    updateSmokeRegistry(repoRoot, (registry) => {
-      registry.checks['@smoke-auth'].blocking = true;
-      registry.checks['@smoke-auth'].quarantine = true;
-      registry.checks['@smoke-app-shell'].blocking = true;
-      registry.checks['@smoke-app-shell'].quarantine = false;
-    });
-
-    const result = runCli(['run', 'smoke', 'staging', '--json'], repoRoot);
-    const output = JSON.parse(result.stdout);
-    const latest = JSON.parse(readFileSync(path.join(resolveSharedSmokeStateRoot(repoRoot), 'latest.json'), 'utf8'));
-    const authCheck = latest.staging.checks.find((check) => check.tag === '@smoke-auth');
-    const appShellCheck = latest.staging.checks.find((check) => check.tag === '@smoke-app-shell');
-
-    assert.equal(output.status, 'passed');
-    assert.equal(latest.staging.status, 'passed');
-    assert.equal(authCheck.status, 'failed');
-    assert.equal(authCheck.quarantine, true);
-    assert.equal(authCheck.effectiveBlocking, false);
-    assert.equal(appShellCheck.status, 'passed');
-    assert.equal(appShellCheck.effectiveBlocking, true);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('non-blocking cohort failures stay visible without failing the smoke run', async () => {
-  const repoRoot = createRepo();
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    writeFullDeployConfigState(repoRoot);
-    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.smoke = {
-        requireStagingSmoke: true,
-        staging: {
-          command: cohortSmokeResultCommand({
-            default: {
-              checks: [{ tag: '@smoke-auth', status: 'passed' }],
-              exitCode: 0,
-            },
-            beta: {
-              checks: [{ tag: '@smoke-auth', status: 'failed' }],
-              exitCode: 1,
-            },
-          }),
-          cohorts: [
-            { name: 'default', blocking: true },
-            { name: 'beta', blocking: false },
-          ],
-        },
-      };
-    });
-    await writeSucceededDeployRecord(repoRoot, 'staging', '1111111111111111111111111111111111111111', ['frontend']);
-    runCli(['run', 'smoke', 'plan'], repoRoot);
-    updateSmokeRegistry(repoRoot, (registry) => {
-      registry.checks['@smoke-auth'].blocking = true;
-      registry.checks['@smoke-auth'].quarantine = false;
-    });
-
-    const result = runCli(['run', 'smoke', 'staging', '--json'], repoRoot);
-    const output = JSON.parse(result.stdout);
-    const latest = JSON.parse(readFileSync(path.join(resolveSharedSmokeStateRoot(repoRoot), 'latest.json'), 'utf8'));
-    const authCheck = latest.staging.checks.find((check) => check.tag === '@smoke-auth');
-    const betaCohort = latest.staging.cohortResults.find((cohort) => cohort.name === 'beta');
-
-    assert.equal(output.status, 'passed');
-    assert.equal(latest.staging.status, 'passed');
-    assert.equal(authCheck.status, 'passed');
-    assert.equal(authCheck.effectiveBlocking, true);
-    assert.equal(betaCohort.status, 'failed');
-    assert.match(output.message, /Non-blocking cohort failures:/);
-    assert.match(output.message, /beta/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
-
-test('smoke waiver create rejects unknown or out-of-environment tags', async () => {
-  const repoRoot = createRepo();
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
-    runCli(['run', 'smoke', 'plan'], repoRoot);
-
-    const missingTag = runCli(
-      ['run', 'smoke', 'waiver', 'create', '@smoke-typo', 'staging', '--reason', 'known flake'],
+      ['run', 'deploy', 'prod', '--skip-smoke-coverage', '--reason', 'legacy override'],
       repoRoot,
       {},
       true,
     );
-    assert.notEqual(missingTag.status, 0);
-    assert.match(missingTag.stderr, /No smoke registry entry found for @smoke-typo/i);
-
-    const wrongEnvironment = runCli(
-      ['run', 'smoke', 'waiver', 'create', '@smoke-auth', 'prod', '--reason', 'known flake'],
-      repoRoot,
-      {},
-      true,
-    );
-    assert.notEqual(wrongEnvironment.status, 0);
-    assert.match(wrongEnvironment.stderr, /@smoke-auth is not configured for prod/i);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /--skip-smoke-coverage is no longer supported/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
 });
 
-test('smoke waiver extend enforces maxExtensions and overextended waivers no longer bypass smoke failures', async () => {
-  const repoRoot = createRepo();
 
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    runCli(['setup'], repoRoot);
-    writeFullDeployConfigState(repoRoot);
-    mkdirSync(path.join(repoRoot, 'e2e'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'e2e', 'auth.spec.ts'), "test('@smoke-auth sign in', async () => {});\n", 'utf8');
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.smoke = {
-        waivers: { maxExtensions: 0 },
-        requireStagingSmoke: true,
-        staging: { command: smokeResultCommand([{ tag: '@smoke-auth', status: 'failed' }], { exitCode: 1 }) },
-      };
-    });
-    await writeSucceededDeployRecord(repoRoot, 'staging', '1111111111111111111111111111111111111111', ['frontend']);
-    runCli(['run', 'smoke', 'plan'], repoRoot);
-    updateSmokeRegistry(repoRoot, (registry) => {
-      registry.checks['@smoke-auth'].blocking = true;
-      registry.checks['@smoke-auth'].quarantine = false;
-    });
-    runCli(['run', 'smoke', 'waiver', 'create', '@smoke-auth', 'staging', '--reason', 'known flake'], repoRoot);
 
-    const extendResult = runCli(
-      ['run', 'smoke', 'waiver', 'extend', '@smoke-auth', 'staging', '--reason', 'still flaky'],
-      repoRoot,
-      {},
-      true,
-    );
-    assert.notEqual(extendResult.status, 0);
-    assert.match(extendResult.stderr, /maxExtensions=0/i);
 
-    const waiversPath = machineSmokeWaiversPath(repoRoot);
-    mkdirSync(path.dirname(waiversPath), { recursive: true });
-    writeFileSync(waiversPath, `${JSON.stringify({
-      waivers: [{
-        tag: '@smoke-auth',
-        environment: 'staging',
-        reason: 'manually overextended',
-        createdAt: '2026-04-22T00:00:00Z',
-        expiresAt: '2099-04-22T00:00:00Z',
-        extensions: 1,
-      }],
-    }, null, 2)}\n`, 'utf8');
 
-    const smokeResult = runCli(['run', 'smoke', 'staging'], repoRoot, {}, true);
-    assert.notEqual(smokeResult.status, 0);
-    assert.match(smokeResult.stderr, /Blocking failures:/);
-    assert.doesNotMatch(smokeResult.stderr, /Waived failures:/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 test('install-codex outside a pipelane repo installs durable global default skills', () => {
   const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-install-codex-'));
@@ -3232,7 +2396,6 @@ test('syncDocs.packageScripts: false preserves consumer-customized workflow scri
       'pipelane:merge': 'my-wrapper merge',
       'pipelane:release': 'my-wrapper release',
       'pipelane:deploy': 'my-wrapper deploy',
-      'pipelane:smoke': 'my-wrapper smoke',
       'pipelane:clean': 'my-wrapper clean',
       'pipelane:devmode': 'my-wrapper devmode',
       'pipelane:status': 'my-wrapper status',
@@ -5076,7 +4239,7 @@ test('review setup bare command renders grouped rows without writing config', ()
     assert.equal(result.status, 0);
     assert.match(result.stdout, /Review setup/);
     assert.match(result.stdout, /Claude review support:/);
-    assert.match(result.stdout, /Codex \/claude review bridge:/);
+    assert.match(result.stdout, /Codex \/claude-review bridge:/);
     assert.match(result.stdout, /Anthropic API env:/);
     assert.match(result.stdout, /M\. Mechanical gates:/);
     assert.match(result.stdout, /T\. Test gates:/);
@@ -5089,7 +4252,7 @@ test('review setup bare command renders grouped rows without writing config', ()
     assert.match(result.stdout, /\/karpathy diff/);
     assert.match(result.stdout, /\/code-review high/);
     assert.match(result.stdout, /\/gstack review/);
-    assert.match(result.stdout, /\/claude review code/);
+    assert.match(result.stdout, /\/claude-review/);
     assert.match(result.stdout, /code-review-ultra/);
     assert.match(result.stdout, /\/karpathy-audit/);
     assert.match(result.stdout, /Cross-model review/);
@@ -5166,7 +4329,7 @@ test('review setup bare command shows saved adversarial review command', () => {
           type: 'agent',
           role: 'adversarial-code-reviewer',
           blocking: true,
-          userCommands: ['/codex challenge'],
+          userCommands: ['/codex review'],
         },
       ],
     };
@@ -5175,8 +4338,8 @@ test('review setup bare command shows saved adversarial review command', () => {
 
     const result = runCli(['run', 'review', 'setup'], repoRoot);
 
-    assert.match(result.stdout, /C4\s+on\s+adversarial-review\s+Cross-model review \| \/codex challenge/);
-    assert.doesNotMatch(result.stdout, /C4[^\n]*\/claude review code/);
+    assert.match(result.stdout, /C4\s+on\s+adversarial-review\s+Cross-model review \| \/codex review/);
+    assert.doesNotMatch(result.stdout, /C4[^\n]*\/claude-review/);
     assert.equal(readFileSync(configPath, 'utf8'), before);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -5405,7 +4568,7 @@ test('review setup --yes recommends installed cross-model review', () => {
 
     assert.equal(raw.reviewGates.policyVersion, 2);
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'adversarial-review'), true);
-    assert.deepEqual(raw.reviewGates.gates.find((gate) => gate.id === 'adversarial-review').userCommands, ['/claude review code']);
+    assert.deepEqual(raw.reviewGates.gates.find((gate) => gate.id === 'adversarial-review').userCommands, ['/claude-review']);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -5666,7 +4829,7 @@ test('review setup can explicitly toggle AI review gates non-interactively', () 
 
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'), true);
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'), false);
-    assert.deepEqual(raw.reviewGates.gates.find((gate) => gate.id === 'adversarial-review').userCommands, ['/claude review code']);
+    assert.deepEqual(raw.reviewGates.gates.find((gate) => gate.id === 'adversarial-review').userCommands, ['/claude-review']);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -5803,7 +4966,7 @@ test('review setup interactive can enable installed adversarial review', () => {
     const gate = raw.reviewGates.gates.find((entry) => entry.id === 'adversarial-review');
 
     assert.match(result.stdout, /Cross-model review/);
-    assert.deepEqual(gate.userCommands, ['/claude review code']);
+    assert.deepEqual(gate.userCommands, ['/claude-review']);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -5811,7 +4974,7 @@ test('review setup interactive can enable installed adversarial review', () => {
   }
 });
 
-test('review setup detects the Codex /claude review bridge as adversarial review support', () => {
+test('review setup detects the Codex /claude-review bridge as adversarial review support', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
   const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-claude-'));
@@ -5826,9 +4989,9 @@ test('review setup detects the Codex /claude review bridge as adversarial review
     const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
 
     assert.match(result.stdout, /Cross-model review/);
-    assert.match(result.stdout, /\/claude review code .*installed/);
+    assert.match(result.stdout, /\/claude-review .*installed/);
     assert.doesNotMatch(result.stdout, /Install and enable/);
-    assert.deepEqual(raw.reviewGates.gates.find((gate) => gate.id === 'adversarial-review').userCommands, ['/claude review code']);
+    assert.deepEqual(raw.reviewGates.gates.find((gate) => gate.id === 'adversarial-review').userCommands, ['/claude-review']);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -5836,7 +4999,7 @@ test('review setup detects the Codex /claude review bridge as adversarial review
   }
 });
 
-test('review setup saves Claude-side gstack /codex challenge as the adversarial command', () => {
+test('review setup saves Claude-side gstack /codex review as the adversarial command', () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
   const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-claude-'));
@@ -5849,7 +5012,7 @@ test('review setup saves Claude-side gstack /codex challenge as the adversarial 
     mkdirSync(path.join(claudeHome, 'skills', 'gstack', 'codex'), { recursive: true });
     writeFileSync(
       path.join(claudeHome, 'skills', 'gstack', 'codex', 'SKILL.md'),
-      'codex adversarial challenge skill\n',
+      'codex review adversarial skill\n',
       'utf8',
     );
 
@@ -5861,8 +5024,8 @@ test('review setup saves Claude-side gstack /codex challenge as the adversarial 
     const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
     const gate = raw.reviewGates.gates.find((entry) => entry.id === 'adversarial-review');
 
-    assert.match(result.stdout, /\/codex challenge .*installed/);
-    assert.deepEqual(gate.userCommands, ['/codex challenge']);
+    assert.match(result.stdout, /\/codex review .*installed/);
+    assert.deepEqual(gate.userCommands, ['/codex review']);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -6914,6 +6077,238 @@ test('review uses current native Codex exec default for AI gates', () => {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
     rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('review runs Codex /claude-review bridge gates even when Claude is on PATH', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-adversarial-bin-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-home-'));
+  const codexLogPath = path.join(binDir, 'codex-log.txt');
+  const claudeLogPath = path.join(binDir, 'claude-log.txt');
+  try {
+    seedCodexClaudeReviewBridge(codexHome);
+    const codexPath = path.join(binDir, 'codex');
+    writeFileSync(
+      codexPath,
+      [
+        '#!/usr/bin/env node',
+        "import { readFileSync, writeFileSync } from 'node:fs';",
+        "const args = process.argv.slice(2);",
+        "if (args.join(' ') === 'exec --help' || args.includes('--help')) {",
+        "  console.log('Usage: codex exec [OPTIONS] [PROMPT]');",
+        "  console.log('--sandbox <SANDBOX_MODE>');",
+        "  process.exit(0);",
+        "}",
+        "if (args.join(' ') !== 'exec --sandbox workspace-write -') {",
+        "  console.error(`unexpected codex args: ${args.join(' ')}`);",
+        "  process.exit(2);",
+        "}",
+        "const prompt = readFileSync(0, 'utf8');",
+        "writeFileSync(process.env.PIPELANE_TEST_CODEX_LOG, `${args.join(' ')}\\n${prompt.split('\\n')[0]}\\n${prompt.includes('Gate: adversarial-review')}\\n`, 'utf8');",
+        "if (!prompt.startsWith('/claude-review\\n\\n')) process.exit(3);",
+        "console.log('PIPELANE_REVIEW_GATE_RESULT=passed');",
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    chmodSync(codexPath, 0o755);
+    const claudePath = path.join(binDir, 'claude');
+    writeFileSync(
+      claudePath,
+      [
+        '#!/usr/bin/env node',
+        "import { appendFileSync, readFileSync } from 'node:fs';",
+        "const args = process.argv.slice(2);",
+        "if (args.includes('--help')) {",
+        "  console.log('Usage: claude --print');",
+        "  console.log('dontAsk');",
+        "  process.exit(0);",
+        "}",
+        "appendFileSync(process.env.PIPELANE_TEST_CLAUDE_LOG, `${args.join(' ')}\\n`, 'utf8');",
+        "const prompt = readFileSync(0, 'utf8');",
+        "if (prompt.startsWith('/claude')) {",
+        "  console.error('Unknown command: /claude');",
+        "  process.exit(7);",
+        "}",
+        "console.log('PIPELANE_REVIEW_GATE_RESULT=passed');",
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    chmodSync(claudePath, 0o755);
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      policyVersion: 2,
+      planReview: { gates: [] },
+      gates: [{
+        id: 'adversarial-review',
+        phase: 'ai-diff',
+        type: 'agent',
+        role: 'adversarial-code-reviewer',
+        userCommands: ['/claude-review', '/codex review'],
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt adversarial review gate');
+
+    const result = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      CODEX_HOME: codexHome,
+      PIPELANE_REVIEW_GATE_USE_REAL_NATIVE: '1',
+      PIPELANE_TEST_CODEX_LOG: codexLogPath,
+      PIPELANE_TEST_CLAUDE_LOG: claudeLogPath,
+    }).stdout);
+
+    const gate = result.gates.find((entry) => entry.gateId === 'adversarial-review');
+    assert.equal(result.status, 'passed');
+    assert.equal(gate.status, 'passed');
+    assert.equal(gate.command, 'codex exec --sandbox workspace-write -');
+    assert.equal(gate.attester.provider, 'codex');
+    assert.equal(readFileSync(codexLogPath, 'utf8'), 'exec --sandbox workspace-write -\n/claude-review\ntrue\n');
+    assert.equal(existsSync(claudeLogPath), false, 'Codex /claude-review bridge gates must not be piped into claude --print');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('review tees up a Codex fallback agent when /claude-review is unavailable', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-adversarial-codex-fallback-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-home-'));
+  const codexLogPath = path.join(binDir, 'codex-log.txt');
+  try {
+    const codexPath = path.join(binDir, 'codex');
+    writeFileSync(
+      codexPath,
+      [
+        '#!/usr/bin/env node',
+        "import { readFileSync, writeFileSync } from 'node:fs';",
+        "const args = process.argv.slice(2);",
+        "if (args.join(' ') === 'exec --help' || args.includes('--help')) {",
+        "  console.log('Usage: codex exec [OPTIONS] [PROMPT]');",
+        "  console.log('--sandbox <SANDBOX_MODE>');",
+        "  process.exit(0);",
+        "}",
+        "const prompt = readFileSync(0, 'utf8');",
+        "writeFileSync(process.env.PIPELANE_TEST_CODEX_LOG, `${args.join(' ')}\\n${prompt.split('\\n')[0]}\\n${prompt.includes('Gate: adversarial-review')}\\n`, 'utf8');",
+        "if (prompt.startsWith('/claude-review')) process.exit(3);",
+        "console.log('PIPELANE_REVIEW_GATE_RESULT=passed');",
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    chmodSync(codexPath, 0o755);
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      policyVersion: 2,
+      planReview: { gates: [] },
+      gates: [{
+        id: 'adversarial-review',
+        phase: 'ai-diff',
+        type: 'agent',
+        role: 'adversarial-code-reviewer',
+        userCommands: ['/claude-review'],
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt adversarial review gate without bridge skill');
+
+    const result = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
+      CODEX_HOME: codexHome,
+      PIPELANE_REVIEW_GATE_USE_REAL_NATIVE: '1',
+      PIPELANE_TEST_CODEX_LOG: codexLogPath,
+    }).stdout);
+
+    const gate = result.gates.find((entry) => entry.gateId === 'adversarial-review');
+    assert.equal(result.status, 'passed');
+    assert.equal(gate.status, 'passed');
+    assert.equal(gate.command, 'codex exec --sandbox workspace-write -');
+    assert.equal(gate.attester.provider, 'codex');
+    assert.equal(readFileSync(codexLogPath, 'utf8'), 'exec --sandbox workspace-write -\nYou are running as an independent Pipelane AI review gate.\ntrue\n');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('review runs Claude /codex review bridge gates when that provider is selected', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-adversarial-claude-bin-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-claude-home-'));
+  const claudeLogPath = path.join(binDir, 'claude-log.txt');
+  try {
+    const codexPath = path.join(binDir, 'codex');
+    writeFileSync(codexPath, '#!/usr/bin/env sh\nexit 0\n', 'utf8');
+    chmodSync(codexPath, 0o755);
+    mkdirSync(path.join(claudeHome, 'skills', 'gstack', 'codex'), { recursive: true });
+    writeFileSync(
+      path.join(claudeHome, 'skills', 'gstack', 'codex', 'SKILL.md'),
+      'codex review adversarial skill\n',
+      'utf8',
+    );
+    const claudePath = path.join(binDir, 'claude');
+    writeFileSync(
+      claudePath,
+      [
+        '#!/usr/bin/env node',
+        "import { readFileSync, writeFileSync } from 'node:fs';",
+        "const args = process.argv.slice(2);",
+        "if (args.includes('--help')) {",
+        "  console.log('Usage: claude --print');",
+        "  console.log('dontAsk');",
+        "  process.exit(0);",
+        "}",
+        "const prompt = readFileSync(0, 'utf8');",
+        "writeFileSync(process.env.PIPELANE_TEST_CLAUDE_LOG, `${args.join(' ')}\\n${prompt.split('\\n')[0]}\\n${prompt.includes('Gate: adversarial-review')}\\n`, 'utf8');",
+        "if (!prompt.startsWith('/codex review\\n\\n')) process.exit(3);",
+        "console.log('PIPELANE_REVIEW_GATE_RESULT=passed');",
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    chmodSync(claudePath, 0o755);
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      policyVersion: 2,
+      planReview: { gates: [] },
+      gates: [{
+        id: 'adversarial-review',
+        phase: 'ai-diff',
+        type: 'agent',
+        role: 'adversarial-code-reviewer',
+        userCommands: ['/codex review'],
+        blocking: true,
+      }],
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt Claude-side adversarial review gate');
+
+    const result = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
+      CLAUDE_HOME: claudeHome,
+      PIPELANE_REVIEW_GATE_USE_REAL_NATIVE: '1',
+      PIPELANE_TEST_CLAUDE_LOG: claudeLogPath,
+    }).stdout);
+
+    const gate = result.gates.find((entry) => entry.gateId === 'adversarial-review');
+    assert.equal(result.status, 'passed');
+    assert.equal(gate.status, 'passed');
+    assert.equal(gate.command, 'claude --print --permission-mode dontAsk');
+    assert.equal(gate.attester.provider, 'claude');
+    assert.equal(readFileSync(claudeLogPath, 'utf8'), '--print --permission-mode dontAsk\n/codex review\ntrue\n');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
   }
 });
 
@@ -14694,29 +14089,30 @@ test('review runner streams non-tty gate progress before captured AI gate comple
     child.stdout.on('data', (chunk) => {
       stdout += chunk.toString('utf8');
     });
-    const sawStart = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`timed out waiting for review progress; stderr=${stderr}`)), 2000);
+    const sawPrepare = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timed out waiting for review prepare progress; stderr=${stderr}`)), 15_000);
       child.stderr.on('data', (chunk) => {
         stderr += chunk.toString('utf8');
-        if (stderr.includes('pipelane review: starting ai-diff/gstack-review')) {
+        if (stderr.includes('pipelane review: preparing gates')) {
           clearTimeout(timer);
           resolve();
         }
       });
       child.on('error', reject);
       child.on('exit', (code) => {
-        if (!stderr.includes('pipelane review: starting ai-diff/gstack-review')) {
+        if (!stderr.includes('pipelane review: preparing gates')) {
           clearTimeout(timer);
-          reject(new Error(`review exited before progress; code=${code}; stdout=${stdout}; stderr=${stderr}`));
+          reject(new Error(`review exited before prepare progress; code=${code}; stdout=${stdout}; stderr=${stderr}`));
         }
       });
     });
 
-    await sawStart;
+    await sawPrepare;
     assert.equal(existsSync(completedPath), false, 'progress should print before the captured AI command completes');
     const [code] = await once(child, 'exit');
 
     assert.equal(code, 0, stdout + stderr);
+    assert.match(stderr, /pipelane review: starting ai-diff\/gstack-review/);
     assert.match(stderr, /pipelane review: finished ai-diff\/gstack-review: passed/);
     assert.match(stdout, /Pipelane review/);
   } finally {
@@ -14973,7 +14369,7 @@ test('review pass records clean manual gates against current review evidence', (
   }
 });
 
-test('review pass rejects v2 independent AI gates when author identity is unavailable', () => {
+test('review pass records v2 independent AI gate acceptance when author identity is unavailable', () => {
   const repoRoot = createRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App', {
@@ -14997,7 +14393,7 @@ test('review pass rejects v2 independent AI gates when author identity is unavai
     const reviewState = JSON.parse(readFileSync(review.evidencePath, 'utf8'));
     assert.equal(reviewState.records[0].authorIdentity ?? null, null);
 
-    const pass = runCli([
+    const pass = JSON.parse(runCli([
       'run',
       'review',
       'pass',
@@ -15008,10 +14404,14 @@ test('review pass rejects v2 independent AI gates when author identity is unavai
       '--json',
     ], repoRoot, {
       CLAUDE_SESSION_ID: 'trusted-reviewer-without-author',
-    }, true);
+    }).stdout);
 
-    assert.equal(pass.status, 1);
-    assert.match(pass.stderr, /recorded worker session identity is unavailable/);
+    assert.equal(pass.status, 'attested');
+    assert.match(pass.evidencePath, /review-acceptance-state\.json$/);
+    const acceptanceState = JSON.parse(readFileSync(pass.evidencePath, 'utf8'));
+    assert.equal(acceptanceState.records[0].id.startsWith('review-acceptance-'), true);
+    assert.equal(acceptanceState.records[0].gateId, 'code-review-high');
+    assert.equal(acceptanceState.records[0].actor.sessionId, hashedSessionId('trusted-reviewer-without-author'));
     const afterPass = JSON.parse(readFileSync(review.evidencePath, 'utf8'));
     assert.equal(afterPass.records.some((record) => record.id.startsWith('review-pass-')), false);
   } finally {
@@ -17159,44 +16559,6 @@ function updateWorkflowConfig(repoRoot, updater) {
   updater(config);
   writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
   return config;
-}
-
-function updateSmokeRegistry(repoRoot, updater) {
-  const registryPath = machineSmokeRegistryPath(repoRoot);
-  const registry = JSON.parse(readFileSync(registryPath, 'utf8'));
-  updater(registry);
-  writeFileSync(registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
-  return registry;
-}
-
-function smokeResultCommand(checks, options = {}) {
-  const payload = {
-    schemaVersion: 1,
-    checks,
-  };
-  const payloadLiteral = JSON.stringify(JSON.stringify(payload));
-  const exitCode = Number.isFinite(options.exitCode) ? Number(options.exitCode) : inferSmokeExitCode(checks);
-  return `node -e 'require(\"node:fs\").writeFileSync(process.env.PIPELANE_SMOKE_RESULTS_PATH, ${payloadLiteral}); process.exit(${exitCode})'`;
-}
-
-function cohortSmokeResultCommand(resultsByCohort) {
-  const payloadLiteral = JSON.stringify(JSON.stringify(resultsByCohort));
-  return [
-    'node -e',
-    `'const fs = require("node:fs");`,
-    `const results = JSON.parse(${payloadLiteral});`,
-    'const cohort = process.env.PIPELANE_COHORT || "default";',
-    'const response = results[cohort] || results.default;',
-    'if (!response) process.exit(2);',
-    'const payload = { schemaVersion: 1, checks: response.checks || [] };',
-    'fs.writeFileSync(process.env.PIPELANE_SMOKE_RESULTS_PATH, JSON.stringify(payload));',
-    'process.exit(Number.isFinite(response.exitCode) ? response.exitCode : ((response.checks || []).some((check) => check.status === "failed") ? 1 : 0));',
-    `'`,
-  ].join(' ');
-}
-
-function inferSmokeExitCode(checks) {
-  return checks.some((check) => check.status === 'failed') ? 1 : 0;
 }
 
 function resolveCommonDir(repoRoot) {
@@ -29107,6 +28469,75 @@ test('writeJsonFile leaves only the target file after a successful atomic write'
   }
 });
 
+test('deploy environment lock claim rejects a second live owner and releases by owner only', async () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+    const first = {
+      environment: 'staging',
+      runId: 'deploy-staging-one',
+      sha: '1111111111111111111111111111111111111111',
+      createdAt: '2026-07-10T12:00:00.000Z',
+      pid: process.pid,
+      repoRoot,
+    };
+    const second = {
+      ...first,
+      runId: 'deploy-staging-two',
+      sha: '2222222222222222222222222222222222222222',
+    };
+
+    const firstClaim = stateMod.claimDeployEnvironmentLock(context.commonDir, first, { isStale: () => false });
+    const secondClaim = stateMod.claimDeployEnvironmentLock(context.commonDir, second, { isStale: () => false });
+
+    assert.equal(firstClaim.status, 'claimed');
+    assert.equal(secondClaim.status, 'blocked');
+    assert.equal(secondClaim.existing.runId, first.runId);
+    assert.equal(stateMod.loadDeployEnvironmentLock(context.commonDir, 'staging').runId, first.runId);
+    assert.equal(stateMod.removeDeployEnvironmentLock(context.commonDir, 'staging', second.runId), false);
+    assert.equal(stateMod.loadDeployEnvironmentLock(context.commonDir, 'staging').runId, first.runId);
+    assert.equal(stateMod.removeDeployEnvironmentLock(context.commonDir, 'staging', first.runId), true);
+    assert.equal(stateMod.loadDeployEnvironmentLock(context.commonDir, 'staging'), null);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('deploy environment lock claim reclaims stale owners before claiming', async () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+    const stale = {
+      environment: 'prod',
+      runId: 'deploy-prod-stale',
+      sha: '1111111111111111111111111111111111111111',
+      createdAt: '2026-07-10T12:00:00.000Z',
+      pid: process.pid,
+      repoRoot,
+    };
+    const fresh = {
+      ...stale,
+      runId: 'deploy-prod-fresh',
+      sha: '2222222222222222222222222222222222222222',
+    };
+
+    const staleClaim = stateMod.claimDeployEnvironmentLock(context.commonDir, stale, { isStale: () => false });
+    const freshClaim = stateMod.claimDeployEnvironmentLock(context.commonDir, fresh, {
+      isStale: (existing) => existing.runId === stale.runId,
+    });
+
+    assert.equal(staleClaim.status, 'claimed');
+    assert.equal(freshClaim.status, 'claimed');
+    assert.equal(stateMod.loadDeployEnvironmentLock(context.commonDir, 'prod').runId, fresh.runId);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('renderCockpit shows RELEASE GATE PREVIOUSLY BYPASSED banner when override cleared but lastOverride persists', async () => {
   // The audit trail must outlive the active-override flag. After
   // /devmode build, effectiveOverride is null but lastOverride persists
@@ -30747,10 +30178,11 @@ test('review gate catalog detects package scripts and separates human aliases', 
     assert.equal(mod.resolveReviewGateAlias('code-review high'), 'code-review-high');
     assert.equal(mod.resolveReviewGateAlias('/code-review ultra'), 'code-review-ultra');
     assert.equal(mod.resolveReviewGateAlias('claude ultrareview'), 'code-review-ultra');
+    assert.equal(mod.resolveReviewGateAlias('/claude-review'), 'adversarial-review');
     assert.equal(mod.resolveReviewGateAlias('/claude review'), 'adversarial-review');
     assert.equal(mod.resolveReviewGateAlias('/claude review code'), 'adversarial-review');
+    assert.equal(mod.resolveReviewGateAlias('/codex review'), 'adversarial-review');
     assert.equal(mod.resolveReviewGateAlias('/codex challenge'), 'adversarial-review');
-    assert.equal(mod.resolveReviewGateAlias('/codex review'), null);
     assert.equal(mod.resolveReviewGateAlias('/adversarial review'), null);
     assert.equal(mod.resolveReviewGateAlias('/adversarial-review'), null);
     assert.equal(mod.resolveReviewGateAlias('/not-a-real-gate'), null);
@@ -34101,7 +33533,9 @@ test('machine-local setup preserves consumer prose that quotes the outer lessons
 
     runCli(['setup', '--yes'], repoRoot);
     const after = readFileSync(claudePath, 'utf8');
-    assert.equal(after, claude);
+    assert.match(after, /<!-- pipelane:claude-workspace-policy:start -->/);
+    assert.match(after, /For any code-changing task, start in a Pipelane task workspace/);
+    assert.match(after, /<!-- pipelane:claude-workspace-policy:end -->/);
     assert.match(after, /- 2026-06-25: keep this entry/);               // accreted entry preserved
     assert.match(after, /## Maintainer Notes/);                          // prose heading survives
     assert.match(after, /Do not hand-edit between the/);                 // prose body survives

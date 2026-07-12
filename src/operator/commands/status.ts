@@ -442,7 +442,6 @@ function cloneOperatorFlags(flags: OperatorFlags): OperatorFlags {
     ...flags,
     surfaces: [...flags.surfaces],
     forceInclude: [...flags.forceInclude],
-    criticalPaths: [...flags.criticalPaths],
   };
 }
 

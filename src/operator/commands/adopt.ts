@@ -260,7 +260,6 @@ function saveAdoptedTaskLock(options: {
     mode: options.existingLock?.mode ?? options.mode,
     surfaces: options.surfaces,
     nextAction: options.existingLock?.nextAction,
-    promotedWithoutStagingSmoke: options.existingLock?.promotedWithoutStagingSmoke,
     bindingHistory: history,
     updatedAt,
   });

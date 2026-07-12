@@ -1,12 +1,19 @@
 import crypto from 'node:crypto';
 
 import {
+  canonicalize,
+  resolveReviewStateKey,
+} from './integrity.ts';
+import {
   appendReviewOverrideRecord,
   formatWorkflowCommand,
+  loadReviewAcceptanceState,
   loadReviewState,
   nowIso,
   runGit,
+  type GateDefinitionHash,
   type OperatorFlags,
+  type ReviewAcceptanceRecord,
   type ReviewGateConfig,
   type ReviewGateRunRecord,
   type ReviewRunRecord,
@@ -72,6 +79,9 @@ export function evaluateReviewEvidenceForPr(
   options: { latestOverride?: ReviewRunRecord | null; command?: string; target?: ReviewEvidenceTarget } = {},
 ): ReviewEvidenceCheckResult {
   const reviewState = loadReviewState(context.commonDir, context.config);
+  const reviewAcceptanceState = resolveReviewStateKey()
+    ? loadReviewAcceptanceState(context.commonDir, context.config)
+    : { records: [] };
   const expectedGates = context.config.reviewGates?.gates ?? [];
   if (expectedGates.length === 0) {
     return {
@@ -95,6 +105,7 @@ export function evaluateReviewEvidenceForPr(
         context,
         reviewRun: selectedLatest,
         allRecords: reviewState.records,
+        acceptanceRecords: reviewAcceptanceState.records,
         currentBranch: target.branchName,
         currentSha: target.sha,
         currentWorktreeStatusDigest: target.worktreeStatusDigest,
@@ -354,6 +365,7 @@ function attachEquivalentReviewGateEvidence(options: {
   context: WorkflowContext;
   reviewRun: ReviewRunRecord;
   allRecords: ReviewRunRecord[];
+  acceptanceRecords: ReviewAcceptanceRecord[];
   currentBranch: string;
   currentSha: string;
   currentWorktreeStatusDigest: string;
@@ -377,13 +389,29 @@ function attachEquivalentReviewGateEvidence(options: {
   );
   if (pendingManualGates.length === 0) return reviewRun;
 
-  const passedByGateId = new Map<string, ReviewGateRunRecord>();
+  const evidenceCandidates: Array<{ recordedAt: string; gate: ReviewGateRunRecord }> = [];
   for (const record of options.allRecords) {
     if (!reviewRunMatchesEquivalentGateEvidence(reviewRun, record)) continue;
     for (const gate of record.gates) {
-      if (isPassedManualReviewGate(gate) && !passedByGateId.has(gate.gateId)) {
-        passedByGateId.set(gate.gateId, gate);
+      if (isPassedManualReviewGate(gate)) {
+        evidenceCandidates.push({ recordedAt: gate.finishedAt || record.finishedAt, gate });
       }
+    }
+  }
+  for (const acceptance of options.acceptanceRecords) {
+    const pendingGate = pendingManualGates.find((gate) => gate.gateId === acceptance.gateId);
+    if (!pendingGate || !reviewAcceptanceMatchesGate(reviewRun, pendingGate, acceptance, options.context.config.reviewGates?.policyVersion ?? 1)) continue;
+    evidenceCandidates.push({
+      recordedAt: acceptance.recordedAt,
+      gate: reviewAcceptanceToGate(pendingGate, acceptance),
+    });
+  }
+
+  evidenceCandidates.sort((a, b) => b.recordedAt.localeCompare(a.recordedAt));
+  const passedByGateId = new Map<string, ReviewGateRunRecord>();
+  for (const candidate of evidenceCandidates) {
+    if (!passedByGateId.has(candidate.gate.gateId)) {
+      passedByGateId.set(candidate.gate.gateId, candidate.gate);
     }
   }
 
@@ -409,6 +437,48 @@ function attachEquivalentReviewGateEvidence(options: {
   return attached
     ? { ...reviewRun, status: summarizeReviewRunStatus(gates), gates }
     : reviewRun;
+}
+
+export function reviewGateDefinitionHash(gate: Pick<ReviewGateConfig, 'id' | 'phase' | 'type' | 'blocking' | 'command' | 'skill' | 'role' | 'userCommands'> | Pick<ReviewGateRunRecord, 'gateId' | 'phase' | 'type' | 'blocking' | 'command' | 'skill' | 'role' | 'userCommands'>): GateDefinitionHash {
+  const id = 'gateId' in gate ? gate.gateId : gate.id;
+  return crypto.createHash('sha256').update(canonicalize({
+    id,
+    phase: gate.phase,
+    type: gate.type,
+    blocking: gate.blocking !== false,
+    command: normalizeOptionalGateField(gate.command),
+    skill: normalizeOptionalGateField(gate.skill),
+    role: normalizeOptionalGateField(gate.role),
+    userCommands: gate.userCommands ?? [],
+  })).digest('hex');
+}
+
+function reviewAcceptanceMatchesGate(
+  reviewRun: ReviewRunRecord,
+  gate: ReviewGateRunRecord,
+  acceptance: ReviewAcceptanceRecord,
+  policyVersion: number,
+): boolean {
+  return acceptance.acceptabilityClass !== 'policy-bypass'
+    && acceptance.gateId === gate.gateId
+    && acceptance.gateDefinitionHash === reviewGateDefinitionHash(gate)
+    && acceptance.policyVersion === policyVersion
+    && acceptance.branchName === reviewRun.branchName
+    && acceptance.sha === reviewRun.sha
+    && acceptance.worktreeStatusDigest === (reviewRun.worktreeStatusDigest ?? '')
+    && acceptance.worktreeMaterialTreeHash === (reviewRun.worktreeMaterialTreeHash ?? '');
+}
+
+function reviewAcceptanceToGate(gate: ReviewGateRunRecord, acceptance: ReviewAcceptanceRecord): ReviewGateRunRecord {
+  return {
+    ...gate,
+    status: 'passed',
+    attester: acceptance.actor,
+    summary: `manual acceptance: ${acceptance.reason}`,
+    startedAt: acceptance.recordedAt,
+    finishedAt: acceptance.recordedAt,
+    durationMs: 0,
+  };
 }
 
 function reviewRunCoversFullGateSet(reviewRun: ReviewRunRecord): boolean {

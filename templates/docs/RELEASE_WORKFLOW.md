@@ -263,7 +263,7 @@ and/or `pipelane install-codex`.
 
 Runtime configuration lives outside the repo at
 `$PIPELANE_HOME/repos/<repo-key>/config.json` (default home:
-`~/.pipelane`). Deploy, smoke, and review setup mutations write there. Pipelane
+`~/.pipelane`). Deploy and review setup mutations write there. Pipelane
 does not use `.pipelane.json`, `.project-workflow.json`, or
 `package.json:pipelane` as active config inputs.
 

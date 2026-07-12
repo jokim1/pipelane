@@ -61,6 +61,7 @@ import {
   createReviewActorIdentity,
   resolveReviewActorIdentity,
 } from '../review-identity.ts';
+import { reviewGateDefinitionHash } from '../review-enforcement.ts';
 import { buildReviewRunRecord, collectChangedFiles } from './review.ts';
 import { closeSafeCompletedTaskWorkspaces } from './clean.ts';
 import {
@@ -74,9 +75,11 @@ import {
   resolveGitCommonDir,
   resolveWorkflowContext,
   runGit,
+  loadReviewAcceptanceState,
   loadReviewState,
   isStableEvidenceId,
   type ParsedOperatorArgs,
+  type ReviewAcceptanceRecord,
   type ReviewGateConfig,
   type ReviewGateRunRecord,
   type ReviewGatePhase,
@@ -3374,16 +3377,14 @@ function attachAttestedManualGateEvidence(
 ): ReviewRunRecord {
   if (!reviewRunCoversFullGateSet(reviewRun)) return reviewRun;
   if (!resolveReviewStateKey()) return reviewRun;
-  const evidenceRecords = selectMatchingAttestedManualGateEvidenceRecords(sliceContext, reviewRun);
-  if (evidenceRecords.length === 0) return reviewRun;
+  const evidenceCandidates = selectMatchingAttestedManualGateEvidence(sliceContext, reviewRun);
+  if (evidenceCandidates.length === 0) return reviewRun;
 
   const passedManualGates = new Map<string, ReviewGateRunRecord>();
-  for (const evidence of evidenceRecords) {
-    for (const gate of evidence.gates) {
-      if (!isPassedManualReviewGate(gate)) continue;
-      if (!passedManualGates.has(gate.gateId)) {
-        passedManualGates.set(gate.gateId, gate);
-      }
+  evidenceCandidates.sort((a, b) => b.recordedAt.localeCompare(a.recordedAt));
+  for (const candidate of evidenceCandidates) {
+    if (!passedManualGates.has(candidate.gate.gateId)) {
+      passedManualGates.set(candidate.gate.gateId, candidate.gate);
     }
   }
   if (passedManualGates.size === 0) return reviewRun;
@@ -3414,22 +3415,76 @@ function attachAttestedManualGateEvidence(
   };
 }
 
-function selectMatchingAttestedManualGateEvidenceRecords(
+function selectMatchingAttestedManualGateEvidence(
   sliceContext: WorkflowContext,
   reviewRun: ReviewRunRecord,
-): ReviewRunRecord[] {
+): Array<{ recordedAt: string; gate: ReviewGateRunRecord }> {
   if (!reviewRun.worktreeStatusDigest || reviewRun.worktreeStatusReliable !== true) return [];
   const state = loadReviewState(sliceContext.commonDir, sliceContext.config);
-  return state.records.filter((record) =>
-    !record.dryRun
-    && !record.gateFilter
-    && !record.phaseFilter
-    && record.branchName === reviewRun.branchName
-    && record.sha === reviewRun.sha
-    && record.worktreeStatusDigest === reviewRun.worktreeStatusDigest
-    && record.worktreeStatusReliable === true
-    && record.gates.some(isPassedManualReviewGate)
-  );
+  const candidates: Array<{ recordedAt: string; gate: ReviewGateRunRecord }> = [];
+  for (const record of state.records) {
+    if (
+      !reviewRunMatchesEquivalentGateEvidence(reviewRun, record)
+      || !record.gates.some(isPassedManualReviewGate)
+    ) {
+      continue;
+    }
+    for (const gate of record.gates) {
+      if (isPassedManualReviewGate(gate)) {
+        candidates.push({ recordedAt: gate.finishedAt || record.finishedAt, gate });
+      }
+    }
+  }
+
+  const acceptanceState = loadReviewAcceptanceState(sliceContext.commonDir, sliceContext.config);
+  const pendingManualById = new Map(reviewRun.gates
+    .filter((gate) => gate.status === 'pending' && gate.blocking !== false && isManualReviewGateRun(gate))
+    .map((gate) => [gate.gateId, gate]));
+  for (const acceptance of acceptanceState.records) {
+    const pendingGate = pendingManualById.get(acceptance.gateId);
+    if (!pendingGate || !reviewAcceptanceMatchesGate(reviewRun, pendingGate, acceptance, sliceContext.config.reviewGates?.policyVersion ?? 1)) continue;
+    candidates.push({
+      recordedAt: acceptance.recordedAt,
+      gate: reviewAcceptanceToGate(pendingGate, acceptance),
+    });
+  }
+  return candidates;
+}
+
+function reviewRunMatchesEquivalentGateEvidence(expected: ReviewRunRecord, evidence: ReviewRunRecord): boolean {
+  return reviewRunCoversFullGateSet(evidence)
+    && evidence.branchName === expected.branchName
+    && evidence.sha === expected.sha
+    && evidence.worktreeStatusDigest === expected.worktreeStatusDigest
+    && evidence.worktreeStatusReliable === true;
+}
+
+function reviewAcceptanceMatchesGate(
+  reviewRun: ReviewRunRecord,
+  gate: ReviewGateRunRecord,
+  acceptance: ReviewAcceptanceRecord,
+  policyVersion: number,
+): boolean {
+  return acceptance.acceptabilityClass !== 'policy-bypass'
+    && acceptance.gateId === gate.gateId
+    && acceptance.gateDefinitionHash === reviewGateDefinitionHash(gate)
+    && acceptance.policyVersion === policyVersion
+    && acceptance.branchName === reviewRun.branchName
+    && acceptance.sha === reviewRun.sha
+    && acceptance.worktreeStatusDigest === (reviewRun.worktreeStatusDigest ?? '')
+    && acceptance.worktreeMaterialTreeHash === (reviewRun.worktreeMaterialTreeHash ?? '');
+}
+
+function reviewAcceptanceToGate(gate: ReviewGateRunRecord, acceptance: ReviewAcceptanceRecord): ReviewGateRunRecord {
+  return {
+    ...gate,
+    status: 'passed',
+    attester: acceptance.actor,
+    summary: `manual acceptance: ${acceptance.reason}`,
+    startedAt: acceptance.recordedAt,
+    finishedAt: acceptance.recordedAt,
+    durationMs: 0,
+  };
 }
 
 function isPassedManualReviewGate(gate: ReviewGateRunRecord): boolean {
@@ -3926,7 +3981,7 @@ function executeProviderWorker(options: {
     let spawnError: Error | null = null;
     let timedOut = false;
     let killTimer: NodeJS.Timeout | null = null;
-    const child = spawn('/bin/sh', ['-lc', options.command], {
+    const child = spawn('/bin/sh', ['-c', options.command], {
       cwd: options.cwd,
       env: options.env,
       detached: true,
