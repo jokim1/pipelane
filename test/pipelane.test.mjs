@@ -1652,6 +1652,8 @@ test('install-codex outside a pipelane repo installs durable global default skil
     const pipelaneSkill = readFileSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
     assert.match(pipelaneSkill, /first token is `orchestrate`/);
     assert.match(pipelaneSkill, /\/pipelane orchestrate analyze --plan-file/);
+    assert.match(pipelaneSkill, /next reply is `1`, `Y`, or `yes`/);
+    assert.match(pipelaneSkill, /run `\/pipelane update --yes`/);
     const newSkill = readFileSync(path.join(codexHome, 'skills', 'new', 'SKILL.md'), 'utf8');
     assert.match(newSkill, /Fresh checkout behavior/);
     assert.match(newSkill, /repo-local npm scripts or repo-local binaries/);
@@ -1773,6 +1775,8 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     assert.match(deploySkill, /1 \(Continue to \/deploy staging\)/);
     const pipelaneSkill = readFileSync(path.join(claudeHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
     assert.match(pipelaneSkill, /normal clean repo setup and repair path/);
+    assert.match(pipelaneSkill, /next reply is `1`, `Y`, or `yes`/);
+    assert.match(pipelaneSkill, /run `\/pipelane update --yes`/);
     assert.match(pipelaneSkill, /only supported setup and repair path/);
     assert.match(pipelaneSkill, /must not materialize tracked/);
     assert.match(pipelaneSkill, /Choice handoff behavior/);

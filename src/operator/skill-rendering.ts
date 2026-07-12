@@ -181,6 +181,12 @@ after a prior command printed a numbered selector, do not refer back to only
 for example \`1 (Continue to /deploy staging: run /merge, then /deploy staging)\`
 or \`2 (Take one step only: run /merge)\`.
 
+When \`${slashAlias} update\` reports optional guidance changes, summarize the
+result with concise bullets and preserve its numbered action. If the operator's
+next reply is \`1\`, \`Y\`, or \`yes\`, run \`${slashAlias} update --yes\` and
+report which guidance file was updated. Do not leave the operator to translate
+the recommendation into a manual file edit.
+
 ## Interactive review setup behavior
 
 Agent Bash tools commonly run commands without an interactive TTY, and shell
