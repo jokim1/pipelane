@@ -28597,6 +28597,63 @@ test('deploy environment lock claim reclaims stale owners before claiming', asyn
   }
 });
 
+test('deploy environment locks retain the legacy runtime path across rolling upgrades', async () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+    const lockPath = stateMod.resolveDeployLockPath(context.commonDir, 'staging');
+    assert.match(lockPath, /smoke-runtime\/locks\/staging\.json$/);
+
+    const legacyOwner = {
+      environment: 'staging',
+      runId: 'legacy-deploy-owner',
+      sha: '1111111111111111111111111111111111111111',
+      createdAt: '2026-07-10T12:00:00.000Z',
+      pid: process.pid,
+      repoRoot,
+    };
+    mkdirSync(path.dirname(lockPath), { recursive: true });
+    writeFileSync(lockPath, `${JSON.stringify(legacyOwner, null, 2)}\n`);
+
+    const claim = stateMod.claimDeployEnvironmentLock(context.commonDir, {
+      ...legacyOwner,
+      runId: 'new-deploy-owner',
+    }, { isStale: () => false });
+    assert.equal(claim.status, 'blocked');
+    assert.equal(claim.existing.runId, legacyOwner.runId);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('deploy environment lock claim recovers malformed lock state under the mutation guard', async () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+    const lockPath = stateMod.resolveDeployLockPath(context.commonDir, 'prod');
+    mkdirSync(path.dirname(lockPath), { recursive: true });
+    writeFileSync(lockPath, '{"environment":"prod","runId":');
+
+    const owner = {
+      environment: 'prod',
+      runId: 'recovered-deploy-owner',
+      sha: '2222222222222222222222222222222222222222',
+      createdAt: '2026-07-10T12:00:00.000Z',
+      pid: process.pid,
+      repoRoot,
+    };
+    const claim = stateMod.claimDeployEnvironmentLock(context.commonDir, owner, { isStale: () => false });
+    assert.equal(claim.status, 'claimed');
+    assert.equal(stateMod.loadDeployEnvironmentLock(context.commonDir, 'prod').runId, owner.runId);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('renderCockpit shows RELEASE GATE PREVIOUSLY BYPASSED banner when override cleared but lastOverride persists', async () => {
   // The audit trail must outlive the active-override flag. After
   // /devmode build, effectiveOverride is null but lastOverride persists
