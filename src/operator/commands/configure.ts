@@ -15,6 +15,7 @@ import {
 import {
   loadWorkflowConfig,
   normalizeRouteSafetyConfig,
+  patchReadableWorkflowConfig,
   resolveRepoRoot,
   type RouteSafetyConfig,
 } from '../state.ts';
@@ -238,6 +239,7 @@ export async function handleConfigure(cwd: string, argv: string[]): Promise<Conf
   const finalConfig = options.json ? flagged : await promptForValues(applyDetectedConfigureValues(flagged, detection), workflowConfig.routeSafety);
 
   saveSharedDeployConfig(repoRoot, finalConfig);
+  syncAdditionalWorkflowSurfaces(repoRoot, finalConfig);
 
   if (options.json) {
     process.stdout.write(`${JSON.stringify(finalConfig, null, 2)}\n`);
@@ -250,6 +252,20 @@ export async function handleConfigure(cwd: string, argv: string[]): Promise<Conf
   }
 
   return { repoRoot, configPath, config: finalConfig };
+}
+
+function syncAdditionalWorkflowSurfaces(repoRoot: string, deployConfig: DeployConfig): void {
+  const additionalSurfaces = additionalDeploySurfaceNames(deployConfig);
+  if (additionalSurfaces.length === 0) return;
+  patchReadableWorkflowConfig(repoRoot, (raw) => {
+    const configured = Array.isArray(raw.surfaces)
+      ? raw.surfaces.filter((surface): surface is string => typeof surface === 'string' && surface.trim().length > 0)
+      : [];
+    return {
+      ...raw,
+      surfaces: [...new Set([...configured, ...additionalSurfaces])],
+    };
+  });
 }
 
 function applyFlagOverrides(base: DeployConfig, options: ConfigureOptions): DeployConfig {
