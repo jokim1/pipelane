@@ -831,8 +831,8 @@ export async function applyAgentsGuidanceMigrationsWithApproval(
   process.stdout.write(`${formatAgentsGuidanceMigrations(migrations).join('\n')}\n`);
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
-    const answer = (await rl.question('Apply these AGENTS.md changes? Enter Y to proceed. [Y/n] ')).trim().toLowerCase();
-    if (answer !== '' && answer !== 'y' && answer !== 'yes') {
+    const answer = (await rl.question('Apply these AGENTS.md changes? Enter 1 or Y to proceed. [Y/n] ')).trim().toLowerCase();
+    if (answer !== '' && answer !== '1' && answer !== 'y' && answer !== 'yes') {
       return [];
     }
   } finally {
@@ -938,8 +938,8 @@ export async function applyLessonsMigrationWithApproval(
   process.stdout.write(`${formatLessonsMigration(migration).join('\n')}\n`);
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
-    const answer = (await rl.question('Apply this CLAUDE.md Lessons block change? Enter Y to proceed. [Y/n] ')).trim().toLowerCase();
-    if (answer !== '' && answer !== 'y' && answer !== 'yes') {
+    const answer = (await rl.question('Apply this CLAUDE.md Lessons block change? Enter 1 or Y to proceed. [Y/n] ')).trim().toLowerCase();
+    if (answer !== '' && answer !== '1' && answer !== 'y' && answer !== 'yes') {
       return null;
     }
   } finally {
@@ -1108,8 +1108,8 @@ export async function applyClaudeGuidanceMigrationsWithApproval(
   process.stdout.write(`${formatClaudeGuidanceMigrations(migrations).join('\n')}\n`);
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
-    const answer = (await rl.question('Apply these CLAUDE.md changes? Enter Y to proceed. [Y/n] ')).trim().toLowerCase();
-    if (answer !== '' && answer !== 'y' && answer !== 'yes') {
+    const answer = (await rl.question('Apply these CLAUDE.md changes? Enter 1 or Y to proceed. [Y/n] ')).trim().toLowerCase();
+    if (answer !== '' && answer !== '1' && answer !== 'y' && answer !== 'yes') {
       return [];
     }
   } finally {

@@ -1652,6 +1652,8 @@ test('install-codex outside a pipelane repo installs durable global default skil
     const pipelaneSkill = readFileSync(path.join(codexHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
     assert.match(pipelaneSkill, /first token is `orchestrate`/);
     assert.match(pipelaneSkill, /\/pipelane orchestrate analyze --plan-file/);
+    assert.match(pipelaneSkill, /next reply is `1`, `Y`, or `yes`/);
+    assert.match(pipelaneSkill, /run `\/pipelane update --yes`/);
     const newSkill = readFileSync(path.join(codexHome, 'skills', 'new', 'SKILL.md'), 'utf8');
     assert.match(newSkill, /Fresh checkout behavior/);
     assert.match(newSkill, /repo-local npm scripts or repo-local binaries/);
@@ -1773,6 +1775,8 @@ test('install-claude outside a pipelane repo installs durable personal skills an
     assert.match(deploySkill, /1 \(Continue to \/deploy staging\)/);
     const pipelaneSkill = readFileSync(path.join(claudeHome, 'skills', 'pipelane', 'SKILL.md'), 'utf8');
     assert.match(pipelaneSkill, /normal clean repo setup and repair path/);
+    assert.match(pipelaneSkill, /next reply is `1`, `Y`, or `yes`/);
+    assert.match(pipelaneSkill, /run `\/pipelane update --yes`/);
     assert.match(pipelaneSkill, /only supported setup and repair path/);
     assert.match(pipelaneSkill, /must not materialize tracked/);
     assert.match(pipelaneSkill, /Choice handoff behavior/);
@@ -2090,6 +2094,8 @@ test('pipelane.md documents exact first-token routing for subcommands', () => {
   assert.match(template, /Exactly equals `update`/);
   assert.match(template, /No prefix matching/);
   assert.match(template, /`\/pipelane update-this-thing` routes to UNKNOWN MODE, not UPDATE MODE/);
+  assert.match(template, /next reply is `1`,\s*`Y`, or `yes`/);
+  assert.match(template, /run `\/pipelane update --yes`/);
 });
 
 test('fix.md template locks parser grammar fields and verbatim hint strings', () => {
@@ -26330,6 +26336,59 @@ test('update reports up-to-date when installed sha matches remote main', () => {
     rmSync(binDir, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
     rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('update --yes applies pending CLAUDE.md workspace guidance when already up to date', async () => {
+  const repoRoot = createRepo();
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
+  const previous = {
+    PIPELANE_HOME: process.env.PIPELANE_HOME,
+    CODEX_HOME: process.env.CODEX_HOME,
+    CLAUDE_HOME: process.env.CLAUDE_HOME,
+  };
+  const sha = '0123456789abcdef0123456789abcdef01234567';
+  try {
+    process.env.PIPELANE_HOME = pipelaneHome;
+    process.env.CODEX_HOME = codexHome;
+    process.env.CLAUDE_HOME = claudeHome;
+    writePipelaneConfig(repoRoot, 'Demo App');
+    const claudePath = path.join(repoRoot, 'CLAUDE.md');
+    writeFileSync(claudePath, '# Demo App\n\nKeep this consumer-owned note.\n', 'utf8');
+
+    const update = await import(path.join(KIT_ROOT, 'src', 'operator', 'update.ts'));
+    await update.runUpdate(repoRoot, {
+      check: false,
+      yes: true,
+      json: false,
+      output: 'silent',
+      initialStatus: {
+        repoRoot,
+        installedSha: sha,
+        installedShaShort: sha.slice(0, 7),
+        latestSha: sha,
+        latestShaShort: sha.slice(0, 7),
+        installedVersion: '0.2.0',
+        upToDate: true,
+        aheadBy: 0,
+        commits: [],
+      },
+    });
+
+    const claude = readFileSync(claudePath, 'utf8');
+    assert.match(claude, /pipelane:claude-workspace-policy:start/);
+    assert.match(claude, /Keep this consumer-owned note/);
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
   }
 });
 

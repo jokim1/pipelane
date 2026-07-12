@@ -8,6 +8,9 @@ import { installClaudeBootstrapSkill } from './claude-install.ts';
 import { installCodexBootstrapSkill } from './codex-install.ts';
 import { readManagedRuntimeMetadata, type ManagedRuntimeMetadata } from './global-runtime.ts';
 import {
+  applyAgentsGuidanceMigrationsWithApproval,
+  applyClaudeGuidanceMigrationsWithApproval,
+  applyLessonsMigrationWithApproval,
   detectSetupDrift,
   formatAgentsGuidanceMigrations,
   formatClaudeGuidanceMigrations,
@@ -289,6 +292,9 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
   // currently-installed pipelane, even when no upstream update exists.
   if (options.check || status.upToDate) {
     let driftResult = tryDetectDrift(repoRoot);
+    if (!options.check && !options.json) {
+      driftResult = await applyUpdateGuidanceMigrations(repoRoot, driftResult, options);
+    }
     const globalSurfaces = options.check
       ? skippedGlobalSurfaces('read-only --check')
       : refreshInstalledGlobalSurfaces(repoRoot);
@@ -362,6 +368,9 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
   }
 
   let driftResult = tryDetectDrift(repoRoot);
+  if (!options.json) {
+    driftResult = await applyUpdateGuidanceMigrations(repoRoot, driftResult, options);
+  }
   const globalSurfaces = installRefresh;
 
   if (options.json) {
@@ -401,6 +410,35 @@ export async function runUpdate(cwd: string, options: UpdateOptions): Promise<Up
     ranSetup,
     globalSurfaces,
   };
+}
+
+async function applyUpdateGuidanceMigrations(
+  repoRoot: string,
+  result: DriftResult,
+  options: Pick<UpdateOptions, 'yes'>,
+): Promise<DriftResult> {
+  const drift = result.drift;
+  if (!drift || result.error) {
+    return result;
+  }
+
+  const appliedAgents = await applyAgentsGuidanceMigrationsWithApproval(
+    drift.agentsGuidanceMigrations ?? [],
+    { yes: options.yes },
+  );
+  const appliedClaude = await applyClaudeGuidanceMigrationsWithApproval(
+    drift.claudeGuidanceMigrations ?? [],
+    { yes: options.yes },
+  );
+  const appliedLessons = await applyLessonsMigrationWithApproval(
+    drift.lessonsMigration ?? null,
+    { yes: options.yes },
+  );
+
+  if (appliedAgents.length === 0 && appliedClaude.length === 0 && !appliedLessons) {
+    return result;
+  }
+  return tryDetectDrift(repoRoot);
 }
 
 function writeUpdateOutput(options: Pick<UpdateOptions, 'output'>, text: string): void {
@@ -720,19 +758,19 @@ function installLatestManagedRuntimes(latestSha: string, options: Pick<UpdateOpt
 function emitGlobalSurfaceRefreshHint(result: GlobalSurfaceRefresh, options: Pick<UpdateOptions, 'output'>): void {
   const lines: string[] = [];
   if (result.codex.status === 'refreshed') {
-    lines.push('Refreshed machine-local Codex commands. Restart Codex if command discovery is already loaded.');
+    lines.push('- Refreshed machine-local Codex commands. Restart Codex if command discovery is already loaded.');
   } else if (result.codex.status === 'failed') {
-    lines.push(`Machine-local Codex refresh failed: ${result.codex.detail}`);
+    lines.push(`- Codex command refresh failed: ${result.codex.detail}`);
   }
 
   if (result.claude.status === 'refreshed') {
-    lines.push('Refreshed machine-local Claude commands. Restart Claude if skill discovery is already loaded.');
+    lines.push('- Refreshed machine-local Claude commands. Restart Claude if skill discovery is already loaded.');
   } else if (result.claude.status === 'failed') {
-    lines.push(`Machine-local Claude refresh failed: ${result.claude.detail}`);
+    lines.push(`- Claude command refresh failed: ${result.claude.detail}`);
   }
 
   if (lines.length > 0) {
-    writeUpdateOutput(options, `\n${lines.join('\n')}\n`);
+    writeUpdateOutput(options, `\nUpdated surfaces:\n${lines.join('\n')}\n`);
   }
 }
 
@@ -750,24 +788,22 @@ function emitDriftHint(result: DriftResult, options: Pick<UpdateOptions, 'output
   if (!drift.needsSetup) {
     let emittedGuidanceMigration = false;
     if (agentsGuidanceMigrations.length > 0) {
-      writeUpdateOutput(options, '\nAGENTS.md consumer-owned guidance note:\n');
+      writeUpdateOutput(options, '\nOptional guidance updates:\n');
       writeUpdateOutput(options, formatAgentsGuidanceMigrations(agentsGuidanceMigrations).join('\n') + '\n');
-      writeUpdateOutput(options, 'Pipelane setup will not rewrite AGENTS.md. Apply any wanted guidance edits manually in the application repo.\n');
       emittedGuidanceMigration = true;
     }
     if (claudeGuidanceMigrations.length > 0) {
-      writeUpdateOutput(options, '\nCLAUDE.md consumer-owned guidance note:\n');
+      if (!emittedGuidanceMigration) writeUpdateOutput(options, '\nOptional guidance updates:\n');
       writeUpdateOutput(options, formatClaudeGuidanceMigrations(claudeGuidanceMigrations).join('\n') + '\n');
-      writeUpdateOutput(options, 'Pipelane setup will not rewrite CLAUDE.md. Apply any wanted guidance edits manually in the application repo.\n');
       emittedGuidanceMigration = true;
     }
     if (drift.lessonsMigration) {
-      writeUpdateOutput(options, '\nCLAUDE.md Lessons block guidance note:\n');
+      if (!emittedGuidanceMigration) writeUpdateOutput(options, '\nOptional guidance updates:\n');
       writeUpdateOutput(options, formatLessonsMigration(drift.lessonsMigration).join('\n') + '\n');
-      writeUpdateOutput(options, 'Pipelane setup will not rewrite CLAUDE.md. Add the Lessons block manually if this repo wants it.\n');
       emittedGuidanceMigration = true;
     }
     if (emittedGuidanceMigration) {
+      writeUpdateOutput(options, '- Next: reply `1` or `Y` to apply these changes, or run `/pipelane update --yes`.\n');
       return;
     }
     if (warnings.length > 0) {

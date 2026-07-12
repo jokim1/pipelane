@@ -343,5 +343,11 @@ Use `--check` to inspect without mutating. Use `--json` for structured output; J
 
 Configuration or alias collisions are reported but NOT auto-resolved — setup is skipped and the operator must rename, remove, or adjust aliases before retrying.
 
+If update reports optional guidance changes, summarize the result with concise
+bullets and preserve its numbered action. When the operator's next reply is `1`,
+`Y`, or `yes`, run `/pipelane update --yes` and report which guidance file was
+updated. Do not leave the operator to translate the recommendation into a manual
+file edit.
+
 <!-- pipelane:consumer-extension:start -->
 <!-- pipelane:consumer-extension:end -->
