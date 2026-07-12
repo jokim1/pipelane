@@ -622,10 +622,12 @@ export function setNextAction(
 ): TaskLock | null {
   const lock = loadTaskLock(commonDir, config, taskSlug);
   if (!lock) return null;
+  const updatedAt = nowIso();
   return saveTaskLock(commonDir, config, taskSlug, {
     ...lock,
     nextAction: text,
-    updatedAt: nowIso(),
+    nextActionUpdatedAt: updatedAt,
+    updatedAt,
   });
 }
 

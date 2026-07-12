@@ -21,6 +21,7 @@ import {
   resolveWorkflowContext,
   runGit,
   saveStatusDecisionRecord,
+  TASK_LOCK_STALE_MS,
   type DeployRecord,
   type Mode,
   type OperatorFlags,
@@ -688,7 +689,7 @@ function renderCurrentCheckout(
   lines.push(`  compare runtime→origin: ${sanitizeForTerminal(checkout.relationships.runtimeToOrigin.state)} (${sanitizeForTerminal(checkout.relationships.runtimeToOrigin.reason)})`);
 
   if (checkout.nextAction) {
-    lines.push(`  next: ${sanitizeForTerminal(checkout.nextAction)}`);
+    lines.push(`  next: ${sanitizeForTerminal(checkout.nextAction)}${formatNextActionTiming(checkout.nextActionAgeMs ?? null, checkout.nextActionStale ?? false)}`);
   }
 
   return lines;
@@ -719,9 +720,14 @@ function renderBranch(branch: BranchRow, baseBranch: string, color: boolean): st
   }
   const lockNextAction = readNextAction(branch);
   if (lockNextAction) {
-    detail.push(`    next: ${sanitizeForTerminal(lockNextAction)}`);
+    detail.push(`    next: ${sanitizeForTerminal(lockNextAction)}${formatNextActionTiming(branch.task?.nextActionAgeMs ?? null, branch.task?.nextActionStale ?? false)}`);
   }
   return [header, laneLine, ...detail];
+}
+
+function formatNextActionTiming(ageMs: number | null, stale: boolean): string {
+  if (ageMs === null) return ' (age unknown)';
+  return ` (age ${formatDuration(ageMs)}${stale ? ', stale' : ''})`;
 }
 
 function readNextAction(branch: BranchRow): string | null {
@@ -868,7 +874,6 @@ const ANSI = {
 // has consciously moved on from).
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_WINDOW_DAYS = 7;
-const STUCK_IDLE_MS = 72 * 60 * 60 * 1000;
 const STAGING_WITHOUT_PROD_MS = 48 * 60 * 60 * 1000;
 const ORPHAN_PR_WINDOW_MS = 14 * DAY_MS;
 // --week table / --stuck sha displays. 12 chars matches the default /status
@@ -1058,7 +1063,7 @@ export function buildStuckView(
     const idleMs = nowMs - updatedMs;
     // Spec is "idle > 72h" (strict). Using `<=` to skip means exactly-72h
     // is NOT flagged, matching the manifest's `updatedAt > 72h` language.
-    if (idleMs <= STUCK_IDLE_MS) continue;
+    if (idleMs <= TASK_LOCK_STALE_MS) continue;
     idleTasks.push({
       taskSlug: lock.taskSlug,
       taskName: lock.taskName ?? null,

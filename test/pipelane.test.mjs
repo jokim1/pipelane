@@ -28043,7 +28043,7 @@ test('renderCockpit produces a deterministic one-screen cockpit from a fixture e
           status: 'open-pr',
           current: true,
           note: 'PR #12 is open',
-          task: { taskSlug: 'active-task', mode: 'release', worktreePath: '/tmp/x', updatedAt: '2026-04-18T00:00:00.000Z', nextAction: 'PR #12 open, awaiting CI' },
+          task: { taskSlug: 'active-task', mode: 'release', worktreePath: '/tmp/x', updatedAt: '2026-04-18T00:00:00.000Z', nextAction: 'PR #12 open, awaiting CI', nextActionUpdatedAt: '2026-04-14T00:00:00.000Z', nextActionAgeMs: 4 * 24 * 60 * 60 * 1000, nextActionStale: true },
           surfaces: ['frontend'],
           cleanup: { available: false, eligible: false, reason: 'workspace still active' },
           pr: { number: 12, state: 'OPEN', url: 'https://x', title: 'Active', mergedAt: null },
@@ -28116,7 +28116,7 @@ test('renderCockpit produces a deterministic one-screen cockpit from a fixture e
   // 5-lane line with all five labels in order, for the active row.
   assert.match(rendered, /\[Local .\] \[PR .\] \[Base: main .\] \[Staging .\] \[Production .\]/);
   // v1.3: nextAction breadcrumb surfaces in the cockpit.
-  assert.match(rendered, /next: PR #12 open, awaiting CI/);
+  assert.match(rendered, /next: PR #12 open, awaiting CI \(age 4d, stale\)/);
   // Empty attention shows the filler line rather than nothing.
   assert.match(rendered, /\(nothing blocking\)/);
   // Current-branch marker appears only for the one flagged current.
@@ -28173,11 +28173,39 @@ test('setNextAction persists nextAction on the task lock and is a no-op when no 
     const updated = helpers.setNextAction(commonDir, config, 'abc', 'PR #42 open, awaiting CI');
     assert.ok(updated);
     assert.equal(updated.nextAction, 'PR #42 open, awaiting CI');
+    assert.equal(updated.nextActionUpdatedAt, updated.updatedAt);
     const loaded = stateMod.loadTaskLock(commonDir, config, 'abc');
     assert.equal(loaded?.nextAction, 'PR #42 open, awaiting CI');
+    assert.equal(loaded?.nextActionUpdatedAt, updated.nextActionUpdatedAt);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
+});
+
+test('buildNextActionTiming uses the action timestamp with strict stale and clock-skew handling', async () => {
+  const snapshotMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'api', 'snapshot.ts'));
+  const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+  const checkedAt = '2026-04-18T00:00:00.000Z';
+  const exactBoundary = '2026-04-15T00:00:00.000Z';
+  const justOverBoundary = new Date(Date.parse(exactBoundary) - 1).toISOString();
+
+  assert.deepEqual(
+    snapshotMod.buildNextActionTiming('continue', exactBoundary, '2026-04-18T00:00:00.000Z', checkedAt),
+    { nextActionUpdatedAt: exactBoundary, nextActionAgeMs: stateMod.TASK_LOCK_STALE_MS, nextActionStale: false },
+  );
+  assert.equal(
+    snapshotMod.buildNextActionTiming('continue', justOverBoundary, checkedAt, checkedAt).nextActionStale,
+    true,
+  );
+  assert.deepEqual(
+    snapshotMod.buildNextActionTiming('continue', '2026-04-18T01:00:00.000Z', checkedAt, checkedAt),
+    { nextActionUpdatedAt: '2026-04-18T01:00:00.000Z', nextActionAgeMs: null, nextActionStale: false },
+  );
+  assert.equal(
+    snapshotMod.buildNextActionTiming('continue', undefined, exactBoundary, checkedAt).nextActionUpdatedAt,
+    exactBoundary,
+    'legacy locks fall back to the lock timestamp',
+  );
 });
 
 test('buildWorkflowApiSnapshot surfaces TaskLock.nextAction through the envelope (end-to-end)', async () => {
@@ -28195,15 +28223,18 @@ test('buildWorkflowApiSnapshot surfaces TaskLock.nextAction through the envelope
     const snapshotMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'api', 'snapshot.ts'));
     const statusMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'status.ts'));
     const context = stateMod.resolveWorkflowContext(repoRoot);
+    const currentBranch = run('git', ['branch', '--show-current'], repoRoot);
 
+    const nextActionUpdatedAt = new Date(Date.now() - 90 * 60 * 60 * 1000).toISOString();
     stateMod.saveTaskLock(context.commonDir, context.config, 'demo-task', {
       taskSlug: 'demo-task',
-      branchName: 'codex/demo-task-0000',
+      branchName: currentBranch,
       worktreePath: repoRoot,
       mode: 'build',
       surfaces: ['frontend'],
       updatedAt: new Date().toISOString(),
       nextAction: 'PR #42 open, awaiting CI',
+      nextActionUpdatedAt,
     });
 
     const envelope = await snapshotMod.buildWorkflowApiSnapshot(repoRoot);
@@ -28212,10 +28243,17 @@ test('buildWorkflowApiSnapshot surfaces TaskLock.nextAction through the envelope
     assert.ok(demoBranch, 'expected demo-task branch in envelope');
     assert.equal(demoBranch.task.nextAction, 'PR #42 open, awaiting CI',
       'envelope must carry nextAction from the underlying TaskLock');
+    assert.equal(demoBranch.task.nextActionUpdatedAt, nextActionUpdatedAt);
+    assert.ok(demoBranch.task.nextActionAgeMs >= 89 * 60 * 60 * 1000);
+    assert.equal(demoBranch.task.nextActionStale, true);
+    assert.equal(envelope.data.boardContext.currentCheckout.nextAction, 'PR #42 open, awaiting CI');
+    assert.equal(envelope.data.boardContext.currentCheckout.nextActionUpdatedAt, nextActionUpdatedAt);
+    assert.ok(envelope.data.boardContext.currentCheckout.nextActionAgeMs >= 89 * 60 * 60 * 1000);
+    assert.equal(envelope.data.boardContext.currentCheckout.nextActionStale, true);
 
     // And the cockpit must render it.
     const rendered = statusMod.renderCockpit(envelope, { color: false });
-    assert.match(rendered, /next: PR #42 open, awaiting CI/);
+    assert.match(rendered, /next: PR #42 open, awaiting CI \(age 3d18h, stale\)/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });

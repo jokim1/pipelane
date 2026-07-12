@@ -295,6 +295,9 @@ export interface TaskLock {
   // today; /resume render integration is queued for the next slice. Absent
   // on fresh locks until the first mutation writes it.
   nextAction?: string;
+  // Timestamp for the nextAction breadcrumb itself. Older locks omit this;
+  // readers fall back to updatedAt so the state format remains compatible.
+  nextActionUpdatedAt?: string;
   // Audit trail for task/worktree rebinding recoveries. The current lock
   // branch/path remain authoritative; history explains how they changed.
   bindingHistory?: Array<{
@@ -307,6 +310,8 @@ export interface TaskLock {
     fingerprint: string;
   }>;
 }
+
+export const TASK_LOCK_STALE_MS = 72 * 60 * 60 * 1000;
 
 export interface PrRecord {
   taskSlug: string;

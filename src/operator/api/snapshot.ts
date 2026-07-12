@@ -13,6 +13,7 @@ import {
   nowIso,
   resolveWorkflowContext,
   runGit,
+  TASK_LOCK_STALE_MS,
 } from '../state.ts';
 import {
   computeDeployConfigFingerprint,
@@ -98,6 +99,9 @@ export interface BranchRow {
     // by state-mutating commands (pr/merge/deploy). Null when the lock
     // hasn't been touched by a state mutation yet.
     nextAction: string | null;
+    nextActionUpdatedAt: string | null;
+    nextActionAgeMs: number | null;
+    nextActionStale: boolean;
   } | null;
   surfaces: string[];
   cleanup: {
@@ -139,6 +143,9 @@ export interface CurrentCheckoutTruth {
   baseBranch: string;
   taskSlug: string | null;
   nextAction: string | null;
+  nextActionUpdatedAt: string | null;
+  nextActionAgeMs: number | null;
+  nextActionStale: boolean;
   summary: string;
   layers: {
     worktree: CheckoutTruthLayer;
@@ -1375,6 +1382,12 @@ function buildCurrentCheckoutTruth(options: {
   runtimeObservation: FrontendRuntimeObservation;
   worktreeToOrigin: CheckoutTruthRelationship;
 }): CurrentCheckoutTruth {
+  const nextActionTiming = buildNextActionTiming(
+    options.activeLock?.nextAction,
+    options.activeLock?.nextActionUpdatedAt,
+    options.activeLock?.updatedAt,
+    options.checkedAt,
+  );
   const latestProdFrontendDeploy = findLatestFrontendDeployRecord(options.deployRecords, 'prod');
   const latestSuccessfulProdFrontendDeploy = latestProdFrontendDeploy?.status === 'succeeded'
     ? latestProdFrontendDeploy
@@ -1438,6 +1451,7 @@ function buildCurrentCheckoutTruth(options: {
     baseBranch: options.baseBranch,
     taskSlug: options.activeLock?.taskSlug ?? null,
     nextAction: options.activeLock?.nextAction?.trim() || null,
+    ...nextActionTiming,
     summary: summarizeCurrentCheckoutTruth({
       currentBranch: options.currentBranch,
       baseBranch: options.baseBranch,
@@ -1907,6 +1921,12 @@ function buildBranchRow(options: {
     prodVerified: Boolean(prRecord?.mergedSha) && productionCell.state === 'healthy',
     checkedAt,
   });
+  const nextActionTiming = buildNextActionTiming(
+    lock.nextAction,
+    lock.nextActionUpdatedAt,
+    lock.updatedAt,
+    checkedAt,
+  );
 
   const note = !worktreeExists
     ? `worktree missing at ${lock.worktreePath}`
@@ -1939,6 +1959,7 @@ function buildBranchRow(options: {
       worktreePath: lock.worktreePath,
       updatedAt: lock.updatedAt ?? null,
       nextAction: lock.nextAction ?? null,
+      ...nextActionTiming,
     },
     surfaces: lock.surfaces ?? [],
     cleanup: {
@@ -1979,6 +2000,29 @@ function buildBranchRow(options: {
       taskSlug: lock.taskSlug,
       checkedAt,
     }),
+  };
+}
+
+export function buildNextActionTiming(
+  nextAction: string | undefined,
+  nextActionUpdatedAt: string | undefined,
+  lockUpdatedAt: string | undefined,
+  checkedAt: string,
+): { nextActionUpdatedAt: string | null; nextActionAgeMs: number | null; nextActionStale: boolean } {
+  if (!nextAction?.trim()) {
+    return { nextActionUpdatedAt: null, nextActionAgeMs: null, nextActionStale: false };
+  }
+  const effectiveUpdatedAt = nextActionUpdatedAt ?? lockUpdatedAt;
+  const checkedAtMs = Date.parse(checkedAt);
+  const effectiveUpdatedAtMs = effectiveUpdatedAt ? Date.parse(effectiveUpdatedAt) : Number.NaN;
+  if (Number.isFinite(checkedAtMs) && Number.isFinite(effectiveUpdatedAtMs) && effectiveUpdatedAtMs > checkedAtMs) {
+    return { nextActionUpdatedAt: effectiveUpdatedAt ?? null, nextActionAgeMs: null, nextActionStale: false };
+  }
+  const nextActionAgeMs = lockAgeMs(effectiveUpdatedAt, checkedAtMs);
+  return {
+    nextActionUpdatedAt: effectiveUpdatedAt ?? null,
+    nextActionAgeMs,
+    nextActionStale: nextActionAgeMs !== null && nextActionAgeMs > TASK_LOCK_STALE_MS,
   };
 }
 
