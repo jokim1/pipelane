@@ -492,6 +492,31 @@ and non-TTY execution paths.
     before honoring the API confirmation bypass. Drift fails closed with a new
     preflight remedy.
 
+34. **Direct production effect binding accidentally rejected confirmed route
+    deploys (P0).** **Location:** `src/operator/commands/deploy.ts:1303` and
+    `src/operator/destination-executor.ts:292`. **Repro:** preflight and execute
+    `api action route.deploy.prod` when production is the remaining route step;
+    the route child carried the established route-confirmed marker but not the
+    direct action's approved SHA/surface variables, so the new assertion read
+    missing approval data and blocked before dispatch. **Proposed fix
+    (implemented):** give direct `deploy.prod` confirmation a distinct internal
+    marker, apply exact SHA/surface comparison only to that marker, preserve the
+    existing route fingerprint confirmation path, and scrub the direct marker
+    from destination children. A full route preflight/token/execute regression
+    now reaches successful production dispatch.
+
+35. **Production effect-resolution errors escaped the API envelope (P1).**
+    **Location:** `src/operator/api/actions.ts:193`,
+    `src/operator/api/actions.ts:731`, and
+    `src/operator/api/actions.ts:1050`. **Repro:** preflight `deploy.prod` with a
+    missing task lock, missing merged SHA, or invalid ref, or delete a named ref
+    between valid preflight and execute; normalization threw directly and left
+    JSON callers with empty stdout. **Proposed fix (implemented):** catch exact
+    effect-resolution failures in both preview and execute, rebuild only raw
+    side-effect-free inputs, return `ok:false` / `preflight.allowed:false` with
+    no token, and persist task-scoped execute blockers through the existing
+    action feedback path.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original
