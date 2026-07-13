@@ -398,6 +398,11 @@ async function probeUrl(target: ProbeTarget, nowFn: () => Date): Promise<ProbeRe
     if (process.env.NODE_ENV !== 'test') {
       throw new Error('PIPELANE_DOCTOR_PROBE_STUB_STATUS is set but NODE_ENV is not "test". Unset it and re-run.');
     }
+    const startedMarker = process.env.PIPELANE_DOCTOR_PROBE_STUB_STARTED_FILE?.trim();
+    if (startedMarker) writeFileSync(startedMarker, `${process.pid}\n`, 'utf8');
+    const delayText = process.env.PIPELANE_DOCTOR_PROBE_STUB_DELAY_MS?.trim() ?? '';
+    const delayMs = /^\d+$/.test(delayText) ? Number(delayText) : 0;
+    if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
     const statusCode = Number(stub);
     const code = Number.isFinite(statusCode) ? statusCode : 599;
     const ok = code >= 200 && code < 300;

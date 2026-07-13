@@ -682,6 +682,8 @@ const PROBE_STATE_FILENAME = 'probe-state.json';
 const TASK_LOCKS_DIRNAME = 'task-locks';
 const TASK_CLEANUP_LOCKS_DIRNAME = 'task-cleanup-locks';
 const TASK_CLEANUP_LOCK_STALE_MS = 10 * 60 * 1000;
+const TASK_MUTATION_LOCKS_DIRNAME = 'task-mutation-locks';
+const TASK_MUTATION_LOCK_STALE_MS = 60 * 1000;
 const ORPHAN_CLEANUP_LOCKS_DIRNAME = 'orphan-cleanup-locks';
 const INSTALL_MARKER_FILENAME = 'installed.json';
 const LEGACY_MIGRATION_FILENAME = 'legacy-migration.json';
@@ -2851,17 +2853,124 @@ export function loadTaskLock(commonDir: string, config: WorkflowConfig, taskSlug
   return readVersionedJsonFile<TaskLock | null>('taskLock', commonDir, config, taskLockPath(commonDir, config, taskSlug), null);
 }
 
-export function saveTaskLock(commonDir: string, config: WorkflowConfig, taskSlug: string, value: TaskLock): TaskLock {
-  assertTaskCleanupUnlocked(commonDir, config, taskSlug);
+export function updateTaskLock(
+  commonDir: string,
+  config: WorkflowConfig,
+  taskSlug: string,
+  update: (current: TaskLock | null) => TaskLock | null,
+  options: {
+    allowCleanupLock?: boolean;
+    afterWrite?: (next: TaskLock | null, previous: TaskLock | null) => void;
+  } = {},
+): TaskLock | null {
+  const releaseMutationLock = acquireTaskMutationLock(commonDir, config, taskSlug);
+  try {
+    if (!options.allowCleanupLock) assertTaskCleanupUnlocked(commonDir, config, taskSlug);
+    const current = loadTaskLock(commonDir, config, taskSlug);
+    const next = update(current);
+    const changed = next !== current;
+    if (changed) writeTaskLockMutationValue(commonDir, config, taskSlug, next);
+    try {
+      options.afterWrite?.(next, current);
+    } catch (error) {
+      if (changed) {
+        try {
+          writeTaskLockMutationValue(commonDir, config, taskSlug, current);
+        } catch {}
+      }
+      throw error;
+    }
+    return next;
+  } finally {
+    releaseMutationLock();
+  }
+}
+
+function writeTaskLockMutationValue(
+  commonDir: string,
+  config: WorkflowConfig,
+  taskSlug: string,
+  value: TaskLock | null,
+): void {
+  const targetPath = taskLockPath(commonDir, config, taskSlug);
+  if (!value) {
+    try {
+      if (existsSync(targetPath)) unlinkSync(targetPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    return;
+  }
+  if (value.taskSlug !== taskSlug) {
+    throw new Error(`Task lock mutation for ${taskSlug} returned mismatched slug ${value.taskSlug}.`);
+  }
   ensureStateDir(commonDir, config);
-  writeVersionedJsonFile('taskLock', taskLockPath(commonDir, config, taskSlug), value);
-  return value;
+  writeVersionedJsonFile('taskLock', targetPath, value);
+}
+
+export function saveTaskLock(commonDir: string, config: WorkflowConfig, taskSlug: string, value: TaskLock): TaskLock {
+  return updateTaskLock(commonDir, config, taskSlug, () => value) as TaskLock;
 }
 
 export function removeTaskLock(commonDir: string, config: WorkflowConfig, taskSlug: string): void {
-  const targetPath = taskLockPath(commonDir, config, taskSlug);
-  if (existsSync(targetPath)) {
-    unlinkSync(targetPath);
+  updateTaskLock(commonDir, config, taskSlug, () => null);
+}
+
+function taskMutationLockPath(commonDir: string, config: WorkflowConfig, taskSlug: string): string {
+  return path.join(resolveStateDir(commonDir, config), TASK_MUTATION_LOCKS_DIRNAME, `${taskSlug}.lock`);
+}
+
+function acquireTaskMutationLock(commonDir: string, config: WorkflowConfig, taskSlug: string): () => void {
+  const lockPath = taskMutationLockPath(commonDir, config, taskSlug);
+  mkdirSync(path.dirname(lockPath), { recursive: true });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      mkdirSync(lockPath);
+      writeFileSync(
+        path.join(lockPath, 'owner.json'),
+        `${JSON.stringify({ taskSlug, pid: process.pid, acquiredAt: nowIso() }, null, 2)}\n`,
+        'utf8',
+      );
+      return () => rmSync(lockPath, { recursive: true, force: true });
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err.code !== 'EEXIST') {
+        rmSync(lockPath, { recursive: true, force: true });
+        throw new Error(`Could not acquire task lock mutation lease for ${taskSlug}: ${err.message}`);
+      }
+      if (clearAbandonedTaskMutationLock(lockPath)) continue;
+      throw new Error(`Task ${taskSlug} is being updated by another Pipelane process; retry after it finishes.`);
+    }
+  }
+  throw new Error(`Could not acquire task lock mutation lease for ${taskSlug}.`);
+}
+
+function clearAbandonedTaskMutationLock(lockPath: string): boolean {
+  let owner: { pid?: unknown } | null = null;
+  try {
+    owner = JSON.parse(readFileSync(path.join(lockPath, 'owner.json'), 'utf8')) as { pid?: unknown };
+  } catch {}
+  const pid = typeof owner?.pid === 'number' && Number.isSafeInteger(owner.pid) && owner.pid > 0
+    ? owner.pid
+    : null;
+  if (pid !== null && processIsAliveForTaskMutation(pid)) return false;
+  if (pid === null) {
+    try {
+      if (Date.now() - statSync(lockPath).mtimeMs <= TASK_MUTATION_LOCK_STALE_MS) return false;
+    } catch {
+      return false;
+    }
+  }
+  rmSync(lockPath, { recursive: true, force: true });
+  return true;
+}
+
+function processIsAliveForTaskMutation(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
   }
 }
 

@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 export interface PipelaneRuntimeIdentity {
   version: string;
   sha: string;
+  dirty: boolean;
   builtAt: string | null;
   packageRoot: string;
   source: 'dist' | 'src';
@@ -19,6 +20,7 @@ export interface PipelaneRuntimeIdentity {
 
 interface BuildInfoFile {
   sha?: unknown;
+  dirty?: unknown;
   builtAt?: unknown;
 }
 
@@ -39,11 +41,12 @@ export function resolvePipelaneRuntimeIdentity(moduleUrl = import.meta.url): Pip
     ? readJsonFile<BuildInfoFile>(path.join(packageRoot, 'dist', 'build-info.json'))
     : null;
   const builtSha = cleanText(buildInfo?.sha);
-  const sourceSha = source === 'src' ? resolveGitSha(packageRoot) : '';
+  const sourceGit = source === 'src' ? resolveGitIdentity(packageRoot) : { sha: '', dirty: false };
 
   return {
     version: cleanText(packageJson.version) || 'unknown',
-    sha: builtSha || sourceSha || 'unknown',
+    sha: builtSha || sourceGit.sha || 'unknown',
+    dirty: source === 'dist' ? buildInfo?.dirty === true : sourceGit.dirty,
     builtAt: cleanIsoTimestamp(buildInfo?.builtAt),
     packageRoot,
     source,
@@ -51,7 +54,7 @@ export function resolvePipelaneRuntimeIdentity(moduleUrl = import.meta.url): Pip
 }
 
 export function formatPipelaneRuntimeBanner(identity: PipelaneRuntimeIdentity): string {
-  return `pipelane v${identity.version} (${shortBuildSha(identity.sha)}) from ${identity.packageRoot}`;
+  return `pipelane v${identity.version} (${formatBuildRef(identity)}) from ${identity.packageRoot}`;
 }
 
 export function formatPipelaneVersion(identity: PipelaneRuntimeIdentity): string {
@@ -63,9 +66,9 @@ export function formatPipelaneVersion(identity: PipelaneRuntimeIdentity): string
 export function buildRuntimeWarnings(identity: PipelaneRuntimeIdentity, cwd: string): string[] {
   const warnings: string[] = [];
   const pinnedSha = resolveHostPipelanePin(cwd);
-  if (pinnedSha && identity.sha !== 'unknown' && !sameGitSha(identity.sha, pinnedSha)) {
+  if (pinnedSha && identity.sha !== 'unknown' && (identity.dirty || !sameGitSha(identity.sha, pinnedSha))) {
     warnings.push(
-      `Warning: running ${shortBuildSha(identity.sha)} but repo pins ${shortBuildSha(pinnedSha)} — run npm install or point npx at the repo install.`,
+      `Warning: running ${formatBuildRef(identity)} but repo pins ${shortBuildSha(pinnedSha)} — run npm install or point npx at the repo install.`,
     );
   }
   if (distIsOlderThanSource(identity)) {
@@ -90,15 +93,21 @@ function resolvePackageRoot(modulePath: string): string {
   }
 }
 
-function resolveGitSha(packageRoot: string): string {
+function resolveGitIdentity(packageRoot: string): { sha: string; dirty: boolean } {
   try {
-    return execFileSync('git', ['rev-parse', '--verify', 'HEAD'], {
+    const sha = execFileSync('git', ['rev-parse', '--verify', 'HEAD'], {
       cwd: packageRoot,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
+    const dirty = execFileSync('git', ['status', '--porcelain', '--untracked-files=normal'], {
+      cwd: packageRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim().length > 0;
+    return { sha, dirty };
   } catch {
-    return '';
+    return { sha: '', dirty: false };
   }
 }
 
@@ -185,6 +194,10 @@ function cleanIsoTimestamp(value: unknown): string | null {
 
 function shortBuildSha(value: string): string {
   return /^[a-f0-9]{7,64}$/i.test(value) ? value.slice(0, 7) : value;
+}
+
+function formatBuildRef(identity: Pick<PipelaneRuntimeIdentity, 'sha' | 'dirty'>): string {
+  return `${shortBuildSha(identity.sha)}${identity.dirty ? '-dirty' : ''}`;
 }
 
 function sameGitSha(left: string, right: string): boolean {

@@ -901,6 +901,7 @@ export function closeSafeCompletedTaskWorkspaces(options: {
       const pruned = pruneDeadTaskLocks(options.commonDir, options.config, {
         taskSlug: lock.taskSlug,
         minAgeMs,
+        cleanupLockHeld: true,
       });
       if (pruned.removed.length === 0) {
         skipped.push({

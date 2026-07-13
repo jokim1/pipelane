@@ -20,6 +20,24 @@ function resolveBuildSha() {
   }
 }
 
+function resolveBuildDirty() {
+  const supplied = process.env.PIPELANE_BUILD_DIRTY?.trim().toLowerCase();
+  if (supplied) {
+    if (['1', 'true', 'yes'].includes(supplied)) return true;
+    if (['0', 'false', 'no'].includes(supplied)) return false;
+    throw new Error('PIPELANE_BUILD_DIRTY must be one of: 1, 0, true, false, yes, no.');
+  }
+  try {
+    return execFileSync('git', ['status', '--porcelain', '--untracked-files=normal'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
 function resolveBuildTimestamp() {
   const supplied = process.env.PIPELANE_BUILD_TIMESTAMP?.trim();
   if (supplied) {
@@ -33,6 +51,7 @@ function resolveBuildTimestamp() {
 mkdirSync(path.dirname(outputPath), { recursive: true });
 writeFileSync(temporaryPath, `${JSON.stringify({
   sha: resolveBuildSha(),
+  dirty: resolveBuildDirty(),
   builtAt: resolveBuildTimestamp(),
 }, null, 2)}\n`, 'utf8');
 renameSync(temporaryPath, outputPath);

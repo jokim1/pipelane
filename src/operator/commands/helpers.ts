@@ -17,8 +17,8 @@ import {
   runCommandCapture,
   runGh,
   runGit,
-  saveTaskLock,
   slugifyTaskName,
+  updateTaskLock,
   type DeployRecord,
   type PrRecord,
   type TaskLock,
@@ -118,7 +118,13 @@ export function assertTaskCommandWorktree(
     const currentBranch = command === 'pr'
       ? runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? ''
       : '';
-    if (currentBranch && inferTaskSlugsFromBranchName(context.config, currentBranch).includes(resolved.taskSlug)) {
+    const sharedRepoRoot = resolveSharedRepoRoot(context.commonDir);
+    const isSharedCheckout = normalizeExistingPath(context.repoRoot) === normalizeExistingPath(sharedRepoRoot);
+    if (
+      !isSharedCheckout
+      && currentBranch
+      && inferTaskSlugsFromBranchName(context.config, currentBranch).includes(resolved.taskSlug)
+    ) {
       return { taskSlug: resolved.taskSlug, lock: resolved };
     }
     const commandLabel = formatWorkflowCommand(context.config, command);
@@ -684,14 +690,15 @@ export function setNextAction(
   taskSlug: string,
   text: string,
 ): TaskLock | null {
-  const lock = loadTaskLock(commonDir, config, taskSlug);
-  if (!lock) return null;
-  const updatedAt = nowIso();
-  return saveTaskLock(commonDir, config, taskSlug, {
-    ...lock,
-    nextAction: text,
-    nextActionUpdatedAt: updatedAt,
-    updatedAt,
+  return updateTaskLock(commonDir, config, taskSlug, (lock) => {
+    if (!lock) return null;
+    const updatedAt = nowIso();
+    return {
+      ...lock,
+      nextAction: text,
+      nextActionUpdatedAt: updatedAt,
+      updatedAt,
+    };
   });
 }
 

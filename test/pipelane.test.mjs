@@ -243,6 +243,7 @@ test('runtime identity embeds build metadata and exposes version identity withou
   writeFileSync(path.join(packageRoot, 'package.json'), `${JSON.stringify({ name: 'pipelane', version: '9.8.7' })}\n`, 'utf8');
   writeFileSync(path.join(packageRoot, 'dist', 'build-info.json'), `${JSON.stringify({
     sha: 'abcdef0123456789abcdef0123456789abcdef01',
+    dirty: true,
     builtAt: '2026-07-12T20:30:40.000Z',
   })}\n`, 'utf8');
 
@@ -252,30 +253,53 @@ test('runtime identity embeds build metadata and exposes version identity withou
   assert.deepEqual(identity, {
     version: '9.8.7',
     sha: 'abcdef0123456789abcdef0123456789abcdef01',
+    dirty: true,
     builtAt: '2026-07-12T20:30:40.000Z',
     packageRoot: realpathSync(packageRoot),
     source: 'dist',
   });
-  assert.equal(runtimeIdentity.formatPipelaneRuntimeBanner(identity), `pipelane v9.8.7 (abcdef0) from ${realpathSync(packageRoot)}`);
+  assert.equal(runtimeIdentity.formatPipelaneRuntimeBanner(identity), `pipelane v9.8.7 (abcdef0-dirty) from ${realpathSync(packageRoot)}`);
   assert.match(runtimeIdentity.formatPipelaneVersion(identity), /build timestamp: 2026-07-12T20:30:40\.000Z/);
 
   const generatedRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-build-info-'));
   run(process.execPath, [path.join(KIT_ROOT, 'scripts', 'write-build-info.mjs')], generatedRoot, {
     PIPELANE_BUILD_SHA: '1234567890abcdef',
+    PIPELANE_BUILD_DIRTY: '1',
     PIPELANE_BUILD_TIMESTAMP: '2026-07-12T21:22:23Z',
   });
   assert.deepEqual(JSON.parse(readFileSync(path.join(generatedRoot, 'dist', 'build-info.json'), 'utf8')), {
     sha: '1234567890abcdef',
+    dirty: true,
     builtAt: '2026-07-12T21:22:23.000Z',
   });
+
+  const sourceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-source-identity-'));
+  mkdirSync(path.join(sourceRoot, 'src'), { recursive: true });
+  writeFileSync(path.join(sourceRoot, 'package.json'), `${JSON.stringify({ name: 'pipelane', version: '1.2.3' })}\n`, 'utf8');
+  writeFileSync(path.join(sourceRoot, 'src', 'runtime-identity.ts'), 'export {};\n', 'utf8');
+  run('git', ['init'], sourceRoot);
+  run('git', ['config', 'user.email', 'test@example.com'], sourceRoot);
+  run('git', ['config', 'user.name', 'Test User'], sourceRoot);
+  run('git', ['add', '.'], sourceRoot);
+  run('git', ['commit', '-m', 'initial'], sourceRoot);
+  const sourceModuleUrl = pathToFileURL(path.join(sourceRoot, 'src', 'runtime-identity.ts')).href;
+  assert.equal(runtimeIdentity.resolvePipelaneRuntimeIdentity(sourceModuleUrl).dirty, false);
+  writeFileSync(path.join(sourceRoot, 'src', 'runtime-identity.ts'), 'export const tracked = true;\n', 'utf8');
+  const trackedDirty = runtimeIdentity.resolvePipelaneRuntimeIdentity(sourceModuleUrl);
+  assert.equal(trackedDirty.dirty, true);
+  assert.match(runtimeIdentity.formatPipelaneRuntimeBanner(trackedDirty), /-dirty\) from /);
+  run('git', ['add', '.'], sourceRoot);
+  run('git', ['commit', '-m', 'tracked change'], sourceRoot);
+  writeFileSync(path.join(sourceRoot, 'src', 'untracked.ts'), 'export const untracked = true;\n', 'utf8');
+  assert.equal(runtimeIdentity.resolvePipelaneRuntimeIdentity(sourceModuleUrl).dirty, true);
 
   const repoRoot = createRepo();
   writePipelaneConfig(repoRoot);
   const status = runCli(['run', 'status', '--json'], repoRoot);
-  assert.match(status.stderr.split(/\r?\n/)[0], /^pipelane v0\.2\.0 \([a-f0-9]{7}\) from \/.+$/);
+  assert.match(status.stderr.split(/\r?\n/)[0], /^pipelane v0\.2\.0 \([a-f0-9]{7}(?:-dirty)?\) from \/.+$/);
   assert.doesNotThrow(() => JSON.parse(status.stdout));
   const version = runCli(['--version'], repoRoot);
-  assert.match(version.stdout, /^pipelane v0\.2\.0 \([a-f0-9]{7}\) from \/.+\nbuild timestamp: unavailable\n$/);
+  assert.match(version.stdout, /^pipelane v0\.2\.0 \([a-f0-9]{7}(?:-dirty)?\) from \/.+\nbuild timestamp: unavailable\n$/);
 });
 
 test('runtime identity warns when a host repo pin differs from the running build', async () => {
@@ -289,12 +313,25 @@ test('runtime identity warns when a host repo pin differs from the running build
   const warnings = runtimeIdentity.buildRuntimeWarnings({
     version: '0.2.0',
     sha: 'e12f3a9123456789',
+    dirty: false,
     builtAt: '2026-07-12T20:30:40.000Z',
     packageRoot: '/tmp/installed-pipelane',
     source: 'dist',
   }, repoRoot);
   assert.deepEqual(warnings, [
     'Warning: running e12f3a9 but repo pins e4b0693 — run npm install or point npx at the repo install.',
+  ]);
+
+  const dirtyWarnings = runtimeIdentity.buildRuntimeWarnings({
+    version: '0.2.0',
+    sha: 'e4b0693123456789',
+    dirty: true,
+    builtAt: '2026-07-12T20:30:40.000Z',
+    packageRoot: '/tmp/installed-pipelane',
+    source: 'dist',
+  }, repoRoot);
+  assert.deepEqual(dirtyWarnings, [
+    'Warning: running e4b0693-dirty but repo pins e4b0693 — run npm install or point npx at the repo install.',
   ]);
 });
 
@@ -23470,6 +23507,19 @@ test('pr from the base checkout hard-errors with the attached task path and neve
     assert.equal(blocked.status, 1);
     assert.match(blocked.stderr, /belongs to a different worktree/);
     assert.equal(readFileSync(lockPath, 'utf8'), beforeLock, 'base checkout recovery must not mutate the lock');
+
+    execFileSync('git', ['checkout', '-b', 'codex/canvas-palette-options-dead'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const taskShapedSharedCheckout = runCli([
+      'run', 'pr', '--task', 'Canvas Palette Options', '--json',
+    ], repoRoot, {}, true);
+    assert.equal(taskShapedSharedCheckout.status, 1);
+    assert.equal(taskShapedSharedCheckout.stdout, '');
+    assert.match(taskShapedSharedCheckout.stderr, /belongs to a different worktree/);
+    assert.match(taskShapedSharedCheckout.stderr, new RegExp(`cd ${created.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.equal(readFileSync(lockPath, 'utf8'), beforeLock, 'task-shaped shared checkout must not enter PR recovery');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -28805,6 +28855,65 @@ test('devmode release refreshes only age-stale probes inline and remains fail-cl
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('devmode release never overwrites a rebound or removed task lock after delayed probe refresh', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-devmode-probe-'));
+  const markerPath = path.join(markerRoot, 'probe-started');
+  try {
+    writePipelaneConfig(repoRoot, 'Concurrent Mode Reconciliation');
+    writeFullDeployConfigState(repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Concurrent Reconciliation', '--json'], repoRoot).stdout);
+    await writeStagingSucceededRecord(repoRoot, ['frontend', 'edge', 'sql'], { skipProbeState: true });
+    writeStaleProbeState(repoRoot, ['frontend', 'edge', 'sql']);
+
+    const childEnv = {
+      PIPELANE_DOCTOR_PROBE_STUB_STATUS: '200',
+      PIPELANE_DOCTOR_PROBE_STUB_DELAY_MS: '750',
+      PIPELANE_DOCTOR_PROBE_STUB_STARTED_FILE: markerPath,
+    };
+    const reboundRun = runCliAsync(['run', 'devmode', 'release', '--json'], created.worktreePath, childEnv);
+    await waitForPathForTest(markerPath);
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = stateMod.resolveWorkflowContext(created.worktreePath);
+    const reboundPath = path.join(path.dirname(created.worktreePath), 'rebound-destination');
+    stateMod.updateTaskLock(context.commonDir, context.config, 'concurrent-reconciliation', (lock) => ({
+      ...lock,
+      taskSlug: lock.taskSlug,
+      branchName: 'codex/concurrent-reconciliation-rebound',
+      worktreePath: reboundPath,
+      updatedAt: new Date().toISOString(),
+    }));
+
+    const reboundResult = await reboundRun;
+    assert.equal(reboundResult.status, 1);
+    assert.match(reboundResult.stderr, /changed binding while devmode release checked release readiness/);
+    const reboundLock = stateMod.loadTaskLock(context.commonDir, context.config, 'concurrent-reconciliation');
+    assert.equal(reboundLock.worktreePath, reboundPath);
+    assert.equal(reboundLock.mode, 'build');
+    assert.equal(stateMod.resolveWorkflowContext(repoRoot).modeState.mode, 'build');
+
+    rmSync(markerPath, { force: true });
+    writeStaleProbeState(repoRoot, ['frontend', 'edge', 'sql']);
+    const removedRun = runCliAsync([
+      'run', 'devmode', 'release', '--task', 'Concurrent Reconciliation', '--json',
+    ], created.worktreePath, childEnv);
+    await waitForPathForTest(markerPath);
+    stateMod.removeTaskLock(context.commonDir, context.config, 'concurrent-reconciliation');
+
+    const removedResult = await removedRun;
+    assert.equal(removedResult.status, 1);
+    assert.match(removedResult.stderr, /disappeared while devmode release checked release readiness/);
+    assert.equal(stateMod.loadTaskLock(context.commonDir, context.config, 'concurrent-reconciliation'), null);
+    assert.equal(stateMod.resolveWorkflowContext(repoRoot).modeState.mode, 'build');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(markerRoot, { recursive: true, force: true });
   }
 });
 

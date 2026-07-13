@@ -15,8 +15,8 @@ import {
   nowIso,
   printResult,
   saveModeState,
-  saveTaskLock,
   slugifyTaskName,
+  updateTaskLock,
   type Mode,
   type ModeState,
   type ParsedOperatorArgs,
@@ -199,32 +199,55 @@ function persistModeAndTaskLock(
   nextModeState: ModeState,
   taskLock: TaskLock | null,
 ): string {
-  if (!taskLock || taskLock.mode === nextModeState.mode) {
+  if (!taskLock) {
     saveModeState(context.commonDir, context.config, nextModeState);
     return '';
   }
 
-  const previousMode = taskLock.mode;
-  const nextLock: TaskLock = {
-    ...taskLock,
-    mode: nextModeState.mode as Mode,
-    updatedAt: nextModeState.updatedAt ?? nowIso(),
-  };
+  let previousMode: Mode = taskLock.mode;
+  let nextLock: TaskLock | null = null;
+  nextLock = updateTaskLock(
+    context.commonDir,
+    context.config,
+    taskLock.taskSlug,
+    (latestLock) => {
+      if (!latestLock) {
+        throw new Error([
+          `Task lock ${taskLock.taskSlug} disappeared while devmode ${nextModeState.mode} checked release readiness.`,
+          'The lock was not recreated and global mode state was not changed.',
+          'Resolve or resume the task workspace, then retry devmode.',
+        ].join('\n'));
+      }
+      if (
+        latestLock.branchName !== taskLock.branchName
+        || normalizeExistingPath(latestLock.worktreePath) !== normalizeExistingPath(taskLock.worktreePath)
+      ) {
+        throw new Error([
+          `Task lock ${taskLock.taskSlug} changed binding while devmode ${nextModeState.mode} checked release readiness.`,
+          `Current task worktree: ${latestLock.worktreePath}`,
+          'No mode state was changed.',
+          `Next: cd ${latestLock.worktreePath} and retry devmode ${nextModeState.mode} --task "${taskLock.taskSlug}".`,
+        ].join('\n'));
+      }
+      previousMode = latestLock.mode;
+      if (latestLock.mode === nextModeState.mode) return latestLock;
+      return {
+        ...latestLock,
+        mode: nextModeState.mode as Mode,
+        updatedAt: nextModeState.updatedAt ?? nowIso(),
+      };
+    },
+    {
+      // Keep the per-task mutation lease through the global mode write so two
+      // devmode processes for the same task cannot cross their writes.
+      afterWrite: () => saveModeState(context.commonDir, context.config, nextModeState),
+    },
+  );
+  if (!nextLock) throw new Error(`Task lock ${taskLock.taskSlug} disappeared during mode reconciliation.`);
 
-  // Write the lock first: a cleanup lease can reject this save, in which case
-  // mode-state remains untouched. If the following mode write unexpectedly
-  // fails, best-effort rollback restores the prior lock snapshot.
-  saveTaskLock(context.commonDir, context.config, taskLock.taskSlug, nextLock);
-  try {
-    saveModeState(context.commonDir, context.config, nextModeState);
-  } catch (error) {
-    try {
-      saveTaskLock(context.commonDir, context.config, taskLock.taskSlug, taskLock);
-    } catch {}
-    throw error;
-  }
-
-  return `task lock ${taskLock.taskSlug}: ${previousMode} → ${nextModeState.mode}`;
+  return previousMode === nextModeState.mode
+    ? ''
+    : `task lock ${taskLock.taskSlug}: ${previousMode} → ${nextModeState.mode}`;
 }
 
 // v1.5: identify the operator who set the override. Mirrors the attribution

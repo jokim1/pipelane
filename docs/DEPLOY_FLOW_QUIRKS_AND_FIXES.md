@@ -244,6 +244,37 @@ and non-TTY execution paths.
    unchanged, and its dedicated tests continue to inject the markers
    explicitly.
 
+10. **A task-shaped branch in the shared checkout could bypass the cwd guard
+    for PR recovery (P1).** **Location:**
+    `src/operator/commands/helpers.ts:114`. **Repro:** rename the shared/base
+    checkout branch so it parses to the attached task slug, then run
+    `pr --task <task>` there; the branch-name recovery exception could run
+    before the hard error even though the lock named another worktree.
+    **Proposed fix (implemented):** allow the fingerprint-bound recovery
+    exception only in non-shared worktrees. Shared checkouts always print the
+    exact task path and take no dirty-tree or base-drift measurements.
+
+11. **Delayed release readiness could overwrite or resurrect a task lock
+    (P0).** **Location:** `src/operator/commands/devmode.ts:197` and
+    `src/operator/state.ts:2854`. **Repro:** begin `devmode release` with stale
+    probes, then rebind or clean the task while the inline probe is pending;
+    the command retained the pre-probe snapshot and could write it after the
+    concurrent mutation. **Proposed fix (implemented):** serialize task-lock
+    writes through a per-task mutation lease, reload after readiness, abort on
+    missing/changed bindings, and patch only `mode` into the latest record.
+    PR recovery, next-action updates, and cleanup pruning now use the same
+    atomic update path; delayed-probe tests cover both rebind and removal.
+
+12. **Dirty builds claimed the clean commit SHA (P0).** **Location:**
+    `scripts/write-build-info.mjs:23` and `src/runtime-identity.ts:35`.
+    **Repro:** change tracked or untracked source, build or run the source CLI,
+    and observe a banner indistinguishable from clean `HEAD`. This defeated
+    Q0's diagnostic purpose. **Proposed fix (implemented):** record a build
+    dirty bit, detect source-tree dirtiness, render `<sha>-dirty` in banners
+    and `--version`, and treat a dirty build as different from an otherwise
+    matching host pin. Tests cover tracked and untracked changes plus explicit
+    build metadata.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original

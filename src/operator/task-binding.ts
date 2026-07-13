@@ -15,7 +15,7 @@ import {
   normalizePath,
   nowIso,
   runGit,
-  saveTaskLock,
+  updateTaskLock,
   slugifyTaskName,
   type TaskLock,
   type WorkflowConfig,
@@ -326,43 +326,45 @@ export function applyTaskBindingRecovery(
     };
   }
 
-  const latestLock = loadTaskLock(context.commonDir, context.config, diagnosis.taskSlug);
-  if (!latestLock) {
-    throw new Error(`No task lock found for ${diagnosis.taskSlug}. Run the preflight again.`);
-  }
-  if (
-    latestLock.branchName !== diagnosis.lock.branchName
-    || normalizeExistingPath(latestLock.worktreePath) !== normalizeExistingPath(diagnosis.lock.worktreePath)
-    || latestLock.mode !== diagnosis.lock.mode
-    || (latestLock.updatedAt ?? '') !== (diagnosis.lock.updatedAt ?? '')
-  ) {
-    throw new Error('Task binding recovery selection is stale. Run the preflight again.');
-  }
+  const lock = updateTaskLock(context.commonDir, context.config, diagnosis.taskSlug, (latestLock) => {
+    if (!latestLock) {
+      throw new Error(`No task lock found for ${diagnosis.taskSlug}. Run the preflight again.`);
+    }
+    if (
+      latestLock.branchName !== diagnosis.lock.branchName
+      || normalizeExistingPath(latestLock.worktreePath) !== normalizeExistingPath(diagnosis.lock.worktreePath)
+      || latestLock.mode !== diagnosis.lock.mode
+      || (latestLock.updatedAt ?? '') !== (diagnosis.lock.updatedAt ?? '')
+    ) {
+      throw new Error('Task binding recovery selection is stale. Run the preflight again.');
+    }
 
-  const updatedAt = nowIso();
-  const history = [
-    ...(Array.isArray(latestLock.bindingHistory) ? latestLock.bindingHistory : []),
-    {
-      reboundAt: updatedAt,
-      reason: 'pr recovery: use current checkout',
-      fromBranchName: latestLock.branchName,
-      fromWorktreePath: latestLock.worktreePath,
-      toBranchName: diagnosis.current.branchName,
-      toWorktreePath: context.repoRoot,
-      fingerprint,
-    },
-  ].slice(-20);
+    const updatedAt = nowIso();
+    const history = [
+      ...(Array.isArray(latestLock.bindingHistory) ? latestLock.bindingHistory : []),
+      {
+        reboundAt: updatedAt,
+        reason: 'pr recovery: use current checkout',
+        fromBranchName: latestLock.branchName,
+        fromWorktreePath: latestLock.worktreePath,
+        toBranchName: diagnosis.current.branchName,
+        toWorktreePath: context.repoRoot,
+        fingerprint,
+      },
+    ].slice(-20);
 
-  const lock = saveTaskLock(context.commonDir, context.config, diagnosis.taskSlug, {
-    taskSlug: latestLock.taskSlug,
-    taskName: latestLock.taskName,
-    branchName: diagnosis.current.branchName,
-    worktreePath: context.repoRoot,
-    mode: latestLock.mode,
-    surfaces: latestLock.surfaces,
-    bindingHistory: history,
-    updatedAt,
+    return {
+      taskSlug: latestLock.taskSlug,
+      taskName: latestLock.taskName,
+      branchName: diagnosis.current.branchName,
+      worktreePath: context.repoRoot,
+      mode: latestLock.mode,
+      surfaces: latestLock.surfaces,
+      bindingHistory: history,
+      updatedAt,
+    };
   });
+  if (!lock) throw new Error(`No task lock found for ${diagnosis.taskSlug}. Run the preflight again.`);
 
   return {
     taskSlug: diagnosis.taskSlug,

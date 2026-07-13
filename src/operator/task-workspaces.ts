@@ -12,7 +12,7 @@ import {
   loadAllTaskLocks,
   loadTaskLock,
   saveTaskLock,
-  taskLockPath,
+  updateTaskLock,
   slugifyTaskName,
 } from './state.ts';
 
@@ -403,6 +403,9 @@ export interface PruneDeadTaskLocksOptions {
   minAgeMs?: number;
   // Override the clock for tests.
   now?: () => number;
+  // Auto-clean already owns the task cleanup lease. Its final metadata prune
+  // may enter the shared mutation lock without rejecting its own lease.
+  cleanupLockHeld?: boolean;
 }
 
 export interface PruneDeadTaskLocksResult {
@@ -480,16 +483,27 @@ export function pruneDeadTaskLocks(
       }
     }
 
-    const targetPath = taskLockPath(commonDir, config, lock.taskSlug);
+    let removedCurrent: TaskLock | null = null;
     try {
-      unlinkSync(targetPath);
+      updateTaskLock(commonDir, config, lock.taskSlug, (current) => {
+        if (!current) return null;
+        if (!sameTaskLockRevision(current, lock)) {
+          throw new Error('task lock changed after cleanup inspected it');
+        }
+        removedCurrent = current;
+        return null;
+      }, { allowCleanupLock: options.cleanupLockHeld === true });
     } catch (error) {
       const err = error as NodeJS.ErrnoException;
-      // Two parallel `/clean --apply --all-stale` runs will both observe a
-      // dead lock and race to delete. Second deleter gets ENOENT; swallow it
-      // — the lock is already gone, which is the outcome we wanted.
-      if (err.code !== 'ENOENT') throw error;
+      skipped.push({
+        taskSlug: lock.taskSlug,
+        branchName: lock.branchName,
+        worktreePath: lock.worktreePath,
+        reason: err.message || 'task lock changed while cleanup was pruning it',
+      });
+      continue;
     }
+    if (!removedCurrent) continue;
     removed.push({
       taskSlug: lock.taskSlug,
       branchName: lock.branchName,
@@ -500,6 +514,15 @@ export function pruneDeadTaskLocks(
   }
 
   return { removed, skipped };
+}
+
+function sameTaskLockRevision(left: TaskLock, right: TaskLock): boolean {
+  return left.taskSlug === right.taskSlug
+    && left.branchName === right.branchName
+    && normalizeExistingPath(left.worktreePath) === normalizeExistingPath(right.worktreePath)
+    && left.mode === right.mode
+    && left.updatedAt === right.updatedAt
+    && JSON.stringify(left.surfaces) === JSON.stringify(right.surfaces);
 }
 
 function lockAge(updatedAt: string | undefined, now: number): number | null {
