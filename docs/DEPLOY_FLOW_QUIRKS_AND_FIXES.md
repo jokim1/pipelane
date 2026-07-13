@@ -232,6 +232,18 @@ and non-TTY execution paths.
    `TIMEOUT` with a single-gate remedy, and use append-only record precedence
    when composing retry evidence.
 
+9. **The test harness inherited a live outer review-gate context (P1).**
+   **Location:** `test/pipelane.test.mjs:89`. **Repro:** run the repository's
+   configured `npm test` gate through `pipelane run review`; fixture CLIs and
+   direct in-process review fixtures inherited the real gate's depth and
+   parent PID, then failed closed as recursive production review invocations
+   even though the same 814-test suite passed standalone. **Proposed fix
+   (implemented):** scrub ambient recursion markers once at the suite boundary
+   and scrub ambient review identity from every fixture CLI unless the
+   individual test explicitly supplies it. Production recursion protection is
+   unchanged, and its dedicated tests continue to inject the markers
+   explicitly.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original
