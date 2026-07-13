@@ -112,7 +112,17 @@ export function guardReviewRunStartForRouteSafety(
   const record = ensureRouteRecord(state, identity);
   const config = normalizeRouteSafetyConfig(context.config.routeSafety);
   const willRunAiReview = reviewRunMayUseAi(context.config.reviewGates?.gates ?? [], parsed);
-  const reason = routeLimitReason(record, config, { willRunAiReview });
+  const requestedGate = parsed.flags.reviewGate.trim();
+  const retryingTimedOutGate = Boolean(
+    requestedGate
+    && record.lastTimedOutGateIds?.includes(requestedGate),
+  );
+  // A targeted retry is the recovery path for missing timeout evidence. It
+  // must remain available even when the previous attempt exhausted the
+  // route's wall-clock or AI budget.
+  const reason = retryingTimedOutGate
+    ? ''
+    : routeLimitReason(record, config, { willRunAiReview });
   if (!reason) {
     saveRouteSafetyState(context.commonDir, context.config, state);
     return { action: 'continue', message: '' };
@@ -148,9 +158,12 @@ export function recordReviewRunForRouteSafety(
   }
 
   const config = normalizeRouteSafetyConfig(context.config.routeSafety);
-  const reason = reviewRun.status === 'failed' && config.stopOnMajorFindings
-    ? 'blocking/major review findings are present'
-    : routeLimitReason(record, config, { willRunAiReview: false });
+  const timedOutGateIds = reviewTimedOutGateIds(reviewRun);
+  const reason = timedOutGateIds.length > 0
+    ? `review gate timed out: ${timedOutGateIds.join(', ')}`
+    : reviewRun.status === 'failed' && config.stopOnMajorFindings
+      ? 'blocking/major review findings are present'
+      : routeLimitReason(record, config, { willRunAiReview: false });
   if (!reason) {
     saveRouteSafetyState(context.commonDir, context.config, state);
     return { action: 'continue', message: '' };
@@ -198,6 +211,12 @@ export function applyRouteSafetyResumeOverride(cwd: string, parsed: ParsedOperat
     throw new Error('No paused route-bound fix/review loop was found for this checkout. Re-run the route command to recreate the pause, then use the printed resume command.');
   }
   const resume = resumeRecordFromFlags(parsed);
+  if (resume.acceptedFindings && (record.lastTimedOutGateIds?.length ?? 0) > 0) {
+    throw new Error([
+      'Cannot accept timed-out review gates as findings because they contain no verdict.',
+      ...record.lastTimedOutGateIds!.map((gateId) => `Re-run: pipelane run review --gate ${gateId}`),
+    ].join('\n'));
+  }
   record.resumes = [resume, ...(record.resumes ?? [])].slice(0, 20);
   record.updatedAt = nowIso();
   if (resume.acceptedFindings) {
@@ -258,6 +277,16 @@ async function pauseRouteSafety(
       };
     }
     if (answer === '4') {
+      if ((record.lastTimedOutGateIds?.length ?? 0) > 0) {
+        saveRouteSafetyState(context.commonDir, context.config, state);
+        return {
+          action: 'stop',
+          message: [
+            'Timed-out review gates cannot be accepted as findings because they contain no verdict.',
+            ...record.lastTimedOutGateIds!.map((gateId) => `Re-run: pipelane run review --gate ${gateId}`),
+          ].join('\n'),
+        };
+      }
       const confirmation = (await rl.question('Type "continue without fixing" to confirm: ')).trim();
       if (confirmation !== 'continue without fixing') {
         saveRouteSafetyState(context.commonDir, context.config, state);
@@ -339,12 +368,18 @@ function renderRouteSafetyPauseMessage(
   }
   lines.push(
     '',
-    'Resume commands:',
-    'pipelane resume --one-more-loop',
-    'pipelane resume --more-loops=2 --more-minutes=45',
-    'pipelane resume --until-review-passes --max-more-loops=3 --max-more-minutes=120',
-    'pipelane resume --accept-findings',
+    (record.lastTimedOutGateIds?.length ?? 0) > 0 ? 'Retry commands:' : 'Resume commands:',
   );
+  if ((record.lastTimedOutGateIds?.length ?? 0) > 0) {
+    lines.push(...record.lastTimedOutGateIds!.map((gateId) => `pipelane run review --gate ${gateId}`));
+  } else {
+    lines.push(
+      'pipelane resume --one-more-loop',
+      'pipelane resume --more-loops=2 --more-minutes=45',
+      'pipelane resume --until-review-passes --max-more-loops=3 --max-more-minutes=120',
+      'pipelane resume --accept-findings',
+    );
+  }
   return lines.join('\n');
 }
 
@@ -450,15 +485,18 @@ function ensureRouteRecord(state: RouteSafetyState, identity: RouteSafetyRouteId
 }
 
 function countReviewRun(record: RouteSafetyRecord, reviewRun: ReviewRunRecord): void {
+  const timedOutGateIds = reviewTimedOutGateIds(reviewRun);
   if (record.countedReviewRunIds.includes(reviewRun.id)) {
     record.lastReviewRunId = reviewRun.id;
     record.lastReviewStatus = reviewRun.status;
+    record.lastTimedOutGateIds = timedOutGateIds;
     return;
   }
   record.countedReviewRunIds = [reviewRun.id, ...record.countedReviewRunIds].slice(0, 50);
   record.lastReviewRunId = reviewRun.id;
   record.lastReviewStatus = reviewRun.status;
-  if (reviewRun.status === 'failed') {
+  record.lastTimedOutGateIds = timedOutGateIds;
+  if (reviewRun.status === 'failed' && reviewRunHasActionableFailure(reviewRun)) {
     record.fixReviewLoops += 1;
   }
   if (reviewRunUsesAiReview(reviewRun)) {
@@ -469,10 +507,25 @@ function countReviewRun(record: RouteSafetyRecord, reviewRun: ReviewRunRecord): 
 function reviewRunUsesAiReview(reviewRun: ReviewRunRecord): boolean {
   return reviewRun.gates.some((gate) =>
     (gate.type === 'skill' || gate.type === 'agent')
+    && gate.outcome !== 'timeout'
     && gate.status !== 'skipped'
     && Boolean(gate.command)
     && !(gate.status === 'pending' && gate.summary.startsWith('deferred:'))
     && gate.skipReason !== 'dry-run'
+  );
+}
+
+function reviewTimedOutGateIds(reviewRun: ReviewRunRecord): string[] {
+  return reviewRun.gates
+    .filter((gate) => gate.outcome === 'timeout')
+    .map((gate) => gate.gateId);
+}
+
+function reviewRunHasActionableFailure(reviewRun: ReviewRunRecord): boolean {
+  return reviewRun.gates.some((gate) =>
+    gate.blocking
+    && gate.status === 'failed'
+    && gate.outcome !== 'timeout'
   );
 }
 

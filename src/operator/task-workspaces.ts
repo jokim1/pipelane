@@ -492,7 +492,10 @@ export function pruneDeadTaskLocks(
         }
         removedCurrent = current;
         return null;
-      }, { allowCleanupLock: options.cleanupLockHeld === true });
+      }, {
+        allowCleanupLock: options.cleanupLockHeld === true,
+        mutationLockHeld: options.cleanupLockHeld === true,
+      });
     } catch (error) {
       const err = error as NodeJS.ErrnoException;
       skipped.push({

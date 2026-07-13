@@ -847,6 +847,7 @@ async function runApprovedOrchestration(
       })
     : null;
   const autoFixResult = reviewResult?.status === 'failed'
+    && run.slices.some((slice) => failedBlockingReviewGates(slice).length > 0)
     ? await autoFixFailedReviewSlices(context, run, reviewResult)
     : null;
   if (autoFixResult?.finalReview) {
@@ -1168,7 +1169,13 @@ function resolveReviewAutoFixBudget(run: OrchestrationRunRecord): {
 }
 
 function failedBlockingReviewGates(slice: OrchestrationSliceRecord): ReviewGateRunRecord[] {
-  return slice.review?.run.gates.filter((gate) => gate.blocking && gate.status === 'failed') ?? [];
+  // A timeout is missing evidence, not a code finding. Never launch a
+  // code-changing fix worker when the review produced no verdict to fix.
+  return slice.review?.run.gates.filter((gate) =>
+    gate.blocking
+    && gate.status === 'failed'
+    && gate.outcome !== 'timeout'
+  ) ?? [];
 }
 
 // B2 (honesty): a slice counts as fixed only when its re-review actually passed,

@@ -478,6 +478,7 @@ export interface RouteSafetyRecord {
   acceptedReviewRunId?: string;
   lastReviewRunId?: string;
   lastReviewStatus?: ReviewRunStatus;
+  lastTimedOutGateIds?: string[];
   pausedAt?: string;
   pauseReason?: string;
   resumes?: RouteSafetyResumeRecord[];
@@ -1510,8 +1511,6 @@ const LEGACY_PROJECT_CONFIG_FIELDS = [
   'projectKey',
   'displayName',
   'baseBranch',
-  'stateDir',
-  'taskWorktreeDirName',
   'branchPrefix',
   'legacyBranchPrefixes',
   'surfaces',
@@ -1921,6 +1920,19 @@ function clearStaleTaskCleanupLock(lockPath: string): boolean {
 }
 
 export function acquireTaskCleanupLock(commonDir: string, config: WorkflowConfig, taskSlug: string): { acquired: true; release: () => void } | { acquired: false; reason: string } {
+  let releaseMutationLock: (() => void) | null = null;
+  try {
+    // Cleanup removes the worktree/branch before pruning the durable task
+    // lock. Hold the same mutation lease used by every task-lock writer for
+    // that entire interval so no writer can pass a one-time cleanup check and
+    // race destructive cleanup. The canonical order is mutation -> cleanup.
+    releaseMutationLock = acquireTaskMutationLock(commonDir, config, taskSlug);
+  } catch (error) {
+    return {
+      acquired: false,
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
   const lockPath = taskCleanupLockPath(commonDir, config, taskSlug);
   mkdirSync(path.dirname(lockPath), { recursive: true });
   clearStaleTaskCleanupLock(lockPath);
@@ -1933,13 +1945,21 @@ export function acquireTaskCleanupLock(commonDir: string, config: WorkflowConfig
       `${JSON.stringify({ taskSlug, pid: process.pid, acquiredAt: nowIso() }, null, 2)}\n`,
       'utf8',
     );
-    return { acquired: true, release: () => rmSync(lockPath, { recursive: true, force: true }) };
+    return {
+      acquired: true,
+      release: () => {
+        rmSync(lockPath, { recursive: true, force: true });
+        releaseMutationLock?.();
+      },
+    };
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
     if (err.code === 'EEXIST') {
+      releaseMutationLock();
       return { acquired: false, reason: 'another cleanup already owns this task lock' };
     }
     if (created) rmSync(lockPath, { recursive: true, force: true });
+    releaseMutationLock();
     return { acquired: false, reason: `could not acquire cleanup lock: ${err.message}` };
   }
 }
@@ -2674,6 +2694,10 @@ function normalizeRouteSafetyRecord(value: unknown): RouteSafetyRecord | null {
   if (raw.lastReviewStatus === 'passed' || raw.lastReviewStatus === 'failed' || raw.lastReviewStatus === 'pending') {
     record.lastReviewStatus = raw.lastReviewStatus;
   }
+  if (Array.isArray(raw.lastTimedOutGateIds)) {
+    record.lastTimedOutGateIds = raw.lastTimedOutGateIds
+      .filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0);
+  }
   if (typeof raw.pausedAt === 'string') record.pausedAt = raw.pausedAt;
   if (typeof raw.pauseReason === 'string') record.pauseReason = raw.pauseReason;
   if (Array.isArray(raw.resumes)) {
@@ -2913,10 +2937,13 @@ export function updateTaskLock(
   update: (current: TaskLock | null) => TaskLock | null,
   options: {
     allowCleanupLock?: boolean;
+    mutationLockHeld?: boolean;
     afterWrite?: (next: TaskLock | null, previous: TaskLock | null) => void;
   } = {},
 ): TaskLock | null {
-  const releaseMutationLock = acquireTaskMutationLock(commonDir, config, taskSlug);
+  const releaseMutationLock = options.mutationLockHeld
+    ? () => {}
+    : acquireTaskMutationLock(commonDir, config, taskSlug);
   try {
     if (!options.allowCleanupLock) assertTaskCleanupUnlocked(commonDir, config, taskSlug);
     const current = loadTaskLock(commonDir, config, taskSlug);

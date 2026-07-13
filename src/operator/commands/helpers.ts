@@ -81,7 +81,9 @@ export function resolveModeSurfaces(
   explicitSurfaces: string[],
   taskLock: TaskLock | null,
 ): string[] {
-  const selected = resolveCommandSurfaces(context, explicitSurfaces, taskLock?.surfaces ?? []);
+  const selected = explicitSurfaces.length > 0 || context.modeState.requestedSurfaces.length > 0 || !taskLock
+    ? resolveCommandSurfaces(context, explicitSurfaces)
+    : resolveCommandSurfaces(context, [], taskLock.surfaces);
   if (!taskLock) return selected;
 
   // A task-scoped mode transition must prove readiness for every surface the

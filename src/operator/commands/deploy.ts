@@ -257,6 +257,7 @@ function resolveDeployPrRecord(
   context: WorkflowContext,
   identity: DeployCommandIdentity,
   environment: 'staging' | 'prod',
+  persist = true,
 ): PrRecord | null {
   if (!identity.livePr) {
     return loadPrRecord(context.commonDir, context.config, identity.taskSlug);
@@ -265,12 +266,43 @@ function resolveDeployPrRecord(
   const commandLabel = formatWorkflowCommand(context.config, 'deploy', environment);
   requireMergedPr(identity.livePr, `${commandLabel} --pr ${identity.livePr.number}`);
   const branchName = identity.livePr.headRefName?.trim() || identity.branchName;
-  return savePrRecord(
-    context.commonDir,
-    context.config,
-    identity.taskSlug,
-    prRecordFromLivePr(identity.livePr, branchName),
-  );
+  const record = prRecordFromLivePr(identity.livePr, branchName);
+  return persist
+    ? savePrRecord(context.commonDir, context.config, identity.taskSlug, record)
+    : { ...record, taskSlug: identity.taskSlug, updatedAt: nowIso() };
+}
+
+export interface DeployApprovalInputs {
+  targetSha: string;
+  resolvedSurfaces: string[];
+}
+
+/** Resolve the exact production effect approved by an API confirm token. */
+export function resolveDeployApprovalInputs(cwd: string, parsed: ParsedOperatorArgs): DeployApprovalInputs {
+  const context = resolveWorkflowContext(cwd);
+  assertTaskCommandWorktree(context, 'deploy', parsed.flags.task, parsed.flags.pr);
+  const identity = resolveDeployCommandIdentity(context, parsed, {});
+  ensureDeployCommandLease(context, identity);
+  const prRecord = resolveDeployPrRecord(context, identity, 'prod', false);
+  const target = resolveDeployTargetForTask({
+    repoRoot: context.repoRoot,
+    baseBranch: context.config.baseBranch,
+    explicitSha: parsed.flags.sha,
+    prRecord,
+    mode: context.modeState.mode,
+    config: context.config,
+  });
+  // API action positional arguments are `action deploy.prod`, not deploy
+  // surface shorthands. The stable API exposes surfaces only through
+  // --surfaces, which is also what the child command receives.
+  const explicitSurfaces = [...parsed.flags.surfaces];
+  const resolvedSurfaces = resolveDeploySurfacesForTarget({
+    context,
+    explicitSurfaces,
+    fallbackSurfaces: identity.lock?.surfaces ?? [],
+    targetSha: target.sha,
+  });
+  return { targetSha: target.sha, resolvedSurfaces: [...resolvedSurfaces].sort() };
 }
 
 export async function dispatchDeploy(
@@ -311,6 +343,7 @@ export async function dispatchDeploy(
     fallbackSurfaces: identity.lock?.surfaces ?? [],
     targetSha: target.sha,
   });
+  assertApiApprovedProdDeployInputs(environment, target.sha, surfaces);
   if (surfaces.length === 0) {
     const timestamp = nowIso();
     const cleanCommand = formatWorkflowCommand(context.config, 'clean', `--apply --task ${taskSlug}`);
@@ -1264,6 +1297,33 @@ export function watchWorkflowRun(
 }
 
 export const PROD_CONFIRM_PREFIX_LENGTH = 4;
+export const DEPLOY_PROD_APPROVED_SHA_ENV = 'PIPELANE_DEPLOY_PROD_APPROVED_SHA';
+export const DEPLOY_PROD_APPROVED_SURFACES_ENV = 'PIPELANE_DEPLOY_PROD_APPROVED_SURFACES';
+
+function assertApiApprovedProdDeployInputs(
+  environment: 'staging' | 'prod',
+  targetSha: string,
+  surfaces: string[],
+): void {
+  if (environment !== 'prod' || process.env.PIPELANE_DEPLOY_PROD_API_CONFIRMED !== '1') return;
+  const approvedSha = process.env[DEPLOY_PROD_APPROVED_SHA_ENV]?.trim() ?? '';
+  const approvedSurfaces = (process.env[DEPLOY_PROD_APPROVED_SURFACES_ENV] ?? '')
+    .split(',')
+    .map((surface) => surface.trim())
+    .filter(Boolean)
+    .sort();
+  delete process.env[DEPLOY_PROD_APPROVED_SHA_ENV];
+  delete process.env[DEPLOY_PROD_APPROVED_SURFACES_ENV];
+  if (approvedSha !== targetSha || approvedSurfaces.join(',') !== [...surfaces].sort().join(',')) {
+    delete process.env.PIPELANE_DEPLOY_PROD_API_CONFIRMED;
+    throw new Error([
+      'deploy prod blocked: resolved target changed after API confirmation.',
+      `Approved: ${approvedSha || '(missing SHA)'} [${approvedSurfaces.join(', ') || 'no surfaces'}]`,
+      `Current: ${targetSha} [${[...surfaces].sort().join(', ') || 'no surfaces'}]`,
+      'Run the deploy.prod API preflight again and approve the new confirmation token.',
+    ].join('\n'));
+  }
+}
 
 // v0.5: interactive typed-SHA prefix prompt. Callers must land here only
 // when a human-in-the-loop confirmation is actually required — the API

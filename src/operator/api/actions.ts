@@ -65,6 +65,11 @@ import {
   DESTINATION_ROUTE_PROD_CONFIRMED_ENV,
 } from '../destination-executor.ts';
 import { evaluateReviewEvidenceForPr, reviewEvidenceOverrideReason } from '../review-enforcement.ts';
+import {
+  DEPLOY_PROD_APPROVED_SHA_ENV,
+  DEPLOY_PROD_APPROVED_SURFACES_ENV,
+  resolveDeployApprovalInputs,
+} from '../commands/deploy.ts';
 
 export const STABLE_ACTION_IDS = [
   'new',
@@ -798,7 +803,11 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
   const startedAt = nowIso();
   const result = actionId === 'git.catchupBase'
     ? runCatchupBase(cwd)
-    : runCliWithJson(cwd, buildUnderlyingArgs(actionId, parsed), buildChildEnv(actionId, destinationPlan));
+    : runCliWithJson(
+        cwd,
+        buildUnderlyingArgs(actionId, parsed),
+        buildChildEnv(actionId, destinationPlan, normalizedInputs),
+      );
   const finishedAt = nowIso();
   const failureReason = result.ok ? '' : describeExecutionFailure(actionId, result);
 
@@ -1034,13 +1043,17 @@ function normalizeInputs(
       return { task: flags.task, pr: flags.pr, override: flags.override, reason: flags.reason };
     case 'deploy.staging':
       return { task: flags.task, pr: flags.pr, sha: flags.sha, surfaces: flags.surfaces };
-    case 'deploy.prod':
+    case 'deploy.prod': {
+      const resolved = cwd ? resolveDeployApprovalInputs(cwd, parsed) : undefined;
       return {
         task: flags.task,
         pr: flags.pr,
         sha: flags.sha,
         surfaces: flags.surfaces,
+        targetSha: resolved?.targetSha,
+        resolvedSurfaces: resolved?.resolvedSurfaces,
       };
+    }
     case 'route.merge':
     case 'route.deploy.staging':
     case 'route.deploy.prod':
@@ -1331,7 +1344,11 @@ const TEST_HOOK_ENV_KEYS = [
   'PIPELANE_DOCTOR_FIX_STUB',
 ];
 
-function buildChildEnv(actionId: StableActionId, destinationPlan?: DestinationPlan | null): NodeJS.ProcessEnv {
+function buildChildEnv(
+  actionId: StableActionId,
+  destinationPlan?: DestinationPlan | null,
+  normalizedInputs: Record<string, unknown> = {},
+): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const key of TEST_HOOK_ENV_KEYS) {
     delete env[key];
@@ -1352,6 +1369,14 @@ function buildChildEnv(actionId: StableActionId, destinationPlan?: DestinationPl
     // scrubs this flag the moment it reads it so grandchild subprocesses
     // don't inherit an open prod-confirm bit.
     env.PIPELANE_DEPLOY_PROD_API_CONFIRMED = '1';
+    if (actionId === 'deploy.prod') {
+      env[DEPLOY_PROD_APPROVED_SHA_ENV] = typeof normalizedInputs.targetSha === 'string'
+        ? normalizedInputs.targetSha
+        : '';
+      env[DEPLOY_PROD_APPROVED_SURFACES_ENV] = Array.isArray(normalizedInputs.resolvedSurfaces)
+        ? normalizedInputs.resolvedSurfaces.join(',')
+        : '';
+    }
   } else {
     // Never let a stray bypass leak into other actions' execution.
     delete env.PIPELANE_DEPLOY_PROD_API_CONFIRMED;
