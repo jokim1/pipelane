@@ -350,6 +350,36 @@ and non-TTY execution paths.
     the legacy source and write its normalized machine-local copy before any
     operator command consumes config.
 
+21. **API devmode preflight and execution resolved different task scope
+    (P1).** **Location:** `src/operator/api/actions.ts:359` and
+    `src/operator/commands/helpers.ts:62`. **Repro:** preflight
+    `devmode.build --task missing-task`, or preflight `devmode.release` with an
+    explicit surface disjoint from the named task lock; preflight could allow
+    the action even though execution rejected the missing lock or widened
+    readiness to the task's persisted surfaces. **Proposed fix (implemented):**
+    share task-lock and surface resolution between direct devmode execution
+    and API preflight; invalid task identity now blocks before execution, and
+    release preflight evaluates the full persisted task scope.
+
+22. **`review setup` re-hydration could overwrite saved gate policy (P1).**
+    **Location:** `src/operator/commands/review.ts:821` and
+    `src/operator/commands/review.ts:1956`. **Repro:** save a `test` gate with
+    `timeoutMs: 123456` and `blocking: false`, then run
+    `review setup --enable test`; the catalog entry replaced those fields with
+    its defaults. **Proposed fix (implemented):** carry `timeoutMs` and
+    `blocking` through both catalog and custom-gate hydration paths and
+    serialize the hydrated policy unchanged.
+
+23. **Self-hosted review timeout overrides leaked into fixture CLIs (P1).**
+    **Location:** `test/pipelane.test.mjs:112`. **Repro:** run `npm test` as a
+    review gate with `PIPELANE_REVIEW_GATE_TIMEOUT_MS=2700000`; fixture review
+    commands inherited that outer value, replacing their deliberately short
+    timeout and making timeout assertions fail. **Proposed fix (implemented):**
+    scrub the outer review control-plane timeout from fixture environments
+    unless the individual test explicitly supplies it. A regression test runs
+    under the ambient override and proves explicit fixture overrides still
+    work.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original
