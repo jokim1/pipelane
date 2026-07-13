@@ -418,8 +418,78 @@ and non-TTY execution paths.
     overlay probe parsed the whole file with a throwing helper even though no
     `package.json:pipelane` block could be established. **Proposed fix
     (implemented):** use the existing warning-and-fallback JSON reader for the
-    optional package overlay probe, preserving synthesized defaults and leaving
-    machine-local state unmaterialized.
+   optional package overlay probe, preserving synthesized defaults and leaving
+   machine-local state unmaterialized.
+
+28. **Legacy auto-import trusted checkout-controlled filesystem paths (P0).**
+    **Location:** `src/operator/state.ts:1509` and the legacy state migration
+    path. **Repro:** commit `.pipelane.json` with `stateDir` pointing outside
+    the Git common directory, remove machine-local config, and run any command;
+    migration could recursively copy attacker-selected files into trusted
+    machine state. `taskWorktreeDirName` exposed the same path-trust class for
+    future workspace creation. **Proposed fix (implemented):** remove both path
+    fields from the legacy metadata allowlist, derive safe machine defaults,
+    warn that the fields were ignored, and cover an external-directory payload
+    with a regression test.
+
+29. **Task cleanup and task-lock mutation used independent leases (P1).**
+    **Location:** `src/operator/state.ts:1922`,
+    `src/operator/state.ts:2940`, and
+    `src/operator/task-workspaces.ts:497`. **Repro:** begin `/clean` after its
+    one-time cleanup-lock check while another process begins `updateTaskLock`;
+    cleanup could remove the worktree/branch and then fail to prune the lock,
+    while the writer persisted state for the deleted workspace. **Proposed fix
+    (implemented):** acquire one composite lease in the canonical order
+    task-mutation then cleanup, retain it across destructive cleanup and lock
+    pruning, and let the cleanup-held prune reuse rather than reacquire the
+    mutation lease. A two-process regression proves writers are excluded for
+    the entire cleanup window.
+
+30. **Review timeouts consumed route loop and AI budgets and could be waived as
+    findings (P1).** **Location:** `src/operator/route-loop-safety.ts:104`,
+    `src/operator/route-loop-safety.ts:142`, and
+    `src/operator/route-loop-safety.ts:487`. **Repro:** let the first blocking
+    AI gate time out under the default one-loop/one-AI-run limits; the targeted
+    retry was rejected as exhausted, while `resume --accept-findings` could
+    bless a run that contained no verdict. **Proposed fix (implemented):**
+    record timed-out gate IDs separately, exclude timeout-only gates from fix
+    and AI counters, always admit the matching targeted retry even after the
+    wall-clock limit, reject accept-findings in both headless and TTY paths,
+    and print only exact `review --gate <id>` retry commands.
+
+31. **Orchestration launched code-changing auto-fix workers for review
+    timeouts (P1).** **Location:** `src/operator/commands/orchestrate.ts:850`
+    and `src/operator/commands/orchestrate.ts:1171`. **Repro:** let a blocking
+    slice review gate time out; orchestration treated its generic failed status
+    as a finding and sent an agent a fix prompt despite having no reviewer
+    verdict. **Proposed fix (implemented):** make actionable failed gates
+    explicitly exclude `outcome: timeout` and skip auto-fix entirely when no
+    actionable gate remains. A worker-invocation regression proves only the
+    original implementation worker runs.
+
+32. **Global mode surfaces did not widen persisted task scope (P1).**
+    **Location:** `src/operator/commands/helpers.ts:79`. **Repro:** persist
+    global requested surface `frontend`, retain task surface `sql`, and run a
+    task-scoped mode transition without explicit `--surfaces`; the task-lock
+    fallback replaced the global selection and readiness checked only `sql`.
+    **Proposed fix (implemented):** choose explicit surfaces first, otherwise
+    honor non-empty global requested surfaces, and union that selection with
+    the durable task scope. Preserve the historical task-only fallback when no
+    global or explicit selection exists.
+
+33. **`deploy.prod` confirmation tokens were bound to raw flags rather than the
+    resolved production effect (P0).** **Location:**
+    `src/operator/api/actions.ts:1046`,
+    `src/operator/commands/deploy.ts:281`, and
+    `src/operator/commands/deploy.ts:1303`. **Repro:** preflight with no
+    explicit SHA/surfaces, change the recorded merged SHA or inferred surface
+    set, then execute the old token; the parent consumed it and gave the child
+    a prompt bypass for a target the operator never saw. **Proposed fix
+    (implemented):** resolve and fingerprint the exact target SHA plus sorted
+    surface set during preflight, re-resolve before token consumption, and pass
+    those approved values to the child, which compares them again immediately
+    before honoring the API confirmation bypass. Drift fails closed with a new
+    preflight remedy.
 
 ### Filed for follow-up
 
