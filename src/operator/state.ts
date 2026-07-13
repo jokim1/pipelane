@@ -1146,7 +1146,11 @@ export function synthesizeWorkflowConfig(repoRoot: string): WorkflowConfig {
 }
 
 export function loadWorkflowConfig(repoRoot: string): WorkflowConfig {
-  const configPath = resolveReadableConfigPath(repoRoot);
+  // The first operator command is the migration boundary. Importing here
+  // prevents commands such as /new from deriving task identity from defaults
+  // and only discovering the repo's legacy base/surfaces later at deploy time.
+  const imported = importLegacyWorkflowConfigIfNeeded(repoRoot);
+  const configPath = imported?.configPath ?? resolveReadableConfigPath(repoRoot);
 
   // Self-heal: when no machine-local config exists, derive a workable config
   // from defaults and repo signals. Mutators materialize the local file through

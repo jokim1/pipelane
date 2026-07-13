@@ -8,6 +8,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { sanitizeForTerminal } from './operator/text-output.ts';
 
 export interface PipelaneRuntimeIdentity {
   version: string;
@@ -40,7 +41,7 @@ export function resolvePipelaneRuntimeIdentity(moduleUrl = import.meta.url): Pip
   const buildInfo = source === 'dist'
     ? readJsonFile<BuildInfoFile>(path.join(packageRoot, 'dist', 'build-info.json'))
     : null;
-  const builtSha = cleanText(buildInfo?.sha);
+  const builtSha = cleanBuildSha(buildInfo?.sha);
   const sourceGit = source === 'src' ? resolveGitIdentity(packageRoot) : { sha: '', dirty: false };
 
   return {
@@ -54,12 +55,12 @@ export function resolvePipelaneRuntimeIdentity(moduleUrl = import.meta.url): Pip
 }
 
 export function formatPipelaneRuntimeBanner(identity: PipelaneRuntimeIdentity): string {
-  return `pipelane v${identity.version} (${formatBuildRef(identity)}) from ${identity.packageRoot}`;
+  return `pipelane v${cleanBannerField(identity.version, 'unknown')} (${formatBuildRef(identity)}) from ${cleanBannerField(identity.packageRoot, 'unknown')}`;
 }
 
 export function formatPipelaneVersion(identity: PipelaneRuntimeIdentity): string {
   const lines = [formatPipelaneRuntimeBanner(identity)];
-  lines.push(`build timestamp: ${identity.builtAt ?? 'unavailable'}`);
+  lines.push(`build timestamp: ${cleanIsoTimestamp(identity.builtAt) ?? 'unavailable'}`);
   return lines.join('\n');
 }
 
@@ -72,7 +73,7 @@ export function buildRuntimeWarnings(identity: PipelaneRuntimeIdentity, cwd: str
     );
   }
   if (distIsOlderThanSource(identity)) {
-    warnings.push(`Warning: dist/ is older than the newest src/ file in ${identity.packageRoot} — run npm run build.`);
+    warnings.push(`Warning: dist/ is older than the newest src/ file in ${cleanBannerField(identity.packageRoot, 'unknown')} — run npm run build.`);
   }
   return warnings;
 }
@@ -186,6 +187,16 @@ function cleanText(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+function cleanBuildSha(value: unknown): string {
+  const text = cleanText(value);
+  return /^[a-f0-9]{7,64}$/i.test(text) ? text : '';
+}
+
+function cleanBannerField(value: unknown, fallback: string): string {
+  const text = sanitizeForTerminal(cleanText(value)).replace(/\s*\n+\s*/g, ' ');
+  return text || fallback;
+}
+
 function cleanIsoTimestamp(value: unknown): string | null {
   const text = cleanText(value);
   if (!text || Number.isNaN(Date.parse(text))) return null;
@@ -193,7 +204,7 @@ function cleanIsoTimestamp(value: unknown): string | null {
 }
 
 function shortBuildSha(value: string): string {
-  return /^[a-f0-9]{7,64}$/i.test(value) ? value.slice(0, 7) : value;
+  return cleanBuildSha(value).slice(0, 7) || 'unknown';
 }
 
 function formatBuildRef(identity: Pick<PipelaneRuntimeIdentity, 'sha' | 'dirty'>): string {

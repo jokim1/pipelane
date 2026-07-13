@@ -55,6 +55,7 @@ export async function handleApi(cwd: string, parsed: ParsedOperatorArgs): Promis
       'confirmToken',
       'autoConfirm',
     ]);
+    validateApiActionInputs(actionId, parsed);
 
     const execute = parsed.flags.execute ?? false;
     let confirmToken = parsed.flags.confirmToken ?? '';
@@ -110,3 +111,20 @@ const API_ACTION_INPUT_FLAGS: Record<(typeof STABLE_ACTION_IDS)[number], Operato
   'rollback.staging': ['task', 'surfaces'],
   'rollback.prod': ['task', 'surfaces'],
 };
+
+function validateApiActionInputs(
+  actionId: (typeof STABLE_ACTION_IDS)[number],
+  parsed: ParsedOperatorArgs,
+): void {
+  if (parsed.flags.reason.trim() && !parsed.flags.override) {
+    throw new Error(`api action ${actionId} only accepts --reason together with --override.`);
+  }
+  if (
+    actionId === 'taskLock.verify'
+    && parsed.flags.mode.trim()
+    && parsed.flags.mode !== 'build'
+    && parsed.flags.mode !== 'release'
+  ) {
+    throw new Error('api action taskLock.verify --mode must be build or release.');
+  }
+}

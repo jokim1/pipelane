@@ -52,6 +52,25 @@ export async function handleRepoGuard(cwd: string, parsed: ParsedOperatorArgs): 
   });
   const mode = context.modeState.mode;
   const surfaces = resolveCommandSurfaces(context, parsed.flags.surfaces, existingLock?.surfaces ?? []);
+  if (existingLock && existingLock.mode !== mode) {
+    throw new Error([
+      `repo-guard cannot change task ${taskSlug} from ${existingLock.mode} mode to ${mode} mode.`,
+      `Run ${formatWorkflowCommand(context.config, 'devmode', `${mode} --task "${taskSlug}"`)} first so the normal readiness checks update the task lock, then rerun repo-guard.`,
+    ].join('\n'));
+  }
+  if (mode === 'release') {
+    const releaseReadySurfaces = new Set(context.modeState.requestedSurfaces);
+    const uncheckedSurfaces = surfaces.filter((surface) => !releaseReadySurfaces.has(surface));
+    if (uncheckedSurfaces.length > 0) {
+      const requiredSurfaces = context.config.surfaces.filter((surface) =>
+        releaseReadySurfaces.has(surface) || surfaces.includes(surface)
+      );
+      throw new Error([
+        `repo-guard cannot create a release-mode task lock for unchecked surfaces: ${uncheckedSurfaces.join(', ')}.`,
+        `Run ${formatWorkflowCommand(context.config, 'devmode', 'release')} --surfaces "${requiredSurfaces.join(',')}" first so release readiness covers them, then rerun repo-guard.`,
+      ].join('\n'));
+    }
+  }
 
   if (reasons.length === 0) {
     const lock = saveTaskLock(context.commonDir, context.config, taskSlug, {

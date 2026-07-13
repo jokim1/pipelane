@@ -391,13 +391,6 @@ function attachEquivalentReviewGateEvidence(options: {
     && gate.blocking !== false
     && isManualReviewGateRun(gate)
   );
-  const retryableExecutableGates = reviewRun.gates.filter((gate) =>
-    gate.blocking !== false
-    && gate.status === 'failed'
-    && !isManualReviewGateRun(gate)
-  );
-  if (pendingManualGates.length === 0 && retryableExecutableGates.length === 0) return reviewRun;
-
   const evidenceCandidates: Array<{ recordedAt: string; gate: ReviewGateRunRecord }> = [];
   for (const record of options.allRecords) {
     if (!reviewRunMatchesEquivalentGateEvidence(reviewRun, record)) continue;
@@ -420,7 +413,7 @@ function attachEquivalentReviewGateEvidence(options: {
       continue;
     }
     for (const gate of record.gates) {
-      if (gate.status === 'passed' && gate.gateId === record.gateFilter) {
+      if ((gate.status === 'passed' || gate.status === 'failed') && gate.gateId === record.gateFilter) {
         retryCandidates.push({ recordedAt: gate.finishedAt || record.finishedAt, gate });
       }
     }
@@ -435,45 +428,58 @@ function attachEquivalentReviewGateEvidence(options: {
   }
 
   evidenceCandidates.sort((a, b) => b.recordedAt.localeCompare(a.recordedAt));
-  const passedByGateId = new Map<string, ReviewGateRunRecord>();
+  const passedByGateId = new Map<string, { recordedAt: string; gate: ReviewGateRunRecord }>();
   for (const candidate of evidenceCandidates) {
     if (!passedByGateId.has(candidate.gate.gateId)) {
-      passedByGateId.set(candidate.gate.gateId, candidate.gate);
+      passedByGateId.set(candidate.gate.gateId, candidate);
     }
   }
 
-  retryCandidates.sort((a, b) => b.recordedAt.localeCompare(a.recordedAt));
-  const retriedByGateId = new Map<string, ReviewGateRunRecord>();
+  const retriedByGateId = new Map<string, { recordedAt: string; gate: ReviewGateRunRecord }>();
+  // allRecords is append-only and newest-first. Preserve that order so a later
+  // filtered failure supersedes an earlier pass even when timestamps collide.
   for (const candidate of retryCandidates) {
     if (!retriedByGateId.has(candidate.gate.gateId)) {
-      retriedByGateId.set(candidate.gate.gateId, candidate.gate);
+      retriedByGateId.set(candidate.gate.gateId, candidate);
     }
   }
 
   if (passedByGateId.size === 0 && retriedByGateId.size === 0) return reviewRun;
   let attached = false;
   const gates = reviewRun.gates.map((gate): ReviewGateRunRecord => {
+    // A skill/agent gate may be either manually attested or executed by a
+    // configured reviewer command. A filtered executable retry is direct gate
+    // evidence, so apply it before the manual-attestation fallback regardless
+    // of the gate's declared type.
+    const retried = retriedByGateId.get(gate.gateId);
+    const passed = gate.status === 'pending' && isManualReviewGateRun(gate)
+      ? passedByGateId.get(gate.gateId)
+      : undefined;
+    const retryMatches = Boolean(
+      retried
+      && reviewGateDefinitionHash(gate) === reviewGateDefinitionHash(retried.gate)
+    );
+    // Retry and manual-acceptance records live in separate append-only state
+    // files, so recordedAt is their shared chronology. On an exact timestamp
+    // tie, prefer executable retry evidence and fail closed if it failed.
+    if (retryMatches && (!passed || retried!.recordedAt >= passed.recordedAt)) {
+      attached = true;
+      return retried!.gate;
+    }
+
     if (gate.status === 'pending' && isManualReviewGateRun(gate)) {
-      const passed = passedByGateId.get(gate.gateId);
-      if (!passed || !manualReviewGateEvidenceMatches(gate, passed)) return gate;
+      if (!passed || !manualReviewGateEvidenceMatches(gate, passed.gate)) return gate;
       attached = true;
       const attachedGate: ReviewGateRunRecord = {
         ...gate,
         status: 'passed',
-        summary: passed.summary,
-        startedAt: passed.startedAt,
-        finishedAt: passed.finishedAt,
-        durationMs: passed.durationMs,
+        summary: passed.gate.summary,
+        startedAt: passed.gate.startedAt,
+        finishedAt: passed.gate.finishedAt,
+        durationMs: passed.gate.durationMs,
       };
-      if (passed.attester) attachedGate.attester = passed.attester;
+      if (passed.gate.attester) attachedGate.attester = passed.gate.attester;
       return attachedGate;
-    }
-
-    if (gate.status === 'failed' && !isManualReviewGateRun(gate)) {
-      const retried = retriedByGateId.get(gate.gateId);
-      if (!retried || reviewGateDefinitionHash(gate) !== reviewGateDefinitionHash(retried)) return gate;
-      attached = true;
-      return retried;
     }
 
     return gate;

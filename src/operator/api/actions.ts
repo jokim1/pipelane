@@ -886,7 +886,7 @@ function assertTaskApiActionWorktree(
     return;
   }
   if (actionId === 'merge' || actionId === 'route.merge') {
-    assertTaskCommandWorktree(context, 'merge', parsed.flags.task);
+    assertTaskCommandWorktree(context, 'merge', parsed.flags.task, parsed.flags.pr);
     return;
   }
   if (
@@ -895,7 +895,7 @@ function assertTaskApiActionWorktree(
     || actionId === 'route.deploy.staging'
     || actionId === 'route.deploy.prod'
   ) {
-    assertTaskCommandWorktree(context, 'deploy', parsed.flags.task);
+    assertTaskCommandWorktree(context, 'deploy', parsed.flags.task, parsed.flags.pr);
   }
 }
 

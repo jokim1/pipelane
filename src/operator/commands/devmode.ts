@@ -53,8 +53,8 @@ export async function handleDevmode(cwd: string, parsed: ParsedOperatorArgs): Pr
     return;
   }
 
-  const surfaces = resolveCommandSurfaces(context, parsed.flags.surfaces);
   const taskLock = resolveModeTaskLock(context, parsed.flags.task);
+  const surfaces = resolveModeSurfaces(context, parsed.flags.surfaces, taskLock);
 
   if (action === 'build') {
     // v1.5: keep lastOverride around when flipping off release. The durable
@@ -99,7 +99,10 @@ export async function handleDevmode(cwd: string, parsed: ParsedOperatorArgs): Pr
       readiness = evaluateReleaseReadiness({
         config: context.config,
         deployConfig,
-        deployRecords: deployState.records,
+        // The probe is asynchronous. Re-read deploy state so a staging
+        // request or failure recorded while healthchecks were running cannot
+        // be hidden by the pre-probe success snapshot.
+        deployRecords: loadDeployState(context.commonDir, context.config).records,
         probeState: loadProbeState(context.commonDir, context.config),
         surfaces,
       });
@@ -194,6 +197,21 @@ function resolveModeTaskLock(context: WorkflowContext, explicitTask: string): Ta
   return matches[0] ?? null;
 }
 
+function resolveModeSurfaces(
+  context: WorkflowContext,
+  explicitSurfaces: string[],
+  taskLock: TaskLock | null,
+): string[] {
+  const selected = resolveCommandSurfaces(context, explicitSurfaces, taskLock?.surfaces ?? []);
+  if (!taskLock) return selected;
+
+  // A task-scoped mode transition must prove readiness for every surface the
+  // durable task lock still claims. Explicit/global selections may widen that
+  // set, but they cannot silently substitute a disjoint surface set.
+  const required = new Set([...selected, ...taskLock.surfaces]);
+  return context.config.surfaces.filter((surface) => required.has(surface));
+}
+
 function persistModeAndTaskLock(
   context: WorkflowContext,
   nextModeState: ModeState,
@@ -229,6 +247,15 @@ function persistModeAndTaskLock(
           `Next: cd ${latestLock.worktreePath} and retry devmode ${nextModeState.mode} --task "${taskLock.taskSlug}".`,
         ].join('\n'));
       }
+      if (!sameSurfaceSet(latestLock.surfaces, taskLock.surfaces)) {
+        throw new Error([
+          `Task lock ${taskLock.taskSlug} changed surfaces while devmode ${nextModeState.mode} checked release readiness.`,
+          `Checked surfaces: ${taskLock.surfaces.join(', ')}`,
+          `Current task surfaces: ${latestLock.surfaces.join(', ')}`,
+          'No mode state was changed.',
+          `Retry devmode ${nextModeState.mode} --task "${taskLock.taskSlug}" so readiness covers the current task surfaces.`,
+        ].join('\n'));
+      }
       previousMode = latestLock.mode;
       if (latestLock.mode === nextModeState.mode) return latestLock;
       return {
@@ -248,6 +275,11 @@ function persistModeAndTaskLock(
   return previousMode === nextModeState.mode
     ? ''
     : `task lock ${taskLock.taskSlug}: ${previousMode} → ${nextModeState.mode}`;
+}
+
+function sameSurfaceSet(left: string[], right: string[]): boolean {
+  const canonicalize = (values: string[]) => [...new Set(values)].sort().join('\n');
+  return canonicalize(left) === canonicalize(right);
 }
 
 // v1.5: identify the operator who set the override. Mirrors the attribution

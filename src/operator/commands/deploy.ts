@@ -279,7 +279,7 @@ export async function dispatchDeploy(
   options: DispatchDeployOptions = {},
 ): Promise<DispatchDeployResult> {
   const context = resolveWorkflowContext(cwd);
-  assertTaskCommandWorktree(context, 'deploy', options.explicitTask ?? parsed.flags.task);
+  assertTaskCommandWorktree(context, 'deploy', options.explicitTask ?? parsed.flags.task, parsed.flags.pr);
   const environment = options.environment ?? resolveDeployEnvironmentForMode(parsed.positional[0], context.modeState.mode);
   const surfacePositionals = parsed.positional.length > 0 ? parsed.positional.slice(1) : [];
   const explicitSurfaces = options.explicitSurfaces ?? [...parsed.flags.surfaces, ...surfacePositionals];
@@ -780,7 +780,7 @@ async function reconcileCompletedRequestedDeploy(options: {
 
 export async function handleDeploy(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const context = resolveWorkflowContext(cwd);
-  assertTaskCommandWorktree(context, 'deploy', parsed.flags.task);
+  assertTaskCommandWorktree(context, 'deploy', parsed.flags.task, parsed.flags.pr);
   if (await maybeHandleDestinationCommand(cwd, parsed)) return;
 
   const result = await dispatchDeploy(cwd, parsed);

@@ -38,7 +38,7 @@ import { maybeHandleDestinationCommand } from './destination.ts';
 
 export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const context = resolveWorkflowContext(cwd);
-  assertTaskCommandWorktree(context, 'merge', parsed.flags.task);
+  assertTaskCommandWorktree(context, 'merge', parsed.flags.task, parsed.flags.pr);
   if (await maybeHandleDestinationCommand(cwd, parsed)) return;
   const mergeContext = resolveMergeCommandContext(context, parsed);
   const { taskSlug, prBranchName, pr } = mergeContext;

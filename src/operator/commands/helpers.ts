@@ -93,12 +93,19 @@ export function assertTaskCommandWorktree(
   context: WorkflowContext,
   command: Extract<WorkflowCommand, 'pr' | 'merge' | 'deploy'>,
   explicitTask = '',
+  explicitPr = '',
 ): { taskSlug: string; lock: TaskLock } | null {
   const locks = loadAllTaskLocks(context.commonDir, context.config);
+  if (locks.length === 0) return null;
   let resolved: TaskLock | null = null;
 
   if (explicitTask.trim()) {
     const taskSlug = slugifyTaskName(explicitTask);
+    resolved = locks.find((lock) => lock.taskSlug === taskSlug) ?? null;
+  } else if (explicitPr.trim()) {
+    const pr = loadPrByNumber(context.repoRoot, parsePrNumberFlag(explicitPr));
+    const prBranch = pr.headRefName?.trim() ?? '';
+    const taskSlug = deriveTaskSlugFromPr(context.config, pr, prBranch);
     resolved = locks.find((lock) => lock.taskSlug === taskSlug) ?? null;
   } else {
     const currentPath = normalizeExistingPath(context.repoRoot);
