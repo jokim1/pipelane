@@ -275,6 +275,81 @@ and non-TTY execution paths.
     matching host pin. Tests cover tracked and untracked changes plus explicit
     build metadata.
 
+13. **Inline probe refresh reused a stale deploy-state snapshot (P1).**
+    **Location:** `src/operator/commands/devmode.ts:96`. **Repro:** begin
+    `devmode release` when stale probe evidence is the only blocker, then
+    record a new staging request or failure while the read-only probe is
+    running; the post-probe readiness check used to retain the older staging
+    success. **Proposed fix (implemented):** re-read deploy state after the
+    asynchronous probe before evaluating release readiness, so concurrent
+    deploy activity remains fail-closed.
+
+14. **Filtered review retries could leave stale evidence attestable (P1).**
+    **Location:** `src/operator/review-enforcement.ts:403`. **Repro:** run a
+    failing full review, retry one gate successfully, then retry it again and
+    fail; the composer used to attach only successful retry records. A
+    command-backed `type: skill` retry was also ignored as manual, and manual
+    acceptance could win without comparing its time to executable evidence.
+    **Proposed fix (implemented):** let the latest matching filtered pass or
+    failure supersede earlier evidence, preserve append order for timestamp
+    ties, compose executable retries for every command-backed gate, and use
+    the shared `recordedAt` chronology for manual acceptance versus retries.
+
+15. **API action flags could be syntactically accepted but semantically
+    orphaned (P2).** **Location:** `src/operator/commands/api.ts:52` and
+    `src/operator/commands/api.ts:115`. **Repro:** pass `--reason` without
+    `--override`, or pass `taskLock.verify --mode banana`; the first value had
+    no effect and the second flowed into later/default behavior. **Proposed
+    fix (implemented):** reject both invalid contracts before preflight or
+    confirmation-token issuance.
+
+16. **Untrusted runtime identity fields could break the first-line banner
+    contract (P1).** **Location:** `src/runtime-identity.ts:44` and
+    `src/runtime-identity.ts:190`. **Repro:** place a malformed SHA in build
+    metadata or control/newline characters in package identity/path fields;
+    output could gain a forged line before a command's real result, including
+    text resembling a review marker. **Proposed fix (implemented):** validate
+    build SHAs, normalize timestamps, and terminal-sanitize every rendered
+    banner field onto one line.
+
+17. **An explicit PR number could bypass the task cwd guard (P1).**
+    **Location:** `src/operator/commands/helpers.ts:92` and the merge, deploy,
+    and API action call sites. **Repro:** from the shared checkout, run
+    `merge --pr <n>` or `deploy --pr <n>` without `--task` while that PR maps
+    to a lock in another worktree; the early guard could not identify the task
+    and later code measured the caller checkout. **Proposed fix (implemented):**
+    resolve PR-to-task identity before any cwd measurement and apply the same
+    guard during API preflight, which now mints no token on mismatch.
+
+18. **Task surfaces were another snapshot/live-state pair without complete
+    reconciliation (P1).** **Location:** `src/operator/commands/devmode.ts:56`
+    and `src/operator/commands/devmode.ts:197`. **Repro:** request disjoint
+    surfaces explicitly or through global mode while a task lock already
+    covers more surfaces, or change that lock during an inline probe; release
+    readiness could omit persisted task scope or persist against changed
+    scope. **Proposed fix (implemented):** union persisted task surfaces into
+    readiness, allow explicit/global inputs only to widen that set, and verify
+    the live lock surfaces under the task mutation lease before writing mode.
+
+19. **`repo-guard` could mint a release lock outside the checked mode or
+    surface set (P1).** **Location:**
+    `src/operator/commands/repo-guard.ts:53`. **Repro:** retain a build-mode
+    task lock while global mode is release, or create a release task for
+    `worker` after readiness covered only `frontend`; `repo-guard` could copy
+    global mode into the task snapshot. **Proposed fix (implemented):** reject
+    existing mode divergence and reject unchecked release surfaces, pointing
+    to `devmode release` with the required surface union so the readiness gate
+    remains authoritative.
+
+20. **Legacy config import was not on the first general-command path (P2).**
+    **Location:** `src/operator/state.ts:1148`. **Repro:** run `status` or
+    `new` in a repo with only `.pipelane.json`, `.project-workflow.json`, or
+    `package.json:pipelane`; the general loader synthesized defaults before a
+    later setup/configure path performed migration. **Proposed fix
+    (implemented):** make `loadWorkflowConfig` the migration boundary: retain
+    the legacy source and write its normalized machine-local copy before any
+    operator command consumes config.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original
@@ -383,12 +458,15 @@ Timeouts remain fail-closed through the backwards-compatible gate
 `TIMEOUT` marker. The result points directly to
 `pipelane run review --gate <id>`.
 
-A successful executable-gate retry is append-only evidence. For `/pr`
-attestation, pipelane selects the latest matching full, non-filtered review run
-and virtually composes later successful `--gate <id>` retry records with it
-when branch, SHA, worktree identity, and gate definition all match. The stored
-full run is never rewritten; unrelated or stale filtered runs cannot replace
-the full-run envelope.
+Executable-gate retries are append-only evidence. For `/pr` attestation,
+pipelane selects the latest matching full, non-filtered review run and
+virtually composes the latest subsequent `--gate <id>` result with it when
+branch, SHA, worktree identity, and gate definition all match. A newer failed
+retry invalidates an older pass; command-backed skill gates participate, and
+manual acceptance versus executable retry evidence follows `recordedAt`
+chronology with exact ties failing closed. The stored full run is never
+rewritten; unrelated or stale filtered runs cannot replace the full-run
+envelope.
 
 | # | Quirk | Fix lives in | Priority | Note |
 |---|---|---|---|---|
