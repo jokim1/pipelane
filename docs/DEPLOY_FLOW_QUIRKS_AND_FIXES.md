@@ -380,6 +380,47 @@ and non-TTY execution paths.
     under the ambient override and proves explicit fixture overrides still
     work.
 
+24. **Legacy auto-import could promote checkout-controlled safety policy into
+    machine-local trust (P1).** **Location:** `src/operator/state.ts:1508`.
+    **Repro:** commit `.pipelane.json` with `reviewGates.gates: []`, remove the
+    machine-local config, and run any operator command; the first-command
+    migration persisted the empty gate set, allowing the checkout to disable
+    `/pr` attestation. Other executable and route/release policy fields had the
+    same trust-boundary problem. **Proposed fix (implemented):** migrate through
+    an explicit project-metadata allowlist (identity, branch/worktree shape,
+    surfaces, aliases, deploy workflow, and legacy docs settings), derive all
+    safety policy from machine defaults, and warn once with the ignored field
+    names so an operator can configure trusted overrides explicitly.
+
+25. **The API cwd guard threw before producing its promised JSON envelope
+    (P1).** **Location:** `src/operator/api/actions.ts:181` and
+    `src/operator/api/actions.ts:663`. **Repro:** preflight task-scoped
+    `merge --pr <n>` or `deploy --pr <n>` from the shared checkout while the PR
+    task is leased to another worktree; the command exited nonzero with empty
+    stdout, forcing a headless caller to parse stderr and violating the
+    `ApiEnvelope` contract. **Proposed fix (implemented):** convert only the API
+    guard failure into `ok:false`, `preflight.allowed:false` structured output
+    before route/base/dirty measurement, with the exact `cd` remedy and no
+    confirmation token. Direct `/merge` and `/deploy` retain Q5's hard error.
+
+26. **Build-identity tests bypassed production dirty-state detection (P1).**
+    **Location:** `test/pipelane.test.mjs:288` and
+    `scripts/write-build-info.mjs:23`. **Repro:** break the script's real
+    `git status --porcelain --untracked-files=normal` path; the test still
+    passed because it always set `PIPELANE_BUILD_DIRTY=1`. **Proposed fix
+    (implemented):** retain the deterministic override contract test and add
+    clean, tracked-dirty, and untracked-dirty temporary Git repositories with
+    the dirty override explicitly unset.
+
+27. **Malformed unrelated `package.json` blocked synthesized config fallback
+    (P2).** **Location:** `src/operator/state.ts:1572`. **Repro:** use a repo
+    with malformed `package.json` but no known legacy config file; the legacy
+    overlay probe parsed the whole file with a throwing helper even though no
+    `package.json:pipelane` block could be established. **Proposed fix
+    (implemented):** use the existing warning-and-fallback JSON reader for the
+    optional package overlay probe, preserving synthesized defaults and leaving
+    machine-local state unmaterialized.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original
