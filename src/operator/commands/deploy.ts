@@ -66,6 +66,12 @@ import { observeFrontendRuntime, toDeployRuntimeObservation } from '../runtime-o
 import { DESTINATION_APPROVED_TARGET_SHA_ENV, DESTINATION_INTERNAL_STEP_ENV } from '../destination-executor.ts';
 import { inferTargetSurfacesFromSurfacePathMap, targetSurfaceInferenceBlockers } from '../target-surface-map.ts';
 import {
+  deploySurfaceContractConfigurationIssues,
+  loadDeploySurfaceContractForTarget,
+  resolveDeploySurfacePathMap,
+  workflowNameForDeployEnvironment,
+} from '../deploy-surface-contract.ts';
+import {
   describeCompletedDeployWorkflowRun,
   observeCompletedDeployWorkflowRun,
 } from '../deploy-workflow-runs.ts';
@@ -286,6 +292,7 @@ export async function dispatchDeploy(
   ensureDeployCommandLease(context, identity);
   const prRecord = resolveDeployPrRecord(context, identity, environment);
   const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
+  const workflowName = workflowNameForDeployEnvironment(context.config, deployConfig, environment);
   const allowHealthcheckStubBypass = process.env.NODE_ENV === 'test'
     && Boolean(process.env.PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS);
   const routeApprovedBuildSha = process.env[DESTINATION_INTERNAL_STEP_ENV] === '1'
@@ -302,12 +309,28 @@ export async function dispatchDeploy(
       mode: context.modeState.mode,
       config: context.config,
     });
+  const surfaceContract = loadDeploySurfaceContractForTarget(
+    context.repoRoot,
+    workflowName,
+    target.sha,
+    context.config.baseBranch,
+  );
+  const surfaceContractIssues = deploySurfaceContractConfigurationIssues(surfaceContract, context.config, deployConfig);
+  if (surfaceContractIssues.length > 0) {
+    throw new Error([
+      `Deploy blocked: ${workflowName} surface contract is not configured.`,
+      ...surfaceContractIssues.map((issue) => `- ${issue}`),
+      'Run /pipelane configure to register every custom surface before deploying.',
+    ].join('\n'));
+  }
+  const surfacePathMap = resolveDeploySurfacePathMap(context.config, surfaceContract);
   const asyncRequested = options.async ?? parsed.flags.async;
   const surfaces = resolveDeploySurfacesForTarget({
     context,
     explicitSurfaces,
     fallbackSurfaces: identity.lock?.surfaces ?? [],
     targetSha: target.sha,
+    surfacePathMap,
   });
   if (surfaces.length === 0) {
     const timestamp = nowIso();
@@ -519,10 +542,6 @@ export async function dispatchDeploy(
     if (environment === 'prod' && context.modeState.mode === 'release') {
       await requireProdConfirmation(target.sha);
     }
-
-    const workflowName = environment === 'staging'
-      ? (deployConfig.frontend.staging.deployWorkflow || context.config.deployWorkflowName)
-      : (deployConfig.frontend.production.deployWorkflow || context.config.deployWorkflowName);
 
     const requestedAt = nowIso();
     const triggeredBy = resolveTriggeredBy();
@@ -788,6 +807,7 @@ function resolveDeploySurfacesForTarget(options: {
   explicitSurfaces: string[];
   fallbackSurfaces: string[];
   targetSha: string;
+  surfacePathMap?: Record<string, string[]>;
 }): string[] {
   const surfaces = resolveCommandSurfaces(options.context, options.explicitSurfaces, options.fallbackSurfaces);
   if (options.explicitSurfaces.length > 0) return surfaces;
@@ -796,6 +816,7 @@ function resolveDeploySurfacesForTarget(options: {
     repoRoot: options.context.repoRoot,
     config: options.context.config,
     targetSha: options.targetSha,
+    surfacePathMap: options.surfacePathMap,
   });
   if (!inference) return surfaces;
 
@@ -804,7 +825,7 @@ function resolveDeploySurfacesForTarget(options: {
     throw new Error([
       'Deploy blocked: target changes do not match surfacePathMap.',
       ...blockers,
-      'Add missing paths to machine-local surfacePathMap config or re-run with --surfaces <csv> if this deployment is intentionally manual.',
+      'Add missing paths to the deploy surface contract or machine-local surfacePathMap, or re-run with --surfaces <csv> if this deployment is intentionally manual.',
     ].join('\n'));
   }
 
