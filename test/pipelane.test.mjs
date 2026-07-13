@@ -297,6 +297,36 @@ test('runtime identity embeds build metadata and exposes version identity withou
     builtAt: '2026-07-12T21:22:23.000Z',
   });
 
+  const gitBuildRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-git-build-info-'));
+  writeFileSync(path.join(gitBuildRoot, '.gitignore'), 'dist/\n', 'utf8');
+  writeFileSync(path.join(gitBuildRoot, 'tracked.txt'), 'clean\n', 'utf8');
+  run('git', ['init', '-b', 'main'], gitBuildRoot);
+  run('git', ['config', 'user.email', 'test@example.com'], gitBuildRoot);
+  run('git', ['config', 'user.name', 'Test User'], gitBuildRoot);
+  run('git', ['add', '.'], gitBuildRoot);
+  run('git', ['commit', '-m', 'initial'], gitBuildRoot);
+  const gitBuildEnv = {
+    PIPELANE_BUILD_SHA: '',
+    PIPELANE_BUILD_DIRTY: '',
+    PIPELANE_BUILD_TIMESTAMP: '2026-07-12T21:22:23Z',
+  };
+  run(process.execPath, [path.join(KIT_ROOT, 'scripts', 'write-build-info.mjs')], gitBuildRoot, gitBuildEnv);
+  let gitBuildInfo = JSON.parse(readFileSync(path.join(gitBuildRoot, 'dist', 'build-info.json'), 'utf8'));
+  assert.equal(gitBuildInfo.sha, run('git', ['rev-parse', 'HEAD'], gitBuildRoot));
+  assert.equal(gitBuildInfo.dirty, false, 'a clean Git checkout must produce a clean build identity');
+
+  writeFileSync(path.join(gitBuildRoot, 'tracked.txt'), 'tracked change\n', 'utf8');
+  run(process.execPath, [path.join(KIT_ROOT, 'scripts', 'write-build-info.mjs')], gitBuildRoot, gitBuildEnv);
+  gitBuildInfo = JSON.parse(readFileSync(path.join(gitBuildRoot, 'dist', 'build-info.json'), 'utf8'));
+  assert.equal(gitBuildInfo.dirty, true, 'a tracked modification must mark the build dirty');
+
+  run('git', ['add', 'tracked.txt'], gitBuildRoot);
+  run('git', ['commit', '-m', 'tracked change'], gitBuildRoot);
+  writeFileSync(path.join(gitBuildRoot, 'untracked.txt'), 'untracked\n', 'utf8');
+  run(process.execPath, [path.join(KIT_ROOT, 'scripts', 'write-build-info.mjs')], gitBuildRoot, gitBuildEnv);
+  gitBuildInfo = JSON.parse(readFileSync(path.join(gitBuildRoot, 'dist', 'build-info.json'), 'utf8'));
+  assert.equal(gitBuildInfo.dirty, true, 'an untracked file must mark the build dirty');
+
   const sourceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-source-identity-'));
   mkdirSync(path.join(sourceRoot, 'src'), { recursive: true });
   writeFileSync(path.join(sourceRoot, 'package.json'), `${JSON.stringify({ name: 'pipelane', version: '1.2.3' })}\n`, 'utf8');
@@ -4032,6 +4062,22 @@ test('loadWorkflowConfig self-heals when no .pipelane.json exists, inferring nam
   }
 });
 
+test('loadWorkflowConfig preserves synthesized fallback when package.json is malformed', async () => {
+  const repoRoot = createRepo();
+  try {
+    writeFileSync(path.join(repoRoot, 'package.json'), '{not json\n', 'utf8');
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const { result: loaded, stderr } = captureStderr(() => stateMod.loadWorkflowConfig(repoRoot));
+    assert.equal(loaded.displayName, path.basename(repoRoot));
+    assert.equal(loaded.baseBranch, 'main');
+    assert.match(stderr, /contains malformed JSON; using fallback state/);
+    assert.equal(existsSync(machinePipelaneConfigPath(repoRoot)), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('loadWorkflowConfig imports package.json:pipelane into machine-local config', async () => {
   const repoRoot = createRepo();
   try {
@@ -4054,6 +4100,46 @@ test('loadWorkflowConfig imports package.json:pipelane into machine-local config
     assert.equal(loaded.syncDocs?.readmeSection, false);
     assert.equal(existsSync(machinePipelaneConfigPath(repoRoot)), true);
     assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('legacy config auto-import keeps repository-controlled policy out of machine-local trust', async () => {
+  const repoRoot = createRepo();
+  try {
+    writeFileSync(path.join(repoRoot, '.pipelane.json'), `${JSON.stringify({
+      displayName: 'Legacy Safe App',
+      baseBranch: 'trunk',
+      surfaces: ['frontend'],
+      prePrChecks: [],
+      prPathDenyList: [],
+      releaseMode: { requireStagingPromotion: false },
+      reviewGates: { gates: [] },
+      routeSafety: { stopOnMajorFindings: false, defaultMinutes: 1 },
+      orchestrate: { hardStops: { maxIterations: 999 } },
+    }, null, 2)}\n`, 'utf8');
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const { result: loaded, stderr } = captureStderr(() => stateMod.loadWorkflowConfig(repoRoot));
+    assert.equal(loaded.displayName, 'Legacy Safe App');
+    assert.equal(loaded.baseBranch, 'trunk');
+    assert.deepEqual(loaded.surfaces, ['frontend']);
+    assert.ok(loaded.prePrChecks.length > 0, 'legacy checkout must not disable pre-PR checks');
+    assert.ok(loaded.prPathDenyList.length > 0, 'legacy checkout must not disable denied-path policy');
+    assert.equal(loaded.releaseMode.requireStagingPromotion, true);
+    assert.ok(loaded.reviewGates.gates.length > 0, 'legacy checkout must not disable default review gates');
+    assert.equal(loaded.routeSafety.stopOnMajorFindings, true);
+    assert.equal(loaded.orchestrate, undefined);
+    assert.match(stderr, /ignored machine-local policy field\(s\) prePrChecks, prPathDenyList, releaseMode, reviewGates, routeSafety, orchestrate/);
+
+    const persisted = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
+    assert.ok(persisted.prePrChecks.length > 0);
+    assert.ok(persisted.prPathDenyList.length > 0);
+    assert.equal(persisted.releaseMode.requireStagingPromotion, true);
+    assert.ok(persisted.reviewGates.gates.length > 0);
+    assert.equal(persisted.routeSafety.stopOnMajorFindings, true);
+    assert.equal(persisted.orchestrate, undefined);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -16240,8 +16326,9 @@ test('setup migrates legacy repo-local .pipelane.json into machine-local config'
     assert.equal(config.projectKey, 'legacy-local-app');
     assert.equal(config.baseBranch, 'trunk');
     assert.equal(config.aliases.pr, '/ship');
-    assert.deepEqual(config.prePrChecks, ['npm run lint:legacy']);
+    assert.deepEqual(config.prePrChecks, ['npm run test', 'npm run typecheck', 'npm run build']);
     assert.equal(config.aliases.deploy, '/deploy');
+    assert.match(result.stderr, /ignored machine-local policy field\(s\) prePrChecks/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -21575,8 +21662,13 @@ test('merge --pr blocks in the shared checkout when the PR task is leased elsewh
 
     const apiBlocked = runCli(['run', 'api', 'action', 'merge', '--pr', '1', '--json'], repoRoot, env, true);
     assert.equal(apiBlocked.status, 1);
-    assert.match(apiBlocked.stderr, /task lease-merge belongs to a different worktree/);
-    assert.equal(apiBlocked.stdout.trim(), '', 'wrong-worktree preflight must not return or mint a confirmation token');
+    const apiEnvelope = JSON.parse(apiBlocked.stdout);
+    assert.equal(apiEnvelope.ok, false);
+    assert.equal(apiEnvelope.data.preflight.allowed, false);
+    assert.match(apiEnvelope.message, /task lease-merge belongs to a different worktree/);
+    assert.match(apiEnvelope.data.preflight.reason, new RegExp(`cd ${created.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.equal(apiEnvelope.data.preflight.confirmation, null);
+    assert.doesNotMatch(apiBlocked.stdout, /PIPELANE_CONFIRM_TOKEN=/);
     assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'api-confirmations')), false);
 
     const blocked = runCli(['run', 'merge', '--pr', '1', '--json'], repoRoot, env, true);
@@ -21625,8 +21717,13 @@ test('deploy --pr blocks in the shared checkout when the PR task is leased elsew
       'run', 'api', 'action', 'deploy.staging', '--pr', '1', '--json',
     ], repoRoot, env, true);
     assert.equal(apiBlocked.status, 1);
-    assert.match(apiBlocked.stderr, /task lease-deploy belongs to a different worktree/);
-    assert.equal(apiBlocked.stdout.trim(), '', 'wrong-worktree preflight must not return or mint a confirmation token');
+    const apiEnvelope = JSON.parse(apiBlocked.stdout);
+    assert.equal(apiEnvelope.ok, false);
+    assert.equal(apiEnvelope.data.preflight.allowed, false);
+    assert.match(apiEnvelope.message, /task lease-deploy belongs to a different worktree/);
+    assert.match(apiEnvelope.data.preflight.reason, new RegExp(`cd ${created.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.equal(apiEnvelope.data.preflight.confirmation, null);
+    assert.doesNotMatch(apiBlocked.stdout, /PIPELANE_CONFIRM_TOKEN=/);
     assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'api-confirmations')), false);
 
     const blocked = runCli(['run', 'deploy', 'staging', '--pr', '1', '--json'], repoRoot, env, true);

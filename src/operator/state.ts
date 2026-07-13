@@ -1505,6 +1505,50 @@ export type LegacyWorkflowConfigSource =
   | 'legacy-project-workflow-json'
   | 'legacy-package-json';
 
+const LEGACY_PROJECT_CONFIG_FIELDS = [
+  'version',
+  'projectKey',
+  'displayName',
+  'baseBranch',
+  'stateDir',
+  'taskWorktreeDirName',
+  'branchPrefix',
+  'legacyBranchPrefixes',
+  'surfaces',
+  'aliases',
+  'deployWorkflowName',
+  'syncDocs',
+  'surfacePathMap',
+] as const;
+
+function normalizeLegacyWorkflowImport(
+  raw: Record<string, unknown>,
+  repoRoot: string,
+  sourceLabel: string,
+): WorkflowConfig {
+  // Legacy files are useful migration inputs for project identity and the
+  // command/deploy shape, but they live in the checkout and are therefore not
+  // a trust boundary for agent review policy. In particular, persisting
+  // `reviewGates.gates: []` into machine-local config would let a checkout
+  // disable the very attestation that protects /pr. Keep the established
+  // legacy migration surface while deriving safety policy from trusted
+  // machine defaults; operators can opt into custom policy later through the
+  // explicit machine-local configure path.
+  const allowed = new Set<string>(LEGACY_PROJECT_CONFIG_FIELDS);
+  const sanitized: Record<string, unknown> = {};
+  const ignored: string[] = [];
+  for (const [field, value] of Object.entries(raw)) {
+    if (allowed.has(field)) sanitized[field] = value;
+    else ignored.push(field);
+  }
+  if (ignored.length > 0) {
+    process.stderr.write(
+      `Warning: ignored machine-local policy field(s) ${ignored.join(', ')} while importing ${sourceLabel}. Configure them explicitly after migration.\n`,
+    );
+  }
+  return normalizeWorkflowConfig(sanitized as Partial<WorkflowConfig>, { repoRoot });
+}
+
 export function importLegacyWorkflowConfigIfNeeded(repoRoot: string): {
   configPath: string;
   config: WorkflowConfig;
@@ -1520,20 +1564,25 @@ export function importLegacyWorkflowConfigIfNeeded(repoRoot: string): {
     const targetPath = path.join(repoRoot, legacy.filename);
     if (!existsSync(targetPath)) continue;
     const raw = readLegacyWorkflowConfigObject(targetPath, `legacy repo-local ${legacy.filename}`);
-    const config = normalizeWorkflowConfig(raw, { repoRoot });
+    const config = normalizeLegacyWorkflowImport(raw, repoRoot, `legacy repo-local ${legacy.filename}`);
     writeWorkflowConfig(repoRoot, config);
     return { configPath: resolveConfigPath(repoRoot), config, source: legacy.source };
   }
 
   const packageJsonPath = path.join(repoRoot, 'package.json');
   if (!existsSync(packageJsonPath)) return null;
-  const pkg = readLegacyWorkflowConfigObject(packageJsonPath, 'package.json');
+  const pkg = readJsonFile<Record<string, unknown> | null>(packageJsonPath, null);
+  if (!pkg || typeof pkg !== 'object' || Array.isArray(pkg)) return null;
   if (!Object.prototype.hasOwnProperty.call(pkg, 'pipelane')) return null;
   const overlay = pkg.pipelane;
   if (!overlay || typeof overlay !== 'object' || Array.isArray(overlay)) {
     throw new Error(`Malformed legacy package.json:pipelane at ${packageJsonPath}: expected a JSON object. Fix or remove it, then rerun the Pipelane command.`);
   }
-  const config = normalizeWorkflowConfig(overlay as Partial<WorkflowConfig>, { repoRoot });
+  const config = normalizeLegacyWorkflowImport(
+    overlay as Record<string, unknown>,
+    repoRoot,
+    'legacy package.json:pipelane',
+  );
   writeWorkflowConfig(repoRoot, config);
   return { configPath: resolveConfigPath(repoRoot), config, source: 'legacy-package-json' };
 }

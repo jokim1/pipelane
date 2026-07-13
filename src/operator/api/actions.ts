@@ -179,7 +179,10 @@ export function buildActionPreflightEnvelope(cwd: string, actionId: StableAction
   }
 
   const context = resolveWorkflowContext(cwd);
-  assertTaskApiActionWorktree(context, actionId, parsed);
+  const worktreeBlock = buildTaskApiActionWorktreeBlock(context, cwd, actionId, parsed);
+  if (worktreeBlock) {
+    return worktreeBlock;
+  }
   const routePlan = buildRoutePlanForAction(cwd, actionId, parsed);
   const destinationPlan = routePlan.destinationPlan;
   const normalizedInputs = normalizeInputs(actionId, parsed, cwd, destinationPlan, routePlan.error);
@@ -657,6 +660,53 @@ function buildDeployActionOnboardingBlock(
   });
 }
 
+function buildTaskApiActionWorktreeBlock(
+  context: WorkflowContext,
+  cwd: string,
+  actionId: StableActionId,
+  parsed: ParsedOperatorArgs,
+): ApiEnvelope<ActionPreflightData> | null {
+  try {
+    assertTaskApiActionWorktree(context, actionId, parsed);
+    return null;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const checkedAt = nowIso();
+    // Do not build a destination plan here: the cwd guard intentionally runs
+    // before route/base/dirty measurements. Basic flag normalization is pure;
+    // for route actions the message also becomes the route blocker.
+    const normalizedInputs = normalizeInputs(actionId, parsed, cwd, null, message);
+    const data: ActionPreflightData = {
+      action: {
+        id: actionId,
+        label: ACTION_LABELS[actionId],
+        risky: API_RISKY_ACTION_IDS.has(actionId),
+      },
+      preflight: {
+        allowed: false,
+        state: 'blocked',
+        reason: message,
+        needsInput: false,
+        missingInputs: [],
+        inputs: [],
+        defaultParams: {},
+        warnings: [],
+        issues: [],
+        normalizedInputs,
+        requiresConfirmation: false,
+        confirmation: null,
+        freshness: buildFreshness({ checkedAt, stale: true }),
+      },
+    };
+    return buildApiEnvelope<ActionPreflightData>({
+      command: 'pipelane.api.action',
+      ok: false,
+      message,
+      data,
+    });
+  }
+}
+
 export async function runActionExecute(cwd: string, actionId: StableActionId, parsed: ParsedOperatorArgs, confirmToken: string): Promise<ApiEnvelope<ActionExecutionData | ActionPreflightData>> {
   const onboardingBlock = buildDeployActionOnboardingBlock(cwd, actionId, parsed);
   if (onboardingBlock) {
@@ -664,7 +714,10 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
   }
 
   const context = resolveWorkflowContext(cwd);
-  assertTaskApiActionWorktree(context, actionId, parsed);
+  const worktreeBlock = buildTaskApiActionWorktreeBlock(context, cwd, actionId, parsed);
+  if (worktreeBlock) {
+    return worktreeBlock;
+  }
   const routePlan = buildRoutePlanForAction(cwd, actionId, parsed);
   const destinationPlan = routePlan.destinationPlan;
   const normalizedInputs = normalizeInputs(actionId, parsed, cwd, destinationPlan, routePlan.error);
