@@ -630,7 +630,10 @@ function buildDeployActionOnboardingBlock(
   }
 
   const checkedAt = nowIso();
-  const normalizedInputs = normalizeInputs(actionId, parsed, cwd, null);
+  // Onboarding is already the authoritative blocker. Keep normalization pure
+  // here so effect resolution cannot throw before the structured remedy is
+  // returned for an unconfigured repository.
+  const normalizedInputs = normalizeInputs(actionId, parsed, undefined, null);
   if (actionId === 'route.deploy.staging' || actionId === 'route.deploy.prod') {
     normalizedInputs.routeBlockers = ['repo not onboarded'];
   }
@@ -680,7 +683,7 @@ function buildTaskApiActionWorktreeBlock(
     // Do not build a destination plan here: the cwd guard intentionally runs
     // before route/base/dirty measurements. Basic flag normalization is pure;
     // for route actions the message also becomes the route blocker.
-    const normalizedInputs = normalizeInputs(actionId, parsed, cwd, null, message);
+    const normalizedInputs = normalizeInputs(actionId, parsed, undefined, null, message);
     const data: ActionPreflightData = {
       action: {
         id: actionId,

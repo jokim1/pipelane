@@ -81,7 +81,12 @@ export function resolveModeSurfaces(
   explicitSurfaces: string[],
   taskLock: TaskLock | null,
 ): string[] {
-  const selected = explicitSurfaces.length > 0 || context.modeState.requestedSurfaces.length > 0 || !taskLock
+  // A fresh synthesized mode state mirrors all configured surfaces but is not
+  // an operator selection. Only a persisted mode snapshot (`updatedAt`) may
+  // widen a task implicitly; otherwise preserve the task-lock fallback.
+  const hasPersistedGlobalSelection = Boolean(context.modeState.updatedAt)
+    && context.modeState.requestedSurfaces.length > 0;
+  const selected = explicitSurfaces.length > 0 || hasPersistedGlobalSelection || !taskLock
     ? resolveCommandSurfaces(context, explicitSurfaces)
     : resolveCommandSurfaces(context, [], taskLock.surfaces);
   if (!taskLock) return selected;

@@ -473,9 +473,10 @@ and non-TTY execution paths.
     task-scoped mode transition without explicit `--surfaces`; the task-lock
     fallback replaced the global selection and readiness checked only `sql`.
     **Proposed fix (implemented):** choose explicit surfaces first, otherwise
-    honor non-empty global requested surfaces, and union that selection with
-    the durable task scope. Preserve the historical task-only fallback when no
-    global or explicit selection exists.
+    honor non-empty persisted global requested surfaces, and union that
+    selection with the durable task scope. Preserve the historical task-only
+    fallback when no persisted global or explicit selection exists; a fresh
+    synthesized all-surfaces default is not treated as operator intent.
 
 33. **`deploy.prod` confirmation tokens were bound to raw flags rather than the
     resolved production effect (P0).** **Location:**
