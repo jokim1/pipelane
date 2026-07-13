@@ -29625,9 +29625,17 @@ test('task-scoped pr merge and deploy reject the wrong checkout before cwd drift
     for (const args of commands) {
       const blocked = runCli(args, repoRoot, {}, true);
       assert.equal(blocked.status, 1, `${args[1]} should hard-error in the wrong checkout`);
-      assert.match(blocked.stderr, /task cwd-trust-guard belongs to a different worktree/);
-      assert.match(blocked.stderr, new RegExp(`  cd ${created.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
-      assert.doesNotMatch(blocked.stderr, /behind origin\/main|dirty local changes|requires --title/);
+      const apiEnvelope = args[1] === 'api' ? JSON.parse(blocked.stdout) : null;
+      const diagnostic = apiEnvelope?.message ?? blocked.stderr;
+      assert.match(diagnostic, /task cwd-trust-guard belongs to a different worktree/);
+      assert.match(diagnostic, new RegExp(`  cd ${created.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+      assert.doesNotMatch(diagnostic, /behind origin\/main|dirty local changes|requires --title/);
+      if (apiEnvelope) {
+        assert.equal(apiEnvelope.ok, false);
+        assert.equal(apiEnvelope.data.preflight.allowed, false);
+        assert.equal(apiEnvelope.data.preflight.confirmation, null);
+        assert.doesNotMatch(blocked.stdout, /PIPELANE_CONFIRM_TOKEN=/);
+      }
     }
     assert.match(run('git', ['status', '--short'], repoRoot), /\?\? unrelated-main-change\.txt/);
   } finally {
