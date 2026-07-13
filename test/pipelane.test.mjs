@@ -688,7 +688,11 @@ Run the generic pipelane wrapper for this repo.
 function seedCodexReviewSkills(codexHome, skills = ['karpathy-diff', 'review', 'karpathy-audit', 'qa-only', 'adversarial-review']) {
   for (const skill of skills) {
     mkdirSync(path.join(codexHome, 'skills', skill), { recursive: true });
-    writeFileSync(path.join(codexHome, 'skills', skill, 'SKILL.md'), `${skill} review skill\n`, 'utf8');
+    writeFileSync(
+      path.join(codexHome, 'skills', skill, 'SKILL.md'),
+      `---\nname: ${skill}\ndescription: ${skill} review skill\n---\n\n# ${skill}\n`,
+      'utf8',
+    );
   }
 }
 
@@ -4088,6 +4092,8 @@ test('review setup reports effective review gates without materializing config',
     assert.equal(report.status, 'reported');
     assert.equal(report.configPath, null);
     assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
+    assert.equal(report.effective.enforcementMode, 'strict-v3');
+    assert.equal(report.effective.policyVersion, 3);
     assert.deepEqual(report.detectedScripts, ['build', 'test', 'typecheck']);
     assert.ok(report.effective.planReview.gates.some((gate) => gate.id === 'plan-eng-review'));
     assert.ok(report.effective.gates.some((gate) => gate.id === 'karpathy-diff'));
@@ -4112,8 +4118,11 @@ test('review setup --yes persists the recommended gate checklist', () => {
     assert.equal(report.status, 'configured');
     assert.equal(realpathSync(report.configPath), realpathSync(machinePipelaneConfigPath(repoRoot)));
     assert.deepEqual(Object.keys(raw.reviewGates).sort(), ['enforcementMode', 'gates', 'planReview', 'policyVersion']);
-    assert.equal(raw.reviewGates.enforcementMode, 'legacy-v2');
-    assert.equal(raw.reviewGates.policyVersion, 2);
+    assert.equal(raw.reviewGates.enforcementMode, 'strict-v3');
+    assert.equal(raw.reviewGates.policyVersion, 3);
+    assert.match(report.message, /Available native adapters:/);
+    assert.match(report.message, /Legacy evidence will remain readable but cannot satisfy strict gates/);
+    assert.match(report.message, /exact-scope bypass/);
     assert.ok(Array.isArray(raw.reviewGates.gates));
     assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'typecheck'));
     assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'test'));
@@ -4495,8 +4504,8 @@ test('review setup --yes saves explicit recommended gates when detected tools ma
 
     assert.equal(report.status, 'configured');
     assert.deepEqual(Object.keys(raw.reviewGates).sort(), ['enforcementMode', 'gates', 'planReview', 'policyVersion']);
-    assert.equal(raw.reviewGates.enforcementMode, 'legacy-v2');
-    assert.equal(raw.reviewGates.policyVersion, 2);
+    assert.equal(raw.reviewGates.enforcementMode, 'strict-v3');
+    assert.equal(raw.reviewGates.policyVersion, 3);
     assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'));
     assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'));
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'human-prod-deploy-approval'), false);
@@ -4520,7 +4529,7 @@ test('review setup --yes uses code-review high when the capability probe passes'
     });
     const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
 
-    assert.equal(raw.reviewGates.policyVersion, 2);
+    assert.equal(raw.reviewGates.policyVersion, 3);
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'code-review-high'), true);
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'), false);
   } finally {
@@ -4575,7 +4584,7 @@ test('review setup --yes recommends installed cross-model review', () => {
     });
     const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
 
-    assert.equal(raw.reviewGates.policyVersion, 2);
+    assert.equal(raw.reviewGates.policyVersion, 3);
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'adversarial-review'), true);
     assert.deepEqual(raw.reviewGates.gates.find((gate) => gate.id === 'adversarial-review').userCommands, ['/claude-review']);
   } finally {
@@ -4929,8 +4938,8 @@ test('review setup interactive toggle of installed AI gate writes explicit gate 
 
     assert.doesNotMatch(result.stdout, /Install and enable/);
     assert.deepEqual(Object.keys(raw.reviewGates).sort(), ['enforcementMode', 'gates', 'planReview', 'policyVersion']);
-    assert.equal(raw.reviewGates.enforcementMode, 'legacy-v2');
-    assert.equal(raw.reviewGates.policyVersion, 2);
+    assert.equal(raw.reviewGates.enforcementMode, 'strict-v3');
+    assert.equal(raw.reviewGates.policyVersion, 3);
     assert.ok(Array.isArray(raw.reviewGates.gates));
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'), false);
     assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'));
@@ -4944,6 +4953,7 @@ test('review setup detects provider-prefixed Karpathy skills as installed', () =
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-codex-'));
   try {
+    writePipelaneConfig(repoRoot, 'Legacy Provider Prefix');
     seedCodexReviewSkills(codexHome, ['gstack-karpathy-diff', 'review', 'karpathy-audit']);
 
     const result = runCli(['run', 'review', 'setup'], repoRoot, {
@@ -14564,6 +14574,7 @@ test('review pass refuses stale or executable gate evidence', () => {
 test('review runner includes staged-only files for whenChanged gates', () => {
   const repoRoot = createRepo();
   try {
+    writePipelaneConfig(repoRoot, 'Legacy Staged whenChanged');
     writeFileSync(path.join(repoRoot, 'AGENTS.md'), 'Agent guidance\n', 'utf8');
     execFileSync('git', ['add', 'AGENTS.md'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
 
@@ -15424,6 +15435,7 @@ test('api snapshot degrades pending, failed, and incomplete review evidence', ()
 
   const dryRunRepoRoot = createRepo();
   try {
+    writePipelaneConfig(dryRunRepoRoot, 'Legacy Dry Run Evidence');
     JSON.parse(runCli(['run', 'review', '--gate', 'typecheck', '--dry-run', '--json'], dryRunRepoRoot).stdout);
     const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], dryRunRepoRoot).stdout);
     const reviewHealth = envelope.data.sourceHealth.find((entry) => entry.name === 'review.current');
@@ -34824,6 +34836,25 @@ test('strict review setup preserves explicit dual-mode rollback semantics', () =
     const legacy = JSON.parse(runCli(['run', 'review', 'setup', '--enforcement-mode', 'legacy-v2', '--json'], repoRoot).stdout);
     assert.equal(legacy.effective.enforcementMode, 'legacy-v2');
     assert.equal(legacy.effective.policyVersion, 2);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('strict activation keeps existing machine config on legacy-v2 until an explicit choice', () => {
+  const repoRoot = createRepo();
+  try {
+    const configPath = writePipelaneConfig(repoRoot, 'Legacy Activation Compatibility');
+    const configured = JSON.parse(runCli(['run', 'review', 'setup', '--json'], repoRoot).stdout);
+    assert.equal(configured.effective.enforcementMode, 'legacy-v2');
+    assert.equal(configured.effective.policyVersion, 2);
+
+    const raw = JSON.parse(readFileSync(configPath, 'utf8'));
+    delete raw.reviewGates;
+    writeFileSync(configPath, `${JSON.stringify(raw, null, 2)}\n`, 'utf8');
+    const preReviewGates = JSON.parse(runCli(['run', 'review', 'setup', '--json'], repoRoot).stdout);
+    assert.equal(preReviewGates.effective.enforcementMode, 'legacy-v2');
+    assert.equal(preReviewGates.effective.policyVersion, 2);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
