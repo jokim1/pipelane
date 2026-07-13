@@ -539,25 +539,6 @@ export function renderCockpit(
     lines.push('');
   }
   const review = envelope.data.review;
-  const currentReviewMatchesMode = review
-    ? review.current?.enforcementMode === review.enforcementMode
-      && review.current?.policyVersion === review.policyVersion
-    : false;
-  if (review?.enforcementMode === 'strict-v3' && !currentReviewMatchesMode) {
-    const prAction = boardContext.aliases?.pr ?? '/pr';
-    lines.push(colorize('ℹ STRICT REVIEW UPGRADE IMPACT', color, 'yellow'));
-    lines.push(review.current
-      ? `  current evidence used ${sanitizeForTerminal(review.current.enforcementMode ?? 'legacy-v2')} policy ${sanitizeForTerminal(String(review.current.policyVersion ?? 'unknown'))}; strict-v3 policy ${review.policyVersion} requires a rerun.`
-      : '  this checkout has no current strict-v3 review evidence; unrelated recent history is not substituted.');
-    lines.push('  normal development remains available; the next gated release action needs one explicit choice.');
-    lines.push('  recommended: /pipelane review --intent "<what this change should accomplish>", repair any findings, then rerun.');
-    for (const gateId of review.blockingGateIds) {
-      lines.push(`  proceed anyway: /pipelane review override --gate ${sanitizeForTerminal(gateId)} --scope=${JSON.stringify(prAction)} --reason "<why this exact target and action may proceed>"`);
-    }
-    lines.push('  A bypass remains recorded as user consent; failed or pending evidence is never relabeled passed.');
-    lines.push('');
-  }
-
   // v1.2: probe banner mirrors the override banner pattern. Red for
   // degraded (a probe actively failed), yellow for stale (a probe exists
   // but is past PROBE_STALE_MS). Healthy + unknown stay silent; unknown
@@ -577,6 +558,28 @@ export function renderCockpit(
 
   lines.push(...renderCurrentCheckout(boardContext.currentCheckout, color));
   lines.push('');
+
+  lines.push(...renderReview(review, color));
+  lines.push('');
+
+  const currentReviewMatchesMode = review
+    ? review.current?.enforcementMode === review.enforcementMode
+      && review.current?.policyVersion === review.policyVersion
+    : false;
+  if (review?.enforcementMode === 'strict-v3' && !currentReviewMatchesMode) {
+    const prAction = boardContext.aliases?.pr ?? '/pr';
+    lines.push(colorize('ℹ STRICT REVIEW UPGRADE IMPACT', color, 'yellow'));
+    lines.push(review.current
+      ? `  current evidence used ${sanitizeForTerminal(review.current.enforcementMode ?? 'legacy-v2')} policy ${sanitizeForTerminal(String(review.current.policyVersion ?? 'unknown'))}; strict-v3 policy ${review.policyVersion} requires a rerun.`
+      : '  this checkout has no current strict-v3 review evidence; unrelated recent history is not substituted.');
+    lines.push('  normal development remains available; the next gated release action needs one explicit choice.');
+    lines.push('  recommended: /pipelane review --intent "<what this change should accomplish>", repair any findings, then rerun.');
+    for (const gateId of review.blockingGateIds) {
+      lines.push(`  proceed anyway: /pipelane review override --gate ${sanitizeForTerminal(gateId)} --scope=${JSON.stringify(prAction)} --reason "<why this exact target and action may proceed>"`);
+    }
+    lines.push('  A bypass remains recorded as user consent; failed or pending evidence is never relabeled passed.');
+    lines.push('');
+  }
 
   lines.push(...renderOrchestration(orchestration, color));
   lines.push('');
@@ -622,6 +625,57 @@ export function renderCockpit(
   }
 
   return lines.join('\n');
+}
+
+function renderReview(
+  review: SnapshotData['review'] | undefined,
+  color: boolean,
+): string[] {
+  const lines = [colorize('REVIEW', color, 'bold')];
+  if (!review?.current) {
+    lines.push('  current evidence: none for this checkout');
+    if (review?.recent) {
+      const recent = review.recent.presentation;
+      lines.push(recent
+        ? `  recent (not current): ${sanitizeForTerminal(recent.runId)} [${sanitizeForTerminal(recent.status)}] branch=${sanitizeForTerminal(recent.branchName)} sha=${sanitizeForTerminal(recent.sha.slice(0, 12))}`
+        : `  recent (not current): ${sanitizeForTerminal(review.recent.id)} [${sanitizeForTerminal(review.recent.status)}] branch=${sanitizeForTerminal(review.recent.branchName)} sha=${sanitizeForTerminal(review.recent.sha.slice(0, 12))}`);
+    }
+    return lines;
+  }
+
+  if (!review.current.presentation) {
+    lines.push(`  current: ${sanitizeForTerminal(review.current.id)} [${sanitizeForTerminal(review.current.status)}]`);
+    lines.push('  details: this compatibility snapshot has no structured presentation; refresh it with the current Pipelane runtime');
+    return lines;
+  }
+
+  const presentation = review.current.presentation;
+  lines.push(`  current: ${sanitizeForTerminal(presentation.runId)} [${sanitizeForTerminal(presentation.status)}]`);
+  lines.push(`  identity: branch=${sanitizeForTerminal(presentation.branchName)} sha=${sanitizeForTerminal(presentation.sha.slice(0, 12))}${presentation.targetDigest ? ` target=${sanitizeForTerminal(presentation.targetDigest.slice(0, 12))}` : ''}`);
+  lines.push(`  evidence: gates ${presentation.counts.gates.passed} passed, ${presentation.counts.gates.failed} failed, ${presentation.counts.gates.pending} pending, ${presentation.counts.gates.skipped} skipped`);
+  lines.push(`  findings: ${presentation.counts.findings.blocking} blocking (${presentation.counts.findings.critical} critical, ${presentation.counts.findings.warning} warning), ${presentation.counts.findings.advisory} advisory`);
+
+  const detailedGates = presentation.gates.filter((gate) =>
+    gate.findings.length > 0 || gate.protocolErrors.length > 0 || gate.status === 'failed' || gate.status === 'pending'
+  );
+  if (detailedGates.length === 0) {
+    lines.push('  details: no findings or protocol errors');
+  } else {
+    lines.push('  details:');
+    for (const gate of detailedGates) {
+      lines.push(`    - ${sanitizeForTerminal(gate.gateId)} [${sanitizeForTerminal(gate.status)}] ${sanitizeForTerminal(gate.summary)}`);
+      for (const finding of gate.findings) {
+        lines.push(`      - ${sanitizeForTerminal(finding.id)} [${sanitizeForTerminal(finding.severity)}] ${sanitizeForTerminal(finding.title)}${finding.location ? ` (${sanitizeForTerminal(finding.location)})` : ''}`);
+      }
+      for (const error of gate.protocolErrors) {
+        lines.push(`      protocol error: ${sanitizeForTerminal(error)}`);
+      }
+    }
+  }
+  if (presentation.nextAction) {
+    lines.push(`  next: ${sanitizeForTerminal(presentation.nextAction.command)} (${sanitizeForTerminal(presentation.nextAction.summary)})`);
+  }
+  return lines;
 }
 
 function renderOrchestration(

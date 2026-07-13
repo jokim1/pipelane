@@ -1881,6 +1881,54 @@
       color: #d8f3ff;
     }
 
+    .review-stack {
+      display: grid;
+      gap: 12px;
+    }
+
+    .review-summary,
+    .review-gate {
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.025);
+      padding: 14px 16px;
+    }
+
+    .review-identity,
+    .review-counts {
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.55;
+      overflow-wrap: anywhere;
+    }
+
+    .review-findings {
+      margin: 10px 0 0;
+      padding-left: 20px;
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .review-details {
+      margin-top: 10px;
+      border-top: 1px solid var(--line);
+      padding-top: 10px;
+    }
+
+    .review-details summary {
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .review-details pre {
+      margin: 10px 0 0;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
     .empty-state {
       padding: 14px 16px;
       border-radius: 16px;
@@ -2031,6 +2079,16 @@
             <div id="hero-mode"></div>
             <div class="hero-statusline" id="hero-statusline">Checking local dashboard health…</div>
           </div>
+        </div>
+      </section>
+
+      <section class="panel" id="review-panel">
+        <div class="panel-header">
+          <div class="panel-title">Review</div>
+          <div class="footer-note" id="review-summary">Current-checkout evidence and findings.</div>
+        </div>
+        <div class="panel-body">
+          <div id="review-content" class="review-stack"></div>
         </div>
       </section>
 
@@ -2212,6 +2270,83 @@
         .replaceAll('>', '&gt;')
         .replaceAll('"', '&quot;')
         .replaceAll("'", '&#39;');
+    }
+
+    function reviewGateMarkup(gate) {
+      const findings = Array.isArray(gate?.findings) ? gate.findings : [];
+      const protocolErrors = Array.isArray(gate?.protocolErrors) ? gate.protocolErrors : [];
+      const findingMarkup = findings.length
+        ? `<ul class="review-findings">${findings.map((finding) => `<li><strong>${escapeHtml(finding.id)}</strong> [${escapeHtml(finding.severity)}] ${escapeHtml(finding.title)}${finding.location ? ` <span class="footer-note">(${escapeHtml(finding.location)})</span>` : ''}</li>`).join('')}</ul>`
+        : '<div class="footer-note" style="margin-top:8px">No structured findings.</div>';
+      const report = gate?.report?.text
+        ? `<details class="review-details"><summary>Sanitized report${gate.report.truncated ? ' · truncated at evidence limit' : ''}</summary><pre class="code-block">${escapeHtml(gate.report.text)}</pre></details>`
+        : '';
+      const diagnostics = gate?.diagnostics?.text
+        ? `<details class="review-details"><summary>Sanitized diagnostics${gate.diagnostics.truncated ? ' · truncated at evidence limit' : ''}</summary><pre class="code-block">${escapeHtml(gate.diagnostics.text)}</pre></details>`
+        : '';
+      const protocol = protocolErrors.length
+        ? `<details class="review-details" open><summary>Protocol errors (${escapeHtml(protocolErrors.length)})</summary><ul class="review-findings">${protocolErrors.map((error) => `<li>${escapeHtml(error)}</li>`).join('')}</ul></details>`
+        : '';
+      return `
+        <article class="review-gate ${stateClass(gate?.status)}">
+          <div class="lane-head">
+            <strong>${escapeHtml(gate?.gateId || 'review gate')}</strong>
+            <span class="mini-pill">${escapeHtml(gate?.status || 'unknown')}</span>
+          </div>
+          <div class="reason-block">${escapeHtml(gate?.summary || 'No gate summary provided.')}</div>
+          <div class="review-counts">${escapeHtml(gate?.counts?.blocking || 0)} blocking · ${escapeHtml(gate?.counts?.advisory || 0)} advisory</div>
+          ${findingMarkup}
+          ${report}
+          ${diagnostics}
+          ${protocol}
+        </article>
+      `;
+    }
+
+    function reviewPresentationMarkup(presentation, options = {}) {
+      if (!presentation) return '';
+      const gates = Array.isArray(presentation.gates) ? presentation.gates : [];
+      const visibleGates = gates.filter((gate) =>
+        gate?.status === 'failed'
+        || gate?.status === 'pending'
+        || (gate?.findings || []).length
+        || (gate?.protocolErrors || []).length
+      );
+      const identity = options.hideIdentity ? '' : `
+        <div class="review-summary">
+          <div class="lane-head">
+            <strong>${escapeHtml(presentation.relation === 'recent' ? 'Recent evidence (not current)' : 'Current-checkout evidence')}</strong>
+            <span class="mini-pill">${escapeHtml(presentation.status || 'unknown')}</span>
+          </div>
+          <div class="review-identity">run=${escapeHtml(presentation.runId)} · branch=${escapeHtml(presentation.branchName)} · sha=${escapeHtml(String(presentation.sha || '').slice(0, 12))}${presentation.targetDigest ? ` · target=${escapeHtml(String(presentation.targetDigest).slice(0, 12))}` : ''}</div>
+          <div class="review-counts">${escapeHtml(presentation.counts?.findings?.blocking || 0)} blocking findings · ${escapeHtml(presentation.counts?.findings?.advisory || 0)} advisory · ${escapeHtml(presentation.counts?.protocolErrors || 0)} protocol errors</div>
+        </div>
+      `;
+      const gateMarkup = visibleGates.length
+        ? visibleGates.map(reviewGateMarkup).join('')
+        : '<div class="empty-state">No findings or protocol errors in this review run.</div>';
+      const next = presentation.relation !== 'recent' && presentation.nextAction
+        ? `<div class="review-summary"><strong>Recommended next action</strong><div class="reason-block">${escapeHtml(presentation.nextAction.summary)}</div><code class="inline-code">${escapeHtml(presentation.nextAction.command)}</code></div>`
+        : '';
+      return `${identity}${gateMarkup}${next}`;
+    }
+
+    function renderReview() {
+      const review = state.snapshot?.data?.review;
+      const container = document.getElementById('review-content');
+      const summary = document.getElementById('review-summary');
+      if (!review?.current?.presentation) {
+        summary.textContent = 'No evidence for the current checkout.';
+        const recent = review?.recent?.presentation;
+        container.innerHTML = `
+          <div class="empty-state">No review evidence matches the current checkout. Unrelated recent history is never substituted as current evidence.</div>
+          ${recent ? reviewPresentationMarkup(recent) : ''}
+        `;
+        return;
+      }
+      const presentation = review.current.presentation;
+      summary.textContent = `${presentation.counts?.findings?.blocking || 0} blocking · ${presentation.counts?.findings?.advisory || 0} advisory`;
+      container.innerHTML = reviewPresentationMarkup(presentation);
     }
 
     function stateClass(value) {
@@ -3726,6 +3861,7 @@
       const wrap = document.getElementById('action-feedback-wrap');
       const container = document.getElementById('action-feedback');
       const feedback = state.actionFeedback;
+      const review = state.lastPreflight?.data?.preflight?.review || null;
 
       if (!feedback) {
         wrap.style.display = 'none';
@@ -3741,6 +3877,7 @@
             <span class="mini-pill">${escapeHtml(feedback.state || 'unknown')}</span>
           </div>
           <div class="reason-block">${escapeHtml(feedback.reason || 'No action feedback available.')}</div>
+          ${review ? `<div class="review-stack" style="margin-top:12px">${reviewPresentationMarkup(review, { hideIdentity: false })}</div>` : ''}
           <div class="footer-note" style="margin-top:10px">${escapeHtml(feedback.detail || `Updated ${relativeTime(feedback.at)}`)}</div>
         </article>
       `;
@@ -4070,6 +4207,7 @@
               <span class="mini-pill">${escapeHtml(preflightData.state || 'unknown')}</span>
             </div>
             <div class="reason-block">${escapeHtml(preflightData.reason || 'No preflight reason provided.')}</div>
+            ${preflightData.review ? `<div class="review-stack" style="margin-top:12px">${reviewPresentationMarkup(preflightData.review)}</div>` : ''}
           </article>
         </div>
       ` : '';
@@ -4618,6 +4756,7 @@
 
       state.loading.action = true;
       state.pendingConfirmation = null;
+      state.lastPreflight = null;
       state.lastActionContext = {
         actionId,
         label: actionSource.label || actionSource.id || actionId,
@@ -4798,6 +4937,7 @@
       renderHelpPanel();
       renderHero();
       renderAttention();
+      renderReview();
       renderActiveTask();
       renderBranchTable();
       renderBranchContextMenu();

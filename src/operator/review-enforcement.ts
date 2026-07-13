@@ -31,6 +31,7 @@ import { REVIEW_GATES_POLICY_VERSION } from './review-gate-policy.ts';
 import { buildReviewTargetManifest } from './review-contract.ts';
 import { readVerifiedReviewArtifact } from './review-artifacts.ts';
 import { reviewArtifactRoot } from './state.ts';
+import { projectReviewRun, renderReviewPresentation } from './review-output.ts';
 import { readWorktreeStatusSnapshot } from './worktree-status.ts';
 
 export type ReviewEvidenceGateStatus = 'missing' | 'failed' | 'pending' | 'incomplete';
@@ -369,12 +370,24 @@ export function selectCurrentReviewEvidenceRecord(
 }
 
 export function formatReviewEvidenceBlocker(context: WorkflowContext, issues: ReviewEvidenceIssue[], command = formatWorkflowCommand(context.config, 'pr')): string {
+  const latest = selectCurrentReviewEvidenceRecord(context);
+  const gateIds = issues.flatMap((issue) => issue.gateId ? [issue.gateId] : []);
+  const evidenceLines = latest
+    ? renderReviewPresentation(projectReviewRun(latest, {
+        artifactRoot: reviewArtifactRoot(context.commonDir, context.config),
+        relation: 'current',
+      }), {
+        gateIds: gateIds.length > 0 ? gateIds : undefined,
+        includePassed: gateIds.length > 0,
+      })
+    : [];
   const bypassCommands = (context.config.reviewGates?.gates ?? [])
     .filter((gate) => gate.blocking !== false)
     .map((gate) => `/pipelane review override --gate ${gate.id} --scope=${JSON.stringify(command)} --reason "<why this exact target and action may proceed despite ${gate.id}>"`);
   return [
     `${command} blocked because review gate evidence is not ready.`,
     ...issues.map((issue) => `- ${issue.message}`),
+    ...(evidenceLines.length > 0 ? ['', 'Review evidence details:', ...evidenceLines] : []),
     `Recommended: Run /pipelane review${context.config.reviewGates?.enforcementMode === 'strict-v3' ? ' --intent "<what this change should accomplish>"' : ''} after repairing the evidence source or findings, then retry ${command}.`,
     ...(bypassCommands.length > 0 ? [
       'Proceed anyway only with explicit informed consent for every blocking gate in scope:',

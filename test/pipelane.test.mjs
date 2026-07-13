@@ -11579,9 +11579,18 @@ test('orchestrate review records pending AI gates and blocks incomplete slice ev
     assert.equal(onDisk.slices[1].review, null);
     assert.match(reviewed.slices.find((slice) => slice.id === onDisk.slices[1].id).blocker, /worker has not completed successfully/);
     assert.match(reviewed.message, /Pending gates:/);
+    assert.match(reviewed.message, /Review evidence details:/);
     assert.match(reviewed.message, new RegExp(`${onDisk.slices[0].id}/karpathy-diff`));
     assert.match(reviewed.message, /author self-review pending: run \/karpathy diff/);
     assert.ok(reviewed.message.includes(`worktree: ${onDisk.slices[0].worktreePath}`));
+    assert.ok(reviewed.message.indexOf('Review evidence details:') < reviewed.message.indexOf('Next: complete pending'));
+    const snapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    const sliceSummary = snapshot.data.orchestration.activeRun.slices.find((slice) => slice.id === onDisk.slices[0].id);
+    assert.equal(sliceSummary.reviewPresentation.relation, 'embedded');
+    assert.equal(sliceSummary.reviewPresentation.status, 'pending');
+    assert.equal(sliceSummary.reviewPresentation.gates[0].gateId, 'karpathy-diff');
+    assert.equal(sliceSummary.reviewPresentation.counts.findings.blocking, 0);
+    assert.equal(sliceSummary.reviewPresentation.nextAction.command, '/pipelane review');
   } finally {
     for (const worktreePath of createdWorktrees) {
       rmSync(worktreePath, { recursive: true, force: true });
@@ -15363,6 +15372,9 @@ test('api snapshot exposes truthful current review with a deprecated latest alia
     assert.equal(envelope.data.review.latest.id, review.runId);
     assert.deepEqual(envelope.data.review.latest, envelope.data.review.current);
     assert.equal(envelope.data.review.latest.status, 'passed');
+    assert.equal(envelope.data.review.current.presentation.relation, 'current');
+    assert.equal(envelope.data.review.current.presentation.runId, review.runId);
+    assert.equal(envelope.data.review.current.presentation.counts.gates.passed, 1);
     assert.equal(reviewHealth.state, 'healthy');
     assert.equal(reviewHealth.blocking, false);
     assert.match(reviewHealth.reason, new RegExp(review.runId));
@@ -15391,6 +15403,12 @@ test('api snapshot never presents another branch review as current or latest', (
     assert.equal(envelope.data.review.latest, null);
     assert.equal(envelope.data.review.recent.id, reviewed.runId);
     assert.equal(envelope.data.review.recent.branchName, 'codex/reviewed-elsewhere');
+    assert.equal(envelope.data.review.recent.presentation.relation, 'recent');
+    const status = runCli(['run', 'status'], repoRoot).stdout;
+    assert.match(status, /REVIEW/);
+    assert.match(status, /current evidence: none for this checkout/);
+    assert.match(status, /recent \(not current\):/);
+    assert.doesNotMatch(status, /current: .*\[passed\]/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -17392,6 +17410,10 @@ function writePassingReviewEvidence(repoRoot, options = {}) {
       ...gate,
       status: options.gateStatuses?.[gate.gateId] || (gate.status === 'skipped' ? 'skipped' : 'passed'),
       summary: options.gateSummaries?.[gate.gateId] || gate.summary,
+      ...(options.gateFindings?.[gate.gateId] ? { findings: options.gateFindings[gate.gateId] } : {}),
+      ...(options.gateStdoutTails?.[gate.gateId] ? { stdoutTail: options.gateStdoutTails[gate.gateId] } : {}),
+      ...(options.gateStderrTails?.[gate.gateId] ? { stderrTail: options.gateStderrTails[gate.gateId] } : {}),
+      ...(options.gateErrors?.[gate.gateId] ? options.gateErrors[gate.gateId] : {}),
     };
     return attester ? { ...next, attester } : next;
   });
@@ -19948,6 +19970,15 @@ test('api action pr preflight blocks pending and filtered review evidence', () =
       status: 'pending',
       gateStatuses: { 'karpathy-diff': 'pending' },
       gateSummaries: { 'karpathy-diff': 'author self-review pending: run /karpathy diff' },
+      gateFindings: {
+        'karpathy-diff': [
+          { id: 'F001', severity: 'critical', title: 'First finding', location: 'src/one.ts:1' },
+          { id: 'F002', severity: 'warning', title: 'Second finding', location: 'src/two.ts:2' },
+          { id: 'F003', severity: 'nit', title: 'Third finding', location: 'src/three.ts:3' },
+        ],
+      },
+      gateStdoutTails: { 'karpathy-diff': 'Full retained report' },
+      gateStderrTails: { 'karpathy-diff': 'Retained provider diagnostics' },
     });
 
     const pending = runCli(
@@ -19963,6 +19994,27 @@ test('api action pr preflight blocks pending and filtered review evidence', () =
     assert.match(pendingEnvelope.data.preflight.reason, /blocking gate karpathy-diff is pending/);
     assert.equal(pendingEnvelope.data.preflight.issues[0].status, 'pending');
     assert.equal(pendingEnvelope.data.preflight.issues[0].gateId, 'karpathy-diff');
+    assert.equal(pendingEnvelope.data.preflight.review.relation, 'current');
+    const presentedKarpathyGate = pendingEnvelope.data.preflight.review.gates.find((gate) => gate.gateId === 'karpathy-diff');
+    assert.deepEqual(presentedKarpathyGate.findings.map((finding) => finding.id), ['F001', 'F002', 'F003']);
+    assert.equal(pendingEnvelope.data.preflight.review.counts.findings.blocking, 2);
+    assert.equal(pendingEnvelope.data.preflight.review.counts.findings.advisory, 1);
+    assert.equal(pendingEnvelope.data.preflight.review.nextAction.command, '/pipelane review');
+    assert.match(presentedKarpathyGate.report.text, /Full retained report/);
+    assert.match(presentedKarpathyGate.diagnostics.text, /Retained provider diagnostics/);
+    const statusOutput = runCli(['run', 'status'], created.worktreePath).stdout;
+    assert.match(statusOutput, /karpathy-diff \[pending\]/);
+    assert.match(statusOutput, /findings: 2 blocking .* 1 advisory/);
+    const routeBlocked = runCli(['run', 'pr', '--title', 'Review Pending', '--json'], created.worktreePath, {}, true);
+    assert.equal(routeBlocked.status, 1);
+    assert.match(routeBlocked.stderr, /Findings \(2 blocking, 1 advisory\)/);
+    assert.ok(routeBlocked.stderr.indexOf('First finding') < routeBlocked.stderr.indexOf('Second finding'));
+    assert.ok(routeBlocked.stderr.indexOf('Second finding') < routeBlocked.stderr.indexOf('Third finding'));
+    const recoveryIndex = ['Recommended:', 'Recommended recovery:', 'Proceed anyway only with explicit informed consent']
+      .map((label) => routeBlocked.stderr.indexOf(label))
+      .filter((index) => index >= 0)
+      .sort((left, right) => left - right)[0];
+    assert.ok(routeBlocked.stderr.indexOf('Third finding') < recoveryIndex, routeBlocked.stderr);
 
     writePassingReviewEvidence(created.worktreePath, { gateFilter: 'typecheck' });
     const filtered = runCli(
@@ -20144,9 +20196,19 @@ test('route safety renders the TTY pause menu with explicit loop choices', async
     const menu = safety.renderRouteSafetyInteractiveMenu(context, record, {
       reason: 'blocking/major review findings are present',
       issues: [{
-        status: 'failed',
-        message: 'blocking gate ai-review failed: major finding',
+        status: 'incomplete',
+        gateId: 'ai-review',
+        message: 'blocking gate ai-review lacks compatible capability evidence',
         blocking: true,
+        gate: {
+          gateId: 'ai-review',
+          phase: 'ai-diff',
+          type: 'skill',
+          blocking: true,
+          status: 'passed',
+          summary: 'adapter returned a report without capability attestation',
+          findings: [],
+        },
       }],
       latest: null,
     });
@@ -20159,6 +20221,7 @@ test('route safety renders the TTY pause menu with explicit loop choices', async
     assert.match(menu, /fix\/review loops/i);
     assert.match(menu, /minutes/i);
     assert.match(menu, /AI review runs/i);
+    assert.match(menu, /lacks compatible capability evidence/);
     assert.doesNotMatch(menu, /\bbudget\b|\bcap\b/i);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -20254,7 +20317,7 @@ test('review and route blockers retain both failed report and diagnostics before
 
     const review = JSON.parse(runCli(['run', 'review', '--json'], created.worktreePath, {}, true).stdout);
     assert.equal(review.status, 'failed');
-    assert.match(review.message, /Failed gate details:/);
+    assert.match(review.message, /Review evidence details:/);
     assert.match(review.message, /Report:\n\s+retained finding: null input crashes/);
     assert.match(review.message, /Diagnostics:\n\s+provider diagnostic: model exited cleanly/);
 
@@ -25528,6 +25591,23 @@ test('dashboard action runner allows sequential recovery inputs', () => {
   const html = readFileSync(path.join(KIT_ROOT, 'src', 'dashboard', 'public', 'index.html'), 'utf8');
 
   assert.match(html, /attempt < 4/);
+});
+
+test('dashboard presents current review identity, all findings, sanitized reports, and structured preflight evidence', () => {
+  const html = readFileSync(path.join(KIT_ROOT, 'src', 'dashboard', 'public', 'index.html'), 'utf8');
+
+  assert.match(html, /id="review-panel"/);
+  assert.match(html, /function reviewPresentationMarkup\(presentation/);
+  assert.match(html, /Recent evidence \(not current\)/);
+  assert.match(html, /Unrelated recent history is never substituted as current evidence/);
+  assert.match(html, /escapeHtml\(finding\.title\)/);
+  assert.match(html, /escapeHtml\(gate\.report\.text\)/);
+  assert.match(html, /escapeHtml\(gate\.diagnostics\.text\)/);
+  assert.match(html, /preflightData\.review/);
+  assert.match(html, /state\.lastPreflight\?\.data\?\.preflight\?\.review/);
+  assert.match(html, /state\.lastPreflight = null;\s+state\.lastActionContext/);
+  assert.match(html, /presentation\.relation !== 'recent' && presentation\.nextAction/);
+  assert.ok(html.indexOf('const gateMarkup') < html.indexOf("const next = presentation.relation !== 'recent'"));
 });
 
 test('dashboard branch ledger keeps its headers sticky while rows scroll', () => {
@@ -34634,7 +34714,89 @@ test('artifact coordinator keeps signer and ledger-save failures from creating f
   }
 });
 
-test('strict karpathy execution requires intent and trusted contract, adapts native JSON, and retains every finding', () => {
+test('review presentation projects bounded artifacts, all severities, and control-safe protocol details', async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-presentation-'));
+  const artifacts = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-artifacts.ts'));
+  const output = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-output.ts'));
+  try {
+    const reference = artifacts.persistReviewArtifact({
+      root,
+      runId: 'review-presentation',
+      gateRecordId: 'karpathy-diff',
+      report: `\u001b[31m<script>full report</script>${'x'.repeat(70 * 1024)}\u001b[0m`,
+      diagnostics: '\u001b]0;spoofed-title\u0007provider diagnostic',
+    });
+    artifacts.releaseReviewArtifactLease(root, 'review-presentation');
+    const now = '2026-07-13T00:00:00.000Z';
+    const record = {
+      id: 'review-presentation', branchName: 'codex/presentation', sha: 'a'.repeat(40), status: 'failed', dryRun: false,
+      startedAt: now, finishedAt: now, durationMs: 1, changedFiles: ['src/example.ts'],
+      enforcementMode: 'strict-v3', policyVersion: 3,
+      gates: [{
+        id: 'gate-presentation', gateId: 'karpathy-diff', phase: 'ai-diff', type: 'skill', blocking: true, status: 'failed',
+        summary: 'Three findings', errorCode: 'EREVIEWPROTOCOL', errorMessage: '\u001b[2Jmalformed envelope',
+        startedAt: now, finishedAt: now, durationMs: 1, reportArtifact: reference,
+        findings: [
+          { id: 'F001', severity: 'critical', title: 'First finding' },
+          { id: 'F002', severity: 'warning', title: 'Second finding' },
+          { id: 'F003', severity: 'nit', title: 'Third finding' },
+        ],
+      }],
+    };
+    const presentation = output.projectReviewRun(record, { artifactRoot: root, relation: 'current' });
+    assert.equal(presentation.counts.findings.blocking, 2);
+    assert.equal(presentation.counts.findings.advisory, 1);
+    assert.deepEqual(presentation.gates[0].findings.map((finding) => finding.id), ['F001', 'F002', 'F003']);
+    assert.equal(presentation.gates[0].report.source, 'artifact');
+    assert.match(presentation.gates[0].report.text, /^<script>full report<\/script>/);
+    assert.equal(presentation.gates[0].report.truncated, true);
+    assert.ok(Buffer.byteLength(presentation.gates[0].report.text, 'utf8') <= 64 * 1024);
+    assert.equal(presentation.gates[0].diagnostics.text, 'provider diagnostic');
+    assert.doesNotMatch(JSON.stringify(presentation), /\u001b|spoofed-title/);
+    assert.match(presentation.gates[0].protocolErrors[0], /EREVIEWPROTOCOL: malformed envelope/);
+    const rendered = output.renderReviewPresentation(presentation).join('\n');
+    assert.ok(rendered.indexOf('First finding') < rendered.indexOf('Second finding'));
+    assert.ok(rendered.indexOf('Second finding') < rendered.indexOf('Third finding'));
+    assert.ok(rendered.indexOf('Third finding') < rendered.indexOf('Report'));
+
+    const corrupt = output.projectReviewRun({ ...record, gates: [{ ...record.gates[0], reportArtifact: { ...reference, digest: '0'.repeat(64) } }] }, { artifactRoot: root });
+    assert.match(corrupt.gates[0].protocolErrors.join('\n'), /Artifact integrity:/);
+
+    const advisoryReference = artifacts.persistReviewArtifact({
+      root,
+      runId: 'review-advisory',
+      gateRecordId: 'karpathy-diff',
+      report: 'Advisory-only report',
+      diagnostics: '',
+    });
+    artifacts.releaseReviewArtifactLease(root, 'review-advisory');
+    const advisoryRecord = {
+      ...record,
+      id: 'review-advisory',
+      status: 'passed',
+      gates: [{
+        ...record.gates[0],
+        id: 'gate-advisory',
+        status: 'passed',
+        summary: 'Advisory only',
+        errorCode: null,
+        errorMessage: null,
+        reportArtifact: advisoryReference,
+        findings: [{ id: 'F001', severity: 'nit', title: 'Advisory finding' }],
+      }],
+    };
+    const advisory = output.projectReviewRun(advisoryRecord, { artifactRoot: root, relation: 'current' });
+    assert.equal(advisory.counts.findings.blocking, 0);
+    assert.equal(advisory.counts.findings.advisory, 1);
+    assert.equal(advisory.gates[0].diagnostics, null);
+    assert.match(output.renderReviewPresentation(advisory).join('\n'), /Advisory finding/);
+    assert.equal(advisory.nextAction.command, '/pr');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('strict karpathy execution requires intent and trusted contract, adapts native JSON, and retains every finding', async () => {
   const repoRoot = createRepo();
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-strict-codex-'));
   const sentinel = path.join(codexHome, 'provider-invoked');
@@ -34681,6 +34843,36 @@ test('strict karpathy execution requires intent and trusted contract, adapts nat
     assert.ok(review.message.indexOf('Third finding') < review.message.indexOf('Recommended: repair failed blocking gates'));
     assert.ok(review.message.indexOf('Recommended: repair failed blocking gates') < review.message.indexOf('Proceed anyway only with exact-scope informed consent'));
     assert.match(review.message, /review override --gate karpathy-diff --scope \/pr/);
+    const snapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    const presentation = snapshot.data.review.current.presentation;
+    assert.deepEqual(presentation.gates[0].findings.map((entry) => entry.id), ['F001', 'F002', 'F003']);
+    assert.equal(presentation.counts.findings.blocking, 2);
+    assert.equal(presentation.counts.findings.advisory, 1);
+    assert.match(presentation.gates[0].report.text, /Full reviewer report/);
+    const statusOutput = runCli(['run', 'status'], repoRoot).stdout;
+    assert.match(statusOutput, /REVIEW/);
+    assert.match(statusOutput, /First finding/);
+    assert.match(statusOutput, /Second finding/);
+    assert.match(statusOutput, /Third finding/);
+    assert.ok(statusOutput.indexOf('Third finding') < statusOutput.indexOf('next: \/pipelane review'));
+    const stateModule = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const enforcementModule = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-enforcement.ts'));
+    const evidence = enforcementModule.evaluateReviewEvidenceForPr(stateModule.resolveWorkflowContext(repoRoot), { command: '/pr' });
+    assert.equal(evidence.allowed, false);
+    assert.match(evidence.message, /Findings \(2 blocking, 1 advisory\)/);
+    assert.ok(evidence.message.indexOf('First finding') < evidence.message.indexOf('Second finding'));
+    assert.ok(evidence.message.indexOf('Second finding') < evidence.message.indexOf('Third finding'));
+    assert.ok(evidence.message.indexOf('Third finding') < evidence.message.indexOf('Recommended:'));
+    assert.ok(evidence.message.indexOf('Recommended:') < evidence.message.indexOf('Proceed anyway only with explicit informed consent'));
+    const deployBlocker = enforcementModule.formatReviewEvidenceBlocker(
+      stateModule.resolveWorkflowContext(repoRoot),
+      evidence.issues,
+      '/deploy staging',
+    );
+    assert.match(deployBlocker, /\/deploy staging blocked/);
+    assert.match(deployBlocker, /Findings \(2 blocking, 1 advisory\)/);
+    assert.ok(deployBlocker.indexOf('Third finding') < deployBlocker.indexOf('Recommended:'));
+    assert.match(deployBlocker, /--scope="\/deploy staging"/);
     const ledger = JSON.parse(readFileSync(review.evidencePath, 'utf8'));
     assert.equal(ledger.records[0].intent.source, 'explicit-unbound');
     assert.match(ledger.records[0].target.targetDigest, /^[a-f0-9]{64}$/);

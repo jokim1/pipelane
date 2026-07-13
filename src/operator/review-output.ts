@@ -1,32 +1,331 @@
-import type { ReviewGateRunRecord } from './state.ts';
+import type {
+  ReviewFindingSeverity,
+  ReviewGateRunRecord,
+  ReviewRunRecord,
+} from './state.ts';
 import { sanitizeForTerminal } from './text-output.ts';
 import { readVerifiedReviewArtifact } from './review-artifacts.ts';
 
 const REVIEW_GATE_RESULT_LINE = /^PIPELANE_REVIEW_GATE_RESULT=(?:passed|failed|\{.*\})\s*$/gm;
 
+export type ReviewPresentationRelation = 'current' | 'recent' | 'embedded';
+export type ReviewPresentationTextSource = 'artifact' | 'legacy-stdout' | 'legacy-stderr';
+
+export interface ReviewFindingPresentation {
+  id: string;
+  severity: ReviewFindingSeverity;
+  title: string;
+  location: string | null;
+}
+
+export interface ReviewPresentationText {
+  text: string;
+  source: ReviewPresentationTextSource;
+  bytes: number | null;
+  truncated: boolean;
+  diagnosticOnly: boolean;
+}
+
+export interface ReviewGatePresentation {
+  gateId: string;
+  phase: ReviewGateRunRecord['phase'];
+  type: ReviewGateRunRecord['type'];
+  blocking: boolean;
+  status: ReviewGateRunRecord['status'];
+  summary: string;
+  counts: {
+    critical: number;
+    warning: number;
+    nit: number;
+    blocking: number;
+    advisory: number;
+    total: number;
+  };
+  findings: ReviewFindingPresentation[];
+  report: ReviewPresentationText | null;
+  diagnostics: ReviewPresentationText | null;
+  protocolErrors: string[];
+  result: null | {
+    protocolVersion: number;
+    declaredStatus: 'passed' | 'failed';
+    effectiveStatus: 'passed' | 'failed';
+    blockingCount: number;
+    advisoryCount: number;
+    findingsKnown: boolean;
+    providerExitCode: number | null;
+    adapterExitCode: number;
+  };
+}
+
+export interface ReviewRunPresentation {
+  schemaVersion: 1;
+  relation: ReviewPresentationRelation;
+  runId: string;
+  status: ReviewRunRecord['status'];
+  branchName: string;
+  sha: string;
+  targetDigest: string | null;
+  enforcementMode: ReviewRunRecord['enforcementMode'] | null;
+  policyVersion: number | null;
+  counts: {
+    gates: {
+      total: number;
+      passed: number;
+      failed: number;
+      pending: number;
+      skipped: number;
+    };
+    findings: {
+      critical: number;
+      warning: number;
+      nit: number;
+      blocking: number;
+      advisory: number;
+      total: number;
+    };
+    protocolErrors: number;
+  };
+  gates: ReviewGatePresentation[];
+  nextAction: null | {
+    kind: 'repair-rerun' | 'complete-rerun' | 'continue';
+    summary: string;
+    command: string;
+  };
+}
+
+export interface ProjectReviewRunOptions {
+  artifactRoot?: string;
+  relation?: ReviewPresentationRelation;
+  includeReportText?: boolean;
+}
+
+export interface RenderReviewPresentationOptions {
+  gateIds?: Iterable<string>;
+  includePassed?: boolean;
+  includeGateHeader?: boolean;
+  indent?: string;
+}
+
 function visibleStream(value: string | undefined): string {
   return sanitizeForTerminal((value ?? '').replace(REVIEW_GATE_RESULT_LINE, '').trim());
 }
 
-export function visibleReviewGateFailureOutput(gate: ReviewGateRunRecord, artifactRoot?: string): string {
-  if (gate.status !== 'failed' && gate.status !== 'pending') return '';
-  const findings = (gate.findings ?? []).map((finding) =>
-    `- ${sanitizeForTerminal(finding.id)} [${sanitizeForTerminal(finding.severity)}] ${sanitizeForTerminal(finding.title)}${finding.location ? ` (${sanitizeForTerminal(finding.location)})` : ''}`
-  );
-  let report = visibleStream(gate.stdoutTail);
-  let diagnostics = visibleStream(gate.stderrTail);
-  if (artifactRoot && gate.reportArtifact) {
+function visible(value: string | undefined | null): string {
+  return sanitizeForTerminal(value ?? '');
+}
+
+function findingCounts(findings: ReviewFindingPresentation[]): ReviewGatePresentation['counts'] {
+  const critical = findings.filter((finding) => finding.severity === 'critical').length;
+  const warning = findings.filter((finding) => finding.severity === 'warning').length;
+  const nit = findings.filter((finding) => finding.severity === 'nit').length;
+  return {
+    critical,
+    warning,
+    nit,
+    blocking: critical + warning,
+    advisory: nit,
+    total: findings.length,
+  };
+}
+
+function legacyPresentationText(
+  text: string,
+  source: Extract<ReviewPresentationTextSource, 'legacy-stdout' | 'legacy-stderr'>,
+): ReviewPresentationText | null {
+  if (!text) return null;
+  return {
+    text,
+    source,
+    bytes: null,
+    truncated: false,
+    diagnosticOnly: false,
+  };
+}
+
+export function projectReviewGate(
+  gate: ReviewGateRunRecord,
+  artifactRoot?: string,
+  includeReportText = true,
+): ReviewGatePresentation {
+  const findings = (gate.findings ?? []).map((finding) => ({
+    id: visible(finding.id),
+    severity: finding.severity,
+    title: visible(finding.title),
+    location: finding.location ? visible(finding.location) : null,
+  }));
+  let report = includeReportText ? legacyPresentationText(visibleStream(gate.stdoutTail), 'legacy-stdout') : null;
+  let diagnostics = includeReportText ? legacyPresentationText(visibleStream(gate.stderrTail), 'legacy-stderr') : null;
+  const protocolErrors = [
+    gate.errorCode || gate.errorMessage
+      ? [visible(gate.errorCode), visible(gate.errorMessage)].filter(Boolean).join(': ')
+      : '',
+  ].filter(Boolean);
+
+  if (includeReportText && artifactRoot && gate.reportArtifact) {
     try {
       const artifact = readVerifiedReviewArtifact(artifactRoot, gate.reportArtifact);
-      report = visibleStream(artifact.report);
-      diagnostics = visibleStream(artifact.diagnostics);
+      const artifactReport = visibleStream(artifact.report);
+      const artifactDiagnostics = visibleStream(artifact.diagnostics);
+      report = artifactReport
+        ? {
+            text: artifactReport,
+            source: 'artifact',
+            bytes: gate.reportArtifact.reportBytes,
+            truncated: gate.reportArtifact.reportTruncated,
+            diagnosticOnly: gate.reportArtifact.diagnosticOnly === true,
+          }
+        : null;
+      diagnostics = artifactDiagnostics
+        ? {
+            text: artifactDiagnostics,
+            source: 'artifact',
+            bytes: gate.reportArtifact.diagnosticsBytes,
+            truncated: gate.reportArtifact.diagnosticsTruncated,
+            diagnosticOnly: gate.reportArtifact.diagnosticOnly === true,
+          }
+        : null;
     } catch (error) {
-      diagnostics = [diagnostics, `Artifact integrity: ${error instanceof Error ? error.message : String(error)}`].filter(Boolean).join('\n');
+      protocolErrors.push(`Artifact integrity: ${visible(error instanceof Error ? error.message : String(error))}`);
     }
   }
-  const sections: string[] = [];
-  if (findings.length > 0) sections.push('Findings:', ...findings);
-  if (report) sections.push(...(sections.length > 0 ? [''] : []), 'Report:', report);
-  if (diagnostics) sections.push(...(sections.length > 0 ? [''] : []), 'Diagnostics:', diagnostics);
-  return sections.join('\n');
+
+  return {
+    gateId: visible(gate.gateId),
+    phase: gate.phase,
+    type: gate.type,
+    blocking: gate.blocking,
+    status: gate.status,
+    summary: visible(gate.summary),
+    counts: findingCounts(findings),
+    findings,
+    report,
+    diagnostics,
+    protocolErrors,
+    result: gate.result
+      ? {
+          protocolVersion: gate.result.protocolVersion,
+          declaredStatus: gate.result.declaredStatus,
+          effectiveStatus: gate.result.effectiveStatus,
+          blockingCount: gate.result.blockingCount,
+          advisoryCount: gate.result.advisoryCount,
+          findingsKnown: gate.result.findingsKnown,
+          providerExitCode: gate.result.providerExitCode ?? null,
+          adapterExitCode: gate.result.adapterExitCode,
+        }
+      : null,
+  };
+}
+
+export function projectReviewRun(
+  record: ReviewRunRecord,
+  options: ProjectReviewRunOptions = {},
+): ReviewRunPresentation {
+  const includeReportText = options.includeReportText ?? (options.relation !== 'recent');
+  const gates = record.gates.map((gate) => projectReviewGate(gate, options.artifactRoot, includeReportText));
+  const gateCounts = {
+    total: gates.length,
+    passed: gates.filter((gate) => gate.status === 'passed').length,
+    failed: gates.filter((gate) => gate.status === 'failed').length,
+    pending: gates.filter((gate) => gate.status === 'pending').length,
+    skipped: gates.filter((gate) => gate.status === 'skipped').length,
+  };
+  const findingTotals = findingCounts(gates.flatMap((gate) => gate.findings));
+  const relation = options.relation ?? 'embedded';
+  const nextAction = relation === 'recent'
+    ? null
+    : record.status === 'failed'
+    ? {
+        kind: 'repair-rerun' as const,
+        summary: 'Repair every blocking finding or evidence error, then rerun review.',
+        command: '/pipelane review',
+      }
+    : record.status === 'pending'
+      ? {
+          kind: 'complete-rerun' as const,
+          summary: 'Complete pending evidence, then rerun review.',
+          command: '/pipelane review',
+        }
+      : {
+          kind: 'continue' as const,
+          summary: 'Review evidence passed; continue to PR when ready.',
+          command: '/pr',
+        };
+  return {
+    schemaVersion: 1,
+    relation,
+    runId: visible(record.id),
+    status: record.status,
+    branchName: visible(record.branchName),
+    sha: visible(record.sha),
+    targetDigest: record.target?.targetDigest ? visible(record.target.targetDigest) : null,
+    enforcementMode: record.enforcementMode ?? null,
+    policyVersion: record.policyVersion ?? null,
+    counts: {
+      gates: gateCounts,
+      findings: findingTotals,
+      protocolErrors: gates.reduce((count, gate) => count + gate.protocolErrors.length, 0),
+    },
+    gates,
+    nextAction,
+  };
+}
+
+function renderFinding(finding: ReviewFindingPresentation): string {
+  return `- ${finding.id} [${finding.severity}] ${finding.title}${finding.location ? ` (${finding.location})` : ''}`;
+}
+
+export function renderReviewGatePresentation(
+  gate: ReviewGatePresentation,
+  options: Pick<RenderReviewPresentationOptions, 'includeGateHeader' | 'indent'> = {},
+): string[] {
+  const indent = options.indent ?? '';
+  const lines: string[] = [];
+  if (options.includeGateHeader !== false) {
+    lines.push(`${indent}- ${gate.gateId} [${gate.phase}] ${gate.status.toUpperCase()} (${gate.blocking ? 'blocking' : 'non-blocking'}) - ${gate.summary}`);
+  }
+  const contentIndent = options.includeGateHeader === false ? indent : `${indent}  `;
+  if (gate.findings.length > 0) {
+    lines.push(`${contentIndent}Findings (${gate.counts.blocking} blocking, ${gate.counts.advisory} advisory):`);
+    lines.push(...gate.findings.map((finding) => `${contentIndent}  ${renderFinding(finding)}`));
+  }
+  if (gate.report) {
+    const suffix = gate.report.truncated ? ' (truncated at the persisted evidence limit)' : '';
+    lines.push(`${contentIndent}Report${suffix}:`);
+    lines.push(...gate.report.text.split('\n').map((line) => `${contentIndent}  ${line}`));
+  }
+  if (gate.diagnostics) {
+    const suffix = gate.diagnostics.truncated ? ' (truncated at the persisted evidence limit)' : '';
+    lines.push(`${contentIndent}Diagnostics${suffix}:`);
+    lines.push(...gate.diagnostics.text.split('\n').map((line) => `${contentIndent}  ${line}`));
+  }
+  if (gate.protocolErrors.length > 0) {
+    lines.push(`${contentIndent}Protocol errors:`);
+    lines.push(...gate.protocolErrors.map((error) => `${contentIndent}  - ${error}`));
+  }
+  return lines;
+}
+
+export function renderReviewPresentation(
+  presentation: ReviewRunPresentation,
+  options: RenderReviewPresentationOptions = {},
+): string[] {
+  const gateIds = options.gateIds ? new Set(options.gateIds) : null;
+  const gates = presentation.gates.filter((gate) =>
+    (!gateIds || gateIds.has(gate.gateId))
+    && (
+      options.includePassed === true
+      || gate.status === 'failed'
+      || gate.status === 'pending'
+      || gate.findings.length > 0
+      || gate.protocolErrors.length > 0
+    )
+  );
+  return gates.flatMap((gate) => renderReviewGatePresentation(gate, options));
+}
+
+export function visibleReviewGateFailureOutput(gate: ReviewGateRunRecord, artifactRoot?: string): string {
+  if (gate.status !== 'failed' && gate.status !== 'pending') return '';
+  return renderReviewGatePresentation(projectReviewGate(gate, artifactRoot), {
+    includeGateHeader: false,
+  }).join('\n');
 }

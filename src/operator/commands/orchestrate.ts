@@ -63,6 +63,7 @@ import {
 } from '../review-identity.ts';
 import { reviewGateDefinitionHash } from '../review-enforcement.ts';
 import { appendArtifactBackedReviewRun } from '../review-artifacts.ts';
+import { projectReviewRun, renderReviewPresentation } from '../review-output.ts';
 import { buildReviewRunRecord, collectChangedFiles, collectReviewIntentCandidates } from './review.ts';
 import { closeSafeCompletedTaskWorkspaces } from './clean.ts';
 import {
@@ -872,7 +873,15 @@ async function runApprovedOrchestration(
     run,
     review: reviewResult ? summarizeEntryReview(reviewResult) : null,
     autoFix: autoFixResult ? summarizeEntryAutoFix(autoFixResult) : null,
-    message: appendOrchestrationDiagnostics(renderApprovedOrchestrationReport(run, finalLedgerPath || ledgerPath, planPath, startResult, reviewResult, autoFixResult), warnings, scan),
+    message: appendOrchestrationDiagnostics(renderApprovedOrchestrationReport(
+      run,
+      finalLedgerPath || ledgerPath,
+      planPath,
+      startResult,
+      reviewResult,
+      autoFixResult,
+      reviewArtifactRoot(context.commonDir, context.config),
+    ), warnings, scan),
   };
   return report;
 }
@@ -1854,6 +1863,7 @@ function renderApprovedOrchestrationReport(
   },
   reviewResult: ReviewCompletedSlicesResult | null,
   autoFixResult: ReviewAutoFixResult | null,
+  artifactRoot?: string,
 ): string {
   const lines = [
     'Pipelane orchestrate',
@@ -1876,6 +1886,10 @@ function renderApprovedOrchestrationReport(
     renderOrchestrationOutline(run),
   ];
   const pendingGateLines = reviewResult?.pendingCount ? formatPendingReviewGateInstructions(run) : [];
+  const reviewEvidenceLines = formatSliceReviewEvidence(run, artifactRoot);
+  if (reviewEvidenceLines.length > 0) {
+    lines.push('', 'Review evidence details:', ...reviewEvidenceLines);
+  }
   if (pendingGateLines.length > 0) {
     lines.push('', 'Pending gates:', ...pendingGateLines);
   }
@@ -2525,7 +2539,7 @@ function handleOrchestrationReview(cwd: string, parsed: ParsedOperatorArgs): voi
       dryRun: parsed.flags.reviewDryRun,
       gateFilter,
       phaseFilter,
-    }),
+    }, reviewArtifactRoot(context.commonDir, context.config)),
   };
 
   printResult(parsed.flags, report);
@@ -6388,6 +6402,7 @@ function renderOrchestrationReviewReport(
     gateFilter: string;
     phaseFilter: ReviewGatePhase | '';
   },
+  artifactRoot?: string,
 ): string {
   const lines = [
     'Pipelane orchestrate review',
@@ -6419,6 +6434,11 @@ function renderOrchestrationReviewReport(
         lines.push(`- ${slice.id}: ${slice.reviewStatus ?? 'unknown'} ${slice.runId ?? ''} (${slice.gateCount} gates)`);
       }
     }
+  }
+
+  const reviewEvidenceLines = formatSliceReviewEvidence(run, artifactRoot);
+  if (reviewEvidenceLines.length > 0) {
+    lines.push('', 'Review evidence details:', ...reviewEvidenceLines);
   }
 
   if (pendingGateLines.length > 0) {
@@ -6577,6 +6597,20 @@ function latestSliceReviewRecord(slice: OrchestrationSliceRecord): Orchestration
   return records.reduce<OrchestrationSliceReviewRecord | null>((latest, record) =>
     latest === null || record.reviewedAt > latest.reviewedAt ? record : latest
   , null);
+}
+
+function formatSliceReviewEvidence(run: OrchestrationRunRecord, artifactRoot?: string): string[] {
+  const lines: string[] = [];
+  for (const slice of selectActiveSlices(run)) {
+    const review = latestSliceReviewRecord(slice);
+    if (!review) continue;
+    const presentation = projectReviewRun(review.run, { artifactRoot, relation: 'embedded' });
+    const details = renderReviewPresentation(presentation, { indent: '  ' });
+    if (details.length === 0) continue;
+    lines.push(`- ${sanitizeForTerminal(slice.id)} [${sanitizeForTerminal(presentation.status)}]`);
+    lines.push(...details);
+  }
+  return lines;
 }
 
 function formatPendingReviewGateAction(gate: ReviewGateRunRecord): string {
