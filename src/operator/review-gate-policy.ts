@@ -1,6 +1,13 @@
-import type { ReviewGateType } from './state.ts';
+import type { ReviewEnforcementMode, ReviewFindingSeverity, ReviewGateType } from './state.ts';
 
-export const REVIEW_GATES_POLICY_VERSION = 2;
+export const LEGACY_REVIEW_GATES_POLICY_VERSION = 2;
+export const STRICT_REVIEW_GATES_POLICY_VERSION = 3;
+export const REVIEW_GATES_POLICY_VERSION = STRICT_REVIEW_GATES_POLICY_VERSION;
+export const RECOMMENDED_REVIEW_ENFORCEMENT_MODE: ReviewEnforcementMode = 'strict-v3';
+
+export function reviewPolicyVersionForMode(mode: ReviewEnforcementMode): number {
+  return mode === 'strict-v3' ? STRICT_REVIEW_GATES_POLICY_VERSION : LEGACY_REVIEW_GATES_POLICY_VERSION;
+}
 
 export type ReviewGatePolicyRole =
   | 'self-review'
@@ -13,6 +20,18 @@ export type ReviewGatePolicyRole =
   | 'high-stakes-human'
   | 'human-approval'
   | 'other';
+
+export type ReviewCapabilityPolicy = 'strict-skill' | 'role-equivalent' | 'manual-only';
+
+export interface ReviewGateExecutionPolicy {
+  role: ReviewGatePolicyRole;
+  capability: ReviewCapabilityPolicy;
+  trustedInstructionSource: 'machine-local' | 'not-applicable';
+  mutation: 'read-only' | 'fix-first' | 'manual';
+  blockingSeverities: ReviewFindingSeverity[];
+  advisorySeverities: ReviewFindingSeverity[];
+  manualReport: 'required' | 'not-required';
+}
 
 type ReviewGatePolicySubject =
   | { id: string; type: ReviewGateType }
@@ -43,6 +62,30 @@ export function reviewGatePolicyRole(gate: ReviewGatePolicySubject): ReviewGateP
   if (gate.type === 'approval') return 'human-approval';
   if (gate.type === 'command' || gate.type === 'pipelane') return 'deterministic';
   return 'other';
+}
+
+export function reviewGateExecutionPolicy(gate: ReviewGatePolicySubject): ReviewGateExecutionPolicy {
+  const id = 'gateId' in gate ? gate.gateId : gate.id;
+  const role = reviewGatePolicyRole(gate);
+  const aiGate = gate.type === 'skill' || gate.type === 'agent';
+  const capability: ReviewCapabilityPolicy = role === 'self-review' || role === 'instruction-audit'
+    ? 'strict-skill'
+    : gate.type === 'approval' || role === 'human-approval' || role === 'high-stakes-human'
+      ? 'manual-only'
+      : 'role-equivalent';
+  return {
+    role,
+    capability,
+    trustedInstructionSource: capability === 'strict-skill' ? 'machine-local' : 'not-applicable',
+    mutation: gate.type === 'approval' || role === 'human-approval' || role === 'high-stakes-human'
+      ? 'manual'
+      : id === 'gstack-review'
+        ? 'fix-first'
+        : 'read-only',
+    blockingSeverities: ['critical', 'warning'],
+    advisorySeverities: ['nit'],
+    manualReport: aiGate ? 'required' : 'not-required',
+  };
 }
 
 export function isIndependentAiReviewGate(gate: ReviewGatePolicySubject): boolean {

@@ -5,9 +5,11 @@ import {
   formatWorkflowCommand,
   loadAllTaskLocks,
   loadTaskLock,
+  legacyTaskBindingId,
   normalizeExistingPath,
   normalizePath,
   nowIso,
+  newTaskBindingId,
   printResult,
   removeTaskLock,
   resolveWorkflowContext,
@@ -27,6 +29,7 @@ import {
   resolveTaskCommandIdentity,
 } from '../task-workspaces.ts';
 import { inferTaskSlugsFromBranchName, resolveCommandSurfaces } from './helpers.ts';
+import { taskBriefFromFlags } from '../review-data.ts';
 
 interface WorktreeEntry {
   path: string;
@@ -36,6 +39,7 @@ interface WorktreeEntry {
 
 export async function handleAdopt(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const context = resolveWorkflowContext(cwd);
+  const requestedBrief = taskBriefFromFlags(parsed.flags.brief, parsed.flags.briefFile, 'adopt');
   const target = resolveAdoptTarget(context.repoRoot, context.commonDir, parsed.flags.branch);
   const command = formatWorkflowCommand(context.config, 'adopt');
 
@@ -79,6 +83,13 @@ export async function handleAdopt(cwd: string, parsed: ParsedOperatorArgs): Prom
   const sameBinding = existingLock
     && existingLock.branchName === target.branchName
     && normalizeExistingPath(existingLock.worktreePath) === normalizedTargetPath;
+  if (sameBinding && existingLock.taskBrief && requestedBrief && existingLock.taskBrief.digest !== requestedBrief.digest && !parsed.flags.force) {
+    throw new Error([
+      `Task ${taskName} already has an immutable brief for this binding.`,
+      'Changing it requires an audited new binding.',
+      `Rerun ${command} --task "${taskName}" --force --brief "<new objective>".`,
+    ].join('\n'));
+  }
   if (existingLock && !sameBinding && !parsed.flags.force) {
     throw new Error([
       `Task ${taskName} is already active with a different branch/worktree.`,
@@ -130,6 +141,7 @@ export async function handleAdopt(cwd: string, parsed: ParsedOperatorArgs): Prom
     config: context.config,
     taskSlug,
     taskName,
+    requestedBrief,
     branchName: target.branchName,
     worktreePath: target.path,
     mode: context.modeState.mode,
@@ -244,6 +256,7 @@ function saveAdoptedTaskLock(options: {
   config: WorkflowConfig;
   taskSlug: string;
   taskName: string;
+  requestedBrief?: TaskLock['taskBrief'];
   branchName: string;
   worktreePath: string;
   mode: TaskLock['mode'];
@@ -252,9 +265,25 @@ function saveAdoptedTaskLock(options: {
 }): TaskLock {
   const updatedAt = nowIso();
   const history = buildAdoptBindingHistory(options, updatedAt);
+  const sameBinding = Boolean(options.existingLock
+    && options.existingLock.branchName === options.branchName
+    && normalizeExistingPath(options.existingLock.worktreePath) === normalizeExistingPath(options.worktreePath));
+  const briefChangesBinding = Boolean(
+    sameBinding
+    && options.existingLock?.taskBrief
+    && options.requestedBrief
+    && options.existingLock.taskBrief.digest !== options.requestedBrief.digest
+  );
+  const retainBinding = sameBinding && !briefChangesBinding;
   return saveTaskLock(options.commonDir, options.config, options.taskSlug, {
     taskSlug: options.taskSlug,
     taskName: options.taskName,
+    taskBindingId: retainBinding
+      ? options.existingLock?.taskBindingId ?? legacyTaskBindingId(options.config, options.existingLock!)
+      : newTaskBindingId(),
+    taskBrief: retainBinding
+      ? options.existingLock?.taskBrief ?? options.requestedBrief
+      : options.requestedBrief,
     branchName: options.branchName,
     worktreePath: options.worktreePath,
     mode: options.existingLock?.mode ?? options.mode,

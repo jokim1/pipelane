@@ -1,5 +1,9 @@
+import { createHash } from 'node:crypto';
+
 import {
+  ensureTaskBindingId,
   formatWorkflowCommand,
+  loadAllTaskLocks,
   loadTaskLock,
   printResult,
   resolveWorkflowContext,
@@ -15,6 +19,7 @@ import {
   evaluateReviewEvidenceForPr,
   formatReviewEvidenceOverrideMessage,
   recordReviewEvidenceOverride,
+  recordReviewEvidenceConsents,
   reviewEvidenceOverrideReason,
   type ReviewEvidenceTarget,
 } from '../review-enforcement.ts';
@@ -53,7 +58,7 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
 
   const reviewTarget = resolveReviewEvidenceTargetForPr(context, pr);
   const reviewOverrideReason = reviewEvidenceOverrideReason(parsed.flags);
-  let reviewOverrideApplied = Boolean(reviewOverrideReason);
+  let reviewOverrideApplied = false;
   reviewOverrideApplied = assertReviewEvidenceReadyForMerge(cwd, parsed, context, reviewTarget) || reviewOverrideApplied;
 
   watchPrChecks(context.repoRoot, pr.number);
@@ -62,6 +67,27 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
   const checkedReviewTarget = resolveReviewEvidenceTargetForPr(context, checkedPr);
   reviewOverrideApplied = assertReviewEvidenceReadyForMerge(cwd, parsed, context, checkedReviewTarget) || reviewOverrideApplied;
   if (reviewOverrideApplied) {
+    const finalEvidence = evaluateReviewEvidenceForPr(context, {
+      command: formatWorkflowCommand(context.config, 'merge'),
+      target: checkedReviewTarget,
+    });
+    if (!finalEvidence.allowed) {
+      recordReviewEvidenceConsents(
+        context,
+        finalEvidence,
+        formatWorkflowCommand(context.config, 'merge'),
+        reviewOverrideReason,
+        'gate-bypass',
+        checkedReviewTarget,
+      );
+      const consented = evaluateReviewEvidenceForPr(context, {
+        command: formatWorkflowCommand(context.config, 'merge'),
+        target: checkedReviewTarget,
+      });
+      if (!consented.allowed) {
+        throw new Error('Exact-scope review consent did not authorize the final merge target; no merge was attempted.');
+      }
+    }
     recordReviewEvidenceOverride(context, formatWorkflowCommand(context.config, 'merge'), reviewOverrideReason);
   }
   const reviewOverrideMessage = reviewOverrideApplied
@@ -197,6 +223,17 @@ function resolveReviewEvidenceTargetForPr(context: WorkflowContext, pr: LivePr):
     ].join('\n'));
   }
 
+  const lock = loadAllTaskLocks(context.commonDir, context.config).find((candidate) => candidate.branchName === branchName);
+  const taskBindingId = lock
+    ? ensureTaskBindingId(context.commonDir, context.config, lock.taskSlug)?.taskBindingId ?? ''
+    : '';
+  const reviewTargetDigest = createHash('sha256').update(JSON.stringify({
+    version: 2,
+    branchName,
+    sha,
+    worktreeStatusDigest: '',
+    worktreeMaterialTreeHash: treeHash,
+  })).digest('hex');
   return {
     branchName,
     sha,
@@ -206,6 +243,8 @@ function resolveReviewEvidenceTargetForPr(context: WorkflowContext, pr: LivePr):
     worktreeMaterialTreeHash: treeHash,
     worktreeMaterialTreeReliable: true,
     worktreeMaterialTreeWarnings: [],
+    taskBindingId,
+    reviewTargetDigest,
     headLabel: `PR branch ${branchName} HEAD`,
   };
 }

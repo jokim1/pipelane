@@ -62,7 +62,8 @@ import {
   resolveReviewActorIdentity,
 } from '../review-identity.ts';
 import { reviewGateDefinitionHash } from '../review-enforcement.ts';
-import { buildReviewRunRecord, collectChangedFiles } from './review.ts';
+import { appendArtifactBackedReviewRun } from '../review-artifacts.ts';
+import { buildReviewRunRecord, collectChangedFiles, collectReviewIntentCandidates } from './review.ts';
 import { closeSafeCompletedTaskWorkspaces } from './clean.ts';
 import {
   DEFAULT_GOAL_PROVIDER,
@@ -77,6 +78,8 @@ import {
   runGit,
   loadReviewAcceptanceState,
   loadReviewState,
+  appendReviewRunRecord,
+  reviewArtifactRoot,
   isStableEvidenceId,
   type ParsedOperatorArgs,
   type ReviewAcceptanceRecord,
@@ -3100,6 +3103,7 @@ function reviewCompletedSlices(
     writeOrchestrationReviewProgress(options, `reviewing slice ${slice.id} (${sliceIndex + 1}/${selectedSlices.length}) in ${sliceRepoRoot}`);
     const sliceContext = buildSliceReviewContext(context, sliceRepoRoot);
     const reviewBaseRef = reviewBaseRefForRun(context, run);
+    const intent = collectReviewIntentCandidates(sliceContext, { orchestrationOutcome: slice.outcome });
     const reviewRun = attachAttestedManualGateEvidence(sliceContext, buildReviewRunRecord({
       repoRoot: sliceRepoRoot,
       commonDir: sliceContext.commonDir,
@@ -3110,6 +3114,8 @@ function reviewCompletedSlices(
       gateFilter: options.gateFilter,
       phaseFilter: options.phaseFilter,
       activeSurfaces: resolveSliceActiveSurfaces(context, run, slice),
+      intentCandidates: intent.candidates,
+      taskBindingId: intent.taskBindingId,
       profileContext: {
         runProfile: run.baselinePreflight?.profile ?? 'implementation',
         sliceProfile: slice.reviewProfile ?? 'implementation',
@@ -3121,6 +3127,11 @@ function reviewCompletedSlices(
         writeOrchestrationReviewProgress(options, `slice ${slice.id}: gate ${gate.gateId} ${gate.status} after ${gate.durationMs}ms - ${gate.summary}`);
       },
     }));
+    appendArtifactBackedReviewRun({
+      root: reviewArtifactRoot(sliceContext.commonDir, sliceContext.config),
+      runId: reviewRun.id,
+      appendRecord: () => appendReviewRunRecord(sliceContext.commonDir, sliceContext.config, reviewRun),
+    });
     const reviewRecord = buildSliceReviewRecord(context, run, slice, reviewRun);
     if (options.requireGates && reviewRun.gates.length === 0) {
       appendSliceReviewDiagnostic(slice, reviewRecord);
