@@ -178,8 +178,9 @@ export function buildActionPreflightEnvelope(cwd: string, actionId: StableAction
 
   const context = resolveWorkflowContext(cwd);
   assertTaskApiActionWorktree(context, actionId, parsed);
-  const destinationPlan = buildRoutePlanForAction(cwd, actionId, parsed);
-  const normalizedInputs = normalizeInputs(actionId, parsed, cwd, destinationPlan);
+  const routePlan = buildRoutePlanForAction(cwd, actionId, parsed);
+  const destinationPlan = routePlan.destinationPlan;
+  const normalizedInputs = normalizeInputs(actionId, parsed, cwd, destinationPlan, routePlan.error);
   const risky = API_RISKY_ACTION_IDS.has(actionId);
   const requiresConfirmation = actionRequiresConfirmation(actionId, normalizedInputs);
   const checkedAt = nowIso();
@@ -650,8 +651,9 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
 
   const context = resolveWorkflowContext(cwd);
   assertTaskApiActionWorktree(context, actionId, parsed);
-  const destinationPlan = buildRoutePlanForAction(cwd, actionId, parsed);
-  const normalizedInputs = normalizeInputs(actionId, parsed, cwd, destinationPlan);
+  const routePlan = buildRoutePlanForAction(cwd, actionId, parsed);
+  const destinationPlan = routePlan.destinationPlan;
+  const normalizedInputs = normalizeInputs(actionId, parsed, cwd, destinationPlan, routePlan.error);
   const risky = API_RISKY_ACTION_IDS.has(actionId);
   const requiresConfirmation = actionRequiresConfirmation(actionId, normalizedInputs);
   const checkedAt = nowIso();
@@ -903,12 +905,22 @@ function isRouteActionId(actionId: StableActionId): boolean {
     || actionId === 'route.deploy.prod';
 }
 
-function buildRoutePlanForAction(cwd: string, actionId: StableActionId, parsed: ParsedOperatorArgs): DestinationPlan | null {
-  if (!isRouteActionId(actionId)) return null;
+function buildRoutePlanForAction(
+  cwd: string,
+  actionId: StableActionId,
+  parsed: ParsedOperatorArgs,
+): { destinationPlan: DestinationPlan | null; error: string } {
+  if (!isRouteActionId(actionId)) return { destinationPlan: null, error: '' };
   try {
-    return buildDestinationPlanForCommand(cwd, parsedForRouteAction(actionId, parsed));
-  } catch {
-    return null;
+    return {
+      destinationPlan: buildDestinationPlanForCommand(cwd, parsedForRouteAction(actionId, parsed)),
+      error: '',
+    };
+  } catch (error) {
+    return {
+      destinationPlan: null,
+      error: error instanceof Error ? error.message : String(error),
+    };
   }
 }
 
@@ -927,6 +939,7 @@ function normalizeInputs(
   parsed: ParsedOperatorArgs,
   cwd?: string,
   destinationPlan?: DestinationPlan | null,
+  routePlanError = '',
 ): Record<string, unknown> {
   const { flags } = parsed;
   switch (actionId) {
@@ -974,7 +987,7 @@ function normalizeInputs(
         override: flags.override,
         reason: flags.reason,
         route: destinationPlan?.fingerprintInputs,
-        routeBlockers: destinationPlan?.blockers ?? ['route could not be planned'],
+        routeBlockers: destinationPlan?.blockers ?? [routePlanError || 'route could not be planned'],
       };
     case 'clean.plan':
       return {};

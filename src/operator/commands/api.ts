@@ -1,4 +1,4 @@
-import type { ParsedOperatorArgs } from '../state.ts';
+import { assertOnlyFlags, type OperatorFlagKey, type ParsedOperatorArgs } from '../state.ts';
 import { buildBranchDetailsEnvelope, buildBranchPatchEnvelope } from '../api/branch.ts';
 import { buildWorkflowApiSnapshot } from '../api/snapshot.ts';
 import {
@@ -49,6 +49,13 @@ export async function handleApi(cwd: string, parsed: ParsedOperatorArgs): Promis
       );
     }
 
+    assertOnlyFlags(parsed, [
+      ...API_ACTION_INPUT_FLAGS[actionId],
+      'execute',
+      'confirmToken',
+      'autoConfirm',
+    ]);
+
     const execute = parsed.flags.execute ?? false;
     let confirmToken = parsed.flags.confirmToken ?? '';
 
@@ -81,3 +88,25 @@ export async function handleApi(cwd: string, parsed: ParsedOperatorArgs): Promis
     `Unknown api subcommand "${subcommand}". Supported: snapshot, branch, action.`,
   );
 }
+
+const API_ACTION_INPUT_FLAGS: Record<(typeof STABLE_ACTION_IDS)[number], OperatorFlagKey[]> = {
+  new: ['task', 'offline'],
+  resume: ['task'],
+  'devmode.build': ['task'],
+  'devmode.release': ['task', 'surfaces', 'override', 'reason'],
+  'taskLock.verify': ['task', 'mode'],
+  pr: ['task', 'title', 'message', 'recover', 'bindingFingerprint', 'override', 'reason'],
+  merge: ['task', 'pr', 'override', 'reason'],
+  'deploy.staging': ['task', 'pr', 'sha', 'surfaces'],
+  'deploy.prod': ['task', 'pr', 'sha', 'surfaces'],
+  'route.merge': ['task', 'pr', 'title', 'message', 'override', 'reason'],
+  'route.deploy.staging': ['task', 'pr', 'sha', 'surfaces', 'title', 'message'],
+  'route.deploy.prod': ['task', 'pr', 'sha', 'surfaces', 'title', 'message'],
+  'clean.plan': [],
+  'clean.apply': ['task', 'allStale'],
+  'doctor.diagnose': [],
+  'doctor.probe': [],
+  'git.catchupBase': [],
+  'rollback.staging': ['task', 'surfaces'],
+  'rollback.prod': ['task', 'surfaces'],
+};

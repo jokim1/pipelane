@@ -27358,6 +27358,35 @@ test('api confirmation flags are explicit, machine-readable, 30-minute, and opti
   }
 });
 
+test('api actions reject flags that their underlying command would ignore', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+
+    const ignoredTitle = runCli([
+      'run', 'api', 'action', 'doctor.diagnose', '--title', 'silently lost', '--json',
+    ], repoRoot, {}, true);
+    assert.equal(ignoredTitle.status, 1);
+    assert.match(ignoredTitle.stderr, /api does not accept flag\(s\): --title/);
+
+    const obsoleteSmokeFlag = runCli([
+      'run', 'api', 'action', 'deploy.staging', '--skip-smoke-coverage', '--json',
+    ], repoRoot, {}, true);
+    assert.equal(obsoleteSmokeFlag.status, 1);
+    assert.match(obsoleteSmokeFlag.stderr, /api does not accept flag\(s\): --skip-smoke-coverage/);
+
+    for (const actionId of ['deploy.prod', 'route.deploy.prod']) {
+      const invalidReason = runCli([
+        'run', 'api', 'action', actionId, '--reason', 'accepted by preview but rejected by execute', '--json',
+      ], repoRoot, {}, true);
+      assert.equal(invalidReason.status, 1, actionId);
+      assert.match(invalidReason.stderr, /api does not accept flag\(s\): --reason/, actionId);
+    }
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('api action preflight: clean.apply without scope returns allowed:false state:blocked and no token', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
@@ -30135,6 +30164,34 @@ test('api deploy preflight in an un-onboarded repo blocks with guided setup', ()
     } finally {
       rmSync(repoRoot, { recursive: true, force: true });
     }
+  }
+});
+
+test('api route preflight preserves an exact destination-planning error', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigState(repoRoot);
+
+    const result = runCli(
+      ['run', 'api', 'action', 'route.deploy.staging', '--surfaces', 'worker'],
+      repoRoot,
+      {},
+      true,
+    );
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 1);
+    assert.equal(output.ok, false);
+    assert.match(output.message, /unsupported surface "worker"/i);
+    assert.deepEqual(
+      output.data.preflight.normalizedInputs.routeBlockers,
+      [output.message],
+    );
+    assert.doesNotMatch(output.message, /route could not be planned/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
   }
 });
 
