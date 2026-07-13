@@ -75,7 +75,7 @@ import {
   type ShellRelationshipState,
   type SourceHealthEntry,
 } from './envelope.ts';
-import { evaluateReviewEvidenceForPr, type ReviewEvidenceCheckResult } from '../review-enforcement.ts';
+import { evaluateReviewEvidenceForPr, selectCurrentReviewEvidenceRecord, type ReviewEvidenceCheckResult } from '../review-enforcement.ts';
 
 export interface BranchLanes {
   local: ApiStatusCell;
@@ -289,6 +289,10 @@ export interface SnapshotData {
     overallFreshness: ReturnType<typeof buildFreshness>;
   };
   review: {
+    schemaVersion: 2;
+    current: ReviewRunRecord | null;
+    recent: ReviewRunRecord | null;
+    /** @deprecated Use current. Removed in 0.3.0. */
     latest: ReviewRunRecord | null;
     latestOverride: ReviewOverrideRecord | null;
   };
@@ -312,6 +316,8 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
   const deployState = loadDeployState(context.commonDir, context.config);
   const reviewState = loadReviewState(context.commonDir, context.config);
   const reviewEvidence = evaluateReviewEvidenceForPr(context);
+  const currentReview = selectCurrentReviewEvidenceRecord(context, reviewState.records);
+  const recentReview = reviewState.records.find((record) => record.id !== currentReview?.id) ?? null;
   const reviewHealth = summarizeReviewEvidenceHealth(reviewEvidence);
   const orchestrationScan = scanOrchestrationRunDiagnostics(context.commonDir, context.config);
   const orchestration = buildOrchestrationSnapshot(context.commonDir, context.config, currentBranch, orchestrationScan);
@@ -408,7 +414,7 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
       observedAt: runtimeObservation.observedAt,
     }),
     buildSourceHealthEntry({
-      name: 'review.latest',
+      name: 'review.current',
       state: reviewHealth.state,
       blocking: reviewHealth.blocking,
       reason: reviewHealth.reason,
@@ -534,7 +540,10 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
         overallFreshness: buildFreshness({ checkedAt }),
       },
       review: {
-        latest: reviewEvidence.latest ?? reviewState.records[0] ?? null,
+        schemaVersion: 2,
+        current: currentReview,
+        recent: recentReview,
+        latest: currentReview,
         latestOverride: reviewState.overrides[0] ?? null,
       },
       orchestration,

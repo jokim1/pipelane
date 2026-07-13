@@ -6,6 +6,7 @@ import path from 'node:path';
 export const DEPLOY_STATE_KEY_ENV = 'PIPELANE_DEPLOY_STATE_KEY';
 export const PROBE_STATE_KEY_ENV = 'PIPELANE_PROBE_STATE_KEY';
 export const REVIEW_STATE_KEY_ENV = 'PIPELANE_REVIEW_STATE_KEY';
+export const REVIEW_CONSENT_STATE_KEY_ENV = 'PIPELANE_REVIEW_CONSENT_STATE_KEY';
 export const ORCHESTRATION_STATE_KEY_ENV = 'PIPELANE_ORCHESTRATION_STATE_KEY';
 export const ORCHESTRATION_STATE_KEY_FILE_ENV = 'PIPELANE_ORCHESTRATION_STATE_KEY_FILE';
 export const MIN_STATE_KEY_LENGTH = 32;
@@ -71,6 +72,16 @@ export function resolveReviewStateKey(): string | undefined {
   return resolveStateKey(REVIEW_STATE_KEY_ENV);
 }
 
+export function reviewConsentStateKeyPath(): string {
+  return path.join(pipelaneHomeDir(), 'keys', 'review-consent-state.key');
+}
+
+export function resolveReviewConsentStateKey(): string {
+  const explicit = resolveStateKey(REVIEW_CONSENT_STATE_KEY_ENV);
+  if (explicit) return validateRequiredStateKey(REVIEW_CONSENT_STATE_KEY_ENV, explicit);
+  return readOrCreatePersistedStateKey(reviewConsentStateKeyPath(), REVIEW_CONSENT_STATE_KEY_ENV);
+}
+
 function validateRequiredStateKey(name: string, raw: string | undefined, sourceLabel = name): string {
   if (raw === undefined) {
     throw new Error(`${name} is missing; set a signing key of at least ${MIN_STATE_KEY_LENGTH} characters before mutating or reading signed orchestration ledgers.`);
@@ -100,12 +111,15 @@ export function orchestrationStateKeyPath(): string {
 }
 
 function readOrCreatePersistedOrchestrationStateKey(): string {
-  const keyPath = orchestrationStateKeyPath();
+  return readOrCreatePersistedStateKey(orchestrationStateKeyPath(), ORCHESTRATION_STATE_KEY_ENV);
+}
+
+function readOrCreatePersistedStateKey(keyPath: string, envName: string): string {
   try {
     return validateRequiredStateKey(
-      ORCHESTRATION_STATE_KEY_ENV,
+      envName,
       readFileSync(keyPath, 'utf8'),
-      `${ORCHESTRATION_STATE_KEY_FILE_ENV} ${keyPath}`,
+      keyPath,
     );
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
@@ -129,9 +143,9 @@ function readOrCreatePersistedOrchestrationStateKey(): string {
     const err = error as NodeJS.ErrnoException;
     if (err.code !== 'EEXIST') throw error;
     return validateRequiredStateKey(
-      ORCHESTRATION_STATE_KEY_ENV,
+      envName,
       readFileSync(keyPath, 'utf8'),
-      `${ORCHESTRATION_STATE_KEY_FILE_ENV} ${keyPath}`,
+      keyPath,
     );
   }
 }

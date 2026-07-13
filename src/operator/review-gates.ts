@@ -10,6 +10,10 @@ import {
   type ReviewGatesConfig,
   type ReviewPlanGateConfig,
 } from './state.ts';
+import {
+  RECOMMENDED_REVIEW_ENFORCEMENT_MODE,
+  reviewPolicyVersionForMode,
+} from './review-gate-policy.ts';
 
 export type ReviewGateCatalogKind = 'plan' | 'review';
 
@@ -383,6 +387,8 @@ export function buildReviewGatesConfig(
     includeMissingCoreScripts: options.includeMissingCoreScripts === true,
   });
   return {
+    enforcementMode: RECOMMENDED_REVIEW_ENFORCEMENT_MODE,
+    policyVersion: reviewPolicyVersionForMode(RECOMMENDED_REVIEW_ENFORCEMENT_MODE),
     planReview: resolution.planReview,
     gates: options.includeRuntimeGates === false
       ? resolution.gates.filter((gate) => gate.id !== 'browser-qa')

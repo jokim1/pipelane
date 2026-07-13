@@ -4,7 +4,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync,
 import os from 'node:os';
 import path from 'node:path';
 
-import { computeUrlFingerprint, resolveProbeStateKey, resolveReviewStateKey, signSignedPayload, verifySignedPayload } from './integrity.ts';
+import { computeUrlFingerprint, resolveProbeStateKey, resolveReviewConsentStateKey, resolveReviewStateKey, signSignedPayload, verifySignedPayload } from './integrity.ts';
 import { buildDefaultReviewGatesConfig } from './review-gates.ts';
 
 export type Mode = 'build' | 'release';
@@ -61,6 +61,7 @@ export type ReviewPlanGatePhase = 'plan';
 export type ReviewGatePhase = 'static' | 'behavioral' | 'ai-diff' | 'instruction' | 'runtime' | 'human';
 export type ReviewGateType = 'command' | 'skill' | 'agent' | 'approval' | 'pipelane';
 export type ReviewProfile = 'docs-only' | 'implementation';
+export type ReviewEnforcementMode = 'legacy-v2' | 'strict-v3';
 
 export function isStableEvidenceId(value: unknown): value is string {
   return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(value);
@@ -95,6 +96,7 @@ export interface ReviewGateConfig {
 
 export interface ReviewGatesConfig {
   policyVersion?: number;
+  enforcementMode?: ReviewEnforcementMode;
   planReview?: {
     gates?: ReviewPlanGateConfig[];
   };
@@ -135,6 +137,33 @@ export interface ReviewAcceptanceRecord extends AcceptanceScope {
 }
 
 export interface ReviewAcceptanceState { records: ReviewAcceptanceRecord[]; }
+
+export type ReviewConsentKind = 'gate-bypass' | 'accept-findings' | 'manual-substitution';
+export type ReviewConsentGateState = ReviewGateRunStatus | 'missing' | 'unavailable' | 'malformed-protocol' | 'incomplete';
+
+export interface ReviewConsentRecord {
+  id: string;
+  kind: ReviewConsentKind;
+  gateId: string;
+  gateDefinitionHash: GateDefinitionHash;
+  policyVersion: number;
+  enforcementMode: ReviewEnforcementMode;
+  taskBindingId: string;
+  reviewRunId?: string;
+  originalGateState: ReviewConsentGateState;
+  branchName: string;
+  sha: string;
+  worktreeStatusDigest: string;
+  worktreeMaterialTreeHash: string;
+  reviewTargetDigest: string;
+  routeAction: string;
+  actor: ReviewActorIdentity;
+  source: string;
+  reason: string;
+  reasonHash: string;
+  recordedAt: string;
+  signature?: string;
+}
 
 export type OrchestrateGoalConfirmationMode = 'confirm' | 'auto' | 'off';
 export const GOAL_PROVIDERS = ['codex', 'claude', 'generic'] as const;
@@ -285,6 +314,8 @@ export interface ModeState {
 export interface TaskLock {
   taskSlug: string;
   taskName?: string;
+  taskBindingId?: string;
+  taskBrief?: TaskBrief;
   branchName: string;
   worktreePath: string;
   mode: Mode;
@@ -309,6 +340,14 @@ export interface TaskLock {
     toWorktreePath: string;
     fingerprint: string;
   }>;
+}
+
+export interface TaskBrief {
+  objective: string;
+  constraints: string[];
+  acceptanceCriteria: string[];
+  source: 'new' | 'adopt' | 'first-review' | 'rebind';
+  digest: string;
 }
 
 export const TASK_LOCK_STALE_MS = 72 * 60 * 60 * 1000;
@@ -373,6 +412,80 @@ export interface ActionState {
 export type ReviewGateRunStatus = 'passed' | 'failed' | 'skipped' | 'pending';
 export type ReviewRunStatus = 'passed' | 'failed' | 'pending';
 
+export type ReviewFindingSeverity = 'critical' | 'warning' | 'nit';
+
+export interface ReviewFinding {
+  id: string;
+  severity: ReviewFindingSeverity;
+  title: string;
+  location?: string;
+}
+
+export interface ReviewResultMetadata {
+  protocolVersion: 0 | 1;
+  declaredStatus: 'passed' | 'failed';
+  effectiveStatus: 'passed' | 'failed';
+  blockingCount: number;
+  advisoryCount: number;
+  findingsKnown: boolean;
+  providerExitCode?: number;
+  adapterExitCode: number;
+}
+
+export interface ReviewCapabilityEvidence {
+  requestedCapability: string;
+  effectiveCapability: 'contract-supplied-adapter' | 'role-equivalent-adapter' | 'manual-attestation' | 'unavailable';
+  adapter: string;
+  provider: string;
+  sourceKind?: string;
+  source?: string;
+  contractDigest?: string;
+  contractBytes?: number;
+  contractSupplied: boolean;
+  wrapperCompatible: boolean;
+}
+
+export interface ReviewReportArtifactReference {
+  path: string;
+  digest: string;
+  bytes: number;
+  reportBytes: number;
+  diagnosticsBytes: number;
+  reportTruncated: boolean;
+  diagnosticsTruncated: boolean;
+  diagnosticOnly?: boolean;
+}
+
+export interface ReviewIntent {
+  text: string;
+  source: 'explicit-unbound' | 'orchestration-slice' | 'task-brief';
+  digest: string;
+  taskBindingId?: string;
+}
+
+export interface ReviewIntentCandidate {
+  text: string;
+  source: ReviewIntent['source'];
+  authoritative: boolean;
+  taskBindingId?: string;
+}
+
+export interface ReviewTargetManifest {
+  baseBranchLabel: string;
+  baseTipOid: string;
+  mergeBaseOid: string;
+  headOid: string;
+  worktreeStatusDigest: string;
+  materialTreeHash: string;
+  serializationVersion: number;
+  baseTreeManifestDigest: string;
+  materialTreeManifestDigest: string;
+  changedFilesDigest: string;
+  ignorePolicyDigest: string;
+  machineFingerprint: string;
+  targetDigest: string;
+}
+
 export interface ReviewGateRunRecord {
   id: string;
   gateId: string;
@@ -395,6 +508,10 @@ export interface ReviewGateRunRecord {
   finishedAt: string;
   stdoutTail?: string;
   stderrTail?: string;
+  capability?: ReviewCapabilityEvidence;
+  result?: ReviewResultMetadata;
+  findings?: ReviewFinding[];
+  reportArtifact?: ReviewReportArtifactReference;
   skipReason?: string;
 }
 
@@ -424,6 +541,9 @@ export interface ReviewRunRecord {
   worktreeMaterialTreeWarnings?: string[];
   authorIdentity?: ReviewActorIdentity | null;
   reviewer?: ReviewActorIdentity;
+  taskBindingId?: string;
+  intent?: ReviewIntent;
+  target?: ReviewTargetManifest;
   gates: ReviewGateRunRecord[];
   signature?: string;
 }
@@ -442,9 +562,10 @@ export interface ReviewOverrideRecord {
 export interface ReviewState {
   records: ReviewRunRecord[];
   overrides: ReviewOverrideRecord[];
+  consents?: ReviewConsentRecord[];
 }
 
-export type RouteSafetyResumeKind = 'one-more-loop' | 'more-loops-and-minutes' | 'until-review-passes' | 'accept-findings';
+export type RouteSafetyResumeKind = 'one-more-loop' | 'more-loops-and-minutes' | 'until-review-passes' | 'accept-findings' | 'legacy-import' | 'legacy-fresh-start';
 
 export interface RouteSafetyResumeRecord {
   id: string;
@@ -458,9 +579,35 @@ export interface RouteSafetyResumeRecord {
   maxMoreMinutes?: number;
   acceptedFindings?: boolean;
   confirmation?: string;
+  reason?: string;
+  legacyMigrationAction?: 'import' | 'fresh-start';
+  legacyMigrationSourceDigest?: string;
+}
+
+export interface RouteSafetyAttemptRecord {
+  digest: string;
+  fingerprint: string;
+  headSha: string;
+  worktreeStatusDigest: string;
+  observedAt: string;
+  reviewRunId?: string;
+}
+
+export interface RouteSafetyLegacyMigration {
+  status: 'pending' | 'imported' | 'fresh-start';
+  candidateDigests: string[];
+  extraLoops?: number;
+  extraMinutes?: number;
+  decidedAt?: string;
+  reason?: string;
+  sourceDigest?: string;
 }
 
 export interface RouteSafetyRecord {
+  lineageVersion?: 1;
+  lineageDigest?: string;
+  lineageFingerprint?: string;
+  taskBindingId?: string;
   routeFingerprintDigest: string;
   routeFingerprint: string;
   targetCommand: string;
@@ -480,6 +627,10 @@ export interface RouteSafetyRecord {
   pausedAt?: string;
   pauseReason?: string;
   resumes?: RouteSafetyResumeRecord[];
+  attempts?: RouteSafetyAttemptRecord[];
+  currentAttemptDigest?: string;
+  acceptedAttemptDigest?: string;
+  legacyMigration?: RouteSafetyLegacyMigration;
 }
 
 export interface RouteSafetyState {
@@ -670,14 +821,18 @@ const REVIEW_STATE_FILENAME = 'review-state.json';
 const REVIEW_ACCEPTANCE_STATE_FILENAME = 'review-acceptance-state.json';
 const REVIEW_STATE_LOCK_FILENAME = 'review-state.lock';
 const ROUTE_SAFETY_STATE_FILENAME = 'route-safety-state.json';
+const ROUTE_SAFETY_STATE_LOCK_FILENAME = 'route-safety-state.lock';
 const REVIEW_STATE_MAX_RECORDS = 20;
 const REVIEW_OVERRIDE_MAX_RECORDS = 50;
 const REVIEW_ACCEPTANCE_MAX_RECORDS = 200;
+const REVIEW_CONSENT_MAX_RECORDS = 200;
 const ACTION_STATE_MAX_DECISIONS = 100;
 const REVIEW_STATE_LOCK_STALE_MS = 2 * 60 * 1000;
 const DEPLOY_CONFIG_FILENAME = 'deploy-config.json';
 const PROBE_STATE_FILENAME = 'probe-state.json';
 const TASK_LOCKS_DIRNAME = 'task-locks';
+const TASK_BINDING_LOCKS_DIRNAME = 'task-binding-locks';
+const TASK_BINDING_LOCK_STALE_MS = 2 * 60 * 1000;
 const TASK_CLEANUP_LOCKS_DIRNAME = 'task-cleanup-locks';
 const TASK_CLEANUP_LOCK_STALE_MS = 10 * 60 * 1000;
 const ORPHAN_CLEANUP_LOCKS_DIRNAME = 'orphan-cleanup-locks';
@@ -1164,7 +1319,22 @@ export function loadWorkflowConfig(repoRoot: string): WorkflowConfig {
   const fileKey = typeof parsed.projectKey === 'string' ? parsed.projectKey.trim() : '';
   const projectKey = fileKey || inferProjectKey(inferredName);
   const base = defaultWorkflowConfig(projectKey, inferredName, { repoRoot });
-  const merged = mergeWorkflowLayers(base, parsed);
+  // A persisted machine config identifies an existing repo. Missing mode is
+  // therefore a legacy-v2 compatibility choice, not permission to inherit a
+  // newly activated strict default. Only setup/migration writes strict-v3.
+  const parsedReviewGates = isRecord(parsed.reviewGates) ? parsed.reviewGates : {};
+  const persistedEnforcementMode = parsedReviewGates.enforcementMode === 'strict-v3'
+    ? 'strict-v3'
+    : 'legacy-v2';
+  const compatibleParsed: Partial<WorkflowConfig> = {
+    ...parsed,
+    reviewGates: {
+      ...parsedReviewGates,
+      enforcementMode: persistedEnforcementMode,
+      policyVersion: persistedEnforcementMode === 'strict-v3' ? 3 : 2,
+    } as ReviewGatesConfig,
+  };
+  const merged = mergeWorkflowLayers(base, compatibleParsed);
   return normalizeWorkflowConfig(merged, { repoRoot });
 }
 
@@ -1263,11 +1433,13 @@ export function normalizeReviewGatesConfig(
   const gates = Array.isArray(raw.gates)
     ? normalizeReviewGateList(raw.gates)
     : defaults.gates;
+  const enforcementMode: ReviewEnforcementMode = raw.enforcementMode === 'strict-v3'
+    ? 'strict-v3'
+    : 'legacy-v2';
 
   return {
-    policyVersion: typeof raw.policyVersion === 'number' && Number.isFinite(raw.policyVersion)
-      ? Math.trunc(raw.policyVersion)
-      : undefined,
+    enforcementMode,
+    policyVersion: enforcementMode === 'strict-v3' ? 3 : 2,
     planReview: {
       gates: planGates ?? [],
     },
@@ -1567,6 +1739,10 @@ export function reviewStatePath(commonDir: string, config: WorkflowConfig): stri
   return path.join(resolveStateDir(commonDir, config), REVIEW_STATE_FILENAME);
 }
 
+export function reviewArtifactRoot(commonDir: string, config: WorkflowConfig): string {
+  return path.join(resolveStateDir(commonDir, config), 'review-artifacts');
+}
+
 export function reviewAcceptanceStatePath(commonDir: string, config: WorkflowConfig): string {
   return path.join(resolveStateDir(commonDir, config), REVIEW_ACCEPTANCE_STATE_FILENAME);
 }
@@ -1577,6 +1753,10 @@ export function routeSafetyStatePath(commonDir: string, config: WorkflowConfig):
 
 function reviewStateLockPath(commonDir: string, config: WorkflowConfig): string {
   return path.join(resolveStateDir(commonDir, config), REVIEW_STATE_LOCK_FILENAME);
+}
+
+function routeSafetyStateLockPath(commonDir: string, config: WorkflowConfig): string {
+  return path.join(resolveStateDir(commonDir, config), ROUTE_SAFETY_STATE_LOCK_FILENAME);
 }
 
 export function deployConfigPath(commonDir: string, config: WorkflowConfig): string {
@@ -2399,7 +2579,7 @@ function isStatusDecisionStatus(value: unknown): value is StatusDecisionStatus {
 }
 
 export function loadReviewState(commonDir: string, config: WorkflowConfig): ReviewState {
-  const raw = readVersionedJsonFile<ReviewState>('reviewState', commonDir, config, reviewStatePath(commonDir, config), { records: [], overrides: [] });
+  const raw = readVersionedJsonFile<ReviewState>('reviewState', commonDir, config, reviewStatePath(commonDir, config), { records: [], overrides: [], consents: [] });
   const stateKey = resolveReviewStateKey();
   const records = Array.isArray(raw?.records)
     ? raw.records.filter(isReviewRunRecord).slice(0, REVIEW_STATE_MAX_RECORDS)
@@ -2409,7 +2589,12 @@ export function loadReviewState(commonDir: string, config: WorkflowConfig): Revi
     ? raw.overrides.filter(isReviewOverrideRecord).slice(0, REVIEW_OVERRIDE_MAX_RECORDS)
       .filter((record) => !stateKey || verifySignedPayload(record, stateKey))
     : [];
-  return { records, overrides };
+  const consentKey = resolveReviewConsentStateKey();
+  const consents = Array.isArray(raw?.consents)
+    ? raw.consents.filter(isReviewConsentRecord).slice(0, REVIEW_CONSENT_MAX_RECORDS)
+      .filter((record) => verifySignedPayload(record, consentKey))
+    : [];
+  return { records, overrides, consents };
 }
 
 export function saveReviewState(commonDir: string, config: WorkflowConfig, value: ReviewState): void {
@@ -2417,6 +2602,7 @@ export function saveReviewState(commonDir: string, config: WorkflowConfig, value
   writeVersionedJsonFile('reviewState', reviewStatePath(commonDir, config), {
     records: value.records.slice(0, REVIEW_STATE_MAX_RECORDS),
     overrides: (value.overrides ?? []).slice(0, REVIEW_OVERRIDE_MAX_RECORDS),
+    consents: (value.consents ?? []).slice(0, REVIEW_CONSENT_MAX_RECORDS),
   });
 }
 
@@ -2499,6 +2685,29 @@ export function appendReviewOverrideRecord(commonDir: string, config: WorkflowCo
   }
 }
 
+export function appendReviewConsentRecord(commonDir: string, config: WorkflowConfig, record: ReviewConsentRecord): ReviewConsentRecord {
+  const lock = acquireReviewStateLock(commonDir, config);
+  try {
+    const state = loadReviewState(commonDir, config);
+    const consentKey = resolveReviewConsentStateKey();
+    const persisted = { ...record, signature: signSignedPayload(record, consentKey) };
+    state.consents = [persisted, ...(state.consents ?? [])].slice(0, REVIEW_CONSENT_MAX_RECORDS);
+    saveReviewState(commonDir, config, state);
+    return persisted;
+  } finally {
+    lock.release();
+  }
+}
+
+export function withReviewStateLock<T>(commonDir: string, config: WorkflowConfig, fn: () => T): T {
+  const lock = acquireReviewStateLock(commonDir, config);
+  try {
+    return fn();
+  } finally {
+    lock.release();
+  }
+}
+
 export function loadRouteSafetyState(commonDir: string, config: WorkflowConfig): RouteSafetyState {
   const raw = readVersionedJsonFile<RouteSafetyState>('routeSafetyState', commonDir, config, routeSafetyStatePath(commonDir, config), { routes: {} });
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { routes: {} };
@@ -2507,7 +2716,7 @@ export function loadRouteSafetyState(commonDir: string, config: WorkflowConfig):
   if (rawRoutes && typeof rawRoutes === 'object' && !Array.isArray(rawRoutes)) {
     for (const [digest, record] of Object.entries(rawRoutes)) {
       const normalized = normalizeRouteSafetyRecord(record);
-      if (normalized && normalized.routeFingerprintDigest === digest) {
+      if (normalized && (normalized.lineageDigest === digest || normalized.routeFingerprintDigest === digest)) {
         routes[digest] = normalized;
       }
     }
@@ -2525,6 +2734,18 @@ export function loadRouteSafetyState(commonDir: string, config: WorkflowConfig):
 export function saveRouteSafetyState(commonDir: string, config: WorkflowConfig, value: RouteSafetyState): void {
   ensureStateDir(commonDir, config);
   writeVersionedJsonFile('routeSafetyState', routeSafetyStatePath(commonDir, config), value);
+}
+
+export function withRouteSafetyStateLock<T>(commonDir: string, config: WorkflowConfig, fn: () => T): T {
+  const lock = acquireDirectoryStateLock(
+    routeSafetyStateLockPath(commonDir, config),
+    'route safety state is locked: another process is updating the route lineage. Wait and retry.',
+  );
+  try {
+    return fn();
+  } finally {
+    lock.release();
+  }
 }
 
 function normalizeRouteSafetyRecord(value: unknown): RouteSafetyRecord | null {
@@ -2558,15 +2779,27 @@ function normalizeRouteSafetyRecord(value: unknown): RouteSafetyRecord | null {
     aiReviewRuns: nonNegativeInteger(raw.aiReviewRuns),
     countedReviewRunIds,
   };
+  if (raw.lineageVersion === 1) record.lineageVersion = 1;
+  if (typeof raw.lineageDigest === 'string') record.lineageDigest = raw.lineageDigest;
+  if (typeof raw.lineageFingerprint === 'string') record.lineageFingerprint = raw.lineageFingerprint;
+  if (typeof raw.taskBindingId === 'string') record.taskBindingId = raw.taskBindingId;
   if (typeof raw.acceptedFindingsAt === 'string') record.acceptedFindingsAt = raw.acceptedFindingsAt;
   if (typeof raw.acceptedFindingsSource === 'string') record.acceptedFindingsSource = raw.acceptedFindingsSource;
   if (typeof raw.acceptedReviewRunId === 'string') record.acceptedReviewRunId = raw.acceptedReviewRunId;
+  if (typeof raw.acceptedAttemptDigest === 'string') record.acceptedAttemptDigest = raw.acceptedAttemptDigest;
   if (typeof raw.lastReviewRunId === 'string') record.lastReviewRunId = raw.lastReviewRunId;
   if (raw.lastReviewStatus === 'passed' || raw.lastReviewStatus === 'failed' || raw.lastReviewStatus === 'pending') {
     record.lastReviewStatus = raw.lastReviewStatus;
   }
   if (typeof raw.pausedAt === 'string') record.pausedAt = raw.pausedAt;
   if (typeof raw.pauseReason === 'string') record.pauseReason = raw.pauseReason;
+  if (typeof raw.currentAttemptDigest === 'string') record.currentAttemptDigest = raw.currentAttemptDigest;
+  if (Array.isArray(raw.attempts)) {
+    const attempts = raw.attempts.filter(isRouteSafetyAttemptRecord).slice(0, 50);
+    if (attempts.length > 0) record.attempts = attempts;
+  }
+  const legacyMigration = normalizeRouteSafetyLegacyMigration(raw.legacyMigration);
+  if (legacyMigration) record.legacyMigration = legacyMigration;
   if (Array.isArray(raw.resumes)) {
     const resumes = raw.resumes
       .map(normalizeRouteSafetyResumeRecord)
@@ -2588,6 +2821,8 @@ function normalizeRouteSafetyResumeRecord(value: unknown): RouteSafetyResumeReco
       && raw.kind !== 'more-loops-and-minutes'
       && raw.kind !== 'until-review-passes'
       && raw.kind !== 'accept-findings'
+      && raw.kind !== 'legacy-import'
+      && raw.kind !== 'legacy-fresh-start'
     )
   ) {
     return null;
@@ -2609,7 +2844,39 @@ function normalizeRouteSafetyResumeRecord(value: unknown): RouteSafetyResumeReco
   if (maxMoreMinutes !== undefined) record.maxMoreMinutes = maxMoreMinutes;
   if (raw.acceptedFindings === true) record.acceptedFindings = true;
   if (typeof raw.confirmation === 'string') record.confirmation = raw.confirmation;
+  if (typeof raw.reason === 'string') record.reason = raw.reason;
+  if (raw.legacyMigrationAction === 'import' || raw.legacyMigrationAction === 'fresh-start') {
+    record.legacyMigrationAction = raw.legacyMigrationAction;
+  }
+  if (typeof raw.legacyMigrationSourceDigest === 'string') record.legacyMigrationSourceDigest = raw.legacyMigrationSourceDigest;
   return record;
+}
+
+function isRouteSafetyAttemptRecord(value: unknown): value is RouteSafetyAttemptRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return typeof raw.digest === 'string'
+    && typeof raw.fingerprint === 'string'
+    && typeof raw.headSha === 'string'
+    && typeof raw.worktreeStatusDigest === 'string'
+    && typeof raw.observedAt === 'string'
+    && (raw.reviewRunId === undefined || typeof raw.reviewRunId === 'string');
+}
+
+function normalizeRouteSafetyLegacyMigration(value: unknown): RouteSafetyLegacyMigration | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  if (raw.status !== 'pending' && raw.status !== 'imported' && raw.status !== 'fresh-start') return null;
+  if (!Array.isArray(raw.candidateDigests) || !raw.candidateDigests.every((entry) => typeof entry === 'string')) return null;
+  return {
+    status: raw.status,
+    candidateDigests: raw.candidateDigests,
+    ...(nonNegativeInteger(raw.extraLoops) > 0 ? { extraLoops: nonNegativeInteger(raw.extraLoops) } : {}),
+    ...(nonNegativeInteger(raw.extraMinutes) > 0 ? { extraMinutes: nonNegativeInteger(raw.extraMinutes) } : {}),
+    ...(typeof raw.decidedAt === 'string' ? { decidedAt: raw.decidedAt } : {}),
+    ...(typeof raw.reason === 'string' ? { reason: raw.reason } : {}),
+    ...(typeof raw.sourceDigest === 'string' ? { sourceDigest: raw.sourceDigest } : {}),
+  };
 }
 
 function nonNegativeInteger(value: unknown): number {
@@ -2639,6 +2906,9 @@ function isReviewRunRecord(value: unknown): value is ReviewRunRecord {
     && (raw.worktreeMaterialTreeReliable === undefined || typeof raw.worktreeMaterialTreeReliable === 'boolean')
     && (raw.authorIdentity === undefined || raw.authorIdentity === null || isReviewActorIdentity(raw.authorIdentity))
     && (raw.reviewer === undefined || isReviewActorIdentity(raw.reviewer))
+    && (raw.taskBindingId === undefined || typeof raw.taskBindingId === 'string')
+    && (raw.intent === undefined || isReviewIntent(raw.intent))
+    && (raw.target === undefined || isReviewTargetManifest(raw.target))
     && (raw.signature === undefined || typeof raw.signature === 'string')
     && (
       raw.worktreeStatusWarnings === undefined
@@ -2676,6 +2946,33 @@ function isReviewOverrideRecord(value: unknown): value is ReviewOverrideRecord {
     && isReviewActorIdentity(raw.actor)
     && typeof raw.branchName === 'string'
     && typeof raw.sha === 'string'
+    && (raw.signature === undefined || typeof raw.signature === 'string');
+}
+
+function isReviewConsentRecord(value: unknown): value is ReviewConsentRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return typeof raw.id === 'string'
+    && (raw.kind === 'gate-bypass' || raw.kind === 'accept-findings' || raw.kind === 'manual-substitution')
+    && typeof raw.gateId === 'string'
+    && typeof raw.gateDefinitionHash === 'string'
+    && typeof raw.policyVersion === 'number'
+    && Number.isSafeInteger(raw.policyVersion)
+    && (raw.enforcementMode === 'legacy-v2' || raw.enforcementMode === 'strict-v3')
+    && typeof raw.taskBindingId === 'string'
+    && (raw.reviewRunId === undefined || typeof raw.reviewRunId === 'string')
+    && typeof raw.originalGateState === 'string'
+    && typeof raw.branchName === 'string'
+    && typeof raw.sha === 'string'
+    && typeof raw.worktreeStatusDigest === 'string'
+    && typeof raw.worktreeMaterialTreeHash === 'string'
+    && typeof raw.reviewTargetDigest === 'string'
+    && typeof raw.routeAction === 'string'
+    && isReviewActorIdentity(raw.actor)
+    && typeof raw.source === 'string'
+    && typeof raw.reason === 'string'
+    && typeof raw.reasonHash === 'string'
+    && typeof raw.recordedAt === 'string'
     && (raw.signature === undefined || typeof raw.signature === 'string');
 }
 
@@ -2735,11 +3032,98 @@ function isReviewGateRunRecord(value: unknown): value is ReviewGateRunRecord {
     && typeof raw.finishedAt === 'string'
     && (raw.stdoutTail === undefined || typeof raw.stdoutTail === 'string')
     && (raw.stderrTail === undefined || typeof raw.stderrTail === 'string')
+    && (raw.capability === undefined || isReviewCapabilityEvidence(raw.capability))
+    && (raw.result === undefined || isReviewResultMetadata(raw.result))
+    && (raw.findings === undefined || (Array.isArray(raw.findings) && raw.findings.every(isReviewFinding)))
+    && (raw.reportArtifact === undefined || isReviewReportArtifactReference(raw.reportArtifact))
     && (raw.skipReason === undefined || typeof raw.skipReason === 'string');
 }
 
+function isReviewFinding(value: unknown): value is ReviewFinding {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return typeof raw.id === 'string'
+    && (raw.severity === 'critical' || raw.severity === 'warning' || raw.severity === 'nit')
+    && typeof raw.title === 'string'
+    && (raw.location === undefined || typeof raw.location === 'string');
+}
+
+function isReviewResultMetadata(value: unknown): value is ReviewResultMetadata {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return (raw.protocolVersion === 0 || raw.protocolVersion === 1)
+    && (raw.declaredStatus === 'passed' || raw.declaredStatus === 'failed')
+    && (raw.effectiveStatus === 'passed' || raw.effectiveStatus === 'failed')
+    && typeof raw.blockingCount === 'number'
+    && typeof raw.advisoryCount === 'number'
+    && typeof raw.findingsKnown === 'boolean'
+    && (raw.providerExitCode === undefined || typeof raw.providerExitCode === 'number')
+    && typeof raw.adapterExitCode === 'number';
+}
+
+function isReviewCapabilityEvidence(value: unknown): value is ReviewCapabilityEvidence {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return typeof raw.requestedCapability === 'string'
+    && (raw.effectiveCapability === 'contract-supplied-adapter' || raw.effectiveCapability === 'role-equivalent-adapter' || raw.effectiveCapability === 'manual-attestation' || raw.effectiveCapability === 'unavailable')
+    && typeof raw.adapter === 'string'
+    && typeof raw.provider === 'string'
+    && typeof raw.contractSupplied === 'boolean'
+    && typeof raw.wrapperCompatible === 'boolean'
+    && (raw.sourceKind === undefined || typeof raw.sourceKind === 'string')
+    && (raw.source === undefined || typeof raw.source === 'string')
+    && (raw.contractDigest === undefined || typeof raw.contractDigest === 'string')
+    && (raw.contractBytes === undefined || typeof raw.contractBytes === 'number');
+}
+
+function isReviewReportArtifactReference(value: unknown): value is ReviewReportArtifactReference {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return typeof raw.path === 'string'
+    && typeof raw.digest === 'string'
+    && typeof raw.bytes === 'number'
+    && typeof raw.reportBytes === 'number'
+    && typeof raw.diagnosticsBytes === 'number'
+    && typeof raw.reportTruncated === 'boolean'
+    && typeof raw.diagnosticsTruncated === 'boolean'
+    && (raw.diagnosticOnly === undefined || typeof raw.diagnosticOnly === 'boolean');
+}
+
+function isReviewIntent(value: unknown): value is ReviewIntent {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return typeof raw.text === 'string'
+    && (raw.source === 'explicit-unbound' || raw.source === 'orchestration-slice' || raw.source === 'task-brief')
+    && typeof raw.digest === 'string'
+    && (raw.taskBindingId === undefined || typeof raw.taskBindingId === 'string');
+}
+
+function isReviewTargetManifest(value: unknown): value is ReviewTargetManifest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return typeof raw.baseBranchLabel === 'string'
+    && typeof raw.baseTipOid === 'string'
+    && typeof raw.mergeBaseOid === 'string'
+    && typeof raw.headOid === 'string'
+    && typeof raw.worktreeStatusDigest === 'string'
+    && typeof raw.materialTreeHash === 'string'
+    && typeof raw.serializationVersion === 'number'
+    && typeof raw.baseTreeManifestDigest === 'string'
+    && typeof raw.materialTreeManifestDigest === 'string'
+    && typeof raw.changedFilesDigest === 'string'
+    && typeof raw.ignorePolicyDigest === 'string'
+    && typeof raw.machineFingerprint === 'string'
+    && typeof raw.targetDigest === 'string';
+}
+
 function acquireReviewStateLock(commonDir: string, config: WorkflowConfig): { release: () => void } {
-  const lockPath = reviewStateLockPath(commonDir, config);
+  return acquireDirectoryStateLock(
+    reviewStateLockPath(commonDir, config),
+    'review state is locked: another review run is writing evidence. Wait for it to finish and retry.',
+  );
+}
+
+function acquireDirectoryStateLock(lockPath: string, lockedMessage: string): { release: () => void } {
   mkdirSync(path.dirname(lockPath), { recursive: true });
   clearStaleReviewStateLock(lockPath);
   try {
@@ -2752,9 +3136,9 @@ function acquireReviewStateLock(commonDir: string, config: WorkflowConfig): { re
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
     if (err.code === 'EEXIST') {
-      throw new Error('review state is locked: another review run is writing evidence. Wait for it to finish and retry.');
+      throw new Error(lockedMessage);
     }
-    throw new Error(`could not acquire review state lock: ${err.message}`);
+    throw new Error(`could not acquire state lock: ${err.message}`);
   }
 }
 
@@ -2796,11 +3180,73 @@ export function loadTaskLock(commonDir: string, config: WorkflowConfig, taskSlug
   return readVersionedJsonFile<TaskLock | null>('taskLock', commonDir, config, taskLockPath(commonDir, config, taskSlug), null);
 }
 
+export function newTaskBindingId(): string {
+  return `task-binding-${crypto.randomUUID()}`;
+}
+
+export function legacyTaskBindingId(config: WorkflowConfig, lock: TaskLock): string {
+  return `task-binding-legacy-${crypto.createHash('sha256').update(JSON.stringify({
+    projectKey: config.projectKey,
+    taskSlug: lock.taskSlug,
+    branchName: lock.branchName,
+    worktreePath: normalizePath(lock.worktreePath),
+    createdBeforeBindingIdsAt: lock.updatedAt,
+  })).digest('hex').slice(0, 32)}`;
+}
+
+export function ensureTaskBindingId(commonDir: string, config: WorkflowConfig, taskSlug: string): TaskLock | null {
+  const lockGuard = acquireTaskBindingLock(commonDir, config, taskSlug);
+  try {
+    const lock = loadTaskLock(commonDir, config, taskSlug);
+    if (!lock || lock.taskBindingId) return lock;
+    const taskBindingId = legacyTaskBindingId(config, lock);
+    return saveTaskLock(commonDir, config, taskSlug, { ...lock, taskBindingId });
+  } finally {
+    lockGuard.release();
+  }
+}
+
+export function updateTaskBinding(
+  commonDir: string,
+  config: WorkflowConfig,
+  taskSlug: string,
+  update: (current: TaskLock) => TaskLock,
+): TaskLock {
+  const lockGuard = acquireTaskBindingLock(commonDir, config, taskSlug);
+  try {
+    const current = loadTaskLock(commonDir, config, taskSlug);
+    if (!current) throw new Error(`No task lock found for ${taskSlug}.`);
+    return saveTaskLock(commonDir, config, taskSlug, update(current));
+  } finally {
+    lockGuard.release();
+  }
+}
+
 export function saveTaskLock(commonDir: string, config: WorkflowConfig, taskSlug: string, value: TaskLock): TaskLock {
   assertTaskCleanupUnlocked(commonDir, config, taskSlug);
   ensureStateDir(commonDir, config);
   writeVersionedJsonFile('taskLock', taskLockPath(commonDir, config, taskSlug), value);
   return value;
+}
+
+function acquireTaskBindingLock(commonDir: string, config: WorkflowConfig, taskSlug: string): { release: () => void } {
+  const root = path.join(resolveStateDir(commonDir, config), TASK_BINDING_LOCKS_DIRNAME);
+  const lockPath = path.join(root, `${slugifyTaskName(taskSlug)}.lock`);
+  mkdirSync(root, { recursive: true });
+  try {
+    if (existsSync(lockPath) && Date.now() - statSync(lockPath).mtimeMs > TASK_BINDING_LOCK_STALE_MS) {
+      rmSync(lockPath, { recursive: true, force: true });
+    }
+    mkdirSync(lockPath);
+    writeJsonFile(path.join(lockPath, 'owner.json'), { pid: process.pid, acquiredAt: nowIso() });
+    return { release: () => rmSync(lockPath, { recursive: true, force: true }) };
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === 'EEXIST') {
+      throw new Error(`task binding ${taskSlug} is locked by another Pipelane process. Wait and retry.`);
+    }
+    throw error;
+  }
 }
 
 export function removeTaskLock(commonDir: string, config: WorkflowConfig, taskSlug: string): void {
@@ -3566,7 +4012,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       requireNoPositional('pipelane run adopt [--task <task-name>] [--branch <branch>] [--surfaces <csv>] [--force]');
       return;
     case 'resume':
-      assertOnlyFlags(parsed, ['task', 'oneMoreLoop', 'moreLoops', 'moreMinutes', 'untilReviewPasses', 'maxMoreLoops', 'maxMoreMinutes', 'acceptFindings']);
+      assertOnlyFlags(parsed, ['task', 'oneMoreLoop', 'moreLoops', 'moreMinutes', 'untilReviewPasses', 'maxMoreLoops', 'maxMoreMinutes', 'acceptFindings', 'reason', 'scope']);
       requireNoPositional('pipelane run resume [--task <task-name>] [--one-more-loop | --more-loops <n> --more-minutes <n> | --until-review-passes --max-more-loops <n> --max-more-minutes <n> | --accept-findings]');
       validateResumeRouteSafetyFlags(parsed);
       return;
@@ -3690,9 +4136,18 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         }
         return;
       }
+      if (subcommand === 'override') {
+        assertOnlyFlags(parsed, ['reviewGate', 'reason', 'scope']);
+        if (parsed.positional.length !== 1) {
+          throw new Error('review override requires exactly: pipelane run review override --gate <id> --reason <informed-consent-reason> [--scope <exact-route-action>]');
+        }
+        if (!parsed.flags.reviewGate.trim()) throw new Error('review override requires --gate <id>.');
+        if (!parsed.flags.reason.trim()) throw new Error('review override requires --reason <informed-consent-reason>.');
+        return;
+      }
       assertOnlyFlags(parsed, ['reviewDryRun', 'reviewGate', 'reviewPhase']);
       if (parsed.positional.length > 0) {
-        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review pass --gate <id> --message <text>, or pipelane run review setup [gate[,gate...]...] [--yes] [--reset] [--print] [--list-gates] [--toggle <gate[,gate...]>] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]');
+        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review pass --gate <id> --message <text>, pipelane run review override --gate <id> --reason <text> [--scope <action>], or pipelane run review setup [gate[,gate...]...] [--yes] [--reset] [--print] [--list-gates] [--toggle <gate[,gate...]>] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]');
       }
       const phase = parsed.flags.reviewPhase.trim();
       if (phase && !includesString(REVIEW_GATE_PHASES, phase)) {
@@ -4107,11 +4562,12 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
 }
 
 function validateResumeRouteSafetyFlags(parsed: ParsedOperatorArgs): void {
+  const hasMigrationScope = parsed.flags.scope.trim().length > 0;
   const modes = [
     parsed.flags.oneMoreLoop,
     parsed.flags.moreLoops.trim().length > 0 || parsed.flags.moreMinutes.trim().length > 0,
     parsed.flags.untilReviewPasses || parsed.flags.maxMoreLoops.trim().length > 0 || parsed.flags.maxMoreMinutes.trim().length > 0,
-    parsed.flags.acceptFindings,
+    parsed.flags.acceptFindings || hasMigrationScope,
   ].filter(Boolean).length;
   if (modes === 0) return;
   if (parsed.flags.task.trim()) {
@@ -4119,6 +4575,15 @@ function validateResumeRouteSafetyFlags(parsed: ParsedOperatorArgs): void {
   }
   if (modes > 1) {
     throw new Error('resume accepts one route-loop override at a time: --one-more-loop, --more-loops/--more-minutes, --until-review-passes, or --accept-findings.');
+  }
+  if ((parsed.flags.acceptFindings || hasMigrationScope) && !parsed.flags.reason.trim()) {
+    throw new Error('resume --accept-findings and legacy migration choices require --reason <informed-consent-reason>.');
+  }
+  if (parsed.flags.reason.trim() && !parsed.flags.acceptFindings && !hasMigrationScope) {
+    throw new Error('resume only accepts --reason with --accept-findings or an explicit legacy migration --scope.');
+  }
+  if (hasMigrationScope && !/^legacy-(?:import:[a-f0-9]{64}|fresh-start)$/.test(parsed.flags.scope.trim())) {
+    throw new Error('resume --scope must be legacy-import:<candidate-digest> or legacy-fresh-start.');
   }
   const requirePositive = (flag: string, value: string): void => {
     if (!/^[1-9]\d*$/.test(value.trim()) || !Number.isSafeInteger(Number.parseInt(value.trim(), 10))) {

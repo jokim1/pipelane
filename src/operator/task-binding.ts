@@ -14,6 +14,7 @@ import {
   normalizeExistingPath,
   normalizePath,
   nowIso,
+  newTaskBindingId,
   runGit,
   saveTaskLock,
   slugifyTaskName,
@@ -356,6 +357,7 @@ export function applyTaskBindingRecovery(
   const lock = saveTaskLock(context.commonDir, context.config, diagnosis.taskSlug, {
     taskSlug: latestLock.taskSlug,
     taskName: latestLock.taskName,
+    taskBindingId: newTaskBindingId(),
     branchName: diagnosis.current.branchName,
     worktreePath: context.repoRoot,
     mode: latestLock.mode,

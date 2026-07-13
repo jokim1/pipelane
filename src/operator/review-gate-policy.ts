@@ -1,6 +1,14 @@
-import type { ReviewGateType } from './state.ts';
+import type { ReviewEnforcementMode, ReviewGateType } from './state.ts';
 
-export const REVIEW_GATES_POLICY_VERSION = 2;
+export const LEGACY_REVIEW_GATES_POLICY_VERSION = 2;
+export const STRICT_REVIEW_GATES_POLICY_VERSION = 3;
+export const REVIEW_GATES_POLICY_VERSION = LEGACY_REVIEW_GATES_POLICY_VERSION;
+// Activation changes this one recommendation only after adapter smoke passes.
+export const RECOMMENDED_REVIEW_ENFORCEMENT_MODE: ReviewEnforcementMode = 'legacy-v2';
+
+export function reviewPolicyVersionForMode(mode: ReviewEnforcementMode): number {
+  return mode === 'strict-v3' ? STRICT_REVIEW_GATES_POLICY_VERSION : LEGACY_REVIEW_GATES_POLICY_VERSION;
+}
 
 export type ReviewGatePolicyRole =
   | 'self-review'

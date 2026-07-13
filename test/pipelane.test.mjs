@@ -15332,7 +15332,7 @@ test('review runner supports gate dry-run filtering', () => {
   }
 });
 
-test('api snapshot exposes the latest review run', () => {
+test('api snapshot exposes truthful current review with a deprecated latest alias', () => {
   const repoRoot = createRepo();
   try {
     writeSingleCommandReviewGate(repoRoot, {
@@ -15341,13 +15341,41 @@ test('api snapshot exposes the latest review run', () => {
 
     const review = JSON.parse(runCli(['run', 'review', '--json'], repoRoot).stdout);
     const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
-    const reviewHealth = envelope.data.sourceHealth.find((entry) => entry.name === 'review.latest');
+    const reviewHealth = envelope.data.sourceHealth.find((entry) => entry.name === 'review.current');
 
+    assert.equal(envelope.data.review.schemaVersion, 2);
+    assert.equal(envelope.data.review.current.id, review.runId);
     assert.equal(envelope.data.review.latest.id, review.runId);
+    assert.deepEqual(envelope.data.review.latest, envelope.data.review.current);
     assert.equal(envelope.data.review.latest.status, 'passed');
     assert.equal(reviewHealth.state, 'healthy');
     assert.equal(reviewHealth.blocking, false);
     assert.match(reviewHealth.reason, new RegExp(review.runId));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('api snapshot never presents another branch review as current or latest', () => {
+  const repoRoot = createRepo();
+  try {
+    writeSingleCommandReviewGate(repoRoot, {
+      command: `${process.execPath} -e "console.log('reviewed branch ok')"`,
+    });
+    run('git', ['checkout', '-b', 'codex/reviewed-elsewhere'], repoRoot);
+    writeFileSync(path.join(repoRoot, 'reviewed-only.txt'), 'branch-specific material\n', 'utf8');
+    run('git', ['add', '.'], repoRoot);
+    run('git', ['commit', '-m', 'Add branch-specific material'], repoRoot);
+    const reviewed = JSON.parse(runCli(['run', 'review', '--json'], repoRoot).stdout);
+
+    run('git', ['checkout', 'main'], repoRoot);
+    const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+
+    assert.equal(envelope.data.review.schemaVersion, 2);
+    assert.equal(envelope.data.review.current, null);
+    assert.equal(envelope.data.review.latest, null);
+    assert.equal(envelope.data.review.recent.id, reviewed.runId);
+    assert.equal(envelope.data.review.recent.branchName, 'codex/reviewed-elsewhere');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -15359,7 +15387,7 @@ test('api snapshot degrades pending, failed, and incomplete review evidence', ()
   try {
     JSON.parse(runCli(['run', 'review', '--json'], pendingRepoRoot, pendingNpmShim.env).stdout);
     const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], pendingRepoRoot).stdout);
-    const reviewHealth = envelope.data.sourceHealth.find((entry) => entry.name === 'review.latest');
+    const reviewHealth = envelope.data.sourceHealth.find((entry) => entry.name === 'review.current');
     const issue = envelope.data.attention.find((entry) => entry.code === 'review.pending');
 
     assert.equal(envelope.data.review.latest.status, 'pending');
@@ -15379,7 +15407,7 @@ test('api snapshot degrades pending, failed, and incomplete review evidence', ()
 
     JSON.parse(runCli(['run', 'review', '--phase', 'static', '--json'], failedRepoRoot, {}, true).stdout);
     const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], failedRepoRoot).stdout);
-    const reviewHealth = envelope.data.sourceHealth.find((entry) => entry.name === 'review.latest');
+    const reviewHealth = envelope.data.sourceHealth.find((entry) => entry.name === 'review.current');
     const issue = envelope.data.attention.find((entry) => entry.code === 'review.failed');
 
     assert.equal(envelope.data.review.latest.status, 'failed');
@@ -15394,7 +15422,7 @@ test('api snapshot degrades pending, failed, and incomplete review evidence', ()
   try {
     JSON.parse(runCli(['run', 'review', '--gate', 'typecheck', '--dry-run', '--json'], dryRunRepoRoot).stdout);
     const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], dryRunRepoRoot).stdout);
-    const reviewHealth = envelope.data.sourceHealth.find((entry) => entry.name === 'review.latest');
+    const reviewHealth = envelope.data.sourceHealth.find((entry) => entry.name === 'review.current');
     const issue = envelope.data.attention.find((entry) => entry.code === 'review.incomplete');
 
     assert.equal(envelope.data.review.latest.status, 'passed');
@@ -20100,7 +20128,7 @@ test('route safety renders the TTY pause menu with explicit loop choices', async
     });
 
     assert.match(menu, /1\. Stop here and show review findings/);
-    assert.match(menu, /2\. Allow one more fix\/review loop/);
+    assert.match(menu, /2\. Return to the host for one repair\/review attempt/);
     assert.match(menu, /3\. Choose how many more loops and minutes to allow/);
     assert.match(menu, /4\. Continue without fixing these findings/);
     assert.match(menu, /5\. Keep going until review passes, with explicit limits/);
@@ -20175,6 +20203,49 @@ test('route safety pauses non-TTY PR flow on blocking review findings and reuses
   }
 });
 
+test('review and route blockers retain both failed report and diagnostics before recovery choices', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.reviewGates = {
+        enforcementMode: 'legacy-v2',
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: [{
+          id: 'karpathy-output-fixture',
+          phase: 'ai-diff',
+          type: 'command',
+          blocking: true,
+          command: `node -e "console.log('retained finding: null input crashes'); console.error('provider diagnostic: model exited cleanly'); process.exit(2)"`,
+        }],
+      };
+    });
+    commitAll(repoRoot, 'Configure retained failure output');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Retain Failure Output', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'failure.txt'), 'material change\n', 'utf8');
+
+    const review = JSON.parse(runCli(['run', 'review', '--json'], created.worktreePath, {}, true).stdout);
+    assert.equal(review.status, 'failed');
+    assert.match(review.message, /Failed gate details:/);
+    assert.match(review.message, /Report:\n\s+retained finding: null input crashes/);
+    assert.match(review.message, /Diagnostics:\n\s+provider diagnostic: model exited cleanly/);
+
+    const blocked = runCli(['run', 'pr', '--title', 'Retain Failure Output', '--json'], created.worktreePath, {}, true);
+    assert.equal(blocked.status, 1);
+    const reportIndex = blocked.stderr.indexOf('retained finding: null input crashes');
+    const choicesIndex = blocked.stderr.indexOf('Resume commands:');
+    assert.ok(reportIndex >= 0, blocked.stderr);
+    assert.ok(blocked.stderr.includes('provider diagnostic: model exited cleanly'), blocked.stderr);
+    assert.ok(choicesIndex > reportIndex, 'all retained failure output must appear before recovery choices');
+    assert.doesNotMatch(blocked.stderr, /\/fix|fix now/i);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('route safety explicit resume overrides can accept findings and continue', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
@@ -20212,7 +20283,7 @@ test('route safety explicit resume overrides can accept findings and continue', 
 
     const oneMore = JSON.parse(runCli(['run', 'resume', '--one-more-loop', '--json'], created.worktreePath).stdout);
     assert.match(oneMore.message, /Allowed one more fix\/review loop/);
-    const accepted = JSON.parse(runCli(['run', 'resume', '--accept-findings', '--json'], created.worktreePath).stdout);
+    const accepted = JSON.parse(runCli(['run', 'resume', '--accept-findings', '--reason', 'risk accepted for this exact PR', '--json'], created.worktreePath).stdout);
     assert.match(accepted.message, /Accepted current review findings/);
 
     const pr = JSON.parse(runCli(['run', 'pr', '--title', 'Route Safety Resume', '--json'], created.worktreePath, env).stdout);
@@ -20225,6 +20296,97 @@ test('route safety explicit resume overrides can accept findings and continue', 
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
     rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('signed review consent is exact-scope and never relabels failed evidence as passed', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.reviewGates = {
+        enforcementMode: 'legacy-v2',
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: [{
+          id: 'consent-failure',
+          phase: 'static',
+          type: 'command',
+          blocking: true,
+          command: 'node -e "process.exit(9)"',
+        }],
+      };
+    });
+    commitAll(repoRoot, 'Configure consent regression');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Exact Consent', '--json'], repoRoot).stdout);
+    const lock = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`), 'utf8'));
+    assert.match(lock.taskBindingId, /^task-binding-/);
+
+    const featurePath = path.join(created.worktreePath, 'consent.txt');
+    writeFileSync(featurePath, 'review this exact material\n', 'utf8');
+    const failed = JSON.parse(runCli(['run', 'review', '--json'], created.worktreePath, {}, true).stdout);
+    assert.equal(failed.status, 'failed');
+    const override = JSON.parse(runCli([
+      'run', 'review', 'override',
+      '--gate', 'consent-failure',
+      '--reason', 'the operator accepts this exact known failure for this PR only',
+      '--scope', '/pr',
+      '--json',
+    ], created.worktreePath).stdout);
+    assert.equal(override.status, 'bypassed');
+    assert.match(override.message, /not relabeled as passed/);
+
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const enforcement = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-enforcement.ts'));
+    const context = state.resolveWorkflowContext(created.worktreePath);
+    const consented = enforcement.evaluateReviewEvidenceForPr(context, { command: '/pr' });
+    assert.equal(consented.allowed, true);
+    assert.equal(consented.latest.gates.find((gate) => gate.gateId === 'consent-failure').status, 'failed');
+    assert.equal(consented.bypassedIssues[0].gateId, 'consent-failure');
+    assert.match(consented.message, /bypassed by user/);
+    assert.match(consented.message, /not relabeled as passed/);
+
+    const stored = state.loadReviewState(context.commonDir, context.config);
+    assert.equal(stored.consents.length, 1);
+    assert.match(stored.consents[0].signature, /^[a-f0-9]{64}$/);
+    assert.equal(stored.consents[0].taskBindingId, lock.taskBindingId);
+    assert.equal(enforcement.evaluateReviewEvidenceForPr(context, { command: '/merge' }).allowed, false);
+
+    writeFileSync(featurePath, 'changed after consent\n', 'utf8');
+    assert.equal(enforcement.evaluateReviewEvidenceForPr(context, { command: '/pr' }).allowed, false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('legacy task locks receive one deterministic binding id without invented intent', async () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = state.resolveWorkflowContext(repoRoot);
+    const legacyLock = {
+      taskSlug: 'legacy-binding',
+      taskName: 'Legacy Binding Label',
+      branchName: run('git', ['branch', '--show-current'], repoRoot),
+      worktreePath: repoRoot,
+      mode: 'build',
+      surfaces: ['frontend'],
+      updatedAt: '2026-01-02T03:04:05.000Z',
+    };
+    state.saveTaskLock(context.commonDir, context.config, legacyLock.taskSlug, legacyLock);
+    const expected = state.legacyTaskBindingId(context.config, legacyLock);
+
+    const first = state.ensureTaskBindingId(context.commonDir, context.config, legacyLock.taskSlug);
+    const second = state.ensureTaskBindingId(context.commonDir, context.config, legacyLock.taskSlug);
+    assert.equal(first.taskBindingId, expected);
+    assert.equal(second.taskBindingId, expected);
+    assert.equal(first.taskBrief, undefined, 'migration must not promote a task label into authoritative intent');
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'task-binding-locks', 'legacy-binding.lock')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
   }
 });
 
@@ -20268,7 +20430,7 @@ test('route safety accept-findings does not bypass incomplete review evidence', 
     assert.match(blocked.stderr, /dry run/);
     assert.doesNotMatch(blocked.stderr, /Route-bound delivery paused/);
 
-    const resume = runCli(['run', 'resume', '--accept-findings', '--json'], created.worktreePath, {}, true);
+    const resume = runCli(['run', 'resume', '--accept-findings', '--reason', 'only for this exact dry-run target', '--json'], created.worktreePath, {}, true);
     assert.equal(resume.status, 1);
     assert.match(resume.stderr, /No paused route-bound fix\/review loop/);
     assert.equal(existsSync(ghStateFile), false, 'incomplete review evidence must not open PR after accept-findings');
@@ -20314,7 +20476,7 @@ test('route safety accept-findings is bound to the accepted review run id', () =
     const paused = runCli(['run', 'pr', '--title', 'Route Safety Review Id', '--json'], created.worktreePath, env, true);
     assert.equal(paused.status, 1);
     runCli(['run', 'resume', '--one-more-loop', '--json'], created.worktreePath);
-    runCli(['run', 'resume', '--accept-findings', '--json'], created.worktreePath);
+    runCli(['run', 'resume', '--accept-findings', '--reason', 'accept only the first review run', '--json'], created.worktreePath);
 
     const secondReview = JSON.parse(runCli(['run', 'review', '--json'], created.worktreePath, {}, true).stdout);
     assert.notEqual(secondReview.runId, firstReview.runId);
@@ -20419,7 +20581,15 @@ test('route safety resume approvals are isolated by route fingerprint changes', 
     runCli(['run', 'review', '--json'], created.worktreePath, {}, true);
     const paused = runCli(['run', 'pr', '--title', 'Route Safety Isolation', '--json'], created.worktreePath, env, true);
     assert.equal(paused.status, 1);
-    runCli(['run', 'resume', '--accept-findings', '--json'], created.worktreePath);
+    const beforeChange = latestRouteSafetyRecord(created.worktreePath);
+    runCli(['run', 'resume', '--accept-findings', '--reason', 'accept only the reviewed checkout', '--json'], created.worktreePath);
+
+    writeFileSync(featurePath, 'uncommitted repair attempt\n', 'utf8');
+    const dirtyAttempt = runCli(['run', 'pr', '--title', 'Route Safety Isolation', '--json'], created.worktreePath, env, true);
+    assert.equal(dirtyAttempt.status, 1);
+    const afterDirtyChange = latestRouteSafetyRecord(created.worktreePath);
+    assert.equal(afterDirtyChange.lineageDigest, beforeChange.lineageDigest, 'an uncommitted fix must retain the route lineage');
+    assert.notEqual(afterDirtyChange.currentAttemptDigest, beforeChange.currentAttemptDigest);
 
     execFileSync('git', ['add', '.'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
     execFileSync('git', ['commit', '-m', 'Change after accepted findings'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -20429,10 +20599,158 @@ test('route safety resume approvals are isolated by route fingerprint changes', 
     assert.match(changedRoute.stderr, /Route-bound delivery paused before \/pr/);
     assert.match(changedRoute.stderr, /current HEAD|different worktree state|blocking\/major review findings/);
     assert.equal(existsSync(ghStateFile), false, 'accepted findings for old route fingerprint must not open PR after HEAD changes');
+    const afterChange = latestRouteSafetyRecord(created.worktreePath);
+    assert.equal(afterChange.lineageDigest, beforeChange.lineageDigest, 'committing a fix must not reset the route budget lineage');
+    assert.equal(afterChange.fixReviewLoops, beforeChange.fixReviewLoops, 'a new exact attempt must retain spent loop budget');
+    assert.notEqual(afterChange.currentAttemptDigest, beforeChange.currentAttemptDigest);
+    assert.ok(afterChange.attempts.length >= 3);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
     rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('stable route lineage conservatively auto-migrates an unambiguous legacy candidate set', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.reviewGates = {
+        enforcementMode: 'legacy-v2',
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: [{ id: 'route-migration-fixture', phase: 'static', type: 'command', blocking: true, command: 'node -e "process.exit(0)"' }],
+      };
+    });
+    commitAll(repoRoot, 'Configure route migration');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Route Migration', '--json'], repoRoot).stdout);
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = state.resolveWorkflowContext(created.worktreePath);
+    const branchName = run('git', ['branch', '--show-current'], created.worktreePath);
+    const headSha = run('git', ['rev-parse', 'HEAD'], created.worktreePath);
+    const firstDigest = '1'.repeat(64);
+    const secondDigest = '2'.repeat(64);
+    const legacyRecord = (digest, firstStartedAt, fixReviewLoops, aiReviewRuns, runIds) => ({
+      routeFingerprintDigest: digest,
+      routeFingerprint: JSON.stringify({ legacy: digest }),
+      targetCommand: '/pr',
+      taskSlug: created.taskSlug,
+      branchName,
+      headSha,
+      firstStartedAt,
+      updatedAt: '2026-06-02T00:00:00.000Z',
+      fixReviewLoops,
+      aiReviewRuns,
+      countedReviewRunIds: runIds,
+      resumes: [{
+        id: `legacy-resume-${digest.slice(0, 2)}`,
+        kind: 'more-loops-and-minutes',
+        recordedAt: '2026-06-01T12:00:00.000Z',
+        source: 'resume',
+        moreLoops: digest === firstDigest ? 1 : 3,
+        moreMinutes: digest === firstDigest ? 10 : 5,
+      }],
+    });
+    state.saveRouteSafetyState(context.commonDir, context.config, {
+      routes: {
+        [firstDigest]: legacyRecord(firstDigest, '2026-06-01T00:00:00.000Z', 2, 1, ['legacy-review-a']),
+        [secondDigest]: legacyRecord(secondDigest, '2026-05-01T00:00:00.000Z', 3, 2, ['legacy-review-b', 'legacy-review-a']),
+      },
+    });
+
+    const blocked = runCli(['run', 'review', '--json'], created.worktreePath, {}, true);
+    assert.equal(blocked.status, 1);
+    const migratedState = state.loadRouteSafetyState(context.commonDir, context.config);
+    const lineage = Object.values(migratedState.routes).find((record) => record.lineageVersion === 1);
+    assert.ok(lineage);
+    assert.equal(lineage.legacyMigration.status, 'imported');
+    assert.deepEqual(new Set(lineage.legacyMigration.candidateDigests), new Set([firstDigest, secondDigest]));
+    assert.equal(lineage.firstStartedAt, '2026-05-01T00:00:00.000Z');
+    assert.equal(lineage.fixReviewLoops, 3);
+    assert.equal(lineage.aiReviewRuns, 2);
+    assert.equal(lineage.legacyMigration.extraLoops, 3, 'duplicate legacy allowances use the maximum, not a sum');
+    assert.equal(lineage.legacyMigration.extraMinutes, 10, 'each legacy allowance dimension migrates conservatively');
+    assert.deepEqual(new Set(lineage.countedReviewRunIds), new Set(['legacy-review-a', 'legacy-review-b']));
+    assert.ok(migratedState.routes[firstDigest], 'legacy source records remain preserved');
+    assert.ok(migratedState.routes[secondDigest], 'legacy source records remain preserved');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('ambiguous legacy route history requires audited selected import and never silently resets', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.reviewGates = {
+        enforcementMode: 'legacy-v2',
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: [{ id: 'ambiguous-route-fixture', phase: 'static', type: 'command', blocking: true, command: 'node -e "process.exit(0)"' }],
+      };
+    });
+    commitAll(repoRoot, 'Configure ambiguous route migration');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Ambiguous Route', '--json'], repoRoot).stdout);
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = state.resolveWorkflowContext(created.worktreePath);
+    const branchName = run('git', ['branch', '--show-current'], created.worktreePath);
+    const headSha = run('git', ['rev-parse', 'HEAD'], created.worktreePath);
+    const selectedDigest = 'a'.repeat(64);
+    const competingDigest = 'b'.repeat(64);
+    const candidate = (digest, taskSlug, loops) => ({
+      routeFingerprintDigest: digest,
+      routeFingerprint: JSON.stringify({ legacy: digest }),
+      targetCommand: '/pr',
+      taskSlug,
+      branchName,
+      headSha,
+      firstStartedAt: '2026-04-01T00:00:00.000Z',
+      updatedAt: '2026-04-02T00:00:00.000Z',
+      fixReviewLoops: loops,
+      aiReviewRuns: loops,
+      countedReviewRunIds: [`legacy-${loops}`],
+    });
+    state.saveRouteSafetyState(context.commonDir, context.config, {
+      routes: {
+        [selectedDigest]: candidate(selectedDigest, created.taskSlug, 4),
+        [competingDigest]: candidate(competingDigest, 'older-task-on-reused-branch', 9),
+      },
+    });
+
+    const blocked = runCli(['run', 'review', '--json'], created.worktreePath, {}, true);
+    assert.equal(blocked.status, 1);
+    const blockedOutput = `${blocked.stdout}\n${blocked.stderr}`;
+    assert.match(blockedOutput, /legacy route history is ambiguous/);
+    assert.match(blockedOutput, new RegExp(`legacy-import:${selectedDigest}`));
+    assert.match(blockedOutput, /legacy-fresh-start/);
+    let migratedState = state.loadRouteSafetyState(context.commonDir, context.config);
+    let lineage = Object.values(migratedState.routes).find((record) => record.lineageVersion === 1);
+    assert.equal(lineage.legacyMigration.status, 'pending');
+    assert.equal(lineage.fixReviewLoops, 0, 'an ambiguous budget may not be silently attached');
+    assert.ok(migratedState.routes[selectedDigest]);
+    assert.ok(migratedState.routes[competingDigest]);
+
+    const imported = JSON.parse(runCli([
+      'run', 'resume',
+      '--scope', `legacy-import:${selectedDigest}`,
+      '--reason', 'this preserved route is the audited predecessor of the active task binding',
+      '--json',
+    ], created.worktreePath).stdout);
+    assert.match(imported.message, /Imported the preserved budget/);
+    migratedState = state.loadRouteSafetyState(context.commonDir, context.config);
+    lineage = Object.values(migratedState.routes).find((record) => record.lineageVersion === 1);
+    assert.equal(lineage.legacyMigration.status, 'imported');
+    assert.equal(lineage.legacyMigration.sourceDigest, selectedDigest);
+    assert.equal(lineage.legacyMigration.reason, 'this preserved route is the audited predecessor of the active task binding');
+    assert.equal(lineage.fixReviewLoops, 4);
+    assert.equal(lineage.aiReviewRuns, 4);
+    assert.ok(migratedState.routes[competingDigest], 'unselected ambiguous candidates remain preserved');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
   }
 });
 

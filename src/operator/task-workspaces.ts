@@ -11,6 +11,7 @@ import {
   runCommandCapture,
   loadAllTaskLocks,
   loadTaskLock,
+  newTaskBindingId,
   saveTaskLock,
   taskLockPath,
   slugifyTaskName,
@@ -530,6 +531,7 @@ export function saveNewTaskLock(options: {
   return saveTaskLock(options.commonDir, options.config, options.taskSlug, {
     taskSlug: options.taskSlug,
     taskName: options.taskName,
+    taskBindingId: newTaskBindingId(),
     branchName: options.branchName,
     worktreePath: options.worktreePath,
     mode: options.mode,

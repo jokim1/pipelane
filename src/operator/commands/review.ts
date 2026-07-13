@@ -26,6 +26,7 @@ import { DEPLOY_STATE_KEY_ENV, ORCHESTRATION_STATE_KEY_ENV, PROBE_STATE_KEY_ENV,
 import {
   appendReviewAcceptanceRecord,
   appendReviewRunRecord,
+  formatWorkflowCommand,
   loadReviewState,
   normalizePath,
   nowIso,
@@ -56,7 +57,12 @@ import {
   guardReviewRunStartForRouteSafety,
   recordReviewRunForRouteSafety,
 } from '../route-loop-safety.ts';
-import { reviewGateDefinitionHash } from '../review-enforcement.ts';
+import {
+  evaluateReviewEvidenceForPr,
+  recordReviewEvidenceConsents,
+  reviewGateDefinitionHash,
+} from '../review-enforcement.ts';
+import { visibleReviewGateFailureOutput } from '../review-output.ts';
 import { sanitizeForTerminal } from '../text-output.ts';
 
 type ReviewSetupStatus = 'configured' | 'reported' | 'cancelled';
@@ -323,8 +329,43 @@ export async function handleReview(cwd: string, parsed: ParsedOperatorArgs): Pro
     handleReviewPass(cwd, parsed);
     return;
   }
+  if (subcommand === 'override') {
+    handleReviewOverride(cwd, parsed);
+    return;
+  }
 
   handleReviewRun(cwd, parsed);
+}
+
+function handleReviewOverride(cwd: string, parsed: ParsedOperatorArgs): void {
+  const context = resolveWorkflowContext(cwd);
+  const gateId = parsed.flags.reviewGate.trim();
+  const reason = parsed.flags.reason.trim();
+  const routeAction = parsed.flags.scope.trim() || formatWorkflowCommand(context.config, 'pr');
+  const evidence = evaluateReviewEvidenceForPr(context, { command: routeAction });
+  const allIssues = [...evidence.issues, ...evidence.bypassedIssues];
+  const matching = allIssues.filter((issue) => issue.gateId === gateId);
+  if (matching.length === 0) {
+    throw new Error(`review override found no blocking ${gateId} evidence for the current exact target and route action ${routeAction}.`);
+  }
+  const consents = recordReviewEvidenceConsents(context, {
+    ...evidence,
+    issues: matching,
+    bypassedIssues: [],
+  }, routeAction, reason);
+  printResult(parsed.flags, {
+    command: 'review override',
+    status: 'bypassed',
+    gateId,
+    routeAction,
+    consents,
+    message: [
+      `Recorded exact-scope informed consent for ${gateId}.`,
+      `Route action: ${routeAction}`,
+      `Reason: ${reason}`,
+      'The failed or pending gate remains failed or pending; it was not relabeled as passed.',
+    ].join('\n'),
+  });
 }
 
 async function handleReviewSetup(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
@@ -4217,6 +4258,17 @@ function renderReviewRunReport(record: ReviewRunRecord, evidencePath: string): s
       const marker = gate.status.toUpperCase();
       const blocking = gate.blocking ? 'blocking' : 'non-blocking';
       lines.push(`- ${gate.gateId} [${gate.phase}] ${marker} (${blocking}) - ${gate.summary}`);
+    }
+  }
+
+  const failedGateDetails = record.gates
+    .map((gate) => ({ gate, output: visibleReviewGateFailureOutput(gate) }))
+    .filter((entry) => entry.output.length > 0);
+  if (failedGateDetails.length > 0) {
+    lines.push('', 'Failed gate details:');
+    for (const { gate, output } of failedGateDetails) {
+      lines.push(`- ${gate.gateId} output:`);
+      lines.push(...output.split('\n').map((line) => `  ${line}`));
     }
   }
 

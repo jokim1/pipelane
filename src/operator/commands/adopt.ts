@@ -5,9 +5,11 @@ import {
   formatWorkflowCommand,
   loadAllTaskLocks,
   loadTaskLock,
+  legacyTaskBindingId,
   normalizeExistingPath,
   normalizePath,
   nowIso,
+  newTaskBindingId,
   printResult,
   removeTaskLock,
   resolveWorkflowContext,
@@ -252,9 +254,16 @@ function saveAdoptedTaskLock(options: {
 }): TaskLock {
   const updatedAt = nowIso();
   const history = buildAdoptBindingHistory(options, updatedAt);
+  const sameBinding = Boolean(options.existingLock
+    && options.existingLock.branchName === options.branchName
+    && normalizeExistingPath(options.existingLock.worktreePath) === normalizeExistingPath(options.worktreePath));
   return saveTaskLock(options.commonDir, options.config, options.taskSlug, {
     taskSlug: options.taskSlug,
     taskName: options.taskName,
+    taskBindingId: sameBinding
+      ? options.existingLock?.taskBindingId ?? legacyTaskBindingId(options.config, options.existingLock!)
+      : newTaskBindingId(),
+    taskBrief: sameBinding ? options.existingLock?.taskBrief : undefined,
     branchName: options.branchName,
     worktreePath: options.worktreePath,
     mode: options.existingLock?.mode ?? options.mode,
