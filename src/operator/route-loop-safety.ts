@@ -33,7 +33,12 @@ import {
   type ReviewEvidenceCheckResult,
   type ReviewEvidenceIssue,
 } from './review-enforcement.ts';
-import { visibleReviewGateFailureOutput } from './review-output.ts';
+import {
+  projectReviewGate,
+  projectReviewRun,
+  renderReviewGatePresentation,
+  renderReviewPresentation,
+} from './review-output.ts';
 import { reviewArtifactRoot } from './state.ts';
 import { readWorktreeStatusSnapshot } from './worktree-status.ts';
 
@@ -972,14 +977,23 @@ function formatReviewFindings(options: PauseOptions, artifactRoot?: string): str
     : options.latest
       ? reviewIssuesFromRun(options.latest)
       : [];
-  const lines: string[] = [];
+  const gateIds = issues.flatMap((issue) => issue.gateId ? [issue.gateId] : []);
+  const lines = issues
+    .filter((issue) => !issue.gate || issue.status === 'incomplete')
+    .map((issue) => `- ${issue.message}`);
+  if (options.latest) {
+    lines.push(...renderReviewPresentation(projectReviewRun(options.latest, {
+      artifactRoot,
+      relation: 'current',
+    }), {
+      gateIds: gateIds.length > 0 ? gateIds : undefined,
+      includePassed: gateIds.length > 0,
+    }));
+    return lines;
+  }
   for (const issue of issues) {
-    lines.push(`- ${issue.message}`);
     if (!issue.gate) continue;
-    const output = visibleReviewGateFailureOutput(issue.gate, artifactRoot);
-    if (!output) continue;
-    lines.push(`  ${issue.gate.gateId} output:`);
-    lines.push(...output.split('\n').map((line) => `    ${line}`));
+    lines.push(...renderReviewGatePresentation(projectReviewGate(issue.gate, artifactRoot)));
   }
   return lines;
 }

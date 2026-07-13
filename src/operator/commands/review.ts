@@ -102,7 +102,7 @@ import {
   persistReviewArtifact,
 } from '../review-artifacts.ts';
 import { normalizeTaskBrief, redactReviewSecrets, REVIEW_DATA_LIMITS } from '../review-data.ts';
-import { visibleReviewGateFailureOutput } from '../review-output.ts';
+import { projectReviewRun, renderReviewGatePresentation } from '../review-output.ts';
 import { sanitizeForTerminal } from '../text-output.ts';
 
 type ReviewSetupStatus = 'configured' | 'reported' | 'cancelled';
@@ -4930,6 +4930,7 @@ function redactReviewOutput(value: string): string {
 }
 
 function renderReviewRunReport(record: ReviewRunRecord, evidencePath: string, artifactRoot?: string): string {
+  const presentation = projectReviewRun(record, { artifactRoot, relation: 'current' });
   const lines = [
     'Pipelane review',
     `Status: ${record.status}`,
@@ -4945,21 +4946,23 @@ function renderReviewRunReport(record: ReviewRunRecord, evidencePath: string, ar
   if (record.gates.length === 0) {
     lines.push('- none');
   } else {
-    for (const gate of record.gates) {
+    for (const gate of presentation.gates) {
       const marker = gate.status.toUpperCase();
       const blocking = gate.blocking ? 'blocking' : 'non-blocking';
-      lines.push(`- ${gate.gateId} [${gate.phase}] ${marker} (${blocking}) - ${gate.summary}`);
+      lines.push(`- ${gate.gateId} [${gate.phase}] ${marker} (${blocking}) - ${gate.summary} (${gate.counts.blocking} blocking findings, ${gate.counts.advisory} advisory)`);
     }
   }
 
-  const failedGateDetails = record.gates
-    .map((gate) => ({ gate, output: visibleReviewGateFailureOutput(gate, artifactRoot) }))
-    .filter((entry) => entry.output.length > 0);
-  if (failedGateDetails.length > 0) {
-    lines.push('', 'Failed gate details:');
-    for (const { gate, output } of failedGateDetails) {
-      lines.push(`- ${gate.gateId} output:`);
-      lines.push(...output.split('\n').map((line) => `  ${line}`));
+  const presentedGateDetails = presentation.gates.filter((gate) =>
+    gate.status === 'failed'
+    || gate.status === 'pending'
+    || gate.findings.length > 0
+    || gate.protocolErrors.length > 0
+  );
+  if (presentedGateDetails.length > 0) {
+    lines.push('', 'Review evidence details:');
+    for (const gate of presentedGateDetails) {
+      lines.push(...renderReviewGatePresentation(gate));
     }
   }
 

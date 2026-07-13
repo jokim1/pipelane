@@ -70,6 +70,12 @@ that ignore unknown fields parse every revision transparently. See
   is branch history and must not be treated as current. `review.latest` remains
   a compatibility alias for `review.current` through the 0.2.x line and is
   removed in 0.3.0.
+- `review.current.presentation` and `review.recent.presentation` are derived,
+  control-safe display data. They include the relation (`current` or `recent`),
+  checkout identity, gate and finding counts, every structured finding,
+  protocol errors, bounded report/diagnostic text when applicable, and a next
+  action only for actionable current evidence. Recent history never supplies a
+  current-checkout action, and the projection never changes evidence status.
 - `review.enforcementMode`, `review.policyVersion`, and
   `review.blockingGateIds` describe the current configured contract so clients
   can distinguish an upgrade mismatch from current evidence without guessing.
@@ -157,6 +163,12 @@ Preflight for `pr`, task-branch `merge`, and route actions that would run
 the checkout is behind the configured base branch. Clients should surface the
 reason and have the operator rebase before retrying, rather than confirming
 or executing a stale route.
+
+When review evidence blocks one of those actions, `preflight.review` contains
+the same typed presentation used by `/status` and the board. Clients should
+render all relevant findings and protocol errors before the recovery and
+exact-scope bypass choices in `preflight.reason`. A bypass remains consent for
+that scope; it does not change a failed or pending gate to passed.
 
 `doctor.fix` is intentionally **not** exposed as an API action — it is
 interactive (TTY prompts for platform + URLs) and lives behind
