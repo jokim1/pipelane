@@ -30,6 +30,7 @@ export interface ReviewGateCatalogEntry {
   baselineCommandId?: string;
   replacesBaselineCommandId?: string;
   optional?: boolean;
+  timeoutMs?: number;
 }
 
 export interface PackageScriptDetection {
@@ -172,6 +173,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     type: 'command',
     scriptNames: ['test', 'test:unit'],
     recommended: true,
+    timeoutMs: 45 * 60 * 1000,
   },
   {
     id: 'build',
@@ -191,6 +193,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     whenChanged: ['docs/**', 'README.md', 'CHANGELOG.md', '*.md', '*.mdx'],
     userCommands: ['/review', '/gstack review', '/gstack-review'],
     recommended: true,
+    timeoutMs: 30 * 60 * 1000,
   },
   {
     id: 'karpathy-diff',
@@ -200,6 +203,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     skill: 'karpathy-diff',
     userCommands: ['/karpathy diff', '/karpathy-diff', '/karpathy:diff'],
     recommended: true,
+    timeoutMs: 30 * 60 * 1000,
   },
   {
     id: 'code-review-high',
@@ -209,6 +213,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     role: 'claude-code-review-high',
     userCommands: ['/code-review high'],
     recommended: false,
+    timeoutMs: 30 * 60 * 1000,
   },
   {
     id: 'adversarial-review',
@@ -218,6 +223,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     role: 'adversarial-code-reviewer',
     userCommands: ['/claude-review', '/codex review'],
     recommended: false,
+    timeoutMs: 30 * 60 * 1000,
   },
   {
     id: 'code-review-ultra',
@@ -228,6 +234,7 @@ export const REVIEW_GATE_CATALOG: ReviewGateCatalogEntry[] = [
     when: 'risk:auth|billing|migrations|sql|secrets|deploy|infra|concurrency|api|rollback',
     userCommands: ['/code-review ultra', 'claude ultrareview --json'],
     recommended: false,
+    timeoutMs: 30 * 60 * 1000,
   },
   {
     id: 'karpathy-audit',
@@ -459,6 +466,7 @@ function toReviewGateConfig(entry: ResolvedReviewGateCatalogEntry): ReviewGateCo
     role: entry.role,
     when: entry.when,
     whenChanged: entry.whenChanged,
+    timeoutMs: entry.timeoutMs,
     userCommands: entry.userCommands,
     profiles: entry.profiles,
     baselineCommandId: entry.baselineCommandId ?? (entry.type === 'command' && isStableEvidenceId(entry.id) ? entry.id : undefined),

@@ -6,7 +6,7 @@ import type { WorkflowConfig } from '../state.ts';
 import { nowIso, resolveStateDir } from '../state.ts';
 
 export const API_CONFIRMATIONS_DIRNAME = 'api-confirmations';
-export const API_CONFIRMATION_TTL_MS = 10 * 60 * 1000;
+export const API_CONFIRMATION_TTL_MS = 30 * 60 * 1000;
 const API_CONFIRMATION_TOKEN_PATTERN = /^[a-f0-9]{32,64}$/;
 
 export interface ConfirmationRecord {
@@ -70,7 +70,8 @@ export function sweepExpiredApiConfirmations(commonDir: string, config: Workflow
     if (entry.endsWith('.json')) {
       try {
         const record = JSON.parse(readFileSync(filePath, 'utf8')) as ConfirmationRecord;
-        if (!record.expiresAt || Date.parse(record.expiresAt) < now) {
+        const expiresAtMs = typeof record.expiresAt === 'string' ? Date.parse(record.expiresAt) : NaN;
+        if (!Number.isFinite(expiresAtMs) || expiresAtMs < now) {
           unlinkSync(filePath);
         }
       } catch {
@@ -154,7 +155,8 @@ export function consumeActionConfirmation(
   if (!record) {
     throw new Error('No confirmation token found for this action.');
   }
-  if (!record.expiresAt || Date.parse(record.expiresAt) < Date.now()) {
+  const expiresAtMs = typeof record.expiresAt === 'string' ? Date.parse(record.expiresAt) : NaN;
+  if (!Number.isFinite(expiresAtMs) || expiresAtMs < Date.now()) {
     throw new Error('Confirmation token expired. Run the preflight again.');
   }
   if (record.fingerprint !== expectedFingerprint) {

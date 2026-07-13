@@ -252,6 +252,68 @@ function runCli(args, cwd, env = {}, allowFailure = false) {
   return result;
 }
 
+test('runtime identity embeds build metadata and exposes version identity without corrupting JSON stdout', async () => {
+  const runtimeIdentity = await import(pathToFileURL(path.join(KIT_ROOT, 'src', 'runtime-identity.ts')).href);
+  const packageRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-runtime-identity-'));
+  mkdirSync(path.join(packageRoot, 'dist'), { recursive: true });
+  writeFileSync(path.join(packageRoot, 'package.json'), `${JSON.stringify({ name: 'pipelane', version: '9.8.7' })}\n`, 'utf8');
+  writeFileSync(path.join(packageRoot, 'dist', 'build-info.json'), `${JSON.stringify({
+    sha: 'abcdef0123456789abcdef0123456789abcdef01',
+    builtAt: '2026-07-12T20:30:40.000Z',
+  })}\n`, 'utf8');
+
+  const identity = runtimeIdentity.resolvePipelaneRuntimeIdentity(
+    pathToFileURL(path.join(packageRoot, 'dist', 'runtime-identity.js')).href,
+  );
+  assert.deepEqual(identity, {
+    version: '9.8.7',
+    sha: 'abcdef0123456789abcdef0123456789abcdef01',
+    builtAt: '2026-07-12T20:30:40.000Z',
+    packageRoot: realpathSync(packageRoot),
+    source: 'dist',
+  });
+  assert.equal(runtimeIdentity.formatPipelaneRuntimeBanner(identity), `pipelane v9.8.7 (abcdef0) from ${realpathSync(packageRoot)}`);
+  assert.match(runtimeIdentity.formatPipelaneVersion(identity), /build timestamp: 2026-07-12T20:30:40\.000Z/);
+
+  const generatedRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-build-info-'));
+  run(process.execPath, [path.join(KIT_ROOT, 'scripts', 'write-build-info.mjs')], generatedRoot, {
+    PIPELANE_BUILD_SHA: '1234567890abcdef',
+    PIPELANE_BUILD_TIMESTAMP: '2026-07-12T21:22:23Z',
+  });
+  assert.deepEqual(JSON.parse(readFileSync(path.join(generatedRoot, 'dist', 'build-info.json'), 'utf8')), {
+    sha: '1234567890abcdef',
+    builtAt: '2026-07-12T21:22:23.000Z',
+  });
+
+  const repoRoot = createRepo();
+  writePipelaneConfig(repoRoot);
+  const status = runCli(['run', 'status', '--json'], repoRoot);
+  assert.match(status.stderr.split(/\r?\n/)[0], /^pipelane v0\.2\.0 \([a-f0-9]{7}\) from \/.+$/);
+  assert.doesNotThrow(() => JSON.parse(status.stdout));
+  const version = runCli(['--version'], repoRoot);
+  assert.match(version.stdout, /^pipelane v0\.2\.0 \([a-f0-9]{7}\) from \/.+\nbuild timestamp: unavailable\n$/);
+});
+
+test('runtime identity warns when a host repo pin differs from the running build', async () => {
+  const runtimeIdentity = await import(pathToFileURL(path.join(KIT_ROOT, 'src', 'runtime-identity.ts')).href);
+  const repoRoot = createRepo();
+  const packageJsonPath = path.join(repoRoot, 'package.json');
+  const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+  pkg.devDependencies = { ...(pkg.devDependencies ?? {}), pipelane: 'github:example/pipelane#e4b0693' };
+  writeFileSync(packageJsonPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+
+  const warnings = runtimeIdentity.buildRuntimeWarnings({
+    version: '0.2.0',
+    sha: 'e12f3a9123456789',
+    builtAt: '2026-07-12T20:30:40.000Z',
+    packageRoot: '/tmp/installed-pipelane',
+    source: 'dist',
+  }, repoRoot);
+  assert.deepEqual(warnings, [
+    'Warning: running e12f3a9 but repo pins e4b0693 — run npm install or point npx at the repo install.',
+  ]);
+});
+
 function scriptsWithPreinstallGuard(scripts = {}) {
   return {
     ...scripts,
@@ -4053,6 +4115,54 @@ test('linked worktrees do not inherit unignored untracked config from another ch
   }
 });
 
+test('deploy onboarding auto-imports legacy repo-local and package.json workflow config', async () => {
+  const onboardingMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'onboarding.ts'));
+  const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+
+  for (const source of ['file', 'package']) {
+    const repoRoot = createRepo();
+    try {
+      if (source === 'file') {
+        writeFileSync(path.join(repoRoot, '.pipelane.json'), `${JSON.stringify({
+          displayName: 'Legacy File App',
+          projectKey: 'legacy-file-app',
+          surfaces: ['frontend'],
+        }, null, 2)}\n`, 'utf8');
+      } else {
+        const packageJsonPath = path.join(repoRoot, 'package.json');
+        const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+        pkg.pipelane = {
+          displayName: 'Legacy Package App',
+          projectKey: 'legacy-package-app',
+          surfaces: ['edge'],
+        };
+        writeFileSync(packageJsonPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+      }
+
+      assert.equal(stateMod.resolveReadableConfigPath(repoRoot), null);
+      assert.equal(onboardingMod.buildMissingDeployOnboardingMessage(repoRoot, { environment: 'staging' }), null);
+      assert.ok(stateMod.resolveReadableConfigPath(repoRoot), `${source} legacy config should be imported machine-locally`);
+      const loaded = stateMod.loadWorkflowConfig(repoRoot);
+      assert.equal(loaded.displayName, source === 'file' ? 'Legacy File App' : 'Legacy Package App');
+      assert.deepEqual(loaded.surfaces, [source === 'file' ? 'frontend' : 'edge']);
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test('deploy onboarding error includes a concrete non-interactive configure command', async () => {
+  const onboardingMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'onboarding.ts'));
+  const repoRoot = createRepo();
+  try {
+    const message = onboardingMod.buildMissingDeployOnboardingMessage(repoRoot, { environment: 'staging' });
+    assert.match(message, /pipelane configure --json --platform=github-actions/);
+    assert.match(message, /--frontend-staging-url=https:\/\/staging\.example\.com/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('loadWorkflowConfig detects package scripts for default review gates without inventing missing scripts', async () => {
   const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
   const repoRoot = createRepo();
@@ -4061,7 +4171,9 @@ test('loadWorkflowConfig detects package scripts for default review gates withou
     assert.deepEqual(loaded.reviewGates.gates.slice(0, 3).map((gate) => gate.id), ['typecheck', 'test', 'build']);
     assert.equal(loaded.reviewGates.gates.find((gate) => gate.id === 'typecheck').command, 'npm run typecheck');
     assert.equal(loaded.reviewGates.gates.find((gate) => gate.id === 'test').command, 'npm run test');
+    assert.equal(loaded.reviewGates.gates.find((gate) => gate.id === 'test').timeoutMs, 45 * 60 * 1000);
     assert.equal(loaded.reviewGates.gates.find((gate) => gate.id === 'build').command, 'npm run build');
+    assert.equal(loaded.reviewGates.gates.find((gate) => gate.id === 'karpathy-diff').timeoutMs, 30 * 60 * 1000);
 
     const packageJsonPath = path.join(repoRoot, 'package.json');
     const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
@@ -4113,6 +4225,8 @@ test('review setup --yes persists the recommended gate checklist', () => {
     assert.deepEqual(Object.keys(raw.reviewGates).sort(), ['gates', 'planReview', 'policyVersion']);
     assert.equal(raw.reviewGates.policyVersion, 2);
     assert.ok(Array.isArray(raw.reviewGates.gates));
+    assert.equal(raw.reviewGates.gates.find((gate) => gate.id === 'test').timeoutMs, 45 * 60 * 1000);
+    assert.equal(raw.reviewGates.gates.find((gate) => gate.id === 'karpathy-diff').timeoutMs, 30 * 60 * 1000);
     assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'typecheck'));
     assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'test'));
     assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'build'));
@@ -14151,6 +14265,70 @@ test('review runner records pending AI gates without failing the process', () =>
   }
 });
 
+test('a successful review --gate retry augments the latest full run without rewriting its evidence', async () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Incremental Review Demo', {
+      routeSafety: {
+        defaultFixReviewLoops: 3,
+        defaultMinutes: 90,
+        defaultAiReviewRuns: 1,
+        stopOnMajorFindings: true,
+      },
+      reviewGates: {
+        planReview: { gates: [] },
+        gates: [
+          {
+            id: 'always-pass',
+            phase: 'static',
+            type: 'command',
+            command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify('process.exit(0)')}`,
+            blocking: true,
+          },
+          {
+            id: 'retry-gate',
+            phase: 'behavioral',
+            type: 'command',
+            command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.exit(process.env.PIPELANE_TEST_RETRY_GATE_PASS === '1' ? 0 : 2)")}`,
+            blocking: true,
+          },
+        ],
+      },
+    });
+    commitLocal(repoRoot, 'Configure incremental review gates');
+
+    const first = runCli(['run', 'review', '--json'], repoRoot, {
+      PIPELANE_TEST_RETRY_GATE_PASS: '0',
+    }, true);
+    const fullReport = JSON.parse(first.stdout);
+    assert.equal(first.status, 1);
+    assert.equal(fullReport.gates.find((gate) => gate.gateId === 'always-pass').status, 'passed');
+    assert.equal(fullReport.gates.find((gate) => gate.gateId === 'retry-gate').status, 'failed');
+
+    const retried = JSON.parse(runCli(['run', 'review', '--gate', 'retry-gate', '--json'], repoRoot, {
+      PIPELANE_TEST_RETRY_GATE_PASS: '1',
+    }).stdout);
+    assert.equal(retried.status, 'passed');
+    assert.equal(retried.gateFilter, 'retry-gate');
+
+    const evidencePath = path.join(sharedStateDir(repoRoot), 'review-state.json');
+    const state = JSON.parse(readFileSync(evidencePath, 'utf8'));
+    const savedFullRun = state.records.find((record) => record.id === fullReport.runId);
+    const savedRetry = state.records.find((record) => record.id === retried.runId);
+    assert.equal(savedFullRun.gates.find((gate) => gate.gateId === 'retry-gate').status, 'failed', 'stored evidence is append-only');
+    assert.equal(savedRetry.gates[0].status, 'passed');
+
+    const { resolveWorkflowContext } = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const { evaluateReviewEvidenceForPr } = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-enforcement.ts'));
+    const attestation = evaluateReviewEvidenceForPr(resolveWorkflowContext(repoRoot));
+    assert.equal(attestation.allowed, true, attestation.message);
+    assert.equal(attestation.latest.id, fullReport.runId, 'the full run remains the attestation envelope');
+    assert.equal(attestation.latest.gates.find((gate) => gate.gateId === 'retry-gate').status, 'passed');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('review evidence remains valid after committing the reviewed dirty tree', async () => {
   const repoRoot = createRepo();
   try {
@@ -14828,6 +15006,54 @@ test('review runner fails when a blocking command gate fails', () => {
   }
 });
 
+test('review gate timeouts have a distinct outcome and a targeted retry remedy', () => {
+  const repoRoot = createRepo();
+  try {
+    writeSingleCommandReviewGate(repoRoot, {
+      id: 'slow-check',
+      timeoutMs: 75,
+      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify('setTimeout(() => {}, 5000)')}`,
+    });
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.routeSafety.defaultFixReviewLoops = 3;
+    });
+
+    const result = runCli(['run', 'review', '--gate', 'slow-check', '--json'], repoRoot, {}, true);
+    const report = JSON.parse(result.stdout);
+    const gate = report.gates[0];
+
+    assert.equal(result.status, 1);
+    assert.equal(report.status, 'failed');
+    assert.equal(gate.status, 'failed', 'timeout remains fail-closed for existing status consumers');
+    assert.equal(gate.outcome, 'timeout');
+    assert.match(gate.summary, /timed out after 75ms/);
+    assert.match(gate.summary, /pipelane run review --gate slow-check/);
+
+    const human = runCli(['run', 'review', '--gate', 'slow-check'], repoRoot, {}, true);
+    assert.equal(human.status, 1);
+    assert.match(human.stdout, /slow-check \[static\] TIMEOUT/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('PIPELANE_REVIEW_GATE_TIMEOUT_MS overrides per-gate timeouts and rejects invalid values', async () => {
+  const reviewMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'review.ts'));
+  const previous = process.env.PIPELANE_REVIEW_GATE_TIMEOUT_MS;
+  try {
+    process.env.PIPELANE_REVIEW_GATE_TIMEOUT_MS = '1234';
+    assert.equal(reviewMod.resolveReviewGateTimeoutMs({ timeoutMs: 9999 }), 1234);
+    process.env.PIPELANE_REVIEW_GATE_TIMEOUT_MS = 'not-a-duration';
+    assert.throws(
+      () => reviewMod.resolveReviewGateTimeoutMs({ timeoutMs: 9999 }),
+      /PIPELANE_REVIEW_GATE_TIMEOUT_MS must be an integer/,
+    );
+  } finally {
+    if (previous === undefined) delete process.env.PIPELANE_REVIEW_GATE_TIMEOUT_MS;
+    else process.env.PIPELANE_REVIEW_GATE_TIMEOUT_MS = previous;
+  }
+});
+
 test('review runner fails when a command gate commits to HEAD', () => {
   const repoRoot = createRepo();
   try {
@@ -15246,11 +15472,13 @@ test('review command gate lock timeout returns a failed gate record with owner d
     assert.notEqual(result.status, 0);
     assert.equal(report.status, 'failed');
     assert.equal(gate.status, 'failed');
+    assert.equal(gate.outcome, 'timeout');
     assert.equal(gate.errorCode, 'EREVIEWGATELOCKTIMEOUT');
     assert.equal(gate.exitCode, null);
     assert.match(gate.summary, /Owner pid/);
     assert.match(gate.summary, /external-owner/);
     assert.match(gate.summary, /review-external-lock/);
+    assert.match(gate.summary, /pipelane run review --gate typecheck/);
     assert.match(gate.summary, new RegExp(lockPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     assert.equal(existsSync(markerPath), false);
   } finally {
@@ -15998,6 +16226,37 @@ test('repo-guard links shared node_modules when it creates a new isolated worktr
     assert.equal(realpathSync(linkedNodeModules), realpathSync(path.join(repoRoot, 'node_modules')));
     assert.match(guarded.message, /Dependency setup note: node_modules in this worktree is a symlink/);
     assert.doesNotMatch(guarded.message, /Warning: node_modules in this worktree is a symlink/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('repo-guard rejects invalid or divergent mode snapshots before creating a lock', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    commitAll(repoRoot, 'Adopt workflow-kit');
+
+    const invalid = runCli([
+      'run', 'repo-guard', '--task', 'Invalid Mode', '--mode', 'banana', '--json',
+    ], repoRoot, {}, true);
+    assert.equal(invalid.status, 1);
+    assert.match(invalid.stderr, /--mode must be build or release/);
+
+    const divergent = runCli([
+      'run', 'repo-guard', '--task', 'Release Mode', '--mode', 'release', '--json',
+    ], repoRoot, {}, true);
+    assert.equal(divergent.status, 1);
+    assert.match(divergent.stderr, /would create a task lock that disagrees with current mode build/);
+    assert.match(divergent.stderr, /Run \/devmode release first/);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'task-locks', 'release-mode.json')), false);
+
+    const invalidVerify = runCli([
+      'run', 'task-lock', 'verify', '--task', 'Release Mode', '--mode', 'banana', '--json',
+    ], repoRoot, {}, true);
+    assert.equal(invalidVerify.status, 1);
+    assert.match(invalidVerify.stderr, /task-lock verify --mode must be build or release/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -17619,6 +17878,24 @@ test('release-check passes when a staging-succeeded DeployRecord covers every re
   }
 });
 
+test('release-check recommends the minimal probe remedy after staging has already succeeded', async () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeFullDeployConfigState(repoRoot);
+    await writeStagingSucceededRecord(repoRoot, ['frontend', 'edge', 'sql'], { skipProbeState: true });
+
+    const result = runCli(['run', 'release-check', '--json'], repoRoot, {}, true);
+    const output = JSON.parse(result.stdout);
+    assert.equal(result.status, 1);
+    assert.match(output.message, /Next: run `\/doctor --probe`, then retry this command/);
+    assert.doesNotMatch(output.message, /Next: run `\/pipelane configure`/);
+    assert.doesNotMatch(output.message, /Next: re-run `\/deploy staging`/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('release-check tells the operator to wait when staging deploy is still in flight', () => {
   const repoRoot = createRepo();
   try {
@@ -19090,7 +19367,7 @@ test('pr blocks stale task branches before committing or opening review', () => 
 
     const result = runCli(['run', 'pr', '--title', 'Stale Review', '--json'], created.worktreePath, env, true);
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /\/pr blocked because this checkout is behind origin\/main by 1 commit/);
+    assert.match(result.stderr, /\/pr blocked because task branch codex\/stale-review-.* is behind origin\/main by 1 commit/);
     assert.match(result.stderr, /git rebase origin\/main/);
 
     assert.match(run('git', ['status', '--short'], created.worktreePath), /feature\.txt/);
@@ -19128,7 +19405,7 @@ test('merge blocks stale task branches before calling gh merge', () => {
 
     const result = runCli(['run', 'merge', '--json'], created.worktreePath, env, true);
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /\/merge blocked because this checkout is behind origin\/main by 1 commit/);
+    assert.match(result.stderr, /\/merge blocked because task branch codex\/stale-merge-.* is behind origin\/main by 1 commit/);
     assert.match(result.stderr, /git rebase origin\/main/);
 
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
@@ -19881,7 +20158,7 @@ test('pr accepts legacy reviewer-less review pass evidence with trusted AI attes
   }
 });
 
-test('api action pr preflight blocks pending and filtered review evidence', () => {
+test('api action pr preflight keeps full pending evidence authoritative over a filtered retry', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
@@ -19921,8 +20198,8 @@ test('api action pr preflight blocks pending and filtered review evidence', () =
     );
     assert.equal(filtered.status, 1);
     const filteredEnvelope = JSON.parse(filtered.stdout);
-    assert.match(filteredEnvelope.data.preflight.reason, /latest review .* was filtered by gate typecheck/);
-    assert.equal(filteredEnvelope.data.preflight.issues[0].status, 'incomplete');
+    assert.match(filteredEnvelope.data.preflight.reason, /blocking gate karpathy-diff is pending/);
+    assert.equal(filteredEnvelope.data.preflight.issues[0].status, 'pending');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -20911,8 +21188,8 @@ test('pr blocks lockless shared-checkout commits while task worktree locks are a
 
     const blocked = runCli(['run', 'pr', '--title', 'Manual Shared Lease', '--json'], repoRoot, env, true);
     assert.equal(blocked.status, 1);
-    assert.match(blocked.stderr, /\/pr blocked because this is the shared checkout while task worktree locks are active/);
-    assert.match(blocked.stderr, /Mutating workflow commands must run from a task-owned worktree lease/);
+    assert.match(blocked.stderr, /\/pr blocked because task active-isolated-task belongs to a different worktree/);
+    assert.match(blocked.stderr, /No base-drift or dirty-worktree measurements were taken/);
     assert.match(blocked.stderr, new RegExp(active.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     assert.match(run('git', ['status', '--short'], repoRoot), /\?\? shared-change\.txt/);
     assert.equal(existsSync(ghStateFile), false, 'blocked shared-checkout PR must not call gh');
@@ -20947,9 +21224,8 @@ test('merge --pr blocks in the shared checkout when the PR task is leased elsewh
 
     const blocked = runCli(['run', 'merge', '--pr', '1', '--json'], repoRoot, env, true);
     assert.equal(blocked.status, 1);
-    assert.match(blocked.stderr, /Task lock mismatch/);
-    assert.match(blocked.stderr, /expected branch codex\/lease-merge-/);
-    assert.match(blocked.stderr, new RegExp(`expected worktree ${created.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.match(blocked.stderr, /\/merge blocked because task lease-merge belongs to a different worktree/);
+    assert.match(blocked.stderr, new RegExp(`Task worktree: ${created.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
 
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
     assert.equal(ghState.prMergeCalls.length, 0, 'shared-checkout merge must not call gh pr merge');
@@ -20989,9 +21265,8 @@ test('deploy --pr blocks in the shared checkout when the PR task is leased elsew
 
     const blocked = runCli(['run', 'deploy', 'staging', '--pr', '1', '--json'], repoRoot, env, true);
     assert.equal(blocked.status, 1);
-    assert.match(blocked.stderr, /Task lock mismatch/);
-    assert.match(blocked.stderr, /expected branch codex\/lease-deploy-/);
-    assert.match(blocked.stderr, new RegExp(`expected worktree ${created.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.match(blocked.stderr, /\/deploy blocked because task lease-deploy belongs to a different worktree/);
+    assert.match(blocked.stderr, new RegExp(`Task worktree: ${created.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
 
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
     assert.equal(ghState.prMergeCalls.length, 1);
@@ -21654,7 +21929,8 @@ test('build-mode bare deploy auto-merge stops when review evidence is not ready'
     assert.equal(payload.execution.completed, false);
     assert.equal(payload.execution.failedStep, '/merge');
     assert.equal(payload.execution.failureMessage, undefined);
-    assert.match(payload.execution.steps[0].stderr, /^\/merge blocked because review gate evidence is not ready\./);
+    assert.match(payload.execution.steps[0].stderr, /^pipelane v\S+ \([^)]+\) from .+\n/);
+    assert.match(payload.execution.steps[0].stderr, /\/merge blocked because review gate evidence is not ready\./);
     assert.match(payload.execution.steps[0].stderr, /no review run has been recorded/);
     assert.doesNotMatch(payload.execution.steps[0].stderr, /\/pr\b/);
     assert.equal(ghState.prMergeCalls.length, 0);
@@ -22337,7 +22613,7 @@ test('api action deploy.prod --execute bypasses the TTY prompt via the API env v
 
     // Preflight issues a token fingerprinted on the normalized deploy.prod inputs.
     const preflight = JSON.parse(runCli(
-      ['run', 'api', 'action', 'deploy.prod', '--task', 'Prod Api'],
+      ['run', 'api', 'action', 'deploy.prod', '--task', 'Prod Api', '--json'],
       created.worktreePath,
       env,
     ).stdout);
@@ -22579,8 +22855,10 @@ test('pr in an external task-like checkout returns recovery choices instead of /
       ['use-current-checkout', 'continue-attached-workspace'],
     );
     assert.match(output.message, /You have 2 options:/);
-    assert.match(output.message, /Type which option you would like to proceed with/);
-    assert.doesNotMatch(output.message, /\/new|--task/);
+    assert.match(output.message, /--recover use-current-checkout --binding-fingerprint [a-f0-9]{64}/);
+    assert.match(output.message, new RegExp(`cd '${created.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}'`));
+    assert.match(output.message, /No interactive prompt is waiting for input/);
+    assert.doesNotMatch(output.message, /\/new/);
 
     const lock = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`), 'utf8'));
     assert.equal(lock.worktreePath, created.worktreePath, 'first preflight must not mutate the existing task lock');
@@ -23135,7 +23413,7 @@ test('pr recovery blocks when current checkout is already locked by another task
   }
 });
 
-test('pr recovery blocks detached HEAD before rebinding the task lock', () => {
+test('pr from a detached wrong checkout hands off before inspecting recovery state', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const externalParent = mkdtempSync(path.join(os.tmpdir(), 'pipelane-external-'));
   const externalWorktree = path.join(externalParent, 'canvas-palette-options-4f2a');
@@ -23161,7 +23439,9 @@ test('pr recovery blocks detached HEAD before rebinding the task lock', () => {
 
     const result = runCli(['run', 'pr', '--task', 'Canvas Palette Options', '--json'], externalWorktree, {}, true);
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /detached HEAD/);
+    assert.match(result.stderr, /belongs to a different worktree/);
+    assert.match(result.stderr, new RegExp(`cd ${created.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.match(result.stderr, /No base-drift or dirty-worktree measurements were taken/);
     assert.equal(readFileSync(lockPath, 'utf8'), beforeLock, 'detached recovery must not mutate the lock');
   } finally {
     try {
@@ -23175,7 +23455,7 @@ test('pr recovery blocks detached HEAD before rebinding the task lock', () => {
   }
 });
 
-test('pr recovery from base checkout only offers attached workspace and never rebinds base', () => {
+test('pr from the base checkout hard-errors with the attached task path and never rebinds', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
 
   try {
@@ -23190,12 +23470,10 @@ test('pr recovery from base checkout only offers attached workspace and never re
 
     const result = runCli(['run', 'pr', '--task', 'Canvas Palette Options', '--json'], repoRoot, {}, true);
     assert.equal(result.status, 1);
-    const output = JSON.parse(result.stdout);
-
-    assert.equal(output.needsRecoveryChoice, true);
-    assert.deepEqual(output.options.map((option) => option.value), ['continue-attached-workspace']);
-    assert.doesNotMatch(JSON.stringify(output.options), /use-current-checkout/);
-    assert.match(output.message, /You have 1 option:/);
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, /belongs to a different worktree/);
+    assert.match(result.stderr, new RegExp(`cd ${created.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.match(result.stderr, /No base-drift or dirty-worktree measurements were taken/);
     assert.equal(readFileSync(lockPath, 'utf8'), beforeLock, 'base checkout preflight must not mutate the lock');
 
     const blocked = runCli([
@@ -23206,7 +23484,7 @@ test('pr recovery from base checkout only offers attached workspace and never re
       '--json',
     ], repoRoot, {}, true);
     assert.equal(blocked.status, 1);
-    assert.match(blocked.stderr, /stale|preflight|no longer/i);
+    assert.match(blocked.stderr, /belongs to a different worktree/);
     assert.equal(readFileSync(lockPath, 'utf8'), beforeLock, 'base checkout recovery must not mutate the lock');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -26931,7 +27209,7 @@ test('api action preflight: risky action issues a confirmation token', () => {
     writePipelaneConfig(repoRoot, 'Demo App');
     commitAll(repoRoot, 'Adopt pipelane');
 
-    const envelope = JSON.parse(runCli(['run', 'api', 'action', 'merge'], repoRoot).stdout);
+    const envelope = JSON.parse(runCli(['run', 'api', 'action', 'merge', '--json'], repoRoot).stdout);
     assert.equal(envelope.data.action.risky, true);
     assert.equal(envelope.data.preflight.requiresConfirmation, true);
     assert.ok(envelope.data.preflight.confirmation?.token);
@@ -26948,7 +27226,7 @@ test('api action preflight includes explicit PR identity in normalized inputs', 
     writePipelaneConfig(repoRoot, 'Demo App');
     commitAll(repoRoot, 'Adopt pipelane');
 
-    const merge = JSON.parse(runCli(['run', 'api', 'action', 'merge', '--pr', '422'], repoRoot).stdout);
+    const merge = JSON.parse(runCli(['run', 'api', 'action', 'merge', '--pr', '422', '--json'], repoRoot).stdout);
     assert.equal(merge.data.preflight.normalizedInputs.pr, '422');
     assert.equal(merge.data.preflight.normalizedInputs.task, '');
     assert.ok(merge.data.preflight.confirmation?.token);
@@ -26997,7 +27275,7 @@ test('api action execute: risky action accepts a matching confirm token and runs
 
     // clean.apply now requires scope. Pass --all-stale so the preflight is
     // allowed and the confirm token binds to that scope via the fingerprint.
-    const preflight = JSON.parse(runCli(['run', 'api', 'action', 'clean.apply', '--all-stale'], repoRoot).stdout);
+    const preflight = JSON.parse(runCli(['run', 'api', 'action', 'clean.apply', '--all-stale', '--json'], repoRoot).stdout);
     const token = preflight.data.preflight.confirmation.token;
     assert.ok(token);
 
@@ -27011,6 +27289,69 @@ test('api action execute: risky action accepts a matching confirm token and runs
     assert.equal(envelope.data.action.id, 'clean.apply');
     assert.equal(envelope.data.execution.exitCode, 0);
     assert.ok(envelope.data.execution.result, 'handler output parsed');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('api confirmation flags are explicit, machine-readable, 30-minute, and optionally single-shot', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const ignoredToken = runCli([
+      'run', 'api', 'action', 'clean.apply', '--all-stale', '--confirm-token', 'a'.repeat(32),
+    ], repoRoot, {}, true);
+    assert.equal(ignoredToken.status, 1);
+    assert.match(ignoredToken.stderr, /--confirm-token requires --execute/);
+
+    const machinePreflight = runCli(['run', 'api', 'action', 'clean.apply', '--all-stale'], repoRoot);
+    const [machineLine, ...jsonLines] = machinePreflight.stdout.trim().split(/\r?\n/);
+    assert.match(machineLine, /^PIPELANE_CONFIRM_TOKEN=[a-f0-9]{32}$/);
+    const machineEnvelope = JSON.parse(jsonLines.join('\n'));
+    assert.equal(machineEnvelope.data.preflight.confirmation.token, machineLine.split('=')[1]);
+
+    const strictJson = runCli(['run', 'api', 'action', 'clean.apply', '--all-stale', '--json'], repoRoot);
+    assert.doesNotMatch(strictJson.stdout, /^PIPELANE_CONFIRM_TOKEN=/);
+    assert.ok(JSON.parse(strictJson.stdout).data.preflight.confirmation.token);
+
+    const confirmations = await import(path.join(KIT_ROOT, 'src', 'operator', 'api', 'confirm-tokens.ts'));
+    assert.equal(confirmations.API_CONFIRMATION_TTL_MS, 30 * 60 * 1000);
+    const createdAt = Date.parse(machineEnvelope.data.preflight.confirmation.expiresAt) - confirmations.API_CONFIRMATION_TTL_MS;
+    assert.ok(Math.abs(Date.now() - createdAt) < 10_000);
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+    const malformedFingerprint = confirmations.buildActionFingerprint('clean.apply', { allStale: true });
+    const malformed = confirmations.createActionConfirmation(context.commonDir, context.config, {
+      actionId: 'clean.apply',
+      fingerprint: malformedFingerprint,
+      normalizedInputs: { allStale: true },
+    });
+    writeFileSync(confirmations.apiConfirmationPath(context.commonDir, context.config, malformed.token), `${JSON.stringify({
+      ...malformed,
+      expiresAt: 'not-a-date',
+    }, null, 2)}\n`, 'utf8');
+    assert.throws(
+      () => confirmations.consumeActionConfirmation(context.commonDir, context.config, malformed.token, malformedFingerprint),
+      /Confirmation token expired/,
+      'malformed expiry must fail closed instead of creating a non-expiring token',
+    );
+
+    const disabled = runCli([
+      'run', 'api', 'action', 'clean.apply', '--all-stale', '--execute', '--auto-confirm', '--json',
+    ], repoRoot, {}, true);
+    assert.equal(disabled.status, 1);
+    assert.match(disabled.stderr, /PIPELANE_ALLOW_AUTOCONFIRM=1/);
+
+    const enabled = runCli([
+      'run', 'api', 'action', 'clean.apply', '--all-stale', '--execute', '--auto-confirm', '--json',
+    ], repoRoot, { PIPELANE_ALLOW_AUTOCONFIRM: '1' });
+    const executed = JSON.parse(enabled.stdout);
+    assert.equal(executed.ok, true);
+    assert.equal(executed.data.execution.exitCode, 0);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -28352,6 +28693,136 @@ test('devmode release --override --reason persists reason into lastOverride', as
     assert.equal(after.modeState.lastOverride.reason, 'shipping hotfix TICKET-42');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('devmode reconciles the active task lock in both mode directions without bypassing release readiness', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeFullDeployConfigState(repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Mode Reconciliation', '--json'], repoRoot).stdout);
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', 'mode-reconciliation.json');
+    assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).mode, 'build');
+
+    runCli([
+      'run', 'devmode', 'release', '--override', '--reason', 'legacy mismatch fixture', '--json',
+    ], repoRoot);
+    const legacyMismatch = runCli([
+      'run', 'task-lock', 'verify', '--task', 'Mode Reconciliation', '--json',
+    ], created.worktreePath, {}, true);
+    assert.equal(legacyMismatch.status, 1);
+    assert.match(JSON.parse(legacyMismatch.stdout).message, /\/devmode release --task "mode-reconciliation"/);
+    runCli(['run', 'devmode', 'build', '--task', 'Mode Reconciliation', '--json'], created.worktreePath);
+
+    const blocked = runCli(['run', 'devmode', 'release', '--json'], created.worktreePath, {}, true);
+    assert.equal(blocked.status, 1);
+    assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).mode, 'build', 'failed readiness must not reconcile the lock');
+
+    await writeStagingSucceededRecord(repoRoot, ['frontend', 'edge', 'sql']);
+    const released = JSON.parse(runCli(['run', 'devmode', 'release', '--json'], created.worktreePath).stdout);
+    assert.equal(released.mode, 'release');
+    assert.equal(released.taskLockTransition, 'task lock mode-reconciliation: build → release');
+    assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).mode, 'release');
+
+    const releaseVerify = JSON.parse(runCli([
+      'run', 'task-lock', 'verify', '--task', 'Mode Reconciliation', '--json',
+    ], created.worktreePath).stdout);
+    assert.equal(releaseVerify.ok, true, 'new → devmode release → task-lock verify must need no manual state edit');
+
+    const built = JSON.parse(runCli(['run', 'devmode', 'build', '--json'], created.worktreePath).stdout);
+    assert.equal(built.taskLockTransition, 'task lock mode-reconciliation: release → build');
+    assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).mode, 'build');
+    const buildVerify = JSON.parse(runCli([
+      'run', 'task-lock', 'verify', '--task', 'Mode Reconciliation', '--json',
+    ], created.worktreePath).stdout);
+    assert.equal(buildVerify.ok, true, 'release-locked tasks must always have a path back to build');
+
+    const apiRelease = JSON.parse(runCli([
+      'run', 'api', 'action', 'devmode.release', '--task', 'Mode Reconciliation', '--execute', '--json',
+    ], created.worktreePath).stdout);
+    assert.equal(apiRelease.ok, true);
+    assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).mode, 'release', 'API drivers must not silently drop --task');
+    const apiBuild = JSON.parse(runCli([
+      'run', 'api', 'action', 'devmode.build', '--task', 'Mode Reconciliation', '--execute', '--json',
+    ], created.worktreePath).stdout);
+    assert.equal(apiBuild.ok, true);
+    assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).mode, 'build');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('devmode release refreshes only age-stale probes inline and remains fail-closed on a real probe failure', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Inline Probe Refresh');
+    writeFullDeployConfigState(repoRoot);
+    await writeStagingSucceededRecord(repoRoot, ['frontend', 'edge', 'sql'], { skipProbeState: true });
+    writeStaleProbeState(repoRoot, ['frontend', 'edge', 'sql']);
+
+    const apiPreflight = JSON.parse(runCli([
+      'run', 'api', 'action', 'devmode.release', '--json',
+    ], repoRoot).stdout);
+    assert.equal(apiPreflight.ok, true, 'API preflight must allow the CLI to perform its inline read-only refresh');
+
+    const refreshed = JSON.parse(runCli(['run', 'devmode', 'release', '--json'], repoRoot, {
+      PIPELANE_DOCTOR_PROBE_STUB_STATUS: '200',
+    }).stdout);
+    assert.equal(refreshed.mode, 'release');
+    assert.match(refreshed.message, /Refreshed stale release probes inline/);
+    assert.equal(refreshed.probeRefresh.records.filter((record) => record.environment === 'staging').length, 3);
+    assert.equal(refreshed.probeRefresh.records.every((record) => record.ok), true);
+
+    runCli(['run', 'devmode', 'build', '--json'], repoRoot);
+    writeStaleProbeState(repoRoot, ['frontend', 'edge', 'sql']);
+    const failed = runCli(['run', 'devmode', 'release', '--json'], repoRoot, {
+      PIPELANE_DOCTOR_PROBE_STUB_STATUS: '503',
+    }, true);
+    const failedReport = JSON.parse(failed.stdout);
+    assert.equal(failed.status, 1);
+    assert.equal(failedReport.ready, false);
+    assert.equal(failedReport.probeRefresh.records.some((record) => record.environment === 'staging' && !record.ok), true);
+    assert.match(failedReport.message, /HTTP 503/);
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    assert.equal(stateMod.resolveWorkflowContext(repoRoot).modeState.mode, 'build');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('task-scoped pr merge and deploy reject the wrong checkout before cwd drift or dirty measurements', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Cwd Trust Guard', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(repoRoot, 'unrelated-main-change.txt'), 'do not inspect or stage me\n', 'utf8');
+    advanceRemoteMain(remoteRoot, 'remote-cwd-guard.txt');
+
+    const commands = [
+      ['run', 'pr', '--task', 'Cwd Trust Guard', '--title', 'Wrong checkout', '--json'],
+      ['run', 'merge', '--task', 'Cwd Trust Guard', '--json'],
+      ['run', 'deploy', 'staging', '--task', 'Cwd Trust Guard', '--json'],
+      ['run', 'api', 'action', 'pr', '--task', 'Cwd Trust Guard', '--title', 'Wrong checkout', '--json'],
+      ['run', 'api', 'action', 'merge', '--task', 'Cwd Trust Guard', '--json'],
+      ['run', 'api', 'action', 'deploy.staging', '--task', 'Cwd Trust Guard', '--json'],
+    ];
+    for (const args of commands) {
+      const blocked = runCli(args, repoRoot, {}, true);
+      assert.equal(blocked.status, 1, `${args[1]} should hard-error in the wrong checkout`);
+      assert.match(blocked.stderr, /task cwd-trust-guard belongs to a different worktree/);
+      assert.match(blocked.stderr, new RegExp(`  cd ${created.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+      assert.doesNotMatch(blocked.stderr, /behind origin\/main|dirty local changes|requires --title/);
+    }
+    assert.match(run('git', ['status', '--short'], repoRoot), /\?\? unrelated-main-change\.txt/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
   }
 });
 
@@ -30765,7 +31236,7 @@ test('v1.1 api action rollback.prod preflight issues a confirm-token, execute re
     // Preflight: requires no prior deploy state — it's a read-only gate
     // that returns a confirm token fingerprinted on the normalized inputs.
     const preflight = JSON.parse(runCli(
-      ['run', 'api', 'action', 'rollback.prod', '--task', 'Confirm Binding', '--surfaces', 'frontend'],
+      ['run', 'api', 'action', 'rollback.prod', '--task', 'Confirm Binding', '--surfaces', 'frontend', '--json'],
       created.worktreePath, env,
     ).stdout);
     assert.equal(preflight.ok, true);
@@ -31090,7 +31561,7 @@ test('v1.1 codex fixup: rollback.* preflight surface fallback matches execute (t
     // lane → target is 'oldfrontendsha'. The pre-Codex-fix behavior
     // would fall to config.surfaces and target 'oldallsurfaces' instead.
     const preflight = JSON.parse(runCli(
-      ['run', 'api', 'action', 'rollback.prod', '--task', 'Narrow'],
+      ['run', 'api', 'action', 'rollback.prod', '--task', 'Narrow', '--json'],
       created.worktreePath, env,
     ).stdout);
     assert.equal(preflight.ok, true);
@@ -32483,7 +32954,7 @@ test('destination routes block opaque dirty approvals before local PR side effec
   }
 });
 
-test('destination routes with explicit task plan against the attached worktree from parent checkout', () => {
+test('destination routes with an explicit task hand off before planning from the parent checkout', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
@@ -32498,23 +32969,22 @@ test('destination routes with explicit task plan against the attached worktree f
       ['run', 'deploy', 'staging', '--task', 'Attached Route', '--plan', '--json'],
       repoRoot,
       { PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200' },
+      true,
     );
-    const payload = JSON.parse(result.stdout);
 
-    assert.equal(result.status, 0);
-    assert.equal(payload.taskSlug, 'attached-route');
-    assert.equal(payload.worktreePath, created.worktreePath);
-    assert.equal(payload.fingerprintInputs.worktreePath, created.worktreePath);
-    assert.match(payload.currentStatus, new RegExp(created.branch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-    assert.deepEqual(payload.blockers, []);
-    assert.doesNotMatch(payload.message, /parent-only\.txt|No task lock matches branch main|no active task could be inferred/);
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, /belongs to a different worktree/);
+    assert.match(result.stderr, new RegExp(`cd ${created.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.match(result.stderr, /No base-drift or dirty-worktree measurements were taken/);
+    assert.doesNotMatch(result.stderr, /parent-only\.txt/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
   }
 });
 
-test('destination route execution runs explicit task PR step inside the attached worktree', () => {
+test('destination route execution refuses to proxy an explicit task PR from the parent checkout', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
   const ghStateFile = path.join(fakeBin, 'gh-state.json');
@@ -32537,17 +33007,20 @@ test('destination route execution runs explicit task PR step inside the attached
       ['run', 'pr', '--task', 'Attached Execute', '--title', 'Attached Execute', '--yes', '--json'],
       repoRoot,
       env,
+      true,
     );
-    const payload = JSON.parse(result.stdout);
-    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    const ghState = existsSync(ghStateFile)
+      ? JSON.parse(readFileSync(ghStateFile, 'utf8'))
+      : { prs: {} };
     const pr = Object.values(ghState.prs).find((entry) => entry.title === 'Attached Execute');
 
-    assert.equal(result.status, 0);
-    assert.equal(payload.execution.steps[0].cwd, created.worktreePath);
-    assert.ok(pr, 'route-created PR should be created from the task worktree');
-    assert.equal(pr.headRefName, created.branch);
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, /belongs to a different worktree/);
+    assert.match(result.stderr, new RegExp(`cd ${created.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.equal(pr, undefined, 'wrong-checkout route must not create a PR');
     assert.match(run('git', ['status', '--short'], repoRoot), /parent-only\.txt/);
-    assert.equal(run('git', ['log', '-1', '--pretty=%s'], created.worktreePath), 'Attached Execute');
+    assert.match(run('git', ['status', '--short'], created.worktreePath), /feature\.txt/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -32954,6 +33427,7 @@ test('api route actions re-check review evidence at execute time', () => {
       'run', 'api', 'action', 'route.merge',
       '--task', 'Route Review Drift',
       '--title', 'Route Review Drift',
+      '--json',
     ];
     const preflight = JSON.parse(runCli(routeArgs, created.worktreePath, env).stdout);
     const token = preflight.data.preflight.confirmation.token;
@@ -33002,6 +33476,7 @@ test('api route actions forward approved PR title and message into the PR child'
       '--task', 'Route Metadata',
       '--title', 'Approved PR Title',
       '--message', 'approved commit message',
+      '--json',
     ];
     const preflight = JSON.parse(runCli(routeArgs, created.worktreePath, env).stdout);
     const token = preflight.data.preflight.confirmation.token;
@@ -33584,11 +34059,10 @@ test('orchestrate paused run reviews as passed (not blocked) and the next action
     assert.equal(snapshot.data.orchestration.activeRun.nextAction.id, 'orchestrate.resume');
 
     const deployFromParent = runCli(['run', 'deploy', 'staging', '--plan', '--json'], repoRoot, {}, true);
-    const deployPlan = JSON.parse(deployFromParent.stdout);
     assert.equal(deployFromParent.status, 1);
-    assert.match(deployPlan.blockers.join('\n'), /active orchestration run/);
-    assert.match(deployPlan.blockers.join('\n'), /do not run \/deploy staging from main/);
-    assert.match(deployPlan.blockers.join('\n'), /cd .* && \/deploy staging --task/);
+    assert.equal(deployFromParent.stdout, '');
+    assert.match(deployFromParent.stderr, /belongs to a different worktree|shared checkout while task worktree locks are active/);
+    assert.match(deployFromParent.stderr, /cd |resume/);
   } finally {
     for (const worktreePath of createdWorktrees) rmSync(worktreePath, { recursive: true, force: true });
     rmSync(repoRoot, { recursive: true, force: true });

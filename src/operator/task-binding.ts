@@ -371,11 +371,29 @@ export function applyTaskBindingRecovery(
   };
 }
 
-export function formatTaskBindingRecoveryMessage(diagnosis: TaskBindingNeedsRecovery): string {
-  const optionLines = diagnosis.options.flatMap((option, index) => [
-    `${index + 1}. ${option.label}`,
-    `   ${option.description}`,
-  ]);
+export function formatTaskBindingRecoveryMessage(
+  config: WorkflowConfig,
+  diagnosis: TaskBindingNeedsRecovery,
+): string {
+  const optionLines = diagnosis.options.flatMap((option, index) => {
+    const commands = option.value === 'continue-attached-workspace'
+      ? [
+          `   Run: cd ${shellQuoteForCommand(diagnosis.lock.worktreePath)}`,
+          `        ${formatWorkflowCommand(config, 'pr')}`,
+        ]
+      : [
+          `   Run: ${formatWorkflowCommand(config, 'pr', [
+            `--task ${shellQuoteForCommand(diagnosis.taskSlug)}`,
+            `--recover ${option.value}`,
+            `--binding-fingerprint ${option.fingerprint}`,
+          ])}`,
+        ];
+    return [
+      `${index + 1}. ${option.label}`,
+      `   ${option.description}`,
+      ...commands,
+    ];
+  });
   const optionCount = diagnosis.options.length;
   const attachedState = diagnosis.attached.exists
     ? `${diagnosis.lock.branchName} at ${diagnosis.lock.worktreePath}${diagnosis.attached.dirty ? ` (${diagnosis.attached.statusEntryCount} uncommitted status entr${diagnosis.attached.statusEntryCount === 1 ? 'y' : 'ies'})` : ''}`
@@ -387,12 +405,16 @@ export function formatTaskBindingRecoveryMessage(diagnosis: TaskBindingNeedsReco
     `You have ${optionCount} option${optionCount === 1 ? '' : 's'}:`,
     ...optionLines,
     '',
-    'Type which option you would like to proceed with.',
+    'Choose one of the commands above. No interactive prompt is waiting for input.',
     '',
     `Current checkout: ${diagnosis.current.branchName} at ${diagnosis.current.repoRoot}`,
     `Attached task workspace: ${attachedState}`,
     `Task: ${diagnosis.taskSlug}`,
   ].join('\n');
+}
+
+function shellQuoteForCommand(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 export function resolveLocalPrTitleRequirement(

@@ -68,6 +68,8 @@ const REVIEW_CONFIG_CHANGE_WHEN = 'review-config-changed';
 const REVIEW_CONFIG_CHANGE_PATHS: string[] = [];
 const REVIEW_PHASE_ORDER = REVIEW_GATE_PHASES;
 const DEFAULT_GATE_TIMEOUT_MS = 30 * 60 * 1000;
+const REVIEW_GATE_TIMEOUT_ENV = 'PIPELANE_REVIEW_GATE_TIMEOUT_MS';
+const MAX_REVIEW_GATE_TIMEOUT_MS = 2_147_483_647;
 const MAX_FIX_FIRST_REVIEW_RESTARTS = 2;
 const DEFAULT_REVIEW_SETUP_NPM_INSTALL_TIMEOUT_MS = 2 * 60 * 1000;
 const OUTPUT_TAIL_CHARS = 4000;
@@ -1962,6 +1964,7 @@ function reviewSetupGateToConfig(gate: ReviewSetupGateOption): ReviewGateConfig 
     role: entry.role,
     when: entry.when,
     whenChanged: entry.whenChanged,
+    timeoutMs: entry.timeoutMs,
     userCommands,
     profiles: entry.profiles,
     baselineCommandId: entry.baselineCommandId ?? (entry.type === 'command' && isStableEvidenceId(entry.id) ? entry.id : undefined),
@@ -2249,7 +2252,7 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
 }
 
 function formatReviewGateProgressStart(gate: ReviewGateConfig): string {
-  const timeoutSeconds = Math.ceil((gate.timeoutMs ?? DEFAULT_GATE_TIMEOUT_MS) / 1000);
+  const timeoutSeconds = Math.ceil(resolveReviewGateTimeoutMs(gate) / 1000);
   return `pipelane review: starting ${sanitizeForTerminal(gate.phase)}/${sanitizeForTerminal(gate.id)} (${sanitizeForTerminal(gate.type)}, timeout ${timeoutSeconds}s)`;
 }
 
@@ -2260,7 +2263,21 @@ function formatReviewPrepareProgress(): string {
 function formatReviewGateProgressFinish(gate: ReviewGateRunRecord): string {
   const summary = oneLineForChecklist(gate.summary ?? '');
   const detail = summary ? ` - ${summary}` : '';
-  return `pipelane review: finished ${sanitizeForTerminal(gate.phase)}/${sanitizeForTerminal(gate.gateId)}: ${sanitizeForTerminal(gate.status)}${detail}`;
+  const outcome = gate.outcome === 'timeout' ? 'timeout' : gate.status;
+  return `pipelane review: finished ${sanitizeForTerminal(gate.phase)}/${sanitizeForTerminal(gate.gateId)}: ${sanitizeForTerminal(outcome)}${detail}`;
+}
+
+export function resolveReviewGateTimeoutMs(gate: Pick<ReviewGateConfig, 'timeoutMs'>): number {
+  const raw = process.env[REVIEW_GATE_TIMEOUT_ENV]?.trim();
+  if (!raw) return gate.timeoutMs ?? DEFAULT_GATE_TIMEOUT_MS;
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`${REVIEW_GATE_TIMEOUT_ENV} must be an integer from 1 to ${MAX_REVIEW_GATE_TIMEOUT_MS} milliseconds.`);
+  }
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > MAX_REVIEW_GATE_TIMEOUT_MS) {
+    throw new Error(`${REVIEW_GATE_TIMEOUT_ENV} must be an integer from 1 to ${MAX_REVIEW_GATE_TIMEOUT_MS} milliseconds.`);
+  }
+  return parsed;
 }
 
 export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): ReviewRunRecord {
@@ -3297,7 +3314,7 @@ function runReviewGate(options: {
     });
   }
 
-  const timeoutMs = gate.timeoutMs ?? DEFAULT_GATE_TIMEOUT_MS;
+  const timeoutMs = resolveReviewGateTimeoutMs(gate);
   const inheritedContext = evaluateInheritedReviewGateContext();
   const nestedFailure = nestedReviewGateFailureSummary(inheritedContext);
   if (nestedFailure) {
@@ -3321,9 +3338,13 @@ function runReviewGate(options: {
     inheritedContext,
   });
   if (lock.status === 'failed') {
+    const lockTimedOut = lock.errorCode === REVIEW_GATE_LOCK_TIMEOUT_ERROR_CODE;
     return finishGate(base, startMs, {
       status: 'failed',
-      summary: lock.summary,
+      ...(lockTimedOut ? { outcome: 'timeout' as const } : {}),
+      summary: lockTimedOut
+        ? `${lock.summary} Re-run pipelane run review --gate ${gate.id}.`
+        : lock.summary,
       exitCode: null,
       errorCode: lock.errorCode,
     });
@@ -3367,9 +3388,12 @@ function runReviewGate(options: {
 
   return finishGate(base, startMs, {
     status: ok && !checkoutMutationSummary ? 'passed' : 'failed',
+    ...(timedOut ? { outcome: 'timeout' as const } : {}),
     summary: ok && !checkoutMutationSummary
       ? `command passed: ${gate.command}`
-      : checkoutMutationSummary ?? errorSummary,
+      : checkoutMutationSummary ?? (timedOut
+        ? `${errorSummary}. Re-run pipelane run review --gate ${gate.id}.`
+        : errorSummary),
     exitCode,
     ...(signal ? { signal } : {}),
     ...(errorCode ? { errorCode } : {}),
@@ -3418,7 +3442,7 @@ function runAiReviewGate(options: {
     });
   }
 
-  const timeoutMs = gate.timeoutMs ?? DEFAULT_GATE_TIMEOUT_MS;
+  const timeoutMs = resolveReviewGateTimeoutMs(gate);
   const sessionId = `review-gate:${gate.id}:${crypto.randomUUID()}`;
   const inheritedContext = evaluateInheritedReviewGateContext();
   const nestedFailure = nestedReviewGateFailureSummary(inheritedContext);
@@ -3443,9 +3467,13 @@ function runAiReviewGate(options: {
     inheritedContext,
   });
   if (lock.status === 'failed') {
+    const lockTimedOut = lock.errorCode === REVIEW_GATE_LOCK_TIMEOUT_ERROR_CODE;
     return finishGate({ ...base, command }, startMs, {
       status: 'failed',
-      summary: lock.summary,
+      ...(lockTimedOut ? { outcome: 'timeout' as const } : {}),
+      summary: lockTimedOut
+        ? `${lock.summary} Re-run pipelane run review --gate ${gate.id}.`
+        : lock.summary,
       exitCode: null,
       errorCode: lock.errorCode,
     });
@@ -3506,8 +3534,11 @@ function runAiReviewGate(options: {
   if (timedOut) {
     return finishGate({ ...base, command }, startMs, {
       status: 'failed',
-      summary: `AI review command timed out after ${timeoutMs}ms`,
+      outcome: 'timeout',
+      summary: `AI review command timed out after ${timeoutMs}ms. Re-run pipelane run review --gate ${gate.id}.`,
       exitCode,
+      errorCode: (result.error as NodeJS.ErrnoException).code ?? 'ETIMEDOUT',
+      errorMessage: result.error?.message ?? null,
       attester,
       stdoutTail: redactedStdout,
       stderrTail: redactedStderr,
@@ -4214,7 +4245,7 @@ function renderReviewRunReport(record: ReviewRunRecord, evidencePath: string): s
     lines.push('- none');
   } else {
     for (const gate of record.gates) {
-      const marker = gate.status.toUpperCase();
+      const marker = gate.outcome === 'timeout' ? 'TIMEOUT' : gate.status.toUpperCase();
       const blocking = gate.blocking ? 'blocking' : 'non-blocking';
       lines.push(`- ${gate.gateId} [${gate.phase}] ${marker} (${blocking}) - ${gate.summary}`);
     }

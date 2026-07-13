@@ -166,18 +166,22 @@ export function selectReviewEvidenceRecord(
   },
 ): ReviewRunRecord | null {
   const { currentBranch, currentSha } = options;
-  return records.find((record) =>
-    record.branchName === currentBranch
-    && record.sha === currentSha
-    && reviewRecordMatchesCurrentWorktree(record, options)
-  )
-    ?? records.find((record) => record.branchName === currentBranch && record.sha === currentSha)
-    ?? records.find((record) =>
-      record.branchName === currentBranch
-      && reviewRecordMatchesCurrentWorktree(record, options)
-    )
-    ?? records.find((record) => record.branchName === currentBranch)
-    ?? null;
+  const predicates = [
+    (record: ReviewRunRecord) => record.branchName === currentBranch
+      && record.sha === currentSha
+      && reviewRecordMatchesCurrentWorktree(record, options),
+    (record: ReviewRunRecord) => record.branchName === currentBranch && record.sha === currentSha,
+    (record: ReviewRunRecord) => record.branchName === currentBranch
+      && reviewRecordMatchesCurrentWorktree(record, options),
+    (record: ReviewRunRecord) => record.branchName === currentBranch,
+  ];
+  for (const predicate of predicates) {
+    const full = records.find((record) => reviewRunCoversFullGateSet(record) && predicate(record));
+    if (full) return full;
+    const any = records.find(predicate);
+    if (any) return any;
+  }
+  return null;
 }
 
 export function formatReviewEvidenceBlocker(context: WorkflowContext, issues: ReviewEvidenceIssue[], command = formatWorkflowCommand(context.config, 'pr')): string {
@@ -387,7 +391,12 @@ function attachEquivalentReviewGateEvidence(options: {
     && gate.blocking !== false
     && isManualReviewGateRun(gate)
   );
-  if (pendingManualGates.length === 0) return reviewRun;
+  const retryableExecutableGates = reviewRun.gates.filter((gate) =>
+    gate.blocking !== false
+    && gate.status === 'failed'
+    && !isManualReviewGateRun(gate)
+  );
+  if (pendingManualGates.length === 0 && retryableExecutableGates.length === 0) return reviewRun;
 
   const evidenceCandidates: Array<{ recordedAt: string; gate: ReviewGateRunRecord }> = [];
   for (const record of options.allRecords) {
@@ -395,6 +404,24 @@ function attachEquivalentReviewGateEvidence(options: {
     for (const gate of record.gates) {
       if (isPassedManualReviewGate(gate)) {
         evidenceCandidates.push({ recordedAt: gate.finishedAt || record.finishedAt, gate });
+      }
+    }
+  }
+  const retryCandidates: Array<{ recordedAt: string; gate: ReviewGateRunRecord }> = [];
+  const fullRunIndex = options.allRecords.findIndex((record) => record.id === reviewRun.id);
+  for (const [recordIndex, record] of options.allRecords.entries()) {
+    if (
+      fullRunIndex < 0
+      || recordIndex >= fullRunIndex
+      || record.dryRun
+      || !record.gateFilter
+      || !reviewRunMatchesEquivalentGateIdentity(reviewRun, record)
+    ) {
+      continue;
+    }
+    for (const gate of record.gates) {
+      if (gate.status === 'passed' && gate.gateId === record.gateFilter) {
+        retryCandidates.push({ recordedAt: gate.finishedAt || record.finishedAt, gate });
       }
     }
   }
@@ -415,23 +442,41 @@ function attachEquivalentReviewGateEvidence(options: {
     }
   }
 
-  if (passedByGateId.size === 0) return reviewRun;
+  retryCandidates.sort((a, b) => b.recordedAt.localeCompare(a.recordedAt));
+  const retriedByGateId = new Map<string, ReviewGateRunRecord>();
+  for (const candidate of retryCandidates) {
+    if (!retriedByGateId.has(candidate.gate.gateId)) {
+      retriedByGateId.set(candidate.gate.gateId, candidate.gate);
+    }
+  }
+
+  if (passedByGateId.size === 0 && retriedByGateId.size === 0) return reviewRun;
   let attached = false;
   const gates = reviewRun.gates.map((gate): ReviewGateRunRecord => {
-    if (gate.status !== 'pending' || !isManualReviewGateRun(gate)) return gate;
-    const passed = passedByGateId.get(gate.gateId);
-    if (!passed || !manualReviewGateEvidenceMatches(gate, passed)) return gate;
-    attached = true;
-    const attachedGate: ReviewGateRunRecord = {
-      ...gate,
-      status: 'passed',
-      summary: passed.summary,
-      startedAt: passed.startedAt,
-      finishedAt: passed.finishedAt,
-      durationMs: passed.durationMs,
-    };
-    if (passed.attester) attachedGate.attester = passed.attester;
-    return attachedGate;
+    if (gate.status === 'pending' && isManualReviewGateRun(gate)) {
+      const passed = passedByGateId.get(gate.gateId);
+      if (!passed || !manualReviewGateEvidenceMatches(gate, passed)) return gate;
+      attached = true;
+      const attachedGate: ReviewGateRunRecord = {
+        ...gate,
+        status: 'passed',
+        summary: passed.summary,
+        startedAt: passed.startedAt,
+        finishedAt: passed.finishedAt,
+        durationMs: passed.durationMs,
+      };
+      if (passed.attester) attachedGate.attester = passed.attester;
+      return attachedGate;
+    }
+
+    if (gate.status === 'failed' && !isManualReviewGateRun(gate)) {
+      const retried = retriedByGateId.get(gate.gateId);
+      if (!retried || reviewGateDefinitionHash(gate) !== reviewGateDefinitionHash(retried)) return gate;
+      attached = true;
+      return retried;
+    }
+
+    return gate;
   });
 
   return attached
@@ -487,7 +532,11 @@ function reviewRunCoversFullGateSet(reviewRun: ReviewRunRecord): boolean {
 
 function reviewRunMatchesEquivalentGateEvidence(expected: ReviewRunRecord, evidence: ReviewRunRecord): boolean {
   return reviewRunCoversFullGateSet(evidence)
-    && evidence.branchName === expected.branchName
+    && reviewRunMatchesEquivalentGateIdentity(expected, evidence);
+}
+
+function reviewRunMatchesEquivalentGateIdentity(expected: ReviewRunRecord, evidence: ReviewRunRecord): boolean {
+  return evidence.branchName === expected.branchName
     && evidence.sha === expected.sha
     && reviewRecordMatchesCurrentWorktree(evidence, {
       currentWorktreeStatusDigest: expected.worktreeStatusDigest ?? '',

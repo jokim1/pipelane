@@ -21,6 +21,7 @@ import {
 import { routeSafetyAcceptsReviewFindings } from '../route-loop-safety.ts';
 import {
   buildSharedCheckoutLeaseBlocker,
+  assertTaskCommandWorktree,
   buildStaleBaseBlocker,
   deriveTaskSlugFromPr,
   ensureTaskLockMatchesCurrent,
@@ -36,16 +37,16 @@ import {
 import { maybeHandleDestinationCommand } from './destination.ts';
 
 export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
-  if (await maybeHandleDestinationCommand(cwd, parsed)) return;
-
   const context = resolveWorkflowContext(cwd);
+  assertTaskCommandWorktree(context, 'merge', parsed.flags.task);
+  if (await maybeHandleDestinationCommand(cwd, parsed)) return;
   const mergeContext = resolveMergeCommandContext(context, parsed);
   const { taskSlug, prBranchName, pr } = mergeContext;
   const currentBranchName = runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
   const currentHeadSha = runGit(context.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '';
   assertPrIsOpenForMerge(pr);
   if (!parsed.flags.pr.trim() || currentBranchName === prBranchName) {
-    const staleBaseBlocker = buildStaleBaseBlocker(context, 'merge');
+    const staleBaseBlocker = buildStaleBaseBlocker(context, 'merge', prBranchName);
     if (staleBaseBlocker) {
       throw new Error(staleBaseBlocker);
     }

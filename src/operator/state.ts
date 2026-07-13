@@ -380,6 +380,7 @@ export interface ReviewGateRunRecord {
   type: ReviewGateType;
   blocking: boolean;
   status: ReviewGateRunStatus;
+  outcome?: 'timeout';
   attester?: ReviewActorIdentity;
   command?: string;
   skill?: string;
@@ -597,6 +598,7 @@ export interface OperatorFlags {
   surfaces: string[];
   execute: boolean;
   confirmToken: string;
+  autoConfirm: boolean;
   forceInclude: string[];
   async: boolean;
   // v1.4: mutually exclusive `/status` view selectors. Default (all false
@@ -1490,6 +1492,58 @@ export function writeWorkflowConfig(repoRoot: string, config: WorkflowConfig): v
     ...config,
     aliases: resolveWorkflowAliases(config.aliases),
   });
+}
+
+export type LegacyWorkflowConfigSource =
+  | 'legacy-pipelane-json'
+  | 'legacy-project-workflow-json'
+  | 'legacy-package-json';
+
+export function importLegacyWorkflowConfigIfNeeded(repoRoot: string): {
+  configPath: string;
+  config: WorkflowConfig;
+  source: LegacyWorkflowConfigSource;
+} | null {
+  if (resolveReadableConfigPath(repoRoot)) return null;
+
+  const legacyFiles: Array<{ filename: string; source: LegacyWorkflowConfigSource }> = [
+    { filename: CONFIG_FILENAME, source: 'legacy-pipelane-json' },
+    { filename: LEGACY_CONFIG_FILENAME, source: 'legacy-project-workflow-json' },
+  ];
+  for (const legacy of legacyFiles) {
+    const targetPath = path.join(repoRoot, legacy.filename);
+    if (!existsSync(targetPath)) continue;
+    const raw = readLegacyWorkflowConfigObject(targetPath, `legacy repo-local ${legacy.filename}`);
+    const config = normalizeWorkflowConfig(raw, { repoRoot });
+    writeWorkflowConfig(repoRoot, config);
+    return { configPath: resolveConfigPath(repoRoot), config, source: legacy.source };
+  }
+
+  const packageJsonPath = path.join(repoRoot, 'package.json');
+  if (!existsSync(packageJsonPath)) return null;
+  const pkg = readLegacyWorkflowConfigObject(packageJsonPath, 'package.json');
+  if (!Object.prototype.hasOwnProperty.call(pkg, 'pipelane')) return null;
+  const overlay = pkg.pipelane;
+  if (!overlay || typeof overlay !== 'object' || Array.isArray(overlay)) {
+    throw new Error(`Malformed legacy package.json:pipelane at ${packageJsonPath}: expected a JSON object. Fix or remove it, then rerun the Pipelane command.`);
+  }
+  const config = normalizeWorkflowConfig(overlay as Partial<WorkflowConfig>, { repoRoot });
+  writeWorkflowConfig(repoRoot, config);
+  return { configPath: resolveConfigPath(repoRoot), config, source: 'legacy-package-json' };
+}
+
+function readLegacyWorkflowConfigObject(targetPath: string, label: string): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(targetPath, 'utf8'));
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Malformed ${label} at ${targetPath}: ${detail}. Fix or remove it, then rerun the Pipelane command.`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`Malformed ${label} at ${targetPath}: expected a JSON object. Fix or remove it, then rerun the Pipelane command.`);
+  }
+  return parsed as Record<string, unknown>;
 }
 
 // Read machine-local workflow config, run the patcher, and write the result
@@ -2714,6 +2768,7 @@ function isReviewGateRunRecord(value: unknown): value is ReviewGateRunRecord {
     && includesString(REVIEW_GATE_TYPES, raw.type)
     && typeof raw.blocking === 'boolean'
     && (raw.status === 'passed' || raw.status === 'failed' || raw.status === 'skipped' || raw.status === 'pending')
+    && (raw.outcome === undefined || raw.outcome === 'timeout')
     && (raw.attester === undefined || isReviewActorIdentity(raw.attester))
     && (raw.command === undefined || typeof raw.command === 'string')
     && (raw.skill === undefined || typeof raw.skill === 'string')
@@ -2976,6 +3031,7 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     surfaces: [],
     execute: false,
     confirmToken: '',
+    autoConfirm: false,
     forceInclude: [],
     async: false,
     week: false,
@@ -3286,6 +3342,12 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       continue;
     }
 
+    if (flagName === '--auto-confirm') {
+      rejectInlineValue('--auto-confirm');
+      flags.autoConfirm = true;
+      continue;
+    }
+
     if (flagName === '--force-include') {
       const raw = readFlagValue('--force-include');
       flags.forceInclude.push(...raw.split(',').map((item) => item.trim()).filter(Boolean));
@@ -3537,7 +3599,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
 
   switch (parsed.command) {
     case 'devmode': {
-      if (parsed.positional.length > 1) failUnexpected('pipelane run devmode [status|build|release] [--surfaces <csv>] [--override --reason <text>]');
+      if (parsed.positional.length > 1) failUnexpected('pipelane run devmode [status|build|release] [--task <task-name>] [--surfaces <csv>] [--override --reason <text>]');
       const action = parsed.positional[0] ?? 'status';
       if (action && action !== 'status' && action !== 'build' && action !== 'release') {
         throw new Error(`Unknown devmode action "${action}". Supported actions: status, build, release.`);
@@ -3545,9 +3607,9 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       if (action === 'status') {
         assertOnlyFlags(parsed, []);
       } else if (action === 'build') {
-        assertOnlyFlags(parsed, ['surfaces']);
+        assertOnlyFlags(parsed, ['task', 'surfaces']);
       } else {
-        assertOnlyFlags(parsed, ['surfaces', 'override', 'reason']);
+        assertOnlyFlags(parsed, ['task', 'surfaces', 'override', 'reason']);
       }
       if (parsed.flags.reason && !parsed.flags.override) {
         throw new Error('devmode only accepts --reason together with --override.');
@@ -3573,6 +3635,9 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
     case 'repo-guard':
       assertOnlyFlags(parsed, ['task', 'mode', 'surfaces', 'offline']);
       requireNoPositional('pipelane run repo-guard --task <task-name> [--mode build|release] [--surfaces <csv>] [--offline]');
+      if (parsed.flags.mode.trim() && parsed.flags.mode !== 'build' && parsed.flags.mode !== 'release') {
+        throw new Error('repo-guard --mode must be build or release.');
+      }
       return;
     case 'pr':
       assertOnlyFlags(parsed, ['task', 'title', 'message', 'forceInclude', 'recover', 'bindingFingerprint', 'override', 'reason', 'plan', 'yes']);
@@ -3641,6 +3706,9 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       assertOnlyFlags(parsed, ['task', 'mode']);
       if (parsed.positional.length !== 1 || parsed.positional[0] !== 'verify') {
         throw new Error('task-lock requires exactly: pipelane run task-lock verify --task <task-name> [--mode build|release]');
+      }
+      if (parsed.flags.mode.trim() && parsed.flags.mode !== 'build' && parsed.flags.mode !== 'release') {
+        throw new Error('task-lock verify --mode must be build or release.');
       }
       return;
     case 'deploy':
@@ -4063,9 +4131,22 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
           'allStale',
           'execute',
           'confirmToken',
+          'autoConfirm',
         ]);
         if (parsed.positional.length !== 2) {
-          throw new Error('api action requires exactly: pipelane run api action <action-id> [--execute] [--confirm-token <token>]');
+          throw new Error('api action requires exactly: pipelane run api action <action-id> [--execute (--confirm-token <token>|--auto-confirm)]');
+        }
+        if (parsed.flags.confirmToken && !parsed.flags.execute) {
+          throw new Error('api action --confirm-token requires --execute; tokens are never ignored or used to mint a new preflight token.');
+        }
+        if (parsed.flags.autoConfirm && !parsed.flags.execute) {
+          throw new Error('api action --auto-confirm requires --execute.');
+        }
+        if (parsed.flags.autoConfirm && parsed.flags.confirmToken) {
+          throw new Error('api action cannot combine --auto-confirm and --confirm-token; choose single-shot or two-step confirmation.');
+        }
+        if (parsed.flags.autoConfirm && process.env.PIPELANE_ALLOW_AUTOCONFIRM !== '1') {
+          throw new Error('api action --auto-confirm requires PIPELANE_ALLOW_AUTOCONFIRM=1. The default remains two-step preflight plus execute.');
         }
         requirePositivePrNumber();
         const actionId = parsed.positional[1] ?? '';
@@ -4144,7 +4225,7 @@ function validateResumeRouteSafetyFlags(parsed: ParsedOperatorArgs): void {
   }
 }
 
-type OperatorFlagKey = keyof OperatorFlags;
+export type OperatorFlagKey = keyof OperatorFlags;
 
 const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flags: OperatorFlags) => boolean }> = [
   { key: 'apply', label: '--apply', active: (flags) => flags.apply },
@@ -4184,6 +4265,7 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'surfaces', label: '--surfaces', active: (flags) => flags.surfaces.length > 0 },
   { key: 'execute', label: '--execute', active: (flags) => flags.execute },
   { key: 'confirmToken', label: '--confirm-token', active: (flags) => flags.confirmToken.trim().length > 0 },
+  { key: 'autoConfirm', label: '--auto-confirm', active: (flags) => flags.autoConfirm },
   { key: 'forceInclude', label: '--force-include', active: (flags) => flags.forceInclude.length > 0 },
   { key: 'async', label: '--async', active: (flags) => flags.async },
   { key: 'week', label: '--week', active: (flags) => flags.week },
@@ -4218,7 +4300,7 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'orchestrationTrustsLocalState', label: '--i-understand-this-trusts-local-state', active: (flags) => flags.orchestrationTrustsLocalState },
 ];
 
-function assertOnlyFlags(parsed: ParsedOperatorArgs, allowed: OperatorFlagKey[]): void {
+export function assertOnlyFlags(parsed: ParsedOperatorArgs, allowed: OperatorFlagKey[]): void {
   const allowedSet = new Set<OperatorFlagKey>(['json', 'help', ...allowed]);
   const unexpected = FLAG_RENDERERS
     .filter((entry) => !allowedSet.has(entry.key) && entry.active(parsed.flags))

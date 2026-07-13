@@ -50,12 +50,26 @@ export async function handleApi(cwd: string, parsed: ParsedOperatorArgs): Promis
     }
 
     const execute = parsed.flags.execute ?? false;
-    const confirmToken = parsed.flags.confirmToken ?? '';
+    let confirmToken = parsed.flags.confirmToken ?? '';
+
+    if (execute && parsed.flags.autoConfirm) {
+      const preflight = buildActionPreflightEnvelope(cwd, actionId, parsed);
+      if (!preflight.ok) {
+        process.stdout.write(`${JSON.stringify(preflight, null, 2)}\n`);
+        process.exitCode = 1;
+        return;
+      }
+      confirmToken = preflight.data.preflight.confirmation?.token ?? '';
+    }
 
     const envelope = execute
       ? await runActionExecute(cwd, actionId, parsed, confirmToken)
       : buildActionPreflightEnvelope(cwd, actionId, parsed);
 
+    if (!execute && !parsed.flags.json) {
+      const token = envelope.data.preflight.confirmation?.token;
+      if (token) process.stdout.write(`PIPELANE_CONFIRM_TOKEN=${token}\n`);
+    }
     process.stdout.write(`${JSON.stringify(envelope, null, 2)}\n`);
     if (!envelope.ok) {
       process.exitCode = 1;

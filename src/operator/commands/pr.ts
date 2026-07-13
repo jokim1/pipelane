@@ -1,5 +1,6 @@
 import {
   buildPrBody,
+  assertTaskCommandWorktree,
   buildSharedCheckoutLeaseBlocker,
   buildStaleBaseBlocker,
   collectChangedPaths,
@@ -49,9 +50,9 @@ import {
 import { buildDestinationPlanForCommand } from '../destination-planner.ts';
 
 export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
-  if (await maybeHandleDestinationCommand(cwd, parsed)) return;
-
   const context = resolveWorkflowContext(cwd);
+  assertTaskCommandWorktree(context, 'pr', parsed.flags.task);
+  if (await maybeHandleDestinationCommand(cwd, parsed)) return;
   let taskSlug = '';
   let lock: TaskLock | null = null;
 
@@ -67,7 +68,7 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
     return;
   }
   if (binding.status === 'needs-recovery') {
-    const message = formatTaskBindingRecoveryMessage(binding.diagnosis);
+    const message = formatTaskBindingRecoveryMessage(context.config, binding.diagnosis);
     if (parsed.flags.json) {
       printResult(parsed.flags, {
         taskSlug: binding.diagnosis.taskSlug,
@@ -111,7 +112,7 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
   }
 
   const branchName = runGit(context.repoRoot, ['branch', '--show-current']) ?? '';
-  const staleBaseBlocker = buildStaleBaseBlocker(context, 'pr');
+  const staleBaseBlocker = buildStaleBaseBlocker(context, 'pr', lock?.branchName || branchName);
   if (staleBaseBlocker) {
     throw new Error(staleBaseBlocker);
   }

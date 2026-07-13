@@ -2,6 +2,7 @@ import { mkdirSync } from 'node:fs';
 
 import { computeRepoGuardUnsafeReasons } from '../repo-guard.ts';
 import {
+  formatWorkflowCommand,
   loadAllTaskLocks,
   loadTaskLock,
   printResult,
@@ -28,6 +29,13 @@ export async function handleRepoGuard(cwd: string, parsed: ParsedOperatorArgs): 
   }
 
   const context = resolveWorkflowContext(cwd);
+  const requestedMode = parsed.flags.mode.trim();
+  if (requestedMode && requestedMode !== context.modeState.mode) {
+    throw new Error([
+      `repo-guard --mode ${requestedMode} would create a task lock that disagrees with current mode ${context.modeState.mode}.`,
+      `Run ${formatWorkflowCommand(context.config, 'devmode', requestedMode)} first so release readiness is checked, then rerun repo-guard.`,
+    ].join('\n'));
+  }
   const { taskName, taskSlug } = resolveTaskCommandIdentity(parsed.flags.task);
   const { branchName, statusLines } = readWorktreeStatus(context.repoRoot);
   const existingLock = loadTaskLock(context.commonDir, context.config, taskSlug);
@@ -42,7 +50,7 @@ export async function handleRepoGuard(cwd: string, parsed: ParsedOperatorArgs): 
     existingTaskWorktree: existingLock?.worktreePath ?? null,
     allLocks: loadAllTaskLocks(context.commonDir, context.config),
   });
-  const mode = (parsed.flags.mode || context.modeState.mode) as 'build' | 'release';
+  const mode = context.modeState.mode;
   const surfaces = resolveCommandSurfaces(context, parsed.flags.surfaces, existingLock?.surfaces ?? []);
 
   if (reasons.length === 0) {

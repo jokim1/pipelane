@@ -1,4 +1,5 @@
 import {
+  importLegacyWorkflowConfigIfNeeded,
   resolveConfigPath,
   resolveReadableConfigPath,
   resolveRepoRoot,
@@ -14,7 +15,7 @@ export function buildMissingDeployOnboardingMessage(
   options: DeployOnboardingMessageOptions = {},
 ): string | null {
   const repoRoot = resolveRepoRoot(cwd);
-  if (resolveReadableConfigPath(repoRoot)) {
+  if (resolveReadableConfigPath(repoRoot) || importLegacyWorkflowConfigIfNeeded(repoRoot)) {
     return null;
   }
 
@@ -44,7 +45,8 @@ export function buildMissingDeployOnboardingMessage(
     '3. Cancel.',
     '   Command: cancel',
     '',
-    'Deploy values may need app-specific URLs, workflows, healthchecks, or commands. For non-interactive setup, pass them with `/pipelane configure --json ...`.',
+    'Deploy values may need app-specific URLs, workflows, healthchecks, or commands.',
+    'Non-interactive example: pipelane configure --json --platform=github-actions --frontend-staging-url=https://staging.example.com --frontend-production-url=https://example.com',
   ].join('\n');
 }
 

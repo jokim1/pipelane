@@ -465,6 +465,7 @@ export type ReleaseReadinessBlockerKind = 'config' | 'observed' | 'probe' | 'uns
 export interface ReleaseReadinessBlocker {
   kind: ReleaseReadinessBlockerKind;
   message: string;
+  code?: 'probe-stale-age';
 }
 
 export interface RequestedDeployRecordState {
@@ -729,21 +730,26 @@ export function evaluateReleaseReadiness(options: {
     return `${surface} staging: ${result.reason}. Run \`${formatWorkflowCommand(options.config, 'deploy', ['staging', surface])}\` first.`;
   };
   const probeState = options.probeState ?? { records: [], updatedAt: '' };
-  const probeFreshness = (surface: string): string | null => {
+  const probeFreshness = (surface: string): { message: string; code?: ReleaseReadinessBlocker['code'] } | null => {
     const expectedUrl = resolveSurfaceProbeUrl(options.deployConfig, 'staging', surface) || undefined;
     const probe = explainSurfaceProbe({ probeState, surface, environment: 'staging', expectedUrl });
     if (probe.state === 'healthy') return null;
     if (probe.state === 'unknown') {
-      return `${surface} staging: no probe recorded. Run \`${formatWorkflowCommand(options.config, 'doctor', '--probe')}\`.`;
+      return { message: `${surface} staging: no probe recorded. Run \`${formatWorkflowCommand(options.config, 'doctor', '--probe')}\`.` };
     }
-    return `${surface} staging probe is ${probe.state}: ${probe.reason}. Re-run \`${formatWorkflowCommand(options.config, 'doctor', '--probe')}\`.`;
+    return {
+      message: `${surface} staging probe is ${probe.state}: ${probe.reason}. Re-run \`${formatWorkflowCommand(options.config, 'doctor', '--probe')}\`.`,
+      ...(probe.state === 'stale' && probe.ageMs !== null && probe.ageMs > PROBE_STALE_MS
+        ? { code: 'probe-stale-age' as const }
+        : {}),
+    };
   };
 
   for (const surface of options.surfaces) {
     const missing: string[] = [];
     const blockers: ReleaseReadinessBlocker[] = [];
-    const addBlocker = (kind: ReleaseReadinessBlockerKind, message: string) => {
-      blockers.push({ kind, message });
+    const addBlocker = (kind: ReleaseReadinessBlockerKind, message: string, code?: ReleaseReadinessBlocker['code']) => {
+      blockers.push({ kind, message, ...(code ? { code } : {}) });
       missing.push(message);
     };
 
@@ -790,7 +796,7 @@ export function evaluateReleaseReadiness(options: {
       const observed = observedStagingSuccess('frontend');
       if (observed) addBlocker('observed', observed);
       const probe = probeFreshness('frontend');
-      if (probe) addBlocker('probe', probe);
+      if (probe) addBlocker('probe', probe.message, probe.code);
     } else if (surface === 'edge') {
       if (!options.deployConfig.edge.staging.deployCommand) {
         addBlocker('config', 'edge staging deploy command');
@@ -808,7 +814,7 @@ export function evaluateReleaseReadiness(options: {
       // command/verification config remains the release readiness signal.
       if (options.deployConfig.edge.staging.healthcheckUrl) {
         const probe = probeFreshness('edge');
-        if (probe) addBlocker('probe', probe);
+        if (probe) addBlocker('probe', probe.message, probe.code);
       }
     } else if (surface === 'sql') {
       if (!options.deployConfig.sql.staging.applyCommand) {
@@ -824,7 +830,7 @@ export function evaluateReleaseReadiness(options: {
       if (observed) addBlocker('observed', observed);
       if (options.deployConfig.sql.staging.healthcheckUrl) {
         const probe = probeFreshness('sql');
-        if (probe) addBlocker('probe', probe);
+        if (probe) addBlocker('probe', probe.message, probe.code);
       }
     } else if (additional) {
       if (!additional.staging.deployCommand) {
@@ -840,7 +846,7 @@ export function evaluateReleaseReadiness(options: {
       if (observed) addBlocker('observed', observed);
       if (additional.staging.healthcheckUrl) {
         const probe = probeFreshness(surface);
-        if (probe) addBlocker('probe', probe);
+        if (probe) addBlocker('probe', probe.message, probe.code);
       }
     }
 
@@ -857,6 +863,17 @@ export function evaluateReleaseReadiness(options: {
     blockedSurfaces,
     results,
   };
+}
+
+export function releaseReadinessHasOnlyStaleProbeAgeBlockers(
+  readiness: ReturnType<typeof evaluateReleaseReadiness>,
+): boolean {
+  return !readiness.ready
+    && readiness.blockedSurfaces.length > 0
+    && readiness.blockedSurfaces.every((surface) => {
+      const blockers = readiness.results[surface]?.blockers ?? [];
+      return blockers.length > 0 && blockers.every((blocker) => blocker.code === 'probe-stale-age');
+    });
 }
 
 export function buildReleaseCheckMessage(
@@ -905,6 +922,10 @@ export function buildReleaseCheckMessage(
       readiness.results[surface].blockers.length > 0
       && readiness.results[surface].blockers.every((blocker) => blocker.kind === 'observed' || blocker.kind === 'probe'),
     );
+    const allProbeBlockers = readiness.blockedSurfaces.every((surface) =>
+      readiness.results[surface].blockers.length > 0
+      && readiness.results[surface].blockers.every((blocker) => blocker.kind === 'probe'),
+    );
     const onlyPendingStagingOrProbeBlockers = hasPendingStagingBlocker
       && readiness.blockedSurfaces.every((surface) =>
         readiness.results[surface].blockers.length > 0
@@ -930,6 +951,8 @@ export function buildReleaseCheckMessage(
       lines.push(`Use \`${formatWorkflowCommand(config, 'status')}\` if you need the current staging state.`);
     } else if (onlyObservedOrProbeBlockers && hasDeployActionObservedBlocker) {
       lines.push(`Next: re-run \`${formatWorkflowCommand(config, 'deploy', 'staging')}\` for the blocked surface(s), then retry this command.`);
+    } else if (allProbeBlockers) {
+      lines.push(`Next: run \`${formatWorkflowCommand(config, 'doctor', '--probe')}\`, then retry this command.`);
     } else {
       lines.push('Next: run `/pipelane configure` to save machine-local deploy configuration, then');
       lines.push(`\`${formatWorkflowCommand(config, 'devmode', 'build')}\` and \`${formatWorkflowCommand(config, 'deploy', 'staging')}\` to register a staging success.`);

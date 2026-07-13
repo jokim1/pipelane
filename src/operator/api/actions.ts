@@ -17,15 +17,23 @@ import {
   type WorkflowContext,
 } from '../state.ts';
 import {
+  buildReleaseCheckMessage,
   computeDeployConfigFingerprint,
   emptyDeployConfig,
   evaluateReleaseReadiness,
   loadDeployConfig,
   normalizeDeployEnvironment,
+  releaseReadinessHasOnlyStaleProbeAgeBlockers,
   resolveDeployStateKey,
   verifyDeployRecord,
 } from '../release-gate.ts';
-import { buildStaleBaseBlocker, findLastGoodDeploy, inferActiveTaskLock, resolveCommandSurfaces } from '../commands/helpers.ts';
+import {
+  assertTaskCommandWorktree,
+  buildStaleBaseBlocker,
+  findLastGoodDeploy,
+  inferActiveTaskLock,
+  resolveCommandSurfaces,
+} from '../commands/helpers.ts';
 import {
   diagnoseTaskBinding,
   isTaskBindingRecovery,
@@ -169,6 +177,7 @@ export function buildActionPreflightEnvelope(cwd: string, actionId: StableAction
   }
 
   const context = resolveWorkflowContext(cwd);
+  assertTaskApiActionWorktree(context, actionId, parsed);
   const destinationPlan = buildRoutePlanForAction(cwd, actionId, parsed);
   const normalizedInputs = normalizeInputs(actionId, parsed, cwd, destinationPlan);
   const risky = API_RISKY_ACTION_IDS.has(actionId);
@@ -367,10 +376,13 @@ function evaluatePreflightGate(context: WorkflowContext, actionId: StableActionI
       surfaces: requestedSurfaces,
     });
 
-    if (!override && !readiness.ready) {
+    if (!override && !readiness.ready && !releaseReadinessHasOnlyStaleProbeAgeBlockers(readiness)) {
       const blocked = readiness.blockedSurfaces.join(', ') || requestedSurfaces.join(', ');
       return buildReleaseOverrideInputGate(
-        `Release readiness is blocked for ${blocked}. Provide an override reason, or run /doctor --probe and retry.`,
+        [
+          `Release readiness is blocked for ${blocked}. Provide an override reason, or resolve the blockers below and retry.`,
+          buildReleaseCheckMessage(readiness, requestedSurfaces, context.config),
+        ].join('\n\n'),
       );
     }
   }
@@ -637,6 +649,7 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
   }
 
   const context = resolveWorkflowContext(cwd);
+  assertTaskApiActionWorktree(context, actionId, parsed);
   const destinationPlan = buildRoutePlanForAction(cwd, actionId, parsed);
   const normalizedInputs = normalizeInputs(actionId, parsed, cwd, destinationPlan);
   const risky = API_RISKY_ACTION_IDS.has(actionId);
@@ -861,6 +874,29 @@ function actionRequiresConfirmation(actionId: StableActionId, normalizedInputs: 
     && normalizedInputs.recover.trim().length > 0;
 }
 
+function assertTaskApiActionWorktree(
+  context: WorkflowContext,
+  actionId: StableActionId,
+  parsed: ParsedOperatorArgs,
+): void {
+  if (actionId === 'pr') {
+    assertTaskCommandWorktree(context, 'pr', parsed.flags.task);
+    return;
+  }
+  if (actionId === 'merge' || actionId === 'route.merge') {
+    assertTaskCommandWorktree(context, 'merge', parsed.flags.task);
+    return;
+  }
+  if (
+    actionId === 'deploy.staging'
+    || actionId === 'deploy.prod'
+    || actionId === 'route.deploy.staging'
+    || actionId === 'route.deploy.prod'
+  ) {
+    assertTaskCommandWorktree(context, 'deploy', parsed.flags.task);
+  }
+}
+
 function isRouteActionId(actionId: StableActionId): boolean {
   return actionId === 'route.merge'
     || actionId === 'route.deploy.staging'
@@ -899,9 +935,9 @@ function normalizeInputs(
     case 'resume':
       return { task: flags.task };
     case 'devmode.build':
-      return {};
+      return { task: flags.task };
     case 'devmode.release':
-      return { surfaces: flags.surfaces, override: flags.override, reason: flags.reason };
+      return { task: flags.task, surfaces: flags.surfaces, override: flags.override, reason: flags.reason };
     case 'taskLock.verify':
       return { task: flags.task, mode: flags.mode };
     case 'pr':
@@ -924,7 +960,6 @@ function normalizeInputs(
         pr: flags.pr,
         sha: flags.sha,
         surfaces: flags.surfaces,
-        reason: flags.reason,
       };
     case 'route.merge':
     case 'route.deploy.staging':
@@ -1101,9 +1136,11 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
       break;
     case 'devmode.build':
       args.push('devmode', 'build');
+      pushOpt('--task', flags.task);
       break;
     case 'devmode.release':
       args.push('devmode', 'release');
+      pushOpt('--task', flags.task);
       pushSurfaces();
       if (flags.override) args.push('--override');
       pushOpt('--reason', flags.reason);
@@ -1143,7 +1180,6 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
       pushOpt('--pr', flags.pr);
       pushOpt('--sha', flags.sha);
       pushSurfaces();
-      pushOpt('--reason', flags.reason);
       break;
     case 'route.merge':
       args.push('merge', '--yes');
@@ -1165,7 +1201,6 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
       pushRoutePrMetadata();
       pushOpt('--sha', flags.sha);
       pushSurfaces();
-      pushOpt('--reason', flags.reason);
       break;
     case 'clean.plan':
       args.push('clean', '--status-only');
@@ -1346,10 +1381,11 @@ function resolveCliEntry(): string {
   return srcCli;
 }
 
-export function parseApiActionFlags(argv: string[]): { execute: boolean; confirmToken: string; rest: string[] } {
+export function parseApiActionFlags(argv: string[]): { execute: boolean; confirmToken: string; autoConfirm: boolean; rest: string[] } {
   const rest: string[] = [];
   let execute = false;
   let confirmToken = '';
+  let autoConfirm = false;
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
     if (token === '--execute') {
@@ -1361,7 +1397,20 @@ export function parseApiActionFlags(argv: string[]): { execute: boolean; confirm
       i += 1;
       continue;
     }
+    if (token === '--auto-confirm') {
+      autoConfirm = true;
+      continue;
+    }
     rest.push(token);
   }
-  return { execute, confirmToken, rest };
+  if (confirmToken && !execute) {
+    throw new Error('api action --confirm-token requires --execute; tokens are never ignored.');
+  }
+  if (autoConfirm && !execute) {
+    throw new Error('api action --auto-confirm requires --execute.');
+  }
+  if (autoConfirm && confirmToken) {
+    throw new Error('api action cannot combine --auto-confirm and --confirm-token.');
+  }
+  return { execute, confirmToken, autoConfirm, rest };
 }

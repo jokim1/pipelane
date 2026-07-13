@@ -24,6 +24,12 @@ import { resolveRepoRoot } from './operator/state.ts';
 import { bootstrapWorktreeNodeModulesIfNeeded } from './operator/task-workspaces.ts';
 import { maybeNotifyUpdate, parseUpdateArgs, runUpdate } from './operator/update.ts';
 import { runVerify } from './operator/verify.ts';
+import {
+  buildRuntimeWarnings,
+  formatPipelaneRuntimeBanner,
+  formatPipelaneVersion,
+  resolvePipelaneRuntimeIdentity,
+} from './runtime-identity.ts';
 
 function printTopLevelHelp(): void {
   process.stdout.write(`Pipelane - build, release, and development orchestration for AI-assisted codebases
@@ -230,6 +236,13 @@ async function maybeApplyLessonsMigrationAfterPrompt(
 
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
+  const runtimeIdentity = resolvePipelaneRuntimeIdentity();
+
+  if (command === '--version' || command === '-v') {
+    assertNoArgs(rest, '--version');
+    process.stdout.write(`${formatPipelaneVersion(runtimeIdentity)}\n`);
+    return;
+  }
 
   if (!command || command === '--help' || command === '-h') {
     printTopLevelHelp();
@@ -239,6 +252,16 @@ async function main(): Promise<void> {
   if (command === 'init' || command === 'bootstrap' || command === 'sync-docs') {
     handleUnsupportedRepoLocalAdapterCommand(command, rest);
     return;
+  }
+
+  if (command === 'run') {
+    // Keep the structured stdout contract intact for --json callers. The
+    // identity line is deliberately the first stderr line so a combined
+    // terminal/agent transcript still answers exactly which build ran.
+    process.stderr.write(`${formatPipelaneRuntimeBanner(runtimeIdentity)}\n`);
+    for (const warning of buildRuntimeWarnings(runtimeIdentity, process.cwd())) {
+      process.stderr.write(`${warning}\n`);
+    }
   }
 
   // Auto-link shared node_modules into externally-created worktrees (Claude

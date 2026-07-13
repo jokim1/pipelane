@@ -1,7 +1,31 @@
-import { buildReleaseCheckMessage, emptyDeployConfig, evaluateReleaseReadiness, loadDeployConfig } from '../release-gate.ts';
-import { formatWorkflowCommand, loadDeployState, loadProbeState, printResult, saveModeState, type ParsedOperatorArgs, type WorkflowContext } from '../state.ts';
+import {
+  buildReleaseCheckMessage,
+  emptyDeployConfig,
+  evaluateReleaseReadiness,
+  loadDeployConfig,
+  releaseReadinessHasOnlyStaleProbeAgeBlockers,
+} from '../release-gate.ts';
+import {
+  formatWorkflowCommand,
+  loadAllTaskLocks,
+  loadDeployState,
+  loadProbeState,
+  loadTaskLock,
+  normalizeExistingPath,
+  nowIso,
+  printResult,
+  saveModeState,
+  saveTaskLock,
+  slugifyTaskName,
+  type Mode,
+  type ModeState,
+  type ParsedOperatorArgs,
+  type TaskLock,
+  type WorkflowContext,
+} from '../state.ts';
 import { resolveWorkflowContext } from '../state.ts';
 import { resolveCommandSurfaces, sanitizeForTerminal } from './helpers.ts';
+import { executeProbeWithStateLock, type ProbeOutcome } from './doctor.ts';
 
 export async function handleDevmode(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const context = resolveWorkflowContext(cwd);
@@ -30,25 +54,29 @@ export async function handleDevmode(cwd: string, parsed: ParsedOperatorArgs): Pr
   }
 
   const surfaces = resolveCommandSurfaces(context, parsed.flags.surfaces);
+  const taskLock = resolveModeTaskLock(context, parsed.flags.task);
 
   if (action === 'build') {
     // v1.5: keep lastOverride around when flipping off release. The durable
     // audit trail should survive mode churn — the gate-bypass breadcrumb is
     // only interesting long after the override is switched off.
-    saveModeState(context.commonDir, context.config, {
+    const nextModeState: ModeState = {
       mode: 'build',
       requestedSurfaces: surfaces,
       override: null,
       lastOverride: context.modeState.lastOverride,
-      updatedAt: new Date().toISOString(),
-    });
+      updatedAt: nowIso(),
+    };
+    const taskLockTransition = persistModeAndTaskLock(context, nextModeState, taskLock);
     printResult(parsed.flags, {
       mode: 'build',
       requestedSurfaces: surfaces,
+      taskLockTransition,
       message: [
         'Dev Mode: [build]',
         `Requested surfaces: ${surfaces.join(', ')}`,
-      ].join('\n'),
+        taskLockTransition,
+      ].filter(Boolean).join('\n'),
     });
     return;
   }
@@ -57,7 +85,7 @@ export async function handleDevmode(cwd: string, parsed: ParsedOperatorArgs): Pr
     const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
     const deployState = loadDeployState(context.commonDir, context.config);
     const probeState = loadProbeState(context.commonDir, context.config);
-    const readiness = evaluateReleaseReadiness({
+    let readiness = evaluateReleaseReadiness({
       config: context.config,
       deployConfig,
       deployRecords: deployState.records,
@@ -65,11 +93,28 @@ export async function handleDevmode(cwd: string, parsed: ParsedOperatorArgs): Pr
       surfaces,
     });
 
+    let probeRefresh: ProbeOutcome | null = null;
+    if (!readiness.ready && !parsed.flags.override && releaseReadinessHasOnlyStaleProbeAgeBlockers(readiness)) {
+      probeRefresh = await executeProbeWithStateLock(context);
+      readiness = evaluateReleaseReadiness({
+        config: context.config,
+        deployConfig,
+        deployRecords: deployState.records,
+        probeState: loadProbeState(context.commonDir, context.config),
+        surfaces,
+      });
+    }
+
     if (!readiness.ready && !parsed.flags.override) {
       printResult(parsed.flags, {
         ready: false,
         blockedSurfaces: readiness.blockedSurfaces,
-        message: buildReleaseCheckMessage(readiness, surfaces, context.config),
+        probeRefresh,
+        message: [
+          probeRefresh ? 'Refreshed stale release probes inline.' : '',
+          probeRefresh?.message ?? '',
+          buildReleaseCheckMessage(readiness, surfaces, context.config),
+        ].filter(Boolean).join('\n\n'),
       });
       process.exitCode = 1;
       return;
@@ -102,28 +147,84 @@ export async function handleDevmode(cwd: string, parsed: ParsedOperatorArgs): Pr
       }
       : context.modeState.lastOverride;
 
-    saveModeState(context.commonDir, context.config, {
+    const nextModeState: ModeState = {
       mode: 'release',
       requestedSurfaces: surfaces,
       override,
       lastOverride,
       updatedAt: now,
-    });
+    };
+    const taskLockTransition = persistModeAndTaskLock(context, nextModeState, taskLock);
 
     printResult(parsed.flags, {
       mode: 'release',
       requestedSurfaces: surfaces,
       override: parsed.flags.override,
+      taskLockTransition,
+      probeRefresh,
       message: [
+        probeRefresh ? 'Refreshed stale release probes inline.' : '',
+        probeRefresh?.message ?? '',
         'Dev Mode: [release]',
         `Requested surfaces: ${surfaces.join(', ')}`,
         override ? `Release override: ${override.reason}` : 'Release override: none',
-      ].join('\n'),
+        taskLockTransition,
+      ].filter(Boolean).join('\n'),
     });
     return;
   }
 
   throw new Error(`Unknown devmode action "${action}".`);
+}
+
+function resolveModeTaskLock(context: WorkflowContext, explicitTask: string): TaskLock | null {
+  if (explicitTask.trim()) {
+    const taskSlug = slugifyTaskName(explicitTask);
+    const lock = loadTaskLock(context.commonDir, context.config, taskSlug);
+    if (!lock) throw new Error(`No task lock found for ${taskSlug}.`);
+    return lock;
+  }
+
+  const repoPath = normalizeExistingPath(context.repoRoot);
+  const matches = loadAllTaskLocks(context.commonDir, context.config)
+    .filter((lock) => normalizeExistingPath(lock.worktreePath) === repoPath);
+  if (matches.length > 1) {
+    throw new Error(`Multiple task locks claim worktree ${context.repoRoot}. Pass --task explicitly after repairing the duplicate locks.`);
+  }
+  return matches[0] ?? null;
+}
+
+function persistModeAndTaskLock(
+  context: WorkflowContext,
+  nextModeState: ModeState,
+  taskLock: TaskLock | null,
+): string {
+  if (!taskLock || taskLock.mode === nextModeState.mode) {
+    saveModeState(context.commonDir, context.config, nextModeState);
+    return '';
+  }
+
+  const previousMode = taskLock.mode;
+  const nextLock: TaskLock = {
+    ...taskLock,
+    mode: nextModeState.mode as Mode,
+    updatedAt: nextModeState.updatedAt ?? nowIso(),
+  };
+
+  // Write the lock first: a cleanup lease can reject this save, in which case
+  // mode-state remains untouched. If the following mode write unexpectedly
+  // fails, best-effort rollback restores the prior lock snapshot.
+  saveTaskLock(context.commonDir, context.config, taskLock.taskSlug, nextLock);
+  try {
+    saveModeState(context.commonDir, context.config, nextModeState);
+  } catch (error) {
+    try {
+      saveTaskLock(context.commonDir, context.config, taskLock.taskSlug, taskLock);
+    } catch {}
+    throw error;
+  }
+
+  return `task lock ${taskLock.taskSlug}: ${previousMode} → ${nextModeState.mode}`;
 }
 
 // v1.5: identify the operator who set the override. Mirrors the attribution

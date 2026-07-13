@@ -6,13 +6,11 @@ import { fileURLToPath } from 'node:url';
 import type { SyncDocsConfig, WorkflowCommand, WorkflowConfig } from './state.ts';
 import {
   aliasCommandName,
-  CONFIG_FILENAME,
-  LEGACY_CONFIG_FILENAME,
+  importLegacyWorkflowConfigIfNeeded,
   loadWorkflowConfig,
   MANAGED_COMMANDS,
   MANAGED_EXTRA_COMMANDS,
   MANAGED_WORKFLOW_COMMANDS,
-  normalizeWorkflowConfig,
   type ManagedCommand,
   readJsonFile,
   resolveConfigPath,
@@ -21,7 +19,6 @@ import {
   resolveSyncDocs,
   resolveWorkflowAliases,
   runGit,
-  synthesizeWorkflowConfig,
   writeWorkflowConfig,
   writeJsonFile,
 } from './state.ts';
@@ -496,7 +493,7 @@ export interface SetupConsumerRepoResult {
   repoRoot: string;
   workflowConfigPath: string;
   workflowConfigCreated: boolean;
-  workflowConfigSource: 'existing-machine' | 'legacy-pipelane-json' | 'legacy-project-workflow-json' | 'synthesized';
+  workflowConfigSource: 'existing-machine' | 'legacy-pipelane-json' | 'legacy-project-workflow-json' | 'legacy-package-json' | 'synthesized';
   createdClaude: boolean;
   createdRepoGuidance: boolean;
   skippedClaudeScaffold: boolean;
@@ -535,31 +532,6 @@ interface SetupWorkflowConfig {
   source: SetupConsumerRepoResult['workflowConfigSource'];
 }
 
-function readLegacyRepoLocalWorkflowConfig(repoRoot: string): {
-  filename: typeof CONFIG_FILENAME | typeof LEGACY_CONFIG_FILENAME;
-  raw: Partial<WorkflowConfig>;
-} | null {
-  for (const filename of [CONFIG_FILENAME, LEGACY_CONFIG_FILENAME] as const) {
-    const targetPath = path.join(repoRoot, filename);
-    if (!existsSync(targetPath)) continue;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(readFileSync(targetPath, 'utf8'));
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      throw new Error(`Malformed legacy repo-local ${filename} at ${targetPath}: ${detail}. Fix or remove it, then rerun /pipelane setup.`);
-    }
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new Error(`Malformed legacy repo-local ${filename} at ${targetPath}: expected a JSON object. Fix or remove it, then rerun /pipelane setup.`);
-    }
-    return {
-      filename,
-      raw: parsed as Partial<WorkflowConfig>,
-    };
-  }
-  return null;
-}
-
 function setupWorkflowConfig(repoRoot: string): SetupWorkflowConfig {
   const readableConfigPath = resolveReadableConfigPath(repoRoot);
   if (readableConfigPath) {
@@ -571,20 +543,22 @@ function setupWorkflowConfig(repoRoot: string): SetupWorkflowConfig {
     };
   }
 
-  const legacy = readLegacyRepoLocalWorkflowConfig(repoRoot);
-  const config = legacy
-    ? normalizeWorkflowConfig(legacy.raw, { repoRoot })
-    : synthesizeWorkflowConfig(repoRoot);
-  writeWorkflowConfig(repoRoot, config);
+  const imported = importLegacyWorkflowConfigIfNeeded(repoRoot);
+  if (!imported) {
+    const config = loadWorkflowConfig(repoRoot);
+    writeWorkflowConfig(repoRoot, config);
+    return {
+      config,
+      configPath: resolveConfigPath(repoRoot),
+      created: true,
+      source: 'synthesized',
+    };
+  }
   return {
-    config,
-    configPath: resolveConfigPath(repoRoot),
+    config: imported.config,
+    configPath: imported.configPath,
     created: true,
-    source: legacy?.filename === LEGACY_CONFIG_FILENAME
-      ? 'legacy-project-workflow-json'
-      : legacy
-        ? 'legacy-pipelane-json'
-        : 'synthesized',
+    source: imported.source,
   };
 }
 
@@ -1519,6 +1493,9 @@ function formatWorkflowConfigSetupLine(result: SetupConsumerRepoResult): string 
   }
   if (result.workflowConfigSource === 'legacy-project-workflow-json') {
     return `Migrated legacy repo-local .project-workflow.json into machine-local config at ${result.workflowConfigPath}.`;
+  }
+  if (result.workflowConfigSource === 'legacy-package-json') {
+    return `Migrated legacy package.json:pipelane config into machine-local config at ${result.workflowConfigPath}.`;
   }
   return `Created machine-local Pipelane config from repo defaults at ${result.workflowConfigPath}.`;
 }

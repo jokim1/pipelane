@@ -23,7 +23,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.build.json",
     "dashboard": "node ./src/cli.ts dashboard",
     "board": "node ./src/cli.ts board",
-    "build": "tsc -p tsconfig.build.json && node -e \"import('node:fs').then(m=>m.cpSync('src/dashboard/public','dist/dashboard/public',{recursive:true}))\"",
+    "build": "tsc -p tsconfig.build.json && node scripts/write-build-info.mjs && node -e \"import('node:fs').then(m=>m.cpSync('src/dashboard/public','dist/dashboard/public',{recursive:true}))\"",
     "prepare": "npm run build",
     "clean": "rm -rf dist",
     "pipelane:setup": "pipelane setup",

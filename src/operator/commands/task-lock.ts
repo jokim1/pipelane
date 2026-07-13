@@ -1,4 +1,4 @@
-import { printResult, resolveWorkflowContext, loadTaskLock, type ParsedOperatorArgs } from '../state.ts';
+import { formatWorkflowCommand, printResult, resolveWorkflowContext, loadTaskLock, type ParsedOperatorArgs } from '../state.ts';
 import { resolveTaskCommandIdentity } from '../task-workspaces.ts';
 import { verifyTaskLockState } from '../repo-guard.ts';
 import { runGit } from '../state.ts';
@@ -44,6 +44,9 @@ export async function handleTaskLock(cwd: string, parsed: ParsedOperatorArgs): P
         'Task lock mismatch.',
         `Task: ${taskSlug}`,
         ...mismatches.map((mismatch) => `- ${mismatch}`),
+        ...(mismatches.some((mismatch) => mismatch.includes('mode'))
+          ? [`Next: run ${formatWorkflowCommand(context.config, 'devmode', `${context.modeState.mode} --task "${taskSlug}"`)} to reconcile the task lock through the normal readiness checks.`]
+          : []),
       ].join('\n'),
   });
 

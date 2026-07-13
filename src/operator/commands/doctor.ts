@@ -337,6 +337,10 @@ export async function executeProbe(context: WorkflowContext, nowFn: () => Date =
   return { records, message: lines.join('\n') };
 }
 
+export async function executeProbeWithStateLock(context: WorkflowContext): Promise<ProbeOutcome> {
+  return withDoctorStateLock(context, 'probe', () => executeProbe(context));
+}
+
 interface ProbeTarget {
   environment: ProbeEnvironment;
   surface: string;

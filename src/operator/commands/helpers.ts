@@ -89,6 +89,52 @@ export function inferActiveTaskLock(context: WorkflowContext, explicitTask = '')
   throw new Error(`No task lock matches branch ${branchName} at ${context.repoRoot}. Run ${formatWorkflowCommand(context.config, 'new')} or pass --task.`);
 }
 
+export function assertTaskCommandWorktree(
+  context: WorkflowContext,
+  command: Extract<WorkflowCommand, 'pr' | 'merge' | 'deploy'>,
+  explicitTask = '',
+): { taskSlug: string; lock: TaskLock } | null {
+  const locks = loadAllTaskLocks(context.commonDir, context.config);
+  let resolved: TaskLock | null = null;
+
+  if (explicitTask.trim()) {
+    const taskSlug = slugifyTaskName(explicitTask);
+    resolved = locks.find((lock) => lock.taskSlug === taskSlug) ?? null;
+  } else {
+    const currentPath = normalizeExistingPath(context.repoRoot);
+    const pathMatches = locks.filter((lock) => normalizeExistingPath(lock.worktreePath) === currentPath);
+    if (pathMatches.length > 1) {
+      throw new Error(`Multiple task locks claim worktree ${context.repoRoot}. Pass --task explicitly after repairing the duplicate locks.`);
+    }
+    resolved = pathMatches[0] ?? (locks.length === 1 ? locks[0] : null);
+  }
+
+  if (!resolved) return null;
+  if (normalizeExistingPath(resolved.worktreePath) !== normalizeExistingPath(context.repoRoot)) {
+    // PR recovery has an intentional exception: an externally-created
+    // task-shaped branch may offer the explicit, fingerprint-bound rebind
+    // flow. Checking only the branch identity here takes no dirty-tree or
+    // base-drift measurements. Shared/base checkouts still hard-error below.
+    const currentBranch = command === 'pr'
+      ? runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? ''
+      : '';
+    if (currentBranch && inferTaskSlugsFromBranchName(context.config, currentBranch).includes(resolved.taskSlug)) {
+      return { taskSlug: resolved.taskSlug, lock: resolved };
+    }
+    const commandLabel = formatWorkflowCommand(context.config, command);
+    throw new Error([
+      `${commandLabel} blocked because task ${resolved.taskSlug} belongs to a different worktree.`,
+      `Current checkout: ${context.repoRoot}`,
+      `Task worktree: ${resolved.worktreePath}`,
+      'Run:',
+      `  cd ${resolved.worktreePath}`,
+      `Then re-run ${commandLabel}. No base-drift or dirty-worktree measurements were taken in the current checkout.`,
+    ].join('\n'));
+  }
+
+  return { taskSlug: resolved.taskSlug, lock: resolved };
+}
+
 export function ensureTaskLockMatchesCurrent(context: WorkflowContext, lock: TaskLock, requestedMode = ''): void {
   const branchName = runGit(context.repoRoot, ['branch', '--show-current']) ?? '';
   const mismatches = verifyTaskLockState({
@@ -100,10 +146,14 @@ export function ensureTaskLockMatchesCurrent(context: WorkflowContext, lock: Tas
   });
 
   if (mismatches.length > 0) {
+    const modeRemedy = mismatches.some((mismatch) => mismatch.includes('mode'))
+      ? `Next: run ${formatWorkflowCommand(context.config, 'devmode', `${context.modeState.mode} --task "${lock.taskSlug}"`)} to reconcile the task lock through the normal readiness checks.`
+      : '';
     throw new Error([
       'Task lock mismatch.',
       ...mismatches.map((mismatch) => `- ${mismatch}`),
-    ].join('\n'));
+      modeRemedy,
+    ].filter(Boolean).join('\n'));
   }
 }
 
@@ -208,13 +258,19 @@ interface BaseDriftStatus {
   behind: number;
   fetchFailed: boolean;
   fetchError: string;
+  comparedRefLabel: string;
 }
 
-export function buildStaleBaseBlocker(context: WorkflowContext, command: Extract<WorkflowCommand, 'pr' | 'merge'>): string {
+export function buildStaleBaseBlocker(
+  context: WorkflowContext,
+  command: Extract<WorkflowCommand, 'pr' | 'merge'>,
+  taskBranch = '',
+): string {
   return buildStaleBaseBlockerForRepo({
     repoRoot: context.repoRoot,
     config: context.config,
     command,
+    taskBranch,
   });
 }
 
@@ -222,14 +278,15 @@ export function buildStaleBaseBlockerForRepo(options: {
   repoRoot: string;
   config: Pick<WorkflowConfig, 'aliases' | 'baseBranch'>;
   command: Extract<WorkflowCommand, 'pr' | 'merge'>;
+  taskBranch?: string;
 }): string {
-  const status = inspectBaseDrift(options.repoRoot, options.config.baseBranch);
+  const status = inspectBaseDrift(options.repoRoot, options.config.baseBranch, options.taskBranch);
   if (!status || status.behind <= 0) return '';
 
   const commandLabel = formatWorkflowCommand(options.config, options.command);
   const commitWord = status.behind === 1 ? 'commit' : 'commits';
   const lines = [
-    `${commandLabel} blocked because this checkout is behind ${status.upstreamRef} by ${status.behind} ${commitWord}.`,
+    `${commandLabel} blocked because ${status.comparedRefLabel} is behind ${status.upstreamRef} by ${status.behind} ${commitWord}.`,
     'Rebase before creating, updating, or merging the PR so review only includes this task and does not carry upstream reversions.',
     '',
     'Run:',
@@ -244,22 +301,28 @@ export function buildStaleBaseBlockerForRepo(options: {
   return lines.join('\n');
 }
 
-function inspectBaseDrift(repoRoot: string, rawBaseBranch: string): BaseDriftStatus | null {
+function inspectBaseDrift(repoRoot: string, rawBaseBranch: string, rawTaskBranch = ''): BaseDriftStatus | null {
   const baseBranch = rawBaseBranch.trim();
   if (!baseBranch) return null;
   const upstreamRef = `origin/${baseBranch}`;
+  const taskBranch = rawTaskBranch.trim();
+  const localTaskRef = taskBranch ? `refs/heads/${taskBranch}` : '';
+  const comparedRef = localTaskRef
+    && runCommandCapture('git', ['rev-parse', '--verify', localTaskRef], { cwd: repoRoot }).ok
+    ? localTaskRef
+    : 'HEAD';
 
   const fetch = runCommandCapture('git', ['fetch', 'origin', baseBranch, '--no-tags'], {
     cwd: repoRoot,
     timeoutMs: 30_000,
   });
-  const headSha = runCommandCapture('git', ['rev-parse', '--verify', 'HEAD'], { cwd: repoRoot });
+  const headSha = runCommandCapture('git', ['rev-parse', '--verify', comparedRef], { cwd: repoRoot });
   const upstreamSha = runCommandCapture('git', ['rev-parse', '--verify', upstreamRef], { cwd: repoRoot });
   if (!headSha.ok || !headSha.stdout || !upstreamSha.ok || !upstreamSha.stdout) {
     return null;
   }
 
-  const counts = runCommandCapture('git', ['rev-list', '--left-right', '--count', `HEAD...${upstreamRef}`], {
+  const counts = runCommandCapture('git', ['rev-list', '--left-right', '--count', `${comparedRef}...${upstreamRef}`], {
     cwd: repoRoot,
   });
   if (!counts.ok || !counts.stdout.trim()) return null;
@@ -275,6 +338,7 @@ function inspectBaseDrift(repoRoot: string, rawBaseBranch: string): BaseDriftSta
     behind,
     fetchFailed: !fetch.ok,
     fetchError: fetch.stderr || fetch.stdout || `git fetch origin ${baseBranch} --no-tags exited ${fetch.exitCode}`,
+    comparedRefLabel: taskBranch && comparedRef === localTaskRef ? `task branch ${taskBranch}` : 'this checkout',
   };
 }
 
