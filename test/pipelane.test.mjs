@@ -23198,6 +23198,108 @@ test('api action deploy.prod binds the confirmed target and bypasses the TTY pro
   }
 });
 
+test('api action deploy.prod returns structured blockers for effect-resolution failures', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Prod Resolution Envelope');
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const missingTask = runCli([
+      'run', 'api', 'action', 'deploy.prod', '--task', 'Does Not Exist', '--json',
+    ], repoRoot, {}, true);
+    assert.equal(missingTask.status, 1);
+    const missingTaskEnvelope = JSON.parse(missingTask.stdout);
+    assert.equal(missingTaskEnvelope.ok, false);
+    assert.equal(missingTaskEnvelope.data.preflight.allowed, false);
+    assert.match(missingTaskEnvelope.message, /No task lock found for does-not-exist/);
+
+    runCli(['run', 'devmode', 'release', '--override', '--reason', 'resolution-envelope', '--json'], repoRoot);
+    const releaseTask = JSON.parse(runCli([
+      'run', 'new', '--task', 'Missing Merge', '--json',
+    ], repoRoot).stdout);
+    const missingMerge = runCli([
+      'run', 'api', 'action', 'deploy.prod', '--task', 'Missing Merge', '--json',
+    ], releaseTask.worktreePath, {}, true);
+    assert.equal(missingMerge.status, 1);
+    const missingMergeEnvelope = JSON.parse(missingMerge.stdout);
+    assert.equal(missingMergeEnvelope.ok, false);
+    assert.equal(missingMergeEnvelope.data.preflight.confirmation, null);
+    assert.match(missingMergeEnvelope.message, /No merged SHA recorded/);
+
+    runCli(['run', 'devmode', 'build', '--task', 'Missing Merge', '--json'], releaseTask.worktreePath);
+    const invalidSha = runCli([
+      'run', 'api', 'action', 'deploy.prod', '--task', 'Missing Merge',
+      '--sha', 'definitely-not-a-ref', '--json',
+    ], releaseTask.worktreePath, {}, true);
+    assert.equal(invalidSha.status, 1);
+    const invalidShaEnvelope = JSON.parse(invalidSha.stdout);
+    assert.equal(invalidShaEnvelope.ok, false);
+    assert.match(invalidShaEnvelope.message, /Could not resolve definitely-not-a-ref/);
+
+    execFileSync('git', ['branch', 'temporary-prod-target', 'HEAD'], { cwd: releaseTask.worktreePath });
+    const valid = JSON.parse(runCli([
+      'run', 'api', 'action', 'deploy.prod', '--task', 'Missing Merge',
+      '--sha', 'temporary-prod-target', '--json',
+    ], releaseTask.worktreePath).stdout);
+    const token = valid.data.preflight.confirmation.token;
+    execFileSync('git', ['branch', '-D', 'temporary-prod-target'], { cwd: releaseTask.worktreePath });
+    const executeDrift = runCli([
+      'run', 'api', 'action', 'deploy.prod', '--task', 'Missing Merge',
+      '--sha', 'temporary-prod-target', '--execute', '--confirm-token', token, '--json',
+    ], releaseTask.worktreePath, {}, true);
+    assert.equal(executeDrift.status, 1);
+    const executeEnvelope = JSON.parse(executeDrift.stdout);
+    assert.equal(executeEnvelope.ok, false);
+    assert.equal(executeEnvelope.data.preflight.allowed, false);
+    assert.match(executeEnvelope.message, /Could not resolve temporary-prod-target/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('api action route.deploy.prod preserves route confirmation through full execution', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+  try {
+    writePipelaneConfig(repoRoot, 'Prod Route Api');
+    commitAll(repoRoot, 'Adopt pipelane');
+    runCli(['run', 'devmode', 'release', '--override', '--reason', 'prod-route-api', '--json'], repoRoot);
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Prod Route Api', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'route prod\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Prod Route Api', '--json'], created.worktreePath, env);
+    runCli(['run', 'merge', '--json'], created.worktreePath, env);
+    runCli(['run', 'deploy', 'staging', '--json'], created.worktreePath, env);
+
+    const preflight = JSON.parse(runCli([
+      'run', 'api', 'action', 'route.deploy.prod', '--task', 'Prod Route Api', '--json',
+    ], created.worktreePath, env).stdout);
+    const token = preflight.data.preflight.confirmation.token;
+    assert.ok(token);
+    const executed = runCli([
+      'run', 'api', 'action', 'route.deploy.prod', '--task', 'Prod Route Api',
+      '--execute', '--confirm-token', token, '--json',
+    ], created.worktreePath, env, true);
+    const envelope = JSON.parse(executed.stdout);
+    assert.equal(executed.status, 0, JSON.stringify(envelope, null, 2));
+    assert.equal(envelope.ok, true);
+    assert.equal(envelope.data.execution.exitCode, 0);
+    assert.doesNotMatch(JSON.stringify(envelope), /Approved: \(missing SHA\)/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
 test('deploy prod blocks when release-mode staging lacks a succeeded record', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));

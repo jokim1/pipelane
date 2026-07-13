@@ -1299,13 +1299,14 @@ export function watchWorkflowRun(
 export const PROD_CONFIRM_PREFIX_LENGTH = 4;
 export const DEPLOY_PROD_APPROVED_SHA_ENV = 'PIPELANE_DEPLOY_PROD_APPROVED_SHA';
 export const DEPLOY_PROD_APPROVED_SURFACES_ENV = 'PIPELANE_DEPLOY_PROD_APPROVED_SURFACES';
+export const DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV = 'PIPELANE_DEPLOY_PROD_DIRECT_API_CONFIRMED';
 
 function assertApiApprovedProdDeployInputs(
   environment: 'staging' | 'prod',
   targetSha: string,
   surfaces: string[],
 ): void {
-  if (environment !== 'prod' || process.env.PIPELANE_DEPLOY_PROD_API_CONFIRMED !== '1') return;
+  if (environment !== 'prod' || process.env[DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV] !== '1') return;
   const approvedSha = process.env[DEPLOY_PROD_APPROVED_SHA_ENV]?.trim() ?? '';
   const approvedSurfaces = (process.env[DEPLOY_PROD_APPROVED_SURFACES_ENV] ?? '')
     .split(',')
@@ -1316,6 +1317,7 @@ function assertApiApprovedProdDeployInputs(
   delete process.env[DEPLOY_PROD_APPROVED_SURFACES_ENV];
   if (approvedSha !== targetSha || approvedSurfaces.join(',') !== [...surfaces].sort().join(',')) {
     delete process.env.PIPELANE_DEPLOY_PROD_API_CONFIRMED;
+    delete process.env[DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV];
     throw new Error([
       'deploy prod blocked: resolved target changed after API confirmation.',
       `Approved: ${approvedSha || '(missing SHA)'} [${approvedSurfaces.join(', ') || 'no surfaces'}]`,
@@ -1334,6 +1336,7 @@ export async function requireProdConfirmation(sha: string): Promise<void> {
     // spawns (healthcheck scripts, retries, nested CLI re-entry) does not
     // inherit an open prod-confirm flag.
     delete process.env.PIPELANE_DEPLOY_PROD_API_CONFIRMED;
+    delete process.env[DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV];
     return;
   }
 

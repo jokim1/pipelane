@@ -68,6 +68,7 @@ import { evaluateReviewEvidenceForPr, reviewEvidenceOverrideReason } from '../re
 import {
   DEPLOY_PROD_APPROVED_SHA_ENV,
   DEPLOY_PROD_APPROVED_SURFACES_ENV,
+  DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV,
   resolveDeployApprovalInputs,
 } from '../commands/deploy.ts';
 
@@ -190,7 +191,18 @@ export function buildActionPreflightEnvelope(cwd: string, actionId: StableAction
   }
   const routePlan = buildRoutePlanForAction(cwd, actionId, parsed);
   const destinationPlan = routePlan.destinationPlan;
-  const normalizedInputs = normalizeInputs(actionId, parsed, cwd, destinationPlan, routePlan.error);
+  let normalizedInputs: Record<string, unknown>;
+  try {
+    normalizedInputs = normalizeInputs(actionId, parsed, cwd, destinationPlan, routePlan.error);
+  } catch (error) {
+    return buildActionResolutionBlock({
+      context,
+      actionId,
+      parsed,
+      destinationPlan,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
   const risky = API_RISKY_ACTION_IDS.has(actionId);
   const requiresConfirmation = actionRequiresConfirmation(actionId, normalizedInputs);
   const checkedAt = nowIso();
@@ -715,6 +727,66 @@ function buildTaskApiActionWorktreeBlock(
   }
 }
 
+function buildActionResolutionBlock(options: {
+  context: WorkflowContext;
+  actionId: StableActionId;
+  parsed: ParsedOperatorArgs;
+  destinationPlan?: DestinationPlan | null;
+  message: string;
+  persist?: boolean;
+}): ApiEnvelope<ActionPreflightData> {
+  const checkedAt = nowIso();
+  // Resolution already failed, so reconstruct only the raw, side-effect-free
+  // inputs. This preserves the JSON contract while the reason carries the
+  // exact missing-lock/SHA/merge remedy.
+  const normalizedInputs = normalizeInputs(
+    options.actionId,
+    options.parsed,
+    undefined,
+    options.destinationPlan,
+    options.message,
+  );
+  if (options.persist) {
+    persistActionPreflightBlockIfTaskScoped({
+      context: options.context,
+      actionId: options.actionId,
+      label: ACTION_LABELS[options.actionId],
+      normalizedInputs,
+      checkedAt,
+      reason: options.message,
+    });
+  }
+  const data: ActionPreflightData = {
+    action: {
+      id: options.actionId,
+      label: ACTION_LABELS[options.actionId],
+      risky: API_RISKY_ACTION_IDS.has(options.actionId),
+    },
+    preflight: {
+      allowed: false,
+      state: 'blocked',
+      reason: options.message,
+      needsInput: false,
+      missingInputs: [],
+      inputs: [],
+      defaultParams: {},
+      warnings: [],
+      issues: [],
+      normalizedInputs,
+      requiresConfirmation: false,
+      confirmation: null,
+      freshness: buildFreshness({ checkedAt, stale: true }),
+      ...(options.destinationPlan ? { destinationPlan: options.destinationPlan } : {}),
+    },
+  };
+  return buildApiEnvelope<ActionPreflightData>({
+    command: 'pipelane.api.action',
+    ok: false,
+    message: options.message,
+    data,
+  });
+}
+
 export async function runActionExecute(cwd: string, actionId: StableActionId, parsed: ParsedOperatorArgs, confirmToken: string): Promise<ApiEnvelope<ActionExecutionData | ActionPreflightData>> {
   const onboardingBlock = buildDeployActionOnboardingBlock(cwd, actionId, parsed);
   if (onboardingBlock) {
@@ -728,7 +800,19 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
   }
   const routePlan = buildRoutePlanForAction(cwd, actionId, parsed);
   const destinationPlan = routePlan.destinationPlan;
-  const normalizedInputs = normalizeInputs(actionId, parsed, cwd, destinationPlan, routePlan.error);
+  let normalizedInputs: Record<string, unknown>;
+  try {
+    normalizedInputs = normalizeInputs(actionId, parsed, cwd, destinationPlan, routePlan.error);
+  } catch (error) {
+    return buildActionResolutionBlock({
+      context,
+      actionId,
+      parsed,
+      destinationPlan,
+      message: error instanceof Error ? error.message : String(error),
+      persist: true,
+    });
+  }
   const risky = API_RISKY_ACTION_IDS.has(actionId);
   const requiresConfirmation = actionRequiresConfirmation(actionId, normalizedInputs);
   const checkedAt = nowIso();
@@ -1364,6 +1448,7 @@ function buildChildEnv(
   if (actionId === 'route.deploy.prod') {
     env[DESTINATION_ROUTE_PROD_CONFIRMED_ENV] = '1';
     delete env.PIPELANE_DEPLOY_PROD_API_CONFIRMED;
+    delete env[DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV];
   } else if (actionId === 'deploy.prod' || actionId === 'rollback.prod') {
     // Both deploy.prod and rollback.prod's CLI shims require human
     // confirmation via requireProdConfirmation. The API path has already
@@ -1373,6 +1458,7 @@ function buildChildEnv(
     // don't inherit an open prod-confirm bit.
     env.PIPELANE_DEPLOY_PROD_API_CONFIRMED = '1';
     if (actionId === 'deploy.prod') {
+      env[DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV] = '1';
       env[DEPLOY_PROD_APPROVED_SHA_ENV] = typeof normalizedInputs.targetSha === 'string'
         ? normalizedInputs.targetSha
         : '';
@@ -1383,6 +1469,7 @@ function buildChildEnv(
   } else {
     // Never let a stray bypass leak into other actions' execution.
     delete env.PIPELANE_DEPLOY_PROD_API_CONFIRMED;
+    delete env[DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV];
   }
   return env;
 }
