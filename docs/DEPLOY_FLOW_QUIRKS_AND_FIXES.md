@@ -155,7 +155,197 @@ Both statements were about the *shared checkout*, not the task: the PR branch wa
 
 ---
 
+## Audit round 2
+
+Audit date: 2026-07-12. The sweep covered the task lifecycle commands, API
+actions and confirmation tokens, onboarding, release readiness, and shared
+state resolution. It specifically checked cwd trust, snapshot/live-state
+reconciliation, flag consumption, agent-latency timeouts, remediation text,
+and non-TTY execution paths.
+
+### Fixed in this PR
+
+1. **API task actions could bypass the cwd guard (P1).**
+   **Location:** `src/operator/api/actions.ts:173` and
+   `src/operator/api/actions.ts:646`. **Repro:** preflight or execute
+   `api action merge`/`deploy.prod` from the shared checkout while the
+   resolvable task lock points at another worktree; the API used to plan and
+   measure the caller checkout even though the direct command was guarded.
+   **Proposed fix (implemented):** resolve and validate the task worktree
+   before route planning, freshness checks, token minting, or execution.
+
+2. **API actions accepted flags that were ignored or failed only after a
+   successful preflight (P2).** **Location:**
+   `src/operator/commands/api.ts:52` and `src/operator/commands/api.ts:92`.
+   **Repro:** `api action doctor.diagnose --title x` silently discarded the
+   title; `api action deploy.prod --reason x` could preview successfully but
+   the underlying `deploy` rejects `--reason`. **Proposed fix (implemented):**
+   use an action-specific allowlist and reject unsupported inputs before
+   preflight. This new hard error is a compatibility-safe bugfix because the
+   rejected values could never affect a successful action.
+
+3. **Route preflight swallowed destination-planner errors (P2).**
+   **Location:** `src/operator/api/actions.ts:908`. **Repro:** request
+   `route.deploy.staging --surfaces worker` when `worker` is unsupported; the
+   envelope said only `route could not be planned`. **Proposed fix
+   (implemented):** retain the sanitized caught error and expose it through
+   `routeBlockers`, while keeping the preflight fail-closed.
+
+4. **`repo-guard --mode` could create an invalid or divergent lock snapshot
+   (P1).** **Location:** `src/operator/commands/repo-guard.ts:32` and
+   `src/operator/state.ts:3635`. **Repro:** in build mode, run
+   `repo-guard --task x --mode release`; this could write a release lock
+   without running release readiness. Arbitrary strings were also accepted.
+   **Proposed fix (implemented):** validate the enum and reject divergence
+   with the minimal `devmode <mode>` remedy, so the release transition still
+   goes through its fail-closed check.
+
+5. **PR binding recovery told headless callers to “type” a choice even though
+   no prompt was reading input (P2).** **Location:**
+   `src/operator/task-binding.ts:385`. **Repro:** create a lock/current-branch
+   binding conflict and run `pr` without `--recover`; an agent can wait for a
+   prompt that does not exist. **Proposed fix (implemented):** print complete,
+   fingerprint-bound recovery commands and explicitly state that no
+   interactive prompt is waiting.
+
+6. **A malformed confirmation expiry became non-expiring (P1).**
+   **Location:** `src/operator/api/confirm-tokens.ts:158`. **Repro:** replace a
+   stored token's `expiresAt` with `not-a-date`; `NaN < Date.now()` is false,
+   so the old check accepted it. **Proposed fix (implemented):** reject every
+   non-finite parsed expiry as expired before checking the fingerprint.
+
+7. **Probe-only release blockers suggested a heavier setup/deploy loop (P3).**
+   **Location:** `src/operator/release-gate.ts:930`. **Repro:** retain a valid
+   staging success but remove or stale only the probe evidence; the generic
+   fallback suggested configure plus redeploy. **Proposed fix (implemented):**
+   classify the blocker set and print the read-only `doctor --probe` remedy
+   when every real blocker is a probe.
+
+8. **Review retry hardening had three secondary gaps (P2).** **Location:**
+   `src/operator/commands/review.ts:1956`,
+   `src/operator/commands/review.ts:3328`, and
+   `src/operator/review-enforcement.ts:410`. **Repro:** `review setup` could
+   rewrite a configured gate without its `timeoutMs`; waiting for another
+   process's command-gate lock timed out as generic `FAILED`; same-millisecond
+   filtered retries could be ordered ambiguously. **Proposed fix
+   (implemented):** preserve the configured timeout, mark lock-wait timeout as
+   `TIMEOUT` with a single-gate remedy, and use append-only record precedence
+   when composing retry evidence.
+
+### Filed for follow-up
+
+1. **`repo-guard` can silently rebind a live task and orphan its original
+   worktree (P1).** **Location:** `src/operator/commands/repo-guard.ts:41` and
+   `src/operator/commands/repo-guard.ts:80`. **Repro:** create task `x`, then
+   run `repo-guard --task x` from an unsafe shared checkout; the command can
+   create a second worktree and overwrite the only lock for the first one.
+   **Proposed fix:** if the existing lock points at a live worktree, hand off
+   to its exact path. Require an explicit, fingerprint-bound `--rebind` to
+   replace it and retain the former binding in audit history.
+
+2. **A successful GitHub merge has no local reconciliation path after the
+   post-merge poll times out (P1).** **Location:**
+   `src/operator/commands/merge.ts:72` and
+   `src/operator/commands/merge.ts:85`. **Repro:** let `gh pr merge` succeed
+   but delay `mergeCommit.oid` beyond the 30-second poll; no PR record is
+   saved, and a rerun rejects the now-`MERGED` PR before repairing state.
+   **Proposed fix:** recognize an already-merged PR on entry, poll/reconcile
+   its exact merge commit without issuing another merge, persist the missing
+   record, and print a distinct timeout remedy.
+
+3. **Required-check watching is unbounded for agent drivers (P2).**
+   **Location:** `src/operator/commands/helpers.ts:663`. **Repro:** leave a
+   required GitHub check permanently pending; `gh pr checks --watch` has no
+   Pipelane timeout and the `/merge` process can wait forever. **Proposed fix:**
+   add a strict `PIPELANE_PR_CHECKS_TIMEOUT_MS`, execute the child with that
+   bound, and report `TIMEOUT` plus a safe `/merge` rerun remedy.
+
+4. **Rollback preflight can mint a production confirmation token for an
+   impossible rollback (P1).** **Location:**
+   `src/operator/api/actions.ts:1027` and
+   `src/operator/api/actions.ts:1079`. **Repro:** preflight `rollback.prod`
+   with no matching last-good deploy, with an in-flight deploy, or immediately
+   after a successful rollback; resolution returns `undefined`, but preflight
+   can still report ready and issue a token before execute fails. **Proposed
+   fix:** return a typed resolution result with an actionable blocker, make
+   preflight `allowed:false` and mint no token, then retain the current
+   execute-time re-resolution/fingerprint check for TOCTOU safety.
+
+5. **The deploy environment lock's age can override a demonstrably live owner
+   (P1).** **Location:** `src/operator/commands/deploy.ts:104`. **Repro:** let a
+   synchronous deploy legitimately run longer than four hours; a second
+   deploy treats the lock as stale before checking that its PID is alive and
+   can start concurrently. **Proposed fix:** never reclaim a live matching
+   owner solely because of age; add a nonce/heartbeat or process-start
+   identity so PID reuse remains detectable.
+
+6. **Timeout environment variables parse inconsistently and often default
+   silently (P2).** **Location:** `src/operator/commands/helpers.ts:656`,
+   `src/operator/commands/review.ts:1687`,
+   `src/operator/release-gate.ts:496`,
+   `src/operator/api/actions.ts:1095`, and
+   `src/operator/commands/deploy.ts:1363`. **Repro:** values such as `12junk`
+   are partially accepted by `parseInt`, while an invalid healthcheck interval
+   becomes `NaN` and effectively removes the wait. **Proposed fix:** introduce
+   one strict positive-integer duration parser with explicit errors and
+   per-setting minimum/maximum bounds, then use it across the command surface.
+
+7. **Route deploy advertises review-override handling but has no executable
+   override path (P2).** **Location:** `src/operator/api/actions.ts:275`,
+   `src/operator/commands/api.ts:102`, and
+   `src/operator/state.ts:3714`. **Repro:** a route-to-staging/prod plan that
+   includes PR creation is blocked on review evidence; its evaluator knows
+   about `override`/`reason`, but route deploy actions cannot carry those
+   inputs through the underlying `deploy` command. **Proposed fix:** either add
+   destination-only `--override --reason` support and thread it through route
+   execution, or remove the dead evaluator branch and document that operators
+   must complete review evidence first. Until then, unsupported values fail
+   early instead of producing a successful preview followed by failed
+   execution.
+
+---
+
 ## Priority and sequencing
+
+### API confirmation contract implemented by Q4
+
+Risky API actions keep the default two-step flow. A preflight without
+`--json` prints `PIPELANE_CONFIRM_TOKEN=<token>` as its first stdout line,
+followed by the documented `ApiEnvelope`; strict `--json` output remains one
+valid JSON document and exposes the token at
+`data.preflight.confirmation.{token,expiresAt}`. Tokens are single-use,
+fingerprint-bound, and live for 30 minutes. `--confirm-token` without
+`--execute` is a hard error.
+
+An agent driver may opt into the single-shot equivalent with:
+
+```bash
+PIPELANE_ALLOW_AUTOCONFIRM=1 pipelane run api action deploy.prod \
+  --task <task> --execute --auto-confirm --json
+```
+
+Without `PIPELANE_ALLOW_AUTOCONFIRM=1`, `--auto-confirm` is rejected. A bare
+`--execute` still refuses risky actions without a valid token.
+
+### Review timeout and retry contract implemented by Q3
+
+The default preset gives the `test` gate 45 minutes and every `ai-diff` gate
+30 minutes. An explicit gate `timeoutMs` remains authoritative unless
+`PIPELANE_REVIEW_GATE_TIMEOUT_MS=<milliseconds>` is set, which overrides all
+gates for the current process. Invalid override values are hard errors instead
+of silently falling back.
+
+Timeouts remain fail-closed through the backwards-compatible gate
+`status: "failed"`, with the additive `outcome: "timeout"` field and a visible
+`TIMEOUT` marker. The result points directly to
+`pipelane run review --gate <id>`.
+
+A successful executable-gate retry is append-only evidence. For `/pr`
+attestation, pipelane selects the latest matching full, non-filtered review run
+and virtually composes later successful `--gate <id>` retry records with it
+when branch, SHA, worktree identity, and gate definition all match. The stored
+full run is never rewritten; unrelated or stale filtered runs cannot replace
+the full-run envelope.
 
 | # | Quirk | Fix lives in | Priority | Note |
 |---|---|---|---|---|
