@@ -28,6 +28,9 @@ import {
 } from './state.ts';
 import { blockingAiReviewEvidenceBlocker, resolveReviewActorIdentity } from './review-identity.ts';
 import { REVIEW_GATES_POLICY_VERSION } from './review-gate-policy.ts';
+import { buildReviewTargetManifest } from './review-contract.ts';
+import { readVerifiedReviewArtifact } from './review-artifacts.ts';
+import { reviewArtifactRoot } from './state.ts';
 import { readWorktreeStatusSnapshot } from './worktree-status.ts';
 
 export type ReviewEvidenceGateStatus = 'missing' | 'failed' | 'pending' | 'incomplete';
@@ -225,7 +228,12 @@ export function evaluateReviewEvidenceForPr(
   const issues = collectReviewEvidenceIssues({
     latest,
     expectedGates,
-    strictIndependentAi: context.config.reviewGates?.policyVersion === REVIEW_GATES_POLICY_VERSION,
+    strictIndependentAi: (context.config.reviewGates?.policyVersion ?? 1) >= 2,
+    strictEvidence: context.config.reviewGates?.enforcementMode === 'strict-v3',
+    artifactRoot: reviewArtifactRoot(context.commonDir, context.config),
+    currentReviewTargetDigest: target.reviewTargetDigest,
+    expectedEnforcementMode: context.config.reviewGates?.enforcementMode ?? 'legacy-v2',
+    expectedPolicyVersion: context.config.reviewGates?.policyVersion ?? REVIEW_GATES_POLICY_VERSION,
     currentBranch: target.branchName,
     currentSha: target.sha,
     currentHeadLabel: target.headLabel ?? 'current HEAD',
@@ -265,33 +273,54 @@ export function evaluateReviewEvidenceForPr(
 }
 
 function currentCheckoutReviewEvidenceTarget(repoRoot: string): ReviewEvidenceTarget {
+  const context = resolveWorkflowContext(repoRoot);
   const worktreeStatus = readWorktreeStatusSnapshot(repoRoot, {
     includeStatusDigest: true,
     includeMaterialTreeHash: true,
   });
-  const context = resolveWorkflowContext(repoRoot);
   const lock = loadAllTaskLocks(context.commonDir, context.config).find((candidate) =>
     candidate.branchName === worktreeStatus.branchName
     && normalizeExistingPath(candidate.worktreePath) === normalizeExistingPath(repoRoot)
   );
   const migratedLock = lock ? ensureTaskBindingId(context.commonDir, context.config, lock.taskSlug) : null;
   const taskBindingId = migratedLock?.taskBindingId ?? '';
-  const reviewTargetDigest = crypto.createHash('sha256').update(canonicalize({
+  let reviewTargetDigest = crypto.createHash('sha256').update(canonicalize({
     version: 2,
     branchName: worktreeStatus.branchName,
     sha: worktreeStatus.head,
     worktreeStatusDigest: worktreeStatus.statusDigest,
     worktreeMaterialTreeHash: worktreeStatus.materialTreeHash ?? '',
   })).digest('hex');
+  let worktreeStatusDigest = worktreeStatus.statusDigest;
+  let worktreeStatusReliable = worktreeStatus.statusDigestReliable;
+  let worktreeStatusWarnings = worktreeStatus.statusDigestWarnings;
+  let worktreeMaterialTreeHash = worktreeStatus.materialTreeHash ?? '';
+  let worktreeMaterialTreeReliable = worktreeStatus.materialTreeReliable === true;
+  let worktreeMaterialTreeWarnings = worktreeStatus.materialTreeWarnings ?? [];
+  if (context.config.reviewGates?.enforcementMode === 'strict-v3') {
+    try {
+      const strictTarget = buildReviewTargetManifest(repoRoot, context.config.baseBranch).manifest;
+      reviewTargetDigest = strictTarget.targetDigest;
+      worktreeStatusDigest = strictTarget.worktreeStatusDigest;
+      worktreeStatusReliable = true;
+      worktreeStatusWarnings = [];
+      worktreeMaterialTreeHash = strictTarget.materialTreeHash;
+      worktreeMaterialTreeReliable = true;
+      worktreeMaterialTreeWarnings = [];
+    } catch {
+      // An exact status/material identity still permits informed consent when
+      // target capture itself is the blocking condition.
+    }
+  }
   return {
     branchName: worktreeStatus.branchName,
     sha: worktreeStatus.head,
-    worktreeStatusDigest: worktreeStatus.statusDigest,
-    worktreeStatusReliable: worktreeStatus.statusDigestReliable,
-    worktreeStatusWarnings: worktreeStatus.statusDigestWarnings,
-    worktreeMaterialTreeHash: worktreeStatus.materialTreeHash ?? '',
-    worktreeMaterialTreeReliable: worktreeStatus.materialTreeReliable === true,
-    worktreeMaterialTreeWarnings: worktreeStatus.materialTreeWarnings ?? [],
+    worktreeStatusDigest,
+    worktreeStatusReliable,
+    worktreeStatusWarnings,
+    worktreeMaterialTreeHash,
+    worktreeMaterialTreeReliable,
+    worktreeMaterialTreeWarnings,
     taskBindingId,
     reviewTargetDigest,
   };
@@ -340,10 +369,18 @@ export function selectCurrentReviewEvidenceRecord(
 }
 
 export function formatReviewEvidenceBlocker(context: WorkflowContext, issues: ReviewEvidenceIssue[], command = formatWorkflowCommand(context.config, 'pr')): string {
+  const bypassCommands = (context.config.reviewGates?.gates ?? [])
+    .filter((gate) => gate.blocking !== false)
+    .map((gate) => `/pipelane review override --gate ${gate.id} --scope=${JSON.stringify(command)} --reason "<why this exact target and action may proceed despite ${gate.id}>"`);
   return [
     `${command} blocked because review gate evidence is not ready.`,
     ...issues.map((issue) => `- ${issue.message}`),
-    `Run /pipelane review and complete any pending AI/manual gates before retrying ${command}.`,
+    `Recommended: Run /pipelane review${context.config.reviewGates?.enforcementMode === 'strict-v3' ? ' --intent "<what this change should accomplish>"' : ''} after repairing the evidence source or findings, then retry ${command}.`,
+    ...(bypassCommands.length > 0 ? [
+      'Proceed anyway only with explicit informed consent for every blocking gate in scope:',
+      ...bypassCommands,
+      'A bypass never relabels failed, pending, unavailable, or malformed evidence as passed.',
+    ] : []),
   ].join('\n');
 }
 
@@ -351,6 +388,11 @@ function collectReviewEvidenceIssues(options: {
   latest: ReviewRunRecord | null;
   expectedGates: ReviewGateConfig[];
   strictIndependentAi: boolean;
+  strictEvidence: boolean;
+  artifactRoot: string;
+  currentReviewTargetDigest: string;
+  expectedEnforcementMode: 'legacy-v2' | 'strict-v3';
+  expectedPolicyVersion: number;
   currentBranch: string;
   currentSha: string;
   currentHeadLabel: string;
@@ -365,6 +407,11 @@ function collectReviewEvidenceIssues(options: {
     latest,
     expectedGates,
     strictIndependentAi,
+    strictEvidence,
+    artifactRoot,
+    currentReviewTargetDigest,
+    expectedEnforcementMode,
+    expectedPolicyVersion,
     currentBranch,
     currentSha,
     currentHeadLabel,
@@ -378,12 +425,16 @@ function collectReviewEvidenceIssues(options: {
   if (!latest) {
     const blockingGates = expectedGates.filter((gate) => gate.blocking !== false);
     return blockingGates.length > 0
-      ? blockingGates.map((gate) => ({
+      ? [{
+          status: 'missing' as const,
+          message: 'no review run has been recorded for this checkout',
+          blocking: true,
+        }, ...blockingGates.map((gate) => ({
           status: 'missing' as const,
           gateId: gate.id,
           message: `configured gate ${gate.id} has no review run for this checkout`,
           blocking: true,
-        }))
+        }))]
       : [{
           status: 'missing',
           message: 'no review run has been recorded for this checkout',
@@ -392,6 +443,23 @@ function collectReviewEvidenceIssues(options: {
   }
 
   const issues: ReviewEvidenceIssue[] = [];
+  if (
+    latest.enforcementMode !== undefined
+    && (latest.enforcementMode !== expectedEnforcementMode || latest.policyVersion !== expectedPolicyVersion)
+  ) {
+    issues.push({
+      status: 'incomplete',
+      message: `latest review ${latest.id} used ${latest.enforcementMode} policy ${latest.policyVersion ?? 'unknown'}, not ${expectedEnforcementMode} policy ${expectedPolicyVersion}; rerun review after the mode change`,
+      blocking: true,
+    });
+  }
+  if (strictEvidence && (latest.enforcementMode !== 'strict-v3' || latest.policyVersion !== expectedPolicyVersion)) {
+    issues.push({
+      status: 'incomplete',
+      message: `latest review ${latest.id} is legacy evidence and cannot satisfy strict-v3; rerun review or use an exact-scope informed bypass`,
+      blocking: true,
+    });
+  }
   if (latest.dryRun) {
     issues.push({
       status: 'incomplete',
@@ -458,9 +526,42 @@ function collectReviewEvidenceIssues(options: {
     });
   }
 
+  if (strictEvidence) {
+    if (!latest.intent) {
+      issues.push({ status: 'incomplete', message: `latest review ${latest.id} has no authoritative intent evidence`, blocking: true });
+    }
+    if (!latest.target) {
+      issues.push({ status: 'incomplete', message: `latest review ${latest.id} has no immutable target manifest`, blocking: true });
+    } else if (latest.target.targetDigest !== currentReviewTargetDigest) {
+      issues.push({ status: 'incomplete', message: `latest review ${latest.id} targets a different immutable checkout`, blocking: true });
+    }
+  }
+
   for (const gate of latest.gates) {
     const blocking = gate.blocking !== false;
     if (!blocking) continue;
+    const expected = expectedGates.find((candidate) => candidate.id === gate.gateId);
+    if (strictEvidence && (gate.type === 'skill' || gate.type === 'agent') && gate.status === 'passed') {
+      const strictSkill = expected?.id === 'karpathy-diff' || expected?.id === 'karpathy-audit';
+      const capabilityOk = gate.capability?.wrapperCompatible === true
+        && gate.capability.contractSupplied === true
+        && gate.capability.effectiveCapability === (strictSkill ? 'contract-supplied-adapter' : 'role-equivalent-adapter');
+      if (!capabilityOk) {
+        issues.push({ status: 'incomplete', gateId: gate.gateId, message: `blocking gate ${gate.gateId} lacks compatible capability evidence`, blocking, gate });
+      }
+      if (!gate.result || (strictSkill && gate.result.protocolVersion !== 1) || gate.result.effectiveStatus !== 'passed') {
+        issues.push({ status: 'incomplete', gateId: gate.gateId, message: `blocking gate ${gate.gateId} lacks a valid strict result envelope`, blocking, gate });
+      }
+      if (!gate.reportArtifact || gate.reportArtifact.diagnosticOnly) {
+        issues.push({ status: 'incomplete', gateId: gate.gateId, message: `blocking gate ${gate.gateId} lacks an authoritative retained report artifact`, blocking, gate });
+      } else {
+        try {
+          readVerifiedReviewArtifact(artifactRoot, gate.reportArtifact);
+        } catch (error) {
+          issues.push({ status: 'incomplete', gateId: gate.gateId, message: `blocking gate ${gate.gateId} report integrity failed: ${error instanceof Error ? error.message : String(error)}`, blocking, gate });
+        }
+      }
+    }
     if (gate.status === 'failed') {
       issues.push({
         status: 'failed',
@@ -606,7 +707,7 @@ function attachEquivalentReviewGateEvidence(options: {
     : reviewRun;
 }
 
-export function reviewGateDefinitionHash(gate: Pick<ReviewGateConfig, 'id' | 'phase' | 'type' | 'blocking' | 'command' | 'skill' | 'role' | 'userCommands'> | Pick<ReviewGateRunRecord, 'gateId' | 'phase' | 'type' | 'blocking' | 'command' | 'skill' | 'role' | 'userCommands'>): GateDefinitionHash {
+export function reviewGateDefinitionHash(gate: ReviewGateConfig | ReviewGateRunRecord): GateDefinitionHash {
   const id = 'gateId' in gate ? gate.gateId : gate.id;
   return crypto.createHash('sha256').update(canonicalize({
     id,
@@ -616,7 +717,13 @@ export function reviewGateDefinitionHash(gate: Pick<ReviewGateConfig, 'id' | 'ph
     command: normalizeOptionalGateField(gate.command),
     skill: normalizeOptionalGateField(gate.skill),
     role: normalizeOptionalGateField(gate.role),
+    when: normalizeOptionalGateField(gate.when),
+    whenChanged: gate.whenChanged ?? [],
+    timeoutMs: gate.timeoutMs ?? null,
     userCommands: gate.userCommands ?? [],
+    profiles: gate.profiles ?? [],
+    baselineCommandId: normalizeOptionalGateField(gate.baselineCommandId),
+    replacesBaselineCommandId: normalizeOptionalGateField(gate.replacesBaselineCommandId),
   })).digest('hex');
 }
 

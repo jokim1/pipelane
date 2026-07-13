@@ -523,6 +523,7 @@ export function saveNewTaskLock(options: {
   config: WorkflowConfig;
   taskSlug: string;
   taskName: string;
+  taskBrief?: TaskLock['taskBrief'];
   branchName: string;
   worktreePath: string;
   mode: Mode;
@@ -532,6 +533,7 @@ export function saveNewTaskLock(options: {
     taskSlug: options.taskSlug,
     taskName: options.taskName,
     taskBindingId: newTaskBindingId(),
+    taskBrief: options.taskBrief,
     branchName: options.branchName,
     worktreePath: options.worktreePath,
     mode: options.mode,

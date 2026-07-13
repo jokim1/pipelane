@@ -34,6 +34,7 @@ import {
   type ReviewEvidenceIssue,
 } from './review-enforcement.ts';
 import { visibleReviewGateFailureOutput } from './review-output.ts';
+import { reviewArtifactRoot } from './state.ts';
 import { readWorktreeStatusSnapshot } from './worktree-status.ts';
 
 export const ROUTE_SAFETY_FINGERPRINT_ENV = 'PIPELANE_ROUTE_SAFETY_FINGERPRINT';
@@ -372,15 +373,15 @@ async function pauseRouteSafety(
       };
     }
     if (answer === '4') {
-      const confirmation = (await rl.question('Type "continue without fixing" to confirm: ')).trim();
-      if (confirmation !== 'continue without fixing') {
+      const confirmation = (await rl.question('Type "proceed with blocked evidence" to confirm: ')).trim();
+      if (confirmation !== 'proceed with blocked evidence') {
         saveRouteSafetyState(context.commonDir, context.config, state);
         return {
           action: 'stop',
           message: 'Confirmation did not match. Stop here and show review findings.',
         };
       }
-      const reason = (await rl.question('Why are you proceeding with these exact findings? ')).trim();
+      const reason = (await rl.question('Why may this exact target and route proceed despite the blocked evidence? ')).trim();
       if (!reason) {
         saveRouteSafetyState(context.commonDir, context.config, state);
         return { action: 'stop', message: 'A non-empty informed-consent reason is required. Findings remain blocked.' };
@@ -392,7 +393,7 @@ async function pauseRouteSafety(
       });
       record.resumes = [resume, ...(record.resumes ?? [])].slice(0, 20);
       record.acceptedFindingsAt = resume.recordedAt;
-      record.acceptedFindingsSource = 'TTY option 4: continue without fixing these findings';
+      record.acceptedFindingsSource = 'TTY option 4: proceed with blocked evidence';
       record.acceptedReviewRunId = record.lastReviewRunId;
       record.acceptedAttemptDigest = record.currentAttemptDigest;
       recordReviewEvidenceConsents(context, {
@@ -441,7 +442,7 @@ export function renderRouteSafetyInteractiveMenu(
     '1. Stop here and show review findings',
     '2. Return to the host for one repair/review attempt',
     '3. Choose how many more loops and minutes to allow',
-    '4. Continue without fixing these findings',
+    '4. Proceed anyway for this exact target and route',
     '5. Keep going until review passes, with explicit limits',
   ].join('\n');
 }
@@ -462,17 +463,26 @@ function renderRouteSafetyPauseMessage(
     `Minutes: ${elapsed}/${limits.minutes}`,
     `AI review runs: ${record.aiReviewRuns}/${limits.aiReviewRuns}`,
   ];
-  const findings = formatReviewFindings(options);
+  const findings = formatReviewFindings(options, reviewArtifactRoot(context.commonDir, context.config));
   if (findings.length > 0) {
     lines.push('', 'Review findings:', ...findings);
   }
+  const bypassCommands = (context.config.reviewGates?.gates ?? [])
+    .filter((gate) => gate.blocking !== false)
+    .map((gate) => `pipelane run review override --gate ${gate.id} --scope=${JSON.stringify(record.targetCommand)} --reason="<why this exact target and route may proceed despite ${gate.id}>"`);
   lines.push(
+    '',
+    'Recommended recovery: repair every blocking finding or unavailable/pending evidence source, rerun /pipelane review, then retry the route.',
+    ...(bypassCommands.length > 0 ? [
+      'Exact-scope informed bypasses (one consent per configured blocking gate; evidence remains failed or pending):',
+      ...bypassCommands,
+    ] : []),
     '',
     'Resume commands:',
     'pipelane resume --one-more-loop',
     'pipelane resume --more-loops=2 --more-minutes=45',
     'pipelane resume --until-review-passes --max-more-loops=3 --max-more-minutes=120',
-    'pipelane resume --accept-findings --reason="<why these exact findings are acceptable>"',
+    'pipelane resume --accept-findings --reason="<why this exact target and route may proceed despite the blocked evidence>"',
   );
   if (record.legacyMigration?.status === 'pending') {
     lines.push(
@@ -721,6 +731,7 @@ function reviewRunUsesAiReview(reviewRun: ReviewRunRecord): boolean {
     (gate.type === 'skill' || gate.type === 'agent')
     && gate.status !== 'skipped'
     && Boolean(gate.command)
+    && gate.exitCode !== undefined
     && !(gate.status === 'pending' && gate.summary.startsWith('deferred:'))
     && gate.skipReason !== 'dry-run'
   );
@@ -955,7 +966,7 @@ function elapsedMinutes(firstStartedAt: string): number {
   return Math.max(0, Math.floor((Date.now() - started) / 60000));
 }
 
-function formatReviewFindings(options: PauseOptions): string[] {
+function formatReviewFindings(options: PauseOptions, artifactRoot?: string): string[] {
   const issues = options.issues && options.issues.length > 0
     ? options.issues
     : options.latest
@@ -965,7 +976,7 @@ function formatReviewFindings(options: PauseOptions): string[] {
   for (const issue of issues) {
     lines.push(`- ${issue.message}`);
     if (!issue.gate) continue;
-    const output = visibleReviewGateFailureOutput(issue.gate);
+    const output = visibleReviewGateFailureOutput(issue.gate, artifactRoot);
     if (!output) continue;
     lines.push(`  ${issue.gate.gateId} output:`);
     lines.push(...output.split('\n').map((line) => `    ${line}`));

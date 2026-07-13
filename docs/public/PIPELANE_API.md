@@ -66,6 +66,17 @@ that ignore unknown fields parse every revision transparently. See
   - `probeState` — rollup of per-surface staging probes: one of
     `healthy | degraded | stale | unknown`. See `doctor.probe` below.
 - `boardContext.activeTask` / `overallFreshness`.
+- `review.current` is evidence for the current checkout only; `review.recent`
+  is branch history and must not be treated as current. `review.latest` remains
+  a compatibility alias for `review.current` through the 0.2.x line and is
+  removed in 0.3.0.
+- `review.enforcementMode`, `review.policyVersion`, and
+  `review.blockingGateIds` describe the current configured contract so clients
+  can distinguish an upgrade mismatch from current evidence without guessing.
+- Strict review records may add `taskBindingId`, `intent`, `target`, per-gate
+  `capability`, `result`, `findings`, and `reportArtifact`. These fields are
+  additive. Consumers must not infer a clean result when `findingsKnown` is
+  false, and must preserve `bypassed` separately from `passed`.
 - `sourceHealth[]` — per-source liveness cells. Always includes
   `git.local` and `task-locks`; v1.2 adds one entry per configured staging
   probe surface (e.g. `deployProbe.frontend`, `deployProbe.edge`,

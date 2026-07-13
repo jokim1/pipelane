@@ -496,6 +496,7 @@ Each gate has:
 ```jsonc
 {
   "reviewGates": {
+    "enforcementMode": "legacy-v2",
     "planReview": {
       "gates": [
         { "id": "plan-eng-review", "phase": "plan", "type": "skill", "skill": "plan-eng-review", "blocking": true },
@@ -595,6 +596,16 @@ The bounded ledger records the latest runs with branch, SHA, changed
 files, gate order, skipped gates and skip reasons, command or skill result,
 timeout status, output tails, and final blocking/advisory verdict.
 
+Strict-v3 adds the authoritative intent and its source, immutable base-tip,
+merge-base, HEAD and material-manifest digests, exact capability-contract and
+adapter evidence, policy-derived structured findings, and a digest-bound report
+artifact under the configured state directory's `review-artifacts/` tree.
+Artifacts are written, synced, renamed, reread, and verified before a signed
+ledger entry may reference them. `pipelane run review gc` performs a locked,
+batched full sweep; routine review runs perform a bounded 24-hour-grace prune.
+An active per-run writer lease prevents even a full sweep from racing the
+artifact-before-ledger crash window; an abandoned lease ages out for recovery.
+
 `/pr` enforces blocking configured review gates before commit, push, or PR
 handoff. A failed or pending blocking gate stops `/pr`. Evidence must be for
 the current branch, HEAD, and worktree state, and cannot come from a dry-run or
@@ -610,10 +621,15 @@ environment override (`PIPELANE_REVIEW_<GATE_ID>_COMMAND` or
 installed native Codex/Claude CLI default. Runtime skill and agent gates, such
 as `browser-qa`, require a gate `command` or gate-specific environment override;
 they do not consume shared AI-review overrides or native Codex/Claude defaults.
-The command receives a review prompt on stdin and must print
-`PIPELANE_REVIEW_GATE_RESULT=passed` or
-`PIPELANE_REVIEW_GATE_RESULT=failed` on its own line. Missing result markers
-fail closed.
+In legacy-v2, custom commands retain the exact standalone result-marker
+contract. In strict-v3, raw provider prose cannot declare Pipelane status.
+Pipelane requests provider-native structured JSON, separately validates provider
+completion, derives blocking status from critical/warning findings, and owns the
+single final version-1 canonical envelope. Duplicate, trailing, oversized,
+malformed, stderr-only, invalid-UTF-8, or nonzero-adapter outcomes fail closed.
+Strict skill gates never fall back to a generic reviewer: the exact full
+contract must resolve from a trusted machine-local skill root and its digest is
+bound into evidence.
 
 Read-only AI review commands must not modify files. Pipelane snapshots the
 worktree before and after each AI review command; if a read-only gate changes
@@ -634,6 +650,18 @@ pipelane run review pass --gate gstack-review --message "Ran /review clean"
 The pass command only applies to a full, non-dry-run review for the current
 branch, HEAD, and worktree state. If the worktree changes, rerun
 `/pipelane review` before recording manual passes again.
+It cannot substitute for a strict-skill gate. For a missing strict skill or
+adapter, restore the named capability and rerun, or use
+`/pipelane review override --gate <id> --scope <route-action> --reason <reason>`
+for the exact target and route action. Failed/pending findings remain visibly
+failed/pending after consent; they are never relabeled as passed.
+
+Task labels, branch names, PR titles, commits, and diff inference are not task
+intent. A first interactive strict review may initialize a bound task's one-time
+immutable brief. JSON and non-interactive callers receive `needsInput` and must
+supply `--intent` or explicitly bypass. Orchestration always uses the approved
+slice outcome as the authoritative review intent, with the parent brief as
+context when present.
 
 For orchestration slices, run those two commands from the slice worktree. The
 parent `orchestrate review` command will attach matching passed manual gates on

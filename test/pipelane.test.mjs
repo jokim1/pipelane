@@ -394,6 +394,7 @@ function preparePlannedRun(repoRoot, planned, overrides = {}, options = {}) {
 
 function shouldSeedPassingReviewEvidence(args) {
   if (args[0] !== 'run') return false;
+  if (args.includes('--override')) return false;
   if (args[1] === 'pr') return true;
   return args[1] === 'api' && args[2] === 'action' && args[3] === 'pr';
 }
@@ -4110,7 +4111,8 @@ test('review setup --yes persists the recommended gate checklist', () => {
 
     assert.equal(report.status, 'configured');
     assert.equal(realpathSync(report.configPath), realpathSync(machinePipelaneConfigPath(repoRoot)));
-    assert.deepEqual(Object.keys(raw.reviewGates).sort(), ['gates', 'planReview', 'policyVersion']);
+    assert.deepEqual(Object.keys(raw.reviewGates).sort(), ['enforcementMode', 'gates', 'planReview', 'policyVersion']);
+    assert.equal(raw.reviewGates.enforcementMode, 'legacy-v2');
     assert.equal(raw.reviewGates.policyVersion, 2);
     assert.ok(Array.isArray(raw.reviewGates.gates));
     assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'typecheck'));
@@ -4492,7 +4494,8 @@ test('review setup --yes saves explicit recommended gates when detected tools ma
     const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
 
     assert.equal(report.status, 'configured');
-    assert.deepEqual(Object.keys(raw.reviewGates).sort(), ['gates', 'planReview', 'policyVersion']);
+    assert.deepEqual(Object.keys(raw.reviewGates).sort(), ['enforcementMode', 'gates', 'planReview', 'policyVersion']);
+    assert.equal(raw.reviewGates.enforcementMode, 'legacy-v2');
     assert.equal(raw.reviewGates.policyVersion, 2);
     assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'));
     assert.ok(raw.reviewGates.gates.some((gate) => gate.id === 'gstack-review'));
@@ -4925,7 +4928,8 @@ test('review setup interactive toggle of installed AI gate writes explicit gate 
     const raw = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
 
     assert.doesNotMatch(result.stdout, /Install and enable/);
-    assert.deepEqual(Object.keys(raw.reviewGates).sort(), ['gates', 'planReview', 'policyVersion']);
+    assert.deepEqual(Object.keys(raw.reviewGates).sort(), ['enforcementMode', 'gates', 'planReview', 'policyVersion']);
+    assert.equal(raw.reviewGates.enforcementMode, 'legacy-v2');
     assert.equal(raw.reviewGates.policyVersion, 2);
     assert.ok(Array.isArray(raw.reviewGates.gates));
     assert.equal(raw.reviewGates.gates.some((gate) => gate.id === 'karpathy-diff'), false);
@@ -17330,6 +17334,11 @@ function writePassingReviewEvidence(repoRoot, options = {}) {
     sessionId: hashedSessionId('test-review-attester-session'),
     source: 'CLAUDE_SESSION_ID',
   };
+  const defaultAuthorIdentity = {
+    provider: 'codex',
+    sessionId: hashedSessionId('test-review-author-session'),
+    source: 'CODEX_SESSION_ID',
+  };
   record.status = options.status || 'passed';
   if (Object.prototype.hasOwnProperty.call(options, 'authorIdentity')) {
     if (options.authorIdentity === null) {
@@ -17337,6 +17346,8 @@ function writePassingReviewEvidence(repoRoot, options = {}) {
     } else {
       record.authorIdentity = options.authorIdentity;
     }
+  } else if (!record.authorIdentity) {
+    record.authorIdentity = defaultAuthorIdentity;
   }
   if (Object.prototype.hasOwnProperty.call(options, 'reviewer')) {
     record.reviewer = options.reviewer;
@@ -18929,7 +18940,7 @@ test('merge can explicitly override missing review evidence with a reason', () =
       '--json',
     ], created.worktreePath, env).stdout);
     assert.equal(merged.mergedSha, 'deadbeefcafebabe');
-    assert.match(merged.message, /review gate override accepted: review accepted outside Pipelane/);
+    assert.match(merged.message, /review evidence was bypassed by the user for this exact target; failed or pending gates were not passed: review accepted outside Pipelane/);
     const reviewState = JSON.parse(readFileSync(evidencePath, 'utf8'));
     assert.equal(reviewState.overrides.length, 1);
     assert.equal(reviewState.overrides[0].command, '/merge');
@@ -19279,7 +19290,7 @@ test('pr can explicitly override missing review evidence with a reason', () => {
     ], created.worktreePath, env);
     const payload = JSON.parse(result.stdout);
     assert.equal(result.status, 0);
-    assert.match(payload.message, /review gate override accepted: external review gates already passed/);
+    assert.match(payload.message, /review evidence was bypassed by the user for this exact target; failed or pending gates were not passed: external review gates already passed/);
     assert.match(payload.url, /example\.test\/pr/);
     const reviewState = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'review-state.json'), 'utf8'));
     assert.equal(reviewState.overrides.length, 1);
@@ -19585,7 +19596,7 @@ test('pr blocks same-session AI review attestation for legacy configs', async ()
       env: { CODEX_SESSION_ID: 'legacy-same-review-session' },
     });
     writePassingReviewEvidence(created.worktreePath, {
-      authorIdentity: null,
+      authorIdentity: sameSessionReviewer,
       reviewer: sameSessionReviewer,
       gateAttester: sameSessionReviewer,
     });
@@ -19664,6 +19675,7 @@ test('pr blocks reviewer-less AI review evidence with generic attester', async (
       env: { PIPELANE_AGENT_SESSION_ID: 'generic-attester-session' },
     });
     writePassingReviewEvidence(created.worktreePath, {
+      authorIdentity: null,
       omitReviewer: true,
       gateAttester: genericAttester,
     });
@@ -20130,7 +20142,7 @@ test('route safety renders the TTY pause menu with explicit loop choices', async
     assert.match(menu, /1\. Stop here and show review findings/);
     assert.match(menu, /2\. Return to the host for one repair\/review attempt/);
     assert.match(menu, /3\. Choose how many more loops and minutes to allow/);
-    assert.match(menu, /4\. Continue without fixing these findings/);
+    assert.match(menu, /4\. Proceed anyway for this exact target and route/);
     assert.match(menu, /5\. Keep going until review passes, with explicit limits/);
     assert.match(menu, /fix\/review loops/i);
     assert.match(menu, /minutes/i);
@@ -20188,6 +20200,8 @@ test('route safety pauses non-TTY PR flow on blocking review findings and reuses
       assert.match(result.stderr, /pipelane resume --more-loops=2 --more-minutes=45/);
       assert.match(result.stderr, /pipelane resume --until-review-passes --max-more-loops=3 --max-more-minutes=120/);
       assert.match(result.stderr, /pipelane resume --accept-findings/);
+      assert.match(result.stderr, /pipelane run review override --gate always-fails/);
+      assert.match(result.stderr, /Recommended recovery: repair every blocking finding/);
       assert.doesNotMatch(result.stderr, /\bbudget\b|\bcap\b/i);
     }
 
@@ -20352,13 +20366,172 @@ test('signed review consent is exact-scope and never relabels failed evidence as
     assert.match(stored.consents[0].signature, /^[a-f0-9]{64}$/);
     assert.equal(stored.consents[0].taskBindingId, lock.taskBindingId);
     assert.equal(enforcement.evaluateReviewEvidenceForPr(context, { command: '/merge' }).allowed, false);
+    const changedPolicyContext = {
+      ...context,
+      config: { ...context.config, reviewGates: { ...context.config.reviewGates, policyVersion: 3 } },
+    };
+    assert.equal(enforcement.evaluateReviewEvidenceForPr(changedPolicyContext, { command: '/pr' }).allowed, false, 'policy changes invalidate consent');
+    const changedGateContext = {
+      ...context,
+      config: {
+        ...context.config,
+        reviewGates: {
+          ...context.config.reviewGates,
+          gates: context.config.reviewGates.gates.map((gate) => ({ ...gate, timeoutMs: 12345 })),
+        },
+      },
+    };
+    assert.equal(enforcement.evaluateReviewEvidenceForPr(changedGateContext, { command: '/pr' }).allowed, false, 'gate definition changes invalidate consent');
 
     writeFileSync(featurePath, 'changed after consent\n', 'utf8');
     assert.equal(enforcement.evaluateReviewEvidenceForPr(context, { command: '/pr' }).allowed, false);
+    writeFileSync(featurePath, 'review this exact material\n', 'utf8');
+    runCli([
+      'run', 'review', 'override', '--gate', 'consent-failure', '--scope', '/pr',
+      '--reason', 'fresh consent after the target was changed and restored', '--json',
+    ], created.worktreePath);
+    assert.equal(enforcement.evaluateReviewEvidenceForPr(context, { command: '/pr' }).allowed, true);
+    runCli(['run', 'adopt', '--task', created.taskSlug, '--force', '--brief', 'One-time objective initialization', '--json'], created.worktreePath);
+    runCli(['run', 'adopt', '--task', created.taskSlug, '--force', '--brief', 'A genuinely rebound objective', '--json'], created.worktreePath);
+    assert.equal(enforcement.evaluateReviewEvidenceForPr(context, { command: '/pr' }).allowed, false, 'task rebind invalidates consent even when target bytes match');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
   }
+});
+
+test('review override can consent one configured gate at a time when only global strict evidence issues block', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Global Strict Bypass', {
+      reviewGates: {
+        enforcementMode: 'strict-v3',
+        policyVersion: 3,
+        gates: [{ id: 'deterministic-clean', phase: 'static', type: 'command', blocking: true, command: 'node -e "process.exit(0)"' }],
+      },
+    });
+    commitAll(repoRoot, 'Configure strict global bypass');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Global Evidence Bypass', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'global evidence mismatch\n', 'utf8');
+    const record = writePassingReviewEvidence(created.worktreePath);
+    const statePath = JSON.parse(runCli(['run', 'review', '--dry-run', '--intent', 'Review the exact global bypass fixture', '--json'], created.worktreePath).stdout).evidencePath;
+    const stateJson = JSON.parse(readFileSync(statePath, 'utf8'));
+    const current = stateJson.records.find((entry) => entry.id === record.id) ?? stateJson.records[0];
+    current.enforcementMode = 'legacy-v2';
+    current.policyVersion = 2;
+    current.status = 'passed';
+    current.dryRun = false;
+    current.gates = current.gates.map((gate) => ({ ...gate, status: 'passed', summary: 'deterministic fixture passed' }));
+    delete current.signature;
+    stateJson.records = [current];
+    writeFileSync(statePath, `${JSON.stringify(stateJson, null, 2)}\n`, 'utf8');
+
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const enforcement = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-enforcement.ts'));
+    const context = state.resolveWorkflowContext(created.worktreePath);
+    const blocked = enforcement.evaluateReviewEvidenceForPr(context, { command: '/pr' });
+    assert.equal(blocked.allowed, false);
+    assert.equal(blocked.issues.every((issue) => !issue.gateId), true, 'fixture must exercise global-only evidence blockers');
+
+    const bypass = JSON.parse(runCli([
+      'run', 'review', 'override', '--gate', 'deterministic-clean', '--scope', '/pr',
+      '--reason', 'the operator accepts the exact legacy evidence mismatch for this target only', '--json',
+    ], created.worktreePath).stdout);
+    assert.equal(bypass.status, 'bypassed');
+    const allowed = enforcement.evaluateReviewEvidenceForPr(context, { command: '/pr' });
+    assert.equal(allowed.allowed, true);
+    assert.equal(allowed.latest.gates[0].status, 'passed');
+    assert.ok(allowed.bypassedIssues.every((issue) => !issue.gateId), 'global issues stay global and are not rewritten as passed gates');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('universal consent covers failed, pending, unavailable, malformed, strict, independent, deterministic, and human gate blocks', async () => {
+  const repoRoot = createRepo();
+  try {
+    const gates = [
+      { id: 'deterministic-failed', phase: 'static', type: 'command', blocking: true, command: 'npm test' },
+      { id: 'karpathy-diff', phase: 'ai-diff', type: 'skill', blocking: true, skill: 'karpathy-diff' },
+      { id: 'code-review-high', phase: 'ai-diff', type: 'agent', blocking: true, role: 'primary-independent-review' },
+      { id: 'malformed-adapter', phase: 'ai-diff', type: 'agent', blocking: true, role: 'reviewer' },
+      { id: 'karpathy-audit', phase: 'ai-diff', type: 'skill', blocking: true, skill: 'karpathy-audit' },
+      { id: 'human-approval', phase: 'human', type: 'approval', blocking: true },
+    ];
+    writePipelaneConfig(repoRoot, 'Universal Consent Matrix', {
+      reviewGates: { enforcementMode: 'strict-v3', policyVersion: 3, gates },
+    });
+    commitLocal(repoRoot, 'Configure universal consent matrix');
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const enforcement = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-enforcement.ts'));
+    const context = state.resolveWorkflowContext(repoRoot);
+    const statuses = ['failed', 'pending', 'missing', 'incomplete', 'pending', 'pending'];
+    assert.throws(() => enforcement.recordReviewEvidenceConsents(context, {
+      allowed: false, latest: null, issues: [{ status: 'failed', gateId: gates[0].id, message: 'fixture', blocking: true }], bypassedIssues: [], consents: [], message: '',
+    }, '/pr', ''), /non-empty informed-consent reason/);
+    for (const [index, gate] of gates.entries()) {
+      const consent = enforcement.recordReviewEvidenceConsents(context, {
+        allowed: false,
+        latest: null,
+        issues: [{ status: statuses[index], gateId: gate.id, message: `${gate.id} fixture block`, blocking: true }],
+        bypassedIssues: [], consents: [], message: '',
+      }, '/pr', `accept ${gate.id} only for this exact target and route`);
+      assert.equal(consent.length, 1);
+      assert.equal(consent[0].gateId, gate.id);
+      assert.equal(consent[0].originalGateState, statuses[index]);
+      assert.match(consent[0].signature, /^[a-f0-9]{64}$/);
+    }
+    const exact = enforcement.evaluateReviewEvidenceForPr(context, { command: '/pr' });
+    assert.equal(exact.allowed, true);
+    assert.equal(exact.latest, null, 'bypass must not invent or relabel review evidence');
+    assert.ok(exact.bypassedIssues.length >= gates.length);
+    assert.match(exact.message, /bypassed by user/);
+    assert.match(exact.message, /not relabeled as passed/);
+    assert.equal(enforcement.evaluateReviewEvidenceForPr(context, { command: '/merge' }).allowed, false, 'route action changes invalidate every consent');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review gate definition consent hash binds every execution-affecting field', async () => {
+  const enforcement = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-enforcement.ts'));
+  const base = {
+    id: 'gate-one', phase: 'static', type: 'command', blocking: true, command: 'npm test',
+    skill: 'fixture', role: 'reviewer', when: 'always', whenChanged: ['src/**'], timeoutMs: 1000,
+    userCommands: ['/review'], profiles: ['implementation'], baselineCommandId: 'test', replacesBaselineCommandId: 'legacy-test',
+  };
+  const original = enforcement.reviewGateDefinitionHash(base);
+  for (const changed of [
+    { timeoutMs: 2000 }, { when: 'changed' }, { whenChanged: ['lib/**'] }, { profiles: ['docs-only'] },
+    { baselineCommandId: 'build' }, { replacesBaselineCommandId: 'old-build' }, { userCommands: ['/different'] },
+  ]) {
+    assert.notEqual(enforcement.reviewGateDefinitionHash({ ...base, ...changed }), original);
+  }
+});
+
+test('captured 0.2 review reader preserves additive strict history but fails newer policy evidence closed after rollback', () => {
+  const captured02Reader = (text) => {
+    const raw = JSON.parse(text);
+    if (!raw || typeof raw !== 'object' || !Array.isArray(raw.records)) throw new Error('invalid 0.2 review state');
+    if (!raw.records.every((record) => typeof record.id === 'string' && Array.isArray(record.gates))) throw new Error('invalid 0.2 review record');
+    return { records: raw.records };
+  };
+  const additive = {
+    id: 'review-strict-additive', branchName: 'feature', sha: '1'.repeat(40), status: 'failed', dryRun: false,
+    enforcementMode: 'strict-v3', policyVersion: 3, taskBindingId: 'task-binding-fixture',
+    intent: { text: 'Exact objective', source: 'task-brief', digest: '2'.repeat(64) },
+    target: { targetDigest: '3'.repeat(64) },
+    gates: [{
+      id: 'gate-one', gateId: 'karpathy-diff', phase: 'ai-diff', type: 'skill', blocking: true, status: 'failed',
+      capability: { effectiveCapability: 'contract-supplied-adapter' }, result: { protocolVersion: 1 },
+      reportArtifact: { path: 'review/gate.json', digest: '4'.repeat(64), bytes: 20 }, findings: [{ id: 'F001', severity: 'warning', title: 'Scope mismatch' }],
+    }],
+  };
+  const read = captured02Reader(JSON.stringify({ schemaVersion: 2, records: [additive], consents: [{ id: 'new-consent' }] }));
+  assert.deepEqual(read.records[0], additive, 'an additive 0.2 reader retains the complete record object and unknown optional fields');
+  const captured02AllowsRelease = (record) => record.policyVersion === 2 && record.status === 'passed';
+  assert.equal(captured02AllowsRelease(read.records[0]), false, 'rollback must rerun instead of downgrading strict-v3 evidence semantics');
 });
 
 test('legacy task locks receive one deterministic binding id without invented intent', async () => {
@@ -20428,6 +20601,8 @@ test('route safety accept-findings does not bypass incomplete review evidence', 
     assert.equal(blocked.status, 1);
     assert.match(blocked.stderr, /review gate evidence is not ready/);
     assert.match(blocked.stderr, /dry run/);
+    assert.match(blocked.stderr, /review override --gate must-run/);
+    assert.match(blocked.stderr, /never relabels failed, pending, unavailable, or malformed evidence as passed/);
     assert.doesNotMatch(blocked.stderr, /Route-bound delivery paused/);
 
     const resume = runCli(['run', 'resume', '--accept-findings', '--reason', 'only for this exact dry-run target', '--json'], created.worktreePath, {}, true);
@@ -34023,4 +34198,937 @@ test('machine-local setup preserves consumer prose that quotes the outer lessons
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
+});
+
+test('strict review protocol derives status from bounded structured findings and rejects transport ambiguity', async () => {
+  const contract = await import(pathToFileURL(path.join(KIT_ROOT, 'dist', 'operator', 'review-contract.js')).href);
+  const policy = (await import(pathToFileURL(path.join(KIT_ROOT, 'dist', 'operator', 'review-gate-policy.js')).href)
+    .then((mod) => mod.reviewGateExecutionPolicy({ id: 'karpathy-diff', type: 'skill' })));
+  const finding = { severity: 'warning', title: 'Scope is broader than the task', location: 'src/demo.ts:1' };
+  const line = contract.canonicalEnvelopeLine('failed', [finding]);
+  const parseLine = (value) => {
+    const framer = new contract.ReviewProtocolFramer();
+    framer.feed(Buffer.from(value));
+    return framer.finish(policy);
+  };
+  for (const chunkSize of [1, 2, 7, 31, line.length]) {
+    const framer = new contract.ReviewProtocolFramer();
+    const bytes = Buffer.from(`${line}\n`);
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) framer.feed(bytes.subarray(offset, offset + chunkSize));
+    const parsed = framer.finish(policy);
+    assert.equal(parsed.status, 'failed');
+    assert.deepEqual(parsed.findings.map((entry) => entry.id), ['F001']);
+    assert.equal(parsed.result.blockingCount, 1);
+  }
+  assert.equal(parseLine(contract.canonicalEnvelopeLine('passed', [])).status, 'passed', 'final newline is optional');
+  assert.equal(parseLine(`${contract.canonicalEnvelopeLine('passed', [{ severity: 'nit', title: 'Naming preference' }])}\n`).result.advisoryCount, 1);
+  assert.equal(parseLine(`${contract.canonicalEnvelopeLine('failed', [{ severity: 'critical', title: 'Data loss' }])}\n`).result.blockingCount, 1);
+  assert.equal(parseLine(`${contract.canonicalEnvelopeLine('failed', [finding, { severity: 'nit', title: 'Naming preference' }])}\n`).findings.length, 2);
+  assert.deepEqual(parseLine(`${contract.canonicalEnvelopeLine('failed', [finding, finding])}\n`).findings.map((entry) => entry.id), ['F001', 'F002'], 'duplicate content is retained with deterministic evidence-local ids');
+  assert.equal(parseLine(`${contract.canonicalEnvelopeLine('failed', Array.from({ length: 100 }, (_, index) => ({ severity: 'warning', title: `Finding ${index}` })))}\n`).findings.length, 100);
+
+  const cases = [
+    `${line}\n${line}\n`,
+    `${line}\ntrailing output\n`,
+    `PIPELANE_REVIEW_GATE_RESULT=${JSON.stringify({ version: 1, status: 'passed', findings: [finding] })}\n`,
+    `PIPELANE_REVIEW_GATE_RESULT=${JSON.stringify({ version: 1, status: 'failed', findings: [] })}\n`,
+    `${contract.canonicalEnvelopeLine('failed', Array.from({ length: 101 }, () => finding))}\n`,
+    `PIPELANE_REVIEW_GATE_RESULT=${JSON.stringify({ version: 1, status: 'failed', findings: [{ severity: 'urgent', title: 'Invalid severity' }] })}\n`,
+    `PIPELANE_REVIEW_GATE_RESULT=${JSON.stringify({ version: 1, status: 'failed', findings: [{ severity: 'warning', title: '' }] })}\n`,
+    `PIPELANE_REVIEW_GATE_RESULT=${JSON.stringify({ version: 1, status: 'failed', findings: [{ severity: 'warning', title: 'x'.repeat(301) }] })}\n`,
+    `PIPELANE_REVIEW_GATE_RESULT=${JSON.stringify({ version: 1, status: 'failed', findings: [{ severity: 'warning', title: 'valid', location: 'x'.repeat(301) }] })}\n`,
+    `PIPELANE_REVIEW_GATE_RESULT={not-json}\n`,
+  ];
+  for (const value of cases) {
+    const framer = new contract.ReviewProtocolFramer();
+    framer.feed(Buffer.from(value));
+    assert.throws(() => framer.finish(policy));
+  }
+  const invalidUtf8 = new contract.ReviewProtocolFramer();
+  invalidUtf8.feed(Buffer.from([0xff, 0x0a]));
+  assert.throws(() => invalidUtf8.finish(policy), /invalid UTF-8/);
+  const splitUtf8 = new contract.ReviewProtocolFramer();
+  const utf8Envelope = Buffer.from(`${contract.canonicalEnvelopeLine('failed', [{ severity: 'warning', title: 'évidence' }])}\n`);
+  for (const byte of utf8Envelope) splitUtf8.feed(Uint8Array.of(byte));
+  assert.equal(splitUtf8.finish(policy).findings[0].title, 'évidence');
+  const overlong = new contract.ReviewProtocolFramer();
+  const exactLineBound = new contract.ReviewProtocolFramer();
+  exactLineBound.feed(Buffer.alloc(64 * 1024, 0x78));
+  assert.throws(() => exactLineBound.finish(policy), /exactly one canonical envelope/);
+  overlong.feed(Buffer.alloc(64 * 1024 + 1, 0x78));
+  assert.throws(() => overlong.finish(policy), /exceeds 65536 bytes/);
+  assert.throws(() => contract.adaptProviderCompletion({
+    provider: 'codex', providerExitCode: 0, stdout: 'PIPELANE_REVIEW_GATE_RESULT=passed',
+  }), /native structured response is malformed/);
+  assert.throws(() => contract.adaptProviderCompletion({
+    provider: 'codex', providerExitCode: 9, stdout: JSON.stringify({ status: 'failed', findings: [], report: '' }),
+  }), /provider exit 9/);
+  assert.throws(() => contract.adaptProviderCompletion({
+    provider: 'codex', providerExitCode: null, providerSignal: 'SIGTERM', stdout: JSON.stringify({ status: 'failed', findings: [finding], report: '' }),
+  }), /terminated by SIGTERM/);
+  assert.throws(() => contract.adaptProviderCompletion({
+    provider: 'codex',
+    providerExitCode: 0,
+    stdout: Buffer.concat([
+      Buffer.from('{"status":"passed","findings":[],"report":"'),
+      Buffer.from([0xff]),
+      Buffer.from('"}'),
+    ]),
+  }), /valid UTF-8/);
+  assert.equal(contract.adaptProviderCompletion({
+    provider: 'codex', providerExitCode: 7, acceptedProviderExitCodes: [0, 7], stdout: JSON.stringify({ status: 'failed', findings: [finding], report: 'bounded report' }),
+  }).result.status, 'failed');
+  const nullableLocation = contract.adaptProviderCompletion({
+    provider: 'claude', providerExitCode: 0,
+    stdout: JSON.stringify({ structured_output: { status: 'failed', findings: [{ ...finding, location: null }], report: 'nullable native location' } }),
+  });
+  assert.equal(nullableLocation.result.findings[0].location, undefined);
+  const nativeSchema = contract.providerNativeJsonSchema();
+  assert.deepEqual(nativeSchema.properties.findings.items.required, ['severity', 'title', 'location']);
+  assert.deepEqual(nativeSchema.properties.findings.items.properties.location.type, ['string', 'null']);
+  assert.throws(() => contract.adaptProviderCompletion({
+    provider: 'codex', providerExitCode: 0, adapterExitCode: 1, stdout: JSON.stringify({ status: 'passed', findings: [], report: '' }),
+  }), /adapter exited 1/);
+  assert.equal(contract.LEGACY_REVIEW_PROTOCOL_REMOVAL_VERSION, '0.3.0');
+  assert.equal(contract.parseLegacyRoleEquivalentEnvelope('report\nPIPELANE_REVIEW_GATE_RESULT=passed\n').result.findingsKnown, false);
+  assert.throws(() => parseLine('PIPELANE_REVIEW_GATE_RESULT=passed\n'), /malformed|canonical/);
+  assert.equal(contract.parseLegacyRoleEquivalentEnvelope('PIPELANE_REVIEW_GATE_RESULT:passed'), null);
+  assert.equal(contract.parseLegacyRoleEquivalentEnvelope('PIPELANE_REVIEW_GATE_RESULT=passed\ntrailing'), null);
+});
+
+test('all review gate roles consume one execution policy for capability, mutation, severity, and reports', async () => {
+  const policy = await import(pathToFileURL(path.join(KIT_ROOT, 'dist', 'operator', 'review-gate-policy.js')).href);
+  const cases = [
+    [{ id: 'karpathy-diff', type: 'skill' }, 'self-review', 'strict-skill', 'read-only', 'required'],
+    [{ id: 'karpathy-audit', type: 'skill' }, 'instruction-audit', 'strict-skill', 'read-only', 'required'],
+    [{ id: 'gstack-review', type: 'skill' }, 'primary-independent-review', 'role-equivalent', 'fix-first', 'required'],
+    [{ id: 'adversarial-review', type: 'agent' }, 'cross-model-review', 'role-equivalent', 'read-only', 'required'],
+    [{ id: 'code-review-ultra', type: 'agent' }, 'high-stakes-review', 'role-equivalent', 'read-only', 'required'],
+    [{ id: 'browser-qa', type: 'agent' }, 'runtime-qa', 'role-equivalent', 'read-only', 'required'],
+    [{ id: 'high-stakes-human-approval', type: 'approval' }, 'high-stakes-human', 'manual-only', 'manual', 'not-required'],
+    [{ id: 'typecheck', type: 'command' }, 'deterministic', 'role-equivalent', 'read-only', 'not-required'],
+  ];
+  for (const [gate, role, capability, mutation, manualReport] of cases) {
+    const resolved = policy.reviewGateExecutionPolicy(gate);
+    assert.equal(resolved.role, role);
+    assert.equal(resolved.capability, capability);
+    assert.equal(resolved.mutation, mutation);
+    assert.equal(resolved.manualReport, manualReport);
+    assert.deepEqual(resolved.blockingSeverities, ['critical', 'warning']);
+    assert.deepEqual(resolved.advisorySeverities, ['nit']);
+  }
+});
+
+test('review intent precedence keeps approved slice outcome authoritative and rejects labels and bound conflicts', async () => {
+  const contract = await import(pathToFileURL(path.join(KIT_ROOT, 'dist', 'operator', 'review-contract.js')).href);
+  const resolved = contract.resolveReviewIntent([
+    { text: 'Approved slice outcome', source: 'orchestration-slice', authoritative: true },
+    { text: 'Parent objective constraint', source: 'task-brief', authoritative: true },
+    { text: 'Attempted generic replacement', source: 'explicit-unbound', authoritative: true },
+    { text: 'branch-label-only', source: 'explicit-unbound', authoritative: false },
+  ], 'task-binding-one');
+  assert.equal(resolved.status, 'resolved');
+  assert.equal(resolved.intent.source, 'orchestration-slice');
+  assert.match(resolved.intent.text, /^Approved slice outcome/);
+  assert.match(resolved.intent.text, /Bound task context:\nParent objective constraint/);
+  assert.doesNotMatch(resolved.intent.text, /Attempted generic replacement|branch-label-only/);
+  assert.equal(resolved.intent.taskBindingId, 'task-binding-one');
+  assert.equal(contract.resolveReviewIntent([{ text: 'branch-label-only', source: 'explicit-unbound', authoritative: false }]).status, 'needs-input');
+  assert.throws(() => contract.resolveReviewIntent([
+    { text: 'Immutable brief', source: 'task-brief', authoritative: true },
+    { text: 'Conflicting explicit input', source: 'explicit-unbound', authoritative: true },
+  ]), /immutable brief.*conflicts/i);
+});
+
+test('strict capability resolution accepts only exact regular trusted skills with compatible declarations', async () => {
+  const contract = await import(pathToFileURL(path.join(KIT_ROOT, 'dist', 'operator', 'review-contract.js')).href);
+  const root = mkdtempSync(path.join(os.tmpdir(), 'pipelane-trusted-skills-'));
+  const outside = mkdtempSync(path.join(os.tmpdir(), 'pipelane-untrusted-skill-'));
+  const gate = { id: 'karpathy-diff', phase: 'ai-diff', type: 'skill', blocking: true, skill: 'karpathy-diff' };
+  const skillDir = path.join(root, 'karpathy-diff');
+  const skillFile = path.join(skillDir, 'SKILL.md');
+  try {
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(skillFile, '---\nname: karpathy-diff\n---\nRead-only traceability review.\n', 'utf8');
+    assert.equal(contract.resolveTrustedSkillCapability(gate, [{ kind: 'test', root }], 'codex').evidence.source, 'test:karpathy-diff/SKILL.md');
+
+    writeFileSync(skillFile, '---\nname: another-skill\n---\nname: karpathy-diff\n', 'utf8');
+    assert.equal(contract.resolveTrustedSkillCapability(gate, [{ kind: 'test', root }], 'codex'), null, 'body text must not spoof the frontmatter name');
+    writeFileSync(skillFile, `---\nname: karpathy-diff\n---\n${'x'.repeat(512 * 1024)}\n`, 'utf8');
+    assert.equal(contract.resolveTrustedSkillCapability(gate, [{ kind: 'test', root }], 'codex'), null, 'oversize contracts fail closed');
+
+    writeFileSync(skillFile, '---\nname: karpathy-diff\n---\npipelane-mutation: write\n', 'utf8');
+    assert.throws(() => contract.resolveTrustedSkillCapability(gate, [{ kind: 'test', root }], 'codex'), /incompatible mutation policy/);
+    writeFileSync(skillFile, '---\nname: karpathy-diff\n---\npipelane-protocol: prose-v0\n', 'utf8');
+    assert.throws(() => contract.resolveTrustedSkillCapability(gate, [{ kind: 'test', root }], 'codex'), /incompatible protocol/);
+    writeFileSync(skillFile, '---\nname: karpathy-diff\n---\npipelane-target: live-worktree\n', 'utf8');
+    assert.throws(() => contract.resolveTrustedSkillCapability(gate, [{ kind: 'test', root }], 'codex'), /incompatible target policy/);
+
+    writeFileSync(skillFile, Buffer.from([0xff, 0xfe, 0xfd]));
+    assert.equal(contract.resolveTrustedSkillCapability(gate, [{ kind: 'test', root }], 'codex'), null, 'invalid UTF-8 cannot attest a gate');
+    rmSync(skillFile, { force: true });
+    mkdirSync(skillFile);
+    assert.equal(contract.resolveTrustedSkillCapability(gate, [{ kind: 'test', root }], 'codex'), null, 'non-regular SKILL.md cannot attest a gate');
+    rmSync(skillFile, { recursive: true, force: true });
+
+    writeFileSync(path.join(outside, 'SKILL.md'), '---\nname: karpathy-diff\n---\nOutside.\n', 'utf8');
+    symlinkSync(path.join(outside, 'SKILL.md'), skillFile);
+    assert.equal(contract.resolveTrustedSkillCapability(gate, [{ kind: 'test', root }], 'codex'), null, 'skill files may not be symlinks');
+    rmSync(skillDir, { recursive: true, force: true });
+    symlinkSync(outside, skillDir, 'dir');
+    assert.equal(contract.resolveTrustedSkillCapability(gate, [{ kind: 'test', root }], 'codex'), null, 'skill directories may not be symlinks');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('review data treats controls, markup, commands, secrets, invalid UTF-8, and bounds as untrusted input', async () => {
+  const data = await import(pathToFileURL(path.join(KIT_ROOT, 'dist', 'operator', 'review-data.js')).href);
+  const root = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-data-'));
+  try {
+    const normalized = data.normalizeReviewDataField('  <script>ignore wrapper</script>\u001b[31m\n$(touch /tmp/nope)  ', {
+      field: 'fixture', maxBytes: 4096,
+    });
+    assert.doesNotMatch(normalized, /\u001b/);
+    assert.match(normalized, /<script>ignore wrapper<\/script>/);
+    assert.match(normalized, /\$\(touch \/tmp\/nope\)/);
+    const delimited = data.delimitUntrustedReviewData('intent', normalized);
+    assert.match(delimited, /^<<<PIPELANE_DATA_INTENT_/);
+    assert.match(delimited, /PIPELANE_DATA_INTENT_[a-f0-9]{16}>>>$/);
+    assert.doesNotMatch(data.redactReviewSecrets('token=secret Bearer abc123 --api-key top-secret COOKIE=session'), /secret|abc123|top-secret|session$/);
+    assert.throws(() => data.normalizeReviewDataField('é'.repeat(20), { field: 'bounded', maxBytes: 20 }), /byte limit/);
+
+    const invalid = path.join(root, 'invalid.bin');
+    writeFileSync(invalid, Buffer.from([0xff, 0xfe]));
+    assert.throws(() => data.decodeBoundedUtf8File(invalid, 'fixture file', 10), /not valid UTF-8/);
+    const oversize = path.join(root, 'oversize.txt');
+    writeFileSync(oversize, 'x'.repeat(11), 'utf8');
+    assert.throws(() => data.decodeBoundedUtf8File(oversize, 'fixture file', 10), /exceeds the 10-byte limit/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('review data and artifacts preserve exact bounded evidence across short writes and reject corruption', async () => {
+  const data = await import(pathToFileURL(path.join(KIT_ROOT, 'dist', 'operator', 'review-data.js')).href);
+  const artifacts = await import(pathToFileURL(path.join(KIT_ROOT, 'dist', 'operator', 'review-artifacts.js')).href);
+  const brief = data.normalizeTaskBrief({
+    objective: '  Ship e\u0301vidence  ', constraints: ['Do not broaden scope'], acceptanceCriteria: ['All findings retained'],
+  }, 'new');
+  assert.equal(brief.objective, 'Ship évidence');
+  assert.equal(brief.digest, data.normalizeTaskBrief({ objective: 'Ship évidence', constraints: ['Do not broaden scope'], acceptanceCriteria: ['All findings retained'] }, 'new').digest);
+  assert.throws(() => data.normalizeTaskBrief({ objective: 'x'.repeat(data.REVIEW_DATA_LIMITS.objectiveBytes + 1) }, 'new'), /byte limit/);
+  assert.match(data.redactReviewSecrets('Authorization: Bearer secret-value API_KEY=top-secret'), /REDACTED/);
+
+  const root = mkdtempSync(path.join(os.tmpdir(), 'pipelane-artifacts-'));
+  try {
+    const shortWriteOps = {
+      ...artifacts.nodeReviewArtifactFileOps,
+      write(handle, bytes, offset) {
+        return artifacts.nodeReviewArtifactFileOps.write(handle, bytes.subarray(0, Math.min(bytes.length, offset + 7)), offset);
+      },
+    };
+    const reference = artifacts.persistReviewArtifact({
+      root, runId: 'review-one', gateRecordId: 'karpathy-diff-one',
+      report: `${'évidence\n'.repeat(12000)}API_KEY=super-secret`, diagnostics: 'stderr Bearer private-token',
+      fileOps: shortWriteOps,
+    });
+    assert.equal(reference.reportTruncated, true);
+    const loaded = artifacts.readVerifiedReviewArtifact(root, reference);
+    assert.match(loaded.report, /bytes omitted/);
+    const omitted = Number.parseInt(loaded.report.match(/\[(\d+) bytes omitted\]/)?.[1] ?? '', 10);
+    assert.equal(Number.isSafeInteger(omitted), true);
+    assert.doesNotMatch(loaded.report, /super-secret/);
+    assert.doesNotMatch(loaded.diagnostics, /private-token/);
+    const absolute = path.join(root, reference.path);
+    writeFileSync(absolute, `${readFileSync(absolute, 'utf8')}tampered`, 'utf8');
+    assert.throws(() => artifacts.readVerifiedReviewArtifact(root, reference), /missing, changed|digest/);
+    rmSync(absolute, { force: true });
+    assert.throws(() => artifacts.readVerifiedReviewArtifact(root, reference), /missing or unreadable/);
+    assert.throws(() => artifacts.persistReviewArtifact({ root, runId: '///', gateRecordId: 'gate', report: '', diagnostics: '' }), /safe path representation/);
+    const outside = mkdtempSync(path.join(os.tmpdir(), 'pipelane-artifact-outside-'));
+    try {
+      symlinkSync(outside, path.join(root, 'symlink-run'), 'dir');
+      assert.throws(() => artifacts.persistReviewArtifact({ root, runId: 'symlink-run', gateRecordId: 'gate', report: 'must not escape', diagnostics: '' }), /symlink ancestor/);
+      assert.throws(() => artifacts.readVerifiedReviewArtifact(root, { path: 'symlink-run/artifact.json', digest: '0'.repeat(64), bytes: 0 }), /symlink ancestor/);
+
+      const linkedRoot = `${root}-linked-root`;
+      writeFileSync(path.join(outside, 'outside-artifact.json'), '{}', 'utf8');
+      symlinkSync(outside, linkedRoot, 'dir');
+      try {
+        assert.deepEqual(artifacts.discoverReviewArtifactCandidates(linkedRoot), []);
+        const unsafeGc = artifacts.garbageCollectReviewArtifacts({
+          root: linkedRoot,
+          referencedPaths: new Set(),
+          exhaustive: true,
+        });
+        assert.match(unsafeGc.errors[0], /root.*symbolic link/);
+        assert.equal(existsSync(path.join(outside, 'outside-artifact.json')), true, 'GC must not traverse a symlinked artifact root');
+      } finally {
+        rmSync(linkedRoot, { force: true });
+      }
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('artifact-first persistence fails every crash window without returning false evidence and GC revalidates candidates', async () => {
+  const artifacts = await import(pathToFileURL(path.join(KIT_ROOT, 'dist', 'operator', 'review-artifacts.js')).href);
+  const stages = ['openExclusive', 'write', 'flushFile', 'rename', 'flushDirectory', 'inspect', 'read'];
+  for (const stage of stages) {
+    const root = mkdtempSync(path.join(os.tmpdir(), `pipelane-artifact-${stage}-`));
+    try {
+      const ops = { ...artifacts.nodeReviewArtifactFileOps };
+      const original = ops[stage];
+      ops[stage] = (...args) => {
+        if (stage === 'write') return 0;
+        if (stage === 'read') return Buffer.from('corrupt reread');
+        throw Object.assign(new Error(`${stage} injected failure`), { code: stage === 'openExclusive' ? 'EACCES' : 'ENOSPC' });
+      };
+      assert.throws(() => artifacts.persistReviewArtifact({
+        root, runId: `review-${stage}`, gateRecordId: 'gate', report: 'report', diagnostics: 'diagnostics', fileOps: ops,
+      }), stage === 'write' ? /invalid progress/ : stage === 'read' ? /digest verification/ : new RegExp(stage));
+      ops[stage] = original;
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  const root = mkdtempSync(path.join(os.tmpdir(), 'pipelane-artifact-gc-'));
+  try {
+    const keep = artifacts.persistReviewArtifact({ root, runId: 'review-keep', gateRecordId: 'gate', report: 'keep', diagnostics: '' });
+    const remove = artifacts.persistReviewArtifact({ root, runId: 'review-remove', gateRecordId: 'gate', report: 'remove', diagnostics: '' });
+    artifacts.releaseReviewArtifactLease(root, 'review-keep');
+    artifacts.releaseReviewArtifactLease(root, 'review-remove');
+    const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    utimesSync(path.join(root, remove.path), old, old);
+    let candidates = artifacts.discoverReviewArtifactCandidates(root);
+    const collected = artifacts.garbageCollectReviewArtifacts({ root, referencedPaths: new Set([keep.path]), candidates, nowMs: Date.now(), maxDeletes: 50, maxDurationMs: 100 });
+    assert.equal(collected.deleted, 1);
+    assert.equal(existsSync(path.join(root, keep.path)), true);
+    assert.equal(existsSync(path.join(root, remove.path)), false);
+
+    const raced = artifacts.persistReviewArtifact({ root, runId: 'review-race', gateRecordId: 'gate', report: 'race', diagnostics: '' });
+    artifacts.releaseReviewArtifactLease(root, 'review-race');
+    utimesSync(path.join(root, raced.path), old, old);
+    candidates = artifacts.discoverReviewArtifactCandidates(root);
+    writeFileSync(path.join(root, raced.path), readFileSync(path.join(root, raced.path)));
+    const raceResult = artifacts.garbageCollectReviewArtifacts({ root, referencedPaths: new Set(), candidates, nowMs: Date.now(), maxDeletes: 50, maxDurationMs: 100 });
+    assert.equal(raceResult.deleted, 0, 'identity/mtime change after discovery must be revalidated under the caller lock');
+    assert.equal(existsSync(path.join(root, raced.path)), true);
+
+    const young = artifacts.persistReviewArtifact({ root, runId: 'review-young', gateRecordId: 'gate', report: 'young', diagnostics: '' });
+    artifacts.releaseReviewArtifactLease(root, 'review-young');
+    const grace = artifacts.garbageCollectReviewArtifacts({ root, referencedPaths: new Set([keep.path]), candidates: artifacts.discoverReviewArtifactCandidates(root), nowMs: Date.now() });
+    assert.equal(existsSync(path.join(root, young.path)), true);
+    assert.ok(grace.skipped >= 1);
+
+    const orphan = artifacts.persistReviewArtifact({ root, runId: 'review-ledger-failure', gateRecordId: 'gate', report: 'orphan', diagnostics: '' });
+    let releaseCalled = false;
+    assert.throws(() => artifacts.appendArtifactBackedReviewRun({
+      root,
+      runId: 'review-ledger-failure',
+      appendRecord: () => { throw new Error('injected ledger failure'); },
+      releaseLease: () => { releaseCalled = true; },
+    }), /injected ledger failure/);
+    assert.equal(releaseCalled, false, 'a failed signed-ledger append must not release the writer lease');
+    const activeSweep = artifacts.garbageCollectReviewArtifacts({
+      root,
+      referencedPaths: new Set(),
+      candidates: artifacts.discoverReviewArtifactCandidates(root),
+      exhaustive: true,
+      nowMs: Date.now(),
+    });
+    assert.equal(existsSync(path.join(root, orphan.path)), true, 'even exhaustive GC must not race an active artifact writer');
+    assert.ok(activeSweep.skipped >= 1);
+    artifacts.releaseReviewArtifactLease(root, 'review-ledger-failure');
+    const settledSweep = artifacts.garbageCollectReviewArtifacts({
+      root,
+      referencedPaths: new Set(),
+      candidates: artifacts.discoverReviewArtifactCandidates(root),
+      exhaustive: true,
+      nowMs: Date.now(),
+    });
+    assert.equal(settledSweep.deleted >= 1, true);
+    assert.equal(existsSync(path.join(root, orphan.path)), false);
+
+    const budgeted = ['one', 'two', 'three'].map((id) => {
+      const reference = artifacts.persistReviewArtifact({ root, runId: `review-budget-${id}`, gateRecordId: 'gate', report: id, diagnostics: '' });
+      artifacts.releaseReviewArtifactLease(root, `review-budget-${id}`);
+      utimesSync(path.join(root, reference.path), old, old);
+      return reference;
+    });
+    const deleteBudget = artifacts.garbageCollectReviewArtifacts({
+      root, referencedPaths: new Set(), candidates: artifacts.discoverReviewArtifactCandidates(root),
+      nowMs: Date.now(), maxDeletes: 1, maxDurationMs: 1000,
+    });
+    assert.equal(deleteBudget.deleted, 1);
+    assert.ok(deleteBudget.skipped >= 2, 'delete budget counts the unvisited remainder as skipped');
+    const timeBudget = artifacts.garbageCollectReviewArtifacts({
+      root, referencedPaths: new Set(), candidates: artifacts.discoverReviewArtifactCandidates(root),
+      nowMs: Date.now(), maxDeletes: 50, maxDurationMs: 0,
+    });
+    assert.equal(timeBudget.deleted, 0);
+    assert.ok(timeBudget.skipped >= budgeted.length - 1, 'time budget stops scanning instead of lstat-ing the remainder');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('artifact coordinator keeps signer and ledger-save failures from creating false signed references', async () => {
+  const repoRoot = createRepo();
+  const artifacts = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-artifacts.ts'));
+  const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+  try {
+    writePipelaneConfig(repoRoot, 'Artifact Coordinator');
+    const context = state.resolveWorkflowContext(repoRoot);
+    const artifactRoot = state.reviewArtifactRoot(context.commonDir, context.config);
+    const now = new Date().toISOString();
+    const record = (id, reference) => ({
+      id, branchName: 'main', sha: run('git', ['rev-parse', 'HEAD'], repoRoot), status: 'failed', dryRun: false,
+      startedAt: now, finishedAt: now, durationMs: 0, changedFiles: [], gates: [{
+        id: `${id}-gate`, gateId: 'karpathy-diff', phase: 'ai-diff', type: 'skill', blocking: true, status: 'failed',
+        summary: 'fixture failure', startedAt: now, finishedAt: now, durationMs: 0, reportArtifact: reference,
+      }],
+    });
+    for (const stage of ['signer', 'ledger']) {
+      const runId = `review-${stage}-failure`;
+      const reference = artifacts.persistReviewArtifact({ root: artifactRoot, runId, gateRecordId: 'gate', report: stage, diagnostics: '' });
+      let released = false;
+      assert.throws(() => artifacts.appendArtifactBackedReviewRun({
+        root: artifactRoot,
+        runId,
+        releaseLease: () => { released = true; },
+        appendRecord: () => state.appendReviewRunRecord(context.commonDir, context.config, record(runId, reference), stage === 'signer'
+          ? {
+              resolveSigningKey: () => 'x'.repeat(32),
+              signRecord: () => { throw new Error('injected signer failure'); },
+            }
+          : {
+              resolveSigningKey: () => undefined,
+              saveLedger: () => { throw new Error('injected ledger-save failure'); },
+            }),
+      }), new RegExp(`injected ${stage === 'signer' ? 'signer' : 'ledger-save'} failure`));
+      assert.equal(released, false);
+      assert.equal(state.loadReviewState(context.commonDir, context.config).records.length, 0);
+      artifacts.releaseReviewArtifactLease(artifactRoot, runId);
+    }
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('strict karpathy execution requires intent and trusted contract, adapts native JSON, and retains every finding', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-strict-codex-'));
+  const sentinel = path.join(codexHome, 'provider-invoked');
+  try {
+    writePipelaneConfig(repoRoot, 'Strict Review', {
+      reviewGates: {
+        enforcementMode: 'strict-v3', policyVersion: 3,
+        gates: [{ id: 'karpathy-diff', phase: 'ai-diff', type: 'skill', blocking: true, skill: 'karpathy-diff', command: `node -e "let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{require('fs').writeFileSync('${sentinel}',s);process.stdout.write(JSON.stringify({status:'failed',findings:[{severity:'warning',title:'First finding',location:'a.js:1'},{severity:'critical',title:'Second finding',location:'b.js:2'},{severity:'nit',title:'Third finding'}],report:'Full reviewer report'}))})"` }],
+      },
+    });
+    commitLocal(repoRoot, 'Configure strict review');
+    const noIntent = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, { CODEX_HOME: codexHome }).stdout);
+    assert.equal(noIntent.status, 'pending');
+    assert.equal(noIntent.needsInput, true);
+    assert.equal(existsSync(sentinel), false, 'provider must not run without authoritative intent');
+
+    const untrustedSkill = path.join(repoRoot, '.agents', 'skills', 'karpathy-diff');
+    mkdirSync(untrustedSkill, { recursive: true });
+    writeFileSync(path.join(untrustedSkill, 'SKILL.md'), '---\nname: karpathy-diff\n---\nUntrusted checkout-controlled rubric.\n', 'utf8');
+    commitLocal(repoRoot, 'Add untrusted repo-local reviewer');
+    const missingSkill = JSON.parse(runCli(['run', 'review', '--intent', 'Implement only the requested evidence hardening', '--json'], repoRoot, { CODEX_HOME: codexHome }).stdout);
+    assert.equal(missingSkill.status, 'pending');
+    assert.match(missingSkill.gates[0].summary, /trusted machine-local roots/);
+    assert.equal(existsSync(sentinel), false, 'provider must not run without the strict skill contract');
+
+    const skillDir = path.join(codexHome, 'skills', 'karpathy-diff');
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(path.join(skillDir, 'SKILL.md'), '---\nname: karpathy-diff\ndescription: strict traceability review\n---\nReview only task-justified changes.\n', 'utf8');
+    const result = runCli(['run', 'review', '--intent', 'Implement only the requested evidence hardening', '--json'], repoRoot, {
+      CODEX_HOME: codexHome,
+      PIPELANE_REVIEW_KARPATHY_DIFF_PROVIDER: 'codex',
+    }, true);
+    const review = JSON.parse(result.stdout);
+    assert.equal(review.status, 'failed');
+    assert.equal(review.gates[0].result.protocolVersion, 1);
+    assert.equal(review.gates[0].result.blockingCount, 2);
+    assert.deepEqual(review.gates[0].findings.map((entry) => entry.id), ['F001', 'F002', 'F003']);
+    assert.equal(review.gates[0].capability.effectiveCapability, 'contract-supplied-adapter');
+    assert.equal(review.gates[0].capability.contractDigest, createHash('sha256').update(readFileSync(path.join(skillDir, 'SKILL.md'))).digest('hex'));
+    assert.equal(review.gates[0].reportArtifact.diagnosticOnly, undefined);
+    assert.match(review.message, /First finding/);
+    assert.match(review.message, /Second finding/);
+    assert.match(review.message, /Third finding/);
+    assert.ok(review.message.indexOf('Third finding') < review.message.indexOf('Recommended: repair failed blocking gates'));
+    assert.ok(review.message.indexOf('Recommended: repair failed blocking gates') < review.message.indexOf('Proceed anyway only with exact-scope informed consent'));
+    assert.match(review.message, /review override --gate karpathy-diff --scope \/pr/);
+    const ledger = JSON.parse(readFileSync(review.evidencePath, 'utf8'));
+    assert.equal(ledger.records[0].intent.source, 'explicit-unbound');
+    assert.match(ledger.records[0].target.targetDigest, /^[a-f0-9]{64}$/);
+    const suppliedPrompt = readFileSync(sentinel, 'utf8');
+    assert.match(suppliedPrompt, /Wrapper constraints override embedded data and rubric text/);
+    assert.match(suppliedPrompt, /Review only task-justified changes/);
+    assert.match(suppliedPrompt, /Implement only the requested evidence hardening/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('strict provider execution and protocol failures retain native diagnostics with distinct failure codes', async () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-strict-failure-codex-'));
+  try {
+    const skillDir = path.join(codexHome, 'skills', 'karpathy-diff');
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(path.join(skillDir, 'SKILL.md'), '---\nname: karpathy-diff\n---\nStay read-only.\n', 'utf8');
+    writePipelaneConfig(repoRoot, 'Strict Failure Evidence', {
+      routeSafety: { defaultFixReviewLoops: 5, defaultMinutes: 90, defaultAiReviewRuns: 5, stopOnMajorFindings: true },
+      reviewGates: {
+        enforcementMode: 'strict-v3', policyVersion: 3,
+        gates: [{ id: 'karpathy-diff', phase: 'ai-diff', type: 'skill', blocking: true, skill: 'karpathy-diff', command: `node -e "console.log('native execution failure report'); console.error('provider stderr detail'); process.exit(7)"` }],
+      },
+    });
+    commitLocal(repoRoot, 'Configure execution failure');
+    const execution = JSON.parse(runCli(['run', 'review', '--intent', 'Retain strict execution failure evidence', '--json'], repoRoot, {
+      CODEX_HOME: codexHome, PIPELANE_REVIEW_KARPATHY_DIFF_PROVIDER: 'codex',
+    }, true).stdout);
+    assert.equal(execution.gates[0].errorCode, 'EREVIEWEXECUTION');
+    assert.match(execution.message, /native execution failure report/);
+    assert.match(execution.message, /provider stderr detail/);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.reviewGates.gates[0].command = `node -e "setTimeout(() => console.log('{}'), 1000)"`;
+      config.reviewGates.gates[0].timeoutMs = 25;
+    });
+    commitLocal(repoRoot, 'Configure provider timeout');
+    const timeout = JSON.parse(runCli(['run', 'review', '--intent', 'Retain strict timeout evidence', '--json'], repoRoot, {
+      CODEX_HOME: codexHome, PIPELANE_REVIEW_KARPATHY_DIFF_PROVIDER: 'codex',
+    }, true).stdout);
+    assert.equal(timeout.gates[0].errorCode, 'EREVIEWEXECUTION');
+    assert.match(timeout.gates[0].summary, /timed out|ETIMEDOUT/i);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.reviewGates.gates[0].command = `node -e "console.log('native malformed protocol report'); process.exit(0)"`;
+      delete config.reviewGates.gates[0].timeoutMs;
+    });
+    commitLocal(repoRoot, 'Configure malformed protocol');
+    const protocol = JSON.parse(runCli(['run', 'review', '--intent', 'Retain strict malformed protocol evidence', '--json'], repoRoot, {
+      CODEX_HOME: codexHome, PIPELANE_REVIEW_KARPATHY_DIFF_PROVIDER: 'codex',
+    }, true).stdout);
+    assert.equal(protocol.gates[0].errorCode, 'EREVIEWPROTOCOL');
+    assert.match(protocol.message, /native malformed protocol report/);
+
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.reviewGates.gates[0].command = `node -e "process.stdout.write(Buffer.from('eyJzdGF0dXMiOiJwYXNzZWQiLCJmaW5kaW5ncyI6W10sInJlcG9ydCI6Ig==','base64'));process.stdout.write(Buffer.from([255]));process.stdout.write(Buffer.from('In0=','base64'))"`;
+    });
+    commitLocal(repoRoot, 'Configure invalid UTF-8 protocol');
+    const invalidUtf8 = JSON.parse(runCli(['run', 'review', '--intent', 'Reject invalid provider transport bytes', '--json'], repoRoot, {
+      CODEX_HOME: codexHome, PIPELANE_REVIEW_KARPATHY_DIFF_PROVIDER: 'codex',
+    }, true).stdout);
+    assert.ok(invalidUtf8.gates?.[0], `expected invalid UTF-8 gate evidence: ${JSON.stringify(invalidUtf8)}`);
+    assert.equal(invalidUtf8.gates[0].errorCode, 'EREVIEWPROTOCOL');
+    assert.match(invalidUtf8.gates[0].summary, /not valid UTF-8/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('strict skills reject v0 markers while role-equivalent gates retain visibly degraded v0 evidence through 0.2.x', () => {
+  const strictRepo = createRepo();
+  const roleRepo = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-v0-codex-'));
+  try {
+    const skillDir = path.join(codexHome, 'skills', 'karpathy-diff');
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(path.join(skillDir, 'SKILL.md'), '---\nname: karpathy-diff\n---\nStrict v1 only.\n', 'utf8');
+    writePipelaneConfig(strictRepo, 'Strict V0 Rejection', {
+      reviewGates: { enforcementMode: 'strict-v3', policyVersion: 3, gates: [{
+        id: 'karpathy-diff', phase: 'ai-diff', type: 'skill', blocking: true, skill: 'karpathy-diff',
+        command: `node -e "console.log('legacy strict report'); console.log('PIPELANE_REVIEW_GATE_RESULT=passed')"`,
+      }] },
+    });
+    commitLocal(strictRepo, 'Configure strict v0 rejection');
+    const strict = JSON.parse(runCli(['run', 'review', '--intent', 'Reject legacy marker for strict skill', '--json'], strictRepo, {
+      CODEX_HOME: codexHome, PIPELANE_REVIEW_KARPATHY_DIFF_PROVIDER: 'codex',
+    }, true).stdout);
+    assert.equal(strict.gates[0].status, 'failed');
+    assert.equal(strict.gates[0].errorCode, 'EREVIEWPROTOCOL');
+
+    writePipelaneConfig(roleRepo, 'Role V0 Compatibility', {
+      reviewGates: { enforcementMode: 'strict-v3', policyVersion: 3, gates: [{
+        id: 'code-review-high', phase: 'ai-diff', type: 'agent', blocking: true, role: 'primary-independent-review',
+        command: `node -e "console.log('legacy role report'); console.log('PIPELANE_REVIEW_GATE_RESULT=passed')"`,
+      }] },
+    });
+    commitLocal(roleRepo, 'Configure role v0 compatibility');
+    const role = JSON.parse(runCli(['run', 'review', '--intent', 'Preserve 0.2 role compatibility', '--json'], roleRepo, {
+      PIPELANE_REVIEW_CODE_REVIEW_HIGH_PROVIDER: 'codex',
+    }).stdout);
+    assert.equal(role.gates[0].status, 'passed');
+    assert.equal(role.gates[0].result.protocolVersion, 0);
+    assert.equal(role.gates[0].result.findingsKnown, false);
+    assert.match(role.message, /findings unknown|legacy role report/i);
+  } finally {
+    rmSync(strictRepo, { recursive: true, force: true });
+    rmSync(roleRepo, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('strict read-only review invalidates ambient material changes after one provider attempt and keeps diagnostics only', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-ambient-codex-'));
+  const attempts = path.join(codexHome, 'attempts');
+  try {
+    const skillDir = path.join(codexHome, 'skills', 'karpathy-diff');
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(path.join(skillDir, 'SKILL.md'), '---\nname: karpathy-diff\ndescription: strict traceability review\n---\nStay read-only.\n', 'utf8');
+    const changedPath = path.join(repoRoot, 'ambient-output.txt');
+    writePipelaneConfig(repoRoot, 'Ambient Review', {
+      reviewGates: {
+        enforcementMode: 'strict-v3', policyVersion: 3,
+        gates: [{ id: 'karpathy-diff', phase: 'ai-diff', type: 'skill', blocking: true, skill: 'karpathy-diff', command: `node -e "require('fs').appendFileSync('${attempts}','1');require('fs').writeFileSync('${changedPath}','ambient');process.stdout.write(JSON.stringify({status:'passed',findings:[],report:'Non-authoritative clean report'}))"` }],
+      },
+    });
+    commitLocal(repoRoot, 'Configure ambient review');
+    const child = runCli(['run', 'review', '--intent', 'Review without changing material', '--json'], repoRoot, {
+      CODEX_HOME: codexHome, PIPELANE_REVIEW_KARPATHY_DIFF_PROVIDER: 'codex',
+    }, true);
+    const review = JSON.parse(child.stdout);
+    assert.equal(review.status, 'failed');
+    assert.match(review.gates[0].summary, /the checkout changed while the gate was running/);
+    assert.match(review.gates[0].summary, /ambient-output\.txt/);
+    assert.equal(review.gates[0].reportArtifact.diagnosticOnly, true);
+    assert.equal(readFileSync(attempts, 'utf8'), '1', 'ambient invalidation must not trigger an automatic AI retry');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('strict review setup preserves explicit dual-mode rollback semantics', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Strict Setup');
+    const strict = JSON.parse(runCli(['run', 'review', 'setup', '--enforcement-mode', 'strict-v3', '--json'], repoRoot).stdout);
+    assert.equal(strict.effective.enforcementMode, 'strict-v3');
+    assert.equal(strict.effective.policyVersion, 3);
+    assert.match(strict.message, /exact-scope bypass/);
+    const legacy = JSON.parse(runCli(['run', 'review', 'setup', '--enforcement-mode', 'legacy-v2', '--json'], repoRoot).stdout);
+    assert.equal(legacy.effective.enforcementMode, 'legacy-v2');
+    assert.equal(legacy.effective.policyVersion, 2);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('dual-mode setup, review, route enforcement, and rollback preserve legacy behavior end to end', async () => {
+  const repoRoot = createRepo();
+  const invoked = path.join(repoRoot, '.git', 'review-invocations');
+  try {
+    writePipelaneConfig(repoRoot, 'Dual Mode Rollback', {
+      routeSafety: { defaultFixReviewLoops: 4, defaultMinutes: 90, defaultAiReviewRuns: 4, stopOnMajorFindings: true },
+      reviewGates: {
+        enforcementMode: 'legacy-v2', policyVersion: 2,
+        gates: [{
+          id: 'karpathy-diff', phase: 'ai-diff', type: 'skill', blocking: true, skill: 'karpathy-diff',
+          command: `node -e "require('fs').appendFileSync('${invoked}','1'); console.log('legacy report'); console.log('PIPELANE_REVIEW_GATE_RESULT=passed')"`,
+        }],
+      },
+    });
+    commitLocal(repoRoot, 'Configure dual mode review');
+    const legacy = JSON.parse(runCli(['run', 'review', '--json'], repoRoot).stdout);
+    assert.equal(legacy.status, 'passed');
+    assert.equal(readFileSync(invoked, 'utf8'), '1');
+
+    const strictSetup = JSON.parse(runCli(['run', 'review', 'setup', '--enforcement-mode', 'strict-v3', '--json'], repoRoot).stdout);
+    assert.equal(strictSetup.effective.enforcementMode, 'strict-v3');
+    const strict = JSON.parse(runCli(['run', 'review', '--json'], repoRoot).stdout);
+    assert.equal(strict.status, 'pending');
+    assert.equal(strict.needsInput, true);
+    assert.equal(readFileSync(invoked, 'utf8'), '1', 'strict review cannot invoke a provider without authoritative intent');
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const enforcement = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-enforcement.ts'));
+    let context = state.resolveWorkflowContext(repoRoot);
+    const strictRoute = enforcement.evaluateReviewEvidenceForPr(context, { command: '/pr' });
+    assert.equal(strictRoute.allowed, false);
+    assert.match(strictRoute.message, /pending|strict-v3|authoritative intent/);
+
+    const rollback = JSON.parse(runCli(['run', 'review', 'setup', '--enforcement-mode', 'legacy-v2', '--json'], repoRoot).stdout);
+    assert.equal(rollback.effective.enforcementMode, 'legacy-v2');
+    const rerun = JSON.parse(runCli(['run', 'review', '--json'], repoRoot).stdout);
+    assert.equal(rerun.status, 'passed');
+    assert.equal(readFileSync(invoked, 'utf8'), '11');
+    context = state.resolveWorkflowContext(repoRoot);
+    assert.equal(enforcement.evaluateReviewEvidenceForPr(context, { command: '/pr' }).allowed, true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('status gives active strict upgrades exact intent, rerun, and per-gate proceed-anyway choices without blocking development', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Strict Upgrade Impact', {
+      reviewGates: {
+        enforcementMode: 'strict-v3', policyVersion: 3,
+        gates: [
+          { id: 'karpathy-diff', phase: 'ai-diff', type: 'skill', blocking: true, skill: 'karpathy-diff' },
+          { id: 'typecheck', phase: 'static', type: 'command', blocking: true, command: 'npm run typecheck' },
+        ],
+      },
+    });
+    const output = runCli(['run', 'status'], repoRoot).stdout;
+    assert.match(output, /STRICT REVIEW UPGRADE IMPACT/);
+    assert.match(output, /normal development remains available/);
+    assert.match(output, /\/pipelane review --intent/);
+    assert.match(output, /repair any findings, then rerun/);
+    assert.match(output, /review override --gate karpathy-diff/);
+    assert.match(output, /review override --gate typecheck/);
+    assert.match(output, /never relabeled passed/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('strict target manifest binds raw material identity while excluding effective ignored churn', async () => {
+  const contract = await import(pathToFileURL(path.join(KIT_ROOT, 'dist', 'operator', 'review-contract.js')).href);
+  const repoRoot = createRepo();
+  const globalIgnore = path.join(repoRoot, '..', `${path.basename(repoRoot)}-global-ignore`);
+  try {
+    writeFileSync(path.join(repoRoot, '.gitignore'), 'ignored-build/\n.DS_Store\n', 'utf8');
+    commitLocal(repoRoot, 'Define ignore policy');
+    const clean = contract.buildReviewTargetManifest(repoRoot, 'main');
+    writeFileSync(path.join(repoRoot, '.DS_Store'), 'ignored one', 'utf8');
+    mkdirSync(path.join(repoRoot, 'ignored-build'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'ignored-build', 'bundle.js'), 'ignored two', 'utf8');
+    const ignored = contract.buildReviewTargetManifest(repoRoot, 'main');
+    assert.equal(ignored.manifest.targetDigest, clean.manifest.targetDigest);
+
+    mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'src', 'binary.bin'), Buffer.from([0, 255, 1, 2]));
+    symlinkSync('binary.bin', path.join(repoRoot, 'src', 'binary-link'));
+    const rawName = 'src/raw-\nname';
+    writeFileSync(path.join(repoRoot, rawName), 'raw-delimiter bytes');
+    renameSync(path.join(repoRoot, 'README.md'), path.join(repoRoot, 'RENAMED.md'));
+    const material = contract.buildReviewTargetManifest(repoRoot, 'main');
+    assert.notEqual(material.manifest.targetDigest, clean.manifest.targetDigest);
+    assert.ok(material.changedFiles.includes('README.md'));
+    assert.ok(material.changedFiles.includes('RENAMED.md'));
+    assert.ok(material.changedFiles.includes('src/binary.bin'));
+    assert.ok(material.changedFiles.includes('src/binary-link'));
+    assert.ok(material.changedFiles.includes(rawName));
+
+    writeFileSync(globalIgnore, '*.machine-only\n', 'utf8');
+    execFileSync('git', ['config', 'core.excludesFile', globalIgnore], { cwd: repoRoot });
+    const withGlobalPolicy = contract.buildReviewTargetManifest(repoRoot, 'main');
+    assert.notEqual(withGlobalPolicy.manifest.ignorePolicyDigest, material.manifest.ignorePolicyDigest);
+    writeFileSync(path.join(repoRoot, 'local.machine-only'), 'ignored by global policy', 'utf8');
+    const globalChurn = contract.buildReviewTargetManifest(repoRoot, 'main');
+    assert.equal(globalChurn.manifest.targetDigest, withGlobalPolicy.manifest.targetDigest);
+
+    writeFileSync(path.join(repoRoot, '.git', 'info', 'exclude'), 'info-only\n', 'utf8');
+    const infoPolicy = contract.buildReviewTargetManifest(repoRoot, 'main');
+    assert.notEqual(infoPolicy.manifest.ignorePolicyDigest, withGlobalPolicy.manifest.ignorePolicyDigest);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(globalIgnore, { force: true });
+  }
+});
+
+test('strict target manifest fails closed on missing history and unmerged indexes and binds moving refs, modes, gitlinks, and machine identity', async () => {
+  const contract = await import(pathToFileURL(path.join(KIT_ROOT, 'dist', 'operator', 'review-contract.js')).href);
+  const roots = [];
+  try {
+    const missing = createRepo();
+    roots.push(missing);
+    assert.throws(() => contract.buildReviewTargetManifest(missing, 'does-not-exist'), /could not resolve base/);
+
+    const disconnected = createRepo();
+    roots.push(disconnected);
+    execFileSync('git', ['switch', '--orphan', 'disconnected'], { cwd: disconnected, stdio: ['ignore', 'pipe', 'pipe'] });
+    for (const entry of readdirSync(disconnected)) if (entry !== '.git') rmSync(path.join(disconnected, entry), { recursive: true, force: true });
+    writeFileSync(path.join(disconnected, 'orphan.txt'), 'disconnected history\n', 'utf8');
+    commitLocal(disconnected, 'Disconnected root');
+    assert.throws(() => contract.buildReviewTargetManifest(disconnected, 'main'), /could not resolve merge base/);
+
+    const shallowSource = createRepo();
+    roots.push(shallowSource);
+    writeFileSync(path.join(shallowSource, 'main-only.txt'), 'main tip\n', 'utf8');
+    commitLocal(shallowSource, 'Advance main');
+    execFileSync('git', ['switch', '-c', 'feature', 'HEAD~1'], { cwd: shallowSource, stdio: ['ignore', 'pipe', 'pipe'] });
+    writeFileSync(path.join(shallowSource, 'feature-only.txt'), 'feature tip\n', 'utf8');
+    commitLocal(shallowSource, 'Advance feature');
+    const shallowParent = mkdtempSync(path.join(os.tmpdir(), 'pipelane-shallow-target-'));
+    roots.push(shallowParent);
+    const shallow = path.join(shallowParent, 'clone');
+    execFileSync('git', ['clone', '--depth', '1', '--branch', 'feature', pathToFileURL(shallowSource).href, shallow], { stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['fetch', '--depth', '1', 'origin', 'main:refs/remotes/origin/main'], { cwd: shallow, stdio: ['ignore', 'pipe', 'pipe'] });
+    assert.throws(() => contract.buildReviewTargetManifest(shallow, 'main'), /could not resolve merge base/);
+
+    const unmerged = createRepo();
+    roots.push(unmerged);
+    const firstOid = spawnSync('git', ['hash-object', '-w', '--stdin'], { cwd: unmerged, input: 'first\n', encoding: 'utf8' }).stdout.trim();
+    const secondOid = spawnSync('git', ['hash-object', '-w', '--stdin'], { cwd: unmerged, input: 'second\n', encoding: 'utf8' }).stdout.trim();
+    execFileSync('git', ['update-index', '--index-info'], {
+      cwd: unmerged,
+      input: `100644 ${firstOid} 1\tconflict.txt\n100644 ${secondOid} 2\tconflict.txt\n`,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    assert.throws(() => contract.buildReviewTargetManifest(unmerged, 'main'), /unmerged index entry.*conflict\.txt/);
+
+    const moving = createRepo();
+    roots.push(moving);
+    execFileSync('git', ['switch', '-c', 'feature'], { cwd: moving, stdio: ['ignore', 'pipe', 'pipe'] });
+    writeFileSync(path.join(moving, 'feature.txt'), 'feature\n', 'utf8');
+    commitLocal(moving, 'Feature commit');
+    const beforeMove = contract.buildReviewTargetManifest(moving, 'main');
+    execFileSync('git', ['update-ref', 'refs/heads/main', 'HEAD'], { cwd: moving, stdio: ['ignore', 'pipe', 'pipe'] });
+    const afterMove = contract.buildReviewTargetManifest(moving, 'main');
+    assert.notEqual(afterMove.manifest.baseTipOid, beforeMove.manifest.baseTipOid);
+    assert.notEqual(afterMove.manifest.targetDigest, beforeMove.manifest.targetDigest);
+
+    const executable = createRepo();
+    roots.push(executable);
+    writeFileSync(path.join(executable, 'tool.sh'), '#!/bin/sh\nexit 0\n', 'utf8');
+    commitLocal(executable, 'Add non-executable tool');
+    const nonExecutable = contract.buildReviewTargetManifest(executable, 'main');
+    chmodSync(path.join(executable, 'tool.sh'), 0o755);
+    const executableTarget = contract.buildReviewTargetManifest(executable, 'main');
+    assert.notEqual(executableTarget.manifest.materialTreeManifestDigest, nonExecutable.manifest.materialTreeManifestDigest);
+    assert.match(executableTarget.materialInventory.find((entry) => entry.displayPath === 'tool.sh').identity, /^100755:/);
+
+    const submoduleSource = createRepo();
+    const submoduleHost = createRepo();
+    roots.push(submoduleSource, submoduleHost);
+    execFileSync('git', ['-c', 'protocol.file.allow=always', 'submodule', 'add', submoduleSource, 'vendor/fixture'], { cwd: submoduleHost, stdio: ['ignore', 'pipe', 'pipe'] });
+    commitLocal(submoduleHost, 'Add fixture submodule');
+    const initialized = contract.buildReviewTargetManifest(submoduleHost, 'main');
+    const initializedGitlink = initialized.materialInventory.find((entry) => entry.displayPath === 'vendor/fixture').identity;
+    rmSync(path.join(submoduleHost, 'vendor', 'fixture'), { recursive: true, force: true });
+    const absentCheckout = contract.buildReviewTargetManifest(submoduleHost, 'main');
+    assert.equal(absentCheckout.materialInventory.find((entry) => entry.displayPath === 'vendor/fixture').identity, initializedGitlink, 'an uninitialized submodule uses the index gitlink OID');
+
+    const machineSource = createRepo();
+    roots.push(machineSource);
+    const cloneParent = mkdtempSync(path.join(os.tmpdir(), 'pipelane-machine-clone-'));
+    roots.push(cloneParent);
+    const clone = path.join(cloneParent, 'clone');
+    execFileSync('git', ['clone', machineSource, clone], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const sourceTarget = contract.buildReviewTargetManifest(machineSource, 'main');
+    const cloneTarget = contract.buildReviewTargetManifest(clone, 'main');
+    assert.equal(cloneTarget.manifest.baseTreeManifestDigest, sourceTarget.manifest.baseTreeManifestDigest);
+    assert.equal(cloneTarget.manifest.materialTreeManifestDigest, sourceTarget.manifest.materialTreeManifestDigest);
+    assert.notEqual(cloneTarget.manifest.machineFingerprint, sourceTarget.manifest.machineFingerprint);
+    assert.notEqual(cloneTarget.manifest.targetDigest, sourceTarget.manifest.targetDigest);
+  } finally {
+    for (const root of [...roots].reverse()) rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('strict target content serialization digests stay stable across Git version labels under the same policy', async () => {
+  const contract = await import(pathToFileURL(path.join(KIT_ROOT, 'dist', 'operator', 'review-contract.js')).href);
+  const repoRoot = createRepo();
+  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-fake-git-version-'));
+  const originalPath = process.env.PATH;
+  try {
+    writeFileSync(path.join(repoRoot, 'material.txt'), 'same bytes and modes\n', 'utf8');
+    commitLocal(repoRoot, 'Add stable material');
+    const baseline = contract.buildReviewTargetManifest(repoRoot, 'main');
+    const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+    assert.ok(realGit, 'test requires the real git executable path');
+    const wrapper = path.join(fakeBin, 'git');
+    writeFileSync(wrapper, `#!/bin/sh\nif [ "$1" = "--version" ]; then\n  echo "git version 999.0.synthetic"\n  exit 0\nfi\nexec ${JSON.stringify(realGit)} "$@"\n`, 'utf8');
+    chmodSync(wrapper, 0o755);
+    process.env.PATH = `${fakeBin}:${originalPath}`;
+    const alternateVersion = contract.buildReviewTargetManifest(repoRoot, 'main');
+
+    assert.equal(alternateVersion.manifest.baseTreeManifestDigest, baseline.manifest.baseTreeManifestDigest);
+    assert.equal(alternateVersion.manifest.materialTreeManifestDigest, baseline.manifest.materialTreeManifestDigest);
+    assert.equal(alternateVersion.manifest.changedFilesDigest, baseline.manifest.changedFilesDigest);
+    assert.equal(alternateVersion.manifest.ignorePolicyDigest, baseline.manifest.ignorePolicyDigest);
+    assert.notEqual(alternateVersion.manifest.machineFingerprint, baseline.manifest.machineFingerprint, 'machine-local evidence still records the runtime Git version boundary');
+  } finally {
+    process.env.PATH = originalPath;
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
+test('task briefs are opt-in, immutable per binding, and first strict intent initializes once without inventing legacy scope', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  let worktreePath = '';
+  try {
+    writePipelaneConfig(repoRoot, 'Task Briefs', {
+      reviewGates: {
+        enforcementMode: 'strict-v3', policyVersion: 3,
+        gates: [{ id: 'karpathy-diff', phase: 'ai-diff', type: 'skill', blocking: true, skill: 'karpathy-diff', command: 'node -e "process.stdout.write(\'{}\')"' }],
+      },
+    });
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'brief-init', '--json'], repoRoot).stdout);
+    worktreePath = created.worktreePath;
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`);
+    const before = JSON.parse(readFileSync(lockPath, 'utf8'));
+    assert.equal(before.taskBrief, undefined);
+    assert.match(before.taskBindingId, /^task-binding-/);
+
+    const initialized = JSON.parse(runCli(['run', 'review', '--intent', 'Preserve all strict review evidence', '--json'], worktreePath).stdout);
+    assert.equal(initialized.status, 'pending');
+    const after = JSON.parse(readFileSync(lockPath, 'utf8'));
+    assert.equal(after.taskBindingId, before.taskBindingId);
+    assert.equal(after.taskBrief.objective, 'Preserve all strict review evidence');
+    assert.equal(after.taskBrief.source, 'first-review');
+
+    const conflict = runCli(['run', 'review', '--intent', 'Silently change the objective', '--json'], worktreePath, {}, true);
+    assert.notEqual(conflict.status, 0);
+    assert.match(conflict.stderr, /immutable brief.*conflicts|audited rebind/i);
+    assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).taskBrief.digest, after.taskBrief.digest);
+
+    const rebound = JSON.parse(runCli(['run', 'adopt', '--task', 'brief-init', '--force', '--brief', 'Audited replacement objective', '--json'], worktreePath).stdout);
+    const reboundLock = JSON.parse(readFileSync(lockPath, 'utf8'));
+    assert.notEqual(reboundLock.taskBindingId, before.taskBindingId);
+    assert.equal(reboundLock.taskBrief.objective, 'Audited replacement objective');
+    assert.equal(reboundLock.taskBrief.source, 'adopt');
+    assert.equal(rebound.taskSlug, created.taskSlug);
+  } finally {
+    if (worktreePath) rmSync(worktreePath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('first strict review TTY intent prompt uses an editable label suggestion and requires explicit confirmation', async () => {
+  const review = await import(pathToFileURL(path.join(KIT_ROOT, 'dist', 'operator', 'commands', 'review.js')).href);
+  const questions = [];
+  const answers = ['A precise edited objective', 'yes'];
+  const confirmed = await review.promptForAuthoritativeReviewIntent({
+    suggestedLabel: 'non-authoritative-task-label',
+    ask: async (question) => {
+      questions.push(question);
+      return answers.shift();
+    },
+  });
+  assert.equal(confirmed.objective, 'A precise edited objective');
+  assert.equal(confirmed.source, 'first-review');
+  assert.match(questions[0], /Suggested label: non-authoritative-task-label/);
+  assert.match(questions[1], /authoritative review objective/);
+
+  const cancelled = await review.promptForAuthoritativeReviewIntent({
+    suggestedLabel: 'must-not-be-promoted',
+    ask: async () => '',
+  });
+  assert.equal(cancelled, null);
+  const rejectedAnswers = ['Candidate objective', 'no'];
+  const rejected = await review.promptForAuthoritativeReviewIntent({
+    ask: async () => rejectedAnswers.shift(),
+  });
+  assert.equal(rejected, null);
 });

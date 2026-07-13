@@ -538,6 +538,25 @@ export function renderCockpit(
     lines.push(`  at: ${sanitizeForTerminal(reviewOverride.recordedAt)} by ${sanitizeForTerminal(reviewOverride.actor.provider)}:${sanitizeForTerminal(reviewOverride.actor.source)}`);
     lines.push('');
   }
+  const review = envelope.data.review;
+  const currentReviewMatchesMode = review
+    ? review.current?.enforcementMode === review.enforcementMode
+      && review.current?.policyVersion === review.policyVersion
+    : false;
+  if (review?.enforcementMode === 'strict-v3' && !currentReviewMatchesMode) {
+    const prAction = boardContext.aliases?.pr ?? '/pr';
+    lines.push(colorize('ℹ STRICT REVIEW UPGRADE IMPACT', color, 'yellow'));
+    lines.push(review.current
+      ? `  current evidence used ${sanitizeForTerminal(review.current.enforcementMode ?? 'legacy-v2')} policy ${sanitizeForTerminal(String(review.current.policyVersion ?? 'unknown'))}; strict-v3 policy ${review.policyVersion} requires a rerun.`
+      : '  this checkout has no current strict-v3 review evidence; unrelated recent history is not substituted.');
+    lines.push('  normal development remains available; the next gated release action needs one explicit choice.');
+    lines.push('  recommended: /pipelane review --intent "<what this change should accomplish>", repair any findings, then rerun.');
+    for (const gateId of review.blockingGateIds) {
+      lines.push(`  proceed anyway: /pipelane review override --gate ${sanitizeForTerminal(gateId)} --scope=${JSON.stringify(prAction)} --reason "<why this exact target and action may proceed>"`);
+    }
+    lines.push('  A bypass remains recorded as user consent; failed or pending evidence is never relabeled passed.');
+    lines.push('');
+  }
 
   // v1.2: probe banner mirrors the override banner pattern. Red for
   // degraded (a probe actively failed), yellow for stale (a probe exists

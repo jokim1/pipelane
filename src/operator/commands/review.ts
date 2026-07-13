@@ -20,14 +20,20 @@ import {
   isIndependentAiReviewGate,
   matchesReviewRisk,
   REVIEW_GATES_POLICY_VERSION,
+  RECOMMENDED_REVIEW_ENFORCEMENT_MODE,
+  reviewPolicyVersionForMode,
+  reviewGateExecutionPolicy,
 } from '../review-gate-policy.ts';
 import { readWorktreeStatusSnapshot, type WorktreeStatusSnapshot } from '../worktree-status.ts';
 import { DEPLOY_STATE_KEY_ENV, ORCHESTRATION_STATE_KEY_ENV, PROBE_STATE_KEY_ENV, REVIEW_STATE_KEY_ENV } from '../integrity.ts';
 import {
   appendReviewAcceptanceRecord,
   appendReviewRunRecord,
+  ensureTaskBindingId,
   formatWorkflowCommand,
+  loadAllTaskLocks,
   loadReviewState,
+  normalizeExistingPath,
   normalizePath,
   nowIso,
   patchReadableWorkflowConfig,
@@ -39,17 +45,26 @@ import {
   reviewAcceptanceReasonHash,
   reviewAcceptanceStatePath,
   reviewStatePath,
+  reviewArtifactRoot,
   resolveWorkflowContext,
   runGit,
+  updateTaskBinding,
+  withReviewStateLock,
   writeJsonFile,
   isStableEvidenceId,
   type ParsedOperatorArgs,
   type ReviewAcceptanceRecord,
   type ReviewGateConfig,
+  type ReviewCapabilityEvidence,
   type ReviewGatePhase,
   type ReviewProfile,
   type ReviewGateRunRecord,
+  type ReviewIntent,
+  type ReviewIntentCandidate,
   type ReviewRunRecord,
+  type ReviewTargetManifest,
+  type TaskBrief,
+  type TaskLock,
   type WorkflowConfig,
   type ReviewPlanGateConfig,
 } from '../state.ts';
@@ -62,6 +77,31 @@ import {
   recordReviewEvidenceConsents,
   reviewGateDefinitionHash,
 } from '../review-enforcement.ts';
+import {
+  adaptProviderCompletion,
+  buildReviewTargetManifest,
+  changedMaterialPaths,
+  canonicalEnvelopeLine,
+  providerNativeJsonSchema,
+  parseLegacyRoleEquivalentEnvelope,
+  ReviewProtocolFramer,
+  renderStrictReviewPrompt,
+  resolveReviewIntent,
+  resolveRoleEquivalentCapability,
+  resolveTrustedSkillCapability,
+  taskBriefIntentText,
+  type BuiltReviewTarget,
+  type ResolvedReviewCapability,
+  type TrustedSkillRoot,
+} from '../review-contract.ts';
+import {
+  appendArtifactBackedReviewRun,
+  collectReferencedReviewArtifactPaths,
+  discoverReviewArtifactCandidates,
+  garbageCollectReviewArtifacts,
+  persistReviewArtifact,
+} from '../review-artifacts.ts';
+import { normalizeTaskBrief, redactReviewSecrets, REVIEW_DATA_LIMITS } from '../review-data.ts';
 import { visibleReviewGateFailureOutput } from '../review-output.ts';
 import { sanitizeForTerminal } from '../text-output.ts';
 
@@ -153,6 +193,10 @@ interface ReviewGateMutation {
 interface ReviewRunAttemptInput {
   changedFiles: string[];
   worktreeStatus: WorktreeStatusSnapshot;
+  intent?: ReviewIntent;
+  target?: ReviewTargetManifest;
+  builtTarget?: BuiltReviewTarget;
+  strictPreparationError?: string;
   reviewConfigChanged: boolean;
   reviewConfigChangeApproval: ReviewGateRunRecord | null;
   reviewConfigChangeNeedsApproval: boolean;
@@ -183,6 +227,7 @@ interface ReviewSetupSaveOptions {
   useSelectedDefaults?: boolean;
   changedGateIds?: Set<string>;
   disabledGateIds?: Set<string>;
+  enforcementMode?: WorkflowConfig['reviewGates']['enforcementMode'];
 }
 
 interface AdversarialReviewProvider {
@@ -220,6 +265,7 @@ interface AiReviewGateCommandResolution {
   command: string;
   provider: string;
   promptCommand?: string | null;
+  nativeDefault?: boolean;
 }
 
 interface ReviewSetupReport {
@@ -236,6 +282,8 @@ interface ReviewSetupReport {
   };
   detectedScripts: string[];
   effective: {
+    enforcementMode: 'legacy-v2' | 'strict-v3';
+    policyVersion: number;
     planReview: {
       gates: ReviewPlanGateConfig[];
     };
@@ -308,6 +356,8 @@ export interface BuildReviewRunRecordOptions {
   phaseFilter?: ReviewGatePhase | '';
   activeSurfaces: string[];
   changedFiles?: string[];
+  intentCandidates?: ReviewIntentCandidate[];
+  taskBindingId?: string;
   reviewConfigChangeApproval?: ReviewGateRunRecord | null;
   profileContext?: ReviewProfileContext;
   onGateStart?: (gate: ReviewGateConfig) => void;
@@ -333,8 +383,23 @@ export async function handleReview(cwd: string, parsed: ParsedOperatorArgs): Pro
     handleReviewOverride(cwd, parsed);
     return;
   }
+  if (subcommand === 'gc') {
+    handleReviewGc(cwd, parsed);
+    return;
+  }
 
-  handleReviewRun(cwd, parsed);
+  await handleReviewRun(cwd, parsed);
+}
+
+function handleReviewGc(cwd: string, parsed: ParsedOperatorArgs): void {
+  const context = resolveWorkflowContext(cwd);
+  const result = pruneReviewArtifacts(context, true);
+  printResult(parsed.flags, {
+    command: 'review gc',
+    status: result.errors.length > 0 ? 'degraded' : 'complete',
+    ...result,
+    message: `Review artifact GC scanned ${result.scanned}, kept ${result.referenced} referenced, deleted ${result.deleted}, skipped ${result.skipped}, errors ${result.errors.length}.`,
+  });
 }
 
 function handleReviewOverride(cwd: string, parsed: ParsedOperatorArgs): void {
@@ -342,9 +407,16 @@ function handleReviewOverride(cwd: string, parsed: ParsedOperatorArgs): void {
   const gateId = parsed.flags.reviewGate.trim();
   const reason = parsed.flags.reason.trim();
   const routeAction = parsed.flags.scope.trim() || formatWorkflowCommand(context.config, 'pr');
+  const configuredGate = context.config.reviewGates?.gates?.find((gate) => gate.id === gateId && gate.blocking !== false);
+  if (!configuredGate) {
+    throw new Error(`review override requires a configured blocking gate; ${gateId || '<empty>'} is not in the current blocking gate set.`);
+  }
   const evidence = evaluateReviewEvidenceForPr(context, { command: routeAction });
   const allIssues = [...evidence.issues, ...evidence.bypassedIssues];
-  const matching = allIssues.filter((issue) => issue.gateId === gateId);
+  const matchingGateIssues = allIssues.filter((issue) => issue.gateId === gateId);
+  const matching = matchingGateIssues.length > 0
+    ? matchingGateIssues
+    : allIssues.filter((issue) => !issue.gateId).map((issue) => ({ ...issue, gateId }));
   if (matching.length === 0) {
     throw new Error(`review override found no blocking ${gateId} evidence for the current exact target and route action ${routeAction}.`);
   }
@@ -380,12 +452,18 @@ async function handleReviewSetup(cwd: string, parsed: ParsedOperatorArgs): Promi
 
   if (mutationFlags) {
     const resetToDefaults = parsed.flags.yes || parsed.flags.reviewReset;
-    const prepared = prepareInteractiveReviewSetup(context.repoRoot, context.config, { resetToDefaults });
+    const enforcementMode = (parsed.flags.reviewEnforcementMode || (resetToDefaults ? RECOMMENDED_REVIEW_ENFORCEMENT_MODE : context.config.reviewGates?.enforcementMode ?? RECOMMENDED_REVIEW_ENFORCEMENT_MODE)) as 'legacy-v2' | 'strict-v3';
+    const prepared = prepareInteractiveReviewSetup(context.repoRoot, context.config, { resetToDefaults, enforcementMode });
     const selectionResult = applyReviewSetupSelections(context.repoRoot, prepared, parsed);
     if (resetToDefaults) {
       actionMessages.push('Reset review gates to recommended defaults.');
     }
     actionMessages.push(...selectionResult.messages);
+    if (enforcementMode === 'strict-v3' && (parsed.flags.reviewEnforcementMode || resetToDefaults)) {
+      actionMessages.push(strictModeSetupImpact(context.repoRoot));
+    } else if (parsed.flags.reviewEnforcementMode) {
+      actionMessages.push('Selected legacy-v2 enforcement. Existing strict evidence stays readable, but legacy routes require legacy-v2 evidence or an exact-scope informed bypass.');
+    }
     const existingReviewGates = hasSavedConfig ? context.config.reviewGates?.gates ?? [] : [];
     writeResult = saveInteractiveReviewSetup(context.repoRoot, prepared.gates, {
       existingReviewGates,
@@ -393,6 +471,7 @@ async function handleReviewSetup(cwd: string, parsed: ParsedOperatorArgs): Promi
       useSelectedDefaults: resetToDefaults,
       changedGateIds: new Set([...selectionResult.enabledIds, ...selectionResult.installedIds, ...selectionResult.toggledOnIds]),
       disabledGateIds: new Set([...selectionResult.disabledIds, ...selectionResult.toggledOffIds]),
+      enforcementMode,
     });
     context = resolveWorkflowContext(cwd);
     if (!parsed.flags.json) {
@@ -443,6 +522,8 @@ async function handleReviewSetup(cwd: string, parsed: ParsedOperatorArgs): Promi
     },
     detectedScripts: Object.keys(detection.scripts).sort(),
     effective: {
+      enforcementMode: context.config.reviewGates?.enforcementMode ?? RECOMMENDED_REVIEW_ENFORCEMENT_MODE,
+      policyVersion: context.config.reviewGates?.policyVersion ?? reviewPolicyVersionForMode(RECOMMENDED_REVIEW_ENFORCEMENT_MODE),
       planReview: { gates: effectivePlanGates },
       gates: effectiveGates,
     },
@@ -574,10 +655,13 @@ function resolveReviewPassTarget(options: {
   if (!isManualReviewGate(expectedGate)) {
     throw new Error(`review pass only accepts manual gates. Gate ${gateId} is type ${expectedGate.type}; rerun /pipelane review to execute it.`);
   }
+  if (options.config.reviewGates?.enforcementMode === 'strict-v3' && reviewGateExecutionPolicy(expectedGate).capability === 'strict-skill') {
+    throw new Error(`review pass cannot substitute for strict skill gate ${gateId}. Restore the trusted skill and adapter, rerun /pipelane review, or use /pipelane review override --gate ${gateId} --scope /pr --reason "<why this exact target and action may proceed>".`);
+  }
 
   const currentBranch = runGit(options.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
   const currentSha = runGit(options.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '';
-  const worktreeStatus = readWorktreeStatusSnapshot(options.repoRoot, {
+  let worktreeStatus = readWorktreeStatusSnapshot(options.repoRoot, {
     includeStatusDigest: true,
     includeMaterialTreeHash: true,
   });
@@ -643,7 +727,7 @@ export function buildReviewPassRecord(options: {
       finishedAt: startedAt,
       durationMs: 0,
     };
-    const strictIndependentAi = options.config.reviewGates?.policyVersion === REVIEW_GATES_POLICY_VERSION;
+    const strictIndependentAi = (options.config.reviewGates?.policyVersion ?? 1) >= 2;
     const blocker = blockingAiReviewEvidenceBlocker({
       reviewRun: { ...base, gates: [candidateGate] },
       worker: strictIndependentAi ? base.authorIdentity ?? null : base.reviewer ?? null,
@@ -783,7 +867,7 @@ async function runInteractiveReviewSetup(cwd: string, parsed: ParsedOperatorArgs
   }
 }
 
-function prepareInteractiveReviewSetup(repoRoot: string, config: WorkflowConfig, options: { resetToDefaults?: boolean } = {}): {
+function prepareInteractiveReviewSetup(repoRoot: string, config: WorkflowConfig, options: { resetToDefaults?: boolean; enforcementMode?: 'legacy-v2' | 'strict-v3' } = {}): {
   repoRoot: string;
   packageJson: ReviewSetupReport['packageJson'];
   detectedScripts: string[];
@@ -803,7 +887,10 @@ function prepareInteractiveReviewSetup(repoRoot: string, config: WorkflowConfig,
   const gates: ReviewSetupGateOption[] = orderedCatalog.map((entry, index) => {
     const savedGate = savedGateById.get(entry.id);
     const displayEntry = savedGate ? hydrateReviewSetupEntryFromSavedGate(entry, savedGate) : entry;
-    const installState = detectGateInstallState(repoRoot, entry);
+    const strictSkill = reviewGateExecutionPolicy({ id: entry.id, type: entry.type }).capability === 'strict-skill';
+    const installState = detectGateInstallState(repoRoot, entry, {
+      trustedOnly: (options.enforcementMode ?? config.reviewGates?.enforcementMode) === 'strict-v3' && strictSkill,
+    });
     const recommended = isRecommendedInteractiveGate(entry, installState);
     const section = reviewSetupSectionForGate(entry.id);
     return {
@@ -922,6 +1009,7 @@ function hasReviewSetupMutationFlags(parsed: ParsedOperatorArgs): boolean {
     || parsed.flags.reviewInstall.length > 0
     || parsed.flags.reviewToggle.length > 0
     || parsed.flags.reviewReset
+    || parsed.flags.reviewEnforcementMode.trim().length > 0
     || parsed.flags.yes;
 }
 
@@ -1151,7 +1239,7 @@ function isRecommendedInteractiveGate(entry: ResolvedReviewGateCatalogEntry, ins
   return true;
 }
 
-function detectGateInstallState(repoRoot: string, entry: ResolvedReviewGateCatalogEntry): GateInstallState {
+function detectGateInstallState(repoRoot: string, entry: ResolvedReviewGateCatalogEntry, options: { trustedOnly?: boolean } = {}): GateInstallState {
   if (entry.type === 'command') {
     if (entry.available) return 'not applicable';
     return reviewGateInstallOptions(entry, repoRoot).length > 0 ? 'not installed' : 'unavailable';
@@ -1170,9 +1258,19 @@ function detectGateInstallState(repoRoot: string, entry: ResolvedReviewGateCatal
         ? 'not installed'
         : 'unavailable';
   }
+  if (options.trustedOnly && reviewGateExecutionPolicy({ id: entry.id, type: entry.type }).capability === 'strict-skill') {
+    if (entry.phase === 'plan') return 'unavailable';
+    try {
+      return resolveTrustedSkillCapability(entry as ReviewGateConfig, trustedMachineSkillRoots(), 'codex')
+        ? 'installed'
+        : hasReviewGateInstaller(entry, repoRoot) ? 'not installed' : 'unavailable';
+    } catch {
+      return hasReviewGateInstaller(entry, repoRoot) ? 'not installed' : 'unavailable';
+    }
+  }
   const names = knownInstallNamesForGate(entry);
   if (names.length === 0) return 'unavailable';
-  if (names.some((name) => isSkillInstalled(repoRoot, name))) return 'installed';
+  if (names.some((name) => isSkillInstalled(repoRoot, name, options))) return 'installed';
   return hasReviewGateInstaller(entry, repoRoot) ? 'not installed' : 'unavailable';
 }
 
@@ -1181,12 +1279,12 @@ function knownInstallNamesForGate(entry: ResolvedReviewGateCatalogEntry): string
   return entry.role ? [entry.role, entry.id] : [entry.id];
 }
 
-function isSkillInstalled(repoRoot: string, name: string): boolean {
+function isSkillInstalled(repoRoot: string, name: string, options: { trustedOnly?: boolean } = {}): boolean {
   const codexHome = codexHomePath();
   const claudeHome = claudeHomePath();
-  const names = skillInstallNameVariants(name);
+  const names = options.trustedOnly ? [name.trim()] : skillInstallNameVariants(name);
   const candidates = names.flatMap((candidateName) => [
-    path.join(repoRoot, '.agents', 'skills', candidateName, 'SKILL.md'),
+    ...(options.trustedOnly ? [] : [path.join(repoRoot, '.agents', 'skills', candidateName, 'SKILL.md')]),
     path.join(codexHome, 'skills', candidateName, 'SKILL.md'),
     path.join(claudeHome, 'skills', candidateName, 'SKILL.md'),
     path.join(claudeHome, 'skills', 'gstack', candidateName.replace(/^gstack-/, ''), 'SKILL.md'),
@@ -1938,7 +2036,7 @@ function saveInteractiveReviewSetup(
     : selectedGates);
   return patchReadableWorkflowConfig(repoRoot, (raw) => ({
     ...raw,
-    reviewGates: buildReviewGatesExplicitPatch(raw, gatesToSave),
+    reviewGates: buildReviewGatesExplicitPatch(raw, gatesToSave, options.enforcementMode),
   }));
 }
 
@@ -1976,6 +2074,7 @@ function mergeReviewSetupGates(
 function buildReviewGatesExplicitPatch(
   raw: Record<string, unknown>,
   gates: ReviewGateConfig[],
+  enforcementMode?: 'legacy-v2' | 'strict-v3',
 ): Record<string, unknown> {
   const existing = asRecord(raw.reviewGates);
   const next: Record<string, unknown> = {};
@@ -1983,9 +2082,17 @@ function buildReviewGatesExplicitPatch(
   if (planReview) {
     next.planReview = planReview;
   }
-  next.policyVersion = REVIEW_GATES_POLICY_VERSION;
+  const mode = enforcementMode
+    ?? (existing?.enforcementMode === 'strict-v3' ? 'strict-v3' : existing?.enforcementMode === 'legacy-v2' ? 'legacy-v2' : RECOMMENDED_REVIEW_ENFORCEMENT_MODE);
+  next.enforcementMode = mode;
+  next.policyVersion = reviewPolicyVersionForMode(mode);
   next.gates = gates;
   return next;
+}
+
+function strictModeSetupImpact(repoRoot: string): string {
+  const adapters = [isExecutableOnPath('codex') ? 'Codex' : '', isExecutableOnPath('claude') ? 'Claude' : ''].filter(Boolean);
+  return `Selected strict-v3 enforcement. Available native adapters: ${adapters.join(', ') || 'none'}. Legacy evidence will remain readable but cannot satisfy strict gates; rerun against authoritative intent and an immutable target, or use an explicit reasoned exact-scope bypass for any failed or pending gate.`;
 }
 
 function reviewSetupGateToConfig(gate: ReviewSetupGateOption): ReviewGateConfig {
@@ -2193,7 +2300,7 @@ function reviewGateExecutionOrder(gates: ReviewGateConfig[]): ReviewGateConfig[]
   ];
 }
 
-function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
+async function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const context = resolveWorkflowContext(cwd);
   const phaseFilter = parsed.flags.reviewPhase.trim() as ReviewGatePhase | '';
   const gateFilter = parsed.flags.reviewGate.trim();
@@ -2228,6 +2335,7 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
     gateFilter,
     reviewConfigChanged,
   });
+  const intentPreparation = await prepareTopLevelReviewIntent(context, parsed, selectedGates);
   const checklist = parsed.flags.json
     ? null
     : createReviewChecklist(selectedGates);
@@ -2248,6 +2356,8 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
     phaseFilter,
     activeSurfaces,
     changedFiles,
+    intentCandidates: intentPreparation.candidates,
+    taskBindingId: intentPreparation.taskBindingId,
     reviewConfigChangeApproval: selectReviewConfigChangeApproval(context.commonDir, context.config, context.repoRoot),
     onGateStart: (gate) => {
       checklist?.start(gate);
@@ -2261,7 +2371,12 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
     },
   });
 
-  appendReviewRunRecord(context.commonDir, context.config, record);
+  appendArtifactBackedReviewRun({
+    root: reviewArtifactRoot(context.commonDir, context.config),
+    runId: record.id,
+    appendRecord: () => appendReviewRunRecord(context.commonDir, context.config, record),
+  });
+  pruneReviewArtifacts(context, false);
   const routeSafety = recordReviewRunForRouteSafety(cwd, parsed, record);
 
   const report = {
@@ -2275,9 +2390,16 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
     phaseFilter: phaseFilter || null,
     changedFiles: record.changedFiles,
     gates: record.gates,
+    ...(context.config.reviewGates?.enforcementMode === 'strict-v3' && !record.intent ? {
+      needsInput: true,
+      intentCommand: '/pipelane review --intent "<what this change should accomplish>"',
+      bypassCommands: selectedGates
+        .filter((gate) => gate.blocking !== false && (gate.type === 'skill' || gate.type === 'agent'))
+        .map((gate) => `/pipelane review override --gate ${gate.id} --scope /pr --reason "<why this exact target and action may proceed>"`),
+    } : {}),
     message: [
       checklist && !liveChecklist ? renderReviewChecklist(checklist.snapshot()) : '',
-      renderReviewRunReport(record, reviewStatePath(context.commonDir, context.config)),
+      renderReviewRunReport(record, reviewStatePath(context.commonDir, context.config), reviewArtifactRoot(context.commonDir, context.config)),
       routeSafety.action === 'stop' ? routeSafety.message : '',
     ].filter(Boolean).join('\n\n'),
   };
@@ -2287,6 +2409,127 @@ function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): void {
   if (record.status === 'failed' || routeSafety.action === 'stop') {
     process.exitCode = 1;
   }
+}
+
+function pruneReviewArtifacts(
+  context: ReturnType<typeof resolveWorkflowContext>,
+  exhaustive: boolean,
+): ReturnType<typeof garbageCollectReviewArtifacts> {
+  const root = reviewArtifactRoot(context.commonDir, context.config);
+  const aggregate = { scanned: 0, referenced: 0, deleted: 0, skipped: 0, errors: [] as string[] };
+  do {
+    // Discovery is intentionally outside the mutation lock. Every candidate is
+    // identity-checked again under the lock after the signed ledger is reloaded.
+    const candidates = discoverReviewArtifactCandidates(root);
+    const batch = withReviewStateLock(context.commonDir, context.config, () => {
+      const state = loadReviewState(context.commonDir, context.config);
+      return garbageCollectReviewArtifacts({
+        root,
+        referencedPaths: collectReferencedReviewArtifactPaths(state.records),
+        candidates,
+        exhaustive,
+        maxDeletes: 50,
+        maxDurationMs: 100,
+      });
+    });
+    aggregate.scanned += batch.scanned;
+    aggregate.referenced += batch.referenced;
+    aggregate.deleted += batch.deleted;
+    aggregate.skipped += batch.skipped;
+    aggregate.errors.push(...batch.errors);
+    if (!exhaustive || batch.deleted === 0) break;
+  } while (true);
+  return aggregate;
+}
+
+export function collectReviewIntentCandidates(
+  context: ReturnType<typeof resolveWorkflowContext>,
+  options: { explicitIntent?: string; orchestrationOutcome?: string } = {},
+): { candidates: ReviewIntentCandidate[]; taskBindingId?: string; lock: TaskLock | null } {
+  const branchName = runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
+  const lockCandidate = loadAllTaskLocks(context.commonDir, context.config).find((candidate) =>
+    candidate.branchName === branchName
+    && normalizeExistingPath(candidate.worktreePath) === normalizeExistingPath(context.repoRoot)
+  ) ?? null;
+  const lock = lockCandidate ? ensureTaskBindingId(context.commonDir, context.config, lockCandidate.taskSlug) : null;
+  const candidates: ReviewIntentCandidate[] = [];
+  if (options.orchestrationOutcome?.trim()) {
+    candidates.push({ text: options.orchestrationOutcome, source: 'orchestration-slice', authoritative: true });
+  }
+  if (lock?.taskBrief) {
+    candidates.push({ text: taskBriefIntentText(lock.taskBrief), source: 'task-brief', authoritative: true });
+  }
+  if (options.explicitIntent?.trim()) {
+    candidates.push({ text: options.explicitIntent, source: 'explicit-unbound', authoritative: true });
+  }
+  if (lock?.taskName) {
+    candidates.push({ text: lock.taskName, source: 'explicit-unbound', authoritative: false });
+  }
+  return { candidates, taskBindingId: lock?.taskBindingId, lock };
+}
+
+async function prepareTopLevelReviewIntent(
+  context: ReturnType<typeof resolveWorkflowContext>,
+  parsed: ParsedOperatorArgs,
+  selectedGates: ReviewGateConfig[],
+): Promise<{ candidates: ReviewIntentCandidate[]; taskBindingId?: string }> {
+  if (context.config.reviewGates?.enforcementMode !== 'strict-v3' || !selectedGates.some((gate) => gate.type === 'skill' || gate.type === 'agent')) {
+    return { candidates: [] };
+  }
+  let collected = collectReviewIntentCandidates(context, { explicitIntent: parsed.flags.reviewIntent });
+  if (collected.lock && parsed.flags.reviewIntent.trim() && !collected.lock.taskBrief) {
+    const brief = normalizeTaskBrief({ objective: parsed.flags.reviewIntent }, 'first-review');
+    const bindingId = collected.lock.taskBindingId;
+    const updated = updateTaskBinding(context.commonDir, context.config, collected.lock.taskSlug, (current) => {
+      if (current.taskBindingId !== bindingId) throw new Error('Task binding changed while initializing the review brief; rerun review.');
+      if (current.taskBrief && current.taskBrief.digest !== brief.digest) {
+        throw new Error('The active task binding acquired a conflicting immutable brief; rerun review and choose an audited rebind if the objective changed.');
+      }
+      return { ...current, taskBrief: current.taskBrief ?? brief, updatedAt: nowIso() };
+    });
+    collected = collectReviewIntentCandidates(context);
+    collected.taskBindingId = updated.taskBindingId;
+  }
+  let resolution = resolveReviewIntent(collected.candidates, collected.taskBindingId);
+  if (resolution.status === 'resolved' || parsed.flags.json || process.stdin.isTTY !== true || process.stdout.isTTY !== true) {
+    return { candidates: collected.candidates, taskBindingId: collected.taskBindingId };
+  }
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const normalized = await promptForAuthoritativeReviewIntent({
+      suggestedLabel: collected.lock?.taskName,
+      ask: (question) => rl.question(question),
+    });
+    if (!normalized) return { candidates: collected.candidates, taskBindingId: collected.taskBindingId };
+    if (collected.lock) {
+      const bindingId = collected.lock.taskBindingId;
+      updateTaskBinding(context.commonDir, context.config, collected.lock.taskSlug, (current) => {
+        if (current.taskBindingId !== bindingId) throw new Error('Task binding changed while confirming review intent; rerun review.');
+        if (current.taskBrief) throw new Error('The task binding acquired a brief while intent was being confirmed; rerun review.');
+        return { ...current, taskBrief: normalized, updatedAt: nowIso() };
+      });
+      collected = collectReviewIntentCandidates(context);
+    } else {
+      collected.candidates.push({ text: normalized.objective, source: 'explicit-unbound', authoritative: true });
+    }
+    resolution = resolveReviewIntent(collected.candidates, collected.taskBindingId);
+    if (resolution.status !== 'resolved') throw new Error('Confirmed review intent could not be resolved.');
+    return { candidates: collected.candidates, taskBindingId: collected.taskBindingId };
+  } finally {
+    rl.close();
+  }
+}
+
+export async function promptForAuthoritativeReviewIntent(options: {
+  suggestedLabel?: string;
+  ask: (question: string) => Promise<string>;
+}): Promise<TaskBrief | null> {
+  const suggestion = options.suggestedLabel ? ` Suggested label: ${sanitizeForTerminal(options.suggestedLabel)}.` : '';
+  const objective = (await options.ask(`What should this change accomplish?${suggestion} `)).trim();
+  if (!objective) return null;
+  const normalized = normalizeTaskBrief({ objective }, 'first-review');
+  const confirmed = (await options.ask(`Use "${sanitizeForTerminal(normalized.objective)}" as the authoritative review objective? [y/N] `)).trim().toLowerCase();
+  return confirmed === 'y' || confirmed === 'yes' ? normalized : null;
 }
 
 function formatReviewGateProgressStart(gate: ReviewGateConfig): string {
@@ -2325,6 +2568,8 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
     gateFilter,
     changedFiles: options.changedFiles,
     reviewConfigChangeApproval: options.reviewConfigChangeApproval,
+    intentCandidates: options.intentCandidates,
+    taskBindingId: options.taskBindingId,
     attemptNumber,
   });
   let gateRecords: ReviewGateRunRecord[] = [];
@@ -2355,6 +2600,8 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
       gates: options.gates,
       phaseFilter,
       gateFilter,
+      intentCandidates: options.intentCandidates,
+      taskBindingId: options.taskBindingId,
       attemptNumber: attemptNumber + 1,
     });
 
@@ -2393,6 +2640,11 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
     worktreeMaterialTreeWarnings: attempt.worktreeStatus.materialTreeWarnings,
     authorIdentity: resolveReviewAuthorIdentity(),
     reviewer: resolveReviewActorIdentity(),
+    enforcementMode: stateContext.config.reviewGates?.enforcementMode ?? 'legacy-v2',
+    policyVersion: stateContext.config.reviewGates?.policyVersion ?? REVIEW_GATES_POLICY_VERSION,
+    ...(options.taskBindingId ? { taskBindingId: options.taskBindingId } : {}),
+    ...(attempt.intent ? { intent: attempt.intent } : {}),
+    ...(attempt.target ? { target: attempt.target } : {}),
     gates: gateRecords,
   };
 }
@@ -2407,31 +2659,78 @@ function buildReviewRunAttemptInput(options: {
   gateFilter: string;
   changedFiles?: string[];
   reviewConfigChangeApproval?: ReviewGateRunRecord | null;
+  intentCandidates?: ReviewIntentCandidate[];
+  taskBindingId?: string;
   attemptNumber: number;
 }): ReviewRunAttemptInput {
-  const changedFiles = options.attemptNumber === 0 && options.changedFiles
+  let changedFiles = options.attemptNumber === 0 && options.changedFiles
     ? options.changedFiles
     : collectChangedFiles(options.repoRoot, options.baseBranch);
-  const worktreeStatus = readWorktreeStatusSnapshot(options.repoRoot, {
+  let worktreeStatus = readWorktreeStatusSnapshot(options.repoRoot, {
     includeStatusDigest: true,
     includeMaterialTreeHash: true,
   });
-  const reviewConfigChanged = changedFiles.some(isReviewConfigPath);
-  const reviewConfigChangeApproval = reviewConfigChanged
+  let reviewConfigChanged = changedFiles.some(isReviewConfigPath);
+  let reviewConfigChangeApproval = reviewConfigChanged
     ? options.attemptNumber === 0 && options.reviewConfigChangeApproval !== undefined
       ? options.reviewConfigChangeApproval
       : selectReviewConfigChangeApproval(options.commonDir, options.config, options.repoRoot)
     : null;
-  const selectedGates = selectReviewGatesForRun({
+  let selectedGates = selectReviewGatesForRun({
     gates: options.gates,
     phaseFilter: options.phaseFilter,
     gateFilter: options.gateFilter,
     reviewConfigChanged,
   });
 
+  let intent: ReviewIntent | undefined;
+  let builtTarget: BuiltReviewTarget | undefined;
+  const strictPreparationErrors: string[] = [];
+  const strictAiSelected = options.config.reviewGates?.enforcementMode === 'strict-v3'
+    && selectedGates.some((gate) => gate.type === 'skill' || gate.type === 'agent');
+  if (strictAiSelected) {
+    try {
+      const resolution = resolveReviewIntent(options.intentCandidates ?? [], options.taskBindingId);
+      if (resolution.status === 'resolved') intent = resolution.intent;
+      else strictPreparationErrors.push(resolution.reason);
+    } catch (error) {
+      strictPreparationErrors.push(error instanceof Error ? error.message : String(error));
+    }
+    try {
+      builtTarget = buildReviewTargetManifest(options.repoRoot, options.baseBranch);
+      worktreeStatus = {
+        ...worktreeStatus,
+        statusDigest: builtTarget.manifest.worktreeStatusDigest,
+        statusDigestReliable: true,
+        statusDigestWarnings: [],
+        materialTreeHash: builtTarget.manifest.materialTreeHash,
+        materialTreeReliable: true,
+        materialTreeWarnings: [],
+      };
+      changedFiles = builtTarget.changedFiles;
+      reviewConfigChanged = changedFiles.some(isReviewConfigPath);
+      reviewConfigChangeApproval = reviewConfigChanged
+        ? options.attemptNumber === 0 && options.reviewConfigChangeApproval !== undefined
+          ? options.reviewConfigChangeApproval
+          : selectReviewConfigChangeApproval(options.commonDir, options.config, options.repoRoot)
+        : null;
+      selectedGates = selectReviewGatesForRun({
+        gates: options.gates,
+        phaseFilter: options.phaseFilter,
+        gateFilter: options.gateFilter,
+        reviewConfigChanged,
+      });
+    } catch (error) {
+      strictPreparationErrors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   return {
     changedFiles,
     worktreeStatus,
+    ...(intent ? { intent } : {}),
+    ...(builtTarget ? { builtTarget, target: builtTarget.manifest } : {}),
+    ...(strictPreparationErrors.length > 0 ? { strictPreparationError: strictPreparationErrors.join(' ') } : {}),
     reviewConfigChanged,
     reviewConfigChangeApproval,
     reviewConfigChangeNeedsApproval: reviewConfigChanged && !reviewConfigChangeApproval,
@@ -2471,6 +2770,9 @@ function runReviewAttempt(options: {
           dryRun: options.dryRun,
           reviewConfigChanged: options.attempt.reviewConfigChangeNeedsApproval,
           changedFiles: options.attempt.changedFiles,
+          intent: options.attempt.intent,
+          builtTarget: options.attempt.builtTarget,
+          strictPreparationError: options.attempt.strictPreparationError,
           activeSurfaces: options.activeSurfaces,
           profileContext: options.profileContext,
           deferAiGate,
@@ -2482,11 +2784,17 @@ function runReviewAttempt(options: {
   let blockingDeterministicFailure = false;
   for (const gate of reviewGateExecutionOrder(options.attempt.selectedGates)) {
     const before = isFixFirstReviewGate(gate) && !options.dryRun
-      ? readReviewGateWorktreeStatus(options.repoRoot)
+      ? options.config.reviewGates?.enforcementMode === 'strict-v3'
+        ? options.attempt.worktreeStatus
+        : readReviewGateWorktreeStatus(options.repoRoot)
       : null;
     if (!isDeterministicReviewGate(gate)) {
       const record = evaluateGate(gate, blockingDeterministicFailure);
-      const after = before ? readReviewGateWorktreeStatus(options.repoRoot) : null;
+      const after = before
+        ? options.config.reviewGates?.enforcementMode === 'strict-v3'
+          ? readStrictReviewGateWorktreeStatus(options.repoRoot, options.baseBranch)
+          : readReviewGateWorktreeStatus(options.repoRoot)
+        : null;
       if (before && after && reviewGateWorktreeMutated(before, after)) {
         return {
           gates: reviewAttemptRecordsInConfiguredOrder(options.attempt.selectedGates, recordByGate),
@@ -2502,6 +2810,35 @@ function runReviewAttempt(options: {
     gates: reviewAttemptRecordsInConfiguredOrder(options.attempt.selectedGates, recordByGate),
     mutation: null,
   };
+}
+
+function readStrictReviewGateWorktreeStatus(repoRoot: string, baseBranch: string): WorktreeStatusSnapshot {
+  const fallback = readReviewGateWorktreeStatus(repoRoot);
+  try {
+    const target = buildReviewTargetManifest(repoRoot, baseBranch).manifest;
+    return {
+      ...fallback,
+      head: target.headOid,
+      statusDigest: target.worktreeStatusDigest,
+      statusDigestReliable: true,
+      statusDigestWarnings: [],
+      materialTreeHash: target.materialTreeHash,
+      materialTreeReliable: true,
+      materialTreeWarnings: [],
+    };
+  } catch (error) {
+    const diagnostic = error instanceof Error ? error.message : String(error);
+    const failedIdentity = crypto.createHash('sha256').update(`strict-target-capture-failed:${diagnostic}`).digest('hex');
+    return {
+      ...fallback,
+      statusDigest: failedIdentity,
+      statusDigestReliable: true,
+      statusDigestWarnings: [diagnostic],
+      materialTreeHash: failedIdentity,
+      materialTreeReliable: true,
+      materialTreeWarnings: [diagnostic],
+    };
+  }
 }
 
 // B4: deterministic gates execute programmatically (pass/fail) with no AI judge —
@@ -2587,7 +2924,13 @@ function skippedReviewGateRecord(gate: ReviewGateConfig, summary: string, skipRe
     command: gate.command,
     skill: gate.skill,
     role: gate.role,
+    when: gate.when,
+    whenChanged: gate.whenChanged,
+    timeoutMs: gate.timeoutMs,
     userCommands: gate.userCommands,
+    profiles: gate.profiles,
+    baselineCommandId: gate.baselineCommandId,
+    replacesBaselineCommandId: gate.replacesBaselineCommandId,
     status: 'skipped',
     summary,
     startedAt,
@@ -2990,6 +3333,8 @@ function spawnReviewGateCommand(
   result: { status: number | null; signal: NodeJS.Signals | null; error?: NodeJS.ErrnoException };
   stdout: string;
   stderr: string;
+  stdoutBytes: Buffer;
+  stderrBytes: Buffer;
   aiReviewGateResult: 'passed' | 'failed' | null;
 } {
   const payload = JSON.stringify({
@@ -3019,6 +3364,8 @@ function spawnReviewGateCommand(
       },
       stdout: helper.stdout ?? '',
       stderr: helper.stderr ?? '',
+      stdoutBytes: Buffer.from(helper.stdout ?? '', 'utf8'),
+      stderrBytes: Buffer.from(helper.stderr ?? '', 'utf8'),
       aiReviewGateResult: null,
     };
   }
@@ -3030,19 +3377,29 @@ function spawnReviewGateCommand(
       errorMessage?: string | null;
       stdout?: string;
       stderr?: string;
+      stdoutBase64?: string;
+      stderrBase64?: string;
       aiReviewGateResult?: 'passed' | 'failed' | null;
     };
     const error = parsed.errorCode
       ? makeSpawnError(parsed.errorCode, parsed.errorMessage ?? parsed.errorCode)
       : undefined;
+    const stdoutBytes = parsed.stdoutBase64 === undefined
+      ? Buffer.from(parsed.stdout ?? '', 'utf8')
+      : Buffer.from(parsed.stdoutBase64, 'base64');
+    const stderrBytes = parsed.stderrBase64 === undefined
+      ? Buffer.from(parsed.stderr ?? '', 'utf8')
+      : Buffer.from(parsed.stderrBase64, 'base64');
     return {
       result: {
         status: typeof parsed.status === 'number' ? parsed.status : null,
         signal: parsed.signal ?? null,
         ...(error ? { error } : {}),
       },
-      stdout: parsed.stdout ?? '',
-      stderr: parsed.stderr ?? '',
+      stdout: stdoutBytes.toString('utf8'),
+      stderr: stderrBytes.toString('utf8'),
+      stdoutBytes,
+      stderrBytes,
       aiReviewGateResult: parsed.aiReviewGateResult ?? null,
     };
   } catch (error) {
@@ -3054,6 +3411,8 @@ function spawnReviewGateCommand(
       },
       stdout: helper.stdout ?? '',
       stderr: helper.stderr ?? '',
+      stdoutBytes: Buffer.from(helper.stdout ?? '', 'utf8'),
+      stderrBytes: Buffer.from(helper.stderr ?? '', 'utf8'),
       aiReviewGateResult: null,
     };
   }
@@ -3220,15 +3579,15 @@ process.stdin.on('end', () => {
       signal: signal || null,
       errorCode,
       errorMessage,
-      stdout: tailBufferToString(stdout),
-      stderr: tailBufferToString(stderr),
+      stdoutBase64: tailBufferToBase64(stdout),
+      stderrBase64: tailBufferToBase64(stderr),
       aiReviewGateResult,
     });
   }
 });
 
-function tailBufferToString(tail) {
-  return Buffer.concat(tail.chunks, tail.bytes).toString('utf8');
+function tailBufferToBase64(tail) {
+  return Buffer.concat(tail.chunks, tail.bytes).toString('base64');
 }
 
 function emit(record) {
@@ -3252,6 +3611,9 @@ function runReviewGate(options: {
   dryRun: boolean;
   reviewConfigChanged: boolean;
   changedFiles: string[];
+  intent?: ReviewIntent;
+  builtTarget?: BuiltReviewTarget;
+  strictPreparationError?: string;
   activeSurfaces: string[];
   profileContext?: ReviewProfileContext;
   // B4: when a blocking deterministic gate has already failed this run, defer the
@@ -3270,7 +3632,13 @@ function runReviewGate(options: {
     command: gate.command,
     skill: gate.skill,
     role: gate.role,
+    when: gate.when,
+    whenChanged: gate.whenChanged,
+    timeoutMs: gate.timeoutMs,
     userCommands: gate.userCommands,
+    profiles: gate.profiles,
+    baselineCommandId: gate.baselineCommandId,
+    replacesBaselineCommandId: gate.replacesBaselineCommandId,
     startedAt,
   };
   const skipReason = skipReasonForGate(gate, changedFiles, activeSurfaces, options.profileContext);
@@ -3304,6 +3672,9 @@ function runReviewGate(options: {
       dryRun,
       reviewConfigChanged,
       changedFiles,
+      intent: options.intent,
+      builtTarget: options.builtTarget,
+      strictPreparationError: options.strictPreparationError,
     });
   }
 
@@ -3432,9 +3803,15 @@ function runAiReviewGate(options: {
   dryRun: boolean;
   reviewConfigChanged: boolean;
   changedFiles: string[];
+  intent?: ReviewIntent;
+  builtTarget?: BuiltReviewTarget;
+  strictPreparationError?: string;
 }): ReviewGateRunRecord {
   const { base, startMs, gate, repoRoot, commonDir, config, runId, baseBranch, dryRun, reviewConfigChanged, changedFiles } = options;
   const resolved = resolveAiReviewGateCommand(gate);
+  if (config.reviewGates?.enforcementMode === 'strict-v3') {
+    return runStrictAiReviewGate({ ...options, resolved });
+  }
   if (!resolved) {
     return finishGate(base, startMs, {
       status: 'pending',
@@ -3611,6 +3988,320 @@ function runAiReviewGate(options: {
   });
 }
 
+function runStrictAiReviewGate(options: {
+  base: Omit<ReviewGateRunRecord, 'status' | 'summary' | 'finishedAt' | 'durationMs'>;
+  startMs: number;
+  gate: ReviewGateConfig;
+  repoRoot: string;
+  commonDir: string;
+  config: WorkflowConfig;
+  runId: string;
+  baseBranch: string;
+  dryRun: boolean;
+  reviewConfigChanged: boolean;
+  changedFiles: string[];
+  intent?: ReviewIntent;
+  builtTarget?: BuiltReviewTarget;
+  strictPreparationError?: string;
+  resolved: AiReviewGateCommandResolution | null;
+}): ReviewGateRunRecord {
+  const { base, startMs, gate, repoRoot, commonDir, config, runId, dryRun, reviewConfigChanged, changedFiles, intent, builtTarget, resolved } = options;
+  const policy = reviewGateExecutionPolicy(gate);
+  const provider = resolved?.provider ?? 'unavailable';
+  const auditedCommand = resolved?.nativeDefault
+    ? resolved.provider === 'codex'
+      ? 'codex exec --sandbox read-only --ephemeral --output-schema <pipelane-schema> --output-last-message <pipelane-result> -'
+      : 'claude --print --permission-mode dontAsk --no-session-persistence --output-format json --json-schema <pipelane-schema>'
+    : resolved?.command;
+  const unavailableCapability = (): ReviewCapabilityEvidence => ({
+    requestedCapability: policy.capability === 'strict-skill' ? `skill:${gate.skill?.trim() || gate.id}` : `role:${policy.role}`,
+    effectiveCapability: 'unavailable',
+    adapter: `${provider}-native-v1`,
+    provider,
+    contractSupplied: false,
+    wrapperCompatible: false,
+  });
+  if (!intent) {
+    return finishGate(base, startMs, {
+      status: 'pending',
+      summary: `${options.strictPreparationError ?? 'no authoritative task intent was supplied'}; rerun /pipelane review --intent "<what this change should accomplish>" or proceed with /pipelane review override --gate ${gate.id} --scope /pr --reason "<why this exact target and action may proceed>"`,
+      capability: unavailableCapability(),
+    });
+  }
+  if (!builtTarget) {
+    return finishGate(base, startMs, {
+      status: 'failed',
+      summary: `${options.strictPreparationError ?? 'strict review could not capture the immutable target'} Recover the base/history or stabilize the checkout, rerun /pipelane review, or proceed with /pipelane review override --gate ${gate.id} --scope /pr --reason "<why this exact target and action may proceed>".`,
+      capability: unavailableCapability(),
+    });
+  }
+  if (!resolved) {
+    return finishGate(base, startMs, {
+      status: 'pending',
+      summary: `strict ${gate.id} has no enabled native structured-review adapter; restore an enabled Codex or Claude adapter, rerun review, or proceed with /pipelane review override --gate ${gate.id} --scope /pr --reason "<why this exact target and action may proceed>"`,
+      capability: unavailableCapability(),
+    });
+  }
+  let capability: ResolvedReviewCapability;
+  try {
+    if (policy.capability === 'strict-skill') {
+      const strict = resolveTrustedSkillCapability(gate, trustedMachineSkillRoots(), provider);
+      if (!strict) {
+        return finishGate({ ...base, command: auditedCommand }, startMs, {
+          status: 'pending',
+          summary: `strict skill ${gate.skill?.trim() || gate.id} is unavailable from trusted machine-local roots; install or restore the exact skill, rerun review, or proceed with /pipelane review override --gate ${gate.id} --scope /pr --reason "<why this exact target and action may proceed>"`,
+          capability: unavailableCapability(),
+        });
+      }
+      capability = strict;
+    } else if (policy.capability === 'role-equivalent') {
+      capability = resolveRoleEquivalentCapability(gate, provider);
+    } else {
+      return finishGate({ ...base, command: auditedCommand }, startMs, {
+        status: 'pending',
+        summary: `gate ${gate.id} requires manual evidence and cannot be satisfied by an automatic adapter`,
+        capability: unavailableCapability(),
+      });
+    }
+  } catch (error) {
+    return finishGate({ ...base, command: auditedCommand }, startMs, {
+      status: 'pending',
+      summary: `${error instanceof Error ? error.message : String(error)} Restore a compatible trusted capability, rerun review, or use the exact-scope bypass.`,
+      capability: unavailableCapability(),
+    });
+  }
+  if (reviewConfigChanged) {
+    return finishGate({ ...base, command: auditedCommand }, startMs, {
+      status: 'skipped',
+      summary: `skipped: review config inputs changed; ${gate.type} gates require trusted approval before execution`,
+      skipReason: REVIEW_CONFIG_CHANGE_WHEN,
+      capability: capability.evidence,
+    });
+  }
+  if (dryRun) {
+    return finishGate({ ...base, command: auditedCommand }, startMs, {
+      status: 'skipped',
+      summary: `dry-run: would run strict ${capability.evidence.adapter} against target ${builtTarget.manifest.targetDigest.slice(0, 12)}`,
+      skipReason: 'dry-run',
+      capability: capability.evidence,
+    });
+  }
+
+  const timeoutMs = gate.timeoutMs ?? DEFAULT_GATE_TIMEOUT_MS;
+  const sessionId = `review-gate:${gate.id}:${crypto.randomUUID()}`;
+  const inheritedContext = evaluateInheritedReviewGateContext();
+  const nestedFailure = nestedReviewGateFailureSummary(inheritedContext);
+  if (nestedFailure) {
+    return finishGate({ ...base, command: auditedCommand }, startMs, {
+      status: 'failed', summary: nestedFailure, exitCode: null, errorCode: NESTED_REVIEW_GATE_ERROR_CODE, capability: capability.evidence,
+    });
+  }
+  const env = buildAiReviewGateEnv(provider, sessionId, gate, { repoRoot, runId, inheritedContext });
+  const lock = acquireReviewCommandGateLock({
+    commonDir,
+    config,
+    repoRoot,
+    gateId: gate.id,
+    command: auditedCommand ?? resolved.command,
+    runId,
+    timeoutMs,
+    depth: inheritedReviewGateDepthForChild(inheritedContext),
+    inheritedContext,
+  });
+  if (lock.status === 'failed') {
+    return finishGate({ ...base, command: auditedCommand }, startMs, {
+      status: 'failed', summary: lock.summary, exitCode: null, errorCode: lock.errorCode, capability: capability.evidence,
+    });
+  }
+  const prompt = renderStrictReviewPrompt({ gate, intent, target: builtTarget.manifest, changedFiles, capability });
+  let completion: StrictProviderCompletion;
+  try {
+    completion = spawnStrictProviderCompletion(resolved, { cwd: repoRoot, timeout: timeoutMs, env, input: prompt });
+  } finally {
+    if (lock.status === 'acquired') {
+      try { lock.release(); } catch {}
+    }
+  }
+  const exitCode = typeof completion.result.status === 'number' ? completion.result.status : null;
+  const diagnostics = redactReviewOutput([completion.providerChatter, completion.stderr].filter(Boolean).join('\n'));
+  const stdoutTail = tail(redactReviewOutput(completion.nativeOutput));
+  const stderrTail = tail(diagnostics);
+  let report = '';
+  let parsed: ReturnType<ReviewProtocolFramer['finish']> | null = null;
+  let protocolError = '';
+  const executionFailed = Boolean(completion.result.error || completion.result.signal || exitCode === null || exitCode !== 0);
+  try {
+    if (completion.result.error) throw completion.result.error;
+    const adapted = adaptProviderCompletion({
+      provider,
+      providerExitCode: exitCode,
+      providerSignal: completion.result.signal,
+      stdout: completion.nativeOutputBytes,
+      adapterExitCode: 0,
+    });
+    report = adapted.result.report;
+    const framer = new ReviewProtocolFramer();
+    framer.feed(Buffer.from(`${adapted.emission}\n`, 'utf8'));
+    parsed = framer.finish(policy);
+    parsed.result.providerExitCode = adapted.providerExitCode;
+  } catch (error) {
+    const degraded = policy.capability === 'role-equivalent'
+      ? parseLegacyRoleEquivalentEnvelope(completion.nativeOutput)
+      : null;
+    if (degraded && !completion.result.error && !completion.result.signal && exitCode === 0) {
+      parsed = degraded;
+      report = completion.nativeOutput.replace(/PIPELANE_REVIEW_GATE_RESULT=(?:passed|failed)\s*$/i, '').trim();
+    } else {
+      protocolError = error instanceof Error ? error.message : String(error);
+      if (!report && completion.nativeOutput.trim()) report = completion.nativeOutput;
+    }
+  }
+
+  let afterTarget: BuiltReviewTarget | null = null;
+  let targetInvalidation = '';
+  let materialChanges: string[] = [];
+  try {
+    afterTarget = buildReviewTargetManifest(repoRoot, options.baseBranch);
+    if (afterTarget.manifest.targetDigest !== builtTarget.manifest.targetDigest && policy.mutation === 'read-only') {
+      materialChanges = changedMaterialPaths(builtTarget, afterTarget);
+      targetInvalidation = `the checkout changed while the gate was running${materialChanges.length > 0 ? `: ${materialChanges.join(', ')}` : '; immutable base or target identity changed'}`;
+    }
+  } catch (error) {
+    if (policy.mutation === 'read-only') targetInvalidation = `the checkout changed while the gate was running and the new target could not be captured: ${error instanceof Error ? error.message : String(error)}`;
+  }
+
+  let reportArtifact: ReviewGateRunRecord['reportArtifact'];
+  try {
+    reportArtifact = persistReviewArtifact({
+      root: reviewArtifactRoot(commonDir, config),
+      runId,
+      gateRecordId: base.id,
+      report,
+      diagnostics: protocolError ? `${diagnostics}\nProtocol error: ${protocolError}` : diagnostics,
+    });
+    if (targetInvalidation) reportArtifact = { ...reportArtifact, diagnosticOnly: true };
+  } catch (error) {
+    return finishGate({ ...base, command: auditedCommand }, startMs, {
+      status: 'failed',
+      summary: `review artifact persistence failed; no review result was signed: ${error instanceof Error ? error.message : String(error)}`,
+      exitCode,
+      capability: capability.evidence,
+      stdoutTail,
+      stderrTail,
+    });
+  }
+  if (targetInvalidation) {
+    return finishGate({ ...base, command: auditedCommand }, startMs, {
+      status: 'failed',
+      summary: `${targetInvalidation}. The report is diagnostics only; stabilize the writer, legitimately ignore generated churn, rerun review, or use /pipelane review override --gate ${gate.id} --scope /pr --reason "<why this exact target and action may proceed>".`,
+      exitCode,
+      capability: capability.evidence,
+      reportArtifact,
+      stdoutTail: tail(report),
+      stderrTail,
+      errorCode: 'EREVIEWTARGETCHANGED',
+    });
+  }
+  if (!parsed) {
+    const failureKind = executionFailed ? 'execution' : 'protocol';
+    return finishGate({ ...base, command: auditedCommand }, startMs, {
+      status: 'failed',
+      summary: `strict review ${failureKind} failed: ${protocolError || 'no valid result'}. Repair or select a compliant adapter, rerun review, or use the exact-scope bypass.`,
+      exitCode,
+      capability: capability.evidence,
+      reportArtifact,
+      stdoutTail,
+      stderrTail,
+      errorCode: executionFailed ? 'EREVIEWEXECUTION' : 'EREVIEWPROTOCOL',
+    });
+  }
+  return finishGate({ ...base, command: auditedCommand }, startMs, {
+    status: parsed.status,
+    summary: parsed.result.findingsKnown === false
+      ? `degraded legacy protocol v0 ${parsed.status}; findings unknown, so this is not a zero-findings or clean claim`
+      : parsed.status === 'passed'
+        ? `strict review completed: ${parsed.result.blockingCount} blocking and ${parsed.result.advisoryCount} advisory findings`
+        : `strict review found ${parsed.result.blockingCount} blocking and ${parsed.result.advisoryCount} advisory findings`,
+    exitCode,
+    attester: resolveReviewActorIdentity({ provider, env }),
+    capability: capability.evidence,
+    result: parsed.result,
+    findings: parsed.findings,
+    reportArtifact,
+    stdoutTail: tail(report),
+    stderrTail,
+  });
+}
+
+function trustedMachineSkillRoots(): TrustedSkillRoot[] {
+  return [
+    { kind: 'codex-user', root: path.join(codexHomePath(), 'skills') },
+    { kind: 'claude-user', root: path.join(claudeHomePath(), 'skills') },
+    { kind: 'agents-user', root: path.join(os.homedir(), '.agents', 'skills') },
+    { kind: 'gstack-machine', root: path.join(os.homedir(), '.gstack', 'repos', 'gstack', '.agents', 'skills') },
+    ...claudeTrustedPluginSkillRoots(claudeHomePath()),
+  ];
+}
+
+function claudeTrustedPluginSkillRoots(claudeHome: string): TrustedSkillRoot[] {
+  const versionRoot = path.join(claudeHome, 'plugins', 'cache', 'karpathy-skills', 'karpathy');
+  if (!existsSync(versionRoot)) return [];
+  try {
+    return readdirSync(versionRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
+      .map((entry) => ({ kind: 'claude-plugin-cache', root: path.join(versionRoot, entry.name, 'skills') }));
+  } catch {
+    return [];
+  }
+}
+
+interface StrictProviderCompletion {
+  result: { status: number | null; signal: NodeJS.Signals | null; error?: NodeJS.ErrnoException };
+  nativeOutput: string;
+  nativeOutputBytes: Buffer;
+  providerChatter: string;
+  stderr: string;
+}
+
+function spawnStrictProviderCompletion(
+  resolved: AiReviewGateCommandResolution,
+  options: { cwd: string; timeout: number; env: NodeJS.ProcessEnv; input: string },
+): StrictProviderCompletion {
+  if (!resolved.nativeDefault) {
+    const completion = spawnReviewGateCommand(resolved.command, options);
+    return {
+      result: completion.result,
+      nativeOutput: completion.stdout,
+      nativeOutputBytes: completion.stdoutBytes,
+      providerChatter: '',
+      stderr: completion.stderr,
+    };
+  }
+  const tempRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-review-adapter-'));
+  try {
+    const schemaPath = path.join(tempRoot, 'schema.json');
+    const resultPath = path.join(tempRoot, 'result.json');
+    writeFileSync(schemaPath, `${JSON.stringify(providerNativeJsonSchema())}\n`, { encoding: 'utf8', mode: 0o600 });
+    const command = resolved.provider === 'codex'
+      ? `codex exec --sandbox read-only --ephemeral --color never --output-schema ${shellQuote(schemaPath)} --output-last-message ${shellQuote(resultPath)} -`
+      : `claude --print --permission-mode dontAsk --no-session-persistence --output-format json --json-schema ${shellQuote(JSON.stringify(providerNativeJsonSchema()))}`;
+    const completion = spawnReviewGateCommand(command, options);
+    const nativeOutputBytes = resolved.provider === 'codex' && existsSync(resultPath)
+      ? readFileSync(resultPath)
+      : completion.stdoutBytes;
+    const nativeOutput = nativeOutputBytes.toString('utf8');
+    return {
+      result: completion.result,
+      nativeOutput,
+      nativeOutputBytes,
+      providerChatter: resolved.provider === 'codex' ? completion.stdout : '',
+      stderr: completion.stderr,
+    };
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
+}
+
 function aiReviewPromptGate(gate: ReviewGateConfig, promptCommand: string | null | undefined): ReviewGateConfig {
   if (promptCommand === undefined) return gate;
   return {
@@ -3683,13 +4374,13 @@ function defaultAiReviewGateCommandResolution(gate: ReviewGateConfig): AiReviewG
   const adversarialResolution = defaultAdversarialReviewGateCommandResolution(gate);
   if (adversarialResolution !== undefined) return adversarialResolution;
   if (gate.type === 'agent' && isExecutableOnPath('claude')) {
-    return { command: defaultClaudeReviewCommand(), provider: 'claude' };
+    return { command: defaultClaudeReviewCommand(), provider: 'claude', nativeDefault: true };
   }
   if (isExecutableOnPath('codex')) {
-    return { command: defaultCodexReviewCommand(), provider: 'codex' };
+    return { command: defaultCodexReviewCommand(), provider: 'codex', nativeDefault: true };
   }
   if (isExecutableOnPath('claude')) {
-    return { command: defaultClaudeReviewCommand(), provider: 'claude' };
+    return { command: defaultClaudeReviewCommand(), provider: 'claude', nativeDefault: true };
   }
   return null;
 }
@@ -3710,16 +4401,16 @@ function defaultAdversarialReviewGateCommandResolution(gate: ReviewGateConfig): 
   const hasClaudeCommand = commandProviders.has('claude');
 
   if (hasCodexCommand && codexCommand && isCodexClaudeReviewBridgeInstalled(codexHomePath())) {
-    return { command: codexCommand, provider: 'codex', promptCommand: '/claude-review' };
+    return { command: codexCommand, provider: 'codex', promptCommand: '/claude-review', nativeDefault: true };
   }
   if (hasClaudeCommand && claudeCommand && isClaudeGstackCodexReviewInstalled(claudeHomePath())) {
-    return { command: claudeCommand, provider: 'claude', promptCommand: '/codex review' };
+    return { command: claudeCommand, provider: 'claude', promptCommand: '/codex review', nativeDefault: true };
   }
   if (hasCodexCommand && codexCommand) {
-    return { command: codexCommand, provider: 'codex', promptCommand: null };
+    return { command: codexCommand, provider: 'codex', promptCommand: null, nativeDefault: true };
   }
   if (hasClaudeCommand && claudeCommand) {
-    return { command: claudeCommand, provider: 'claude', promptCommand: null };
+    return { command: claudeCommand, provider: 'claude', promptCommand: null, nativeDefault: true };
   }
   return null;
 }
@@ -4238,7 +4929,7 @@ function redactReviewOutput(value: string): string {
     });
 }
 
-function renderReviewRunReport(record: ReviewRunRecord, evidencePath: string): string {
+function renderReviewRunReport(record: ReviewRunRecord, evidencePath: string, artifactRoot?: string): string {
   const lines = [
     'Pipelane review',
     `Status: ${record.status}`,
@@ -4262,7 +4953,7 @@ function renderReviewRunReport(record: ReviewRunRecord, evidencePath: string): s
   }
 
   const failedGateDetails = record.gates
-    .map((gate) => ({ gate, output: visibleReviewGateFailureOutput(gate) }))
+    .map((gate) => ({ gate, output: visibleReviewGateFailureOutput(gate, artifactRoot) }))
     .filter((entry) => entry.output.length > 0);
   if (failedGateDetails.length > 0) {
     lines.push('', 'Failed gate details:');
@@ -4282,13 +4973,21 @@ function renderReviewRunReport(record: ReviewRunRecord, evidencePath: string): s
 
   const configChangePending = pending.some((gate) => gate.gateId === REVIEW_CONFIG_CHANGE_GATE_ID);
   if (record.status === 'failed') {
-    lines.push('', 'Next: fix failed blocking gates, then rerun /pipelane review.');
+    lines.push('', 'Recommended: repair failed blocking gates, then rerun /pipelane review.');
   } else if (configChangePending) {
-    lines.push('', `Next: inspect the review config diff, then record approval with /pipelane review pass --gate ${REVIEW_CONFIG_CHANGE_GATE_ID} --message "<what changed and why it is trusted>".`);
+    lines.push('', `Recommended: inspect the review config diff, then record approval with /pipelane review pass --gate ${REVIEW_CONFIG_CHANGE_GATE_ID} --message "<what changed and why it is trusted>".`);
   } else if (record.status === 'pending') {
-    lines.push('', 'Next: complete pending AI/manual gates, then rerun or attach their evidence before PR enforcement.');
+    lines.push('', 'Recommended: complete pending AI/manual gates, then rerun or attach their evidence before PR enforcement.');
   } else {
     lines.push('', 'Next: continue to /pr when ready.');
+  }
+
+  const bypassable = record.gates.filter((gate) => gate.blocking && (gate.status === 'failed' || gate.status === 'pending'));
+  if (bypassable.length > 0) {
+    lines.push('', 'Proceed anyway only with exact-scope informed consent (the gate remains failed or pending):');
+    for (const gate of bypassable) {
+      lines.push(`- /pipelane review override --gate ${gate.gateId} --scope /pr --reason "<why this exact target and action may proceed>"`);
+    }
   }
 
   return lines.join('\n');
@@ -4364,6 +5063,7 @@ function renderReviewSetupReport(
   }
 
   lines.push('', 'Plan review gates:');
+  lines.push(`Enforcement: ${report.effective.enforcementMode} (policy ${report.effective.policyVersion})`);
   lines.push(...formatPlanGates(report.effective.planReview.gates));
 
   lines.push('', 'Review gates:');
@@ -4402,6 +5102,8 @@ function renderReviewSetupReport(
       '',
       'Effective reviewGates:',
       JSON.stringify({
+        enforcementMode: report.effective.enforcementMode,
+        policyVersion: report.effective.policyVersion,
         planReview: report.effective.planReview,
         gates: report.effective.gates,
       }, null, 2),

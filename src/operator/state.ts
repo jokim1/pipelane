@@ -497,7 +497,13 @@ export interface ReviewGateRunRecord {
   command?: string;
   skill?: string;
   role?: string;
+  when?: string;
+  whenChanged?: string[];
+  timeoutMs?: number;
   userCommands?: string[];
+  profiles?: ReviewProfile[];
+  baselineCommandId?: string;
+  replacesBaselineCommandId?: string;
   summary: string;
   exitCode?: number | null;
   signal?: string | null;
@@ -541,6 +547,8 @@ export interface ReviewRunRecord {
   worktreeMaterialTreeWarnings?: string[];
   authorIdentity?: ReviewActorIdentity | null;
   reviewer?: ReviewActorIdentity;
+  enforcementMode?: ReviewEnforcementMode;
+  policyVersion?: number;
   taskBindingId?: string;
   intent?: ReviewIntent;
   target?: ReviewTargetManifest;
@@ -737,6 +745,8 @@ export interface OperatorFlags {
   sha: string;
   pr: string;
   task: string;
+  brief: string;
+  briefFile: string;
   branch: string;
   file: string;
   title: string;
@@ -770,6 +780,8 @@ export interface OperatorFlags {
   reviewDryRun: boolean;
   reviewGate: string;
   reviewPhase: string;
+  reviewIntent: string;
+  reviewEnforcementMode: string;
   goalSliceId: string;
   goalOutcome: string;
   goalPlanFile: string;
@@ -1436,10 +1448,15 @@ export function normalizeReviewGatesConfig(
   const enforcementMode: ReviewEnforcementMode = raw.enforcementMode === 'strict-v3'
     ? 'strict-v3'
     : 'legacy-v2';
+  const legacyPolicyVersion = raw.enforcementMode === 'legacy-v2'
+    ? 2
+    : typeof raw.policyVersion === 'number' && Number.isFinite(raw.policyVersion)
+      ? Math.trunc(raw.policyVersion)
+      : 2;
 
   return {
     enforcementMode,
-    policyVersion: enforcementMode === 'strict-v3' ? 3 : 2,
+    policyVersion: enforcementMode === 'strict-v3' ? 3 : legacyPolicyVersion,
     planReview: {
       gates: planGates ?? [],
     },
@@ -2653,16 +2670,25 @@ export function reviewAcceptanceReasonHash(reason: string): string {
   return crypto.createHash('sha256').update(reason.trim()).digest('hex');
 }
 
-export function appendReviewRunRecord(commonDir: string, config: WorkflowConfig, record: ReviewRunRecord): ReviewRunRecord {
+export function appendReviewRunRecord(
+  commonDir: string,
+  config: WorkflowConfig,
+  record: ReviewRunRecord,
+  dependencies: {
+    resolveSigningKey?: () => string | undefined;
+    signRecord?: (record: ReviewRunRecord, key: string) => string;
+    saveLedger?: (commonDir: string, config: WorkflowConfig, state: ReviewState) => void;
+  } = {},
+): ReviewRunRecord {
   const lock = acquireReviewStateLock(commonDir, config);
   try {
     const state = loadReviewState(commonDir, config);
-    const stateKey = resolveReviewStateKey();
+    const stateKey = (dependencies.resolveSigningKey ?? resolveReviewStateKey)();
     const persisted = stateKey
-      ? { ...record, signature: signSignedPayload(record, stateKey) }
+      ? { ...record, signature: (dependencies.signRecord ?? signSignedPayload)(record, stateKey) }
       : record;
     state.records = [persisted, ...state.records].slice(0, REVIEW_STATE_MAX_RECORDS);
-    saveReviewState(commonDir, config, state);
+    (dependencies.saveLedger ?? saveReviewState)(commonDir, config, state);
     return persisted;
   } finally {
     lock.release();
@@ -2906,6 +2932,8 @@ function isReviewRunRecord(value: unknown): value is ReviewRunRecord {
     && (raw.worktreeMaterialTreeReliable === undefined || typeof raw.worktreeMaterialTreeReliable === 'boolean')
     && (raw.authorIdentity === undefined || raw.authorIdentity === null || isReviewActorIdentity(raw.authorIdentity))
     && (raw.reviewer === undefined || isReviewActorIdentity(raw.reviewer))
+    && (raw.enforcementMode === undefined || raw.enforcementMode === 'legacy-v2' || raw.enforcementMode === 'strict-v3')
+    && (raw.policyVersion === undefined || (typeof raw.policyVersion === 'number' && Number.isSafeInteger(raw.policyVersion)))
     && (raw.taskBindingId === undefined || typeof raw.taskBindingId === 'string')
     && (raw.intent === undefined || isReviewIntent(raw.intent))
     && (raw.target === undefined || isReviewTargetManifest(raw.target))
@@ -3015,6 +3043,9 @@ function isReviewGateRunRecord(value: unknown): value is ReviewGateRunRecord {
     && (raw.command === undefined || typeof raw.command === 'string')
     && (raw.skill === undefined || typeof raw.skill === 'string')
     && (raw.role === undefined || typeof raw.role === 'string')
+    && (raw.when === undefined || typeof raw.when === 'string')
+    && (raw.whenChanged === undefined || (Array.isArray(raw.whenChanged) && raw.whenChanged.every((entry) => typeof entry === 'string')))
+    && (raw.timeoutMs === undefined || (typeof raw.timeoutMs === 'number' && Number.isFinite(raw.timeoutMs) && raw.timeoutMs >= 0))
     && (
       raw.userCommands === undefined
       || (
@@ -3022,6 +3053,9 @@ function isReviewGateRunRecord(value: unknown): value is ReviewGateRunRecord {
         && raw.userCommands.every((entry) => typeof entry === 'string')
       )
     )
+    && (raw.profiles === undefined || (Array.isArray(raw.profiles) && raw.profiles.every((entry) => entry === 'docs-only' || entry === 'implementation')))
+    && (raw.baselineCommandId === undefined || typeof raw.baselineCommandId === 'string')
+    && (raw.replacesBaselineCommandId === undefined || typeof raw.replacesBaselineCommandId === 'string')
     && typeof raw.summary === 'string'
     && (raw.exitCode === undefined || raw.exitCode === null || typeof raw.exitCode === 'number')
     && (raw.signal === undefined || raw.signal === null || typeof raw.signal === 'string')
@@ -3411,6 +3445,8 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     sha: '',
     pr: '',
     task: '',
+    brief: '',
+    briefFile: '',
     branch: '',
     file: '',
     title: '',
@@ -3438,6 +3474,8 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     reviewDryRun: false,
     reviewGate: '',
     reviewPhase: '',
+    reviewIntent: '',
+    reviewEnforcementMode: '',
     goalSliceId: '',
     goalOutcome: '',
     goalPlanFile: '',
@@ -3639,6 +3677,14 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       flags.task = readFlagValue('--task');
       continue;
     }
+    if (flagName === '--brief') {
+      flags.brief = readFlagValue('--brief');
+      continue;
+    }
+    if (flagName === '--brief-file') {
+      flags.briefFile = readFlagValue('--brief-file');
+      continue;
+    }
     if (flagName === '--one-more-loop') {
       rejectInlineValue('--one-more-loop');
       flags.oneMoreLoop = true;
@@ -3821,6 +3867,14 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       flags.reviewPhase = readFlagValue('--phase').trim();
       continue;
     }
+    if (flagName === '--intent') {
+      flags.reviewIntent = readFlagValue('--intent');
+      continue;
+    }
+    if (flagName === '--enforcement-mode') {
+      flags.reviewEnforcementMode = readFlagValue('--enforcement-mode').trim();
+      continue;
+    }
     if (flagName === '--slice-id') {
       flags.goalSliceId = readFlagValue('--slice-id').trim();
       continue;
@@ -4001,15 +4055,17 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       return;
     }
     case 'new':
-      assertOnlyFlags(parsed, ['task', 'surfaces', 'offline', 'unnamed', 'force']);
-      requireNoPositional('pipelane run new (--task <task-name> | --unnamed) [--surfaces <csv>] [--offline] [--force]');
+      assertOnlyFlags(parsed, ['task', 'brief', 'briefFile', 'surfaces', 'offline', 'unnamed', 'force']);
+      requireNoPositional('pipelane run new (--task <task-name> | --unnamed) [--brief <objective> | --brief-file <json>] [--surfaces <csv>] [--offline] [--force]');
       if (parsed.flags.task.trim() && parsed.flags.unnamed) {
         throw new Error('new cannot combine --task and --unnamed; provide a task name or explicitly request a generated slug.');
       }
+      if (parsed.flags.brief.trim() && parsed.flags.briefFile.trim()) throw new Error('new cannot combine --brief and --brief-file.');
       return;
     case 'adopt':
-      assertOnlyFlags(parsed, ['task', 'branch', 'surfaces', 'force']);
-      requireNoPositional('pipelane run adopt [--task <task-name>] [--branch <branch>] [--surfaces <csv>] [--force]');
+      assertOnlyFlags(parsed, ['task', 'brief', 'briefFile', 'branch', 'surfaces', 'force']);
+      requireNoPositional('pipelane run adopt [--task <task-name>] [--brief <objective> | --brief-file <json>] [--branch <branch>] [--surfaces <csv>] [--force]');
+      if (parsed.flags.brief.trim() && parsed.flags.briefFile.trim()) throw new Error('adopt cannot combine --brief and --brief-file.');
       return;
     case 'resume':
       assertOnlyFlags(parsed, ['task', 'oneMoreLoop', 'moreLoops', 'moreMinutes', 'untilReviewPasses', 'maxMoreLoops', 'maxMoreMinutes', 'acceptFindings', 'reason', 'scope']);
@@ -4117,9 +4173,12 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
     case 'review': {
       const subcommand = parsed.positional[0] ?? '';
       if (subcommand === 'setup') {
-        assertOnlyFlags(parsed, ['reviewPrint', 'reviewListGates', 'reviewEnable', 'reviewDisable', 'reviewInstall', 'reviewToggle', 'reviewReset', 'yes']);
+        assertOnlyFlags(parsed, ['reviewPrint', 'reviewListGates', 'reviewEnable', 'reviewDisable', 'reviewInstall', 'reviewToggle', 'reviewReset', 'reviewEnforcementMode', 'yes']);
         if (parsed.positional.length !== 1) {
           throw new Error('review setup requires exactly: pipelane run review setup [gate[,gate...]...] [--yes] [--reset] [--print] [--list-gates] [--toggle <gate[,gate...]>] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]');
+        }
+        if (parsed.flags.reviewEnforcementMode && parsed.flags.reviewEnforcementMode !== 'legacy-v2' && parsed.flags.reviewEnforcementMode !== 'strict-v3') {
+          throw new Error('--enforcement-mode must be legacy-v2 or strict-v3.');
         }
         return;
       }
@@ -4145,13 +4204,21 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         if (!parsed.flags.reason.trim()) throw new Error('review override requires --reason <informed-consent-reason>.');
         return;
       }
-      assertOnlyFlags(parsed, ['reviewDryRun', 'reviewGate', 'reviewPhase']);
+      if (subcommand === 'gc') {
+        assertOnlyFlags(parsed, []);
+        if (parsed.positional.length !== 1) throw new Error('review gc accepts no additional arguments.');
+        return;
+      }
+      assertOnlyFlags(parsed, ['reviewDryRun', 'reviewGate', 'reviewPhase', 'reviewIntent']);
       if (parsed.positional.length > 0) {
         throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review pass --gate <id> --message <text>, pipelane run review override --gate <id> --reason <text> [--scope <action>], or pipelane run review setup [gate[,gate...]...] [--yes] [--reset] [--print] [--list-gates] [--toggle <gate[,gate...]>] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]');
       }
       const phase = parsed.flags.reviewPhase.trim();
       if (phase && !includesString(REVIEW_GATE_PHASES, phase)) {
         throw new Error(`--phase must be one of: ${REVIEW_GATE_PHASES.join(', ')}.`);
+      }
+      if (parsed.flags.reviewEnforcementMode && parsed.flags.reviewEnforcementMode !== 'legacy-v2' && parsed.flags.reviewEnforcementMode !== 'strict-v3') {
+        throw new Error('--enforcement-mode must be legacy-v2 or strict-v3.');
       }
       return;
     }
@@ -4631,6 +4698,8 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'sha', label: '--sha', active: (flags) => flags.sha.trim().length > 0 },
   { key: 'pr', label: '--pr', active: (flags) => flags.pr.trim().length > 0 },
   { key: 'task', label: '--task', active: (flags) => flags.task.trim().length > 0 },
+  { key: 'brief', label: '--brief', active: (flags) => flags.brief.trim().length > 0 },
+  { key: 'briefFile', label: '--brief-file', active: (flags) => flags.briefFile.trim().length > 0 },
   { key: 'oneMoreLoop', label: '--one-more-loop', active: (flags) => flags.oneMoreLoop },
   { key: 'moreLoops', label: '--more-loops', active: (flags) => flags.moreLoops.trim().length > 0 },
   { key: 'moreMinutes', label: '--more-minutes', active: (flags) => flags.moreMinutes.trim().length > 0 },
@@ -4646,6 +4715,8 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'bindingFingerprint', label: '--binding-fingerprint', active: (flags) => flags.bindingFingerprint.trim().length > 0 },
   { key: 'mode', label: '--mode', active: (flags) => flags.mode.trim().length > 0 },
   { key: 'scope', label: '--scope', active: (flags) => flags.scope.trim().length > 0 },
+  { key: 'reviewIntent', label: '--intent', active: (flags) => flags.reviewIntent.trim().length > 0 },
+  { key: 'reviewEnforcementMode', label: '--enforcement-mode', active: (flags) => flags.reviewEnforcementMode.trim().length > 0 },
   { key: 'surfaces', label: '--surfaces', active: (flags) => flags.surfaces.length > 0 },
   { key: 'execute', label: '--execute', active: (flags) => flags.execute },
   { key: 'confirmToken', label: '--confirm-token', active: (flags) => flags.confirmToken.trim().length > 0 },

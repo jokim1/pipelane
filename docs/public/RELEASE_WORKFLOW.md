@@ -162,6 +162,17 @@ Recommended review order before merge:
 For manual review gates, run the referenced skill, fix any findings, then
 record the clean gate with Pipelane, for example
 `pipelane run review pass --gate gstack-review --message "Ran /review clean"`.
+Strict Karpathy gates are different: a generic manual pass cannot substitute
+for the named skill contract. Restore the trusted skill and native adapter and
+rerun the gate, or record an informed exact-scope bypass with
+`pipelane run review override --gate <id> --scope /pr --reason "<why this exact target and action may proceed>"`.
+
+`reviewGates.enforcementMode` can be `legacy-v2` or `strict-v3`. Strict review
+requires an authoritative task objective (`/new --brief`, `/adopt --brief`, an
+approved orchestration slice outcome, or `/review --intent`), captures an
+immutable machine-local Git target, and records the exact supplied capability,
+adapter, structured findings, and result protocol. A bypass never changes a
+failed or pending gate to passed.
 
 The static gates should run before AI review. Do not spend review-model tokens
 on issues ESLint, TypeScript, tests, or the build can reject deterministically.

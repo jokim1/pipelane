@@ -290,6 +290,9 @@ export interface SnapshotData {
   };
   review: {
     schemaVersion: 2;
+    enforcementMode: 'legacy-v2' | 'strict-v3';
+    policyVersion: number;
+    blockingGateIds: string[];
     current: ReviewRunRecord | null;
     recent: ReviewRunRecord | null;
     /** @deprecated Use current. Removed in 0.3.0. */
@@ -541,6 +544,9 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
       },
       review: {
         schemaVersion: 2,
+        enforcementMode: context.config.reviewGates?.enforcementMode ?? 'legacy-v2',
+        policyVersion: context.config.reviewGates?.policyVersion ?? 2,
+        blockingGateIds: (context.config.reviewGates?.gates ?? []).filter((gate) => gate.blocking !== false).map((gate) => gate.id),
         current: currentReview,
         recent: recentReview,
         latest: currentReview,
