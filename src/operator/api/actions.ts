@@ -33,6 +33,8 @@ import {
   findLastGoodDeploy,
   inferActiveTaskLock,
   resolveCommandSurfaces,
+  resolveModeSurfaces,
+  resolveModeTaskLock,
 } from '../commands/helpers.ts';
 import {
   diagnoseTaskBinding,
@@ -354,6 +356,18 @@ function evaluatePreflightGate(context: WorkflowContext, actionId: StableActionI
       };
     }
   }
+  let modeTaskLock: ReturnType<typeof resolveModeTaskLock> = null;
+  if (actionId === 'devmode.build' || actionId === 'devmode.release') {
+    const task = typeof inputs.task === 'string' ? inputs.task : '';
+    try {
+      modeTaskLock = resolveModeTaskLock(context, task);
+    } catch (error) {
+      return {
+        allowed: false,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
   if (actionId === 'devmode.release') {
     const override = inputs.override === true;
     const reason = typeof inputs.reason === 'string' ? inputs.reason.trim() : '';
@@ -368,7 +382,7 @@ function evaluatePreflightGate(context: WorkflowContext, actionId: StableActionI
     const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
     const deployState = loadDeployState(context.commonDir, context.config);
     const probeState = loadProbeState(context.commonDir, context.config);
-    const requestedSurfaces = resolveCommandSurfaces(context, surfaces);
+    const requestedSurfaces = resolveModeSurfaces(context, surfaces, modeTaskLock);
     const readiness = evaluateReleaseReadiness({
       config: context.config,
       deployConfig,

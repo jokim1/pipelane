@@ -7,15 +7,12 @@ import {
 } from '../release-gate.ts';
 import {
   formatWorkflowCommand,
-  loadAllTaskLocks,
   loadDeployState,
   loadProbeState,
-  loadTaskLock,
   normalizeExistingPath,
   nowIso,
   printResult,
   saveModeState,
-  slugifyTaskName,
   updateTaskLock,
   type Mode,
   type ModeState,
@@ -24,7 +21,7 @@ import {
   type WorkflowContext,
 } from '../state.ts';
 import { resolveWorkflowContext } from '../state.ts';
-import { resolveCommandSurfaces, sanitizeForTerminal } from './helpers.ts';
+import { resolveModeSurfaces, resolveModeTaskLock, sanitizeForTerminal } from './helpers.ts';
 import { executeProbeWithStateLock, type ProbeOutcome } from './doctor.ts';
 
 export async function handleDevmode(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
@@ -178,38 +175,6 @@ export async function handleDevmode(cwd: string, parsed: ParsedOperatorArgs): Pr
   }
 
   throw new Error(`Unknown devmode action "${action}".`);
-}
-
-function resolveModeTaskLock(context: WorkflowContext, explicitTask: string): TaskLock | null {
-  if (explicitTask.trim()) {
-    const taskSlug = slugifyTaskName(explicitTask);
-    const lock = loadTaskLock(context.commonDir, context.config, taskSlug);
-    if (!lock) throw new Error(`No task lock found for ${taskSlug}.`);
-    return lock;
-  }
-
-  const repoPath = normalizeExistingPath(context.repoRoot);
-  const matches = loadAllTaskLocks(context.commonDir, context.config)
-    .filter((lock) => normalizeExistingPath(lock.worktreePath) === repoPath);
-  if (matches.length > 1) {
-    throw new Error(`Multiple task locks claim worktree ${context.repoRoot}. Pass --task explicitly after repairing the duplicate locks.`);
-  }
-  return matches[0] ?? null;
-}
-
-function resolveModeSurfaces(
-  context: WorkflowContext,
-  explicitSurfaces: string[],
-  taskLock: TaskLock | null,
-): string[] {
-  const selected = resolveCommandSurfaces(context, explicitSurfaces, taskLock?.surfaces ?? []);
-  if (!taskLock) return selected;
-
-  // A task-scoped mode transition must prove readiness for every surface the
-  // durable task lock still claims. Explicit/global selections may widen that
-  // set, but they cannot silently substitute a disjoint surface set.
-  const required = new Set([...selected, ...taskLock.surfaces]);
-  return context.config.surfaces.filter((surface) => required.has(surface));
 }
 
 function persistModeAndTaskLock(

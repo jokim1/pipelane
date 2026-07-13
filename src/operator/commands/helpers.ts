@@ -59,6 +59,38 @@ export function resolveCommandSurfaces(
   return [...context.config.surfaces];
 }
 
+export function resolveModeTaskLock(context: WorkflowContext, explicitTask = ''): TaskLock | null {
+  if (explicitTask.trim()) {
+    const taskSlug = slugifyTaskName(explicitTask);
+    const lock = loadTaskLock(context.commonDir, context.config, taskSlug);
+    if (!lock) throw new Error(`No task lock found for ${taskSlug}.`);
+    return lock;
+  }
+
+  const repoPath = normalizeExistingPath(context.repoRoot);
+  const matches = loadAllTaskLocks(context.commonDir, context.config)
+    .filter((lock) => normalizeExistingPath(lock.worktreePath) === repoPath);
+  if (matches.length > 1) {
+    throw new Error(`Multiple task locks claim worktree ${context.repoRoot}. Pass --task explicitly after repairing the duplicate locks.`);
+  }
+  return matches[0] ?? null;
+}
+
+export function resolveModeSurfaces(
+  context: WorkflowContext,
+  explicitSurfaces: string[],
+  taskLock: TaskLock | null,
+): string[] {
+  const selected = resolveCommandSurfaces(context, explicitSurfaces, taskLock?.surfaces ?? []);
+  if (!taskLock) return selected;
+
+  // A task-scoped mode transition must prove readiness for every surface the
+  // durable task lock still claims. Explicit/global selections may widen that
+  // set, but they cannot silently substitute a disjoint surface set.
+  const required = new Set([...selected, ...taskLock.surfaces]);
+  return context.config.surfaces.filter((surface) => required.has(surface));
+}
+
 export function inferActiveTaskLock(context: WorkflowContext, explicitTask = ''): { taskSlug: string; lock: TaskLock } {
   if (explicitTask.trim()) {
     const taskSlug = slugifyTaskName(explicitTask);

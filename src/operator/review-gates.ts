@@ -18,6 +18,7 @@ export interface ReviewGateCatalogEntry {
   kind: ReviewGateCatalogKind;
   phase: ReviewGatePhase | 'plan';
   type: ReviewGateType;
+  blocking?: boolean;
   recommended?: boolean;
   command?: string;
   scriptNames?: string[];

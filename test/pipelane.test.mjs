@@ -109,6 +109,10 @@ const HERMETIC_DESTINATION_ROUTE_ENV_KEYS = [
   'PIPELANE_DESTINATION_APPROVED_TARGET_SHA',
 ];
 
+const HERMETIC_REVIEW_CONTROL_ENV_KEYS = [
+  'PIPELANE_REVIEW_GATE_TIMEOUT_MS',
+];
+
 function buildCliChildEnv(env = {}) {
   const childEnv = { ...process.env, CODEX_HOME: DEFAULT_CODEX_HOME, PIPELANE_HOME: DEFAULT_PIPELANE_HOME, CLAUDE_HOME: DEFAULT_CLAUDE_HOME, ...env };
   if ('PIPELANE_ORCHESTRATION_STATE_KEY' in env) {
@@ -131,6 +135,11 @@ function buildCliChildEnv(env = {}) {
   for (const identityKey of HERMETIC_REVIEW_IDENTITY_ENV_KEYS) {
     if (!(identityKey in env)) delete childEnv[identityKey];
   }
+  // A self-hosted review may override its own gate timeout. That outer control
+  // value must not replace the deliberately tiny timeouts used by fixture CLIs.
+  for (const controlKey of HERMETIC_REVIEW_CONTROL_ENV_KEYS) {
+    if (!(controlKey in env)) delete childEnv[controlKey];
+  }
   // Destination routes execute child commands with internal routing flags. If a
   // route child runs this test suite, nested test CLI calls must not inherit
   // those flags unless the individual test opts into that route-internal mode.
@@ -148,6 +157,7 @@ test('buildCliChildEnv scrubs inherited review-gate context unless explicitly su
     'PIPELANE_REVIEW_GATE_ID',
     'PIPELANE_REVIEW_GATE_RUN_ID',
     'PIPELANE_UNSAFE_ALLOW_NESTED_REVIEW_GATES',
+    'PIPELANE_REVIEW_GATE_TIMEOUT_MS',
   ];
   const previous = new Map(keys.map((key) => [key, process.env[key]]));
   try {
@@ -164,6 +174,7 @@ test('buildCliChildEnv scrubs inherited review-gate context unless explicitly su
       PIPELANE_REVIEW_GATE_ID: 'typecheck',
       PIPELANE_REVIEW_GATE_RUN_ID: 'review-explicit',
       PIPELANE_UNSAFE_ALLOW_NESTED_REVIEW_GATES: '1',
+      PIPELANE_REVIEW_GATE_TIMEOUT_MS: '1234',
     });
     assert.equal(explicit.PIPELANE_REVIEW_GATE_DEPTH, '2');
     assert.equal(explicit.PIPELANE_REVIEW_GATE_PARENT_PID, '123');
@@ -171,6 +182,7 @@ test('buildCliChildEnv scrubs inherited review-gate context unless explicitly su
     assert.equal(explicit.PIPELANE_REVIEW_GATE_ID, 'typecheck');
     assert.equal(explicit.PIPELANE_REVIEW_GATE_RUN_ID, 'review-explicit');
     assert.equal(explicit.PIPELANE_UNSAFE_ALLOW_NESTED_REVIEW_GATES, '1');
+    assert.equal(explicit.PIPELANE_REVIEW_GATE_TIMEOUT_MS, '1234');
   } finally {
     for (const [key, value] of previous) {
       if (value === undefined) delete process.env[key];
@@ -4963,6 +4975,36 @@ test('review setup targeted enable preserves an explicit empty gate list', () =>
     const raw = JSON.parse(readFileSync(configPath, 'utf8'));
 
     assert.deepEqual(raw.reviewGates.gates.map((gate) => gate.id), ['human-merge-approval']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('review setup re-enabling a saved gate preserves its timeout and blocking policy', () => {
+  const repoRoot = createRepo();
+  try {
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{
+        id: 'test',
+        phase: 'behavioral',
+        type: 'command',
+        command: 'npm run test:focused',
+        blocking: false,
+        timeoutMs: 123456,
+      }],
+    };
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    runCli(['run', 'review', 'setup', '--enable', 'test', '--json'], repoRoot);
+    const saved = JSON.parse(readFileSync(configPath, 'utf8')).reviewGates.gates
+      .find((gate) => gate.id === 'test');
+
+    assert.equal(saved.command, 'npm run test:focused');
+    assert.equal(saved.blocking, false);
+    assert.equal(saved.timeoutMs, 123456);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -28062,6 +28104,28 @@ test('api action execute: devmode actions switch the repo mode', () => {
   }
 });
 
+test('api devmode preflight resolves the same task binding as execution', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    for (const actionId of ['devmode.build', 'devmode.release']) {
+      const result = runCli([
+        'run', 'api', 'action', actionId, '--task', 'missing-task', '--json',
+      ], repoRoot, {}, true);
+      assert.equal(result.status, 1);
+      const envelope = JSON.parse(result.stdout);
+      assert.equal(envelope.ok, false);
+      assert.equal(envelope.data.preflight.allowed, false);
+      assert.match(envelope.message, /No task lock found for missing-task/);
+    }
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('api action execute: devmode release without override returns needs-input preflight', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
@@ -29148,6 +29212,12 @@ test('task-scoped devmode readiness covers persisted surfaces and rejects concur
       'run', 'new', '--task', 'SQL Readiness', '--surfaces', 'sql', '--json',
     ], repoRoot).stdout);
     await writeStagingSucceededRecord(repoRoot, ['frontend']);
+    const apiDisjoint = runCli([
+      'run', 'api', 'action', 'devmode.release', '--task', 'SQL Readiness',
+      '--surfaces', 'frontend', '--json',
+    ], sqlTask.worktreePath, {}, true);
+    assert.equal(apiDisjoint.status, 1);
+    assert.match(JSON.parse(apiDisjoint.stdout).message, /sql/);
     const disjoint = runCli([
       'run', 'devmode', 'release', '--task', 'SQL Readiness',
       '--surfaces', 'frontend', '--json',
