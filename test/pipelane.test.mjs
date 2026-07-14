@@ -16275,6 +16275,87 @@ test('targeted retries retain other unresolved review gate timeouts', () => {
   }
 });
 
+test('route safety and API snapshots use the composed full review after targeted retries', () => {
+  const repoRoot = createRepo();
+  try {
+    const failWhen = (name) => `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`process.exit(process.env.${name} === '1' ? 1 : 0)`)}`;
+    const retryableSlow = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("if (process.env.SLOW_RESULT === 'pass') process.exit(0); if (process.env.SLOW_RESULT === 'fail') process.exit(1); setTimeout(() => {}, 5000)")}`;
+    writePipelaneConfig(repoRoot, 'Composed Review Consumers', {
+      routeSafety: { defaultFixReviewLoops: 5, defaultMinutes: 90, defaultAiReviewRuns: 3, stopOnMajorFindings: true },
+      reviewGates: {
+        planReview: { gates: [] },
+        gates: [
+          { id: 'actionable-check', phase: 'static', type: 'command', blocking: true, command: failWhen('FAIL_ACTIONABLE') },
+          { id: 'slow-check', phase: 'behavioral', type: 'command', blocking: true, timeoutMs: 250, command: retryableSlow },
+        ],
+      },
+    });
+    commitLocal(repoRoot, 'Configure composed review consumers');
+
+    const mixedFullResult = runCli(['run', 'review', '--json'], repoRoot, { FAIL_ACTIONABLE: '1' }, true);
+    const mixedFull = JSON.parse(mixedFullResult.stdout);
+    assert.equal(mixedFullResult.status, 1);
+    assert.equal(mixedFull.status, 'failed');
+    assert.equal(mixedFull.gates.find((gate) => gate.gateId === 'slow-check').outcome, 'timeout');
+
+    const timeoutRetry = runCli(
+      ['run', 'review', '--gate', 'slow-check', '--json'],
+      repoRoot,
+      { SLOW_RESULT: 'pass' },
+      true,
+    );
+    assert.equal(JSON.parse(timeoutRetry.stdout).status, 'passed', 'the filtered run itself passed');
+    assert.equal(timeoutRetry.status, 1, 'the composed full review still has an actionable failure');
+    let route = latestRouteSafetyRecord(repoRoot);
+    assert.equal(route.lastReviewRunId, mixedFull.runId);
+    assert.equal(route.lastReviewStatus, 'failed');
+    assert.deepEqual(route.lastTimedOutGateIds, []);
+    assert.match(route.pauseReason, /blocking\/major review findings/);
+
+    let snapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    assert.equal(snapshot.data.review.current.id, mixedFull.runId);
+    assert.equal(snapshot.data.review.current.presentation.status, 'failed');
+    assert.equal(
+      snapshot.data.review.current.presentation.gates.find((gate) => gate.gateId === 'slow-check').status,
+      'passed',
+    );
+    const firstFix = runCli(['run', 'resume', '--request-fix', '--json'], repoRoot);
+    assert.equal(firstFix.status, 0, `${firstFix.stdout}\n${firstFix.stderr}`);
+    assert.match(JSON.parse(firstFix.stdout).message, /Host-mediated fix action/);
+
+    const passingFullResult = runCli(['run', 'review', '--json'], repoRoot, { SLOW_RESULT: 'pass' });
+    const passingFull = JSON.parse(passingFullResult.stdout);
+    assert.equal(passingFull.status, 'passed');
+    assert.equal(latestRouteSafetyRecord(repoRoot).lastReviewStatus, 'passed');
+
+    const failedRetry = runCli(
+      ['run', 'review', '--gate', 'slow-check', '--json'],
+      repoRoot,
+      { SLOW_RESULT: 'fail' },
+      true,
+    );
+    assert.equal(JSON.parse(failedRetry.stdout).status, 'failed');
+    assert.equal(failedRetry.status, 1);
+    route = latestRouteSafetyRecord(repoRoot);
+    assert.equal(route.lastReviewRunId, passingFull.runId);
+    assert.equal(route.lastReviewStatus, 'failed', 'the failed retry must update the composed full status');
+    assert.deepEqual(route.lastTimedOutGateIds, []);
+    assert.match(route.pauseReason, /blocking\/major review findings/);
+
+    snapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    assert.equal(snapshot.data.review.current.id, passingFull.runId);
+    assert.equal(snapshot.data.review.current.presentation.status, 'failed');
+    assert.equal(
+      snapshot.data.review.current.presentation.gates.find((gate) => gate.gateId === 'slow-check').status,
+      'failed',
+    );
+    const secondFix = runCli(['run', 'resume', '--request-fix', '--json'], repoRoot);
+    assert.equal(secondFix.status, 0, `${secondFix.stdout}\n${secondFix.stderr}`);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('a full review with only non-blocking timeouts does not stop delivery', () => {
   const repoRoot = createRepo();
   try {

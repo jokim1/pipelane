@@ -331,7 +331,9 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
   const deployState = loadDeployState(context.commonDir, context.config);
   const reviewState = loadReviewState(context.commonDir, context.config);
   const reviewEvidence = evaluateReviewEvidenceForPr(context);
-  const currentReview = selectCurrentReviewEvidenceRecord(context, reviewState.records);
+  const currentReview = (context.config.reviewGates?.gates?.length ?? 0) > 0
+    ? reviewEvidence.latest
+    : selectCurrentReviewEvidenceRecord(context, reviewState.records);
   const currentReviewConsents = selectCurrentReviewConsents(context, currentReview);
   const recentReview = reviewState.records.find((record) => record.id !== currentReview?.id) ?? null;
   const artifactRoot = reviewArtifactRoot(context.commonDir, context.config);

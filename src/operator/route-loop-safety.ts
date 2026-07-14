@@ -228,9 +228,13 @@ export function recordReviewRunForRouteSafety(
     const state = loadRouteSafetyState(context.commonDir, context.config);
     const record = ensureRouteRecord(state, identity);
     countReviewRun(record, reviewRun);
+    const effectiveReview = loadEffectiveRouteReview(context, record.lastReviewRunId) ?? reviewRun;
+    if (record.lastReviewRunId === effectiveReview.id) {
+      record.lastReviewStatus = effectiveReview.status;
+    }
     const unresolvedTimedOutGateIds = record.lastTimedOutGateIds ?? [];
     if (
-      reviewRun.status === 'passed'
+      effectiveReview.status === 'passed'
       && unresolvedTimedOutGateIds.length === 0
       && record.legacyMigration?.status !== 'pending'
     ) {
@@ -243,7 +247,7 @@ export function recordReviewRunForRouteSafety(
     const config = normalizeRouteSafetyConfig(context.config.routeSafety);
     const reason = unresolvedTimedOutGateIds.length > 0
       ? `review gate timed out: ${unresolvedTimedOutGateIds.join(', ')}`
-      : reviewRun.status === 'failed' && config.stopOnMajorFindings
+      : effectiveReview.status === 'failed' && config.stopOnMajorFindings
         ? 'blocking/major review findings are present'
         : routeLimitReason(record, config, { willRunAiReview: false });
     if (!reason) {
@@ -256,8 +260,8 @@ export function recordReviewRunForRouteSafety(
       action: 'stop',
       message: renderRouteSafetyPauseMessage(context, record, {
         reason,
-        latest: reviewRun,
-        issues: reviewIssuesFromRun(reviewRun),
+        latest: effectiveReview,
+        issues: reviewIssuesFromRun(effectiveReview),
       }),
     };
   });
@@ -541,7 +545,7 @@ function requestFixAttempt(
       ...record.lastTimedOutGateIds!.map((gateId) => `Re-run: pipelane run review --gate ${gateId}`),
     ].join('\n'));
   }
-  const review = loadReviewState(context.commonDir, context.config).records.find((entry) => entry.id === record.lastReviewRunId);
+  const review = loadEffectiveRouteReview(context, record.lastReviewRunId);
   if (
     !review
     || review.status !== 'failed'
@@ -762,7 +766,7 @@ function renderFixRequestMessage(
   evidence: FixAttemptEvidence,
   token: string,
 ): string {
-  const review = loadReviewState(context.commonDir, context.config).records.find((entry) => entry.id === evidence.failedReviewRunId);
+  const review = loadEffectiveRouteReview(context, evidence.failedReviewRunId);
   const findings = review
     ? renderReviewPresentation(projectReviewRun(review, {
         artifactRoot: reviewArtifactRoot(context.commonDir, context.config),
@@ -1013,7 +1017,7 @@ function fixRequestAvailable(context: WorkflowContext, record: RouteSafetyRecord
     || !record.lastReviewRunId
     || !record.currentAttemptDigest
   ) return false;
-  const review = loadReviewState(context.commonDir, context.config).records.find((entry) => entry.id === record.lastReviewRunId);
+  const review = loadEffectiveRouteReview(context, record.lastReviewRunId);
   return Boolean(
     review
     && review.status === 'failed'
@@ -1022,6 +1026,15 @@ function fixRequestAvailable(context: WorkflowContext, record: RouteSafetyRecord
     && !review.phaseFilter
     && reviewRunHasActionableFailure(review)
   );
+}
+
+function loadEffectiveRouteReview(
+  context: WorkflowContext,
+  expectedReviewRunId: string | undefined,
+): ReviewRunRecord | null {
+  if (!expectedReviewRunId) return null;
+  const effective = evaluateReviewEvidenceForPr(context).latest;
+  return effective?.id === expectedReviewRunId ? effective : null;
 }
 
 function renderRouteSafetyResumeMessage(

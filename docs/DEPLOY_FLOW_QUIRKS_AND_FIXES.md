@@ -838,6 +838,19 @@ and non-TTY execution paths.
     through `updateTaskLock` so the canonical mutation lease covers the entire
     callback.
 
+65. **Route and API consumers ignored composed targeted-review evidence (P1).**
+    **Location:** `src/operator/route-loop-safety.ts:219` and
+    `src/operator/api/snapshot.ts:333`. **Repro:** let a full review contain one
+    actionable failure and one timeout, then pass only the timed-out gate; `/pr`
+    correctly retained the failed full envelope, but route safety could clear
+    its pause from the raw passing retry, the snapshot displayed that partial
+    run, and fix eligibility inspected the uncomposed full record. The inverse
+    case—a passing full run followed by a failed targeted retry—also remained
+    invisible to those consumers. **Proposed fix (implemented):** route status,
+    pause rendering, fix issuance, and API snapshot projection now use the same
+    current-checkout composed full-review envelope as enforcement, while the
+    timeout ledger still reconciles only gates actually retried.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original
