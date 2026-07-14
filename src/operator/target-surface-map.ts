@@ -83,14 +83,17 @@ function listTargetChangedPaths(repoRoot: string, baseBranch: string, targetSha:
 }
 
 function resolveDiffBase(repoRoot: string, baseBranch: string, target: string): string | null {
-  for (const ref of [`origin/${baseBranch}`, baseBranch]) {
-    const base = runGit(repoRoot, ['merge-base', target, ref], true)?.trim();
-    if (base && base !== target) return base;
-  }
-
   const parentsLine = runGit(repoRoot, ['rev-list', '--parents', '-n', '1', target], true)?.trim();
   const parents = parentsLine ? parentsLine.split(/\s+/u).slice(1) : [];
-  return parents[0] ?? null;
+  const firstParent = parents[0] ?? null;
+
+  for (const ref of [`origin/${baseBranch}`, baseBranch]) {
+    const base = runGit(repoRoot, ['merge-base', target, ref], true)?.trim();
+    if (!base) continue;
+    return base === target ? firstParent : base;
+  }
+
+  return firstParent;
 }
 
 function splitNul(raw: string | null): string[] {
