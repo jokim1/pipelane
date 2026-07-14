@@ -143,7 +143,7 @@ export function provisionRepositorySecrets(
   const apply = options.apply === true;
   const rotate = options.rotate === true;
   const env = options.env ?? process.env;
-  const existing = listRepositorySecretNames(repoRoot);
+  const existing = listRepositorySecretNames(repoRoot, env);
   const entries: SecretProvisioningEntryResult[] = [];
   const resolvedValues = new Map<string, string>();
 
@@ -158,7 +158,7 @@ export function provisionRepositorySecrets(
       });
       continue;
     }
-    const resolved = resolveSecretValue(repoRoot, secret.source, env);
+    const resolved = resolveSecretValue(repoRoot, secret.source, env, apply);
     if (!resolved.ok) {
       entries.push({ name: secret.name, status: 'blocked', detail: resolved.detail, ...guidance });
       continue;
@@ -166,21 +166,63 @@ export function provisionRepositorySecrets(
     resolvedValues.set(secret.name, resolved.value);
     entries.push({
       name: secret.name,
-      status: apply ? 'provisioned' : 'ready',
-      detail: apply ? `${resolved.detail}; installed through gh stdin` : resolved.detail,
+      status: 'ready',
+      detail: resolved.detail,
       ...guidance,
     });
   }
 
   if (apply) {
-    for (const [name, value] of resolvedValues) {
-      setRepositorySecret(repoRoot, name, value);
-    }
-    const verified = listRepositorySecretNames(repoRoot);
-    for (const entry of entries) {
-      if (entry.status === 'provisioned' && !verified.has(entry.name)) {
-        entry.status = 'blocked';
-        entry.detail = 'gh accepted the write but the secret was absent during verification';
+    const blockedBeforeWrite = entries.some((entry) => entry.status === 'blocked');
+    if (rotate && blockedBeforeWrite) {
+      for (const entry of entries) {
+        if (entry.status === 'ready') {
+          entry.detail = `${entry.detail}; rotation was not started because another declared replacement is blocked`;
+        }
+      }
+    } else {
+      const writtenNames: string[] = [];
+      let failedWrite: string | null = null;
+      for (const [name, value] of resolvedValues) {
+        const entry = entries.find((candidate) => candidate.name === name);
+        if (!entry) continue;
+        if (failedWrite) {
+          entry.status = 'blocked';
+          entry.detail = `not attempted because the earlier GitHub write for ${failedWrite} failed`;
+          continue;
+        }
+        try {
+          setRepositorySecret(repoRoot, name, value, env);
+          writtenNames.push(name);
+          entry.status = 'provisioned';
+          entry.detail = `${entry.detail}; installed through gh stdin`;
+        } catch (error) {
+          failedWrite = name;
+          entry.status = 'blocked';
+          const prior = writtenNames.length > 0
+            ? ` after ${writtenNames.length} earlier secret${writtenNames.length === 1 ? '' : 's'} ${writtenNames.length === 1 ? 'was' : 'were'} ${rotate ? 'rotated' : 'installed'}`
+            : '';
+          entry.detail = `GitHub rejected this write${prior}; no later writes were attempted. Inspect repository secrets, correct access, and rerun provisioning`;
+        }
+      }
+
+      if (writtenNames.length > 0) {
+        try {
+          const verified = listRepositorySecretNames(repoRoot, env);
+          for (const entry of entries) {
+            if (entry.status === 'provisioned' && !verified.has(entry.name)) {
+              entry.status = 'blocked';
+              entry.detail = 'GitHub accepted the write but the secret was absent during verification; inspect repository secrets before rerunning';
+            }
+          }
+        } catch {
+          for (const entry of entries) {
+            if (entry.status === 'provisioned') {
+              entry.status = 'blocked';
+              entry.detail = 'GitHub accepted the write but verification failed; inspect repository secrets before rerunning';
+            }
+          }
+        }
       }
     }
   }
@@ -326,6 +368,7 @@ function resolveSecretValue(
   repoRoot: string,
   source: RepositorySecretSource,
   env: NodeJS.ProcessEnv,
+  allowToolExecution: boolean,
 ): ResolvedSecretValue | UnresolvedSecretValue {
   if (source.type === 'environment') {
     const value = env[source.variable];
@@ -350,6 +393,12 @@ function resolveSecretValue(
           `read allowlisted ${source.dotenvVariable} from ${source.dotenvFile}`,
         );
       }
+    }
+    if (!allowToolExecution) {
+      return {
+        ok: false,
+        detail: `environment variable ${source.variable} is not set and Wrangler token discovery is deferred until explicit provisioning`,
+      };
     }
     return readWranglerApiToken(repoRoot, source, env);
   }
@@ -492,9 +541,10 @@ function checkedSecretValue(value: string, detail: string): ResolvedSecretValue 
   return { ok: true, value, detail };
 }
 
-function listRepositorySecretNames(repoRoot: string): Set<string> {
+function listRepositorySecretNames(repoRoot: string, env: NodeJS.ProcessEnv): Set<string> {
   const result = spawnSync('gh', ['secret', 'list', '--json', 'name'], {
     cwd: repoRoot,
+    env: githubCliEnv(env),
     encoding: 'utf8',
     timeout: 15_000,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -511,9 +561,10 @@ function listRepositorySecretNames(repoRoot: string): Set<string> {
   }
 }
 
-function setRepositorySecret(repoRoot: string, name: string, value: string): void {
+function setRepositorySecret(repoRoot: string, name: string, value: string, env: NodeJS.ProcessEnv): void {
   const result = spawnSync('gh', ['secret', 'set', name], {
     cwd: repoRoot,
+    env: githubCliEnv(env),
     input: value,
     encoding: 'utf8',
     timeout: 30_000,
@@ -522,6 +573,15 @@ function setRepositorySecret(repoRoot: string, name: string, value: string): voi
   if (result.error || result.status !== 0) {
     throw new Error(`GitHub repository secret ${name} could not be installed. Pipelane did not log or persist the secret value locally.`);
   }
+}
+
+function githubCliEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const childEnv = { ...env };
+  // gh gives GH_REPO precedence over the repository identified by cwd. Secret
+  // provisioning is always scoped to the checked-out repository, so an ambient
+  // override must never redirect reads or writes to another repository.
+  delete childEnv.GH_REPO;
+  return childEnv;
 }
 
 function findExecutableOnPath(name: string, pathValue: string | undefined): string | null {

@@ -985,12 +985,27 @@ const state = fs.existsSync(statePath)
   : { secrets: {}, setCalls: [] };
 const args = process.argv.slice(2);
 const writeState = () => fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + '\\n', 'utf8');
+if (process.env.GH_REPO) {
+  process.stderr.write('GH_REPO must not redirect repository-secret provisioning\\n');
+  process.exit(9);
+}
 if (args[0] === 'secret' && args[1] === 'list') {
-  process.stdout.write(JSON.stringify(Object.keys(state.secrets || {}).sort().map((name) => ({ name }))));
+  if (process.env.GH_SECRET_FAIL_VERIFICATION === '1' && (state.setCalls || []).length > 0) {
+    process.stderr.write('simulated verification failure\\n');
+    process.exit(8);
+  }
+  const hidden = process.env.GH_SECRET_HIDE_AFTER_SET || '';
+  process.stdout.write(JSON.stringify(Object.keys(state.secrets || {}).sort()
+    .filter((name) => !(hidden === name && (state.setCalls || []).some((entry) => entry.name === name)))
+    .map((name) => ({ name }))));
   process.exit(0);
 }
 if (args[0] === 'secret' && args[1] === 'set') {
   const name = args[2];
+  if (process.env.GH_SECRET_FAIL_SET_NAME === name) {
+    process.stderr.write('simulated secret write failure\\n');
+    process.exit(7);
+  }
   const body = fs.readFileSync(0);
   const record = {
     sha256: crypto.createHash('sha256').update(body).digest('hex'),
@@ -29867,6 +29882,73 @@ test('setup provisions missing secrets through stdin, preserves existing values,
   }
 });
 
+test('repository-secret provisioning ignores ambient GH_REPO redirection', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      { name: 'SCOPED_TOKEN', source: { type: 'environment', variable: 'TEST_SCOPED_TOKEN' } },
+    ]);
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+
+    const result = runCli(['setup', '--provision-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      GH_REPO: 'attacker/unrelated-repository',
+      TEST_SCOPED_TOKEN: 'scoped-value-never-print',
+    });
+
+    assert.equal(result.status, 0);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls.map((entry) => entry.name), ['SCOPED_TOKEN']);
+    assert.doesNotMatch(result.stdout, /scoped-value-never-print|attacker\/unrelated-repository/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('plain setup never executes a repository-local Wrangler binary', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-wrangler-marker-'));
+  const stateFile = path.join(binDir, 'state.json');
+  const markerPath = path.join(markerRoot, 'wrangler-ran.txt');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [{
+      name: 'CLOUDFLARE_AI_EVAL_TOKEN',
+      source: { type: 'cloudflare-api-token', variable: 'TEST_CF_AI_TOKEN', wranglerCwd: 'web' },
+    }]);
+    const wranglerBin = path.join(repoRoot, 'web', 'node_modules', '.bin');
+    mkdirSync(wranglerBin, { recursive: true });
+    writeFileSync(
+      path.join(wranglerBin, 'wrangler'),
+      `#!/usr/bin/env node\nrequire('node:fs').writeFileSync(process.env.WRANGLER_EXECUTION_MARKER, 'ran');process.stdout.write(JSON.stringify({type:'api_token',token:'never-read-during-inspection'}));\n`,
+      { mode: 0o755, encoding: 'utf8' },
+    );
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+
+    const result = runCli(['setup'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      WRANGLER_EXECUTION_MARKER: markerPath,
+    });
+
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /Wrangler token discovery is deferred until explicit provisioning/);
+    assert.equal(existsSync(markerPath), false);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(markerRoot, { recursive: true, force: true });
+  }
+});
+
 test('setup automatically reads an allowlisted dotenv token and conventional held-out corpus path', () => {
   const repoRoot = createRepo();
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
@@ -29955,6 +30037,118 @@ test('configure secret provisioning rotates only when explicitly requested', () 
     assert.match(rotated.stdout, /- ROTATABLE_TOKEN\n  Status: provisioned — .*installed through gh stdin/);
     assert.doesNotMatch(rotated.stdout, /new-value-never-print/);
     assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls.length, 1);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('secret rotation resolves every replacement before writing any secret', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      { name: 'FIRST_ROTATION_TOKEN', source: { type: 'environment', variable: 'TEST_FIRST_ROTATION_TOKEN' } },
+      { name: 'SECOND_ROTATION_TOKEN', source: { type: 'environment', variable: 'TEST_SECOND_ROTATION_TOKEN' } },
+    ]);
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    const initial = {
+      secrets: {
+        FIRST_ROTATION_TOKEN: { sha256: 'old-first', bytes: 9 },
+        SECOND_ROTATION_TOKEN: { sha256: 'old-second', bytes: 10 },
+      },
+      setCalls: [],
+    };
+    writeFileSync(stateFile, `${JSON.stringify(initial)}\n`, 'utf8');
+
+    const result = runCli(['configure', '--provision-secrets', '--rotate-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      TEST_FIRST_ROTATION_TOKEN: 'new-first-never-print',
+    }, true);
+
+    assert.equal(result.status, 64);
+    assert.match(result.stdout, /rotation was not started because another declared replacement is blocked/);
+    assert.match(result.stdout, /environment variable TEST_SECOND_ROTATION_TOKEN is not set/);
+    assert.doesNotMatch(result.stdout, /new-first-never-print/);
+    const state = JSON.parse(readFileSync(stateFile, 'utf8'));
+    assert.deepEqual(state.setCalls, []);
+    assert.deepEqual(state.secrets, initial.secrets);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('secret rotation reports partial state and stops after a GitHub write failure', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      { name: 'FIRST_ROTATION_TOKEN', source: { type: 'environment', variable: 'TEST_FIRST_ROTATION_TOKEN' } },
+      { name: 'SECOND_ROTATION_TOKEN', source: { type: 'environment', variable: 'TEST_SECOND_ROTATION_TOKEN' } },
+      { name: 'THIRD_ROTATION_TOKEN', source: { type: 'environment', variable: 'TEST_THIRD_ROTATION_TOKEN' } },
+    ]);
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, `${JSON.stringify({
+      secrets: {
+        FIRST_ROTATION_TOKEN: { sha256: 'old-first', bytes: 9 },
+        SECOND_ROTATION_TOKEN: { sha256: 'old-second', bytes: 10 },
+        THIRD_ROTATION_TOKEN: { sha256: 'old-third', bytes: 9 },
+      },
+      setCalls: [],
+    })}\n`, 'utf8');
+
+    const result = runCli(['configure', '--provision-secrets', '--rotate-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      GH_SECRET_FAIL_SET_NAME: 'SECOND_ROTATION_TOKEN',
+      TEST_FIRST_ROTATION_TOKEN: 'new-first-never-print',
+      TEST_SECOND_ROTATION_TOKEN: 'new-second-never-print',
+      TEST_THIRD_ROTATION_TOKEN: 'new-third-never-print',
+    }, true);
+
+    assert.equal(result.status, 64);
+    assert.match(result.stdout, /GitHub rejected this write after 1 earlier secret was rotated; no later writes were attempted/);
+    assert.match(result.stdout, /not attempted because the earlier GitHub write for SECOND_ROTATION_TOKEN failed/);
+    assert.doesNotMatch(result.stdout, /new-(?:first|second|third)-never-print/);
+    const state = JSON.parse(readFileSync(stateFile, 'utf8'));
+    assert.deepEqual(state.setCalls.map((entry) => entry.name), ['FIRST_ROTATION_TOKEN']);
+    assert.equal(state.secrets.SECOND_ROTATION_TOKEN.sha256, 'old-second');
+    assert.equal(state.secrets.THIRD_ROTATION_TOKEN.sha256, 'old-third');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('secret provisioning reports a write that cannot be verified', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      { name: 'UNVERIFIED_TOKEN', source: { type: 'environment', variable: 'TEST_UNVERIFIED_TOKEN' } },
+    ]);
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+
+    const result = runCli(['setup', '--provision-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      GH_SECRET_HIDE_AFTER_SET: 'UNVERIFIED_TOKEN',
+      TEST_UNVERIFIED_TOKEN: 'unverified-value-never-print',
+    }, true);
+
+    assert.equal(result.status, 64);
+    assert.match(result.stdout, /secret was absent during verification/);
+    assert.doesNotMatch(result.stdout, /unverified-value-never-print/);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls.map((entry) => entry.name), ['UNVERIFIED_TOKEN']);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(binDir, { recursive: true, force: true });

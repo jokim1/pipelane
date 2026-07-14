@@ -46,6 +46,12 @@ declared secret:
 /pipelane setup --provision-secrets --rotate-secrets
 ```
 
+Before rotation starts, Pipelane resolves and validates every declared
+replacement. If any source is blocked, it writes nothing. GitHub does not offer
+an atomic multi-secret transaction, so if a later API write fails after an
+earlier write succeeds, Pipelane stops immediately and reports the partial
+state for you to inspect before rerunning.
+
 ## Cloudflare API tokens
 
 A Cloudflare token lets the repository's workflow call the Cloudflare API. The
@@ -57,6 +63,10 @@ such as an environment variable, an allowlisted key in a local `.env` file, or
 Wrangler authenticated with a durable API token. It does not copy a refreshable
 Wrangler OAuth login into GitHub Actions and cannot grant Cloudflare permissions
 on your behalf.
+
+Plain `/pipelane setup` never executes a repository-local Wrangler binary.
+Wrangler token discovery runs only after you explicitly request
+`--provision-secrets`.
 
 Never paste a token into the provisioning manifest, source code, documentation,
 or chat. Put it only in one of the local sources printed by `/pipelane setup`.
