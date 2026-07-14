@@ -118,6 +118,19 @@ const REVIEW_GATE_CONTEXT_ENV_KEYS = [
   'PIPELANE_UNSAFE_ALLOW_NESTED_REVIEW_GATES',
 ];
 
+function withoutAmbientEnv(keys, callback) {
+  const previous = new Map(keys.map((key) => [key, process.env[key]]));
+  try {
+    for (const key of keys) delete process.env[key];
+    return callback();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
 function buildCliChildEnv(env = {}) {
   const childEnv = { ...process.env, CODEX_HOME: DEFAULT_CODEX_HOME, PIPELANE_HOME: DEFAULT_PIPELANE_HOME, CLAUDE_HOME: DEFAULT_CLAUDE_HOME, ...env };
   if ('PIPELANE_ORCHESTRATION_STATE_KEY' in env) {
@@ -15264,7 +15277,10 @@ test('docs-only review profile does not skip repurposed full-suite gate ids', as
     const reviewMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'review.ts'));
     const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
     const context = stateMod.resolveWorkflowContext(repoRoot);
-    const record = reviewMod.buildReviewRunRecord({
+    // This fixture exercises profile selection, not the production nested-gate
+    // guard. Full review runs export a live outer gate into this test process,
+    // so isolate the direct in-process call just as runCli isolates child CLIs.
+    const record = withoutAmbientEnv(REVIEW_GATE_CONTEXT_ENV_KEYS, () => reviewMod.buildReviewRunRecord({
       repoRoot,
       commonDir: context.commonDir,
       config: context.config,
@@ -15274,7 +15290,7 @@ test('docs-only review profile does not skip repurposed full-suite gate ids', as
       activeSurfaces: context.config.surfaces,
       changedFiles: [],
       profileContext: { runProfile: 'docs-only', sliceProfile: 'docs-only' },
-    });
+    }));
 
     assert.equal(record.status, 'passed');
     assert.equal(record.gates[0].gateId, 'test');
