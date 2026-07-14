@@ -17,6 +17,7 @@ import { evaluateReviewEvidenceForPr, reviewEvidenceOverrideReason } from './rev
 import {
   ROUTE_SAFETY_FINGERPRINT_ENV,
   evaluateDestinationRouteReviewSafety,
+  recordDestinationRouteCompleted,
 } from './route-loop-safety.ts';
 import { resolveWorkflowContext, type ParsedOperatorArgs } from './state.ts';
 
@@ -99,7 +100,10 @@ export async function executeDestinationRoute(
 
   while (true) {
     const step = nextExecutableStep(currentPlan);
-    if (!step) return execution;
+    if (!step) {
+      recordDestinationRouteCompleted(resolveWorkflowContext(routeCwd), currentPlan);
+      return execution;
+    }
 
     const stepBlocker = validateStepStart(plan, currentPlan, step);
     if (stepBlocker) {

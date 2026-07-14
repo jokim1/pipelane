@@ -656,9 +656,15 @@ function renderReview(
   lines.push(`  identity: branch=${sanitizeForTerminal(presentation.branchName)} sha=${sanitizeForTerminal(presentation.sha.slice(0, 12))}${presentation.targetDigest ? ` target=${sanitizeForTerminal(presentation.targetDigest.slice(0, 12))}` : ''}`);
   lines.push(`  evidence: gates ${presentation.counts.gates.passed} passed, ${presentation.counts.gates.failed} failed, ${presentation.counts.gates.pending} pending, ${presentation.counts.gates.skipped} skipped`);
   lines.push(`  findings: ${presentation.counts.findings.blocking} blocking (${presentation.counts.findings.critical} critical, ${presentation.counts.findings.warning} warning), ${presentation.counts.findings.advisory} advisory`);
+  for (const authorization of presentation.authorizations ?? []) {
+    lines.push(`  authorization: ${sanitizeForTerminal(authorization.label).toUpperCase()} for ${sanitizeForTerminal(authorization.gateId)} and ${sanitizeForTerminal(authorization.routeAction)} — ${sanitizeForTerminal(authorization.reason)}`);
+    if (authorization.kind === 'manual-substitution') {
+      lines.push('    underlying capability remains manual-attestation, not automatic strict review');
+    }
+  }
 
   const detailedGates = presentation.gates.filter((gate) =>
-    gate.findings.length > 0 || gate.protocolErrors.length > 0 || gate.status === 'failed' || gate.status === 'pending'
+    gate.findings.length > 0 || gate.protocolErrors.length > 0 || gate.status === 'failed' || gate.status === 'pending' || gate.manualAttestation !== null
   );
   if (detailedGates.length === 0) {
     lines.push('  details: no findings or protocol errors');
@@ -666,6 +672,9 @@ function renderReview(
     lines.push('  details:');
     for (const gate of detailedGates) {
       lines.push(`    - ${sanitizeForTerminal(gate.gateId)} [${sanitizeForTerminal(gate.status)}] ${sanitizeForTerminal(gate.summary)}`);
+      if (gate.manualAttestation) {
+        lines.push(`      evidence: MANUAL ATTESTATION [${sanitizeForTerminal(gate.manualAttestation.status)}], source=${sanitizeForTerminal(gate.manualAttestation.source)}, exit=${gate.manualAttestation.exitCode}`);
+      }
       for (const finding of gate.findings) {
         lines.push(`      - ${sanitizeForTerminal(finding.id)} [${sanitizeForTerminal(finding.severity)}] ${sanitizeForTerminal(finding.title)}${finding.location ? ` (${sanitizeForTerminal(finding.location)})` : ''}`);
       }

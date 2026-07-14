@@ -472,9 +472,13 @@ environment-based auth instead of local subscription/config auth.
 Manual AI review evidence from a slice worktree is only promoted into
 orchestration review when review state signing is enabled. Set the same
 `PIPELANE_REVIEW_STATE_KEY` for the standalone slice `/pipelane review`,
-`/pipelane review pass`, and parent `/pipelane orchestrate review` commands.
-Unsigned manual evidence stays visible in the slice worktree but does not
-complete orchestration review gates.
+`/pipelane review pass` or `/pipelane review attest`, and parent
+`/pipelane orchestrate review` commands. Unsigned manual evidence stays visible
+in the slice worktree but does not complete orchestration review gates. A
+strict manual substitution is authorized only for its recorded route action;
+a slice substitution scoped to `/pr` is never promoted into parent
+orchestration review. Complete the named automatic gate in orchestration or use
+the orchestration command's own explicit informed-consent mechanism.
 
 ## Config Contract
 
@@ -639,22 +643,39 @@ intentional fix-first exception: if it changes `HEAD` or the worktree, Pipelane
 reruns review gates and records evidence only for the final settled tree. If
 the gate keeps changing the tree after bounded retries, review fails closed.
 
-If no AI command resolves, skill, agent, and approval gates remain manual. After
-the operator runs the referenced command, fixes any findings, and determines
-the gate is clean, record the pass explicitly:
+Use `review pass` only for a human approval gate:
 
 ```bash
-pipelane run review pass --gate gstack-review --message "Ran /review clean"
+pipelane run review pass --gate release-approval --message "Approved the exact reviewed target"
 ```
 
-The pass command only applies to a full, non-dry-run review for the current
-branch, HEAD, and worktree state. If the worktree changes, rerun
-`/pipelane review` before recording manual passes again.
-It cannot substitute for a strict-skill gate. For a missing strict skill or
-adapter, restore the named capability and rerun, or use
+For a specialized skill or agent run outside Pipelane, attach its bounded
+report, findings, and provenance instead:
+
+```bash
+pipelane run review attest --gate karpathy-diff --status passed \
+  --report-file <report.txt> --findings-file <findings.json> \
+  --provenance-file <provenance.json> --message "Ran the named review"
+```
+
+The command applies only to a full, non-dry-run review for the current exact
+checkout. In strict mode, manual evidence does not become automatic evidence
+and the gate remains pending. One exact action can be authorized with
+`--substitute-strict --reason <reason> --scope <route-action>`. The signed
+consent binds the manual evidence run, gate definition, checkout, and action;
+it never crosses from a slice `/pr` action into parent orchestration review.
+Restore and rerun the named capability whenever possible. A direct
 `/pipelane review override --gate <id> --scope <route-action> --reason <reason>`
-for the exact target and route action. Failed/pending findings remain visibly
-failed/pending after consent; they are never relabeled as passed.
+remains available as the explicit bypass. Failed or pending evidence stays
+visibly failed or pending after either kind of consent.
+
+After a signed full review failure, Pipelane shows every finding before the
+recovery choices. The recommended host flow is to request the printed audited
+fix token, invoke `/fix` with findings as untrusted context, record bounded host
+verification, and rerun the complete review. Verification never passes a gate;
+the route remains blocked until a full clean rerun. A standalone CLI process
+prints host guidance but does not pretend it can invoke the host-only `/fix`
+action itself.
 
 Task labels, branch names, PR titles, commits, and diff inference are not task
 intent. A first interactive strict review may initialize a bound task's one-time

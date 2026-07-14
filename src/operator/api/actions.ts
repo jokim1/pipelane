@@ -74,6 +74,7 @@ import {
   resolveDeployApprovalInputs,
 } from '../commands/deploy.ts';
 import { projectReviewRun, type ReviewRunPresentation } from '../review-output.ts';
+import { assertManagedLocalStateValid, assertManagedLocalStateValidForTree } from '../local-state.ts';
 
 export const STABLE_ACTION_IDS = [
   'new',
@@ -112,6 +113,35 @@ export const STABLE_ACTION_IDS = [
 ] as const;
 
 export type StableActionId = (typeof STABLE_ACTION_IDS)[number];
+export type ApiManagedLocalStateSensitivity = 'observe' | 'current-state' | 'target-tree' | 'independent-recovery';
+
+export const STABLE_ACTION_MANAGED_STATE_SENSITIVITY: Record<StableActionId, ApiManagedLocalStateSensitivity> = {
+  new: 'target-tree',
+  resume: 'observe',
+  'devmode.build': 'observe',
+  'devmode.release': 'observe',
+  'taskLock.verify': 'observe',
+  pr: 'current-state',
+  merge: 'independent-recovery',
+  'deploy.staging': 'current-state',
+  'deploy.prod': 'current-state',
+  'route.merge': 'current-state',
+  'route.deploy.staging': 'current-state',
+  'route.deploy.prod': 'current-state',
+  'clean.plan': 'observe',
+  'clean.apply': 'independent-recovery',
+  'doctor.diagnose': 'observe',
+  'doctor.probe': 'observe',
+  'git.catchupBase': 'target-tree',
+  'rollback.staging': 'independent-recovery',
+  'rollback.prod': 'independent-recovery',
+};
+
+export function classifyStableActionManagedStateSensitivity(actionId: StableActionId): ApiManagedLocalStateSensitivity {
+  const sensitivity = STABLE_ACTION_MANAGED_STATE_SENSITIVITY[actionId];
+  if (!sensitivity) throw new Error(`Managed local-state sensitivity is not classified for stable API action ${actionId}.`);
+  return sensitivity;
+}
 
 // Typed risky set so TS flags a forgotten entry instead of silently
 // dropping a new risky action into the non-risky path.
@@ -193,6 +223,7 @@ export function buildActionPreflightEnvelope(cwd: string, actionId: StableAction
   if (worktreeBlock) {
     return worktreeBlock;
   }
+  assertStableActionManagedState(context.repoRoot, actionId);
   const routePlan = buildRoutePlanForAction(cwd, actionId, parsed);
   const destinationPlan = routePlan.destinationPlan;
   let normalizedInputs: Record<string, unknown>;
@@ -304,9 +335,10 @@ function reviewPresentationForEvidence(
   evidence: ReviewEvidenceCheckResult,
 ): ReviewRunPresentation | null {
   return evidence.latest
-    ? projectReviewRun(evidence.latest, {
+      ? projectReviewRun(evidence.latest, {
         artifactRoot: reviewArtifactRoot(context.commonDir, context.config),
         relation: 'current',
+        consents: evidence.consents,
       })
     : null;
 }
@@ -819,6 +851,7 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
   if (worktreeBlock) {
     return worktreeBlock;
   }
+  assertStableActionManagedState(context.repoRoot, actionId);
   const routePlan = buildRoutePlanForAction(cwd, actionId, parsed);
   const destinationPlan = routePlan.destinationPlan;
   let normalizedInputs: Record<string, unknown>;
@@ -1561,6 +1594,19 @@ function runCatchupBase(cwd: string): { ok: boolean; exitCode: number; stdout: s
     return gitActionResult(false, fetch.status ?? 1, fetch.stdout?.trim() ?? '', fetch.stderr?.trim() || `git fetch origin ${baseBranch} failed.`, null);
   }
 
+  try {
+    assertManagedLocalStateValid(context.repoRoot);
+    assertManagedLocalStateValidForTree(context.repoRoot, `origin/${baseBranch}`);
+  } catch (error) {
+    return gitActionResult(
+      false,
+      1,
+      fetch.stdout?.trim() ?? '',
+      error instanceof Error ? error.message : String(error),
+      { baseBranch, currentBranch: current },
+    );
+  }
+
   const merge = spawnSync('git', ['merge', '--ff-only', `origin/${baseBranch}`], {
     cwd,
     encoding: 'utf8',
@@ -1585,6 +1631,13 @@ function runCatchupBase(cwd: string): { ok: boolean; exitCode: number; stdout: s
     merge.stderr?.trim() ?? '',
     parsed,
   );
+}
+
+function assertStableActionManagedState(repoRoot: string, actionId: StableActionId): void {
+  const sensitivity = classifyStableActionManagedStateSensitivity(actionId);
+  if (sensitivity === 'current-state' || sensitivity === 'target-tree') {
+    assertManagedLocalStateValid(repoRoot);
+  }
 }
 
 function gitActionResult(ok: boolean, exitCode: number, stdout: string, stderr: string, parsed: unknown): { ok: boolean; exitCode: number; stdout: string; stderr: string; parsed: unknown } {

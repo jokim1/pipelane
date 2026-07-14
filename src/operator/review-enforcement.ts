@@ -32,6 +32,7 @@ import { buildReviewTargetManifest } from './review-contract.ts';
 import { readVerifiedReviewArtifact } from './review-artifacts.ts';
 import { reviewArtifactRoot } from './state.ts';
 import { projectReviewRun, renderReviewPresentation } from './review-output.ts';
+import { normalizeReviewDataField, REVIEW_DATA_LIMITS } from './review-data.ts';
 import { readWorktreeStatusSnapshot } from './worktree-status.ts';
 
 export type ReviewEvidenceGateStatus = 'missing' | 'failed' | 'pending' | 'incomplete';
@@ -51,6 +52,7 @@ export interface ReviewEvidenceCheckResult {
   bypassedIssues: ReviewEvidenceIssue[];
   consents: ReviewConsentRecord[];
   message: string;
+  target?: ReviewEvidenceTarget;
 }
 
 export interface ReviewEvidenceTarget {
@@ -117,9 +119,16 @@ export function buildReviewEvidenceConsentRecords(
   kind: ReviewConsentKind = 'gate-bypass',
   targetOverride?: ReviewEvidenceTarget,
 ): ReviewConsentRecord[] {
-  const normalizedReason = reason.trim();
-  if (!normalizedReason) throw new Error('review bypass requires a non-empty informed-consent reason.');
-  const target = targetOverride ?? currentCheckoutReviewEvidenceTarget(context.repoRoot);
+  const normalizedReason = normalizeReviewDataField(reason, {
+    field: 'review informed-consent reason',
+    maxBytes: REVIEW_DATA_LIMITS.reasonBytes,
+    redact: true,
+  });
+  const currentTarget = targetOverride ? null : currentCheckoutReviewEvidenceTarget(context.repoRoot);
+  if (evidence.target && currentTarget && !reviewEvidenceTargetsEqual(evidence.target, currentTarget)) {
+    throw new Error('The exact review target changed before informed consent could be recorded. No consent was written; reevaluate the current target.');
+  }
+  const target = targetOverride ?? evidence.target ?? currentTarget ?? currentCheckoutReviewEvidenceTarget(context.repoRoot);
   const issueByGate = new Map<string, ReviewEvidenceIssue>();
   for (const issue of [...evidence.issues, ...evidence.bypassedIssues]) {
     if (issue.gateId) issueByGate.set(issue.gateId, issue);
@@ -150,7 +159,11 @@ export function buildReviewEvidenceConsentRecords(
       reviewTargetDigest: target.reviewTargetDigest,
       routeAction,
       actor: resolveReviewActorIdentity(),
-      source: kind === 'accept-findings' ? 'route-safety' : 'review-override',
+      source: kind === 'accept-findings'
+        ? 'route-safety'
+        : kind === 'manual-substitution'
+          ? 'manual-attestation'
+          : 'review-override',
       reason: normalizedReason,
       reasonHash: crypto.createHash('sha256').update(normalizedReason).digest('hex'),
       recordedAt,
@@ -166,8 +179,7 @@ function consentMatchesTarget(
   enforcementMode: ReviewConsentRecord['enforcementMode'],
   currentReviewRunId: string,
 ): boolean {
-  return consent.kind !== 'manual-substitution'
-    && consent.policyVersion === policyVersion
+  return consent.policyVersion === policyVersion
     && consent.enforcementMode === enforcementMode
     && consent.taskBindingId === target.taskBindingId
     && consent.branchName === target.branchName
@@ -176,26 +188,65 @@ function consentMatchesTarget(
     && consent.worktreeMaterialTreeHash === target.worktreeMaterialTreeHash
     && consent.reviewTargetDigest === target.reviewTargetDigest
     && consent.routeAction === routeAction
-    && (consent.kind !== 'accept-findings' || (currentReviewRunId.length > 0 && consent.reviewRunId === currentReviewRunId));
+    && (
+      consent.kind !== 'accept-findings'
+      || (currentReviewRunId.length > 0 && consent.reviewRunId === currentReviewRunId)
+    );
+}
+
+export function selectCurrentReviewConsents(
+  context: WorkflowContext,
+  latest: ReviewRunRecord | null,
+  target: ReviewEvidenceTarget = currentCheckoutReviewEvidenceTarget(context.repoRoot),
+): ReviewConsentRecord[] {
+  const state = loadReviewState(context.commonDir, context.config);
+  const policyVersion = context.config.reviewGates?.policyVersion ?? 2;
+  const enforcementMode = context.config.reviewGates?.enforcementMode ?? 'legacy-v2';
+  return (state.consents ?? []).filter((consent) => {
+    if (!consentMatchesTarget(consent, target, consent.routeAction, policyVersion, enforcementMode, latest?.id ?? '')) return false;
+    if (consent.kind !== 'manual-substitution') return true;
+    const manual = latest?.gates.find((gate) => gate.gateId === consent.gateId)?.manualAttestation;
+    return Boolean(manual?.substitutionRequested && manual.status === 'passed' && manual.reviewRunId === consent.reviewRunId);
+  });
 }
 
 function issueHasConsent(issue: ReviewEvidenceIssue, consents: ReviewConsentRecord[], expectedGates: ReviewGateConfig[]): boolean {
-  const matchesGate = (gate: ReviewGateConfig): boolean => consents.some((consent) =>
-    consent.gateId === gate.id && consent.gateDefinitionHash === reviewGateDefinitionHash(gate)
-  );
+  const matchesGate = (gate: ReviewGateConfig, allowManualSubstitution: boolean): boolean => consents.some((consent) => {
+    if (consent.gateId !== gate.id || consent.gateDefinitionHash !== reviewGateDefinitionHash(gate)) return false;
+    if (consent.kind !== 'manual-substitution') return true;
+    if (!allowManualSubstitution) return false;
+    const manual = issue.gate?.manualAttestation;
+    return Boolean(
+      manual
+      && manual.status === 'passed'
+      && manual.substitutionRequested
+      && consent.reviewRunId === manual.reviewRunId
+    );
+  });
   if (issue.gateId) {
     const gate = expectedGates.find((candidate) => candidate.id === issue.gateId);
-    return Boolean(gate && matchesGate(gate));
+    return Boolean(gate && matchesGate(gate, true));
   }
-  return expectedGates.length > 0 && expectedGates.every(matchesGate);
+  return expectedGates.length > 0 && expectedGates.every((gate) => matchesGate(gate, false));
 }
 
 function formatReviewConsentMessage(routeAction: string, issues: ReviewEvidenceIssue[], consents: ReviewConsentRecord[]): string {
+  const kinds = new Set(consents.map((consent) => consent.kind));
+  const authorization = kinds.size === 1 && kinds.has('manual-substitution')
+    ? 'explicit exact-scope manual review substitution authorizes this action'
+    : kinds.size === 1 && kinds.has('accept-findings')
+      ? 'the user accepted these findings for this exact action'
+      : 'explicit exact-scope consent authorizes this action';
+  const label = (consent: ReviewConsentRecord): string => consent.kind === 'manual-substitution'
+    ? 'manual review substituted'
+    : consent.kind === 'accept-findings'
+      ? 'findings accepted'
+      : 'bypassed by user';
   return [
-    `${routeAction} review evidence remains blocked, but explicit exact-scope consent authorizes this action.`,
-    ...issues.map((issue) => `- ${issue.gateId ?? 'review'}: bypassed by user; ${issue.message}`),
-    ...consents.map((consent) => `- consent ${consent.id}: ${consent.reason}`),
-    'The failed or pending evidence was not relabeled as passed.',
+    `${routeAction} review evidence remains non-automatic, but ${authorization}.`,
+    ...issues.map((issue) => `- ${issue.gateId ?? 'review'}: ${issue.message}`),
+    ...consents.map((consent) => `- ${label(consent)} (${consent.id}): ${consent.reason}`),
+    'The failed or pending evidence was not relabeled as passed; the underlying manual capability was not relabeled as automatic review.',
   ].join('\n');
 }
 
@@ -280,15 +331,25 @@ export function evaluateReviewEvidenceForPr(
     issues: remainingIssues,
     bypassedIssues,
     consents: activeConsents,
+    target,
     message: issues.length === 0
       ? ''
       : allBypassed
         ? formatReviewConsentMessage(routeAction, bypassedIssues, activeConsents)
-        : formatReviewEvidenceBlocker(context, remainingIssues, options.command),
+        : formatReviewEvidenceBlocker(context, remainingIssues, options.command, latest, activeConsents),
   };
 }
 
-function currentCheckoutReviewEvidenceTarget(repoRoot: string): ReviewEvidenceTarget {
+export function reviewEvidenceTargetsEqual(left: ReviewEvidenceTarget, right: ReviewEvidenceTarget): boolean {
+  return left.branchName === right.branchName
+    && left.sha === right.sha
+    && left.worktreeStatusDigest === right.worktreeStatusDigest
+    && left.worktreeMaterialTreeHash === right.worktreeMaterialTreeHash
+    && left.taskBindingId === right.taskBindingId
+    && left.reviewTargetDigest === right.reviewTargetDigest;
+}
+
+export function currentCheckoutReviewEvidenceTarget(repoRoot: string): ReviewEvidenceTarget {
   const context = resolveWorkflowContext(repoRoot);
   const worktreeStatus = readWorktreeStatusSnapshot(repoRoot, {
     includeStatusDigest: true,
@@ -388,13 +449,20 @@ export function selectCurrentReviewEvidenceRecord(
   ) ?? null;
 }
 
-export function formatReviewEvidenceBlocker(context: WorkflowContext, issues: ReviewEvidenceIssue[], command = formatWorkflowCommand(context.config, 'pr')): string {
-  const latest = selectCurrentReviewEvidenceRecord(context);
+export function formatReviewEvidenceBlocker(
+  context: WorkflowContext,
+  issues: ReviewEvidenceIssue[],
+  command = formatWorkflowCommand(context.config, 'pr'),
+  latestOverride?: ReviewRunRecord | null,
+  consents: ReviewConsentRecord[] = [],
+): string {
+  const latest = latestOverride === undefined ? selectCurrentReviewEvidenceRecord(context) : latestOverride;
   const gateIds = issues.flatMap((issue) => issue.gateId ? [issue.gateId] : []);
   const evidenceLines = latest
     ? renderReviewPresentation(projectReviewRun(latest, {
         artifactRoot: reviewArtifactRoot(context.commonDir, context.config),
         relation: 'current',
+        consents,
       }), {
         gateIds: gateIds.length > 0 ? gateIds : undefined,
         includePassed: gateIds.length > 0,
@@ -773,6 +841,17 @@ function attachEquivalentReviewGateEvidence(options: {
         startedAt: passed.gate.startedAt,
         finishedAt: passed.gate.finishedAt,
         durationMs: passed.gate.durationMs,
+        capability: passed.gate.capability,
+        result: passed.gate.result,
+        findings: passed.gate.findings,
+        reportArtifact: passed.gate.reportArtifact,
+        manualAttestation: passed.gate.manualAttestation,
+        exitCode: passed.gate.exitCode,
+        signal: passed.gate.signal,
+        errorCode: passed.gate.errorCode,
+        errorMessage: passed.gate.errorMessage,
+        stdoutTail: passed.gate.stdoutTail,
+        stderrTail: passed.gate.stderrTail,
       };
       if (passed.gate.attester) attachedGate.attester = passed.gate.attester;
       return attachedGate;
@@ -844,13 +923,17 @@ function reviewRunMatchesEquivalentGateEvidence(expected: ReviewRunRecord, evide
 }
 
 export function reviewRunMatchesEquivalentGateIdentity(expected: ReviewRunRecord, evidence: ReviewRunRecord): boolean {
-  return evidence.branchName === expected.branchName
-    && evidence.sha === expected.sha
+  return reviewRunsTargetSameCheckout(expected, evidence)
     && (evidence.enforcementMode ?? 'legacy-v2') === (expected.enforcementMode ?? 'legacy-v2')
     && (evidence.policyVersion ?? 1) === (expected.policyVersion ?? 1)
     && (evidence.taskBindingId ?? '') === (expected.taskBindingId ?? '')
     && (evidence.intent?.digest ?? '') === (expected.intent?.digest ?? '')
-    && (evidence.target?.targetDigest ?? '') === (expected.target?.targetDigest ?? '')
+    && (evidence.target?.targetDigest ?? '') === (expected.target?.targetDigest ?? '');
+}
+
+export function reviewRunsTargetSameCheckout(expected: ReviewRunRecord, evidence: ReviewRunRecord): boolean {
+  return evidence.branchName === expected.branchName
+    && evidence.sha === expected.sha
     && reviewRecordMatchesCurrentWorktree(evidence, {
       currentWorktreeStatusDigest: expected.worktreeStatusDigest ?? '',
       currentWorktreeStatusReliable: expected.worktreeStatusReliable,
@@ -860,20 +943,15 @@ export function reviewRunMatchesEquivalentGateIdentity(expected: ReviewRunRecord
 }
 
 function isPassedManualReviewGate(gate: ReviewGateRunRecord): boolean {
-  return gate.status === 'passed' && isManualReviewGateRun(gate);
+  return gate.status === 'passed'
+    && isManualReviewGateRun(gate)
+    && gate.manualAttestation?.substitutionRequested !== true;
 }
 
 function manualReviewGateEvidenceMatches(expected: ReviewGateRunRecord, evidence: ReviewGateRunRecord): boolean {
   return isManualReviewGateRun(expected)
     && isManualReviewGateRun(evidence)
-    && expected.gateId === evidence.gateId
-    && expected.type === evidence.type
-    && expected.phase === evidence.phase
-    && expected.blocking === evidence.blocking
-    && normalizeOptionalGateField(expected.skill) === normalizeOptionalGateField(evidence.skill)
-    && normalizeOptionalGateField(expected.role) === normalizeOptionalGateField(evidence.role)
-    && normalizeOptionalGateField(expected.command) === normalizeOptionalGateField(evidence.command)
-    && normalizeOptionalGateList(expected.userCommands) === normalizeOptionalGateList(evidence.userCommands);
+    && reviewGateDefinitionHash(expected) === reviewGateDefinitionHash(evidence);
 }
 
 function isManualReviewGateRun(gate: Pick<ReviewGateRunRecord, 'type'>): boolean {

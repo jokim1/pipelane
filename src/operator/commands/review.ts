@@ -56,6 +56,7 @@ import {
   type ReviewAcceptanceRecord,
   type ReviewGateConfig,
   type ReviewCapabilityEvidence,
+  type ReviewConsentRecord,
   type ReviewGatePhase,
   type ReviewProfile,
   type ReviewGateRunRecord,
@@ -73,9 +74,11 @@ import {
   recordReviewRunForRouteSafety,
 } from '../route-loop-safety.ts';
 import {
+  currentCheckoutReviewEvidenceTarget,
   evaluateReviewEvidenceForPr,
   recordReviewEvidenceConsents,
   reviewGateDefinitionHash,
+  type ReviewEvidenceTarget,
 } from '../review-enforcement.ts';
 import {
   adaptProviderCompletion,
@@ -100,14 +103,16 @@ import {
   discoverReviewArtifactCandidates,
   garbageCollectReviewArtifacts,
   persistReviewArtifact,
+  releaseReviewArtifactLease,
 } from '../review-artifacts.ts';
-import { normalizeTaskBrief, redactReviewSecrets, REVIEW_DATA_LIMITS } from '../review-data.ts';
+import { normalizeReviewDataField, normalizeTaskBrief, redactReviewSecrets, REVIEW_DATA_LIMITS } from '../review-data.ts';
+import { readManualReviewInput } from '../review-manual.ts';
 import { projectReviewRun, renderReviewGatePresentation } from '../review-output.ts';
 import { sanitizeForTerminal } from '../text-output.ts';
 
 type ReviewSetupStatus = 'configured' | 'reported' | 'cancelled';
 type ReviewCommandStatus = ReviewRunRecord['status'];
-type ReviewAttestStatus = 'attested';
+type ReviewAttestStatus = 'attested' | 'recorded-failed' | 'pending' | 'manual-review-substituted';
 
 const REVIEW_CONFIG_CHANGE_GATE_ID = 'review-config-change';
 const REVIEW_CONFIG_CHANGE_WHEN = 'review-config-changed';
@@ -315,7 +320,7 @@ interface ReviewSetupReport {
 }
 
 interface ReviewAttestReport {
-  command: 'review pass';
+  command: 'review pass' | 'review attest';
   status: ReviewAttestStatus;
   runId: string;
   repoRoot: string;
@@ -378,7 +383,11 @@ export async function handleReview(cwd: string, parsed: ParsedOperatorArgs): Pro
     return;
   }
   if (subcommand === 'pass' || subcommand === 'attest') {
-    handleReviewPass(cwd, parsed);
+    if (subcommand === 'attest') {
+      handleReviewAttest(cwd, parsed);
+    } else {
+      handleReviewPass(cwd, parsed);
+    }
     return;
   }
   if (subcommand === 'override') {
@@ -408,7 +417,14 @@ function handleReviewOverride(cwd: string, parsed: ParsedOperatorArgs): void {
   const context = resolveWorkflowContext(cwd);
   const gateId = parsed.flags.reviewGate.trim();
   const reason = parsed.flags.reason.trim();
-  const routeAction = parsed.flags.scope.trim() || formatWorkflowCommand(context.config, 'pr');
+  const routeAction = normalizeReviewDataField(
+    parsed.flags.scope.trim() || formatWorkflowCommand(context.config, 'pr'),
+    {
+      field: 'manual review route action',
+      maxBytes: REVIEW_DATA_LIMITS.reasonBytes,
+      redact: true,
+    },
+  );
   const configuredGate = context.config.reviewGates?.gates?.find((gate) => gate.id === gateId && gate.blocking !== false);
   if (!configuredGate) {
     throw new Error(`review override requires a configured blocking gate; ${gateId || '<empty>'} is not in the current blocking gate set.`);
@@ -581,6 +597,241 @@ function handleReviewPass(cwd: string, parsed: ParsedOperatorArgs): void {
   printResult(parsed.flags, report);
 }
 
+function handleReviewAttest(cwd: string, parsed: ParsedOperatorArgs): void {
+  const context = resolveWorkflowContext(cwd);
+  const gateId = parsed.flags.reviewGate.trim();
+  const status = parsed.flags.reviewStatus as 'passed' | 'failed';
+  const substituteStrict = parsed.flags.reviewSubstituteStrict;
+  const routeAction = normalizeReviewDataField(
+    parsed.flags.scope.trim() || formatWorkflowCommand(context.config, 'pr'),
+    {
+      field: 'manual review route action',
+      maxBytes: REVIEW_DATA_LIMITS.reasonBytes,
+      redact: true,
+    },
+  );
+  const message = normalizeReviewDataField(parsed.flags.message, {
+    field: 'manual review message',
+    maxBytes: REVIEW_DATA_LIMITS.reasonBytes,
+    redact: true,
+  });
+  const evidenceTarget = currentCheckoutReviewEvidenceTarget(context.repoRoot);
+  const target = resolveReviewAttestTarget({
+    repoRoot: context.repoRoot,
+    commonDir: context.commonDir,
+    config: context.config,
+    gateId,
+  });
+  const policy = reviewGateExecutionPolicy(target.expectedGate);
+  const strictSpecialized = context.config.reviewGates?.enforcementMode === 'strict-v3'
+    && policy.manualReport === 'required';
+  if (substituteStrict && status !== 'passed') {
+    throw new Error('review attest --substitute-strict is only valid with --status passed. Failed manual evidence must remain failed.');
+  }
+  if (substituteStrict && !strictSpecialized) {
+    throw new Error(`review attest --substitute-strict only applies to a specialized gate under strict-v3; ${gateId} does not require strict substitution.`);
+  }
+  if (!substituteStrict && parsed.flags.scope.trim()) {
+    throw new Error('review attest only accepts --scope with --substitute-strict because ordinary evidence is target-bound, not route-authorizing.');
+  }
+
+  const manual = readManualReviewInput({
+    status,
+    reportFile: parsed.flags.reviewReportFile,
+    findingsFile: parsed.flags.reviewFindingsFile,
+    provenanceFile: parsed.flags.reviewProvenanceFile,
+  });
+  assertReviewAttestTargetUnchanged(evidenceTarget, currentCheckoutReviewEvidenceTarget(context.repoRoot));
+  const recordedAt = nowIso();
+  const runId = `review-attest-${new Date(recordedAt).toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto.randomUUID().slice(0, 8)}`;
+  const attester = resolveReviewActorIdentity();
+  const gateStatus: ReviewGateRunRecord['status'] = status === 'failed'
+    ? 'failed'
+    : strictSpecialized
+      ? 'pending'
+      : 'passed';
+  const artifactRoot = reviewArtifactRoot(context.commonDir, context.config);
+  const artifact = persistReviewArtifact({
+    root: artifactRoot,
+    runId,
+    gateRecordId: target.gate.id,
+    report: manual.report,
+    diagnostics: '',
+  });
+  const manualGate: ReviewGateRunRecord = {
+    ...target.gate,
+    status: gateStatus,
+    attester,
+    summary: manualAttestationSummary({ status, message, strictSpecialized, substituteStrict }),
+    startedAt: recordedAt,
+    finishedAt: recordedAt,
+    durationMs: 0,
+    exitCode: manual.provenance.exitCode,
+    capability: {
+      requestedCapability: policy.capability,
+      effectiveCapability: 'manual-attestation',
+      adapter: 'manual-attestation',
+      provider: manual.provenance.provider ?? attester.provider,
+      sourceKind: 'manual',
+      source: manual.provenance.source,
+      contractSupplied: false,
+      wrapperCompatible: false,
+    },
+    findings: manual.findings,
+    reportArtifact: artifact,
+    manualAttestation: {
+      status,
+      message,
+      provenance: manual.provenance,
+      substitutionRequested: substituteStrict,
+      reviewRunId: runId,
+    },
+    result: undefined,
+    stdoutTail: undefined,
+    stderrTail: undefined,
+    errorCode: undefined,
+    errorMessage: undefined,
+    skipReason: undefined,
+  };
+  const gates = target.base.gates.map((gate) => gate.gateId === gateId ? manualGate : gate);
+  const record: ReviewRunRecord = {
+    ...target.base,
+    id: runId,
+    status: summarizeRunStatus(gates),
+    startedAt: recordedAt,
+    finishedAt: recordedAt,
+    durationMs: 0,
+    worktreeStatusDigest: evidenceTarget.worktreeStatusDigest,
+    worktreeStatusReliable: evidenceTarget.worktreeStatusReliable,
+    worktreeStatusWarnings: evidenceTarget.worktreeStatusWarnings,
+    worktreeMaterialTreeHash: evidenceTarget.worktreeMaterialTreeHash,
+    worktreeMaterialTreeReliable: evidenceTarget.worktreeMaterialTreeReliable,
+    worktreeMaterialTreeWarnings: evidenceTarget.worktreeMaterialTreeWarnings,
+    gates,
+    signature: undefined,
+  };
+
+  let persisted: ReviewRunRecord;
+  try {
+    persisted = appendArtifactBackedReviewRun({
+      root: artifactRoot,
+      runId,
+      appendRecord: () => appendReviewRunRecord(context.commonDir, context.config, record),
+    });
+  } catch (error) {
+    releaseReviewArtifactLease(artifactRoot, runId);
+    throw error;
+  }
+
+  let consents: ReviewConsentRecord[] = [];
+  if (substituteStrict) {
+    const evidence = evaluateReviewEvidenceForPr(context, {
+      latestOverride: persisted,
+      command: routeAction,
+      target: evidenceTarget,
+    });
+    const gateIssues = [...evidence.issues, ...evidence.bypassedIssues].filter((issue) => issue.gateId === gateId);
+    if (gateIssues.length === 0) {
+      throw new Error(`manual substitution for ${gateId} found no strict gate evidence requiring authorization; no consent was recorded.`);
+    }
+    consents = recordReviewEvidenceConsents(context, {
+      ...evidence,
+      issues: gateIssues,
+      bypassedIssues: [],
+    }, routeAction, parsed.flags.reason, 'manual-substitution', evidenceTarget);
+  }
+
+  const evidencePath = reviewStatePath(context.commonDir, context.config);
+  const report: ReviewAttestReport & { routeAction?: string; consents?: typeof consents } = {
+    command: 'review attest',
+    status: status === 'failed'
+      ? 'recorded-failed'
+      : substituteStrict
+        ? 'manual-review-substituted'
+        : gateStatus === 'pending'
+          ? 'pending'
+          : 'attested',
+    runId: persisted.id,
+    repoRoot: context.repoRoot,
+    evidencePath,
+    gateId,
+    ...(substituteStrict ? { routeAction, consents } : {}),
+    message: renderReviewAttestReport(persisted, manualGate, evidencePath, routeAction, consents),
+  };
+  printResult(parsed.flags, report);
+}
+
+function assertReviewAttestTargetUnchanged(before: ReviewEvidenceTarget, after: ReviewEvidenceTarget): void {
+  const stable = before.branchName === after.branchName
+    && before.sha === after.sha
+    && before.worktreeStatusDigest === after.worktreeStatusDigest
+    && before.worktreeMaterialTreeHash === after.worktreeMaterialTreeHash
+    && before.taskBindingId === after.taskBindingId
+    && before.reviewTargetDigest === after.reviewTargetDigest;
+  if (!stable) {
+    throw new Error('review attest target changed while manual evidence was being read. No evidence or authorization was recorded; rerun against one stable exact checkout.');
+  }
+}
+
+interface ReviewAttestTarget {
+  expectedGate: ReviewGateConfig;
+  base: ReviewRunRecord;
+  gate: ReviewGateRunRecord;
+  worktreeStatus: WorktreeStatusSnapshot;
+}
+
+function resolveReviewAttestTarget(options: {
+  repoRoot: string;
+  commonDir: string;
+  config: WorkflowConfig;
+  gateId: string;
+}): ReviewAttestTarget {
+  const expectedGate = options.config.reviewGates?.gates?.find((gate) => gate.id === options.gateId);
+  if (!expectedGate) {
+    throw new Error(`No configured review gate matches --gate ${options.gateId}. Run "pipelane run review setup --list-gates" to inspect configured gates.`);
+  }
+  if (!isManualReviewGate(expectedGate)) {
+    throw new Error(`review attest only accepts manual or specialized gates. Gate ${options.gateId} is type ${expectedGate.type}; rerun /pipelane review to execute it.`);
+  }
+  const currentBranch = runGit(options.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
+  const currentSha = runGit(options.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '';
+  const worktreeStatus = readCurrentReviewEvidenceWorktreeStatus(options.repoRoot, options.config);
+  if (!worktreeSnapshotHasReviewIdentity(worktreeStatus)) {
+    throw new Error(`review attest cannot bind an unreliable worktree state: ${formatReviewWorktreeIdentityWarnings(worktreeStatus)}`);
+  }
+  const base = loadReviewState(options.commonDir, options.config).records.find((record) =>
+    !record.dryRun
+    && !record.gateFilter
+    && !record.phaseFilter
+    && record.branchName === currentBranch
+    && record.sha === currentSha
+    && reviewRecordMatchesWorktreeSnapshot(record, worktreeStatus)
+  );
+  if (!base) {
+    throw new Error('review attest requires a full, non-dry-run /pipelane review for the current branch, HEAD, and exact worktree state.');
+  }
+  const gate = base.gates.find((entry) => entry.gateId === options.gateId);
+  if (!gate) throw new Error(`Gate ${options.gateId} is missing from current review evidence. Rerun /pipelane review before attaching evidence.`);
+  return { expectedGate, base, gate, worktreeStatus };
+}
+
+function manualAttestationSummary(options: {
+  status: 'passed' | 'failed';
+  message: string;
+  strictSpecialized: boolean;
+  substituteStrict: boolean;
+}): string {
+  const message = normalizeReviewDataField(options.message, {
+    field: 'review pass message',
+    maxBytes: REVIEW_DATA_LIMITS.reasonBytes,
+    redact: true,
+  });
+  if (options.status === 'failed') return `manual review failed: ${message}`;
+  if (options.substituteStrict) return `manual review substituted by explicit exact-scope consent: ${message}`;
+  if (options.strictSpecialized) return `manual review clean but strict substitution not authorized: ${message}`;
+  return `manual review attested clean: ${message}`;
+}
+
 function buildAndPersistReviewPassEvidence(
   context: ReturnType<typeof resolveWorkflowContext>,
   options: { gateId: string; message: string },
@@ -654,6 +905,9 @@ function resolveReviewPassTarget(options: {
   if (!expectedGate) {
     throw new Error(`No configured review gate matches --gate ${gateId}. Run "pipelane run review setup --list-gates" to inspect configured gates.`);
   }
+  if (reviewGateExecutionPolicy(expectedGate).manualReport === 'required') {
+    throw new Error(`review pass cannot satisfy specialized gate ${gateId}. Attach structured manual evidence with: ${reviewAttestRecoveryCommand(gateId)}`);
+  }
   if (!isManualReviewGate(expectedGate)) {
     throw new Error(`review pass only accepts manual gates. Gate ${gateId} is type ${expectedGate.type}; rerun /pipelane review to execute it.`);
   }
@@ -663,10 +917,7 @@ function resolveReviewPassTarget(options: {
 
   const currentBranch = runGit(options.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
   const currentSha = runGit(options.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '';
-  let worktreeStatus = readWorktreeStatusSnapshot(options.repoRoot, {
-    includeStatusDigest: true,
-    includeMaterialTreeHash: true,
-  });
+  const worktreeStatus = readCurrentReviewEvidenceWorktreeStatus(options.repoRoot, options.config);
   if (!worktreeSnapshotHasReviewIdentity(worktreeStatus)) {
     throw new Error(`review pass cannot attest an unreliable worktree state: ${formatReviewWorktreeIdentityWarnings(worktreeStatus)}`);
   }
@@ -4668,6 +4919,24 @@ function worktreeSnapshotHasReviewIdentity(snapshot: WorktreeStatusSnapshot): bo
   return snapshot.statusDigestReliable || snapshot.materialTreeReliable === true;
 }
 
+function readCurrentReviewEvidenceWorktreeStatus(repoRoot: string, config: WorkflowConfig): WorktreeStatusSnapshot {
+  const snapshot = readWorktreeStatusSnapshot(repoRoot, {
+    includeStatusDigest: true,
+    includeMaterialTreeHash: true,
+  });
+  if (config.reviewGates?.enforcementMode !== 'strict-v3') return snapshot;
+  const manifest = buildReviewTargetManifest(repoRoot, config.baseBranch).manifest;
+  return {
+    ...snapshot,
+    statusDigest: manifest.worktreeStatusDigest,
+    statusDigestReliable: true,
+    statusDigestWarnings: [],
+    materialTreeHash: manifest.materialTreeHash,
+    materialTreeReliable: true,
+    materialTreeWarnings: [],
+  };
+}
+
 function reviewRecordMatchesWorktreeSnapshot(
   record: Pick<ReviewRunRecord, 'worktreeStatusDigest' | 'worktreeStatusReliable' | 'worktreeMaterialTreeHash' | 'worktreeMaterialTreeReliable'>,
   snapshot: WorktreeStatusSnapshot,
@@ -4746,6 +5015,10 @@ function isManualReviewGate(gate: Pick<ReviewGateConfig | ReviewGateRunRecord, '
 
 function manualPassSummary(message: string): string {
   return `manual pass: ${message}`;
+}
+
+function reviewAttestRecoveryCommand(gateId: string): string {
+  return `/pipelane review attest --gate ${gateId} --status passed --report-file <review-report> --findings-file <findings.json> --provenance-file <manual-execution.json> --message "<what ran>"`;
 }
 
 function summarizeConfigChangeApprovalStatus(gates: ReviewGateRunRecord[]): ReviewCommandStatus {
@@ -5086,6 +5359,50 @@ function renderReviewPassReport(record: ReviewRunRecord, gateId: string, evidenc
     lines.push('', 'Next: complete the remaining pending AI/manual gates, then record each pass.');
   }
 
+  return lines.join('\n');
+}
+
+function renderReviewAttestReport(
+  record: ReviewRunRecord,
+  gate: ReviewGateRunRecord,
+  evidencePath: string,
+  routeAction: string,
+  consents: ReviewConsentRecord[],
+): string {
+  const lines = [
+    'Pipelane manual review evidence',
+    `Evidence status: ${gate.manualAttestation?.status ?? gate.status}`,
+    `Enforcement gate status: ${gate.status}`,
+    `Effective capability: ${gate.capability?.effectiveCapability ?? 'manual-attestation'}`,
+    `Evidence: ${evidencePath}`,
+    `Run: ${record.id}`,
+    `Gate: ${gate.gateId}`,
+    `Summary: ${gate.summary}`,
+  ];
+  if (gate.findings && gate.findings.length > 0) {
+    lines.push('', 'Structured findings:');
+    for (const finding of gate.findings) {
+      lines.push(`- ${finding.id} [${finding.severity}] ${finding.title}${finding.location ? ` (${finding.location})` : ''}`);
+    }
+  }
+  if (consents.length > 0) {
+    lines.push(
+      '',
+      `Manual review substituted for exact route action: ${routeAction}`,
+      ...consents.map((consent) => `- manual-substitution ${consent.id}: ${consent.reason}`),
+      'This remains manual-attestation evidence; it was not relabeled as automatic strict-skill execution.',
+    );
+  } else if (gate.manualAttestation?.status === 'passed' && gate.status === 'pending') {
+    lines.push(
+      '',
+      'The clean manual report is retained, but strict enforcement remains pending.',
+      `To authorize this manual evidence for one exact action, rerun with --substitute-strict --reason "<why manual evidence may substitute>" --scope ${routeAction}.`,
+    );
+  } else if (gate.status === 'failed') {
+    lines.push('', 'Repair every blocking finding, then rerun the full /pipelane review. The failed evidence remains blocked.');
+  } else if (record.status === 'passed') {
+    lines.push('', 'Next: continue to /pr when ready.');
+  }
   return lines.join('\n');
 }
 

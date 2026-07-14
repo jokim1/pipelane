@@ -24,6 +24,7 @@ import {
   resolveTaskWorktreeRoot,
 } from '../task-workspaces.ts';
 import { resolveCommandSurfaces } from './helpers.ts';
+import { assertManagedLocalStateValid, assertManagedLocalStateValidForTree } from '../local-state.ts';
 
 export async function handleRepoGuard(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   if (!parsed.flags.task.trim()) {
@@ -38,6 +39,7 @@ export async function handleRepoGuard(cwd: string, parsed: ParsedOperatorArgs): 
       `Run ${formatWorkflowCommand(context.config, 'devmode', requestedMode)} first so release readiness is checked, then rerun repo-guard.`,
     ].join('\n'));
   }
+  assertManagedLocalStateValid(context.repoRoot);
   const { taskName, taskSlug } = resolveTaskCommandIdentity(parsed.flags.task);
   const { branchName, statusLines } = readWorktreeStatus(context.repoRoot);
   const existingLock = loadTaskLock(context.commonDir, context.config, taskSlug);
@@ -101,6 +103,7 @@ export async function handleRepoGuard(cwd: string, parsed: ParsedOperatorArgs): 
   }
 
   const baseRef = resolveTaskBaseRef(context.repoRoot, context.config.baseBranch, parsed.flags.offline);
+  assertManagedLocalStateValidForTree(context.repoRoot, baseRef.sourceRef);
   const workspace = generateUniqueTaskWorkspace(context.repoRoot, context.commonDir, context.config, taskSlug);
   mkdirSync(resolveTaskWorktreeRoot(context.commonDir, context.config), { recursive: true });
   runGit(context.repoRoot, ['worktree', 'add', workspace.worktreePath, '-b', workspace.branchName, baseRef.sourceRef]);
