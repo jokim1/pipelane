@@ -1,6 +1,6 @@
 # Repo Guidance
 
-Last reviewed: 2026-06-15
+Last reviewed: 2026-07-13
 Refresh cadence: 30 days or 50 commits
 Drift-hint threshold: 20 commits / 30 days
 Owners: jokim1
@@ -24,40 +24,32 @@ every breaking change.
 
 ## Current roadmap memory
 
-`/orchestrate` is the planned execution layer above the existing release
-workflow. Treat `docs/public/ORCHESTRATION.md` as the current design note.
-It is not shipped command behavior yet.
+Review gates and `/orchestrate` v1a are shipped command behavior. Treat
+`docs/public/ORCHESTRATION.md` as the current operator contract, not a future
+design note.
 
-Decisions captured through 2026-06-16:
+Decisions captured through 2026-07-13:
 
-- Build the review-gate foundation before full multi-agent `/orchestrate`.
-  First ship top-level `reviewGates` config, `/pipelane review setup`,
-  `/pipelane review`, evidence under `<git-common-dir>/<config.stateDir>/`,
-  and `/pr` enforcement. Full slice orchestration consumes this layer later.
-- `/pipelane review setup` is the user-facing setup command for plan-review
-  gates and implementation review gates. Plain `/pipelane setup` remains
-  broader repo onboarding/setup.
-- Review gates are ordered by phase: static, behavioral, AI diff, instruction,
-  runtime, then human gates.
-- Static gates run before AI review. Lint, typecheck, format checks,
-  secret scans, dependency audits, tests, and build should reject cheap
-  deterministic failures before gstack `/review`, `/karpathy diff`, or an
-  adversarial reviewer runs. gstack `/review` is the fix-first gate; run it
-  before read-only AI confirmations.
-- `/karpathy diff` is the code-diff review gate. `/karpathy audit` is the
-  instruction/memory-file audit gate and should only run when files like
-  `CLAUDE.md`, `AGENTS.md`, `.cursor/rules/**`, or `.codex/skills/**` change.
-- Goal mode for future orchestration should use provider-neutral `GoalSpec`
-  objects. AI drafts the finish line, proof, handoff, blocked policy, and
-  budget; the user confirms, edits, splits, or runs without goal mode. Native
-  Codex or Claude `/goal` is an adapter detail, not the source of truth.
-- Setup should detect existing scripts first (`lint`, `typecheck`,
-  `format:check`, `test`, `build`) and warn about missing optional gates
-  instead of inventing a toolchain silently.
-- `/orchestrate` should hand successful work back to the existing Pipelane
-  release flow. It must not auto-merge, auto-deploy production, or bypass
-  existing `/pr`, `/merge`, `/deploy`, `/rollback`, and `/clean`
-  gates.
+- `/pipelane review setup`, `/pipelane review`, machine-local evidence, and
+  `/pr` enforcement form the shipped review-gate foundation. Review evidence
+  must bind the exact PR head and reviewed material tree; stale or anonymous
+  evidence fails closed.
+- Review gates remain ordered by phase: static, behavioral, AI diff,
+  instruction, runtime, then human gates. Cheap deterministic checks run before
+  AI review, and fix-first gstack `/review` runs before read-only confirmations.
+- `/orchestrate` v1a uses provider-neutral `GoalSpec` objects, signed run
+  ledgers, leased task worktrees, independent review gates, and route-bound
+  delivery handoff. It may prepare and review work, but it must not bypass
+  `/pr`, `/merge`, `/deploy`, `/rollback`, or `/clean`.
+- Deploy surfaces are consumer-defined. Configured custom names and repo-owned,
+  workflow-bound surface contracts must flow through planning, execution,
+  readiness, status, and deploy verification without hard-coded allowlists.
+- Release-mode delivery infers surfaces from the exact target SHA, fails closed
+  on unmapped target files, deploys the merged SHA to staging, and promotes that
+  same SHA to production.
+- Setup detects existing scripts first (`lint`, `typecheck`, `format:check`,
+  `test`, `build`) and warns about missing optional gates instead of inventing
+  a toolchain silently.
 
 ## Project invariants
 
@@ -119,6 +111,12 @@ cleaner approach failed.
 - **Probe freshness is load-bearing for the release gate.** Staging
   probes older than 24h flip the release lane fail-closed. Do not extend
   the freshness window without re-reading `docs/RELEASE_WORKFLOW.md`.
+- **Target deploy-surface inference is commit-scoped.** A workflow-bound
+  contract is resolved from the target SHA, with the configured base as the
+  compatibility fallback. Before merge, diff the target against the remote
+  base merge-base. Once the remote base equals the merged target, diff the
+  target against its first parent; never fall through to a stale local base
+  ref. Unmapped target files and unsupported surfaces remain blockers.
 
 ## State-resilience invariants
 
@@ -168,8 +166,10 @@ constants — touching any of them is a contract change.
 - Zero runtime dependencies. `package.json` has no `dependencies`, only
   `devDependencies`. New deps need explicit review — the value
   proposition of pipelane is "one tiny install."
-- Tests use `node --test` (not jest, not vitest). Test file lives at
-  `test/pipelane.test.mjs`. Use `.mjs` ESM, `node:assert` for assertions.
+- Tests use `node --test` (not jest, not vitest). `npm test` must go through
+  `scripts/run-tests.mjs`, which owns process cleanup and full-suite runner
+  safety. Main coverage lives in `test/pipelane.test.mjs`; use `.mjs` ESM and
+  `node:assert` for assertions.
 - Build compiles TS → `dist/`. `bin/pipelane` prefers `dist/cli.js`,
   falls back to `src/cli.ts` for in-repo development. Don't break that
   fallback.
@@ -212,10 +212,6 @@ listed here.
 - **Staleness-check extraction to `pipelane:guidance-status` script.**
   Phase 2 of `/fix` plan. Stays inline in the prompt for Phase 1.
   Unfreeze when: Phase 1 lands and metrics dashboard work begins.
-- **`/orchestrate` implementation.** Planned but not shipped. Do not add
-  partial command docs or generated adapters without the schema, setup
-  command, gate catalog, tests, and board visibility plan landing together.
-  Unfreeze when: implementation starts from `docs/public/ORCHESTRATION.md`.
 
 ## PR and review strategy
 
@@ -226,6 +222,9 @@ listed here.
   scope.
 - Pre-PR checks: `npm test`, `npm run typecheck`, `npm run build`.
   Configured in `templates/project-pipelane.json` `prePrChecks`.
+- Review evidence must identify its reviewer and bind the current PR head and
+  material tree. A passing gate from an older commit, different tree, or
+  unauthenticated reviewer cannot authorize `/pr` or a destination route.
 - PR path deny list enforced in `pipelane run pr` before the silent
   `git add -A`: `CLAUDE.md`, `.env`, `.env.*`, `*.pem`, `*.p12`,
   `id_rsa*`, `*.key`. See `DEFAULT_PR_PATH_DENY_LIST` in `state.ts`.
@@ -258,6 +257,11 @@ transcript; no consent gate (section name is legacy).
   inject sequence. Re-ordering silently breaks consumer edit survival.
 - **Probe freshness window / release-gate fail-closed thresholds.**
   Affects every consumer's ability to ship.
+- **Deploy target and surface resolution.** Changes to
+  `deploy-surface-contract.ts`, `target-surface-map.ts`, destination
+  planning/execution, target-SHA selection, or workflow dispatch affect which
+  consumer code reaches staging and production. Require target-SHA regression
+  coverage for both open-PR and post-merge states.
 - **CI workflow files** (`.github/workflows/*.yml`). Consumer CI
   depends on the template file shapes published through pipelane.
 - **`orchestrate` config schema, gate catalog, or command adapters.**
