@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -1799,14 +1799,10 @@ const LEGACY_PROJECT_CONFIG_FIELDS = [
   'version',
   'projectKey',
   'displayName',
-  'baseBranch',
   'branchPrefix',
   'legacyBranchPrefixes',
-  'surfaces',
   'aliases',
-  'deployWorkflowName',
   'syncDocs',
-  'surfacePathMap',
 ] as const;
 
 function normalizeLegacyWorkflowImport(
@@ -1820,8 +1816,11 @@ function normalizeLegacyWorkflowImport(
   // `reviewGates.gates: []` into machine-local config would let a checkout
   // disable the very attestation that protects /pr. Keep the established
   // legacy migration surface while deriving safety policy from trusted
-  // machine defaults; operators can opt into custom policy later through the
-  // explicit machine-local configure path.
+  // machine defaults. Checkout-controlled base/deploy routing (baseBranch,
+  // surfaces, deployWorkflowName, and surfacePathMap) is policy too: importing
+  // it would let the first command in an untrusted checkout poison later
+  // review or deployment routing. Operators can opt into those fields later
+  // through the explicit machine-local configure path.
   const allowed = new Set<string>(LEGACY_PROJECT_CONFIG_FIELDS);
   const sanitized: Record<string, unknown> = {};
   const ignored: string[] = [];
@@ -1874,7 +1873,9 @@ export function importLegacyWorkflowConfigIfNeeded(repoRoot: string): {
     const raw = readLegacyWorkflowConfigObject(targetPath, `legacy repo-local ${legacy.filename}`);
     const { config, legacyStateDir } = normalizeLegacyWorkflowImport(raw, repoRoot, `legacy repo-local ${legacy.filename}`);
     if (legacyStateDir) {
-      migrateLegacyStateDirFromDirectories(resolveGitCommonDir(repoRoot), config, [legacyStateDir]);
+      migrateLegacyStateDirFromDirectories(resolveGitCommonDir(repoRoot), config, [legacyStateDir], {
+        requireComplete: true,
+      });
     }
     writeWorkflowConfig(repoRoot, config);
     return { configPath: resolveConfigPath(repoRoot), config, source: legacy.source };
@@ -1895,7 +1896,9 @@ export function importLegacyWorkflowConfigIfNeeded(repoRoot: string): {
     'legacy package.json:pipelane',
   );
   if (legacyStateDir) {
-    migrateLegacyStateDirFromDirectories(resolveGitCommonDir(repoRoot), config, [legacyStateDir]);
+    migrateLegacyStateDirFromDirectories(resolveGitCommonDir(repoRoot), config, [legacyStateDir], {
+      requireComplete: true,
+    });
   }
   writeWorkflowConfig(repoRoot, config);
   return { configPath: resolveConfigPath(repoRoot), config, source: 'legacy-package-json' };
@@ -2527,8 +2530,10 @@ function migrateLegacyStateDirFromDirectories(
   commonDir: string,
   config: WorkflowConfig,
   legacyStateDirs: string[],
+  options: { requireComplete?: boolean } = {},
 ): void {
   const canonicalDir = resolveStateDir(commonDir, config);
+  const requireComplete = options.requireComplete === true;
   if (hasInstallMarker(commonDir, config)) return;
   if (existsSync(legacyMigrationPath(commonDir, config))) return;
 
@@ -2537,42 +2542,69 @@ function migrateLegacyStateDirFromDirectories(
 
     let entries: string[];
     try {
-      entries = readdirSync(legacyDir);
-    } catch {
+      injectLegacyMigrationFailure('readdir');
+      entries = readdirSync(legacyDir).sort();
+    } catch (error) {
+      if (requireComplete) {
+        throw new Error(
+          `Could not enumerate legacy Pipelane state at ${legacyDir}; machine-local config was not imported. Fix access and retry.`,
+          { cause: error },
+        );
+      }
       continue;
     }
     if (entries.length === 0) continue;
 
     mkdirSync(canonicalDir, { recursive: true });
     const copied: string[] = [];
+    const completed: string[] = [];
     for (const name of entries) {
       const src = path.join(legacyDir, name);
       const dst = path.join(canonicalDir, name);
-      if (existsSync(dst)) continue;
+      if (existsSync(dst)) {
+        if (!requireComplete) continue;
+        if (!legacyMigrationPathsEquivalent(src, dst)) {
+          throw new Error(
+            `Legacy Pipelane state entry ${name} conflicts with ${dst}; machine-local config was not imported. Preserve the correct state, remove the conflicting copy, and retry.`,
+          );
+        }
+        completed.push(name);
+        continue;
+      }
       try {
+        injectLegacyMigrationFailure(`copy:${name}`);
         // cpSync handles both files and directories with `recursive: true`.
         cpSync(src, dst, { recursive: true });
         copied.push(name);
-      } catch {
+        completed.push(name);
+      } catch (error) {
+        if (requireComplete) {
+          throw new Error(
+            `Could not copy legacy Pipelane state entry ${name} from ${legacyDir}; machine-local config and migration markers were not written. Fix access and retry.`,
+            { cause: error },
+          );
+        }
         // Per-entry failures don't abort the run — the operator can
         // re-attempt by deleting the partial canonical entry. We
         // record what was copied successfully.
       }
     }
 
-    if (copied.length === 0) continue;
+    const migratedEntries = requireComplete ? completed : copied;
+    if (migratedEntries.length === 0) continue;
 
     writeJsonFile(legacyMigrationPath(commonDir, config), {
       from: legacyDir,
       to: canonicalDir,
       copiedAt: nowIso(),
-      entries: copied,
+      entries: migratedEntries,
+      ...(requireComplete ? { copied, verified: completed.filter((name) => !copied.includes(name)) } : {}),
     });
     // Plant the install marker so subsequent loads know this dir is
     // populated and the loud-warn path is armed for any genuinely
     // missing files post-migration.
     ensureInstallMarker(commonDir, config);
-    markStateFilesWritten(commonDir, config, copied);
+    markStateFilesWritten(commonDir, config, migratedEntries);
 
     // De-dup so concurrent commands in the same process (the
     // dashboard server hitting multiple loaders) don't each emit
@@ -2580,7 +2612,7 @@ function migrateLegacyStateDirFromDirectories(
     if (!legacyMigrationLogged.has(canonicalDir)) {
       legacyMigrationLogged.add(canonicalDir);
       process.stderr.write(
-        `[pipelane] Migrated ${copied.length} legacy state file(s) from ${legacyDir} to ${canonicalDir}. `
+        `[pipelane] Migrated ${migratedEntries.length} legacy state file(s) from ${legacyDir} to ${canonicalDir}. `
         + `The legacy directory is unchanged; remove it manually once you've confirmed pipelane behaves correctly.\n`,
       );
     }
@@ -2589,6 +2621,43 @@ function migrateLegacyStateDirFromDirectories(
     // operator should resolve that manually rather than us guessing
     // the order.
     return;
+  }
+}
+
+function injectLegacyMigrationFailure(label: string): void {
+  if (process.env.NODE_ENV === 'test' && process.env.PIPELANE_TEST_LEGACY_MIGRATION_FAIL === label) {
+    throw new Error(`injected legacy migration failure: ${label}`);
+  }
+}
+
+function legacyMigrationPathsEquivalent(source: string, destination: string): boolean {
+  try {
+    const sourceStat = lstatSync(source);
+    const destinationStat = lstatSync(destination);
+    if (sourceStat.isSymbolicLink() || destinationStat.isSymbolicLink()) {
+      return sourceStat.isSymbolicLink()
+        && destinationStat.isSymbolicLink()
+        && readlinkSync(source) === readlinkSync(destination);
+    }
+    if (sourceStat.isFile() || destinationStat.isFile()) {
+      return sourceStat.isFile()
+        && destinationStat.isFile()
+        && sourceStat.size === destinationStat.size
+        && readFileSync(source).equals(readFileSync(destination));
+    }
+    if (sourceStat.isDirectory() || destinationStat.isDirectory()) {
+      if (!sourceStat.isDirectory() || !destinationStat.isDirectory()) return false;
+      const sourceEntries = readdirSync(source).sort();
+      const destinationEntries = readdirSync(destination).sort();
+      return sourceEntries.length === destinationEntries.length
+        && sourceEntries.every((name, index) =>
+          name === destinationEntries[index]
+          && legacyMigrationPathsEquivalent(path.join(source, name), path.join(destination, name))
+        );
+    }
+    return false;
+  } catch {
+    return false;
   }
 }
 

@@ -202,7 +202,8 @@ function persistModeAndTaskLock(
         ].join('\n'));
       }
       if (
-        latestLock.branchName !== taskLock.branchName
+        latestLock.taskBindingId !== taskLock.taskBindingId
+        || latestLock.branchName !== taskLock.branchName
         || normalizeExistingPath(latestLock.worktreePath) !== normalizeExistingPath(taskLock.worktreePath)
       ) {
         throw new Error([

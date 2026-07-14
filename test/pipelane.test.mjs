@@ -4167,7 +4167,7 @@ test('loadWorkflowConfig imports legacy repo-local .project-workflow.json into m
     const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
     const loaded = stateMod.loadWorkflowConfig(repoRoot);
     assert.equal(loaded.displayName, 'Legacy App');
-    assert.equal(loaded.baseBranch, 'trunk');
+    assert.equal(loaded.baseBranch, 'main', 'checkout-controlled base routing must not become machine trust');
     assert.equal(existsSync(machinePipelaneConfigPath(repoRoot)), true);
     assert.equal(existsSync(path.join(repoRoot, '.pipelane.json')), false);
   } finally {
@@ -4175,7 +4175,7 @@ test('loadWorkflowConfig imports legacy repo-local .project-workflow.json into m
   }
 });
 
-test('legacy baseBranch import and fetch reject Git option injection', async () => {
+test('legacy baseBranch import is ignored and direct fetch rejects Git option injection', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const markerPath = path.join(repoRoot, 'base-branch-option-injection-ran');
   const maliciousBaseBranch = `--upload-pack=touch ${markerPath}`;
@@ -4186,11 +4186,9 @@ test('legacy baseBranch import and fetch reject Git option injection', async () 
     }, null, 2)}\n`, 'utf8');
 
     const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
-    assert.throws(
-      () => stateMod.loadWorkflowConfig(repoRoot),
-      /Invalid baseBranch .*expected a Git branch name/,
-    );
-    assert.equal(existsSync(machinePipelaneConfigPath(repoRoot)), false);
+    const loaded = stateMod.loadWorkflowConfig(repoRoot);
+    assert.equal(loaded.baseBranch, 'main');
+    assert.equal(existsSync(machinePipelaneConfigPath(repoRoot)), true);
 
     const taskWorkspaces = await import(path.join(KIT_ROOT, 'src', 'operator', 'task-workspaces.ts'));
     assert.throws(
@@ -4257,7 +4255,7 @@ test('loadWorkflowConfig imports package.json:pipelane into machine-local config
     const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
     const loaded = stateMod.loadWorkflowConfig(repoRoot);
     assert.equal(loaded.displayName, 'Canvas App');
-    assert.equal(loaded.baseBranch, 'trunk');
+    assert.equal(loaded.baseBranch, 'main', 'package overlay cannot silently choose deploy/review base');
     assert.equal(loaded.aliases.pr, '/ship');
     assert.equal(loaded.aliases.merge, stateMod.DEFAULT_WORKFLOW_ALIASES.merge);
     assert.equal(loaded.syncDocs?.readmeSection, false);
@@ -4282,6 +4280,8 @@ test('legacy config auto-import keeps repository-controlled policy out of machin
       stateDir: path.relative(path.join(repoRoot, '.git'), attackerRoot),
       taskWorktreeDirName: '../../attacker-worktrees',
       surfaces: ['frontend'],
+      deployWorkflowName: 'Attacker Deploy',
+      surfacePathMap: { frontend: ['.'] },
       prePrChecks: [],
       prPathDenyList: [],
       releaseMode: { requireStagingPromotion: false },
@@ -4295,8 +4295,10 @@ test('legacy config auto-import keeps repository-controlled policy out of machin
     const { result: loaded, stderr } = captureStderr(() => stateMod.loadWorkflowConfig(repoRoot));
     assert.equal(loaded.displayName, 'Legacy Safe App');
     assert.equal(loaded.projectKey, 'escape');
-    assert.equal(loaded.baseBranch, 'trunk');
-    assert.deepEqual(loaded.surfaces, ['frontend']);
+    assert.equal(loaded.baseBranch, 'main');
+    assert.deepEqual(loaded.surfaces, stateMod.defaultWorkflowConfig('escape', 'Legacy Safe App').surfaces);
+    assert.equal(loaded.deployWorkflowName, 'Deploy Hosted');
+    assert.equal(loaded.surfacePathMap, undefined);
     assert.equal(loaded.stateDir, 'pipelane-state');
     assert.notEqual(loaded.taskWorktreeDirName, '../../attacker-worktrees');
     assert.equal(loaded.taskWorktreeDirName, 'escape-worktrees');
@@ -4307,6 +4309,7 @@ test('legacy config auto-import keeps repository-controlled policy out of machin
     assert.equal(loaded.routeSafety.stopOnMajorFindings, true);
     assert.equal(loaded.orchestrate, undefined);
     assert.match(stderr, /ignored machine-local policy field\(s\).*stateDir, taskWorktreeDirName/);
+    assert.match(stderr, /baseBranch.*surfaces.*deployWorkflowName.*surfacePathMap/);
     assert.match(stderr, /rejected unsafe legacy stateDir/);
     assert.match(stderr, /prePrChecks, prPathDenyList, releaseMode, reviewGates, routeSafety, orchestrate/);
     assert.match(stderr, /normalized unsafe legacy projectKey "\.\.\/\.\.\/escape" to "escape"/);
@@ -4370,6 +4373,66 @@ test('legacy config auto-import migrates a safe custom stateDir before sanitizin
     assert.match(stderr, /Migrated 1 legacy state file\(s\) from/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('legacy custom-state auto-import fails closed on enumeration and copy failures, then safely retries a partial copy', async () => {
+  const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+  const repos = [];
+  const setupLegacyRepo = () => {
+    const repoRoot = createRepo();
+    repos.push(repoRoot);
+    const legacyDir = path.join(resolveCommonDir(repoRoot), 'custom-state');
+    mkdirSync(legacyDir, { recursive: true });
+    writeFileSync(path.join(legacyDir, 'mode-state.json'), `${JSON.stringify({
+      mode: 'release',
+      requestedSurfaces: ['frontend'],
+      override: null,
+      updatedAt: '2026-07-12T00:00:00.000Z',
+    }, null, 2)}\n`, 'utf8');
+    writeFileSync(path.join(legacyDir, 'probe-state.json'), '{"records":[]}\n', 'utf8');
+    writeFileSync(path.join(repoRoot, '.pipelane.json'), `${JSON.stringify({
+      displayName: 'Legacy Retry State',
+      stateDir: 'custom-state',
+    }, null, 2)}\n`, 'utf8');
+    return { repoRoot, canonicalDir: sharedStateDir(repoRoot) };
+  };
+
+  try {
+    for (const failure of ['readdir', 'copy:mode-state.json']) {
+      const { repoRoot, canonicalDir } = setupLegacyRepo();
+      process.env.PIPELANE_TEST_LEGACY_MIGRATION_FAIL = failure;
+      assert.throws(
+        () => stateMod.resolveWorkflowContext(repoRoot),
+        failure === 'readdir' ? /machine-local config was not imported/ : /migration markers were not written/,
+      );
+      assert.equal(existsSync(machinePipelaneConfigPath(repoRoot)), false);
+      assert.equal(existsSync(path.join(canonicalDir, 'legacy-migration.json')), false);
+      assert.equal(existsSync(path.join(canonicalDir, 'installed.json')), false);
+    }
+
+    const { repoRoot, canonicalDir } = setupLegacyRepo();
+    process.env.PIPELANE_TEST_LEGACY_MIGRATION_FAIL = 'copy:probe-state.json';
+    assert.throws(
+      () => stateMod.resolveWorkflowContext(repoRoot),
+      /migration markers were not written/,
+    );
+    assert.equal(existsSync(path.join(canonicalDir, 'mode-state.json')), true, 'first entry demonstrates a partial copy');
+    assert.equal(existsSync(path.join(canonicalDir, 'probe-state.json')), false);
+    assert.equal(existsSync(path.join(canonicalDir, 'legacy-migration.json')), false);
+    assert.equal(existsSync(path.join(canonicalDir, 'installed.json')), false);
+    assert.equal(existsSync(machinePipelaneConfigPath(repoRoot)), false);
+
+    delete process.env.PIPELANE_TEST_LEGACY_MIGRATION_FAIL;
+    const retried = stateMod.resolveWorkflowContext(repoRoot);
+    assert.equal(retried.modeState.mode, 'release');
+    assert.equal(existsSync(path.join(canonicalDir, 'probe-state.json')), true);
+    assert.equal(existsSync(path.join(canonicalDir, 'legacy-migration.json')), true);
+    assert.equal(existsSync(path.join(canonicalDir, 'installed.json')), true);
+    assert.equal(existsSync(machinePipelaneConfigPath(repoRoot)), true);
+  } finally {
+    delete process.env.PIPELANE_TEST_LEGACY_MIGRATION_FAIL;
+    for (const repoRoot of repos) rmSync(repoRoot, { recursive: true, force: true });
   }
 });
 
@@ -22213,9 +22276,17 @@ test('route safety explicit resume overrides can accept findings and continue', 
 
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Route Safety Resume', '--json'], repoRoot).stdout);
     writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'route safety resume\n', 'utf8');
-    runCli(['run', 'review', '--json'], created.worktreePath, {}, true);
+    const fullReview = JSON.parse(runCli(['run', 'review', '--json'], created.worktreePath, {}, true).stdout);
     const paused = runCli(['run', 'pr', '--title', 'Route Safety Resume', '--json'], created.worktreePath, env, true);
     assert.equal(paused.status, 1);
+
+    const filteredRetry = runCli(['run', 'review', '--gate', 'always-fails', '--json'], created.worktreePath, {}, true);
+    assert.equal(filteredRetry.status, 1);
+    assert.equal(
+      latestRouteSafetyRecord(created.worktreePath).lastReviewRunId,
+      fullReview.runId,
+      'a filtered retry must not replace the full review envelope used by route acceptance',
+    );
 
     const oneMore = JSON.parse(runCli(['run', 'resume', '--one-more-loop', '--json'], created.worktreePath).stdout);
     assert.match(oneMore.message, /Allowed one more fix\/review loop/);
@@ -31659,7 +31730,7 @@ test('devmode release refreshes only age-stale probes inline and remains fail-cl
   }
 });
 
-test('devmode release never overwrites a rebound or removed task lock after delayed probe refresh', async () => {
+test('devmode release never overwrites a rebound identity or removed task lock after delayed probe refresh', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-devmode-probe-'));
   const markerPath = path.join(markerRoot, 'probe-started');
@@ -31681,12 +31752,9 @@ test('devmode release never overwrites a rebound or removed task lock after dela
 
     const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
     const context = stateMod.resolveWorkflowContext(created.worktreePath);
-    const reboundPath = path.join(path.dirname(created.worktreePath), 'rebound-destination');
     stateMod.updateTaskLock(context.commonDir, context.config, 'concurrent-reconciliation', (lock) => ({
       ...lock,
-      taskSlug: lock.taskSlug,
-      branchName: 'codex/concurrent-reconciliation-rebound',
-      worktreePath: reboundPath,
+      taskBindingId: 'task-binding-identity-only-rebind',
       updatedAt: new Date().toISOString(),
     }));
 
@@ -31694,7 +31762,9 @@ test('devmode release never overwrites a rebound or removed task lock after dela
     assert.equal(reboundResult.status, 1);
     assert.match(reboundResult.stderr, /changed binding while devmode release checked release readiness/);
     const reboundLock = stateMod.loadTaskLock(context.commonDir, context.config, 'concurrent-reconciliation');
-    assert.equal(reboundLock.worktreePath, reboundPath);
+    assert.equal(reboundLock.worktreePath, created.worktreePath, 'identity-only race keeps the same worktree path');
+    assert.equal(reboundLock.branchName, created.branch);
+    assert.equal(reboundLock.taskBindingId, 'task-binding-identity-only-rebind');
     assert.equal(reboundLock.mode, 'build');
     assert.equal(stateMod.resolveWorkflowContext(repoRoot).modeState.mode, 'build');
 

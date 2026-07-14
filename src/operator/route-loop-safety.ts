@@ -1215,26 +1215,31 @@ function recordExactAttempt(record: RouteSafetyRecord, identity: RouteSafetyRout
 
 function countReviewRun(record: RouteSafetyRecord, reviewRun: ReviewRunRecord): void {
   const timedOutGateIds = reconcileTimedOutGateIds(record.lastTimedOutGateIds ?? [], reviewRun);
+  const coversFullGateSet = !reviewRun.dryRun && !reviewRun.gateFilter && !reviewRun.phaseFilter;
   if (record.countedReviewRunIds.includes(reviewRun.id)) {
-    record.lastReviewRunId = reviewRun.id;
-    record.lastReviewStatus = reviewRun.status;
+    if (coversFullGateSet) {
+      record.lastReviewRunId = reviewRun.id;
+      record.lastReviewStatus = reviewRun.status;
+      recordFixRerunTransition(record, reviewRun);
+    }
     record.lastTimedOutGateIds = timedOutGateIds;
-    recordFixRerunTransition(record, reviewRun);
     return;
   }
   record.countedReviewRunIds = [reviewRun.id, ...record.countedReviewRunIds].slice(0, 50);
-  record.lastReviewRunId = reviewRun.id;
-  record.lastReviewStatus = reviewRun.status;
   record.lastTimedOutGateIds = timedOutGateIds;
-  const attempt = record.attempts?.find((entry) => entry.digest === record.currentAttemptDigest);
-  if (attempt) attempt.reviewRunId = reviewRun.id;
-  if (reviewRun.status === 'failed' && reviewRunHasActionableFailure(reviewRun)) {
-    record.fixReviewLoops += 1;
+  if (coversFullGateSet) {
+    record.lastReviewRunId = reviewRun.id;
+    record.lastReviewStatus = reviewRun.status;
+    const attempt = record.attempts?.find((entry) => entry.digest === record.currentAttemptDigest);
+    if (attempt) attempt.reviewRunId = reviewRun.id;
+    if (reviewRun.status === 'failed' && reviewRunHasActionableFailure(reviewRun)) {
+      record.fixReviewLoops += 1;
+    }
+    recordFixRerunTransition(record, reviewRun);
   }
   if (reviewRunUsesAiReview(reviewRun)) {
     record.aiReviewRuns += 1;
   }
-  recordFixRerunTransition(record, reviewRun);
 }
 
 function recordFixRerunTransition(record: RouteSafetyRecord, reviewRun: ReviewRunRecord): void {

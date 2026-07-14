@@ -697,9 +697,60 @@ and non-TTY execution paths.
     whose base branch begins with `--upload-pack=` and let `/new` refresh the
     base ref; the value crossed the config boundary without Git ref validation
     and was passed to `git fetch` without an option terminator. **Proposed fix
-    (implemented):** validate every normalized base branch with
-    `git check-ref-format`, reject dash-prefixed values with an actionable
-    error, and place `--` before fetch positionals as defense in depth.
+    (implemented):** legacy auto-import no longer promotes a
+    checkout-controlled base branch into machine trust; direct machine-local
+    configuration still validates every normalized base branch with
+    `git check-ref-format`, rejects dash-prefixed values with an actionable
+    error, and places `--` before fetch positionals as defense in depth.
+
+52. **A failed custom-state migration could permanently discard release-mode
+    safeguards (P0).** **Location:** `src/operator/state.ts:1876` and
+    `src/operator/state.ts:2529`. **Repro:** point a safe legacy `stateDir` at
+    existing release state, then make enumeration or any copy fail during the
+    first auto-import; the old best-effort helper still wrote sanitized
+    machine config, and a partial success could write migration/install
+    markers. Future loads stopped consulting the legacy directory and could
+    default to build mode. **Proposed fix (implemented):** auto-imported custom
+    state uses a strict migration mode: enumeration or copy failure throws
+    before machine config or markers are written, existing destinations must
+    be recursively byte-equivalent, and a retry verifies earlier copied
+    entries before completing the remaining copy. Failure-injection coverage
+    exercises enumeration failure, zero-copy failure, partial copy, and a
+    successful retry. Historical default-directory migration keeps its
+    backwards-compatible best-effort behavior.
+
+53. **Legacy auto-import promoted checkout-controlled deploy routing into
+    machine trust (P0).** **Location:** `src/operator/state.ts:1798`.
+    **Repro:** place `baseBranch`, `surfaces`, `deployWorkflowName`, or
+    `surfacePathMap` in `.pipelane.json` or `package.json:pipelane`, then run
+    the first command; those values were persisted in the shared machine-local
+    config and controlled later review/deploy routing. **Proposed fix
+    (implemented):** auto-import now limits itself to non-routing project
+    identity/ergonomic fields and prints the existing ignored-policy warning
+    for all four routing fields. Operators must configure routing explicitly
+    through the machine-local path.
+
+54. **Delayed release reconciliation did not bind the immutable task identity
+    (P1).** **Location:** `src/operator/commands/devmode.ts:204`. **Repro:**
+    start `devmode release` while a stale probe runs, rebind the same slug to a
+    new `taskBindingId` without changing branch, path, or surfaces, then let
+    the probe finish; the old lease check wrote release mode into the new
+    binding. **Proposed fix (implemented):** compare `taskBindingId` alongside
+    branch and canonical worktree path under the task mutation lease. The
+    identity-only race now fails closed and leaves both task and global mode
+    in build.
+
+55. **A targeted review retry replaced the route's full evidence ID and broke
+    `resume --accept-findings` (P1).** **Location:**
+    `src/operator/route-loop-safety.ts:1216`. **Repro:** pause a route on a
+    failed full review, run `review --gate <id>`, then accept the remaining
+    findings; evidence composition correctly retained the full run as its
+    envelope, while route safety stored the filtered run ID, so the exact-ID
+    consent check always rejected. **Proposed fix (implemented):** filtered,
+    phase-filtered, and dry-run reviews can update timeout and AI-budget
+    accounting but cannot replace `lastReviewRunId`, `lastReviewStatus`, or
+    the attempt's full-review binding. A failed targeted retry now remains
+    composable and accept-findings operates on the matching full envelope.
 
 ### Filed for follow-up
 
