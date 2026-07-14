@@ -14949,10 +14949,9 @@ test('filtered retry equivalence binds policy, task, intent, and review target i
   }
 });
 
-test('manual acceptance and executable skill-gate retries are applied in recorded chronology', async () => {
+test('structured manual evidence and executable skill-gate retries are applied in recorded chronology', async () => {
   const repoRoot = createRepo();
   const previousReviewStateKey = process.env.PIPELANE_REVIEW_STATE_KEY;
-  const previousClaudeSessionId = process.env.CLAUDE_SESSION_ID;
   try {
     writePipelaneConfig(repoRoot, 'Chronological Review Demo', {
       reviewGates: {
@@ -14970,6 +14969,7 @@ test('manual acceptance and executable skill-gate retries are applied in recorde
     });
     commitLocal(repoRoot, 'Configure chronological AI review gate');
 
+    const manualFiles = writeManualReviewFiles(repoRoot, 'chronological-gstack');
     const fullRun = writePassingReviewEvidence(repoRoot, {
       status: 'pending',
       gateStatuses: { 'gstack-review': 'pending' },
@@ -14995,25 +14995,18 @@ test('manual acceptance and executable skill-gate retries are applied in recorde
     stateMod.appendReviewRunRecord(context.commonDir, context.config, { ...fullRun, signature: undefined });
     stateMod.appendReviewRunRecord(context.commonDir, context.config, { ...olderRetry, signature: undefined });
 
-    process.env.CLAUDE_SESSION_ID = 'chronological-review-attester';
-    const reviewCommand = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'review.ts'));
-    const acceptance = reviewCommand.buildReviewAcceptanceRecord({
-      repoRoot,
-      commonDir: context.commonDir,
-      config: context.config,
-      gateId: 'gstack-review',
-      message: 'Independent review completed cleanly',
-    });
-    stateMod.appendReviewAcceptanceRecord(context.commonDir, context.config, acceptance);
-    if (previousClaudeSessionId === undefined) {
-      delete process.env.CLAUDE_SESSION_ID;
-    } else {
-      process.env.CLAUDE_SESSION_ID = previousClaudeSessionId;
-    }
+    const attested = runCli([
+      ...manualReviewAttestArgs('gstack-review', manualFiles, 'Independent review completed cleanly'),
+    ], repoRoot, {
+      PIPELANE_REVIEW_STATE_KEY: 'chronological-review-state-key-0001',
+      CLAUDE_SESSION_ID: 'chronological-review-attester',
+    }, true);
+    assert.equal(attested.status, 0, attested.stderr);
+    const attestedPayload = JSON.parse(attested.stdout);
     const { evaluateReviewEvidenceForPr } = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-enforcement.ts'));
     const accepted = evaluateReviewEvidenceForPr(stateMod.resolveWorkflowContext(repoRoot));
     assert.equal(accepted.allowed, true, accepted.message);
-    assert.equal(accepted.latest.id, fullRun.id);
+    assert.equal(accepted.latest.id, attestedPayload.runId);
     assert.match(accepted.latest.gates[0].summary, /Independent review completed cleanly/);
 
     const newerRetryAt = new Date(Date.now() + 1_000).toISOString();
@@ -15034,18 +15027,13 @@ test('manual acceptance and executable skill-gate retries are applied in recorde
 
     const rejected = evaluateReviewEvidenceForPr(stateMod.resolveWorkflowContext(repoRoot));
     assert.equal(rejected.allowed, false);
-    assert.equal(rejected.latest.id, fullRun.id);
+    assert.equal(rejected.latest.id, attestedPayload.runId);
     assert.equal(rejected.latest.gates[0].summary, 'Newer executable retry failed');
   } finally {
     if (previousReviewStateKey === undefined) {
       delete process.env.PIPELANE_REVIEW_STATE_KEY;
     } else {
       process.env.PIPELANE_REVIEW_STATE_KEY = previousReviewStateKey;
-    }
-    if (previousClaudeSessionId === undefined) {
-      delete process.env.CLAUDE_SESSION_ID;
-    } else {
-      process.env.CLAUDE_SESSION_ID = previousClaudeSessionId;
     }
     rmSync(repoRoot, { recursive: true, force: true });
   }
