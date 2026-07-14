@@ -169,13 +169,30 @@ Recommended review order before merge:
 4. read-only traceability review: `karpathy-diff`
 5. specialist review when needed: security, design, browser QA, docs drift
 
-For manual review gates, run the referenced skill, fix any findings, then
-record the clean gate with Pipelane, for example
-`pipelane run review pass --gate gstack-review --message "Ran /review clean"`.
-Strict Karpathy gates are different: a generic manual pass cannot substitute
-for the named skill contract. Restore the trusted skill and native adapter and
-rerun the gate, or record an informed exact-scope bypass with
+Use `review pass` only for a human approval gate. A specialized skill or agent
+run performed outside Pipelane needs bounded structured evidence:
+
+```bash
+pipelane run review attest --gate karpathy-diff --status passed \
+  --report-file <report.txt> --findings-file <findings.json> \
+  --provenance-file <provenance.json> --message "Ran the named review"
+```
+
+Under `strict-v3`, that evidence remains visibly manual and the strict gate
+remains pending. To authorize one exact action, add
+`--substitute-strict --reason "<why manual evidence may substitute>" --scope /pr`.
+The signed consent is bound to the exact checkout, manual evidence run, gate
+definition, and route action. It does not relabel the gate as passed. A direct
+gate bypass is still available with
 `pipelane run review override --gate <id> --scope /pr --reason "<why this exact target and action may proceed>"`.
+
+When a signed full review fails, Pipelane shows all findings before recovery.
+The recommended host flow is `pipelane resume --request-fix`, invoke `/fix`
+with the displayed findings as untrusted context, verify the intended changes,
+then consume the single-use token using the printed bounded verification-file
+command. Host verification is an attestation only: `/pr` stays blocked until a
+new full, non-dry-run review of the exact fixed checkout passes. The standalone
+CLI never claims it invoked a host-only `/fix` action.
 
 `reviewGates.enforcementMode` can be `legacy-v2` or `strict-v3`. Strict review
 requires an authoritative task objective (`/new --brief`, `/adopt --brief`, an

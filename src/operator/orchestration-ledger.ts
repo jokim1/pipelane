@@ -1973,7 +1973,13 @@ export function isActiveOrchestrationRun(
 export interface OrchestrationReviewSatisfactionOptions {
   headCache?: Map<string, string | null>;
   headTreeCache?: Map<string, string | null>;
-  statusDigestCache?: Map<string, { digest: string; reliable: boolean; dirty?: boolean } | null>;
+  statusDigestCache?: Map<string, {
+    digest: string;
+    reliable: boolean;
+    dirty?: boolean;
+    materialTreeHash?: string;
+    materialTreeReliable?: boolean;
+  } | null>;
   worktreeExistsCache?: Map<string, boolean>;
   // C2: verify the embedded review signature + binding on read. `reviewStateKey`
   // defaults to the env key (`resolveReviewStateKey`) when omitted; when no key is
@@ -2093,19 +2099,31 @@ export function sliceReviewFullySatisfied(
   if (!slice.worktreePath || !sliceWorktreeExists(slice, options)) {
     return slice.status === 'completed';
   }
-  if (!reviewRun.worktreeStatusDigest || reviewRun.worktreeStatusReliable !== true) {
+  const hasReliableReviewedIdentity = (
+    Boolean(reviewRun.worktreeStatusDigest)
+    && reviewRun.worktreeStatusReliable === true
+  ) || (
+    Boolean(reviewRun.worktreeMaterialTreeHash)
+    && reviewRun.worktreeMaterialTreeReliable === true
+  );
+  if (!hasReliableReviewedIdentity) {
     return false;
   }
   const currentHead = currentSliceHead(slice, options);
   if (!currentHead) return false;
   const currentStatus = currentSliceStatusDigest(slice, options);
-  if (
-    reviewRun.sha === currentHead
-    && currentStatus !== null
-    && currentStatus.reliable
-    && reviewRun.worktreeStatusDigest === currentStatus.digest
-  ) {
-    return true;
+  if (reviewRun.sha === currentHead && currentStatus !== null) {
+    if (currentStatus.reliable && reviewRun.worktreeStatusReliable === true && reviewRun.worktreeStatusDigest === currentStatus.digest) {
+      return true;
+    }
+    if (
+      currentStatus.materialTreeReliable === true
+      && reviewRun.worktreeMaterialTreeReliable === true
+      && Boolean(reviewRun.worktreeMaterialTreeHash)
+      && reviewRun.worktreeMaterialTreeHash === currentStatus.materialTreeHash
+    ) {
+      return true;
+    }
   }
   return materialTreeMatchesReviewedTree(slice, reviewRun, currentStatus, options);
 }
@@ -2237,14 +2255,29 @@ function currentSliceHead(slice: OrchestrationSliceRecord, options: Orchestratio
 function currentSliceStatusDigest(
   slice: OrchestrationSliceRecord,
   options: OrchestrationReviewSatisfactionOptions,
-): { digest: string; reliable: boolean; dirty?: boolean } | null {
+): {
+  digest: string;
+  reliable: boolean;
+  dirty?: boolean;
+  materialTreeHash?: string;
+  materialTreeReliable?: boolean;
+} | null {
   if (!slice.worktreePath || !sliceWorktreeExists(slice, options)) return null;
   if (options.statusDigestCache?.has(slice.worktreePath)) {
     return options.statusDigestCache.get(slice.worktreePath) ?? null;
   }
-  const snapshot = readWorktreeStatusSnapshot(slice.worktreePath, { includeStatusDigest: true });
+  const snapshot = readWorktreeStatusSnapshot(slice.worktreePath, {
+    includeStatusDigest: true,
+    includeMaterialTreeHash: true,
+  });
   const status = snapshot.exists
-    ? { digest: snapshot.statusDigest, reliable: snapshot.statusDigestReliable, dirty: snapshot.dirty }
+    ? {
+        digest: snapshot.statusDigest,
+        reliable: snapshot.statusDigestReliable,
+        dirty: snapshot.dirty,
+        materialTreeHash: snapshot.materialTreeHash,
+        materialTreeReliable: snapshot.materialTreeReliable,
+      }
     : null;
   options.statusDigestCache?.set(slice.worktreePath, status);
   return status;
@@ -2263,7 +2296,13 @@ function currentSliceHeadTree(slice: OrchestrationSliceRecord, options: Orchestr
 function materialTreeMatchesReviewedTree(
   slice: OrchestrationSliceRecord,
   reviewRun: ReviewRunRecord,
-  currentStatus: { digest: string; reliable: boolean; dirty?: boolean } | null,
+  currentStatus: {
+    digest: string;
+    reliable: boolean;
+    dirty?: boolean;
+    materialTreeHash?: string;
+    materialTreeReliable?: boolean;
+  } | null,
   options: OrchestrationReviewSatisfactionOptions,
 ): boolean {
   if (

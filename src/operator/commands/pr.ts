@@ -46,6 +46,7 @@ import {
 } from '../review-enforcement.ts';
 import {
   evaluateDestinationRouteReviewSafety,
+  recordDestinationRouteCompleted,
   routeSafetyAcceptsReviewFindings,
 } from '../route-loop-safety.ts';
 import { buildDestinationPlanForCommand } from '../destination-planner.ts';
@@ -264,6 +265,10 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
     taskSlug,
     prNumber ? `PR #${prNumber} open, awaiting CI` : 'PR created, awaiting CI',
   );
+  if (process.env.PIPELANE_DESTINATION_INTERNAL_STEP !== '1') {
+    const completedPlan = buildDestinationPlanForCommand(cwd, parsed);
+    if (completedPlan) recordDestinationRouteCompleted(context, completedPlan);
+  }
   const reviewOverrideMessage = reviewOverrideApplied
     ? formatReviewEvidenceOverrideMessage(formatWorkflowCommand(context.config, 'pr'), reviewOverrideReason)
     : '';

@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs';
 
-import type { DeployRecord, PrRecord, ProbeState, ReviewOverrideRecord, ReviewRunRecord, TaskLock, WorkflowConfig } from '../state.ts';
+import type { DeployRecord, PrRecord, ProbeState, ReviewConsentRecord, ReviewOverrideRecord, ReviewRunRecord, TaskLock, WorkflowConfig } from '../state.ts';
 import {
   DEFAULT_MODE,
   formatWorkflowCommand,
@@ -76,7 +76,12 @@ import {
   type ShellRelationshipState,
   type SourceHealthEntry,
 } from './envelope.ts';
-import { evaluateReviewEvidenceForPr, selectCurrentReviewEvidenceRecord, type ReviewEvidenceCheckResult } from '../review-enforcement.ts';
+import {
+  evaluateReviewEvidenceForPr,
+  selectCurrentReviewConsents,
+  selectCurrentReviewEvidenceRecord,
+  type ReviewEvidenceCheckResult,
+} from '../review-enforcement.ts';
 import { projectReviewRun, type ReviewRunPresentation } from '../review-output.ts';
 
 export interface BranchLanes {
@@ -327,10 +332,11 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
   const reviewState = loadReviewState(context.commonDir, context.config);
   const reviewEvidence = evaluateReviewEvidenceForPr(context);
   const currentReview = selectCurrentReviewEvidenceRecord(context, reviewState.records);
+  const currentReviewConsents = selectCurrentReviewConsents(context, currentReview);
   const recentReview = reviewState.records.find((record) => record.id !== currentReview?.id) ?? null;
   const artifactRoot = reviewArtifactRoot(context.commonDir, context.config);
   const currentReviewSnapshot = currentReview
-    ? attachReviewPresentation(currentReview, artifactRoot, 'current')
+    ? attachReviewPresentation(currentReview, artifactRoot, 'current', currentReviewConsents)
     : null;
   const recentReviewSnapshot = recentReview
     ? attachReviewPresentation(recentReview, artifactRoot, 'recent')
@@ -579,10 +585,11 @@ function attachReviewPresentation(
   record: ReviewRunRecord,
   artifactRoot: string,
   relation: ReviewRunPresentation['relation'],
+  consents: ReviewConsentRecord[] = [],
 ): ReviewSnapshotRecord {
   return {
     ...record,
-    presentation: projectReviewRun(record, { artifactRoot, relation }),
+    presentation: projectReviewRun(record, { artifactRoot, relation, consents }),
   };
 }
 

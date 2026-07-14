@@ -1,4 +1,5 @@
 import type {
+  ReviewConsentRecord,
   ReviewFindingSeverity,
   ReviewGateRunRecord,
   ReviewRunRecord,
@@ -7,6 +8,11 @@ import { sanitizeForTerminal } from './text-output.ts';
 import { readVerifiedReviewArtifact } from './review-artifacts.ts';
 
 const REVIEW_GATE_RESULT_LINE = /^PIPELANE_REVIEW_GATE_RESULT=(?:passed|failed|\{.*\})\s*$/gm;
+
+export const REVIEW_FINDINGS_HEADING = 'Review findings:';
+export const REVIEW_RECOVERY_HEADING = 'Review recovery choices:';
+export const REVIEW_FIX_ACTION_ID = 'request-audited-fix';
+export const REVIEW_FIX_ACTION_LABEL = 'Fix the shown findings now through one audited host attempt';
 
 export type ReviewPresentationRelation = 'current' | 'recent' | 'embedded';
 export type ReviewPresentationTextSource = 'artifact' | 'legacy-stdout' | 'legacy-stderr';
@@ -45,6 +51,15 @@ export interface ReviewGatePresentation {
   report: ReviewPresentationText | null;
   diagnostics: ReviewPresentationText | null;
   protocolErrors: string[];
+  evidenceKind: 'automatic' | 'manual-attestation' | 'manual-approval';
+  manualAttestation: null | {
+    status: 'passed' | 'failed';
+    message: string;
+    source: string;
+    command: string;
+    exitCode: number;
+    substitutionRequested: boolean;
+  };
   result: null | {
     protocolVersion: number;
     declaredStatus: 'passed' | 'failed';
@@ -86,6 +101,15 @@ export interface ReviewRunPresentation {
     protocolErrors: number;
   };
   gates: ReviewGatePresentation[];
+  authorizations: Array<{
+    id: string;
+    kind: ReviewConsentRecord['kind'];
+    gateId: string;
+    label: 'bypassed by user' | 'findings accepted' | 'manual review substituted';
+    reason: string;
+    routeAction: string;
+    recordedAt: string;
+  }>;
   nextAction: null | {
     kind: 'repair-rerun' | 'complete-rerun' | 'continue';
     summary: string;
@@ -97,6 +121,7 @@ export interface ProjectReviewRunOptions {
   artifactRoot?: string;
   relation?: ReviewPresentationRelation;
   includeReportText?: boolean;
+  consents?: ReviewConsentRecord[];
 }
 
 export interface RenderReviewPresentationOptions {
@@ -201,6 +226,21 @@ export function projectReviewGate(
     report,
     diagnostics,
     protocolErrors,
+    evidenceKind: gate.manualAttestation
+      ? 'manual-attestation'
+      : gate.type === 'approval'
+        ? 'manual-approval'
+        : 'automatic',
+    manualAttestation: gate.manualAttestation
+      ? {
+          status: gate.manualAttestation.status,
+          message: visible(gate.manualAttestation.message),
+          source: visible(gate.manualAttestation.provenance.source),
+          command: visible(gate.manualAttestation.provenance.command),
+          exitCode: gate.manualAttestation.provenance.exitCode,
+          substitutionRequested: gate.manualAttestation.substitutionRequested,
+        }
+      : null,
     result: gate.result
       ? {
           protocolVersion: gate.result.protocolVersion,
@@ -231,6 +271,19 @@ export function projectReviewRun(
   };
   const findingTotals = findingCounts(gates.flatMap((gate) => gate.findings));
   const relation = options.relation ?? 'embedded';
+  const authorizations = (options.consents ?? []).map((consent) => ({
+    id: visible(consent.id),
+    kind: consent.kind,
+    gateId: visible(consent.gateId),
+    label: consent.kind === 'manual-substitution'
+      ? 'manual review substituted' as const
+      : consent.kind === 'accept-findings'
+        ? 'findings accepted' as const
+        : 'bypassed by user' as const,
+    reason: visible(consent.reason),
+    routeAction: visible(consent.routeAction),
+    recordedAt: visible(consent.recordedAt),
+  }));
   const nextAction = relation === 'recent'
     ? null
     : record.status === 'failed'
@@ -266,6 +319,7 @@ export function projectReviewRun(
       protocolErrors: gates.reduce((count, gate) => count + gate.protocolErrors.length, 0),
     },
     gates,
+    authorizations,
     nextAction,
   };
 }
@@ -284,6 +338,10 @@ export function renderReviewGatePresentation(
     lines.push(`${indent}- ${gate.gateId} [${gate.phase}] ${gate.status.toUpperCase()} (${gate.blocking ? 'blocking' : 'non-blocking'}) - ${gate.summary}`);
   }
   const contentIndent = options.includeGateHeader === false ? indent : `${indent}  `;
+  if (gate.manualAttestation) {
+    lines.push(`${contentIndent}Evidence: MANUAL ATTESTATION (${gate.manualAttestation.status}); automatic capability was not claimed.`);
+    lines.push(`${contentIndent}Provenance: ${gate.manualAttestation.source}; command=${gate.manualAttestation.command}; exit=${gate.manualAttestation.exitCode}`);
+  }
   if (gate.findings.length > 0) {
     lines.push(`${contentIndent}Findings (${gate.counts.blocking} blocking, ${gate.counts.advisory} advisory):`);
     lines.push(...gate.findings.map((finding) => `${contentIndent}  ${renderFinding(finding)}`));
@@ -316,11 +374,21 @@ export function renderReviewPresentation(
       options.includePassed === true
       || gate.status === 'failed'
       || gate.status === 'pending'
+      || gate.manualAttestation !== null
       || gate.findings.length > 0
       || gate.protocolErrors.length > 0
     )
   );
-  return gates.flatMap((gate) => renderReviewGatePresentation(gate, options));
+  const authorizations = presentation.authorizations.flatMap((authorization) => [
+    `- ${authorization.label.toUpperCase()} for ${authorization.gateId} and ${authorization.routeAction}: ${authorization.reason}`,
+    ...(authorization.kind === 'manual-substitution'
+      ? ['  Underlying capability remains manual-attestation, not automatic strict review.']
+      : []),
+  ]);
+  return [
+    ...(authorizations.length > 0 ? ['Review authorizations:', ...authorizations] : []),
+    ...gates.flatMap((gate) => renderReviewGatePresentation(gate, options)),
+  ];
 }
 
 export function visibleReviewGateFailureOutput(gate: ReviewGateRunRecord, artifactRoot?: string): string {
