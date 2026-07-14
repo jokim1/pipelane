@@ -222,7 +222,12 @@ run_pipelane review $REST
 
 where `$REST` is `$ARGUMENTS` with the leading `review` token stripped.
 
-Use this path for `/pipelane review`, `/pipelane review --json`, `/pipelane review --dry-run`, `/pipelane review --gate <id>`, `/pipelane review --phase <phase>`, and `/pipelane review setup ...`. Display the output directly.
+Use this path for `/pipelane review`, `/pipelane review --json`, `/pipelane review --dry-run`, `/pipelane review --gate <id>`, `/pipelane review --phase <phase>`, `/pipelane review record ...`, and `/pipelane review setup ...`. Display the output directly.
+
+For `review record`, preserve the full CLI surface: `--gate code-review-high`,
+`--task`, `--tool`, `--summary`, `--findings-count`, `--artifact`, and optional
+`--sha`. Explain that it records exact-HEAD external review evidence; it is not
+a waiver and it does not replace the per-HEAD `karpathy-diff` clean-pass check.
 
 For normal `/pipelane review` output, relay the CLI's `Review checklist`
 directly. TTY runs show live checklist updates; captured/non-TTY runs show one

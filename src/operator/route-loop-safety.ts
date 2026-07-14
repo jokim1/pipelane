@@ -1,4 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { mkdirSync, rmSync } from 'node:fs';
+import path from 'node:path';
 import readline from 'node:readline/promises';
 
 import {
@@ -9,6 +11,7 @@ import {
 } from './destination-planner.ts';
 import {
   DEFAULT_ROUTE_SAFETY,
+  appendReviewFindingDispositionRecord,
   ensureTaskBindingId,
   formatWorkflowCommand,
   loadAllTaskLocks,
@@ -18,19 +21,24 @@ import {
   normalizeRouteSafetyConfig,
   nowIso,
   resolveWorkflowContext,
+  reviewFindingFollowUpRoot,
+  recordedReviewArtifactReference,
   runGit,
   saveRouteSafetyState,
   withRouteSafetyStateLock,
+  writeJsonFile,
   type ParsedOperatorArgs,
   type FixAttemptEvidence,
   type FixCheckoutIdentity,
   type ReviewRunRecord,
+  type ReviewFindingDispositionRecord,
   type RouteSafetyRecord,
   type RouteSafetyResumeRecord,
   type RouteSafetyState,
   type WorkflowContext,
 } from './state.ts';
 import {
+  currentCheckoutReviewEvidenceTarget,
   evaluateReviewEvidenceForPr,
   recordReviewEvidenceConsents,
   type ReviewEvidenceCheckResult,
@@ -89,6 +97,8 @@ export function hasRouteSafetyResumeOverride(flags: ParsedOperatorArgs['flags'])
     || flags.maxMoreLoops.trim().length > 0
     || flags.maxMoreMinutes.trim().length > 0
     || flags.acceptFindings
+    || flags.spinOff.trim().length > 0
+    || flags.spinoffTask.trim().length > 0
     || flags.requestFix
     || flags.fixToken.trim().length > 0
     || flags.verificationFile.trim().length > 0
@@ -256,6 +266,7 @@ export function applyRouteSafetyResumeOverride(cwd: string, parsed: ParsedOperat
 } {
   const context = resolveWorkflowContext(cwd);
   if (parsed.flags.acceptFindings) return applyAcceptedFindingsResume(context, parsed);
+  if (parsed.flags.spinOff.trim()) return applyFindingSpinOffResume(context, parsed);
   const verification = parsed.flags.fixToken.trim()
     ? readFixVerificationFile(parsed.flags.verificationFile.trim())
     : null;
@@ -348,6 +359,177 @@ export function applyRouteSafetyResumeOverride(cwd: string, parsed: ParsedOperat
       || (fixAttempt ? renderFixAttemptConsumedMessage(record, fixAttempt) : '')
       || renderRouteSafetyResumeMessage(context, record, resume),
   };
+}
+
+function applyFindingSpinOffResume(
+  context: WorkflowContext,
+  parsed: ParsedOperatorArgs,
+): { message: string; record: RouteSafetyRecord } {
+  const reason = normalizeReviewDataField(parsed.flags.reason, {
+    field: 'spin-off reason',
+    maxBytes: REVIEW_DATA_LIMITS.reasonBytes,
+    redact: true,
+  });
+  const followUpTask = normalizeReviewDataField(parsed.flags.spinoffTask, {
+    field: 'spin-off task label',
+    maxBytes: REVIEW_DATA_LIMITS.reasonBytes,
+    redact: true,
+  });
+  const expected = withRouteSafetyStateLock(context.commonDir, context.config, () => {
+    const state = loadRouteSafetyState(context.commonDir, context.config);
+    const branchName = runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
+    const latestPaused = state.latestPausedRouteFingerprintDigest
+      ? state.routes[state.latestPausedRouteFingerprintDigest]
+      : null;
+    const record = findPausedRouteRecordForCurrentCheckout(context, state)
+      ?? (latestPaused?.pausedAt && latestPaused.branchName === branchName ? latestPaused : null);
+    const currentSha = runGit(context.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '';
+    const reviewRunId = record?.lastReviewRunId
+      ?? loadReviewState(context.commonDir, context.config).records.find((entry) =>
+        !entry.dryRun && !entry.gateFilter && !entry.phaseFilter
+        && entry.status === 'failed' && entry.branchName === branchName && entry.sha === currentSha
+      )?.id;
+    if (!record || !reviewRunId) {
+      throw new Error('No exact paused review findings were found for this checkout. Rerun the route before spinning off a finding.');
+    }
+    return {
+      record,
+      reviewRunId,
+    };
+  });
+  const state = loadReviewState(context.commonDir, context.config);
+  const review = state.records.find((entry) => entry.id === expected.reviewRunId);
+  if (!review || review.dryRun || review.gateFilter || review.phaseFilter || review.status !== 'failed') {
+    throw new Error('Spin-off requires a current full failed review run with structured findings. Rerun the route and review first.');
+  }
+  const resolved = resolveFindingReference(review, parsed.flags.spinOff.trim());
+  const target = currentCheckoutReviewEvidenceTarget(context.repoRoot);
+  if (
+    review.branchName !== target.branchName
+    || review.sha !== target.sha
+    || review.worktreeStatusDigest !== target.worktreeStatusDigest
+    || review.worktreeMaterialTreeHash !== target.worktreeMaterialTreeHash
+  ) {
+    throw new Error('The checkout changed after this finding was reported. Rerun the full review before spinning off a finding.');
+  }
+  const duplicate = (state.findingDispositions ?? []).find((entry) =>
+    entry.findingRef === resolved.findingRef
+    && entry.branchName === target.branchName
+    && entry.sha === target.sha
+    && entry.worktreeStatusDigest === target.worktreeStatusDigest
+    && entry.worktreeMaterialTreeHash === target.worktreeMaterialTreeHash
+  );
+  if (duplicate) throw new Error(`Finding ${resolved.findingRef} is already spun off as ${duplicate.followUpTask} (${duplicate.id}).`);
+
+  const recordedAt = nowIso();
+  const id = `review-spinoff-${new Date(recordedAt).toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${randomUUID().slice(0, 8)}`;
+  const dispositionEffect = 'satisfies-finding-at-exact-head' as const;
+  const criticalRiskAcknowledged = resolved.finding.severity === 'critical';
+  const artifactRoot = reviewFindingFollowUpRoot(context.commonDir, context.config);
+  mkdirSync(artifactRoot, { recursive: true });
+  const artifactPath = path.join(artifactRoot, `${id}.json`);
+  const artifactPayload = {
+    schemaVersion: 1,
+    id,
+    kind: 'spin-off',
+    findingRef: resolved.findingRef,
+    reviewRunId: review.id,
+    gateId: resolved.gate.gateId,
+    finding: resolved.finding,
+    followUpTask,
+    reason,
+    dispositionEffect,
+    criticalRiskAcknowledged,
+    branchName: target.branchName,
+    sha: target.sha,
+    worktreeStatusDigest: target.worktreeStatusDigest,
+    worktreeMaterialTreeHash: target.worktreeMaterialTreeHash,
+    reviewTargetDigest: target.reviewTargetDigest,
+    recordedAt,
+  };
+  writeJsonFile(artifactPath, artifactPayload);
+  const artifact = recordedReviewArtifactReference(artifactPath);
+  const after = currentCheckoutReviewEvidenceTarget(context.repoRoot);
+  if (
+    after.branchName !== target.branchName
+    || after.sha !== target.sha
+    || after.worktreeStatusDigest !== target.worktreeStatusDigest
+    || after.worktreeMaterialTreeHash !== target.worktreeMaterialTreeHash
+    || after.reviewTargetDigest !== target.reviewTargetDigest
+  ) {
+    rmSync(artifactPath, { force: true });
+    throw new Error('The checkout changed while the spin-off artifact was being recorded. No disposition was written; rerun review against the stable checkout.');
+  }
+  const disposition: ReviewFindingDispositionRecord = {
+    id,
+    kind: 'spin-off',
+    findingRef: resolved.findingRef,
+    reviewRunId: review.id,
+    gateId: resolved.gate.gateId,
+    finding: resolved.finding,
+    followUpTask,
+    reason,
+    reasonHash: createHash('sha256').update(reason).digest('hex'),
+    dispositionEffect,
+    criticalRiskAcknowledged,
+    taskBindingId: target.taskBindingId,
+    branchName: target.branchName,
+    sha: target.sha,
+    worktreeStatusDigest: target.worktreeStatusDigest,
+    worktreeMaterialTreeHash: target.worktreeMaterialTreeHash,
+    reviewTargetDigest: target.reviewTargetDigest,
+    actor: resolveReviewActorIdentity(),
+    source: 'resume --spin-off',
+    recordedAt,
+    artifact,
+  };
+  let persisted: ReviewFindingDispositionRecord;
+  try {
+    persisted = appendReviewFindingDispositionRecord(context.commonDir, context.config, disposition);
+  } catch (error) {
+    rmSync(artifactPath, { force: true });
+    throw error;
+  }
+  return {
+    record: expected.record,
+    message: [
+      `Spun off ${persisted.findingRef} for this exact HEAD.`,
+      `Follow-up task: ${persisted.followUpTask}`,
+      `Reason: ${persisted.reason}`,
+      `Artifact: ${persisted.artifact.path} (sha256:${persisted.artifact.digest})`,
+      'Gate effect: this finding is satisfied by disposition at this exact HEAD; the original failed review remains failed and is not relabeled as clean.',
+      ...(persisted.criticalRiskAcknowledged ? [
+        'Informed consent: this critical finding will not block release or deploy at this exact HEAD. The recorded command, reason, actor, and artifact acknowledge that risk.',
+      ] : []),
+      'This is for remedies that are genuinely new scope; a live defect in code shipping now should be folded or explicitly accepted.',
+      `Next: rerun ${expected.record.targetCommand}; a new review is not required while the recorded checkout is unchanged.`,
+    ].join('\n'),
+  };
+}
+
+function resolveFindingReference(review: ReviewRunRecord, requested: string): {
+  findingRef: string;
+  gate: ReviewRunRecord['gates'][number];
+  finding: NonNullable<ReviewRunRecord['gates'][number]['findings']>[number];
+} {
+  const candidates = review.gates.flatMap((gate) => (gate.findings ?? []).map((finding) => ({
+    gate,
+    finding,
+    findingRef: `${review.id}/${gate.gateId}/${finding.id}`,
+    gateRef: `${gate.gateId}/${finding.id}`,
+  })));
+  const matches = candidates.filter((candidate) =>
+    requested === candidate.findingRef
+    || requested === candidate.gateRef
+    || requested === candidate.finding.id
+  );
+  if (matches.length === 0) {
+    throw new Error(`Finding ${requested} is not present in paused review ${review.id}. Use one of: ${candidates.map((candidate) => candidate.findingRef).join(', ') || '<no structured findings>'}.`);
+  }
+  if (matches.length > 1) {
+    throw new Error(`Finding ref ${requested} is ambiguous. Use the full stable ref: ${matches.map((candidate) => candidate.findingRef).join(', ')}.`);
+  }
+  return matches[0]!;
 }
 
 function applyAcceptedFindingsResume(
@@ -860,6 +1042,14 @@ function renderRouteSafetyPauseMessage(
     .filter((gate) => gate.blocking !== false)
     .map((gate) => `pipelane run review override --gate ${gate.id} --scope=${JSON.stringify(record.targetCommand)} --reason="<why this exact target and route may proceed despite ${gate.id}>"`);
   const fixAvailable = fixRequestAvailable(context, record);
+  const spinOffCommands = options.latest
+    ? options.latest.gates.flatMap((gate) => (gate.findings ?? []).map((finding) =>
+        ({
+          command: `pipelane resume --spin-off=${JSON.stringify(`${options.latest!.id}/${gate.gateId}/${finding.id}`)} --spinoff-task="<new-task-label>" --reason="<why this remedy is new scope>"`,
+          severity: finding.severity,
+        })
+      ))
+    : [];
   lines.push(
     '',
     REVIEW_RECOVERY_HEADING,
@@ -877,6 +1067,17 @@ function renderRouteSafetyPauseMessage(
     'pipelane resume --one-more-loop',
     'pipelane resume --more-loops=2 --more-minutes=45',
     'pipelane resume --until-review-passes --max-more-loops=3 --max-more-minutes=120',
+    ...(spinOffCommands.length > 0 ? [
+      'Spin off an individual finding only when its remedy is genuinely new scope (a new subsystem, refactor, or follow-up slice):',
+      ...spinOffCommands.flatMap((entry) => entry.severity === 'critical'
+        ? [
+            'CRITICAL informed consent: running the following command records that this finding will not block release or deploy at this exact HEAD:',
+            entry.command,
+          ]
+        : [entry.command]),
+      'A spin-off satisfies the selected finding at this exact HEAD without relabeling the original failed review as clean; rerun the paused route, not the unchanged review.',
+      'Do not spin off a live defect in code shipping now; fold it into this branch or explicitly accept it.',
+    ] : []),
     'pipelane resume --accept-findings --reason="<why this exact target and route may proceed despite the blocked evidence>"',
   );
   if (record.legacyMigration?.status === 'pending') {
