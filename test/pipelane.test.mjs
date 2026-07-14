@@ -22815,7 +22815,9 @@ test('route safety explicit resume overrides can accept findings and continue', 
     const accepted = JSON.parse(runCli(['run', 'resume', '--accept-findings', '--reason', 'risk accepted for this exact PR', '--json'], created.worktreePath).stdout);
     assert.match(accepted.message, /Accepted current review findings/);
 
-    const pr = JSON.parse(runCli(['run', 'pr', '--title', 'Route Safety Resume', '--json'], created.worktreePath, env).stdout);
+    const prResult = runCli(['run', 'pr', '--title', 'Route Safety Resume', '--json'], created.worktreePath, env, true);
+    assert.equal(prResult.status, 0, `${prResult.stdout}\n${prResult.stderr}`);
+    const pr = JSON.parse(prResult.stdout);
     assert.match(pr.url, /example\.test\/pr/);
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
     assert.equal(Object.keys(ghState.prs).length, 1);
