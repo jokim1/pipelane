@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -15,12 +15,25 @@ import {
   slugifyTaskName,
   type WorkflowCommand,
 } from '../operator/state.ts';
+import { isStableActionBrowserExposed } from '../operator/api/actions.ts';
 
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = 3033;
 const SNAPSHOT_CACHE_MS = 10_000;
 const EXECUTION_HISTORY_LIMIT = 40;
 const EXECUTION_EVENT_HISTORY_LIMIT = 200;
+const BOARD_SESSION_HEADER = 'x-pipelane-board-session';
+const BOARD_SESSION_TOKEN_PLACEHOLDER = '__PIPELANE_BOARD_SESSION_TOKEN__';
+const JSON_CONTENT_TYPE = /^[\t ]*application\/json[\t ]*(?:;[\t ]*charset[\t ]*=[\t ]*(?:"utf-8"|utf-8)[\t ]*)?$/iu;
+
+const RESPONSE_SECURITY_HEADERS = {
+  'Content-Security-Policy': "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; object-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'",
+  'Cross-Origin-Opener-Policy': 'same-origin',
+  'Cross-Origin-Resource-Policy': 'same-origin',
+  'Referrer-Policy': 'no-referrer',
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+} as const;
 
 type JsonObject = Record<string, unknown>;
 
@@ -108,6 +121,80 @@ function valueAfter(args: string[], flag: string): string {
 function sanitizePort(raw: string): number {
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_PORT;
+}
+
+type LoopbackHost = 'localhost' | '127.0.0.1' | '::1';
+
+const LOOPBACK_HOSTS: readonly LoopbackHost[] = ['localhost', '127.0.0.1', '::1'];
+
+function normalizeDashboardHost(rawHost: string): string {
+  const host = rawHost.trim();
+  return host === '[::1]' ? '::1' : host;
+}
+
+function normalizeLoopbackHost(rawHost: string): LoopbackHost | null {
+  const host = normalizeDashboardHost(rawHost).toLowerCase();
+  if ((LOOPBACK_HOSTS as readonly string[]).includes(host)) {
+    return host as LoopbackHost;
+  }
+  return null;
+}
+
+function formatUrlHost(host: string): string {
+  const normalized = normalizeDashboardHost(host);
+  return normalized.includes(':') ? `[${normalized}]` : normalized;
+}
+
+export function formatDashboardOrigin(host: string, port: number): string {
+  return new URL(`http://${formatUrlHost(host)}:${port}`).origin;
+}
+
+function expectedHostAuthorities(host: LoopbackHost, port: number): string[] {
+  const authorityHost = formatUrlHost(host);
+  if (port === 80) {
+    return [authorityHost, `${authorityHost}:80`];
+  }
+  return [`${authorityHost}:${port}`];
+}
+
+function resolveLoopbackRequestOrigin(port: number, value: string | undefined): string | null {
+  if (!value || value !== value.trim()) {
+    return null;
+  }
+  const normalized = value.toLowerCase();
+  const requestHost = LOOPBACK_HOSTS.find((host) =>
+    expectedHostAuthorities(host, port).some((authority) => normalized === authority.toLowerCase())
+  );
+  return requestHost ? formatDashboardOrigin(requestHost, port) : null;
+}
+
+function isMutationMethod(method: string): boolean {
+  return method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS';
+}
+
+function singleRequestHeader(req: IncomingMessage, name: string): string {
+  const value = req.headers[name];
+  return typeof value === 'string' ? value : '';
+}
+
+function secureTokenMatches(expected: string, actual: string): boolean {
+  const expectedBytes = Buffer.from(expected, 'utf8');
+  const actualBytes = Buffer.from(actual, 'utf8');
+  return expectedBytes.length === actualBytes.length && timingSafeEqual(expectedBytes, actualBytes);
+}
+
+function applyResponseSecurityHeaders(res: ServerResponse): void {
+  for (const [name, value] of Object.entries(RESPONSE_SECURITY_HEADERS)) {
+    res.setHeader(name, value);
+  }
+}
+
+function buildBoardSecurityFailure(error: string, message: string): JsonObject {
+  return {
+    ok: false,
+    error,
+    message,
+  };
 }
 
 function sanitizeBoundedInt(raw: unknown, fallback: number, minimum: number, maximum: number): number {
@@ -566,14 +653,26 @@ function getUiFilePath(): string {
   return fileURLToPath(new URL('./public/index.html', import.meta.url));
 }
 
-function printDashboardBanner(options: DashboardServerOptions): void {
+function renderDashboardUi(uiFilePath: string, browserSessionToken: string): string {
+  const source = readFileSync(uiFilePath, 'utf8');
+  const placeholderCount = source.split(BOARD_SESSION_TOKEN_PLACEHOLDER).length - 1;
+  if (placeholderCount !== 1) {
+    throw new Error('Dashboard UI must contain exactly one browser-session token placeholder.');
+  }
+  return source.replace(BOARD_SESSION_TOKEN_PLACEHOLDER, browserSessionToken);
+}
+
+function printDashboardBanner(options: DashboardServerOptions, actualPort: number): void {
   process.stdout.write(`Dashboard repo: ${options.repoRoot}\n`);
-  process.stdout.write(`Dashboard: http://${options.host}:${options.port}\n`);
+  process.stdout.write(`Dashboard: ${formatDashboardOrigin(options.host, actualPort)}\n`);
   process.stdout.write(`Dashboard settings: ${options.settingsPath}\n`);
 }
 
 export async function startDashboardServer(options: DashboardServerOptions): Promise<void> {
   const uiFilePath = getUiFilePath();
+  const browserSessionToken = randomBytes(32).toString('base64url');
+  const loopbackHost = normalizeLoopbackHost(options.host);
+  let actualPort = options.port;
   let dashboardSettings = options.settings;
   const executions = new Map<string, ExecutionRecord>();
   const snapshotCache = {
@@ -777,17 +876,69 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
 
   const server = createServer(async (req, res) => {
     try {
+      applyResponseSecurityHeaders(res);
       const method = req.method ?? 'GET';
-      const url = new URL(req.url ?? '/', `http://${options.host}:${options.port}`);
+      const url = new URL(req.url ?? '/', formatDashboardOrigin(options.host, actualPort));
       const pathname = url.pathname;
+      const requestOrigin = loopbackHost
+        ? resolveLoopbackRequestOrigin(actualPort, req.headers.host)
+        : null;
+
+      if (loopbackHost && !requestOrigin) {
+        sendJson(res, 403, buildBoardSecurityFailure(
+          'board_invalid_host',
+          'The request Host does not match this Board process.',
+        ));
+        return;
+      }
 
       if (method === 'OPTIONS') {
-        res.writeHead(204, {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type',
-        });
-        res.end();
+        sendJson(res, 405, buildBoardSecurityFailure(
+          'board_cross_origin_disabled',
+          'Cross-origin Board requests are not supported.',
+        ));
+        return;
+      }
+
+      if (isMutationMethod(method)) {
+        if (!loopbackHost) {
+          sendJson(res, 403, buildBoardSecurityFailure(
+            'board_read_only',
+            'Board mutations are disabled when the server is bound beyond loopback.',
+          ));
+          return;
+        }
+
+        if (singleRequestHeader(req, 'origin') !== requestOrigin) {
+          sendJson(res, 403, buildBoardSecurityFailure(
+            'board_invalid_origin',
+            'Board mutations require the exact same-origin request Origin.',
+          ));
+          return;
+        }
+
+        if (!secureTokenMatches(browserSessionToken, singleRequestHeader(req, BOARD_SESSION_HEADER))) {
+          sendJson(res, 403, buildBoardSecurityFailure(
+            'board_invalid_session',
+            'Board mutations require the current browser-session token.',
+          ));
+          return;
+        }
+
+        if (!JSON_CONTENT_TYPE.test(singleRequestHeader(req, 'content-type'))) {
+          sendJson(res, 415, buildBoardSecurityFailure(
+            'board_unsupported_media_type',
+            'Board mutations require Content-Type: application/json.',
+          ));
+          return;
+        }
+      }
+
+      if (method === 'HEAD') {
+        sendJson(res, 405, buildBoardSecurityFailure(
+          'board_method_not_allowed',
+          'HEAD requests are not supported by this Board server.',
+        ));
         return;
       }
 
@@ -905,6 +1056,13 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           sendJson(res, 400, buildTransportFailure('Action preflight requests require an action id.'));
           return;
         }
+        if (!isStableActionBrowserExposed(actionId)) {
+          sendJson(res, 403, buildBoardSecurityFailure(
+            'board_action_not_exposed',
+            'This action is not available through the Board.',
+          ));
+          return;
+        }
 
         try {
           const body = await readJsonBody(req);
@@ -923,6 +1081,13 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
         const actionId = decodeURIComponent(actionValue.replace(/\/$/, ''));
         if (!actionId) {
           sendJson(res, 400, buildTransportFailure('Action execute requests require an action id.'));
+          return;
+        }
+        if (!isStableActionBrowserExposed(actionId)) {
+          sendJson(res, 403, buildBoardSecurityFailure(
+            'board_action_not_exposed',
+            'This action is not available through the Board.',
+          ));
           return;
         }
 
@@ -999,7 +1164,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           return;
         }
 
-        sendText(res, 200, readFileSync(uiFilePath, 'utf8'), 'text/html; charset=utf-8');
+        sendText(res, 200, renderDashboardUi(uiFilePath, browserSessionToken), 'text/html; charset=utf-8');
         return;
       }
 
@@ -1012,7 +1177,11 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
 
   await new Promise<void>((resolve) => {
     server.listen(options.port, options.host, () => {
-      printDashboardBanner(options);
+      const address = server.address();
+      if (address && typeof address === 'object') {
+        actualPort = address.port;
+      }
+      printDashboardBanner(options, actualPort);
       resolve();
     });
   });
@@ -1029,7 +1198,7 @@ export function getDashboardOptions(
   const settings = readDashboardSettings(repoRoot, settingsPath);
   return {
     repoRoot,
-    host: valueAfter(argv, '--host') || DEFAULT_HOST,
+    host: normalizeDashboardHost(valueAfter(argv, '--host') || DEFAULT_HOST),
     port: sanitizePort(valueAfter(argv, '--port') || process.env.PORT || String(settings.preferredPort || DEFAULT_PORT)),
     settingsPath,
     settings,

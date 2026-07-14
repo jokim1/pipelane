@@ -4,7 +4,7 @@ import { chmodSync, cpSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readF
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer as createNetServer } from 'node:net';
-import { createServer as createHttpServer } from 'node:http';
+import { createServer as createHttpServer, request as httpRequest } from 'node:http';
 import { createHash, createHmac } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -984,6 +984,10 @@ const workflowArgs = args[0] === 'run' && args[1] === 'api'
   ? args.slice(2)
   : markerIndex === -1 ? args : args.slice(markerIndex + 1);
 
+if (process.env.WORKFLOW_API_CALL_LOG) {
+  fs.appendFileSync(process.env.WORKFLOW_API_CALL_LOG, JSON.stringify(workflowArgs) + '\\n', 'utf8');
+}
+
 const valueAfter = (flag) => {
   const index = workflowArgs.indexOf(flag);
   return index === -1 ? '' : workflowArgs[index + 1] || '';
@@ -1033,6 +1037,13 @@ if (command === 'action') {
   }
 
   if (workflowArgs.includes('--execute')) {
+    if (actionState.requiredConfirmToken && valueAfter('--confirm-token') !== actionState.requiredConfirmToken) {
+      respond({
+        ok: false,
+        error: 'invalid_confirmation_token',
+        message: 'Confirmation token does not match this action.',
+      }, 1);
+    }
     if (actionState.executeStderr) {
       process.stderr.write(actionState.executeStderr);
     }
@@ -1050,9 +1061,9 @@ process.exit(1);
 `, { mode: 0o755, encoding: 'utf8' });
 }
 
-async function getFreePort() {
+async function getFreePort(host = '127.0.0.1') {
   const server = createNetServer();
-  server.listen(0, '127.0.0.1');
+  server.listen(0, host);
   await once(server, 'listening');
   const address = server.address();
   const port = typeof address === 'object' && address ? address.port : 0;
@@ -1144,9 +1155,16 @@ async function startRuntimeMarkerServer(handler) {
   };
 }
 
-async function startDashboardServer(repoRoot, env = {}) {
-  const port = await getFreePort();
-  const processHandle = spawn('node', [CLI_PATH, 'dashboard', '--repo', repoRoot, '--port', String(port)], {
+function formatDashboardTestOrigin(host, port) {
+  const urlHost = host.includes(':') ? `[${host}]` : host;
+  return new URL(`http://${urlHost}:${port}`).origin;
+}
+
+async function startDashboardServer(repoRoot, env = {}, serverOptions = {}) {
+  const host = serverOptions.host || '127.0.0.1';
+  const portProbeHost = host === '0.0.0.0' ? '127.0.0.1' : host;
+  const port = await getFreePort(portProbeHost);
+  const processHandle = spawn('node', [CLI_PATH, 'dashboard', '--repo', repoRoot, '--host', host, '--port', String(port)], {
     cwd: KIT_ROOT,
     env: { ...process.env, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -1171,7 +1189,7 @@ async function startDashboardServer(repoRoot, env = {}) {
       reject(new Error(`Dashboard server exited early with ${code}.\nstdout:\n${stdout}\nstderr:\n${stderr}`));
     };
     const handleStdout = () => {
-      if (!stdout.includes(`Dashboard: http://127.0.0.1:${port}`)) {
+      if (!stdout.includes(`Dashboard: ${formatDashboardTestOrigin(host, port)}`)) {
         return;
       }
       clearTimeout(timeout);
@@ -1185,11 +1203,75 @@ async function startDashboardServer(repoRoot, env = {}) {
     handleStdout();
   });
 
+  const connectHost = host === '0.0.0.0' ? '127.0.0.1' : host;
   return {
+    host,
+    origin: formatDashboardTestOrigin(host, port),
     port,
-    baseUrl: `http://127.0.0.1:${port}`,
+    baseUrl: formatDashboardTestOrigin(connectHost, port),
     processHandle,
   };
+}
+
+async function readDashboardBrowserSession(server) {
+  const response = await fetch(`${server.baseUrl}/`);
+  const html = await response.text();
+  const match = html.match(/const BOARD_SESSION_TOKEN = '([A-Za-z0-9_-]+)'/u);
+  assert.ok(match, 'served Board page must contain an injected browser-session token');
+  return { response, html, token: match[1] };
+}
+
+function dashboardMutationHeaders(server, token, patch = {}) {
+  return {
+    'Content-Type': 'application/json',
+    Origin: server.origin,
+    'X-Pipelane-Board-Session': token,
+    ...patch,
+  };
+}
+
+function requestDashboard(server, requestPath, options = {}) {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest({
+      hostname: server.host === '0.0.0.0' ? '127.0.0.1' : server.host,
+      port: server.port,
+      path: requestPath,
+      method: options.method || 'GET',
+      headers: options.headers || {},
+    }, (response) => {
+      let body = '';
+      response.on('data', (chunk) => {
+        body += chunk.toString('utf8');
+      });
+      response.on('end', () => {
+        let json = null;
+        try {
+          json = body ? JSON.parse(body) : null;
+        } catch {
+          json = null;
+        }
+        resolve({
+          status: response.statusCode || 0,
+          headers: response.headers,
+          body,
+          json,
+        });
+      });
+    });
+    request.on('error', reject);
+    if (options.body !== undefined) {
+      request.write(options.body);
+    }
+    request.end();
+  });
+}
+
+function workflowApiCalls(logPath) {
+  if (!existsSync(logPath)) return [];
+  return readFileSync(logPath, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
 }
 
 function makeDashboardFixture() {
@@ -1481,6 +1563,7 @@ function makeDashboardFixture() {
         executeStderr: 'Deploying staging...\\n',
       },
       'deploy.prod': {
+        requiredConfirmToken: 'confirm-prod-token',
         preflight: {
           schemaVersion: '2026-04-14',
           command: 'pipelane.api.action',
@@ -26474,6 +26557,379 @@ process.exit(0);
   }
 });
 
+test('stable action metadata is authoritative and browser exposure defaults closed', async () => {
+  const actions = await import(path.join(KIT_ROOT, 'src', 'operator', 'api', 'actions.ts'));
+  const ids = [...actions.STABLE_ACTION_IDS];
+
+  assert.deepEqual(ids.sort(), Object.keys(actions.STABLE_ACTION_METADATA).sort());
+  assert.deepEqual(ids.sort(), Object.keys(actions.STABLE_ACTION_MANAGED_STATE_SENSITIVITY).sort());
+  assert.equal(Object.isFrozen(actions.STABLE_ACTION_METADATA), true);
+  for (const actionId of ids) {
+    const metadata = actions.STABLE_ACTION_METADATA[actionId];
+    assert.equal(Object.isFrozen(metadata), true);
+    assert.equal(actions.STABLE_ACTION_MANAGED_STATE_SENSITIVITY[actionId], metadata.managedStateSensitivity);
+    assert.equal(actions.API_RISKY_ACTION_IDS.has(actionId), metadata.risky);
+  }
+
+  assert.equal(actions.STABLE_ACTION_METADATA['taskLock.verify'].browserExposed, false);
+  assert.equal(actions.STABLE_ACTION_METADATA['doctor.diagnose'].browserExposed, false);
+  assert.equal(actions.isStableActionId('taskLock.verify'), true, 'direct API action remains registered');
+  assert.equal(actions.isStableActionBrowserExposed('taskLock.verify'), false);
+  assert.equal(actions.isStableActionBrowserExposed('deploy.staging'), true);
+  assert.equal(actions.isStableActionId('orchestrate.choose'), false, 'PR 0 must not register the dependent action');
+});
+
+test('dashboard rejects untrusted mutation requests before any state change or action process', async () => {
+  const repoRoot = createRepo();
+  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-dashboard-security-'));
+  const fixtureFile = path.join(fakeBin, 'workflow-api-fixture.json');
+  const callLog = path.join(fakeBin, 'workflow-api-calls.jsonl');
+  const fakePipelane = path.join(fakeBin, 'pipelane');
+  const env = {
+    PATH: `${fakeBin}:${process.env.PATH}`,
+    WORKFLOW_API_FIXTURE_FILE: fixtureFile,
+    WORKFLOW_API_CALL_LOG: callLog,
+    PIPELANE_DASHBOARD_API_BIN: fakePipelane,
+    PIPELANE_DASHBOARD_HOME: path.join(fakeBin, 'dashboard-state'),
+  };
+  writeFakePipelane(fakeBin, fixtureFile);
+  writeFileSync(fixtureFile, JSON.stringify(makeDashboardFixture(), null, 2) + '\n', 'utf8');
+
+  let server;
+  try {
+    server = await startDashboardServer(repoRoot, env);
+    const boardSession = await readDashboardBrowserSession(server);
+    const validHeaders = dashboardMutationHeaders(server, boardSession.token);
+    const actionPath = `/api/action/${encodeURIComponent('deploy.staging')}/preflight`;
+    const malformedBody = '{not valid json';
+    const cases = [
+      {
+        name: 'missing Origin',
+        headers: { ...validHeaders, Origin: undefined },
+        status: 403,
+        error: 'board_invalid_origin',
+      },
+      {
+        name: 'cross-origin Origin',
+        headers: { ...validHeaders, Origin: 'https://attacker.example' },
+        status: 403,
+        error: 'board_invalid_origin',
+      },
+      {
+        name: 'DNS-rebinding Host',
+        headers: { ...validHeaders, Host: `board.attacker.example:${server.port}` },
+        status: 403,
+        error: 'board_invalid_host',
+      },
+      {
+        name: 'wrong loopback port',
+        headers: { ...validHeaders, Host: `127.0.0.1:${server.port + 1}` },
+        status: 403,
+        error: 'board_invalid_host',
+      },
+      {
+        name: 'missing browser-session token',
+        headers: { ...validHeaders, 'X-Pipelane-Board-Session': undefined },
+        status: 403,
+        error: 'board_invalid_session',
+      },
+      {
+        name: 'wrong browser-session token',
+        headers: { ...validHeaders, 'X-Pipelane-Board-Session': 'wrong-session-token' },
+        status: 403,
+        error: 'board_invalid_session',
+      },
+      {
+        name: 'API confirmation token used as browser-session token',
+        headers: { ...validHeaders, 'X-Pipelane-Board-Session': 'confirm-prod-token' },
+        status: 403,
+        error: 'board_invalid_session',
+      },
+      {
+        name: 'text/plain JSON confusion',
+        headers: { ...validHeaders, 'Content-Type': 'text/plain' },
+        body: malformedBody,
+        status: 415,
+        error: 'board_unsupported_media_type',
+      },
+      {
+        name: 'form content type',
+        headers: { ...validHeaders, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: malformedBody,
+        status: 415,
+        error: 'board_unsupported_media_type',
+      },
+      {
+        name: 'missing content type',
+        headers: { ...validHeaders, 'Content-Type': undefined },
+        body: malformedBody,
+        status: 415,
+        error: 'board_unsupported_media_type',
+      },
+      {
+        name: 'malformed application/json content type',
+        headers: { ...validHeaders, 'Content-Type': 'application/json; charset' },
+        body: malformedBody,
+        status: 415,
+        error: 'board_unsupported_media_type',
+      },
+      {
+        name: 'stable API action not exposed to browsers',
+        path: `/api/action/${encodeURIComponent('taskLock.verify')}/preflight`,
+        headers: validHeaders,
+        status: 403,
+        error: 'board_action_not_exposed',
+      },
+    ];
+
+    for (const requestCase of cases) {
+      const headers = Object.fromEntries(
+        Object.entries(requestCase.headers).filter(([, value]) => value !== undefined),
+      );
+      const response = await requestDashboard(server, requestCase.path || actionPath, {
+        method: 'POST',
+        headers,
+        body: requestCase.body ?? JSON.stringify({ params: {} }),
+      });
+      assert.equal(response.status, requestCase.status, requestCase.name);
+      assert.equal(response.json?.error, requestCase.error, requestCase.name);
+      assert.equal(response.headers['access-control-allow-origin'], undefined, requestCase.name);
+      assert.deepEqual(workflowApiCalls(callLog), [], `${requestCase.name} must not invoke the operator API`);
+    }
+
+    const health = await fetch(`${server.baseUrl}/api/health`).then((response) => response.json());
+    assert.equal(existsSync(health.settingsPath), false);
+
+    const settingsWithoutToken = await requestDashboard(server, '/api/settings', {
+      method: 'PUT',
+      headers: Object.fromEntries(Object.entries(validHeaders).filter(([name]) => name !== 'X-Pipelane-Board-Session')),
+      body: JSON.stringify({ settings: { boardTitle: 'must not persist' } }),
+    });
+    assert.equal(settingsWithoutToken.status, 403);
+    assert.equal(settingsWithoutToken.json?.error, 'board_invalid_session');
+    assert.equal(existsSync(health.settingsPath), false, 'rejected settings request must not create the settings file');
+
+    const executeWithoutToken = await requestDashboard(server, `/api/action/${encodeURIComponent('deploy.prod')}/execute`, {
+      method: 'POST',
+      headers: Object.fromEntries(Object.entries(validHeaders).filter(([name]) => name !== 'X-Pipelane-Board-Session')),
+      body: JSON.stringify({ params: {}, confirmToken: 'confirm-prod-token' }),
+    });
+    assert.equal(executeWithoutToken.status, 403);
+    assert.equal(executeWithoutToken.json?.error, 'board_invalid_session');
+    assert.deepEqual(workflowApiCalls(callLog), [], 'rejected execute request must not start an action process');
+
+    const preflightOptions = await requestDashboard(server, actionPath, {
+      method: 'OPTIONS',
+      headers: {
+        Origin: 'https://attacker.example',
+        'Access-Control-Request-Method': 'POST',
+        'Access-Control-Request-Headers': 'content-type,x-pipelane-board-session',
+      },
+    });
+    assert.equal(preflightOptions.status, 405);
+    assert.equal(preflightOptions.headers['access-control-allow-origin'], undefined);
+    assert.equal(preflightOptions.headers['access-control-allow-methods'], undefined);
+    assert.deepEqual(workflowApiCalls(callLog), [], 'CORS preflight must not invoke the operator API');
+  } finally {
+    if (server?.processHandle) {
+      server.processHandle.kill('SIGTERM');
+      await once(server.processHandle, 'exit').catch(() => undefined);
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
+test('dashboard browser-session tokens are process-bound and cannot replace API confirmation tokens', async () => {
+  const repoRoot = createRepo();
+  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-dashboard-session-'));
+  const fixtureFile = path.join(fakeBin, 'workflow-api-fixture.json');
+  const callLog = path.join(fakeBin, 'workflow-api-calls.jsonl');
+  const fakePipelane = path.join(fakeBin, 'pipelane');
+  const env = {
+    PATH: `${fakeBin}:${process.env.PATH}`,
+    WORKFLOW_API_FIXTURE_FILE: fixtureFile,
+    WORKFLOW_API_CALL_LOG: callLog,
+    PIPELANE_DASHBOARD_API_BIN: fakePipelane,
+    PIPELANE_DASHBOARD_HOME: path.join(fakeBin, 'dashboard-state'),
+  };
+  writeFakePipelane(fakeBin, fixtureFile);
+  writeFileSync(fixtureFile, JSON.stringify(makeDashboardFixture(), null, 2) + '\n', 'utf8');
+
+  let firstServer;
+  let secondServer;
+  try {
+    firstServer = await startDashboardServer(repoRoot, env);
+    const firstSession = await readDashboardBrowserSession(firstServer);
+    firstServer.processHandle.kill('SIGTERM');
+    await once(firstServer.processHandle, 'exit');
+    firstServer = null;
+
+    secondServer = await startDashboardServer(repoRoot, env);
+    const secondSession = await readDashboardBrowserSession(secondServer);
+    assert.notEqual(firstSession.token, secondSession.token);
+
+    const staleSession = await requestDashboard(secondServer, `/api/action/${encodeURIComponent('deploy.staging')}/preflight`, {
+      method: 'POST',
+      headers: dashboardMutationHeaders(secondServer, firstSession.token),
+      body: JSON.stringify({ params: {} }),
+    });
+    assert.equal(staleSession.status, 403);
+    assert.equal(staleSession.json?.error, 'board_invalid_session');
+    assert.deepEqual(workflowApiCalls(callLog), []);
+
+    const browserTokenAsConfirmation = await fetch(`${secondServer.baseUrl}/api/action/${encodeURIComponent('deploy.prod')}/execute`, {
+      method: 'POST',
+      headers: dashboardMutationHeaders(secondServer, secondSession.token),
+      body: JSON.stringify({ params: {}, confirmToken: secondSession.token }),
+    });
+    assert.equal(browserTokenAsConfirmation.status, 202);
+    const started = await browserTokenAsConfirmation.json();
+    await fetch(`${secondServer.baseUrl}/api/executions/${started.executionId}/events`).then((response) => response.text());
+    const execution = await fetch(`${secondServer.baseUrl}/api/executions/${started.executionId}`).then((response) => response.json());
+    assert.equal(execution.execution.status, 'failed');
+    assert.equal(execution.execution.finalEnvelope.error, 'invalid_confirmation_token');
+  } finally {
+    for (const server of [firstServer, secondServer]) {
+      if (server?.processHandle) {
+        server.processHandle.kill('SIGTERM');
+        await once(server.processHandle, 'exit').catch(() => undefined);
+      }
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
+test('dashboard stays read-only when bound beyond loopback', async () => {
+  const repoRoot = createRepo();
+  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-dashboard-read-only-'));
+  const fixtureFile = path.join(fakeBin, 'workflow-api-fixture.json');
+  const callLog = path.join(fakeBin, 'workflow-api-calls.jsonl');
+  const fakePipelane = path.join(fakeBin, 'pipelane');
+  const env = {
+    PATH: `${fakeBin}:${process.env.PATH}`,
+    WORKFLOW_API_FIXTURE_FILE: fixtureFile,
+    WORKFLOW_API_CALL_LOG: callLog,
+    PIPELANE_DASHBOARD_API_BIN: fakePipelane,
+    PIPELANE_DASHBOARD_HOME: path.join(fakeBin, 'dashboard-state'),
+  };
+  writeFakePipelane(fakeBin, fixtureFile);
+  writeFileSync(fixtureFile, JSON.stringify(makeDashboardFixture(), null, 2) + '\n', 'utf8');
+
+  let server;
+  try {
+    server = await startDashboardServer(repoRoot, env, { host: '0.0.0.0' });
+    const boardSession = await readDashboardBrowserSession(server);
+    assert.equal(boardSession.response.status, 200, 'read-only Board page remains available');
+    const health = await fetch(`${server.baseUrl}/api/health`).then((response) => response.json());
+
+    const settings = await requestDashboard(server, '/api/settings', {
+      method: 'PUT',
+      headers: dashboardMutationHeaders(server, boardSession.token),
+      body: JSON.stringify({ settings: { boardTitle: 'must stay read-only' } }),
+    });
+    assert.equal(settings.status, 403);
+    assert.equal(settings.json?.error, 'board_read_only');
+    assert.equal(existsSync(health.settingsPath), false);
+
+    const action = await requestDashboard(server, `/api/action/${encodeURIComponent('deploy.staging')}/preflight`, {
+      method: 'POST',
+      headers: dashboardMutationHeaders(server, boardSession.token),
+      body: JSON.stringify({ params: {} }),
+    });
+    assert.equal(action.status, 403);
+    assert.equal(action.json?.error, 'board_read_only');
+    assert.deepEqual(workflowApiCalls(callLog), []);
+  } finally {
+    if (server?.processHandle) {
+      server.processHandle.kill('SIGTERM');
+      await once(server.processHandle, 'exit').catch(() => undefined);
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
+test('dashboard accepts exact localhost and IPv6 loopback Host and Origin pairs', async () => {
+  for (const host of ['localhost', '::1']) {
+    const repoRoot = createRepo();
+    const dashboardHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-dashboard-loopback-'));
+    let server;
+    try {
+      server = await startDashboardServer(repoRoot, { PIPELANE_DASHBOARD_HOME: dashboardHome }, { host });
+      const boardSession = await readDashboardBrowserSession(server);
+      const response = await fetch(`${server.baseUrl}/api/settings`, {
+        method: 'PUT',
+        headers: dashboardMutationHeaders(server, boardSession.token),
+        body: JSON.stringify({ settings: { boardTitle: `${host} Board` } }),
+      });
+      assert.equal(response.status, 200, host);
+      const payload = await response.json();
+      assert.equal(payload.settings.boardTitle, `${host} Board`);
+    } finally {
+      if (server?.processHandle) {
+        server.processHandle.kill('SIGTERM');
+        await once(server.processHandle, 'exit').catch(() => undefined);
+      }
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(dashboardHome, { recursive: true, force: true });
+    }
+  }
+});
+
+test('dashboard accepts a localhost authority on a 127.0.0.1 bind without weakening same-origin checks', async () => {
+  const repoRoot = createRepo();
+  const dashboardHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-dashboard-loopback-alias-'));
+  let server;
+  try {
+    server = await startDashboardServer(repoRoot, { PIPELANE_DASHBOARD_HOME: dashboardHome });
+    const localhostOrigin = formatDashboardTestOrigin('localhost', server.port);
+    const localhostHost = `localhost:${server.port}`;
+    const page = await requestDashboard(server, '/', {
+      headers: { Host: localhostHost },
+    });
+    assert.equal(page.status, 200);
+    const tokenMatch = page.body.match(/const BOARD_SESSION_TOKEN = '([A-Za-z0-9_-]+)'/u);
+    assert.ok(tokenMatch, 'localhost Board page must contain an injected browser-session token');
+
+    const update = await requestDashboard(server, '/api/settings', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Host: localhostHost,
+        Origin: localhostOrigin,
+        'X-Pipelane-Board-Session': tokenMatch[1],
+      },
+      body: JSON.stringify({ settings: { boardTitle: 'Localhost Alias Board' } }),
+    });
+    assert.equal(update.status, 200);
+    assert.equal(update.json?.settings?.boardTitle, 'Localhost Alias Board');
+
+    const mismatchedOrigin = await requestDashboard(server, '/api/settings', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Host: localhostHost,
+        Origin: server.origin,
+        'X-Pipelane-Board-Session': tokenMatch[1],
+      },
+      body: JSON.stringify({ settings: { boardTitle: 'must not persist' } }),
+    });
+    assert.equal(mismatchedOrigin.status, 403);
+    assert.equal(mismatchedOrigin.json?.error, 'board_invalid_origin');
+    const settings = await fetch(`${server.baseUrl}/api/settings`).then((response) => response.json());
+    assert.equal(settings.settings.boardTitle, 'Localhost Alias Board');
+  } finally {
+    if (server?.processHandle) {
+      server.processHandle.kill('SIGTERM');
+      await once(server.processHandle, 'exit').catch(() => undefined);
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(dashboardHome, { recursive: true, force: true });
+  }
+});
+
 test('dashboard proxies pipelane api routes and persists local board settings', async () => {
   const repoRoot = createRepo();
   const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-dashboard-bin-'));
@@ -26484,6 +26940,7 @@ test('dashboard proxies pipelane api routes and persists local board settings', 
     PATH: `${fakeBin}:${process.env.PATH}`,
     WORKFLOW_API_FIXTURE_FILE: fixtureFile,
     PIPELANE_DASHBOARD_API_BIN: fakePipelane,
+    PIPELANE_DASHBOARD_HOME: path.join(fakeBin, 'dashboard-state'),
   };
 
   writeFakePipelane(fakeBin, fixtureFile);
@@ -26493,6 +26950,13 @@ test('dashboard proxies pipelane api routes and persists local board settings', 
 
   try {
     server = await startDashboardServer(repoRoot, env);
+    const boardSession = await readDashboardBrowserSession(server);
+    assert.match(boardSession.token, /^[A-Za-z0-9_-]{43}$/u);
+    assert.doesNotMatch(boardSession.html, /__PIPELANE_BOARD_SESSION_TOKEN__/u);
+    assert.equal(boardSession.response.headers.get('access-control-allow-origin'), null);
+    assert.equal(boardSession.response.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(boardSession.response.headers.get('x-frame-options'), 'DENY');
+    assert.match(boardSession.response.headers.get('content-security-policy') || '', /frame-ancestors 'none'/u);
 
     const health = await fetch(`${server.baseUrl}/api/health`).then((response) => response.json());
     assert.equal(health.pipelaneApiConfigured, true);
@@ -26505,7 +26969,7 @@ test('dashboard proxies pipelane api routes and persists local board settings', 
 
     const settingsUpdateResponse = await fetch(`${server.baseUrl}/api/settings`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: dashboardMutationHeaders(server, boardSession.token),
       body: JSON.stringify({
         settings: {
           boardTitle: 'Operator Cockpit',
@@ -26516,6 +26980,7 @@ test('dashboard proxies pipelane api routes and persists local board settings', 
       }),
     });
     assert.equal(settingsUpdateResponse.status, 200);
+    assert.equal(settingsUpdateResponse.headers.get('access-control-allow-origin'), null);
     const settingsUpdate = await settingsUpdateResponse.json();
     assert.equal(settingsUpdate.settings.boardTitle, 'Operator Cockpit');
     assert.equal(settingsUpdate.settings.autoRefreshSeconds, 45);
@@ -26540,16 +27005,17 @@ test('dashboard proxies pipelane api routes and persists local board settings', 
 
     const preflightResponse = await fetch(`${server.baseUrl}/api/action/${encodeURIComponent('deploy.staging')}/preflight`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: dashboardMutationHeaders(server, boardSession.token),
       body: JSON.stringify({ params: { task: 'pipeline-board' } }),
     });
     assert.equal(preflightResponse.status, 200);
+    assert.equal(preflightResponse.headers.get('access-control-allow-origin'), null);
     const preflight = await preflightResponse.json();
     assert.equal(preflight.data.preflight.allowed, true);
 
     const executeResponse = await fetch(`${server.baseUrl}/api/action/${encodeURIComponent('deploy.prod')}/execute`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: dashboardMutationHeaders(server, boardSession.token),
       body: JSON.stringify({ params: { task: 'pipeline-board' }, confirmToken: 'confirm-prod-token' }),
     });
     assert.equal(executeResponse.status, 202);
@@ -26594,9 +27060,10 @@ test('dashboard pr preflight resolves the task lock before same-slug current bra
     });
 
     server = await startDashboardServer(repoRoot);
+    const boardSession = await readDashboardBrowserSession(server);
     const preflightResponse = await fetch(`${server.baseUrl}/api/action/${encodeURIComponent('pr')}/preflight`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: dashboardMutationHeaders(server, boardSession.token),
       body: JSON.stringify({ params: { task: 'Dashboard Cwd Routing' } }),
     });
     const envelope = await preflightResponse.json();

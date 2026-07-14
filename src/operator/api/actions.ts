@@ -59,66 +59,68 @@ import { evaluateReviewEvidenceForPr, reviewEvidenceOverrideReason, type ReviewE
 import { projectReviewRun, type ReviewRunPresentation } from '../review-output.ts';
 import { assertManagedLocalStateValid, assertManagedLocalStateValidForTree } from '../local-state.ts';
 
-export const STABLE_ACTION_IDS = [
-  'new',
-  'resume',
-  'devmode.build',
-  'devmode.release',
-  'taskLock.verify',
-  'pr',
-  'merge',
-  'deploy.staging',
-  'deploy.prod',
-  'route.merge',
-  'route.deploy.staging',
-  'route.deploy.prod',
-  'clean.plan',
-  'clean.apply',
-  // v1.2: doctor.* actions — both non-risky. doctor.diagnose is a pure
-  // read; doctor.probe writes probe-state.json but only stores observed
-  // liveness (never changes runtime behavior outside its own lane).
-  // doctor.fix is interactive and lives behind the CLI today; it's NOT
-  // registered as an API action because it needs TTY prompts — exposing
-  // it over the API would either require a config-shape payload (which
-  // duplicates `pipelane configure`) or a long-lived stdin proxy.
-  'doctor.diagnose',
-  'doctor.probe',
-  'git.catchupBase',
-  // v1.1: rollback.* — one-command deploy recovery. Pipelane-only
-  // extension above the base action set. rollback.staging is
-  // low-risk (staging is allowed to break); rollback.prod joins the
-  // risky set alongside deploy.prod and requires a confirm-token.
-  // --revert-pr is NOT exposed as an API action — opening a PR from a
-  // long-lived board/CI shell needs branch-rename + conflict handling
-  // that live behind the TTY path today.
-  'rollback.staging',
-  'rollback.prod',
-] as const;
-
-export type StableActionId = (typeof STABLE_ACTION_IDS)[number];
 export type ApiManagedLocalStateSensitivity = 'observe' | 'current-state' | 'target-tree' | 'independent-recovery';
 
-export const STABLE_ACTION_MANAGED_STATE_SENSITIVITY: Record<StableActionId, ApiManagedLocalStateSensitivity> = {
-  new: 'target-tree',
-  resume: 'observe',
-  'devmode.build': 'observe',
-  'devmode.release': 'observe',
-  'taskLock.verify': 'observe',
-  pr: 'current-state',
-  merge: 'independent-recovery',
-  'deploy.staging': 'current-state',
-  'deploy.prod': 'current-state',
-  'route.merge': 'current-state',
-  'route.deploy.staging': 'current-state',
-  'route.deploy.prod': 'current-state',
-  'clean.plan': 'observe',
-  'clean.apply': 'independent-recovery',
-  'doctor.diagnose': 'observe',
-  'doctor.probe': 'observe',
-  'git.catchupBase': 'target-tree',
-  'rollback.staging': 'independent-recovery',
-  'rollback.prod': 'independent-recovery',
-};
+export interface StableActionMetadata {
+  readonly label: string;
+  readonly risky: boolean;
+  readonly managedStateSensitivity: ApiManagedLocalStateSensitivity;
+  readonly browserExposed: boolean;
+}
+
+type StableActionMetadataInput = Omit<StableActionMetadata, 'risky' | 'browserExposed'>
+  & Partial<Pick<StableActionMetadata, 'risky' | 'browserExposed'>>;
+
+function stableAction(metadata: StableActionMetadataInput): StableActionMetadata {
+  return Object.freeze({
+    risky: false,
+    browserExposed: false,
+    ...metadata,
+  });
+}
+
+// This registry is the sole declaration point for stable API actions. The
+// Board consumes browserExposed from here instead of treating every API action
+// as browser-reachable. Omitted exposure is deliberately fail-closed.
+export const STABLE_ACTION_METADATA = Object.freeze({
+  new: stableAction({ label: 'Create task workspace', managedStateSensitivity: 'target-tree', browserExposed: true }),
+  resume: stableAction({ label: 'Resume task workspace', managedStateSensitivity: 'observe', browserExposed: true }),
+  'devmode.build': stableAction({ label: 'Switch to build mode', managedStateSensitivity: 'observe', browserExposed: true }),
+  'devmode.release': stableAction({ label: 'Switch to release mode', managedStateSensitivity: 'observe', browserExposed: true }),
+  'taskLock.verify': stableAction({ label: 'Verify task lock', managedStateSensitivity: 'observe' }),
+  pr: stableAction({ label: 'Prepare PR', managedStateSensitivity: 'current-state', browserExposed: true }),
+  merge: stableAction({ label: 'Merge PR', risky: true, managedStateSensitivity: 'independent-recovery', browserExposed: true }),
+  'deploy.staging': stableAction({ label: 'Deploy staging', managedStateSensitivity: 'current-state', browserExposed: true }),
+  'deploy.prod': stableAction({ label: 'Deploy production', risky: true, managedStateSensitivity: 'current-state', browserExposed: true }),
+  'route.merge': stableAction({ label: 'Take task to merge', risky: true, managedStateSensitivity: 'current-state', browserExposed: true }),
+  'route.deploy.staging': stableAction({ label: 'Take task to staging', risky: true, managedStateSensitivity: 'current-state', browserExposed: true }),
+  'route.deploy.prod': stableAction({ label: 'Take task to production', risky: true, managedStateSensitivity: 'current-state', browserExposed: true }),
+  'clean.plan': stableAction({ label: 'Plan cleanup', managedStateSensitivity: 'observe', browserExposed: true }),
+  'clean.apply': stableAction({ label: 'Apply cleanup', risky: true, managedStateSensitivity: 'independent-recovery', browserExposed: true }),
+  // doctor.diagnose remains available to direct API clients, but the Board has
+  // no diagnosis action UI and therefore does not expose it by default.
+  'doctor.diagnose': stableAction({ label: 'Diagnose deploy configuration', managedStateSensitivity: 'observe' }),
+  // doctor.probe writes probe-state.json but only stores observed liveness.
+  // doctor.fix remains interactive and is not a stable API action.
+  'doctor.probe': stableAction({ label: 'Run live healthcheck probe', managedStateSensitivity: 'observe', browserExposed: true }),
+  'git.catchupBase': stableAction({ label: 'Catch up local base branch', managedStateSensitivity: 'target-tree', browserExposed: true }),
+  // --revert-pr remains outside the API because its branch conflict handling
+  // is TTY-owned. Production rollback keeps its existing confirmation layer.
+  'rollback.staging': stableAction({ label: 'Rollback staging to last-good deploy', managedStateSensitivity: 'independent-recovery', browserExposed: true }),
+  'rollback.prod': stableAction({ label: 'Rollback production to last-good deploy', risky: true, managedStateSensitivity: 'independent-recovery', browserExposed: true }),
+} as const satisfies Record<string, StableActionMetadata>);
+
+export type StableActionId = keyof typeof STABLE_ACTION_METADATA;
+
+export const STABLE_ACTION_IDS: readonly StableActionId[] = Object.freeze(
+  Object.keys(STABLE_ACTION_METADATA) as StableActionId[],
+);
+
+export const STABLE_ACTION_MANAGED_STATE_SENSITIVITY: Readonly<Record<StableActionId, ApiManagedLocalStateSensitivity>> = Object.freeze(
+  Object.fromEntries(
+    STABLE_ACTION_IDS.map((actionId) => [actionId, STABLE_ACTION_METADATA[actionId].managedStateSensitivity]),
+  ) as Record<StableActionId, ApiManagedLocalStateSensitivity>,
+);
 
 export function classifyStableActionManagedStateSensitivity(actionId: StableActionId): ApiManagedLocalStateSensitivity {
   const sensitivity = STABLE_ACTION_MANAGED_STATE_SENSITIVITY[actionId];
@@ -126,41 +128,11 @@ export function classifyStableActionManagedStateSensitivity(actionId: StableActi
   return sensitivity;
 }
 
-// Typed risky set so TS flags a forgotten entry instead of silently
-// dropping a new risky action into the non-risky path.
-export const API_RISKY_ACTION_IDS: ReadonlySet<StableActionId> = new Set<StableActionId>([
-  'clean.apply',
-  'merge',
-  'deploy.prod',
-  'route.merge',
-  'route.deploy.staging',
-  'route.deploy.prod',
-  'rollback.prod',
-]);
+export const API_RISKY_ACTION_IDS: ReadonlySet<StableActionId> = new Set(
+  STABLE_ACTION_IDS.filter((actionId) => STABLE_ACTION_METADATA[actionId].risky),
+);
 
 const ACTION_FEEDBACK_MAX_OUTPUT_CHARS = 20_000;
-
-const ACTION_LABELS: Record<StableActionId, string> = {
-  new: 'Create task workspace',
-  resume: 'Resume task workspace',
-  'devmode.build': 'Switch to build mode',
-  'devmode.release': 'Switch to release mode',
-  'taskLock.verify': 'Verify task lock',
-  pr: 'Prepare PR',
-  merge: 'Merge PR',
-  'deploy.staging': 'Deploy staging',
-  'deploy.prod': 'Deploy production',
-  'route.merge': 'Take task to merge',
-  'route.deploy.staging': 'Take task to staging',
-  'route.deploy.prod': 'Take task to production',
-  'clean.plan': 'Plan cleanup',
-  'clean.apply': 'Apply cleanup',
-  'doctor.diagnose': 'Diagnose deploy configuration',
-  'doctor.probe': 'Run live healthcheck probe',
-  'git.catchupBase': 'Catch up local base branch',
-  'rollback.staging': 'Rollback staging to last-good deploy',
-  'rollback.prod': 'Rollback production to last-good deploy',
-};
 
 export interface ActionPreflightData {
   action: { id: string; label: string; risky: boolean };
@@ -192,7 +164,11 @@ export interface ActionExecutionData extends ActionPreflightData {
 }
 
 export function isStableActionId(value: string): value is StableActionId {
-  return (STABLE_ACTION_IDS as readonly string[]).includes(value);
+  return Object.hasOwn(STABLE_ACTION_METADATA, value);
+}
+
+export function isStableActionBrowserExposed(value: string): value is StableActionId {
+  return isStableActionId(value) && STABLE_ACTION_METADATA[value].browserExposed;
 }
 
 export function buildActionPreflightEnvelope(cwd: string, actionId: StableActionId, parsed: ParsedOperatorArgs): ApiEnvelope<ActionPreflightData> {
@@ -212,7 +188,7 @@ export function buildActionPreflightEnvelope(cwd: string, actionId: StableAction
   const gate = evaluatePreflightGate(context, actionId, normalizedInputs);
   if (gate.allowed === false) {
     const data: ActionPreflightData = {
-      action: { id: actionId, label: ACTION_LABELS[actionId], risky },
+      action: { id: actionId, label: STABLE_ACTION_METADATA[actionId].label, risky },
       preflight: {
         allowed: false,
         state: 'blocked',
@@ -251,7 +227,7 @@ export function buildActionPreflightEnvelope(cwd: string, actionId: StableAction
   }
 
   const data: ActionPreflightData = {
-    action: { id: actionId, label: ACTION_LABELS[actionId], risky },
+    action: { id: actionId, label: STABLE_ACTION_METADATA[actionId].label, risky },
     preflight: {
       allowed: true,
       state: 'healthy',
@@ -654,7 +630,7 @@ function buildDeployActionOnboardingBlock(
   const data: ActionPreflightData = {
     action: {
       id: actionId,
-      label: ACTION_LABELS[actionId],
+      label: STABLE_ACTION_METADATA[actionId].label,
       risky: API_RISKY_ACTION_IDS.has(actionId),
     },
     preflight: {
@@ -700,13 +676,13 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
     persistActionPreflightBlockIfTaskScoped({
       context,
       actionId,
-      label: ACTION_LABELS[actionId],
+      label: STABLE_ACTION_METADATA[actionId].label,
       normalizedInputs,
       checkedAt,
       reason: gate.reason,
     });
     const preflight: ActionPreflightData = {
-      action: { id: actionId, label: ACTION_LABELS[actionId], risky },
+      action: { id: actionId, label: STABLE_ACTION_METADATA[actionId].label, risky },
       preflight: {
         allowed: false,
         state: 'blocked',
@@ -740,7 +716,7 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const preflight: ActionPreflightData = {
-        action: { id: actionId, label: ACTION_LABELS[actionId], risky },
+        action: { id: actionId, label: STABLE_ACTION_METADATA[actionId].label, risky },
         preflight: {
           allowed: false,
           state: 'blocked',
@@ -775,7 +751,7 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
   const failureReason = result.ok ? '' : describeExecutionFailure(actionId, result);
 
   const data: ActionExecutionData = {
-    action: { id: actionId, label: ACTION_LABELS[actionId], risky },
+    action: { id: actionId, label: STABLE_ACTION_METADATA[actionId].label, risky },
     preflight: {
       allowed: true,
       state: result.ok ? 'healthy' : 'blocked',
@@ -802,7 +778,7 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
   persistActionRunIfTaskScoped({
     context,
     actionId,
-    label: ACTION_LABELS[actionId],
+    label: STABLE_ACTION_METADATA[actionId].label,
     normalizedInputs,
     startedAt,
     finishedAt,
