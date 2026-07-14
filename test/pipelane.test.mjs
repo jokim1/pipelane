@@ -4590,7 +4590,7 @@ test('linked worktrees do not inherit unignored untracked config from another ch
   }
 });
 
-test('deploy onboarding auto-imports legacy repo-local and package.json workflow config', async () => {
+test('deploy onboarding auto-imports legacy identity while ignoring checkout-controlled routing', async () => {
   const onboardingMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'onboarding.ts'));
   const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
 
@@ -4619,7 +4619,11 @@ test('deploy onboarding auto-imports legacy repo-local and package.json workflow
       assert.ok(stateMod.resolveReadableConfigPath(repoRoot), `${source} legacy config should be imported machine-locally`);
       const loaded = stateMod.loadWorkflowConfig(repoRoot);
       assert.equal(loaded.displayName, source === 'file' ? 'Legacy File App' : 'Legacy Package App');
-      assert.deepEqual(loaded.surfaces, [source === 'file' ? 'frontend' : 'edge']);
+      assert.deepEqual(
+        loaded.surfaces,
+        stateMod.defaultWorkflowConfig(loaded.projectKey, loaded.displayName).surfaces,
+        'legacy deploy surfaces require explicit machine-local configuration',
+      );
     } finally {
       rmSync(repoRoot, { recursive: true, force: true });
     }
