@@ -10,6 +10,7 @@ import {
   loadProbeState,
   loadTaskLock,
   nowIso,
+  reviewArtifactRoot,
   resolveWorkflowContext,
   runGit,
   slugifyTaskName,
@@ -64,7 +65,7 @@ import {
   DESTINATION_APPROVED_ROUTE_FINGERPRINT_ENV,
   DESTINATION_ROUTE_PROD_CONFIRMED_ENV,
 } from '../destination-executor.ts';
-import { evaluateReviewEvidenceForPr, reviewEvidenceOverrideReason } from '../review-enforcement.ts';
+import { evaluateReviewEvidenceForPr, reviewEvidenceOverrideReason, type ReviewEvidenceCheckResult } from '../review-enforcement.ts';
 import {
   DEPLOY_PROD_APPROVED_DISPATCH_CONFIG_ENV,
   DEPLOY_PROD_APPROVED_SHA_ENV,
@@ -72,6 +73,7 @@ import {
   DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV,
   resolveDeployApprovalInputs,
 } from '../commands/deploy.ts';
+import { projectReviewRun, type ReviewRunPresentation } from '../review-output.ts';
 
 export const STABLE_ACTION_IDS = [
   'new',
@@ -164,6 +166,7 @@ export interface ActionPreflightData {
     confirmation: { token: string; expiresAt: string } | null;
     freshness: ReturnType<typeof buildFreshness>;
     destinationPlan?: DestinationPlan;
+    review?: ReviewRunPresentation | null;
   };
 }
 
@@ -222,6 +225,7 @@ export function buildActionPreflightEnvelope(cwd: string, actionId: StableAction
         defaultParams: gate.defaultParams ?? {},
         warnings: [],
         issues: gate.issues ?? [],
+        review: gate.review ?? null,
         normalizedInputs,
         requiresConfirmation: false,
         confirmation: null,
@@ -292,6 +296,19 @@ interface PreflightGateBlocked {
   inputs?: ApiActionInput[];
   defaultParams?: Record<string, unknown>;
   issues?: unknown[];
+  review?: ReviewRunPresentation | null;
+}
+
+function reviewPresentationForEvidence(
+  context: WorkflowContext,
+  evidence: ReviewEvidenceCheckResult,
+): ReviewRunPresentation | null {
+  return evidence.latest
+    ? projectReviewRun(evidence.latest, {
+        artifactRoot: reviewArtifactRoot(context.commonDir, context.config),
+        relation: 'current',
+      })
+    : null;
 }
 
 function evaluatePreflightGate(context: WorkflowContext, actionId: StableActionId, inputs: Record<string, unknown>): PreflightGateResult {
@@ -344,6 +361,7 @@ function evaluatePreflightGate(context: WorkflowContext, actionId: StableActionI
           allowed: false,
           reason: reviewEvidence.message,
           issues: reviewEvidence.issues,
+          review: reviewPresentationForEvidence(context, reviewEvidence),
         };
       }
     }
@@ -502,6 +520,7 @@ function evaluatePrPreflightGate(context: WorkflowContext, inputs: Record<string
           allowed: false,
           reason: reviewEvidence.message,
           issues: reviewEvidence.issues,
+          review: reviewPresentationForEvidence(context, reviewEvidence),
         };
       }
     }
@@ -538,6 +557,7 @@ function evaluatePrPreflightGate(context: WorkflowContext, inputs: Record<string
         allowed: false,
         reason: reviewEvidence.message,
         issues: reviewEvidence.issues,
+        review: reviewPresentationForEvidence(context, reviewEvidence),
       };
     }
     return { allowed: true };
@@ -839,6 +859,7 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
         defaultParams: gate.defaultParams ?? {},
         warnings: [],
         issues: gate.issues ?? [],
+        review: gate.review ?? null,
         normalizedInputs,
         requiresConfirmation: false,
         confirmation: null,

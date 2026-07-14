@@ -27,8 +27,9 @@ The board is **not**:
 
 This reference design deliberately optimizes for operator clarity over generic dashboard tropes.
 
-1. Attention first
-   Surface blockers, degraded sources, and release readiness before the branch ledger.
+1. Findings before choices
+   Show current-checkout review findings and protocol errors before any recovery
+   or bypass action. Other blockers and degraded sources follow before the branch ledger.
 
 2. One active card per branch
    A branch should appear as a single active card in the lane it is currently working through.
@@ -60,11 +61,12 @@ journey, release journey, helpful anytime commands, `/fix`, and web commands.
 The reference board is structured in this order:
 
 1. Hero
-2. Attention
-3. Board Context
-4. Branch Ledger
-5. Help drawer
-6. Branch Detail drawer
+2. Review
+3. Attention
+4. Board Actions
+5. Branch Ledger
+6. Help drawer
+7. Branch Detail drawer
 
 ### Hero
 
@@ -113,6 +115,15 @@ The planned orchestration panel should show:
 Static gates should appear before AI review gates. The board should make it
 obvious when lint, typecheck, tests, or build failed before any AI review ran.
 
+### Review
+
+Shows only evidence bound to the current checkout as current. It includes the
+run and target identity, gate status and counts, every structured finding,
+protocol errors, and expandable bounded report and diagnostic text. Report
+content is HTML-escaped at the final dashboard sink. Unrelated branch history
+may appear only as “Recent evidence (not current)” and never supplies a next
+action. The recommended action appears after the findings.
+
 ### Attention
 
 Shows the highest-signal blockers and warnings from `snapshot.data.attention`.
@@ -120,7 +131,7 @@ The board keeps the API payload intact, but renders related probe alerts as one
 plain-language card with a single next command. Attention cards should answer:
 what is wrong, why it matters, and what command to run next.
 
-### Board Context
+### Board Actions
 
 Shows:
 
@@ -183,12 +194,13 @@ Use the board as an operator cockpit, not as a passive status wall.
 Recommended pattern:
 
 1. Leave the board open while you work
-2. Watch `Attention` and `Release Readiness` before acting
-3. Click a branch card to inspect lane reasons and file changes
-4. Use explicit row actions or the card context menu for preflighted workflow actions
-5. Watch action feedback after every click
-6. Use the execution console for risky actions
-7. Clean up live branches once the board marks them `Ready to Clean`
+2. Read current review findings before considering recovery choices
+3. Watch `Attention` and `Release Readiness` before acting
+4. Click a branch card to inspect lane reasons and file changes
+5. Use explicit row actions or the card context menu for preflighted workflow actions
+6. Watch action feedback after every click
+7. Use the execution console for risky actions
+8. Clean up live branches once the board marks them `Ready to Clean`
 
 ## Local settings
 

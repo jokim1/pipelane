@@ -23,6 +23,7 @@ import {
   formatTaskBindingRecoveryMessage,
 } from '../task-binding.ts';
 import {
+  ensureTaskBindingId,
   loadDeployState,
   formatWorkflowCommand,
   loadPrRecord,
@@ -41,6 +42,7 @@ import {
   evaluateReviewEvidenceForPr,
   formatReviewEvidenceOverrideMessage,
   recordReviewEvidenceOverride,
+  recordReviewEvidenceConsents,
   reviewEvidenceOverrideReason,
 } from '../review-enforcement.ts';
 import {
@@ -89,6 +91,7 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
   taskSlug = binding.taskSlug;
   lock = binding.lock;
   if (lock) {
+    lock = ensureTaskBindingId(context.commonDir, context.config, lock.taskSlug) ?? lock;
     ensureTaskLockMatchesCurrent(context, lock);
   }
 
@@ -130,7 +133,7 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
   }
 
   const reviewOverrideReason = reviewEvidenceOverrideReason(parsed.flags);
-  let reviewOverrideApplied = Boolean(reviewOverrideReason);
+  let reviewOverrideApplied = false;
   const reviewEvidence = evaluateReviewEvidenceForPr(context);
   if (!reviewEvidence.allowed && reviewOverrideReason) {
     reviewOverrideApplied = true;
@@ -195,6 +198,27 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
     runGit(context.repoRoot, ['commit', '-m', parsed.flags.message.trim() || prTitle]);
   }
 
+  if (reviewOverrideApplied) {
+    const finalReviewEvidence = evaluateReviewEvidenceForPr(context, {
+      command: formatWorkflowCommand(context.config, 'pr'),
+    });
+    if (!finalReviewEvidence.allowed) {
+      recordReviewEvidenceConsents(
+        context,
+        finalReviewEvidence,
+        formatWorkflowCommand(context.config, 'pr'),
+        reviewOverrideReason,
+      );
+      const consented = evaluateReviewEvidenceForPr(context, {
+        command: formatWorkflowCommand(context.config, 'pr'),
+      });
+      if (!consented.allowed) {
+        throw new Error('Exact-scope review consent did not authorize the final PR target; no remote action was attempted.');
+      }
+    }
+    recordReviewEvidenceOverride(context, formatWorkflowCommand(context.config, 'pr'), reviewOverrideReason);
+  }
+
   runGit(context.repoRoot, ['push', '-u', 'origin', branchName]);
   let prNumber = existingPr?.number;
   let prUrl = existingPr?.url;
@@ -241,9 +265,6 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
     taskSlug,
     prNumber ? `PR #${prNumber} open, awaiting CI` : 'PR created, awaiting CI',
   );
-  if (reviewOverrideApplied) {
-    recordReviewEvidenceOverride(context, formatWorkflowCommand(context.config, 'pr'), reviewOverrideReason);
-  }
   const reviewOverrideMessage = reviewOverrideApplied
     ? formatReviewEvidenceOverrideMessage(formatWorkflowCommand(context.config, 'pr'), reviewOverrideReason)
     : '';

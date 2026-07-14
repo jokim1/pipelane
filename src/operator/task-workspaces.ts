@@ -11,6 +11,7 @@ import {
   runCommandCapture,
   loadAllTaskLocks,
   loadTaskLock,
+  newTaskBindingId,
   saveTaskLock,
   updateTaskLock,
   slugifyTaskName,
@@ -561,6 +562,7 @@ export function saveNewTaskLock(options: {
   config: WorkflowConfig;
   taskSlug: string;
   taskName: string;
+  taskBrief?: TaskLock['taskBrief'];
   branchName: string;
   worktreePath: string;
   mode: Mode;
@@ -569,6 +571,8 @@ export function saveNewTaskLock(options: {
   return saveTaskLock(options.commonDir, options.config, options.taskSlug, {
     taskSlug: options.taskSlug,
     taskName: options.taskName,
+    taskBindingId: newTaskBindingId(),
+    taskBrief: options.taskBrief,
     branchName: options.branchName,
     worktreePath: options.worktreePath,
     mode: options.mode,

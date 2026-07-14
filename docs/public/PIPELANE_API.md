@@ -66,6 +66,23 @@ that ignore unknown fields parse every revision transparently. See
   - `probeState` — rollup of per-surface staging probes: one of
     `healthy | degraded | stale | unknown`. See `doctor.probe` below.
 - `boardContext.activeTask` / `overallFreshness`.
+- `review.current` is evidence for the current checkout only; `review.recent`
+  is branch history and must not be treated as current. `review.latest` remains
+  a compatibility alias for `review.current` through the 0.2.x line and is
+  removed in 0.3.0.
+- `review.current.presentation` and `review.recent.presentation` are derived,
+  control-safe display data. They include the relation (`current` or `recent`),
+  checkout identity, gate and finding counts, every structured finding,
+  protocol errors, bounded report/diagnostic text when applicable, and a next
+  action only for actionable current evidence. Recent history never supplies a
+  current-checkout action, and the projection never changes evidence status.
+- `review.enforcementMode`, `review.policyVersion`, and
+  `review.blockingGateIds` describe the current configured contract so clients
+  can distinguish an upgrade mismatch from current evidence without guessing.
+- Strict review records may add `taskBindingId`, `intent`, `target`, per-gate
+  `capability`, `result`, `findings`, and `reportArtifact`. These fields are
+  additive. Consumers must not infer a clean result when `findingsKnown` is
+  false, and must preserve `bypassed` separately from `passed`.
 - `sourceHealth[]` — per-source liveness cells. Always includes
   `git.local` and `task-locks`; v1.2 adds one entry per configured staging
   probe surface (e.g. `deployProbe.frontend`, `deployProbe.edge`,
@@ -146,6 +163,12 @@ Preflight for `pr`, task-branch `merge`, and route actions that would run
 the checkout is behind the configured base branch. Clients should surface the
 reason and have the operator rebase before retrying, rather than confirming
 or executing a stale route.
+
+When review evidence blocks one of those actions, `preflight.review` contains
+the same typed presentation used by `/status` and the board. Clients should
+render all relevant findings and protocol errors before the recovery and
+exact-scope bypass choices in `preflight.reason`. A bypass remains consent for
+that scope; it does not change a failed or pending gate to passed.
 
 `doctor.fix` is intentionally **not** exposed as an API action — it is
 interactive (TTY prompts for platform + URLs) and lives behind
@@ -240,6 +263,47 @@ below).
   flag-shaped arg (`--json`, `-x`) errors instead of silently
   swallowing it.
 
+### Repo-owned deploy surface contract (optional)
+
+A GitHub Actions workflow can bind its accepted deployment surfaces to a
+tracked JSON manifest with a top-level comment:
+
+```yaml
+name: Deploy Hosted
+# pipelane-surface-contract: .github/deploy-surfaces.json
+```
+
+The versioned manifest is the source of truth for both the deploy surface list
+and path attribution:
+
+```json
+{
+  "version": 1,
+  "workflow": "Deploy Hosted",
+  "surfaces": {
+    "frontend": ["src/", "public/"],
+    "sql": ["supabase/migrations/"],
+    "mcp": ["packages/mcp-server/"]
+  }
+}
+```
+
+`pipelane configure` discovers custom surfaces from the contract and registers
+them in machine-local workflow and deploy configuration. `/doctor`, direct
+deploy, and destination planning fail closed if the contract is malformed or a
+declared custom surface is not configured. For implicit deploys, the target
+commit is classified from this manifest before any stored task-lock surfaces;
+the workflow dispatch therefore receives the surfaces affected by the actual
+target diff. Deploy and blast views read the contract from the target SHA,
+falling back to the configured base branch for an older PR that predates the
+manifest. This keeps release planning correct even when the PR worktree itself
+has not been rebased. Explicit `--surfaces` remains available for intentionally
+manual deployments, but does not bypass an invalid or incompletely configured
+contract.
+
+The tracked contract overrides machine-local path entries for surfaces it
+declares. Machine-local entries for unrelated surfaces remain available.
+
 ### `surfacePathMap` machine-local config (optional, v1.4+)
 
 Opt-in map consumed by `--blast` and by deploy preflight when the
@@ -274,9 +338,9 @@ Patterns are normalized to POSIX separators (backslashes are rewritten
 to forward slashes) so Windows-authored maps match git's forward-slash
 path output.
 
-When two surfaces overlap on the same file, the alphabetically-earlier
-surface name wins. Design your map so patterns don't overlap if that
-matters for your use case.
+When two surfaces overlap on the same file, the file is assigned to both.
+This makes shared lockfiles, workflow definitions, and deployment metadata
+expand the deploy set instead of silently selecting only one affected surface.
 
 ## Compatibility
 

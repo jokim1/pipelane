@@ -568,6 +568,18 @@ and non-TTY execution paths.
     bytes cannot create a second output line while the safe text remains
     actionable.
 
+40. **Strict route lineage could make a paused lockless review impossible to
+    resume (P1).** **Location:** `src/operator/route-loop-safety.ts:959` after
+    integrating strict review lineage from current `origin/main`. **Repro:**
+    run a targeted review from a lockless branch and let a gate time out; the
+    destination-derived review plan inferred a task slug for its unbound
+    lineage, while a later bare `resume` derived an empty-slug binding ID and
+    reported that no paused route existed. **Proposed fix (implemented):**
+    rediscover each candidate with the task slug captured in that route
+    record, preserving the same repository/worktree/branch-bound hash. The
+    timeout regression now reaches—and enforces—the non-waivable timeout guard
+    under upstream's mandatory informed-consent `--reason` contract.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original

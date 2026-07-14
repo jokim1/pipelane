@@ -11,6 +11,7 @@ import {
   loadPrState,
   loadProbeState,
   nowIso,
+  reviewArtifactRoot,
   resolveWorkflowContext,
   runGit,
   TASK_LOCK_STALE_MS,
@@ -75,7 +76,8 @@ import {
   type ShellRelationshipState,
   type SourceHealthEntry,
 } from './envelope.ts';
-import { evaluateReviewEvidenceForPr, type ReviewEvidenceCheckResult } from '../review-enforcement.ts';
+import { evaluateReviewEvidenceForPr, selectCurrentReviewEvidenceRecord, type ReviewEvidenceCheckResult } from '../review-enforcement.ts';
+import { projectReviewRun, type ReviewRunPresentation } from '../review-output.ts';
 
 export interface BranchLanes {
   local: ApiStatusCell;
@@ -172,6 +174,7 @@ export interface OrchestrationSliceSummary {
   reviewStatus: NonNullable<OrchestrationSliceRecord['review']>['run']['status'] | null;
   reviewIndependence: ReviewIndependenceLabel | null;
   reviewEvidenceLabel: string;
+  reviewPresentation: ReviewRunPresentation | null;
   trustedReviewComplete: boolean;
   missingWorktree: OrchestrationMissingWorktreeDiagnostic | null;
 }
@@ -289,7 +292,14 @@ export interface SnapshotData {
     overallFreshness: ReturnType<typeof buildFreshness>;
   };
   review: {
-    latest: ReviewRunRecord | null;
+    schemaVersion: 2;
+    enforcementMode: 'legacy-v2' | 'strict-v3';
+    policyVersion: number;
+    blockingGateIds: string[];
+    current: ReviewSnapshotRecord | null;
+    recent: ReviewSnapshotRecord | null;
+    /** @deprecated Use current. Removed in 0.3.0. */
+    latest: ReviewSnapshotRecord | null;
     latestOverride: ReviewOverrideRecord | null;
   };
   orchestration: OrchestrationSnapshot;
@@ -298,6 +308,10 @@ export interface SnapshotData {
   availableActions: ApiActionState[];
   branches: BranchRow[];
 }
+
+export type ReviewSnapshotRecord = ReviewRunRecord & {
+  presentation: ReviewRunPresentation;
+};
 
 export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope<SnapshotData>> {
   const context = resolveWorkflowContext(cwd);
@@ -312,6 +326,15 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
   const deployState = loadDeployState(context.commonDir, context.config);
   const reviewState = loadReviewState(context.commonDir, context.config);
   const reviewEvidence = evaluateReviewEvidenceForPr(context);
+  const currentReview = selectCurrentReviewEvidenceRecord(context, reviewState.records);
+  const recentReview = reviewState.records.find((record) => record.id !== currentReview?.id) ?? null;
+  const artifactRoot = reviewArtifactRoot(context.commonDir, context.config);
+  const currentReviewSnapshot = currentReview
+    ? attachReviewPresentation(currentReview, artifactRoot, 'current')
+    : null;
+  const recentReviewSnapshot = recentReview
+    ? attachReviewPresentation(recentReview, artifactRoot, 'recent')
+    : null;
   const reviewHealth = summarizeReviewEvidenceHealth(reviewEvidence);
   const orchestrationScan = scanOrchestrationRunDiagnostics(context.commonDir, context.config);
   const orchestration = buildOrchestrationSnapshot(context.commonDir, context.config, currentBranch, orchestrationScan);
@@ -408,7 +431,7 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
       observedAt: runtimeObservation.observedAt,
     }),
     buildSourceHealthEntry({
-      name: 'review.latest',
+      name: 'review.current',
       state: reviewHealth.state,
       blocking: reviewHealth.blocking,
       reason: reviewHealth.reason,
@@ -534,7 +557,13 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
         overallFreshness: buildFreshness({ checkedAt }),
       },
       review: {
-        latest: reviewEvidence.latest ?? reviewState.records[0] ?? null,
+        schemaVersion: 2,
+        enforcementMode: context.config.reviewGates?.enforcementMode ?? 'legacy-v2',
+        policyVersion: context.config.reviewGates?.policyVersion ?? 2,
+        blockingGateIds: (context.config.reviewGates?.gates ?? []).filter((gate) => gate.blocking !== false).map((gate) => gate.id),
+        current: currentReviewSnapshot,
+        recent: recentReviewSnapshot,
+        latest: currentReviewSnapshot,
         latestOverride: reviewState.overrides[0] ?? null,
       },
       orchestration,
@@ -544,6 +573,17 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
       branches,
     },
   });
+}
+
+function attachReviewPresentation(
+  record: ReviewRunRecord,
+  artifactRoot: string,
+  relation: ReviewRunPresentation['relation'],
+): ReviewSnapshotRecord {
+  return {
+    ...record,
+    presentation: projectReviewRun(record, { artifactRoot, relation }),
+  };
 }
 
 function summarizeReviewEvidenceHealth(evidence: ReviewEvidenceCheckResult): {
@@ -783,6 +823,7 @@ function summarizeOrchestrationRun(
     reviewableBySlice.set(slice.id, sliceWorktreeExists(slice, reviewOptions));
     providerCounts[slice.provider] = (providerCounts[slice.provider] ?? 0) + 1;
     const missingWorktree = missingRelevantSliceWorktreeDiagnostic(slice, reviewOptions);
+    const latestReview = latestOrchestrationReviewRun(slice);
     if (missingWorktree) missingWorktrees.push(missingWorktree);
     return {
       id: slice.id,
@@ -795,6 +836,12 @@ function summarizeOrchestrationRun(
       reviewStatus: slice.review?.status ?? null,
       reviewIndependence: slice.review?.independence ?? null,
       reviewEvidenceLabel: orchestrationReviewEvidenceLabel(slice, trustedReviewComplete),
+      reviewPresentation: latestReview
+        ? projectReviewRun(latestReview.run, {
+            artifactRoot: reviewArtifactRoot(commonDir, config),
+            relation: 'embedded',
+          })
+        : null,
       trustedReviewComplete,
       missingWorktree,
     };
@@ -819,6 +866,15 @@ function summarizeOrchestrationRun(
     missingWorktrees,
     slices,
   };
+}
+
+function latestOrchestrationReviewRun(slice: OrchestrationSliceRecord) {
+  return [
+    ...(slice.review ? [slice.review] : []),
+    ...(slice.reviewDiagnostics ?? []),
+  ].reduce<(NonNullable<OrchestrationSliceRecord['review']>) | null>((latest, record) =>
+    latest === null || record.reviewedAt > latest.reviewedAt ? record : latest
+  , null);
 }
 
 function orchestrationReviewEvidenceLabel(slice: OrchestrationSliceRecord, trustedReviewComplete: boolean): string {

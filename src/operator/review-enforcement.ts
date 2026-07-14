@@ -6,14 +6,21 @@ import {
 } from './integrity.ts';
 import {
   appendReviewOverrideRecord,
+  appendReviewConsentRecord,
+  ensureTaskBindingId,
   formatWorkflowCommand,
+  loadAllTaskLocks,
   loadReviewAcceptanceState,
   loadReviewState,
   nowIso,
+  normalizeExistingPath,
+  resolveWorkflowContext,
   runGit,
   type GateDefinitionHash,
   type OperatorFlags,
   type ReviewAcceptanceRecord,
+  type ReviewConsentKind,
+  type ReviewConsentRecord,
   type ReviewGateConfig,
   type ReviewGateRunRecord,
   type ReviewRunRecord,
@@ -21,6 +28,10 @@ import {
 } from './state.ts';
 import { blockingAiReviewEvidenceBlocker, resolveReviewActorIdentity } from './review-identity.ts';
 import { REVIEW_GATES_POLICY_VERSION } from './review-gate-policy.ts';
+import { buildReviewTargetManifest } from './review-contract.ts';
+import { readVerifiedReviewArtifact } from './review-artifacts.ts';
+import { reviewArtifactRoot } from './state.ts';
+import { projectReviewRun, renderReviewPresentation } from './review-output.ts';
 import { readWorktreeStatusSnapshot } from './worktree-status.ts';
 
 export type ReviewEvidenceGateStatus = 'missing' | 'failed' | 'pending' | 'incomplete';
@@ -37,6 +48,8 @@ export interface ReviewEvidenceCheckResult {
   allowed: boolean;
   latest: ReviewRunRecord | null;
   issues: ReviewEvidenceIssue[];
+  bypassedIssues: ReviewEvidenceIssue[];
+  consents: ReviewConsentRecord[];
   message: string;
 }
 
@@ -49,6 +62,8 @@ export interface ReviewEvidenceTarget {
   worktreeMaterialTreeHash: string;
   worktreeMaterialTreeReliable: boolean;
   worktreeMaterialTreeWarnings: string[];
+  taskBindingId: string;
+  reviewTargetDigest: string;
   headLabel?: string;
 }
 
@@ -58,7 +73,7 @@ export function reviewEvidenceOverrideReason(flags: Pick<OperatorFlags, 'overrid
 }
 
 export function formatReviewEvidenceOverrideMessage(command: string, reason: string): string {
-  return `${command} review gate override accepted: ${reason}`;
+  return `${command} review evidence was bypassed by the user for this exact target; failed or pending gates were not passed: ${reason}`;
 }
 
 export function recordReviewEvidenceOverride(context: WorkflowContext, command: string, reason: string): void {
@@ -72,6 +87,101 @@ export function recordReviewEvidenceOverride(context: WorkflowContext, command: 
     branchName: runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '',
     sha: runGit(context.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '',
   });
+}
+
+/**
+ * blocked evidence -> informed choice -> signed consent -> exact route action
+ *       |                    |                    |
+ *       +-- scope changes ---+------> invalid (never relabeled as passed)
+ */
+export function recordReviewEvidenceConsents(
+  context: WorkflowContext,
+  evidence: ReviewEvidenceCheckResult,
+  routeAction: string,
+  reason: string,
+  kind: ReviewConsentKind = 'gate-bypass',
+  targetOverride?: ReviewEvidenceTarget,
+): ReviewConsentRecord[] {
+  const normalizedReason = reason.trim();
+  if (!normalizedReason) throw new Error('review bypass requires a non-empty informed-consent reason.');
+  const target = targetOverride ?? currentCheckoutReviewEvidenceTarget(context.repoRoot);
+  const issueByGate = new Map<string, ReviewEvidenceIssue>();
+  for (const issue of [...evidence.issues, ...evidence.bypassedIssues]) {
+    if (issue.gateId) issueByGate.set(issue.gateId, issue);
+  }
+  const gateConfigs = (context.config.reviewGates?.gates ?? []).filter((gate) => gate.blocking !== false);
+  const selected = issueByGate.size > 0
+    ? gateConfigs.filter((gate) => issueByGate.has(gate.id))
+    : gateConfigs;
+  if (selected.length === 0) throw new Error('review bypass found no configured blocking gate in scope.');
+  const recordedAt = nowIso();
+  return selected.map((gate) => {
+    const issue = issueByGate.get(gate.id);
+    const originalGateState = issue?.status ?? 'missing';
+    return appendReviewConsentRecord(context.commonDir, context.config, {
+      id: `review-consent-${new Date(recordedAt).toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto.randomUUID().slice(0, 8)}`,
+      kind,
+      gateId: gate.id,
+      gateDefinitionHash: reviewGateDefinitionHash(gate),
+      policyVersion: context.config.reviewGates?.policyVersion ?? 2,
+      enforcementMode: context.config.reviewGates?.enforcementMode ?? 'legacy-v2',
+      taskBindingId: target.taskBindingId,
+      ...(evidence.latest?.id ? { reviewRunId: evidence.latest.id } : {}),
+      originalGateState,
+      branchName: target.branchName,
+      sha: target.sha,
+      worktreeStatusDigest: target.worktreeStatusDigest,
+      worktreeMaterialTreeHash: target.worktreeMaterialTreeHash,
+      reviewTargetDigest: target.reviewTargetDigest,
+      routeAction,
+      actor: resolveReviewActorIdentity(),
+      source: kind === 'accept-findings' ? 'route-safety' : 'review-override',
+      reason: normalizedReason,
+      reasonHash: crypto.createHash('sha256').update(normalizedReason).digest('hex'),
+      recordedAt,
+    });
+  });
+}
+
+function consentMatchesTarget(
+  consent: ReviewConsentRecord,
+  target: ReviewEvidenceTarget,
+  routeAction: string,
+  policyVersion: number,
+  enforcementMode: ReviewConsentRecord['enforcementMode'],
+  currentReviewRunId: string,
+): boolean {
+  return consent.kind !== 'manual-substitution'
+    && consent.policyVersion === policyVersion
+    && consent.enforcementMode === enforcementMode
+    && consent.taskBindingId === target.taskBindingId
+    && consent.branchName === target.branchName
+    && consent.sha === target.sha
+    && consent.worktreeStatusDigest === target.worktreeStatusDigest
+    && consent.worktreeMaterialTreeHash === target.worktreeMaterialTreeHash
+    && consent.reviewTargetDigest === target.reviewTargetDigest
+    && consent.routeAction === routeAction
+    && (consent.kind !== 'accept-findings' || (currentReviewRunId.length > 0 && consent.reviewRunId === currentReviewRunId));
+}
+
+function issueHasConsent(issue: ReviewEvidenceIssue, consents: ReviewConsentRecord[], expectedGates: ReviewGateConfig[]): boolean {
+  const matchesGate = (gate: ReviewGateConfig): boolean => consents.some((consent) =>
+    consent.gateId === gate.id && consent.gateDefinitionHash === reviewGateDefinitionHash(gate)
+  );
+  if (issue.gateId) {
+    const gate = expectedGates.find((candidate) => candidate.id === issue.gateId);
+    return Boolean(gate && matchesGate(gate));
+  }
+  return expectedGates.length > 0 && expectedGates.every(matchesGate);
+}
+
+function formatReviewConsentMessage(routeAction: string, issues: ReviewEvidenceIssue[], consents: ReviewConsentRecord[]): string {
+  return [
+    `${routeAction} review evidence remains blocked, but explicit exact-scope consent authorizes this action.`,
+    ...issues.map((issue) => `- ${issue.gateId ?? 'review'}: bypassed by user; ${issue.message}`),
+    ...consents.map((consent) => `- consent ${consent.id}: ${consent.reason}`),
+    'The failed or pending evidence was not relabeled as passed.',
+  ].join('\n');
 }
 
 export function evaluateReviewEvidenceForPr(
@@ -88,6 +198,8 @@ export function evaluateReviewEvidenceForPr(
       allowed: true,
       latest: options.latestOverride ?? reviewState.records[0] ?? null,
       issues: [],
+      bypassedIssues: [],
+      consents: [],
       message: '',
     };
   }
@@ -117,7 +229,12 @@ export function evaluateReviewEvidenceForPr(
   const issues = collectReviewEvidenceIssues({
     latest,
     expectedGates,
-    strictIndependentAi: context.config.reviewGates?.policyVersion === REVIEW_GATES_POLICY_VERSION,
+    strictIndependentAi: (context.config.reviewGates?.policyVersion ?? 1) >= 2,
+    strictEvidence: context.config.reviewGates?.enforcementMode === 'strict-v3',
+    artifactRoot: reviewArtifactRoot(context.commonDir, context.config),
+    currentReviewTargetDigest: target.reviewTargetDigest,
+    expectedEnforcementMode: context.config.reviewGates?.enforcementMode ?? 'legacy-v2',
+    expectedPolicyVersion: context.config.reviewGates?.policyVersion ?? REVIEW_GATES_POLICY_VERSION,
     currentBranch: target.branchName,
     currentSha: target.sha,
     currentHeadLabel: target.headLabel ?? 'current HEAD',
@@ -128,29 +245,85 @@ export function evaluateReviewEvidenceForPr(
     currentWorktreeMaterialTreeReliable: target.worktreeMaterialTreeReliable,
     currentWorktreeMaterialTreeWarnings: target.worktreeMaterialTreeWarnings,
   });
+  const routeAction = options.command ?? formatWorkflowCommand(context.config, 'pr');
+  const expectedBlockingGates = expectedGates.filter((gate) => gate.blocking !== false);
+  const activeConsents = (reviewState.consents ?? []).filter((consent) => consentMatchesTarget(
+    consent,
+    target,
+    routeAction,
+    context.config.reviewGates?.policyVersion ?? 2,
+    context.config.reviewGates?.enforcementMode ?? 'legacy-v2',
+    latest?.id ?? '',
+  ));
+  const bypassedIssues = issues.filter((issue) => issueHasConsent(issue, activeConsents, expectedBlockingGates));
+  const remainingIssues = issues.filter((issue) => !bypassedIssues.includes(issue));
+  const allBypassed = issues.length > 0 && remainingIssues.length === 0;
 
   return {
-    allowed: issues.length === 0,
+    allowed: remainingIssues.length === 0,
     latest,
-    issues,
-    message: issues.length === 0 ? '' : formatReviewEvidenceBlocker(context, issues, options.command),
+    issues: remainingIssues,
+    bypassedIssues,
+    consents: activeConsents,
+    message: issues.length === 0
+      ? ''
+      : allBypassed
+        ? formatReviewConsentMessage(routeAction, bypassedIssues, activeConsents)
+        : formatReviewEvidenceBlocker(context, remainingIssues, options.command),
   };
 }
 
 function currentCheckoutReviewEvidenceTarget(repoRoot: string): ReviewEvidenceTarget {
+  const context = resolveWorkflowContext(repoRoot);
   const worktreeStatus = readWorktreeStatusSnapshot(repoRoot, {
     includeStatusDigest: true,
     includeMaterialTreeHash: true,
   });
-  return {
+  const lock = loadAllTaskLocks(context.commonDir, context.config).find((candidate) =>
+    candidate.branchName === worktreeStatus.branchName
+    && normalizeExistingPath(candidate.worktreePath) === normalizeExistingPath(repoRoot)
+  );
+  const migratedLock = lock ? ensureTaskBindingId(context.commonDir, context.config, lock.taskSlug) : null;
+  const taskBindingId = migratedLock?.taskBindingId ?? '';
+  let reviewTargetDigest = crypto.createHash('sha256').update(canonicalize({
+    version: 2,
     branchName: worktreeStatus.branchName,
     sha: worktreeStatus.head,
     worktreeStatusDigest: worktreeStatus.statusDigest,
-    worktreeStatusReliable: worktreeStatus.statusDigestReliable,
-    worktreeStatusWarnings: worktreeStatus.statusDigestWarnings,
     worktreeMaterialTreeHash: worktreeStatus.materialTreeHash ?? '',
-    worktreeMaterialTreeReliable: worktreeStatus.materialTreeReliable === true,
-    worktreeMaterialTreeWarnings: worktreeStatus.materialTreeWarnings ?? [],
+  })).digest('hex');
+  let worktreeStatusDigest = worktreeStatus.statusDigest;
+  let worktreeStatusReliable = worktreeStatus.statusDigestReliable;
+  let worktreeStatusWarnings = worktreeStatus.statusDigestWarnings;
+  let worktreeMaterialTreeHash = worktreeStatus.materialTreeHash ?? '';
+  let worktreeMaterialTreeReliable = worktreeStatus.materialTreeReliable === true;
+  let worktreeMaterialTreeWarnings = worktreeStatus.materialTreeWarnings ?? [];
+  if (context.config.reviewGates?.enforcementMode === 'strict-v3') {
+    try {
+      const strictTarget = buildReviewTargetManifest(repoRoot, context.config.baseBranch).manifest;
+      reviewTargetDigest = strictTarget.targetDigest;
+      worktreeStatusDigest = strictTarget.worktreeStatusDigest;
+      worktreeStatusReliable = true;
+      worktreeStatusWarnings = [];
+      worktreeMaterialTreeHash = strictTarget.materialTreeHash;
+      worktreeMaterialTreeReliable = true;
+      worktreeMaterialTreeWarnings = [];
+    } catch {
+      // An exact status/material identity still permits informed consent when
+      // target capture itself is the blocking condition.
+    }
+  }
+  return {
+    branchName: worktreeStatus.branchName,
+    sha: worktreeStatus.head,
+    worktreeStatusDigest,
+    worktreeStatusReliable,
+    worktreeStatusWarnings,
+    worktreeMaterialTreeHash,
+    worktreeMaterialTreeReliable,
+    worktreeMaterialTreeWarnings,
+    taskBindingId,
+    reviewTargetDigest,
   };
 }
 
@@ -184,11 +357,47 @@ export function selectReviewEvidenceRecord(
   return null;
 }
 
+export function selectCurrentReviewEvidenceRecord(
+  context: WorkflowContext,
+  records: ReviewRunRecord[] = loadReviewState(context.commonDir, context.config).records,
+): ReviewRunRecord | null {
+  const target = currentCheckoutReviewEvidenceTarget(context.repoRoot);
+  return records.find((record) =>
+    record.branchName === target.branchName
+    && reviewRecordMatchesCurrentWorktree(record, {
+      currentWorktreeStatusDigest: target.worktreeStatusDigest,
+      currentWorktreeStatusReliable: target.worktreeStatusReliable,
+      currentWorktreeMaterialTreeHash: target.worktreeMaterialTreeHash,
+      currentWorktreeMaterialTreeReliable: target.worktreeMaterialTreeReliable,
+    })
+  ) ?? null;
+}
+
 export function formatReviewEvidenceBlocker(context: WorkflowContext, issues: ReviewEvidenceIssue[], command = formatWorkflowCommand(context.config, 'pr')): string {
+  const latest = selectCurrentReviewEvidenceRecord(context);
+  const gateIds = issues.flatMap((issue) => issue.gateId ? [issue.gateId] : []);
+  const evidenceLines = latest
+    ? renderReviewPresentation(projectReviewRun(latest, {
+        artifactRoot: reviewArtifactRoot(context.commonDir, context.config),
+        relation: 'current',
+      }), {
+        gateIds: gateIds.length > 0 ? gateIds : undefined,
+        includePassed: gateIds.length > 0,
+      })
+    : [];
+  const bypassCommands = (context.config.reviewGates?.gates ?? [])
+    .filter((gate) => gate.blocking !== false)
+    .map((gate) => `/pipelane review override --gate ${gate.id} --scope=${JSON.stringify(command)} --reason "<why this exact target and action may proceed despite ${gate.id}>"`);
   return [
     `${command} blocked because review gate evidence is not ready.`,
     ...issues.map((issue) => `- ${issue.message}`),
-    `Run /pipelane review and complete any pending AI/manual gates before retrying ${command}.`,
+    ...(evidenceLines.length > 0 ? ['', 'Review evidence details:', ...evidenceLines] : []),
+    `Recommended: Run /pipelane review${context.config.reviewGates?.enforcementMode === 'strict-v3' ? ' --intent "<what this change should accomplish>"' : ''} after repairing the evidence source or findings, then retry ${command}.`,
+    ...(bypassCommands.length > 0 ? [
+      'Proceed anyway only with explicit informed consent for every blocking gate in scope:',
+      ...bypassCommands,
+      'A bypass never relabels failed, pending, unavailable, or malformed evidence as passed.',
+    ] : []),
   ].join('\n');
 }
 
@@ -196,6 +405,11 @@ function collectReviewEvidenceIssues(options: {
   latest: ReviewRunRecord | null;
   expectedGates: ReviewGateConfig[];
   strictIndependentAi: boolean;
+  strictEvidence: boolean;
+  artifactRoot: string;
+  currentReviewTargetDigest: string;
+  expectedEnforcementMode: 'legacy-v2' | 'strict-v3';
+  expectedPolicyVersion: number;
   currentBranch: string;
   currentSha: string;
   currentHeadLabel: string;
@@ -210,6 +424,11 @@ function collectReviewEvidenceIssues(options: {
     latest,
     expectedGates,
     strictIndependentAi,
+    strictEvidence,
+    artifactRoot,
+    currentReviewTargetDigest,
+    expectedEnforcementMode,
+    expectedPolicyVersion,
     currentBranch,
     currentSha,
     currentHeadLabel,
@@ -221,14 +440,43 @@ function collectReviewEvidenceIssues(options: {
     currentWorktreeMaterialTreeWarnings,
   } = options;
   if (!latest) {
-    return [{
-      status: 'missing',
-      message: 'no review run has been recorded for this checkout',
-      blocking: true,
-    }];
+    const blockingGates = expectedGates.filter((gate) => gate.blocking !== false);
+    return blockingGates.length > 0
+      ? [{
+          status: 'missing' as const,
+          message: 'no review run has been recorded for this checkout',
+          blocking: true,
+        }, ...blockingGates.map((gate) => ({
+          status: 'missing' as const,
+          gateId: gate.id,
+          message: `configured gate ${gate.id} has no review run for this checkout`,
+          blocking: true,
+        }))]
+      : [{
+          status: 'missing',
+          message: 'no review run has been recorded for this checkout',
+          blocking: true,
+        }];
   }
 
   const issues: ReviewEvidenceIssue[] = [];
+  if (
+    latest.enforcementMode !== undefined
+    && (latest.enforcementMode !== expectedEnforcementMode || latest.policyVersion !== expectedPolicyVersion)
+  ) {
+    issues.push({
+      status: 'incomplete',
+      message: `latest review ${latest.id} used ${latest.enforcementMode} policy ${latest.policyVersion ?? 'unknown'}, not ${expectedEnforcementMode} policy ${expectedPolicyVersion}; rerun review after the mode change`,
+      blocking: true,
+    });
+  }
+  if (strictEvidence && (latest.enforcementMode !== 'strict-v3' || latest.policyVersion !== expectedPolicyVersion)) {
+    issues.push({
+      status: 'incomplete',
+      message: `latest review ${latest.id} is legacy evidence and cannot satisfy strict-v3; rerun review or use an exact-scope informed bypass`,
+      blocking: true,
+    });
+  }
   if (latest.dryRun) {
     issues.push({
       status: 'incomplete',
@@ -295,9 +543,42 @@ function collectReviewEvidenceIssues(options: {
     });
   }
 
+  if (strictEvidence) {
+    if (!latest.intent) {
+      issues.push({ status: 'incomplete', message: `latest review ${latest.id} has no authoritative intent evidence`, blocking: true });
+    }
+    if (!latest.target) {
+      issues.push({ status: 'incomplete', message: `latest review ${latest.id} has no immutable target manifest`, blocking: true });
+    } else if (latest.target.targetDigest !== currentReviewTargetDigest) {
+      issues.push({ status: 'incomplete', message: `latest review ${latest.id} targets a different immutable checkout`, blocking: true });
+    }
+  }
+
   for (const gate of latest.gates) {
     const blocking = gate.blocking !== false;
     if (!blocking) continue;
+    const expected = expectedGates.find((candidate) => candidate.id === gate.gateId);
+    if (strictEvidence && (gate.type === 'skill' || gate.type === 'agent') && gate.status === 'passed') {
+      const strictSkill = expected?.id === 'karpathy-diff' || expected?.id === 'karpathy-audit';
+      const capabilityOk = gate.capability?.wrapperCompatible === true
+        && gate.capability.contractSupplied === true
+        && gate.capability.effectiveCapability === (strictSkill ? 'contract-supplied-adapter' : 'role-equivalent-adapter');
+      if (!capabilityOk) {
+        issues.push({ status: 'incomplete', gateId: gate.gateId, message: `blocking gate ${gate.gateId} lacks compatible capability evidence`, blocking, gate });
+      }
+      if (!gate.result || (strictSkill && gate.result.protocolVersion !== 1) || gate.result.effectiveStatus !== 'passed') {
+        issues.push({ status: 'incomplete', gateId: gate.gateId, message: `blocking gate ${gate.gateId} lacks a valid strict result envelope`, blocking, gate });
+      }
+      if (!gate.reportArtifact || gate.reportArtifact.diagnosticOnly) {
+        issues.push({ status: 'incomplete', gateId: gate.gateId, message: `blocking gate ${gate.gateId} lacks an authoritative retained report artifact`, blocking, gate });
+      } else {
+        try {
+          readVerifiedReviewArtifact(artifactRoot, gate.reportArtifact);
+        } catch (error) {
+          issues.push({ status: 'incomplete', gateId: gate.gateId, message: `blocking gate ${gate.gateId} report integrity failed: ${error instanceof Error ? error.message : String(error)}`, blocking, gate });
+        }
+      }
+    }
     if (gate.status === 'failed') {
       issues.push({
         status: 'failed',
@@ -490,7 +771,7 @@ function attachEquivalentReviewGateEvidence(options: {
     : reviewRun;
 }
 
-export function reviewGateDefinitionHash(gate: Pick<ReviewGateConfig, 'id' | 'phase' | 'type' | 'blocking' | 'command' | 'skill' | 'role' | 'userCommands'> | Pick<ReviewGateRunRecord, 'gateId' | 'phase' | 'type' | 'blocking' | 'command' | 'skill' | 'role' | 'userCommands'>): GateDefinitionHash {
+export function reviewGateDefinitionHash(gate: ReviewGateConfig | ReviewGateRunRecord): GateDefinitionHash {
   const id = 'gateId' in gate ? gate.gateId : gate.id;
   return crypto.createHash('sha256').update(canonicalize({
     id,
@@ -500,7 +781,13 @@ export function reviewGateDefinitionHash(gate: Pick<ReviewGateConfig, 'id' | 'ph
     command: normalizeOptionalGateField(gate.command),
     skill: normalizeOptionalGateField(gate.skill),
     role: normalizeOptionalGateField(gate.role),
+    when: normalizeOptionalGateField(gate.when),
+    whenChanged: gate.whenChanged ?? [],
+    timeoutMs: gate.timeoutMs ?? null,
     userCommands: gate.userCommands ?? [],
+    profiles: gate.profiles ?? [],
+    baselineCommandId: normalizeOptionalGateField(gate.baselineCommandId),
+    replacesBaselineCommandId: normalizeOptionalGateField(gate.replacesBaselineCommandId),
   })).digest('hex');
 }
 

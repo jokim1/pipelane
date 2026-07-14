@@ -29,6 +29,7 @@ import {
 } from '../task-workspaces.ts';
 import { runGit } from '../state.ts';
 import { inferTaskSlugsFromBranchName, resolveCommandSurfaces } from './helpers.ts';
+import { taskBriefFromFlags } from '../review-data.ts';
 
 // v1.5: soft-warn when the operator has 3+ active tasks. Never blocks —
 // small teams legitimately juggle several lanes, but 24 half-alive
@@ -39,6 +40,7 @@ export const WIP_SOFT_WARN_THRESHOLD = 3;
 export async function handleNew(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const rawTask = parsed.flags.task.trim();
   const context = resolveWorkflowContext(cwd);
+  const taskBrief = taskBriefFromFlags(parsed.flags.brief, parsed.flags.briefFile, 'new');
 
   if (!rawTask && !parsed.flags.unnamed) {
     throw new Error(formatMissingTaskError(context.config, listOrphanWorktrees(context.commonDir, context.config)));
@@ -111,6 +113,7 @@ export async function handleNew(cwd: string, parsed: ParsedOperatorArgs): Promis
     config: context.config,
     taskSlug,
     taskName,
+    taskBrief,
     branchName: workspace.branchName,
     worktreePath: workspace.worktreePath,
     mode,
