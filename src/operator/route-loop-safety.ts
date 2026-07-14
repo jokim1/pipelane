@@ -892,9 +892,9 @@ function reconcileTimedOutGateIds(previous: string[], reviewRun: ReviewRunRecord
   if (!reviewRun.gateFilter) return reviewTimedOutGateIds(reviewRun);
   const unresolved = new Set(previous);
   const retried = reviewRun.gates.find((gate) => gate.gateId === reviewRun.gateFilter);
-  if (retried?.outcome === 'timeout') {
+  if (retried?.outcome === 'timeout' && retried.blocking) {
     unresolved.add(reviewRun.gateFilter);
-  } else if (retried && (retried.status === 'passed' || retried.status === 'failed')) {
+  } else if (retried && (!retried.blocking || retried.status === 'passed' || retried.status === 'failed')) {
     unresolved.delete(reviewRun.gateFilter);
   }
   return [...unresolved].sort();
@@ -914,7 +914,7 @@ function reviewRunUsesAiReview(reviewRun: ReviewRunRecord): boolean {
 
 function reviewTimedOutGateIds(reviewRun: ReviewRunRecord): string[] {
   return reviewRun.gates
-    .filter((gate) => gate.outcome === 'timeout')
+    .filter((gate) => gate.blocking && gate.outcome === 'timeout')
     .map((gate) => gate.gateId);
 }
 

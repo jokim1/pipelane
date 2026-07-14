@@ -243,7 +243,7 @@ export function generateUniqueTaskWorkspace(repoRoot: string, commonDir: string,
 
 export function resolveTaskBaseRef(repoRoot: string, baseBranch: string, offline = false): { sourceRef: string; warnings: string[] } {
   const remoteRef = `origin/${baseBranch}`;
-  const fetchResult = runCommandCapture('git', ['fetch', 'origin', baseBranch], { cwd: repoRoot });
+  const fetchResult = runCommandCapture('git', ['fetch', '--', 'origin', baseBranch], { cwd: repoRoot });
 
   if (fetchResult.ok) {
     if (!runGit(repoRoot, ['rev-parse', '--verify', remoteRef], true)) {

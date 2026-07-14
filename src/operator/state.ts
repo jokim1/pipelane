@@ -1378,11 +1378,13 @@ export function normalizeWorkflowConfig(
     defaultWorkflowConfig(projectKey, displayName, { repoRoot: options.repoRoot }),
     raw,
   );
+  const baseBranch = normalizeBaseBranch(withDefaults.baseBranch);
   const branchPrefix = normalizeBranchPrefix(withDefaults.branchPrefix);
   const legacyBranchPrefixes = normalizeLegacyBranchPrefixes(withDefaults.legacyBranchPrefixes)
     .filter((prefix, index, all) => prefix !== branchPrefix && all.indexOf(prefix) === index);
   const normalized = {
     ...(withDefaults as WorkflowConfig),
+    baseBranch,
     branchPrefix,
     legacyBranchPrefixes,
     prPathDenyList: withDefaults.prPathDenyList ?? [...DEFAULT_PR_PATH_DENY_LIST],
@@ -1672,6 +1674,19 @@ function normalizeLegacyBranchPrefixes(prefixes: unknown): string[] {
   return normalized;
 }
 
+function normalizeBaseBranch(value: unknown): string {
+  const branchName = cleanString(value);
+  if (
+    !branchName
+    || branchName.startsWith('-')
+    || !runCommandCapture('git', ['check-ref-format', `refs/heads/${branchName}`]).ok
+  ) {
+    const printable = sanitizeLegacyWarningValue(typeof value === 'string' ? value : String(value ?? ''));
+    throw new Error(`Invalid baseBranch "${printable}": expected a Git branch name.`);
+  }
+  return branchName;
+}
+
 function normalizeBranchPrefix(prefix: unknown): string {
   return normalizeOptionalBranchPrefix(prefix) ?? DEFAULT_BRANCH_PREFIX;
 }
@@ -1722,7 +1737,7 @@ function normalizeLegacyWorkflowImport(
   raw: Record<string, unknown>,
   repoRoot: string,
   sourceLabel: string,
-): WorkflowConfig {
+): { config: WorkflowConfig; legacyStateDir: string | null } {
   // Legacy files are useful migration inputs for project identity and the
   // command/deploy shape, but they live in the checkout and are therefore not
   // a trust boundary for agent review policy. In particular, persisting
@@ -1755,7 +1770,11 @@ function normalizeLegacyWorkflowImport(
       `Warning: ignored machine-local policy field(s) ${printableIgnored} while importing ${sourceLabel}. Configure them explicitly after migration.\n`,
     );
   }
-  return normalizeWorkflowConfig(sanitized as Partial<WorkflowConfig>, { repoRoot });
+  const commonDir = resolveGitCommonDir(repoRoot);
+  return {
+    config: normalizeWorkflowConfig(sanitized as Partial<WorkflowConfig>, { repoRoot }),
+    legacyStateDir: resolveSafeLegacyStateDir(commonDir, raw.stateDir, sourceLabel),
+  };
 }
 
 function sanitizeLegacyWarningValue(value: string): string {
@@ -1777,7 +1796,10 @@ export function importLegacyWorkflowConfigIfNeeded(repoRoot: string): {
     const targetPath = path.join(repoRoot, legacy.filename);
     if (!existsSync(targetPath)) continue;
     const raw = readLegacyWorkflowConfigObject(targetPath, `legacy repo-local ${legacy.filename}`);
-    const config = normalizeLegacyWorkflowImport(raw, repoRoot, `legacy repo-local ${legacy.filename}`);
+    const { config, legacyStateDir } = normalizeLegacyWorkflowImport(raw, repoRoot, `legacy repo-local ${legacy.filename}`);
+    if (legacyStateDir) {
+      migrateLegacyStateDirFromDirectories(resolveGitCommonDir(repoRoot), config, [legacyStateDir]);
+    }
     writeWorkflowConfig(repoRoot, config);
     return { configPath: resolveConfigPath(repoRoot), config, source: legacy.source };
   }
@@ -1791,11 +1813,14 @@ export function importLegacyWorkflowConfigIfNeeded(repoRoot: string): {
   if (!overlay || typeof overlay !== 'object' || Array.isArray(overlay)) {
     throw new Error(`Malformed legacy package.json:pipelane at ${packageJsonPath}: expected a JSON object. Fix or remove it, then rerun the Pipelane command.`);
   }
-  const config = normalizeLegacyWorkflowImport(
+  const { config, legacyStateDir } = normalizeLegacyWorkflowImport(
     overlay as Record<string, unknown>,
     repoRoot,
     'legacy package.json:pipelane',
   );
+  if (legacyStateDir) {
+    migrateLegacyStateDirFromDirectories(resolveGitCommonDir(repoRoot), config, [legacyStateDir]);
+  }
   writeWorkflowConfig(repoRoot, config);
   return { configPath: resolveConfigPath(repoRoot), config, source: 'legacy-package-json' };
 }
@@ -1855,6 +1880,30 @@ function resolveMachineRepoDirForCommonDir(commonDir: string): string {
 
 function legacyStateDirPath(commonDir: string, stateDirName: string): string {
   return path.join(commonDir, stateDirName);
+}
+
+function resolveSafeLegacyStateDir(commonDir: string, raw: unknown, sourceLabel: string): string | null {
+  if (raw === undefined) return null;
+  const printable = sanitizeLegacyWarningValue(typeof raw === 'string' ? raw : String(raw));
+  const value = typeof raw === 'string' ? raw.trim() : '';
+  const containsTraversal = value.split(/[\\/]/u).includes('..');
+  const looksAbsolute = path.isAbsolute(value) || /^[A-Za-z]:[\\/]/u.test(value) || value.startsWith('\\\\');
+  if (!value || containsTraversal || looksAbsolute) {
+    process.stderr.write(
+      `Warning: rejected unsafe legacy stateDir "${printable}" while importing ${sourceLabel}; legacy state was not copied.\n`,
+    );
+    return null;
+  }
+
+  const canonicalCommonDir = normalizeExistingPath(commonDir);
+  const candidate = normalizeExistingPath(path.resolve(commonDir, value));
+  if (candidate === canonicalCommonDir || !candidate.startsWith(`${canonicalCommonDir}${path.sep}`)) {
+    process.stderr.write(
+      `Warning: rejected unsafe legacy stateDir "${printable}" while importing ${sourceLabel}; legacy state was not copied.\n`,
+    );
+    return null;
+  }
+  return candidate;
 }
 
 export function resolveSharedRepoRoot(commonDir: string): string {
@@ -2390,13 +2439,24 @@ const legacyMigrationLogged = new Set<string>();
 // fresh canonical state written post-rename keeps priority over
 // stale legacy data.
 export function migrateLegacyStateDir(commonDir: string, config: WorkflowConfig): void {
+  const legacyStateDirNames = Array.from(new Set([config.stateDir, ...LEGACY_STATE_DIRS]));
+  migrateLegacyStateDirFromDirectories(
+    commonDir,
+    config,
+    legacyStateDirNames.map((legacyName) => legacyStateDirPath(commonDir, legacyName)),
+  );
+}
+
+function migrateLegacyStateDirFromDirectories(
+  commonDir: string,
+  config: WorkflowConfig,
+  legacyStateDirs: string[],
+): void {
   const canonicalDir = resolveStateDir(commonDir, config);
   if (hasInstallMarker(commonDir, config)) return;
   if (existsSync(legacyMigrationPath(commonDir, config))) return;
 
-  const legacyStateDirNames = Array.from(new Set([config.stateDir, ...LEGACY_STATE_DIRS]));
-  for (const legacyName of legacyStateDirNames) {
-    const legacyDir = legacyStateDirPath(commonDir, legacyName);
+  for (const legacyDir of Array.from(new Set(legacyStateDirs))) {
     if (!existsSync(legacyDir)) continue;
 
     let entries: string[];

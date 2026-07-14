@@ -4087,6 +4087,35 @@ test('loadWorkflowConfig imports legacy repo-local .project-workflow.json into m
   }
 });
 
+test('legacy baseBranch import and fetch reject Git option injection', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const markerPath = path.join(repoRoot, 'base-branch-option-injection-ran');
+  const maliciousBaseBranch = `--upload-pack=touch ${markerPath}`;
+  try {
+    writeFileSync(path.join(repoRoot, '.pipelane.json'), `${JSON.stringify({
+      displayName: 'Unsafe Legacy Base',
+      baseBranch: maliciousBaseBranch,
+    }, null, 2)}\n`, 'utf8');
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    assert.throws(
+      () => stateMod.loadWorkflowConfig(repoRoot),
+      /Invalid baseBranch .*expected a Git branch name/,
+    );
+    assert.equal(existsSync(machinePipelaneConfigPath(repoRoot)), false);
+
+    const taskWorkspaces = await import(path.join(KIT_ROOT, 'src', 'operator', 'task-workspaces.ts'));
+    assert.throws(
+      () => taskWorkspaces.resolveTaskBaseRef(repoRoot, maliciousBaseBranch),
+      /Could not refresh/,
+    );
+    assert.equal(existsSync(markerPath), false, 'dash-prefixed base branch must not become a git-fetch option');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('loadWorkflowConfig self-heals when no .pipelane.json exists, inferring name from package.json', async () => {
   const repoRoot = createRepo();
   try {
@@ -4190,6 +4219,7 @@ test('legacy config auto-import keeps repository-controlled policy out of machin
     assert.equal(loaded.routeSafety.stopOnMajorFindings, true);
     assert.equal(loaded.orchestrate, undefined);
     assert.match(stderr, /ignored machine-local policy field\(s\).*stateDir, taskWorktreeDirName/);
+    assert.match(stderr, /rejected unsafe legacy stateDir/);
     assert.match(stderr, /prePrChecks, prPathDenyList, releaseMode, reviewGates, routeSafety, orchestrate/);
     assert.match(stderr, /normalized unsafe legacy projectKey "\.\.\/\.\.\/escape" to "escape"/);
     assert.doesNotMatch(stderr, /\x1b|\x07/);
@@ -4218,6 +4248,65 @@ test('legacy config auto-import keeps repository-controlled policy out of machin
     assert.equal(persisted.routeSafety.stopOnMajorFindings, true);
     assert.equal(persisted.orchestrate, undefined);
     assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'attacker-state.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(attackerRoot, { recursive: true, force: true });
+  }
+});
+
+test('legacy config auto-import migrates a safe custom stateDir before sanitizing policy', async () => {
+  const repoRoot = createRepo();
+  try {
+    const commonDir = resolveCommonDir(repoRoot);
+    const legacyDir = path.join(commonDir, 'custom-state');
+    mkdirSync(legacyDir, { recursive: true });
+    writeFileSync(path.join(legacyDir, 'mode-state.json'), `${JSON.stringify({
+      mode: 'release',
+      requestedSurfaces: ['frontend'],
+      override: null,
+      updatedAt: '2026-07-12T00:00:00.000Z',
+    }, null, 2)}\n`, 'utf8');
+    writeFileSync(path.join(repoRoot, '.pipelane.json'), `${JSON.stringify({
+      displayName: 'Legacy Custom State',
+      stateDir: 'custom-state',
+    }, null, 2)}\n`, 'utf8');
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const { result: context, stderr } = captureStderr(() => stateMod.resolveWorkflowContext(repoRoot));
+
+    assert.equal(context.config.stateDir, 'pipelane-state', 'repository policy must remain sanitized');
+    assert.equal(context.modeState.mode, 'release', 'legacy mode must survive the machine-local migration');
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'mode-state.json')), true);
+    const audit = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'legacy-migration.json'), 'utf8'));
+    assert.equal(audit.from, stateMod.normalizeExistingPath(legacyDir));
+    assert.match(stderr, /Migrated 1 legacy state file\(s\) from/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('legacy config auto-import rejects a custom stateDir symlink that escapes the Git common dir', async () => {
+  const repoRoot = createRepo();
+  const attackerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-legacy-state-link-'));
+  try {
+    writeFileSync(path.join(attackerRoot, 'mode-state.json'), `${JSON.stringify({
+      mode: 'release',
+      requestedSurfaces: [],
+      override: null,
+      updatedAt: '2026-07-12T00:00:00.000Z',
+    }, null, 2)}\n`, 'utf8');
+    symlinkSync(attackerRoot, path.join(resolveCommonDir(repoRoot), 'linked-state'), process.platform === 'win32' ? 'junction' : 'dir');
+    writeFileSync(path.join(repoRoot, '.pipelane.json'), `${JSON.stringify({
+      displayName: 'Legacy Linked State',
+      stateDir: 'linked-state',
+    }, null, 2)}\n`, 'utf8');
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const { result: context, stderr } = captureStderr(() => stateMod.resolveWorkflowContext(repoRoot));
+
+    assert.equal(context.modeState.mode, 'build');
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'mode-state.json')), false);
+    assert.match(stderr, /rejected unsafe legacy stateDir "linked-state"/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(attackerRoot, { recursive: true, force: true });
@@ -15586,6 +15675,7 @@ test('targeted retries retain other unresolved review gate timeouts', () => {
         gates: [
           { id: 'slow-a', phase: 'static', type: 'command', blocking: true, timeoutMs: 500, command: timeoutUnless('PASS_A') },
           { id: 'slow-b', phase: 'behavioral', type: 'command', blocking: true, timeoutMs: 500, command: timeoutUnless('PASS_B') },
+          { id: 'optional-slow', phase: 'runtime', type: 'command', blocking: false, timeoutMs: 500, command: timeoutUnless('PASS_OPTIONAL') },
         ],
       },
     });
@@ -15594,6 +15684,14 @@ test('targeted retries retain other unresolved review gate timeouts', () => {
     const full = runCli(['run', 'review', '--json'], repoRoot, {}, true);
     assert.equal(full.status, 1);
     assert.deepEqual(latestRouteSafetyRecord(repoRoot).lastTimedOutGateIds, ['slow-a', 'slow-b']);
+
+    const retryOptional = runCli(['run', 'review', '--gate', 'optional-slow', '--json'], repoRoot, {}, true);
+    assert.equal(JSON.parse(retryOptional.stdout).status, 'passed', 'a non-blocking timeout must not fail the review run');
+    assert.deepEqual(
+      latestRouteSafetyRecord(repoRoot).lastTimedOutGateIds,
+      ['slow-a', 'slow-b'],
+      'a targeted non-blocking timeout must not enter the unresolved blocking ledger',
+    );
 
     const retryA = runCli(['run', 'review', '--gate', 'slow-a', '--json'], repoRoot, { PASS_A: '1' }, true);
     assert.equal(retryA.status, 1, 'the command remains fail-closed while another timeout is unresolved');
@@ -15608,6 +15706,32 @@ test('targeted retries retain other unresolved review gate timeouts', () => {
 
     const retryB = runCli(['run', 'review', '--gate', 'slow-b', '--json'], repoRoot, { PASS_B: '1' }, true);
     assert.equal(retryB.status, 0, `${retryB.stdout}\n${retryB.stderr}`);
+    assert.deepEqual(latestRouteSafetyRecord(repoRoot).lastTimedOutGateIds, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('a full review with only non-blocking timeouts does not stop delivery', () => {
+  const repoRoot = createRepo();
+  try {
+    writeSingleCommandReviewGate(repoRoot, {
+      id: 'optional-slow',
+      blocking: false,
+      timeoutMs: 75,
+      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify('setTimeout(() => {}, 5000)')}`,
+    });
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.routeSafety.defaultFixReviewLoops = 3;
+    });
+
+    const result = runCli(['run', 'review', '--json'], repoRoot, {}, true);
+    const report = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.equal(report.status, 'passed');
+    assert.equal(report.gates[0].outcome, 'timeout');
+    assert.equal(report.gates[0].blocking, false);
     assert.deepEqual(latestRouteSafetyRecord(repoRoot).lastTimedOutGateIds, []);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
