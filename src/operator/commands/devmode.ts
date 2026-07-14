@@ -21,7 +21,7 @@ import {
   type WorkflowContext,
 } from '../state.ts';
 import { resolveWorkflowContext } from '../state.ts';
-import { resolveModeSurfaces, resolveModeTaskLock, sanitizeForTerminal } from './helpers.ts';
+import { quoteShellWord, resolveModeSurfaces, resolveModeTaskLock, sanitizeForTerminal } from './helpers.ts';
 import { executeProbeWithStateLock, type ProbeOutcome } from './doctor.ts';
 
 export async function handleDevmode(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
@@ -210,7 +210,7 @@ function persistModeAndTaskLock(
           `Task lock ${taskLock.taskSlug} changed binding while devmode ${nextModeState.mode} checked release readiness.`,
           `Current task worktree: ${latestLock.worktreePath}`,
           'No mode state was changed.',
-          `Next: cd ${latestLock.worktreePath} and retry devmode ${nextModeState.mode} --task "${taskLock.taskSlug}".`,
+          `Next: cd ${quoteShellWord(latestLock.worktreePath)} and retry devmode ${nextModeState.mode} --task "${taskLock.taskSlug}".`,
         ].join('\n'));
       }
       if (!sameSurfaceSet(latestLock.surfaces, taskLock.surfaces)) {

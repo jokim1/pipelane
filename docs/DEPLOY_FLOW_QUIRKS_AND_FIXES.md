@@ -752,6 +752,15 @@ and non-TTY execution paths.
     the attempt's full-review binding. A failed targeted retry now remains
     composable and accept-findings operates on the matching full envelope.
 
+56. **Wrong-worktree remediation printed unquoted `cd` paths (P3).**
+    **Location:** `src/operator/commands/helpers.ts:30` and
+    `src/operator/commands/helpers.ts:214`. **Repro:** put a task worktree
+    under a path containing spaces or an apostrophe and copy the printed
+    remedy; the shell split or misparsed the exact destination. **Proposed fix
+    (implemented):** render safe path tokens unchanged and POSIX single-quote
+    every other path, including embedded-apostrophe escaping. The same helper
+    is used by delayed devmode binding remediation.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original

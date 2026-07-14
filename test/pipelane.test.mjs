@@ -31392,6 +31392,13 @@ test('setNextAction persists nextAction on the task lock and is a no-op when no 
   }
 });
 
+test('task-worktree remediation shell-quotes paths with spaces and apostrophes', async () => {
+  const helpers = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'helpers.ts'));
+  assert.equal(helpers.quoteShellWord('/tmp/plain-path'), '/tmp/plain-path');
+  assert.equal(helpers.quoteShellWord('/tmp/task path'), "'/tmp/task path'");
+  assert.equal(helpers.quoteShellWord("/tmp/joseph's task"), "'/tmp/joseph'\\''s task'");
+});
+
 test('buildNextActionTiming uses the action timestamp with strict stale and clock-skew handling', async () => {
   const snapshotMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'api', 'snapshot.ts'));
   const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));

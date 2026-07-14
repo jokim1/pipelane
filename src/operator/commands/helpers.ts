@@ -27,6 +27,10 @@ import { verifyTaskLockState } from '../repo-guard.ts';
 
 export { sanitizeForTerminal } from '../text-output.ts';
 
+export function quoteShellWord(value: string): string {
+  return /^[A-Za-z0-9_./:@-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 export interface LivePr {
   number: number;
   title: string;
@@ -207,7 +211,7 @@ export function assertTaskCommandWorktree(
       `Current checkout: ${context.repoRoot}`,
       `Task worktree: ${resolved.worktreePath}`,
       'Run:',
-      `  cd ${resolved.worktreePath}`,
+      `  cd ${quoteShellWord(resolved.worktreePath)}`,
       `Then re-run ${commandLabel}. No base-drift or dirty-worktree measurements were taken in the current checkout.`,
     ].join('\n'));
   }
