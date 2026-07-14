@@ -222,6 +222,54 @@ and workflow state live under `$PIPELANE_HOME` (default `~/.pipelane`). Pipelane
 does not create tracked `.claude/commands`, `.agents/skills`, package scripts,
 package lockfiles, or Pipelane docs in the application repo.
 
+Applications can opt into setup-time GitHub repository-secret provisioning by
+committing `.github/pipelane-provisioning.json`. Plain `/pipelane setup`
+inspects the manifest and reports whether each value is already configured,
+available locally, or blocked. `/pipelane setup --provision-secrets` installs
+available values through `gh secret set` over stdin. Existing secrets are
+preserved; use `--rotate-secrets` only when replacement is intentional.
+
+The manifest supports three closed source adapters: an environment variable, a
+durable Cloudflare API token (environment variable, an explicitly allowlisted
+dotenv key, or Wrangler API-token auth), and a Base64-encoded file. File inputs
+can opt into held-out chat-corpus schema validation before any secret is
+written. Pipelane never prints a resolved value and never runs a command from
+the manifest.
+
+```json
+{
+  "version": 1,
+  "github": {
+    "repositorySecrets": [
+      {
+        "name": "CLOUDFLARE_AI_EVAL_TOKEN",
+        "source": {
+          "type": "cloudflare-api-token",
+          "variable": "CLOUDFLARE_AI_EVAL_TOKEN",
+          "wranglerCwd": "web",
+          "dotenvFile": "web/.env",
+          "dotenvVariable": "CLOUDFLARE_API_TOKEN"
+        }
+      },
+      {
+        "name": "CHAT_HELDOUT_CORPUS_BASE64",
+        "source": {
+          "type": "file-base64",
+          "pathVariable": "CHAT_HELDOUT_CORPUS_PATH",
+          "defaultPath": ".pipelane/secrets/chat-heldout-corpus.json",
+          "validator": "chat-heldout-corpus-v1"
+        }
+      }
+    ]
+  }
+}
+```
+
+Cloudflare OAuth sessions are intentionally not copied into CI because they
+are refreshable user credentials. If the allowlisted dotenv key and Wrangler
+both lack a durable API token, setup reports the blocked source and leaves the
+GitHub secret unchanged.
+
 Core commands:
 
 | Command | Use it when |
