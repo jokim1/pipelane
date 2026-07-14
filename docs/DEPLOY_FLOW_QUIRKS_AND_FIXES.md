@@ -542,6 +542,32 @@ and non-TTY execution paths.
     two-process CLI regression pauses the targeted clean while a concurrent
     task-scoped `devmode` command proves it cannot enter the mutation window.
 
+38. **Direct production confirmation did not bind dispatch configuration
+    (P0).** **Location:** `src/operator/commands/deploy.ts:283`,
+    `src/operator/api/actions.ts:1134`, and
+    `src/operator/commands/deploy.ts:1332`. **Repro:** preflight
+    `deploy.prod`, then change the machine-local production deploy command or
+    the workflow-config fallback `deployWorkflowName` during the token's
+    30-minute lifetime; SHA and surfaces were unchanged, so the old approval
+    could dispatch a different production effect. **Proposed fix
+    (implemented):** bind a canonical fingerprint of the production config
+    slice plus resolved workflow name, base branch, and mode into normalized
+    token inputs; re-resolve before token consumption; pass the exact value to
+    the child, which recomputes and compares it before honoring the one-shot
+    non-TTY bypass. Regressions cover fallback-workflow drift, production
+    command drift, and a deliberately mismatched child approval environment.
+
+39. **Legacy-import warnings allowed terminal and transcript injection
+    (P0).** **Location:** `src/operator/state.ts:1544`. **Repro:** place
+    newline, ANSI CSI, or OSC sequences in a checkout-controlled legacy
+    `projectKey` or ignored JSON property name; the import warning wrote those
+    bytes directly to stderr, allowing forged log lines or review markers.
+    **Proposed fix (implemented):** strip terminal controls, collapse all
+    whitespace to a single line, and only then render or slug-normalize the
+    dynamic value. A hostile-config regression proves newline, ANSI, and OSC
+    bytes cannot create a second output line while the safe text remains
+    actionable.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original
