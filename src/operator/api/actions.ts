@@ -66,6 +66,7 @@ import {
 } from '../destination-executor.ts';
 import { evaluateReviewEvidenceForPr, reviewEvidenceOverrideReason } from '../review-enforcement.ts';
 import {
+  DEPLOY_PROD_APPROVED_DISPATCH_CONFIG_ENV,
   DEPLOY_PROD_APPROVED_SHA_ENV,
   DEPLOY_PROD_APPROVED_SURFACES_ENV,
   DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV,
@@ -1139,6 +1140,7 @@ function normalizeInputs(
         surfaces: flags.surfaces,
         targetSha: resolved?.targetSha,
         resolvedSurfaces: resolved?.resolvedSurfaces,
+        dispatchConfigFingerprint: resolved?.dispatchConfigFingerprint,
       };
     }
     case 'route.merge':
@@ -1442,6 +1444,9 @@ function buildChildEnv(
   }
   delete env[DESTINATION_APPROVED_ROUTE_FINGERPRINT_ENV];
   delete env[DESTINATION_ROUTE_PROD_CONFIRMED_ENV];
+  delete env[DEPLOY_PROD_APPROVED_SHA_ENV];
+  delete env[DEPLOY_PROD_APPROVED_SURFACES_ENV];
+  delete env[DEPLOY_PROD_APPROVED_DISPATCH_CONFIG_ENV];
   if (isRouteActionId(actionId) && destinationPlan) {
     env[DESTINATION_APPROVED_ROUTE_FINGERPRINT_ENV] = destinationPlanFingerprintDigest(destinationPlan);
   }
@@ -1464,6 +1469,9 @@ function buildChildEnv(
         : '';
       env[DEPLOY_PROD_APPROVED_SURFACES_ENV] = Array.isArray(normalizedInputs.resolvedSurfaces)
         ? normalizedInputs.resolvedSurfaces.join(',')
+        : '';
+      env[DEPLOY_PROD_APPROVED_DISPATCH_CONFIG_ENV] = typeof normalizedInputs.dispatchConfigFingerprint === 'string'
+        ? normalizedInputs.dispatchConfigFingerprint
         : '';
     }
   } else {

@@ -1,4 +1,5 @@
 import readline from 'node:readline';
+import crypto from 'node:crypto';
 
 import {
   buildReleaseCheckMessage,
@@ -70,6 +71,7 @@ import {
   describeCompletedDeployWorkflowRun,
   observeCompletedDeployWorkflowRun,
 } from '../deploy-workflow-runs.ts';
+import { canonicalize } from '../integrity.ts';
 
 function surfacesKey(surfaces: string[]): string {
   return [...surfaces].sort().join(',');
@@ -275,6 +277,21 @@ function resolveDeployPrRecord(
 export interface DeployApprovalInputs {
   targetSha: string;
   resolvedSurfaces: string[];
+  dispatchConfigFingerprint: string;
+}
+
+function computeDeployApprovalDispatchFingerprint(
+  context: WorkflowContext,
+  deployConfig: DeployConfig,
+): string {
+  const workflowName = deployConfig.frontend.production.deployWorkflow
+    || context.config.deployWorkflowName;
+  return crypto.createHash('sha256').update(canonicalize({
+    deployConfigFingerprint: computeDeployConfigFingerprint(deployConfig, 'prod'),
+    workflowName,
+    baseBranch: context.config.baseBranch,
+    mode: context.modeState.mode,
+  })).digest('hex');
 }
 
 /** Resolve the exact production effect approved by an API confirm token. */
@@ -302,7 +319,12 @@ export function resolveDeployApprovalInputs(cwd: string, parsed: ParsedOperatorA
     fallbackSurfaces: identity.lock?.surfaces ?? [],
     targetSha: target.sha,
   });
-  return { targetSha: target.sha, resolvedSurfaces: [...resolvedSurfaces].sort() };
+  const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
+  return {
+    targetSha: target.sha,
+    resolvedSurfaces: [...resolvedSurfaces].sort(),
+    dispatchConfigFingerprint: computeDeployApprovalDispatchFingerprint(context, deployConfig),
+  };
 }
 
 export async function dispatchDeploy(
@@ -343,7 +365,12 @@ export async function dispatchDeploy(
     fallbackSurfaces: identity.lock?.surfaces ?? [],
     targetSha: target.sha,
   });
-  assertApiApprovedProdDeployInputs(environment, target.sha, surfaces);
+  assertApiApprovedProdDeployInputs(
+    environment,
+    target.sha,
+    surfaces,
+    computeDeployApprovalDispatchFingerprint(context, deployConfig),
+  );
   if (surfaces.length === 0) {
     const timestamp = nowIso();
     const cleanCommand = formatWorkflowCommand(context.config, 'clean', `--apply --task ${taskSlug}`);
@@ -1299,12 +1326,14 @@ export function watchWorkflowRun(
 export const PROD_CONFIRM_PREFIX_LENGTH = 4;
 export const DEPLOY_PROD_APPROVED_SHA_ENV = 'PIPELANE_DEPLOY_PROD_APPROVED_SHA';
 export const DEPLOY_PROD_APPROVED_SURFACES_ENV = 'PIPELANE_DEPLOY_PROD_APPROVED_SURFACES';
+export const DEPLOY_PROD_APPROVED_DISPATCH_CONFIG_ENV = 'PIPELANE_DEPLOY_PROD_APPROVED_DISPATCH_CONFIG';
 export const DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV = 'PIPELANE_DEPLOY_PROD_DIRECT_API_CONFIRMED';
 
 function assertApiApprovedProdDeployInputs(
   environment: 'staging' | 'prod',
   targetSha: string,
   surfaces: string[],
+  dispatchConfigFingerprint: string,
 ): void {
   if (environment !== 'prod' || process.env[DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV] !== '1') return;
   const approvedSha = process.env[DEPLOY_PROD_APPROVED_SHA_ENV]?.trim() ?? '';
@@ -1313,15 +1342,22 @@ function assertApiApprovedProdDeployInputs(
     .map((surface) => surface.trim())
     .filter(Boolean)
     .sort();
+  const approvedDispatchConfig = process.env[DEPLOY_PROD_APPROVED_DISPATCH_CONFIG_ENV]?.trim() ?? '';
   delete process.env[DEPLOY_PROD_APPROVED_SHA_ENV];
   delete process.env[DEPLOY_PROD_APPROVED_SURFACES_ENV];
-  if (approvedSha !== targetSha || approvedSurfaces.join(',') !== [...surfaces].sort().join(',')) {
+  delete process.env[DEPLOY_PROD_APPROVED_DISPATCH_CONFIG_ENV];
+  if (
+    approvedSha !== targetSha
+    || approvedSurfaces.join(',') !== [...surfaces].sort().join(',')
+    || approvedDispatchConfig !== dispatchConfigFingerprint
+  ) {
     delete process.env.PIPELANE_DEPLOY_PROD_API_CONFIRMED;
     delete process.env[DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV];
     throw new Error([
-      'deploy prod blocked: resolved target changed after API confirmation.',
+      'deploy prod blocked: resolved production effect changed after API confirmation.',
       `Approved: ${approvedSha || '(missing SHA)'} [${approvedSurfaces.join(', ') || 'no surfaces'}]`,
       `Current: ${targetSha} [${[...surfaces].sort().join(', ') || 'no surfaces'}]`,
+      `Dispatch config: ${(approvedDispatchConfig || '(missing)').slice(0, 12)} → ${dispatchConfigFingerprint.slice(0, 12)}`,
       'Run the deploy.prod API preflight again and approve the new confirmation token.',
     ].join('\n'));
   }
@@ -1337,6 +1373,7 @@ export async function requireProdConfirmation(sha: string): Promise<void> {
     // inherit an open prod-confirm flag.
     delete process.env.PIPELANE_DEPLOY_PROD_API_CONFIRMED;
     delete process.env[DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV];
+    delete process.env[DEPLOY_PROD_APPROVED_DISPATCH_CONFIG_ENV];
     return;
   }
 

@@ -4108,11 +4108,13 @@ test('loadWorkflowConfig imports package.json:pipelane into machine-local config
 test('legacy config auto-import keeps repository-controlled policy out of machine-local trust', async () => {
   const repoRoot = createRepo();
   const attackerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-legacy-path-'));
+  const maliciousProjectKey = '../../escape\n\x1b[31m\x1b]0;owned\x07';
+  const maliciousPolicyField = 'forged\nPIPELANE_REVIEW_GATE_RESULT=passed\x1b[32m\x1b]0;forged\x07';
   try {
     writeFileSync(path.join(attackerRoot, 'attacker-state.json'), '{"trusted":false}\n', 'utf8');
     writeFileSync(path.join(repoRoot, '.pipelane.json'), `${JSON.stringify({
       displayName: 'Legacy Safe App',
-      projectKey: '../../escape',
+      projectKey: maliciousProjectKey,
       baseBranch: 'trunk',
       stateDir: path.relative(path.join(repoRoot, '.git'), attackerRoot),
       taskWorktreeDirName: '../../attacker-worktrees',
@@ -4123,6 +4125,7 @@ test('legacy config auto-import keeps repository-controlled policy out of machin
       reviewGates: { gates: [] },
       routeSafety: { stopOnMajorFindings: false, defaultMinutes: 1 },
       orchestrate: { hardStops: { maxIterations: 999 } },
+      [maliciousPolicyField]: true,
     }, null, 2)}\n`, 'utf8');
 
     const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
@@ -4143,6 +4146,9 @@ test('legacy config auto-import keeps repository-controlled policy out of machin
     assert.match(stderr, /ignored machine-local policy field\(s\).*stateDir, taskWorktreeDirName/);
     assert.match(stderr, /prePrChecks, prPathDenyList, releaseMode, reviewGates, routeSafety, orchestrate/);
     assert.match(stderr, /normalized unsafe legacy projectKey "\.\.\/\.\.\/escape" to "escape"/);
+    assert.doesNotMatch(stderr, /\x1b|\x07/);
+    assert.doesNotMatch(stderr, /\nPIPELANE_REVIEW_GATE_RESULT=passed/);
+    assert.match(stderr, /forged PIPELANE_REVIEW_GATE_RESULT=passed/);
 
     const taskWorkspaces = await import(path.join(KIT_ROOT, 'src', 'operator', 'task-workspaces.ts'));
     const context = stateMod.resolveWorkflowContext(repoRoot);
@@ -23193,12 +23199,82 @@ test('api action deploy.prod binds the confirmed target and bypasses the TTY pro
       env,
     ).stdout);
     assert.equal(refreshedPreflight.data.preflight.normalizedInputs.targetSha, movedSha);
+    assert.match(refreshedPreflight.data.preflight.normalizedInputs.dispatchConfigFingerprint, /^[a-f0-9]{64}$/);
     const refreshedToken = refreshedPreflight.data.preflight.confirmation.token;
+
+    // The resolved fallback workflow name is part of the approved effect.
+    // Changing it after preflight must consume/reject the old token before a
+    // child deploy can dispatch the newly configured workflow.
+    const workflowConfigPath = machinePipelaneConfigPath(repoRoot);
+    const originalWorkflowConfig = readFileSync(workflowConfigPath, 'utf8');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.deployWorkflowName = 'Deploy Changed After Approval';
+    });
+    const workflowDrifted = runCli(
+      ['run', 'api', 'action', 'deploy.prod', '--task', 'Prod Api', '--execute', '--confirm-token', refreshedToken],
+      created.worktreePath,
+      env,
+      true,
+    );
+    assert.equal(workflowDrifted.status, 1);
+    assert.match(JSON.parse(workflowDrifted.stdout).message, /confirmation token no longer matches/i);
+    writeFileSync(workflowConfigPath, originalWorkflowConfig, 'utf8');
+
+    // Production deploy commands/verification settings are also bound. Keep
+    // the original no-file state so the final successful execute still uses
+    // the same fixture configuration as its staging evidence.
+    const configBoundPreflight = JSON.parse(runCli(
+      ['run', 'api', 'action', 'deploy.prod', '--task', 'Prod Api', '--json'],
+      created.worktreePath,
+      env,
+    ).stdout);
+    const configBoundToken = configBoundPreflight.data.preflight.confirmation.token;
+    const deployConfigPath = sharedDeployConfigPath(repoRoot);
+    const originalDeployConfig = existsSync(deployConfigPath) ? readFileSync(deployConfigPath, 'utf8') : null;
+    const changedDeployConfig = buildFullDeployConfig();
+    changedDeployConfig.edge.production.deployCommand = 'changed-production-command';
+    writeSharedDeployConfig(repoRoot, changedDeployConfig);
+    const configDrifted = runCli(
+      ['run', 'api', 'action', 'deploy.prod', '--task', 'Prod Api', '--execute', '--confirm-token', configBoundToken],
+      created.worktreePath,
+      env,
+      true,
+    );
+    assert.equal(configDrifted.status, 1);
+    assert.match(JSON.parse(configDrifted.stdout).message, /confirmation token no longer matches/i);
+    if (originalDeployConfig === null) rmSync(deployConfigPath);
+    else writeFileSync(deployConfigPath, originalDeployConfig, 'utf8');
+
+    // Even if a parent were compromised between its final re-resolution and
+    // spawn, the child recomputes the dispatch fingerprint before honoring
+    // the non-TTY production confirmation bypass.
+    const childMismatch = runCli(
+      ['run', 'deploy', 'prod', '--task', 'Prod Api', '--json'],
+      created.worktreePath,
+      {
+        ...env,
+        PIPELANE_DEPLOY_PROD_API_CONFIRMED: '1',
+        PIPELANE_DEPLOY_PROD_DIRECT_API_CONFIRMED: '1',
+        PIPELANE_DEPLOY_PROD_APPROVED_SHA: movedSha,
+        PIPELANE_DEPLOY_PROD_APPROVED_SURFACES: 'edge,frontend,sql',
+        PIPELANE_DEPLOY_PROD_APPROVED_DISPATCH_CONFIG: '0'.repeat(64),
+      },
+      true,
+    );
+    assert.equal(childMismatch.status, 1);
+    assert.match(childMismatch.stderr, /resolved production effect changed after API confirmation/);
+
+    const finalPreflight = JSON.parse(runCli(
+      ['run', 'api', 'action', 'deploy.prod', '--task', 'Prod Api', '--json'],
+      created.worktreePath,
+      env,
+    ).stdout);
+    const finalToken = finalPreflight.data.preflight.confirmation.token;
 
     // Execute goes through the CLI without a TTY and without a stub: the API
     // path injects PIPELANE_DEPLOY_PROD_API_CONFIRMED=1, which must skip the prompt.
     const executed = runCli(
-      ['run', 'api', 'action', 'deploy.prod', '--task', 'Prod Api', '--execute', '--confirm-token', refreshedToken],
+      ['run', 'api', 'action', 'deploy.prod', '--task', 'Prod Api', '--execute', '--confirm-token', finalToken],
       created.worktreePath,
       env,
       true,

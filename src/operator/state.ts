@@ -6,6 +6,7 @@ import path from 'node:path';
 
 import { computeUrlFingerprint, resolveProbeStateKey, resolveReviewStateKey, signSignedPayload, verifySignedPayload } from './integrity.ts';
 import { buildDefaultReviewGatesConfig } from './review-gates.ts';
+import { sanitizeForTerminal } from './text-output.ts';
 
 export type Mode = 'build' | 'release';
 export type KnownSurface = 'frontend' | 'edge' | 'sql';
@@ -1542,20 +1543,26 @@ function normalizeLegacyWorkflowImport(
   }
   const importedProjectKey = cleanString(sanitized.projectKey);
   if (importedProjectKey) {
-    const safeProjectKey = inferProjectKey(importedProjectKey);
+    const printableProjectKey = sanitizeLegacyWarningValue(importedProjectKey);
+    const safeProjectKey = inferProjectKey(printableProjectKey);
     if (safeProjectKey !== importedProjectKey) {
       process.stderr.write(
-        `Warning: normalized unsafe legacy projectKey "${importedProjectKey}" to "${safeProjectKey}" while importing ${sourceLabel}.\n`,
+        `Warning: normalized unsafe legacy projectKey "${printableProjectKey}" to "${safeProjectKey}" while importing ${sourceLabel}.\n`,
       );
     }
     sanitized.projectKey = safeProjectKey;
   }
   if (ignored.length > 0) {
+    const printableIgnored = ignored.map(sanitizeLegacyWarningValue).join(', ');
     process.stderr.write(
-      `Warning: ignored machine-local policy field(s) ${ignored.join(', ')} while importing ${sourceLabel}. Configure them explicitly after migration.\n`,
+      `Warning: ignored machine-local policy field(s) ${printableIgnored} while importing ${sourceLabel}. Configure them explicitly after migration.\n`,
     );
   }
   return normalizeWorkflowConfig(sanitized as Partial<WorkflowConfig>, { repoRoot });
+}
+
+function sanitizeLegacyWarningValue(value: string): string {
+  return sanitizeForTerminal(value).replace(/\s+/gu, ' ').trim() || '(empty)';
 }
 
 export function importLegacyWorkflowConfigIfNeeded(repoRoot: string): {
