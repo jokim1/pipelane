@@ -61,7 +61,20 @@ function resolveLinkableSharedRepoRoot(commonDir: string): string | null {
 
 export function resolveTaskWorktreeRoot(commonDir: string, config: WorkflowConfig): string {
   const sharedRepoRoot = resolveSharedRepoRoot(commonDir);
-  return path.join(path.dirname(sharedRepoRoot), config.taskWorktreeDirName);
+  const siblingRoot = normalizeExistingPath(path.dirname(sharedRepoRoot));
+  const worktreeRoot = normalizeExistingPath(path.resolve(siblingRoot, config.taskWorktreeDirName));
+  const relative = path.relative(siblingRoot, worktreeRoot);
+  if (
+    !relative
+    || relative === '..'
+    || relative.startsWith(`..${path.sep}`)
+    || path.isAbsolute(relative)
+  ) {
+    throw new Error(
+      `Invalid taskWorktreeDirName "${config.taskWorktreeDirName}": task worktrees must stay inside ${siblingRoot}.`,
+    );
+  }
+  return worktreeRoot;
 }
 
 /**

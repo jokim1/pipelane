@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import {
@@ -91,64 +91,77 @@ async function handleApplyTaskOrAllStale(
     throw new Error(`Could not derive a valid task slug from --task "${taskFlag}".`);
   }
 
-  const { removed, skipped } = pruneDeadTaskLocks(commonDir, config, {
-    taskSlug: targetSlug,
-    minAgeMs: readMinAgeOverride(),
-  });
+  const cleanupLease = targetSlug
+    ? acquireTaskCleanupLock(commonDir, config, targetSlug)
+    : null;
+  if (cleanupLease?.acquired === false) {
+    throw new Error(`Could not clean task ${targetSlug}: ${cleanupLease.reason}`);
+  }
 
-  // --task is the end-of-task closer: prune the lock, then tear down the
-  // worktree + local branch the lock pointed at. --all-stale stays
-  // metadata-only — it sweeps abandoned locks across many tasks and the
-  // blast radius of bulk worktree removal would be too high (e.g. an
-  // operator restarting the daemon would briefly orphan locks for live
-  // worktrees the operator wanted to keep).
-  const artifactResults = taskFlag
-    ? performArtifactRemoval({
-        removed,
-        sharedRepoRoot,
-        callerCwd: cwd,
-        force: parsed.flags.force,
-        safeDeleteBranchRefs: buildSafeDeleteBranchRefs(removed, prRecords, deployRecords),
-      })
-    : [];
+  try {
+    waitForTargetedCleanupLeaseTestHook();
+    const { removed, skipped } = pruneDeadTaskLocks(commonDir, config, {
+      taskSlug: targetSlug,
+      minAgeMs: readMinAgeOverride(),
+      cleanupLockHeld: targetSlug !== undefined,
+    });
 
-  const messageLines: string[] = [];
-  if (removed.length === 0) {
-    messageLines.push(
-      taskFlag
-        ? `No task lock matched --task ${targetSlug}.`
-        : 'No stale task locks were pruned.',
-    );
-  } else if (taskFlag) {
-    messageLines.push('Closed out task workspaces:');
-    for (const lock of removed) {
-      const result = artifactResults.find((entry) => entry.taskSlug === lock.taskSlug);
-      const parts = ['lock'];
-      if (result?.worktreeRemoved) parts.push('worktree');
-      if (result?.branchRemoved) parts.push('branch');
-      messageLines.push(`- ${lock.taskSlug}: removed ${parts.join(' + ')}`);
-      if (result) {
-        for (const warning of result.warnings) messageLines.push(`  note: ${warning}`);
-        for (const error of result.errors) messageLines.push(`  ! ${error}`);
+    // --task is the end-of-task closer: prune the lock, then tear down the
+    // worktree + local branch the lock pointed at. The targeted path holds the
+    // composite mutation -> cleanup lease across both steps so a concurrent
+    // writer cannot recreate durable state that points at deleted artifacts.
+    // --all-stale stays metadata-only — it sweeps abandoned locks across many
+    // tasks and the blast radius of bulk worktree removal would be too high.
+    const artifactResults = taskFlag
+      ? performArtifactRemoval({
+          removed,
+          sharedRepoRoot,
+          callerCwd: cwd,
+          force: parsed.flags.force,
+          safeDeleteBranchRefs: buildSafeDeleteBranchRefs(removed, prRecords, deployRecords),
+        })
+      : [];
+
+    const messageLines: string[] = [];
+    if (removed.length === 0) {
+      messageLines.push(
+        taskFlag
+          ? `No task lock matched --task ${targetSlug}.`
+          : 'No stale task locks were pruned.',
+      );
+    } else if (taskFlag) {
+      messageLines.push('Closed out task workspaces:');
+      for (const lock of removed) {
+        const result = artifactResults.find((entry) => entry.taskSlug === lock.taskSlug);
+        const parts = ['lock'];
+        if (result?.worktreeRemoved) parts.push('worktree');
+        if (result?.branchRemoved) parts.push('branch');
+        messageLines.push(`- ${lock.taskSlug}: removed ${parts.join(' + ')}`);
+        if (result) {
+          for (const warning of result.warnings) messageLines.push(`  note: ${warning}`);
+          for (const error of result.errors) messageLines.push(`  ! ${error}`);
+        }
       }
+    } else {
+      messageLines.push('Pruned stale task locks:');
+      messageLines.push(
+        ...removed.map((entry) => `- ${entry.taskSlug}: ${entry.branchName} @ ${entry.worktreePath}`),
+      );
     }
-  } else {
-    messageLines.push('Pruned stale task locks:');
-    messageLines.push(
-      ...removed.map((entry) => `- ${entry.taskSlug}: ${entry.branchName} @ ${entry.worktreePath}`),
-    );
-  }
-  if (skipped.length > 0) {
-    messageLines.push('Kept (too young to prune, <5 min):');
-    messageLines.push(...skipped.map((entry) => `- ${entry.taskSlug}: ${entry.reason}`));
-  }
+    if (skipped.length > 0) {
+      messageLines.push('Kept (too young to prune, <5 min):');
+      messageLines.push(...skipped.map((entry) => `- ${entry.taskSlug}: ${entry.reason}`));
+    }
 
-  printResult(parsed.flags, {
-    removed: removed.map((entry) => entry.taskSlug),
-    skipped: skipped.map((entry) => ({ taskSlug: entry.taskSlug, reason: entry.reason })),
-    artifacts: artifactResults,
-    message: messageLines.join('\n'),
-  });
+    printResult(parsed.flags, {
+      removed: removed.map((entry) => entry.taskSlug),
+      skipped: skipped.map((entry) => ({ taskSlug: entry.taskSlug, reason: entry.reason })),
+      artifacts: artifactResults,
+      message: messageLines.join('\n'),
+    });
+  } finally {
+    if (cleanupLease?.acquired === true) cleanupLease.release();
+  }
 }
 
 async function handleApplyCompletedWithIgnored(
@@ -1131,6 +1144,24 @@ function formatOrphanLine(entry: OrphanWithMetadata): string {
   const treeTag = entry.classification.treeState;
   const prTag = entry.mergedPr ? `, PR #${entry.mergedPr.number} merged` : '';
   return `- ${entry.orphan.path}  [${sourceTag}, ${branchTag}, ${treeTag}${prTag}]`;
+}
+
+// Deterministic concurrency hook for the targeted-cleanup CLI regression.
+// Production ignores these variables even if they leak into the environment.
+function waitForTargetedCleanupLeaseTestHook(): void {
+  if (process.env.NODE_ENV !== 'test') return;
+  const markerPath = process.env.PIPELANE_TEST_CLEAN_LEASE_MARKER;
+  const releasePath = process.env.PIPELANE_TEST_CLEAN_LEASE_RELEASE;
+  if (!markerPath || !releasePath) return;
+  writeFileSync(markerPath, String(process.pid), 'utf8');
+  const deadline = Date.now() + 10_000;
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  while (!existsSync(releasePath)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for targeted-cleanup test release at ${releasePath}.`);
+    }
+    Atomics.wait(sleeper, 0, 0, 25);
+  }
 }
 
 // Test hook: override the 5-min prune floor. Gated to NODE_ENV==='test' so a

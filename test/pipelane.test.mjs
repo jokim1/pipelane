@@ -4112,6 +4112,7 @@ test('legacy config auto-import keeps repository-controlled policy out of machin
     writeFileSync(path.join(attackerRoot, 'attacker-state.json'), '{"trusted":false}\n', 'utf8');
     writeFileSync(path.join(repoRoot, '.pipelane.json'), `${JSON.stringify({
       displayName: 'Legacy Safe App',
+      projectKey: '../../escape',
       baseBranch: 'trunk',
       stateDir: path.relative(path.join(repoRoot, '.git'), attackerRoot),
       taskWorktreeDirName: '../../attacker-worktrees',
@@ -4127,10 +4128,12 @@ test('legacy config auto-import keeps repository-controlled policy out of machin
     const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
     const { result: loaded, stderr } = captureStderr(() => stateMod.loadWorkflowConfig(repoRoot));
     assert.equal(loaded.displayName, 'Legacy Safe App');
+    assert.equal(loaded.projectKey, 'escape');
     assert.equal(loaded.baseBranch, 'trunk');
     assert.deepEqual(loaded.surfaces, ['frontend']);
     assert.equal(loaded.stateDir, 'pipelane-state');
     assert.notEqual(loaded.taskWorktreeDirName, '../../attacker-worktrees');
+    assert.equal(loaded.taskWorktreeDirName, 'escape-worktrees');
     assert.ok(loaded.prePrChecks.length > 0, 'legacy checkout must not disable pre-PR checks');
     assert.ok(loaded.prPathDenyList.length > 0, 'legacy checkout must not disable denied-path policy');
     assert.equal(loaded.releaseMode.requireStagingPromotion, true);
@@ -4139,6 +4142,21 @@ test('legacy config auto-import keeps repository-controlled policy out of machin
     assert.equal(loaded.orchestrate, undefined);
     assert.match(stderr, /ignored machine-local policy field\(s\).*stateDir, taskWorktreeDirName/);
     assert.match(stderr, /prePrChecks, prPathDenyList, releaseMode, reviewGates, routeSafety, orchestrate/);
+    assert.match(stderr, /normalized unsafe legacy projectKey "\.\.\/\.\.\/escape" to "escape"/);
+
+    const taskWorkspaces = await import(path.join(KIT_ROOT, 'src', 'operator', 'task-workspaces.ts'));
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+    assert.equal(
+      taskWorkspaces.resolveTaskWorktreeRoot(context.commonDir, loaded),
+      path.join(realpathSync(path.dirname(repoRoot)), 'escape-worktrees'),
+    );
+    assert.throws(
+      () => taskWorkspaces.resolveTaskWorktreeRoot(context.commonDir, {
+        ...loaded,
+        taskWorktreeDirName: '../../escape-worktrees',
+      }),
+      /task worktrees must stay inside/,
+    );
 
     const persisted = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
     assert.ok(persisted.prePrChecks.length > 0);
@@ -24598,6 +24616,75 @@ test('clean --apply --task closes out the workspace: lock + worktree + merged br
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('clean --apply --task holds the composite lease across the real CLI destructive window', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-clean-cli-lease-'));
+  const markerPath = path.join(markerRoot, 'lease-held');
+  const releasePath = path.join(markerRoot, 'release');
+  let cleaner = null;
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Cleanup CLI Lease', '--json'], repoRoot).stdout);
+
+    cleaner = spawn(process.execPath, [
+      CLI_PATH,
+      'run',
+      'clean',
+      '--apply',
+      '--task',
+      'Cleanup CLI Lease',
+      '--json',
+    ], {
+      cwd: repoRoot,
+      env: buildCliChildEnv({
+        PIPELANE_CLEAN_MIN_AGE_MS: '0',
+        PIPELANE_TEST_CLEAN_LEASE_MARKER: markerPath,
+        PIPELANE_TEST_CLEAN_LEASE_RELEASE: releasePath,
+      }),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const cleanerExit = once(cleaner, 'exit');
+    let cleanerStdout = '';
+    let cleanerStderr = '';
+    cleaner.stdout.on('data', (chunk) => { cleanerStdout += chunk.toString('utf8'); });
+    cleaner.stderr.on('data', (chunk) => { cleanerStderr += chunk.toString('utf8'); });
+    await waitForPathForTest(markerPath);
+
+    const contender = spawnSync(process.execPath, [
+      CLI_PATH,
+      'run',
+      'devmode',
+      'build',
+      '--task',
+      'Cleanup CLI Lease',
+      '--json',
+    ], {
+      cwd: created.worktreePath,
+      env: buildCliChildEnv(),
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(contender.status, 1, contender.stdout || contender.stderr);
+    assert.match(contender.stderr, /being updated by another Pipelane process|being cleaned by another Pipelane process/);
+
+    writeFileSync(releasePath, 'release\n', 'utf8');
+    const [cleanerCode] = await cleanerExit;
+    assert.equal(cleanerCode, 0, cleanerStderr || cleanerStdout);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'task-locks', 'cleanup-cli-lease.json')), false);
+    assert.equal(existsSync(created.worktreePath), false);
+    assert.equal(localBranchExists(repoRoot, created.branch), false);
+  } finally {
+    if (cleaner && cleaner.exitCode === null) {
+      writeFileSync(releasePath, 'release\n', 'utf8');
+      cleaner.kill('SIGTERM');
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(markerRoot, { recursive: true, force: true });
   }
 });
 

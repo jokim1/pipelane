@@ -1540,6 +1540,16 @@ function normalizeLegacyWorkflowImport(
     if (allowed.has(field)) sanitized[field] = value;
     else ignored.push(field);
   }
+  const importedProjectKey = cleanString(sanitized.projectKey);
+  if (importedProjectKey) {
+    const safeProjectKey = inferProjectKey(importedProjectKey);
+    if (safeProjectKey !== importedProjectKey) {
+      process.stderr.write(
+        `Warning: normalized unsafe legacy projectKey "${importedProjectKey}" to "${safeProjectKey}" while importing ${sourceLabel}.\n`,
+      );
+    }
+    sanitized.projectKey = safeProjectKey;
+  }
   if (ignored.length > 0) {
     process.stderr.write(
       `Warning: ignored machine-local policy field(s) ${ignored.join(', ')} while importing ${sourceLabel}. Configure them explicitly after migration.\n`,
