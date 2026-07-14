@@ -580,6 +580,93 @@ and non-TTY execution paths.
     timeout regression now reaches—and enforces—the non-waivable timeout guard
     under upstream's mandatory informed-consent `--reason` contract.
 
+41. **Route acceptance could race newer review/route state and persist before
+    signed consent existed (P1).** **Location:**
+    `src/operator/route-loop-safety.ts:266` and
+    `src/operator/route-loop-safety.ts:402`. **Repro:** pause a route on failed
+    evidence, start `resume --accept-findings` (or wait at TTY option 4), then
+    let a concurrent review or resume update the route before the prompt
+    returns; the old path saved a stale route snapshot and, in headless mode,
+    recorded acceptance before re-evaluating/signing the exact evidence.
+    **Proposed fix (implemented):** capture the route lineage, attempt, review
+    run, and target command; reload and compare them under the route lock;
+    re-evaluate the same review under the review lock; persist the complete
+    signed-consent batch; and only then commit route acceptance. Consent save
+    failure leaves the route untouched, route save failure removes only the
+    newly written consent IDs, and every TTY mutation now reloads current state
+    instead of overwriting it with the pre-prompt snapshot.
+
+42. **Targeted review retries matched an underspecified evidence identity
+    (P1).** **Location:** `src/operator/review-enforcement.ts:846`. **Repro:**
+    retain branch, SHA, and dirty-tree digest while changing task binding,
+    authoritative intent, review target digest, policy version, or enforcement
+    mode; a later `review --gate <id>` could be composed into the older full
+    run. **Proposed fix (implemented):** require exact equality for all five
+    fields in addition to the existing branch/SHA/worktree identity. A matrix
+    regression proves each mismatch independently prevents composition.
+
+43. **Strict-v3 reviewers bypassed the shared timeout contract (P1).**
+    **Location:** `src/operator/commands/review.ts:4125`. **Repro:** configure a
+    strict skill gate and set `PIPELANE_REVIEW_GATE_TIMEOUT_MS`; legacy command
+    and AI gates used the override, while the strict provider read only its
+    configured `timeoutMs`, then reported the timeout as generic execution
+    failure. **Proposed fix (implemented):** use the common strict duration
+    resolver for provider and command-lock waits, persist additive
+    `outcome: "timeout"` / `errorCode: "ETIMEDOUT"`, and print the exact
+    `pipelane run review --gate <id>` remedy.
+
+44. **A successful targeted retry erased unrelated unresolved timeouts (P1).**
+    **Location:** `src/operator/route-loop-safety.ts:867`. **Repro:** let gates
+    A and B time out, then pass only `review --gate A`; assigning the filtered
+    run's empty timeout list replaced `[A, B]`, so accept-findings no longer
+    saw B. **Proposed fix (implemented):** treat the route timeout list as an
+    unresolved set: full reviews replace it, a filtered timeout adds its gate,
+    and a definitive filtered pass/failure removes only that gate. The route
+    remains fail-closed until every timed-out gate receives a real verdict.
+
+45. **Production API preflight and execution resolved surfaces from different
+    contracts (P1).** **Location:** `src/operator/commands/deploy.ts:304`.
+    **Repro:** add a target-SHA deploy contract containing a custom surface,
+    leave stale lock surfaces, preflight `api action deploy.prod`, then execute
+    its token; preflight used the default machine map while execution loaded
+    the target contract, so a legitimate token was guaranteed to drift.
+    **Proposed fix (implemented):** load and validate the exact target's
+    workflow surface contract during approval resolution and pass its resolved
+    path map into the same inference routine used by execution. A custom-MCP
+    production regression now preflights and executes the same surface set.
+
+46. **Multiple task locks reopened shared-checkout PR recovery (P1).**
+    **Location:** `src/operator/commands/helpers.ts:150`. **Repro:** keep two
+    task locks, check out a task-shaped branch in the shared checkout, and run
+    `/pr` without `--task`; no path matched and the old single-lock fallback
+    returned null, allowing downstream branch inference to offer recovery from
+    the wrong checkout. **Proposed fix (implemented):** in the shared checkout,
+    resolve a unique branch-derived lock before any measurements so the error
+    names its exact worktree; otherwise hard-error with an explicit `--task`
+    remedy. The non-shared recovery exception remains available.
+
+47. **A symlinked worktree-root ancestor escaped containment when the final
+    directory did not exist (P0).** **Location:** `src/operator/state.ts:1023`.
+    **Repro:** configure `taskWorktreeDirName` as `link/missing`, where `link`
+    is a sibling symlink outside the allowed root; `realpathSync` failed on the
+    missing leaf and the old fallback compared the harmless lexical path.
+    **Proposed fix (implemented):** walk upward to the nearest existing
+    ancestor, canonicalize that ancestor, append the missing segments, and use
+    the resulting path for every containment/equality check. `/new` now rejects
+    the escape before creating anything.
+
+48. **Non-JSON API preflight is a two-record stdout protocol, not a single JSON
+    document (P3, reviewed; no code change).** **Location:**
+    `src/operator/commands/api.ts:77`. **Repro:** invoke a risky preflight
+    without `--json` and feed all stdout directly to `JSON.parse`; the required
+    `PIPELANE_CONFIRM_TOKEN=<token>` machine line precedes the envelope.
+    **Proposed fix:** programmatic callers that want a single JSON document
+    must pass `--json` and read
+    `data.preflight.confirmation.{token,expiresAt}`. This is the deliberate Q4
+    plan-of-record contract (the standalone line exists for shell callers), so
+    removing it would regress the accepted token ergonomics rather than fix a
+    deploy-flow bug.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original
