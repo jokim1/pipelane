@@ -41,6 +41,7 @@ import {
   verifyDeploySurface,
   watchWorkflowRun,
 } from './deploy.ts';
+import { assertManagedLocalStateValid, assertManagedLocalStateValidForTree } from '../local-state.ts';
 
 // v1.1: `/rollback <env>` dispatches a NEW deploy of the last-known-good
 // sha for the named environment + surfaces. It is NOT a revert of the
@@ -443,6 +444,7 @@ async function handleRevertPr(
   if (context.modeState.mode !== 'release') {
     throw new Error(`--revert-pr is release-mode only. Switch modes with ${formatWorkflowCommand(context.config, 'devmode', 'release')} first.`);
   }
+  assertManagedLocalStateValid(context.repoRoot);
 
   // Refuse to operate against a dirty worktree — we're about to `switch`
   // branches mid-command, and uncommitted work that gets stranded on an
@@ -506,6 +508,7 @@ async function handleRevertPr(
   if (!baseRef) {
     throw new Error(`--revert-pr blocked: cannot resolve base branch "${context.config.baseBranch}" locally or on origin.`);
   }
+  assertManagedLocalStateValidForTree(context.repoRoot, baseRef);
 
   // Security: confirm mergedSha is an ancestor of the base branch.
   // Otherwise an attacker controlling pr-state.json could point us at

@@ -26,6 +26,7 @@ import {
   writeJsonFile,
 } from './state.ts';
 import { loadDeployConfig } from './release-gate.ts';
+import { initializeManagedLocalState } from './local-state.ts';
 
 const README_MARKER_START = '<!-- pipelane:readme:start -->';
 const README_MARKER_END = '<!-- pipelane:readme:end -->';
@@ -512,6 +513,8 @@ export interface SetupConsumerRepoResult {
   appliedLessonsMigration: LessonsMigration | null;
   warnings: string[];
   taskStartCommand: string;
+  localStateExcludePath: string;
+  localStateInitialized: boolean;
 }
 
 export interface CodexSkillDrift {
@@ -1143,6 +1146,7 @@ export function setupConsumerRepo(cwd: string, options: SetupConsumerRepoOptions
   const repoRoot = resolveRepoRoot(cwd, true);
   const workflowConfig = setupWorkflowConfig(repoRoot);
   const config = workflowConfig.config;
+  const localState = initializeManagedLocalState(repoRoot);
   syncConsumerDocs(repoRoot, config);
   const scaffoldClaudeMd = false;
   const scaffoldRepoGuidance = false;
@@ -1207,6 +1211,8 @@ export function setupConsumerRepo(cwd: string, options: SetupConsumerRepoOptions
     appliedLessonsMigration,
     warnings: [],
     taskStartCommand: resolveWorkflowAliases(config.aliases).new,
+    localStateExcludePath: localState.excludePath,
+    localStateInitialized: localState.created,
   };
 }
 
@@ -1450,6 +1456,9 @@ export function formatSetupResult(result: SetupConsumerRepoResult): string[] {
   const lines: string[] = [
     `Pipelane setup complete in ${result.repoRoot}`,
     formatWorkflowConfigSetupLine(result),
+    result.localStateInitialized
+      ? `Initialized the persistent Pipelane local-state v1 block in ${result.localStateExcludePath}. Rerun review once because workspace identity changed.`
+      : `Using the persistent Pipelane local-state v1 block in ${result.localStateExcludePath}.`,
     result.createdClaude
       ? 'Created local CLAUDE.md from a legacy scaffold.'
       : result.skippedClaudeScaffold

@@ -75,6 +75,7 @@ import {
   describeCompletedDeployWorkflowRun,
   observeCompletedDeployWorkflowRun,
 } from '../deploy-workflow-runs.ts';
+import { assertManagedLocalStateValid } from '../local-state.ts';
 
 function surfacesKey(surfaces: string[]): string {
   return [...surfaces].sort().join(',');
@@ -284,6 +285,7 @@ export async function dispatchDeploy(
   options: DispatchDeployOptions = {},
 ): Promise<DispatchDeployResult> {
   const context = resolveWorkflowContext(cwd);
+  assertManagedLocalStateValid(context.repoRoot);
   const environment = options.environment ?? resolveDeployEnvironmentForMode(parsed.positional[0], context.modeState.mode);
   const surfacePositionals = parsed.positional.length > 0 ? parsed.positional.slice(1) : [];
   const explicitSurfaces = options.explicitSurfaces ?? [...parsed.flags.surfaces, ...surfacePositionals];

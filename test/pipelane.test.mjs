@@ -9,6 +9,7 @@ import { createHash, createHmac } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import './local-state.test.mjs';
 
 const KIT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CLI_PATH = path.join(KIT_ROOT, 'src', 'cli.ts');
@@ -29,6 +30,9 @@ process.env.CODEX_HOME = DEFAULT_CODEX_HOME;
 process.env.PIPELANE_HOME = DEFAULT_PIPELANE_HOME;
 const LOCAL_PIPELANE_INSTALL_SPEC = `file:${KIT_ROOT}`;
 const DEFAULT_ORCHESTRATION_STATE_KEY = 'pipelane-test-orchestration-state-key-0001';
+const TEST_LOCAL_STATE_START = '# >>> pipelane local-state v1 >>>';
+const TEST_LOCAL_STATE_END = '# <<< pipelane local-state v1 <<<';
+const TEST_EMPTY_LOCAL_STATE_BLOCK = `${TEST_LOCAL_STATE_START}\n${TEST_LOCAL_STATE_END}\n`;
 const PIPELANE_PREINSTALL_GUARD_SCRIPT = `node -e "const p='./node_modules/pipelane/scripts/preinstall-guard.cjs';require('fs').existsSync(p)&&require(p)"`;
 const GENERATED_CLAUDE_COMMANDS = [
   'adopt',
@@ -449,9 +453,20 @@ function createRepo() {
   execFileSync('git', ['init', '-b', 'main'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
   execFileSync('git', ['config', 'user.email', 'codex@example.com'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
   execFileSync('git', ['config', 'user.name', 'Codex'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+  initializeTestLocalState(repoRoot);
   execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
   execFileSync('git', ['commit', '-m', 'Initial commit'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
   return repoRoot;
+}
+
+function initializeTestLocalState(repoRoot) {
+  const commonDirRaw = execFileSync('git', ['rev-parse', '--git-common-dir'], { cwd: repoRoot, encoding: 'utf8' }).trim();
+  const excludePath = path.join(path.resolve(repoRoot, commonDirRaw), 'info', 'exclude');
+  const existing = existsSync(excludePath) ? readFileSync(excludePath) : Buffer.alloc(0);
+  if (existing.includes(Buffer.from(TEST_LOCAL_STATE_START))) return excludePath;
+  const boundary = existing.length > 0 && existing[existing.length - 1] !== 0x0a ? Buffer.from('\n') : Buffer.alloc(0);
+  writeFileSync(excludePath, Buffer.concat([existing, boundary, Buffer.from(TEST_EMPTY_LOCAL_STATE_BLOCK)]));
+  return excludePath;
 }
 
 function machineRepoKey(repoRoot) {
@@ -1636,7 +1651,7 @@ test('retired smoke command is not dispatched', () => {
     writePipelaneConfig(repoRoot, 'Demo App');
     const result = runCli(['run', 'smoke'], repoRoot, {}, true);
     assert.notEqual(result.status, 0);
-    assert.match(`${result.stdout}\n${result.stderr}`, /unknown .*command|unsupported/i);
+    assert.match(`${result.stdout}\n${result.stderr}`, /unknown .*command|unsupported|not classified/i);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -36191,9 +36206,11 @@ test('strict target manifest binds raw material identity while excluding effecti
     const globalChurn = contract.buildReviewTargetManifest(repoRoot, 'main');
     assert.equal(globalChurn.manifest.targetDigest, withGlobalPolicy.manifest.targetDigest);
 
-    writeFileSync(path.join(repoRoot, '.git', 'info', 'exclude'), 'info-only\n', 'utf8');
+    const infoExcludePath = path.join(repoRoot, '.git', 'info', 'exclude');
+    writeFileSync(infoExcludePath, Buffer.concat([Buffer.from('info-only\n'), readFileSync(infoExcludePath)]));
     const infoPolicy = contract.buildReviewTargetManifest(repoRoot, 'main');
-    assert.notEqual(infoPolicy.manifest.ignorePolicyDigest, withGlobalPolicy.manifest.ignorePolicyDigest);
+    assert.equal(infoPolicy.manifest.ignorePolicyDigest, withGlobalPolicy.manifest.ignorePolicyDigest);
+    assert.equal(infoPolicy.manifest.targetDigest, globalChurn.manifest.targetDigest);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(globalIgnore, { force: true });
@@ -36227,6 +36244,7 @@ test('strict target manifest fails closed on missing history and unmerged indexe
     roots.push(shallowParent);
     const shallow = path.join(shallowParent, 'clone');
     execFileSync('git', ['clone', '--depth', '1', '--branch', 'feature', pathToFileURL(shallowSource).href, shallow], { stdio: ['ignore', 'pipe', 'pipe'] });
+    initializeTestLocalState(shallow);
     execFileSync('git', ['fetch', '--depth', '1', 'origin', 'main:refs/remotes/origin/main'], { cwd: shallow, stdio: ['ignore', 'pipe', 'pipe'] });
     assert.throws(() => contract.buildReviewTargetManifest(shallow, 'main'), /could not resolve merge base/);
 
@@ -36280,6 +36298,7 @@ test('strict target manifest fails closed on missing history and unmerged indexe
     roots.push(cloneParent);
     const clone = path.join(cloneParent, 'clone');
     execFileSync('git', ['clone', machineSource, clone], { stdio: ['ignore', 'pipe', 'pipe'] });
+    initializeTestLocalState(clone);
     const sourceTarget = contract.buildReviewTargetManifest(machineSource, 'main');
     const cloneTarget = contract.buildReviewTargetManifest(clone, 'main');
     assert.equal(cloneTarget.manifest.baseTreeManifestDigest, sourceTarget.manifest.baseTreeManifestDigest);

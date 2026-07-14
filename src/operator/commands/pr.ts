@@ -50,11 +50,12 @@ import {
   routeSafetyAcceptsReviewFindings,
 } from '../route-loop-safety.ts';
 import { buildDestinationPlanForCommand } from '../destination-planner.ts';
+import { assertManagedLocalStateValid } from '../local-state.ts';
 
 export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
-  if (await maybeHandleDestinationCommand(cwd, parsed)) return;
-
   const context = resolveWorkflowContext(cwd);
+  assertManagedLocalStateValid(context.repoRoot);
+  if (await maybeHandleDestinationCommand(cwd, parsed)) return;
   let taskSlug = '';
   let lock: TaskLock | null = null;
 
