@@ -373,6 +373,8 @@ export function planDestination(snapshot: DestinationSnapshot, target: Destinati
     taskSlug: snapshot.taskSlug,
     mode: snapshot.mode,
     target,
+    baseBranch: snapshot.config.baseBranch,
+    defaultDeployWorkflowName: snapshot.defaultDeployWorkflowName,
     worktreePath: snapshot.worktreePath,
     branchName: snapshot.branchName,
     prNumber: snapshot.livePr?.number ?? snapshot.prRecord?.number ?? null,

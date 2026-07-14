@@ -420,6 +420,9 @@ export interface PruneDeadTaskLocksOptions {
   // Auto-clean already owns the task cleanup lease. Its final metadata prune
   // may enter the shared mutation lock without rejecting its own lease.
   cleanupLockHeld?: boolean;
+  // API-confirmed cleanup passes the exact lock revisions approved by the
+  // preflight. New or rebound locks are never swept under an older token.
+  approvedLocks?: TaskLock[];
 }
 
 export interface PruneDeadTaskLocksResult {
@@ -438,10 +441,26 @@ export function pruneDeadTaskLocks(
   const now = (options.now ?? (() => Date.now()))();
 
   const isTargetedScope = options.taskSlug !== undefined;
+  const approvedBySlug = options.approvedLocks
+    ? new Map(options.approvedLocks.map((lock) => [lock.taskSlug, lock]))
+    : null;
 
   for (const lock of loadAllTaskLocks(commonDir, config)) {
     if (options.taskSlug && lock.taskSlug !== options.taskSlug) {
       continue;
+    }
+    if (approvedBySlug) {
+      const approved = approvedBySlug.get(lock.taskSlug);
+      if (!approved) continue;
+      if (!sameTaskLockRevision(lock, approved)) {
+        skipped.push({
+          taskSlug: lock.taskSlug,
+          branchName: lock.branchName,
+          worktreePath: lock.worktreePath,
+          reason: 'task lock changed after cleanup was approved',
+        });
+        continue;
+      }
     }
 
     const reasons: string[] = [];
@@ -535,6 +554,7 @@ export function pruneDeadTaskLocks(
 
 function sameTaskLockRevision(left: TaskLock, right: TaskLock): boolean {
   return left.taskSlug === right.taskSlug
+    && left.taskBindingId === right.taskBindingId
     && left.branchName === right.branchName
     && normalizeExistingPath(left.worktreePath) === normalizeExistingPath(right.worktreePath)
     && left.mode === right.mode

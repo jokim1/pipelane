@@ -432,6 +432,8 @@ function routeStaticFingerprint(plan: DestinationPlan): Record<string, unknown> 
     worktreePath: fp.worktreePath,
     mode: fp.mode,
     target: fp.target,
+    baseBranch: fp.baseBranch,
+    defaultDeployWorkflowName: fp.defaultDeployWorkflowName,
     explicitDeploySha: fp.explicitDeploySha,
     surfaces: fp.surfaces,
     targetSha: fp.explicitDeploySha ? fp.targetSha : undefined,
@@ -444,6 +446,8 @@ function routeFingerprint(plan: DestinationPlan): {
   worktreePath: unknown;
   mode: string;
   target: string;
+  baseBranch: unknown;
+  defaultDeployWorkflowName: unknown;
   prNumber: unknown;
   headSha: unknown;
   mergedSha: unknown;
@@ -457,6 +461,8 @@ function routeFingerprint(plan: DestinationPlan): {
     worktreePath?: unknown;
     mode?: string;
     target?: string;
+    baseBranch?: unknown;
+    defaultDeployWorkflowName?: unknown;
     prNumber?: unknown;
     headSha?: unknown;
     mergedSha?: unknown;
@@ -470,6 +476,8 @@ function routeFingerprint(plan: DestinationPlan): {
     worktreePath: fp.worktreePath,
     mode: fp.mode ?? '',
     target: fp.target ?? '',
+    baseBranch: fp.baseBranch,
+    defaultDeployWorkflowName: fp.defaultDeployWorkflowName,
     prNumber: fp.prNumber,
     headSha: fp.headSha,
     mergedSha: fp.mergedSha,

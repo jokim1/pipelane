@@ -2275,6 +2275,7 @@
     function reviewGateMarkup(gate) {
       const findings = Array.isArray(gate?.findings) ? gate.findings : [];
       const protocolErrors = Array.isArray(gate?.protocolErrors) ? gate.protocolErrors : [];
+      const displayedStatus = gate?.outcome === 'timeout' ? 'timeout' : (gate?.status || 'unknown');
       const findingMarkup = findings.length
         ? `<ul class="review-findings">${findings.map((finding) => `<li><strong>${escapeHtml(finding.id)}</strong> [${escapeHtml(finding.severity)}] ${escapeHtml(finding.title)}${finding.location ? ` <span class="footer-note">(${escapeHtml(finding.location)})</span>` : ''}</li>`).join('')}</ul>`
         : '<div class="footer-note" style="margin-top:8px">No structured findings.</div>';
@@ -2294,7 +2295,7 @@
         <article class="review-gate ${stateClass(gate?.status)}">
           <div class="lane-head">
             <strong>${escapeHtml(gate?.gateId || 'review gate')}</strong>
-            <span class="mini-pill">${escapeHtml(gate?.status || 'unknown')}</span>
+            <span class="mini-pill">${escapeHtml(displayedStatus)}</span>
           </div>
           <div class="reason-block">${escapeHtml(gate?.summary || 'No gate summary provided.')}</div>
           ${manual}

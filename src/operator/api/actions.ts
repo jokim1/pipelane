@@ -7,14 +7,17 @@ import type { ParsedOperatorArgs } from '../state.ts';
 import {
   appendActionRunRecord,
   loadDeployState,
+  loadAllTaskLocks,
   loadProbeState,
   loadTaskLock,
+  normalizeExistingPath,
   nowIso,
   reviewArtifactRoot,
   resolveWorkflowContext,
   runGit,
   slugifyTaskName,
   type DeployRecord,
+  type TaskLock,
   type WorkflowContext,
 } from '../state.ts';
 import {
@@ -71,10 +74,12 @@ import {
   DEPLOY_PROD_APPROVED_SHA_ENV,
   DEPLOY_PROD_APPROVED_SURFACES_ENV,
   DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV,
+  computeDeployApprovalDispatchFingerprint,
   resolveDeployApprovalInputs,
 } from '../commands/deploy.ts';
 import { projectReviewRun, type ReviewRunPresentation } from '../review-output.ts';
 import { assertManagedLocalStateValid, assertManagedLocalStateValidForTree } from '../local-state.ts';
+import { CLEAN_APPROVED_LOCKS_ENV } from '../commands/clean.ts';
 
 export const STABLE_ACTION_IDS = [
   'new',
@@ -1215,7 +1220,11 @@ function normalizeInputs(
     case 'clean.plan':
       return {};
     case 'clean.apply':
-      return { task: flags.task, allStale: flags.allStale };
+      return {
+        task: flags.task,
+        allStale: flags.allStale,
+        cleanupLocks: cwd ? resolveCleanupApprovalLocks(cwd, flags.task, flags.allStale) : undefined,
+      };
     case 'doctor.diagnose':
       return {};
     case 'doctor.probe':
@@ -1228,9 +1237,31 @@ function normalizeInputs(
     }
     case 'rollback.prod': {
       const resolved = resolveRollbackInputs(cwd, 'prod', flags.surfaces, flags.task);
-      return { task: flags.task, surfaces: flags.surfaces, resolvedSurfaces: resolved?.surfaces, targetSha: resolved?.targetSha };
+      return {
+        task: flags.task,
+        surfaces: flags.surfaces,
+        resolvedSurfaces: resolved?.surfaces,
+        targetSha: resolved?.targetSha,
+        dispatchConfigFingerprint: resolved?.dispatchConfigFingerprint,
+      };
     }
   }
+}
+
+function resolveCleanupApprovalLocks(cwd: string, task: string, allStale: boolean): TaskLock[] {
+  const context = resolveWorkflowContext(cwd);
+  const taskSlug = task.trim() ? slugifyTaskName(task) : '';
+  return loadAllTaskLocks(context.commonDir, context.config)
+    .filter((lock) => allStale || lock.taskSlug === taskSlug)
+    .map((lock) => ({
+      taskSlug: lock.taskSlug,
+      taskBindingId: lock.taskBindingId,
+      branchName: lock.branchName,
+      worktreePath: normalizeExistingPath(lock.worktreePath),
+      mode: lock.mode,
+      surfaces: [...lock.surfaces],
+      updatedAt: lock.updatedAt,
+    }));
 }
 
 // v1.1 R7 fix: bind the rollback target sha to the confirm-token
@@ -1256,7 +1287,7 @@ function resolveRollbackInputs(
   environment: 'staging' | 'prod',
   surfaceFlags: string[],
   taskFlag: string,
-): { surfaces: string[]; targetSha: string } | undefined {
+): { surfaces: string[]; targetSha: string; dispatchConfigFingerprint: string } | undefined {
   if (!cwd) return undefined;
   try {
     const context = resolveWorkflowContext(cwd);
@@ -1333,7 +1364,11 @@ function resolveRollbackInputs(
       configFingerprint: computeDeployConfigFingerprint(deployConfig, environment),
     });
     if (!target?.sha) return undefined;
-    return { surfaces, targetSha: target.sha };
+    return {
+      surfaces,
+      targetSha: target.sha,
+      dispatchConfigFingerprint: computeDeployApprovalDispatchFingerprint(context, deployConfig),
+    };
   } catch {
     return undefined;
   }
@@ -1501,8 +1536,12 @@ function buildChildEnv(
   delete env[DEPLOY_PROD_APPROVED_SHA_ENV];
   delete env[DEPLOY_PROD_APPROVED_SURFACES_ENV];
   delete env[DEPLOY_PROD_APPROVED_DISPATCH_CONFIG_ENV];
+  delete env[CLEAN_APPROVED_LOCKS_ENV];
   if (isRouteActionId(actionId) && destinationPlan) {
     env[DESTINATION_APPROVED_ROUTE_FINGERPRINT_ENV] = destinationPlanFingerprintDigest(destinationPlan);
+  }
+  if (actionId === 'clean.apply') {
+    env[CLEAN_APPROVED_LOCKS_ENV] = JSON.stringify(normalizedInputs.cleanupLocks ?? []);
   }
   if (actionId === 'route.deploy.prod') {
     env[DESTINATION_ROUTE_PROD_CONFIRMED_ENV] = '1';
@@ -1516,7 +1555,7 @@ function buildChildEnv(
     // scrubs this flag the moment it reads it so grandchild subprocesses
     // don't inherit an open prod-confirm bit.
     env.PIPELANE_DEPLOY_PROD_API_CONFIRMED = '1';
-    if (actionId === 'deploy.prod') {
+    if (actionId === 'deploy.prod' || actionId === 'rollback.prod') {
       env[DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV] = '1';
       env[DEPLOY_PROD_APPROVED_SHA_ENV] = typeof normalizedInputs.targetSha === 'string'
         ? normalizedInputs.targetSha

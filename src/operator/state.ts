@@ -932,6 +932,31 @@ const TASK_MUTATION_LOCK_STALE_MS = 60 * 1000;
 const ORPHAN_CLEANUP_LOCKS_DIRNAME = 'orphan-cleanup-locks';
 const INSTALL_MARKER_FILENAME = 'installed.json';
 const LEGACY_MIGRATION_FILENAME = 'legacy-migration.json';
+const LEGACY_STATE_ENTRY_NAMES = new Set([
+  MODE_STATE_FILENAME,
+  PR_STATE_FILENAME,
+  DEPLOY_STATE_FILENAME,
+  ACTION_STATE_FILENAME,
+  REVIEW_STATE_FILENAME,
+  REVIEW_ACCEPTANCE_STATE_FILENAME,
+  REVIEW_STATE_LOCK_FILENAME,
+  ROUTE_SAFETY_STATE_FILENAME,
+  ROUTE_SAFETY_STATE_LOCK_FILENAME,
+  DEPLOY_CONFIG_FILENAME,
+  PROBE_STATE_FILENAME,
+  TASK_LOCKS_DIRNAME,
+  TASK_BINDING_LOCKS_DIRNAME,
+  TASK_CLEANUP_LOCKS_DIRNAME,
+  TASK_MUTATION_LOCKS_DIRNAME,
+  ORPHAN_CLEANUP_LOCKS_DIRNAME,
+  INSTALL_MARKER_FILENAME,
+  LEGACY_MIGRATION_FILENAME,
+  'api-confirmations',
+  'doctor.lock.json',
+  'orchestrate',
+  'review-artifacts',
+  'review-gates',
+]);
 
 // State-resilience invariants. Pipelane state lives under
 // `$PIPELANE_HOME/repos/<repo-key>/state`, where the repo key is derived from
@@ -2534,8 +2559,13 @@ function migrateLegacyStateDirFromDirectories(
 ): void {
   const canonicalDir = resolveStateDir(commonDir, config);
   const requireComplete = options.requireComplete === true;
-  if (hasInstallMarker(commonDir, config)) return;
-  if (existsSync(legacyMigrationPath(commonDir, config))) return;
+  // The generic canonical markers prove only that *some* machine-local state
+  // has been initialized or migrated. During a repo-local config import we
+  // have an explicit legacy directory that must be copied or verified before
+  // the machine config is committed, even when another command initialized
+  // canonical state first.
+  if (!requireComplete && hasInstallMarker(commonDir, config)) return;
+  if (!requireComplete && existsSync(legacyMigrationPath(commonDir, config))) return;
 
   for (const legacyDir of Array.from(new Set(legacyStateDirs))) {
     if (!existsSync(legacyDir)) continue;
@@ -2544,6 +2574,13 @@ function migrateLegacyStateDirFromDirectories(
     try {
       injectLegacyMigrationFailure('readdir');
       entries = readdirSync(legacyDir).sort();
+      if (requireComplete) {
+        // Reject unrelated Git internals from their shallow names before any
+        // recursive walk; otherwise stateDir="objects" could still make the
+        // safety validator traverse the entire object database.
+        assertLegacyMigrationEntriesAllowed(entries, legacyDir);
+        assertLegacyMigrationTreeHasNoSymlinks(legacyDir);
+      }
     } catch (error) {
       if (requireComplete) {
         throw new Error(
@@ -2563,6 +2600,7 @@ function migrateLegacyStateDirFromDirectories(
       const dst = path.join(canonicalDir, name);
       if (existsSync(dst)) {
         if (!requireComplete) continue;
+        assertLegacyMigrationTreeHasNoSymlinks(dst);
         if (!legacyMigrationPathsEquivalent(src, dst)) {
           throw new Error(
             `Legacy Pipelane state entry ${name} conflicts with ${dst}; machine-local config was not imported. Preserve the correct state, remove the conflicting copy, and retry.`,
@@ -2575,10 +2613,12 @@ function migrateLegacyStateDirFromDirectories(
         injectLegacyMigrationFailure(`copy:${name}`);
         // cpSync handles both files and directories with `recursive: true`.
         cpSync(src, dst, { recursive: true });
+        if (requireComplete) assertLegacyMigrationTreeHasNoSymlinks(dst);
         copied.push(name);
         completed.push(name);
       } catch (error) {
         if (requireComplete) {
+          rmSync(dst, { recursive: true, force: true });
           throw new Error(
             `Could not copy legacy Pipelane state entry ${name} from ${legacyDir}; machine-local config and migration markers were not written. Fix access and retry.`,
             { cause: error },
@@ -2621,6 +2661,25 @@ function migrateLegacyStateDirFromDirectories(
     // operator should resolve that manually rather than us guessing
     // the order.
     return;
+  }
+}
+
+function assertLegacyMigrationEntriesAllowed(entries: string[], legacyDir: string): void {
+  const unexpected = entries.filter((name) => !LEGACY_STATE_ENTRY_NAMES.has(name));
+  if (unexpected.length === 0) return;
+  throw new Error(
+    `legacy state directory ${legacyDir} contains non-Pipelane entries: ${unexpected.slice(0, 5).join(', ')}`,
+  );
+}
+
+function assertLegacyMigrationTreeHasNoSymlinks(target: string): void {
+  const metadata = lstatSync(target);
+  if (metadata.isSymbolicLink()) {
+    throw new Error(`legacy state contains an unsafe symbolic link at ${target}`);
+  }
+  if (!metadata.isDirectory()) return;
+  for (const name of readdirSync(target)) {
+    assertLegacyMigrationTreeHasNoSymlinks(path.join(target, name));
   }
 }
 
@@ -3759,10 +3818,11 @@ export function legacyTaskBindingId(config: WorkflowConfig, lock: TaskLock): str
 export function ensureTaskBindingId(commonDir: string, config: WorkflowConfig, taskSlug: string): TaskLock | null {
   const lockGuard = acquireTaskBindingLock(commonDir, config, taskSlug);
   try {
-    const lock = loadTaskLock(commonDir, config, taskSlug);
-    if (!lock || lock.taskBindingId) return lock;
-    const taskBindingId = legacyTaskBindingId(config, lock);
-    return saveTaskLock(commonDir, config, taskSlug, { ...lock, taskBindingId });
+    return updateTaskLock(commonDir, config, taskSlug, (lock) => {
+      if (!lock || lock.taskBindingId) return lock;
+      const taskBindingId = legacyTaskBindingId(config, lock);
+      return { ...lock, taskBindingId };
+    });
   } finally {
     lockGuard.release();
   }
@@ -3776,9 +3836,10 @@ export function updateTaskBinding(
 ): TaskLock {
   const lockGuard = acquireTaskBindingLock(commonDir, config, taskSlug);
   try {
-    const current = loadTaskLock(commonDir, config, taskSlug);
-    if (!current) throw new Error(`No task lock found for ${taskSlug}.`);
-    return saveTaskLock(commonDir, config, taskSlug, update(current));
+    return updateTaskLock(commonDir, config, taskSlug, (current) => {
+      if (!current) throw new Error(`No task lock found for ${taskSlug}.`);
+      return update(current);
+    }) as TaskLock;
   } finally {
     lockGuard.release();
   }

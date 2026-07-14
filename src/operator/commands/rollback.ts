@@ -32,6 +32,8 @@ import {
   setNextAction,
 } from './helpers.ts';
 import {
+  assertApiApprovedProdEffectInputs,
+  computeDeployApprovalDispatchFingerprint,
   describeDeployVerificationFailure,
   findRecentRun,
   formatDeployVerificationLine,
@@ -256,6 +258,13 @@ export async function handleRollback(cwd: string, parsed: ParsedOperatorArgs): P
   // via PIPELANE_DEPLOY_PROD_API_CONFIRMED after consuming an HMAC
   // token, so programmatic callers aren't blocked.
   if (environment === 'prod') {
+    assertApiApprovedProdEffectInputs(
+      environment,
+      target.sha,
+      surfaces,
+      computeDeployApprovalDispatchFingerprint(context, deployConfig),
+      'rollback prod',
+    );
     await requireProdConfirmation(target.sha);
   }
 

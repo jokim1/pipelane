@@ -287,7 +287,7 @@ export interface DeployApprovalInputs {
   dispatchConfigFingerprint: string;
 }
 
-function computeDeployApprovalDispatchFingerprint(
+export function computeDeployApprovalDispatchFingerprint(
   context: WorkflowContext,
   deployConfig: DeployConfig,
 ): string {
@@ -407,11 +407,12 @@ export async function dispatchDeploy(
     targetSha: target.sha,
     surfacePathMap,
   });
-  assertApiApprovedProdDeployInputs(
+  assertApiApprovedProdEffectInputs(
     environment,
     target.sha,
     surfaces,
     computeDeployApprovalDispatchFingerprint(context, deployConfig),
+    'deploy prod',
   );
   if (surfaces.length === 0) {
     const timestamp = nowIso();
@@ -1073,12 +1074,18 @@ function planDeployWorkflowInvocation(options: {
   }
 
   const acceptedInputs = options.triggers.workflowDispatchInputs;
-  if (acceptedInputs && !acceptedInputs.has('sha') && !options.targetIsCurrentBase) {
+  if (
+    acceptedInputs
+    && !acceptedInputs.has('sha')
+    && (options.environment === 'prod' || !options.targetIsCurrentBase)
+  ) {
     throw new Error([
       `Deploy workflow ${options.workflowName} does not accept a sha input.`,
       `Requested SHA: ${options.targetSha}`,
       `Current ${options.context.config.baseBranch}: ${resolveCurrentBaseBranchSha(options.context) || 'unresolved'}`,
-      'Refusing to dispatch because the workflow would not be pinned to the requested deploy target.',
+      options.environment === 'prod'
+        ? 'Refusing to dispatch production because the workflow cannot be pinned to the approved deploy target.'
+        : 'Refusing to dispatch because the workflow would not be pinned to the requested deploy target.',
     ].join('\n'));
   }
 
@@ -1369,11 +1376,12 @@ export const DEPLOY_PROD_APPROVED_SURFACES_ENV = 'PIPELANE_DEPLOY_PROD_APPROVED_
 export const DEPLOY_PROD_APPROVED_DISPATCH_CONFIG_ENV = 'PIPELANE_DEPLOY_PROD_APPROVED_DISPATCH_CONFIG';
 export const DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV = 'PIPELANE_DEPLOY_PROD_DIRECT_API_CONFIRMED';
 
-function assertApiApprovedProdDeployInputs(
+export function assertApiApprovedProdEffectInputs(
   environment: 'staging' | 'prod',
   targetSha: string,
   surfaces: string[],
   dispatchConfigFingerprint: string,
+  effectLabel: 'deploy prod' | 'rollback prod',
 ): void {
   if (environment !== 'prod' || process.env[DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV] !== '1') return;
   const approvedSha = process.env[DEPLOY_PROD_APPROVED_SHA_ENV]?.trim() ?? '';
@@ -1394,11 +1402,11 @@ function assertApiApprovedProdDeployInputs(
     delete process.env.PIPELANE_DEPLOY_PROD_API_CONFIRMED;
     delete process.env[DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV];
     throw new Error([
-      'deploy prod blocked: resolved production effect changed after API confirmation.',
+      `${effectLabel} blocked: resolved production effect changed after API confirmation.`,
       `Approved: ${approvedSha || '(missing SHA)'} [${approvedSurfaces.join(', ') || 'no surfaces'}]`,
       `Current: ${targetSha} [${[...surfaces].sort().join(', ') || 'no surfaces'}]`,
       `Dispatch config: ${(approvedDispatchConfig || '(missing)').slice(0, 12)} → ${dispatchConfigFingerprint.slice(0, 12)}`,
-      'Run the deploy.prod API preflight again and approve the new confirmation token.',
+      `Run the ${effectLabel.replace(' ', '.')} API preflight again and approve the new confirmation token.`,
     ].join('\n'));
   }
 }

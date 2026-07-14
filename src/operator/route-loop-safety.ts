@@ -535,8 +535,21 @@ function requestFixAttempt(
   if (record.lastReviewStatus !== 'failed' || !record.lastReviewRunId || !record.currentAttemptDigest) {
     throw new Error('A fix attempt requires one exact failed review run on the paused route. Rerun /pipelane review and use the printed fix action.');
   }
+  if ((record.lastTimedOutGateIds?.length ?? 0) > 0) {
+    throw new Error([
+      'A fix attempt requires actionable failed review evidence; timed-out gates contain no verdict.',
+      ...record.lastTimedOutGateIds!.map((gateId) => `Re-run: pipelane run review --gate ${gateId}`),
+    ].join('\n'));
+  }
   const review = loadReviewState(context.commonDir, context.config).records.find((entry) => entry.id === record.lastReviewRunId);
-  if (!review || review.status !== 'failed' || review.dryRun || review.gateFilter || review.phaseFilter) {
+  if (
+    !review
+    || review.status !== 'failed'
+    || review.dryRun
+    || review.gateFilter
+    || review.phaseFilter
+    || !reviewRunHasActionableFailure(review)
+  ) {
     throw new Error('The paused route no longer has readable signed failed review evidence. Rerun /pipelane review before requesting a fix.');
   }
   const before = currentFixCheckoutIdentity(context);
@@ -995,12 +1008,20 @@ function renderRouteSafetyPauseMessage(
 function fixRequestAvailable(context: WorkflowContext, record: RouteSafetyRecord): boolean {
   if (
     record.legacyMigration?.status === 'pending'
+    || (record.lastTimedOutGateIds?.length ?? 0) > 0
     || record.lastReviewStatus !== 'failed'
     || !record.lastReviewRunId
     || !record.currentAttemptDigest
   ) return false;
   const review = loadReviewState(context.commonDir, context.config).records.find((entry) => entry.id === record.lastReviewRunId);
-  return Boolean(review && review.status === 'failed' && !review.dryRun && !review.gateFilter && !review.phaseFilter);
+  return Boolean(
+    review
+    && review.status === 'failed'
+    && !review.dryRun
+    && !review.gateFilter
+    && !review.phaseFilter
+    && reviewRunHasActionableFailure(review)
+  );
 }
 
 function renderRouteSafetyResumeMessage(
@@ -1265,13 +1286,15 @@ function recordFixRerunTransition(record: RouteSafetyRecord, reviewRun: ReviewRu
 }
 
 function reconcileTimedOutGateIds(previous: string[], reviewRun: ReviewRunRecord): string[] {
-  if (!reviewRun.gateFilter) return reviewTimedOutGateIds(reviewRun);
+  if (reviewRun.dryRun) return [...new Set(previous)].sort();
+  if (!reviewRun.gateFilter && !reviewRun.phaseFilter) return reviewTimedOutGateIds(reviewRun);
   const unresolved = new Set(previous);
-  const retried = reviewRun.gates.find((gate) => gate.gateId === reviewRun.gateFilter);
-  if (retried?.outcome === 'timeout' && retried.blocking) {
-    unresolved.add(reviewRun.gateFilter);
-  } else if (retried && (!retried.blocking || retried.status === 'passed' || retried.status === 'failed')) {
-    unresolved.delete(reviewRun.gateFilter);
+  for (const retried of reviewRun.gates) {
+    if (retried.outcome === 'timeout' && retried.blocking) {
+      unresolved.add(retried.gateId);
+    } else if (!retried.blocking || retried.status === 'passed' || retried.status === 'failed') {
+      unresolved.delete(retried.gateId);
+    }
   }
   return [...unresolved].sort();
 }

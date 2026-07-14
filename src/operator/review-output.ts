@@ -38,6 +38,7 @@ export interface ReviewGatePresentation {
   type: ReviewGateRunRecord['type'];
   blocking: boolean;
   status: ReviewGateRunRecord['status'];
+  outcome: ReviewGateRunRecord['outcome'] | null;
   summary: string;
   counts: {
     critical: number;
@@ -220,6 +221,7 @@ export function projectReviewGate(
     type: gate.type,
     blocking: gate.blocking,
     status: gate.status,
+    outcome: gate.outcome ?? null,
     summary: visible(gate.summary),
     counts: findingCounts(findings),
     findings,
@@ -271,6 +273,9 @@ export function projectReviewRun(
   };
   const findingTotals = findingCounts(gates.flatMap((gate) => gate.findings));
   const relation = options.relation ?? 'embedded';
+  const timedOutGateIds = gates
+    .filter((gate) => gate.blocking && gate.outcome === 'timeout')
+    .map((gate) => gate.gateId);
   const authorizations = (options.consents ?? []).map((consent) => ({
     id: visible(consent.id),
     kind: consent.kind,
@@ -286,6 +291,14 @@ export function projectReviewRun(
   }));
   const nextAction = relation === 'recent'
     ? null
+    : timedOutGateIds.length > 0
+    ? {
+        kind: 'complete-rerun' as const,
+        summary: `Obtain a verdict from the timed-out review gate${timedOutGateIds.length === 1 ? '' : 's'}: ${timedOutGateIds.join(', ')}.`,
+        command: timedOutGateIds.length === 1
+          ? `/pipelane review --gate ${timedOutGateIds[0]}`
+          : '/pipelane review',
+      }
     : record.status === 'failed'
     ? {
         kind: 'repair-rerun' as const,
@@ -335,7 +348,8 @@ export function renderReviewGatePresentation(
   const indent = options.indent ?? '';
   const lines: string[] = [];
   if (options.includeGateHeader !== false) {
-    lines.push(`${indent}- ${gate.gateId} [${gate.phase}] ${gate.status.toUpperCase()} (${gate.blocking ? 'blocking' : 'non-blocking'}) - ${gate.summary}`);
+    const marker = gate.outcome === 'timeout' ? 'TIMEOUT' : gate.status.toUpperCase();
+    lines.push(`${indent}- ${gate.gateId} [${gate.phase}] ${marker} (${gate.blocking ? 'blocking' : 'non-blocking'}) - ${gate.summary}`);
   }
   const contentIndent = options.includeGateHeader === false ? indent : `${indent}  `;
   if (gate.manualAttestation) {

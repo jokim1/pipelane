@@ -111,6 +111,7 @@ const HERMETIC_DESTINATION_ROUTE_ENV_KEYS = [
   'PIPELANE_DESTINATION_APPROVED_ROUTE_FINGERPRINT',
   'PIPELANE_DESTINATION_ROUTE_PROD_CONFIRMED',
   'PIPELANE_DESTINATION_APPROVED_TARGET_SHA',
+  'PIPELANE_CLEAN_APPROVED_LOCKS',
 ];
 
 const HERMETIC_REVIEW_CONTROL_ENV_KEYS = [
@@ -4376,6 +4377,39 @@ test('legacy config auto-import migrates a safe custom stateDir before sanitizin
   }
 });
 
+test('legacy config auto-import verifies custom state even when canonical install marker already exists', async () => {
+  const repoRoot = createRepo();
+  try {
+    const commonDir = resolveCommonDir(repoRoot);
+    const legacyDir = path.join(commonDir, 'custom-state');
+    mkdirSync(legacyDir, { recursive: true });
+    writeFileSync(path.join(legacyDir, 'mode-state.json'), `${JSON.stringify({
+      mode: 'release',
+      requestedSurfaces: ['frontend'],
+      override: null,
+      updatedAt: '2026-07-12T00:00:00.000Z',
+    }, null, 2)}\n`, 'utf8');
+    writeFileSync(path.join(repoRoot, '.pipelane.json'), `${JSON.stringify({
+      displayName: 'Legacy Existing Install Marker',
+      stateDir: 'custom-state',
+    }, null, 2)}\n`, 'utf8');
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    stateMod.ensureInstallMarker(commonDir, stateMod.defaultWorkflowConfig('legacy-marker', 'Legacy Marker'));
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'installed.json')), true);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'mode-state.json')), false);
+
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+
+    assert.equal(context.modeState.mode, 'release', 'existing install marker must not abandon legacy release mode');
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'mode-state.json')), true);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'legacy-migration.json')), true);
+    assert.equal(existsSync(machinePipelaneConfigPath(repoRoot)), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('legacy custom-state auto-import fails closed on enumeration and copy failures, then safely retries a partial copy', async () => {
   const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
   const repos = [];
@@ -4458,6 +4492,58 @@ test('legacy config auto-import rejects a custom stateDir symlink that escapes t
     assert.equal(context.modeState.mode, 'build');
     assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'mode-state.json')), false);
     assert.match(stderr, /rejected unsafe legacy stateDir "linked-state"/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(attackerRoot, { recursive: true, force: true });
+  }
+});
+
+test('legacy config auto-import rejects Git internals selected as a custom stateDir', async () => {
+  const repoRoot = createRepo();
+  try {
+    writeFileSync(path.join(repoRoot, '.pipelane.json'), `${JSON.stringify({
+      displayName: 'Legacy Git Internals',
+      stateDir: 'objects',
+    }, null, 2)}\n`, 'utf8');
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    assert.throws(
+      () => stateMod.resolveWorkflowContext(repoRoot),
+      /machine-local config was not imported/,
+    );
+    assert.equal(existsSync(machinePipelaneConfigPath(repoRoot)), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'info')), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'pack')), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'legacy-migration.json')), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'installed.json')), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('legacy config auto-import rejects nested symlinks before copying state into machine trust', async () => {
+  const repoRoot = createRepo();
+  const attackerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-legacy-state-nested-link-'));
+  try {
+    const legacyDir = path.join(resolveCommonDir(repoRoot), 'custom-state');
+    mkdirSync(legacyDir, { recursive: true });
+    writeFileSync(path.join(attackerRoot, 'escaped.json'), '{"escaped":true}\n', 'utf8');
+    symlinkSync(attackerRoot, path.join(legacyDir, 'task-locks'), process.platform === 'win32' ? 'junction' : 'dir');
+    writeFileSync(path.join(repoRoot, '.pipelane.json'), `${JSON.stringify({
+      displayName: 'Legacy Nested Linked State',
+      stateDir: 'custom-state',
+    }, null, 2)}\n`, 'utf8');
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    assert.throws(
+      () => stateMod.resolveWorkflowContext(repoRoot),
+      /machine-local config was not imported/,
+    );
+    assert.equal(existsSync(machinePipelaneConfigPath(repoRoot)), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'task-locks')), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'legacy-migration.json')), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'installed.json')), false);
+    assert.equal(existsSync(path.join(attackerRoot, 'escaped.json')), true);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(attackerRoot, { recursive: true, force: true });
@@ -16050,7 +16136,7 @@ test('review runner fails when a blocking command gate fails', () => {
   }
 });
 
-test('review gate timeouts have a distinct outcome and a targeted retry remedy', () => {
+test('review gate timeouts have a distinct outcome and a targeted retry remedy', async () => {
   const repoRoot = createRepo();
   try {
     writeSingleCommandReviewGate(repoRoot, {
@@ -16062,7 +16148,7 @@ test('review gate timeouts have a distinct outcome and a targeted retry remedy',
       config.routeSafety.defaultFixReviewLoops = 3;
     });
 
-    const result = runCli(['run', 'review', '--gate', 'slow-check', '--json'], repoRoot, {}, true);
+    const result = runCli(['run', 'review', '--json'], repoRoot, {}, true);
     const report = JSON.parse(result.stdout);
     const gate = report.gates[0];
 
@@ -16076,6 +16162,32 @@ test('review gate timeouts have a distinct outcome and a targeted retry remedy',
     assert.equal(routeRecord.fixReviewLoops, 0, 'timeouts must not consume a fix/review loop');
     assert.equal(routeRecord.aiReviewRuns, 0);
     assert.deepEqual(routeRecord.lastTimedOutGateIds, ['slow-check']);
+
+    const requestedFix = runCli(['run', 'resume', '--request-fix', '--json'], repoRoot, {}, true);
+    assert.equal(requestedFix.status, 1);
+    assert.match(requestedFix.stderr, /timed-out gates contain no verdict/);
+    assert.match(requestedFix.stderr, /pipelane run review --gate slow-check/);
+    assert.deepEqual(latestRouteSafetyRecord(repoRoot).fixAttempts ?? [], []);
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const routeSafety = await import(path.join(KIT_ROOT, 'src', 'operator', 'route-loop-safety.ts'));
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+    const reviewRecord = JSON.parse(
+      readFileSync(path.join(sharedStateDir(repoRoot), 'review-state.json'), 'utf8'),
+    ).records[0];
+    const menu = routeSafety.renderRouteSafetyInteractiveMenu(context, routeRecord, {
+      reason: 'review gate timed out',
+      latest: reviewRecord,
+      issues: [],
+    });
+    assert.doesNotMatch(menu, /request-audited-fix|resume --request-fix/);
+
+    const snapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    const presentation = snapshot.data.review.current.presentation;
+    assert.equal(presentation.gates[0].status, 'failed');
+    assert.equal(presentation.gates[0].outcome, 'timeout');
+    assert.equal(presentation.nextAction.kind, 'complete-rerun');
+    assert.equal(presentation.nextAction.command, '/pipelane review --gate slow-check');
 
     const accepted = runCli([
       'run', 'resume', '--accept-findings', '--reason', 'attempted timeout waiver', '--json',
@@ -16112,6 +16224,28 @@ test('targeted retries retain other unresolved review gate timeouts', () => {
 
     const full = runCli(['run', 'review', '--json'], repoRoot, {}, true);
     assert.equal(full.status, 1);
+    assert.deepEqual(latestRouteSafetyRecord(repoRoot).lastTimedOutGateIds, ['slow-a', 'slow-b']);
+
+    const dryRun = runCli(['run', 'review', '--dry-run', '--json'], repoRoot, {}, true);
+    assert.equal(JSON.parse(dryRun.stdout).status, 'passed');
+    assert.deepEqual(
+      latestRouteSafetyRecord(repoRoot).lastTimedOutGateIds,
+      ['slow-a', 'slow-b'],
+      'a dry run cannot resolve a timeout because it produces no verdict',
+    );
+
+    const retryStaticPhase = runCli([
+      'run', 'review', '--phase', 'static', '--json',
+    ], repoRoot, { PASS_A: '1' }, true);
+    assert.equal(JSON.parse(retryStaticPhase.stdout).status, 'passed');
+    assert.deepEqual(
+      latestRouteSafetyRecord(repoRoot).lastTimedOutGateIds,
+      ['slow-b'],
+      'a phase retry resolves only gates that actually ran in that phase',
+    );
+
+    const restoreBothTimeouts = runCli(['run', 'review', '--json'], repoRoot, {}, true);
+    assert.equal(restoreBothTimeouts.status, 1);
     assert.deepEqual(latestRouteSafetyRecord(repoRoot).lastTimedOutGateIds, ['slow-a', 'slow-b']);
 
     const retryOptional = runCli(['run', 'review', '--gate', 'optional-slow', '--json'], repoRoot, {}, true);
@@ -24758,7 +24892,7 @@ test('deploy accepts configured mcp verification command without a healthcheck U
   }
 });
 
-test('deploy filters workflow_dispatch inputs to the deploy workflow schema', () => {
+test('deploy filters staging workflow inputs but blocks unpinned production dispatch', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
   const ghStateFile = path.join(ghBin, 'gh-state.json');
@@ -24789,7 +24923,7 @@ test('deploy filters workflow_dispatch inputs to the deploy workflow schema', ()
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Filtered Inputs', '--json'], repoRoot).stdout);
     const sha = execFileSync('git', ['rev-parse', 'origin/main'], { cwd: created.worktreePath, encoding: 'utf8' }).trim();
     const deployed = JSON.parse(runCli(
-      ['run', 'deploy', 'prod', '--sha', sha, '--async', '--json'],
+      ['run', 'deploy', 'staging', '--sha', sha, '--async', '--json'],
       created.worktreePath,
       env,
     ).stdout);
@@ -24798,7 +24932,18 @@ test('deploy filters workflow_dispatch inputs to the deploy workflow schema', ()
     assert.equal(deployed.dispatchMode, 'workflow_dispatch');
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
     assert.equal(ghState.workflows.length, 1);
-    assert.deepEqual(ghState.workflows[0].args, ['-f', 'environment=production']);
+    assert.deepEqual(ghState.workflows[0].args, ['-f', 'environment=staging']);
+
+    const prod = runCli(
+      ['run', 'deploy', 'prod', '--sha', sha, '--async', '--json'],
+      created.worktreePath,
+      env,
+      true,
+    );
+    assert.equal(prod.status, 1);
+    assert.match(prod.stderr, /does not accept a sha input/);
+    assert.match(prod.stderr, /cannot be pinned to the approved deploy target/);
+    assert.equal(JSON.parse(readFileSync(ghStateFile, 'utf8')).workflows.length, 1, 'blocked production must not dispatch');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -25263,9 +25408,27 @@ test('api action route.deploy.prod preserves route confirmation through full exe
     ], created.worktreePath, env).stdout);
     const token = preflight.data.preflight.confirmation.token;
     assert.ok(token);
-    const executed = runCli([
+
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.deployWorkflowName = 'Deploy Changed After Route Approval';
+    });
+    const rejected = runCli([
       'run', 'api', 'action', 'route.deploy.prod', '--task', 'Prod Route Api',
       '--execute', '--confirm-token', token, '--json',
+    ], created.worktreePath, env, true);
+    assert.equal(rejected.status, 1);
+    assert.match(JSON.parse(rejected.stdout).message, /confirmation token no longer matches/i);
+
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.deployWorkflowName = 'Deploy Hosted';
+    });
+    const refreshed = JSON.parse(runCli([
+      'run', 'api', 'action', 'route.deploy.prod', '--task', 'Prod Route Api', '--json',
+    ], created.worktreePath, env).stdout);
+    const refreshedToken = refreshed.data.preflight.confirmation.token;
+    const executed = runCli([
+      'run', 'api', 'action', 'route.deploy.prod', '--task', 'Prod Route Api',
+      '--execute', '--confirm-token', refreshedToken, '--json',
     ], created.worktreePath, env, true);
     const envelope = JSON.parse(executed.stdout);
     assert.equal(executed.status, 0, JSON.stringify(envelope, null, 2));
@@ -30034,6 +30197,49 @@ test('api action execute: risky action accepts a matching confirm token and runs
   }
 });
 
+test('api clean.apply confirmation rejects a rebound lock and the child keeps it', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Clean Approval Binding');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Clean Approval Binding', '--json'], repoRoot).stdout);
+    const preflight = JSON.parse(runCli([
+      'run', 'api', 'action', 'clean.apply', '--task', 'Clean Approval Binding', '--json',
+    ], repoRoot).stdout);
+    const token = preflight.data.preflight.confirmation.token;
+    const approvedLocks = preflight.data.preflight.normalizedInputs.cleanupLocks;
+    assert.equal(approvedLocks.length, 1);
+
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', 'clean-approval-binding.json');
+    const rebound = JSON.parse(readFileSync(lockPath, 'utf8'));
+    rebound.taskBindingId = 'rebound-after-clean-approval';
+    writeFileSync(lockPath, `${JSON.stringify(rebound, null, 2)}\n`, 'utf8');
+
+    const rejected = runCli([
+      'run', 'api', 'action', 'clean.apply', '--task', 'Clean Approval Binding',
+      '--execute', '--confirm-token', token, '--json',
+    ], repoRoot, {}, true);
+    assert.equal(rejected.status, 1);
+    assert.match(JSON.parse(rejected.stdout).message, /confirmation token no longer matches/i);
+
+    const childRace = runCli([
+      'run', 'clean', '--apply', '--task', 'Clean Approval Binding', '--json',
+    ], repoRoot, {
+      PIPELANE_CLEAN_MIN_AGE_MS: '0',
+      PIPELANE_CLEAN_APPROVED_LOCKS: JSON.stringify(approvedLocks),
+    });
+    const childEnvelope = JSON.parse(childRace.stdout);
+    assert.deepEqual(childEnvelope.removed, []);
+    assert.match(childEnvelope.skipped[0].reason, /changed after cleanup was approved/);
+    assert.ok(existsSync(lockPath));
+    assert.ok(existsSync(created.worktreePath));
+    assert.equal(localBranchExists(repoRoot, created.branch), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('api confirmation flags are explicit, machine-readable, 30-minute, and optionally single-shot', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
@@ -31906,6 +32112,42 @@ test('task mutation leases reject live contention and reclaim dead owners', asyn
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
     rmSync(markerRoot, { recursive: true, force: true });
+  }
+});
+
+test('task binding updates hold the task mutation lease across their callback', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Task Binding Mutation Lease');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Binding Mutation Order', '--json'], repoRoot).stdout);
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = stateMod.resolveWorkflowContext(created.worktreePath);
+    const stateUrl = pathToFileURL(path.join(KIT_ROOT, 'src', 'operator', 'state.ts')).href;
+    const contenderScript = [
+      `const state = await import(${JSON.stringify(stateUrl)});`,
+      `const context = state.resolveWorkflowContext(${JSON.stringify(created.worktreePath)});`,
+      `state.updateTaskLock(context.commonDir, context.config, ${JSON.stringify(created.taskSlug)}, (lock) => ({ ...lock, nextAction: 'contender update' }));`,
+    ].join('\n');
+    let contender = null;
+
+    const updated = stateMod.updateTaskBinding(context.commonDir, context.config, created.taskSlug, (current) => {
+      contender = spawnSync(process.execPath, ['--input-type=module', '-e', contenderScript], {
+        cwd: created.worktreePath,
+        env: buildCliChildEnv(),
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      return { ...current, nextAction: 'binding owner update' };
+    });
+
+    assert.notEqual(contender.status, 0);
+    assert.match(contender.stderr, /being updated by another Pipelane process/);
+    assert.equal(updated.nextAction, 'binding owner update');
+    assert.equal(stateMod.loadTaskLock(context.commonDir, context.config, created.taskSlug).nextAction, 'binding owner update');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
   }
 });
 
@@ -34887,6 +35129,7 @@ test('v1.1 codex fixup: rollback.* preflight surface fallback matches execute (t
     ).stdout);
     assert.equal(preflight.ok, true);
     assert.equal(preflight.data.preflight.normalizedInputs.targetSha, 'oldfrontendsha');
+    assert.match(preflight.data.preflight.normalizedInputs.dispatchConfigFingerprint, /^[a-f0-9]{64}$/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -35001,6 +35244,36 @@ test('v1.1 codex fixup: /rollback prod requires typed-SHA confirmation in build 
     assert.notEqual(refused.status, 0);
     // Error mentions typed-SHA prefix confirmation.
     assert.match(refused.stderr, /typed SHA prefix/);
+
+    const workflowsBefore = JSON.parse(readFileSync(ghStateFile, 'utf8')).workflows.length;
+    const childMismatch = runCli(
+      ['run', 'rollback', 'prod', '--task', 'Build Mode Prod', '--json'],
+      created.worktreePath,
+      {
+        ...env,
+        PIPELANE_DEPLOY_PROD_API_CONFIRMED: '1',
+        PIPELANE_DEPLOY_PROD_DIRECT_API_CONFIRMED: '1',
+        PIPELANE_DEPLOY_PROD_APPROVED_SHA: '2'.repeat(40),
+        PIPELANE_DEPLOY_PROD_APPROVED_SURFACES: 'edge,frontend,sql',
+        PIPELANE_DEPLOY_PROD_APPROVED_DISPATCH_CONFIG: '0'.repeat(64),
+      },
+      true,
+    );
+    assert.equal(childMismatch.status, 1);
+    assert.match(childMismatch.stderr, /rollback prod blocked: resolved production effect changed after API confirmation/);
+    assert.equal(JSON.parse(readFileSync(ghStateFile, 'utf8')).workflows.length, workflowsBefore);
+
+    const preflight = JSON.parse(runCli([
+      'run', 'api', 'action', 'rollback.prod', '--task', 'Build Mode Prod', '--json',
+    ], created.worktreePath, env).stdout);
+    const executed = runCli([
+      'run', 'api', 'action', 'rollback.prod', '--task', 'Build Mode Prod',
+      '--execute', '--confirm-token', preflight.data.preflight.confirmation.token, '--json',
+    ], created.worktreePath, env);
+    const executionEnvelope = JSON.parse(executed.stdout);
+    assert.equal(executionEnvelope.ok, true, JSON.stringify(executionEnvelope, null, 2));
+    assert.equal(executionEnvelope.data.execution.result.sha, goodSha);
+    assert.equal(JSON.parse(readFileSync(ghStateFile, 'utf8')).workflows.length, workflowsBefore + 1);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });

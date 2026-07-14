@@ -763,6 +763,81 @@ and non-TTY execution paths.
     every other path, including embedded-apostrophe escaping. The same helper
     is used by delayed devmode binding remediation.
 
+57. **Legacy custom-state migration preserved descendant symlinks in trusted
+    machine state (P0).** **Location:** `src/operator/state.ts`. **Repro:** put
+    a `task-locks` directory symlink inside an otherwise-contained legacy
+    custom state directory; recursive copy preserved the link, so later
+    machine-trusted writes could escape `PIPELANE_HOME`. **Proposed fix
+    (implemented):** strict legacy import rejects symlinks anywhere in the
+    source or existing destination tree, removes a partially copied entry on
+    failure, and writes no config or migration markers.
+
+58. **An existing canonical install marker skipped required custom-state
+    migration (P0).** **Location:** `src/operator/state.ts`. **Repro:** let an
+    earlier command create `installed.json`, then auto-import a legacy config
+    whose custom state contains release mode; migration returned early and
+    permanently persisted sanitized machine config without the release state.
+    **Proposed fix (implemented):** strict repo-config import treats generic
+    install/migration markers as insufficient and copies or byte-verifies the
+    selected legacy entries before committing machine config.
+
+59. **Checkout-controlled `stateDir` could select `.git/objects` for recursive
+    migration (P0).** **Location:** `src/operator/state.ts`. **Repro:** set
+    `stateDir: "objects"` in legacy repo config; containment checks accepted
+    the Git object database and copied it into machine state, enabling disk
+    amplification and startup denial of service. **Proposed fix (implemented):**
+    strict import accepts only known Pipelane state filenames and directories;
+    Git internals or any other unexpected top-level entry fail closed before
+    the destination or machine config is created.
+
+60. **Production rollback could dispatch a different SHA than its confirmation
+    token approved (P0).** **Location:** `src/operator/api/actions.ts` and
+    `src/operator/commands/rollback.ts`. **Repro:** change deploy history after
+    token consumption but before the rollback child resolves its target; the
+    generic production bypass skipped typed confirmation for the new SHA.
+    **Proposed fix (implemented):** bind target SHA, sorted surfaces, and the
+    production dispatch-configuration fingerprint into token normalization,
+    pass them to the child, and recompute/compare immediately before consuming
+    the bypass. Drift blocks before any workflow dispatch.
+
+61. **A cleanup confirmation token did not bind the task-lock revision it could
+    delete (P0).** **Location:** `src/operator/api/actions.ts:1222`,
+    `src/operator/commands/clean.ts:105`, and
+    `src/operator/task-workspaces.ts:443`. **Repro:** preflight
+    `clean.apply --task X`, rebind X to a new worktree before execution, then
+    consume the old token; the child could prune the replacement lock and its
+    artifacts. **Proposed fix (implemented):** include canonical lock snapshots
+    in token normalization, pass the approved set through a scrubbed one-shot
+    child environment value, and skip any lock whose immutable binding or
+    mutable revision changed before deletion.
+
+62. **Route confirmation omitted deploy-routing defaults from its fingerprint
+    (P0).** **Location:** `src/operator/destination-planner.ts:372` and
+    `src/operator/destination-executor.ts:428`. **Repro:** preflight a route to
+    production, change `baseBranch` or the default deploy workflow before
+    consuming the token, and retain the same task/SHA/surfaces; the old route
+    fingerprint still matched a differently routed effect. **Proposed fix
+    (implemented):** include both routing defaults in static and live route
+    fingerprints so execution rejects drift and requires a new preflight.
+
+63. **Production workflow dispatch could discard the approved SHA (P0).**
+    **Location:** `src/operator/commands/deploy.ts:1076`. **Repro:** configure a
+    production `workflow_dispatch` workflow without a `sha` input and approve a
+    deploy whose target equals the current base; input filtering silently
+    omitted the SHA and dispatched a mutable workflow ref. **Proposed fix
+    (implemented):** production now fails closed whenever the selected workflow
+    cannot accept the approved SHA. Staging retains the compatibility path only
+    when its target is already the current base.
+
+64. **Task-binding updates bypassed the shared task-mutation lease (P1).**
+    **Location:** `src/operator/state.ts:3818`. **Repro:** pause inside
+    `updateTaskBinding` while a concurrent `updateTaskLock` writes the same
+    task; the independent binding lock allowed a lost update and could race
+    cleanup/reconciliation. **Proposed fix (implemented):** keep the binding
+    lock for binding-specific serialization, but perform the read-modify-write
+    through `updateTaskLock` so the canonical mutation lease covers the entire
+    callback.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original

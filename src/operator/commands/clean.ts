@@ -37,6 +37,8 @@ import {
   type RemovedTaskLock,
 } from '../task-workspaces.ts';
 
+export const CLEAN_APPROVED_LOCKS_ENV = 'PIPELANE_CLEAN_APPROVED_LOCKS';
+
 export async function handleClean(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const context = resolveWorkflowContext(cwd);
   const sharedRepoRoot = resolveSharedRepoRoot(context.commonDir);
@@ -104,6 +106,7 @@ async function handleApplyTaskOrAllStale(
       taskSlug: targetSlug,
       minAgeMs: readMinAgeOverride(),
       cleanupLockHeld: targetSlug !== undefined,
+      approvedLocks: readApprovedCleanupLocks(),
     });
 
     // --task is the end-of-task closer: prune the lock, then tear down the
@@ -162,6 +165,35 @@ async function handleApplyTaskOrAllStale(
   } finally {
     if (cleanupLease?.acquired === true) cleanupLease.release();
   }
+}
+
+function readApprovedCleanupLocks(): TaskLock[] | undefined {
+  const encoded = process.env[CLEAN_APPROVED_LOCKS_ENV];
+  delete process.env[CLEAN_APPROVED_LOCKS_ENV];
+  if (encoded === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(encoded);
+  } catch {
+    throw new Error('Approved cleanup lock snapshot is invalid. Run the API preflight again.');
+  }
+  if (!Array.isArray(parsed) || parsed.some((entry) => !isApprovedCleanupLock(entry))) {
+    throw new Error('Approved cleanup lock snapshot is invalid. Run the API preflight again.');
+  }
+  return parsed;
+}
+
+function isApprovedCleanupLock(value: unknown): value is TaskLock {
+  if (!value || typeof value !== 'object') return false;
+  const lock = value as Partial<TaskLock>;
+  return typeof lock.taskSlug === 'string'
+    && (lock.taskBindingId === undefined || typeof lock.taskBindingId === 'string')
+    && typeof lock.branchName === 'string'
+    && typeof lock.worktreePath === 'string'
+    && (lock.mode === 'build' || lock.mode === 'release')
+    && Array.isArray(lock.surfaces)
+    && lock.surfaces.every((surface) => typeof surface === 'string')
+    && typeof lock.updatedAt === 'string';
 }
 
 async function handleApplyCompletedWithIgnored(
