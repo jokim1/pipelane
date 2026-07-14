@@ -271,9 +271,10 @@ function reviewPresentationForEvidence(
   evidence: ReviewEvidenceCheckResult,
 ): ReviewRunPresentation | null {
   return evidence.latest
-    ? projectReviewRun(evidence.latest, {
+      ? projectReviewRun(evidence.latest, {
         artifactRoot: reviewArtifactRoot(context.commonDir, context.config),
         relation: 'current',
+        consents: evidence.consents,
       })
     : null;
 }

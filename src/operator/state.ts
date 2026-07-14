@@ -518,7 +518,27 @@ export interface ReviewGateRunRecord {
   result?: ReviewResultMetadata;
   findings?: ReviewFinding[];
   reportArtifact?: ReviewReportArtifactReference;
+  manualAttestation?: ReviewManualAttestationEvidence;
   skipReason?: string;
+}
+
+export interface ReviewManualExecutionProvenance {
+  source: string;
+  command: string;
+  exitCode: number;
+  startedAt?: string;
+  finishedAt?: string;
+  provider?: string;
+  sessionId?: string;
+  outputDigest?: string;
+}
+
+export interface ReviewManualAttestationEvidence {
+  status: 'passed' | 'failed';
+  message: string;
+  provenance: ReviewManualExecutionProvenance;
+  substitutionRequested: boolean;
+  reviewRunId?: string;
 }
 
 export interface ReviewActorIdentity {
@@ -573,7 +593,7 @@ export interface ReviewState {
   consents?: ReviewConsentRecord[];
 }
 
-export type RouteSafetyResumeKind = 'one-more-loop' | 'more-loops-and-minutes' | 'until-review-passes' | 'accept-findings' | 'legacy-import' | 'legacy-fresh-start';
+export type RouteSafetyResumeKind = 'one-more-loop' | 'more-loops-and-minutes' | 'until-review-passes' | 'accept-findings' | 'fix-attempt' | 'legacy-import' | 'legacy-fresh-start';
 
 export interface RouteSafetyResumeRecord {
   id: string;
@@ -590,6 +610,51 @@ export interface RouteSafetyResumeRecord {
   reason?: string;
   legacyMigrationAction?: 'import' | 'fresh-start';
   legacyMigrationSourceDigest?: string;
+  fixAttemptId?: string;
+}
+
+export interface FixCheckoutIdentity {
+  branchName: string;
+  headSha: string;
+  worktreeStatusDigest: string;
+  materialTreeHash: string;
+  changedPaths: string[];
+  pathDigests?: Record<string, string>;
+}
+
+export interface FixVerificationCommandEvidence {
+  source: 'host-attestation';
+  command: string;
+  exitCode: number;
+  outputDigest: string;
+}
+
+export interface FixAttemptEvidence {
+  id: string;
+  failedReviewRunId: string;
+  taskBindingId: string;
+  routeLineageDigest: string;
+  failedAttemptDigest: string;
+  tokenDigest: string;
+  requestedAt: string;
+  expiresAt: string;
+  before: FixCheckoutIdentity;
+  requestedBy: ReviewActorIdentity;
+  cancelledAt?: string;
+  consumedAt?: string;
+  attemptedAt?: string;
+  verifiedAt?: string;
+  after?: FixCheckoutIdentity;
+  afterAttemptDigest?: string;
+  changedPaths?: string[];
+  host?: ReviewActorIdentity;
+  verificationSource?: string;
+  verification?: FixVerificationCommandEvidence[];
+  noChangeReason?: string;
+  rerunReviewRunId?: string;
+  rerunStatus?: ReviewRunStatus;
+  rerunPassedAt?: string;
+  routeCompletedAt?: string;
 }
 
 export interface RouteSafetyAttemptRecord {
@@ -639,6 +704,7 @@ export interface RouteSafetyRecord {
   currentAttemptDigest?: string;
   acceptedAttemptDigest?: string;
   legacyMigration?: RouteSafetyLegacyMigration;
+  fixAttempts?: FixAttemptEvidence[];
 }
 
 export interface RouteSafetyState {
@@ -805,6 +871,15 @@ export interface OperatorFlags {
   maxMoreLoops: string;
   maxMoreMinutes: string;
   acceptFindings: boolean;
+  requestFix: boolean;
+  fixToken: string;
+  verificationFile: string;
+  noChangeReason: string;
+  reviewStatus: string;
+  reviewReportFile: string;
+  reviewFindingsFile: string;
+  reviewProvenanceFile: string;
+  reviewSubstituteStrict: boolean;
 }
 
 export interface ParsedOperatorArgs {
@@ -2832,6 +2907,10 @@ function normalizeRouteSafetyRecord(value: unknown): RouteSafetyRecord | null {
       .filter((entry): entry is RouteSafetyResumeRecord => entry !== null);
     if (resumes.length > 0) record.resumes = resumes;
   }
+  if (Array.isArray(raw.fixAttempts)) {
+    const fixAttempts = raw.fixAttempts.filter(isFixAttemptEvidence).slice(0, 50);
+    if (fixAttempts.length > 0) record.fixAttempts = fixAttempts;
+  }
   return record;
 }
 
@@ -2847,6 +2926,7 @@ function normalizeRouteSafetyResumeRecord(value: unknown): RouteSafetyResumeReco
       && raw.kind !== 'more-loops-and-minutes'
       && raw.kind !== 'until-review-passes'
       && raw.kind !== 'accept-findings'
+      && raw.kind !== 'fix-attempt'
       && raw.kind !== 'legacy-import'
       && raw.kind !== 'legacy-fresh-start'
     )
@@ -2875,7 +2955,68 @@ function normalizeRouteSafetyResumeRecord(value: unknown): RouteSafetyResumeReco
     record.legacyMigrationAction = raw.legacyMigrationAction;
   }
   if (typeof raw.legacyMigrationSourceDigest === 'string') record.legacyMigrationSourceDigest = raw.legacyMigrationSourceDigest;
+  if (typeof raw.fixAttemptId === 'string') record.fixAttemptId = raw.fixAttemptId;
   return record;
+}
+
+function isFixCheckoutIdentity(value: unknown): value is FixCheckoutIdentity {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return typeof raw.branchName === 'string'
+    && typeof raw.headSha === 'string'
+    && typeof raw.worktreeStatusDigest === 'string'
+    && typeof raw.materialTreeHash === 'string'
+    && Array.isArray(raw.changedPaths)
+    && raw.changedPaths.every((entry) => typeof entry === 'string')
+    && (
+      raw.pathDigests === undefined
+      || (
+        raw.pathDigests !== null
+        && typeof raw.pathDigests === 'object'
+        && !Array.isArray(raw.pathDigests)
+        && Object.values(raw.pathDigests as Record<string, unknown>).every((entry) => typeof entry === 'string')
+      )
+    );
+}
+
+function isFixVerificationCommandEvidence(value: unknown): value is FixVerificationCommandEvidence {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return raw.source === 'host-attestation'
+    && typeof raw.command === 'string'
+    && typeof raw.exitCode === 'number'
+    && Number.isSafeInteger(raw.exitCode)
+    && typeof raw.outputDigest === 'string';
+}
+
+function isFixAttemptEvidence(value: unknown): value is FixAttemptEvidence {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return typeof raw.id === 'string'
+    && typeof raw.failedReviewRunId === 'string'
+    && typeof raw.taskBindingId === 'string'
+    && typeof raw.routeLineageDigest === 'string'
+    && typeof raw.failedAttemptDigest === 'string'
+    && typeof raw.tokenDigest === 'string'
+    && typeof raw.requestedAt === 'string'
+    && typeof raw.expiresAt === 'string'
+    && isFixCheckoutIdentity(raw.before)
+    && isReviewActorIdentity(raw.requestedBy)
+    && (raw.cancelledAt === undefined || typeof raw.cancelledAt === 'string')
+    && (raw.consumedAt === undefined || typeof raw.consumedAt === 'string')
+    && (raw.attemptedAt === undefined || typeof raw.attemptedAt === 'string')
+    && (raw.verifiedAt === undefined || typeof raw.verifiedAt === 'string')
+    && (raw.after === undefined || isFixCheckoutIdentity(raw.after))
+    && (raw.afterAttemptDigest === undefined || typeof raw.afterAttemptDigest === 'string')
+    && (raw.changedPaths === undefined || (Array.isArray(raw.changedPaths) && raw.changedPaths.every((entry) => typeof entry === 'string')))
+    && (raw.host === undefined || isReviewActorIdentity(raw.host))
+    && (raw.verificationSource === undefined || typeof raw.verificationSource === 'string')
+    && (raw.verification === undefined || (Array.isArray(raw.verification) && raw.verification.every(isFixVerificationCommandEvidence)))
+    && (raw.noChangeReason === undefined || typeof raw.noChangeReason === 'string')
+    && (raw.rerunReviewRunId === undefined || typeof raw.rerunReviewRunId === 'string')
+    && (raw.rerunStatus === undefined || raw.rerunStatus === 'passed' || raw.rerunStatus === 'failed' || raw.rerunStatus === 'pending')
+    && (raw.rerunPassedAt === undefined || typeof raw.rerunPassedAt === 'string')
+    && (raw.routeCompletedAt === undefined || typeof raw.routeCompletedAt === 'string');
 }
 
 function isRouteSafetyAttemptRecord(value: unknown): value is RouteSafetyAttemptRecord {
@@ -3070,7 +3211,30 @@ function isReviewGateRunRecord(value: unknown): value is ReviewGateRunRecord {
     && (raw.result === undefined || isReviewResultMetadata(raw.result))
     && (raw.findings === undefined || (Array.isArray(raw.findings) && raw.findings.every(isReviewFinding)))
     && (raw.reportArtifact === undefined || isReviewReportArtifactReference(raw.reportArtifact))
+    && (raw.manualAttestation === undefined || isReviewManualAttestationEvidence(raw.manualAttestation))
     && (raw.skipReason === undefined || typeof raw.skipReason === 'string');
+}
+
+function isReviewManualAttestationEvidence(value: unknown): value is ReviewManualAttestationEvidence {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  if (
+    (raw.status !== 'passed' && raw.status !== 'failed')
+    || typeof raw.message !== 'string'
+    || typeof raw.substitutionRequested !== 'boolean'
+    || (raw.reviewRunId !== undefined && typeof raw.reviewRunId !== 'string')
+  ) return false;
+  if (!raw.provenance || typeof raw.provenance !== 'object' || Array.isArray(raw.provenance)) return false;
+  const provenance = raw.provenance as Record<string, unknown>;
+  return typeof provenance.source === 'string'
+    && typeof provenance.command === 'string'
+    && typeof provenance.exitCode === 'number'
+    && Number.isSafeInteger(provenance.exitCode)
+    && (provenance.startedAt === undefined || typeof provenance.startedAt === 'string')
+    && (provenance.finishedAt === undefined || typeof provenance.finishedAt === 'string')
+    && (provenance.provider === undefined || typeof provenance.provider === 'string')
+    && (provenance.sessionId === undefined || typeof provenance.sessionId === 'string')
+    && (provenance.outputDigest === undefined || typeof provenance.outputDigest === 'string');
 }
 
 function isReviewFinding(value: unknown): value is ReviewFinding {
@@ -3499,6 +3663,15 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     maxMoreLoops: '',
     maxMoreMinutes: '',
     acceptFindings: false,
+    requestFix: false,
+    fixToken: '',
+    verificationFile: '',
+    noChangeReason: '',
+    reviewStatus: '',
+    reviewReportFile: '',
+    reviewFindingsFile: '',
+    reviewProvenanceFile: '',
+    reviewSubstituteStrict: false,
   };
 
   const setPrFromShorthand = (raw: string, source: string): void => {
@@ -3716,6 +3889,23 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       flags.acceptFindings = true;
       continue;
     }
+    if (flagName === '--request-fix') {
+      rejectInlineValue('--request-fix');
+      flags.requestFix = true;
+      continue;
+    }
+    if (flagName === '--fix-token') {
+      flags.fixToken = readFlagValue('--fix-token').trim();
+      continue;
+    }
+    if (flagName === '--verification-file') {
+      flags.verificationFile = readFlagValue('--verification-file').trim();
+      continue;
+    }
+    if (flagName === '--no-change-reason') {
+      flags.noChangeReason = readFlagValue('--no-change-reason');
+      continue;
+    }
 
     if (flagName === '--branch') {
       flags.branch = readFlagValue('--branch');
@@ -3734,6 +3924,27 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
 
     if (flagName === '--message') {
       flags.message = readFlagValue('--message');
+      continue;
+    }
+    if (flagName === '--status') {
+      flags.reviewStatus = readFlagValue('--status').trim();
+      continue;
+    }
+    if (flagName === '--report-file') {
+      flags.reviewReportFile = readFlagValue('--report-file').trim();
+      continue;
+    }
+    if (flagName === '--findings-file') {
+      flags.reviewFindingsFile = readFlagValue('--findings-file').trim();
+      continue;
+    }
+    if (flagName === '--provenance-file') {
+      flags.reviewProvenanceFile = readFlagValue('--provenance-file').trim();
+      continue;
+    }
+    if (flagName === '--substitute-strict') {
+      rejectInlineValue('--substitute-strict');
+      flags.reviewSubstituteStrict = true;
       continue;
     }
 
@@ -4068,7 +4279,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       if (parsed.flags.brief.trim() && parsed.flags.briefFile.trim()) throw new Error('adopt cannot combine --brief and --brief-file.');
       return;
     case 'resume':
-      assertOnlyFlags(parsed, ['task', 'oneMoreLoop', 'moreLoops', 'moreMinutes', 'untilReviewPasses', 'maxMoreLoops', 'maxMoreMinutes', 'acceptFindings', 'reason', 'scope']);
+      assertOnlyFlags(parsed, ['task', 'oneMoreLoop', 'moreLoops', 'moreMinutes', 'untilReviewPasses', 'maxMoreLoops', 'maxMoreMinutes', 'acceptFindings', 'requestFix', 'fixToken', 'verificationFile', 'noChangeReason', 'reason', 'scope']);
       requireNoPositional('pipelane run resume [--task <task-name>] [--one-more-loop | --more-loops <n> --more-minutes <n> | --until-review-passes --max-more-loops <n> --max-more-minutes <n> | --accept-findings]');
       validateResumeRouteSafetyFlags(parsed);
       return;
@@ -4182,7 +4393,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         }
         return;
       }
-      if (subcommand === 'pass' || subcommand === 'attest') {
+      if (subcommand === 'pass') {
         assertOnlyFlags(parsed, ['reviewGate', 'message']);
         if (parsed.positional.length !== 1) {
           throw new Error('review pass requires exactly: pipelane run review pass --gate <id> --message <what was run and why it is clean>');
@@ -4192,6 +4403,30 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         }
         if (!parsed.flags.message.trim()) {
           throw new Error('review pass requires --message <what was run and why it is clean>.');
+        }
+        return;
+      }
+      if (subcommand === 'attest') {
+        assertOnlyFlags(parsed, ['reviewGate', 'reviewStatus', 'reviewReportFile', 'reviewFindingsFile', 'reviewProvenanceFile', 'message', 'reviewSubstituteStrict', 'reason', 'scope']);
+        if (parsed.positional.length !== 1) {
+          throw new Error('review attest requires exactly: pipelane run review attest --gate <id> --status failed|passed --report-file <path> --findings-file <path> --provenance-file <path> --message <what ran> [--substitute-strict --reason <reason>] [--scope <exact-route-action>]');
+        }
+        if (!parsed.flags.reviewGate.trim()) throw new Error('review attest requires --gate <id>.');
+        if (parsed.flags.reviewStatus !== 'failed' && parsed.flags.reviewStatus !== 'passed') {
+          throw new Error('review attest requires --status failed or --status passed.');
+        }
+        if (!parsed.flags.reviewReportFile.trim() || !parsed.flags.reviewFindingsFile.trim() || !parsed.flags.reviewProvenanceFile.trim()) {
+          throw new Error('review attest requires --report-file <path>, --findings-file <path>, and --provenance-file <path>.');
+        }
+        if (!parsed.flags.message.trim()) throw new Error('review attest requires --message <what ran>.');
+        if (parsed.flags.reviewSubstituteStrict && parsed.flags.reviewStatus !== 'passed') {
+          throw new Error('review attest --substitute-strict requires --status passed.');
+        }
+        if (parsed.flags.reviewSubstituteStrict && !parsed.flags.reason.trim()) {
+          throw new Error('review attest --substitute-strict requires --reason <why manual evidence may substitute for this exact strict gate and action>.');
+        }
+        if (parsed.flags.reason.trim() && !parsed.flags.reviewSubstituteStrict) {
+          throw new Error('review attest only accepts --reason with --substitute-strict.');
         }
         return;
       }
@@ -4211,7 +4446,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       }
       assertOnlyFlags(parsed, ['reviewDryRun', 'reviewGate', 'reviewPhase', 'reviewIntent']);
       if (parsed.positional.length > 0) {
-        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review pass --gate <id> --message <text>, pipelane run review override --gate <id> --reason <text> [--scope <action>], or pipelane run review setup [gate[,gate...]...] [--yes] [--reset] [--print] [--list-gates] [--toggle <gate[,gate...]>] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]');
+        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review pass --gate <id> --message <text>, pipelane run review attest --gate <id> --status <passed|failed> --report-file <path> --findings-file <path> --provenance-file <path> --message <text> [--substitute-strict --reason <reason> --scope <action>], pipelane run review override --gate <id> --reason <text> [--scope <action>], or pipelane run review setup [gate[,gate...]...] [--yes] [--reset] [--print] [--list-gates] [--toggle <gate[,gate...]>] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]');
       }
       const phase = parsed.flags.reviewPhase.trim();
       if (phase && !includesString(REVIEW_GATE_PHASES, phase)) {
@@ -4635,19 +4870,30 @@ function validateResumeRouteSafetyFlags(parsed: ParsedOperatorArgs): void {
     parsed.flags.moreLoops.trim().length > 0 || parsed.flags.moreMinutes.trim().length > 0,
     parsed.flags.untilReviewPasses || parsed.flags.maxMoreLoops.trim().length > 0 || parsed.flags.maxMoreMinutes.trim().length > 0,
     parsed.flags.acceptFindings || hasMigrationScope,
+    parsed.flags.requestFix,
+    parsed.flags.fixToken.trim().length > 0 || parsed.flags.verificationFile.trim().length > 0 || parsed.flags.noChangeReason.trim().length > 0,
   ].filter(Boolean).length;
   if (modes === 0) return;
   if (parsed.flags.task.trim()) {
     throw new Error('resume route-loop overrides do not accept --task; run the printed resume command from the paused checkout.');
   }
   if (modes > 1) {
-    throw new Error('resume accepts one route-loop override at a time: --one-more-loop, --more-loops/--more-minutes, --until-review-passes, or --accept-findings.');
+    throw new Error('resume accepts one route-loop action at a time: --request-fix, --fix-token/--verification-file, --one-more-loop, --more-loops/--more-minutes, --until-review-passes, or --accept-findings.');
   }
   if ((parsed.flags.acceptFindings || hasMigrationScope) && !parsed.flags.reason.trim()) {
     throw new Error('resume --accept-findings and legacy migration choices require --reason <informed-consent-reason>.');
   }
   if (parsed.flags.reason.trim() && !parsed.flags.acceptFindings && !hasMigrationScope) {
     throw new Error('resume only accepts --reason with --accept-findings or an explicit legacy migration --scope.');
+  }
+  if (parsed.flags.fixToken.trim() && !parsed.flags.verificationFile.trim()) {
+    throw new Error('resume --fix-token requires --verification-file <bounded-host-verification.json>.');
+  }
+  if (parsed.flags.verificationFile.trim() && !parsed.flags.fixToken.trim()) {
+    throw new Error('resume --verification-file requires the exact printed --fix-token.');
+  }
+  if (parsed.flags.noChangeReason.trim() && !parsed.flags.fixToken.trim()) {
+    throw new Error('resume --no-change-reason is only valid with --fix-token and --verification-file.');
   }
   if (hasMigrationScope && !/^legacy-(?:import:[a-f0-9]{64}|fresh-start)$/.test(parsed.flags.scope.trim())) {
     throw new Error('resume --scope must be legacy-import:<candidate-digest> or legacy-fresh-start.');
@@ -4707,6 +4953,10 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'maxMoreLoops', label: '--max-more-loops', active: (flags) => flags.maxMoreLoops.trim().length > 0 },
   { key: 'maxMoreMinutes', label: '--max-more-minutes', active: (flags) => flags.maxMoreMinutes.trim().length > 0 },
   { key: 'acceptFindings', label: '--accept-findings', active: (flags) => flags.acceptFindings },
+  { key: 'requestFix', label: '--request-fix', active: (flags) => flags.requestFix },
+  { key: 'fixToken', label: '--fix-token', active: (flags) => flags.fixToken.trim().length > 0 },
+  { key: 'verificationFile', label: '--verification-file', active: (flags) => flags.verificationFile.trim().length > 0 },
+  { key: 'noChangeReason', label: '--no-change-reason', active: (flags) => flags.noChangeReason.trim().length > 0 },
   { key: 'branch', label: '--branch', active: (flags) => flags.branch.trim().length > 0 },
   { key: 'file', label: '--file', active: (flags) => flags.file.trim().length > 0 },
   { key: 'title', label: '--title', active: (flags) => flags.title.trim().length > 0 },
@@ -4736,6 +4986,11 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'reviewDryRun', label: '--dry-run', active: (flags) => flags.reviewDryRun },
   { key: 'reviewGate', label: '--gate', active: (flags) => flags.reviewGate.trim().length > 0 },
   { key: 'reviewPhase', label: '--phase', active: (flags) => flags.reviewPhase.trim().length > 0 },
+  { key: 'reviewStatus', label: '--status', active: (flags) => flags.reviewStatus.trim().length > 0 },
+  { key: 'reviewReportFile', label: '--report-file', active: (flags) => flags.reviewReportFile.trim().length > 0 },
+  { key: 'reviewFindingsFile', label: '--findings-file', active: (flags) => flags.reviewFindingsFile.trim().length > 0 },
+  { key: 'reviewProvenanceFile', label: '--provenance-file', active: (flags) => flags.reviewProvenanceFile.trim().length > 0 },
+  { key: 'reviewSubstituteStrict', label: '--substitute-strict', active: (flags) => flags.reviewSubstituteStrict },
   { key: 'goalSliceId', label: '--slice-id', active: (flags) => flags.goalSliceId.trim().length > 0 },
   { key: 'goalOutcome', label: '--outcome', active: (flags) => flags.goalOutcome.trim().length > 0 },
   { key: 'goalPlanFile', label: '--plan-file', active: (flags) => flags.goalPlanFile.trim().length > 0 },

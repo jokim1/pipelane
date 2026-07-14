@@ -61,7 +61,7 @@ import {
   createReviewActorIdentity,
   resolveReviewActorIdentity,
 } from '../review-identity.ts';
-import { reviewGateDefinitionHash } from '../review-enforcement.ts';
+import { reviewGateDefinitionHash, reviewRunsTargetSameCheckout } from '../review-enforcement.ts';
 import { appendArtifactBackedReviewRun } from '../review-artifacts.ts';
 import { projectReviewRun, renderReviewPresentation } from '../review-output.ts';
 import { buildReviewRunRecord, collectChangedFiles, collectReviewIntentCandidates } from './review.ts';
@@ -3421,15 +3421,27 @@ function attachAttestedManualGateEvidence(
       return gate;
     }
     attached = true;
-    return {
+    const attachedGate: ReviewGateRunRecord = {
       ...gate,
       status: 'passed',
-      attester: passedGate.attester,
       summary: passedGate.summary,
       startedAt: passedGate.startedAt,
       finishedAt: passedGate.finishedAt,
       durationMs: passedGate.durationMs,
+      capability: passedGate.capability,
+      result: passedGate.result,
+      findings: passedGate.findings,
+      reportArtifact: passedGate.reportArtifact,
+      manualAttestation: passedGate.manualAttestation,
+      exitCode: passedGate.exitCode,
+      signal: passedGate.signal,
+      errorCode: passedGate.errorCode,
+      errorMessage: passedGate.errorMessage,
+      stdoutTail: passedGate.stdoutTail,
+      stderrTail: passedGate.stderrTail,
     };
+    if (passedGate.attester) attachedGate.attester = passedGate.attester;
+    return attachedGate;
   });
 
   if (!attached) return reviewRun;
@@ -3444,7 +3456,14 @@ function selectMatchingAttestedManualGateEvidence(
   sliceContext: WorkflowContext,
   reviewRun: ReviewRunRecord,
 ): Array<{ recordedAt: string; gate: ReviewGateRunRecord }> {
-  if (!reviewRun.worktreeStatusDigest || reviewRun.worktreeStatusReliable !== true) return [];
+  const hasReliableIdentity = (
+    Boolean(reviewRun.worktreeStatusDigest)
+    && reviewRun.worktreeStatusReliable !== false
+  ) || (
+    Boolean(reviewRun.worktreeMaterialTreeHash)
+    && reviewRun.worktreeMaterialTreeReliable === true
+  );
+  if (!hasReliableIdentity) return [];
   const state = loadReviewState(sliceContext.commonDir, sliceContext.config);
   const candidates: Array<{ recordedAt: string; gate: ReviewGateRunRecord }> = [];
   for (const record of state.records) {
@@ -3478,10 +3497,7 @@ function selectMatchingAttestedManualGateEvidence(
 
 function reviewRunMatchesEquivalentGateEvidence(expected: ReviewRunRecord, evidence: ReviewRunRecord): boolean {
   return reviewRunCoversFullGateSet(evidence)
-    && evidence.branchName === expected.branchName
-    && evidence.sha === expected.sha
-    && evidence.worktreeStatusDigest === expected.worktreeStatusDigest
-    && evidence.worktreeStatusReliable === true;
+    && reviewRunsTargetSameCheckout(expected, evidence);
 }
 
 function reviewAcceptanceMatchesGate(
@@ -3513,20 +3529,16 @@ function reviewAcceptanceToGate(gate: ReviewGateRunRecord, acceptance: ReviewAcc
 }
 
 function isPassedManualReviewGate(gate: ReviewGateRunRecord): boolean {
-  return gate.status === 'passed' && isManualReviewGateRun(gate) && gate.attester !== undefined;
+  return gate.status === 'passed'
+    && isManualReviewGateRun(gate)
+    && gate.attester !== undefined
+    && gate.manualAttestation?.substitutionRequested !== true;
 }
 
 function manualReviewGateEvidenceMatches(expected: ReviewGateRunRecord, evidence: ReviewGateRunRecord): boolean {
   return isManualReviewGateRun(expected)
     && isManualReviewGateRun(evidence)
-    && expected.gateId === evidence.gateId
-    && expected.type === evidence.type
-    && expected.phase === evidence.phase
-    && expected.blocking === evidence.blocking
-    && normalizeOptionalGateField(expected.skill) === normalizeOptionalGateField(evidence.skill)
-    && normalizeOptionalGateField(expected.role) === normalizeOptionalGateField(evidence.role)
-    && normalizeOptionalGateField(expected.command) === normalizeOptionalGateField(evidence.command)
-    && normalizeOptionalGateList(expected.userCommands) === normalizeOptionalGateList(evidence.userCommands);
+    && reviewGateDefinitionHash(expected) === reviewGateDefinitionHash(evidence);
 }
 
 function isManualReviewGateRun(gate: Pick<ReviewGateRunRecord, 'type'>): boolean {

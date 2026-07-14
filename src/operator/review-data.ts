@@ -18,6 +18,14 @@ export const REVIEW_DATA_LIMITS = {
   reportBytes: 64 * 1024,
   diagnosticsBytes: 16 * 1024,
   reasonBytes: 8 * 1024,
+  manualFindingsFileBytes: 64 * 1024,
+  manualProvenanceFileBytes: 32 * 1024,
+  provenanceFieldBytes: 2 * 1024,
+  verificationFileBytes: 64 * 1024,
+  verificationCommandBytes: 2 * 1024,
+  verificationOutputBytes: 16 * 1024,
+  verificationCommandCount: 20,
+  changedPathCount: 512,
 } as const;
 
 export interface TaskBriefInput {
