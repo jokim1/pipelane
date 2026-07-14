@@ -14,8 +14,9 @@ export function inferTargetSurfacesFromSurfacePathMap(options: {
   repoRoot: string;
   config: WorkflowConfig;
   targetSha: string;
+  surfacePathMap?: Record<string, string[]>;
 }): TargetSurfaceInference | null {
-  const map = options.config.surfacePathMap;
+  const map = options.surfacePathMap ?? options.config.surfacePathMap;
   if (!map || Object.keys(map).length === 0 || !options.targetSha.trim()) {
     return null;
   }
@@ -59,7 +60,7 @@ export function targetSurfaceInferenceBlockers(inference: TargetSurfaceInference
   if (inference.other.length > 0) {
     blockers.push([
       `${inference.other.length} target file(s) do not match surfacePathMap: ${previewPaths(inference.other)}.`,
-      'Map them to a surface before deploying without --surfaces.',
+      'Map them in the deploy surface contract or machine-local surfacePathMap before deploying without --surfaces.',
     ].join(' '));
   }
   if (

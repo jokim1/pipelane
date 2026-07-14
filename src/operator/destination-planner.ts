@@ -17,6 +17,13 @@ import { bucketPathsBySurface } from './surface-map.ts';
 import { readWorktreeStatusSnapshot } from './worktree-status.ts';
 import { inferTargetSurfacesFromSurfacePathMap, targetSurfaceInferenceBlockers } from './target-surface-map.ts';
 import {
+  deploySurfaceContractConfigurationIssues,
+  loadDeploySurfaceContract,
+  loadDeploySurfaceContractForTarget,
+  resolveDeploySurfacePathMap,
+  workflowNameForDeployEnvironment,
+} from './deploy-surface-contract.ts';
+import {
   loadDeployState,
   loadTaskLock,
   loadPrRecord,
@@ -118,6 +125,7 @@ export interface DestinationSnapshot {
   configuredSurfaces: string[];
   explicitSurfaces: boolean;
   surfacePathMapBlockers: string[];
+  deploySurfaceContractBlockers: string[];
   titleProvided: boolean;
 }
 
@@ -179,10 +187,15 @@ export function resolveDestinationSnapshot(
   const worktree = readWorktreeStatusSnapshot(routeContext.repoRoot, { includeStatusDigest: true });
   const branchName = worktree.branchName || runGit(routeContext.repoRoot, ['branch', '--show-current'], true)?.trim() || '';
   const headSha = worktree.head || runGit(routeContext.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() || '';
+  const deployConfig = loadDeployConfig(routeContext.repoRoot) ?? emptyDeployConfig();
+  const contractEnvironment = target === 'prod_deployed' ? 'prod' : 'staging';
+  const contractWorkflowName = workflowNameForDeployEnvironment(routeContext.config, deployConfig, contractEnvironment);
+  const workingTreeSurfaceContract = loadDeploySurfaceContract(routeContext.repoRoot, contractWorkflowName);
+  const workingTreeSurfacePathMap = resolveDeploySurfacePathMap(routeContext.config, workingTreeSurfaceContract);
   const rawChangedPaths = worktree.dirty ? worktree.changedPaths : [];
   const changedPaths = rawChangedPaths.filter(isDestinationRelevantChangedPath);
   const dirty = worktree.dirty && (changedPaths.length > 0 || !worktree.statusDigestReliable);
-  const { surfaces: changedBySurface, other: changedOther } = bucketPathsBySurface(changedPaths, routeContext.config.surfacePathMap ?? {});
+  const { surfaces: changedBySurface, other: changedOther } = bucketPathsBySurface(changedPaths, workingTreeSurfacePathMap ?? {});
 
   let livePr: LivePr | null = null;
   let livePrError = '';
@@ -247,7 +260,6 @@ export function resolveDestinationSnapshot(
 
   const prRecord = taskSlug ? loadPrRecord(routeContext.commonDir, routeContext.config, taskSlug) : null;
   const deployState = loadDeployState(routeContext.commonDir, routeContext.config);
-  const deployConfig = loadDeployConfig(routeContext.repoRoot) ?? emptyDeployConfig();
   const explicitDeploySha = parsed.command === 'deploy'
     ? parsed.flags.sha.trim()
     : '';
@@ -258,6 +270,18 @@ export function resolveDestinationSnapshot(
     ? `Could not resolve ${explicitDeploySha}.`
     : '';
   const targetSha = resolvedExplicitDeploySha || (explicitDeploySha ? explicitDeploySha : resolveReleaseSha(livePr, prRecord, headSha));
+  const targetSurfaceContract = loadDeploySurfaceContractForTarget(
+    routeContext.repoRoot,
+    contractWorkflowName,
+    targetSha,
+    routeContext.config.baseBranch,
+  );
+  const effectiveSurfacePathMap = resolveDeploySurfacePathMap(routeContext.config, targetSurfaceContract);
+  const deploySurfaceContractBlockers = deploySurfaceContractConfigurationIssues(
+    targetSurfaceContract,
+    routeContext.config,
+    deployConfig,
+  );
   const explicitSurfaces = [...parsed.flags.surfaces, ...deploySurfacePositionals(parsed)];
   const baseRequestedSurfaces = resolveCommandSurfaces(routeContext, explicitSurfaces, lock?.surfaces ?? []);
   const surfaceInference = explicitSurfaces.length === 0
@@ -265,6 +289,7 @@ export function resolveDestinationSnapshot(
       repoRoot: routeContext.repoRoot,
       config: routeContext.config,
       targetSha,
+      surfacePathMap: effectiveSurfacePathMap,
     })
     : null;
   const surfacePathMapBlockers = targetSurfaceInferenceBlockers(surfaceInference);
@@ -315,6 +340,7 @@ export function resolveDestinationSnapshot(
     configuredSurfaces: [...routeContext.config.surfaces],
     explicitSurfaces: explicitSurfaces.length > 0,
     surfacePathMapBlockers,
+    deploySurfaceContractBlockers,
     titleProvided: parsed.flags.title.trim().length > 0,
   };
 }
@@ -680,6 +706,7 @@ function buildDestinationBlockers(snapshot: DestinationSnapshot, target: Destina
     }
   }
   if (needsDeploySideEffect) {
+    blockers.push(...snapshot.deploySurfaceContractBlockers);
     blockers.push(...snapshot.surfacePathMapBlockers);
   }
   if (snapshot.dirty && !steps.some((step) => step.id === 'pr') && dirtyExplicitTargetBlockers.length === 0) {

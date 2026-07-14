@@ -263,6 +263,47 @@ below).
   flag-shaped arg (`--json`, `-x`) errors instead of silently
   swallowing it.
 
+### Repo-owned deploy surface contract (optional)
+
+A GitHub Actions workflow can bind its accepted deployment surfaces to a
+tracked JSON manifest with a top-level comment:
+
+```yaml
+name: Deploy Hosted
+# pipelane-surface-contract: .github/deploy-surfaces.json
+```
+
+The versioned manifest is the source of truth for both the deploy surface list
+and path attribution:
+
+```json
+{
+  "version": 1,
+  "workflow": "Deploy Hosted",
+  "surfaces": {
+    "frontend": ["src/", "public/"],
+    "sql": ["supabase/migrations/"],
+    "mcp": ["packages/mcp-server/"]
+  }
+}
+```
+
+`pipelane configure` discovers custom surfaces from the contract and registers
+them in machine-local workflow and deploy configuration. `/doctor`, direct
+deploy, and destination planning fail closed if the contract is malformed or a
+declared custom surface is not configured. For implicit deploys, the target
+commit is classified from this manifest before any stored task-lock surfaces;
+the workflow dispatch therefore receives the surfaces affected by the actual
+target diff. Deploy and blast views read the contract from the target SHA,
+falling back to the configured base branch for an older PR that predates the
+manifest. This keeps release planning correct even when the PR worktree itself
+has not been rebased. Explicit `--surfaces` remains available for intentionally
+manual deployments, but does not bypass an invalid or incompletely configured
+contract.
+
+The tracked contract overrides machine-local path entries for surfaces it
+declares. Machine-local entries for unrelated surfaces remain available.
+
 ### `surfacePathMap` machine-local config (optional, v1.4+)
 
 Opt-in map consumed by `--blast` and by deploy preflight when the
@@ -297,9 +338,9 @@ Patterns are normalized to POSIX separators (backslashes are rewritten
 to forward slashes) so Windows-authored maps match git's forward-slash
 path output.
 
-When two surfaces overlap on the same file, the alphabetically-earlier
-surface name wins. Design your map so patterns don't overlap if that
-matters for your use case.
+When two surfaces overlap on the same file, the file is assigned to both.
+This makes shared lockfiles, workflow definitions, and deployment metadata
+expand the deploy set instead of silently selecting only one affected surface.
 
 ## Compatibility
 

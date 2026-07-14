@@ -11,6 +11,8 @@ import {
 } from '../api/actions.ts';
 import { buildWorkflowApiSnapshot, type BranchRow, type SnapshotData } from '../api/snapshot.ts';
 import type { ApiActionInput, ApiActionState, ApiEnvelope, ApiIssue, LaneState, SourceHealthEntry } from '../api/envelope.ts';
+import { loadDeploySurfaceContractForTarget, resolveDeploySurfacePathMap } from '../deploy-surface-contract.ts';
+import { emptyDeployConfig, loadDeployConfig } from '../release-gate.ts';
 import { bucketPathsBySurface } from '../surface-map.ts';
 import {
   loadAllTaskLocks,
@@ -1355,12 +1357,15 @@ export function buildBlastView(
     .map((line) => line.trim())
     .filter(Boolean);
 
-  const map = config.surfacePathMap ?? {};
+  const deployConfig = loadDeployConfig(repoRoot) ?? emptyDeployConfig();
+  const workflowName = deployConfig.frontend.production.deployWorkflow || config.deployWorkflowName;
+  const contract = loadDeploySurfaceContractForTarget(repoRoot, workflowName, resolvedSha, config.baseBranch);
+  const map = resolveDeploySurfacePathMap(config, contract) ?? {};
   const { surfaces, other } = bucketPathsBySurface(files, map);
 
   const hint =
     Object.keys(map).length === 0
-      ? 'configure `surfacePathMap` in machine-local Pipelane config to group these files by surface.'
+      ? 'bind a deploy surface contract or configure `surfacePathMap` in machine-local Pipelane config to group these files by surface.'
       : null;
 
   return {

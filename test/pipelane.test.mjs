@@ -519,6 +519,47 @@ function writePipelaneConfig(repoRoot, displayName = 'Demo App', patch = {}) {
   return configPath;
 }
 
+function writeDeploySurfaceContract(repoRoot, surfaces = {
+  frontend: ['src/frontend/'],
+  edge: ['src/edge/'],
+  sql: ['supabase/'],
+  mcp: ['packages/mcp-server/'],
+}) {
+  const workflowDir = path.join(repoRoot, '.github', 'workflows');
+  mkdirSync(workflowDir, { recursive: true });
+  writeFileSync(
+    path.join(repoRoot, '.github', 'deploy-surfaces.json'),
+    `${JSON.stringify({ version: 1, workflow: 'Deploy Hosted', surfaces }, null, 2)}\n`,
+    'utf8',
+  );
+  writeFileSync(
+    path.join(workflowDir, 'deploy-hosted.yml'),
+    [
+      'name: Deploy Hosted',
+      '# pipelane-surface-contract: .github/deploy-surfaces.json',
+      'on:',
+      '  workflow_dispatch:',
+      '    inputs:',
+      '      environment:',
+      '        required: true',
+      '      sha:',
+      '        required: true',
+      '      surfaces:',
+      '        required: true',
+      'jobs:',
+      '  deploy:',
+      '    runs-on: ubuntu-latest',
+      '    steps:',
+      ...Object.keys(surfaces).flatMap((surface) => [
+        `      - if: contains(inputs.surfaces, '${surface}')`,
+        `        run: echo deploy-${surface}`,
+      ]),
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+}
+
 function writeSingleCommandReviewGate(repoRoot, gate) {
   writePipelaneConfig(repoRoot, 'Demo App', {
     reviewGates: {
@@ -18992,7 +19033,7 @@ test('merge can explicitly override missing review evidence with a reason', () =
   }
 });
 
-test('deploy infers target surfaces from surfacePathMap instead of stale task lock surfaces', () => {
+test('deploy reads the target SHA surface contract when an older PR worktree lacks it', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
   const ghStateFile = path.join(ghBin, 'gh-state.json');
@@ -19007,22 +19048,35 @@ test('deploy infers target surfaces from surfacePathMap instead of stale task lo
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
     runCli(['setup'], repoRoot);
-    const configPath = machinePipelaneConfigPath(repoRoot);
-    const config = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.surfaces = ['frontend', 'sql', 'mcp'];
-    config.surfacePathMap = {
+    const baseBranch = run('git', ['branch', '--show-current'], repoRoot);
+    const preContractSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+    writeDeploySurfaceContract(repoRoot, {
       frontend: ['src/frontend/'],
       sql: ['supabase/'],
       mcp: ['packages/mcp-server/'],
-    };
-    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+    });
+    writeSharedDeployConfig(repoRoot, buildFullDeployConfig());
+    runCli([
+      'configure',
+      '--json',
+      '--mcp-staging-deploy-command=deploy mcp staging',
+      '--mcp-staging-verification-command=verify mcp',
+      '--mcp-production-deploy-command=deploy mcp production',
+      '--mcp-production-verification-command=verify mcp',
+    ], repoRoot);
     commitAll(repoRoot, 'Adopt pipelane');
+    execFileSync('git', ['push', 'origin', baseBranch], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
 
+    execFileSync('git', ['checkout', '-b', 'codex/legacy-mcp-pr', preContractSha], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
     mkdirSync(path.join(repoRoot, 'packages', 'mcp-server'), { recursive: true });
     writeFileSync(path.join(repoRoot, 'packages', 'mcp-server', 'index.ts'), 'export const changed = true;\n', 'utf8');
     execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
     execFileSync('git', ['commit', '-m', 'Change MCP server'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['checkout', baseBranch], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['merge', '--no-ff', 'codex/legacy-mcp-pr', '-m', 'Merge legacy MCP PR'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
     const targetSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+    execFileSync('git', ['checkout', 'codex/legacy-mcp-pr'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    assert.equal(existsSync(path.join(repoRoot, '.github', 'deploy-surfaces.json')), false);
 
     writeTaskLock(repoRoot, 'mcp-only', { mode: 'build', surfaces: ['frontend', 'sql'] });
     writePrRecord(repoRoot, 'mcp-only', targetSha);
@@ -19038,6 +19092,29 @@ test('deploy infers target surfaces from surfacePathMap instead of stale task lo
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
     rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('doctor fails closed when a deploy workflow contract declares an unconfigured custom surface', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeDeploySurfaceContract(repoRoot, {
+      frontend: ['src/frontend/'],
+      sql: ['supabase/'],
+      mcp: ['packages/mcp-server/'],
+    });
+    writeSharedDeployConfig(repoRoot, buildFullDeployConfig());
+
+    const result = runCli(['run', 'doctor', '--json'], repoRoot);
+    const report = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0);
+    assert.match(report.missingFields.join('\n'), /workflow Deploy Hosted declares unconfigured surface mcp/);
+    assert.match(report.missingFields.join('\n'), /mcp custom deploy configuration/);
+    assert.doesNotMatch(report.message, /Deploy configuration: complete/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
   }
 });
 
@@ -28176,6 +28253,79 @@ test('configure writes mcp aliases and generic custom surface flags into DeployC
   }
 });
 
+test('configure discovers custom surfaces from the repo-owned deploy contract', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeDeploySurfaceContract(repoRoot);
+    const initialDeployConfig = buildFullDeployConfig();
+    initialDeployConfig.frontend.staging.deployWorkflow = 'deploy-hosted.yml';
+    initialDeployConfig.frontend.production.deployWorkflow = 'deploy-hosted.yml';
+    writeSharedDeployConfig(repoRoot, initialDeployConfig);
+
+    const result = runCli(['configure', '--json'], repoRoot);
+    const deployConfig = JSON.parse(result.stdout);
+    const workflowConfig = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
+
+    assert.deepEqual(deployConfig.surfaces.mcp, {
+      staging: { deployCommand: '', verificationCommand: '', healthcheckUrl: '' },
+      production: { deployCommand: '', verificationCommand: '', healthcheckUrl: '' },
+    });
+    assert.deepEqual(workflowConfig.surfaces, ['frontend', 'edge', 'sql', 'mcp']);
+
+    const doctor = JSON.parse(runCli(['run', 'doctor', '--json'], repoRoot).stdout);
+    assert.match(doctor.missingFields.join('\n'), /mcp staging deploy command/);
+    assert.match(doctor.missingFields.join('\n'), /mcp production deploy command/);
+    assert.match(doctor.missingFields.join('\n'), /mcp verification command or health check/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure rejects deploy contracts with non-string or traversing surface paths', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeDeploySurfaceContract(repoRoot);
+    writeFileSync(
+      path.join(repoRoot, '.github', 'deploy-surfaces.json'),
+      '{"version":1,"workflow":"Deploy Hosted","surfaces":{"mcp":["packages/mcp-server/",7],"worker":["packages/worker/../../outside/"]}}\n',
+      'utf8',
+    );
+
+    const result = runCli(['configure', '--json'], repoRoot, {}, true);
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /mcp paths must all be strings/);
+    assert.match(result.stderr, /worker contains a path outside the repository/);
+    assert.equal(existsSync(sharedDeployConfigPath(repoRoot)), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('configure rejects a malformed repo-owned deploy contract before writing deploy state', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeDeploySurfaceContract(repoRoot);
+    writeFileSync(
+      path.join(repoRoot, '.github', 'deploy-surfaces.json'),
+      '{"version":2,"workflow":"Deploy Hosted","surfaces":{"mcp":["packages/mcp-server/"]}}\n',
+      'utf8',
+    );
+
+    const result = runCli(['configure', '--json'], repoRoot, {}, true);
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Configure blocked: a deploy surface contract is invalid/);
+    assert.match(result.stderr, /must use version 1/);
+    assert.equal(existsSync(sharedDeployConfigPath(repoRoot)), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('configure leaves repo CLAUDE.md untouched while writing machine-local deploy config', () => {
   const repoRoot = createRepo();
   try {
@@ -30633,6 +30783,55 @@ test('v1.4 --blast groups changed files by surfacePathMap and hints when the map
     assert.equal(viewC.totalFiles, 4);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('surface path maps assign shared files to every matching deploy surface', async () => {
+  const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'surface-map.ts'));
+  const buckets = mod.bucketPathsBySurface(
+    ['package-lock.json', 'packages/mcp-server/src/index.ts', 'src/App.tsx'],
+    {
+      frontend: ['package-lock.json', 'src/'],
+      mcp: ['package-lock.json', 'packages/mcp-server/'],
+    },
+  );
+
+  assert.deepEqual(buckets.surfaces.frontend, ['package-lock.json', 'src/App.tsx']);
+  assert.deepEqual(buckets.surfaces.mcp, ['package-lock.json', 'packages/mcp-server/src/index.ts']);
+  assert.deepEqual(buckets.other, []);
+});
+
+test('surface contracts fall back to the base branch for an older target SHA', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    const baseBranch = run('git', ['branch', '--show-current'], repoRoot);
+    const oldBaseSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+
+    execFileSync('git', ['checkout', '-b', 'codex/old-target', oldBaseSha], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    mkdirSync(path.join(repoRoot, 'packages', 'mcp-server'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'packages', 'mcp-server', 'index.ts'), 'export const oldTarget = true;\n', 'utf8');
+    commitLocal(repoRoot, 'Old MCP target');
+    const oldTargetSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+
+    execFileSync('git', ['checkout', baseBranch], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    writeDeploySurfaceContract(repoRoot);
+    commitAll(repoRoot, 'Add deploy surface contract');
+    execFileSync('git', ['push', 'origin', baseBranch], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['checkout', 'codex/old-target'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'deploy-surface-contract.ts'));
+    const contract = mod.loadDeploySurfaceContractForTarget(
+      repoRoot,
+      'Deploy Hosted',
+      oldTargetSha,
+      baseBranch,
+    );
+
+    assert.ok(contract);
+    assert.deepEqual(contract.surfacePathMap.mcp, ['packages/mcp-server/']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
   }
 });
 
@@ -33367,19 +33566,24 @@ test('destination planner does not treat provider-completed requested deploys as
   }
 });
 
-test('destination planner infers target surfaces from surfacePathMap', () => {
+test('destination planner infers custom target surfaces from the repo-owned deploy contract', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
     runCli(['setup'], repoRoot);
-    writeFullDeployConfigState(repoRoot);
+    writeDeploySurfaceContract(repoRoot, {
+      frontend: ['src/frontend/'],
+      sql: ['supabase/'],
+      mcp: ['packages/mcp-server/'],
+    });
+    const deployConfig = writeFullDeployConfigState(repoRoot);
+    deployConfig.surfaces.mcp = {
+      staging: { deployCommand: 'deploy mcp staging', verificationCommand: 'verify mcp', healthcheckUrl: '' },
+      production: { deployCommand: 'deploy mcp production', verificationCommand: 'verify mcp', healthcheckUrl: '' },
+    };
+    writeSharedDeployConfig(repoRoot, deployConfig);
     updateWorkflowConfig(repoRoot, (config) => {
       config.surfaces = ['frontend', 'sql', 'mcp'];
-      config.surfacePathMap = {
-        frontend: ['src/frontend/'],
-        sql: ['supabase/'],
-        mcp: ['packages/mcp-server/'],
-      };
     });
     commitAll(repoRoot, 'Adopt pipelane');
 

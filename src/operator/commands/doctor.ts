@@ -13,6 +13,10 @@ import {
   type DeployConfig,
 } from '../release-gate.ts';
 import { runNpmGuardSelfCheck } from '../npm-guard-install.ts';
+import {
+  deploySurfaceContractConfigurationIssues,
+  loadConfiguredDeploySurfaceContracts,
+} from '../deploy-surface-contract.ts';
 import { sanitizeForTerminal } from './helpers.ts';
 import {
   ensureStateDir,
@@ -123,13 +127,20 @@ function runDiagnose(context: WorkflowContext, parsed: ParsedOperatorArgs): void
 export function buildDiagnoseReport(context: WorkflowContext): DiagnoseReport {
   const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
   const platform = detectPlatform(context.repoRoot, deployConfig);
-  const missing = listMissingFields(deployConfig);
+  const contracts = loadConfiguredDeploySurfaceContracts(context.repoRoot, context.config, deployConfig);
+  const surfaceContractIssues = contracts.flatMap((contract) =>
+    deploySurfaceContractConfigurationIssues(contract, context.config, deployConfig)
+  );
+  const missing = [...new Set([...listMissingFields(deployConfig), ...surfaceContractIssues])];
   const probeState = loadProbeState(context.commonDir, context.config);
   const lines: string[] = [];
   lines.push('Doctor diagnosis:');
   lines.push(`  Platform: ${platform.configured || '(unset)'} ${platform.detected && platform.detected !== platform.configured ? `(detected: ${platform.detected})` : ''}`.trimEnd());
   if (platform.sources.length > 0) {
     lines.push(`  Platform signals: ${platform.sources.join(', ')}`);
+  }
+  for (const contract of contracts) {
+    lines.push(`  Deploy surfaces: ${contract.surfaces.join(', ') || '(invalid contract)'} (${path.relative(context.repoRoot, contract.manifestPath)})`);
   }
   if (missing.length === 0) {
     lines.push('  Deploy configuration: complete');

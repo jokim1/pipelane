@@ -2,6 +2,7 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline/promises';
 
+import { loadConfiguredDeploySurfaceContracts } from '../deploy-surface-contract.ts';
 import {
   additionalDeploySurfaceNames,
   emptyAdditionalDeploySurfaceConfig,
@@ -226,7 +227,20 @@ export async function handleConfigure(cwd: string, argv: string[]): Promise<Conf
   const repoRoot = resolveRepoRoot(cwd, true);
   const workflowConfig = loadWorkflowConfig(repoRoot);
   const configPath = resolveSharedDeployConfigPath(repoRoot);
-  const baseConfig = loadDeployConfig(repoRoot) ?? emptyDeployConfig();
+  const loadedConfig = loadDeployConfig(repoRoot) ?? emptyDeployConfig();
+  const surfaceContracts = loadConfiguredDeploySurfaceContracts(repoRoot, workflowConfig, loadedConfig);
+  const contractIssues = surfaceContracts.flatMap((contract) => contract.issues);
+  if (contractIssues.length) {
+    throw new Error([
+      'Configure blocked: a deploy surface contract is invalid.',
+      ...contractIssues.map((issue) => `- ${issue}`),
+      'Repair the repo-owned deploy surface contract before configuring deployment.',
+    ].join('\n'));
+  }
+  const baseConfig = registerContractCustomSurfaces(
+    loadedConfig,
+    [...new Set(surfaceContracts.flatMap((contract) => contract.surfaces))],
+  );
   const flagged = applyFlagOverrides(baseConfig, options);
   const detection = options.json
     ? { signals: [], values: [], questions: [] }
@@ -252,6 +266,14 @@ export async function handleConfigure(cwd: string, argv: string[]): Promise<Conf
   }
 
   return { repoRoot, configPath, config: finalConfig };
+}
+
+function registerContractCustomSurfaces(base: DeployConfig, surfaces: string[]): DeployConfig {
+  const next: DeployConfig = JSON.parse(JSON.stringify(base));
+  for (const surface of surfaces) {
+    if (!isReleaseManagedSurface(surface)) ensureAdditionalDeploySurface(next, surface);
+  }
+  return next;
 }
 
 function syncAdditionalWorkflowSurfaces(repoRoot: string, deployConfig: DeployConfig): void {
