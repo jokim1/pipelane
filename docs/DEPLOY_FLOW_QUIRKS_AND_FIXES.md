@@ -667,6 +667,40 @@ and non-TTY execution paths.
     removing it would regress the accepted token ergonomics rather than fix a
     deploy-flow bug.
 
+49. **Legacy custom state directories were sanitized before migration and
+    silently abandoned release state (P0).** **Location:**
+    `src/operator/state.ts:1736` and `src/operator/state.ts:2441`.
+    **Repro:** put `mode-state.json` in `.git/custom-state`, set
+    `stateDir: "custom-state"` in a legacy `.pipelane.json`, and run the first
+    machine-local import; the policy allowlist correctly removed `stateDir`,
+    but migration then searched only the default names and mode fell back to
+    `build`. **Proposed fix (implemented):** capture the raw legacy value only
+    as a one-shot migration hint, require a relative traversal-free path whose
+    canonical target stays inside the Git common directory, migrate it before
+    writing sanitized machine config, and reject absolute/traversal/symlink
+    escapes. The legacy directory remains unchanged.
+
+50. **Non-blocking review-gate timeouts entered the route's fail-closed timeout
+    ledger (P1).** **Location:** `src/operator/route-loop-safety.ts:891` and
+    `src/operator/route-loop-safety.ts:915`. **Repro:** configure a command
+    gate with `blocking:false` and force it to time out; review correctly
+    reports `passed`, but `lastTimedOutGateIds` retained the gate and later
+    route actions stopped as if a required verdict were missing. **Proposed fix
+    (implemented):** full and targeted reconciliation now records timeout IDs
+    only for blocking gates; a targeted non-blocking verdict also removes any
+    stale historical ledger entry. Blocking timeout behavior remains
+    fail-closed.
+
+51. **A repo-controlled legacy `baseBranch` could become a Git option (P0).**
+    **Location:** `src/operator/state.ts:1381` and
+    `src/operator/task-workspaces.ts:244`. **Repro:** import a legacy config
+    whose base branch begins with `--upload-pack=` and let `/new` refresh the
+    base ref; the value crossed the config boundary without Git ref validation
+    and was passed to `git fetch` without an option terminator. **Proposed fix
+    (implemented):** validate every normalized base branch with
+    `git check-ref-format`, reject dash-prefixed values with an actionable
+    error, and place `--` before fetch positionals as defense in depth.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original
