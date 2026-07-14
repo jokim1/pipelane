@@ -517,6 +517,31 @@ and non-TTY execution paths.
     no token, and persist task-scoped execute blockers through the existing
     action feedback path.
 
+36. **Legacy `projectKey` could indirectly escape the task-worktree sibling
+    root (P0).** **Location:** `src/operator/state.ts:1543` and
+    `src/operator/task-workspaces.ts:62`. **Repro:** commit a legacy config
+    with `projectKey: "../../escape"` but omit the already-filtered
+    `taskWorktreeDirName`; import derived `../../escape-worktrees`, and `/new`
+    resolved that path outside the repository's sibling directory. **Proposed
+    fix (implemented):** slug-normalize imported legacy project keys with a
+    visible warning, then independently canonicalize and containment-check
+    every resolved task-worktree root before any caller creates or scans it.
+    The new hard error is a safety bugfix: an unsafe machine-local directory
+    value is rejected instead of authorizing writes outside the managed
+    sibling root.
+
+37. **Targeted cleanup released the composite lease before artifact deletion
+    (P0).** **Location:** `src/operator/commands/clean.ts:94` and
+    `src/operator/commands/clean.ts:115`. **Repro:** start
+    `/clean --apply --task <slug>`, pause after its lock prune, then let
+    `devmode build --task <slug>` recreate or mutate task state before cleanup
+    removes the worktree and branch; durable state could point at deleted
+    artifacts. **Proposed fix (implemented):** acquire the canonical
+    task-mutation then cleanup lease before targeted inspection, let the prune
+    reuse that lease, and release only after worktree/branch deletion. A real
+    two-process CLI regression pauses the targeted clean while a concurrent
+    task-scoped `devmode` command proves it cannot enter the mutation window.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original
