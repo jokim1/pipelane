@@ -17172,11 +17172,11 @@ test('setup migrates legacy repo-local .pipelane.json into machine-local config'
     const config = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
     assert.equal(config.displayName, 'Legacy Local App');
     assert.equal(config.projectKey, 'legacy-local-app');
-    assert.equal(config.baseBranch, 'trunk');
+    assert.equal(config.baseBranch, 'main', 'checkout-controlled base routing must remain machine-defaulted');
     assert.equal(config.aliases.pr, '/ship');
     assert.deepEqual(config.prePrChecks, ['npm run test', 'npm run typecheck', 'npm run build']);
     assert.equal(config.aliases.deploy, '/deploy');
-    assert.match(result.stderr, /ignored machine-local policy field\(s\) prePrChecks/);
+    assert.match(result.stderr, /ignored machine-local policy field\(s\) baseBranch, prePrChecks/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -17201,7 +17201,11 @@ test('the first general operator command imports legacy workflow config before d
     const imported = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
     assert.equal(imported.displayName, 'First Command Legacy App');
     assert.equal(imported.branchPrefix, 'legacy-task/');
-    assert.deepEqual(imported.surfaces, ['sql']);
+    assert.deepEqual(
+      imported.surfaces,
+      ['frontend', 'edge', 'sql'],
+      'checkout-controlled deploy surfaces must remain machine-defaulted',
+    );
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
