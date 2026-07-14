@@ -33614,6 +33614,62 @@ test('destination planner infers custom target surfaces from the repo-owned depl
   }
 });
 
+test('destination planner keeps merged target inference scoped to the target first parent', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    runCli(['setup'], repoRoot);
+    writeDeploySurfaceContract(repoRoot, {
+      frontend: ['src/frontend/'],
+      sql: ['supabase/'],
+      mcp: ['packages/mcp-server/'],
+    });
+    const deployConfig = writeFullDeployConfigState(repoRoot);
+    deployConfig.surfaces.mcp = {
+      staging: { deployCommand: 'deploy mcp staging', verificationCommand: 'verify mcp', healthcheckUrl: '' },
+      production: { deployCommand: 'deploy mcp production', verificationCommand: 'verify mcp', healthcheckUrl: '' },
+    };
+    writeSharedDeployConfig(repoRoot, deployConfig);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.surfaces = ['frontend', 'sql', 'mcp'];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    advanceRemoteMain(remoteRoot, 'unmapped.txt', 'unrelated base change\n');
+    execFileSync('git', ['fetch', 'origin', 'main'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['checkout', '-b', 'codex/mcp-only', 'origin/main'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    mkdirSync(path.join(repoRoot, 'packages', 'mcp-server'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'packages', 'mcp-server', 'index.ts'), 'export const changed = true;\n', 'utf8');
+    commitLocal(repoRoot, 'Change MCP server');
+    const targetSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
+
+    execFileSync('git', ['push', 'origin', 'HEAD:main'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['fetch', 'origin', 'main'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    assert.equal(run('git', ['rev-parse', 'origin/main'], repoRoot), targetSha);
+    assert.notEqual(run('git', ['rev-parse', 'main'], repoRoot), targetSha);
+
+    writeTaskLock(repoRoot, 'mcp-only', { mode: 'build', surfaces: ['frontend', 'sql'] });
+    writePrRecord(repoRoot, 'mcp-only', targetSha);
+
+    const result = runCli(
+      ['run', 'deploy', 'staging', '--task', 'mcp-only', '--plan', '--json'],
+      repoRoot,
+      { PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200' },
+      true,
+    );
+    const plan = JSON.parse(result.stdout);
+    assert.equal(result.status, 0);
+    assert.deepEqual(plan.requestedSurfaces, ['mcp']);
+    assert.deepEqual(plan.blockers, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('destination planner blocks unmapped target files before stale surfaces', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
