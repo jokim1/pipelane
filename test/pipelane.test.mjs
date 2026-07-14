@@ -4224,6 +4224,29 @@ test('legacy config auto-import keeps repository-controlled policy out of machin
   }
 });
 
+test('task worktree containment resolves symlinked ancestors even when the destination does not exist', async () => {
+  const repoRoot = createRepo();
+  const outsideRoot = mkdtempSync(path.join(path.dirname(path.dirname(repoRoot)), 'pipelane-worktree-outside-'));
+  const linkPath = path.join(path.dirname(repoRoot), `pipelane-worktree-link-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  try {
+    symlinkSync(outsideRoot, linkPath, process.platform === 'win32' ? 'junction' : 'dir');
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const taskWorkspaces = await import(path.join(KIT_ROOT, 'src', 'operator', 'task-workspaces.ts'));
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+    assert.throws(
+      () => taskWorkspaces.resolveTaskWorktreeRoot(context.commonDir, {
+        ...context.config,
+        taskWorktreeDirName: `${path.basename(linkPath)}/missing-root`,
+      }),
+      /task worktrees must stay inside/,
+    );
+  } finally {
+    rmSync(linkPath, { force: true });
+    rmSync(outsideRoot, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('linked worktrees share machine-local workflow config', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const worktreePath = path.join(os.tmpdir(), `pipelane-linked-${Date.now()}-${Math.random().toString(16).slice(2)}`);
@@ -14690,6 +14713,45 @@ test('a filtered executable skill-gate retry augments the matching full run', as
   }
 });
 
+test('filtered retry equivalence binds policy, task, intent, and review target identity', async () => {
+  const enforcement = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-enforcement.ts'));
+  const expected = {
+    id: 'full-run',
+    branchName: 'codex/retry-identity',
+    sha: '1'.repeat(40),
+    status: 'failed',
+    dryRun: false,
+    startedAt: '2026-07-12T00:00:00.000Z',
+    finishedAt: '2026-07-12T00:00:01.000Z',
+    durationMs: 1000,
+    changedFiles: ['feature.ts'],
+    worktreeStatusDigest: '2'.repeat(64),
+    worktreeStatusReliable: true,
+    enforcementMode: 'strict-v3',
+    policyVersion: 3,
+    taskBindingId: 'task-binding-original',
+    intent: { text: 'Implement the exact reviewed objective', source: 'task-brief', digest: '3'.repeat(64) },
+    target: { targetDigest: '4'.repeat(64) },
+    gates: [],
+  };
+  const retry = { ...expected, id: 'retry-run', gateFilter: 'typecheck' };
+
+  assert.equal(enforcement.reviewRunMatchesEquivalentGateIdentity(expected, retry), true);
+  for (const changed of [
+    { enforcementMode: 'legacy-v2' },
+    { policyVersion: 2 },
+    { taskBindingId: 'task-binding-other' },
+    { intent: { ...retry.intent, digest: '5'.repeat(64) } },
+    { target: { ...retry.target, targetDigest: '6'.repeat(64) } },
+  ]) {
+    assert.equal(
+      enforcement.reviewRunMatchesEquivalentGateIdentity(expected, { ...retry, ...changed }),
+      false,
+      `retry mismatch must not augment the full run: ${JSON.stringify(changed)}`,
+    );
+  }
+});
+
 test('manual acceptance and executable skill-gate retries are applied in recorded chronology', async () => {
   const repoRoot = createRepo();
   const previousReviewStateKey = process.env.PIPELANE_REVIEW_STATE_KEY;
@@ -15508,6 +15570,45 @@ test('review gate timeouts have a distinct outcome and a targeted retry remedy',
     assert.equal(human.status, 1);
     assert.match(human.stdout, /slow-check \[static\] TIMEOUT/);
     assert.equal(latestRouteSafetyRecord(repoRoot).fixReviewLoops, 0);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('targeted retries retain other unresolved review gate timeouts', () => {
+  const repoRoot = createRepo();
+  try {
+    const timeoutUnless = (name) => `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`if (process.env.${name} === '1') process.exit(0); setTimeout(() => {}, 5000)`)}`;
+    writePipelaneConfig(repoRoot, 'Timeout Retry Ledger', {
+      routeSafety: { defaultFixReviewLoops: 3, defaultMinutes: 90, defaultAiReviewRuns: 3, stopOnMajorFindings: true },
+      reviewGates: {
+        planReview: { gates: [] },
+        gates: [
+          { id: 'slow-a', phase: 'static', type: 'command', blocking: true, timeoutMs: 500, command: timeoutUnless('PASS_A') },
+          { id: 'slow-b', phase: 'behavioral', type: 'command', blocking: true, timeoutMs: 500, command: timeoutUnless('PASS_B') },
+        ],
+      },
+    });
+    commitLocal(repoRoot, 'Configure timeout retry ledger');
+
+    const full = runCli(['run', 'review', '--json'], repoRoot, {}, true);
+    assert.equal(full.status, 1);
+    assert.deepEqual(latestRouteSafetyRecord(repoRoot).lastTimedOutGateIds, ['slow-a', 'slow-b']);
+
+    const retryA = runCli(['run', 'review', '--gate', 'slow-a', '--json'], repoRoot, { PASS_A: '1' }, true);
+    assert.equal(retryA.status, 1, 'the command remains fail-closed while another timeout is unresolved');
+    assert.equal(JSON.parse(retryA.stdout).status, 'passed');
+    assert.deepEqual(latestRouteSafetyRecord(repoRoot).lastTimedOutGateIds, ['slow-b']);
+    const blocked = runCli([
+      'run', 'resume', '--accept-findings', '--reason', 'must not waive the remaining timeout', '--json',
+    ], repoRoot, {}, true);
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /Cannot accept timed-out review gates as findings/);
+    assert.match(blocked.stderr, /pipelane run review --gate slow-b/);
+
+    const retryB = runCli(['run', 'review', '--gate', 'slow-b', '--json'], repoRoot, { PASS_B: '1' }, true);
+    assert.equal(retryB.status, 0, `${retryB.stdout}\n${retryB.stderr}`);
+    assert.deepEqual(latestRouteSafetyRecord(repoRoot).lastTimedOutGateIds, []);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -21626,6 +21727,68 @@ test('route safety accept-findings is bound to the accepted review run id', () =
   }
 });
 
+test('route safety refuses stale accept-findings without persisting route acceptance or consent', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = { PATH: `${ghBin}:${process.env.PATH}`, GH_STATE_FILE: ghStateFile };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Stale Acceptance', {
+      prePrChecks: [],
+      reviewGates: {
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: [{
+          id: 'always-fails',
+          phase: 'static',
+          type: 'command',
+          blocking: true,
+          command: 'node -e "process.exit(1)"',
+        }],
+      },
+    });
+    commitAll(repoRoot, 'Configure stale acceptance fixture');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Stale Acceptance', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'stale acceptance\n', 'utf8');
+    const reviewed = JSON.parse(runCli(['run', 'review', '--json'], created.worktreePath, {}, true).stdout);
+    const paused = runCli(['run', 'pr', '--title', 'Stale Acceptance', '--json'], created.worktreePath, env, true);
+    assert.equal(paused.status, 1);
+
+    const reviewPath = path.join(sharedStateDir(repoRoot), 'review-state.json');
+    const reviewState = JSON.parse(readFileSync(reviewPath, 'utf8'));
+    const original = reviewState.records.find((record) => record.id === reviewed.runId);
+    const laterAt = new Date(Date.now() + 5_000).toISOString();
+    reviewState.records.unshift({
+      ...original,
+      id: `${original.id}-newer`,
+      startedAt: laterAt,
+      finishedAt: laterAt,
+      gates: original.gates.map((gate) => ({ ...gate, startedAt: laterAt, finishedAt: laterAt })),
+      signature: undefined,
+    });
+    writeFileSync(reviewPath, `${JSON.stringify(reviewState, null, 2)}\n`, 'utf8');
+    const routeBefore = latestRouteSafetyRecord(created.worktreePath);
+
+    const rejected = runCli([
+      'run', 'resume', '--accept-findings', '--reason', 'accept only what was inspected', '--json',
+    ], created.worktreePath, {}, true);
+    assert.equal(rejected.status, 1);
+    assert.match(rejected.stderr, /Review evidence changed before findings could be accepted/);
+    const routeAfter = latestRouteSafetyRecord(created.worktreePath);
+    assert.equal(routeAfter.acceptedFindingsAt, routeBefore.acceptedFindingsAt);
+    assert.equal(routeAfter.acceptedReviewRunId, routeBefore.acceptedReviewRunId);
+    assert.deepEqual(routeAfter.resumes ?? [], routeBefore.resumes ?? []);
+    const finalReviewState = JSON.parse(readFileSync(reviewPath, 'utf8'));
+    assert.deepEqual(finalReviewState.consents ?? [], []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
 test('route safety pending review stop exits non-zero', () => {
   const repoRoot = createRepo();
   try {
@@ -22364,6 +22527,43 @@ test('pr blocks lockless shared-checkout commits while task worktree locks are a
     assert.match(blocked.stderr, /\/pr blocked because task active-isolated-task belongs to a different worktree/);
     assert.match(blocked.stderr, /No base-drift or dirty-worktree measurements were taken/);
     assert.match(blocked.stderr, new RegExp(active.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.match(run('git', ['status', '--short'], repoRoot), /\?\? shared-change\.txt/);
+    assert.equal(existsSync(ghStateFile), false, 'blocked shared-checkout PR must not call gh');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('pr resolves a branch-matched lease before rejecting a shared checkout with multiple task locks', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = { PATH: `${ghBin}:${process.env.PATH}`, GH_STATE_FILE: ghStateFile };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    runCli(['setup'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const first = JSON.parse(runCli(['run', 'new', '--task', 'First Shared Lease', '--json'], repoRoot).stdout);
+    runCli(['run', 'new', '--task', 'Second Shared Lease', '--json'], repoRoot);
+    execFileSync('git', ['checkout', '-b', 'codex/first-shared-lease-abcd'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    writeFileSync(path.join(repoRoot, 'shared-change.txt'), 'must remain unstaged\n', 'utf8');
+
+    const blocked = runCli(['run', 'pr', '--title', 'First Shared Lease', '--json'], repoRoot, env, true);
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /task first-shared-lease belongs to a different worktree/);
+    assert.match(blocked.stderr, new RegExp(first.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.match(blocked.stderr, /No base-drift or dirty-worktree measurements were taken/);
     assert.match(run('git', ['status', '--short'], repoRoot), /\?\? shared-change\.txt/);
     assert.equal(existsSync(ghStateFile), false, 'blocked shared-checkout PR must not call gh');
   } finally {
@@ -23932,6 +24132,65 @@ test('api action deploy.prod binds the confirmed target and bypasses the TTY pro
     assert.equal(envelope.data.execution.exitCode, 0);
     assert.equal(envelope.data.execution.result.status, 'succeeded');
     assert.equal(envelope.data.execution.result.environment, 'prod');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('api deploy.prod preflight and execution share the target surface contract', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Contract API Deploy');
+    writeDeploySurfaceContract(repoRoot, { mcp: ['packages/mcp-server/'] });
+    writeSharedDeployConfig(repoRoot, buildFullDeployConfig());
+    runCli([
+      'configure', '--json',
+      '--mcp-staging-deploy-command=deploy mcp staging',
+      '--mcp-staging-verification-command=verify mcp',
+      '--mcp-production-deploy-command=deploy mcp production',
+      '--mcp-production-verification-command=verify mcp',
+    ], repoRoot);
+    commitAll(repoRoot, 'Configure contract API deploy');
+    runCli(['run', 'devmode', 'release', '--override', '--reason', 'contract-api-test', '--json'], repoRoot);
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Contract API Deploy', '--json'], repoRoot).stdout);
+    mkdirSync(path.join(created.worktreePath, 'packages', 'mcp-server'), { recursive: true });
+    writeFileSync(path.join(created.worktreePath, 'packages', 'mcp-server', 'index.ts'), 'export const changed = true;\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Contract API Deploy', '--json'], created.worktreePath, env);
+    runCli(['run', 'merge', '--json'], created.worktreePath, env);
+    const targetSha = run('git', ['rev-parse', 'HEAD'], created.worktreePath);
+    writePrRecord(repoRoot, created.taskSlug, targetSha);
+    runCli(['run', 'deploy', 'staging', '--json'], created.worktreePath, env);
+
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`);
+    const staleLock = JSON.parse(readFileSync(lockPath, 'utf8'));
+    staleLock.surfaces = ['frontend'];
+    writeFileSync(lockPath, `${JSON.stringify(staleLock, null, 2)}\n`, 'utf8');
+
+    const preflight = JSON.parse(runCli([
+      'run', 'api', 'action', 'deploy.prod', '--task', 'Contract API Deploy', '--json',
+    ], created.worktreePath, env).stdout);
+    assert.deepEqual(preflight.data.preflight.normalizedInputs.resolvedSurfaces, ['mcp']);
+    const executed = runCli([
+      'run', 'api', 'action', 'deploy.prod', '--task', 'Contract API Deploy', '--execute',
+      '--confirm-token', preflight.data.preflight.confirmation.token, '--json',
+    ], created.worktreePath, env, true);
+    assert.equal(executed.status, 0, executed.stdout || executed.stderr);
+    const envelope = JSON.parse(executed.stdout);
+    assert.equal(envelope.ok, true);
+    assert.deepEqual(envelope.data.preflight.normalizedInputs.resolvedSurfaces, ['mcp']);
+    assert.deepEqual(envelope.data.execution.result.surfaces, ['mcp']);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -36884,10 +37143,14 @@ test('strict provider execution and protocol failures retain native diagnostics 
     });
     commitLocal(repoRoot, 'Configure provider timeout');
     const timeout = JSON.parse(runCli(['run', 'review', '--intent', 'Retain strict timeout evidence', '--json'], repoRoot, {
-      CODEX_HOME: codexHome, PIPELANE_REVIEW_KARPATHY_DIFF_PROVIDER: 'codex',
+      CODEX_HOME: codexHome,
+      PIPELANE_REVIEW_KARPATHY_DIFF_PROVIDER: 'codex',
+      PIPELANE_REVIEW_GATE_TIMEOUT_MS: '40',
     }, true).stdout);
-    assert.equal(timeout.gates[0].errorCode, 'EREVIEWEXECUTION');
-    assert.match(timeout.gates[0].summary, /timed out|ETIMEDOUT/i);
+    assert.equal(timeout.gates[0].errorCode, 'ETIMEDOUT');
+    assert.equal(timeout.gates[0].outcome, 'timeout');
+    assert.match(timeout.gates[0].summary, /timed out after 40ms/);
+    assert.match(timeout.gates[0].summary, /pipelane run review --gate karpathy-diff/);
     updateWorkflowConfig(repoRoot, (config) => {
       config.reviewGates.gates[0].command = `node -e "console.log('native malformed protocol report'); process.exit(0)"`;
       delete config.reviewGates.gates[0].timeoutMs;

@@ -4122,7 +4122,7 @@ function runStrictAiReviewGate(options: {
     });
   }
 
-  const timeoutMs = gate.timeoutMs ?? DEFAULT_GATE_TIMEOUT_MS;
+  const timeoutMs = resolveReviewGateTimeoutMs(gate);
   const sessionId = `review-gate:${gate.id}:${crypto.randomUUID()}`;
   const inheritedContext = evaluateInheritedReviewGateContext();
   const nestedFailure = nestedReviewGateFailureSummary(inheritedContext);
@@ -4144,8 +4144,16 @@ function runStrictAiReviewGate(options: {
     inheritedContext,
   });
   if (lock.status === 'failed') {
+    const lockTimedOut = lock.errorCode === REVIEW_GATE_LOCK_TIMEOUT_ERROR_CODE;
     return finishGate({ ...base, command: auditedCommand }, startMs, {
-      status: 'failed', summary: lock.summary, exitCode: null, errorCode: lock.errorCode, capability: capability.evidence,
+      status: 'failed',
+      ...(lockTimedOut ? { outcome: 'timeout' as const } : {}),
+      summary: lockTimedOut
+        ? `${lock.summary} Re-run pipelane run review --gate ${gate.id}.`
+        : lock.summary,
+      exitCode: null,
+      errorCode: lock.errorCode,
+      capability: capability.evidence,
     });
   }
   const prompt = renderStrictReviewPrompt({ gate, intent, target: builtTarget.manifest, changedFiles, capability });
@@ -4158,6 +4166,7 @@ function runStrictAiReviewGate(options: {
     }
   }
   const exitCode = typeof completion.result.status === 'number' ? completion.result.status : null;
+  const timedOut = completion.result.error?.code === 'ETIMEDOUT';
   const diagnostics = redactReviewOutput([completion.providerChatter, completion.stderr].filter(Boolean).join('\n'));
   const stdoutTail = tail(redactReviewOutput(completion.nativeOutput));
   const stderrTail = tail(diagnostics);
@@ -4221,6 +4230,20 @@ function runStrictAiReviewGate(options: {
       summary: `review artifact persistence failed; no review result was signed: ${error instanceof Error ? error.message : String(error)}`,
       exitCode,
       capability: capability.evidence,
+      stdoutTail,
+      stderrTail,
+    });
+  }
+  if (timedOut) {
+    return finishGate({ ...base, command: auditedCommand }, startMs, {
+      status: 'failed',
+      outcome: 'timeout',
+      summary: `Strict review command timed out after ${timeoutMs}ms. Re-run pipelane run review --gate ${gate.id}.`,
+      exitCode,
+      errorCode: completion.result.error?.code ?? 'ETIMEDOUT',
+      errorMessage: completion.result.error?.message ?? null,
+      capability: capability.evidence,
+      reportArtifact,
       stdoutTail,
       stderrTail,
     });

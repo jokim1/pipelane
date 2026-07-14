@@ -6,7 +6,7 @@ import {
 } from './integrity.ts';
 import {
   appendReviewOverrideRecord,
-  appendReviewConsentRecord,
+  appendReviewConsentRecords,
   ensureTaskBindingId,
   formatWorkflowCommand,
   loadAllTaskLocks,
@@ -102,6 +102,21 @@ export function recordReviewEvidenceConsents(
   kind: ReviewConsentKind = 'gate-bypass',
   targetOverride?: ReviewEvidenceTarget,
 ): ReviewConsentRecord[] {
+  return appendReviewConsentRecords(
+    context.commonDir,
+    context.config,
+    buildReviewEvidenceConsentRecords(context, evidence, routeAction, reason, kind, targetOverride),
+  );
+}
+
+export function buildReviewEvidenceConsentRecords(
+  context: WorkflowContext,
+  evidence: ReviewEvidenceCheckResult,
+  routeAction: string,
+  reason: string,
+  kind: ReviewConsentKind = 'gate-bypass',
+  targetOverride?: ReviewEvidenceTarget,
+): ReviewConsentRecord[] {
   const normalizedReason = reason.trim();
   if (!normalizedReason) throw new Error('review bypass requires a non-empty informed-consent reason.');
   const target = targetOverride ?? currentCheckoutReviewEvidenceTarget(context.repoRoot);
@@ -118,7 +133,7 @@ export function recordReviewEvidenceConsents(
   return selected.map((gate) => {
     const issue = issueByGate.get(gate.id);
     const originalGateState = issue?.status ?? 'missing';
-    return appendReviewConsentRecord(context.commonDir, context.config, {
+    return {
       id: `review-consent-${new Date(recordedAt).toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto.randomUUID().slice(0, 8)}`,
       kind,
       gateId: gate.id,
@@ -139,7 +154,7 @@ export function recordReviewEvidenceConsents(
       reason: normalizedReason,
       reasonHash: crypto.createHash('sha256').update(normalizedReason).digest('hex'),
       recordedAt,
-    });
+    };
   });
 }
 
@@ -828,9 +843,14 @@ function reviewRunMatchesEquivalentGateEvidence(expected: ReviewRunRecord, evide
     && reviewRunMatchesEquivalentGateIdentity(expected, evidence);
 }
 
-function reviewRunMatchesEquivalentGateIdentity(expected: ReviewRunRecord, evidence: ReviewRunRecord): boolean {
+export function reviewRunMatchesEquivalentGateIdentity(expected: ReviewRunRecord, evidence: ReviewRunRecord): boolean {
   return evidence.branchName === expected.branchName
     && evidence.sha === expected.sha
+    && (evidence.enforcementMode ?? 'legacy-v2') === (expected.enforcementMode ?? 'legacy-v2')
+    && (evidence.policyVersion ?? 1) === (expected.policyVersion ?? 1)
+    && (evidence.taskBindingId ?? '') === (expected.taskBindingId ?? '')
+    && (evidence.intent?.digest ?? '') === (expected.intent?.digest ?? '')
+    && (evidence.target?.targetDigest ?? '') === (expected.target?.targetDigest ?? '')
     && reviewRecordMatchesCurrentWorktree(evidence, {
       currentWorktreeStatusDigest: expected.worktreeStatusDigest ?? '',
       currentWorktreeStatusReliable: expected.worktreeStatusReliable,

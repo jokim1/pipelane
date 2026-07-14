@@ -1021,10 +1021,18 @@ export function normalizePath(targetPath: string): string {
 }
 
 export function normalizeExistingPath(targetPath: string): string {
-  try {
-    return normalizePath(realpathSync(targetPath));
-  } catch {
-    return normalizePath(targetPath);
+  const normalized = normalizePath(targetPath);
+  const missingSegments: string[] = [];
+  let candidate = normalized;
+  while (true) {
+    try {
+      return normalizePath(path.join(realpathSync(candidate), ...missingSegments));
+    } catch {
+      const parent = path.dirname(candidate);
+      if (parent === candidate) return normalized;
+      missingSegments.unshift(path.basename(candidate));
+      candidate = parent;
+    }
   }
 }
 
@@ -2857,18 +2865,31 @@ export function appendReviewOverrideRecord(commonDir: string, config: WorkflowCo
   }
 }
 
-export function appendReviewConsentRecord(commonDir: string, config: WorkflowConfig, record: ReviewConsentRecord): ReviewConsentRecord {
+export function signReviewConsentRecords(records: ReviewConsentRecord[]): ReviewConsentRecord[] {
+  const consentKey = resolveReviewConsentStateKey();
+  return records.map((record) => ({ ...record, signature: signSignedPayload(record, consentKey) }));
+}
+
+export function addReviewConsentRecordsToState(state: ReviewState, records: ReviewConsentRecord[]): ReviewConsentRecord[] {
+  const persisted = signReviewConsentRecords(records);
+  state.consents = [...persisted, ...(state.consents ?? [])].slice(0, REVIEW_CONSENT_MAX_RECORDS);
+  return persisted;
+}
+
+export function appendReviewConsentRecords(commonDir: string, config: WorkflowConfig, records: ReviewConsentRecord[]): ReviewConsentRecord[] {
   const lock = acquireReviewStateLock(commonDir, config);
   try {
     const state = loadReviewState(commonDir, config);
-    const consentKey = resolveReviewConsentStateKey();
-    const persisted = { ...record, signature: signSignedPayload(record, consentKey) };
-    state.consents = [persisted, ...(state.consents ?? [])].slice(0, REVIEW_CONSENT_MAX_RECORDS);
+    const persisted = addReviewConsentRecordsToState(state, records);
     saveReviewState(commonDir, config, state);
     return persisted;
   } finally {
     lock.release();
   }
+}
+
+export function appendReviewConsentRecord(commonDir: string, config: WorkflowConfig, record: ReviewConsentRecord): ReviewConsentRecord {
+  return appendReviewConsentRecords(commonDir, config, [record])[0];
 }
 
 export function withReviewStateLock<T>(commonDir: string, config: WorkflowConfig, fn: () => T): T {

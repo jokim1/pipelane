@@ -152,7 +152,35 @@ export function assertTaskCommandWorktree(
     if (pathMatches.length > 1) {
       throw new Error(`Multiple task locks claim worktree ${context.repoRoot}. Pass --task explicitly after repairing the duplicate locks.`);
     }
-    resolved = pathMatches[0] ?? (locks.length === 1 ? locks[0] : null);
+    resolved = pathMatches[0] ?? null;
+    if (!resolved) {
+      const sharedRepoRoot = resolveSharedRepoRoot(context.commonDir);
+      const isSharedCheckout = currentPath === normalizeExistingPath(sharedRepoRoot);
+      if (isSharedCheckout) {
+        const currentBranch = command === 'pr'
+          ? runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? ''
+          : '';
+        const inferredTaskSlugs = currentBranch
+          ? inferTaskSlugsFromBranchName(context.config, currentBranch)
+          : [];
+        const inferredLocks = locks.filter((lock) => inferredTaskSlugs.includes(lock.taskSlug));
+        if (inferredLocks.length === 1) {
+          resolved = inferredLocks[0];
+        } else if (locks.length === 1) {
+          resolved = locks[0];
+        } else {
+          const commandLabel = formatWorkflowCommand(context.config, command);
+          throw new Error([
+            `${commandLabel} blocked because task-scoped delivery cannot run from the shared checkout.`,
+            `Current checkout: ${context.repoRoot}`,
+            'Pass --task <task> to identify the task, then cd to the exact task worktree printed by Pipelane and re-run the command.',
+            'No base-drift or dirty-worktree measurements were taken in the shared checkout.',
+          ].join('\n'));
+        }
+      } else if (locks.length === 1) {
+        resolved = locks[0];
+      }
+    }
   }
 
   if (!resolved) return null;

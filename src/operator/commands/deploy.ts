@@ -315,6 +315,23 @@ export function resolveDeployApprovalInputs(cwd: string, parsed: ParsedOperatorA
     mode: context.modeState.mode,
     config: context.config,
   });
+  const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
+  const workflowName = workflowNameForDeployEnvironment(context.config, deployConfig, 'prod');
+  const surfaceContract = loadDeploySurfaceContractForTarget(
+    context.repoRoot,
+    workflowName,
+    target.sha,
+    context.config.baseBranch,
+  );
+  const surfaceContractIssues = deploySurfaceContractConfigurationIssues(surfaceContract, context.config, deployConfig);
+  if (surfaceContractIssues.length > 0) {
+    throw new Error([
+      `Deploy blocked: ${workflowName} surface contract is not configured.`,
+      ...surfaceContractIssues.map((issue) => `- ${issue}`),
+      'Run /pipelane configure to register every custom surface before deploying.',
+    ].join('\n'));
+  }
+  const surfacePathMap = resolveDeploySurfacePathMap(context.config, surfaceContract);
   // API action positional arguments are `action deploy.prod`, not deploy
   // surface shorthands. The stable API exposes surfaces only through
   // --surfaces, which is also what the child command receives.
@@ -324,8 +341,8 @@ export function resolveDeployApprovalInputs(cwd: string, parsed: ParsedOperatorA
     explicitSurfaces,
     fallbackSurfaces: identity.lock?.surfaces ?? [],
     targetSha: target.sha,
+    surfacePathMap,
   });
-  const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
   return {
     targetSha: target.sha,
     resolvedSurfaces: [...resolvedSurfaces].sort(),

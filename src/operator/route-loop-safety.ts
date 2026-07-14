@@ -8,17 +8,21 @@ import {
   type DestinationPlan,
 } from './destination-planner.ts';
 import {
+  addReviewConsentRecordsToState,
   DEFAULT_ROUTE_SAFETY,
   ensureTaskBindingId,
   formatWorkflowCommand,
   loadAllTaskLocks,
+  loadReviewState,
   loadRouteSafetyState,
   normalizePath,
   normalizeRouteSafetyConfig,
   nowIso,
   resolveWorkflowContext,
   runGit,
+  saveReviewState,
   saveRouteSafetyState,
+  withReviewStateLock,
   withRouteSafetyStateLock,
   type ParsedOperatorArgs,
   type ReviewRunRecord,
@@ -28,8 +32,8 @@ import {
   type WorkflowContext,
 } from './state.ts';
 import {
+  buildReviewEvidenceConsentRecords,
   evaluateReviewEvidenceForPr,
-  recordReviewEvidenceConsents,
   type ReviewEvidenceCheckResult,
   type ReviewEvidenceIssue,
 } from './review-enforcement.ts';
@@ -69,6 +73,13 @@ interface PauseOptions {
   latest?: ReviewRunRecord | null;
 }
 
+interface RouteAcceptanceExpectation {
+  routeDigest: string;
+  attemptDigest: string;
+  reviewRunId: string;
+  targetCommand: string;
+}
+
 export function hasRouteSafetyResumeOverride(flags: ParsedOperatorArgs['flags']): boolean {
   return flags.oneMoreLoop
     || flags.moreLoops.trim().length > 0
@@ -90,31 +101,30 @@ export async function evaluateDestinationRouteReviewSafety(
   evidence: ReviewEvidenceCheckResult,
 ): Promise<RouteSafetyPauseResult> {
   const identity = routeIdentityForPlan(context, plan);
-  const initialized = withRouteSafetyStateLock(context.commonDir, context.config, () => {
+  const record = withRouteSafetyStateLock(context.commonDir, context.config, () => {
     const state = loadRouteSafetyState(context.commonDir, context.config);
     const record = updateRouteRecordWithReviewEvidence(state, identity, evidence.latest);
     saveRouteSafetyState(context.commonDir, context.config, state);
-    return { state, record };
+    return record;
   });
-  const { state, record } = initialized;
   if (record.legacyMigration?.status === 'pending') {
-    return pauseRouteSafety(context, state, record, {
+    return pauseRouteSafety(context, record, {
       reason: 'legacy route history is ambiguous and requires an explicit audited migration choice',
       issues: evidence.issues,
       latest: evidence.latest,
     });
   }
   if (evidence.allowed) {
-    record.pauseReason = undefined;
-    record.pausedAt = undefined;
-    saveRouteSafetyState(context.commonDir, context.config, state);
+    mutateExpectedRouteRecord(context, routeMutationExpectation(record), (_state, current) => {
+      current.pauseReason = undefined;
+      current.pausedAt = undefined;
+    });
     return { action: 'continue', message: '' };
   }
 
   const config = normalizeRouteSafetyConfig(context.config.routeSafety);
   const hasAcceptableFindings = reviewEvidenceIssuesAreAcceptableFindings(evidence);
   if (hasAcceptableFindings && routeFindingsAccepted(record, config, evidence.latest?.id ?? '')) {
-    saveRouteSafetyState(context.commonDir, context.config, state);
     return { action: 'continue', message: '' };
   }
 
@@ -124,11 +134,10 @@ export async function evaluateDestinationRouteReviewSafety(
     : '';
   const reason = findingReason || limitReason;
   if (!reason) {
-    saveRouteSafetyState(context.commonDir, context.config, state);
     return { action: 'stop', message: evidence.message };
   }
 
-  return pauseRouteSafety(context, state, record, {
+  return pauseRouteSafety(context, record, {
     reason,
     issues: evidence.issues,
     latest: evidence.latest,
@@ -187,7 +196,12 @@ export function recordReviewRunForRouteSafety(
     const state = loadRouteSafetyState(context.commonDir, context.config);
     const record = ensureRouteRecord(state, identity);
     countReviewRun(record, reviewRun);
-    if (reviewRun.status === 'passed' && record.legacyMigration?.status !== 'pending') {
+    const unresolvedTimedOutGateIds = record.lastTimedOutGateIds ?? [];
+    if (
+      reviewRun.status === 'passed'
+      && unresolvedTimedOutGateIds.length === 0
+      && record.legacyMigration?.status !== 'pending'
+    ) {
       record.pauseReason = undefined;
       record.pausedAt = undefined;
       saveRouteSafetyState(context.commonDir, context.config, state);
@@ -195,9 +209,8 @@ export function recordReviewRunForRouteSafety(
     }
 
     const config = normalizeRouteSafetyConfig(context.config.routeSafety);
-    const timedOutGateIds = reviewTimedOutGateIds(reviewRun);
-    const reason = timedOutGateIds.length > 0
-      ? `review gate timed out: ${timedOutGateIds.join(', ')}`
+    const reason = unresolvedTimedOutGateIds.length > 0
+      ? `review gate timed out: ${unresolvedTimedOutGateIds.join(', ')}`
       : reviewRun.status === 'failed' && config.stopOnMajorFindings
         ? 'blocking/major review findings are present'
         : routeLimitReason(record, config, { willRunAiReview: false });
@@ -255,6 +268,7 @@ export function applyRouteSafetyResumeOverride(cwd: string, parsed: ParsedOperat
   let record: RouteSafetyRecord | null = null;
   let resume: RouteSafetyResumeRecord | null = null;
   let migrationMessage = '';
+  let acceptanceExpectation: RouteAcceptanceExpectation | null = null;
   withRouteSafetyStateLock(context.commonDir, context.config, () => {
     const state = loadRouteSafetyState(context.commonDir, context.config);
     record = findPausedRouteRecordForCurrentCheckout(context, state);
@@ -316,27 +330,23 @@ export function applyRouteSafetyResumeOverride(cwd: string, parsed: ParsedOperat
           ...record.lastTimedOutGateIds!.map((gateId) => `Re-run: pipelane run review --gate ${gateId}`),
         ].join('\n'));
       }
-      record.resumes = [resume, ...(record.resumes ?? [])].slice(0, 20);
       if (resume.acceptedFindings) {
-        record.acceptedFindingsAt = resume.recordedAt;
-        record.acceptedFindingsSource = 'resume --accept-findings';
-        record.acceptedReviewRunId = record.lastReviewRunId;
-        record.acceptedAttemptDigest = record.currentAttemptDigest;
+        acceptanceExpectation = routeAcceptanceExpectation(record);
+        return;
       }
+      record.resumes = [resume, ...(record.resumes ?? [])].slice(0, 20);
     }
     record.updatedAt = nowIso();
     state.latestPausedRouteFingerprintDigest = record.routeFingerprintDigest;
     saveRouteSafetyState(context.commonDir, context.config, state);
   });
   if (!record || !resume) throw new Error('Route safety resume could not be recorded.');
-  if (resume.acceptedFindings) {
-    const evidence = evaluateReviewEvidenceForPr(context, { command: record.targetCommand });
-    recordReviewEvidenceConsents(
+  if (resume.acceptedFindings && acceptanceExpectation) {
+    record = commitRouteFindingAcceptance(
       context,
-      evidence,
-      record.targetCommand,
-      resume.reason ?? 'accepted current findings through an explicit route resume',
-      'accept-findings',
+      acceptanceExpectation,
+      resume,
+      'resume --accept-findings',
     );
   }
   return {
@@ -345,22 +355,138 @@ export function applyRouteSafetyResumeOverride(cwd: string, parsed: ParsedOperat
   };
 }
 
+function routeAcceptanceExpectation(record: RouteSafetyRecord): RouteAcceptanceExpectation {
+  return routeAcceptanceExpectationFromMutation(routeMutationExpectation(record));
+}
+
+function routeMutationExpectation(record: RouteSafetyRecord): RouteAcceptanceExpectation {
+  return {
+    routeDigest: record.lineageDigest ?? record.routeFingerprintDigest,
+    attemptDigest: record.currentAttemptDigest ?? '',
+    reviewRunId: record.lastReviewRunId ?? '',
+    targetCommand: record.targetCommand,
+  };
+}
+
+function routeAcceptanceExpectationFromMutation(expected: RouteAcceptanceExpectation): RouteAcceptanceExpectation {
+  if (!expected.attemptDigest || !expected.reviewRunId) {
+    throw new Error('Cannot accept findings without an exact route attempt and review run. Re-run the route command, then review, before accepting findings.');
+  }
+  return expected;
+}
+
+function mutateExpectedRouteRecord(
+  context: WorkflowContext,
+  expected: RouteAcceptanceExpectation,
+  mutate: (state: RouteSafetyState, record: RouteSafetyRecord) => void,
+): RouteSafetyRecord {
+  return withRouteSafetyStateLock(context.commonDir, context.config, () => {
+    const state = loadRouteSafetyState(context.commonDir, context.config);
+    const record = state.routes[expected.routeDigest];
+    if (
+      !record
+      || (record.currentAttemptDigest ?? '') !== expected.attemptDigest
+      || (record.lastReviewRunId ?? '') !== expected.reviewRunId
+      || record.targetCommand !== expected.targetCommand
+    ) {
+      throw new Error('The route attempt or review run changed while waiting for input. Re-run the route command and inspect the current state.');
+    }
+    mutate(state, record);
+    record.updatedAt = nowIso();
+    state.latestPausedRouteFingerprintDigest = record.routeFingerprintDigest;
+    saveRouteSafetyState(context.commonDir, context.config, state);
+    return record;
+  });
+}
+
+function commitRouteFindingAcceptance(
+  context: WorkflowContext,
+  expected: RouteAcceptanceExpectation,
+  resume: RouteSafetyResumeRecord,
+  source: string,
+): RouteSafetyRecord {
+  const reason = resume.reason?.trim() || 'accepted current findings through an explicit route resume';
+  return withRouteSafetyStateLock(context.commonDir, context.config, () => {
+    const state = loadRouteSafetyState(context.commonDir, context.config);
+    const record = state.routes[expected.routeDigest];
+    if (!record) {
+      throw new Error('The paused route changed before findings could be accepted. Re-run the route command and review the current evidence.');
+    }
+    if (
+      record.currentAttemptDigest !== expected.attemptDigest
+      || record.lastReviewRunId !== expected.reviewRunId
+      || record.targetCommand !== expected.targetCommand
+    ) {
+      throw new Error('The route attempt or review run changed before findings could be accepted. Re-run the route command and review the current evidence.');
+    }
+    if ((record.lastTimedOutGateIds?.length ?? 0) > 0) {
+      throw new Error([
+        'Cannot accept timed-out review gates as findings because they contain no verdict.',
+        ...record.lastTimedOutGateIds!.map((gateId) => `Re-run: pipelane run review --gate ${gateId}`),
+      ].join('\n'));
+    }
+
+    let consentIds: string[] = [];
+    withReviewStateLock(context.commonDir, context.config, () => {
+      const evidence = evaluateReviewEvidenceForPr(context, { command: record.targetCommand });
+      if (evidence.latest?.id !== expected.reviewRunId || !reviewEvidenceIssuesAreAcceptableFindings(evidence)) {
+        throw new Error('Review evidence changed before findings could be accepted. Re-run the route command and inspect the current review findings.');
+      }
+      const reviewState = loadReviewState(context.commonDir, context.config);
+      const consentRecords = buildReviewEvidenceConsentRecords(
+        context,
+        evidence,
+        record.targetCommand,
+        reason,
+        'accept-findings',
+      );
+      const persisted = addReviewConsentRecordsToState(reviewState, consentRecords);
+      consentIds = persisted.map((consent) => consent.id);
+      saveReviewState(context.commonDir, context.config, reviewState);
+    });
+
+    record.resumes = [resume, ...(record.resumes ?? [])].slice(0, 20);
+    record.acceptedFindingsAt = resume.recordedAt;
+    record.acceptedFindingsSource = source;
+    record.acceptedReviewRunId = expected.reviewRunId;
+    record.acceptedAttemptDigest = expected.attemptDigest;
+    record.updatedAt = nowIso();
+    state.latestPausedRouteFingerprintDigest = record.routeFingerprintDigest;
+    try {
+      saveRouteSafetyState(context.commonDir, context.config, state);
+    } catch (error) {
+      try {
+        withReviewStateLock(context.commonDir, context.config, () => {
+          const reviewState = loadReviewState(context.commonDir, context.config);
+          const ids = new Set(consentIds);
+          reviewState.consents = (reviewState.consents ?? []).filter((consent) => !ids.has(consent.id));
+          saveReviewState(context.commonDir, context.config, reviewState);
+        });
+      } catch (rollbackError) {
+        throw new Error(`Route acceptance failed and consent rollback also failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`, { cause: error });
+      }
+      throw error;
+    }
+    return record;
+  });
+}
+
 async function pauseRouteSafety(
   context: WorkflowContext,
-  state: RouteSafetyState,
-  record: RouteSafetyRecord,
+  initialRecord: RouteSafetyRecord,
   options: PauseOptions,
 ): Promise<RouteSafetyPauseResult> {
-  markPaused(state, record, options.reason);
+  let record = mutateExpectedRouteRecord(context, routeMutationExpectation(initialRecord), (state, current) => {
+    markPaused(state, current, options.reason);
+  });
+  const expected = routeMutationExpectation(record);
   if (record.legacyMigration?.status === 'pending') {
-    saveRouteSafetyState(context.commonDir, context.config, state);
     return {
       action: 'stop',
       message: renderRouteSafetyPauseMessage(context, record, options),
     };
   }
   if (!process.stdin.isTTY) {
-    saveRouteSafetyState(context.commonDir, context.config, state);
     return {
       action: 'stop',
       message: renderRouteSafetyPauseMessage(context, record, options),
@@ -372,15 +498,15 @@ async function pauseRouteSafety(
   try {
     const answer = (await rl.question('Enter 1, 2, 3, 4, or 5 [1]: ')).trim();
     if (answer === '' || answer === '1') {
-      saveRouteSafetyState(context.commonDir, context.config, state);
       return {
         action: 'stop',
         message: renderRouteSafetyPauseMessage(context, record, options),
       };
     }
     if (answer === '2') {
-      record.resumes = [makeResumeRecord('one-more-loop', 'tty', { oneMoreLoop: true }), ...(record.resumes ?? [])].slice(0, 20);
-      saveRouteSafetyState(context.commonDir, context.config, state);
+      record = mutateExpectedRouteRecord(context, expected, (_state, current) => {
+        current.resumes = [makeResumeRecord('one-more-loop', 'tty', { oneMoreLoop: true }), ...(current.resumes ?? [])].slice(0, 20);
+      });
       return {
         action: 'stop',
         message: 'Recorded: allow one more fix/review loop for this route. Stop here, fix the findings, then rerun /pipelane review.',
@@ -389,8 +515,9 @@ async function pauseRouteSafety(
     if (answer === '3') {
       const moreLoops = await questionPositiveInteger(rl, 'How many more fix/review loops? ');
       const moreMinutes = await questionPositiveInteger(rl, 'How many more minutes? ');
-      record.resumes = [makeResumeRecord('more-loops-and-minutes', 'tty', { moreLoops, moreMinutes }), ...(record.resumes ?? [])].slice(0, 20);
-      saveRouteSafetyState(context.commonDir, context.config, state);
+      record = mutateExpectedRouteRecord(context, expected, (_state, current) => {
+        current.resumes = [makeResumeRecord('more-loops-and-minutes', 'tty', { moreLoops, moreMinutes }), ...(current.resumes ?? [])].slice(0, 20);
+      });
       return {
         action: 'stop',
         message: `Recorded: allow ${moreLoops} more fix/review loop${moreLoops === 1 ? '' : 's'} and ${moreMinutes} more minutes for this route.`,
@@ -398,7 +525,6 @@ async function pauseRouteSafety(
     }
     if (answer === '4') {
       if ((record.lastTimedOutGateIds?.length ?? 0) > 0) {
-        saveRouteSafetyState(context.commonDir, context.config, state);
         return {
           action: 'stop',
           message: [
@@ -409,7 +535,6 @@ async function pauseRouteSafety(
       }
       const confirmation = (await rl.question('Type "proceed with blocked evidence" to confirm: ')).trim();
       if (confirmation !== 'proceed with blocked evidence') {
-        saveRouteSafetyState(context.commonDir, context.config, state);
         return {
           action: 'stop',
           message: 'Confirmation did not match. Stop here and show review findings.',
@@ -417,7 +542,6 @@ async function pauseRouteSafety(
       }
       const reason = (await rl.question('Why may this exact target and route proceed despite the blocked evidence? ')).trim();
       if (!reason) {
-        saveRouteSafetyState(context.commonDir, context.config, state);
         return { action: 'stop', message: 'A non-empty informed-consent reason is required. Findings remain blocked.' };
       }
       const resume = makeResumeRecord('accept-findings', 'tty', {
@@ -425,20 +549,12 @@ async function pauseRouteSafety(
         confirmation,
         reason,
       });
-      record.resumes = [resume, ...(record.resumes ?? [])].slice(0, 20);
-      record.acceptedFindingsAt = resume.recordedAt;
-      record.acceptedFindingsSource = 'TTY option 4: proceed with blocked evidence';
-      record.acceptedReviewRunId = record.lastReviewRunId;
-      record.acceptedAttemptDigest = record.currentAttemptDigest;
-      recordReviewEvidenceConsents(context, {
-        allowed: false,
-        latest: options.latest ?? null,
-        issues: options.issues ?? [],
-        bypassedIssues: [],
-        consents: [],
-        message: '',
-      }, record.targetCommand, reason, 'accept-findings');
-      saveRouteSafetyState(context.commonDir, context.config, state);
+      record = commitRouteFindingAcceptance(
+        context,
+        routeAcceptanceExpectationFromMutation(expected),
+        resume,
+        'TTY option 4: proceed with blocked evidence',
+      );
       return {
         action: 'continue',
         message: 'Recorded: findings accepted by the user for this exact route and target. The gates remain failed; they were not relabeled as passed.',
@@ -447,14 +563,14 @@ async function pauseRouteSafety(
     if (answer === '5') {
       const maxMoreLoops = await questionPositiveInteger(rl, 'Maximum more fix/review loops? ');
       const maxMoreMinutes = await questionPositiveInteger(rl, 'Maximum more minutes? ');
-      record.resumes = [makeResumeRecord('until-review-passes', 'tty', { maxMoreLoops, maxMoreMinutes }), ...(record.resumes ?? [])].slice(0, 20);
-      saveRouteSafetyState(context.commonDir, context.config, state);
+      record = mutateExpectedRouteRecord(context, expected, (_state, current) => {
+        current.resumes = [makeResumeRecord('until-review-passes', 'tty', { maxMoreLoops, maxMoreMinutes }), ...(current.resumes ?? [])].slice(0, 20);
+      });
       return {
         action: 'stop',
         message: `Recorded: keep going until review passes, with explicit limits of ${maxMoreLoops} more fix/review loop${maxMoreLoops === 1 ? '' : 's'} and ${maxMoreMinutes} more minutes.`,
       };
     }
-    saveRouteSafetyState(context.commonDir, context.config, state);
     return {
       action: 'stop',
       message: renderRouteSafetyPauseMessage(context, record, options),
@@ -751,7 +867,7 @@ function recordExactAttempt(record: RouteSafetyRecord, identity: RouteSafetyRout
 }
 
 function countReviewRun(record: RouteSafetyRecord, reviewRun: ReviewRunRecord): void {
-  const timedOutGateIds = reviewTimedOutGateIds(reviewRun);
+  const timedOutGateIds = reconcileTimedOutGateIds(record.lastTimedOutGateIds ?? [], reviewRun);
   if (record.countedReviewRunIds.includes(reviewRun.id)) {
     record.lastReviewRunId = reviewRun.id;
     record.lastReviewStatus = reviewRun.status;
@@ -770,6 +886,18 @@ function countReviewRun(record: RouteSafetyRecord, reviewRun: ReviewRunRecord): 
   if (reviewRunUsesAiReview(reviewRun)) {
     record.aiReviewRuns += 1;
   }
+}
+
+function reconcileTimedOutGateIds(previous: string[], reviewRun: ReviewRunRecord): string[] {
+  if (!reviewRun.gateFilter) return reviewTimedOutGateIds(reviewRun);
+  const unresolved = new Set(previous);
+  const retried = reviewRun.gates.find((gate) => gate.gateId === reviewRun.gateFilter);
+  if (retried?.outcome === 'timeout') {
+    unresolved.add(reviewRun.gateFilter);
+  } else if (retried && (retried.status === 'passed' || retried.status === 'failed')) {
+    unresolved.delete(reviewRun.gateFilter);
+  }
+  return [...unresolved].sort();
 }
 
 function reviewRunUsesAiReview(reviewRun: ReviewRunRecord): boolean {
