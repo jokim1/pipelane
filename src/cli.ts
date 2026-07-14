@@ -23,6 +23,7 @@ import { loadDeployConfig } from './operator/release-gate.ts';
 import {
   formatSecretProvisioningResult,
   provisionRepositorySecrets,
+  SECRET_PROVISIONING_GUIDE_URL,
 } from './operator/secret-provisioning.ts';
 import { resolveRepoRoot } from './operator/state.ts';
 import { bootstrapWorktreeNodeModulesIfNeeded } from './operator/task-workspaces.ts';
@@ -87,7 +88,13 @@ function parseSetupArgs(args: string[]): { yes: boolean; provisionSecrets: boole
       continue;
     }
     if (token === '--help' || token === '-h') {
-      process.stdout.write('pipelane setup [--yes] [--provision-secrets] [--rotate-secrets]\n');
+      process.stdout.write([
+        'pipelane setup [--yes] [--provision-secrets] [--rotate-secrets]',
+        '',
+        'Private CI inputs are declared by individual repositories; Pipelane does not require secrets or a corpus globally.',
+        `Guide: ${SECRET_PROVISIONING_GUIDE_URL}`,
+        '',
+      ].join('\n'));
       process.exit(0);
     }
     throw new Error(`Unknown flag for pipelane setup: ${token}`);

@@ -3,6 +3,7 @@ import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from 'nod
 import path from 'node:path';
 
 export const SECRET_PROVISIONING_MANIFEST = '.github/pipelane-provisioning.json';
+export const SECRET_PROVISIONING_GUIDE_URL = 'https://github.com/jokim1/pipelane/blob/main/docs/public/SECRET_PROVISIONING.md';
 const GITHUB_SECRET_MAX_BYTES = 48 * 1024;
 const SECRET_NAME_PATTERN = /^[A-Z_][A-Z0-9_]*$/;
 const ENVIRONMENT_NAME_PATTERN = /^[A-Z_][A-Z0-9_]*$/;
@@ -61,6 +62,8 @@ export interface SecretProvisioningEntryResult {
   name: string;
   status: SecretProvisioningStatus;
   detail: string;
+  purpose: string;
+  nextStep: string;
 }
 
 export interface SecretProvisioningResult {
@@ -145,13 +148,19 @@ export function provisionRepositorySecrets(
   const resolvedValues = new Map<string, string>();
 
   for (const secret of manifest.github.repositorySecrets) {
+    const guidance = secretGuidance(secret);
     if (existing.has(secret.name) && !rotate) {
-      entries.push({ name: secret.name, status: 'existing', detail: 'already configured; preserved' });
+      entries.push({
+        name: secret.name,
+        status: 'existing',
+        detail: 'already configured; preserved',
+        ...guidance,
+      });
       continue;
     }
     const resolved = resolveSecretValue(repoRoot, secret.source, env);
     if (!resolved.ok) {
-      entries.push({ name: secret.name, status: 'blocked', detail: resolved.detail });
+      entries.push({ name: secret.name, status: 'blocked', detail: resolved.detail, ...guidance });
       continue;
     }
     resolvedValues.set(secret.name, resolved.value);
@@ -159,6 +168,7 @@ export function provisionRepositorySecrets(
       name: secret.name,
       status: apply ? 'provisioned' : 'ready',
       detail: apply ? `${resolved.detail}; installed through gh stdin` : resolved.detail,
+      ...guidance,
     });
   }
 
@@ -189,28 +199,75 @@ export function formatSecretProvisioningResult(
   provisionCommand = '/pipelane configure --provision-secrets',
 ): string[] {
   const lines = [
-    `Repository secret provisioning (${SECRET_PROVISIONING_MANIFEST}):`,
+    `Private CI inputs declared by this repository (${SECRET_PROVISIONING_MANIFEST}):`,
+    'Pipelane itself does not require these inputs. This repository requested them so its GitHub Actions workflows can use private credentials or files that are not committed to Git.',
   ];
   for (const entry of result.entries) {
-    const marker = entry.status === 'existing'
-      ? '✓'
-      : entry.status === 'provisioned'
-        ? '+'
-        : entry.status === 'ready'
-          ? '~'
-          : '!';
-    lines.push(`- ${marker} ${entry.name}: ${entry.detail}`);
+    const status = entry.status === 'existing' ? 'configured' : entry.status;
+    lines.push(`- ${entry.name}`);
+    lines.push(`  Status: ${status} — ${entry.detail}`);
+    lines.push(`  Why: ${entry.purpose}`);
+    if (entry.status === 'blocked') lines.push(`  Next: ${entry.nextStep}`);
   }
-  if (!result.applied && result.entries.some((entry) => entry.status === 'ready')) {
-    lines.push(`Run \`${provisionCommand}\` to install the ready values.`);
-  }
-  if (result.entries.some((entry) => entry.status === 'blocked')) {
-    lines.push('Blocked values were not installed. Supply the named environment/file source, then rerun provisioning.');
-  }
-  if (result.applied && result.ok) {
-    lines.push('All declared repository secrets are configured. Existing values were preserved unless rotation was requested.');
+  const blocked = result.entries.some((entry) => entry.status === 'blocked');
+  const ready = result.entries.some((entry) => entry.status === 'ready');
+  if (blocked || ready) {
+    lines.push('Next steps:');
+    let step = 1;
+    if (blocked) {
+      lines.push(`${step}. Provide only the blocked local inputs using the "Next" instructions above.`);
+      step += 1;
+    }
+    if (!result.applied || blocked) {
+      lines.push(`${step}. Run \`${provisionCommand}\`. Ready values will be installed; existing GitHub secrets will be preserved.`);
+      step += 1;
+    }
+    lines.push(`${step}. Rerun \`/pipelane setup\` and confirm every declared input says "already configured".`);
+  } else {
+    lines.push('Setup complete: every input declared by this repository is already configured. No corpus or secret setup is required by Pipelane itself.');
   }
   return lines;
+}
+
+function secretGuidance(secret: RepositorySecretProvision): { purpose: string; nextStep: string } {
+  const declaredPurpose = secret.description?.trim();
+  let benefit: string;
+  let nextStep: string;
+  if (secret.source.type === 'environment') {
+    benefit = 'It lets this repository\'s CI use a private value without committing that value to Git.';
+    nextStep = `Set ${secret.source.variable} in the current environment, then rerun provisioning.`;
+  } else if (secret.source.type === 'cloudflare-api-token') {
+    benefit = 'It lets this repository\'s CI call Cloudflare without committing an API token to Git.';
+    const sources = [`environment variable ${secret.source.variable}`];
+    if (secret.source.dotenvFile && secret.source.dotenvVariable) {
+      sources.push(`${secret.source.dotenvFile} with ${secret.source.dotenvVariable}=...`);
+    }
+    sources.push('Wrangler authenticated with a durable API token');
+    nextStep = `Provide a durable Cloudflare API token through ${joinChoices(sources)}, then rerun provisioning. OAuth login is not copied into CI.`;
+  } else if (secret.source.validator === 'chat-heldout-corpus-v1') {
+    benefit = 'It lets this repository\'s safety workflow test private cases that implementation code cannot tune against; it is not a Pipelane-wide requirement.';
+    nextStep = secret.source.defaultPath
+      ? `Create ${secret.source.defaultPath}, or set ${secret.source.pathVariable} to another corpus file. Format guide: ${SECRET_PROVISIONING_GUIDE_URL}#held-out-corpus-format.`
+      : `Set ${secret.source.pathVariable} to the corpus file. Format guide: ${SECRET_PROVISIONING_GUIDE_URL}#held-out-corpus-format.`;
+  } else {
+    benefit = 'It makes a private local file available to this repository\'s CI without committing the file to Git.';
+    nextStep = secret.source.defaultPath
+      ? `Create ${secret.source.defaultPath}, or set ${secret.source.pathVariable} to another file, then rerun provisioning.`
+      : `Set ${secret.source.pathVariable} to the file, then rerun provisioning.`;
+  }
+  return {
+    purpose: declaredPurpose ? `${asSentence(declaredPurpose)} ${benefit}` : benefit,
+    nextStep,
+  };
+}
+
+function asSentence(value: string): string {
+  return /[.!?]$/.test(value) ? value : `${value}.`;
+}
+
+function joinChoices(values: string[]): string {
+  if (values.length < 2) return values[0] ?? '';
+  return `${values.slice(0, -1).join(', ')}, or ${values.at(-1)}`;
 }
 
 function parseSecretSource(raw: unknown, location: string, repoRoot: string): RepositorySecretSource {

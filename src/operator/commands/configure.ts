@@ -1226,7 +1226,8 @@ Usage:
 
 Repository-secret provisioning reads the app-owned
 .github/pipelane-provisioning.json manifest. Existing secrets are preserved by
-default; --rotate-secrets explicitly replaces every declared value.
+default; --rotate-secrets explicitly replaces every declared value. Pipelane
+does not require secrets or a corpus in repositories without this manifest.
 
 Flags (all optional; any omitted field keeps its current value):
   --platform=<value>

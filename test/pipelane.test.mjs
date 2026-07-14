@@ -2710,6 +2710,7 @@ test('package files include README-linked public markdown docs', () => {
     'docs/public/ORCHESTRATION.md',
     'docs/public/PIPELANE_BOARD.md',
     'docs/public/PIPELANE_API.md',
+    'docs/public/SECRET_PROVISIONING.md',
   ];
 
   for (const docPath of expectedDocs) {
@@ -29736,6 +29737,23 @@ test('configure --json is idempotent: re-running with the same flags produces id
   }
 });
 
+test('setup introduces no secret or corpus requirement when the repository has no provisioning manifest', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    const help = runCli(['setup', '--help'], repoRoot);
+    assert.match(help.stdout, /Pipelane does not require secrets or a corpus globally/);
+    assert.match(help.stdout, /github\.com\/jokim1\/pipelane\/blob\/main\/docs\/public\/SECRET_PROVISIONING\.md/);
+    const result = runCli(['setup'], repoRoot);
+    assert.equal(result.status, 0);
+    assert.doesNotMatch(result.stdout, /Private CI inputs/);
+    assert.doesNotMatch(result.stdout, /corpus/i);
+    assert.doesNotMatch(result.stdout, /provision-secrets/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('setup discovers ready repository secrets without writing or exposing their values', () => {
   const repoRoot = createRepo();
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
@@ -29749,7 +29767,11 @@ test('setup discovers ready repository secrets without writing or exposing their
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
     writeSecretProvisioningManifest(repoRoot, [
-      { name: 'CLOUDFLARE_AI_EVAL_TOKEN', source: { type: 'environment', variable: 'TEST_CF_AI_TOKEN' } },
+      {
+        name: 'CLOUDFLARE_AI_EVAL_TOKEN',
+        description: 'Runs the repository live moderation evaluation',
+        source: { type: 'environment', variable: 'TEST_CF_AI_TOKEN' },
+      },
       {
         name: 'CHAT_HELDOUT_CORPUS_BASE64',
         source: { type: 'file-base64', pathVariable: 'TEST_HELDOUT_PATH', validator: 'chat-heldout-corpus-v1' },
@@ -29767,8 +29789,13 @@ test('setup discovers ready repository secrets without writing or exposing their
 
     const result = runCli(['setup'], repoRoot, env);
     assert.equal(result.status, 0);
-    assert.match(result.stdout, /CLOUDFLARE_AI_EVAL_TOKEN: read from environment variable TEST_CF_AI_TOKEN/);
-    assert.match(result.stdout, /CHAT_HELDOUT_CORPUS_BASE64: validated and Base64-encoded file/);
+    assert.match(result.stdout, /Pipelane itself does not require these inputs/);
+    assert.match(result.stdout, /- CLOUDFLARE_AI_EVAL_TOKEN\n  Status: ready — read from environment variable TEST_CF_AI_TOKEN/);
+    assert.match(result.stdout, /Why: Runs the repository live moderation evaluation\. It lets this repository's CI use a private value without committing that value to Git\./);
+    assert.match(result.stdout, /- CHAT_HELDOUT_CORPUS_BASE64\n  Status: ready — validated and Base64-encoded file/);
+    assert.match(result.stdout, /not a Pipelane-wide requirement/);
+    assert.match(result.stdout, /Next steps:\n1\. Run `\/pipelane setup --provision-secrets`/);
+    assert.match(result.stdout, /2\. Rerun `\/pipelane setup` and confirm every declared input says "already configured"/);
     assert.match(result.stdout, /\/pipelane setup --provision-secrets/);
     assert.doesNotMatch(result.stdout, new RegExp(token));
     assert.doesNotMatch(result.stdout, /great session tonight/);
@@ -29814,8 +29841,8 @@ test('setup provisions missing secrets through stdin, preserves existing values,
 
     const first = runCli(['setup', '--provision-secrets'], repoRoot, env);
     assert.equal(first.status, 0);
-    assert.match(first.stdout, /CLOUDFLARE_AI_EVAL_TOKEN: already configured; preserved/);
-    assert.match(first.stdout, /CHAT_HELDOUT_CORPUS_BASE64: .*installed through gh stdin/);
+    assert.match(first.stdout, /- CLOUDFLARE_AI_EVAL_TOKEN\n  Status: configured — already configured; preserved/);
+    assert.match(first.stdout, /- CHAT_HELDOUT_CORPUS_BASE64\n  Status: provisioned — .*installed through gh stdin/);
     assert.doesNotMatch(first.stdout, new RegExp(token));
     assert.doesNotMatch(first.stdout, /restricted adversarial case/);
     const afterFirst = JSON.parse(readFileSync(stateFile, 'utf8'));
@@ -29920,7 +29947,7 @@ test('configure secret provisioning rotates only when explicitly requested', () 
     assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls.length, 0);
     const rotated = runCli(['configure', '--provision-secrets', '--rotate-secrets'], repoRoot, env);
     assert.equal(rotated.status, 0);
-    assert.match(rotated.stdout, /ROTATABLE_TOKEN: .*installed through gh stdin/);
+    assert.match(rotated.stdout, /- ROTATABLE_TOKEN\n  Status: provisioned — .*installed through gh stdin/);
     assert.doesNotMatch(rotated.stdout, /new-value-never-print/);
     assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls.length, 1);
   } finally {
@@ -29958,6 +29985,8 @@ test('Cloudflare provisioning refuses to copy refreshable Wrangler OAuth credent
     const result = runCli(['configure', '--provision-secrets'], repoRoot, env, true);
     assert.equal(result.status, 64);
     assert.match(result.stdout, /Wrangler authentication is oauth; CI requires a durable API token/);
+    assert.match(result.stdout, /Next: Provide a durable Cloudflare API token through environment variable TEST_CF_AI_TOKEN/);
+    assert.match(result.stdout, /OAuth login is not copied into CI/);
     assert.doesNotMatch(result.stdout, /oauth-never-copy/);
     assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls, []);
   } finally {
@@ -30031,6 +30060,11 @@ test('manifest-relative secret files cannot escape the repository through symlin
 
     assert.equal(result.status, 64);
     assert.match(result.stdout, /escapes the repository or is a symlink/);
+    assert.match(result.stdout, /Next: Create \.pipelane\/secrets\/chat-heldout-corpus\.json, or set TEST_HELDOUT_PATH to another corpus file/);
+    assert.match(result.stdout, /github\.com\/jokim1\/pipelane\/blob\/main\/docs\/public\/SECRET_PROVISIONING\.md#held-out-corpus-format/);
+    assert.match(result.stdout, /1\. Provide only the blocked local inputs/);
+    assert.match(result.stdout, /2\. Run `\/pipelane setup --provision-secrets`/);
+    assert.match(result.stdout, /3\. Rerun `\/pipelane setup`/);
     assert.doesNotMatch(result.stdout, /must not escape/);
     assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls, []);
   } finally {

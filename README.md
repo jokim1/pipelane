@@ -222,53 +222,21 @@ and workflow state live under `$PIPELANE_HOME` (default `~/.pipelane`). Pipelane
 does not create tracked `.claude/commands`, `.agents/skills`, package scripts,
 package lockfiles, or Pipelane docs in the application repo.
 
-Applications can opt into setup-time GitHub repository-secret provisioning by
-committing `.github/pipelane-provisioning.json`. Plain `/pipelane setup`
-inspects the manifest and reports whether each value is already configured,
-available locally, or blocked. `/pipelane setup --provision-secrets` installs
-available values through `gh secret set` over stdin. Existing secrets are
-preserved; use `--rotate-secrets` only when replacement is intentional.
+Pipelane does not generally require Cloudflare credentials, private corpora, or
+new repository secrets. A repository can opt in by committing
+`.github/pipelane-provisioning.json` when its own CI or deploy workflow needs a
+private credential or file. Repositories without that manifest keep the same
+setup behavior as before.
 
-The manifest supports three closed source adapters: an environment variable, a
-durable Cloudflare API token (environment variable, an explicitly allowlisted
-dotenv key, or Wrangler API-token auth), and a Base64-encoded file. File inputs
-can opt into held-out chat-corpus schema validation before any secret is
-written. Pipelane never prints a resolved value and never runs a command from
-the manifest.
+For an opted-in repository, plain `/pipelane setup` explains what each declared
+input enables, checks its status, and prints the exact next steps. Run
+`/pipelane setup --provision-secrets` to install ready values through GitHub CLI
+stdin without printing them or committing them to Git. Existing secrets are
+preserved; rotation must be explicit.
 
-```json
-{
-  "version": 1,
-  "github": {
-    "repositorySecrets": [
-      {
-        "name": "CLOUDFLARE_AI_EVAL_TOKEN",
-        "source": {
-          "type": "cloudflare-api-token",
-          "variable": "CLOUDFLARE_AI_EVAL_TOKEN",
-          "wranglerCwd": "web",
-          "dotenvFile": "web/.env",
-          "dotenvVariable": "CLOUDFLARE_API_TOKEN"
-        }
-      },
-      {
-        "name": "CHAT_HELDOUT_CORPUS_BASE64",
-        "source": {
-          "type": "file-base64",
-          "pathVariable": "CHAT_HELDOUT_CORPUS_PATH",
-          "defaultPath": ".pipelane/secrets/chat-heldout-corpus.json",
-          "validator": "chat-heldout-corpus-v1"
-        }
-      }
-    ]
-  }
-}
-```
-
-Cloudflare OAuth sessions are intentionally not copied into CI because they
-are refreshable user credentials. If the allowlisted dotenv key and Wrangler
-both lack a durable API token, setup reports the blocked source and leaves the
-GitHub secret unchanged.
+See [Repository secrets and private CI inputs](docs/public/SECRET_PROVISIONING.md)
+for the short step-by-step guide, including Cloudflare tokens, held-out corpus
+files, status meanings, verification, and troubleshooting.
 
 Core commands:
 

@@ -497,8 +497,9 @@ Usage:
 Start here:
   /pipelane setup [--yes] [--provision-secrets] [--rotate-secrets]
       Run clean first-time setup or repair with the machine-local runtime.
-      Repo-owned .github/pipelane-provisioning.json manifests are inspected by
-      default; --provision-secrets installs ready GitHub repository secrets.
+      Only repos with .github/pipelane-provisioning.json declare private CI
+      inputs. Setup explains why each input exists and what to do next;
+      --provision-secrets installs ready GitHub repository secrets.
 
   /pipelane configure [--json] [flags...]
       Fill or update Deploy Configuration values such as staging/prod URLs,
@@ -506,7 +507,8 @@ Start here:
 
   /pipelane configure --provision-secrets [--rotate-secrets]
       Install app-declared repository secrets without changing deploy config.
-      Existing secrets are preserved unless rotation is explicit.
+      Existing secrets are preserved unless rotation is explicit. Repos without
+      a provisioning manifest have no Pipelane secret or corpus requirement.
 
   /pipelane update [--check] [--yes] [--json]
       Check or update Pipelane itself when this repo has a pinned install.
