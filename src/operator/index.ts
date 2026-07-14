@@ -185,7 +185,7 @@ export function classifyOperatorManagedStateSensitivity(parsed: ParsedOperatorAr
       const subcommand = parsed.positional[0] ?? '';
       if (subcommand === '' ) return 'current-state';
       if (subcommand === 'gc') return 'independent-recovery';
-      if (subcommand === 'setup' || subcommand === 'pass' || subcommand === 'attest' || subcommand === 'override') return 'observe';
+      if (subcommand === 'setup' || subcommand === 'pass' || subcommand === 'attest' || subcommand === 'record' || subcommand === 'override') return 'observe';
       throw new Error(`Managed local-state sensitivity is not classified for review ${subcommand}.`);
     }
     case 'orchestrate': {
@@ -230,7 +230,8 @@ Pipelane commands:
   devmode
   new
   adopt
-  resume
+  resume [--spin-off <review-run/gate/Fxxx> --spinoff-task <label> --reason <why-new-scope>]
+         Spin-off records exact-HEAD informed consent for genuine new scope, including critical findings.
   repo-guard
   pr
   merge
@@ -240,6 +241,7 @@ Pipelane commands:
   deploy
   clean
   review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human]
+  review record --gate code-review-high --task <task> --tool <name> --summary <text> --findings-count <n> --artifact <path> [--sha <expected-head>]
   review pass --gate <id> --message <text>
   review attest --gate <id> --status <passed|failed> --report-file <path> --findings-file <path> --provenance-file <path> --message <text> [--substitute-strict --reason <reason> --scope <exact-route-action>]
   review override --gate <id> --reason <informed-consent-reason> [--scope <exact-route-action>]

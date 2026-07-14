@@ -7,6 +7,7 @@ import {
 import {
   appendReviewOverrideRecord,
   appendReviewConsentRecords,
+  assertRecordedReviewArtifact,
   ensureTaskBindingId,
   formatWorkflowCommand,
   loadAllTaskLocks,
@@ -21,6 +22,7 @@ import {
   type ReviewAcceptanceRecord,
   type ReviewConsentKind,
   type ReviewConsentRecord,
+  type ReviewExternalEvidenceRecord,
   type ReviewGateConfig,
   type ReviewGateRunRecord,
   type ReviewRunRecord,
@@ -278,7 +280,7 @@ export function evaluateReviewEvidenceForPr(
     currentWorktreeMaterialTreeHash: target.worktreeMaterialTreeHash,
     currentWorktreeMaterialTreeReliable: target.worktreeMaterialTreeReliable,
   });
-  const latest = selectedLatest
+  const attachedLatest = selectedLatest
     ? attachEquivalentReviewGateEvidence({
         context,
         reviewRun: selectedLatest,
@@ -292,9 +294,13 @@ export function evaluateReviewEvidenceForPr(
         currentWorktreeMaterialTreeReliable: target.worktreeMaterialTreeReliable,
       })
     : null;
+  const latest = attachedLatest
+    ? applyReviewFindingDispositions(attachedLatest, reviewState.findingDispositions ?? [], target)
+    : null;
   const issues = collectReviewEvidenceIssues({
     latest,
     expectedGates,
+    externalEvidence: reviewState.externalEvidence ?? [],
     strictIndependentAi: (context.config.reviewGates?.policyVersion ?? 1) >= 2,
     strictEvidence: context.config.reviewGates?.enforcementMode === 'strict-v3',
     artifactRoot: reviewArtifactRoot(context.commonDir, context.config),
@@ -338,6 +344,61 @@ export function evaluateReviewEvidenceForPr(
         ? formatReviewConsentMessage(routeAction, bypassedIssues, activeConsents)
         : formatReviewEvidenceBlocker(context, remainingIssues, options.command, latest, activeConsents),
   };
+}
+
+function applyReviewFindingDispositions(
+  reviewRun: ReviewRunRecord,
+  dispositions: NonNullable<ReturnType<typeof loadReviewState>['findingDispositions']>,
+  target: ReviewEvidenceTarget,
+): ReviewRunRecord {
+  const applicable = dispositions.filter((record) => {
+    if (
+      record.reviewRunId !== reviewRun.id
+      || record.branchName !== target.branchName
+      || record.sha !== target.sha
+      || record.worktreeStatusDigest !== target.worktreeStatusDigest
+      || record.worktreeMaterialTreeHash !== target.worktreeMaterialTreeHash
+      || record.taskBindingId !== target.taskBindingId
+      || record.reviewTargetDigest !== target.reviewTargetDigest
+    ) return false;
+    try {
+      assertRecordedReviewArtifact(record.artifact);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  if (applicable.length === 0) return reviewRun;
+  const byGate = new Map<string, Set<string>>();
+  for (const disposition of applicable) {
+    const ids = byGate.get(disposition.gateId) ?? new Set<string>();
+    ids.add(disposition.finding.id);
+    byGate.set(disposition.gateId, ids);
+  }
+  let changed = false;
+  const gates = reviewRun.gates.map((gate): ReviewGateRunRecord => {
+    const ids = byGate.get(gate.gateId);
+    if (!ids || !gate.result?.findingsKnown || !gate.findings?.some((finding) => ids.has(finding.id))) return gate;
+    const findings = gate.findings.filter((finding) => !ids.has(finding.id));
+    const blockingCount = findings.filter((finding) => finding.severity === 'critical' || finding.severity === 'warning').length;
+    const advisoryCount = findings.filter((finding) => finding.severity === 'nit').length;
+    const effectiveStatus = blockingCount > 0 ? 'failed' as const : 'passed' as const;
+    const dispositionCount = gate.findings.length - findings.length;
+    changed = true;
+    return {
+      ...gate,
+      status: effectiveStatus,
+      summary: `${gate.summary} (${dispositionCount} finding${dispositionCount === 1 ? '' : 's'} satisfied by spin-off disposition at this exact HEAD; original review result remains ${gate.result.declaredStatus})`,
+      findings,
+      result: {
+        ...gate.result,
+        effectiveStatus,
+        blockingCount,
+        advisoryCount,
+      },
+    };
+  });
+  return changed ? { ...reviewRun, status: summarizeReviewRunStatus(gates), gates } : reviewRun;
 }
 
 export function reviewEvidenceTargetsEqual(left: ReviewEvidenceTarget, right: ReviewEvidenceTarget): boolean {
@@ -487,6 +548,7 @@ export function formatReviewEvidenceBlocker(
 function collectReviewEvidenceIssues(options: {
   latest: ReviewRunRecord | null;
   expectedGates: ReviewGateConfig[];
+  externalEvidence: ReviewExternalEvidenceRecord[];
   strictIndependentAi: boolean;
   strictEvidence: boolean;
   artifactRoot: string;
@@ -506,6 +568,7 @@ function collectReviewEvidenceIssues(options: {
   const {
     latest,
     expectedGates,
+    externalEvidence,
     strictIndependentAi,
     strictEvidence,
     artifactRoot,
@@ -641,7 +704,27 @@ function collectReviewEvidenceIssues(options: {
     const blocking = gate.blocking !== false;
     if (!blocking) continue;
     const expected = expectedGates.find((candidate) => candidate.id === gate.gateId);
-    if (strictEvidence && (gate.type === 'skill' || gate.type === 'agent') && gate.status === 'passed') {
+    const recordedExternal = gate.externalEvidenceId
+      ? externalEvidence.find((record) => record.id === gate.externalEvidenceId)
+      : undefined;
+    let recordedExternalValid = false;
+    if (gate.externalEvidenceId) {
+      const error = validateRecordedExternalReviewEvidence({
+        reviewRun: latest,
+        gate,
+        expected,
+        record: recordedExternal,
+        policyVersion: expectedPolicyVersion,
+        enforcementMode: expectedEnforcementMode,
+        currentReviewTargetDigest,
+      });
+      if (error) {
+        issues.push({ status: 'incomplete', gateId: gate.gateId, message: error, blocking, gate });
+      } else {
+        recordedExternalValid = true;
+      }
+    }
+    if (strictEvidence && (gate.type === 'skill' || gate.type === 'agent') && gate.status === 'passed' && !recordedExternalValid) {
       const strictSkill = expected?.id === 'karpathy-diff' || expected?.id === 'karpathy-audit';
       const capabilityOk = gate.capability?.wrapperCompatible === true
         && gate.capability.contractSupplied === true
@@ -727,6 +810,45 @@ function collectReviewEvidenceIssues(options: {
   }
 
   return issues.filter((issue) => issue.blocking);
+}
+
+function validateRecordedExternalReviewEvidence(options: {
+  reviewRun: ReviewRunRecord;
+  gate: ReviewGateRunRecord;
+  expected: ReviewGateConfig | undefined;
+  record: ReviewExternalEvidenceRecord | undefined;
+  policyVersion: number;
+  enforcementMode: ReviewExternalEvidenceRecord['enforcementMode'];
+  currentReviewTargetDigest: string;
+}): string | null {
+  const { reviewRun, gate, expected, record } = options;
+  if (!record) return `blocking gate ${gate.gateId} references missing recorded external review evidence ${gate.externalEvidenceId}`;
+  if (!expected || gate.gateId !== 'code-review-high' || record.gateId !== gate.gateId) {
+    return `recorded external review evidence ${record.id} is not sanctioned for gate ${gate.gateId}`;
+  }
+  if (
+    record.gateDefinitionHash !== reviewGateDefinitionHash(expected)
+    || record.policyVersion !== options.policyVersion
+    || record.enforcementMode !== options.enforcementMode
+  ) {
+    return `recorded external review evidence ${record.id} is stale for the current ${gate.gateId} definition or policy`;
+  }
+  if (
+    record.branchName !== reviewRun.branchName
+    || record.sha !== reviewRun.sha
+    || record.worktreeStatusDigest !== (reviewRun.worktreeStatusDigest ?? '')
+    || record.worktreeMaterialTreeHash !== (reviewRun.worktreeMaterialTreeHash ?? '')
+    || record.taskBindingId !== (reviewRun.taskBindingId ?? '')
+    || record.reviewTargetDigest !== options.currentReviewTargetDigest
+  ) {
+    return `recorded external review evidence ${record.id} is for a different branch, HEAD, task binding, or worktree state`;
+  }
+  try {
+    assertRecordedReviewArtifact(record.artifact);
+  } catch (error) {
+    return `recorded external review evidence ${record.id} failed artifact integrity: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  return null;
 }
 
 function attachEquivalentReviewGateEvidence(options: {

@@ -2189,6 +2189,7 @@
   </div>
 
   <script>
+    const BOARD_SESSION_TOKEN = '__PIPELANE_BOARD_SESSION_TOKEN__';
     const DEFAULT_BOARD_TITLE = 'Pipelane';
     const DEFAULT_BOARD_SUBTITLE = 'Pipelane — the release cockpit for AI vibe coders. Branch pipeline triage, action preflight, execution follow-through, and cleanup discipline.';
     const BRANCH_COLUMN_STORAGE_KEY = 'pipelane.branchLedger.branchColumnWidth';
@@ -2747,12 +2748,17 @@
     }
 
     async function fetchJson(path, options = {}) {
+      const method = String(options.method || 'GET').toUpperCase();
+      const headers = {
+        'Content-Type': 'application/json',
+        ...(method === 'GET' || method === 'HEAD'
+          ? {}
+          : { 'X-Pipelane-Board-Session': BOARD_SESSION_TOKEN }),
+        ...(options.headers || {}),
+      };
       const response = await fetch(path, {
-        headers: {
-          'Content-Type': 'application/json',
-          ...(options.headers || {}),
-        },
         ...options,
+        headers,
       });
       const text = await response.text();
       const data = text ? JSON.parse(text) : {};

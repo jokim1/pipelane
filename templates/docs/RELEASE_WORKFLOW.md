@@ -110,9 +110,33 @@ Run deterministic checks before AI review whenever this repo has them:
 4. read-only traceability review such as `karpathy-diff`
 5. specialist review when needed: security, design, QA, docs drift
 
-For manual review gates, run the referenced skill, fix any findings, then
-record the clean gate with Pipelane, for example
-`pipelane run review pass --gate gstack-review --message "Ran /review clean"`.
+For a substantive branch, run a broad multi-angle review before entering the
+lane, fold its findings in batches, then record the clean external review at
+the final HEAD:
+
+```bash
+pipelane run review record --gate code-review-high --task <task> \
+  --tool "<reviewer name>" --summary "<one-line result>" \
+  --findings-count <n> --artifact <review-report>
+```
+
+The record is evidence, not a waiver, and is bound to the exact branch, HEAD,
+worktree state, task, artifact digest, and gate definition. A new commit makes
+it stale. `karpathy-diff` still runs at each shipping HEAD as a clean-pass
+check, not a discovery engine. Use `review pass` only for human approval gates;
+use `review override` only for an explicit informed-consent waiver.
+
+When a real review finding requires a separate subsystem or follow-up slice,
+record the individual disposition with
+`pipelane run resume --spin-off <review-run/gate/Fxxx> --spinoff-task "<label>" --reason "<why this is new scope>"`.
+Pipelane writes a durable hashed follow-up artifact and carries the disposition
+into later Karpathy prompts as delimited untrusted data. The original review
+stays failed; the finding is shown as satisfied by disposition at that exact
+HEAD, so rerun the paused route rather than spending tokens on an unchanged
+review. All severities remain eligible. Spinning off a critical finding records
+explicit informed consent that it will not block release or deploy at that
+HEAD. Do not spin off a live defect in code shipping now; fold it or accept it
+explicitly.
 
 Use `/fix` to repair bugs, review findings, CI failures, and code-quality
 issues. Use `/fix rethink` for planning-only architecture review before large

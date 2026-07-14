@@ -13,6 +13,7 @@ import {
 } from '../review-gates.ts';
 import {
   blockingAiReviewEvidenceBlocker,
+  createReviewActorIdentity,
   resolveReviewActorIdentity,
   resolveReviewAuthorIdentity,
 } from '../review-identity.ts';
@@ -28,7 +29,9 @@ import { readWorktreeStatusSnapshot, type WorktreeStatusSnapshot } from '../work
 import { DEPLOY_STATE_KEY_ENV, ORCHESTRATION_STATE_KEY_ENV, PROBE_STATE_KEY_ENV, REVIEW_STATE_KEY_ENV } from '../integrity.ts';
 import {
   appendReviewAcceptanceRecord,
+  appendReviewExternalEvidenceRecord,
   appendReviewRunRecord,
+  assertRecordedReviewArtifact,
   ensureTaskBindingId,
   formatWorkflowCommand,
   loadAllTaskLocks,
@@ -44,6 +47,7 @@ import {
   resolveReadableConfigPath,
   reviewAcceptanceReasonHash,
   reviewAcceptanceStatePath,
+  recordedReviewArtifactReference,
   reviewStatePath,
   reviewArtifactRoot,
   resolveWorkflowContext,
@@ -57,6 +61,7 @@ import {
   type ReviewGateConfig,
   type ReviewCapabilityEvidence,
   type ReviewConsentRecord,
+  type ReviewExternalEvidenceRecord,
   type ReviewGatePhase,
   type ReviewProfile,
   type ReviewGateRunRecord,
@@ -77,6 +82,7 @@ import {
   currentCheckoutReviewEvidenceTarget,
   evaluateReviewEvidenceForPr,
   recordReviewEvidenceConsents,
+  reviewEvidenceTargetsEqual,
   reviewGateDefinitionHash,
   type ReviewEvidenceTarget,
 } from '../review-enforcement.ts';
@@ -88,12 +94,14 @@ import {
   providerNativeJsonSchema,
   parseLegacyRoleEquivalentEnvelope,
   ReviewProtocolFramer,
+  renderDispositionedReviewFindingsPrompt,
   renderStrictReviewPrompt,
   resolveReviewIntent,
   resolveRoleEquivalentCapability,
   resolveTrustedSkillCapability,
   taskBriefIntentText,
   type BuiltReviewTarget,
+  type ReviewDispositionPromptEntry,
   type ResolvedReviewCapability,
   type TrustedSkillRoot,
 } from '../review-contract.ts';
@@ -390,6 +398,10 @@ export async function handleReview(cwd: string, parsed: ParsedOperatorArgs): Pro
     }
     return;
   }
+  if (subcommand === 'record') {
+    handleReviewRecord(cwd, parsed);
+    return;
+  }
   if (subcommand === 'override') {
     handleReviewOverride(cwd, parsed);
     return;
@@ -400,6 +412,94 @@ export async function handleReview(cwd: string, parsed: ParsedOperatorArgs): Pro
   }
 
   await handleReviewRun(cwd, parsed);
+}
+
+function handleReviewRecord(cwd: string, parsed: ParsedOperatorArgs): void {
+  const context = resolveWorkflowContext(cwd);
+  const gateId = parsed.flags.reviewGate.trim();
+  if (gateId !== 'code-review-high') {
+    throw new Error(`review record accepts code-review-high only. ${gateId || '<empty>'} must run through its configured gate; karpathy-diff remains the per-HEAD clean-pass check.`);
+  }
+  const gate = context.config.reviewGates?.gates?.find((candidate) => candidate.id === gateId && candidate.blocking !== false);
+  if (!gate) throw new Error('review record requires code-review-high to be configured as a blocking review gate.');
+
+  const before = currentCheckoutReviewEvidenceTarget(context.repoRoot);
+  if (!before.branchName || !before.sha || !before.worktreeStatusReliable || !before.worktreeMaterialTreeReliable) {
+    throw new Error('review record cannot bind an unreliable branch, HEAD, or worktree identity. Stabilize the checkout and retry.');
+  }
+  const expectedSha = parsed.flags.sha.trim();
+  if (expectedSha) {
+    const resolvedExpected = runGit(context.repoRoot, ['rev-parse', '--verify', `${expectedSha}^{commit}`], true)?.trim() ?? '';
+    if (!resolvedExpected) throw new Error(`review record --sha is not a commit: ${expectedSha}`);
+    if (resolvedExpected !== before.sha) {
+      throw new Error(`review record refused stale review evidence: --sha ${shortSha(resolvedExpected)} does not match current HEAD ${shortSha(before.sha)}. Fold findings first, review the new HEAD, then record again.`);
+    }
+  }
+
+  const task = normalizeReviewDataField(parsed.flags.task, {
+    field: 'external review task',
+    maxBytes: REVIEW_DATA_LIMITS.reasonBytes,
+    redact: true,
+  });
+  const tool = normalizeReviewDataField(parsed.flags.reviewTool, {
+    field: 'external review tool',
+    maxBytes: REVIEW_DATA_LIMITS.reasonBytes,
+    redact: true,
+  });
+  const summary = normalizeReviewDataField(parsed.flags.reviewSummary, {
+    field: 'external review summary',
+    maxBytes: REVIEW_DATA_LIMITS.reasonBytes,
+    redact: true,
+  });
+  if (/[\r\n]/.test(summary)) throw new Error('review record --summary must be one line.');
+  const findingsCount = Number.parseInt(parsed.flags.reviewFindingsCount, 10);
+  const artifact = recordedReviewArtifactReference(path.resolve(context.repoRoot, parsed.flags.reviewArtifact));
+  const after = currentCheckoutReviewEvidenceTarget(context.repoRoot);
+  if (!reviewEvidenceTargetsEqual(before, after)) {
+    throw new Error('review record target changed while the artifact was being hashed. No evidence was recorded; retry against one stable checkout.');
+  }
+  const worktree = readCurrentReviewEvidenceWorktreeStatus(context.repoRoot, context.config);
+  const recordedAt = nowIso();
+  const record: ReviewExternalEvidenceRecord = {
+    id: `review-external-${new Date(recordedAt).toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto.randomUUID().slice(0, 8)}`,
+    gateId,
+    gateDefinitionHash: reviewGateDefinitionHash(gate),
+    policyVersion: context.config.reviewGates?.policyVersion ?? reviewPolicyVersionForMode(context.config.reviewGates?.enforcementMode ?? 'legacy-v2'),
+    enforcementMode: context.config.reviewGates?.enforcementMode ?? 'legacy-v2',
+    task,
+    taskBindingId: before.taskBindingId,
+    branchName: before.branchName,
+    sha: before.sha,
+    worktreeStatusDigest: before.worktreeStatusDigest,
+    worktreeMaterialTreeHash: before.worktreeMaterialTreeHash,
+    reviewTargetDigest: before.reviewTargetDigest,
+    worktreeClean: !worktree.dirty,
+    tool,
+    summary,
+    findingsCount,
+    artifact,
+    recorder: resolveReviewActorIdentity(),
+    recordedAt,
+  };
+  const persisted = appendReviewExternalEvidenceRecord(context.commonDir, context.config, record);
+  const evidencePath = reviewStatePath(context.commonDir, context.config);
+  printResult(parsed.flags, {
+    command: 'review record',
+    status: 'recorded',
+    evidenceId: persisted.id,
+    evidencePath,
+    gateId,
+    branchName: persisted.branchName,
+    sha: persisted.sha,
+    artifact: persisted.artifact,
+    message: [
+      `Recorded external review evidence for ${gateId} at ${shortSha(persisted.sha)}.`,
+      `Tool: ${persisted.tool}`,
+      `Artifact: ${persisted.artifact.path} (sha256:${persisted.artifact.digest})`,
+      'This evidence is valid only for the recorded branch, HEAD, and exact worktree state. A new commit or material change requires a new record.',
+      'Next: run the full Pipelane review; code-review-high will consume this evidence while karpathy-diff still runs as the clean-pass gate.',
+    ].join('\n'),
+  });
 }
 
 function handleReviewGc(cwd: string, parsed: ParsedOperatorArgs): void {
@@ -3932,6 +4032,41 @@ function runReviewGate(options: {
         summary: `deferred: a blocking deterministic gate failed; ${gate.type} judge ${gate.id} not invoked until programmatic gates pass`,
       });
     }
+    const recordedExternal = !dryRun && !reviewConfigChanged
+      ? resolveRecordedExternalReviewEvidence({ repoRoot, commonDir, config, gate })
+      : null;
+    if (recordedExternal?.error) {
+      return finishGate(base, startMs, {
+        status: 'failed',
+        summary: recordedExternal.error,
+        externalEvidenceId: recordedExternal.record.id,
+      });
+    }
+    if (recordedExternal) {
+      const evidence = recordedExternal.record;
+      return finishGate(base, startMs, {
+        status: 'passed',
+        summary: `recorded external review accepted: ${evidence.tool} - ${evidence.summary} (${evidence.findingsCount} findings reported)`,
+        attester: createReviewActorIdentity({
+          provider: evidence.tool,
+          sessionId: evidence.artifact.digest,
+          source: 'review-record:external-artifact',
+        }),
+        capability: {
+          requestedCapability: `role:${reviewGateExecutionPolicy(gate).role}`,
+          effectiveCapability: 'recorded-external-review',
+          adapter: 'review-record-v1',
+          provider: evidence.tool,
+          sourceKind: 'external-artifact',
+          source: evidence.artifact.path,
+          contractDigest: evidence.artifact.digest,
+          contractBytes: evidence.artifact.bytes,
+          contractSupplied: false,
+          wrapperCompatible: false,
+        },
+        externalEvidenceId: evidence.id,
+      });
+    }
     return runAiReviewGate({
       base,
       startMs,
@@ -4070,6 +4205,43 @@ function runReviewGate(options: {
   });
 }
 
+function resolveRecordedExternalReviewEvidence(options: {
+  repoRoot: string;
+  commonDir: string;
+  config: WorkflowConfig;
+  gate: ReviewGateConfig;
+}): { record: ReviewExternalEvidenceRecord; error?: string } | null {
+  if (options.gate.id !== 'code-review-high') return null;
+  const target = currentCheckoutReviewEvidenceTarget(options.repoRoot);
+  const worktree = readCurrentReviewEvidenceWorktreeStatus(options.repoRoot, options.config);
+  const policyVersion = options.config.reviewGates?.policyVersion
+    ?? reviewPolicyVersionForMode(options.config.reviewGates?.enforcementMode ?? 'legacy-v2');
+  const enforcementMode = options.config.reviewGates?.enforcementMode ?? 'legacy-v2';
+  const record = (loadReviewState(options.commonDir, options.config).externalEvidence ?? []).find((candidate) =>
+    candidate.gateId === options.gate.id
+    && candidate.gateDefinitionHash === reviewGateDefinitionHash(options.gate)
+    && candidate.policyVersion === policyVersion
+    && candidate.enforcementMode === enforcementMode
+    && candidate.taskBindingId === target.taskBindingId
+    && candidate.branchName === target.branchName
+    && candidate.sha === target.sha
+    && candidate.worktreeStatusDigest === target.worktreeStatusDigest
+    && candidate.worktreeMaterialTreeHash === target.worktreeMaterialTreeHash
+    && candidate.reviewTargetDigest === target.reviewTargetDigest
+    && candidate.worktreeClean === !worktree.dirty
+  );
+  if (!record) return null;
+  try {
+    assertRecordedReviewArtifact(record.artifact);
+  } catch (error) {
+    return {
+      record,
+      error: `recorded external review evidence ${record.id} failed artifact integrity: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  return { record };
+}
+
 function runAiReviewGate(options: {
   base: Omit<ReviewGateRunRecord, 'status' | 'summary' | 'finishedAt' | 'durationMs'>;
   startMs: number;
@@ -4161,6 +4333,7 @@ function runAiReviewGate(options: {
     repoRoot,
     baseBranch,
     changedFiles,
+    dispositionedFindings: collectDispositionedKarpathyFindings({ repoRoot, commonDir, config, gateId: gate.id }),
   });
   let beforeStatus: WorktreeStatusSnapshot;
   let afterStatus: WorktreeStatusSnapshot;
@@ -4407,7 +4580,14 @@ function runStrictAiReviewGate(options: {
       capability: capability.evidence,
     });
   }
-  const prompt = renderStrictReviewPrompt({ gate, intent, target: builtTarget.manifest, changedFiles, capability });
+  const prompt = renderStrictReviewPrompt({
+    gate,
+    intent,
+    target: builtTarget.manifest,
+    changedFiles,
+    capability,
+    dispositionedFindings: collectDispositionedKarpathyFindings({ repoRoot, commonDir, config, gateId: gate.id }),
+  });
   let completion: StrictProviderCompletion;
   try {
     completion = spawnStrictProviderCompletion(resolved, { cwd: repoRoot, timeout: timeoutMs, env, input: prompt });
@@ -4828,6 +5008,7 @@ function renderAiReviewGatePrompt(options: {
   repoRoot: string;
   baseBranch: string;
   changedFiles: string[];
+  dispositionedFindings?: ReviewDispositionPromptEntry[];
 }): string {
   const { gate, repoRoot, baseBranch, changedFiles } = options;
   const target = formatAiReviewGateTarget(gate);
@@ -4868,6 +5049,9 @@ function renderAiReviewGatePrompt(options: {
     ...truncated,
     '',
     ...mutationPolicy,
+    ...(options.dispositionedFindings && options.dispositionedFindings.length > 0
+      ? [...renderDispositionedReviewFindingsPrompt(options.dispositionedFindings), '']
+      : []),
     'Report blocking correctness, security, data-loss, regression, or test-coverage issues.',
     'If the requested skill or slash command is unavailable, perform the closest equivalent review yourself.',
     '',
@@ -4878,6 +5062,65 @@ function renderAiReviewGatePrompt(options: {
     '- Do not omit the result marker after running tests, even when there are no findings.',
     '- If you are uncertain whether the review completed, print the failed marker.',
   ].join('\n');
+}
+
+function collectDispositionedKarpathyFindings(options: {
+  repoRoot: string;
+  commonDir: string;
+  config: WorkflowConfig;
+  gateId: string;
+}): ReviewDispositionPromptEntry[] {
+  if (options.gateId !== 'karpathy-diff') return [];
+  const target = currentCheckoutReviewEvidenceTarget(options.repoRoot);
+  const state = loadReviewState(options.commonDir, options.config);
+  const entries: ReviewDispositionPromptEntry[] = [];
+  for (const disposition of state.findingDispositions ?? []) {
+    if (
+      disposition.gateId !== options.gateId
+      || disposition.branchName !== target.branchName
+      || disposition.sha !== target.sha
+      || disposition.worktreeStatusDigest !== target.worktreeStatusDigest
+      || disposition.worktreeMaterialTreeHash !== target.worktreeMaterialTreeHash
+      || disposition.taskBindingId !== target.taskBindingId
+      || disposition.reviewTargetDigest !== target.reviewTargetDigest
+    ) continue;
+    entries.push({
+      disposition: 'spin-off',
+      findingRef: disposition.findingRef,
+      severity: disposition.finding.severity,
+      title: disposition.finding.title,
+      ...(disposition.finding.location ? { location: disposition.finding.location } : {}),
+      reason: disposition.reason,
+      followUpTask: disposition.followUpTask,
+    });
+  }
+  for (const consent of state.consents ?? []) {
+    if (
+      consent.kind !== 'accept-findings'
+      || consent.gateId !== options.gateId
+      || consent.branchName !== target.branchName
+      || consent.sha !== target.sha
+      || consent.worktreeStatusDigest !== target.worktreeStatusDigest
+      || consent.worktreeMaterialTreeHash !== target.worktreeMaterialTreeHash
+      || consent.taskBindingId !== target.taskBindingId
+      || consent.reviewTargetDigest !== target.reviewTargetDigest
+      || !consent.reviewRunId
+    ) continue;
+    const review = state.records.find((record) => record.id === consent.reviewRunId);
+    const gate = review?.gates.find((candidate) => candidate.gateId === options.gateId);
+    for (const finding of gate?.findings ?? []) {
+      entries.push({
+        disposition: 'accepted',
+        findingRef: `${review!.id}/${gate!.gateId}/${finding.id}`,
+        severity: finding.severity,
+        title: finding.title,
+        ...(finding.location ? { location: finding.location } : {}),
+        reason: consent.reason,
+      });
+    }
+  }
+  const unique = new Map(entries.map((entry) => [`${entry.disposition}\0${entry.findingRef}`, entry]));
+  return [...unique.values()];
 }
 
 function reviewGateCheckoutMutationSummary(

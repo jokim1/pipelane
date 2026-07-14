@@ -191,6 +191,29 @@ Recommended review order before merge:
 4. read-only traceability review: `karpathy-diff`
 5. specialist review when needed: security, design, browser QA, docs drift
 
+For a substantive branch, treat that list as a pre-lane convergence step:
+run a broad multi-angle review, fold its findings in batches, record the clean
+external review at the final HEAD, and only then enter the release lane.
+`karpathy-diff` remains a per-HEAD clean-pass check, not the branch's discovery
+engine.
+
+An external review may satisfy the `code-review-high` gate without becoming a
+waiver:
+
+```bash
+pipelane run review record --gate code-review-high --task <task> \
+  --tool "<reviewer name>" --summary "<one-line result>" \
+  --findings-count <n> --artifact <review-report> [--sha <reviewed-head>]
+```
+
+The signed record stores the recorder, review tool, timestamp, findings count,
+and the artifact's path, digest, and size in the branch-keyed shared review
+state. It is valid only for that exact branch, HEAD, worktree state, task
+binding, and gate definition; changing the checkout or the artifact makes it
+stale. Fold findings before recording. `karpathy-diff` deliberately does not
+consume this record and still runs at every shipping HEAD. `review override`
+remains the informed-consent waiver for an exact action, not review evidence.
+
 Use `review pass` only for a human approval gate. A specialized skill or agent
 run performed outside Pipelane needs bounded structured evidence:
 
@@ -215,6 +238,30 @@ then consume the single-use token using the printed bounded verification-file
 command. Host verification is an attestation only: `/pr` stays blocked until a
 new full, non-dry-run review of the exact fixed checkout passes. The standalone
 CLI never claims it invoked a host-only `/fix` action.
+
+If one finding is real but its remedy is genuinely new scope, spin off that
+individual stable finding reference:
+
+```bash
+pipelane run resume --spin-off <review-run/gate/Fxxx> \
+  --spinoff-task "<follow-up-label>" --reason "<why this is new scope>"
+```
+
+Pipelane records the exact finding, file references, target, actor, reason, and
+a hashed follow-up artifact in the shared review state. The original failed
+review remains unchanged; enforcement reports the finding as satisfied by
+disposition at that exact HEAD, never as a clean review. Rerun the paused route,
+not the unchanged review. Subsequent Karpathy prompts carry both spun-off and
+explicitly accepted findings as delimited untrusted data and suppress them
+unless the code invalidates the disposition.
+
+All finding severities remain eligible under Pipelane's informed-consent
+policy. For a critical finding, the recovery help and success output explicitly
+state that the disposition will let release or deploy proceed at the exact
+recorded HEAD, and the audit record preserves that acknowledgment. Spin-off is
+still not a soft accept: it is for a genuine new subsystem, refactor, or
+follow-up slice. Fold a live defect in code shipping now, or accept that defect
+explicitly. A reason is always required.
 
 `reviewGates.enforcementMode` can be `legacy-v2` or `strict-v3`. Strict review
 requires an authoritative task objective (`/new --brief`, `/adopt --brief`, an

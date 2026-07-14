@@ -422,6 +422,60 @@ export interface ReviewFinding {
   location?: string;
 }
 
+export interface ReviewRecordedArtifactReference {
+  path: string;
+  digest: string;
+  bytes: number;
+}
+
+export interface ReviewExternalEvidenceRecord {
+  id: string;
+  gateId: string;
+  gateDefinitionHash: GateDefinitionHash;
+  policyVersion: number;
+  enforcementMode: ReviewEnforcementMode;
+  task: string;
+  taskBindingId: string;
+  branchName: string;
+  sha: string;
+  worktreeStatusDigest: string;
+  worktreeMaterialTreeHash: string;
+  reviewTargetDigest: string;
+  worktreeClean: boolean;
+  tool: string;
+  summary: string;
+  findingsCount: number;
+  artifact: ReviewRecordedArtifactReference;
+  recorder: ReviewActorIdentity;
+  recordedAt: string;
+  signature?: string;
+}
+
+export interface ReviewFindingDispositionRecord {
+  id: string;
+  kind: 'spin-off';
+  findingRef: string;
+  reviewRunId: string;
+  gateId: string;
+  finding: ReviewFinding;
+  followUpTask: string;
+  reason: string;
+  reasonHash: string;
+  dispositionEffect: 'satisfies-finding-at-exact-head';
+  criticalRiskAcknowledged: boolean;
+  taskBindingId: string;
+  branchName: string;
+  sha: string;
+  worktreeStatusDigest: string;
+  worktreeMaterialTreeHash: string;
+  reviewTargetDigest: string;
+  actor: ReviewActorIdentity;
+  source: 'resume --spin-off';
+  recordedAt: string;
+  artifact: ReviewRecordedArtifactReference;
+  signature?: string;
+}
+
 export interface ReviewResultMetadata {
   protocolVersion: 0 | 1;
   declaredStatus: 'passed' | 'failed';
@@ -435,7 +489,7 @@ export interface ReviewResultMetadata {
 
 export interface ReviewCapabilityEvidence {
   requestedCapability: string;
-  effectiveCapability: 'contract-supplied-adapter' | 'role-equivalent-adapter' | 'manual-attestation' | 'unavailable';
+  effectiveCapability: 'contract-supplied-adapter' | 'role-equivalent-adapter' | 'recorded-external-review' | 'manual-attestation' | 'unavailable';
   adapter: string;
   provider: string;
   sourceKind?: string;
@@ -520,6 +574,7 @@ export interface ReviewGateRunRecord {
   result?: ReviewResultMetadata;
   findings?: ReviewFinding[];
   reportArtifact?: ReviewReportArtifactReference;
+  externalEvidenceId?: string;
   manualAttestation?: ReviewManualAttestationEvidence;
   skipReason?: string;
 }
@@ -593,6 +648,8 @@ export interface ReviewState {
   records: ReviewRunRecord[];
   overrides: ReviewOverrideRecord[];
   consents?: ReviewConsentRecord[];
+  externalEvidence?: ReviewExternalEvidenceRecord[];
+  findingDispositions?: ReviewFindingDispositionRecord[];
 }
 
 export type RouteSafetyResumeKind = 'one-more-loop' | 'more-loops-and-minutes' | 'until-review-passes' | 'accept-findings' | 'fix-attempt' | 'legacy-import' | 'legacy-fresh-start';
@@ -885,6 +942,12 @@ export interface OperatorFlags {
   reviewFindingsFile: string;
   reviewProvenanceFile: string;
   reviewSubstituteStrict: boolean;
+  reviewTool: string;
+  reviewSummary: string;
+  reviewFindingsCount: string;
+  reviewArtifact: string;
+  spinOff: string;
+  spinoffTask: string;
 }
 
 export interface ParsedOperatorArgs {
@@ -918,6 +981,9 @@ const REVIEW_STATE_MAX_RECORDS = 20;
 const REVIEW_OVERRIDE_MAX_RECORDS = 50;
 const REVIEW_ACCEPTANCE_MAX_RECORDS = 200;
 const REVIEW_CONSENT_MAX_RECORDS = 200;
+const REVIEW_EXTERNAL_EVIDENCE_MAX_RECORDS = 200;
+const REVIEW_FINDING_DISPOSITION_MAX_RECORDS = 500;
+const REVIEW_FOLLOW_UP_DIRNAME = 'review-follow-ups';
 const ACTION_STATE_MAX_DECISIONS = 100;
 const REVIEW_STATE_LOCK_STALE_MS = 2 * 60 * 1000;
 const DEPLOY_CONFIG_FILENAME = 'deploy-config.json';
@@ -996,7 +1062,7 @@ export const STATE_SCHEMA_VERSIONS = {
   deployState: 1,
   prState: 1,
   actionState: 1,
-  reviewState: 1,
+  reviewState: 2,
   reviewAcceptanceState: 1,
   routeSafetyState: 1,
   orchestrationRun: 2,
@@ -1012,14 +1078,20 @@ export type StateKind = keyof typeof STATE_SCHEMA_VERSIONS;
 // `STATE_MIGRATIONS.modeState[1]` mapping a v1 shape forward. Today
 // every shape is the v1 baseline; the registry exists so the next
 // breaking change has a tested home rather than a special case in
-// the loader.
+// the loader. Review state currently demonstrates the v1 -> v2 path.
 export const STATE_MIGRATIONS: Record<StateKind, Record<number, (raw: Record<string, unknown>) => Record<string, unknown>>> = {
   modeState: {},
   probeState: {},
   deployState: {},
   prState: {},
   actionState: {},
-  reviewState: {},
+  reviewState: {
+    1: (raw) => ({
+      ...raw,
+      externalEvidence: Array.isArray(raw.externalEvidence) ? raw.externalEvidence : [],
+      findingDispositions: Array.isArray(raw.findingDispositions) ? raw.findingDispositions : [],
+    }),
+  },
   reviewAcceptanceState: {},
   routeSafetyState: {},
   orchestrationRun: {
@@ -2046,6 +2118,34 @@ export function reviewArtifactRoot(commonDir: string, config: WorkflowConfig): s
   return path.join(resolveStateDir(commonDir, config), 'review-artifacts');
 }
 
+export function reviewFindingFollowUpRoot(commonDir: string, config: WorkflowConfig): string {
+  return path.join(resolveStateDir(commonDir, config), REVIEW_FOLLOW_UP_DIRNAME);
+}
+
+export function recordedReviewArtifactReference(artifactPath: string): ReviewRecordedArtifactReference {
+  const resolved = realpathSync(path.resolve(artifactPath));
+  const stat = statSync(resolved);
+  if (!stat.isFile()) throw new Error(`Review artifact must be a regular file: ${resolved}`);
+  const bytes = readFileSync(resolved);
+  return {
+    path: resolved,
+    digest: crypto.createHash('sha256').update(bytes).digest('hex'),
+    bytes: bytes.length,
+  };
+}
+
+export function assertRecordedReviewArtifact(reference: ReviewRecordedArtifactReference): void {
+  let actual: ReviewRecordedArtifactReference;
+  try {
+    actual = recordedReviewArtifactReference(reference.path);
+  } catch (error) {
+    throw new Error(`recorded review artifact is unavailable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (actual.bytes !== reference.bytes || actual.digest !== reference.digest) {
+    throw new Error(`recorded review artifact changed after evidence was recorded: ${reference.path}`);
+  }
+}
+
 export function reviewAcceptanceStatePath(commonDir: string, config: WorkflowConfig): string {
   return path.join(resolveStateDir(commonDir, config), REVIEW_ACCEPTANCE_STATE_FILENAME);
 }
@@ -3014,7 +3114,13 @@ function isStatusDecisionStatus(value: unknown): value is StatusDecisionStatus {
 }
 
 export function loadReviewState(commonDir: string, config: WorkflowConfig): ReviewState {
-  const raw = readVersionedJsonFile<ReviewState>('reviewState', commonDir, config, reviewStatePath(commonDir, config), { records: [], overrides: [], consents: [] });
+  const raw = readVersionedJsonFile<ReviewState>('reviewState', commonDir, config, reviewStatePath(commonDir, config), {
+    records: [],
+    overrides: [],
+    consents: [],
+    externalEvidence: [],
+    findingDispositions: [],
+  });
   const stateKey = resolveReviewStateKey();
   const records = Array.isArray(raw?.records)
     ? raw.records.filter(isReviewRunRecord).slice(0, REVIEW_STATE_MAX_RECORDS)
@@ -3029,7 +3135,15 @@ export function loadReviewState(commonDir: string, config: WorkflowConfig): Revi
     ? raw.consents.filter(isReviewConsentRecord).slice(0, REVIEW_CONSENT_MAX_RECORDS)
       .filter((record) => verifySignedPayload(record, consentKey))
     : [];
-  return { records, overrides, consents };
+  const externalEvidence = Array.isArray(raw?.externalEvidence)
+    ? raw.externalEvidence.filter(isReviewExternalEvidenceRecord).slice(0, REVIEW_EXTERNAL_EVIDENCE_MAX_RECORDS)
+      .filter((record) => !stateKey || verifySignedPayload(record, stateKey))
+    : [];
+  const findingDispositions = Array.isArray(raw?.findingDispositions)
+    ? raw.findingDispositions.filter(isReviewFindingDispositionRecord).slice(0, REVIEW_FINDING_DISPOSITION_MAX_RECORDS)
+      .filter((record) => !stateKey || verifySignedPayload(record, stateKey))
+    : [];
+  return { records, overrides, consents, externalEvidence, findingDispositions };
 }
 
 export function saveReviewState(commonDir: string, config: WorkflowConfig, value: ReviewState): void {
@@ -3038,6 +3152,8 @@ export function saveReviewState(commonDir: string, config: WorkflowConfig, value
     records: value.records.slice(0, REVIEW_STATE_MAX_RECORDS),
     overrides: (value.overrides ?? []).slice(0, REVIEW_OVERRIDE_MAX_RECORDS),
     consents: (value.consents ?? []).slice(0, REVIEW_CONSENT_MAX_RECORDS),
+    externalEvidence: (value.externalEvidence ?? []).slice(0, REVIEW_EXTERNAL_EVIDENCE_MAX_RECORDS),
+    findingDispositions: (value.findingDispositions ?? []).slice(0, REVIEW_FINDING_DISPOSITION_MAX_RECORDS),
   });
 }
 
@@ -3154,6 +3270,42 @@ export function appendReviewConsentRecords(commonDir: string, config: WorkflowCo
 
 export function appendReviewConsentRecord(commonDir: string, config: WorkflowConfig, record: ReviewConsentRecord): ReviewConsentRecord {
   return appendReviewConsentRecords(commonDir, config, [record])[0];
+}
+
+export function appendReviewExternalEvidenceRecord(
+  commonDir: string,
+  config: WorkflowConfig,
+  record: ReviewExternalEvidenceRecord,
+): ReviewExternalEvidenceRecord {
+  const lock = acquireReviewStateLock(commonDir, config);
+  try {
+    const state = loadReviewState(commonDir, config);
+    const stateKey = resolveReviewStateKey();
+    const persisted = stateKey ? { ...record, signature: signSignedPayload(record, stateKey) } : record;
+    state.externalEvidence = [persisted, ...(state.externalEvidence ?? [])].slice(0, REVIEW_EXTERNAL_EVIDENCE_MAX_RECORDS);
+    saveReviewState(commonDir, config, state);
+    return persisted;
+  } finally {
+    lock.release();
+  }
+}
+
+export function appendReviewFindingDispositionRecord(
+  commonDir: string,
+  config: WorkflowConfig,
+  record: ReviewFindingDispositionRecord,
+): ReviewFindingDispositionRecord {
+  const lock = acquireReviewStateLock(commonDir, config);
+  try {
+    const state = loadReviewState(commonDir, config);
+    const stateKey = resolveReviewStateKey();
+    const persisted = stateKey ? { ...record, signature: signSignedPayload(record, stateKey) } : record;
+    state.findingDispositions = [persisted, ...(state.findingDispositions ?? [])].slice(0, REVIEW_FINDING_DISPOSITION_MAX_RECORDS);
+    saveReviewState(commonDir, config, state);
+    return persisted;
+  } finally {
+    lock.release();
+  }
 }
 
 export function withReviewStateLock<T>(commonDir: string, config: WorkflowConfig, fn: () => T): T {
@@ -3531,6 +3683,71 @@ function isAcceptabilityClass(value: unknown): value is AcceptabilityClass {
   return value === 'manual-review' || value === 'external-review' || value === 'policy-bypass';
 }
 
+function isReviewRecordedArtifactReference(value: unknown): value is ReviewRecordedArtifactReference {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return typeof raw.path === 'string'
+    && typeof raw.digest === 'string'
+    && typeof raw.bytes === 'number'
+    && Number.isSafeInteger(raw.bytes)
+    && raw.bytes >= 0;
+}
+
+function isReviewExternalEvidenceRecord(value: unknown): value is ReviewExternalEvidenceRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return typeof raw.id === 'string'
+    && typeof raw.gateId === 'string'
+    && typeof raw.gateDefinitionHash === 'string'
+    && typeof raw.policyVersion === 'number'
+    && Number.isSafeInteger(raw.policyVersion)
+    && (raw.enforcementMode === 'legacy-v2' || raw.enforcementMode === 'strict-v3')
+    && typeof raw.task === 'string'
+    && typeof raw.taskBindingId === 'string'
+    && typeof raw.branchName === 'string'
+    && typeof raw.sha === 'string'
+    && typeof raw.worktreeStatusDigest === 'string'
+    && typeof raw.worktreeMaterialTreeHash === 'string'
+    && typeof raw.reviewTargetDigest === 'string'
+    && typeof raw.worktreeClean === 'boolean'
+    && typeof raw.tool === 'string'
+    && typeof raw.summary === 'string'
+    && typeof raw.findingsCount === 'number'
+    && Number.isSafeInteger(raw.findingsCount)
+    && raw.findingsCount >= 0
+    && isReviewRecordedArtifactReference(raw.artifact)
+    && isReviewActorIdentity(raw.recorder)
+    && typeof raw.recordedAt === 'string'
+    && (raw.signature === undefined || typeof raw.signature === 'string');
+}
+
+function isReviewFindingDispositionRecord(value: unknown): value is ReviewFindingDispositionRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return typeof raw.id === 'string'
+    && raw.kind === 'spin-off'
+    && typeof raw.findingRef === 'string'
+    && typeof raw.reviewRunId === 'string'
+    && typeof raw.gateId === 'string'
+    && isReviewFinding(raw.finding)
+    && typeof raw.followUpTask === 'string'
+    && typeof raw.reason === 'string'
+    && typeof raw.reasonHash === 'string'
+    && raw.dispositionEffect === 'satisfies-finding-at-exact-head'
+    && typeof raw.criticalRiskAcknowledged === 'boolean'
+    && typeof raw.taskBindingId === 'string'
+    && typeof raw.branchName === 'string'
+    && typeof raw.sha === 'string'
+    && typeof raw.worktreeStatusDigest === 'string'
+    && typeof raw.worktreeMaterialTreeHash === 'string'
+    && typeof raw.reviewTargetDigest === 'string'
+    && isReviewActorIdentity(raw.actor)
+    && raw.source === 'resume --spin-off'
+    && typeof raw.recordedAt === 'string'
+    && isReviewRecordedArtifactReference(raw.artifact)
+    && (raw.signature === undefined || typeof raw.signature === 'string');
+}
+
 function isReviewGateRunRecord(value: unknown): value is ReviewGateRunRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const raw = value as Record<string, unknown>;
@@ -3572,6 +3789,7 @@ function isReviewGateRunRecord(value: unknown): value is ReviewGateRunRecord {
     && (raw.result === undefined || isReviewResultMetadata(raw.result))
     && (raw.findings === undefined || (Array.isArray(raw.findings) && raw.findings.every(isReviewFinding)))
     && (raw.reportArtifact === undefined || isReviewReportArtifactReference(raw.reportArtifact))
+    && (raw.externalEvidenceId === undefined || typeof raw.externalEvidenceId === 'string')
     && (raw.manualAttestation === undefined || isReviewManualAttestationEvidence(raw.manualAttestation))
     && (raw.skipReason === undefined || typeof raw.skipReason === 'string');
 }
@@ -3624,7 +3842,7 @@ function isReviewCapabilityEvidence(value: unknown): value is ReviewCapabilityEv
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const raw = value as Record<string, unknown>;
   return typeof raw.requestedCapability === 'string'
-    && (raw.effectiveCapability === 'contract-supplied-adapter' || raw.effectiveCapability === 'role-equivalent-adapter' || raw.effectiveCapability === 'manual-attestation' || raw.effectiveCapability === 'unavailable')
+    && (raw.effectiveCapability === 'contract-supplied-adapter' || raw.effectiveCapability === 'role-equivalent-adapter' || raw.effectiveCapability === 'recorded-external-review' || raw.effectiveCapability === 'manual-attestation' || raw.effectiveCapability === 'unavailable')
     && typeof raw.adapter === 'string'
     && typeof raw.provider === 'string'
     && typeof raw.contractSupplied === 'boolean'
@@ -4147,6 +4365,12 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     reviewFindingsFile: '',
     reviewProvenanceFile: '',
     reviewSubstituteStrict: false,
+    reviewTool: '',
+    reviewSummary: '',
+    reviewFindingsCount: '',
+    reviewArtifact: '',
+    spinOff: '',
+    spinoffTask: '',
   };
 
   const setPrFromShorthand = (raw: string, source: string): void => {
@@ -4369,6 +4593,14 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       flags.acceptFindings = true;
       continue;
     }
+    if (flagName === '--spin-off') {
+      flags.spinOff = readFlagValue('--spin-off').trim();
+      continue;
+    }
+    if (flagName === '--spinoff-task') {
+      flags.spinoffTask = readFlagValue('--spinoff-task').trim();
+      continue;
+    }
     if (flagName === '--request-fix') {
       rejectInlineValue('--request-fix');
       flags.requestFix = true;
@@ -4420,6 +4652,22 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     }
     if (flagName === '--provenance-file') {
       flags.reviewProvenanceFile = readFlagValue('--provenance-file').trim();
+      continue;
+    }
+    if (flagName === '--tool') {
+      flags.reviewTool = readFlagValue('--tool').trim();
+      continue;
+    }
+    if (flagName === '--summary') {
+      flags.reviewSummary = readFlagValue('--summary').trim();
+      continue;
+    }
+    if (flagName === '--findings-count') {
+      flags.reviewFindingsCount = readFlagValue('--findings-count').trim();
+      continue;
+    }
+    if (flagName === '--artifact') {
+      flags.reviewArtifact = readFlagValue('--artifact').trim();
       continue;
     }
     if (flagName === '--substitute-strict') {
@@ -4765,8 +5013,8 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       if (parsed.flags.brief.trim() && parsed.flags.briefFile.trim()) throw new Error('adopt cannot combine --brief and --brief-file.');
       return;
     case 'resume':
-      assertOnlyFlags(parsed, ['task', 'oneMoreLoop', 'moreLoops', 'moreMinutes', 'untilReviewPasses', 'maxMoreLoops', 'maxMoreMinutes', 'acceptFindings', 'requestFix', 'fixToken', 'verificationFile', 'noChangeReason', 'reason', 'scope']);
-      requireNoPositional('pipelane run resume [--task <task-name>] [--one-more-loop | --more-loops <n> --more-minutes <n> | --until-review-passes --max-more-loops <n> --max-more-minutes <n> | --accept-findings]');
+      assertOnlyFlags(parsed, ['task', 'oneMoreLoop', 'moreLoops', 'moreMinutes', 'untilReviewPasses', 'maxMoreLoops', 'maxMoreMinutes', 'acceptFindings', 'spinOff', 'spinoffTask', 'requestFix', 'fixToken', 'verificationFile', 'noChangeReason', 'reason', 'scope']);
+      requireNoPositional('pipelane run resume [--task <task-name>] [--one-more-loop | --more-loops <n> --more-minutes <n> | --until-review-passes --max-more-loops <n> --max-more-minutes <n> | --accept-findings | --spin-off <finding-ref> --spinoff-task <task-label> --reason <why-new-scope>]');
       validateResumeRouteSafetyFlags(parsed);
       return;
     case 'repo-guard':
@@ -4922,6 +5170,21 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         }
         return;
       }
+      if (subcommand === 'record') {
+        assertOnlyFlags(parsed, ['reviewGate', 'task', 'reviewTool', 'reviewSummary', 'reviewFindingsCount', 'reviewArtifact', 'sha']);
+        if (parsed.positional.length !== 1) {
+          throw new Error('review record requires exactly: pipelane run review record --gate code-review-high --task <task> --tool <name> --summary <one-line> --findings-count <n> --artifact <path> [--sha <expected-head>]');
+        }
+        if (!parsed.flags.reviewGate.trim()) throw new Error('review record requires --gate <id>.');
+        if (!parsed.flags.task.trim()) throw new Error('review record requires --task <task>.');
+        if (!parsed.flags.reviewTool.trim()) throw new Error('review record requires --tool <name>.');
+        if (!parsed.flags.reviewSummary.trim()) throw new Error('review record requires --summary <one-line>.');
+        if (!/^\d+$/.test(parsed.flags.reviewFindingsCount) || !Number.isSafeInteger(Number(parsed.flags.reviewFindingsCount))) {
+          throw new Error('review record requires --findings-count <non-negative-integer>.');
+        }
+        if (!parsed.flags.reviewArtifact.trim()) throw new Error('review record requires --artifact <path>.');
+        return;
+      }
       if (subcommand === 'override') {
         assertOnlyFlags(parsed, ['reviewGate', 'reason', 'scope']);
         if (parsed.positional.length !== 1) {
@@ -4938,7 +5201,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       }
       assertOnlyFlags(parsed, ['reviewDryRun', 'reviewGate', 'reviewPhase', 'reviewIntent']);
       if (parsed.positional.length > 0) {
-        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review pass --gate <id> --message <text>, pipelane run review attest --gate <id> --status <passed|failed> --report-file <path> --findings-file <path> --provenance-file <path> --message <text> [--substitute-strict --reason <reason> --scope <action>], pipelane run review override --gate <id> --reason <text> [--scope <action>], or pipelane run review setup [gate[,gate...]...] [--yes] [--reset] [--print] [--list-gates] [--toggle <gate[,gate...]>] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]');
+        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review record --gate code-review-high --task <task> --tool <name> --summary <text> --findings-count <n> --artifact <path> [--sha <expected-head>], pipelane run review pass --gate <id> --message <text>, pipelane run review attest --gate <id> --status <passed|failed> --report-file <path> --findings-file <path> --provenance-file <path> --message <text> [--substitute-strict --reason <reason> --scope <action>], pipelane run review override --gate <id> --reason <text> [--scope <action>], or pipelane run review setup [gate[,gate...]...] [--yes] [--reset] [--print] [--list-gates] [--toggle <gate[,gate...]>] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]');
       }
       const phase = parsed.flags.reviewPhase.trim();
       if (phase && !includesString(REVIEW_GATE_PHASES, phase)) {
@@ -5403,6 +5666,7 @@ function validateResumeRouteSafetyFlags(parsed: ParsedOperatorArgs): void {
     parsed.flags.moreLoops.trim().length > 0 || parsed.flags.moreMinutes.trim().length > 0,
     parsed.flags.untilReviewPasses || parsed.flags.maxMoreLoops.trim().length > 0 || parsed.flags.maxMoreMinutes.trim().length > 0,
     parsed.flags.acceptFindings || hasMigrationScope,
+    parsed.flags.spinOff.trim().length > 0 || parsed.flags.spinoffTask.trim().length > 0,
     parsed.flags.requestFix,
     parsed.flags.fixToken.trim().length > 0 || parsed.flags.verificationFile.trim().length > 0 || parsed.flags.noChangeReason.trim().length > 0,
   ].filter(Boolean).length;
@@ -5411,13 +5675,18 @@ function validateResumeRouteSafetyFlags(parsed: ParsedOperatorArgs): void {
     throw new Error('resume route-loop overrides do not accept --task; run the printed resume command from the paused checkout.');
   }
   if (modes > 1) {
-    throw new Error('resume accepts one route-loop action at a time: --request-fix, --fix-token/--verification-file, --one-more-loop, --more-loops/--more-minutes, --until-review-passes, or --accept-findings.');
+    throw new Error('resume accepts one route-loop action at a time: --request-fix, --fix-token/--verification-file, --one-more-loop, --more-loops/--more-minutes, --until-review-passes, --accept-findings, or --spin-off.');
   }
   if ((parsed.flags.acceptFindings || hasMigrationScope) && !parsed.flags.reason.trim()) {
     throw new Error('resume --accept-findings and legacy migration choices require --reason <informed-consent-reason>.');
   }
-  if (parsed.flags.reason.trim() && !parsed.flags.acceptFindings && !hasMigrationScope) {
-    throw new Error('resume only accepts --reason with --accept-findings or an explicit legacy migration --scope.');
+  if (parsed.flags.spinOff.trim() || parsed.flags.spinoffTask.trim()) {
+    if (!parsed.flags.spinOff.trim()) throw new Error('resume --spinoff-task requires --spin-off <finding-ref>.');
+    if (!parsed.flags.spinoffTask.trim()) throw new Error('resume --spin-off requires --spinoff-task <new-task-label>.');
+    if (!parsed.flags.reason.trim()) throw new Error('resume --spin-off requires --reason <why this finding belongs in new scope>.');
+  }
+  if (parsed.flags.reason.trim() && !parsed.flags.acceptFindings && !parsed.flags.spinOff.trim() && !hasMigrationScope) {
+    throw new Error('resume only accepts --reason with --accept-findings, --spin-off, or an explicit legacy migration --scope.');
   }
   if (parsed.flags.fixToken.trim() && !parsed.flags.verificationFile.trim()) {
     throw new Error('resume --fix-token requires --verification-file <bounded-host-verification.json>.');
@@ -5487,6 +5756,8 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'maxMoreLoops', label: '--max-more-loops', active: (flags) => flags.maxMoreLoops.trim().length > 0 },
   { key: 'maxMoreMinutes', label: '--max-more-minutes', active: (flags) => flags.maxMoreMinutes.trim().length > 0 },
   { key: 'acceptFindings', label: '--accept-findings', active: (flags) => flags.acceptFindings },
+  { key: 'spinOff', label: '--spin-off', active: (flags) => flags.spinOff.trim().length > 0 },
+  { key: 'spinoffTask', label: '--spinoff-task', active: (flags) => flags.spinoffTask.trim().length > 0 },
   { key: 'requestFix', label: '--request-fix', active: (flags) => flags.requestFix },
   { key: 'fixToken', label: '--fix-token', active: (flags) => flags.fixToken.trim().length > 0 },
   { key: 'verificationFile', label: '--verification-file', active: (flags) => flags.verificationFile.trim().length > 0 },
@@ -5526,6 +5797,10 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'reviewFindingsFile', label: '--findings-file', active: (flags) => flags.reviewFindingsFile.trim().length > 0 },
   { key: 'reviewProvenanceFile', label: '--provenance-file', active: (flags) => flags.reviewProvenanceFile.trim().length > 0 },
   { key: 'reviewSubstituteStrict', label: '--substitute-strict', active: (flags) => flags.reviewSubstituteStrict },
+  { key: 'reviewTool', label: '--tool', active: (flags) => flags.reviewTool.trim().length > 0 },
+  { key: 'reviewSummary', label: '--summary', active: (flags) => flags.reviewSummary.trim().length > 0 },
+  { key: 'reviewFindingsCount', label: '--findings-count', active: (flags) => flags.reviewFindingsCount.trim().length > 0 },
+  { key: 'reviewArtifact', label: '--artifact', active: (flags) => flags.reviewArtifact.trim().length > 0 },
   { key: 'goalSliceId', label: '--slice-id', active: (flags) => flags.goalSliceId.trim().length > 0 },
   { key: 'goalOutcome', label: '--outcome', active: (flags) => flags.goalOutcome.trim().length > 0 },
   { key: 'goalPlanFile', label: '--plan-file', active: (flags) => flags.goalPlanFile.trim().length > 0 },

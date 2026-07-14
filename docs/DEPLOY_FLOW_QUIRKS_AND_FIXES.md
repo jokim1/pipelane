@@ -847,9 +847,10 @@ and non-TTY execution paths.
     run, and fix eligibility inspected the uncomposed full record. The inverse
     case—a passing full run followed by a failed targeted retry—also remained
     invisible to those consumers. **Proposed fix (implemented):** route status,
-    pause rendering, fix issuance, and API snapshot projection now use the same
-    current-checkout composed full-review envelope as enforcement, while the
-    timeout ledger still reconciles only gates actually retried.
+    pause rendering, fix issuance, finding disposition, and API snapshot
+    projection now use the same current-checkout composed full-review envelope
+    as enforcement, while the timeout ledger still reconciles only gates
+    actually retried.
 
 ### Filed for follow-up
 

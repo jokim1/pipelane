@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { buildDashboardRuntimeMetadata, getDashboardOptions } from './server.ts';
+import { buildDashboardRuntimeMetadata, formatDashboardOrigin, getDashboardOptions } from './server.ts';
 
 interface HealthResult {
   ok: boolean;
@@ -315,11 +315,11 @@ export async function stopDashboardForRepo(repoRoot: string): Promise<DashboardS
 async function runStart(argv: string[], cwd: string): Promise<void> {
   const options = getDashboardOptions(argv, cwd, { allowNoOpen: true });
   let port = options.port;
-  let url = `http://${options.host}:${port}`;
+  let url = formatDashboardOrigin(options.host, port);
   const noOpen = hasFlag(argv, '--no-open');
   const useNextOpenPort = async (): Promise<void> => {
     port = await findNextOpenPort(options.host, port);
-    url = `http://${options.host}:${port}`;
+    url = formatDashboardOrigin(options.host, port);
   };
 
   const existingHealth = await probeHealth(options.host, port, 500);
@@ -430,7 +430,7 @@ async function runStop(argv: string[], cwd: string): Promise<void> {
     const health = await probeHealth(options.host, options.port, 500);
     if (health.ok) {
       process.stdout.write(
-        `A dashboard is responding on http://${options.host}:${options.port} but was not started by this command (no PID file).\n`
+        `A dashboard is responding on ${formatDashboardOrigin(options.host, options.port)} but was not started by this command (no PID file).\n`
           + 'Stop it manually if you want it gone.\n',
       );
       return;
@@ -460,7 +460,7 @@ async function runStop(argv: string[], cwd: string): Promise<void> {
 
 async function runStatus(argv: string[], cwd: string): Promise<void> {
   const options = getDashboardOptions(argv, cwd, { allowNoOpen: true });
-  const url = `http://${options.host}:${options.port}`;
+  const url = formatDashboardOrigin(options.host, options.port);
   const health = await probeHealth(options.host, options.port, 500);
   const storedPid = readPidFile(options.repoRoot);
   const pidAlive = storedPid ? isProcessAlive(storedPid) : false;
