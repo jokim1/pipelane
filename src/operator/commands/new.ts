@@ -30,6 +30,7 @@ import {
 import { runGit } from '../state.ts';
 import { inferTaskSlugsFromBranchName, resolveCommandSurfaces } from './helpers.ts';
 import { taskBriefFromFlags } from '../review-data.ts';
+import { assertManagedLocalStateValid, assertManagedLocalStateValidForTree } from '../local-state.ts';
 
 // v1.5: soft-warn when the operator has 3+ active tasks. Never blocks —
 // small teams legitimately juggle several lanes, but 24 half-alive
@@ -40,6 +41,7 @@ export const WIP_SOFT_WARN_THRESHOLD = 3;
 export async function handleNew(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const rawTask = parsed.flags.task.trim();
   const context = resolveWorkflowContext(cwd);
+  assertManagedLocalStateValid(context.repoRoot);
   const taskBrief = taskBriefFromFlags(parsed.flags.brief, parsed.flags.briefFile, 'new');
 
   if (!rawTask && !parsed.flags.unnamed) {
@@ -95,6 +97,7 @@ export async function handleNew(cwd: string, parsed: ParsedOperatorArgs): Promis
   }
 
   const baseRef = resolveTaskBaseRef(context.repoRoot, context.config.baseBranch, parsed.flags.offline);
+  assertManagedLocalStateValidForTree(context.repoRoot, baseRef.sourceRef);
   const workspace = generateUniqueTaskWorkspace(context.repoRoot, context.commonDir, context.config, taskSlug);
   const reasons = buildCurrentWorkspaceReasons({
     repoRoot: context.repoRoot,

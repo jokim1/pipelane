@@ -742,6 +742,7 @@ export interface OperatorFlags {
   skipSmokeCoverage: boolean;
   patch: boolean;
   reason: string;
+  localPath: string;
   sha: string;
   pr: string;
   task: string;
@@ -3442,6 +3443,7 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     skipSmokeCoverage: false,
     patch: false,
     reason: '',
+    localPath: '',
     sha: '',
     pr: '',
     task: '',
@@ -3670,6 +3672,11 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
 
     if (flagName === '--reason') {
       flags.reason = readFlagValue('--reason');
+      continue;
+    }
+
+    if (flagName === '--path') {
+      flags.localPath = readFlagValue('--path');
       continue;
     }
 
@@ -4452,6 +4459,34 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       }
       return;
     }
+    case 'local-state': {
+      const subcommand = parsed.positional[0] ?? '';
+      if (subcommand === 'list') {
+        assertOnlyFlags(parsed, []);
+        if (parsed.positional.length !== 1) {
+          throw new Error('local-state list requires exactly: pipelane run local-state list [--json]');
+        }
+        return;
+      }
+      if (subcommand === 'add') {
+        assertOnlyFlags(parsed, ['localPath', 'reason', 'yes']);
+        if (parsed.positional.length !== 1) {
+          throw new Error('local-state add requires exactly: pipelane run local-state add --path <path> --reason <text> [--yes]');
+        }
+        if (!parsed.flags.localPath) throw new Error('local-state add requires --path <path>.');
+        if (!parsed.flags.reason.trim()) throw new Error('local-state add requires --reason <text>.');
+        return;
+      }
+      if (subcommand === 'remove') {
+        assertOnlyFlags(parsed, ['localPath', 'yes']);
+        if (parsed.positional.length !== 1) {
+          throw new Error('local-state remove requires exactly: pipelane run local-state remove --path <path> [--yes]');
+        }
+        if (!parsed.flags.localPath) throw new Error('local-state remove requires --path <path>.');
+        return;
+      }
+      throw new Error('local-state requires exactly one subcommand: list, add, or remove.');
+    }
     case 'clean': {
       assertOnlyFlags(parsed, [
         'apply',
@@ -4695,6 +4730,7 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'skipSmokeCoverage', label: '--skip-smoke-coverage', active: (flags) => flags.skipSmokeCoverage },
   { key: 'patch', label: '--patch', active: (flags) => flags.patch },
   { key: 'reason', label: '--reason', active: (flags) => flags.reason.trim().length > 0 },
+  { key: 'localPath', label: '--path', active: (flags) => flags.localPath.length > 0 },
   { key: 'sha', label: '--sha', active: (flags) => flags.sha.trim().length > 0 },
   { key: 'pr', label: '--pr', active: (flags) => flags.pr.trim().length > 0 },
   { key: 'task', label: '--task', active: (flags) => flags.task.trim().length > 0 },

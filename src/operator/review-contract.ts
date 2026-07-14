@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { canonicalize } from './integrity.ts';
+import { assertManagedLocalStateValid } from './local-state.ts';
 import {
   REVIEW_DATA_LIMITS,
   delimitUntrustedReviewData,
@@ -264,6 +265,7 @@ function isPathInside(root: string, candidate: string): boolean {
 }
 
 export function buildReviewTargetManifest(repoRoot: string, baseBranchLabel: string): BuiltReviewTarget {
+  const managedLocalState = assertManagedLocalStateValid(repoRoot);
   const baseTipOid = resolveBaseTip(repoRoot, baseBranchLabel);
   const headOid = gitText(repoRoot, ['rev-parse', '--verify', 'HEAD^{commit}'], `resolve HEAD for strict review`).trim();
   const mergeBaseOid = gitText(repoRoot, ['merge-base', baseTipOid, headOid], `resolve merge base for ${baseBranchLabel}`).trim();
@@ -287,6 +289,7 @@ export function buildReviewTargetManifest(repoRoot: string, baseBranchLabel: str
     version: TARGET_SERIALIZATION_VERSION,
     headOid,
     materialTreeManifestDigest,
+    managedLocalStateDigestSuffix: managedLocalState.digestSuffix,
   })).digest('hex');
   const changedFilesDigest = digestRawPathList(changedPathBytes);
   const ignorePolicyDigest = buildIgnorePolicyDigest(repoRoot, materialEntries);
@@ -465,10 +468,6 @@ function buildIgnorePolicyDigest(repoRoot: string, entries: ManifestEntry[]): st
   for (const entry of entries.filter((candidate) => candidate.objectType === 'blob' && path.posix.basename(candidate.pathBytes.toString('utf8')) === '.gitignore')) {
     const absolute = Buffer.concat([Buffer.from(`${repoRoot}${path.sep}`), entry.pathBytes]);
     sources.push({ source: `repo:${entry.pathBytes.toString('hex')}`, digest: crypto.createHash('sha256').update(readFileSync(absolute)).digest('hex') });
-  }
-  const infoExclude = gitText(repoRoot, ['rev-parse', '--git-path', 'info/exclude'], 'resolve .git/info/exclude').trim();
-  if (infoExclude && existsSync(path.resolve(repoRoot, infoExclude))) {
-    sources.push({ source: 'git-info-exclude', digest: crypto.createHash('sha256').update(readFileSync(path.resolve(repoRoot, infoExclude))).digest('hex') });
   }
   const globalExclude = spawnSync('git', ['config', '--path', '--get', 'core.excludesFile'], { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   const globalPath = typeof globalExclude.stdout === 'string' ? globalExclude.stdout.trim() : '';

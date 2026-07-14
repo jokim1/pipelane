@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { normalizePath, runGit } from './state.ts';
+import { inspectManagedLocalState, type ManagedLocalStateInspection } from './local-state.ts';
 
 const STATUS_DIGEST_MAX_FILE_BYTES = 1024 * 1024;
 const STATUS_DIGEST_MAX_DIRTY_PATHS = 512;
@@ -68,8 +69,11 @@ export function readWorktreeStatusSnapshot(
   const statusRaw = status.output.toString('utf8');
   const statusEntries = parseStatusEntries(statusRaw);
   const changedPaths = [...new Set(statusEntries.flatMap((entry) => entry.paths))].sort();
+  const managedLocalState = commonDir && options.includeStatusDigest
+    ? inspectManagedLocalState(normalizedRoot)
+    : null;
   const digest = commonDir && options.includeStatusDigest
-    ? computeWorktreeStatusDigest(normalizedRoot, status, statusEntries)
+    ? computeWorktreeStatusDigest(normalizedRoot, status, statusEntries, managedLocalState)
     : {
       digest: '',
       reliable: status.ok,
@@ -86,7 +90,7 @@ export function readWorktreeStatusSnapshot(
     commonDir,
     head,
     statusDigest: digest.digest,
-    dirty: status.ok ? statusRaw.length > 0 : true,
+    dirty: status.ok ? statusRaw.length > 0 || managedLocalState?.valid === false : true,
     statusEntryCount: statusEntries.length,
     changedPaths,
     statusDigestReliable: digest.reliable,
@@ -194,9 +198,10 @@ function computeWorktreeStatusDigest(
   repoRoot: string,
   status: GitBytesCapture,
   statusEntries: StatusEntry[],
+  managedLocalState: ManagedLocalStateInspection | null,
 ): WorktreeStatusDigestResult {
   const hash = createHash('sha256');
-  const warnings: string[] = [];
+  const warnings: string[] = [...(managedLocalState?.warnings ?? [])];
   if (!status.ok) warnings.push(`git status failed: ${status.error}`);
 
   hash.update('status\0');
@@ -238,6 +243,11 @@ function computeWorktreeStatusDigest(
     hash.update('\0');
     hashPathForStatus(hash, warnings, repoRoot, relativePath);
     hash.update('\0');
+  }
+  if (managedLocalState?.canonicalBlock) {
+    hash.update(managedLocalState.digestSuffix);
+  } else {
+    hash.update('\0pipelane-managed-local-state-v1-invalid\0');
   }
   hash.update('warnings\0');
   for (const warning of warnings) hash.update(`${warning}\0`);

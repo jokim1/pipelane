@@ -5,6 +5,7 @@ import { handleDevmode } from './commands/devmode.ts';
 import { handleDeploy } from './commands/deploy.ts';
 import { handleDoctor } from './commands/doctor.ts';
 import { handleMerge } from './commands/merge.ts';
+import { handleLocalState } from './commands/local-state.ts';
 import { handleNew } from './commands/new.ts';
 import { handleOrchestrate } from './commands/orchestrate.ts';
 import { handlePr } from './commands/pr.ts';
@@ -17,8 +18,10 @@ import { handleRollback } from './commands/rollback.ts';
 import { handleStatus } from './commands/status.ts';
 import { handleTaskLock } from './commands/task-lock.ts';
 import { assertRepoOnboardedForDeploy as assertDeployRepoOnboarded } from './onboarding.ts';
+import { assertManagedLocalStateValid } from './local-state.ts';
 import {
   parseOperatorArgs,
+  resolveRepoRoot,
   resolveWorkflowContext,
   validateOperatorArgs,
   type ParsedOperatorArgs,
@@ -28,6 +31,8 @@ import {
 export interface LoadedContext extends WorkflowContext {
   deployConfigText: string;
 }
+
+export type ManagedLocalStateSensitivity = 'observe' | 'current-state' | 'target-tree' | 'independent-recovery';
 
 export function loadWorkflowContext(cwd: string): LoadedContext {
   const context = resolveWorkflowContext(cwd);
@@ -49,6 +54,10 @@ export async function runOperator(cwd: string, argv: string[]): Promise<void> {
 
   validateOperatorArgs(parsed);
   assertRepoOnboardedForDeploy(cwd, parsed);
+  const managedStateSensitivity = classifyOperatorManagedStateSensitivity(parsed);
+  if (managedStateSensitivity === 'current-state' || managedStateSensitivity === 'target-tree') {
+    assertManagedLocalStateValid(resolveRepoRoot(cwd));
+  }
 
   if (command === 'devmode') {
     await handleDevmode(cwd, parsed);
@@ -120,6 +129,11 @@ export async function runOperator(cwd: string, argv: string[]): Promise<void> {
     return;
   }
 
+  if (command === 'local-state') {
+    await handleLocalState(cwd, parsed);
+    return;
+  }
+
   if (command === 'status') {
     await handleStatus(cwd, parsed);
     return;
@@ -141,6 +155,52 @@ export async function runOperator(cwd: string, argv: string[]): Promise<void> {
   }
 
   throw new Error(`Unknown Pipelane command "${command}". Run "pipelane run --help" to see supported commands.`);
+}
+
+export function classifyOperatorManagedStateSensitivity(parsed: ParsedOperatorArgs): ManagedLocalStateSensitivity {
+  switch (parsed.command) {
+    case 'devmode':
+    case 'adopt':
+    case 'resume':
+    case 'task-lock':
+    case 'release':
+    case 'release-check':
+    case 'local-state':
+    case 'status':
+    case 'doctor':
+    case 'api':
+      return 'observe';
+    case 'new':
+    case 'repo-guard':
+      return 'target-tree';
+    case 'pr':
+    case 'deploy':
+      return 'current-state';
+    case 'merge':
+    case 'clean':
+      return 'independent-recovery';
+    case 'rollback':
+      return parsed.flags.revertPr ? 'target-tree' : 'independent-recovery';
+    case 'review': {
+      const subcommand = parsed.positional[0] ?? '';
+      if (subcommand === '' ) return 'current-state';
+      if (subcommand === 'gc') return 'independent-recovery';
+      if (subcommand === 'setup' || subcommand === 'pass' || subcommand === 'attest' || subcommand === 'override') return 'observe';
+      throw new Error(`Managed local-state sensitivity is not classified for review ${subcommand}.`);
+    }
+    case 'orchestrate': {
+      const subcommand = parsed.positional[0] ?? '';
+      if (subcommand === '' || subcommand === 'run' || subcommand === 'plan' || subcommand === 'analyze') return 'current-state';
+      if (subcommand === 'prepare') return 'target-tree';
+      if (subcommand === 'dispatch' || subcommand === 'start' || subcommand === 'review') return 'current-state';
+      if (subcommand === 'finalize') return 'independent-recovery';
+      if (subcommand === 'goal-spec' || subcommand === 'plan-review' || subcommand === 'scope'
+        || subcommand === 'outline' || subcommand === 'upgrade-ledger') return 'observe';
+      throw new Error(`Managed local-state sensitivity is not classified for orchestrate ${subcommand}.`);
+    }
+    default:
+      throw new Error(`Managed local-state sensitivity is not classified for operator command ${parsed.command || '(empty)'}.`);
+  }
 }
 
 function assertRepoOnboardedForDeploy(cwd: string, parsed: ParsedOperatorArgs): void {
@@ -192,6 +252,9 @@ Pipelane commands:
   orchestrate dispatch --run-id <id>
   orchestrate start --run-id <id> [--slice-id <id>] [--force]
   orchestrate review --run-id <id> [--slice-id <id>] [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human]
+  local-state list [--json]
+  local-state add --path <path> --reason <text> [--yes]
+  local-state remove --path <path> [--yes]
   status
   doctor [--probe | --fix | --check-guard]
   rollback <staging|prod> [--surfaces ...] [--revert-pr]

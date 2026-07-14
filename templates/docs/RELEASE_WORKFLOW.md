@@ -1,6 +1,6 @@
 # Release Workflow
 
-Last updated: June 15, 2026
+Last updated: July 13, 2026
 Status: canonical maintainer workflow for {{DISPLAY_NAME}}
 
 This document is the full operator guide for this repo's pipelane setup.
@@ -48,6 +48,25 @@ This repo exposes the following user-facing slash commands through Claude/Codex 
 If aliases change, rerun setup and reopen Claude/Codex so the new command names are picked up.
 Aliases must be unique, and setup fails closed if an alias would overwrite an unrelated command or skill.
 Codex resolves aliases per repo at runtime, so the same alias name can map to different workflow commands in different pipelane repos on one machine.
+
+## Machine-local tool state
+
+Tool runtime files that belong in the checkout but must never become repository
+content are registered explicitly through Pipelane's fixed CLI:
+
+```text
+pipelane run local-state list
+pipelane run local-state add --path <repo-relative-root> --reason <why> [--yes]
+pipelane run local-state remove --path <repo-relative-root> [--yes]
+```
+
+Setup initializes one persistent empty v1 block in the Git common-dir
+`info/exclude`. Linked worktrees share it. Declarations are exact roots rather
+than globs, tracked content always wins, and a later tracked or kind conflict
+blocks source-changing commands. Non-interactive add requires `--path`,
+`--reason`, and `--yes`; no skill or tool can register itself implicitly.
+Removing a declaration only changes Git visibility, never disk content, and the
+empty block remains after the final removal.
 
 ## pipelane and gstack
 

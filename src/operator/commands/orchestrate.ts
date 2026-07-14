@@ -98,6 +98,7 @@ import {
   resolveTaskWorktreeRoot,
   saveNewTaskLock,
 } from '../task-workspaces.ts';
+import { assertManagedLocalStateValid, assertManagedLocalStateValidForTree } from '../local-state.ts';
 
 const MAX_PLAN_FILE_BYTES = 256 * 1024;
 const MAX_LIKELY_PLAN_FILES = 5;
@@ -735,6 +736,7 @@ function buildCleanSourceSnapshot(
     allowedDirtyPaths?: Set<string>;
   },
 ): OrchestrationSourceSnapshot | null {
+  assertManagedLocalStateValid(context.repoRoot);
   const allDirtyPaths = collectDirtyParentPaths(context.repoRoot);
   const allowedDirtyPaths = allDirtyPaths
     .filter((file) => options.allowedDirtyPaths?.has(file));
@@ -4310,6 +4312,7 @@ function ensureBaselinePreflight(context: WorkflowContext, run: OrchestrationRun
 }
 
 function assertRunSourceSnapshotStillCurrent(context: WorkflowContext, run: OrchestrationRunRecord): void {
+  assertManagedLocalStateValid(context.repoRoot);
   const source = run.sourceSnapshot;
   if (!source) return;
   const currentHead = runGit(context.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '';
@@ -4578,9 +4581,12 @@ function resolveOrchestrationTaskBaseRef(
     if (!resolved) {
       throw new Error(`Could not resolve orchestration source snapshot ref ${sourceRef} for run ${run.id}.`);
     }
+    assertManagedLocalStateValidForTree(context.repoRoot, resolved);
     return { sourceRef: resolved, warnings: [] };
   }
-  return resolveTaskBaseRef(context.repoRoot, run.baseBranch || context.config.baseBranch, offline);
+  const resolved = resolveTaskBaseRef(context.repoRoot, run.baseBranch || context.config.baseBranch, offline);
+  assertManagedLocalStateValidForTree(context.repoRoot, resolved.sourceRef);
+  return resolved;
 }
 
 function persistOrchestrationPrepareProgress(context: WorkflowContext, run: OrchestrationRunRecord): void {
@@ -4798,6 +4804,7 @@ function assertPreparedWorktreeSafe(
   if (actualBranch !== branchName) {
     throw new Error(`Slice ${sliceId} assigned worktree branch mismatch: expected ${branchName}, got ${actualBranch || '(detached)'}.`);
   }
+  assertManagedLocalStateValid(worktreePath);
 }
 
 function handlePlan(cwd: string, parsed: ParsedOperatorArgs): void {
