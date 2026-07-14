@@ -749,8 +749,10 @@ and non-TTY execution paths.
     consent check always rejected. **Proposed fix (implemented):** filtered,
     phase-filtered, and dry-run reviews can update timeout and AI-budget
     accounting but cannot replace `lastReviewRunId`, `lastReviewStatus`, or
-    the attempt's full-review binding. A failed targeted retry now remains
-    composable and accept-findings operates on the matching full envelope.
+    the attempt's existing full-review binding. A filtered run may initialize
+    those fields only when no prior review exists so timeout-only routes retain
+    their non-waivable remedy. A failed targeted retry now remains composable
+    and accept-findings operates on the matching full envelope.
 
 56. **Wrong-worktree remediation printed unquoted `cd` paths (P3).**
     **Location:** `src/operator/commands/helpers.ts:30` and
