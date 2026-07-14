@@ -28,6 +28,17 @@ const DEFAULT_CLAUDE_HOME = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-
 process.env.CLAUDE_HOME = DEFAULT_CLAUDE_HOME;
 process.env.CODEX_HOME = DEFAULT_CODEX_HOME;
 process.env.PIPELANE_HOME = DEFAULT_PIPELANE_HOME;
+// A durable launcher identifies its own managed runtime in the ambient
+// environment. That is host transport state, not test input: update fixtures
+// must discover only the synthetic runtimes they create. Tests that exercise
+// managed execution pass these variables explicitly to their child process.
+for (const key of [
+  'PIPELANE_MANAGED_RUNTIME',
+  'PIPELANE_MANAGED_RUNTIME_ROOT',
+  'PIPELANE_RUNNER_REEXECED',
+]) {
+  delete process.env[key];
+}
 const LOCAL_PIPELANE_INSTALL_SPEC = `file:${KIT_ROOT}`;
 const DEFAULT_ORCHESTRATION_STATE_KEY = 'pipelane-test-orchestration-state-key-0001';
 const TEST_LOCAL_STATE_START = '# >>> pipelane local-state v1 >>>';
