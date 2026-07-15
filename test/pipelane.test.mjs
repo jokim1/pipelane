@@ -29871,8 +29871,24 @@ test('secret provisioning requires approval bound to the repository and manifest
     });
     assert.equal(result.status, 1);
     assert.match(result.stderr, /requires approval bound to this repository and the exact provisioning manifest/);
-    assert.match(result.stderr, /--approve-secret-manifest=[a-f0-9]{64}/);
+    const approval = result.stderr.match(/--approve-secret-manifest=([a-f0-9]{64})/)?.[1];
+    assert.ok(approval);
     assert.doesNotMatch(result.stderr, /never-write-without-approval/);
+
+    run('git', ['remote', 'set-url', 'origin', 'https://github.com/other/repo.git'], repoRoot);
+    const redirected = spawnSync('node', [
+      CLI_PATH,
+      'setup',
+      '--provision-secrets',
+      `--approve-secret-manifest=${approval}`,
+    ], {
+      cwd: repoRoot,
+      env: buildCliChildEnv({ TEST_BOUND_TOKEN: 'never-write-to-changed-repository' }),
+      encoding: 'utf8',
+    });
+    assert.equal(redirected.status, 1);
+    assert.match(redirected.stderr, /requires approval bound to this repository and the exact provisioning manifest/);
+    assert.doesNotMatch(redirected.stderr, /never-write-to-changed-repository/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
