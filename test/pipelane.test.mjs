@@ -16320,6 +16320,7 @@ test('review gate timeouts have a distinct outcome and a targeted retry remedy',
     assert.deepEqual(latestRouteSafetyRecord(repoRoot).fixAttempts ?? [], []);
 
     const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const reviewEnforcement = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-enforcement.ts'));
     const routeSafety = await import(path.join(KIT_ROOT, 'src', 'operator', 'route-loop-safety.ts'));
     const context = stateMod.resolveWorkflowContext(repoRoot);
     const reviewRecord = JSON.parse(
@@ -16345,6 +16346,23 @@ test('review gate timeouts have a distinct outcome and a targeted retry remedy',
     assert.equal(accepted.status, 1);
     assert.match(accepted.stderr, /Cannot accept timed-out review gates as findings/);
     assert.match(accepted.stderr, /pipelane run review --gate slow-check/);
+
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.routeSafety.stopOnMajorFindings = false;
+    });
+    const timeoutEvidence = reviewEnforcement.evaluateReviewEvidenceForPr(
+      stateMod.resolveWorkflowContext(repoRoot),
+      { command: 'pr' },
+    );
+    assert.equal(
+      routeSafety.routeSafetyAcceptsReviewFindings(
+        repoRoot,
+        stateMod.parseOperatorArgs(['pr']),
+        timeoutEvidence,
+      ),
+      false,
+      'disabling major-finding stops must not turn missing timeout evidence into acceptable findings',
+    );
 
     const human = runCli(['run', 'review', '--gate', 'slow-check'], repoRoot, {}, true);
     assert.equal(human.status, 1);
@@ -16477,6 +16495,14 @@ test('route safety and API snapshots use the composed full review after targeted
     const passingFull = JSON.parse(passingFullResult.stdout);
     assert.equal(passingFull.status, 'passed');
     assert.equal(latestRouteSafetyRecord(repoRoot).lastReviewStatus, 'passed');
+    assert.equal(
+      readRouteSafetyState(repoRoot).latestPausedRouteFingerprintDigest,
+      undefined,
+      'a passing review must clear the paused-route pointer',
+    );
+    const resumeAfterPassingReview = runCli(['run', 'resume', '--one-more-loop', '--json'], repoRoot, {}, true);
+    assert.equal(resumeAfterPassingReview.status, 1);
+    assert.match(resumeAfterPassingReview.stderr, /No paused route-bound fix\/review loop was found/);
 
     const failedRetry = runCli(
       ['run', 'review', '--gate', 'slow-check', '--json'],
@@ -32615,6 +32641,7 @@ test('task-scoped devmode readiness covers persisted surfaces and rejects concur
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-devmode-surfaces-'));
   const markerPath = path.join(markerRoot, 'probe-started');
+  const releasePath = path.join(markerRoot, 'release-probe');
   try {
     writePipelaneConfig(repoRoot, 'Task Surface Readiness');
     writeFullDeployConfigState(repoRoot);
@@ -32650,8 +32677,8 @@ test('task-scoped devmode readiness covers persisted surfaces and rejects concur
       'run', 'devmode', 'release', '--task', 'Concurrent Surfaces', '--json',
     ], concurrent.worktreePath, {
       PIPELANE_DOCTOR_PROBE_STUB_STATUS: '200',
-      PIPELANE_DOCTOR_PROBE_STUB_DELAY_MS: '750',
       PIPELANE_DOCTOR_PROBE_STUB_STARTED_FILE: markerPath,
+      PIPELANE_DOCTOR_PROBE_STUB_RELEASE_FILE: releasePath,
     });
     await waitForPathForTest(markerPath);
 
@@ -32662,6 +32689,7 @@ test('task-scoped devmode readiness covers persisted surfaces and rejects concur
       surfaces: ['sql'],
       updatedAt: new Date().toISOString(),
     }));
+    writeFileSync(releasePath, 'release\n', 'utf8');
 
     const changed = await releaseRun;
     assert.equal(changed.status, 1);
@@ -32671,6 +32699,7 @@ test('task-scoped devmode readiness covers persisted surfaces and rejects concur
     assert.equal(latestLock.mode, 'build');
     assert.equal(stateMod.resolveWorkflowContext(repoRoot).modeState.mode, 'build');
   } finally {
+    writeFileSync(releasePath, 'release\n', 'utf8');
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
     rmSync(markerRoot, { recursive: true, force: true });
@@ -32721,6 +32750,7 @@ test('devmode release never overwrites a rebound identity or removed task lock a
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-devmode-probe-'));
   const markerPath = path.join(markerRoot, 'probe-started');
+  const releasePath = path.join(markerRoot, 'release-probe');
   try {
     writePipelaneConfig(repoRoot, 'Concurrent Mode Reconciliation');
     writeFullDeployConfigState(repoRoot);
@@ -32731,8 +32761,8 @@ test('devmode release never overwrites a rebound identity or removed task lock a
 
     const childEnv = {
       PIPELANE_DOCTOR_PROBE_STUB_STATUS: '200',
-      PIPELANE_DOCTOR_PROBE_STUB_DELAY_MS: '750',
       PIPELANE_DOCTOR_PROBE_STUB_STARTED_FILE: markerPath,
+      PIPELANE_DOCTOR_PROBE_STUB_RELEASE_FILE: releasePath,
     };
     const reboundRun = runCliAsync(['run', 'devmode', 'release', '--json'], created.worktreePath, childEnv);
     await waitForPathForTest(markerPath);
@@ -32744,6 +32774,7 @@ test('devmode release never overwrites a rebound identity or removed task lock a
       taskBindingId: 'task-binding-identity-only-rebind',
       updatedAt: new Date().toISOString(),
     }));
+    writeFileSync(releasePath, 'release\n', 'utf8');
 
     const reboundResult = await reboundRun;
     assert.equal(reboundResult.status, 1);
@@ -32756,12 +32787,14 @@ test('devmode release never overwrites a rebound identity or removed task lock a
     assert.equal(stateMod.resolveWorkflowContext(repoRoot).modeState.mode, 'build');
 
     rmSync(markerPath, { force: true });
+    rmSync(releasePath, { force: true });
     writeStaleProbeState(repoRoot, ['frontend', 'edge', 'sql']);
     const removedRun = runCliAsync([
       'run', 'devmode', 'release', '--task', 'Concurrent Reconciliation', '--json',
     ], created.worktreePath, childEnv);
     await waitForPathForTest(markerPath);
     stateMod.removeTaskLock(context.commonDir, context.config, 'concurrent-reconciliation');
+    writeFileSync(releasePath, 'release\n', 'utf8');
 
     const removedResult = await removedRun;
     assert.equal(removedResult.status, 1);
@@ -32769,6 +32802,7 @@ test('devmode release never overwrites a rebound identity or removed task lock a
     assert.equal(stateMod.loadTaskLock(context.commonDir, context.config, 'concurrent-reconciliation'), null);
     assert.equal(stateMod.resolveWorkflowContext(repoRoot).modeState.mode, 'build');
   } finally {
+    writeFileSync(releasePath, 'release\n', 'utf8');
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
     rmSync(markerRoot, { recursive: true, force: true });
@@ -32779,6 +32813,7 @@ test('devmode release re-reads deploy state after an inline probe refresh', asyn
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-devmode-deploy-race-'));
   const markerPath = path.join(markerRoot, 'probe-started');
+  const releasePath = path.join(markerRoot, 'release-probe');
   try {
     writePipelaneConfig(repoRoot, 'Concurrent Deploy Readiness');
     writeFullDeployConfigState(repoRoot);
@@ -32787,14 +32822,15 @@ test('devmode release re-reads deploy state after an inline probe refresh', asyn
 
     const releaseRun = runCliAsync(['run', 'devmode', 'release', '--json'], repoRoot, {
       PIPELANE_DOCTOR_PROBE_STUB_STATUS: '200',
-      PIPELANE_DOCTOR_PROBE_STUB_DELAY_MS: '750',
       PIPELANE_DOCTOR_PROBE_STUB_STARTED_FILE: markerPath,
+      PIPELANE_DOCTOR_PROBE_STUB_RELEASE_FILE: releasePath,
     });
     await waitForPathForTest(markerPath);
     writeStagingRequestedRecord(repoRoot, ['frontend', 'edge', 'sql'], {
       requestedAt: new Date().toISOString(),
       taskSlug: 'concurrent-deploy',
     });
+    writeFileSync(releasePath, 'release\n', 'utf8');
 
     const result = await releaseRun;
     assert.equal(result.status, 1);
@@ -32805,6 +32841,7 @@ test('devmode release re-reads deploy state after an inline probe refresh', asyn
     const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
     assert.equal(stateMod.resolveWorkflowContext(repoRoot).modeState.mode, 'build');
   } finally {
+    writeFileSync(releasePath, 'release\n', 'utf8');
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
     rmSync(markerRoot, { recursive: true, force: true });
@@ -32815,6 +32852,9 @@ test('task mutation leases reject live contention and reclaim dead owners', asyn
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-task-mutation-'));
   const markerPath = path.join(markerRoot, 'lease-held');
+  const holderReleasePath = path.join(markerRoot, 'release-holder');
+  const reclaimMarkerPath = path.join(markerRoot, 'reclaim-held');
+  const reclaimReleasePath = path.join(markerRoot, 'release-reclaim');
   try {
     writePipelaneConfig(repoRoot, 'Task Mutation Lease');
     commitAll(repoRoot, 'Adopt pipelane');
@@ -32826,7 +32866,12 @@ test('task mutation leases reject live contention and reclaim dead owners', asyn
       `const context = state.resolveWorkflowContext(${JSON.stringify(created.worktreePath)});`,
       `state.updateTaskLock(context.commonDir, context.config, 'mutation-lease', (lock) => {`,
       `  fs.writeFileSync(${JSON.stringify(markerPath)}, String(process.pid));`,
-      `  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 750);`,
+      `  const deadline = Date.now() + 10_000;`,
+      `  const waitArray = new Int32Array(new SharedArrayBuffer(4));`,
+      `  while (!fs.existsSync(${JSON.stringify(holderReleasePath)})) {`,
+      `    if (Date.now() >= deadline) throw new Error('Timed out waiting for task mutation holder release.');`,
+      `    Atomics.wait(waitArray, 0, 0, 25);`,
+      `  }`,
       `  return { ...lock, nextAction: 'holder update', updatedAt: new Date().toISOString() };`,
       `});`,
     ].join('\n');
@@ -32850,6 +32895,7 @@ test('task mutation leases reject live contention and reclaim dead owners', asyn
       })),
       /being updated by another Pipelane process/,
     );
+    writeFileSync(holderReleasePath, 'release\n', 'utf8');
 
     const [holderCode] = await holderExit;
     assert.equal(holderCode, 0, holderStderr);
@@ -32867,14 +32913,61 @@ test('task mutation leases reject live contention and reclaim dead owners', asyn
       acquiredAt: new Date(0).toISOString(),
     })}\n`, 'utf8');
 
+    const reclaimerScript = [
+      `const state = await import(${JSON.stringify(stateUrl)});`,
+      `const context = state.resolveWorkflowContext(${JSON.stringify(created.worktreePath)});`,
+      `state.updateTaskLock(context.commonDir, context.config, 'mutation-lease', (lock) => ({`,
+      `  ...lock,`,
+      `  nextAction: 'reclaimed dead owner',`,
+      `  updatedAt: new Date().toISOString(),`,
+      `}));`,
+    ].join('\n');
+    const reclaimer = spawn(process.execPath, ['--input-type=module', '-e', reclaimerScript], {
+      cwd: created.worktreePath,
+      env: buildCliChildEnv({
+        PIPELANE_TEST_TASK_MUTATION_RECLAIM_MARKER: reclaimMarkerPath,
+        PIPELANE_TEST_TASK_MUTATION_RECLAIM_RELEASE: reclaimReleasePath,
+      }),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const reclaimerExit = once(reclaimer, 'exit');
+    let reclaimerStderr = '';
+    reclaimer.stderr.on('data', (chunk) => { reclaimerStderr += chunk.toString('utf8'); });
+    await waitForPathForTest(reclaimMarkerPath);
+
+    assert.throws(
+      () => stateMod.updateTaskLock(context.commonDir, context.config, 'mutation-lease', (lock) => ({
+        ...lock,
+        nextAction: 'second stale reclaimer',
+        updatedAt: new Date().toISOString(),
+      })),
+      /being updated by another Pipelane process/,
+    );
+    reclaimer.kill('SIGKILL');
+    const [reclaimerCode, reclaimerSignal] = await reclaimerExit;
+    assert.equal(reclaimerCode, null, reclaimerStderr);
+    assert.equal(reclaimerSignal, 'SIGKILL');
+
     const reclaimed = stateMod.updateTaskLock(context.commonDir, context.config, 'mutation-lease', (lock) => ({
       ...lock,
-      nextAction: 'reclaimed dead owner',
+      nextAction: 'reclaimed after contender crash',
       updatedAt: new Date().toISOString(),
     }));
-    assert.equal(reclaimed.nextAction, 'reclaimed dead owner');
+    assert.equal(reclaimed.nextAction, 'reclaimed after contender crash');
+    assert.equal(existsSync(mutationLockPath), false);
+
+    mkdirSync(mutationLockPath);
+    utimesSync(mutationLockPath, new Date(0), new Date(0));
+    const reclaimedOwnerless = stateMod.updateTaskLock(
+      context.commonDir,
+      context.config,
+      'mutation-lease',
+      (lock) => ({ ...lock, nextAction: 'reclaimed ownerless lease' }),
+    );
+    assert.equal(reclaimedOwnerless.nextAction, 'reclaimed ownerless lease');
     assert.equal(existsSync(mutationLockPath), false);
   } finally {
+    writeFileSync(holderReleasePath, 'release\n', 'utf8');
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
     rmSync(markerRoot, { recursive: true, force: true });
@@ -32921,6 +33014,7 @@ test('task cleanup holds the task mutation lease for its full destructive window
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-task-cleanup-mutation-'));
   const markerPath = path.join(markerRoot, 'cleanup-held');
+  const releasePath = path.join(markerRoot, 'release-cleanup');
   try {
     writePipelaneConfig(repoRoot, 'Task Cleanup Mutation');
     commitAll(repoRoot, 'Adopt pipelane');
@@ -32933,7 +33027,12 @@ test('task cleanup holds the task mutation lease for its full destructive window
       `const lease = state.acquireTaskCleanupLock(context.commonDir, context.config, 'cleanup-mutation');`,
       `if (!lease.acquired) throw new Error(lease.reason);`,
       `fs.writeFileSync(${JSON.stringify(markerPath)}, String(process.pid));`,
-      `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 750);`,
+      `const deadline = Date.now() + 10_000;`,
+      `const waitArray = new Int32Array(new SharedArrayBuffer(4));`,
+      `while (!fs.existsSync(${JSON.stringify(releasePath)})) {`,
+      `  if (Date.now() >= deadline) throw new Error('Timed out waiting for task cleanup holder release.');`,
+      `  Atomics.wait(waitArray, 0, 0, 25);`,
+      `}`,
       `lease.release();`,
     ].join('\n');
     const holder = spawn(process.execPath, ['--input-type=module', '-e', holderScript], {
@@ -32956,6 +33055,7 @@ test('task cleanup holds the task mutation lease for its full destructive window
       })),
       /being updated by another Pipelane process/,
     );
+    writeFileSync(releasePath, 'release\n', 'utf8');
 
     const [holderCode] = await holderExit;
     assert.equal(holderCode, 0, holderStderr);
@@ -32966,6 +33066,7 @@ test('task cleanup holds the task mutation lease for its full destructive window
     }));
     assert.equal(updated.nextAction, 'cleanup completed');
   } finally {
+    writeFileSync(releasePath, 'release\n', 'utf8');
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
     rmSync(markerRoot, { recursive: true, force: true });

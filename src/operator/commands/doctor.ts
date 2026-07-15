@@ -411,6 +411,16 @@ async function probeUrl(target: ProbeTarget, nowFn: () => Date): Promise<ProbeRe
     }
     const startedMarker = process.env.PIPELANE_DOCTOR_PROBE_STUB_STARTED_FILE?.trim();
     if (startedMarker) writeFileSync(startedMarker, `${process.pid}\n`, 'utf8');
+    const releasePath = process.env.PIPELANE_DOCTOR_PROBE_STUB_RELEASE_FILE?.trim();
+    if (releasePath) {
+      const deadline = Date.now() + 10_000;
+      while (!existsSync(releasePath)) {
+        if (Date.now() >= deadline) {
+          throw new Error(`Timed out waiting for doctor probe test release at ${releasePath}.`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
     const delayText = process.env.PIPELANE_DOCTOR_PROBE_STUB_DELAY_MS?.trim() ?? '';
     const delayMs = /^\d+$/.test(delayText) ? Number(delayText) : 0;
     if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));

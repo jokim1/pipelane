@@ -250,6 +250,7 @@ export function recordReviewRunForRouteSafety(
     ) {
       record.pauseReason = undefined;
       record.pausedAt = undefined;
+      syncLatestPausedRoutePointer(state, record);
       saveRouteSafetyState(context.commonDir, context.config, state);
       return { action: 'continue', message: '' };
     }
@@ -380,7 +381,7 @@ export function applyRouteSafetyResumeOverride(cwd: string, parsed: ParsedOperat
       record.resumes = [resume, ...(record.resumes ?? [])].slice(0, 20);
     }
     record.updatedAt = nowIso();
-    state.latestPausedRouteFingerprintDigest = record.routeFingerprintDigest;
+    syncLatestPausedRoutePointer(state, record);
     saveRouteSafetyState(context.commonDir, context.config, state);
   });
   if (!record || !resume) throw new Error('Route safety resume could not be recorded.');
@@ -432,7 +433,7 @@ function mutateExpectedRouteRecord(
     }
     mutate(state, record);
     record.updatedAt = nowIso();
-    state.latestPausedRouteFingerprintDigest = record.routeFingerprintDigest;
+    syncLatestPausedRoutePointer(state, record);
     saveRouteSafetyState(context.commonDir, context.config, state);
     return record;
   });
@@ -1669,13 +1670,25 @@ function markPaused(state: RouteSafetyState, record: RouteSafetyRecord, reason: 
   record.pausedAt = nowIso();
   record.pauseReason = reason;
   record.updatedAt = record.pausedAt;
-  state.latestPausedRouteFingerprintDigest = record.routeFingerprintDigest;
+  syncLatestPausedRoutePointer(state, record);
+}
+
+function syncLatestPausedRoutePointer(state: RouteSafetyState, record: RouteSafetyRecord): void {
+  if (record.pausedAt) {
+    state.latestPausedRouteFingerprintDigest = record.routeFingerprintDigest;
+  } else if (state.latestPausedRouteFingerprintDigest === record.routeFingerprintDigest) {
+    state.latestPausedRouteFingerprintDigest = undefined;
+  }
 }
 
 function reviewEvidenceIssuesAreAcceptableFindings(evidence: ReviewEvidenceCheckResult): boolean {
   return Boolean(evidence.latest)
     && evidence.issues.length > 0
-    && evidence.issues.every((issue) => issue.blocking && issue.status === 'failed');
+    && evidence.issues.every((issue) => (
+      issue.blocking
+      && issue.status === 'failed'
+      && issue.gate?.outcome !== 'timeout'
+    ));
 }
 
 function findPausedRouteRecordForCurrentCheckout(context: WorkflowContext, state: RouteSafetyState): RouteSafetyRecord | null {
@@ -1690,7 +1703,7 @@ function findPausedRouteRecordForCurrentCheckout(context: WorkflowContext, state
     return record.taskBindingId === binding.taskBindingId;
   };
   const latest = state.latestPausedRouteFingerprintDigest ? state.routes[state.latestPausedRouteFingerprintDigest] : null;
-  if (latest && matchesCurrentCheckout(latest)) return latest;
+  if (latest?.pausedAt && matchesCurrentCheckout(latest)) return latest;
   const paused = Object.values(state.routes)
     .filter((record) =>
       record.pausedAt

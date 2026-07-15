@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
-import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -4094,46 +4094,239 @@ function taskMutationLockPath(commonDir: string, config: WorkflowConfig, taskSlu
 function acquireTaskMutationLock(commonDir: string, config: WorkflowConfig, taskSlug: string): () => void {
   const lockPath = taskMutationLockPath(commonDir, config, taskSlug);
   mkdirSync(path.dirname(lockPath), { recursive: true });
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      mkdirSync(lockPath);
-      writeFileSync(
-        path.join(lockPath, 'owner.json'),
-        `${JSON.stringify({ taskSlug, pid: process.pid, acquiredAt: nowIso() }, null, 2)}\n`,
-        'utf8',
-      );
-      return () => rmSync(lockPath, { recursive: true, force: true });
-    } catch (error) {
-      const err = error as NodeJS.ErrnoException;
-      if (err.code !== 'EEXIST') {
-        rmSync(lockPath, { recursive: true, force: true });
-        throw new Error(`Could not acquire task lock mutation lease for ${taskSlug}: ${err.message}`);
-      }
-      if (clearAbandonedTaskMutationLock(lockPath)) continue;
+  try {
+    return createTaskMutationLock(lockPath, taskSlug);
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code !== 'EEXIST') {
+      throw new Error(`Could not acquire task lock mutation lease for ${taskSlug}: ${err.message}`);
+    }
+  }
+
+  const abandonedIdentity = abandonedTaskMutationLockIdentity(lockPath);
+  if (!abandonedIdentity) {
+    throw new Error(`Task ${taskSlug} is being updated by another Pipelane process; retry after it finishes.`);
+  }
+  const reclaimClaim = acquireTaskMutationReclaimClaim(lockPath, abandonedIdentity);
+  try {
+    pauseTaskMutationReclaimForTest();
+    if (
+      taskMutationLockIdentity(lockPath) !== abandonedIdentity
+      || taskMutationLockOwnerIsLive(lockPath)
+      || !taskMutationReclaimClaimOwnsTurn(lockPath, reclaimClaim)
+    ) {
       throw new Error(`Task ${taskSlug} is being updated by another Pipelane process; retry after it finishes.`);
     }
+    // Only the lowest live claim for this exact directory generation may
+    // remove it. Claims use never-reused tickets inside the doomed directory,
+    // so a crashed reclaimer is ignored without an orphanable second lock.
+    rmSync(lockPath, { recursive: true, force: true });
+    try {
+      return createTaskMutationLock(lockPath, taskSlug);
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err.code === 'EEXIST') {
+        throw new Error(`Task ${taskSlug} is being updated by another Pipelane process; retry after it finishes.`);
+      }
+      throw new Error(`Could not acquire task lock mutation lease for ${taskSlug}: ${err.message}`);
+    }
+  } finally {
+    withdrawTaskMutationReclaimClaim(reclaimClaim);
   }
-  throw new Error(`Could not acquire task lock mutation lease for ${taskSlug}.`);
 }
 
-function clearAbandonedTaskMutationLock(lockPath: string): boolean {
-  let owner: { pid?: unknown } | null = null;
+function createTaskMutationLock(lockPath: string, taskSlug: string): () => void {
+  const ownerNonce = crypto.randomUUID();
+  mkdirSync(lockPath);
   try {
-    owner = JSON.parse(readFileSync(path.join(lockPath, 'owner.json'), 'utf8')) as { pid?: unknown };
-  } catch {}
-  const pid = typeof owner?.pid === 'number' && Number.isSafeInteger(owner.pid) && owner.pid > 0
-    ? owner.pid
-    : null;
-  if (pid !== null && processIsAliveForTaskMutation(pid)) return false;
-  if (pid === null) {
+    writeFileSync(
+      path.join(lockPath, 'owner.json'),
+      `${JSON.stringify({ taskSlug, pid: process.pid, ownerNonce, acquiredAt: nowIso() }, null, 2)}\n`,
+      'utf8',
+    );
+  } catch (error) {
+    rmSync(lockPath, { recursive: true, force: true });
+    throw error;
+  }
+  return () => releaseOwnedTaskMutationPath(lockPath, ownerNonce);
+}
+
+interface TaskMutationReclaimClaim {
+  path: string;
+  ticket: number;
+  ownerNonce: string;
+  lockIdentity: string;
+}
+
+interface StoredTaskMutationReclaimClaim {
+  ticket?: unknown;
+  pid?: unknown;
+  ownerNonce?: unknown;
+  lockIdentity?: unknown;
+  active?: unknown;
+}
+
+function acquireTaskMutationReclaimClaim(
+  lockPath: string,
+  lockIdentity: string,
+): TaskMutationReclaimClaim {
+  const ownerNonce = crypto.randomUUID();
+  for (let ticket = 0; ticket < 10_000; ticket += 1) {
+    const claimPath = path.join(lockPath, `.reclaim-${String(ticket).padStart(5, '0')}.json`);
+    const temporaryPath = path.join(lockPath, `.reclaim-${ownerNonce}-${ticket}.tmp`);
     try {
-      if (Date.now() - statSync(lockPath).mtimeMs <= TASK_MUTATION_LOCK_STALE_MS) return false;
-    } catch {
-      return false;
+      writeFileSync(temporaryPath, `${JSON.stringify({
+        ticket,
+        pid: process.pid,
+        ownerNonce,
+        lockIdentity,
+        active: true,
+        acquiredAt: nowIso(),
+      }, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' });
+      // Hard-linking a fully written unique file makes publication both atomic
+      // and exclusive. A contender can never observe a reserved lower ticket
+      // whose owner metadata is only partially written.
+      linkSync(temporaryPath, claimPath);
+      return { path: claimPath, ticket, ownerNonce, lockIdentity };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') continue;
+      throw error;
+    } finally {
+      try {
+        unlinkSync(temporaryPath);
+      } catch {}
     }
   }
+  throw new Error('Could not reserve a task mutation reclaim claim; too many abandoned contenders exist.');
+}
+
+function taskMutationReclaimClaimOwnsTurn(
+  lockPath: string,
+  claim: TaskMutationReclaimClaim,
+): boolean {
+  let winningTicket = Number.POSITIVE_INFINITY;
+  try {
+    for (const entry of readdirSync(lockPath)) {
+      if (!/^\.reclaim-\d{5}\.json$/.test(entry)) continue;
+      let stored: StoredTaskMutationReclaimClaim | null = null;
+      try {
+        stored = JSON.parse(readFileSync(path.join(lockPath, entry), 'utf8')) as StoredTaskMutationReclaimClaim;
+      } catch {}
+      if (
+        stored?.active !== true
+        || stored.lockIdentity !== claim.lockIdentity
+        || typeof stored.ticket !== 'number'
+        || !Number.isSafeInteger(stored.ticket)
+        || typeof stored.pid !== 'number'
+        || !Number.isSafeInteger(stored.pid)
+        || stored.pid <= 0
+        || !processIsAliveForTaskMutation(stored.pid)
+      ) continue;
+      winningTicket = Math.min(winningTicket, stored.ticket);
+    }
+  } catch {
+    return false;
+  }
+  return winningTicket === claim.ticket && taskMutationReclaimClaimIsOwned(claim);
+}
+
+function withdrawTaskMutationReclaimClaim(claim: TaskMutationReclaimClaim): void {
+  if (!taskMutationReclaimClaimIsOwned(claim)) return;
+  try {
+    writeFileSync(claim.path, `${JSON.stringify({
+      ticket: claim.ticket,
+      pid: process.pid,
+      ownerNonce: claim.ownerNonce,
+      lockIdentity: claim.lockIdentity,
+      active: false,
+      releasedAt: nowIso(),
+    }, null, 2)}\n`, 'utf8');
+  } catch {}
+}
+
+function taskMutationReclaimClaimIsOwned(claim: TaskMutationReclaimClaim): boolean {
+  try {
+    const stored = JSON.parse(readFileSync(claim.path, 'utf8')) as StoredTaskMutationReclaimClaim;
+    return stored.ownerNonce === claim.ownerNonce
+      && stored.lockIdentity === claim.lockIdentity
+      && stored.ticket === claim.ticket
+      && stored.active === true;
+  } catch {
+    return false;
+  }
+}
+
+function releaseOwnedTaskMutationPath(lockPath: string, ownerNonce: string): void {
+  let currentNonce = '';
+  try {
+    const owner = JSON.parse(readFileSync(path.join(lockPath, 'owner.json'), 'utf8')) as { ownerNonce?: unknown };
+    currentNonce = typeof owner.ownerNonce === 'string' ? owner.ownerNonce : '';
+  } catch {}
+  if (currentNonce !== ownerNonce) return;
   rmSync(lockPath, { recursive: true, force: true });
-  return true;
+}
+
+function abandonedTaskMutationLockIdentity(lockPath: string): string | null {
+  const identity = taskMutationLockIdentity(lockPath);
+  if (!identity) return null;
+  if (taskMutationLockOwnerIsLive(lockPath)) return null;
+  let hasValidPid = false;
+  try {
+    const owner = JSON.parse(readFileSync(path.join(lockPath, 'owner.json'), 'utf8')) as { pid?: unknown };
+    hasValidPid = typeof owner.pid === 'number' && Number.isSafeInteger(owner.pid) && owner.pid > 0;
+  } catch {}
+  if (!hasValidPid) {
+    try {
+      if (Date.now() - statSync(lockPath).mtimeMs <= TASK_MUTATION_LOCK_STALE_MS) return null;
+    } catch {
+      return null;
+    }
+  }
+  return identity;
+}
+
+function taskMutationLockOwnerIsLive(lockPath: string): boolean {
+  try {
+    const owner = JSON.parse(readFileSync(path.join(lockPath, 'owner.json'), 'utf8')) as { pid?: unknown };
+    return typeof owner.pid === 'number'
+      && Number.isSafeInteger(owner.pid)
+      && owner.pid > 0
+      && processIsAliveForTaskMutation(owner.pid);
+  } catch {
+    return false;
+  }
+}
+
+function taskMutationLockIdentity(lockPath: string): string | null {
+  try {
+    const stat = statSync(lockPath);
+    let ownerText = '';
+    try {
+      ownerText = readFileSync(path.join(lockPath, 'owner.json'), 'utf8');
+    } catch {}
+    return crypto.createHash('sha256')
+      .update(`${stat.dev}:${stat.ino}:`)
+      .update(ownerText)
+      .digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+function pauseTaskMutationReclaimForTest(): void {
+  if (process.env.NODE_ENV !== 'test') return;
+  const markerPath = process.env.PIPELANE_TEST_TASK_MUTATION_RECLAIM_MARKER?.trim();
+  const releasePath = process.env.PIPELANE_TEST_TASK_MUTATION_RECLAIM_RELEASE?.trim();
+  if (!markerPath || !releasePath) return;
+  writeFileSync(markerPath, String(process.pid), 'utf8');
+  const deadline = Date.now() + 10_000;
+  const waitArray = new Int32Array(new SharedArrayBuffer(4));
+  while (!existsSync(releasePath)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for task mutation reclaim test release at ${releasePath}.`);
+    }
+    Atomics.wait(waitArray, 0, 0, 25);
+  }
 }
 
 function processIsAliveForTaskMutation(pid: number): boolean {

@@ -852,6 +852,40 @@ and non-TTY execution paths.
     as enforcement, while the timeout ledger still reconciles only gates
     actually retried.
 
+66. **Concurrent stale task-mutation reclaimers could delete a successor's
+    live lease (P0).** **Location:** `src/operator/state.ts:4094`. **Repro:**
+    seed an abandoned task-mutation lock and let two processes both observe
+    the dead owner before either removes the directory; the former check-then-
+    delete path allowed the losing reclaimer to remove the winner's newly
+    created lease, so both task-lock mutations could proceed concurrently.
+    **Proposed fix (implemented):** publish atomic, identity-bound reclaim
+    claims inside the abandoned directory, elect the lowest live ticket,
+    recheck the exact directory generation and owner immediately before
+    deletion, and bind normal release to an owner nonce so it cannot remove a
+    successor lease.
+
+67. **Route safety treated a timed-out review gate as an acceptable finding
+    (P0).** **Location:** `src/operator/route-loop-safety.ts:1684`. **Repro:**
+    let the only blocking review issue be a gate with `status: "failed"` and
+    `outcome: "timeout"`, then disable `routeSafety.stopOnMajorFindings`; the
+    old generic failed-gate predicate returned true and could advance the
+    route as though a reviewer had produced an actionable finding. **Proposed
+    fix (implemented):** acceptable findings must be real failed verdicts;
+    timeout outcomes remain fail-closed and require executable gate retry
+    evidence.
+
+68. **Clearing a route pause left a stale pointer that `/resume` could target
+    (P1).** **Location:** `src/operator/route-loop-safety.ts:250`,
+    `src/operator/route-loop-safety.ts:1676`, and
+    `src/operator/route-loop-safety.ts:1703`. **Repro:** pause a route, record a
+    passing review that clears `pausedAt`, then run `resume --one-more-loop`;
+    `latestPausedRouteFingerprintDigest` still named the unpaused record and
+    the fast path returned it without checking `pausedAt`. **Proposed fix
+    (implemented):** synchronize the latest-paused pointer whenever pause
+    state changes, clear it only when it still names that record, and require
+    the fast-path record to remain paused. Tests also replace fixed sleep
+    windows in the affected concurrency cases with explicit release markers.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original
