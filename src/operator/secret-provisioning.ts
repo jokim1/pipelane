@@ -1,12 +1,14 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
+import { parseEnv } from 'node:util';
 
 import { sanitizeForTerminal } from './text-output.ts';
 
 export const SECRET_PROVISIONING_MANIFEST = '.github/pipelane-provisioning.json';
 export const SECRET_PROVISIONING_GUIDE_URL = 'https://github.com/jokim1/pipelane/blob/main/docs/public/SECRET_PROVISIONING.md';
 const GITHUB_SECRET_MAX_BYTES = 48 * 1024;
+const GITHUB_REPOSITORY_SECRET_MAX_COUNT = 100;
 const SECRET_NAME_PATTERN = /^[A-Z_][A-Z0-9_]*$/;
 const ENVIRONMENT_NAME_PATTERN = /^[A-Z_][A-Z0-9_]*$/;
 const HELDOUT_GROUPS = new Set([
@@ -112,7 +114,7 @@ export function loadSecretProvisioningManifest(repoRoot: string): SecretProvisio
     throw new Error(`${SECRET_PROVISIONING_MANIFEST} must declare github.repositorySecrets as an array.`);
   }
   assertAllowedKeys(raw.github, ['repositorySecrets'], `${SECRET_PROVISIONING_MANIFEST} github`);
-  if (raw.github.repositorySecrets.length > 100) {
+  if (raw.github.repositorySecrets.length > GITHUB_REPOSITORY_SECRET_MAX_COUNT) {
     throw new Error(`${SECRET_PROVISIONING_MANIFEST} declares more than GitHub's 100 repository-secret limit.`);
   }
 
@@ -122,6 +124,9 @@ export function loadSecretProvisioningManifest(repoRoot: string): SecretProvisio
     if (!isRecord(entry)) throw new Error(`${location} must be an object.`);
     assertAllowedKeys(entry, ['name', 'description', 'source'], location);
     const name = requiredName(entry.name, `${location}.name`, SECRET_NAME_PATTERN);
+    if (name.startsWith('GITHUB_')) {
+      throw new Error(`${location}.name must not start with GitHub's reserved GITHUB_ prefix.`);
+    }
     if (seen.has(name)) throw new Error(`${SECRET_PROVISIONING_MANIFEST} declares duplicate secret ${name}.`);
     seen.add(name);
     const description = optionalString(entry.description, `${location}.description`);
@@ -146,6 +151,16 @@ export function provisionRepositorySecrets(
   const rotate = options.rotate === true;
   const env = options.env ?? process.env;
   const existing = listRepositorySecretNames(repoRoot, env);
+  const combinedNames = new Set([
+    ...existing,
+    ...manifest.github.repositorySecrets.map((secret) => secret.name.toUpperCase()),
+  ]);
+  if (combinedNames.size > GITHUB_REPOSITORY_SECRET_MAX_COUNT) {
+    throw new Error([
+      `${SECRET_PROVISIONING_MANIFEST} and the repository's existing secrets would total ${combinedNames.size} names,`,
+      `exceeding GitHub's ${GITHUB_REPOSITORY_SECRET_MAX_COUNT} repository-secret limit. Remove unused secrets before provisioning.`,
+    ].join(' '));
+  }
   const entries: SecretProvisioningEntryResult[] = [];
   const resolvedValues = new Map<string, string>();
 
@@ -452,17 +467,37 @@ function readDotenvValue(filePath: string, variable: string): string | null {
   } catch {
     return null;
   }
-  for (const line of body.split(/\r?\n/)) {
-    const match = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
-    if (!match || match[1] !== variable) continue;
-    const raw = match[2].trim();
-    if (!raw) return null;
-    if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
-      return raw.slice(1, -1) || null;
-    }
-    return raw;
+  try {
+    const value = parseEnv(body)[variable];
+    return value && value.trim() ? value : null;
+  } catch {
+    return null;
   }
-  return null;
+}
+
+export interface WranglerSpawnSpec {
+  command: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+  shell: boolean;
+}
+
+export function buildWranglerSpawnSpec(
+  executable: string,
+  env: NodeJS.ProcessEnv,
+  platform = process.platform,
+): WranglerSpawnSpec {
+  const args = ['auth', 'token', '--json'];
+  if (platform !== 'win32' || path.win32.extname(executable).toLowerCase() === '.exe') {
+    return { command: executable, args, env, shell: false };
+  }
+
+  // Windows cannot execute npm's .cmd shim directly. The shell command and all
+  // arguments remain fixed constants; only PATH selects the already-resolved shim.
+  const childEnv = { ...env };
+  const pathKey = Object.keys(childEnv).find((key) => key.toUpperCase() === 'PATH') ?? 'PATH';
+  childEnv[pathKey] = [path.win32.dirname(executable), childEnv[pathKey]].filter(Boolean).join(path.win32.delimiter);
+  return { command: 'wrangler auth token --json', args: [], env: childEnv, shell: true };
 }
 
 function readWranglerApiToken(
@@ -480,17 +515,21 @@ function readWranglerApiToken(
     '.bin',
     process.platform === 'win32' ? 'wrangler.cmd' : 'wrangler',
   );
-  const executable = existsSync(localWrangler) ? localWrangler : findExecutableOnPath('wrangler', env.PATH);
+  const executable = existsSync(localWrangler)
+    ? localWrangler
+    : findExecutableOnPath('wrangler', environmentPath(env));
   if (!executable) {
     return {
       ok: false,
       detail: `environment variable ${source.variable} is not set and Wrangler is unavailable`,
     };
   }
-  const result = spawnSync(executable, ['auth', 'token', '--json'], {
+  const spawnSpec = buildWranglerSpawnSpec(executable, env);
+  const result = spawnSync(spawnSpec.command, spawnSpec.args, {
     cwd: wranglerCwd,
-    env,
+    env: spawnSpec.env,
     encoding: 'utf8',
+    shell: spawnSpec.shell,
     timeout: 15_000,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -530,7 +569,7 @@ function validateChatHeldoutCorpus(body: Buffer): void {
   raw.forEach((entry, index) => {
     const location = `held-out corpus case[${index}]`;
     if (!isRecord(entry)) throw new Error(`${location} must be an object.`);
-    assertAllowedKeys(entry, ['id', 'group', 'text', 'expected', 'critical'], location);
+    assertPrivateAllowedKeys(entry, ['id', 'group', 'text', 'expected', 'critical'], location);
     const id = requiredName(entry.id, `${location}.id`, /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/);
     if (ids.has(id)) throw new Error(`${location}.id duplicates an earlier held-out corpus id.`);
     ids.add(id);
@@ -570,7 +609,9 @@ function listRepositorySecretNames(repoRoot: string, env: NodeJS.ProcessEnv): Se
   try {
     const parsed = JSON.parse(result.stdout ?? '') as unknown;
     if (!Array.isArray(parsed)) throw new Error('not an array');
-    return new Set(parsed.flatMap((entry) => isRecord(entry) && typeof entry.name === 'string' ? [entry.name] : []));
+    return new Set(parsed.flatMap((entry) => isRecord(entry) && typeof entry.name === 'string'
+      ? [entry.name.toUpperCase()]
+      : []));
   } catch {
     throw new Error('GitHub repository secret inspection returned an unreadable response.');
   }
@@ -608,6 +649,11 @@ function findExecutableOnPath(name: string, pathValue: string | undefined): stri
     }
   }
   return null;
+}
+
+function environmentPath(env: NodeJS.ProcessEnv): string | undefined {
+  const key = Object.keys(env).find((candidate) => candidate.toUpperCase() === 'PATH');
+  return key ? env[key] : undefined;
 }
 
 function assertRepoRelativePath(repoRoot: string, value: string, location: string): void {
@@ -650,6 +696,12 @@ function assertAllowedKeys(raw: Record<string, unknown>, allowed: string[], loca
   const unexpected = Object.keys(raw).filter((key) => !allowed.includes(key));
   if (unexpected.length > 0) {
     throw new Error(`${location} has unsupported field${unexpected.length === 1 ? '' : 's'}: ${unexpected.map(singleLineForTerminal).join(', ')}.`);
+  }
+}
+
+function assertPrivateAllowedKeys(raw: Record<string, unknown>, allowed: string[], location: string): void {
+  if (Object.keys(raw).some((key) => !allowed.includes(key))) {
+    throw new Error(`${location} has unsupported fields.`);
   }
 }
 

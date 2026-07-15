@@ -39,6 +39,72 @@ That is the normal flow. You do not need to open GitHub Settings or manually
 Base64-encode files. Pipelane sends secret values to `gh secret set` over stdin,
 does not print them, and preserves existing GitHub secrets.
 
+## Declaring repository inputs
+
+Repository maintainers opt in with a committed
+`.github/pipelane-provisioning.json` manifest. For example:
+
+```json
+{
+  "version": 1,
+  "github": {
+    "repositorySecrets": [
+      {
+        "name": "DEPLOY_API_TOKEN",
+        "description": "Authenticates the production deployment workflow",
+        "source": {
+          "type": "environment",
+          "variable": "DEPLOY_API_TOKEN"
+        }
+      },
+      {
+        "name": "CLOUDFLARE_AI_EVAL_TOKEN",
+        "source": {
+          "type": "cloudflare-api-token",
+          "variable": "CLOUDFLARE_API_TOKEN",
+          "wranglerCwd": "web",
+          "dotenvFile": "web/.env",
+          "dotenvVariable": "CLOUDFLARE_API_TOKEN"
+        }
+      },
+      {
+        "name": "CHAT_HELDOUT_CORPUS_BASE64",
+        "source": {
+          "type": "file-base64",
+          "pathVariable": "CHAT_HELDOUT_PATH",
+          "defaultPath": ".pipelane/secrets/chat-heldout-corpus.json",
+          "validator": "chat-heldout-corpus-v1"
+        }
+      }
+    ]
+  }
+}
+```
+
+The manifest is strict: unsupported or misspelled fields fail setup instead of
+being ignored.
+
+- `name` is the destination GitHub repository-secret name. It must use uppercase
+  letters, numbers, and underscores, cannot start with a number or `GITHUB_`,
+  and must be unique in the manifest.
+- `description` is optional user-facing text explaining why the repository needs
+  the input.
+- `environment` reads the named uppercase `variable` from the current process.
+- `cloudflare-api-token` first checks `variable`, then the optional allowlisted
+  `dotenvFile` and `dotenvVariable`, then Wrangler. `wranglerCwd` and
+  `dotenvFile` must be repository-relative; the two dotenv fields must be
+  provided together.
+- `file-base64` reads the path from `pathVariable`, falling back to the optional
+  repository-relative `defaultPath`, and installs its Base64 encoding. The only
+  current validator is the optional `chat-heldout-corpus-v1` value documented
+  below.
+
+Manifest-relative files must remain inside the repository and cannot be
+symlinks. An explicit path environment variable may select another regular file
+when the operator intentionally keeps private input elsewhere. The combined set
+of existing and declared repository secrets cannot exceed GitHub's 100-secret
+limit, and every final secret value must fit within 48 KB.
+
 Use `--rotate-secrets` only when you intentionally want to replace every
 declared secret:
 

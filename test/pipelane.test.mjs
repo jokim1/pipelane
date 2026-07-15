@@ -29949,11 +29949,12 @@ test('plain setup never executes a repository-local Wrangler binary', () => {
   }
 });
 
-test('setup automatically reads an allowlisted dotenv token and conventional held-out corpus path', () => {
+test('setup parses allowlisted dotenv syntax and uses the last declared token value', () => {
   const repoRoot = createRepo();
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
   const stateFile = path.join(binDir, 'state.json');
   const token = 'dotenv-cloudflare-token-never-print';
+  const unquotedToken = 'dotenv-unquoted-token-never-print';
   const corpusText = `${JSON.stringify([
     { id: 'held-unicode-1', group: 'unicode', text: 'café meetup', expected: 'allow' },
   ])}\n`;
@@ -29971,6 +29972,16 @@ test('setup automatically reads an allowlisted dotenv token and conventional hel
         },
       },
       {
+        name: 'CLOUDFLARE_SECONDARY_TOKEN',
+        source: {
+          type: 'cloudflare-api-token',
+          variable: 'TEST_CF_SECONDARY_TOKEN',
+          wranglerCwd: 'web',
+          dotenvFile: 'web/.env',
+          dotenvVariable: 'CLOUDFLARE_SECONDARY_TOKEN',
+        },
+      },
+      {
         name: 'CHAT_HELDOUT_CORPUS_BASE64',
         source: {
           type: 'file-base64',
@@ -29981,7 +29992,13 @@ test('setup automatically reads an allowlisted dotenv token and conventional hel
       },
     ]);
     mkdirSync(path.join(repoRoot, 'web'), { recursive: true });
-    writeFileSync(path.join(repoRoot, 'web', '.env'), `OTHER=value\nCLOUDFLARE_API_TOKEN='${token}'\n`, 'utf8');
+    writeFileSync(path.join(repoRoot, 'web', '.env'), [
+      'OTHER=value',
+      'CLOUDFLARE_API_TOKEN=stale-token-must-not-win',
+      `CLOUDFLARE_API_TOKEN="${token}" # quoted current value`,
+      `CLOUDFLARE_SECONDARY_TOKEN=${unquotedToken} # unquoted current value`,
+      '',
+    ].join('\n'), 'utf8');
     mkdirSync(path.join(repoRoot, '.pipelane', 'secrets'), { recursive: true });
     writeFileSync(path.join(repoRoot, '.pipelane', 'secrets', 'chat-heldout-corpus.json'), corpusText, 'utf8');
     writeSecretProvisioningFakeGh(binDir, stateFile);
@@ -29994,15 +30011,22 @@ test('setup automatically reads an allowlisted dotenv token and conventional hel
 
     assert.equal(result.status, 0);
     assert.match(result.stdout, /read allowlisted CLOUDFLARE_API_TOKEN from web\/\.env/);
+    assert.match(result.stdout, /read allowlisted CLOUDFLARE_SECONDARY_TOKEN from web\/\.env/);
     assert.match(result.stdout, /validated and Base64-encoded default file \.pipelane\/secrets\/chat-heldout-corpus\.json/);
     assert.doesNotMatch(result.stdout, new RegExp(token));
+    assert.doesNotMatch(result.stdout, new RegExp(unquotedToken));
     assert.doesNotMatch(result.stdout, /café meetup/);
     const state = JSON.parse(readFileSync(stateFile, 'utf8'));
     assert.deepEqual(state.setCalls.map((entry) => entry.name).sort(), [
       'CHAT_HELDOUT_CORPUS_BASE64',
       'CLOUDFLARE_AI_EVAL_TOKEN',
+      'CLOUDFLARE_SECONDARY_TOKEN',
     ]);
+    assert.equal(state.secrets.CLOUDFLARE_AI_EVAL_TOKEN.sha256, createHash('sha256').update(token).digest('hex'));
+    assert.equal(state.secrets.CLOUDFLARE_SECONDARY_TOKEN.sha256, createHash('sha256').update(unquotedToken).digest('hex'));
     assert.equal(JSON.stringify(state).includes(token), false);
+    assert.equal(JSON.stringify(state).includes(unquotedToken), false);
+    assert.equal(JSON.stringify(state).includes('stale-token-must-not-win'), false);
     assert.equal(JSON.stringify(state).includes('café meetup'), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -30077,6 +30101,73 @@ test('secret rotation resolves every replacement before writing any secret', () 
     const state = JSON.parse(readFileSync(stateFile, 'utf8'));
     assert.deepEqual(state.setCalls, []);
     assert.deepEqual(state.secrets, initial.secrets);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('secret provisioning rejects GitHub-reserved names before any batch write', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      { name: 'VALID_ROTATION_TOKEN', source: { type: 'environment', variable: 'TEST_VALID_ROTATION_TOKEN' } },
+      { name: 'GITHUB_TOKEN', source: { type: 'environment', variable: 'TEST_RESERVED_ROTATION_TOKEN' } },
+    ]);
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    const initial = {
+      secrets: { VALID_ROTATION_TOKEN: { sha256: 'old-valid', bytes: 9 } },
+      setCalls: [],
+    };
+    writeFileSync(stateFile, `${JSON.stringify(initial)}\n`, 'utf8');
+
+    const result = runCli(['setup', '--provision-secrets', '--rotate-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      TEST_VALID_ROTATION_TOKEN: 'new-valid-never-write',
+      TEST_RESERVED_ROTATION_TOKEN: 'reserved-never-write',
+    }, true);
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /must not start with GitHub's reserved GITHUB_ prefix/);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')), initial);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('secret provisioning checks existing repository capacity before any batch write', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      { name: 'ONE_SECRET_TOO_MANY', source: { type: 'environment', variable: 'TEST_ONE_SECRET_TOO_MANY' } },
+    ]);
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    const initial = {
+      secrets: Object.fromEntries(Array.from({ length: 100 }, (_, index) => [
+        `EXISTING_SECRET_${index}`,
+        { sha256: `existing-${index}`, bytes: 8 },
+      ])),
+      setCalls: [],
+    };
+    writeFileSync(stateFile, `${JSON.stringify(initial)}\n`, 'utf8');
+
+    const result = runCli(['setup', '--provision-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      TEST_ONE_SECRET_TOO_MANY: 'capacity-never-write',
+    }, true);
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /would total 101 names, exceeding GitHub's 100 repository-secret limit/);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')), initial);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(binDir, { recursive: true, force: true });
@@ -30208,6 +30299,22 @@ test('Cloudflare provisioning refuses to copy refreshable Wrangler OAuth credent
   }
 });
 
+test('Windows Wrangler discovery dispatches npm command shims through a fixed shell command', async () => {
+  const secretProvisioning = await import(path.join(KIT_ROOT, 'src', 'operator', 'secret-provisioning.ts'));
+  const shim = path.win32.join('C:\\repo with spaces', 'node_modules', '.bin', 'wrangler.cmd');
+  const spec = secretProvisioning.buildWranglerSpawnSpec(shim, { Path: 'C:\\Windows\\System32' }, 'win32');
+
+  assert.equal(spec.command, 'wrangler auth token --json');
+  assert.deepEqual(spec.args, []);
+  assert.equal(spec.shell, true);
+  assert.equal(spec.env.Path, `${path.win32.dirname(shim)};C:\\Windows\\System32`);
+
+  const executable = secretProvisioning.buildWranglerSpawnSpec('C:\\tools\\wrangler.exe', {}, 'win32');
+  assert.equal(executable.command, 'C:\\tools\\wrangler.exe');
+  assert.deepEqual(executable.args, ['auth', 'token', '--json']);
+  assert.equal(executable.shell, false);
+});
+
 test('held-out corpus validation fails before any GitHub secret write', () => {
   const repoRoot = createRepo();
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
@@ -30249,6 +30356,7 @@ test('held-out corpus validation errors never print private corpus content', () 
   const corpusPath = path.join(corpusDir, 'private.json');
   const privatePrefix = 'private-corpus-prefix-never-print';
   const privateId = 'private-duplicate-id-never-print';
+  const privateUnexpectedKey = 'private-unexpected-key-never-print';
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
     writeSecretProvisioningManifest(repoRoot, [
@@ -30299,15 +30407,17 @@ test('held-out corpus validation errors never print private corpus content', () 
         error: /critical must be a boolean/,
       },
       {
-        corpus: [{ id: 'misspelled-critical', group: 'benign', text: 'case', expected: 'allow', critcal: true }],
-        error: /unsupported field: critcal/,
+        corpus: [{ id: 'private-field', group: 'benign', text: 'case', expected: 'allow', [privateUnexpectedKey]: true }],
+        error: /unsupported fields/,
+        privateText: privateUnexpectedKey,
       },
     ];
-    for (const { corpus, error } of invalidCases) {
+    for (const { corpus, error, privateText } of invalidCases) {
       writeFileSync(corpusPath, `${JSON.stringify(corpus)}\n`, 'utf8');
       const rejected = runCli(['setup', '--provision-secrets'], repoRoot, env, true);
       assert.equal(rejected.status, 1);
       assert.match(rejected.stderr, error);
+      if (privateText) assert.doesNotMatch(rejected.stderr, new RegExp(privateText));
     }
     assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls, []);
   } finally {
