@@ -102,6 +102,9 @@ Fields:
 - `expected`: `allow` or `reject`;
 - `critical`: optional boolean.
 
+No other fields are accepted. This catches misspelled fields before the private
+corpus is installed in GitHub.
+
 Keep the file private and use synthetic evaluation cases, not production user
 messages. Pipelane validates the structure, Base64-encodes the file, enforces
 GitHub's secret-size limit, and installs the encoded result. The GitHub workflow

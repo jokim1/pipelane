@@ -2,6 +2,8 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 
+import { sanitizeForTerminal } from './text-output.ts';
+
 export const SECRET_PROVISIONING_MANIFEST = '.github/pipelane-provisioning.json';
 export const SECRET_PROVISIONING_GUIDE_URL = 'https://github.com/jokim1/pipelane/blob/main/docs/public/SECRET_PROVISIONING.md';
 const GITHUB_SECRET_MAX_BYTES = 48 * 1024;
@@ -100,7 +102,7 @@ export function loadSecretProvisioningManifest(repoRoot: string): SecretProvisio
     raw = JSON.parse(readFileSync(manifestPath, 'utf8'));
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`${SECRET_PROVISIONING_MANIFEST} is not valid JSON: ${detail}`);
+    throw new Error(`${SECRET_PROVISIONING_MANIFEST} is not valid JSON: ${singleLineForTerminal(detail)}`);
   }
   if (!isRecord(raw) || raw.version !== 1) {
     throw new Error(`${SECRET_PROVISIONING_MANIFEST} must be an object with version 1.`);
@@ -240,6 +242,12 @@ export function formatSecretProvisioningResult(
   result: SecretProvisioningResult,
   provisionCommand = '/pipelane configure --provision-secrets',
 ): string[] {
+  const retryCommand = result.rotate && !provisionCommand.includes('--rotate-secrets')
+    ? `${provisionCommand} --rotate-secrets`
+    : provisionCommand;
+  const retryEffect = result.rotate
+    ? 'Every declared replacement will be retried because rotation was explicit.'
+    : 'Ready values will be installed; existing GitHub secrets will be preserved.';
   const lines = [
     `Private CI inputs declared by this repository (${SECRET_PROVISIONING_MANIFEST}):`,
     'Pipelane itself does not require these inputs. This repository requested them so its GitHub Actions workflows can use private credentials or files that are not committed to Git.',
@@ -247,9 +255,9 @@ export function formatSecretProvisioningResult(
   for (const entry of result.entries) {
     const status = entry.status === 'existing' ? 'configured' : entry.status;
     lines.push(`- ${entry.name}`);
-    lines.push(`  Status: ${status} — ${entry.detail}`);
-    lines.push(`  Why: ${entry.purpose}`);
-    if (entry.status === 'blocked') lines.push(`  Next: ${entry.nextStep}`);
+    lines.push(`  Status: ${status} — ${singleLineForTerminal(entry.detail)}`);
+    lines.push(`  Why: ${singleLineForTerminal(entry.purpose)}`);
+    if (entry.status === 'blocked') lines.push(`  Next: ${singleLineForTerminal(entry.nextStep)}`);
   }
   const blocked = result.entries.some((entry) => entry.status === 'blocked');
   const ready = result.entries.some((entry) => entry.status === 'ready');
@@ -261,7 +269,7 @@ export function formatSecretProvisioningResult(
       step += 1;
     }
     if (!result.applied || blocked) {
-      lines.push(`${step}. Run \`${provisionCommand}\`. Ready values will be installed; existing GitHub secrets will be preserved.`);
+      lines.push(`${step}. Run \`${singleLineForTerminal(retryCommand)}\`. ${retryEffect}`);
       step += 1;
     }
     lines.push(`${step}. Rerun \`/pipelane setup\` and confirm every declared input says "already configured".`);
@@ -423,7 +431,12 @@ function resolveSecretValue(
   if (4 * Math.ceil(fileStat.size / 3) > GITHUB_SECRET_MAX_BYTES) {
     return { ok: false, detail: `${sourceLabel} exceeds GitHub's 48 KB secret limit after Base64 encoding` };
   }
-  const body = readFileSync(filePath);
+  let body: Buffer;
+  try {
+    body = readFileSync(filePath);
+  } catch {
+    return { ok: false, detail: `${sourceLabel} could not be read` };
+  }
   if (source.validator === 'chat-heldout-corpus-v1') validateChatHeldoutCorpus(body);
   const encoded = body.toString('base64');
   return checkedSecretValue(encoded, `validated and Base64-encoded ${sourceLabel}`);
@@ -505,9 +518,10 @@ function validateChatHeldoutCorpus(body: Buffer): void {
   let raw: unknown;
   try {
     raw = JSON.parse(body.toString('utf8'));
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`held-out corpus is not valid JSON: ${detail}`);
+  } catch {
+    // V8's JSON.parse error includes a snippet of the rejected input. The
+    // corpus is private, so keep validation diagnostics content-free.
+    throw new Error('held-out corpus is not valid JSON.');
   }
   if (!Array.isArray(raw) || raw.length === 0) {
     throw new Error('held-out corpus must be a non-empty JSON array.');
@@ -516,8 +530,9 @@ function validateChatHeldoutCorpus(body: Buffer): void {
   raw.forEach((entry, index) => {
     const location = `held-out corpus case[${index}]`;
     if (!isRecord(entry)) throw new Error(`${location} must be an object.`);
+    assertAllowedKeys(entry, ['id', 'group', 'text', 'expected', 'critical'], location);
     const id = requiredName(entry.id, `${location}.id`, /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/);
-    if (ids.has(id)) throw new Error(`held-out corpus contains duplicate id ${id}.`);
+    if (ids.has(id)) throw new Error(`${location}.id duplicates an earlier held-out corpus id.`);
     ids.add(id);
     if (typeof entry.group !== 'string' || !HELDOUT_GROUPS.has(entry.group)) {
       throw new Error(`${location}.group is not a supported moderation group.`);
@@ -634,8 +649,12 @@ function isResolvedInsideRepo(repoRoot: string, target: string): boolean {
 function assertAllowedKeys(raw: Record<string, unknown>, allowed: string[], location: string): void {
   const unexpected = Object.keys(raw).filter((key) => !allowed.includes(key));
   if (unexpected.length > 0) {
-    throw new Error(`${location} has unsupported field${unexpected.length === 1 ? '' : 's'}: ${unexpected.join(', ')}.`);
+    throw new Error(`${location} has unsupported field${unexpected.length === 1 ? '' : 's'}: ${unexpected.map(singleLineForTerminal).join(', ')}.`);
   }
+}
+
+function singleLineForTerminal(value: string): string {
+  return sanitizeForTerminal(value).replace(/\s+/gu, ' ').trim();
 }
 
 function requiredName(value: unknown, location: string, pattern: RegExp): string {

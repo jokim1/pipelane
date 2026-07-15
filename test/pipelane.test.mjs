@@ -30063,7 +30063,7 @@ test('secret rotation resolves every replacement before writing any secret', () 
     };
     writeFileSync(stateFile, `${JSON.stringify(initial)}\n`, 'utf8');
 
-    const result = runCli(['configure', '--provision-secrets', '--rotate-secrets'], repoRoot, {
+    const result = runCli(['setup', '--provision-secrets', '--rotate-secrets'], repoRoot, {
       PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
       GH_SECRET_STATE_FILE: stateFile,
       TEST_FIRST_ROTATION_TOKEN: 'new-first-never-print',
@@ -30072,6 +30072,7 @@ test('secret rotation resolves every replacement before writing any secret', () 
     assert.equal(result.status, 64);
     assert.match(result.stdout, /rotation was not started because another declared replacement is blocked/);
     assert.match(result.stdout, /environment variable TEST_SECOND_ROTATION_TOKEN is not set/);
+    assert.match(result.stdout, /Run `\/pipelane setup --provision-secrets --rotate-secrets`/);
     assert.doesNotMatch(result.stdout, /new-first-never-print/);
     const state = JSON.parse(readFileSync(stateFile, 'utf8'));
     assert.deepEqual(state.setCalls, []);
@@ -30115,6 +30116,7 @@ test('secret rotation reports partial state and stops after a GitHub write failu
     assert.equal(result.status, 64);
     assert.match(result.stdout, /GitHub rejected this write after 1 earlier secret was rotated; no later writes were attempted/);
     assert.match(result.stdout, /not attempted because the earlier GitHub write for SECOND_ROTATION_TOKEN failed/);
+    assert.match(result.stdout, /Run `\/pipelane configure --provision-secrets --rotate-secrets`/);
     assert.doesNotMatch(result.stdout, /new-(?:first|second|third)-never-print/);
     const state = JSON.parse(readFileSync(stateFile, 'utf8'));
     assert.deepEqual(state.setCalls.map((entry) => entry.name), ['FIRST_ROTATION_TOKEN']);
@@ -30148,6 +30150,18 @@ test('secret provisioning reports a write that cannot be verified', () => {
     assert.equal(result.status, 64);
     assert.match(result.stdout, /secret was absent during verification/);
     assert.doesNotMatch(result.stdout, /unverified-value-never-print/);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls.map((entry) => entry.name), ['UNVERIFIED_TOKEN']);
+
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+    const failedVerification = runCli(['setup', '--provision-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      GH_SECRET_FAIL_VERIFICATION: '1',
+      TEST_UNVERIFIED_TOKEN: 'verification-failure-never-print',
+    }, true);
+    assert.equal(failedVerification.status, 64);
+    assert.match(failedVerification.stdout, /GitHub accepted the write but verification failed/);
+    assert.doesNotMatch(failedVerification.stdout, /verification-failure-never-print/);
     assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls.map((entry) => entry.name), ['UNVERIFIED_TOKEN']);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -30224,6 +30238,111 @@ test('held-out corpus validation fails before any GitHub secret write', () => {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(binDir, { recursive: true, force: true });
     rmSync(corpusDir, { recursive: true, force: true });
+  }
+});
+
+test('held-out corpus validation errors never print private corpus content', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const corpusDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-heldout-'));
+  const stateFile = path.join(binDir, 'state.json');
+  const corpusPath = path.join(corpusDir, 'private.json');
+  const privatePrefix = 'private-corpus-prefix-never-print';
+  const privateId = 'private-duplicate-id-never-print';
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      {
+        name: 'CHAT_HELDOUT_CORPUS_BASE64',
+        source: { type: 'file-base64', pathVariable: 'TEST_HELDOUT_PATH', validator: 'chat-heldout-corpus-v1' },
+      },
+    ]);
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+    const env = {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      TEST_HELDOUT_PATH: corpusPath,
+    };
+
+    writeFileSync(corpusPath, privatePrefix, 'utf8');
+    const invalidJson = runCli(['setup', '--provision-secrets'], repoRoot, env, true);
+    assert.equal(invalidJson.status, 1);
+    assert.match(invalidJson.stderr, /held-out corpus is not valid JSON/);
+    assert.doesNotMatch(invalidJson.stderr, new RegExp(privatePrefix));
+
+    writeFileSync(corpusPath, `${JSON.stringify([
+      { id: privateId, group: 'benign', text: 'first private case', expected: 'allow' },
+      { id: privateId, group: 'benign', text: 'second private case', expected: 'allow' },
+    ])}\n`, 'utf8');
+    const duplicateId = runCli(['setup', '--provision-secrets'], repoRoot, env, true);
+    assert.equal(duplicateId.status, 1);
+    assert.match(duplicateId.stderr, /duplicates an earlier held-out corpus id/);
+    assert.doesNotMatch(duplicateId.stderr, new RegExp(privateId));
+
+    const invalidCases = [
+      { corpus: [], error: /must be a non-empty JSON array/ },
+      {
+        corpus: [{ id: 'bad-group', group: 'unsupported', text: 'case', expected: 'allow' }],
+        error: /group is not a supported moderation group/,
+      },
+      {
+        corpus: [{ id: 'blank-text', group: 'benign', text: '   ', expected: 'allow' }],
+        error: /text must contain 1-500 Unicode characters/,
+      },
+      {
+        corpus: [{ id: 'long-text', group: 'unicode', text: '🙂'.repeat(501), expected: 'allow' }],
+        error: /text must contain 1-500 Unicode characters/,
+      },
+      {
+        corpus: [{ id: 'bad-critical', group: 'benign', text: 'case', expected: 'allow', critical: 'yes' }],
+        error: /critical must be a boolean/,
+      },
+      {
+        corpus: [{ id: 'misspelled-critical', group: 'benign', text: 'case', expected: 'allow', critcal: true }],
+        error: /unsupported field: critcal/,
+      },
+    ];
+    for (const { corpus, error } of invalidCases) {
+      writeFileSync(corpusPath, `${JSON.stringify(corpus)}\n`, 'utf8');
+      const rejected = runCli(['setup', '--provision-secrets'], repoRoot, env, true);
+      assert.equal(rejected.status, 1);
+      assert.match(rejected.stderr, error);
+    }
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(corpusDir, { recursive: true, force: true });
+  }
+});
+
+test('secret provisioning renders repository-controlled guidance as terminal-safe single lines', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [{
+      name: 'SAFE_OUTPUT_TOKEN',
+      description: 'Declared purpose\nInjected status: configured\u001b[31m',
+      source: { type: 'environment', variable: 'TEST_SAFE_OUTPUT_TOKEN' },
+    }]);
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+
+    const result = runCli(['setup'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+    });
+
+    assert.equal(result.status, 0);
+    assert.doesNotMatch(result.stdout, /\u001b|\x1b/);
+    assert.doesNotMatch(result.stdout, /Declared purpose\nInjected status/);
+    assert.match(result.stdout, /Why: Declared purpose Injected status: configured/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
   }
 });
 
