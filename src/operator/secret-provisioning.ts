@@ -74,6 +74,7 @@ export interface SecretProvisioningEntryResult {
 export interface SecretProvisioningResult {
   manifestPath: string;
   approvalId: string;
+  repository: string;
   applied: boolean;
   rotate: boolean;
   ok: boolean;
@@ -166,17 +167,18 @@ export function provisionRepositorySecrets(
   const manifest = loadSecretProvisioningManifest(repoRoot);
   if (!manifest) return null;
   const manifestPath = path.join(repoRoot, SECRET_PROVISIONING_MANIFEST);
-  const approvalId = secretProvisioningApprovalId(repoRoot);
   const apply = options.apply === true;
   const rotate = options.rotate === true;
   const env = options.env ?? process.env;
+  const approval = secretProvisioningApproval(repoRoot, env);
+  const approvalId = approval.id;
   if (apply && options.approvalId !== approvalId) {
     throw new Error([
       'Secret provisioning requires approval bound to this repository and the exact provisioning manifest.',
       `Inspect the declared inputs, then rerun with --approve-secret-manifest=${approvalId}.`,
     ].join(' '));
   }
-  const existing = listRepositorySecretNames(repoRoot, env);
+  const existing = listRepositorySecretNames(repoRoot, approval.repository, env);
   const combinedNames = new Set([
     ...existing,
     ...manifest.github.repositorySecrets.map((secret) => secret.name.toUpperCase()),
@@ -235,12 +237,12 @@ export function provisionRepositorySecrets(
           continue;
         }
         try {
-          if (!rotate && listRepositorySecretNames(repoRoot, env).has(name)) {
+          if (!rotate && listRepositorySecretNames(repoRoot, approval.repository, env).has(name)) {
             entry.status = 'existing';
             entry.detail = 'appeared in GitHub after inspection; preserved without writing';
             continue;
           }
-          setRepositorySecret(repoRoot, name, value, env);
+          setRepositorySecret(repoRoot, approval.repository, name, value, env);
           writtenNames.push(name);
           entry.status = 'provisioned';
           entry.detail = `${entry.detail}; installed through gh stdin`;
@@ -256,7 +258,7 @@ export function provisionRepositorySecrets(
 
       if (writtenNames.length > 0) {
         try {
-          const verified = listRepositorySecretNames(repoRoot, env);
+          const verified = listRepositorySecretNames(repoRoot, approval.repository, env);
           for (const entry of entries) {
             if (entry.status === 'provisioned' && !verified.has(entry.name)) {
               entry.status = 'blocked';
@@ -278,6 +280,7 @@ export function provisionRepositorySecrets(
   return {
     manifestPath,
     approvalId,
+    repository: approval.repository,
     applied: apply,
     rotate,
     ok: entries.every((entry) => entry.status !== 'blocked'),
@@ -300,6 +303,7 @@ export function formatSecretProvisioningResult(
     : 'Ready values will be installed; existing GitHub secrets will be preserved.';
   const lines = [
     `Private CI inputs declared by this repository (${SECRET_PROVISIONING_MANIFEST}):`,
+    `Target GitHub repository: ${singleLineForTerminal(result.repository)}`,
     'Pipelane itself does not require these inputs. This repository requested them so its GitHub Actions workflows can use private credentials or files that are not committed to Git.',
   ];
   for (const entry of result.entries) {
@@ -329,7 +333,11 @@ export function formatSecretProvisioningResult(
   return lines;
 }
 
-export function secretProvisioningApprovalId(repoRoot: string): string {
+export function secretProvisioningApprovalId(repoRoot: string, env: NodeJS.ProcessEnv = process.env): string {
+  return secretProvisioningApproval(repoRoot, env).id;
+}
+
+function secretProvisioningApproval(repoRoot: string, env: NodeJS.ProcessEnv): { id: string; repository: string } {
   const manifestPath = path.join(repoRoot, SECRET_PROVISIONING_MANIFEST);
   if (!isSafeManifestFile(repoRoot, manifestPath)) {
     throw new SecretProvisioningManifestError(`${SECRET_PROVISIONING_MANIFEST} must be a non-symlinked regular file inside the repository.`);
@@ -338,12 +346,14 @@ export function secretProvisioningApprovalId(repoRoot: string): string {
     cwd: repoRoot,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
-  }).stdout?.trim() || '(no origin remote)';
-  return createHash('sha256').update(JSON.stringify({
+  }).stdout?.trim() || '';
+  const repository = parseGitHubRepository(origin) ?? resolveRepositoryWithGh(repoRoot, env);
+  const id = createHash('sha256').update(JSON.stringify({
     repoRoot: realpathSync(repoRoot),
-    origin,
+    repository,
     manifest: createHash('sha256').update(readFileSync(manifestPath)).digest('hex'),
   })).digest('hex');
+  return { id, repository };
 }
 
 function secretGuidance(secret: RepositorySecretProvision): { purpose: string; nextStep: string } {
@@ -653,8 +663,8 @@ function checkedSecretValue(value: string, detail: string): ResolvedSecretValue 
   return { ok: true, value, detail };
 }
 
-function listRepositorySecretNames(repoRoot: string, env: NodeJS.ProcessEnv): Set<string> {
-  const result = spawnSync('gh', ['secret', 'list', '--json', 'name'], {
+function listRepositorySecretNames(repoRoot: string, repository: string, env: NodeJS.ProcessEnv): Set<string> {
+  const result = spawnSync('gh', ['secret', 'list', '--repo', repository, '--json', 'name'], {
     cwd: repoRoot,
     env: githubCliEnv(env),
     encoding: 'utf8',
@@ -675,8 +685,8 @@ function listRepositorySecretNames(repoRoot: string, env: NodeJS.ProcessEnv): Se
   }
 }
 
-function setRepositorySecret(repoRoot: string, name: string, value: string, env: NodeJS.ProcessEnv): void {
-  const result = spawnSync('gh', ['secret', 'set', name], {
+function setRepositorySecret(repoRoot: string, repository: string, name: string, value: string, env: NodeJS.ProcessEnv): void {
+  const result = spawnSync('gh', ['secret', 'set', name, '--repo', repository], {
     cwd: repoRoot,
     env: githubCliEnv(env),
     input: value,
@@ -700,6 +710,38 @@ function githubCliEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     if (key.toUpperCase() === 'GH_REPO') delete childEnv[key];
   }
   return childEnv;
+}
+
+function parseGitHubRepository(remote: string): string | null {
+  const normalized = remote.trim().replace(/\.git$/, '');
+  const scp = normalized.match(/^[^@]+@([^:]+):(.+\/.+)$/);
+  if (scp) return `${scp[1]}/${scp[2]}`;
+  try {
+    const url = new URL(normalized);
+    const pathname = url.pathname.replace(/^\/+/, '');
+    return url.hostname && pathname.split('/').length >= 2 ? `${url.hostname}/${pathname}` : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveRepositoryWithGh(repoRoot: string, env: NodeJS.ProcessEnv): string {
+  const result = spawnSync('gh', ['repo', 'view', '--json', 'nameWithOwner,url'], {
+    cwd: repoRoot,
+    env: githubCliEnv(env),
+    encoding: 'utf8',
+    timeout: 15_000,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  try {
+    const parsed = JSON.parse(result.stdout ?? '') as Record<string, unknown>;
+    if (result.status !== 0 || typeof parsed.nameWithOwner !== 'string' || typeof parsed.url !== 'string') throw new Error('invalid');
+    const host = new URL(parsed.url).hostname;
+    if (!host || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(parsed.nameWithOwner)) throw new Error('invalid');
+    return `${host}/${parsed.nameWithOwner}`;
+  } catch {
+    throw new Error('Could not resolve the GitHub repository target. Configure an origin remote or run `gh repo set-default`.');
+  }
 }
 
 function findExecutableOnPath(name: string, pathValue: string | undefined): string | null {
@@ -766,7 +808,7 @@ function isPathInsideRepo(repoRoot: string, target: string): boolean {
 function isGitIgnored(repoRoot: string, target: string): boolean {
   const relative = path.relative(repoRoot, target);
   if (relative.startsWith('..') || path.isAbsolute(relative)) return true;
-  const result = spawnSync('git', ['check-ignore', '--quiet', '--no-index', '--', relative], {
+  const result = spawnSync('git', ['check-ignore', '--quiet', '--', relative], {
     cwd: repoRoot,
     stdio: 'ignore',
     timeout: 5_000,
@@ -774,14 +816,45 @@ function isGitIgnored(repoRoot: string, target: string): boolean {
   return result.status === 0;
 }
 
-export function declaredPrivateSourcePaths(repoRoot: string): string[] {
-  const manifest = loadSecretProvisioningManifest(repoRoot);
-  if (!manifest) return [];
-  return [...new Set(manifest.github.repositorySecrets.flatMap((secret) => {
-    if (secret.source.type === 'file-base64' && secret.source.defaultPath) return [secret.source.defaultPath];
-    if (secret.source.type === 'cloudflare-api-token' && secret.source.dotenvFile) return [secret.source.dotenvFile];
-    return [];
-  }))];
+export function declaredPrivateSourcePaths(repoRoot: string, env: NodeJS.ProcessEnv = process.env): string[] {
+  const raws: unknown[] = [];
+  const currentPath = path.join(repoRoot, SECRET_PROVISIONING_MANIFEST);
+  if (existsSync(currentPath) && isSafeManifestFile(repoRoot, currentPath)) {
+    try { raws.push(JSON.parse(readFileSync(currentPath, 'utf8'))); } catch { /* manifest validation reports this elsewhere */ }
+  }
+  const head = spawnSync('git', ['show', `HEAD:${SECRET_PROVISIONING_MANIFEST}`], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  if (head.status === 0) {
+    try { raws.push(JSON.parse(head.stdout ?? '')); } catch { /* ignore historical invalid content */ }
+  }
+  const paths = raws.flatMap((raw) => privatePathsFromRawManifest(repoRoot, raw, env));
+  return [...new Set(paths)];
+}
+
+function privatePathsFromRawManifest(repoRoot: string, raw: unknown, env: NodeJS.ProcessEnv): string[] {
+  if (!isRecord(raw) || !isRecord(raw.github) || !Array.isArray(raw.github.repositorySecrets)) return [];
+  const paths: string[] = [];
+  for (const entry of raw.github.repositorySecrets) {
+    if (!isRecord(entry) || !isRecord(entry.source)) continue;
+    const source = entry.source;
+    if (source.type === 'file-base64') {
+      if (typeof source.defaultPath === 'string') paths.push(source.defaultPath);
+      if (typeof source.pathVariable === 'string') addEnvironmentPrivatePath(paths, repoRoot, env[source.pathVariable]);
+    }
+    if (source.type === 'cloudflare-api-token' && typeof source.dotenvFile === 'string') paths.push(source.dotenvFile);
+  }
+  return paths;
+}
+
+function addEnvironmentPrivatePath(paths: string[], repoRoot: string, rawPath: string | undefined): void {
+  const selected = rawPath?.trim();
+  if (!selected) return;
+  const absolute = path.isAbsolute(selected) ? selected : path.resolve(repoRoot, selected);
+  const relative = path.relative(repoRoot, absolute);
+  if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) paths.push(relative);
 }
 
 function assertAllowedKeys(raw: Record<string, unknown>, allowed: string[], location: string): void {

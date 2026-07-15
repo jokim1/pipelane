@@ -248,10 +248,9 @@ function runCli(args, cwd, env = {}, allowFailure = false) {
   if (effectiveArgs.includes('--provision-secrets') && !effectiveArgs.some((arg) => arg.startsWith('--approve-secret-manifest='))) {
     const manifestPath = path.join(cwd, '.github', 'pipelane-provisioning.json');
     if (existsSync(manifestPath) && !lstatSync(manifestPath).isSymbolicLink()) {
-      const origin = spawnSync('git', ['config', '--get', 'remote.origin.url'], { cwd, encoding: 'utf8' }).stdout?.trim() || '(no origin remote)';
       const approval = createHash('sha256').update(JSON.stringify({
         repoRoot: realpathSync(cwd),
-        origin,
+        repository: 'github.com/test/repo',
         manifest: createHash('sha256').update(readFileSync(manifestPath)).digest('hex'),
       })).digest('hex');
       effectiveArgs.push(`--approve-secret-manifest=${approval}`);
@@ -1001,6 +1000,14 @@ const writeState = () => fs.writeFileSync(statePath, JSON.stringify(state, null,
 if (Object.keys(process.env).some((key) => key.toUpperCase() === 'GH_REPO')) {
   process.stderr.write('GH_REPO must not redirect repository-secret provisioning\\n');
   process.exit(9);
+}
+if (args[0] === 'repo' && args[1] === 'view') {
+  process.stdout.write(JSON.stringify({ nameWithOwner: 'test/repo', url: 'https://github.com/test/repo' }));
+  process.exit(0);
+}
+if (args[0] === 'secret' && (!args.includes('--repo') || args[args.indexOf('--repo') + 1] !== 'github.com/test/repo')) {
+  process.stderr.write('secret command must bind the approved repository with --repo\\n');
+  process.exit(10);
 }
 if (args[0] === 'secret' && args[1] === 'list') {
   if (process.env.GH_SECRET_APPEAR_ON_SECOND_LIST) {
@@ -29853,6 +29860,7 @@ test('secret provisioning requires approval bound to the repository and manifest
   const repoRoot = createRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
+    run('git', ['remote', 'add', 'origin', 'https://github.com/test/repo.git'], repoRoot);
     writeSecretProvisioningManifest(repoRoot, [
       { name: 'BOUND_TOKEN', source: { type: 'environment', variable: 'TEST_BOUND_TOKEN' } },
     ]);
@@ -29902,6 +29910,77 @@ test('declared private repository files must be ignored and are exposed to PR de
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('tracked private files are rejected even when later ignore rules match them', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      {
+        name: 'TRACKED_DOTENV_TOKEN',
+        source: { type: 'cloudflare-api-token', variable: 'TEST_TRACKED_TOKEN', dotenvFile: 'web/.env', dotenvVariable: 'TOKEN' },
+      },
+      {
+        name: 'TRACKED_PRIVATE_FILE',
+        source: { type: 'file-base64', pathVariable: 'TEST_TRACKED_PATH', defaultPath: '.pipelane/secrets/tracked.json' },
+      },
+    ]);
+    mkdirSync(path.join(repoRoot, 'web'), { recursive: true });
+    mkdirSync(path.join(repoRoot, '.pipelane', 'secrets'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'web', '.env'), 'TOKEN=tracked-never-write\n', 'utf8');
+    writeFileSync(path.join(repoRoot, '.pipelane', 'secrets', 'tracked.json'), '{}\n', 'utf8');
+    writeFileSync(path.join(repoRoot, '.gitignore'), 'web/.env\n.pipelane/secrets/\n', 'utf8');
+    run('git', ['add', '-A'], repoRoot);
+    run('git', ['add', '-f', 'web/.env', '.pipelane/secrets/tracked.json'], repoRoot);
+    run('git', ['commit', '-m', 'Track unsafe private fixtures'], repoRoot);
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+
+    const result = runCli(['setup', '--provision-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+    }, true);
+    assert.equal(result.status, 64);
+    assert.equal((result.stdout.match(/must be Git-ignored before it can be read/g) || []).length, 2);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('PR private-path protection unions current, HEAD, and environment-selected manifest paths', async () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [{
+      name: 'OLD_PRIVATE_FILE',
+      source: { type: 'file-base64', pathVariable: 'TEST_OLD_PRIVATE_PATH', defaultPath: '.pipelane/secrets/old.json' },
+    }]);
+    run('git', ['add', '-A'], repoRoot);
+    run('git', ['commit', '-m', 'Declare old private path'], repoRoot);
+    writeSecretProvisioningManifest(repoRoot, [{
+      name: 'NEW_PRIVATE_FILE',
+      source: { type: 'file-base64', pathVariable: 'TEST_NEW_PRIVATE_PATH', defaultPath: '.pipelane/secrets/new.json' },
+    }]);
+
+    const provisioning = await import(path.join(KIT_ROOT, 'src', 'operator', 'secret-provisioning.ts'));
+    const paths = provisioning.declaredPrivateSourcePaths(repoRoot, {
+      TEST_OLD_PRIVATE_PATH: '.pipelane/secrets/old-selected.json',
+      TEST_NEW_PRIVATE_PATH: '.pipelane/secrets/new-selected.json',
+    });
+    assert.deepEqual(new Set(paths), new Set([
+      '.pipelane/secrets/old.json',
+      '.pipelane/secrets/old-selected.json',
+      '.pipelane/secrets/new.json',
+      '.pipelane/secrets/new-selected.json',
+    ]));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
   }
 });
 
