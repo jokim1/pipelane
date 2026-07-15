@@ -51,6 +51,7 @@ import {
 } from '../route-loop-safety.ts';
 import { buildDestinationPlanForCommand } from '../destination-planner.ts';
 import { assertManagedLocalStateValid } from '../local-state.ts';
+import { declaredPrivateSourcePaths } from '../secret-provisioning.ts';
 
 export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const context = resolveWorkflowContext(cwd);
@@ -179,7 +180,7 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
     const changedPaths = collectChangedPaths(context.repoRoot);
     const denyHits = findDenyListHits(
       changedPaths,
-      context.config.prPathDenyList,
+      [...context.config.prPathDenyList, ...declaredPrivateSourcePaths(context.repoRoot)],
       parsed.flags.forceInclude,
     );
     if (denyHits.length > 0) {

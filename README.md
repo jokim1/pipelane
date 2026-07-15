@@ -230,8 +230,9 @@ setup behavior as before.
 
 For an opted-in repository, plain `/pipelane setup` explains what each declared
 input enables, checks its status, and prints the exact next steps. Run
-`/pipelane setup --provision-secrets` to install ready values through GitHub CLI
-stdin without printing them or committing them to Git. Existing secrets are
+the exact manifest-bound provisioning command printed by setup to install ready
+values through GitHub CLI stdin without printing them or committing them to Git.
+Repository-relative private files must be Git-ignored. Existing secrets are
 preserved; rotation must be explicit.
 
 See [Repository secrets and private CI inputs](docs/public/SECRET_PROVISIONING.md)

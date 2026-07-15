@@ -31,12 +31,15 @@ account permission or invent a meaningful private dataset for you.
    - **Status** says whether it is configured, ready, or blocked.
    - **Next** appears only when you need to provide a local input.
 3. Provide only the blocked inputs using the printed **Next** instructions.
-4. Run `/pipelane setup --provision-secrets`.
+4. Copy and run the exact provisioning command printed by setup. It includes
+   `--approve-secret-manifest=<sha256>`, which binds your approval to this
+   repository and the exact manifest you just inspected.
 5. Rerun `/pipelane setup`. Every declared input should say
    `already configured`.
 
 That is the normal flow. You do not need to open GitHub Settings or manually
-Base64-encode files. Pipelane sends secret values to `gh secret set` over stdin,
+Base64-encode files. Repository-relative private files must be Git-ignored before
+Pipelane will read them. Pipelane sends secret values to `gh secret set` over stdin,
 does not print them, and preserves existing GitHub secrets.
 
 ## Declaring repository inputs
@@ -100,8 +103,10 @@ being ignored.
   below.
 
 Manifest-relative files must remain inside the repository and cannot be
-symlinks. An explicit path environment variable may select another regular file
-when the operator intentionally keeps private input elsewhere. The combined set
+symlinks. Private files inside the repository must also be Git-ignored; Pipelane
+adds their declared paths to its PR staging deny checks as defense in depth. An
+explicit path environment variable may select another regular file when the
+operator intentionally keeps private input elsewhere. The combined set
 of existing and declared repository secrets cannot exceed GitHub's 100-secret
 limit, and every final secret value must fit within 48 KB.
 
@@ -109,7 +114,7 @@ Use `--rotate-secrets` only when you intentionally want to replace every
 declared secret:
 
 ```text
-/pipelane setup --provision-secrets --rotate-secrets
+/pipelane setup --provision-secrets --rotate-secrets --approve-secret-manifest=<sha256 printed by setup>
 ```
 
 Before rotation starts, Pipelane resolves and validates every declared
@@ -130,9 +135,9 @@ Wrangler authenticated with a durable API token. It does not copy a refreshable
 Wrangler OAuth login into GitHub Actions and cannot grant Cloudflare permissions
 on your behalf.
 
-Plain `/pipelane setup` never executes a repository-local Wrangler binary.
-Wrangler token discovery runs only after you explicitly request
-`--provision-secrets`.
+Pipelane never executes a repository-local Wrangler binary. Wrangler token
+discovery runs only after you explicitly approve the exact manifest; it uses a
+Wrangler executable outside the repository with a minimal environment.
 
 Never paste a token into the provisioning manifest, source code, documentation,
 or chat. Put it only in one of the local sources printed by `/pipelane setup`.

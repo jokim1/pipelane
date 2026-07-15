@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { parseEnv } from 'node:util';
@@ -72,6 +73,7 @@ export interface SecretProvisioningEntryResult {
 
 export interface SecretProvisioningResult {
   manifestPath: string;
+  approvalId: string;
   applied: boolean;
   rotate: boolean;
   ok: boolean;
@@ -81,6 +83,7 @@ export interface SecretProvisioningResult {
 export interface SecretProvisioningOptions {
   apply?: boolean;
   rotate?: boolean;
+  approvalId?: string;
   env?: NodeJS.ProcessEnv;
 }
 
@@ -112,13 +115,15 @@ export function loadSecretProvisioningManifest(repoRoot: string): SecretProvisio
 function loadSecretProvisioningManifestUnchecked(repoRoot: string): SecretProvisioningManifest | null {
   const manifestPath = path.join(repoRoot, SECRET_PROVISIONING_MANIFEST);
   if (!existsSync(manifestPath)) return null;
+  if (!isSafeManifestFile(repoRoot, manifestPath)) {
+    throw new Error(`${SECRET_PROVISIONING_MANIFEST} must be a non-symlinked regular file inside the repository.`);
+  }
 
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(manifestPath, 'utf8'));
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`${SECRET_PROVISIONING_MANIFEST} is not valid JSON: ${singleLineForTerminal(detail)}`);
+  } catch {
+    throw new Error(`${SECRET_PROVISIONING_MANIFEST} is not valid JSON.`);
   }
   if (!isRecord(raw) || raw.version !== 1) {
     throw new Error(`${SECRET_PROVISIONING_MANIFEST} must be an object with version 1.`);
@@ -161,9 +166,16 @@ export function provisionRepositorySecrets(
   const manifest = loadSecretProvisioningManifest(repoRoot);
   if (!manifest) return null;
   const manifestPath = path.join(repoRoot, SECRET_PROVISIONING_MANIFEST);
+  const approvalId = secretProvisioningApprovalId(repoRoot);
   const apply = options.apply === true;
   const rotate = options.rotate === true;
   const env = options.env ?? process.env;
+  if (apply && options.approvalId !== approvalId) {
+    throw new Error([
+      'Secret provisioning requires approval bound to this repository and the exact provisioning manifest.',
+      `Inspect the declared inputs, then rerun with --approve-secret-manifest=${approvalId}.`,
+    ].join(' '));
+  }
   const existing = listRepositorySecretNames(repoRoot, env);
   const combinedNames = new Set([
     ...existing,
@@ -223,6 +235,11 @@ export function provisionRepositorySecrets(
           continue;
         }
         try {
+          if (!rotate && listRepositorySecretNames(repoRoot, env).has(name)) {
+            entry.status = 'existing';
+            entry.detail = 'appeared in GitHub after inspection; preserved without writing';
+            continue;
+          }
           setRepositorySecret(repoRoot, name, value, env);
           writtenNames.push(name);
           entry.status = 'provisioned';
@@ -260,6 +277,7 @@ export function provisionRepositorySecrets(
 
   return {
     manifestPath,
+    approvalId,
     applied: apply,
     rotate,
     ok: entries.every((entry) => entry.status !== 'blocked'),
@@ -271,9 +289,12 @@ export function formatSecretProvisioningResult(
   result: SecretProvisioningResult,
   provisionCommand = '/pipelane configure --provision-secrets',
 ): string[] {
-  const retryCommand = result.rotate && !provisionCommand.includes('--rotate-secrets')
+  let retryCommand = result.rotate && !provisionCommand.includes('--rotate-secrets')
     ? `${provisionCommand} --rotate-secrets`
     : provisionCommand;
+  if (!retryCommand.includes('--approve-secret-manifest=')) {
+    retryCommand += ` --approve-secret-manifest=${result.approvalId}`;
+  }
   const retryEffect = result.rotate
     ? 'Every declared replacement will be retried because rotation was explicit.'
     : 'Ready values will be installed; existing GitHub secrets will be preserved.';
@@ -306,6 +327,23 @@ export function formatSecretProvisioningResult(
     lines.push('Setup complete: every input declared by this repository is already configured. No corpus or secret setup is required by Pipelane itself.');
   }
   return lines;
+}
+
+export function secretProvisioningApprovalId(repoRoot: string): string {
+  const manifestPath = path.join(repoRoot, SECRET_PROVISIONING_MANIFEST);
+  if (!isSafeManifestFile(repoRoot, manifestPath)) {
+    throw new SecretProvisioningManifestError(`${SECRET_PROVISIONING_MANIFEST} must be a non-symlinked regular file inside the repository.`);
+  }
+  const origin = spawnSync('git', ['config', '--get', 'remote.origin.url'], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  }).stdout?.trim() || '(no origin remote)';
+  return createHash('sha256').update(JSON.stringify({
+    repoRoot: realpathSync(repoRoot),
+    origin,
+    manifest: createHash('sha256').update(readFileSync(manifestPath)).digest('hex'),
+  })).digest('hex');
 }
 
 function secretGuidance(secret: RepositorySecretProvision): { purpose: string; nextStep: string } {
@@ -423,6 +461,9 @@ function resolveSecretValue(
       if (existsSync(dotenvPath) && !isSafeManifestFile(repoRoot, dotenvPath)) {
         return { ok: false, detail: `allowlisted dotenv file ${source.dotenvFile} escapes the repository or is a symlink` };
       }
+      if (existsSync(dotenvPath) && !isGitIgnored(repoRoot, dotenvPath)) {
+        return { ok: false, detail: `allowlisted dotenv file ${source.dotenvFile} must be Git-ignored before it can be read` };
+      }
       const dotenvValue = readDotenvValue(dotenvPath, source.dotenvVariable);
       if (dotenvValue) {
         return checkedSecretValue(
@@ -449,6 +490,9 @@ function resolveSecretValue(
   if (!existsSync(filePath)) return { ok: false, detail: `${sourceLabel} does not exist` };
   if (!env[source.pathVariable]?.trim() && !isSafeManifestFile(repoRoot, filePath)) {
     return { ok: false, detail: `${sourceLabel} escapes the repository or is a symlink` };
+  }
+  if (isPathInsideRepo(repoRoot, filePath) && !isGitIgnored(repoRoot, filePath)) {
+    return { ok: false, detail: `${sourceLabel} must be Git-ignored before it can be read` };
   }
   let fileStat;
   try {
@@ -523,22 +567,17 @@ function readWranglerApiToken(
   if (!isSafeManifestDirectory(repoRoot, wranglerCwd)) {
     return { ok: false, detail: 'Wrangler working directory escapes the repository or is not a directory' };
   }
-  const localWrangler = path.join(
-    wranglerCwd,
-    'node_modules',
-    '.bin',
-    process.platform === 'win32' ? 'wrangler.cmd' : 'wrangler',
-  );
-  const executable = existsSync(localWrangler)
-    ? localWrangler
-    : findExecutableOnPath('wrangler', environmentPath(env));
+  const executable = findExecutableOnPath('wrangler', environmentPath(env));
   if (!executable) {
     return {
       ok: false,
       detail: `environment variable ${source.variable} is not set and Wrangler is unavailable`,
     };
   }
-  const spawnSpec = buildWranglerSpawnSpec(executable, env);
+  if (isPathInsideRepo(repoRoot, executable)) {
+    return { ok: false, detail: `environment variable ${source.variable} is not set and repository-local Wrangler execution is refused` };
+  }
+  const spawnSpec = buildWranglerSpawnSpec(executable, minimalWranglerEnv(env));
   const result = spawnSync(spawnSpec.command, spawnSpec.args, {
     cwd: wranglerCwd,
     env: spawnSpec.env,
@@ -565,6 +604,11 @@ function readWranglerApiToken(
   } catch {
     return { ok: false, detail: 'Wrangler returned an unreadable authentication response' };
   }
+}
+
+function minimalWranglerEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const allowed = new Set(['PATH', 'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME', 'NO_COLOR', 'SYSTEMROOT', 'COMSPEC']);
+  return Object.fromEntries(Object.entries(env).filter(([key, value]) => value !== undefined && allowed.has(key.toUpperCase())));
 }
 
 function validateChatHeldoutCorpus(body: Buffer): void {
@@ -708,6 +752,36 @@ function isResolvedInsideRepo(repoRoot: string, target: string): boolean {
   const realTarget = realpathSync(target);
   const relative = path.relative(realRepoRoot, realTarget);
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function isPathInsideRepo(repoRoot: string, target: string): boolean {
+  try {
+    const relative = path.relative(realpathSync(repoRoot), realpathSync(target));
+    return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+  } catch {
+    return false;
+  }
+}
+
+function isGitIgnored(repoRoot: string, target: string): boolean {
+  const relative = path.relative(repoRoot, target);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) return true;
+  const result = spawnSync('git', ['check-ignore', '--quiet', '--no-index', '--', relative], {
+    cwd: repoRoot,
+    stdio: 'ignore',
+    timeout: 5_000,
+  });
+  return result.status === 0;
+}
+
+export function declaredPrivateSourcePaths(repoRoot: string): string[] {
+  const manifest = loadSecretProvisioningManifest(repoRoot);
+  if (!manifest) return [];
+  return [...new Set(manifest.github.repositorySecrets.flatMap((secret) => {
+    if (secret.source.type === 'file-base64' && secret.source.defaultPath) return [secret.source.defaultPath];
+    if (secret.source.type === 'cloudflare-api-token' && secret.source.dotenvFile) return [secret.source.dotenvFile];
+    return [];
+  }))];
 }
 
 function assertAllowedKeys(raw: Record<string, unknown>, allowed: string[], location: string): void {

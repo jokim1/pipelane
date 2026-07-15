@@ -70,10 +70,11 @@ function assertNoArgs(args: string[], command: string): void {
   }
 }
 
-function parseSetupArgs(args: string[]): { yes: boolean; provisionSecrets: boolean; rotateSecrets: boolean } {
+function parseSetupArgs(args: string[]): { yes: boolean; provisionSecrets: boolean; rotateSecrets: boolean; approvalId?: string } {
   let yes = false;
   let provisionSecrets = false;
   let rotateSecrets = false;
+  let approvalId: string | undefined;
   for (const token of args) {
     if (token === '--yes' || token === '-y') {
       yes = true;
@@ -88,9 +89,13 @@ function parseSetupArgs(args: string[]): { yes: boolean; provisionSecrets: boole
       rotateSecrets = true;
       continue;
     }
+    if (token.startsWith('--approve-secret-manifest=')) {
+      approvalId = token.slice('--approve-secret-manifest='.length);
+      continue;
+    }
     if (token === '--help' || token === '-h') {
       process.stdout.write([
-        'pipelane setup [--yes] [--provision-secrets] [--rotate-secrets]',
+        'pipelane setup [--yes] [--provision-secrets] [--rotate-secrets] [--approve-secret-manifest=<sha256>]',
         '',
         'Private CI inputs are declared by individual repositories; Pipelane does not require secrets or a corpus globally.',
         `Guide: ${SECRET_PROVISIONING_GUIDE_URL}`,
@@ -100,7 +105,7 @@ function parseSetupArgs(args: string[]): { yes: boolean; provisionSecrets: boole
     }
     throw new Error(`Unknown flag for pipelane setup: ${token}`);
   }
-  return { yes, provisionSecrets, rotateSecrets };
+  return { yes, provisionSecrets, rotateSecrets, ...(approvalId ? { approvalId } : {}) };
 }
 
 function parseVerboseArg(args: string[], command: string): boolean {
@@ -215,12 +220,13 @@ async function maybeOfferConfigureAfterBootstrap(repoRoot: string): Promise<void
 
 function reportSetupSecretProvisioning(
   repoRoot: string,
-  options: { provisionSecrets: boolean; rotateSecrets: boolean },
+  options: { provisionSecrets: boolean; rotateSecrets: boolean; approvalId?: string },
 ): void {
   try {
     const result = provisionRepositorySecrets(repoRoot, {
       apply: options.provisionSecrets,
       rotate: options.rotateSecrets,
+      approvalId: options.approvalId,
     });
     if (!result) return;
     process.stdout.write(`${formatSecretProvisioningResult(

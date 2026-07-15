@@ -30,6 +30,7 @@ export interface ConfigureOptions {
   help: boolean;
   provisionSecrets?: boolean;
   rotateSecrets?: boolean;
+  approvalId?: string;
   platform?: string;
   frontendProductionUrl?: string;
   frontendProductionWorkflow?: string;
@@ -154,6 +155,10 @@ export function parseConfigureArgs(argv: string[]): ConfigureOptions {
       options.rotateSecrets = true;
       continue;
     }
+    if (token.startsWith('--approve-secret-manifest=')) {
+      options.approvalId = token.slice('--approve-secret-manifest='.length);
+      continue;
+    }
 
     const bag = options as unknown as Record<string, unknown>;
 
@@ -247,7 +252,11 @@ export async function handleConfigure(cwd: string, argv: string[]): Promise<Conf
     if (options.json || hasDeployOverrides(options)) {
       throw new Error('--provision-secrets is a standalone configure mode and cannot be combined with --json or deploy-value flags.');
     }
-    const result = provisionRepositorySecrets(repoRoot, { apply: true, rotate: options.rotateSecrets === true });
+    const result = provisionRepositorySecrets(repoRoot, {
+      apply: true,
+      rotate: options.rotateSecrets === true,
+      approvalId: options.approvalId,
+    });
     if (!result) {
       throw new Error('No .github/pipelane-provisioning.json manifest was found in this repository.');
     }
@@ -1222,7 +1231,7 @@ function printUsage(): void {
 Usage:
   pipelane configure                 Interactive prompts for every field
   pipelane configure --json [flags]  Non-interactive; emits the final DeployConfig JSON
-  pipelane configure --provision-secrets [--rotate-secrets]
+  pipelane configure --provision-secrets [--rotate-secrets] --approve-secret-manifest=<sha256>
 
 Repository-secret provisioning reads the app-owned
 .github/pipelane-provisioning.json manifest. Existing secrets are preserved by
