@@ -95,7 +95,21 @@ interface UnresolvedSecretValue {
   detail: string;
 }
 
+export class SecretProvisioningManifestError extends Error {
+  override name = 'SecretProvisioningManifestError';
+}
+
 export function loadSecretProvisioningManifest(repoRoot: string): SecretProvisioningManifest | null {
+  try {
+    return loadSecretProvisioningManifestUnchecked(repoRoot);
+  } catch (error) {
+    if (error instanceof SecretProvisioningManifestError) throw error;
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new SecretProvisioningManifestError(detail, { cause: error });
+  }
+}
+
+function loadSecretProvisioningManifestUnchecked(repoRoot: string): SecretProvisioningManifest | null {
   const manifestPath = path.join(repoRoot, SECRET_PROVISIONING_MANIFEST);
   if (!existsSync(manifestPath)) return null;
 
@@ -635,8 +649,12 @@ function githubCliEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const childEnv = { ...env };
   // gh gives GH_REPO precedence over the repository identified by cwd. Secret
   // provisioning is always scoped to the checked-out repository, so an ambient
-  // override must never redirect reads or writes to another repository.
-  delete childEnv.GH_REPO;
+  // override must never redirect reads or writes to another repository. Match
+  // case-insensitively because Windows environment variable names are
+  // case-insensitive.
+  for (const key of Object.keys(childEnv)) {
+    if (key.toUpperCase() === 'GH_REPO') delete childEnv[key];
+  }
   return childEnv;
 }
 

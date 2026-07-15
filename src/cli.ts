@@ -24,6 +24,7 @@ import {
   formatSecretProvisioningResult,
   provisionRepositorySecrets,
   SECRET_PROVISIONING_GUIDE_URL,
+  SecretProvisioningManifestError,
 } from './operator/secret-provisioning.ts';
 import { resolveRepoRoot } from './operator/state.ts';
 import { bootstrapWorktreeNodeModulesIfNeeded } from './operator/task-workspaces.ts';
@@ -229,7 +230,7 @@ function reportSetupSecretProvisioning(
     if (options.provisionSecrets && !result.ok) process.exitCode = 64;
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    if (options.provisionSecrets) throw error;
+    if (options.provisionSecrets || error instanceof SecretProvisioningManifestError) throw error;
     process.stdout.write(`Repository secret provisioning is declared but could not be inspected: ${detail}\n`);
   }
 }

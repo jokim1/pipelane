@@ -985,7 +985,7 @@ const state = fs.existsSync(statePath)
   : { secrets: {}, setCalls: [] };
 const args = process.argv.slice(2);
 const writeState = () => fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + '\\n', 'utf8');
-if (process.env.GH_REPO) {
+if (Object.keys(process.env).some((key) => key.toUpperCase() === 'GH_REPO')) {
   process.stderr.write('GH_REPO must not redirect repository-secret provisioning\\n');
   process.exit(9);
 }
@@ -29774,6 +29774,31 @@ test('setup introduces no secret or corpus requirement when the repository has n
   }
 });
 
+test('plain setup fails closed when the repository provisioning manifest is invalid', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    mkdirSync(path.join(repoRoot, '.github'), { recursive: true });
+    writeFileSync(
+      path.join(repoRoot, '.github', 'pipelane-provisioning.json'),
+      `${JSON.stringify({
+        version: 1,
+        github: { repositorySecrets: [] },
+        misspelled: true,
+      }, null, 2)}\n`,
+      'utf8',
+    );
+
+    const result = runCli(['setup'], repoRoot, {}, true);
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /has unsupported field: misspelled/);
+    assert.doesNotMatch(result.stdout, /could not be inspected/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('setup discovers ready repository secrets without writing or exposing their values', () => {
   const repoRoot = createRepo();
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
@@ -29882,7 +29907,7 @@ test('setup provisions missing secrets through stdin, preserves existing values,
   }
 });
 
-test('repository-secret provisioning ignores ambient GH_REPO redirection', () => {
+test('repository-secret provisioning ignores ambient GH_REPO redirection case-insensitively', () => {
   const repoRoot = createRepo();
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
   const stateFile = path.join(binDir, 'state.json');
@@ -29897,7 +29922,7 @@ test('repository-secret provisioning ignores ambient GH_REPO redirection', () =>
     const result = runCli(['setup', '--provision-secrets'], repoRoot, {
       PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
       GH_SECRET_STATE_FILE: stateFile,
-      GH_REPO: 'attacker/unrelated-repository',
+      Gh_RePo: 'attacker/unrelated-repository',
       TEST_SCOPED_TOKEN: 'scoped-value-never-print',
     });
 
