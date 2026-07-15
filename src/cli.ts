@@ -35,9 +35,9 @@ function printTopLevelHelp(): void {
   process.stdout.write(`Pipelane - build, release, and development orchestration for AI-assisted codebases
 
 Commands:
-  setup [--yes] [--provision-secrets] [--rotate-secrets]
+  setup [--yes] [--provision-secrets] [--rotate-secrets] [--approve-secret-manifest=<sha256>]
   configure [--json] [surface flags...]
-  configure --provision-secrets [--rotate-secrets]
+  configure --provision-secrets [--rotate-secrets] --approve-secret-manifest=<sha256>
   update [--check] [--yes] [--json]
   install-claude [--verbose]
   install-codex [--verbose]
@@ -228,7 +228,12 @@ function reportSetupSecretProvisioning(
       rotate: options.rotateSecrets,
       approvalId: options.approvalId,
     });
-    if (!result) return;
+    if (!result) {
+      if (options.provisionSecrets) {
+        throw new Error('No .github/pipelane-provisioning.json manifest was found in this repository.');
+      }
+      return;
+    }
     process.stdout.write(`${formatSecretProvisioningResult(
       result,
       '/pipelane setup --provision-secrets',

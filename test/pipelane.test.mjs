@@ -29781,6 +29781,9 @@ test('setup introduces no secret or corpus requirement when the repository has n
   const repoRoot = createRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
+    const topLevelHelp = runCli(['--help'], repoRoot);
+    assert.match(topLevelHelp.stdout, /setup \[--yes\] \[--provision-secrets\] \[--rotate-secrets\] \[--approve-secret-manifest=<sha256>\]/);
+    assert.match(topLevelHelp.stdout, /configure --provision-secrets \[--rotate-secrets\] --approve-secret-manifest=<sha256>/);
     const help = runCli(['setup', '--help'], repoRoot);
     assert.match(help.stdout, /Pipelane does not require secrets or a corpus globally/);
     assert.match(help.stdout, /github\.com\/jokim1\/pipelane\/blob\/main\/docs\/public\/SECRET_PROVISIONING\.md/);
@@ -29789,6 +29792,12 @@ test('setup introduces no secret or corpus requirement when the repository has n
     assert.doesNotMatch(result.stdout, /Private CI inputs/);
     assert.doesNotMatch(result.stdout, /corpus/i);
     assert.doesNotMatch(result.stdout, /provision-secrets/);
+
+    for (const flag of ['--provision-secrets', '--rotate-secrets']) {
+      const explicit = runCli(['setup', flag], repoRoot, {}, true);
+      assert.equal(explicit.status, 1);
+      assert.match(explicit.stderr, /No \.github\/pipelane-provisioning\.json manifest was found/);
+    }
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
