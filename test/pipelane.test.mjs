@@ -4553,6 +4553,50 @@ test('legacy custom-state auto-import fails closed on enumeration and copy failu
   }
 });
 
+test('legacy custom-state auto-import retries after generated controls are rewritten and preserves review follow-ups', async () => {
+  const repoRoot = createRepo();
+  const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+  try {
+    const legacyDir = path.join(resolveCommonDir(repoRoot), 'custom-state');
+    const legacyFollowUpDir = path.join(legacyDir, 'review-follow-ups');
+    const followUpBody = '{"reviewRunId":"review-legacy","status":"pending"}\n';
+    mkdirSync(legacyFollowUpDir, { recursive: true });
+    writeFileSync(path.join(legacyDir, 'mode-state.json'), `${JSON.stringify({
+      mode: 'release',
+      requestedSurfaces: ['frontend'],
+      override: null,
+      updatedAt: '2026-07-12T00:00:00.000Z',
+    }, null, 2)}\n`, 'utf8');
+    writeFileSync(path.join(legacyDir, 'installed.json'), '{"legacy":true}\n', 'utf8');
+    writeFileSync(path.join(legacyDir, 'legacy-migration.json'), '{"legacy":true}\n', 'utf8');
+    writeFileSync(path.join(legacyFollowUpDir, 'follow-up.json'), followUpBody, 'utf8');
+    writeFileSync(path.join(repoRoot, '.pipelane.json'), `${JSON.stringify({
+      displayName: 'Legacy Generated Controls Retry',
+      stateDir: 'custom-state',
+    }, null, 2)}\n`, 'utf8');
+
+    process.env.PIPELANE_TEST_LEGACY_MIGRATION_FAIL = 'before-config-write';
+    assert.throws(
+      () => stateMod.resolveWorkflowContext(repoRoot),
+      /injected legacy migration failure: before-config-write/,
+    );
+    const canonicalDir = sharedStateDir(repoRoot);
+    assert.equal(existsSync(machinePipelaneConfigPath(repoRoot)), false);
+    assert.equal(existsSync(path.join(canonicalDir, 'installed.json')), true);
+    assert.equal(existsSync(path.join(canonicalDir, 'legacy-migration.json')), true);
+    assert.equal(readFileSync(path.join(canonicalDir, 'review-follow-ups', 'follow-up.json'), 'utf8'), followUpBody);
+
+    delete process.env.PIPELANE_TEST_LEGACY_MIGRATION_FAIL;
+    const retried = stateMod.resolveWorkflowContext(repoRoot);
+    assert.equal(retried.modeState.mode, 'release');
+    assert.equal(existsSync(machinePipelaneConfigPath(repoRoot)), true);
+    assert.equal(readFileSync(path.join(canonicalDir, 'review-follow-ups', 'follow-up.json'), 'utf8'), followUpBody);
+  } finally {
+    delete process.env.PIPELANE_TEST_LEGACY_MIGRATION_FAIL;
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test('legacy config auto-import rejects a custom stateDir symlink that escapes the Git common dir', async () => {
   const repoRoot = createRepo();
   const attackerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-legacy-state-link-'));
@@ -32668,6 +32712,27 @@ test('task-scoped devmode readiness covers persisted surfaces and rejects concur
       'build',
     );
 
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.surfaces = config.surfaces.filter((surface) => surface !== 'sql');
+    });
+    const removedApi = runCli([
+      'run', 'api', 'action', 'devmode.release', '--task', 'SQL Readiness', '--json',
+    ], sqlTask.worktreePath, {}, true);
+    assert.equal(removedApi.status, 1);
+    assert.match(removedApi.stderr + removedApi.stdout, /no longer present.*sql/i);
+    const removedCli = runCli([
+      'run', 'devmode', 'release', '--task', 'SQL Readiness', '--json',
+    ], sqlTask.worktreePath, {}, true);
+    assert.equal(removedCli.status, 1);
+    assert.match(removedCli.stderr + removedCli.stdout, /no longer present.*sql/i);
+    assert.equal(
+      JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'task-locks', 'sql-readiness.json'), 'utf8')).mode,
+      'build',
+    );
+    updateWorkflowConfig(repoRoot, (config) => {
+      if (!config.surfaces.includes('sql')) config.surfaces.push('sql');
+    });
+
     const concurrent = JSON.parse(runCli([
       'run', 'new', '--task', 'Concurrent Surfaces', '--surfaces', 'frontend', '--json',
     ], repoRoot).stdout);
@@ -32971,6 +33036,38 @@ test('task mutation leases reject live contention and reclaim dead owners', asyn
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
     rmSync(markerRoot, { recursive: true, force: true });
+  }
+});
+
+test('task mutations reject non-canonical slugs before touching an escaped lock path', async () => {
+  const repoRoot = createRepo();
+  let escapedMutationPath = '';
+  try {
+    writePipelaneConfig(repoRoot, 'Malformed Task Slug');
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+    const maliciousSlug = `../../../victim-${path.basename(repoRoot)}`;
+    escapedMutationPath = path.resolve(
+      stateMod.resolveStateDir(context.commonDir, context.config),
+      'task-mutation-locks',
+      `${maliciousSlug}.lock`,
+    );
+    mkdirSync(escapedMutationPath, { recursive: true });
+    writeFileSync(path.join(escapedMutationPath, 'owner.json'), `${JSON.stringify({
+      taskSlug: maliciousSlug,
+      pid: 2_147_483_647,
+      acquiredAt: new Date(0).toISOString(),
+    })}\n`, 'utf8');
+    writeFileSync(path.join(escapedMutationPath, 'sentinel'), 'preserve\n', 'utf8');
+
+    assert.throws(
+      () => stateMod.updateTaskLock(context.commonDir, context.config, maliciousSlug, () => null),
+      /Invalid task slug/,
+    );
+    assert.equal(readFileSync(path.join(escapedMutationPath, 'sentinel'), 'utf8'), 'preserve\n');
+  } finally {
+    if (escapedMutationPath) rmSync(escapedMutationPath, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
   }
 });
 

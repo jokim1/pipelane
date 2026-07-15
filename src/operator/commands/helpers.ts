@@ -95,6 +95,16 @@ export function resolveModeSurfaces(
     : resolveCommandSurfaces(context, [], taskLock.surfaces);
   if (!taskLock) return selected;
 
+  const configuredSurfaces = new Set(context.config.surfaces);
+  const removedTaskSurfaces = [...new Set(taskLock.surfaces)]
+    .filter((surface) => !configuredSurfaces.has(surface));
+  if (removedTaskSurfaces.length > 0) {
+    throw new Error(
+      `Task lock requires surface(s) no longer present in machine-local configuration: ${removedTaskSurfaces.join(', ')}. `
+      + 'Restore those surfaces in Pipelane configuration, or explicitly recreate the task with the intended narrower scope.',
+    );
+  }
+
   // A task-scoped mode transition must prove readiness for every surface the
   // durable task lock still claims. Explicit/global selections may widen that
   // set, but they cannot silently substitute a disjoint surface set.

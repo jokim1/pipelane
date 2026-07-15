@@ -886,6 +886,51 @@ and non-TTY execution paths.
     the fast-path record to remain paused. Tests also replace fixed sleep
     windows in the affected concurrency cases with explicit release markers.
 
+69. **A malformed persisted task slug could escape the state directory during
+    stale-lock reclamation (P0).** **Location:** `src/operator/state.ts:4122`.
+    **Repro:** migrate or hand-edit a task lock whose `taskSlug` is
+    `../../../victim`, place a dead-owner directory at the resulting traversal
+    path, then perform any task mutation; the mutation lease joined the raw
+    slug into a path and recursively deleted the escaped directory while
+    reclaiming it. **Proposed fix (implemented):** require every task slug used
+    by task, cleanup, binding, and mutation lock paths to equal its non-empty
+    canonical slug before any filesystem operation. Malformed persisted state
+    now fails closed with an explicit repair remedy.
+
+70. **Removing a task surface from machine-local configuration could erase it
+    from release readiness (P1).** **Location:**
+    `src/operator/commands/helpers.ts:83`. **Repro:** create a build-mode task
+    scoped to `sql`, remove `sql` from the configured surface list, then invoke
+    task-scoped `devmode release`; filtering the task/config union through the
+    current configuration produced an empty readiness set and could reconcile
+    the lock to release without proving SQL readiness. **Proposed fix
+    (implemented):** reject task-scoped mode transitions when any persisted
+    task surface is absent from current configuration, naming both the missing
+    surfaces and the explicit restore-or-recreate remedy. CLI and API paths
+    share the check.
+
+71. **An interruption after strict legacy-state markers were rewritten made
+    migration permanently unretryable (P1).** **Location:**
+    `src/operator/state.ts:1961` and `src/operator/state.ts:2675`. **Repro:**
+    import a custom legacy state directory containing `installed.json` and
+    `legacy-migration.json`, interrupt after migration writes fresh destination
+    controls but before machine-local config is committed, then retry; strict
+    byte-equivalence compared the legacy controls to the newly generated ones
+    and rejected the retry forever. **Proposed fix (implemented):** treat those
+    two destination-owned controls as generated migration outputs: validate
+    their filesystem shape, regenerate them after every complete copy/verify
+    pass, and never compare their payload bytes. A failure-injection test proves
+    the post-marker retry path.
+
+72. **Legitimate legacy `review-follow-ups` state blocked strict auto-import
+    (P1).** **Location:** `src/operator/state.ts:1001`. **Repro:** onboard a
+    repo whose old custom state directory contains durable review follow-up
+    records; the strict legacy allowlist labeled that first-party directory as
+    a non-Pipelane entry and reported the repo as not onboarded. **Proposed fix
+    (implemented):** add the existing canonical follow-up directory constant to
+    the strict migration allowlist and verify its contents survive an
+    interrupted import and retry byte-for-byte.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original

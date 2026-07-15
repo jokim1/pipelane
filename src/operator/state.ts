@@ -1015,6 +1015,7 @@ const LEGACY_STATE_ENTRY_NAMES = new Set([
   TASK_CLEANUP_LOCKS_DIRNAME,
   TASK_MUTATION_LOCKS_DIRNAME,
   ORPHAN_CLEANUP_LOCKS_DIRNAME,
+  REVIEW_FOLLOW_UP_DIRNAME,
   INSTALL_MARKER_FILENAME,
   LEGACY_MIGRATION_FILENAME,
   'api-confirmations',
@@ -1022,6 +1023,10 @@ const LEGACY_STATE_ENTRY_NAMES = new Set([
   'orchestrate',
   'review-artifacts',
   'review-gates',
+]);
+const LEGACY_GENERATED_CONTROL_ENTRY_NAMES = new Set([
+  INSTALL_MARKER_FILENAME,
+  LEGACY_MIGRATION_FILENAME,
 ]);
 
 // State-resilience invariants. Pipelane state lives under
@@ -1974,6 +1979,7 @@ export function importLegacyWorkflowConfigIfNeeded(repoRoot: string): {
         requireComplete: true,
       });
     }
+    injectLegacyMigrationFailure('before-config-write');
     writeWorkflowConfig(repoRoot, config);
     return { configPath: resolveConfigPath(repoRoot), config, source: legacy.source };
   }
@@ -1997,6 +2003,7 @@ export function importLegacyWorkflowConfigIfNeeded(repoRoot: string): {
       requireComplete: true,
     });
   }
+  injectLegacyMigrationFailure('before-config-write');
   writeWorkflowConfig(repoRoot, config);
   return { configPath: resolveConfigPath(repoRoot), config, source: 'legacy-package-json' };
 }
@@ -2374,12 +2381,32 @@ export function saveProbeState(commonDir: string, config: WorkflowConfig, value:
   writeVersionedJsonFile('probeState', probeStatePath(commonDir, config), value);
 }
 
+function requireCanonicalTaskSlug(taskSlug: string): string {
+  let canonical = '';
+  try {
+    canonical = slugifyTaskName(taskSlug);
+  } catch {
+    // Replace slugification's user-input echo with the same sanitized
+    // persisted-state repair error used for every malformed slug.
+  }
+  if (!canonical || canonical !== taskSlug) {
+    const printable = sanitizeForTerminal(taskSlug).replace(/\s+/gu, ' ').trim() || '(empty)';
+    throw new Error(
+      `Invalid task slug "${printable}" in persisted state; expected a non-empty canonical slug. `
+      + 'Repair or remove the malformed task lock, then retry.',
+    );
+  }
+  return canonical;
+}
+
 export function taskLockPath(commonDir: string, config: WorkflowConfig, taskSlug: string): string {
-  return path.join(resolveStateDir(commonDir, config), TASK_LOCKS_DIRNAME, `${taskSlug}.json`);
+  const canonicalTaskSlug = requireCanonicalTaskSlug(taskSlug);
+  return path.join(resolveStateDir(commonDir, config), TASK_LOCKS_DIRNAME, `${canonicalTaskSlug}.json`);
 }
 
 function taskCleanupLockPath(commonDir: string, config: WorkflowConfig, taskSlug: string): string {
-  return path.join(resolveStateDir(commonDir, config), TASK_CLEANUP_LOCKS_DIRNAME, `${taskSlug}.lock`);
+  const canonicalTaskSlug = requireCanonicalTaskSlug(taskSlug);
+  return path.join(resolveStateDir(commonDir, config), TASK_CLEANUP_LOCKS_DIRNAME, `${canonicalTaskSlug}.lock`);
 }
 
 function clearStaleTaskCleanupLock(lockPath: string): boolean {
@@ -2698,6 +2725,16 @@ function migrateLegacyStateDirFromDirectories(
     for (const name of entries) {
       const src = path.join(legacyDir, name);
       const dst = path.join(canonicalDir, name);
+      if (requireComplete && LEGACY_GENERATED_CONTROL_ENTRY_NAMES.has(name)) {
+        // These files describe the destination installation and the current
+        // migration attempt. Copying their legacy bytes and then rewriting
+        // them makes an interrupted import fail the next byte-equivalence
+        // check permanently. Validate any existing destination shape and
+        // regenerate both controls after every complete copy/verify pass.
+        if (existsSync(dst)) assertLegacyMigrationTreeHasNoSymlinks(dst);
+        completed.push(name);
+        continue;
+      }
       if (existsSync(dst)) {
         if (!requireComplete) continue;
         assertLegacyMigrationTreeHasNoSymlinks(dst);
@@ -4065,7 +4102,8 @@ export function updateTaskBinding(
 
 function acquireTaskBindingLock(commonDir: string, config: WorkflowConfig, taskSlug: string): { release: () => void } {
   const root = path.join(resolveStateDir(commonDir, config), TASK_BINDING_LOCKS_DIRNAME);
-  const lockPath = path.join(root, `${slugifyTaskName(taskSlug)}.lock`);
+  const canonicalTaskSlug = requireCanonicalTaskSlug(taskSlug);
+  const lockPath = path.join(root, `${canonicalTaskSlug}.lock`);
   mkdirSync(root, { recursive: true });
   try {
     if (existsSync(lockPath) && Date.now() - statSync(lockPath).mtimeMs > TASK_BINDING_LOCK_STALE_MS) {
@@ -4088,7 +4126,8 @@ export function removeTaskLock(commonDir: string, config: WorkflowConfig, taskSl
 }
 
 function taskMutationLockPath(commonDir: string, config: WorkflowConfig, taskSlug: string): string {
-  return path.join(resolveStateDir(commonDir, config), TASK_MUTATION_LOCKS_DIRNAME, `${taskSlug}.lock`);
+  const canonicalTaskSlug = requireCanonicalTaskSlug(taskSlug);
+  return path.join(resolveStateDir(commonDir, config), TASK_MUTATION_LOCKS_DIRNAME, `${canonicalTaskSlug}.lock`);
 }
 
 function acquireTaskMutationLock(commonDir: string, config: WorkflowConfig, taskSlug: string): () => void {
