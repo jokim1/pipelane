@@ -40,7 +40,9 @@ account permission or invent a meaningful private dataset for you.
 That is the normal flow. You do not need to open GitHub Settings or manually
 Base64-encode files. Repository-relative private files must be Git-ignored before
 Pipelane will read them. Pipelane sends secret values to `gh secret set` over stdin,
-does not print them, and preserves existing GitHub secrets.
+does not print them, and preserves existing GitHub secrets. It refuses to run a
+repository-local `gh` executable; use a trusted GitHub CLI installed outside the
+repository.
 
 ## Declaring repository inputs
 
@@ -135,7 +137,7 @@ Wrangler authenticated with a durable API token. It does not copy a refreshable
 Wrangler OAuth login into GitHub Actions and cannot grant Cloudflare permissions
 on your behalf.
 
-Pipelane never executes a repository-local Wrangler binary. Wrangler token
+Pipelane never executes a repository-local GitHub CLI or Wrangler binary. Wrangler token
 discovery runs only after you explicitly approve the exact manifest; it uses a
 Wrangler executable outside the repository with a minimal environment.
 

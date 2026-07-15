@@ -584,7 +584,7 @@ function readWranglerApiToken(
       detail: `environment variable ${source.variable} is not set and Wrangler is unavailable`,
     };
   }
-  if (isPathInsideRepo(repoRoot, executable)) {
+  if (isRepoControlledExecutable(repoRoot, executable)) {
     return { ok: false, detail: `environment variable ${source.variable} is not set and repository-local Wrangler execution is refused` };
   }
   const spawnSpec = buildWranglerSpawnSpec(executable, minimalWranglerEnv(env));
@@ -664,7 +664,7 @@ function checkedSecretValue(value: string, detail: string): ResolvedSecretValue 
 }
 
 function listRepositorySecretNames(repoRoot: string, repository: string, env: NodeJS.ProcessEnv): Set<string> {
-  const result = spawnSync('gh', ['secret', 'list', '--repo', repository, '--json', 'name'], {
+  const result = spawnSync(trustedGitHubCli(repoRoot, env), ['secret', 'list', '--repo', repository, '--json', 'name'], {
     cwd: repoRoot,
     env: githubCliEnv(env),
     encoding: 'utf8',
@@ -686,7 +686,7 @@ function listRepositorySecretNames(repoRoot: string, repository: string, env: No
 }
 
 function setRepositorySecret(repoRoot: string, repository: string, name: string, value: string, env: NodeJS.ProcessEnv): void {
-  const result = spawnSync('gh', ['secret', 'set', name, '--repo', repository], {
+  const result = spawnSync(trustedGitHubCli(repoRoot, env), ['secret', 'set', name, '--repo', repository], {
     cwd: repoRoot,
     env: githubCliEnv(env),
     input: value,
@@ -726,7 +726,7 @@ function parseGitHubRepository(remote: string): string | null {
 }
 
 function resolveRepositoryWithGh(repoRoot: string, env: NodeJS.ProcessEnv): string {
-  const result = spawnSync('gh', ['repo', 'view', '--json', 'nameWithOwner,url'], {
+  const result = spawnSync(trustedGitHubCli(repoRoot, env), ['repo', 'view', '--json', 'nameWithOwner,url'], {
     cwd: repoRoot,
     env: githubCliEnv(env),
     encoding: 'utf8',
@@ -742,6 +742,17 @@ function resolveRepositoryWithGh(repoRoot: string, env: NodeJS.ProcessEnv): stri
   } catch {
     throw new Error('Could not resolve the GitHub repository target. Configure an origin remote or run `gh repo set-default`.');
   }
+}
+
+function trustedGitHubCli(repoRoot: string, env: NodeJS.ProcessEnv): string {
+  const executable = findExecutableOnPath('gh', environmentPath(env));
+  if (!executable) {
+    throw new Error('GitHub CLI is unavailable. Install `gh`, then rerun setup.');
+  }
+  if (isRepoControlledExecutable(repoRoot, executable)) {
+    throw new Error('Repository-local GitHub CLI execution is refused. Put a trusted `gh` executable outside the repository on PATH.');
+  }
+  return executable;
 }
 
 function findExecutableOnPath(name: string, pathValue: string | undefined): string | null {
@@ -803,6 +814,12 @@ function isPathInsideRepo(repoRoot: string, target: string): boolean {
   } catch {
     return false;
   }
+}
+
+function isRepoControlledExecutable(repoRoot: string, target: string): boolean {
+  const relative = path.relative(path.resolve(repoRoot), path.resolve(target));
+  const locatedInside = relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+  return locatedInside || isPathInsideRepo(repoRoot, target);
 }
 
 function isGitIgnored(repoRoot: string, target: string): boolean {

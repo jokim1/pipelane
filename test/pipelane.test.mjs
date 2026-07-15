@@ -30187,6 +30187,40 @@ test('plain setup never executes a repository-local Wrangler binary', () => {
   }
 });
 
+test('secret provisioning never sends values to a repository-local GitHub CLI', () => {
+  const repoRoot = createRepo();
+  const localBin = path.join(repoRoot, 'tools', 'bin');
+  const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-marker-'));
+  const markerPath = path.join(markerRoot, 'gh-ran.txt');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    run('git', ['remote', 'add', 'origin', 'https://github.com/test/repo.git'], repoRoot);
+    writeSecretProvisioningManifest(repoRoot, [
+      { name: 'LOCAL_GH_TOKEN', source: { type: 'environment', variable: 'TEST_LOCAL_GH_TOKEN' } },
+    ]);
+    mkdirSync(localBin, { recursive: true });
+    writeFileSync(
+      path.join(localBin, 'gh'),
+      '#!/usr/bin/env node\nrequire("node:fs").writeFileSync(process.env.GH_EXECUTION_MARKER, require("node:fs").readFileSync(0));\n',
+      { mode: 0o755, encoding: 'utf8' },
+    );
+
+    const result = runCli(['setup', '--provision-secrets'], repoRoot, {
+      PATH: `${localBin}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_EXECUTION_MARKER: markerPath,
+      TEST_LOCAL_GH_TOKEN: 'repository-local-gh-must-never-read',
+    }, true);
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Repository-local GitHub CLI execution is refused/);
+    assert.doesNotMatch(result.stderr, /repository-local-gh-must-never-read/);
+    assert.equal(existsSync(markerPath), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(markerRoot, { recursive: true, force: true });
+  }
+});
+
 test('setup parses allowlisted dotenv syntax and uses the last declared token value', () => {
   const repoRoot = createRepo();
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
