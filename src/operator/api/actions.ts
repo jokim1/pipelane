@@ -208,7 +208,10 @@ export function buildActionPreflightEnvelope(cwd: string, actionId: StableAction
   if (worktreeBlock) {
     return worktreeBlock;
   }
-  assertStableActionManagedState(context.repoRoot, actionId);
+  const managedStateBlock = buildStableActionManagedStateBlock(context, actionId, parsed);
+  if (managedStateBlock) {
+    return managedStateBlock;
+  }
   const routePlan = buildRoutePlanForAction(cwd, actionId, parsed);
   const destinationPlan = routePlan.destinationPlan;
   let normalizedInputs: Record<string, unknown>;
@@ -765,6 +768,26 @@ function buildTaskApiActionWorktreeBlock(
   }
 }
 
+function buildStableActionManagedStateBlock(
+  context: WorkflowContext,
+  actionId: StableActionId,
+  parsed: ParsedOperatorArgs,
+  options: { persist?: boolean } = {},
+): ApiEnvelope<ActionPreflightData> | null {
+  try {
+    assertStableActionManagedState(context.repoRoot, actionId);
+    return null;
+  } catch (error) {
+    return buildActionResolutionBlock({
+      context,
+      actionId,
+      parsed,
+      message: error instanceof Error ? error.message : String(error),
+      persist: options.persist,
+    });
+  }
+}
+
 function buildActionResolutionBlock(options: {
   context: WorkflowContext;
   actionId: StableActionId;
@@ -836,7 +859,10 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
   if (worktreeBlock) {
     return worktreeBlock;
   }
-  assertStableActionManagedState(context.repoRoot, actionId);
+  const managedStateBlock = buildStableActionManagedStateBlock(context, actionId, parsed, { persist: true });
+  if (managedStateBlock) {
+    return managedStateBlock;
+  }
   const routePlan = buildRoutePlanForAction(cwd, actionId, parsed);
   const destinationPlan = routePlan.destinationPlan;
   let normalizedInputs: Record<string, unknown>;
@@ -1547,18 +1573,16 @@ function buildChildEnv(
     // scrubs this flag the moment it reads it so grandchild subprocesses
     // don't inherit an open prod-confirm bit.
     env.PIPELANE_DEPLOY_PROD_API_CONFIRMED = '1';
-    if (actionId === 'deploy.prod' || actionId === 'rollback.prod') {
-      env[DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV] = '1';
-      env[DEPLOY_PROD_APPROVED_SHA_ENV] = typeof normalizedInputs.targetSha === 'string'
-        ? normalizedInputs.targetSha
-        : '';
-      env[DEPLOY_PROD_APPROVED_SURFACES_ENV] = Array.isArray(normalizedInputs.resolvedSurfaces)
-        ? normalizedInputs.resolvedSurfaces.join(',')
-        : '';
-      env[DEPLOY_PROD_APPROVED_DISPATCH_CONFIG_ENV] = typeof normalizedInputs.dispatchConfigFingerprint === 'string'
-        ? normalizedInputs.dispatchConfigFingerprint
-        : '';
-    }
+    env[DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV] = '1';
+    env[DEPLOY_PROD_APPROVED_SHA_ENV] = typeof normalizedInputs.targetSha === 'string'
+      ? normalizedInputs.targetSha
+      : '';
+    env[DEPLOY_PROD_APPROVED_SURFACES_ENV] = Array.isArray(normalizedInputs.resolvedSurfaces)
+      ? normalizedInputs.resolvedSurfaces.join(',')
+      : '';
+    env[DEPLOY_PROD_APPROVED_DISPATCH_CONFIG_ENV] = typeof normalizedInputs.dispatchConfigFingerprint === 'string'
+      ? normalizedInputs.dispatchConfigFingerprint
+      : '';
   } else {
     // Never let a stray bypass leak into other actions' execution.
     delete env.PIPELANE_DEPLOY_PROD_API_CONFIRMED;

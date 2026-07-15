@@ -1017,6 +1017,27 @@ and non-TTY execution paths.
     automatically before onboarding enforcement, preserving Q2. Tests prove
     valid and malformed legacy preflights write nothing and remain structured.
 
+80. **Managed local-state failures escaped the stable API envelope (P1).**
+    **Location:** `src/operator/api/actions.ts:211` and
+    `src/operator/api/actions.ts:839`. **Repro:** remove or corrupt the
+    canonical managed block, then preflight or execute a current-state action
+    such as `api action pr`; the guard threw through the API boundary instead
+    of returning the documented `ok:false`, `allowed:false` preflight with a
+    remediation, so browser and agent drivers lost their structured recovery
+    path. **Proposed fix (implemented):** catch the managed-state guard at both
+    API entry points and reuse the resolution-block envelope, persisting the
+    execute-time blocker where appropriate and never issuing a confirmation
+    token. A regression exercises both preflight and execute against a missing
+    managed block and verifies the exact `pipelane setup` remedy.
+
+81. **The direct production child-environment branch repeated its own action
+    predicate (P3).** **Location:** `src/operator/api/actions.ts:1576`.
+    **Repro:** inspect the `deploy.prod || rollback.prod` branch; it nested the
+    identical condition before installing the direct confirmation bindings,
+    adding an unnecessary second control path to security-sensitive marker
+    setup. **Proposed fix (implemented):** remove the tautological inner
+    branch and keep the existing deploy/rollback marker tests authoritative.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original
@@ -1114,6 +1135,16 @@ and non-TTY execution paths.
    fix-first adapters, and treat a missing review root as a distinct fatal
    mutation with a safe worktree-reconstruction remedy. Prompt-only “do not
    change refs” text is not a sufficient containment boundary.
+
+10. **Source-mode identity resolution runs synchronous Git status even for
+    help/version calls (P3).** **Location:** `src/runtime-identity.ts:97`.
+    **Repro:** run the source CLI with `--help` or `--version` in a large dirty
+    development checkout; banner construction runs both `git rev-parse` and
+    `git status --porcelain` before returning otherwise static output, adding
+    avoidable latency to every short-lived agent probe. Dist installs do not
+    take this path. **Proposed fix:** cache source identity for the process or
+    add a command-aware fast path that preserves SHA while computing the dirty
+    suffix only for normal command banners and stale-dist diagnostics.
 
 ---
 

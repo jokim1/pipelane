@@ -1018,3 +1018,35 @@ test('[T48] local-state new and worktree-creating repo-guard reject conflicting 
     } finally { cleanup(clone, bare, repoRoot); }
   }
 });
+
+test('[T49] local-state API preflight and execute return structured blocks without confirmation', async () => {
+  const repoRoot = createRepo();
+  try {
+    const config = writeMachineConfig(repoRoot);
+    const taskSlug = 'managed-state-api';
+    const context = state.resolveWorkflowContext(repoRoot);
+    state.saveTaskLock(context.commonDir, config, taskSlug, {
+      taskSlug,
+      taskBindingId: state.newTaskBindingId(),
+      branchName: git(repoRoot, ['branch', '--show-current']),
+      worktreePath: repoRoot,
+      mode: 'build',
+      surfaces: [],
+      updatedAt: FIXED_TIME,
+    });
+    stripManagedBlock(repoRoot);
+
+    const parsed = state.parseOperatorArgs(['api', 'action', 'pr', '--task', taskSlug]);
+    const preflight = apiActions.buildActionPreflightEnvelope(repoRoot, 'pr', parsed);
+    const execution = await apiActions.runActionExecute(repoRoot, 'pr', parsed, 'unused-token');
+
+    for (const envelope of [preflight, execution]) {
+      assert.equal(envelope.ok, false);
+      assert.equal(envelope.data.preflight.allowed, false);
+      assert.equal(envelope.data.preflight.state, 'blocked');
+      assert.equal(envelope.data.preflight.confirmation, null);
+      assert.match(envelope.message, /managed local-state is invalid/);
+      assert.match(envelope.data.preflight.reason, /Run `pipelane setup` once/);
+    }
+  } finally { cleanup(repoRoot); }
+});
