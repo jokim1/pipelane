@@ -931,6 +931,35 @@ and non-TTY execution paths.
     the strict migration allowlist and verify its contents survive an
     interrupted import and retry byte-for-byte.
 
+73. **Production approval did not bind the GitHub Actions workflow revision
+    executed (P0).** **Location:** `src/operator/commands/deploy.ts:330`,
+    `src/operator/commands/rollback.ts:261`, and
+    `src/operator/destination-planner.ts:206`. **Repro:** preflight
+    `deploy.prod`, `rollback.prod`, or `route.deploy.prod`, change the workflow
+    YAML on the base branch while leaving the target SHA and deploy config
+    unchanged, then consume the still-live token; the old fingerprint could
+    dispatch newly changed workflow code. **Proposed fix (implemented):** bind
+    the resolved repository, branch ref, remote branch SHA, and workflow YAML
+    digest into direct and routed confirmation fingerprints; prove the branch
+    is stable around YAML resolution; re-resolve immediately before dispatch;
+    and invoke `gh workflow run` with explicit `--repo` and `--ref`. GitHub's
+    dispatch API accepts a branch or tag rather than an arbitrary commit SHA,
+    so the immediate full-identity revalidation is also retained at the last
+    possible point before dispatch.
+
+74. **Strict legacy import could strand a concurrent old-runtime state write
+    after onboarding (P0).** **Location:** `src/operator/state.ts:2753` and
+    `src/operator/state.ts:2915`. **Repro:** pause onboarding after it copies
+    a custom legacy state directory, let an old runtime update `mode-state`,
+    then allow onboarding to commit machine-local config; later commands no
+    longer consulted the legacy directory, permanently losing the newer
+    state. **Proposed fix (implemented):** block while a live source lease is
+    present, exclude transient lease/confirmation directories from the copy,
+    fingerprint all durable source bytes before and after copy and immediately
+    before and after config handoff, and roll back copied state/config if any
+    check changes. A two-process regression mutates source state during the
+    copy handoff and proves a clean retry imports the latest bytes.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original
@@ -1001,6 +1030,16 @@ and non-TTY execution paths.
    must complete review evidence first. Until then, unsupported values fail
    early instead of producing a successful preview followed by failed
    execution.
+
+8. **The public API guide still describes the older confirmation-token
+   behavior (P2).** **Location:** `docs/public/PIPELANE_API.md:14`. **Repro:**
+   follow the public guide for a risky action after Q4; it does not describe
+   the standalone `PIPELANE_CONFIRM_TOKEN` preflight line, the 30-minute TTL,
+   the `--confirm-token`/`--execute` coupling, or gated `--auto-confirm`.
+   **Proposed fix:** update the public API guide to match the implemented
+   envelope and headless flow. This task intentionally leaves it filed because
+   its operator contract forbids touching `docs/public/*` while separate edits
+   are in flight there.
 
 ---
 

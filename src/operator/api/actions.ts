@@ -80,6 +80,10 @@ import {
 import { projectReviewRun, type ReviewRunPresentation } from '../review-output.ts';
 import { assertManagedLocalStateValid, assertManagedLocalStateValidForTree } from '../local-state.ts';
 import { CLEAN_APPROVED_LOCKS_ENV } from '../commands/clean.ts';
+import {
+  deployWorkflowRevisionIdentity,
+  resolveDeployWorkflowRevision,
+} from '../deploy-workflow-identity.ts';
 
 export type ApiManagedLocalStateSensitivity = 'observe' | 'current-state' | 'target-tree' | 'independent-recovery';
 
@@ -1340,10 +1344,22 @@ function resolveRollbackInputs(
       configFingerprint: computeDeployConfigFingerprint(deployConfig, environment),
     });
     if (!target?.sha) return undefined;
+    const workflowName = environment === 'staging'
+      ? (deployConfig.frontend.staging.deployWorkflow || context.config.deployWorkflowName)
+      : (deployConfig.frontend.production.deployWorkflow || context.config.deployWorkflowName);
+    const workflowRevision = environment === 'prod'
+      ? resolveDeployWorkflowRevision(context.repoRoot, workflowName, context.config.baseBranch)
+      : null;
     return {
       surfaces,
       targetSha: target.sha,
-      dispatchConfigFingerprint: computeDeployApprovalDispatchFingerprint(context, deployConfig),
+      dispatchConfigFingerprint: workflowRevision
+        ? computeDeployApprovalDispatchFingerprint(
+          context,
+          deployConfig,
+          deployWorkflowRevisionIdentity(workflowRevision),
+        )
+        : '',
     };
   } catch {
     return undefined;

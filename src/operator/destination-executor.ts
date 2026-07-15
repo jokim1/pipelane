@@ -416,9 +416,12 @@ function destinationMilestoneRank(milestone: DestinationMilestone): number {
 }
 
 function routeStaticDrift(approved: DestinationPlan, current: DestinationPlan): string {
+  const approvedWorkflowRevisions = routeFingerprint(approved).deployWorkflowRevisions;
+  const currentWorkflowRevisions = routeFingerprint(current).deployWorkflowRevisions;
   if (
     canonicalizeDestinationFingerprint(routeStaticFingerprint(approved))
     === canonicalizeDestinationFingerprint(routeStaticFingerprint(current))
+    && pendingDeployWorkflowRevisionsMatch(approvedWorkflowRevisions, currentWorkflowRevisions)
   ) {
     return '';
   }
@@ -441,6 +444,16 @@ function routeStaticFingerprint(plan: DestinationPlan): Record<string, unknown> 
   };
 }
 
+function pendingDeployWorkflowRevisionsMatch(approved: unknown, current: unknown): boolean {
+  if (!current || typeof current !== 'object' || Array.isArray(current)) return true;
+  if (!approved || typeof approved !== 'object' || Array.isArray(approved)) return false;
+  const approvedByEnvironment = approved as Record<string, unknown>;
+  return Object.entries(current as Record<string, unknown>).every(([environment, revision]) => (
+    canonicalizeDestinationFingerprint(revision)
+    === canonicalizeDestinationFingerprint(approvedByEnvironment[environment])
+  ));
+}
+
 function routeFingerprint(plan: DestinationPlan): {
   taskSlug: string;
   worktreePath: unknown;
@@ -455,6 +468,7 @@ function routeFingerprint(plan: DestinationPlan): {
   explicitDeploySha: unknown;
   surfaces: unknown;
   deployConfigFingerprints: unknown;
+  deployWorkflowRevisions: unknown;
 } {
   const fp = plan.fingerprintInputs as {
     taskSlug?: string;
@@ -470,6 +484,7 @@ function routeFingerprint(plan: DestinationPlan): {
     explicitDeploySha?: unknown;
     surfaces?: unknown;
     deployConfigFingerprints?: unknown;
+    deployWorkflowRevisions?: unknown;
   };
   return {
     taskSlug: fp.taskSlug ?? '',
@@ -485,6 +500,7 @@ function routeFingerprint(plan: DestinationPlan): {
     explicitDeploySha: fp.explicitDeploySha,
     surfaces: fp.surfaces,
     deployConfigFingerprints: fp.deployConfigFingerprints,
+    deployWorkflowRevisions: fp.deployWorkflowRevisions,
   };
 }
 

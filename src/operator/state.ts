@@ -1028,6 +1028,16 @@ const LEGACY_GENERATED_CONTROL_ENTRY_NAMES = new Set([
   INSTALL_MARKER_FILENAME,
   LEGACY_MIGRATION_FILENAME,
 ]);
+const LEGACY_TRANSIENT_STATE_ENTRY_NAMES = new Set([
+  REVIEW_STATE_LOCK_FILENAME,
+  ROUTE_SAFETY_STATE_LOCK_FILENAME,
+  TASK_BINDING_LOCKS_DIRNAME,
+  TASK_CLEANUP_LOCKS_DIRNAME,
+  TASK_MUTATION_LOCKS_DIRNAME,
+  ORPHAN_CLEANUP_LOCKS_DIRNAME,
+  'api-confirmations',
+  'doctor.lock.json',
+]);
 
 // State-resilience invariants. Pipelane state lives under
 // `$PIPELANE_HOME/repos/<repo-key>/state`, where the repo key is derived from
@@ -1974,13 +1984,12 @@ export function importLegacyWorkflowConfigIfNeeded(repoRoot: string): {
     if (!existsSync(targetPath)) continue;
     const raw = readLegacyWorkflowConfigObject(targetPath, `legacy repo-local ${legacy.filename}`);
     const { config, legacyStateDir } = normalizeLegacyWorkflowImport(raw, repoRoot, `legacy repo-local ${legacy.filename}`);
-    if (legacyStateDir) {
-      migrateLegacyStateDirFromDirectories(resolveGitCommonDir(repoRoot), config, [legacyStateDir], {
+    const migrationGuard = legacyStateDir
+      ? migrateLegacyStateDirFromDirectories(resolveGitCommonDir(repoRoot), config, [legacyStateDir], {
         requireComplete: true,
-      });
-    }
-    injectLegacyMigrationFailure('before-config-write');
-    writeWorkflowConfig(repoRoot, config);
+      })
+      : null;
+    writeImportedWorkflowConfig(repoRoot, config, migrationGuard);
     return { configPath: resolveConfigPath(repoRoot), config, source: legacy.source };
   }
 
@@ -1998,14 +2007,39 @@ export function importLegacyWorkflowConfigIfNeeded(repoRoot: string): {
     repoRoot,
     'legacy package.json:pipelane',
   );
-  if (legacyStateDir) {
-    migrateLegacyStateDirFromDirectories(resolveGitCommonDir(repoRoot), config, [legacyStateDir], {
+  const migrationGuard = legacyStateDir
+    ? migrateLegacyStateDirFromDirectories(resolveGitCommonDir(repoRoot), config, [legacyStateDir], {
       requireComplete: true,
-    });
-  }
-  injectLegacyMigrationFailure('before-config-write');
-  writeWorkflowConfig(repoRoot, config);
+    })
+    : null;
+  writeImportedWorkflowConfig(repoRoot, config, migrationGuard);
   return { configPath: resolveConfigPath(repoRoot), config, source: 'legacy-package-json' };
+}
+
+function writeImportedWorkflowConfig(
+  repoRoot: string,
+  config: WorkflowConfig,
+  migrationGuard: LegacyMigrationGuard | null,
+): void {
+  injectLegacyMigrationFailure('before-config-write');
+  if (migrationGuard) {
+    try {
+      assertLegacyMigrationGuardStable(migrationGuard);
+    } catch (error) {
+      rollbackLegacyMigrationGuard(migrationGuard);
+      throw error;
+    }
+  }
+  writeWorkflowConfig(repoRoot, config);
+  if (!migrationGuard) return;
+  try {
+    injectLegacyMigrationFailure('after-config-write-before-stability-check');
+    assertLegacyMigrationGuardStable(migrationGuard);
+  } catch (error) {
+    rmSync(resolveConfigPath(repoRoot), { force: true });
+    rollbackLegacyMigrationGuard(migrationGuard);
+    throw error;
+  }
 }
 
 function readLegacyWorkflowConfigObject(targetPath: string, label: string): Record<string, unknown> {
@@ -2661,6 +2695,15 @@ function warnMissingStateAfterInstall(targetPath: string): void {
 
 const legacyMigrationLogged = new Set<string>();
 
+interface LegacyMigrationGuard {
+  legacyDir: string;
+  canonicalDir: string;
+  sourceFingerprint: string;
+  copied: string[];
+  previousInstallMarker: string | null;
+  previousMigrationMarker: string | null;
+}
+
 // One-shot best-effort migration from a known-legacy state dir into
 // the canonical one. Idempotent: skipped when the install marker is
 // already present (canonical install was created first), when an
@@ -2683,7 +2726,7 @@ function migrateLegacyStateDirFromDirectories(
   config: WorkflowConfig,
   legacyStateDirs: string[],
   options: { requireComplete?: boolean } = {},
-): void {
+): LegacyMigrationGuard | null {
   const canonicalDir = resolveStateDir(commonDir, config);
   const requireComplete = options.requireComplete === true;
   // The generic canonical markers prove only that *some* machine-local state
@@ -2691,8 +2734,8 @@ function migrateLegacyStateDirFromDirectories(
   // have an explicit legacy directory that must be copied or verified before
   // the machine config is committed, even when another command initialized
   // canonical state first.
-  if (!requireComplete && hasInstallMarker(commonDir, config)) return;
-  if (!requireComplete && existsSync(legacyMigrationPath(commonDir, config))) return;
+  if (!requireComplete && hasInstallMarker(commonDir, config)) return null;
+  if (!requireComplete && existsSync(legacyMigrationPath(commonDir, config))) return null;
 
   for (const legacyDir of Array.from(new Set(legacyStateDirs))) {
     if (!existsSync(legacyDir)) continue;
@@ -2707,9 +2750,13 @@ function migrateLegacyStateDirFromDirectories(
         // safety validator traverse the entire object database.
         assertLegacyMigrationEntriesAllowed(entries, legacyDir);
         assertLegacyMigrationTreeHasNoSymlinks(legacyDir);
+        assertNoActiveLegacyMigrationLeases(legacyDir);
       }
     } catch (error) {
       if (requireComplete) {
+        if (error instanceof Error && error.message.includes('active writer lease')) {
+          throw error;
+        }
         throw new Error(
           `Could not enumerate legacy Pipelane state at ${legacyDir}; machine-local config was not imported. Fix access and retry.`,
           { cause: error },
@@ -2718,6 +2765,15 @@ function migrateLegacyStateDirFromDirectories(
       continue;
     }
     if (entries.length === 0) continue;
+
+    const sourceFingerprint = requireComplete ? legacyMigrationSourceFingerprint(legacyDir) : '';
+    const previousInstallMarker = requireComplete
+      ? readLegacyMigrationControl(installMarkerPath(commonDir, config))
+      : null;
+    const previousMigrationMarker = requireComplete
+      ? readLegacyMigrationControl(legacyMigrationPath(commonDir, config))
+      : null;
+    entries = entries.filter((name) => !isLegacyMigrationTransientPath(name));
 
     mkdirSync(canonicalDir, { recursive: true });
     const copied: string[] = [];
@@ -2738,7 +2794,7 @@ function migrateLegacyStateDirFromDirectories(
       if (existsSync(dst)) {
         if (!requireComplete) continue;
         assertLegacyMigrationTreeHasNoSymlinks(dst);
-        if (!legacyMigrationPathsEquivalent(src, dst)) {
+        if (!legacyMigrationPathsEquivalent(src, dst, name)) {
           throw new Error(
             `Legacy Pipelane state entry ${name} conflicts with ${dst}; machine-local config was not imported. Preserve the correct state, remove the conflicting copy, and retry.`,
           );
@@ -2749,7 +2805,12 @@ function migrateLegacyStateDirFromDirectories(
       try {
         injectLegacyMigrationFailure(`copy:${name}`);
         // cpSync handles both files and directories with `recursive: true`.
-        cpSync(src, dst, { recursive: true });
+        cpSync(src, dst, {
+          recursive: true,
+          filter: (source) => !isLegacyMigrationTransientPath(
+            normalizePath(path.relative(legacyDir, source)).replaceAll('\\', '/'),
+          ),
+        });
         if (requireComplete) assertLegacyMigrationTreeHasNoSymlinks(dst);
         copied.push(name);
         completed.push(name);
@@ -2767,8 +2828,32 @@ function migrateLegacyStateDirFromDirectories(
       }
     }
 
+    if (requireComplete) {
+      pauseLegacyMigrationStabilityForTest();
+      assertNoActiveLegacyMigrationLeases(legacyDir);
+      if (legacyMigrationSourceFingerprint(legacyDir) !== sourceFingerprint) {
+        for (const name of copied) rmSync(path.join(canonicalDir, name), { recursive: true, force: true });
+        throw new Error([
+          `Legacy Pipelane state changed while it was being imported from ${legacyDir}; machine-local config was not written.`,
+          'Wait for the older Pipelane process to finish, then retry so the latest state is copied atomically.',
+        ].join('\n'));
+      }
+    }
+
     const migratedEntries = requireComplete ? completed : copied;
-    if (migratedEntries.length === 0) continue;
+    if (migratedEntries.length === 0) {
+      if (requireComplete) {
+        return {
+          legacyDir,
+          canonicalDir,
+          sourceFingerprint,
+          copied,
+          previousInstallMarker,
+          previousMigrationMarker,
+        };
+      }
+      continue;
+    }
 
     writeJsonFile(legacyMigrationPath(commonDir, config), {
       from: legacyDir,
@@ -2797,8 +2882,18 @@ function migrateLegacyStateDirFromDirectories(
     // mean pipelane has been moved twice without a marker — an
     // operator should resolve that manually rather than us guessing
     // the order.
-    return;
+    return requireComplete
+      ? {
+        legacyDir,
+        canonicalDir,
+        sourceFingerprint,
+        copied,
+        previousInstallMarker,
+        previousMigrationMarker,
+      }
+      : null;
   }
+  return null;
 }
 
 function assertLegacyMigrationEntriesAllowed(entries: string[], legacyDir: string): void {
@@ -2807,6 +2902,123 @@ function assertLegacyMigrationEntriesAllowed(entries: string[], legacyDir: strin
   throw new Error(
     `legacy state directory ${legacyDir} contains non-Pipelane entries: ${unexpected.slice(0, 5).join(', ')}`,
   );
+}
+
+function isLegacyMigrationTransientPath(relativePath: string): boolean {
+  const normalized = normalizePath(relativePath).replaceAll('\\', '/').replace(/^\.\//u, '');
+  if (!normalized || normalized === '.') return false;
+  const segments = normalized.split('/').filter(Boolean);
+  if (segments.length === 0) return false;
+  if (LEGACY_TRANSIENT_STATE_ENTRY_NAMES.has(segments[0])) return true;
+  return segments.includes('command-gate-locks')
+    || segments.some((segment) => segment.endsWith('.lock'))
+    || segments.some((segment) => /^\.reclaim-.*\.(?:json|tmp)$/u.test(segment));
+}
+
+function assertNoActiveLegacyMigrationLeases(legacyDir: string): void {
+  const visit = (target: string, relativePath: string, insideTransient: boolean): void => {
+    const metadata = lstatSync(target);
+    const transient = insideTransient || isLegacyMigrationTransientPath(relativePath);
+    if (metadata.isDirectory()) {
+      for (const name of readdirSync(target).sort()) {
+        visit(path.join(target, name), path.posix.join(relativePath, name), transient);
+      }
+      return;
+    }
+    if (!transient || !metadata.isFile()) return;
+    const basename = path.basename(target);
+    if (basename !== 'owner.json' && basename !== 'doctor.lock.json') return;
+    let pid = 0;
+    try {
+      const raw = JSON.parse(readFileSync(target, 'utf8')) as { pid?: unknown };
+      if (typeof raw.pid === 'number' && Number.isSafeInteger(raw.pid) && raw.pid > 0) pid = raw.pid;
+    } catch {}
+    if (!pid) return;
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return;
+    }
+    throw new Error([
+      `Legacy Pipelane state at ${legacyDir} has an active writer lease owned by pid ${pid}: ${target}.`,
+      'Wait for that older Pipelane process to finish, then retry. Machine-local config was not imported.',
+    ].join('\n'));
+  };
+  for (const name of readdirSync(legacyDir).sort()) {
+    visit(path.join(legacyDir, name), name, false);
+  }
+}
+
+function legacyMigrationSourceFingerprint(legacyDir: string): string {
+  const hash = crypto.createHash('sha256');
+  const visit = (target: string, relativePath: string): void => {
+    if (isLegacyMigrationTransientPath(relativePath)) return;
+    const metadata = lstatSync(target);
+    if (metadata.isSymbolicLink()) throw new Error(`legacy state contains an unsafe symbolic link at ${target}`);
+    if (metadata.isDirectory()) {
+      hash.update(`d\0${relativePath}\0`);
+      for (const name of readdirSync(target).sort()) {
+        visit(path.join(target, name), path.posix.join(relativePath, name));
+      }
+      return;
+    }
+    if (metadata.isFile()) {
+      hash.update(`f\0${relativePath}\0${metadata.mode}\0${metadata.size}\0`);
+      hash.update(readFileSync(target));
+      hash.update('\0');
+      return;
+    }
+    throw new Error(`legacy state contains an unsupported filesystem entry at ${target}`);
+  };
+  for (const name of readdirSync(legacyDir).sort()) {
+    visit(path.join(legacyDir, name), name);
+  }
+  return hash.digest('hex');
+}
+
+function assertLegacyMigrationGuardStable(guard: LegacyMigrationGuard): void {
+  assertNoActiveLegacyMigrationLeases(guard.legacyDir);
+  if (legacyMigrationSourceFingerprint(guard.legacyDir) === guard.sourceFingerprint) return;
+  throw new Error([
+    `Legacy Pipelane state changed during the onboarding handoff from ${guard.legacyDir}; machine-local config was not retained.`,
+    'Wait for the older Pipelane process to finish, then retry so the latest state is imported.',
+  ].join('\n'));
+}
+
+function readLegacyMigrationControl(target: string): string | null {
+  return existsSync(target) ? readFileSync(target, 'utf8') : null;
+}
+
+function restoreLegacyMigrationControl(target: string, previous: string | null): void {
+  if (previous === null) {
+    rmSync(target, { force: true });
+    return;
+  }
+  writeFileSync(target, previous, 'utf8');
+}
+
+function rollbackLegacyMigrationGuard(guard: LegacyMigrationGuard): void {
+  for (const name of guard.copied) {
+    rmSync(path.join(guard.canonicalDir, name), { recursive: true, force: true });
+  }
+  restoreLegacyMigrationControl(path.join(guard.canonicalDir, INSTALL_MARKER_FILENAME), guard.previousInstallMarker);
+  restoreLegacyMigrationControl(path.join(guard.canonicalDir, LEGACY_MIGRATION_FILENAME), guard.previousMigrationMarker);
+}
+
+function pauseLegacyMigrationStabilityForTest(): void {
+  if (process.env.NODE_ENV !== 'test') return;
+  const markerPath = process.env.PIPELANE_TEST_LEGACY_MIGRATION_STABILITY_MARKER?.trim();
+  const releasePath = process.env.PIPELANE_TEST_LEGACY_MIGRATION_STABILITY_RELEASE?.trim();
+  if (!markerPath || !releasePath) return;
+  writeFileSync(markerPath, `${process.pid}\n`, 'utf8');
+  const deadline = Date.now() + 10_000;
+  const waitArray = new Int32Array(new SharedArrayBuffer(4));
+  while (!existsSync(releasePath)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for legacy migration stability test release at ${releasePath}.`);
+    }
+    Atomics.wait(waitArray, 0, 0, 25);
+  }
 }
 
 function assertLegacyMigrationTreeHasNoSymlinks(target: string): void {
@@ -2826,7 +3038,7 @@ function injectLegacyMigrationFailure(label: string): void {
   }
 }
 
-function legacyMigrationPathsEquivalent(source: string, destination: string): boolean {
+function legacyMigrationPathsEquivalent(source: string, destination: string, relativePath = ''): boolean {
   try {
     const sourceStat = lstatSync(source);
     const destinationStat = lstatSync(destination);
@@ -2843,12 +3055,20 @@ function legacyMigrationPathsEquivalent(source: string, destination: string): bo
     }
     if (sourceStat.isDirectory() || destinationStat.isDirectory()) {
       if (!sourceStat.isDirectory() || !destinationStat.isDirectory()) return false;
-      const sourceEntries = readdirSync(source).sort();
-      const destinationEntries = readdirSync(destination).sort();
+      const sourceEntries = readdirSync(source)
+        .filter((name) => !isLegacyMigrationTransientPath(path.posix.join(relativePath, name)))
+        .sort();
+      const destinationEntries = readdirSync(destination)
+        .filter((name) => !isLegacyMigrationTransientPath(path.posix.join(relativePath, name)))
+        .sort();
       return sourceEntries.length === destinationEntries.length
         && sourceEntries.every((name, index) =>
           name === destinationEntries[index]
-          && legacyMigrationPathsEquivalent(path.join(source, name), path.join(destination, name))
+          && legacyMigrationPathsEquivalent(
+            path.join(source, name),
+            path.join(destination, name),
+            path.posix.join(relativePath, name),
+          )
         );
     }
     return false;

@@ -44,6 +44,11 @@ import {
   watchWorkflowRun,
 } from './deploy.ts';
 import { assertManagedLocalStateValid, assertManagedLocalStateValidForTree } from '../local-state.ts';
+import {
+  assertDeployWorkflowRevisionUnchanged,
+  deployWorkflowRevisionIdentity,
+  resolveDeployWorkflowRevision,
+} from '../deploy-workflow-identity.ts';
 
 // v1.1: `/rollback <env>` dispatches a NEW deploy of the last-known-good
 // sha for the named environment + surfaces. It is NOT a revert of the
@@ -249,6 +254,13 @@ export async function handleRollback(cwd: string, parsed: ParsedOperatorArgs): P
     ].join('\n'));
   }
 
+  const workflowName = environment === 'staging'
+    ? (deployConfig.frontend.staging.deployWorkflow || context.config.deployWorkflowName)
+    : (deployConfig.frontend.production.deployWorkflow || context.config.deployWorkflowName);
+  const approvedWorkflowRevision = environment === 'prod'
+    ? resolveDeployWorkflowRevision(context.repoRoot, workflowName, context.config.baseBranch)
+    : null;
+
   // Prod rollbacks join the risky set — same typed-SHA prefix gate as
   // deploy.prod. Confirmation is required regardless of mode: build
   // mode is the default in synthesized config, and without this gate
@@ -262,15 +274,15 @@ export async function handleRollback(cwd: string, parsed: ParsedOperatorArgs): P
       environment,
       target.sha,
       surfaces,
-      computeDeployApprovalDispatchFingerprint(context, deployConfig),
+      computeDeployApprovalDispatchFingerprint(
+        context,
+        deployConfig,
+        deployWorkflowRevisionIdentity(approvedWorkflowRevision!),
+      ),
       'rollback prod',
     );
     await requireProdConfirmation(target.sha);
   }
-
-  const workflowName = environment === 'staging'
-    ? (deployConfig.frontend.staging.deployWorkflow || context.config.deployWorkflowName)
-    : (deployConfig.frontend.production.deployWorkflow || context.config.deployWorkflowName);
 
   const requestedAt = nowIso();
   const triggeredBy = resolveTriggeredBy();
@@ -292,10 +304,26 @@ export async function handleRollback(cwd: string, parsed: ParsedOperatorArgs): P
     configFingerprint: `${configFingerprint}:rollback-from:${originalFailingSha}`,
   });
 
+  const dispatchWorkflowRevision = resolveDeployWorkflowRevision(
+    context.repoRoot,
+    workflowName,
+    context.config.baseBranch,
+  );
+  if (approvedWorkflowRevision) {
+    assertDeployWorkflowRevisionUnchanged(
+      deployWorkflowRevisionIdentity(approvedWorkflowRevision),
+      deployWorkflowRevisionIdentity(dispatchWorkflowRevision),
+      `rollback ${environment}`,
+    );
+  }
   runGh(context.repoRoot, [
     'workflow',
     'run',
     workflowName,
+    '--repo',
+    dispatchWorkflowRevision.repository,
+    '--ref',
+    dispatchWorkflowRevision.ref,
     '-f',
     `environment=${environment === 'prod' ? 'production' : 'staging'}`,
     '-f',

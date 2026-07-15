@@ -79,6 +79,13 @@ import {
 } from '../deploy-workflow-runs.ts';
 import { canonicalize } from '../integrity.ts';
 import { assertManagedLocalStateValid } from '../local-state.ts';
+import {
+  assertDeployWorkflowRevisionUnchanged,
+  deployWorkflowRevisionIdentity,
+  resolveDeployWorkflowRevision,
+  type DeployWorkflowRevision,
+  type ResolvedDeployWorkflowRevision,
+} from '../deploy-workflow-identity.ts';
 
 function surfacesKey(surfaces: string[]): string {
   return [...surfaces].sort().join(',');
@@ -290,6 +297,7 @@ export interface DeployApprovalInputs {
 export function computeDeployApprovalDispatchFingerprint(
   context: WorkflowContext,
   deployConfig: DeployConfig,
+  workflowRevision: DeployWorkflowRevision,
 ): string {
   const workflowName = deployConfig.frontend.production.deployWorkflow
     || context.config.deployWorkflowName;
@@ -298,6 +306,7 @@ export function computeDeployApprovalDispatchFingerprint(
     workflowName,
     baseBranch: context.config.baseBranch,
     mode: context.modeState.mode,
+    workflowRevision,
   })).digest('hex');
 }
 
@@ -318,6 +327,11 @@ export function resolveDeployApprovalInputs(cwd: string, parsed: ParsedOperatorA
   });
   const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
   const workflowName = workflowNameForDeployEnvironment(context.config, deployConfig, 'prod');
+  const workflowRevision = resolveDeployWorkflowRevision(
+    context.repoRoot,
+    workflowName,
+    context.config.baseBranch,
+  );
   const surfaceContract = loadDeploySurfaceContractForTarget(
     context.repoRoot,
     workflowName,
@@ -347,7 +361,11 @@ export function resolveDeployApprovalInputs(cwd: string, parsed: ParsedOperatorA
   return {
     targetSha: target.sha,
     resolvedSurfaces: [...resolvedSurfaces].sort(),
-    dispatchConfigFingerprint: computeDeployApprovalDispatchFingerprint(context, deployConfig),
+    dispatchConfigFingerprint: computeDeployApprovalDispatchFingerprint(
+      context,
+      deployConfig,
+      deployWorkflowRevisionIdentity(workflowRevision),
+    ),
   };
 }
 
@@ -407,13 +425,25 @@ export async function dispatchDeploy(
     targetSha: target.sha,
     surfacePathMap,
   });
-  assertApiApprovedProdEffectInputs(
-    environment,
-    target.sha,
-    surfaces,
-    computeDeployApprovalDispatchFingerprint(context, deployConfig),
-    'deploy prod',
-  );
+  let approvedWorkflowRevision: ResolvedDeployWorkflowRevision | null = null;
+  if (environment === 'prod' && process.env[DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV] === '1') {
+    approvedWorkflowRevision = resolveDeployWorkflowRevision(
+      context.repoRoot,
+      workflowName,
+      context.config.baseBranch,
+    );
+    assertApiApprovedProdEffectInputs(
+      environment,
+      target.sha,
+      surfaces,
+      computeDeployApprovalDispatchFingerprint(
+        context,
+        deployConfig,
+        deployWorkflowRevisionIdentity(approvedWorkflowRevision),
+      ),
+      'deploy prod',
+    );
+  }
   if (surfaces.length === 0) {
     const timestamp = nowIso();
     const cleanCommand = formatWorkflowCommand(context.config, 'clean', `--apply --task ${taskSlug}`);
@@ -621,6 +651,13 @@ export async function dispatchDeploy(
     // The API path bypasses via PIPELANE_DEPLOY_PROD_API_CONFIRMED — it's already
     // consumed an HMAC confirm token. --override bypasses the release-readiness
     // gate but NOT this check: an AI can set --override too.
+    if (environment === 'prod') {
+      approvedWorkflowRevision ??= resolveDeployWorkflowRevision(
+        context.repoRoot,
+        workflowName,
+        context.config.baseBranch,
+      );
+    }
     if (environment === 'prod' && context.modeState.mode === 'release') {
       await requireProdConfirmation(target.sha);
     }
@@ -629,7 +666,19 @@ export async function dispatchDeploy(
     const triggeredBy = resolveTriggeredBy();
     const dispatchStart = Date.now();
 
-    const workflowTriggers = resolveWorkflowTriggers(context.repoRoot, workflowName);
+    const dispatchWorkflowRevision = resolveDeployWorkflowRevision(
+      context.repoRoot,
+      workflowName,
+      context.config.baseBranch,
+    );
+    if (approvedWorkflowRevision) {
+      assertDeployWorkflowRevisionUnchanged(
+        deployWorkflowRevisionIdentity(approvedWorkflowRevision),
+        deployWorkflowRevisionIdentity(dispatchWorkflowRevision),
+        `deploy ${environment}`,
+      );
+    }
+    const workflowTriggers = parseWorkflowTriggers(dispatchWorkflowRevision.yaml);
     const baseBranchSha = resolveCurrentBaseBranchSha(context);
     const workflowInvocation = planDeployWorkflowInvocation({
       context,
@@ -639,6 +688,8 @@ export async function dispatchDeploy(
       targetIsCurrentBase: Boolean(baseBranchSha && baseBranchSha === target.sha),
       surfaces,
       triggers: workflowTriggers,
+      repository: dispatchWorkflowRevision.repository,
+      ref: dispatchWorkflowRevision.ref,
     });
     if (workflowInvocation.dispatchMode === 'workflow_dispatch') {
       runGh(context.repoRoot, workflowInvocation.args);
@@ -1029,14 +1080,6 @@ interface DeployWorkflowInvocation {
   args: string[];
 }
 
-function resolveWorkflowTriggers(repoRoot: string, workflowName: string): WorkflowTriggers {
-  const output = runCommandCapture('gh', ['workflow', 'view', workflowName, '--yaml'], { cwd: repoRoot });
-  if (!output.ok || !output.stdout.trim()) {
-    return { workflowDispatch: 'unknown', workflowDispatchInputs: null, push: 'unknown' };
-  }
-  return parseWorkflowTriggers(output.stdout);
-}
-
 function planDeployWorkflowInvocation(options: {
   context: WorkflowContext;
   environment: 'staging' | 'prod';
@@ -1045,6 +1088,8 @@ function planDeployWorkflowInvocation(options: {
   targetIsCurrentBase: boolean;
   surfaces: string[];
   triggers: WorkflowTriggers;
+  repository: string;
+  ref: string;
 }): DeployWorkflowInvocation {
   if (
     options.context.modeState.mode === 'build'
@@ -1092,7 +1137,15 @@ function planDeployWorkflowInvocation(options: {
   const dispatchInputs = acceptedInputs
     ? desiredInputs.filter(([name]) => acceptedInputs.has(name))
     : desiredInputs;
-  const args = ['workflow', 'run', options.workflowName];
+  const args = [
+    'workflow',
+    'run',
+    options.workflowName,
+    '--repo',
+    options.repository,
+    '--ref',
+    options.ref,
+  ];
   for (const [name, value] of dispatchInputs) {
     args.push('-f', `${name}=${value}`);
   }

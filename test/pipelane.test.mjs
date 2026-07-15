@@ -1082,7 +1082,7 @@ if (args[0] === 'pr' && args[1] === 'merge') {
   process.exit(0);
 }
 if (args[0] === 'workflow' && args[1] === 'view' && args.includes('--yaml')) {
-  process.stdout.write(process.env.GH_WORKFLOW_YAML || '');
+  process.stdout.write(process.env.GH_WORKFLOW_YAML || 'on:\\n  workflow_dispatch:\\n    inputs:\\n      environment:\\n      sha:\\n      surfaces:\\n      bypass_staging_guard:\\n');
   process.exit(0);
 }
 if (args[0] === 'workflow' && args[1] === 'run') {
@@ -4594,6 +4594,86 @@ test('legacy custom-state auto-import retries after generated controls are rewri
   } finally {
     delete process.env.PIPELANE_TEST_LEGACY_MIGRATION_FAIL;
     rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('legacy custom-state auto-import blocks live leases and rejects a concurrent source writer before config handoff', async () => {
+  const repoRoot = createRepo();
+  const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-legacy-migration-race-'));
+  const markerPath = path.join(markerRoot, 'copied');
+  const releasePath = path.join(markerRoot, 'release');
+  try {
+    const legacyDir = path.join(resolveCommonDir(repoRoot), 'custom-state');
+    const transientLock = path.join(legacyDir, 'task-mutation-locks', 'legacy-writer.lock');
+    mkdirSync(transientLock, { recursive: true });
+    writeFileSync(path.join(legacyDir, 'mode-state.json'), `${JSON.stringify({
+      mode: 'release',
+      requestedSurfaces: ['frontend'],
+      override: null,
+      updatedAt: '2026-07-12T00:00:00.000Z',
+    }, null, 2)}\n`, 'utf8');
+    writeFileSync(path.join(transientLock, 'owner.json'), `${JSON.stringify({ pid: process.pid })}\n`, 'utf8');
+    writeFileSync(path.join(repoRoot, '.pipelane.json'), `${JSON.stringify({
+      displayName: 'Legacy Writer Race',
+      stateDir: 'custom-state',
+    }, null, 2)}\n`, 'utf8');
+
+    const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    assert.throws(
+      () => stateMod.resolveWorkflowContext(repoRoot),
+      /machine-local config was not imported|active writer lease/,
+    );
+    assert.equal(existsSync(machinePipelaneConfigPath(repoRoot)), false);
+
+    rmSync(transientLock, { recursive: true, force: true });
+    mkdirSync(transientLock, { recursive: true });
+    writeFileSync(path.join(transientLock, 'owner.json'), `${JSON.stringify({ pid: 2_147_483_647 })}\n`, 'utf8');
+    const stateUrl = pathToFileURL(path.join(KIT_ROOT, 'src', 'operator', 'state.ts')).href;
+    const child = spawn(process.execPath, ['--input-type=module', '-e', [
+      `const state = await import(${JSON.stringify(stateUrl)});`,
+      `state.resolveWorkflowContext(${JSON.stringify(repoRoot)});`,
+    ].join('\n')], {
+      cwd: repoRoot,
+      env: buildCliChildEnv({
+        PIPELANE_TEST_LEGACY_MIGRATION_STABILITY_MARKER: markerPath,
+        PIPELANE_TEST_LEGACY_MIGRATION_STABILITY_RELEASE: releasePath,
+      }),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const childExit = once(child, 'exit');
+    let childStderr = '';
+    child.stderr.on('data', (chunk) => { childStderr += chunk.toString('utf8'); });
+    await waitForPathForTest(markerPath);
+
+    writeFileSync(path.join(legacyDir, 'mode-state.json'), `${JSON.stringify({
+      mode: 'build',
+      requestedSurfaces: ['frontend'],
+      override: null,
+      updatedAt: '2026-07-12T00:05:00.000Z',
+    }, null, 2)}\n`, 'utf8');
+    writeFileSync(releasePath, 'release\n', 'utf8');
+    const [childCode] = await childExit;
+    assert.notEqual(childCode, 0, childStderr);
+    assert.match(childStderr, /changed while it was being imported/);
+    assert.equal(existsSync(machinePipelaneConfigPath(repoRoot)), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'mode-state.json')), false);
+
+    const retried = stateMod.resolveWorkflowContext(repoRoot);
+    assert.equal(retried.modeState.mode, 'build');
+    assert.equal(existsSync(machinePipelaneConfigPath(repoRoot)), true);
+    const canonicalMutationLocks = path.join(sharedStateDir(repoRoot), 'task-mutation-locks');
+    assert.equal(
+      existsSync(path.join(canonicalMutationLocks, 'legacy-writer.lock')),
+      false,
+      'transient legacy leases must never be copied into canonical state',
+    );
+    if (existsSync(canonicalMutationLocks)) {
+      assert.deepEqual(readdirSync(canonicalMutationLocks), []);
+    }
+  } finally {
+    writeFileSync(releasePath, 'release\n', 'utf8');
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(markerRoot, { recursive: true, force: true });
   }
 });
 
@@ -25384,7 +25464,12 @@ test('deploy filters staging workflow inputs but blocks unpinned production disp
     assert.equal(deployed.dispatchMode, 'workflow_dispatch');
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
     assert.equal(ghState.workflows.length, 1);
-    assert.deepEqual(ghState.workflows[0].args, ['-f', 'environment=staging']);
+    assert.deepEqual(ghState.workflows[0].args, [
+      '--repo', ghState.workflows[0].args[1],
+      '--ref', 'main',
+      '-f', 'environment=staging',
+    ]);
+    assert.match(ghState.workflows[0].args[1], /^test\.invalid\/pipelane\/[0-9a-f]{16}$/);
 
     const prod = runCli(
       ['run', 'deploy', 'prod', '--sha', sha, '--async', '--json'],
@@ -25633,14 +25718,14 @@ test('api action deploy.prod binds the confirmed target and bypasses the TTY pro
     updateWorkflowConfig(repoRoot, (config) => {
       config.deployWorkflowName = 'Deploy Changed After Approval';
     });
-    const workflowDrifted = runCli(
+    const workflowRevisionDrifted = runCli(
       ['run', 'api', 'action', 'deploy.prod', '--task', 'Prod Api', '--execute', '--confirm-token', refreshedToken],
       created.worktreePath,
       env,
       true,
     );
-    assert.equal(workflowDrifted.status, 1);
-    assert.match(JSON.parse(workflowDrifted.stdout).message, /confirmation token no longer matches/i);
+    assert.equal(workflowRevisionDrifted.status, 1);
+    assert.match(JSON.parse(workflowRevisionDrifted.stdout).message, /confirmation token no longer matches/i);
     writeFileSync(workflowConfigPath, originalWorkflowConfig, 'utf8');
 
     // Production deploy commands/verification settings are also bound. Keep
@@ -25687,10 +25772,31 @@ test('api action deploy.prod binds the confirmed target and bypasses the TTY pro
     assert.equal(childMismatch.status, 1);
     assert.match(childMismatch.stderr, /resolved production effect changed after API confirmation/);
 
-    const finalPreflight = JSON.parse(runCli(
+    const workflowBoundPreflight = JSON.parse(runCli(
       ['run', 'api', 'action', 'deploy.prod', '--task', 'Prod Api', '--json'],
       created.worktreePath,
       env,
+    ).stdout);
+    const workflowBoundToken = workflowBoundPreflight.data.preflight.confirmation.token;
+    const changedWorkflowEnv = {
+      ...env,
+      GH_WORKFLOW_YAML: 'on:\n  workflow_dispatch:\n    inputs:\n      environment:\n      sha:\n      surfaces:\n# changed after approval\n',
+    };
+    const workflowsBeforeDrift = JSON.parse(readFileSync(ghStateFile, 'utf8')).workflows.length;
+    const workflowDrifted = runCli(
+      ['run', 'api', 'action', 'deploy.prod', '--task', 'Prod Api', '--execute', '--confirm-token', workflowBoundToken],
+      created.worktreePath,
+      changedWorkflowEnv,
+      true,
+    );
+    assert.equal(workflowDrifted.status, 1);
+    assert.match(JSON.parse(workflowDrifted.stdout).message, /confirmation token no longer matches/i);
+    assert.equal(JSON.parse(readFileSync(ghStateFile, 'utf8')).workflows.length, workflowsBeforeDrift);
+
+    const finalPreflight = JSON.parse(runCli(
+      ['run', 'api', 'action', 'deploy.prod', '--task', 'Prod Api', '--json'],
+      created.worktreePath,
+      changedWorkflowEnv,
     ).stdout);
     const finalToken = finalPreflight.data.preflight.confirmation.token;
 
@@ -25699,7 +25805,7 @@ test('api action deploy.prod binds the confirmed target and bypasses the TTY pro
     const executed = runCli(
       ['run', 'api', 'action', 'deploy.prod', '--task', 'Prod Api', '--execute', '--confirm-token', finalToken],
       created.worktreePath,
-      env,
+      changedWorkflowEnv,
       true,
     );
     const envelope = JSON.parse(executed.stdout);
@@ -25708,6 +25814,9 @@ test('api action deploy.prod binds the confirmed target and bypasses the TTY pro
     assert.equal(envelope.data.execution.exitCode, 0);
     assert.equal(envelope.data.execution.result.status, 'succeeded');
     assert.equal(envelope.data.execution.result.environment, 'prod');
+    const dispatchedWorkflow = JSON.parse(readFileSync(ghStateFile, 'utf8')).workflows.at(-1);
+    assert.ok(dispatchedWorkflow.args.includes('--repo'));
+    assert.ok(dispatchedWorkflow.args.includes('--ref'));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -25874,14 +25983,28 @@ test('api action route.deploy.prod preserves route confirmation through full exe
     updateWorkflowConfig(repoRoot, (config) => {
       config.deployWorkflowName = 'Deploy Hosted';
     });
-    const refreshed = JSON.parse(runCli([
+    const workflowBound = JSON.parse(runCli([
       'run', 'api', 'action', 'route.deploy.prod', '--task', 'Prod Route Api', '--json',
     ], created.worktreePath, env).stdout);
+    const changedWorkflowEnv = {
+      ...env,
+      GH_WORKFLOW_YAML: 'on:\n  workflow_dispatch:\n    inputs:\n      environment:\n      sha:\n      surfaces:\n# route workflow changed\n',
+    };
+    const workflowRejected = runCli([
+      'run', 'api', 'action', 'route.deploy.prod', '--task', 'Prod Route Api',
+      '--execute', '--confirm-token', workflowBound.data.preflight.confirmation.token, '--json',
+    ], created.worktreePath, changedWorkflowEnv, true);
+    assert.equal(workflowRejected.status, 1);
+    assert.match(JSON.parse(workflowRejected.stdout).message, /confirmation token no longer matches/i);
+
+    const refreshed = JSON.parse(runCli([
+      'run', 'api', 'action', 'route.deploy.prod', '--task', 'Prod Route Api', '--json',
+    ], created.worktreePath, changedWorkflowEnv).stdout);
     const refreshedToken = refreshed.data.preflight.confirmation.token;
     const executed = runCli([
       'run', 'api', 'action', 'route.deploy.prod', '--task', 'Prod Route Api',
       '--execute', '--confirm-token', refreshedToken, '--json',
-    ], created.worktreePath, env, true);
+    ], created.worktreePath, changedWorkflowEnv, true);
     const envelope = JSON.parse(executed.stdout);
     assert.equal(executed.status, 0, JSON.stringify(envelope, null, 2));
     assert.equal(envelope.ok, true);
@@ -36230,14 +36353,32 @@ test('v1.1 codex fixup: /rollback prod requires typed-SHA confirmation in build 
     const preflight = JSON.parse(runCli([
       'run', 'api', 'action', 'rollback.prod', '--task', 'Build Mode Prod', '--json',
     ], created.worktreePath, env).stdout);
-    const executed = runCli([
+    const changedWorkflowEnv = {
+      ...env,
+      GH_WORKFLOW_YAML: 'on:\n  workflow_dispatch:\n    inputs:\n      environment:\n      sha:\n      surfaces:\n# rollback workflow changed\n',
+    };
+    const workflowDrifted = runCli([
       'run', 'api', 'action', 'rollback.prod', '--task', 'Build Mode Prod',
       '--execute', '--confirm-token', preflight.data.preflight.confirmation.token, '--json',
-    ], created.worktreePath, env);
+    ], created.worktreePath, changedWorkflowEnv, true);
+    assert.equal(workflowDrifted.status, 1);
+    assert.match(JSON.parse(workflowDrifted.stdout).message, /confirmation token no longer matches/i);
+    assert.equal(JSON.parse(readFileSync(ghStateFile, 'utf8')).workflows.length, workflowsBefore);
+
+    const refreshedPreflight = JSON.parse(runCli([
+      'run', 'api', 'action', 'rollback.prod', '--task', 'Build Mode Prod', '--json',
+    ], created.worktreePath, changedWorkflowEnv).stdout);
+    const executed = runCli([
+      'run', 'api', 'action', 'rollback.prod', '--task', 'Build Mode Prod',
+      '--execute', '--confirm-token', refreshedPreflight.data.preflight.confirmation.token, '--json',
+    ], created.worktreePath, changedWorkflowEnv);
     const executionEnvelope = JSON.parse(executed.stdout);
     assert.equal(executionEnvelope.ok, true, JSON.stringify(executionEnvelope, null, 2));
     assert.equal(executionEnvelope.data.execution.result.sha, goodSha);
     assert.equal(JSON.parse(readFileSync(ghStateFile, 'utf8')).workflows.length, workflowsBefore + 1);
+    const rollbackWorkflow = JSON.parse(readFileSync(ghStateFile, 'utf8')).workflows.at(-1);
+    assert.ok(rollbackWorkflow.args.includes('--repo'));
+    assert.ok(rollbackWorkflow.args.includes('--ref'));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });

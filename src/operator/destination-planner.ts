@@ -55,6 +55,11 @@ import {
   sanitizeForTerminal,
   type LivePr,
 } from './commands/helpers.ts';
+import {
+  deployWorkflowRevisionIdentity,
+  resolveDeployWorkflowRevision,
+  type DeployWorkflowRevision,
+} from './deploy-workflow-identity.ts';
 
 export type DestinationMilestone =
   | 'local_dirty'
@@ -120,6 +125,8 @@ export interface DestinationSnapshot {
   deployRecords: DeployRecord[];
   deployConfig: DeployConfig;
   deployConfigFingerprints: { staging: string; prod: string };
+  deployWorkflowRevisions: Partial<Record<'staging' | 'prod', DeployWorkflowRevision>>;
+  deployWorkflowRevisionBlockers: Partial<Record<'staging' | 'prod', string>>;
   defaultDeployWorkflowName: string;
   requestedSurfaces: string[];
   configuredSurfaces: string[];
@@ -188,6 +195,25 @@ export function resolveDestinationSnapshot(
   const branchName = worktree.branchName || runGit(routeContext.repoRoot, ['branch', '--show-current'], true)?.trim() || '';
   const headSha = worktree.head || runGit(routeContext.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() || '';
   const deployConfig = loadDeployConfig(routeContext.repoRoot) ?? emptyDeployConfig();
+  const deployWorkflowRevisions: Partial<Record<'staging' | 'prod', DeployWorkflowRevision>> = {};
+  const deployWorkflowRevisionBlockers: Partial<Record<'staging' | 'prod', string>> = {};
+  const workflowEnvironments: Array<'staging' | 'prod'> = target === 'prod_deployed'
+    ? ['staging', 'prod']
+    : target === 'staging_deployed' ? ['staging'] : [];
+  for (const environment of workflowEnvironments) {
+    const workflowName = workflowNameForDeployEnvironment(routeContext.config, deployConfig, environment);
+    try {
+      deployWorkflowRevisions[environment] = deployWorkflowRevisionIdentity(resolveDeployWorkflowRevision(
+        routeContext.repoRoot,
+        workflowName,
+        routeContext.config.baseBranch,
+      ));
+    } catch (error) {
+      deployWorkflowRevisionBlockers[environment] = error instanceof Error
+        ? error.message
+        : `could not resolve ${environment} deploy workflow revision`;
+    }
+  }
   const contractEnvironment = target === 'prod_deployed' ? 'prod' : 'staging';
   const contractWorkflowName = workflowNameForDeployEnvironment(routeContext.config, deployConfig, contractEnvironment);
   const workingTreeSurfaceContract = loadDeploySurfaceContract(routeContext.repoRoot, contractWorkflowName);
@@ -335,6 +361,8 @@ export function resolveDestinationSnapshot(
       staging: computeDeployConfigFingerprint(deployConfig, 'staging'),
       prod: computeDeployConfigFingerprint(deployConfig, 'prod'),
     },
+    deployWorkflowRevisions,
+    deployWorkflowRevisionBlockers,
     defaultDeployWorkflowName: routeContext.config.deployWorkflowName,
     requestedSurfaces,
     configuredSurfaces: [...routeContext.config.surfaces],
@@ -357,6 +385,13 @@ export function planDestination(snapshot: DestinationSnapshot, target: Destinati
   const satisfiedSteps = route.filter((_, index) => index <= currentIndex);
   const blockers = buildDestinationBlockers(snapshot, target, remainingSteps);
   const warnings = buildDestinationWarnings(snapshot, remainingSteps);
+  const deployWorkflowRevisions = Object.fromEntries(
+    (['staging', 'prod'] as const)
+      .filter((environment) => remainingSteps.some((step) => step.id === `deploy_${environment}`))
+      .flatMap((environment) => snapshot.deployWorkflowRevisions[environment]
+        ? [[environment, snapshot.deployWorkflowRevisions[environment]]]
+        : []),
+  );
   const surfaces = snapshot.configuredSurfaces.map<SurfaceSummary>((surface) => {
     const requested = snapshot.requestedSurfaces.includes(surface);
     return {
@@ -392,6 +427,7 @@ export function planDestination(snapshot: DestinationSnapshot, target: Destinati
     routeSteps: remainingSteps.map((step) => step.id),
     surfaces: [...snapshot.requestedSurfaces].sort(),
     deployConfigFingerprints: snapshot.deployConfigFingerprints,
+    deployWorkflowRevisions,
   };
   const plan: DestinationPlan = {
     taskSlug: snapshot.taskSlug || 'unknown',
@@ -708,6 +744,12 @@ function buildDestinationBlockers(snapshot: DestinationSnapshot, target: Destina
     }
   }
   if (needsDeploySideEffect) {
+    if (needsStagingDeploy && snapshot.deployWorkflowRevisionBlockers.staging) {
+      blockers.push(snapshot.deployWorkflowRevisionBlockers.staging);
+    }
+    if (needsProdDeploy && snapshot.deployWorkflowRevisionBlockers.prod) {
+      blockers.push(snapshot.deployWorkflowRevisionBlockers.prod);
+    }
     blockers.push(...snapshot.deploySurfaceContractBlockers);
     blockers.push(...snapshot.surfacePathMapBlockers);
   }
