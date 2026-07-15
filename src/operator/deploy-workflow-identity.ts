@@ -139,10 +139,12 @@ function resolveGitHubRepository(repoRoot: string): string {
   ].join('\n'));
 }
 
-function parseGitHubRepository(remote: string): string | null {
+export function parseGitHubRepository(remote: string): string | null {
   let host = '';
   let pathname = '';
-  const scp = remote.match(/^(?:[^@\s]+@)?([^:/\s]+):([^\s]+)$/u);
+  const scp = remote.includes('://')
+    ? null
+    : remote.match(/^(?:[^@\s]+@)?([^:/\s]+):([^\s]+)$/u);
   if (scp) {
     host = scp[1].toLowerCase();
     pathname = scp[2];

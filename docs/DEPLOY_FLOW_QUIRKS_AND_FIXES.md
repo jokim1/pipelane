@@ -973,6 +973,50 @@ and non-TTY execution paths.
     filtered retry with a reused `F001` and proves the new finding fails
     closed.
 
+76. **Normal HTTPS and `ssh://` GitHub remotes were parsed as scp syntax and
+    blocked every workflow deploy (P0).** **Location:**
+    `src/operator/deploy-workflow-identity.ts:142`. **Repro:** configure
+    `origin` as `https://github.com/acme/app.git` or
+    `ssh://git@github.com/acme/app.git`, then plan or execute any staging,
+    production, rollback, or routed workflow dispatch; the scp regex consumed
+    the URL scheme as the host and repository resolution failed before
+    dispatch. **Proposed fix (implemented):** only attempt scp parsing when
+    the remote has no `://`, otherwise use the URL parser. A table regression
+    covers HTTP(S), scp SSH, `ssh://`, enterprise hosts and ports, unsupported
+    schemes, and invalid nested paths.
+
+77. **A route's own merge invalidated its subsequent deploy step even when
+    workflow content was unchanged (P0).** **Location:**
+    `src/operator/destination-executor.ts:418`. **Repro:** approve a route from
+    dirty task through PR, merge, and staging deploy; merge advances
+    `origin/<base>`, so the cross-step workflow identity's remote revision
+    changes and the route stopped before deploy. **Proposed fix (implemented):**
+    keep full remote-revision binding for direct confirmation and last-moment
+    dispatch revalidation, but compare repository, workflow name, ref, and
+    YAML digest for cross-step route drift. A full fake-GitHub regression now
+    opens, merges, advances `origin/main`, and dispatches staging in one route.
+
+78. **Transient legacy state exclusions accidentally absolutized relative
+    paths (P2).** **Location:** `src/operator/state.ts:2930`. **Repro:** place
+    `api-confirmations/*` or `doctor.lock.json` in the old state directory and
+    trigger auto-import; `normalizePath` resolved the relative entry against
+    process cwd, so the first path segment never matched the transient
+    allowlist and stale state was copied and fingerprinted. **Proposed fix
+    (implemented):** normalize separators and leading `./` without resolving
+    against cwd. Migration coverage proves confirmation tokens, doctor locks,
+    and task leases are absent from canonical state.
+
+79. **Deploy API preflight could mutate legacy config/state before returning
+    its read-only envelope (P2).** **Location:** `src/operator/onboarding.ts:14`
+    and `src/operator/state.ts:2024`. **Repro:** run non-executing
+    `api action deploy.staging` in a repo with a legacy config; message
+    construction imported machine-local config and could throw on malformed
+    legacy JSON before returning the structured remedy. **Proposed fix
+    (implemented):** use a read-only legacy-candidate detector for preflight
+    and return the exact direct `/deploy` handoff; direct deploy still imports
+    automatically before onboarding enforcement, preserving Q2. Tests prove
+    valid and malformed legacy preflights write nothing and remain structured.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original
@@ -1053,6 +1097,23 @@ and non-TTY execution paths.
    envelope and headless flow. This task intentionally leaves it filed because
    its operator contract forbids touching `docs/public/*` while separate edits
    are in flight there.
+
+9. **A prompt-constrained fix-first reviewer can remove its own task worktree
+   when the configured provider command has no OS sandbox (P0, uncertain
+   attribution).** **Location:** `src/operator/commands/review.ts:5029` and
+   the configured skill-command execution path. **Repro sketch:** the
+   exact-SHA full review on 2026-07-15 ran `gstack-review` through
+   `claude --print --permission-mode dontAsk`; during that gate the task
+   worktree disappeared from disk and Git's worktree registry, and the gate
+   later reported that it could not finish because the worktree was deleted.
+   The saved branch, commits, task lock, and gate evidence survived, but the
+   wrapper ended with `spawnSync git ENOENT`. It is not yet proven whether the
+   reviewer, a command it launched, or a concurrent cleanup process removed
+   the worktree. **Proposed fix:** record the responsible process/action if
+   possible, require an enforceable filesystem/ref sandbox for external
+   fix-first adapters, and treat a missing review root as a distinct fatal
+   mutation with a safe worktree-reconstruction remedy. Prompt-only “do not
+   change refs” text is not a sufficient containment boundary.
 
 ---
 

@@ -448,10 +448,22 @@ function pendingDeployWorkflowRevisionsMatch(approved: unknown, current: unknown
   if (!current || typeof current !== 'object' || Array.isArray(current)) return true;
   if (!approved || typeof approved !== 'object' || Array.isArray(approved)) return false;
   const approvedByEnvironment = approved as Record<string, unknown>;
-  return Object.entries(current as Record<string, unknown>).every(([environment, revision]) => (
-    canonicalizeDestinationFingerprint(revision)
-    === canonicalizeDestinationFingerprint(approvedByEnvironment[environment])
-  ));
+  return Object.entries(current as Record<string, unknown>).every(([environment, revision]) => {
+    const currentContent = deployWorkflowContentIdentity(revision);
+    const approvedContent = deployWorkflowContentIdentity(approvedByEnvironment[environment]);
+    return currentContent !== null
+      && approvedContent !== null
+      && canonicalizeDestinationFingerprint(currentContent)
+        === canonicalizeDestinationFingerprint(approvedContent);
+  });
+}
+
+function deployWorkflowContentIdentity(value: unknown): Record<string, string> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  const fields = ['repository', 'workflowName', 'ref', 'yamlSha256'] as const;
+  if (!fields.every((field) => typeof candidate[field] === 'string' && candidate[field].trim())) return null;
+  return Object.fromEntries(fields.map((field) => [field, candidate[field] as string]));
 }
 
 function routeFingerprint(plan: DestinationPlan): {

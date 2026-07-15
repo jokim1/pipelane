@@ -1907,6 +1907,11 @@ export type LegacyWorkflowConfigSource =
   | 'legacy-project-workflow-json'
   | 'legacy-package-json';
 
+export interface LegacyWorkflowConfigCandidate {
+  source: LegacyWorkflowConfigSource;
+  path: string;
+}
+
 const LEGACY_PROJECT_CONFIG_FIELDS = [
   'version',
   'projectKey',
@@ -2014,6 +2019,24 @@ export function importLegacyWorkflowConfigIfNeeded(repoRoot: string): {
     : null;
   writeImportedWorkflowConfig(repoRoot, config, migrationGuard);
   return { configPath: resolveConfigPath(repoRoot), config, source: 'legacy-package-json' };
+}
+
+export function detectLegacyWorkflowConfigCandidate(repoRoot: string): LegacyWorkflowConfigCandidate | null {
+  if (resolveReadableConfigPath(repoRoot)) return null;
+  for (const candidate of [
+    { filename: CONFIG_FILENAME, source: 'legacy-pipelane-json' as const },
+    { filename: LEGACY_CONFIG_FILENAME, source: 'legacy-project-workflow-json' as const },
+  ]) {
+    const targetPath = path.join(repoRoot, candidate.filename);
+    if (existsSync(targetPath)) return { source: candidate.source, path: targetPath };
+  }
+  const packageJsonPath = path.join(repoRoot, 'package.json');
+  const pkg = existsSync(packageJsonPath)
+    ? readJsonFile<Record<string, unknown> | null>(packageJsonPath, null)
+    : null;
+  return pkg && typeof pkg === 'object' && !Array.isArray(pkg) && Object.prototype.hasOwnProperty.call(pkg, 'pipelane')
+    ? { source: 'legacy-package-json', path: packageJsonPath }
+    : null;
 }
 
 function writeImportedWorkflowConfig(
@@ -2905,7 +2928,7 @@ function assertLegacyMigrationEntriesAllowed(entries: string[], legacyDir: strin
 }
 
 function isLegacyMigrationTransientPath(relativePath: string): boolean {
-  const normalized = normalizePath(relativePath).replaceAll('\\', '/').replace(/^\.\//u, '');
+  const normalized = relativePath.replaceAll('\\', '/').replace(/^(?:\.\/)+/u, '').replace(/\/{2,}/gu, '/');
   if (!normalized || normalized === '.') return false;
   const segments = normalized.split('/').filter(Boolean);
   if (segments.length === 0) return false;

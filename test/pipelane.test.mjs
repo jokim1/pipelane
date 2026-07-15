@@ -4605,7 +4605,9 @@ test('legacy custom-state auto-import blocks live leases and rejects a concurren
   try {
     const legacyDir = path.join(resolveCommonDir(repoRoot), 'custom-state');
     const transientLock = path.join(legacyDir, 'task-mutation-locks', 'legacy-writer.lock');
+    const legacyConfirmations = path.join(legacyDir, 'api-confirmations');
     mkdirSync(transientLock, { recursive: true });
+    mkdirSync(legacyConfirmations, { recursive: true });
     writeFileSync(path.join(legacyDir, 'mode-state.json'), `${JSON.stringify({
       mode: 'release',
       requestedSurfaces: ['frontend'],
@@ -4613,6 +4615,8 @@ test('legacy custom-state auto-import blocks live leases and rejects a concurren
       updatedAt: '2026-07-12T00:00:00.000Z',
     }, null, 2)}\n`, 'utf8');
     writeFileSync(path.join(transientLock, 'owner.json'), `${JSON.stringify({ pid: process.pid })}\n`, 'utf8');
+    writeFileSync(path.join(legacyConfirmations, 'stale-token.json'), '{"token":"stale"}\n', 'utf8');
+    writeFileSync(path.join(legacyDir, 'doctor.lock.json'), `${JSON.stringify({ pid: 2_147_483_647 })}\n`, 'utf8');
     writeFileSync(path.join(repoRoot, '.pipelane.json'), `${JSON.stringify({
       displayName: 'Legacy Writer Race',
       stateDir: 'custom-state',
@@ -4670,6 +4674,8 @@ test('legacy custom-state auto-import blocks live leases and rejects a concurren
     if (existsSync(canonicalMutationLocks)) {
       assert.deepEqual(readdirSync(canonicalMutationLocks), []);
     }
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'api-confirmations')), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'doctor.lock.json')), false);
   } finally {
     writeFileSync(releasePath, 'release\n', 'utf8');
     rmSync(repoRoot, { recursive: true, force: true });
@@ -4908,7 +4914,12 @@ test('deploy onboarding auto-imports legacy identity while ignoring checkout-con
       }
 
       assert.equal(stateMod.resolveReadableConfigPath(repoRoot), null);
-      assert.equal(onboardingMod.buildMissingDeployOnboardingMessage(repoRoot, { environment: 'staging' }), null);
+      const preview = onboardingMod.buildMissingDeployOnboardingMessage(repoRoot, { environment: 'staging' });
+      assert.match(preview, /Legacy Pipelane config was found/);
+      assert.match(preview, /read-only preflight did not import it/);
+      assert.match(preview, /\/deploy staging/);
+      assert.equal(stateMod.resolveReadableConfigPath(repoRoot), null, 'read-only onboarding preview must not migrate config');
+      onboardingMod.assertRepoOnboardedForDeploy(repoRoot, { environment: 'staging' });
       assert.ok(stateMod.resolveReadableConfigPath(repoRoot), `${source} legacy config should be imported machine-locally`);
       const loaded = stateMod.loadWorkflowConfig(repoRoot);
       assert.equal(loaded.displayName, source === 'file' ? 'Legacy File App' : 'Legacy Package App');
@@ -4920,6 +4931,25 @@ test('deploy onboarding auto-imports legacy identity while ignoring checkout-con
     } finally {
       rmSync(repoRoot, { recursive: true, force: true });
     }
+  }
+});
+
+test('api deploy preflight returns a pure structured legacy-config handoff', () => {
+  const repoRoot = createRepo();
+  try {
+    writeFileSync(path.join(repoRoot, '.pipelane.json'), '{ definitely not valid json\n', 'utf8');
+    const result = runCli(['run', 'api', 'action', 'deploy.staging', '--json'], repoRoot, {}, true);
+    assert.equal(result.status, 1);
+    const envelope = JSON.parse(result.stdout);
+    assert.equal(envelope.ok, false);
+    assert.equal(envelope.data.preflight.allowed, false);
+    assert.match(envelope.message, /Legacy Pipelane config was found/);
+    assert.match(envelope.message, /read-only preflight did not import it/);
+    assert.match(envelope.message, /\/deploy staging/);
+    assert.equal(existsSync(machinePipelaneConfigPath(repoRoot)), false);
+    assert.doesNotMatch(result.stderr, /Malformed legacy/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
   }
 });
 
@@ -25499,6 +25529,61 @@ test('deploy filters staging workflow inputs but blocks unpinned production disp
     assert.match(prod.stderr, /does not accept a sha input/);
     assert.match(prod.stderr, /cannot be pinned to the approved deploy target/);
     assert.equal(JSON.parse(readFileSync(ghStateFile, 'utf8')).workflows.length, 1, 'blocked production must not dispatch');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('GitHub workflow identity parses URL and scp remotes without confusing URL schemes for hosts', async () => {
+  const identity = await import(path.join(KIT_ROOT, 'src', 'operator', 'deploy-workflow-identity.ts'));
+  const cases = [
+    ['https://github.com/acme/widgets.git', 'acme/widgets'],
+    ['http://github.com/acme/widgets', 'acme/widgets'],
+    ['git@github.com:acme/widgets.git', 'acme/widgets'],
+    ['github.com:acme/widgets', 'acme/widgets'],
+    ['ssh://git@github.com/acme/widgets.git', 'acme/widgets'],
+    ['https://github.example.com/acme/widgets.git', 'github.example.com/acme/widgets'],
+    ['ssh://git@github.example.com:2222/acme/widgets.git', 'github.example.com/acme/widgets'],
+    ['git://github.com/acme/widgets.git', null],
+    ['https://github.com/acme/nested/widgets.git', null],
+  ];
+  for (const [remote, expected] of cases) {
+    assert.equal(identity.parseGitHubRepository(remote), expected, remote);
+  }
+});
+
+test('destination route continues from merge to deploy when only the remote base revision advances', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_PR_MERGE_PUSH_HEAD: '1',
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+  try {
+    writePipelaneConfig(repoRoot, 'Merge Then Deploy Route');
+    writeFullDeployConfigState(repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Merge Then Deploy Route', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'merge then deploy\n', 'utf8');
+    writePassingReviewEvidence(created.worktreePath);
+
+    const routed = runCli([
+      'run', 'deploy', 'staging', '--task', 'Merge Then Deploy Route',
+      '--title', 'Merge Then Deploy Route', '--yes', '--json',
+    ], created.worktreePath, env, true);
+    assert.equal(routed.status, 0, `${routed.stdout}\n${routed.stderr}`);
+    const payload = JSON.parse(routed.stdout);
+    assert.equal(payload.execution.completed, true);
+    assert.deepEqual(payload.execution.steps.map((step) => step.id), ['pr', 'merge', 'deploy_staging']);
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.workflows.length, 1, 'the route should dispatch staging after its own merge advances main');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });

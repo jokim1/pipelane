@@ -1,4 +1,5 @@
 import {
+  detectLegacyWorkflowConfigCandidate,
   importLegacyWorkflowConfigIfNeeded,
   resolveConfigPath,
   resolveReadableConfigPath,
@@ -15,9 +16,11 @@ export function buildMissingDeployOnboardingMessage(
   options: DeployOnboardingMessageOptions = {},
 ): string | null {
   const repoRoot = resolveRepoRoot(cwd);
-  if (resolveReadableConfigPath(repoRoot) || importLegacyWorkflowConfigIfNeeded(repoRoot)) {
+  if (resolveReadableConfigPath(repoRoot)) {
     return null;
   }
+
+  const legacyCandidate = detectLegacyWorkflowConfigCandidate(repoRoot);
 
   const environment = options.environment?.trim() ?? '';
   const retry = [
@@ -29,16 +32,20 @@ export function buildMissingDeployOnboardingMessage(
   return [
     'Pipelane configuration has not been set up properly:',
     `- Repo: ${repoRoot}`,
-    '- This repo is not onboarded yet with machine-local Pipelane config.',
+    legacyCandidate
+      ? `- Legacy Pipelane config was found at ${legacyCandidate.path}, but this read-only preflight did not import it.`
+      : '- This repo is not onboarded yet with machine-local Pipelane config.',
     `- Missing machine-local workflow config: ${resolveConfigPath(repoRoot)}`,
     'No deploy started.',
     '',
     'Choose the action to take:',
-    '1. Configure Pipelane for safe /deploy now (recommended).',
+    legacyCandidate
+      ? '1. Import the legacy config and continue with safe /deploy (recommended).'
+      : '1. Configure Pipelane for safe /deploy now (recommended).',
     '   Commands:',
-    '     /pipelane setup --yes',
-    '     /pipelane configure',
-    `     ${retry}`,
+    ...(legacyCandidate
+      ? [`     ${retry}`]
+      : ['     /pipelane setup --yes', '     /pipelane configure', `     ${retry}`]),
     '2. Set up workflow config only, then stop before deploy values.',
     '   Commands:',
     '     /pipelane setup --yes',
@@ -51,6 +58,8 @@ export function buildMissingDeployOnboardingMessage(
 }
 
 export function assertRepoOnboardedForDeploy(cwd: string, options: DeployOnboardingMessageOptions = {}): void {
+  const repoRoot = resolveRepoRoot(cwd);
+  if (!resolveReadableConfigPath(repoRoot)) importLegacyWorkflowConfigIfNeeded(repoRoot);
   const message = buildMissingDeployOnboardingMessage(cwd, options);
   if (message) {
     throw new Error(message);
