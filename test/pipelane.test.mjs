@@ -30141,6 +30141,7 @@ test('setup parses allowlisted dotenv syntax and uses the last declared token va
         },
       },
     ]);
+    writeFileSync(path.join(repoRoot, '.gitignore'), 'web/.env\n.pipelane/secrets/\n', 'utf8');
     mkdirSync(path.join(repoRoot, 'web'), { recursive: true });
     writeFileSync(path.join(repoRoot, 'web', '.env'), [
       'OTHER=value',
