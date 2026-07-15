@@ -20,10 +20,17 @@ import {
   resolveRepoRoot,
   type RouteSafetyConfig,
 } from '../state.ts';
+import {
+  formatSecretProvisioningResult,
+  provisionRepositorySecrets,
+} from '../secret-provisioning.ts';
 
 export interface ConfigureOptions {
   json: boolean;
   help: boolean;
+  provisionSecrets?: boolean;
+  rotateSecrets?: boolean;
+  approvalId?: string;
   platform?: string;
   frontendProductionUrl?: string;
   frontendProductionWorkflow?: string;
@@ -139,6 +146,19 @@ export function parseConfigureArgs(argv: string[]): ConfigureOptions {
       options.json = true;
       continue;
     }
+    if (token === '--provision-secrets') {
+      options.provisionSecrets = true;
+      continue;
+    }
+    if (token === '--rotate-secrets') {
+      options.provisionSecrets = true;
+      options.rotateSecrets = true;
+      continue;
+    }
+    if (token.startsWith('--approve-secret-manifest=')) {
+      options.approvalId = token.slice('--approve-secret-manifest='.length);
+      continue;
+    }
 
     const bag = options as unknown as Record<string, unknown>;
 
@@ -228,6 +248,22 @@ export async function handleConfigure(cwd: string, argv: string[]): Promise<Conf
   const workflowConfig = loadWorkflowConfig(repoRoot);
   const configPath = resolveSharedDeployConfigPath(repoRoot);
   const loadedConfig = loadDeployConfig(repoRoot) ?? emptyDeployConfig();
+  if (options.provisionSecrets) {
+    if (options.json || hasDeployOverrides(options)) {
+      throw new Error('--provision-secrets is a standalone configure mode and cannot be combined with --json or deploy-value flags.');
+    }
+    const result = provisionRepositorySecrets(repoRoot, {
+      apply: true,
+      rotate: options.rotateSecrets === true,
+      approvalId: options.approvalId,
+    });
+    if (!result) {
+      throw new Error('No .github/pipelane-provisioning.json manifest was found in this repository.');
+    }
+    process.stdout.write(`${formatSecretProvisioningResult(result).join('\n')}\n`);
+    if (!result.ok) process.exitCode = 64;
+    return { repoRoot, configPath, config: loadedConfig };
+  }
   const surfaceContracts = loadConfiguredDeploySurfaceContracts(repoRoot, workflowConfig, loadedConfig);
   const contractIssues = surfaceContracts.flatMap((contract) => contract.issues);
   if (contractIssues.length) {
@@ -266,6 +302,19 @@ export async function handleConfigure(cwd: string, argv: string[]): Promise<Conf
   }
 
   return { repoRoot, configPath, config: finalConfig };
+}
+
+function hasDeployOverrides(options: ConfigureOptions): boolean {
+  for (const [, key] of STRING_FLAGS) {
+    if (options[key] !== undefined) return true;
+  }
+  for (const [, key] of BOOLEAN_FLAGS) {
+    if (options[key] !== undefined) return true;
+  }
+  for (const [, key] of SURFACE_STRING_FLAGS) {
+    if (options[key] !== undefined) return true;
+  }
+  return false;
 }
 
 function registerContractCustomSurfaces(base: DeployConfig, surfaces: string[]): DeployConfig {
@@ -1182,6 +1231,12 @@ function printUsage(): void {
 Usage:
   pipelane configure                 Interactive prompts for every field
   pipelane configure --json [flags]  Non-interactive; emits the final DeployConfig JSON
+  pipelane configure --provision-secrets [--rotate-secrets] --approve-secret-manifest=<sha256>
+
+Repository-secret provisioning reads the app-owned
+.github/pipelane-provisioning.json manifest. Existing secrets are preserved by
+default; --rotate-secrets explicitly replaces every declared value. Pipelane
+does not require secrets or a corpus in repositories without this manifest.
 
 Flags (all optional; any omitted field keeps its current value):
   --platform=<value>

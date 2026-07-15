@@ -20,6 +20,12 @@ import {
 import { runOperator } from './operator/index.ts';
 import { installNpmGuard } from './operator/npm-guard-install.ts';
 import { loadDeployConfig } from './operator/release-gate.ts';
+import {
+  formatSecretProvisioningResult,
+  provisionRepositorySecrets,
+  SECRET_PROVISIONING_GUIDE_URL,
+  SecretProvisioningManifestError,
+} from './operator/secret-provisioning.ts';
 import { resolveRepoRoot } from './operator/state.ts';
 import { bootstrapWorktreeNodeModulesIfNeeded } from './operator/task-workspaces.ts';
 import { maybeNotifyUpdate, parseUpdateArgs, runUpdate } from './operator/update.ts';
@@ -35,8 +41,9 @@ function printTopLevelHelp(): void {
   process.stdout.write(`Pipelane - build, release, and development orchestration for AI-assisted codebases
 
 Commands:
-  setup [--yes]
+  setup [--yes] [--provision-secrets] [--rotate-secrets] [--approve-secret-manifest=<sha256>]
   configure [--json] [surface flags...]
+  configure --provision-secrets [--rotate-secrets] --approve-secret-manifest=<sha256>
   update [--check] [--yes] [--json]
   install-claude [--verbose]
   install-codex [--verbose]
@@ -69,20 +76,42 @@ function assertNoArgs(args: string[], command: string): void {
   }
 }
 
-function parseSetupArgs(args: string[]): { yes: boolean } {
+function parseSetupArgs(args: string[]): { yes: boolean; provisionSecrets: boolean; rotateSecrets: boolean; approvalId?: string } {
   let yes = false;
+  let provisionSecrets = false;
+  let rotateSecrets = false;
+  let approvalId: string | undefined;
   for (const token of args) {
     if (token === '--yes' || token === '-y') {
       yes = true;
       continue;
     }
+    if (token === '--provision-secrets') {
+      provisionSecrets = true;
+      continue;
+    }
+    if (token === '--rotate-secrets') {
+      provisionSecrets = true;
+      rotateSecrets = true;
+      continue;
+    }
+    if (token.startsWith('--approve-secret-manifest=')) {
+      approvalId = token.slice('--approve-secret-manifest='.length);
+      continue;
+    }
     if (token === '--help' || token === '-h') {
-      process.stdout.write('pipelane setup [--yes]\n');
+      process.stdout.write([
+        'pipelane setup [--yes] [--provision-secrets] [--rotate-secrets] [--approve-secret-manifest=<sha256>]',
+        '',
+        'Private CI inputs are declared by individual repositories; Pipelane does not require secrets or a corpus globally.',
+        `Guide: ${SECRET_PROVISIONING_GUIDE_URL}`,
+        '',
+      ].join('\n'));
       process.exit(0);
     }
     throw new Error(`Unknown flag for pipelane setup: ${token}`);
   }
-  return { yes };
+  return { yes, provisionSecrets, rotateSecrets, ...(approvalId ? { approvalId } : {}) };
 }
 
 function parseVerboseArg(args: string[], command: string): boolean {
@@ -195,6 +224,34 @@ async function maybeOfferConfigureAfterBootstrap(repoRoot: string): Promise<void
   await handleConfigure(repoRoot, []);
 }
 
+function reportSetupSecretProvisioning(
+  repoRoot: string,
+  options: { provisionSecrets: boolean; rotateSecrets: boolean; approvalId?: string },
+): void {
+  try {
+    const result = provisionRepositorySecrets(repoRoot, {
+      apply: options.provisionSecrets,
+      rotate: options.rotateSecrets,
+      approvalId: options.approvalId,
+    });
+    if (!result) {
+      if (options.provisionSecrets) {
+        throw new Error('No .github/pipelane-provisioning.json manifest was found in this repository.');
+      }
+      return;
+    }
+    process.stdout.write(`${formatSecretProvisioningResult(
+      result,
+      '/pipelane setup --provision-secrets',
+    ).join('\n')}\n`);
+    if (options.provisionSecrets && !result.ok) process.exitCode = 64;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    if (options.provisionSecrets || error instanceof SecretProvisioningManifestError) throw error;
+    process.stdout.write(`Repository secret provisioning is declared but could not be inspected: ${detail}\n`);
+  }
+}
+
 async function maybeApplyGuidanceMigrationsAfterPrompt(
   result: SetupConsumerRepoResult,
   yes: boolean,
@@ -285,6 +342,7 @@ async function main(): Promise<void> {
     result = await maybeApplyGuidanceMigrationsAfterPrompt(result, options.yes);
     result = await maybeApplyLessonsMigrationAfterPrompt(result, options.yes);
     process.stdout.write(formatSetupResult(result).join('\n') + '\n');
+    reportSetupSecretProvisioning(result.repoRoot, options);
     if (!options.yes) {
       await maybeOfferConfigureAfterBootstrap(result.repoRoot);
     }

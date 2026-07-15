@@ -495,12 +495,20 @@ Usage:
   /pipelane help
 
 Start here:
-  /pipelane setup [--yes]
+  /pipelane setup [--yes] [--provision-secrets] [--rotate-secrets] [--approve-secret-manifest=<sha256>]
       Run clean first-time setup or repair with the machine-local runtime.
+      Only repos with .github/pipelane-provisioning.json declare private CI
+      inputs. Setup explains why each input exists and what to do next;
+      --provision-secrets installs ready GitHub repository secrets.
 
   /pipelane configure [--json] [flags...]
       Fill or update Deploy Configuration values such as staging/prod URLs,
       deploy workflow names, healthchecks, edge/sql commands, and Supabase refs.
+
+  /pipelane configure --provision-secrets [--rotate-secrets] --approve-secret-manifest=<sha256>
+      Install app-declared repository secrets without changing deploy config.
+      Existing secrets are preserved unless rotation is explicit. Repos without
+      a provisioning manifest have no Pipelane secret or corpus requirement.
 
   /pipelane update [--check] [--yes] [--json]
       Check or update Pipelane itself when this repo has a pinned install.

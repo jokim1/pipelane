@@ -222,6 +222,23 @@ and workflow state live under `$PIPELANE_HOME` (default `~/.pipelane`). Pipelane
 does not create tracked `.claude/commands`, `.agents/skills`, package scripts,
 package lockfiles, or Pipelane docs in the application repo.
 
+Pipelane does not generally require Cloudflare credentials, private corpora, or
+new repository secrets. A repository can opt in by committing
+`.github/pipelane-provisioning.json` when its own CI or deploy workflow needs a
+private credential or file. Repositories without that manifest keep the same
+setup behavior as before.
+
+For an opted-in repository, plain `/pipelane setup` explains what each declared
+input enables, checks its status, and prints the exact next steps. Run
+the exact manifest-bound provisioning command printed by setup to install ready
+values through GitHub CLI stdin without printing them or committing them to Git.
+Repository-relative private files must be Git-ignored. Existing secrets are
+preserved; rotation must be explicit.
+
+See [Repository secrets and private CI inputs](docs/public/SECRET_PROVISIONING.md)
+for the short step-by-step guide, including Cloudflare tokens, held-out corpus
+files, status meanings, verification, and troubleshooting.
+
 Core commands:
 
 | Command | Use it when |
