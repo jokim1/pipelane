@@ -102,18 +102,20 @@ const HERMETIC_REVIEW_IDENTITY_ENV_KEYS = [
   'PIPELANE_UNSAFE_ALLOW_NESTED_REVIEW_GATES',
 ];
 
-// The test process is itself a command gate when `pipelane review` runs the
-// suite. Its in-process fixtures must not be mistaken for recursive production
-// review invocations. Tests for recursion protection inject these values
-// explicitly after this one-time suite-boundary scrub.
-for (const key of [
+const REVIEW_GATE_CONTEXT_ENV_KEYS = [
   'PIPELANE_REVIEW_GATE_DEPTH',
   'PIPELANE_REVIEW_GATE_PARENT_PID',
   'PIPELANE_REVIEW_GATE_REPO_ROOT',
   'PIPELANE_REVIEW_GATE_ID',
   'PIPELANE_REVIEW_GATE_RUN_ID',
   'PIPELANE_UNSAFE_ALLOW_NESTED_REVIEW_GATES',
-]) {
+];
+
+// The test process is itself a command gate when `pipelane review` runs the
+// suite. Its in-process fixtures must not be mistaken for recursive production
+// review invocations. Tests for recursion protection inject these values
+// explicitly after this one-time suite-boundary scrub.
+for (const key of REVIEW_GATE_CONTEXT_ENV_KEYS) {
   delete process.env[key];
 }
 
