@@ -1038,6 +1038,25 @@ and non-TTY execution paths.
     setup. **Proposed fix (implemented):** remove the tautological inner
     branch and keep the existing deploy/rollback marker tests authoritative.
 
+82. **Universal `baseBranch` validation bypassed transient spawn retries
+    (P2).** **Location:** `src/operator/state.ts:1870`. **Repro:** exhaust a
+    process/file-descriptor slot so `git check-ref-format` returns a transient
+    `EAGAIN`, `EMFILE`, `ENFILE`, or `ENOMEM` while any command loads a valid
+    `baseBranch: main`; the non-retrying capture path converted that transport
+    failure into a misleading `Invalid baseBranch` error and could flake every
+    command under subprocess load. **Proposed fix (implemented):** validate
+    with the existing `runCommand` retry primitive while preserving non-zero
+    Git exits as invalid names. A subprocess-isolated regression injects two
+    transient failures into the real config-normalization path and proves the
+    third attempt succeeds.
+
+83. **Branch-prefix validation used the same non-retrying Git capture path
+    (P3).** **Location:** `src/operator/state.ts:1893`. **Repro:** hit a
+    transient spawn failure while normalizing a configured branch prefix; the
+    prefix silently fell back to the default even though its value was valid.
+    **Proposed fix (implemented):** use the same retrying `runCommand` branch
+    validator; ordinary invalid prefixes retain their existing soft fallback.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original
@@ -1145,6 +1164,25 @@ and non-TTY execution paths.
     take this path. **Proposed fix:** cache source identity for the process or
     add a command-aware fast path that preserves SHA while computing the dirty
     suffix only for normal command banners and stale-dist diagnostics.
+
+11. **Mixed timeout and real-failure review hints mention only the timeout
+    (P3).** **Location:** `src/operator/review-output.ts:292`. **Repro:** let
+    one blocking gate time out while another returns a genuine failed finding;
+    enforcement correctly stays failed, but `nextAction` takes the timeout
+    branch and omits the instruction to repair the failed gate. **Proposed
+    fix:** render a combined repair-and-rerun summary whenever any non-timeout
+    blocking failure coexists with timed-out gates, while retaining the
+    single-gate timeout rerun shortcut for timeout-only runs.
+
+12. **The exported `parseApiActionFlags` helper is dead and duplicates live
+    validation (P3).** **Location:** `src/operator/api/actions.ts:1716`.
+    **Repro:** search call sites; production parsing/enforcement flows through
+    `parseOperatorArgs` and `validateOperatorArgs`, while this exported helper
+    has no caller and repeats the confirm-token/execute checks. **Proposed
+    fix:** first confirm no external consumers import this internal module,
+    then remove the helper or make it the single parser used by the API
+    command. Avoid removing it blindly because compatibility with installed
+    consumers is load-bearing.
 
 ---
 

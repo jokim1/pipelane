@@ -2534,6 +2534,46 @@ test('runWithTransientSpawnRetry retries transient spawn failures but not real e
   assert.equal(real, 1, 'non-transient errors are not retried');
 });
 
+test('workflow config branch validation retries transient git spawn failures', () => {
+  const stateUrl = pathToFileURL(path.join(KIT_ROOT, 'src', 'operator', 'state.ts')).href;
+  const script = `
+    import childProcess from 'node:child_process';
+    import { syncBuiltinESMExports } from 'node:module';
+
+    const originalExecFileSync = childProcess.execFileSync;
+    const originalSpawnSync = childProcess.spawnSync;
+    let attempts = 0;
+    const run = (delegate, command, args, options) => {
+      if (command === 'git' && args?.[0] === 'check-ref-format' && args?.[1] === 'refs/heads/main') {
+        attempts += 1;
+        if (attempts <= 2) {
+          throw Object.assign(new Error('spawn git EAGAIN'), { code: 'EAGAIN' });
+        }
+      }
+      return delegate(command, args, options);
+    };
+    childProcess.execFileSync = (command, args, options) => run(originalExecFileSync, command, args, options);
+    childProcess.spawnSync = (command, args, options) => run(originalSpawnSync, command, args, options);
+    syncBuiltinESMExports();
+
+    const state = await import(${JSON.stringify(stateUrl)});
+    const config = state.normalizeWorkflowConfig({
+      projectKey: 'transient-branch-validation',
+      displayName: 'Transient branch validation',
+      baseBranch: 'main',
+    });
+    if (config.baseBranch !== 'main' || attempts !== 3) {
+      throw new Error('expected two transient failures followed by one successful branch validation; attempts=' + attempts);
+    }
+  `;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    cwd: KIT_ROOT,
+    encoding: 'utf8',
+    env: { ...process.env, NODE_ENV: 'test', PIPELANE_AUTO_UPDATE: '0' },
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+});
+
 test('machine-local setup preserves consumer files that resemble legacy pipelane docs', () => {
   // Repo-local command sync is no longer supported, but stale or
   // consumer-authored `.claude/commands/*` files can still exist. Setup must

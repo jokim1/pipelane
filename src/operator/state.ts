@@ -1867,7 +1867,7 @@ function normalizeBaseBranch(value: unknown): string {
   if (
     !branchName
     || branchName.startsWith('-')
-    || !runCommandCapture('git', ['check-ref-format', `refs/heads/${branchName}`]).ok
+    || runCommand('git', ['check-ref-format', `refs/heads/${branchName}`], { allowFailure: true }) === null
   ) {
     const printable = sanitizeLegacyWarningValue(typeof value === 'string' ? value : String(value ?? ''));
     throw new Error(`Invalid baseBranch "${printable}": expected a Git branch name.`);
@@ -1890,7 +1890,7 @@ function normalizeOptionalBranchPrefix(prefix: unknown): string | null {
 
 function isValidBranchPrefix(prefix: string): boolean {
   const candidate = `${prefix}branch-prefix-validation`;
-  return runCommandCapture('git', ['check-ref-format', '--branch', candidate]).ok;
+  return runCommand('git', ['check-ref-format', '--branch', candidate], { allowFailure: true }) !== null;
 }
 
 export function writeWorkflowConfig(repoRoot: string, config: WorkflowConfig): void {
