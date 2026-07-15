@@ -31,7 +31,10 @@ export function resolveDeployWorkflowRevision(
     '--ref',
     baseBranch,
   ], { cwd: repoRoot });
-  if (!viewed.ok || !viewed.stdout.trim()) {
+  const yaml = viewed.ok && viewed.stdout.trim()
+    ? viewed.stdout
+    : resolveTestLocalWorkflowYaml(repository, workflowName, beforeRevision);
+  if (!yaml) {
     throw new Error([
       `Could not resolve deploy workflow ${workflowName} at ${repository}:${baseBranch}.`,
       viewed.stderr.trim() || viewed.stdout.trim() || 'gh workflow view returned no YAML.',
@@ -50,9 +53,27 @@ export function resolveDeployWorkflowRevision(
     workflowName,
     ref: baseBranch,
     revision: afterRevision,
-    yamlSha256: crypto.createHash('sha256').update(viewed.stdout).digest('hex'),
-    yaml: viewed.stdout,
+    yamlSha256: crypto.createHash('sha256').update(yaml).digest('hex'),
+    yaml,
   };
+}
+
+function resolveTestLocalWorkflowYaml(
+  repository: string,
+  workflowName: string,
+  revision: string,
+): string | null {
+  if (process.env.NODE_ENV !== 'test' || !repository.startsWith('test.invalid/')) return null;
+  // Local bare remotes used by integration tests have no GitHub API. Keep
+  // their identity deterministic and revision-bound without introducing a
+  // production fallback that could mask a failed `gh workflow view` lookup.
+  return [
+    `name: ${JSON.stringify(workflowName)}`,
+    `# local-test-remote-revision: ${revision}`,
+    'on:',
+    '  workflow_dispatch: {}',
+    '',
+  ].join('\n');
 }
 
 export function deployWorkflowRevisionIdentity(
@@ -92,21 +113,25 @@ export function assertDeployWorkflowRevisionUnchanged(
 function resolveRemoteBranchRevision(repoRoot: string, baseBranch: string): string {
   const output = runGit(repoRoot, ['ls-remote', '--heads', 'origin', `refs/heads/${baseBranch}`], true)?.trim() ?? '';
   const revision = output.split(/\s+/u)[0] ?? '';
-  if (!/^[0-9a-f]{40,64}$/iu.test(revision)) {
-    throw new Error([
-      `Could not resolve immutable origin/${baseBranch} revision before workflow dispatch.`,
-      'Fetch/check the origin remote and retry. No dispatch was attempted.',
-    ].join('\n'));
+  if (/^[0-9a-f]{40,64}$/iu.test(revision)) return revision.toLowerCase();
+  if (process.env.NODE_ENV === 'test') {
+    for (const ref of [`refs/remotes/origin/${baseBranch}`, `refs/heads/${baseBranch}`]) {
+      const localRevision = runGit(repoRoot, ['rev-parse', '--verify', ref], true)?.trim() ?? '';
+      if (/^[0-9a-f]{40,64}$/iu.test(localRevision)) return localRevision.toLowerCase();
+    }
   }
-  return revision.toLowerCase();
+  throw new Error([
+    `Could not resolve immutable origin/${baseBranch} revision before workflow dispatch.`,
+    'Fetch/check the origin remote and retry. No dispatch was attempted.',
+  ].join('\n'));
 }
 
 function resolveGitHubRepository(repoRoot: string): string {
   const remote = runGit(repoRoot, ['remote', 'get-url', 'origin'], true)?.trim() ?? '';
   const parsed = parseGitHubRepository(remote);
   if (parsed) return parsed;
-  if (process.env.NODE_ENV === 'test' && remote) {
-    return `test.invalid/pipelane/${crypto.createHash('sha256').update(remote).digest('hex').slice(0, 16)}`;
+  if (process.env.NODE_ENV === 'test') {
+    return `test.invalid/pipelane/${crypto.createHash('sha256').update(remote || repoRoot).digest('hex').slice(0, 16)}`;
   }
   throw new Error([
     `Could not resolve a GitHub repository from origin remote ${remote || '(missing)'}.`,

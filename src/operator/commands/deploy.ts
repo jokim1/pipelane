@@ -425,6 +425,7 @@ export async function dispatchDeploy(
     targetSha: target.sha,
     surfacePathMap,
   });
+  if (environment === 'prod') assertProdConfirmationTestHookSafe();
   let approvedWorkflowRevision: ResolvedDeployWorkflowRevision | null = null;
   if (environment === 'prod' && process.env[DEPLOY_PROD_DIRECT_API_CONFIRMED_ENV] === '1') {
     approvedWorkflowRevision = resolveDeployWorkflowRevision(
@@ -1468,6 +1469,7 @@ export function assertApiApprovedProdEffectInputs(
 // when a human-in-the-loop confirmation is actually required — the API
 // execute path sets PIPELANE_DEPLOY_PROD_API_CONFIRMED=1 to skip.
 export async function requireProdConfirmation(sha: string): Promise<void> {
+  assertProdConfirmationTestHookSafe();
   if (process.env.PIPELANE_DEPLOY_PROD_API_CONFIRMED === '1') {
     // Consume and scrub so any post-confirmation subprocess this deploy
     // spawns (healthcheck scripts, retries, nested CLI re-entry) does not
@@ -1489,12 +1491,6 @@ export async function requireProdConfirmation(sha: string): Promise<void> {
   // defeat the gate. A fire still emits a loud stderr warning.
   const stub = process.env.PIPELANE_DEPLOY_PROD_CONFIRM_STUB;
   if (typeof stub === 'string') {
-    if (process.env.NODE_ENV !== 'test') {
-      throw new Error([
-        'deploy prod blocked: PIPELANE_DEPLOY_PROD_CONFIRM_STUB is set but NODE_ENV is not "test".',
-        'This is a test hook. Unset PIPELANE_DEPLOY_PROD_CONFIRM_STUB in this shell and re-run.',
-      ].join('\n'));
-    }
     process.stderr.write(
       '[pipelane] WARNING: PIPELANE_DEPLOY_PROD_CONFIRM_STUB is active (NODE_ENV=test).\n',
     );
@@ -1521,6 +1517,18 @@ export async function requireProdConfirmation(sha: string): Promise<void> {
     throw new Error([
       'deploy prod blocked: typed SHA prefix did not match.',
       `Expected the first ${PROD_CONFIRM_PREFIX_LENGTH} characters of ${sha}.`,
+    ].join('\n'));
+  }
+}
+
+function assertProdConfirmationTestHookSafe(): void {
+  if (
+    typeof process.env.PIPELANE_DEPLOY_PROD_CONFIRM_STUB === 'string'
+    && process.env.NODE_ENV !== 'test'
+  ) {
+    throw new Error([
+      'deploy prod blocked: PIPELANE_DEPLOY_PROD_CONFIRM_STUB is set but NODE_ENV is not "test".',
+      'This is a test hook. Unset PIPELANE_DEPLOY_PROD_CONFIRM_STUB in this shell and re-run.',
     ].join('\n'));
   }
 }
