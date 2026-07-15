@@ -23,6 +23,7 @@ import {
   type ReviewConsentKind,
   type ReviewConsentRecord,
   type ReviewExternalEvidenceRecord,
+  type ReviewFinding,
   type ReviewGateConfig,
   type ReviewGateRunRecord,
   type ReviewRunRecord,
@@ -369,17 +370,23 @@ function applyReviewFindingDispositions(
     }
   });
   if (applicable.length === 0) return reviewRun;
-  const byGate = new Map<string, Set<string>>();
+  const byGate = new Map<string, ReviewFinding[]>();
   for (const disposition of applicable) {
-    const ids = byGate.get(disposition.gateId) ?? new Set<string>();
-    ids.add(disposition.finding.id);
-    byGate.set(disposition.gateId, ids);
+    const findings = byGate.get(disposition.gateId) ?? [];
+    findings.push(disposition.finding);
+    byGate.set(disposition.gateId, findings);
   }
   let changed = false;
   const gates = reviewRun.gates.map((gate): ReviewGateRunRecord => {
-    const ids = byGate.get(gate.gateId);
-    if (!ids || !gate.result?.findingsKnown || !gate.findings?.some((finding) => ids.has(finding.id))) return gate;
-    const findings = gate.findings.filter((finding) => !ids.has(finding.id));
+    const dispositionedFindings = byGate.get(gate.gateId);
+    if (
+      !dispositionedFindings
+      || !gate.result?.findingsKnown
+      || !gate.findings?.some((finding) => dispositionedFindings.some((recorded) => reviewFindingsEqual(recorded, finding)))
+    ) return gate;
+    const findings = gate.findings.filter((finding) =>
+      !dispositionedFindings.some((recorded) => reviewFindingsEqual(recorded, finding))
+    );
     const blockingCount = findings.filter((finding) => finding.severity === 'critical' || finding.severity === 'warning').length;
     const advisoryCount = findings.filter((finding) => finding.severity === 'nit').length;
     const effectiveStatus = blockingCount > 0 ? 'failed' as const : 'passed' as const;
@@ -399,6 +406,13 @@ function applyReviewFindingDispositions(
     };
   });
   return changed ? { ...reviewRun, status: summarizeReviewRunStatus(gates), gates } : reviewRun;
+}
+
+function reviewFindingsEqual(left: ReviewFinding, right: ReviewFinding): boolean {
+  return left.id === right.id
+    && left.severity === right.severity
+    && left.title === right.title
+    && left.location === right.location;
 }
 
 export function reviewEvidenceTargetsEqual(left: ReviewEvidenceTarget, right: ReviewEvidenceTarget): boolean {

@@ -960,6 +960,19 @@ and non-TTY execution paths.
     check changes. A two-process regression mutates source state during the
     copy handoff and proves a clean retry imports the latest bytes.
 
+75. **A finding disposition could transfer to different content returned by a
+    filtered gate retry (P0).** **Location:**
+    `src/operator/review-enforcement.ts:349`. **Repro:** spin off finding
+    `F001` from a failed full review, then rerun only that gate at the same
+    checkout and have it report an unrelated finding that is also assigned
+    `F001`; composition previously removed the new finding by positional ID
+    alone and could turn the failed retry into passing attestation. **Proposed
+    fix (implemented):** apply a disposition only when ID, severity, title,
+    and optional location exactly equal the recorded finding; changed or
+    absent content remains blocking. A regression composes a same-checkout
+    filtered retry with a reused `F001` and proves the new finding fails
+    closed.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original
