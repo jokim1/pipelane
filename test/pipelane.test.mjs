@@ -28,6 +28,17 @@ const DEFAULT_CLAUDE_HOME = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-
 process.env.CLAUDE_HOME = DEFAULT_CLAUDE_HOME;
 process.env.CODEX_HOME = DEFAULT_CODEX_HOME;
 process.env.PIPELANE_HOME = DEFAULT_PIPELANE_HOME;
+// A durable launcher identifies its own managed runtime in the ambient
+// environment. That is host transport state, not test input: update fixtures
+// must discover only the synthetic runtimes they create. Tests that exercise
+// managed execution pass these variables explicitly to their child process.
+for (const key of [
+  'PIPELANE_MANAGED_RUNTIME',
+  'PIPELANE_MANAGED_RUNTIME_ROOT',
+  'PIPELANE_RUNNER_REEXECED',
+]) {
+  delete process.env[key];
+}
 const LOCAL_PIPELANE_INSTALL_SPEC = `file:${KIT_ROOT}`;
 const DEFAULT_ORCHESTRATION_STATE_KEY = 'pipelane-test-orchestration-state-key-0001';
 const TEST_LOCAL_STATE_START = '# >>> pipelane local-state v1 >>>';
@@ -107,9 +118,21 @@ const REVIEW_GATE_CONTEXT_ENV_KEYS = [
   'PIPELANE_UNSAFE_ALLOW_NESTED_REVIEW_GATES',
 ];
 
+function withoutAmbientEnv(keys, callback) {
+  const previous = new Map(keys.map((key) => [key, process.env[key]]));
+  try {
+    for (const key of keys) delete process.env[key];
+    return callback();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
 function buildCliChildEnv(env = {}) {
   const childEnv = { ...process.env, CODEX_HOME: DEFAULT_CODEX_HOME, PIPELANE_HOME: DEFAULT_PIPELANE_HOME, CLAUDE_HOME: DEFAULT_CLAUDE_HOME, ...env };
-  const preserveLiveReviewGateContext = inheritedReviewGateContextIsLive(process.env);
   if ('PIPELANE_ORCHESTRATION_STATE_KEY' in env) {
     if (env.PIPELANE_ORCHESTRATION_STATE_KEY === undefined) {
       delete childEnv.PIPELANE_ORCHESTRATION_STATE_KEY;
@@ -123,13 +146,11 @@ function buildCliChildEnv(env = {}) {
   for (const stateKey of ['PIPELANE_REVIEW_STATE_KEY', 'PIPELANE_DEPLOY_STATE_KEY', 'PIPELANE_PROBE_STATE_KEY']) {
     if (!(stateKey in env)) delete childEnv[stateKey];
   }
-  // AI review gates run `npm test` from a process that exports reviewer/session
-  // identity. Keep child CLI calls hermetic so tests only see the identities
-  // they intentionally pass. Exception: when this test process itself is running
-  // inside a live review gate, preserve the review-gate context so nested
-  // Pipelane CLIs fail closed instead of recursively running more gates.
+  // Review gates run `npm test` from a process that exports reviewer/session
+  // identity and live gate context. Keep fixture CLI calls hermetic so the suite
+  // can exercise review paths from inside that outer gate. Tests of nested-gate
+  // protection pass the context explicitly and still verify fail-closed behavior.
   for (const identityKey of HERMETIC_REVIEW_IDENTITY_ENV_KEYS) {
-    if (preserveLiveReviewGateContext && REVIEW_GATE_CONTEXT_ENV_KEYS.includes(identityKey)) continue;
     if (!(identityKey in env)) delete childEnv[identityKey];
   }
   // Destination routes execute child commands with internal routing flags. If a
@@ -139,23 +160,6 @@ function buildCliChildEnv(env = {}) {
     if (!(routeKey in env)) delete childEnv[routeKey];
   }
   return childEnv;
-}
-
-function inheritedReviewGateContextIsLive(env = process.env) {
-  const depth = env.PIPELANE_REVIEW_GATE_DEPTH?.trim();
-  if (!depth || !/^\d+$/.test(depth) || Number(depth) <= 0) return false;
-  const parentPidText = env.PIPELANE_REVIEW_GATE_PARENT_PID?.trim();
-  if (!parentPidText || !/^\d+$/.test(parentPidText)) return false;
-  const parentPid = Number(parentPidText);
-  if (!Number.isSafeInteger(parentPid) || parentPid <= 0) return false;
-  if (!env.PIPELANE_REVIEW_GATE_REPO_ROOT || !path.isAbsolute(env.PIPELANE_REVIEW_GATE_REPO_ROOT)) return false;
-  if (!env.PIPELANE_REVIEW_GATE_ID?.trim()) return false;
-  try {
-    process.kill(parentPid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === 'EPERM';
-  }
 }
 
 test('buildCliChildEnv scrubs inherited review-gate context unless explicitly supplied', () => {
@@ -197,7 +201,7 @@ test('buildCliChildEnv scrubs inherited review-gate context unless explicitly su
   }
 });
 
-test('buildCliChildEnv preserves live inherited review-gate context', () => {
+test('buildCliChildEnv scrubs live ambient review-gate context', () => {
   const keys = [
     'PIPELANE_REVIEW_GATE_DEPTH',
     'PIPELANE_REVIEW_GATE_PARENT_PID',
@@ -213,13 +217,11 @@ test('buildCliChildEnv preserves live inherited review-gate context', () => {
     process.env.PIPELANE_REVIEW_GATE_ID = 'parent-review-gate';
     process.env.PIPELANE_REVIEW_GATE_RUN_ID = 'review-parent';
 
-    const preserved = buildCliChildEnv();
+    const scrubbed = buildCliChildEnv();
 
-    assert.equal(preserved.PIPELANE_REVIEW_GATE_DEPTH, '1');
-    assert.equal(preserved.PIPELANE_REVIEW_GATE_PARENT_PID, String(process.pid));
-    assert.equal(preserved.PIPELANE_REVIEW_GATE_REPO_ROOT, KIT_ROOT);
-    assert.equal(preserved.PIPELANE_REVIEW_GATE_ID, 'parent-review-gate');
-    assert.equal(preserved.PIPELANE_REVIEW_GATE_RUN_ID, 'review-parent');
+    for (const key of keys) {
+      assert.equal(scrubbed[key], undefined, `${key} should be scrubbed unless the fixture passes it explicitly`);
+    }
   } finally {
     for (const [key, value] of previous) {
       if (value === undefined) delete process.env[key];
@@ -242,7 +244,19 @@ function runCli(args, cwd, env = {}, allowFailure = false) {
     writePassingReviewEvidence(cwd);
   }
   const childEnv = buildCliChildEnv(env);
-  const result = spawnSync('node', [CLI_PATH, ...args], {
+  const effectiveArgs = [...args];
+  if (effectiveArgs.includes('--provision-secrets') && !effectiveArgs.some((arg) => arg.startsWith('--approve-secret-manifest='))) {
+    const manifestPath = path.join(cwd, '.github', 'pipelane-provisioning.json');
+    if (existsSync(manifestPath) && !lstatSync(manifestPath).isSymbolicLink()) {
+      const approval = createHash('sha256').update(JSON.stringify({
+        repoRoot: realpathSync(cwd),
+        repository: 'github.com/test/repo',
+        manifest: createHash('sha256').update(readFileSync(manifestPath)).digest('hex'),
+      })).digest('hex');
+      effectiveArgs.push(`--approve-secret-manifest=${approval}`);
+    }
+  }
+  const result = spawnSync('node', [CLI_PATH, ...effectiveArgs], {
     cwd,
     env: childEnv,
     encoding: 'utf8',
@@ -886,6 +900,7 @@ if (args[0] === 'pr' && args[1] === 'list') {
   process.stdout.write(JSON.stringify(pr ? [pr] : []));
   process.exit(0);
 }
+
 if (args[0] === 'pr' && args[1] === 'create') {
   const head = findFlag('--head');
   const base = findFlag('--base') || 'main';
@@ -968,6 +983,80 @@ if (args[0] === 'run' && args[1] === 'view') {
 }
 process.exit(0);
 `, { mode: 0o755, encoding: 'utf8' });
+}
+
+function writeSecretProvisioningFakeGh(binDir, stateFile) {
+  mkdirSync(binDir, { recursive: true });
+  const targetPath = path.join(binDir, 'gh');
+  writeFileSync(targetPath, `#!/usr/bin/env node
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const statePath = process.env.GH_SECRET_STATE_FILE;
+const state = fs.existsSync(statePath)
+  ? JSON.parse(fs.readFileSync(statePath, 'utf8'))
+  : { secrets: {}, setCalls: [] };
+const args = process.argv.slice(2);
+const writeState = () => fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + '\\n', 'utf8');
+if (Object.keys(process.env).some((key) => key.toUpperCase() === 'GH_REPO')) {
+  process.stderr.write('GH_REPO must not redirect repository-secret provisioning\\n');
+  process.exit(9);
+}
+if (args[0] === 'repo' && args[1] === 'view') {
+  process.stdout.write(JSON.stringify({ nameWithOwner: 'test/repo', url: 'https://github.com/test/repo' }));
+  process.exit(0);
+}
+if (args[0] === 'secret' && (!args.includes('--repo') || args[args.indexOf('--repo') + 1] !== 'github.com/test/repo')) {
+  process.stderr.write('secret command must bind the approved repository with --repo\\n');
+  process.exit(10);
+}
+if (args[0] === 'secret' && args[1] === 'list') {
+  if (process.env.GH_SECRET_APPEAR_ON_SECOND_LIST) {
+    state.listCalls = (state.listCalls || 0) + 1;
+    if (state.listCalls === 2) {
+      state.secrets[process.env.GH_SECRET_APPEAR_ON_SECOND_LIST] = { sha256: 'concurrent', bytes: 10 };
+    }
+    writeState();
+  }
+  if (process.env.GH_SECRET_FAIL_VERIFICATION === '1' && (state.setCalls || []).length > 0) {
+    process.stderr.write('simulated verification failure\\n');
+    process.exit(8);
+  }
+  const hidden = process.env.GH_SECRET_HIDE_AFTER_SET || '';
+  process.stdout.write(JSON.stringify(Object.keys(state.secrets || {}).sort()
+    .filter((name) => !(hidden === name && (state.setCalls || []).some((entry) => entry.name === name)))
+    .map((name) => ({ name }))));
+  process.exit(0);
+}
+if (args[0] === 'secret' && args[1] === 'set') {
+  const name = args[2];
+  if (process.env.GH_SECRET_FAIL_SET_NAME === name) {
+    process.stderr.write('simulated secret write failure\\n');
+    process.exit(7);
+  }
+  const body = fs.readFileSync(0);
+  const record = {
+    sha256: crypto.createHash('sha256').update(body).digest('hex'),
+    bytes: body.length,
+  };
+  state.secrets = state.secrets || {};
+  state.setCalls = state.setCalls || [];
+  state.secrets[name] = record;
+  state.setCalls.push({ name, ...record });
+  writeState();
+  process.exit(0);
+}
+process.stderr.write('unexpected gh call: ' + args.join(' ') + '\\n');
+process.exit(2);
+`, { mode: 0o755, encoding: 'utf8' });
+}
+
+function writeSecretProvisioningManifest(repoRoot, repositorySecrets) {
+  mkdirSync(path.join(repoRoot, '.github'), { recursive: true });
+  writeFileSync(
+    path.join(repoRoot, '.github', 'pipelane-provisioning.json'),
+    `${JSON.stringify({ version: 1, github: { repositorySecrets } }, null, 2)}\n`,
+    'utf8',
+  );
 }
 
 function writeFakePipelane(binDir, stateFile) {
@@ -2665,6 +2754,7 @@ test('package files include README-linked public markdown docs', () => {
     'docs/public/ORCHESTRATION.md',
     'docs/public/PIPELANE_BOARD.md',
     'docs/public/PIPELANE_API.md',
+    'docs/public/SECRET_PROVISIONING.md',
   ];
 
   for (const docPath of expectedDocs) {
@@ -3468,8 +3558,9 @@ test('durable Codex runner prints detailed /pipelane help', () => {
     assert.equal(bareOutput, helpOutput);
     assert.match(helpOutput, /Pipelane is a build, release, and development orchestrator/);
     assert.match(helpOutput, /normal first-run path is clean/);
-    assert.match(helpOutput, /\/pipelane setup \[--yes\]/);
+    assert.match(helpOutput, /\/pipelane setup \[--yes\] \[--provision-secrets\] \[--rotate-secrets\] \[--approve-secret-manifest=<sha256>\]/);
     assert.match(helpOutput, /\/pipelane configure \[--json\] \[flags\.\.\.\]/);
+    assert.match(helpOutput, /\/pipelane configure --provision-secrets \[--rotate-secrets\] --approve-secret-manifest=<sha256>/);
     assert.match(helpOutput, /\/pipelane review \[--dry-run\]/);
     assert.match(helpOutput, /\/pipelane review setup/);
     assert.match(helpOutput, /\/pipelane orchestrate --plan-file <file> --analysis-file <file> --yes/);
@@ -15228,7 +15319,10 @@ test('docs-only review profile does not skip repurposed full-suite gate ids', as
     const reviewMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'review.ts'));
     const stateMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
     const context = stateMod.resolveWorkflowContext(repoRoot);
-    const record = reviewMod.buildReviewRunRecord({
+    // This fixture exercises profile selection, not the production nested-gate
+    // guard. Full review runs export a live outer gate into this test process,
+    // so isolate the direct in-process call just as runCli isolates child CLIs.
+    const record = withoutAmbientEnv(REVIEW_GATE_CONTEXT_ENV_KEYS, () => reviewMod.buildReviewRunRecord({
       repoRoot,
       commonDir: context.commonDir,
       config: context.config,
@@ -15238,7 +15332,7 @@ test('docs-only review profile does not skip repurposed full-suite gate ids', as
       activeSurfaces: context.config.surfaces,
       changedFiles: [],
       profileContext: { runProfile: 'docs-only', sliceProfile: 'docs-only' },
-    });
+    }));
 
     assert.equal(record.status, 'passed');
     assert.equal(record.gates[0].gateId, 'test');
@@ -29687,6 +29781,1047 @@ test('configure --json is idempotent: re-running with the same flags produces id
     assert.equal(existsSync(path.join(repoRoot, 'CLAUDE.md')), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup introduces no secret or corpus requirement when the repository has no provisioning manifest', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    const topLevelHelp = runCli(['--help'], repoRoot);
+    assert.match(topLevelHelp.stdout, /setup \[--yes\] \[--provision-secrets\] \[--rotate-secrets\] \[--approve-secret-manifest=<sha256>\]/);
+    assert.match(topLevelHelp.stdout, /configure --provision-secrets \[--rotate-secrets\] --approve-secret-manifest=<sha256>/);
+    const help = runCli(['setup', '--help'], repoRoot);
+    assert.match(help.stdout, /Pipelane does not require secrets or a corpus globally/);
+    assert.match(help.stdout, /github\.com\/jokim1\/pipelane\/blob\/main\/docs\/public\/SECRET_PROVISIONING\.md/);
+    const result = runCli(['setup'], repoRoot);
+    assert.equal(result.status, 0);
+    assert.doesNotMatch(result.stdout, /Private CI inputs/);
+    assert.doesNotMatch(result.stdout, /corpus/i);
+    assert.doesNotMatch(result.stdout, /provision-secrets/);
+
+    for (const flag of ['--provision-secrets', '--rotate-secrets']) {
+      const explicit = runCli(['setup', flag], repoRoot, {}, true);
+      assert.equal(explicit.status, 1);
+      assert.match(explicit.stderr, /No \.github\/pipelane-provisioning\.json manifest was found/);
+    }
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('plain setup fails closed when the repository provisioning manifest is invalid', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    mkdirSync(path.join(repoRoot, '.github'), { recursive: true });
+    writeFileSync(
+      path.join(repoRoot, '.github', 'pipelane-provisioning.json'),
+      `${JSON.stringify({
+        version: 1,
+        github: { repositorySecrets: [] },
+        misspelled: true,
+      }, null, 2)}\n`,
+      'utf8',
+    );
+
+    const result = runCli(['setup'], repoRoot, {}, true);
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /has unsupported field: misspelled/);
+    assert.doesNotMatch(result.stdout, /could not be inspected/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('secret provisioning rejects a symlinked manifest without exposing its target', () => {
+  const repoRoot = createRepo();
+  const outside = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-manifest-'));
+  const privateText = 'outside-manifest-private-content-never-print';
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    mkdirSync(path.join(repoRoot, '.github'), { recursive: true });
+    const target = path.join(outside, 'manifest.json');
+    writeFileSync(target, privateText, 'utf8');
+    symlinkSync(target, path.join(repoRoot, '.github', 'pipelane-provisioning.json'));
+
+    const result = runCli(['setup'], repoRoot, {}, true);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /non-symlinked regular file inside the repository/);
+    assert.doesNotMatch(result.stderr, new RegExp(privateText));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('secret provisioning requires approval bound to the repository and manifest digest', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    run('git', ['remote', 'add', 'origin', 'https://github.com/test/repo.git'], repoRoot);
+    writeSecretProvisioningManifest(repoRoot, [
+      { name: 'BOUND_TOKEN', source: { type: 'environment', variable: 'TEST_BOUND_TOKEN' } },
+    ]);
+    const result = spawnSync('node', [CLI_PATH, 'setup', '--provision-secrets'], {
+      cwd: repoRoot,
+      env: buildCliChildEnv({ TEST_BOUND_TOKEN: 'never-write-without-approval' }),
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /requires approval bound to this repository and the exact provisioning manifest/);
+    const approval = result.stderr.match(/--approve-secret-manifest=([a-f0-9]{64})/)?.[1];
+    assert.ok(approval);
+    assert.doesNotMatch(result.stderr, /never-write-without-approval/);
+
+    run('git', ['remote', 'set-url', 'origin', 'https://github.com/other/repo.git'], repoRoot);
+    const redirected = spawnSync('node', [
+      CLI_PATH,
+      'setup',
+      '--provision-secrets',
+      `--approve-secret-manifest=${approval}`,
+    ], {
+      cwd: repoRoot,
+      env: buildCliChildEnv({ TEST_BOUND_TOKEN: 'never-write-to-changed-repository' }),
+      encoding: 'utf8',
+    });
+    assert.equal(redirected.status, 1);
+    assert.match(redirected.stderr, /requires approval bound to this repository and the exact provisioning manifest/);
+    assert.doesNotMatch(redirected.stderr, /never-write-to-changed-repository/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('declared private repository files must be ignored and are exposed to PR deny checks', async () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [{
+      name: 'PRIVATE_FILE',
+      source: { type: 'file-base64', pathVariable: 'TEST_PRIVATE_PATH', defaultPath: '.pipelane/secrets/private.json' },
+    }]);
+    mkdirSync(path.join(repoRoot, '.pipelane', 'secrets'), { recursive: true });
+    writeFileSync(path.join(repoRoot, '.pipelane', 'secrets', 'private.json'), '{}\n', 'utf8');
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+
+    const result = runCli(['setup', '--provision-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+    }, true);
+    assert.equal(result.status, 64);
+    assert.match(result.stdout, /must be Git-ignored before it can be read/);
+
+    const provisioning = await import(path.join(KIT_ROOT, 'src', 'operator', 'secret-provisioning.ts'));
+    const helpers = await import(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'helpers.ts'));
+    const declared = provisioning.declaredPrivateSourcePaths(repoRoot);
+    assert.deepEqual(declared, ['.pipelane/secrets/private.json']);
+    assert.deepEqual(helpers.findDenyListHits(declared, declared, []), [
+      { path: '.pipelane/secrets/private.json', pattern: '.pipelane/secrets/private.json' },
+    ]);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('tracked private files are rejected even when later ignore rules match them', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      {
+        name: 'TRACKED_DOTENV_TOKEN',
+        source: { type: 'cloudflare-api-token', variable: 'TEST_TRACKED_TOKEN', dotenvFile: 'web/.env', dotenvVariable: 'TOKEN' },
+      },
+      {
+        name: 'TRACKED_PRIVATE_FILE',
+        source: { type: 'file-base64', pathVariable: 'TEST_TRACKED_PATH', defaultPath: '.pipelane/secrets/tracked.json' },
+      },
+    ]);
+    mkdirSync(path.join(repoRoot, 'web'), { recursive: true });
+    mkdirSync(path.join(repoRoot, '.pipelane', 'secrets'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'web', '.env'), 'TOKEN=tracked-never-write\n', 'utf8');
+    writeFileSync(path.join(repoRoot, '.pipelane', 'secrets', 'tracked.json'), '{}\n', 'utf8');
+    writeFileSync(path.join(repoRoot, '.gitignore'), 'web/.env\n.pipelane/secrets/\n', 'utf8');
+    run('git', ['add', '-A'], repoRoot);
+    run('git', ['add', '-f', 'web/.env', '.pipelane/secrets/tracked.json'], repoRoot);
+    run('git', ['commit', '-m', 'Track unsafe private fixtures'], repoRoot);
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+
+    const result = runCli(['setup', '--provision-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+    }, true);
+    assert.equal(result.status, 64);
+    assert.equal((result.stdout.match(/must be Git-ignored before it can be read/g) || []).length, 2);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('PR private-path protection unions current, HEAD, and environment-selected manifest paths', async () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [{
+      name: 'OLD_PRIVATE_FILE',
+      source: { type: 'file-base64', pathVariable: 'TEST_OLD_PRIVATE_PATH', defaultPath: '.pipelane/secrets/old.json' },
+    }]);
+    run('git', ['add', '-A'], repoRoot);
+    run('git', ['commit', '-m', 'Declare old private path'], repoRoot);
+    writeSecretProvisioningManifest(repoRoot, [{
+      name: 'NEW_PRIVATE_FILE',
+      source: { type: 'file-base64', pathVariable: 'TEST_NEW_PRIVATE_PATH', defaultPath: '.pipelane/secrets/new.json' },
+    }]);
+
+    const provisioning = await import(path.join(KIT_ROOT, 'src', 'operator', 'secret-provisioning.ts'));
+    const paths = provisioning.declaredPrivateSourcePaths(repoRoot, {
+      TEST_OLD_PRIVATE_PATH: '.pipelane/secrets/old-selected.json',
+      TEST_NEW_PRIVATE_PATH: '.pipelane/secrets/new-selected.json',
+    });
+    assert.deepEqual(new Set(paths), new Set([
+      '.pipelane/secrets/old.json',
+      '.pipelane/secrets/old-selected.json',
+      '.pipelane/secrets/new.json',
+      '.pipelane/secrets/new-selected.json',
+    ]));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup discovers ready repository secrets without writing or exposing their values', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const corpusDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-heldout-'));
+  const stateFile = path.join(binDir, 'state.json');
+  const token = 'cloudflare-eval-token-never-print';
+  const corpusText = `${JSON.stringify([
+    { id: 'held-benign-1', group: 'benign', text: 'great session tonight', expected: 'allow' },
+  ])}\n`;
+  const corpusPath = path.join(corpusDir, 'chat-heldout.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      {
+        name: 'CLOUDFLARE_AI_EVAL_TOKEN',
+        description: 'Runs the repository live moderation evaluation',
+        source: { type: 'environment', variable: 'TEST_CF_AI_TOKEN' },
+      },
+      {
+        name: 'CHAT_HELDOUT_CORPUS_BASE64',
+        source: { type: 'file-base64', pathVariable: 'TEST_HELDOUT_PATH', validator: 'chat-heldout-corpus-v1' },
+      },
+    ]);
+    writeFileSync(corpusPath, corpusText, 'utf8');
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+    const env = {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      TEST_CF_AI_TOKEN: token,
+      TEST_HELDOUT_PATH: corpusPath,
+    };
+
+    const result = runCli(['setup'], repoRoot, env);
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /Pipelane itself does not require these inputs/);
+    assert.match(result.stdout, /- CLOUDFLARE_AI_EVAL_TOKEN\n  Status: ready — read from environment variable TEST_CF_AI_TOKEN/);
+    assert.match(result.stdout, /Why: Runs the repository live moderation evaluation\. It lets this repository's CI use a private value without committing that value to Git\./);
+    assert.match(result.stdout, /- CHAT_HELDOUT_CORPUS_BASE64\n  Status: ready — validated and Base64-encoded file/);
+    assert.match(result.stdout, /not a Pipelane-wide requirement/);
+    assert.match(result.stdout, /Next steps:\n1\. Run `\/pipelane setup --provision-secrets --approve-secret-manifest=[a-f0-9]{64}`/);
+    assert.match(result.stdout, /2\. Rerun `\/pipelane setup` and confirm every declared input says "already configured"/);
+    assert.match(result.stdout, /\/pipelane setup --provision-secrets/);
+    assert.doesNotMatch(result.stdout, new RegExp(token));
+    assert.doesNotMatch(result.stdout, /great session tonight/);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(corpusDir, { recursive: true, force: true });
+  }
+});
+
+test('setup provisions missing secrets through stdin, preserves existing values, and stays idempotent', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const corpusDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-heldout-'));
+  const stateFile = path.join(binDir, 'state.json');
+  const token = 'cloudflare-eval-token-never-persist';
+  const corpusText = `${JSON.stringify([
+    { id: 'held-reject-1', group: 'hate_threat', text: 'restricted adversarial case', expected: 'reject', critical: true },
+  ])}\n`;
+  const corpusPath = path.join(corpusDir, 'chat-heldout.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      { name: 'CLOUDFLARE_AI_EVAL_TOKEN', source: { type: 'environment', variable: 'TEST_CF_AI_TOKEN' } },
+      {
+        name: 'CHAT_HELDOUT_CORPUS_BASE64',
+        source: { type: 'file-base64', pathVariable: 'TEST_HELDOUT_PATH', validator: 'chat-heldout-corpus-v1' },
+      },
+    ]);
+    writeFileSync(corpusPath, corpusText, 'utf8');
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, `${JSON.stringify({
+      secrets: { CLOUDFLARE_AI_EVAL_TOKEN: { sha256: 'existing', bytes: 8 } },
+      setCalls: [],
+    })}\n`, 'utf8');
+    const env = {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      TEST_CF_AI_TOKEN: token,
+      TEST_HELDOUT_PATH: corpusPath,
+    };
+
+    const first = runCli(['setup', '--provision-secrets'], repoRoot, env);
+    assert.equal(first.status, 0);
+    assert.match(first.stdout, /- CLOUDFLARE_AI_EVAL_TOKEN\n  Status: configured — already configured; preserved/);
+    assert.match(first.stdout, /- CHAT_HELDOUT_CORPUS_BASE64\n  Status: provisioned — .*installed through gh stdin/);
+    assert.doesNotMatch(first.stdout, new RegExp(token));
+    assert.doesNotMatch(first.stdout, /restricted adversarial case/);
+    const afterFirst = JSON.parse(readFileSync(stateFile, 'utf8'));
+    assert.deepEqual(afterFirst.setCalls.map((entry) => entry.name), ['CHAT_HELDOUT_CORPUS_BASE64']);
+    const encoded = Buffer.from(corpusText, 'utf8').toString('base64');
+    assert.equal(afterFirst.secrets.CHAT_HELDOUT_CORPUS_BASE64.sha256, createHash('sha256').update(encoded).digest('hex'));
+    assert.equal(JSON.stringify(afterFirst).includes(token), false);
+    assert.equal(JSON.stringify(afterFirst).includes('restricted adversarial case'), false);
+
+    const second = runCli(['setup', '--provision-secrets'], repoRoot, env);
+    assert.equal(second.status, 0);
+    assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls.length, 1, 'idempotent rerun must not replace secrets');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(corpusDir, { recursive: true, force: true });
+  }
+});
+
+test('repository-secret provisioning ignores ambient GH_REPO redirection case-insensitively', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      { name: 'SCOPED_TOKEN', source: { type: 'environment', variable: 'TEST_SCOPED_TOKEN' } },
+    ]);
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+
+    const result = runCli(['setup', '--provision-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      Gh_RePo: 'attacker/unrelated-repository',
+      TEST_SCOPED_TOKEN: 'scoped-value-never-print',
+    });
+
+    assert.equal(result.status, 0);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls.map((entry) => entry.name), ['SCOPED_TOKEN']);
+    assert.doesNotMatch(result.stdout, /scoped-value-never-print|attacker\/unrelated-repository/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('non-rotation provisioning preserves a secret that appears immediately before write', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      { name: 'CONCURRENT_TOKEN', source: { type: 'environment', variable: 'TEST_CONCURRENT_TOKEN' } },
+    ]);
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+
+    const result = runCli(['setup', '--provision-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      GH_SECRET_APPEAR_ON_SECOND_LIST: 'CONCURRENT_TOKEN',
+      TEST_CONCURRENT_TOKEN: 'concurrent-value-never-print',
+    });
+
+    assert.match(result.stdout, /appeared in GitHub after inspection; preserved without writing/);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls, []);
+    assert.doesNotMatch(result.stdout, /concurrent-value-never-print/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('plain setup never executes a repository-local Wrangler binary', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-wrangler-marker-'));
+  const stateFile = path.join(binDir, 'state.json');
+  const markerPath = path.join(markerRoot, 'wrangler-ran.txt');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [{
+      name: 'CLOUDFLARE_AI_EVAL_TOKEN',
+      source: { type: 'cloudflare-api-token', variable: 'TEST_CF_AI_TOKEN', wranglerCwd: 'web' },
+    }]);
+    const wranglerBin = path.join(repoRoot, 'web', 'node_modules', '.bin');
+    mkdirSync(wranglerBin, { recursive: true });
+    writeFileSync(
+      path.join(wranglerBin, 'wrangler'),
+      `#!/usr/bin/env node\nrequire('node:fs').writeFileSync(process.env.WRANGLER_EXECUTION_MARKER, 'ran');process.stdout.write(JSON.stringify({type:'api_token',token:'never-read-during-inspection'}));\n`,
+      { mode: 0o755, encoding: 'utf8' },
+    );
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+
+    const result = runCli(['setup'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      WRANGLER_EXECUTION_MARKER: markerPath,
+    });
+
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /Wrangler token discovery is deferred until explicit provisioning/);
+    assert.equal(existsSync(markerPath), false);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(markerRoot, { recursive: true, force: true });
+  }
+});
+
+test('secret provisioning never sends values to a repository-local GitHub CLI', () => {
+  const repoRoot = createRepo();
+  const localBin = path.join(repoRoot, 'tools', 'bin');
+  const markerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-marker-'));
+  const markerPath = path.join(markerRoot, 'gh-ran.txt');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    run('git', ['remote', 'add', 'origin', 'https://github.com/test/repo.git'], repoRoot);
+    writeSecretProvisioningManifest(repoRoot, [
+      { name: 'LOCAL_GH_TOKEN', source: { type: 'environment', variable: 'TEST_LOCAL_GH_TOKEN' } },
+    ]);
+    mkdirSync(localBin, { recursive: true });
+    writeFileSync(
+      path.join(localBin, 'gh'),
+      '#!/usr/bin/env node\nrequire("node:fs").writeFileSync(process.env.GH_EXECUTION_MARKER, require("node:fs").readFileSync(0));\n',
+      { mode: 0o755, encoding: 'utf8' },
+    );
+
+    const result = runCli(['setup', '--provision-secrets'], repoRoot, {
+      PATH: `${localBin}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_EXECUTION_MARKER: markerPath,
+      TEST_LOCAL_GH_TOKEN: 'repository-local-gh-must-never-read',
+    }, true);
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Repository-local GitHub CLI execution is refused/);
+    assert.doesNotMatch(result.stderr, /repository-local-gh-must-never-read/);
+    assert.equal(existsSync(markerPath), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(markerRoot, { recursive: true, force: true });
+  }
+});
+
+test('setup parses allowlisted dotenv syntax and uses the last declared token value', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  const token = 'dotenv-cloudflare-token-never-print';
+  const unquotedToken = 'dotenv-unquoted-token-never-print';
+  const corpusText = `${JSON.stringify([
+    { id: 'held-unicode-1', group: 'unicode', text: 'café meetup', expected: 'allow' },
+  ])}\n`;
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      {
+        name: 'CLOUDFLARE_AI_EVAL_TOKEN',
+        source: {
+          type: 'cloudflare-api-token',
+          variable: 'TEST_CF_AI_TOKEN',
+          wranglerCwd: 'web',
+          dotenvFile: 'web/.env',
+          dotenvVariable: 'CLOUDFLARE_API_TOKEN',
+        },
+      },
+      {
+        name: 'CLOUDFLARE_SECONDARY_TOKEN',
+        source: {
+          type: 'cloudflare-api-token',
+          variable: 'TEST_CF_SECONDARY_TOKEN',
+          wranglerCwd: 'web',
+          dotenvFile: 'web/.env',
+          dotenvVariable: 'CLOUDFLARE_SECONDARY_TOKEN',
+        },
+      },
+      {
+        name: 'CHAT_HELDOUT_CORPUS_BASE64',
+        source: {
+          type: 'file-base64',
+          pathVariable: 'TEST_HELDOUT_PATH',
+          defaultPath: '.pipelane/secrets/chat-heldout-corpus.json',
+          validator: 'chat-heldout-corpus-v1',
+        },
+      },
+    ]);
+    writeFileSync(path.join(repoRoot, '.gitignore'), 'web/.env\n.pipelane/secrets/\n', 'utf8');
+    mkdirSync(path.join(repoRoot, 'web'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'web', '.env'), [
+      'OTHER=value',
+      'CLOUDFLARE_API_TOKEN=stale-token-must-not-win',
+      `CLOUDFLARE_API_TOKEN="${token}" # quoted current value`,
+      `CLOUDFLARE_SECONDARY_TOKEN=${unquotedToken} # unquoted current value`,
+      '',
+    ].join('\n'), 'utf8');
+    mkdirSync(path.join(repoRoot, '.pipelane', 'secrets'), { recursive: true });
+    writeFileSync(path.join(repoRoot, '.pipelane', 'secrets', 'chat-heldout-corpus.json'), corpusText, 'utf8');
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+
+    const result = runCli(['setup', '--provision-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+    });
+
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /read allowlisted CLOUDFLARE_API_TOKEN from web\/\.env/);
+    assert.match(result.stdout, /read allowlisted CLOUDFLARE_SECONDARY_TOKEN from web\/\.env/);
+    assert.match(result.stdout, /validated and Base64-encoded default file \.pipelane\/secrets\/chat-heldout-corpus\.json/);
+    assert.doesNotMatch(result.stdout, new RegExp(token));
+    assert.doesNotMatch(result.stdout, new RegExp(unquotedToken));
+    assert.doesNotMatch(result.stdout, /café meetup/);
+    const state = JSON.parse(readFileSync(stateFile, 'utf8'));
+    assert.deepEqual(state.setCalls.map((entry) => entry.name).sort(), [
+      'CHAT_HELDOUT_CORPUS_BASE64',
+      'CLOUDFLARE_AI_EVAL_TOKEN',
+      'CLOUDFLARE_SECONDARY_TOKEN',
+    ]);
+    assert.equal(state.secrets.CLOUDFLARE_AI_EVAL_TOKEN.sha256, createHash('sha256').update(token).digest('hex'));
+    assert.equal(state.secrets.CLOUDFLARE_SECONDARY_TOKEN.sha256, createHash('sha256').update(unquotedToken).digest('hex'));
+    assert.equal(JSON.stringify(state).includes(token), false);
+    assert.equal(JSON.stringify(state).includes(unquotedToken), false);
+    assert.equal(JSON.stringify(state).includes('stale-token-must-not-win'), false);
+    assert.equal(JSON.stringify(state).includes('café meetup'), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('configure secret provisioning rotates only when explicitly requested', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      { name: 'ROTATABLE_TOKEN', source: { type: 'environment', variable: 'TEST_ROTATABLE_TOKEN' } },
+    ]);
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, `${JSON.stringify({
+      secrets: { ROTATABLE_TOKEN: { sha256: 'old', bytes: 3 } },
+      setCalls: [],
+    })}\n`, 'utf8');
+    const env = {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      TEST_ROTATABLE_TOKEN: 'new-value-never-print',
+    };
+
+    runCli(['configure', '--provision-secrets'], repoRoot, env);
+    assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls.length, 0);
+    const rotated = runCli(['configure', '--provision-secrets', '--rotate-secrets'], repoRoot, env);
+    assert.equal(rotated.status, 0);
+    assert.match(rotated.stdout, /- ROTATABLE_TOKEN\n  Status: provisioned — .*installed through gh stdin/);
+    assert.doesNotMatch(rotated.stdout, /new-value-never-print/);
+    assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls.length, 1);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('secret rotation resolves every replacement before writing any secret', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      { name: 'FIRST_ROTATION_TOKEN', source: { type: 'environment', variable: 'TEST_FIRST_ROTATION_TOKEN' } },
+      { name: 'SECOND_ROTATION_TOKEN', source: { type: 'environment', variable: 'TEST_SECOND_ROTATION_TOKEN' } },
+    ]);
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    const initial = {
+      secrets: {
+        FIRST_ROTATION_TOKEN: { sha256: 'old-first', bytes: 9 },
+        SECOND_ROTATION_TOKEN: { sha256: 'old-second', bytes: 10 },
+      },
+      setCalls: [],
+    };
+    writeFileSync(stateFile, `${JSON.stringify(initial)}\n`, 'utf8');
+
+    const result = runCli(['setup', '--provision-secrets', '--rotate-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      TEST_FIRST_ROTATION_TOKEN: 'new-first-never-print',
+    }, true);
+
+    assert.equal(result.status, 64);
+    assert.match(result.stdout, /rotation was not started because another declared replacement is blocked/);
+    assert.match(result.stdout, /environment variable TEST_SECOND_ROTATION_TOKEN is not set/);
+    assert.match(result.stdout, /Run `\/pipelane setup --provision-secrets --rotate-secrets --approve-secret-manifest=[a-f0-9]{64}`/);
+    assert.doesNotMatch(result.stdout, /new-first-never-print/);
+    const state = JSON.parse(readFileSync(stateFile, 'utf8'));
+    assert.deepEqual(state.setCalls, []);
+    assert.deepEqual(state.secrets, initial.secrets);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('secret provisioning rejects GitHub-reserved names before any batch write', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      { name: 'VALID_ROTATION_TOKEN', source: { type: 'environment', variable: 'TEST_VALID_ROTATION_TOKEN' } },
+      { name: 'GITHUB_TOKEN', source: { type: 'environment', variable: 'TEST_RESERVED_ROTATION_TOKEN' } },
+    ]);
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    const initial = {
+      secrets: { VALID_ROTATION_TOKEN: { sha256: 'old-valid', bytes: 9 } },
+      setCalls: [],
+    };
+    writeFileSync(stateFile, `${JSON.stringify(initial)}\n`, 'utf8');
+
+    const result = runCli(['setup', '--provision-secrets', '--rotate-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      TEST_VALID_ROTATION_TOKEN: 'new-valid-never-write',
+      TEST_RESERVED_ROTATION_TOKEN: 'reserved-never-write',
+    }, true);
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /must not start with GitHub's reserved GITHUB_ prefix/);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')), initial);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('secret provisioning checks existing repository capacity before any batch write', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      { name: 'ONE_SECRET_TOO_MANY', source: { type: 'environment', variable: 'TEST_ONE_SECRET_TOO_MANY' } },
+    ]);
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    const initial = {
+      secrets: Object.fromEntries(Array.from({ length: 100 }, (_, index) => [
+        `EXISTING_SECRET_${index}`,
+        { sha256: `existing-${index}`, bytes: 8 },
+      ])),
+      setCalls: [],
+    };
+    writeFileSync(stateFile, `${JSON.stringify(initial)}\n`, 'utf8');
+
+    const result = runCli(['setup', '--provision-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      TEST_ONE_SECRET_TOO_MANY: 'capacity-never-write',
+    }, true);
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /would total 101 names, exceeding GitHub's 100 repository-secret limit/);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')), initial);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('secret rotation reports partial state and stops after a GitHub write failure', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      { name: 'FIRST_ROTATION_TOKEN', source: { type: 'environment', variable: 'TEST_FIRST_ROTATION_TOKEN' } },
+      { name: 'SECOND_ROTATION_TOKEN', source: { type: 'environment', variable: 'TEST_SECOND_ROTATION_TOKEN' } },
+      { name: 'THIRD_ROTATION_TOKEN', source: { type: 'environment', variable: 'TEST_THIRD_ROTATION_TOKEN' } },
+    ]);
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, `${JSON.stringify({
+      secrets: {
+        FIRST_ROTATION_TOKEN: { sha256: 'old-first', bytes: 9 },
+        SECOND_ROTATION_TOKEN: { sha256: 'old-second', bytes: 10 },
+        THIRD_ROTATION_TOKEN: { sha256: 'old-third', bytes: 9 },
+      },
+      setCalls: [],
+    })}\n`, 'utf8');
+
+    const result = runCli(['configure', '--provision-secrets', '--rotate-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      GH_SECRET_FAIL_SET_NAME: 'SECOND_ROTATION_TOKEN',
+      TEST_FIRST_ROTATION_TOKEN: 'new-first-never-print',
+      TEST_SECOND_ROTATION_TOKEN: 'new-second-never-print',
+      TEST_THIRD_ROTATION_TOKEN: 'new-third-never-print',
+    }, true);
+
+    assert.equal(result.status, 64);
+    assert.match(result.stdout, /GitHub rejected this write after 1 earlier secret was rotated; no later writes were attempted/);
+    assert.match(result.stdout, /not attempted because the earlier GitHub write for SECOND_ROTATION_TOKEN failed/);
+    assert.match(result.stdout, /Run `\/pipelane configure --provision-secrets --rotate-secrets --approve-secret-manifest=[a-f0-9]{64}`/);
+    assert.doesNotMatch(result.stdout, /new-(?:first|second|third)-never-print/);
+    const state = JSON.parse(readFileSync(stateFile, 'utf8'));
+    assert.deepEqual(state.setCalls.map((entry) => entry.name), ['FIRST_ROTATION_TOKEN']);
+    assert.equal(state.secrets.SECOND_ROTATION_TOKEN.sha256, 'old-second');
+    assert.equal(state.secrets.THIRD_ROTATION_TOKEN.sha256, 'old-third');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('secret provisioning reports a write that cannot be verified', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      { name: 'UNVERIFIED_TOKEN', source: { type: 'environment', variable: 'TEST_UNVERIFIED_TOKEN' } },
+    ]);
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+
+    const result = runCli(['setup', '--provision-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      GH_SECRET_HIDE_AFTER_SET: 'UNVERIFIED_TOKEN',
+      TEST_UNVERIFIED_TOKEN: 'unverified-value-never-print',
+    }, true);
+
+    assert.equal(result.status, 64);
+    assert.match(result.stdout, /secret was absent during verification/);
+    assert.doesNotMatch(result.stdout, /unverified-value-never-print/);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls.map((entry) => entry.name), ['UNVERIFIED_TOKEN']);
+
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+    const failedVerification = runCli(['setup', '--provision-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      GH_SECRET_FAIL_VERIFICATION: '1',
+      TEST_UNVERIFIED_TOKEN: 'verification-failure-never-print',
+    }, true);
+    assert.equal(failedVerification.status, 64);
+    assert.match(failedVerification.stdout, /GitHub accepted the write but verification failed/);
+    assert.doesNotMatch(failedVerification.stdout, /verification-failure-never-print/);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls.map((entry) => entry.name), ['UNVERIFIED_TOKEN']);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('Cloudflare provisioning refuses to copy refreshable Wrangler OAuth credentials into CI', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      {
+        name: 'CLOUDFLARE_AI_EVAL_TOKEN',
+        source: { type: 'cloudflare-api-token', variable: 'TEST_CF_AI_TOKEN', wranglerCwd: 'web' },
+      },
+    ]);
+    mkdirSync(path.join(repoRoot, 'web'), { recursive: true });
+    writeFileSync(
+      path.join(binDir, 'wrangler'),
+      '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({type:"oauth",token:"oauth-never-copy"}));\n',
+      { mode: 0o755, encoding: 'utf8' },
+    );
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+    const env = {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+    };
+
+    const result = runCli(['configure', '--provision-secrets'], repoRoot, env, true);
+    assert.equal(result.status, 64);
+    assert.match(result.stdout, /Wrangler authentication is oauth; CI requires a durable API token/);
+    assert.match(result.stdout, /Next: Provide a durable Cloudflare API token through environment variable TEST_CF_AI_TOKEN/);
+    assert.match(result.stdout, /OAuth login is not copied into CI/);
+    assert.doesNotMatch(result.stdout, /oauth-never-copy/);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('trusted Wrangler api_token discovery provisions without disclosing the token', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  const token = 'trusted-wrangler-token-never-print';
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [{
+      name: 'CLOUDFLARE_AI_EVAL_TOKEN',
+      source: { type: 'cloudflare-api-token', variable: 'TEST_CF_AI_TOKEN', wranglerCwd: 'web' },
+    }]);
+    mkdirSync(path.join(repoRoot, 'web'), { recursive: true });
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(path.join(binDir, 'wrangler'), `#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({type:'api_token',token:'${token}'}));\n`, {
+      mode: 0o755,
+      encoding: 'utf8',
+    });
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+
+    const result = runCli(['configure', '--provision-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+    });
+
+    assert.match(result.stdout, /read a durable API token from Wrangler authentication; installed through gh stdin/);
+    assert.doesNotMatch(result.stdout, new RegExp(token));
+    const state = JSON.parse(readFileSync(stateFile, 'utf8'));
+    assert.equal(state.setCalls.length, 1);
+    assert.equal(state.setCalls[0].sha256, createHash('sha256').update(token).digest('hex'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('Windows Wrangler discovery dispatches npm command shims through a fixed shell command', async () => {
+  const secretProvisioning = await import(path.join(KIT_ROOT, 'src', 'operator', 'secret-provisioning.ts'));
+  const shim = path.win32.join('C:\\repo with spaces', 'node_modules', '.bin', 'wrangler.cmd');
+  const spec = secretProvisioning.buildWranglerSpawnSpec(shim, { Path: 'C:\\Windows\\System32' }, 'win32');
+
+  assert.equal(spec.command, 'wrangler auth token --json');
+  assert.deepEqual(spec.args, []);
+  assert.equal(spec.shell, true);
+  assert.equal(spec.env.Path, `${path.win32.dirname(shim)};C:\\Windows\\System32`);
+
+  const executable = secretProvisioning.buildWranglerSpawnSpec('C:\\tools\\wrangler.exe', {}, 'win32');
+  assert.equal(executable.command, 'C:\\tools\\wrangler.exe');
+  assert.deepEqual(executable.args, ['auth', 'token', '--json']);
+  assert.equal(executable.shell, false);
+});
+
+test('held-out corpus validation fails before any GitHub secret write', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const corpusDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-heldout-'));
+  const stateFile = path.join(binDir, 'state.json');
+  const corpusPath = path.join(corpusDir, 'bad.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      {
+        name: 'CHAT_HELDOUT_CORPUS_BASE64',
+        source: { type: 'file-base64', pathVariable: 'TEST_HELDOUT_PATH', validator: 'chat-heldout-corpus-v1' },
+      },
+    ]);
+    writeFileSync(corpusPath, '[{"id":"bad","group":"benign","text":"ok","expected":"reject_model"}]\n', 'utf8');
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+    const result = runCli(['setup', '--provision-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      TEST_HELDOUT_PATH: corpusPath,
+    }, true);
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /expected must be allow or reject/);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(corpusDir, { recursive: true, force: true });
+  }
+});
+
+test('held-out corpus validation errors never print private corpus content', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const corpusDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-heldout-'));
+  const stateFile = path.join(binDir, 'state.json');
+  const corpusPath = path.join(corpusDir, 'private.json');
+  const privatePrefix = 'private-corpus-prefix-never-print';
+  const privateId = 'private-duplicate-id-never-print';
+  const privateUnexpectedKey = 'private-unexpected-key-never-print';
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      {
+        name: 'CHAT_HELDOUT_CORPUS_BASE64',
+        source: { type: 'file-base64', pathVariable: 'TEST_HELDOUT_PATH', validator: 'chat-heldout-corpus-v1' },
+      },
+    ]);
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+    const env = {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+      TEST_HELDOUT_PATH: corpusPath,
+    };
+
+    writeFileSync(corpusPath, privatePrefix, 'utf8');
+    const invalidJson = runCli(['setup', '--provision-secrets'], repoRoot, env, true);
+    assert.equal(invalidJson.status, 1);
+    assert.match(invalidJson.stderr, /held-out corpus is not valid JSON/);
+    assert.doesNotMatch(invalidJson.stderr, new RegExp(privatePrefix));
+
+    writeFileSync(corpusPath, `${JSON.stringify([
+      { id: privateId, group: 'benign', text: 'first private case', expected: 'allow' },
+      { id: privateId, group: 'benign', text: 'second private case', expected: 'allow' },
+    ])}\n`, 'utf8');
+    const duplicateId = runCli(['setup', '--provision-secrets'], repoRoot, env, true);
+    assert.equal(duplicateId.status, 1);
+    assert.match(duplicateId.stderr, /duplicates an earlier held-out corpus id/);
+    assert.doesNotMatch(duplicateId.stderr, new RegExp(privateId));
+
+    const invalidCases = [
+      { corpus: [], error: /must be a non-empty JSON array/ },
+      {
+        corpus: [{ id: 'bad-group', group: 'unsupported', text: 'case', expected: 'allow' }],
+        error: /group is not a supported moderation group/,
+      },
+      {
+        corpus: [{ id: 'blank-text', group: 'benign', text: '   ', expected: 'allow' }],
+        error: /text must contain 1-500 Unicode characters/,
+      },
+      {
+        corpus: [{ id: 'long-text', group: 'unicode', text: '🙂'.repeat(501), expected: 'allow' }],
+        error: /text must contain 1-500 Unicode characters/,
+      },
+      {
+        corpus: [{ id: 'bad-critical', group: 'benign', text: 'case', expected: 'allow', critical: 'yes' }],
+        error: /critical must be a boolean/,
+      },
+      {
+        corpus: [{ id: 'private-field', group: 'benign', text: 'case', expected: 'allow', [privateUnexpectedKey]: true }],
+        error: /unsupported fields/,
+        privateText: privateUnexpectedKey,
+      },
+    ];
+    for (const { corpus, error, privateText } of invalidCases) {
+      writeFileSync(corpusPath, `${JSON.stringify(corpus)}\n`, 'utf8');
+      const rejected = runCli(['setup', '--provision-secrets'], repoRoot, env, true);
+      assert.equal(rejected.status, 1);
+      assert.match(rejected.stderr, error);
+      if (privateText) assert.doesNotMatch(rejected.stderr, new RegExp(privateText));
+    }
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(corpusDir, { recursive: true, force: true });
+  }
+});
+
+test('secret provisioning renders repository-controlled guidance as terminal-safe single lines', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const stateFile = path.join(binDir, 'state.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [{
+      name: 'SAFE_OUTPUT_TOKEN',
+      description: 'Declared purpose\nInjected status: configured\u001b[31m',
+      source: { type: 'environment', variable: 'TEST_SAFE_OUTPUT_TOKEN' },
+    }]);
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+
+    const result = runCli(['setup'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+    });
+
+    assert.equal(result.status, 0);
+    assert.doesNotMatch(result.stdout, /\u001b|\x1b/);
+    assert.doesNotMatch(result.stdout, /Declared purpose\nInjected status/);
+    assert.match(result.stdout, /Why: Declared purpose Injected status: configured/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('manifest-relative secret files cannot escape the repository through symlinks', () => {
+  const repoRoot = createRepo();
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-secret-gh-'));
+  const outsideDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-heldout-outside-'));
+  const stateFile = path.join(binDir, 'state.json');
+  const outsidePath = path.join(outsideDir, 'heldout.json');
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    writeSecretProvisioningManifest(repoRoot, [
+      {
+        name: 'CHAT_HELDOUT_CORPUS_BASE64',
+        source: {
+          type: 'file-base64',
+          pathVariable: 'TEST_HELDOUT_PATH',
+          defaultPath: '.pipelane/secrets/chat-heldout-corpus.json',
+          validator: 'chat-heldout-corpus-v1',
+        },
+      },
+    ]);
+    writeFileSync(outsidePath, '[{"id":"outside","group":"benign","text":"must not escape","expected":"allow"}]\n', 'utf8');
+    mkdirSync(path.join(repoRoot, '.pipelane', 'secrets'), { recursive: true });
+    symlinkSync(outsidePath, path.join(repoRoot, '.pipelane', 'secrets', 'chat-heldout-corpus.json'));
+    writeSecretProvisioningFakeGh(binDir, stateFile);
+    writeFileSync(stateFile, '{"secrets":{},"setCalls":[]}\n', 'utf8');
+
+    const result = runCli(['setup', '--provision-secrets'], repoRoot, {
+      PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      GH_SECRET_STATE_FILE: stateFile,
+    }, true);
+
+    assert.equal(result.status, 64);
+    assert.match(result.stdout, /escapes the repository or is a symlink/);
+    assert.match(result.stdout, /Next: Create \.pipelane\/secrets\/chat-heldout-corpus\.json, or set TEST_HELDOUT_PATH to another corpus file/);
+    assert.match(result.stdout, /github\.com\/jokim1\/pipelane\/blob\/main\/docs\/public\/SECRET_PROVISIONING\.md#held-out-corpus-format/);
+    assert.match(result.stdout, /1\. Provide only the blocked local inputs/);
+    assert.match(result.stdout, /2\. Run `\/pipelane setup --provision-secrets --approve-secret-manifest=[a-f0-9]{64}`/);
+    assert.match(result.stdout, /3\. Rerun `\/pipelane setup`/);
+    assert.doesNotMatch(result.stdout, /must not escape/);
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).setCalls, []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(outsideDir, { recursive: true, force: true });
   }
 });
 
