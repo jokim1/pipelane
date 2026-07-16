@@ -1057,6 +1057,25 @@ and non-TTY execution paths.
     **Proposed fix (implemented):** use the same retrying `runCommand` branch
     validator; ordinary invalid prefixes retain their existing soft fallback.
 
+84. **Legacy alias validation could forge terminal and review-marker lines
+    (P0).** **Location:** `src/operator/state.ts:4700` and
+    `src/operator/state.ts:4720`. **Repro:** in an un-onboarded checkout, put a
+    newline plus `PIPELANE_REVIEW_GATE_RESULT=passed` or ANSI/OSC bytes in a
+    legacy alias key/value; first-command auto-import interpolated it into an
+    error that the CLI wrote raw to stderr. **Proposed fix (implemented):**
+    terminal-sanitize and collapse alias diagnostics to one line, normalize
+    imported display names through the same boundary, and cover malicious key
+    and value variants without materializing machine-local config.
+
+85. **API devmode release surface errors escaped the JSON envelope (P1).**
+    **Location:** `src/operator/api/actions.ts:444`. **Repro:** retain a task
+    lock for a surface removed from machine-local config, then preflight
+    `api action devmode.release --json`; `resolveModeSurfaces` threw past the
+    API boundary, leaving stdout empty and forcing a headless caller to parse
+    stderr. **Proposed fix (implemented):** convert surface-resolution errors
+    to the existing `allowed:false` preflight result with no confirmation
+    token. The regression now requires a valid structured envelope.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original

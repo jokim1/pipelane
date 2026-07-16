@@ -441,7 +441,15 @@ function evaluatePreflightGate(context: WorkflowContext, actionId: StableActionI
     const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
     const deployState = loadDeployState(context.commonDir, context.config);
     const probeState = loadProbeState(context.commonDir, context.config);
-    const requestedSurfaces = resolveModeSurfaces(context, surfaces, modeTaskLock);
+    let requestedSurfaces: string[];
+    try {
+      requestedSurfaces = resolveModeSurfaces(context, surfaces, modeTaskLock);
+    } catch (error) {
+      return {
+        allowed: false,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
     const readiness = evaluateReleaseReadiness({
       config: context.config,
       deployConfig,

@@ -1956,6 +1956,10 @@ function normalizeLegacyWorkflowImport(
     }
     sanitized.projectKey = safeProjectKey;
   }
+  const importedDisplayName = cleanString(sanitized.displayName);
+  if (importedDisplayName) {
+    sanitized.displayName = sanitizeLegacyWarningValue(importedDisplayName);
+  }
   if (ignored.length > 0) {
     const printableIgnored = ignored.map(sanitizeLegacyWarningValue).join(', ');
     process.stderr.write(
@@ -4696,7 +4700,8 @@ export function normalizeWorkflowAlias(alias: unknown, fallback: string): string
 
   if (!/^\/[a-z0-9][a-z0-9-_]*$/.test(prefixed)) {
     const display = typeof alias === 'string' ? alias : String(alias);
-    throw new Error(`Invalid workflow alias "${display || fallback}". Use slash commands like /new or /release-pr.`);
+    const printable = sanitizeForTerminal(display || fallback).replace(/\s+/gu, ' ').trim() || fallback;
+    throw new Error(`Invalid workflow alias "${printable}". Use slash commands like /new or /release-pr.`);
   }
 
   return prefixed;
@@ -4716,8 +4721,11 @@ export function resolveWorkflowAliases(
     const legacyIgnoredAliasKeys = new Set(['smoke']);
     const unknown = Object.keys(aliases).filter((key) => !known.has(key) && !legacyIgnoredAliasKeys.has(key));
     if (unknown.length > 0) {
+      const printableUnknown = unknown
+        .map((key) => sanitizeForTerminal(key).replace(/\s+/gu, ' ').trim() || '(empty)')
+        .join(', ');
       throw new Error(
-        `Unknown workflow alias key(s): ${unknown.join(', ')}. Known keys: ${WORKFLOW_COMMANDS.join(', ')}.`,
+        `Unknown workflow alias key(s): ${printableUnknown}. Known keys: ${WORKFLOW_COMMANDS.join(', ')}.`,
       );
     }
   }

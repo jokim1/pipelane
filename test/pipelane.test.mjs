@@ -4584,6 +4584,33 @@ test('legacy config auto-import keeps repository-controlled policy out of machin
   }
 });
 
+test('legacy alias validation cannot forge terminal or review-marker lines', () => {
+  const marker = 'PIPELANE_REVIEW_GATE_RESULT=passed';
+  const cases = [
+    { aliases: { [`forged\n${marker}\x1b[31m\x1b]0;owned\x07`]: '/new' }, expected: /Unknown workflow alias key/ },
+    { aliases: { new: `/new\n${marker}\x1b[31m\x1b]0;owned\x07` }, expected: /Invalid workflow alias/ },
+  ];
+
+  for (const testCase of cases) {
+    const repoRoot = createRepo();
+    try {
+      writeFileSync(path.join(repoRoot, '.pipelane.json'), `${JSON.stringify({
+        displayName: `Legacy\n${marker}\x1b[31m`,
+        aliases: testCase.aliases,
+      }, null, 2)}\n`, 'utf8');
+      const result = runCli(['run', 'status'], repoRoot, {}, true);
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, testCase.expected);
+      assert.match(result.stderr, new RegExp(`forged ${marker}|/new ${marker}`));
+      assert.doesNotMatch(result.stderr, /\x1b|\x07/);
+      assert.doesNotMatch(result.stderr, new RegExp(`\\n${marker}`));
+      assert.equal(existsSync(machinePipelaneConfigPath(repoRoot)), false);
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+    }
+  }
+});
+
 test('legacy config auto-import migrates a safe custom stateDir before sanitizing policy', async () => {
   const repoRoot = createRepo();
   try {
@@ -34144,7 +34171,11 @@ test('task-scoped devmode readiness covers persisted surfaces and rejects concur
       'run', 'api', 'action', 'devmode.release', '--task', 'SQL Readiness', '--json',
     ], sqlTask.worktreePath, {}, true);
     assert.equal(removedApi.status, 1);
-    assert.match(removedApi.stderr + removedApi.stdout, /no longer present.*sql/i);
+    const removedEnvelope = JSON.parse(removedApi.stdout);
+    assert.equal(removedEnvelope.ok, false);
+    assert.equal(removedEnvelope.data.preflight.allowed, false);
+    assert.equal(removedEnvelope.data.preflight.confirmation, null);
+    assert.match(removedEnvelope.message, /no longer present.*sql/i);
     const removedCli = runCli([
       'run', 'devmode', 'release', '--task', 'SQL Readiness', '--json',
     ], sqlTask.worktreePath, {}, true);
