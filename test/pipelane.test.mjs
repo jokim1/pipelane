@@ -39657,3 +39657,187 @@ test('first strict review TTY intent prompt uses an editable label suggestion an
   });
   assert.equal(rejected, null);
 });
+
+// ---------------------------------------------------------------------------
+// Convergence S0: runtime provenance, rollback, parity, key provisioning
+// ---------------------------------------------------------------------------
+
+test('write-build-info records sha, dirty, and timestamp with env overrides', () => {
+  const workDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-build-info-'));
+  try {
+    const result = spawnSync('node', [path.join(KIT_ROOT, 'scripts', 'write-build-info.mjs')], {
+      cwd: workDir,
+      env: {
+        ...process.env,
+        PIPELANE_BUILD_SHA: 'abc1234abc1234abc1234abc1234abc1234abc12',
+        PIPELANE_BUILD_DIRTY: '0',
+        PIPELANE_BUILD_TIMESTAMP: '2026-07-16T00:00:00.000Z',
+      },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const info = JSON.parse(readFileSync(path.join(workDir, 'dist', 'build-info.json'), 'utf8'));
+    assert.equal(info.sha, 'abc1234abc1234abc1234abc1234abc1234abc12');
+    assert.equal(info.dirty, false);
+    assert.equal(info.builtAt, '2026-07-16T00:00:00.000Z');
+  } finally {
+    rmSync(workDir, { recursive: true, force: true });
+  }
+});
+
+test('managed runtime install records build-info provenance and retains a rollback runtime', () => {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-rollback-ws-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  try {
+    const env = { CLAUDE_HOME: claudeHome, PIPELANE_HOME: pipelaneHome };
+    runCli(['install-claude'], workspaceRoot, env);
+    const runtimeRoot = managedRuntimeRoot('claude', pipelaneHome);
+    const metadata = JSON.parse(readFileSync(path.join(runtimeRoot, '.pipelane-runtime.json'), 'utf8'));
+    // Provenance: dist/build-info.json identifies the tree the installed dist
+    // was built from and must win over the source root's git HEAD.
+    const buildInfo = JSON.parse(readFileSync(path.join(KIT_ROOT, 'dist', 'build-info.json'), 'utf8'));
+    assert.equal(metadata.sourceSha, buildInfo.sha);
+    assert.equal(Boolean(metadata.sourceDirty), Boolean(buildInfo.dirty));
+
+    // Reinstall retires the current runtime into `<root>.previous`.
+    writeFileSync(path.join(runtimeRoot, 'sentinel-first-install.txt'), 'first', 'utf8');
+    runCli(['install-claude'], workspaceRoot, env);
+    const previousRoot = `${runtimeRoot}.previous`;
+    assert.equal(existsSync(path.join(runtimeRoot, 'sentinel-first-install.txt')), false);
+    assert.ok(existsSync(path.join(previousRoot, 'sentinel-first-install.txt')));
+
+    // Rollback restores the retained runtime and keeps the retired one as the
+    // new previous, so a second rollback rolls forward again.
+    const rollback = runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.match(rollback.stdout, /Rolled back the managed Claude runtime/);
+    assert.ok(existsSync(path.join(runtimeRoot, 'sentinel-first-install.txt')));
+    assert.equal(existsSync(path.join(previousRoot, 'sentinel-first-install.txt')), false);
+    const rollForward = runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.match(rollForward.stdout, /Rolled back the managed Claude runtime/);
+    assert.equal(existsSync(path.join(runtimeRoot, 'sentinel-first-install.txt')), false);
+    assert.ok(existsSync(path.join(previousRoot, 'sentinel-first-install.txt')));
+
+    // Refuses when no previous runtime is retained.
+    rmSync(previousRoot, { recursive: true, force: true });
+    const refused = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+    assert.notEqual(refused.status, 0);
+    assert.match(refused.stderr, /No pipelane-managed previous runtime/);
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('runtime parity check passes on a fresh install, flags drift, and tolerates missing runtimes', () => {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-parity-ws-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  const emptyHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-empty-'));
+  const parityScript = path.join(KIT_ROOT, 'scripts', 'runtime-parity-check.mjs');
+  const runParity = (home) => spawnSync('node', [parityScript], {
+    cwd: KIT_ROOT,
+    env: { ...process.env, PIPELANE_HOME: home },
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  try {
+    runCli(['install-claude'], workspaceRoot, { CLAUDE_HOME: claudeHome, PIPELANE_HOME: pipelaneHome });
+
+    const pass = runParity(pipelaneHome);
+    assert.equal(pass.status, 0, `${pass.stdout}\n${pass.stderr}`);
+    assert.match(pass.stdout, /\[claude\] manifest parity: OK/);
+    assert.match(pass.stdout, /\[claude\] review-surface contract probe: OK/);
+    assert.match(pass.stdout, /\[claude\] review\/pr\/merge surface parity: OK/);
+    assert.match(pass.stdout, /RESULT: PASS/);
+
+    // Mutating a review-surface module inside the runtime is drift.
+    const mutated = path.join(managedRuntimeRoot('claude', pipelaneHome), 'dist', 'operator', 'commands', 'review.js');
+    writeFileSync(mutated, `${readFileSync(mutated, 'utf8')}\n// drift\n`, 'utf8');
+    const fail = runParity(pipelaneHome);
+    assert.equal(fail.status, 1);
+    assert.match(fail.stdout, /dist\/operator\/commands\/review\.js: content differs/);
+    assert.match(fail.stdout, /\[claude\] review\/pr\/merge surface parity: DRIFT/);
+    assert.match(fail.stdout, /RESULT: FAIL/);
+
+    // No runtimes installed: informative, not an error.
+    const none = runParity(emptyHome);
+    assert.equal(none.status, 0, `${none.stdout}\n${none.stderr}`);
+    assert.match(none.stdout, /No managed runtimes are installed/);
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+    rmSync(emptyHome, { recursive: true, force: true });
+  }
+});
+
+test('signing key classes auto-provision persisted keys, including convergence-state', () => {
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-keys-'));
+  const script = [
+    `const doctor = await import(${JSON.stringify(pathToFileURL(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'doctor.ts')).href)});`,
+    'process.stdout.write(JSON.stringify(doctor.collectSigningKeyStatus()));',
+  ].join('\n');
+  try {
+    const env = { ...process.env, PIPELANE_HOME: pipelaneHome };
+    delete env.PIPELANE_ORCHESTRATION_STATE_KEY;
+    delete env.PIPELANE_REVIEW_CONSENT_STATE_KEY;
+    delete env.PIPELANE_CONVERGENCE_STATE_KEY;
+    const result = spawnSync('node', ['--input-type=module', '-e', script], {
+      cwd: KIT_ROOT,
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const statuses = JSON.parse(result.stdout);
+    assert.deepEqual(statuses.map((entry) => entry.name).sort(), ['convergence-state', 'orchestration-state', 'review-consent-state']);
+    for (const entry of statuses) {
+      assert.equal(entry.provisioned, true, `${entry.name}: ${entry.error}`);
+      assert.match(entry.fingerprint, /^[a-f0-9]{16}$/);
+    }
+    for (const keyFile of ['orchestration-state.key', 'review-consent-state.key', 'convergence-state.key']) {
+      assert.ok(existsSync(path.join(pipelaneHome, 'keys', keyFile)), `${keyFile} should be provisioned on disk`);
+    }
+  } finally {
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('review policy update notice fires only for repos on an older policyVersion', () => {
+  const repoRoot = createRepo();
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-policy-'));
+  const script = [
+    `const state = await import(${JSON.stringify(pathToFileURL(path.join(KIT_ROOT, 'src', 'operator', 'state.ts')).href)});`,
+    `const update = await import(${JSON.stringify(pathToFileURL(path.join(KIT_ROOT, 'src', 'operator', 'update.ts')).href)});`,
+    "const { mkdirSync, writeFileSync } = await import('node:fs');",
+    "const path = (await import('node:path')).default;",
+    'const repoRoot = process.argv[1];',
+    'const configPath = state.resolveMachineConfigPath(repoRoot);',
+    'mkdirSync(path.dirname(configPath), { recursive: true });',
+    'const base = { projectKey: "fixture", displayName: "Fixture" };',
+    'writeFileSync(configPath, JSON.stringify({ ...base, reviewGates: {} }, null, 2));',
+    'const legacyNotice = update.reviewPolicyUpdateNotice(repoRoot);',
+    'writeFileSync(configPath, JSON.stringify({ ...base, reviewGates: { enforcementMode: "strict-v3", policyVersion: 3 } }, null, 2));',
+    'const strictNotice = update.reviewPolicyUpdateNotice(repoRoot);',
+    'process.stdout.write(JSON.stringify({ legacyNotice, strictNotice }));',
+  ].join('\n');
+  try {
+    const result = spawnSync('node', ['--input-type=module', '-e', script, repoRoot], {
+      cwd: KIT_ROOT,
+      env: { ...process.env, PIPELANE_HOME: pipelaneHome },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const { legacyNotice, strictNotice } = JSON.parse(result.stdout);
+    assert.match(legacyNotice, /policyVersion 2/);
+    assert.match(legacyNotice, /review setup/);
+    assert.equal(strictNotice, null);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});

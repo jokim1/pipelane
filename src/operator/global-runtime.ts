@@ -19,6 +19,7 @@ export interface ManagedRuntimeMetadata {
   packageVersion: string;
   installedAt: string;
   sourceSha?: string;
+  sourceDirty?: boolean;
   installSpec?: string;
 }
 
@@ -64,20 +65,50 @@ export function readManagedRuntimeMetadata(targetRoot: string): ManagedRuntimeMe
   }
 }
 
-function resolveRuntimeSourceSha(sourceRoot: string): string {
+interface RuntimeSourceProvenance {
+  sha: string;
+  dirty?: boolean;
+}
+
+function readBuildInfoProvenance(sourceRoot: string): RuntimeSourceProvenance | null {
+  try {
+    const parsed = JSON.parse(readFileSync(path.join(sourceRoot, 'dist', 'build-info.json'), 'utf8')) as { sha?: unknown; dirty?: unknown };
+    const sha = typeof parsed.sha === 'string' ? parsed.sha.trim().toLowerCase() : '';
+    if (!/^[a-f0-9]{7,40}$/.test(sha)) {
+      return null;
+    }
+    return parsed.dirty === true ? { sha, dirty: true } : { sha };
+  } catch {
+    return null;
+  }
+}
+
+function resolveRuntimeSourceProvenance(sourceRoot: string): RuntimeSourceProvenance | null {
   const fromEnv = process.env.PIPELANE_INSTALL_SOURCE_SHA?.trim();
   if (fromEnv && /^[a-f0-9]{7,40}$/i.test(fromEnv)) {
-    return fromEnv.toLowerCase();
+    return { sha: fromEnv.toLowerCase() };
+  }
+  // dist/build-info.json records the tree the shipped dist was built from —
+  // the truth about the bits being installed even when the source root's HEAD
+  // has moved past the build, or the root is a git-less npx/npm pack dir.
+  const buildInfo = readBuildInfoProvenance(sourceRoot);
+  if (buildInfo) {
+    return buildInfo;
   }
   try {
-    return execFileSync('git', ['rev-parse', '--verify', 'HEAD'], {
+    const sha = execFileSync('git', ['rev-parse', '--verify', 'HEAD'], {
       cwd: sourceRoot,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim().toLowerCase();
+    return sha ? { sha } : null;
   } catch {
-    return '';
+    return null;
   }
+}
+
+export function previousRuntimePath(targetRoot: string): string {
+  return `${targetRoot}.previous`;
 }
 
 function installLockPath(targetRoot: string): string {
@@ -161,9 +192,12 @@ export function installGlobalRuntime(
       packageVersion,
       installedAt: new Date().toISOString(),
     };
-    const sourceSha = resolveRuntimeSourceSha(sourceRoot);
-    if (sourceSha) {
-      metadata.sourceSha = sourceSha;
+    const provenance = resolveRuntimeSourceProvenance(sourceRoot);
+    if (provenance) {
+      metadata.sourceSha = provenance.sha;
+      if (provenance.dirty) {
+        metadata.sourceDirty = true;
+      }
     }
     const installSpec = process.env.PIPELANE_INSTALL_SPEC?.trim();
     if (installSpec) {
@@ -177,7 +211,16 @@ export function installGlobalRuntime(
     }
     renameSync(tempRoot, targetRoot);
     if (asideRoot) {
-      rmSync(asideRoot, { recursive: true, force: true });
+      // Retain exactly one prior runtime as the rollback target. Best effort:
+      // a failed retention must not fail the already-completed install, so the
+      // aside dir is left in place for manual recovery instead.
+      try {
+        const previousRoot = previousRuntimePath(targetRoot);
+        rmSync(previousRoot, { recursive: true, force: true });
+        renameSync(asideRoot, previousRoot);
+      } catch {
+        // Keep asideRoot on disk; it still holds the prior runtime.
+      }
     }
 
     return { runtimeRoot: targetRoot, packageVersion };
@@ -187,6 +230,49 @@ export function installGlobalRuntime(
       renameSync(asideRoot, targetRoot);
     }
     throw error;
+  } finally {
+    releaseLock();
+  }
+}
+
+export interface RuntimeRollbackResult {
+  runtimeRoot: string;
+  restored: ManagedRuntimeMetadata;
+  retired: ManagedRuntimeMetadata | null;
+}
+
+export function rollbackGlobalRuntime(targetRoot: string): RuntimeRollbackResult {
+  const previousRoot = previousRuntimePath(targetRoot);
+  const releaseLock = acquireInstallLock(targetRoot);
+  try {
+    const restored = readManagedRuntimeMetadata(previousRoot);
+    if (!restored) {
+      throw new Error(`No pipelane-managed previous runtime is retained at ${previousRoot}; nothing to roll back to.`);
+    }
+    if (existsSync(targetRoot) && !isManagedGlobalRuntime(targetRoot)) {
+      throw new Error(`${targetRoot} exists and is not managed by pipelane; refusing to roll back over it.`);
+    }
+    const retired = readManagedRuntimeMetadata(targetRoot);
+    const asideRoot = `${targetRoot}.rollback-${process.pid}-${Date.now()}`;
+    let movedCurrent = false;
+    if (existsSync(targetRoot)) {
+      renameSync(targetRoot, asideRoot);
+      movedCurrent = true;
+    }
+    try {
+      renameSync(previousRoot, targetRoot);
+    } catch (error) {
+      if (movedCurrent) {
+        renameSync(asideRoot, targetRoot);
+      }
+      throw error;
+    }
+    if (movedCurrent) {
+      // The rolled-back runtime becomes the new previous, so a second rollback
+      // rolls forward again.
+      renameSync(asideRoot, previousRoot);
+    }
+    return { runtimeRoot: targetRoot, restored, retired };
   } finally {
     releaseLock();
   }

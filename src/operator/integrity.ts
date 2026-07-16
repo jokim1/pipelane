@@ -7,6 +7,7 @@ export const DEPLOY_STATE_KEY_ENV = 'PIPELANE_DEPLOY_STATE_KEY';
 export const PROBE_STATE_KEY_ENV = 'PIPELANE_PROBE_STATE_KEY';
 export const REVIEW_STATE_KEY_ENV = 'PIPELANE_REVIEW_STATE_KEY';
 export const REVIEW_CONSENT_STATE_KEY_ENV = 'PIPELANE_REVIEW_CONSENT_STATE_KEY';
+export const CONVERGENCE_STATE_KEY_ENV = 'PIPELANE_CONVERGENCE_STATE_KEY';
 export const ORCHESTRATION_STATE_KEY_ENV = 'PIPELANE_ORCHESTRATION_STATE_KEY';
 export const ORCHESTRATION_STATE_KEY_FILE_ENV = 'PIPELANE_ORCHESTRATION_STATE_KEY_FILE';
 export const MIN_STATE_KEY_LENGTH = 32;
@@ -80,6 +81,20 @@ export function resolveReviewConsentStateKey(): string {
   const explicit = resolveStateKey(REVIEW_CONSENT_STATE_KEY_ENV);
   if (explicit) return validateRequiredStateKey(REVIEW_CONSENT_STATE_KEY_ENV, explicit);
   return readOrCreatePersistedStateKey(reviewConsentStateKeyPath(), REVIEW_CONSENT_STATE_KEY_ENV);
+}
+
+export function convergenceStateKeyPath(): string {
+  return path.join(pipelaneHomeDir(), 'keys', 'convergence-state.key');
+}
+
+// Signs the Convergence v1 record classes (verdict-cache entries, bypass
+// records, completion journals). Mandatory and fail-closed for those records
+// (D16): provisioned at S0, before any enforcement consumes it. Legacy
+// review-state records keep their permissive optional-key semantics.
+export function resolveConvergenceStateKey(): string {
+  const explicit = resolveStateKey(CONVERGENCE_STATE_KEY_ENV);
+  if (explicit) return validateRequiredStateKey(CONVERGENCE_STATE_KEY_ENV, explicit);
+  return readOrCreatePersistedStateKey(convergenceStateKeyPath(), CONVERGENCE_STATE_KEY_ENV);
 }
 
 function validateRequiredStateKey(name: string, raw: string | undefined, sourceLabel = name): string {

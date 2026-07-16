@@ -3,7 +3,7 @@ import path from 'node:path';
 
 import { readFixPromptBody } from './fix-prompt.ts';
 import { readLessonPromptBody } from './lesson-prompt.ts';
-import { installGlobalRuntime } from './global-runtime.ts';
+import { installGlobalRuntime, rollbackGlobalRuntime, type RuntimeRollbackResult } from './global-runtime.ts';
 import { defaultWorkflowConfig, homeClaudeDir, pipelaneHomeDir, readJsonFile, writeJsonFile } from './state.ts';
 import {
   desiredHostInstall,
@@ -160,6 +160,10 @@ function writeSkill(skillsRoot: string, runtimeDir: string, entry: DesiredInstal
     mkdirSync(skillDir, { recursive: true });
   }
   writeFileSync(skillDocPath(skillsRoot, entry.name), entry.body, 'utf8');
+}
+
+export function rollbackClaudeManagedRuntime(): RuntimeRollbackResult {
+  return rollbackGlobalRuntime(runtimeRoot(homeClaudeDir()));
 }
 
 export function installClaudeBootstrapSkill(

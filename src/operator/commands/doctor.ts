@@ -2,7 +2,18 @@ import { closeSync, existsSync, lstatSync, openSync, readFileSync, readlinkSync,
 import path from 'node:path';
 import readline from 'node:readline';
 
-import { computeUrlFingerprint, resolveProbeStateKey, signSignedPayload } from '../integrity.ts';
+import {
+  computeUrlFingerprint,
+  convergenceStateKeyPath,
+  orchestrationStateKeyPath,
+  resolveConvergenceStateKey,
+  resolveOrchestrationStateKey,
+  resolveProbeStateKey,
+  resolveReviewConsentStateKey,
+  reviewConsentStateKeyPath,
+  signSignedPayload,
+  stateKeyFingerprint,
+} from '../integrity.ts';
 import {
   additionalDeploySurfaceNames,
   emptyDeployConfig,
@@ -116,7 +127,41 @@ export interface DiagnoseReport {
     present: boolean;
     records: ProbeRecord[];
   };
+  signingKeys: SigningKeyStatus[];
   message: string;
+}
+
+export interface SigningKeyStatus {
+  name: string;
+  path: string;
+  provisioned: boolean;
+  fingerprint: string | null;
+  error: string | null;
+}
+
+// Resolving a persisted key auto-provisions it, so running /doctor is the
+// fleet-wide (machine-wide) provisioning step E4 requires before any
+// convergence enforcement flips.
+export function collectSigningKeyStatus(): SigningKeyStatus[] {
+  const classes: Array<{ name: string; path: string; resolve: () => string }> = [
+    { name: 'orchestration-state', path: orchestrationStateKeyPath(), resolve: resolveOrchestrationStateKey },
+    { name: 'review-consent-state', path: reviewConsentStateKeyPath(), resolve: resolveReviewConsentStateKey },
+    { name: 'convergence-state', path: convergenceStateKeyPath(), resolve: resolveConvergenceStateKey },
+  ];
+  return classes.map((entry) => {
+    try {
+      const key = entry.resolve();
+      return { name: entry.name, path: entry.path, provisioned: true, fingerprint: stateKeyFingerprint(key), error: null };
+    } catch (error) {
+      return {
+        name: entry.name,
+        path: entry.path,
+        provisioned: false,
+        fingerprint: null,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  });
 }
 
 function runDiagnose(context: WorkflowContext, parsed: ParsedOperatorArgs): void {
@@ -161,6 +206,13 @@ export function buildDiagnoseReport(context: WorkflowContext): DiagnoseReport {
     lines.push(`  Runtime versions: managed ${versionSkew.managedVersion}, ignored repo-local ${versionSkew.localVersion}`);
     lines.push('  Warning: durable commands use the machine-local runtime; remove or update the repo-local install only if legacy tooling still calls it.');
   }
+  const signingKeys = collectSigningKeyStatus();
+  lines.push('  Signing keys:');
+  for (const key of signingKeys) {
+    lines.push(key.provisioned
+      ? `    - ${key.name}: provisioned (fingerprint ${key.fingerprint})`
+      : `    - ${key.name}: NOT provisioned (${key.error})`);
+  }
   const latestStaging = latestProbeRecordsBySurface(probeState.records, 'staging');
   if (latestStaging.length === 0) {
     lines.push(`  Probe state: no probes recorded. Run \`${formatWorkflowCommand(context.config, 'doctor', '--probe')}\`.`);
@@ -187,6 +239,7 @@ export function buildDiagnoseReport(context: WorkflowContext): DiagnoseReport {
     platform,
     missingFields: missing,
     probeState: { present: probeState.records.length > 0, records: probeState.records },
+    signingKeys,
     message: lines.join('\n'),
   };
 }

@@ -3,7 +3,7 @@ import path from 'node:path';
 
 import { readFixPromptBody } from './fix-prompt.ts';
 import { readLessonPromptBody } from './lesson-prompt.ts';
-import { installGlobalRuntime, isManagedGlobalRuntime } from './global-runtime.ts';
+import { installGlobalRuntime, isManagedGlobalRuntime, rollbackGlobalRuntime, type RuntimeRollbackResult } from './global-runtime.ts';
 import { defaultWorkflowConfig, homeCodexDir, pipelaneHomeDir, readJsonFile, WORKFLOW_COMMANDS, writeJsonFile } from './state.ts';
 import {
   desiredHostInstall,
@@ -257,6 +257,10 @@ function writeSkill(skillsRoot: string, entry: DesiredInstallEntry): void {
   rmSync(skillDir, { recursive: true, force: true });
   mkdirSync(skillDir, { recursive: true });
   writeFileSync(skillDocPath(skillsRoot, entry.name), entry.body, 'utf8');
+}
+
+export function rollbackCodexManagedRuntime(): RuntimeRollbackResult {
+  return rollbackGlobalRuntime(runtimeRoot(homeCodexDir()));
 }
 
 export function installCodexBootstrapSkill(
