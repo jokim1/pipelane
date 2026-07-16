@@ -1076,6 +1076,17 @@ and non-TTY execution paths.
     to the existing `allowed:false` preflight result with no confirmation
     token. The regression now requires a valid structured envelope.
 
+86. **Legacy state copy classified relative paths against the caller cwd
+    (P0).** **Location:** `src/operator/state.ts:2838`. **Repro:** run first
+    command auto-import from a checkout beneath a directory whose name ends in
+    `.lock`; the recursive copy normalized each relative source path against
+    that cwd, then misclassified durable entries such as `mode-state.json` as
+    transient lease state. Best-effort migration silently dropped them and
+    strict import could fail after copying nothing. **Proposed fix
+    (implemented):** pass the slash-normalized relative path directly to the
+    transient-state classifier. A regression runs import beneath
+    `runner.lock/` and proves release mode and requested surfaces survive.
+
 ### Filed for follow-up
 
 1. **`repo-guard` can silently rebind a live task and orphan its original

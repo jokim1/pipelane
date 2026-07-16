@@ -2835,7 +2835,7 @@ function migrateLegacyStateDirFromDirectories(
         cpSync(src, dst, {
           recursive: true,
           filter: (source) => !isLegacyMigrationTransientPath(
-            normalizePath(path.relative(legacyDir, source)).replaceAll('\\', '/'),
+            path.relative(legacyDir, source).replaceAll('\\', '/'),
           ),
         });
         if (requireComplete) assertLegacyMigrationTreeHasNoSymlinks(dst);

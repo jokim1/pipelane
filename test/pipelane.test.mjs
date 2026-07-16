@@ -4865,6 +4865,39 @@ test('legacy custom-state auto-import blocks live leases and rejects a concurren
   }
 });
 
+test('legacy state migration preserves durable state when cwd contains a .lock path segment', () => {
+  const originalRepoRoot = createRepo();
+  const parentRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-legacy-lock-cwd-'));
+  const lockDir = path.join(parentRoot, 'runner.lock');
+  const repoRoot = path.join(lockDir, 'repo');
+  try {
+    mkdirSync(lockDir, { recursive: true });
+    renameSync(originalRepoRoot, repoRoot);
+    const legacyDir = path.join(resolveCommonDir(repoRoot), 'custom-state');
+    mkdirSync(legacyDir, { recursive: true });
+    writeFileSync(path.join(legacyDir, 'mode-state.json'), `${JSON.stringify({
+      mode: 'release',
+      requestedSurfaces: ['frontend'],
+      override: null,
+      updatedAt: '2026-07-12T00:00:00.000Z',
+    }, null, 2)}\n`, 'utf8');
+    writeFileSync(path.join(repoRoot, '.pipelane.json'), `${JSON.stringify({
+      displayName: 'Legacy Lock Cwd',
+      stateDir: 'custom-state',
+    }, null, 2)}\n`, 'utf8');
+
+    const result = runCli(['run', 'status'], repoRoot);
+    assert.equal(result.status, 0, result.stderr);
+    const migratedMode = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'mode-state.json'), 'utf8'));
+    assert.equal(migratedMode.mode, 'release');
+    assert.deepEqual(migratedMode.requestedSurfaces, ['frontend']);
+    assert.equal(existsSync(machinePipelaneConfigPath(repoRoot)), true);
+  } finally {
+    rmSync(parentRoot, { recursive: true, force: true });
+    rmSync(originalRepoRoot, { recursive: true, force: true });
+  }
+});
+
 test('legacy config auto-import rejects a custom stateDir symlink that escapes the Git common dir', async () => {
   const repoRoot = createRepo();
   const attackerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-legacy-state-link-'));
