@@ -1179,7 +1179,7 @@ export function defaultWorkflowConfig(
     displayName,
     baseBranch: 'main',
     stateDir: 'pipelane-state',
-    taskWorktreeDirName: `${projectKey}-worktrees`,
+    taskWorktreeDirName: `worktrees/${projectKey}`,
     branchPrefix: DEFAULT_BRANCH_PREFIX,
     legacyBranchPrefixes: [],
     surfaces: [...DEFAULT_SURFACES],
