@@ -190,6 +190,20 @@ function resolveRuntimeSourceProvenance(sourceRoot: string): RuntimeSourceProven
   }
 }
 
+// Damaged managed metadata must never be advertised as a rollback target: a
+// retained runtime whose metadata cannot round-trip through rollback reporting
+// makes the install claim a safety net it does not have.
+export function isCompleteRuntimeMetadata(metadata: ManagedRuntimeMetadata | null, host?: string): boolean {
+  return Boolean(
+    metadata
+    && metadata.managedBy === 'pipelane'
+    && metadata.version === 1
+    && (host === undefined ? typeof metadata.host === 'string' && metadata.host.trim().length > 0 : metadata.host === host)
+    && typeof metadata.packageVersion === 'string' && metadata.packageVersion.trim().length > 0
+    && typeof metadata.installedAt === 'string' && !Number.isNaN(Date.parse(metadata.installedAt)),
+  );
+}
+
 function sameRuntimeSource(left: ManagedRuntimeMetadata | null, right: ManagedRuntimeMetadata): boolean {
   if (!left || left.host !== right.host || left.packageVersion !== right.packageVersion) return false;
   if (left.sourceDirty === true || right.sourceDirty === true) return false;
@@ -270,6 +284,10 @@ export function installGlobalRuntime(
           throw new Error(`${targetRoot} already exists and is not managed by pipelane.`);
         }
         retainCurrentRuntime = tryNormalizeLegacyRuntimeMetadata(targetRoot, options.host);
+      } else if (!isCompleteRuntimeMetadata(currentMetadata, options.host)) {
+        // Managed but damaged metadata: the tree cannot serve as a rollback
+        // target, so discard instead of advertising a broken safety net.
+        retainCurrentRuntime = false;
       } else {
         try {
           ensureRestorableRuntime(targetRoot, `Current runtime at ${targetRoot}`);
@@ -405,7 +423,7 @@ export function rollbackGlobalRuntime(
     if (options.expectedHost && restored.host !== options.expectedHost) {
       throw new Error(`Retained runtime at ${previousRoot} belongs to host ${restored.host || 'unknown'}, not ${options.expectedHost}; refusing to activate it.`);
     }
-    if (!restored.packageVersion?.trim() || !restored.installedAt?.trim()) {
+    if (!isCompleteRuntimeMetadata(restored, options.expectedHost)) {
       throw new Error(`Retained runtime metadata at ${previousRoot} is incomplete; refusing to activate it.`);
     }
     ensureRestorableRuntime(previousRoot, `Retained runtime at ${previousRoot}`);
@@ -509,12 +527,11 @@ export function writeHostSkillPayloads(targetRoot: string, payloads: HostSkillPa
 
 // Payloads a retained runtime carries for its managed skills. Returns null when
 // the runtime predates payload retention (no host-skills dir); throws when the
-// dir exists but is inconsistent with managed-skills.json — an inconsistent
-// runtime is not a safe rollback target.
+// manifest is unreadable, empty, or inconsistent with the payload dir — an
+// inconsistent runtime is not a safe rollback target. The manifest is
+// validated BEFORE the legacy no-payload branch so a payload-less runtime
+// cannot smuggle an empty manifest past the refusal.
 export function readHostSkillPayloads(targetRoot: string, label: string): Map<string, string> | null {
-  if (!existsSync(path.join(targetRoot, HOST_SKILLS_DIRNAME))) {
-    return null;
-  }
   let names: string[] = [];
   try {
     const manifest = JSON.parse(readFileSync(path.join(targetRoot, 'managed-skills.json'), 'utf8')) as { skills?: unknown };
@@ -522,6 +539,11 @@ export function readHostSkillPayloads(targetRoot: string, label: string): Map<st
       ? manifest.skills.filter((entry): entry is string => typeof entry === 'string')
       : [];
   } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      // A missing manifest file is the generated-asset validator's finding to
+      // report; deferring keeps its refusal message authoritative.
+      return null;
+    }
     throw new Error(`${label} has an unreadable managed-skills.json: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (names.length === 0) {
@@ -529,6 +551,9 @@ export function readHostSkillPayloads(targetRoot: string, label: string): Map<st
     // truncated manifest would turn the restore step into a mass prune of
     // installed wrappers. Refuse instead of trusting it.
     throw new Error(`${label} has a managed-skills manifest that lists no skills; refusing to roll back to an inconsistent runtime.`);
+  }
+  if (!existsSync(path.join(targetRoot, HOST_SKILLS_DIRNAME))) {
+    return null;
   }
   const payloads = new Map<string, string>();
   for (const name of names) {

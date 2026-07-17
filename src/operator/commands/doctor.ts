@@ -4,12 +4,15 @@ import readline from 'node:readline';
 
 import {
   computeUrlFingerprint,
+  CONVERGENCE_STATE_KEY_ENV,
   convergenceStateKeyPath,
+  ORCHESTRATION_STATE_KEY_ENV,
   orchestrationStateKeyPath,
   resolveConvergenceStateKey,
   resolveOrchestrationStateKey,
   resolveProbeStateKey,
   resolveReviewConsentStateKey,
+  REVIEW_CONSENT_STATE_KEY_ENV,
   reviewConsentStateKeyPath,
   signSignedPayload,
   stateKeyFingerprint,
@@ -134,6 +137,8 @@ export interface DiagnoseReport {
 export interface SigningKeyStatus {
   name: string;
   path: string;
+  source: 'file' | 'env';
+  persisted: boolean;
   provisioned: boolean;
   fingerprint: string | null;
   error: string | null;
@@ -141,21 +146,41 @@ export interface SigningKeyStatus {
 
 // Resolving a persisted key auto-provisions it, so running /doctor is the
 // fleet-wide (machine-wide) provisioning step E4 requires before any
-// convergence enforcement flips.
+// convergence enforcement flips. "provisioned" means the persisted key FILE
+// exists — an ambient env override is reported as its own source and never
+// counts as machine-wide provisioning, because a later run without the
+// override would mint a different key.
 export function collectSigningKeyStatus(): SigningKeyStatus[] {
-  const classes: Array<{ name: string; path: string; resolve: () => string }> = [
-    { name: 'orchestration-state', path: orchestrationStateKeyPath(), resolve: resolveOrchestrationStateKey },
-    { name: 'review-consent-state', path: reviewConsentStateKeyPath(), resolve: resolveReviewConsentStateKey },
-    { name: 'convergence-state', path: convergenceStateKeyPath(), resolve: resolveConvergenceStateKey },
+  const classes: Array<{ name: string; path: string; envName: string; resolve: () => string }> = [
+    { name: 'orchestration-state', path: orchestrationStateKeyPath(), envName: ORCHESTRATION_STATE_KEY_ENV, resolve: resolveOrchestrationStateKey },
+    { name: 'review-consent-state', path: reviewConsentStateKeyPath(), envName: REVIEW_CONSENT_STATE_KEY_ENV, resolve: resolveReviewConsentStateKey },
+    { name: 'convergence-state', path: convergenceStateKeyPath(), envName: CONVERGENCE_STATE_KEY_ENV, resolve: resolveConvergenceStateKey },
   ];
   return classes.map((entry) => {
+    const envOverride = Boolean(process.env[entry.envName]?.trim());
     try {
-      const key = entry.resolve();
-      return { name: entry.name, path: entry.path, provisioned: true, fingerprint: stateKeyFingerprint(key), error: null };
+      if (!envOverride) {
+        entry.resolve();
+      }
+      const persisted = existsSync(entry.path);
+      const persistedKey = persisted ? readFileSync(entry.path, 'utf8').trim() : '';
+      return {
+        name: entry.name,
+        path: entry.path,
+        source: envOverride ? 'env' as const : 'file' as const,
+        persisted,
+        provisioned: persisted,
+        fingerprint: persisted && persistedKey ? stateKeyFingerprint(persistedKey) : null,
+        error: envOverride && !persisted
+          ? `${entry.envName} override is active but no persisted key file exists; unset the override or provision ${entry.path}.`
+          : null,
+      };
     } catch (error) {
       return {
         name: entry.name,
         path: entry.path,
+        source: envOverride ? 'env' as const : 'file' as const,
+        persisted: existsSync(entry.path),
         provisioned: false,
         fingerprint: null,
         error: error instanceof Error ? error.message : String(error),
@@ -209,9 +234,11 @@ export function buildDiagnoseReport(context: WorkflowContext): DiagnoseReport {
   const signingKeys = collectSigningKeyStatus();
   lines.push('  Signing keys:');
   for (const key of signingKeys) {
-    lines.push(key.provisioned
-      ? `    - ${key.name}: provisioned (fingerprint ${key.fingerprint})`
-      : `    - ${key.name}: NOT provisioned (${key.error})`);
+    if (key.provisioned) {
+      lines.push(`    - ${key.name}: provisioned (fingerprint ${key.fingerprint})${key.source === 'env' ? ' with env override active' : ''}`);
+    } else {
+      lines.push(`    - ${key.name}: NOT provisioned (${key.error})`);
+    }
   }
   const latestStaging = latestProbeRecordsBySurface(probeState.records, 'staging');
   if (latestStaging.length === 0) {

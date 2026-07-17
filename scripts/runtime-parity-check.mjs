@@ -354,6 +354,31 @@ async function managedSkillWrapperDrift(host, runtimeRoot) {
   } catch {
     drift.push('host-skills: payload directory is unreadable');
   }
+  // The manifest also cannot hide orphans: a wrapper carrying this host's
+  // managed marker but absent from the manifest is a retired command still
+  // exposed to the host.
+  try {
+    const rendering = await import(pathToFileURL(path.join(localRoot, 'dist', 'operator', 'skill-rendering.js')).href);
+    const markerPrefix = host === 'claude'
+      ? rendering.MACHINE_CLAUDE_SKILL_MARKER_PREFIX
+      : rendering.MACHINE_CODEX_SKILL_MARKER_PREFIX;
+    if (typeof markerPrefix === 'string' && markerPrefix.length > 0 && existsSync(skillsRoot)) {
+      for (const entry of readdirSync(skillsRoot)) {
+        if (names.includes(entry) || !isSafeSkillName(entry)) {
+          continue;
+        }
+        const wrapperPath = path.join(skillsRoot, entry, 'SKILL.md');
+        if (!existsSync(wrapperPath) || !lstatSync(wrapperPath).isFile()) {
+          continue;
+        }
+        if (readFileSync(wrapperPath, 'utf8').includes(`${markerPrefix}${entry} -->`)) {
+          drift.push(`skills/${entry}/SKILL.md: managed wrapper not recorded in managed-skills.json`);
+        }
+      }
+    }
+  } catch (error) {
+    drift.push(`skills: orphan-wrapper scan unavailable (${error instanceof Error ? error.message : String(error)})`);
+  }
   return drift;
 }
 

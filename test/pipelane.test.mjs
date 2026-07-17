@@ -39901,6 +39901,15 @@ test('managed runtime install records build-info provenance and retains a rollba
     assert.match(legacySwap.stdout, /install-claude/);
     runCli(['install-claude', '--rollback'], workspaceRoot, env);
 
+    // A payload-less runtime cannot smuggle an empty manifest past the
+    // refusal: manifest validity is checked before the legacy branch.
+    const legacyManifestBody = readFileSync(previousManifestPath, 'utf8');
+    writeFileSync(previousManifestPath, `${JSON.stringify({ skills: [] })}\n`, 'utf8');
+    const emptyLegacyRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+    assert.notEqual(emptyLegacyRollback.status, 0);
+    assert.match(emptyLegacyRollback.stderr, /lists no skills; refusing to roll back/);
+    writeFileSync(previousManifestPath, legacyManifestBody, 'utf8');
+
     // Rollback must not activate a retained runtime that cannot serve the
     // durable host skills after the swap.
     for (const relative of ['bin/run-pipelane.sh', 'bin/bootstrap-pipelane.sh', 'managed-skills.json']) {
@@ -39975,6 +39984,26 @@ test('managed runtime install records build-info provenance and retains a rollba
     const refused = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
     assert.notEqual(refused.status, 0);
     assert.match(refused.stderr, /No pipelane-managed previous runtime/);
+
+    // A current runtime with damaged managed metadata is discarded at
+    // reinstall instead of being advertised as a rollback target, and a
+    // genuinely good prior rollback target is preserved.
+    const shaA = 'a'.repeat(40);
+    const shaB = 'b'.repeat(40);
+    runCli(['install-claude'], workspaceRoot, { ...env, PIPELANE_INSTALL_SOURCE_SHA: shaA });
+    writeFileSync(path.join(runtimeRoot, 'sentinel-good-previous.txt'), 'good', 'utf8');
+    runCli(['install-claude'], workspaceRoot, { ...env, PIPELANE_INSTALL_SOURCE_SHA: shaB });
+    assert.ok(existsSync(path.join(previousRoot, 'sentinel-good-previous.txt')));
+    const activeMetadataPath = path.join(runtimeRoot, '.pipelane-runtime.json');
+    const activeMetadata = JSON.parse(readFileSync(activeMetadataPath, 'utf8'));
+    writeFileSync(activeMetadataPath, `${JSON.stringify({ ...activeMetadata, packageVersion: '' }, null, 2)}\n`, 'utf8');
+    const discardDamaged = runCli(['install-claude'], workspaceRoot, { ...env, PIPELANE_INSTALL_SOURCE_SHA: shaB });
+    assert.equal(discardDamaged.status, 0);
+    assert.ok(existsSync(path.join(previousRoot, 'sentinel-good-previous.txt')), 'good rollback target must be preserved over a damaged retiree');
+    const refreshedMetadata = JSON.parse(readFileSync(activeMetadataPath, 'utf8'));
+    assert.ok(refreshedMetadata.packageVersion.trim().length > 0);
+    const damagedRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.match(damagedRollback.stdout, /Rolled back the managed Claude runtime/);
   } finally {
     rmSync(workspaceRoot, { recursive: true, force: true });
     rmSync(claudeHome, { recursive: true, force: true });
@@ -40170,6 +40199,16 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
     assert.match(truncatedManifest.stdout, /managed-skills\.json: required skill .+ is missing from the manifest/);
     writeFileSync(skillManifestPath, skillManifestBody, 'utf8');
 
+    // An installed wrapper carrying the managed marker but absent from the
+    // manifest is an exposed retired command, not a passing fleet.
+    const orphanDir = path.join(claudeHome, 'skills', 'orphan-skill');
+    mkdirSync(orphanDir, { recursive: true });
+    writeFileSync(path.join(orphanDir, 'SKILL.md'), '<!-- pipelane:claude-global-skill:orphan-skill -->\nretired command\n', 'utf8');
+    const orphanWrapper = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+    assert.equal(orphanWrapper.status, 1);
+    assert.match(orphanWrapper.stdout, /skills\/orphan-skill\/SKILL\.md: managed wrapper not recorded in managed-skills\.json/);
+    rmSync(orphanDir, { recursive: true, force: true });
+
     // Mutating a review-surface module inside the runtime is drift.
     const mutated = path.join(managedRuntimeRoot('claude', pipelaneHome), 'dist', 'operator', 'commands', 'review.js');
     writeFileSync(mutated, `${readFileSync(mutated, 'utf8')}\n// drift\n`, 'utf8');
@@ -40218,6 +40257,35 @@ test('signing key classes auto-provision persisted keys, including convergence-s
     }
     for (const keyFile of ['orchestration-state.key', 'review-consent-state.key', 'convergence-state.key']) {
       assert.ok(existsSync(path.join(pipelaneHome, 'keys', keyFile)), `${keyFile} should be provisioned on disk`);
+    }
+
+    // Ambient env overrides are not machine-wide provisioning: with the
+    // overrides set and no persisted files, every class must report
+    // unprovisioned with an explicit override error.
+    const overrideHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-keys-env-'));
+    try {
+      const overrideEnv = {
+        ...process.env,
+        PIPELANE_HOME: overrideHome,
+        PIPELANE_ORCHESTRATION_STATE_KEY: 'o'.repeat(48),
+        PIPELANE_REVIEW_CONSENT_STATE_KEY: 'r'.repeat(48),
+        PIPELANE_CONVERGENCE_STATE_KEY: 'c'.repeat(48),
+      };
+      const overridden = spawnSync('node', ['--input-type=module', '-e', script], {
+        cwd: KIT_ROOT,
+        env: overrideEnv,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      assert.equal(overridden.status, 0, overridden.stderr);
+      for (const entry of JSON.parse(overridden.stdout)) {
+        assert.equal(entry.source, 'env');
+        assert.equal(entry.persisted, false);
+        assert.equal(entry.provisioned, false, `${entry.name} must not report an env override as provisioned`);
+        assert.match(entry.error, /override is active but no persisted key file exists/);
+      }
+    } finally {
+      rmSync(overrideHome, { recursive: true, force: true });
     }
   } finally {
     rmSync(pipelaneHome, { recursive: true, force: true });
