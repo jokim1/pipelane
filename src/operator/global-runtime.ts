@@ -524,6 +524,12 @@ export function readHostSkillPayloads(targetRoot: string, label: string): Map<st
   } catch (error) {
     throw new Error(`${label} has an unreadable managed-skills.json: ${error instanceof Error ? error.message : String(error)}`);
   }
+  if (names.length === 0) {
+    // A managed runtime always installs at least one skill: an empty or
+    // truncated manifest would turn the restore step into a mass prune of
+    // installed wrappers. Refuse instead of trusting it.
+    throw new Error(`${label} has a managed-skills manifest that lists no skills; refusing to roll back to an inconsistent runtime.`);
+  }
   const payloads = new Map<string, string>();
   for (const name of names) {
     const target = hostSkillPayloadPath(targetRoot, name);

@@ -306,32 +306,60 @@ function restoreCodexSkillWrappers(
   payloads: Map<string, string>,
 ): { restoredSkills: string[]; removedSkills: string[]; skippedCollisions: string[] } {
   mkdirSync(skillsRoot, { recursive: true });
-  const removedSkills: string[] = [];
-  for (const skillName of retiredNames) {
-    if (payloads.has(skillName) || !isManagedCodexSkill(skillsRoot, skillName)) {
-      continue;
-    }
-    rmSync(skillDirPath(skillsRoot, skillName), { recursive: true, force: true });
-    removedSkills.push(skillName);
+  // Wrapper mutations must be compensable: the outer runtime swap-back cannot
+  // undo removed or rewritten SKILL.md files, so snapshot every wrapper this
+  // restore may touch and put the snapshots back if any mutation fails.
+  const touchable = new Set<string>([...retiredNames, ...payloads.keys()]);
+  const snapshots = new Map<string, string | null>();
+  for (const skillName of touchable) {
+    snapshots.set(skillName, readSkillBody(skillsRoot, skillName));
   }
-  const restoredSkills: string[] = [];
-  const skippedCollisions: string[] = [];
-  for (const [skillName, body] of payloads) {
-    const targetDir = skillDirPath(skillsRoot, skillName);
-    if (existsSync(targetDir) && !isManagedCodexSkill(skillsRoot, skillName)) {
-      // A foreign (unmanaged) skill occupies this name; never clobber it
-      // during a rollback.
-      skippedCollisions.push(skillName);
-      continue;
+  try {
+    const removedSkills: string[] = [];
+    for (const skillName of retiredNames) {
+      if (payloads.has(skillName) || !isManagedCodexSkill(skillsRoot, skillName)) {
+        continue;
+      }
+      rmSync(skillDirPath(skillsRoot, skillName), { recursive: true, force: true });
+      removedSkills.push(skillName);
     }
-    writeSkill(skillsRoot, { name: skillName, body });
-    restoredSkills.push(skillName);
+    const restoredSkills: string[] = [];
+    const skippedCollisions: string[] = [];
+    for (const [skillName, body] of payloads) {
+      const targetDir = skillDirPath(skillsRoot, skillName);
+      if (existsSync(targetDir) && !isManagedCodexSkill(skillsRoot, skillName)) {
+        // A foreign (unmanaged) skill occupies this name; never clobber it
+        // during a rollback.
+        skippedCollisions.push(skillName);
+        continue;
+      }
+      writeSkill(skillsRoot, { name: skillName, body });
+      restoredSkills.push(skillName);
+    }
+    return {
+      restoredSkills: restoredSkills.sort(),
+      removedSkills: removedSkills.sort(),
+      skippedCollisions: skippedCollisions.sort(),
+    };
+  } catch (error) {
+    for (const [skillName, body] of snapshots) {
+      try {
+        if (body === null) {
+          rmSync(skillDirPath(skillsRoot, skillName), { recursive: true, force: true });
+        } else {
+          // Write directly instead of via writeSkill: its delete-then-recreate
+          // step can fail exactly like the mutation that got us here, leaving
+          // the wrapper deleted instead of restored.
+          const skillDir = skillDirPath(skillsRoot, skillName);
+          mkdirSync(skillDir, { recursive: true });
+          writeFileSync(skillDocPath(skillsRoot, skillName), body, 'utf8');
+        }
+      } catch {
+        // Best effort: surface the original failure, not the compensation's.
+      }
+    }
+    throw error;
   }
-  return {
-    restoredSkills: restoredSkills.sort(),
-    removedSkills: removedSkills.sort(),
-    skippedCollisions: skippedCollisions.sort(),
-  };
 }
 
 export function installCodexBootstrapSkill(

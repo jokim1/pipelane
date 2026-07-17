@@ -39856,6 +39856,20 @@ test('managed runtime install records build-info provenance and retains a rollba
     runCli(['install-claude', '--rollback'], workspaceRoot, env);
     assert.doesNotMatch(readFileSync(wrapperPath, 'utf8'), /LOCKSTEP_MARKER/);
 
+    if (process.platform !== 'win32') {
+      // A restore failure mid-flight must compensate: wrappers return to
+      // their pre-rollback bytes and the runtime swap is undone.
+      const skillsRootDir = path.join(claudeHome, 'skills');
+      const wrapperBeforeFailure = readFileSync(wrapperPath, 'utf8');
+      chmodSync(skillsRootDir, 0o555);
+      const failedRestore = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+      chmodSync(skillsRootDir, 0o755);
+      assert.notEqual(failedRestore.status, 0);
+      assert.equal(readFileSync(wrapperPath, 'utf8'), wrapperBeforeFailure);
+      assert.equal(existsSync(path.join(runtimeRoot, 'sentinel-first-install.txt')), false);
+      assert.ok(existsSync(path.join(previousRoot, 'sentinel-first-install.txt')));
+    }
+
     // Rollback prunes wrappers the restored runtime does not provide, and
     // rolling forward restores them.
     const pruneSkill = manifestNames[1];
@@ -39868,6 +39882,16 @@ test('managed runtime install records build-info provenance and retains a rollba
     assert.equal(existsSync(path.join(claudeHome, 'skills', pruneSkill)), false);
     runCli(['install-claude', '--rollback'], workspaceRoot, env);
     assert.ok(existsSync(path.join(claudeHome, 'skills', pruneSkill, 'SKILL.md')));
+
+    // An empty retained manifest cannot authorize a mass wrapper prune.
+    const editedPreviousManifest = readFileSync(previousManifestPath, 'utf8');
+    writeFileSync(previousManifestPath, `${JSON.stringify({ skills: [] })}\n`, 'utf8');
+    const emptyManifestRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+    assert.notEqual(emptyManifestRollback.status, 0);
+    assert.match(emptyManifestRollback.stderr, /lists no skills; refusing to roll back/);
+    assert.ok(existsSync(wrapperPath));
+    assert.equal(existsSync(path.join(runtimeRoot, 'sentinel-first-install.txt')), false);
+    writeFileSync(previousManifestPath, editedPreviousManifest, 'utf8');
 
     // A retained runtime that predates payload retention still swaps, with an
     // explicit re-sync instruction instead of silently mixed wrappers.
@@ -40135,6 +40159,16 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
     assert.equal(ghostPayload.status, 1);
     assert.match(ghostPayload.stdout, /host-skills\/ghost-skill: payload not recorded in managed-skills\.json/);
     rmSync(ghostPayloadDir, { recursive: true, force: true });
+
+    // The manifest is not its own completeness authority: a truncated manifest
+    // (even with matching payloads) must be flagged against the local tree's
+    // expected skill set.
+    const fullManifestNames = JSON.parse(skillManifestBody).skills;
+    writeFileSync(skillManifestPath, `${JSON.stringify({ skills: [fullManifestNames[0]] })}\n`, 'utf8');
+    const truncatedManifest = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+    assert.equal(truncatedManifest.status, 1);
+    assert.match(truncatedManifest.stdout, /managed-skills\.json: required skill .+ is missing from the manifest/);
+    writeFileSync(skillManifestPath, skillManifestBody, 'utf8');
 
     // Mutating a review-surface module inside the runtime is drift.
     const mutated = path.join(managedRuntimeRoot('claude', pipelaneHome), 'dist', 'operator', 'commands', 'review.js');

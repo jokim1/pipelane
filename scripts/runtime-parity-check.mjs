@@ -265,10 +265,33 @@ function isSafeSkillName(skillName) {
   );
 }
 
+// The manifest cannot attest its own completeness: derive the expected skill
+// set from the LOCAL tree's rendering (the independent authority parity
+// already trusts for runner content). Required skills can never be
+// collision-skipped at install, so required ⊆ manifest ⊆ all-expected.
+async function expectedHostSkillNames(host, runtimeRoot) {
+  const rendering = await import(pathToFileURL(path.join(localRoot, 'dist', 'operator', 'skill-rendering.js')).href);
+  const state = await import(pathToFileURL(path.join(localRoot, 'dist', 'operator', 'state.js')).href);
+  const fixPrompt = await import(pathToFileURL(path.join(localRoot, 'dist', 'operator', 'fix-prompt.js')).href);
+  const lessonPrompt = await import(pathToFileURL(path.join(localRoot, 'dist', 'operator', 'lesson-prompt.js')).href);
+  const binDir = path.join(runtimeRoot, 'bin');
+  const install = rendering.desiredHostInstall(host, 'machine-local', state.defaultWorkflowConfig('pipelane', 'Pipelane'), {
+    runnerPath: path.join(binDir, 'run-pipelane.sh'),
+    managedRuntimeRoot: runtimeRoot,
+    managedPipelaneBin: path.join(binDir, 'pipelane'),
+    fixPromptBody: fixPrompt.readFixPromptBody(),
+    lessonPromptBody: lessonPrompt.readLessonPromptBody(),
+  });
+  return {
+    all: new Set(install.entries.map((entry) => entry.name)),
+    required: new Set(install.entries.filter((entry) => entry.required).map((entry) => entry.name)),
+  };
+}
+
 // The runtime's managed-skills manifest and carried host-skill payloads must
 // name real, byte-identical installed wrappers — an empty manifest or a
 // mismatched wrapper is a mixed-version install, not a passing fleet.
-function managedSkillWrapperDrift(host, runtimeRoot) {
+async function managedSkillWrapperDrift(host, runtimeRoot) {
   const drift = [];
   const manifest = readJson(path.join(runtimeRoot, 'managed-skills.json'));
   const names = Array.isArray(manifest?.skills)
@@ -277,6 +300,24 @@ function managedSkillWrapperDrift(host, runtimeRoot) {
   if (names.length === 0) {
     drift.push('managed-skills.json: no managed skills recorded');
     return drift;
+  }
+  let expected = null;
+  try {
+    expected = await expectedHostSkillNames(host, runtimeRoot);
+  } catch (error) {
+    drift.push(`managed-skills.json: completeness authority unavailable (${error instanceof Error ? error.message : String(error)})`);
+  }
+  if (expected) {
+    for (const name of expected.required) {
+      if (!names.includes(name)) {
+        drift.push(`managed-skills.json: required skill ${name} is missing from the manifest`);
+      }
+    }
+    for (const name of names) {
+      if (!expected.all.has(name)) {
+        drift.push(`managed-skills.json: skill ${name} is not part of the expected install set`);
+      }
+    }
   }
   const unsafe = names.filter((name) => !isSafeSkillName(name));
   if (unsafe.length > 0) {
@@ -465,7 +506,7 @@ async function main() {
       ? `[${host}] review/pr/merge surface parity: OK`
       : `[${host}] review/pr/merge surface parity: DRIFT (${surfaceDigestDrift.length} module(s))`);
 
-    const wrapperDrift = managedSkillWrapperDrift(host, root);
+    const wrapperDrift = await managedSkillWrapperDrift(host, root);
     if (wrapperDrift.length === 0) {
       lines.push(`[${host}] managed skill wrappers: OK (manifest, payloads, and installed wrappers agree)`);
     } else {
