@@ -39777,10 +39777,10 @@ test('write-build-info records sha, dirty, and timestamp with env overrides', ()
   }
 });
 
-function runParity(pipelaneHome) {
+function runParity(pipelaneHome, env = {}) {
   return spawnSync('node', [path.join(KIT_ROOT, 'scripts', 'runtime-parity-check.mjs')], {
     cwd: KIT_ROOT,
-    env: { ...process.env, PIPELANE_HOME: pipelaneHome },
+    env: { ...process.env, PIPELANE_HOME: pipelaneHome, ...env },
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -39837,6 +39837,46 @@ test('managed runtime install records build-info provenance and retains a rollba
     assert.equal(existsSync(path.join(runtimeRoot, 'sentinel-first-install.txt')), false);
     assert.ok(existsSync(path.join(previousRoot, 'sentinel-first-install.txt')));
 
+    // Installed wrappers restore in lockstep with the runtime: the runtime
+    // carries its wrapper payloads, and rollback writes the restored
+    // runtime's payloads over the newer install's wrappers.
+    const manifestNames = JSON.parse(readFileSync(path.join(runtimeRoot, 'managed-skills.json'), 'utf8')).skills;
+    assert.ok(Array.isArray(manifestNames) && manifestNames.length > 1, 'expected at least two managed skills');
+    const probeSkill = manifestNames[0];
+    const wrapperPath = path.join(claudeHome, 'skills', probeSkill, 'SKILL.md');
+    const payloadPath = path.join(runtimeRoot, 'host-skills', probeSkill, 'SKILL.md');
+    assert.ok(existsSync(payloadPath), 'install should retain host-skill payloads inside the runtime');
+    assert.equal(readFileSync(wrapperPath, 'utf8'), readFileSync(payloadPath, 'utf8'));
+    const previousPayloadPath = path.join(previousRoot, 'host-skills', probeSkill, 'SKILL.md');
+    const previousPayload = readFileSync(previousPayloadPath, 'utf8');
+    writeFileSync(previousPayloadPath, `${previousPayload}\nLOCKSTEP_MARKER\n`, 'utf8');
+    const wrapperRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.match(wrapperRollback.stdout, /Restored \d+ managed skill wrapper\(s\) in lockstep/);
+    assert.match(readFileSync(wrapperPath, 'utf8'), /LOCKSTEP_MARKER/);
+    runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.doesNotMatch(readFileSync(wrapperPath, 'utf8'), /LOCKSTEP_MARKER/);
+
+    // Rollback prunes wrappers the restored runtime does not provide, and
+    // rolling forward restores them.
+    const pruneSkill = manifestNames[1];
+    const previousManifestPath = path.join(previousRoot, 'managed-skills.json');
+    const previousManifest = JSON.parse(readFileSync(previousManifestPath, 'utf8'));
+    writeFileSync(previousManifestPath, `${JSON.stringify({ skills: previousManifest.skills.filter((name) => name !== pruneSkill) }, null, 2)}\n`, 'utf8');
+    rmSync(path.join(previousRoot, 'host-skills', pruneSkill), { recursive: true, force: true });
+    const pruneRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.match(pruneRollback.stdout, new RegExp(`Removed wrappers the restored runtime does not provide: ${pruneSkill}`));
+    assert.equal(existsSync(path.join(claudeHome, 'skills', pruneSkill)), false);
+    runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.ok(existsSync(path.join(claudeHome, 'skills', pruneSkill, 'SKILL.md')));
+
+    // A retained runtime that predates payload retention still swaps, with an
+    // explicit re-sync instruction instead of silently mixed wrappers.
+    rmSync(path.join(previousRoot, 'host-skills'), { recursive: true, force: true });
+    const legacySwap = runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.match(legacySwap.stdout, /predates host-skill payload retention/);
+    assert.match(legacySwap.stdout, /install-claude/);
+    runCli(['install-claude', '--rollback'], workspaceRoot, env);
+
     // Rollback must not activate a retained runtime that cannot serve the
     // durable host skills after the swap.
     for (const relative of ['bin/run-pipelane.sh', 'bin/bootstrap-pipelane.sh', 'managed-skills.json']) {
@@ -39856,7 +39896,7 @@ test('managed runtime install records build-info provenance and retains a rollba
     const generatedRunnerPath = path.join(managedRuntimeRoot('claude', pipelaneHome), 'bin', 'run-pipelane.sh');
     const generatedRunnerBody = readFileSync(generatedRunnerPath, 'utf8');
     writeFileSync(generatedRunnerPath, `${generatedRunnerBody}\necho PARITY_MISSED_TAMPER\n`, { mode: 0o755, encoding: 'utf8' });
-    const generatedContentDrift = runParity(pipelaneHome);
+    const generatedContentDrift = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
     assert.equal(generatedContentDrift.status, 1);
     assert.match(generatedContentDrift.stdout, /bin\/run-pipelane\.sh: generated runtime content differs/);
     writeFileSync(generatedRunnerPath, generatedRunnerBody, { mode: 0o755, encoding: 'utf8' });
@@ -39955,11 +39995,12 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
   try {
     runCli(['install-claude'], workspaceRoot, { CLAUDE_HOME: claudeHome, PIPELANE_HOME: pipelaneHome });
 
-    const pass = runParity(pipelaneHome);
+    const pass = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
     assert.equal(pass.status, 0, `${pass.stdout}\n${pass.stderr}`);
     assert.match(pass.stdout, /\[claude\] manifest parity: OK/);
     assert.match(pass.stdout, /\[claude\] review-surface contract probe: OK/);
     assert.match(pass.stdout, /\[claude\] review\/pr\/merge surface parity: OK/);
+    assert.match(pass.stdout, /\[claude\] managed skill wrappers: OK/);
     assert.match(pass.stdout, /RESULT: PASS/);
 
     // Build provenance accepts abbreviated Git SHAs. A short and full form of
@@ -39967,7 +40008,7 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
     const runtimeBuildInfoPath = path.join(managedRuntimeRoot('claude', pipelaneHome), 'dist', 'build-info.json');
     const runtimeBuildInfo = JSON.parse(readFileSync(runtimeBuildInfoPath, 'utf8'));
     writeFileSync(runtimeBuildInfoPath, `${JSON.stringify({ ...runtimeBuildInfo, sha: runtimeBuildInfo.sha.slice(0, 7) }, null, 2)}\n`, 'utf8');
-    const abbreviatedSha = runParity(pipelaneHome);
+    const abbreviatedSha = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
     assert.equal(abbreviatedSha.status, 0, `${abbreviatedSha.stdout}\n${abbreviatedSha.stderr}`);
     assert.match(abbreviatedSha.stdout, /\[claude\] manifest parity: OK/);
     writeFileSync(runtimeBuildInfoPath, `${JSON.stringify(runtimeBuildInfo, null, 2)}\n`, 'utf8');
@@ -39979,7 +40020,7 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
       const body = readFileSync(target);
       const mode = statSync(target).mode & 0o777;
       rmSync(target, { force: true });
-      const missingGeneratedAsset = runParity(pipelaneHome);
+      const missingGeneratedAsset = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
       assert.equal(missingGeneratedAsset.status, 1, `${missingGeneratedAsset.stdout}\n${missingGeneratedAsset.stderr}`);
       assert.match(missingGeneratedAsset.stdout, new RegExp(`${relative.replaceAll('/', '\\/')}: missing generated runtime asset`));
       writeFileSync(target, body, { mode });
@@ -39999,7 +40040,7 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
     const metadataPath = path.join(managedRuntimeRoot('claude', pipelaneHome), '.pipelane-runtime.json');
     const metadataBody = readFileSync(metadataPath, 'utf8');
     rmSync(metadataPath, { force: true });
-    const missingMetadata = runParity(pipelaneHome);
+    const missingMetadata = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
     assert.equal(missingMetadata.status, 1);
     assert.match(missingMetadata.stdout, /\.pipelane-runtime\.json: missing or invalid managed-runtime metadata/);
     writeFileSync(metadataPath, metadataBody, 'utf8');
@@ -40008,13 +40049,13 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
     // build-info shipped in the same runtime, not merely be well-shaped JSON.
     const mismatchedMetadata = JSON.parse(metadataBody);
     writeFileSync(metadataPath, `${JSON.stringify({ ...mismatchedMetadata, sourceSha: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' }, null, 2)}\n`, 'utf8');
-    const mismatchedProvenance = runParity(pipelaneHome);
+    const mismatchedProvenance = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
     assert.equal(mismatchedProvenance.status, 1);
     assert.match(mismatchedProvenance.stdout, /source provenance does not match dist\/build-info\.json/);
     writeFileSync(metadataPath, metadataBody, 'utf8');
 
     writeFileSync(metadataPath, `${JSON.stringify({ ...JSON.parse(metadataBody), packageVersion: '999.0.0' }, null, 2)}\n`, 'utf8');
-    const mismatchedPackageVersion = runParity(pipelaneHome);
+    const mismatchedPackageVersion = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
     assert.equal(mismatchedPackageVersion.status, 1);
     assert.match(mismatchedPackageVersion.stdout, /packageVersion "999\.0\.0" does not match package\.json version/);
     writeFileSync(metadataPath, metadataBody, 'utf8');
@@ -40023,7 +40064,7 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
       const runtimeRunner = path.join(managedRuntimeRoot('claude', pipelaneHome), 'bin', 'run-pipelane.sh');
       const runtimeRunnerMode = statSync(runtimeRunner).mode & 0o777;
       chmodSync(runtimeRunner, 0o001);
-      const nonExecutableRuntime = runParity(pipelaneHome);
+      const nonExecutableRuntime = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
       assert.equal(nonExecutableRuntime.status, 1);
       assert.match(nonExecutableRuntime.stdout, /bin\/run-pipelane\.sh: runtime entrypoint is not executable/);
       chmodSync(runtimeRunner, runtimeRunnerMode);
@@ -40033,7 +40074,7 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
       const runtimeBinMode = statSync(runtimeBin).mode & 0o777;
       rmSync(runtimeBin, { force: true });
       symlinkSync(path.join(KIT_ROOT, 'bin', 'pipelane'), runtimeBin);
-      const symlinkedRuntime = runParity(pipelaneHome);
+      const symlinkedRuntime = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
       assert.equal(symlinkedRuntime.status, 1);
       assert.match(symlinkedRuntime.stdout, /bin\/pipelane: runtime entrypoint is not a regular file/);
       rmSync(runtimeBin, { force: true });
@@ -40044,7 +40085,7 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
       const runtimeReviewDataBody = readFileSync(runtimeReviewData);
       rmSync(runtimeReviewData, { force: true });
       symlinkSync(path.join(KIT_ROOT, 'dist', 'operator', 'review-data.js'), runtimeReviewData);
-      const symlinkedPayload = runParity(pipelaneHome);
+      const symlinkedPayload = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
       assert.equal(symlinkedPayload.status, 1);
       assert.match(symlinkedPayload.stdout, /runtime dist\/operator\/review-data\.js: symbolic links are not allowed in runtime payloads/);
       assert.match(symlinkedPayload.stdout, /review-surface contract probe: SKIPPED \(package content drift\)/);
@@ -40058,17 +40099,47 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
     const runtimePolicy = path.join(managedRuntimeRoot('claude', pipelaneHome), 'dist', 'operator', 'review-gate-policy.js');
     const runtimePolicyBody = readFileSync(runtimePolicy, 'utf8');
     writeFileSync(runtimePolicy, `${runtimePolicyBody}\nthrow new Error('DRIFTED_RUNTIME_WAS_EXECUTED');\n`, 'utf8');
-    const guardedProbe = runParity(pipelaneHome);
+    const guardedProbe = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
     assert.equal(guardedProbe.status, 1);
     assert.match(guardedProbe.stdout, /dist\/operator\/review-gate-policy\.js: content differs/);
     assert.match(guardedProbe.stdout, /review-surface contract probe: SKIPPED \(package content drift\)/);
     assert.doesNotMatch(guardedProbe.stderr, /DRIFTED_RUNTIME_WAS_EXECUTED/);
     writeFileSync(runtimePolicy, runtimePolicyBody, 'utf8');
 
+    // Managed-skill wrapper trust: an emptied manifest must be drift, not PASS.
+    const wrapperRuntimeRoot = managedRuntimeRoot('claude', pipelaneHome);
+    const skillManifestPath = path.join(wrapperRuntimeRoot, 'managed-skills.json');
+    const skillManifestBody = readFileSync(skillManifestPath, 'utf8');
+    writeFileSync(skillManifestPath, `${JSON.stringify({ skills: [] })}\n`, 'utf8');
+    const emptiedManifest = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+    assert.equal(emptiedManifest.status, 1);
+    assert.match(emptiedManifest.stdout, /managed-skills\.json: no managed skills recorded/);
+    assert.match(emptiedManifest.stdout, /\[claude\] managed skill wrappers: DRIFT/);
+    writeFileSync(skillManifestPath, skillManifestBody, 'utf8');
+
+    // A tampered installed wrapper must be drift.
+    const wrapperSkill = JSON.parse(skillManifestBody).skills[0];
+    const installedWrapperPath = path.join(claudeHome, 'skills', wrapperSkill, 'SKILL.md');
+    const installedWrapperBody = readFileSync(installedWrapperPath, 'utf8');
+    writeFileSync(installedWrapperPath, `${installedWrapperBody}\nWRAPPER_TAMPER\n`, 'utf8');
+    const tamperedWrapper = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+    assert.equal(tamperedWrapper.status, 1);
+    assert.match(tamperedWrapper.stdout, new RegExp(`skills/${wrapperSkill}/SKILL\\.md: installed wrapper content differs from runtime payload`));
+    writeFileSync(installedWrapperPath, installedWrapperBody, 'utf8');
+
+    // A payload the manifest does not record must be drift.
+    const ghostPayloadDir = path.join(wrapperRuntimeRoot, 'host-skills', 'ghost-skill');
+    mkdirSync(ghostPayloadDir, { recursive: true });
+    writeFileSync(path.join(ghostPayloadDir, 'SKILL.md'), 'ghost', 'utf8');
+    const ghostPayload = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+    assert.equal(ghostPayload.status, 1);
+    assert.match(ghostPayload.stdout, /host-skills\/ghost-skill: payload not recorded in managed-skills\.json/);
+    rmSync(ghostPayloadDir, { recursive: true, force: true });
+
     // Mutating a review-surface module inside the runtime is drift.
     const mutated = path.join(managedRuntimeRoot('claude', pipelaneHome), 'dist', 'operator', 'commands', 'review.js');
     writeFileSync(mutated, `${readFileSync(mutated, 'utf8')}\n// drift\n`, 'utf8');
-    const fail = runParity(pipelaneHome);
+    const fail = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
     assert.equal(fail.status, 1);
     assert.match(fail.stdout, /dist\/operator\/commands\/review\.js: content differs/);
     assert.match(fail.stdout, /\[claude\] review\/pr\/merge surface parity: DRIFT/);

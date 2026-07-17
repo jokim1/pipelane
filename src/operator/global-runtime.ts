@@ -458,3 +458,79 @@ export function rollbackGlobalRuntime(
     releaseLock();
   }
 }
+
+export const HOST_SKILLS_DIRNAME = 'host-skills';
+
+export interface HostSkillPayload {
+  name: string;
+  body: string;
+}
+
+export interface HostRollbackSkillsOutcome {
+  wrappersRestored: boolean;
+  restoredSkills: string[];
+  removedSkills: string[];
+  skippedCollisions: string[];
+  resyncCommand: string | null;
+}
+
+export type HostRuntimeRollbackResult = RuntimeRollbackResult & HostRollbackSkillsOutcome;
+
+function isSafePayloadSkillName(skillName: string): boolean {
+  return (
+    skillName.length > 0
+    && skillName.trim() === skillName
+    && !path.isAbsolute(skillName)
+    && !skillName.includes('/')
+    && !skillName.includes('\\')
+    && skillName !== '.'
+    && skillName !== '..'
+  );
+}
+
+export function hostSkillPayloadPath(targetRoot: string, skillName: string): string {
+  if (!isSafePayloadSkillName(skillName)) {
+    throw new Error(`Unsafe managed skill name in runtime payloads: ${skillName}`);
+  }
+  return path.join(targetRoot, HOST_SKILLS_DIRNAME, skillName, 'SKILL.md');
+}
+
+// The runtime carries the exact wrapper payloads it installed, so a rollback
+// can restore host skills in lockstep with the runtime bits instead of leaving
+// newer wrappers pointed at an older runtime.
+export function writeHostSkillPayloads(targetRoot: string, payloads: HostSkillPayload[]): void {
+  rmSync(path.join(targetRoot, HOST_SKILLS_DIRNAME), { recursive: true, force: true });
+  for (const payload of payloads) {
+    const target = hostSkillPayloadPath(targetRoot, payload.name);
+    mkdirSync(path.dirname(target), { recursive: true });
+    writeFileSync(target, payload.body, 'utf8');
+  }
+}
+
+// Payloads a retained runtime carries for its managed skills. Returns null when
+// the runtime predates payload retention (no host-skills dir); throws when the
+// dir exists but is inconsistent with managed-skills.json — an inconsistent
+// runtime is not a safe rollback target.
+export function readHostSkillPayloads(targetRoot: string, label: string): Map<string, string> | null {
+  if (!existsSync(path.join(targetRoot, HOST_SKILLS_DIRNAME))) {
+    return null;
+  }
+  let names: string[] = [];
+  try {
+    const manifest = JSON.parse(readFileSync(path.join(targetRoot, 'managed-skills.json'), 'utf8')) as { skills?: unknown };
+    names = Array.isArray(manifest.skills)
+      ? manifest.skills.filter((entry): entry is string => typeof entry === 'string')
+      : [];
+  } catch (error) {
+    throw new Error(`${label} has an unreadable managed-skills.json: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const payloads = new Map<string, string>();
+  for (const name of names) {
+    const target = hostSkillPayloadPath(targetRoot, name);
+    if (!existsSync(target) || !lstatSync(target).isFile()) {
+      throw new Error(`${label} is missing the host-skill payload for ${name}; refusing to roll back to an inconsistent runtime.`);
+    }
+    payloads.set(name, readFileSync(target, 'utf8'));
+  }
+  return payloads;
+}

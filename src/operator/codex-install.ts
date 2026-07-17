@@ -3,7 +3,15 @@ import path from 'node:path';
 
 import { readFixPromptBody } from './fix-prompt.ts';
 import { readLessonPromptBody } from './lesson-prompt.ts';
-import { installGlobalRuntime, isManagedGlobalRuntime, rollbackGlobalRuntime, type RuntimeRollbackResult } from './global-runtime.ts';
+import {
+  installGlobalRuntime,
+  isManagedGlobalRuntime,
+  previousRuntimePath,
+  readHostSkillPayloads,
+  rollbackGlobalRuntime,
+  writeHostSkillPayloads,
+  type HostRuntimeRollbackResult,
+} from './global-runtime.ts';
 import { defaultWorkflowConfig, homeCodexDir, pipelaneHomeDir, readJsonFile, WORKFLOW_COMMANDS, writeJsonFile } from './state.ts';
 import {
   desiredHostInstall,
@@ -252,15 +260,78 @@ function assertOrSkipCollision(skillsRoot: string, entry: DesiredInstallEntry, s
   );
 }
 
-function writeSkill(skillsRoot: string, entry: DesiredInstallEntry): void {
+function writeSkill(skillsRoot: string, entry: Pick<DesiredInstallEntry, 'name' | 'body'>): void {
   const skillDir = skillDirPath(skillsRoot, entry.name);
   rmSync(skillDir, { recursive: true, force: true });
   mkdirSync(skillDir, { recursive: true });
   writeFileSync(skillDocPath(skillsRoot, entry.name), entry.body, 'utf8');
 }
 
-export function rollbackCodexManagedRuntime(): RuntimeRollbackResult {
-  return rollbackGlobalRuntime(runtimeRoot(homeCodexDir()), { expectedHost: 'codex' });
+export function rollbackCodexManagedRuntime(): HostRuntimeRollbackResult {
+  const codexHome = homeCodexDir();
+  const skillsRoot = path.join(codexHome, 'skills');
+  const pipelaneRoot = runtimeRoot(codexHome);
+  const previousRoot = previousRuntimePath(pipelaneRoot);
+  // Pre-swap validation: an inconsistent payload set refuses before any swap.
+  const payloads = readHostSkillPayloads(previousRoot, `Retained runtime at ${previousRoot}`);
+  const retiredNames = readManagedSkillNames(skillsRoot, pipelaneRoot);
+  const result = rollbackGlobalRuntime(pipelaneRoot, { expectedHost: 'codex' });
+  if (!payloads) {
+    // The retained runtime predates host-skill payload retention: the dir swap
+    // succeeded, but wrappers cannot be restored in lockstep. Tell the operator
+    // how to re-sync them from the restored runtime itself.
+    return {
+      ...result,
+      wrappersRestored: false,
+      restoredSkills: [],
+      removedSkills: [],
+      skippedCollisions: [],
+      resyncCommand: `${path.join(pipelaneRoot, 'bin', 'pipelane')} install-codex`,
+    };
+  }
+  try {
+    const outcome = restoreCodexSkillWrappers(skillsRoot, retiredNames, payloads);
+    return { ...result, wrappersRestored: true, ...outcome, resyncCommand: null };
+  } catch (error) {
+    // Never leave the restored runtime active with half-written wrappers: put
+    // the runtimes back the way they were, then surface the wrapper error.
+    rollbackGlobalRuntime(pipelaneRoot, { expectedHost: 'codex' });
+    throw error;
+  }
+}
+
+function restoreCodexSkillWrappers(
+  skillsRoot: string,
+  retiredNames: Set<string>,
+  payloads: Map<string, string>,
+): { restoredSkills: string[]; removedSkills: string[]; skippedCollisions: string[] } {
+  mkdirSync(skillsRoot, { recursive: true });
+  const removedSkills: string[] = [];
+  for (const skillName of retiredNames) {
+    if (payloads.has(skillName) || !isManagedCodexSkill(skillsRoot, skillName)) {
+      continue;
+    }
+    rmSync(skillDirPath(skillsRoot, skillName), { recursive: true, force: true });
+    removedSkills.push(skillName);
+  }
+  const restoredSkills: string[] = [];
+  const skippedCollisions: string[] = [];
+  for (const [skillName, body] of payloads) {
+    const targetDir = skillDirPath(skillsRoot, skillName);
+    if (existsSync(targetDir) && !isManagedCodexSkill(skillsRoot, skillName)) {
+      // A foreign (unmanaged) skill occupies this name; never clobber it
+      // during a rollback.
+      skippedCollisions.push(skillName);
+      continue;
+    }
+    writeSkill(skillsRoot, { name: skillName, body });
+    restoredSkills.push(skillName);
+  }
+  return {
+    restoredSkills: restoredSkills.sort(),
+    removedSkills: removedSkills.sort(),
+    skippedCollisions: skippedCollisions.sort(),
+  };
 }
 
 export function installCodexBootstrapSkill(
@@ -302,6 +373,13 @@ export function installCodexBootstrapSkill(
   }
 
   writeJsonFile(managedSkillsPath(pipelaneRoot), { skills: managedNames.sort() });
+  const managedNameSet = new Set(managedNames);
+  writeHostSkillPayloads(
+    pipelaneRoot,
+    install.entries
+      .filter((entry) => managedNameSet.has(entry.name))
+      .map((entry) => ({ name: entry.name, body: entry.body })),
+  );
 
   return {
     codexHome,

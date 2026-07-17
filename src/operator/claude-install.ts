@@ -3,7 +3,15 @@ import path from 'node:path';
 
 import { readFixPromptBody } from './fix-prompt.ts';
 import { readLessonPromptBody } from './lesson-prompt.ts';
-import { installGlobalRuntime, rollbackGlobalRuntime, type RuntimeRollbackResult } from './global-runtime.ts';
+import {
+  installGlobalRuntime,
+  previousRuntimePath,
+  readHostSkillPayloads,
+  rollbackGlobalRuntime,
+  writeHostSkillPayloads,
+  type HostRollbackSkillsOutcome,
+  type HostRuntimeRollbackResult,
+} from './global-runtime.ts';
 import { defaultWorkflowConfig, homeClaudeDir, pipelaneHomeDir, readJsonFile, writeJsonFile } from './state.ts';
 import {
   desiredHostInstall,
@@ -151,7 +159,7 @@ function assertOrSkipCollision(skillsRoot: string, entry: DesiredInstallEntry, s
   );
 }
 
-function writeSkill(skillsRoot: string, runtimeDir: string, entry: DesiredInstallEntry): void {
+function writeSkill(skillsRoot: string, runtimeDir: string, entry: Pick<DesiredInstallEntry, 'name' | 'body'>): void {
   const skillDir = skillDirPath(skillsRoot, entry.name);
   if (path.resolve(skillDir) !== path.resolve(runtimeDir)) {
     rmSync(skillDir, { recursive: true, force: true });
@@ -162,8 +170,76 @@ function writeSkill(skillsRoot: string, runtimeDir: string, entry: DesiredInstal
   writeFileSync(skillDocPath(skillsRoot, entry.name), entry.body, 'utf8');
 }
 
-export function rollbackClaudeManagedRuntime(): RuntimeRollbackResult {
-  return rollbackGlobalRuntime(runtimeRoot(homeClaudeDir()), { expectedHost: 'claude' });
+export function rollbackClaudeManagedRuntime(): HostRuntimeRollbackResult {
+  const claudeHome = homeClaudeDir();
+  const skillsRoot = path.join(claudeHome, 'skills');
+  const pipelaneRoot = runtimeRoot(claudeHome);
+  const previousRoot = previousRuntimePath(pipelaneRoot);
+  // Pre-swap validation: an inconsistent payload set refuses before any swap.
+  const payloads = readHostSkillPayloads(previousRoot, `Retained runtime at ${previousRoot}`);
+  const retiredNames = readManagedSkillNames(pipelaneRoot);
+  const result = rollbackGlobalRuntime(pipelaneRoot, { expectedHost: 'claude' });
+  if (!payloads) {
+    // The retained runtime predates host-skill payload retention: the dir swap
+    // succeeded, but wrappers cannot be restored in lockstep. Tell the operator
+    // how to re-sync them from the restored runtime itself.
+    return {
+      ...result,
+      wrappersRestored: false,
+      restoredSkills: [],
+      removedSkills: [],
+      skippedCollisions: [],
+      resyncCommand: `${path.join(pipelaneRoot, 'bin', 'pipelane')} install-claude`,
+    };
+  }
+  try {
+    const outcome = restoreClaudeSkillWrappers(skillsRoot, pipelaneRoot, retiredNames, payloads);
+    return { ...result, wrappersRestored: true, ...outcome, resyncCommand: null };
+  } catch (error) {
+    // Never leave the restored runtime active with half-written wrappers: put
+    // the runtimes back the way they were, then surface the wrapper error.
+    rollbackGlobalRuntime(pipelaneRoot, { expectedHost: 'claude' });
+    throw error;
+  }
+}
+
+function restoreClaudeSkillWrappers(
+  skillsRoot: string,
+  runtimeDir: string,
+  retiredNames: Set<string>,
+  payloads: Map<string, string>,
+): Omit<HostRollbackSkillsOutcome, 'wrappersRestored' | 'resyncCommand'> {
+  mkdirSync(skillsRoot, { recursive: true });
+  const removedSkills: string[] = [];
+  for (const skillName of retiredNames) {
+    if (payloads.has(skillName) || !isManagedClaudeSkill(skillsRoot, skillName)) {
+      continue;
+    }
+    rmSync(skillDirPath(skillsRoot, skillName), { recursive: true, force: true });
+    removedSkills.push(skillName);
+  }
+  const restoredSkills: string[] = [];
+  const skippedCollisions: string[] = [];
+  for (const [skillName, body] of payloads) {
+    const targetDir = skillDirPath(skillsRoot, skillName);
+    if (
+      existsSync(targetDir)
+      && !isManagedClaudeSkill(skillsRoot, skillName)
+      && skillName !== PIPELANE_DISPATCH_SKILL_NAME
+    ) {
+      // A foreign (unmanaged) skill occupies this name; never clobber it
+      // during a rollback.
+      skippedCollisions.push(skillName);
+      continue;
+    }
+    writeSkill(skillsRoot, runtimeDir, { name: skillName, body });
+    restoredSkills.push(skillName);
+  }
+  return {
+    restoredSkills: restoredSkills.sort(),
+    removedSkills: removedSkills.sort(),
+    skippedCollisions: skippedCollisions.sort(),
+  };
 }
 
 export function installClaudeBootstrapSkill(
@@ -202,6 +278,13 @@ export function installClaudeBootstrapSkill(
   }
 
   writeJsonFile(path.join(pipelaneRoot, MANAGED_CLAUDE_SKILLS_FILENAME), { skills: managedNames.sort() });
+  const managedNameSet = new Set(managedNames);
+  writeHostSkillPayloads(
+    pipelaneRoot,
+    install.entries
+      .filter((entry) => managedNameSet.has(entry.name))
+      .map((entry) => ({ name: entry.name, body: entry.body })),
+  );
 
   return {
     claudeHome,

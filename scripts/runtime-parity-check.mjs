@@ -245,6 +245,77 @@ async function generatedRuntimeDrift(host, runtimeRoot) {
   return drift;
 }
 
+function hostSkillsRootFor(host) {
+  const home = host === 'claude'
+    ? (process.env.CLAUDE_HOME?.trim() || path.join(os.homedir(), '.claude'))
+    : (process.env.CODEX_HOME?.trim() || path.join(os.homedir(), '.codex'));
+  return path.join(home, 'skills');
+}
+
+function isSafeSkillName(skillName) {
+  return (
+    typeof skillName === 'string'
+    && skillName.length > 0
+    && skillName.trim() === skillName
+    && !path.isAbsolute(skillName)
+    && !skillName.includes('/')
+    && !skillName.includes('\\')
+    && skillName !== '.'
+    && skillName !== '..'
+  );
+}
+
+// The runtime's managed-skills manifest and carried host-skill payloads must
+// name real, byte-identical installed wrappers — an empty manifest or a
+// mismatched wrapper is a mixed-version install, not a passing fleet.
+function managedSkillWrapperDrift(host, runtimeRoot) {
+  const drift = [];
+  const manifest = readJson(path.join(runtimeRoot, 'managed-skills.json'));
+  const names = Array.isArray(manifest?.skills)
+    ? manifest.skills.filter((entry) => typeof entry === 'string')
+    : [];
+  if (names.length === 0) {
+    drift.push('managed-skills.json: no managed skills recorded');
+    return drift;
+  }
+  const unsafe = names.filter((name) => !isSafeSkillName(name));
+  if (unsafe.length > 0) {
+    drift.push(`managed-skills.json: unsafe skill name(s): ${unsafe.join(', ')}`);
+    return drift;
+  }
+  const payloadRoot = path.join(runtimeRoot, 'host-skills');
+  if (!existsSync(payloadRoot)) {
+    drift.push('host-skills: runtime carries no skill payloads (predates payload retention; reinstall to restore wrapper parity)');
+    return drift;
+  }
+  const skillsRoot = hostSkillsRootFor(host);
+  for (const name of names) {
+    const payloadPath = path.join(payloadRoot, name, 'SKILL.md');
+    if (!existsSync(payloadPath) || !lstatSync(payloadPath).isFile()) {
+      drift.push(`host-skills/${name}/SKILL.md: payload missing for manifest skill`);
+      continue;
+    }
+    const wrapperPath = path.join(skillsRoot, name, 'SKILL.md');
+    if (!existsSync(wrapperPath) || !lstatSync(wrapperPath).isFile()) {
+      drift.push(`skills/${name}/SKILL.md: installed wrapper missing`);
+      continue;
+    }
+    if (digestFile(payloadPath) !== digestFile(wrapperPath)) {
+      drift.push(`skills/${name}/SKILL.md: installed wrapper content differs from runtime payload`);
+    }
+  }
+  try {
+    for (const entry of readdirSync(payloadRoot)) {
+      if (!names.includes(entry)) {
+        drift.push(`host-skills/${entry}: payload not recorded in managed-skills.json`);
+      }
+    }
+  } catch {
+    drift.push('host-skills: payload directory is unreadable');
+  }
+  return drift;
+}
+
 function compareManifest(runtimeRoot) {
   const drift = [];
   const localManifest = collectManifestFiles(localRoot);
@@ -393,6 +464,17 @@ async function main() {
     lines.push(surfaceDigestDrift.length === 0
       ? `[${host}] review/pr/merge surface parity: OK`
       : `[${host}] review/pr/merge surface parity: DRIFT (${surfaceDigestDrift.length} module(s))`);
+
+    const wrapperDrift = managedSkillWrapperDrift(host, root);
+    if (wrapperDrift.length === 0) {
+      lines.push(`[${host}] managed skill wrappers: OK (manifest, payloads, and installed wrappers agree)`);
+    } else {
+      failed = true;
+      lines.push(`[${host}] managed skill wrappers: DRIFT`);
+      for (const entry of wrapperDrift) {
+        lines.push(`    - ${entry}`);
+      }
+    }
   }
 
   lines.push(failed ? 'RESULT: FAIL' : 'RESULT: PASS');

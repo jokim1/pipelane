@@ -129,7 +129,19 @@ function parseInstallArgs(args: string[], command: string): { verbose: boolean; 
   return { verbose, rollback };
 }
 
-function formatRuntimeRollbackLines(host: string, result: { runtimeRoot: string; restored: { sourceSha?: string; packageVersion: string; installedAt: string }; retired: { sourceSha?: string } | null }): string[] {
+function formatRuntimeRollbackLines(
+  host: string,
+  result: {
+    runtimeRoot: string;
+    restored: { sourceSha?: string; packageVersion: string; installedAt: string };
+    retired: { sourceSha?: string } | null;
+    wrappersRestored: boolean;
+    restoredSkills: string[];
+    removedSkills: string[];
+    skippedCollisions: string[];
+    resyncCommand: string | null;
+  },
+): string[] {
   const restoredRef = result.restored.sourceSha?.slice(0, 7) ?? 'unknown sha';
   const lines = [
     `Rolled back the managed ${host} runtime at ${result.runtimeRoot}.`,
@@ -138,6 +150,20 @@ function formatRuntimeRollbackLines(host: string, result: { runtimeRoot: string;
   lines.push(result.retired
     ? `Retired runtime (${result.retired.sourceSha?.slice(0, 7) ?? 'unknown sha'}) is retained as the new previous; rerun with --rollback to roll forward again.`
     : 'No runtime was active before the rollback, so nothing was retired.');
+  if (result.wrappersRestored) {
+    lines.push(`Restored ${result.restoredSkills.length} managed skill wrapper(s) in lockstep with the runtime.`);
+    if (result.removedSkills.length > 0) {
+      lines.push(`Removed wrappers the restored runtime does not provide: ${result.removedSkills.join(', ')}.`);
+    }
+    if (result.skippedCollisions.length > 0) {
+      lines.push(`Left unmanaged skills in place (name collisions): ${result.skippedCollisions.join(', ')}.`);
+    }
+  } else {
+    lines.push('Restored runtime predates host-skill payload retention; installed skill wrappers were left as-is.');
+    if (result.resyncCommand) {
+      lines.push(`Re-sync wrappers from the restored runtime with: ${result.resyncCommand}`);
+    }
+  }
   return lines;
 }
 
