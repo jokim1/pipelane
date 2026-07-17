@@ -26,7 +26,14 @@ import {
   reviewGateExecutionPolicy,
 } from '../review-gate-policy.ts';
 import { readWorktreeStatusSnapshot, type WorktreeStatusSnapshot } from '../worktree-status.ts';
-import { DEPLOY_STATE_KEY_ENV, ORCHESTRATION_STATE_KEY_ENV, PROBE_STATE_KEY_ENV, REVIEW_STATE_KEY_ENV } from '../integrity.ts';
+import {
+  CONVERGENCE_STATE_KEY_ENV,
+  DEPLOY_STATE_KEY_ENV,
+  ORCHESTRATION_STATE_KEY_ENV,
+  PROBE_STATE_KEY_ENV,
+  REVIEW_CONSENT_STATE_KEY_ENV,
+  REVIEW_STATE_KEY_ENV,
+} from '../integrity.ts';
 import {
   appendReviewAcceptanceRecord,
   appendReviewExternalEvidenceRecord,
@@ -3427,6 +3434,8 @@ function gateSubprocessEnv(options: {
   delete env[ORCHESTRATION_STATE_KEY_ENV];
   delete env[DEPLOY_STATE_KEY_ENV];
   delete env[PROBE_STATE_KEY_ENV];
+  delete env[REVIEW_CONSENT_STATE_KEY_ENV];
+  delete env[CONVERGENCE_STATE_KEY_ENV];
   if (options.stripAiReviewOverrides) {
     stripAiReviewOverrideEnv(env);
   }

@@ -14,7 +14,7 @@
 // Exit 1: drift. Exit 2: local build missing.
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { accessSync, constants, existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -30,6 +30,11 @@ const INSTALL_GENERATED = new Set([
 ]);
 const REQUIRED_GENERATED_ASSETS = [
   'managed-skills.json',
+  'bin/run-pipelane.sh',
+  'bin/bootstrap-pipelane.sh',
+];
+const REQUIRED_EXECUTABLE_ASSETS = [
+  'bin/pipelane',
   'bin/run-pipelane.sh',
   'bin/bootstrap-pipelane.sh',
 ];
@@ -75,9 +80,24 @@ function sameBuildSha(left, right) {
   return longer.startsWith(shorter);
 }
 
-function walkFiles(root, relative = '') {
-  const absolute = path.join(root, relative);
-  const stats = statSync(absolute);
+function walkFiles(root, relative = '', invalid = []) {
+  const normalizedRoot = path.resolve(root);
+  const absolute = path.resolve(normalizedRoot, relative);
+  if (absolute !== normalizedRoot && !absolute.startsWith(`${normalizedRoot}${path.sep}`)) {
+    invalid.push(`${relative}: manifest path escapes runtime root`);
+    return [];
+  }
+  let stats;
+  try {
+    stats = lstatSync(absolute);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return [];
+    throw error;
+  }
+  if (stats.isSymbolicLink()) {
+    invalid.push(`${relative}: symbolic links are not allowed in runtime payloads`);
+    return [];
+  }
   if (stats.isFile()) {
     return [relative];
   }
@@ -86,7 +106,7 @@ function walkFiles(root, relative = '') {
   }
   const collected = [];
   for (const entry of readdirSync(absolute, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
-    collected.push(...walkFiles(root, relative ? `${relative}/${entry.name}` : entry.name));
+    collected.push(...walkFiles(root, relative ? `${relative}/${entry.name}` : entry.name, invalid));
   }
   return collected;
 }
@@ -101,15 +121,13 @@ function manifestEntries(root) {
 
 function collectManifestFiles(root) {
   const files = new Set();
+  const invalid = [];
   for (const entry of manifestEntries(root)) {
-    if (!existsSync(path.join(root, entry))) {
-      continue;
-    }
-    for (const file of walkFiles(root, entry)) {
+    for (const file of walkFiles(root, entry, invalid)) {
       files.add(file.replaceAll('\\', '/'));
     }
   }
-  return files;
+  return { files, invalid };
 }
 
 function buildInfoDrift(localTarget, runtimeTarget) {
@@ -137,27 +155,91 @@ function runtimeMetadataDrift(host, runtimeRoot) {
   if (typeof metadata.packageVersion !== 'string' || metadata.packageVersion.trim().length === 0) {
     drift.push(`${relative}: packageVersion is missing or invalid`);
   }
+  if (metadata.version !== 1) {
+    drift.push(`${relative}: unsupported metadata version ${JSON.stringify(metadata.version)}`);
+  }
+  const runtimePackage = readJson(path.join(runtimeRoot, 'package.json'));
+  if (!runtimePackage || typeof runtimePackage.version !== 'string' || runtimePackage.version.trim().length === 0) {
+    drift.push('package.json: package version is missing or invalid');
+  } else if (metadata.packageVersion !== runtimePackage.version.trim()) {
+    drift.push(`${relative}: packageVersion ${JSON.stringify(metadata.packageVersion)} does not match package.json version ${JSON.stringify(runtimePackage.version.trim())}`);
+  }
   if (typeof metadata.installedAt !== 'string' || Number.isNaN(Date.parse(metadata.installedAt))) {
     drift.push(`${relative}: installedAt is missing or invalid`);
+  }
+  if (typeof metadata.sourceSha !== 'string' || !/^[a-f0-9]{7,40}$/i.test(metadata.sourceSha.trim())) {
+    drift.push(`${relative}: sourceSha is missing or invalid`);
+  }
+  if (metadata.sourceDirty !== undefined && typeof metadata.sourceDirty !== 'boolean') {
+    drift.push(`${relative}: sourceDirty must be a boolean when present`);
+  }
+  const buildInfo = readJson(path.join(runtimeRoot, BUILD_INFO_RELATIVE));
+  if (!buildInfo || typeof buildInfo.sha !== 'string' || !/^[a-f0-9]{7,40}$/i.test(buildInfo.sha.trim()) || typeof buildInfo.dirty !== 'boolean') {
+    drift.push(`${BUILD_INFO_RELATIVE}: missing or invalid runtime build provenance`);
+  } else if (
+    typeof metadata.sourceSha === 'string'
+    && /^[a-f0-9]{7,40}$/i.test(metadata.sourceSha.trim())
+    && (!sameBuildSha(metadata.sourceSha, buildInfo.sha) || Boolean(metadata.sourceDirty) !== buildInfo.dirty)
+  ) {
+    drift.push(`${relative}: source provenance does not match ${BUILD_INFO_RELATIVE}`);
   }
   return drift;
 }
 
-function generatedRuntimeDrift(runtimeRoot) {
+async function generatedRuntimeDrift(host, runtimeRoot) {
   const drift = [];
   for (const relative of REQUIRED_GENERATED_ASSETS) {
     const target = path.join(runtimeRoot, relative);
     if (!existsSync(target)) {
       drift.push(`${relative}: missing generated runtime asset`);
-    } else if (!statSync(target).isFile()) {
+    } else if (!lstatSync(target).isFile()) {
       drift.push(`${relative}: generated runtime asset is not a file`);
     }
   }
   const manifestPath = path.join(runtimeRoot, 'managed-skills.json');
-  if (existsSync(manifestPath)) {
+  if (existsSync(manifestPath) && lstatSync(manifestPath).isFile()) {
     const manifest = readJson(manifestPath);
     if (!manifest || !Array.isArray(manifest.skills) || manifest.skills.some((entry) => typeof entry !== 'string')) {
       drift.push('managed-skills.json: invalid generated runtime manifest');
+    }
+  }
+  if (process.platform !== 'win32') {
+    for (const relative of REQUIRED_EXECUTABLE_ASSETS) {
+      const target = path.join(runtimeRoot, relative);
+      if (!existsSync(target)) continue;
+      if (!lstatSync(target).isFile()) {
+        drift.push(`${relative}: runtime entrypoint is not a regular file`);
+        continue;
+      }
+      try {
+        accessSync(target, constants.X_OK);
+      } catch {
+        drift.push(`${relative}: runtime entrypoint is not executable`);
+      }
+    }
+  }
+  const renderingModulePath = path.join(localRoot, 'dist', 'operator', 'skill-rendering.js');
+  if (existsSync(renderingModulePath)) {
+    const rendering = await import(pathToFileURL(renderingModulePath).href);
+    const managedPipelaneBin = path.join(runtimeRoot, 'bin', 'pipelane');
+    const expected = new Map([
+      ['bin/run-pipelane.sh', rendering.renderManagedRunnerScript({
+        managedRuntimeRoot: runtimeRoot,
+        managedPipelaneBin,
+        hostLabel: host === 'claude' ? 'Claude' : 'Codex',
+      })],
+      ['bin/bootstrap-pipelane.sh', rendering.renderBootstrapScript(managedPipelaneBin)],
+    ]);
+    for (const [relative, body] of expected) {
+      const target = path.join(runtimeRoot, relative);
+      if (!existsSync(target) || !lstatSync(target).isFile()) continue;
+      try {
+        if (readFileSync(target, 'utf8') !== body) {
+          drift.push(`${relative}: generated runtime content differs`);
+        }
+      } catch {
+        drift.push(`${relative}: generated runtime content is unreadable`);
+      }
     }
   }
   return drift;
@@ -165,8 +247,12 @@ function generatedRuntimeDrift(runtimeRoot) {
 
 function compareManifest(runtimeRoot) {
   const drift = [];
-  const localFiles = collectManifestFiles(localRoot);
-  const runtimeFiles = collectManifestFiles(runtimeRoot);
+  const localManifest = collectManifestFiles(localRoot);
+  const runtimeManifest = collectManifestFiles(runtimeRoot);
+  const localFiles = localManifest.files;
+  const runtimeFiles = runtimeManifest.files;
+  drift.push(...localManifest.invalid.map((entry) => `local build ${entry}`));
+  drift.push(...runtimeManifest.invalid.map((entry) => `runtime ${entry}`));
   const union = [...new Set([...localFiles, ...runtimeFiles])].sort();
   let compared = 0;
   for (const relative of union) {
@@ -275,8 +361,11 @@ async function main() {
     lines.push(`[${host}] ${root} (${provenance}, installed ${metadata?.installedAt ?? 'unknown'})`);
 
     const manifest = compareManifest(root);
-    manifest.drift.unshift(...runtimeMetadataDrift(host, root), ...generatedRuntimeDrift(root));
-    const surfaceProbe = await probeReviewSurface(root);
+    // Never execute modules from a runtime whose packaged bytes already
+    // differ. The behavioral probe is only safe after content parity proves
+    // the imported module and all of its packaged dependencies are local bits.
+    const surfaceProbe = manifest.drift.length === 0 ? await probeReviewSurface(root) : null;
+    manifest.drift.unshift(...runtimeMetadataDrift(host, root), ...await generatedRuntimeDrift(host, root));
     const surfaceDigestDrift = manifest.drift.filter((entry) => REVIEW_SURFACE_MODULES.some((module) => entry.startsWith(module)));
 
     if (manifest.drift.length === 0) {
@@ -289,7 +378,9 @@ async function main() {
       }
     }
 
-    if (surfaceProbe.length === 0) {
+    if (surfaceProbe === null) {
+      lines.push(`[${host}] review-surface contract probe: SKIPPED (package content drift)`);
+    } else if (surfaceProbe.length === 0) {
       lines.push(`[${host}] review-surface contract probe: OK (policy/enforcement/result-protocol exports match)`);
     } else {
       failed = true;

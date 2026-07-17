@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { accessSync, constants, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -46,30 +46,54 @@ function installableEntries(root: string): string[] {
 
 function ensureInstallableRuntime(root: string, label = 'Current pipelane package'): void {
   const required = [
-    { path: 'package.json', kind: 'file' },
-    { path: 'bin/pipelane', kind: 'file' },
-    { path: 'dist/cli.js', kind: 'file' },
-    { path: 'templates', kind: 'directory' },
+    { path: 'package.json', kind: 'file', executable: false },
+    { path: 'bin/pipelane', kind: 'file', executable: true },
+    { path: 'dist/cli.js', kind: 'file', executable: false },
+    { path: 'templates', kind: 'directory', executable: false },
   ] as const;
-  for (const { path: relativePath, kind } of required) {
+  for (const { path: relativePath, kind, executable } of required) {
     if (!existsSync(path.join(root, relativePath))) {
       throw new Error(`${label} is missing required runtime asset: ${relativePath}`);
     }
-    const stats = statSync(path.join(root, relativePath));
+    const target = path.join(root, relativePath);
+    const stats = lstatSync(target);
     if ((kind === 'file' && !stats.isFile()) || (kind === 'directory' && !stats.isDirectory())) {
       throw new Error(`${label} has an invalid required runtime asset: ${relativePath} must be a ${kind}.`);
+    }
+    if (executable && process.platform !== 'win32') {
+      try {
+        accessSync(target, constants.X_OK);
+      } catch {
+        throw new Error(`${label} has an invalid required runtime asset: ${relativePath} must be executable.`);
+      }
     }
   }
 }
 
+function ensureRuntimeRootDirectory(root: string, label: string): void {
+  const rootStats = lstatSync(root);
+  if (!rootStats.isDirectory()) {
+    throw new Error(`${label} must be a real directory, not a symbolic link or other file.`);
+  }
+}
+
 function ensureRestorableRuntime(root: string, label: string): void {
+  ensureRuntimeRootDirectory(root, label);
   ensureInstallableRuntime(root, label);
   for (const relativePath of GENERATED_RUNTIME_ASSETS) {
     if (!existsSync(path.join(root, relativePath))) {
       throw new Error(`${label} is missing required generated runtime asset: ${relativePath}`);
     }
-    if (!statSync(path.join(root, relativePath)).isFile()) {
+    const target = path.join(root, relativePath);
+    if (!lstatSync(target).isFile()) {
       throw new Error(`${label} has an invalid required generated runtime asset: ${relativePath} must be a file.`);
+    }
+    if (process.platform !== 'win32' && relativePath.startsWith('bin/')) {
+      try {
+        accessSync(target, constants.X_OK);
+      } catch {
+        throw new Error(`${label} has an invalid required generated runtime asset: ${relativePath} must be executable.`);
+      }
     }
   }
   try {
@@ -114,6 +138,31 @@ function readBuildInfoProvenance(sourceRoot: string): RuntimeSourceProvenance | 
     return parsed.dirty === true ? { sha, dirty: true } : { sha };
   } catch {
     return null;
+  }
+}
+
+function tryNormalizeLegacyRuntimeMetadata(root: string, host: string): boolean {
+  try {
+    ensureRestorableRuntime(root, `Legacy runtime at ${root}`);
+    const pkg = readPackageJson(root);
+    const metadata: ManagedRuntimeMetadata = {
+      version: 1,
+      managedBy: 'pipelane',
+      host,
+      packageVersion: pkg.version?.trim() || '0.0.0',
+      installedAt: new Date().toISOString(),
+    };
+    const provenance = readBuildInfoProvenance(root);
+    if (provenance) {
+      metadata.sourceSha = provenance.sha;
+      if (provenance.dirty) metadata.sourceDirty = true;
+    }
+    writeFileSync(managedRuntimePath(root), `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
+    return true;
+  } catch {
+    // A damaged legacy runtime must remain replaceable. It cannot be a safe
+    // rollback target, so the install succeeds without retaining that tree.
+    return false;
   }
 }
 
@@ -206,16 +255,30 @@ export function installGlobalRuntime(
   const sourceRoot = packageRoot();
   ensureInstallableRuntime(sourceRoot);
 
-  if (existsSync(targetRoot) && !isManagedGlobalRuntime(targetRoot, options.legacyMarkers ?? [])) {
-    throw new Error(`${targetRoot} already exists and is not managed by pipelane.`);
-  }
-
   const parentDir = path.dirname(targetRoot);
   mkdirSync(parentDir, { recursive: true });
   const releaseLock = acquireInstallLock(targetRoot);
   const tempRoot = mkdtempSync(path.join(parentDir, '.pipelane-install-'));
   let asideRoot: string | null = null;
+  let retainCurrentRuntime = true;
   try {
+    if (existsSync(targetRoot)) {
+      const currentMetadata = readManagedRuntimeMetadata(targetRoot);
+      if (!currentMetadata) {
+        const legacyMarkers = options.legacyMarkers ?? [];
+        if (legacyMarkers.length === 0 || !legacyMarkers.every((relativePath) => existsSync(path.join(targetRoot, relativePath)))) {
+          throw new Error(`${targetRoot} already exists and is not managed by pipelane.`);
+        }
+        retainCurrentRuntime = tryNormalizeLegacyRuntimeMetadata(targetRoot, options.host);
+      } else {
+        try {
+          ensureRestorableRuntime(targetRoot, `Current runtime at ${targetRoot}`);
+        } catch {
+          retainCurrentRuntime = false;
+        }
+      }
+    }
+
     const pkg = readPackageJson(sourceRoot);
     const packageVersion = pkg.version?.trim() || '0.0.0';
 
@@ -255,6 +318,7 @@ export function installGlobalRuntime(
       if (!previousMetadata) {
         throw new Error(`${previousRoot} already exists and is not managed by pipelane; refusing to replace it.`);
       }
+      ensureRestorableRuntime(previousRoot, `Retained runtime at ${previousRoot}`);
       if (previousMetadata.host !== options.host) {
         throw new Error(`${previousRoot} belongs to host ${previousMetadata.host || 'unknown'}, not ${options.host}; refusing to replace it.`);
       }
@@ -269,17 +333,39 @@ export function installGlobalRuntime(
     renameSync(tempRoot, targetRoot);
     if (asideRoot) {
       // Retain exactly one prior runtime as the rollback target. Best effort:
-      // a failed retention must not fail the already-completed install, so the
-      // aside dir is left in place for manual recovery instead.
+      // a failed retention must not fail the already-completed install. Keep
+      // both the old canonical target and the retired active runtime until the
+      // replacement rename succeeds, then remove the superseded target.
       try {
-        if (preservePrevious) {
+        if (!retainCurrentRuntime || preservePrevious) {
           rmSync(asideRoot, { recursive: true, force: true });
         } else {
-          rmSync(previousRoot, { recursive: true, force: true });
-          renameSync(asideRoot, previousRoot);
+          const replacedPreviousRoot = existsSync(previousRoot)
+            ? `${previousRoot}.replaced-${process.pid}-${Date.now()}`
+            : null;
+          if (replacedPreviousRoot) {
+            renameSync(previousRoot, replacedPreviousRoot);
+          }
+          try {
+            renameSync(asideRoot, previousRoot);
+          } catch (error) {
+            if (replacedPreviousRoot && !existsSync(previousRoot) && existsSync(replacedPreviousRoot)) {
+              renameSync(replacedPreviousRoot, previousRoot);
+            }
+            throw error;
+          }
+          if (replacedPreviousRoot) {
+            try {
+              rmSync(replacedPreviousRoot, { recursive: true, force: true });
+            } catch {
+              // The new rollback target is already canonical. Leaving the
+              // superseded backup is safer than failing the active install.
+            }
+          }
         }
       } catch {
-        // Keep asideRoot on disk; it still holds the prior runtime.
+        // Keep asideRoot on disk for manual recovery. If a prior canonical
+        // rollback target existed, the rotation above restores it first.
       }
     }
 
@@ -308,6 +394,10 @@ export function rollbackGlobalRuntime(
   const previousRoot = previousRuntimePath(targetRoot);
   const releaseLock = acquireInstallLock(targetRoot);
   try {
+    if (!existsSync(previousRoot)) {
+      throw new Error(`No pipelane-managed previous runtime is retained at ${previousRoot}; nothing to roll back to.`);
+    }
+    ensureRuntimeRootDirectory(previousRoot, `Retained runtime at ${previousRoot}`);
     const restored = readManagedRuntimeMetadata(previousRoot);
     if (!restored) {
       throw new Error(`No pipelane-managed previous runtime is retained at ${previousRoot}; nothing to roll back to.`);
@@ -319,8 +409,11 @@ export function rollbackGlobalRuntime(
       throw new Error(`Retained runtime metadata at ${previousRoot} is incomplete; refusing to activate it.`);
     }
     ensureRestorableRuntime(previousRoot, `Retained runtime at ${previousRoot}`);
-    if (existsSync(targetRoot) && !isManagedGlobalRuntime(targetRoot)) {
-      throw new Error(`${targetRoot} exists and is not managed by pipelane; refusing to roll back over it.`);
+    if (existsSync(targetRoot)) {
+      ensureRuntimeRootDirectory(targetRoot, `Current runtime at ${targetRoot}`);
+      if (!isManagedGlobalRuntime(targetRoot)) {
+        throw new Error(`${targetRoot} exists and is not managed by pipelane; refusing to roll back over it.`);
+      }
     }
     const retired = readManagedRuntimeMetadata(targetRoot);
     const asideRoot = `${targetRoot}.rollback-${process.pid}-${Date.now()}`;
@@ -340,7 +433,25 @@ export function rollbackGlobalRuntime(
     if (movedCurrent) {
       // The rolled-back runtime becomes the new previous, so a second rollback
       // rolls forward again.
-      renameSync(asideRoot, previousRoot);
+      try {
+        renameSync(asideRoot, previousRoot);
+      } catch (error) {
+        // The command must not report failure after silently changing the live
+        // runtime. Put both runtimes back where they started before surfacing
+        // the rotation error.
+        try {
+          renameSync(targetRoot, previousRoot);
+          renameSync(asideRoot, targetRoot);
+        } catch (restoreError) {
+          throw new Error(
+            `Runtime rollback activated ${targetRoot} but could not retain or restore the retired runtime. `
+            + `Recovery paths: active=${targetRoot}, retired=${asideRoot}, previous=${previousRoot}. `
+            + `Rotation error: ${error instanceof Error ? error.message : String(error)}. `
+            + `Restore error: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`,
+          );
+        }
+        throw error;
+      }
     }
     return { runtimeRoot: targetRoot, restored, retired };
   } finally {

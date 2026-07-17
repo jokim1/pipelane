@@ -204,7 +204,7 @@ export function reviewPolicyUpdateNotice(repoRoot: string): string | null {
     if (configured >= REVIEW_GATES_POLICY_VERSION) {
       return null;
     }
-    return `[pipelane] This repo's review gates run policyVersion ${configured}; the installed Pipelane supports ${REVIEW_GATES_POLICY_VERSION}. Run \`pipelane review setup\` to regenerate the repo's review-gate config.\n`;
+    return `[pipelane] This repo's review gates run policyVersion ${configured}; the installed Pipelane supports ${REVIEW_GATES_POLICY_VERSION}. Run \`pipelane review setup --enforcement-mode strict-v3\` to preserve the configured gates and upgrade the review policy.\n`;
   } catch {
     return null;
   }

@@ -39883,6 +39883,19 @@ test('managed runtime install records build-info provenance and retains a rollba
       rmSync(retainedBin, { force: true });
       writeFileSync(retainedBin, retainedBinBody, { mode: retainedBinMode });
       chmodSync(retainedBin, retainedBinMode);
+
+      // The retained runtime root itself must be a real directory. Otherwise a
+      // local symlink can redirect the durable runtime outside PIPELANE_HOME.
+      const retainedElsewhere = `${previousRoot}-symlink-target`;
+      renameSync(previousRoot, retainedElsewhere);
+      symlinkSync(retainedElsewhere, previousRoot, 'dir');
+      const symlinkedPreviousRoot = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+      assert.notEqual(symlinkedPreviousRoot.status, 0);
+      assert.match(symlinkedPreviousRoot.stderr, /must be a real directory, not a symbolic link or other file/);
+      assert.ok(existsSync(path.join(runtimeRoot, 'package.json')));
+      assert.equal(lstatSync(previousRoot).isSymbolicLink(), true);
+      rmSync(previousRoot, { force: true });
+      renameSync(retainedElsewhere, previousRoot);
     }
 
     // A damaged rollback target must never replace the working runtime.
@@ -39901,6 +39914,34 @@ test('managed runtime install records build-info provenance and retains a rollba
   } finally {
     rmSync(workspaceRoot, { recursive: true, force: true });
     rmSync(claudeHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('install-codex normalizes a legacy runtime before retaining and rolling it back', () => {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-rollback-codex-ws-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  try {
+    const env = { CODEX_HOME: codexHome, PIPELANE_HOME: pipelaneHome };
+    runCli(['install-codex'], workspaceRoot, env);
+    const runtimeRoot = managedRuntimeRoot('codex', pipelaneHome);
+    const previousRoot = `${runtimeRoot}.previous`;
+    rmSync(path.join(runtimeRoot, '.pipelane-runtime.json'), { force: true });
+    writeFileSync(path.join(runtimeRoot, 'sentinel-legacy-runtime.txt'), 'legacy', 'utf8');
+
+    runCli(['install-codex'], workspaceRoot, env);
+    const retainedMetadata = JSON.parse(readFileSync(path.join(previousRoot, '.pipelane-runtime.json'), 'utf8'));
+    assert.equal(retainedMetadata.managedBy, 'pipelane');
+    assert.equal(retainedMetadata.host, 'codex');
+    assert.ok(existsSync(path.join(previousRoot, 'sentinel-legacy-runtime.txt')));
+
+    const rollback = runCli(['install-codex', '--rollback'], workspaceRoot, env);
+    assert.match(rollback.stdout, /Rolled back the managed Codex runtime/);
+    assert.ok(existsSync(path.join(runtimeRoot, 'sentinel-legacy-runtime.txt')));
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
     rmSync(pipelaneHome, { recursive: true, force: true });
   }
 });
@@ -40090,24 +40131,31 @@ test('review policy update notice fires only for repos on an older policyVersion
     'const configPath = state.resolveMachineConfigPath(repoRoot);',
     'mkdirSync(path.dirname(configPath), { recursive: true });',
     'const base = { projectKey: "fixture", displayName: "Fixture" };',
-    'writeFileSync(configPath, JSON.stringify({ ...base, reviewGates: {} }, null, 2));',
-    'const legacyNotice = update.reviewPolicyUpdateNotice(repoRoot);',
-    'writeFileSync(configPath, JSON.stringify({ ...base, reviewGates: { enforcementMode: "strict-v3", policyVersion: 3 } }, null, 2));',
-    'const strictNotice = update.reviewPolicyUpdateNotice(repoRoot);',
-    'process.stdout.write(JSON.stringify({ legacyNotice, strictNotice }));',
+    'if (process.argv[2] === "seed") writeFileSync(configPath, JSON.stringify({ ...base, reviewGates: {} }, null, 2));',
+    'process.stdout.write(JSON.stringify({ notice: update.reviewPolicyUpdateNotice(repoRoot), configPath }));',
   ].join('\n');
   try {
-    const result = spawnSync('node', ['--input-type=module', '-e', script, repoRoot], {
+    const seed = spawnSync('node', ['--input-type=module', '-e', script, repoRoot, 'seed'], {
       cwd: KIT_ROOT,
       env: { ...process.env, PIPELANE_HOME: pipelaneHome },
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    assert.equal(result.status, 0, result.stderr);
-    const { legacyNotice, strictNotice } = JSON.parse(result.stdout);
+    assert.equal(seed.status, 0, seed.stderr);
+    const { notice: legacyNotice } = JSON.parse(seed.stdout);
     assert.match(legacyNotice, /policyVersion 2/);
-    assert.match(legacyNotice, /review setup/);
-    assert.equal(strictNotice, null);
+    assert.match(legacyNotice, /review setup --enforcement-mode strict-v3/);
+
+    const migrated = runCli(['review', 'setup', '--enforcement-mode', 'strict-v3', '--json'], repoRoot, { PIPELANE_HOME: pipelaneHome });
+    assert.equal(migrated.status, 0, migrated.stderr);
+    const after = spawnSync('node', ['--input-type=module', '-e', script, repoRoot, 'read'], {
+      cwd: KIT_ROOT,
+      env: { ...process.env, PIPELANE_HOME: pipelaneHome },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(after.status, 0, after.stderr);
+    assert.equal(JSON.parse(after.stdout).notice, null);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(pipelaneHome, { recursive: true, force: true });
