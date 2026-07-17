@@ -126,7 +126,7 @@ function parseVerboseArg(args: string[], command: string): boolean {
 
 // Commands that operate outside the worktree. Skip the worktree symlink for
 // these so we don't surprise users running them in unusual locations.
-const SKIP_WORKTREE_BOOTSTRAP_COMMANDS = new Set(['init', 'bootstrap', 'install-claude', 'install-codex', 'install-npm-guard', 'verify']);
+const SKIP_WORKTREE_BOOTSTRAP_COMMANDS = new Set(['init', 'bootstrap', 'install-claude', 'install-codex', 'install-npm-guard', 'verify', 'run', 'review']);
 const UPDATE_NOTICE_COMMANDS = new Set(['setup', 'configure', 'dashboard', 'board', 'review', 'run']);
 
 function valueAfter(args: string[], flag: string): string {

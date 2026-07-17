@@ -1,8 +1,8 @@
-import { existsSync, lstatSync, mkdirSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, realpathSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-import type { Mode, TaskLock, WorkflowConfig } from './state.ts';
+import type { AutoCleanupBlockerCode, Mode, TaskLock, WorkflowConfig } from './state.ts';
 import {
   normalizePath,
   normalizeExistingPath,
@@ -11,6 +11,7 @@ import {
   runCommandCapture,
   loadAllTaskLocks,
   loadTaskLock,
+  inspectTaskWorkspaceLease,
   newTaskBindingId,
   saveTaskLock,
   taskLockPath,
@@ -430,6 +431,28 @@ export function pruneDeadTaskLocks(
 
     const reasons: string[] = [];
 
+    const workspaceLease = inspectTaskWorkspaceLease(commonDir, config, lock.taskSlug);
+    if (workspaceLease.status !== 'unlocked') {
+      skipped.push({
+        taskSlug: lock.taskSlug,
+        branchName: lock.branchName,
+        worktreePath: lock.worktreePath,
+        reason: workspaceLease.status === 'owned'
+          ? `workspace is in use by ${workspaceLease.owner.command}`
+          : 'workspace lease ownership is malformed; refusing to prune',
+      });
+      continue;
+    }
+    if (!isTargetedScope && lock.cleanup) {
+      skipped.push({
+        taskSlug: lock.taskSlug,
+        branchName: lock.branchName,
+        worktreePath: lock.worktreePath,
+        reason: `cleanup lifecycle state is ${lock.cleanup.status}; stale metadata sweeping does not remove lifecycle intent`,
+      });
+      continue;
+    }
+
     if (!existsSync(lock.worktreePath)) {
       reasons.push(`saved worktree ${lock.worktreePath} no longer exists`);
     }
@@ -542,6 +565,276 @@ export function saveNewTaskLock(options: {
   });
 }
 
+export type DeliveryProof =
+  | {
+      kind: 'merged-pr-head';
+      prNumber: number;
+      prHeadSha: string;
+      mergedSha: string;
+      remoteBaseRef: string;
+      remoteBaseSha: string;
+    }
+  | {
+      kind: 'remote-ancestor';
+      branchHeadSha: string;
+      remoteBaseRef: string;
+      remoteBaseSha: string;
+    };
+
+export interface CleanupEvidenceRevision {
+  remoteBaseSha: string;
+  observedAt: string;
+  source: 'merge-fetch' | 'reconcile-fetch' | 'snapshot-local';
+}
+
+export interface CleanupStatusSnapshot {
+  ok: boolean;
+  trackedChanges: number;
+  untrackedEntries: string[];
+  ignoredEntries: string[];
+  protectedIgnoredEntries: string[];
+  error?: string;
+}
+
+export interface TaskCleanupAssessmentInput {
+  automatic: boolean;
+  automaticEnabled: boolean;
+  lock: TaskLock;
+  taskBindingId: string;
+  sharedRepoRoot: string | null;
+  callerCwd: string;
+  worktreeExists: boolean;
+  observedBranchName: string;
+  branchHeadSha: string;
+  branchExists: boolean;
+  status: CleanupStatusSnapshot;
+  proof: DeliveryProof | null;
+  proofContained: boolean;
+  evidence: CleanupEvidenceRevision | null;
+}
+
+export type BranchDeletionAuthorization = {
+  kind: DeliveryProof['kind'];
+  expectedBranchHeadSha: string;
+  remoteBaseSha: string;
+};
+
+export type TaskCleanupAssessment =
+  | {
+      status: 'eligible';
+      taskSlug: string;
+      expectedBranchHeadSha: string;
+      branchDeletion: BranchDeletionAuthorization;
+      evidence: CleanupEvidenceRevision;
+    }
+  | {
+      status: 'blocked';
+      taskSlug: string;
+      code: AutoCleanupBlockerCode;
+      reason: string;
+    }
+  | {
+      status: 'kept';
+      taskSlug: string;
+      reason: 'operator-requested' | 'automatic-cleanup-disabled';
+    };
+
+function canonicalPath(value: string): string {
+  try {
+    return normalizePath(realpathSync(value));
+  } catch {
+    return normalizePath(path.resolve(value));
+  }
+}
+
+function pathContainsOrEquals(parent: string, candidate: string): boolean {
+  const relative = path.relative(canonicalPath(parent), canonicalPath(candidate));
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+function parsePorcelainV1Z(output: string): Array<{ code: string; path: string }> {
+  const tokens = output.split('\0');
+  const entries: Array<{ code: string; path: string }> = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (!token) continue;
+    if (token.length < 3 || token[2] !== ' ') {
+      entries.push({ code: '??', path: token });
+      continue;
+    }
+    const code = token.slice(0, 2);
+    entries.push({ code, path: token.slice(3) });
+    if ((code[0] === 'R' || code[0] === 'C') && index + 1 < tokens.length) index += 1;
+  }
+  return entries;
+}
+
+function isVerifiedSharedNodeModulesLink(worktreePath: string, sharedRepoRoot: string, ignoredPath: string): boolean {
+  const normalized = ignoredPath.replace(/\\/g, '/').replace(/\/+$/, '');
+  if (normalized !== 'node_modules') return false;
+  const candidate = path.join(worktreePath, ignoredPath);
+  const expected = path.join(sharedRepoRoot, 'node_modules');
+  try {
+    return lstatSync(candidate).isSymbolicLink()
+      && existsSync(expected)
+      && canonicalPath(candidate) === canonicalPath(expected);
+  } catch {
+    return false;
+  }
+}
+
+function isConfiguredDisposableIgnoredPath(
+  worktreePath: string,
+  ignoredPath: string,
+  configuredRoots: string[],
+): boolean {
+  const relativeCandidate = ignoredPath.replace(/\\/g, '/').replace(/\/+$/, '');
+  if (!relativeCandidate || path.isAbsolute(relativeCandidate)) return false;
+  const candidate = path.resolve(worktreePath, relativeCandidate);
+  if (!pathContainsOrEquals(worktreePath, candidate)) return false;
+  for (const root of configuredRoots) {
+    const rootPath = path.resolve(worktreePath, root);
+    if (!pathContainsOrEquals(worktreePath, rootPath)) continue;
+    // A disposable root must not overlap version-controlled content. The
+    // ignored entry itself is absent from `git ls-files`, but deleting its
+    // enclosing worktree would also delete any tracked files beneath the
+    // configured root. Keep the entire root protected in that case.
+    const tracked = runCommandCapture('git', ['ls-files', '-z', '--', `:(literal)${root}`], {
+      cwd: worktreePath,
+      preserveOutput: true,
+    });
+    if (!tracked.ok || tracked.stdout.length > 0) continue;
+    const lexicalRelative = path.relative(rootPath, candidate);
+    if (lexicalRelative !== '' && (lexicalRelative === '..' || lexicalRelative.startsWith(`..${path.sep}`) || path.isAbsolute(lexicalRelative))) continue;
+    try {
+      if (!pathContainsOrEquals(worktreePath, realpathSync(rootPath))) continue;
+      if (!pathContainsOrEquals(realpathSync(rootPath), realpathSync(candidate))) continue;
+    } catch {
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+export function inspectCleanupStatus(options: {
+  worktreePath: string;
+  sharedRepoRoot: string;
+  disposableIgnoredPaths?: string[];
+}): CleanupStatusSnapshot {
+  const result = runCommandCapture(
+    'git',
+    ['status', '--porcelain=v1', '-z', '--ignored=matching', '--untracked-files=all'],
+    { cwd: options.worktreePath, preserveOutput: true },
+  );
+  if (!result.ok) {
+    return {
+      ok: false,
+      trackedChanges: 0,
+      untrackedEntries: [],
+      ignoredEntries: [],
+      protectedIgnoredEntries: [],
+      error: result.stderr.trim() || result.stdout.trim() || 'git status failed',
+    };
+  }
+  let trackedChanges = 0;
+  const untrackedEntries: string[] = [];
+  const ignoredEntries: string[] = [];
+  const protectedIgnoredEntries: string[] = [];
+  for (const entry of parsePorcelainV1Z(result.stdout)) {
+    if (entry.code === '!!') {
+      ignoredEntries.push(entry.path);
+      if (!isVerifiedSharedNodeModulesLink(options.worktreePath, options.sharedRepoRoot, entry.path)
+        && !isConfiguredDisposableIgnoredPath(options.worktreePath, entry.path, options.disposableIgnoredPaths ?? [])) {
+        protectedIgnoredEntries.push(entry.path);
+      }
+    } else if (entry.code === '??') {
+      untrackedEntries.push(entry.path);
+    } else {
+      trackedChanges += 1;
+    }
+  }
+  return { ok: true, trackedChanges, untrackedEntries, ignoredEntries, protectedIgnoredEntries };
+}
+
+export function assessTaskCleanup(input: TaskCleanupAssessmentInput): TaskCleanupAssessment {
+  const taskSlug = input.lock.taskSlug;
+  if (input.automatic && !input.automaticEnabled) {
+    return { status: 'kept', taskSlug, reason: 'automatic-cleanup-disabled' };
+  }
+  if (input.automatic && input.lock.cleanup?.status === 'kept' && input.lock.cleanup.taskBindingId === input.taskBindingId) {
+    return { status: 'kept', taskSlug, reason: 'operator-requested' };
+  }
+  if (!input.lock.taskBindingId || input.lock.taskBindingId !== input.taskBindingId) {
+    return { status: 'blocked', taskSlug, code: 'state-conflict', reason: 'Task binding identity is missing or changed.' };
+  }
+  if (!input.sharedRepoRoot) {
+    return { status: 'blocked', taskSlug, code: 'shared-checkout-unavailable', reason: 'The primary shared checkout could not be resolved.' };
+  }
+  if (canonicalPath(input.lock.worktreePath) === canonicalPath(input.sharedRepoRoot)) {
+    return { status: 'blocked', taskSlug, code: 'shared-checkout', reason: 'The primary shared checkout is never eligible for task cleanup.' };
+  }
+  if (input.worktreeExists && pathContainsOrEquals(input.lock.worktreePath, input.callerCwd)) {
+    return { status: 'blocked', taskSlug, code: 'caller-inside', reason: `The Pipelane process is still inside ${input.lock.worktreePath}.` };
+  }
+  if (input.worktreeExists) {
+    if (!input.status.ok) {
+      return { status: 'blocked', taskSlug, code: 'status-failed', reason: input.status.error ?? 'Could not inspect worktree status.' };
+    }
+    if (!input.observedBranchName) {
+      return { status: 'blocked', taskSlug, code: 'detached', reason: 'The task worktree is detached.' };
+    }
+    if (input.observedBranchName !== input.lock.branchName) {
+      return { status: 'blocked', taskSlug, code: 'branch-mismatch', reason: `Expected branch ${input.lock.branchName}, found ${input.observedBranchName}.` };
+    }
+    if (input.status.trackedChanges > 0 || input.status.untrackedEntries.length > 0) {
+      return { status: 'blocked', taskSlug, code: 'uncommitted', reason: 'The task worktree has tracked or untracked changes.' };
+    }
+    if (input.status.protectedIgnoredEntries.length > 0) {
+      return {
+        status: 'blocked',
+        taskSlug,
+        code: 'ignored-content',
+        reason: `Protected ignored content remains: ${input.status.protectedIgnoredEntries.join(', ')}`,
+      };
+    }
+  }
+  if (!input.branchExists) {
+    if (!input.worktreeExists && input.lock.cleanup) {
+      const targetSha = input.lock.cleanup.targetSha;
+      return {
+        status: 'eligible',
+        taskSlug,
+        expectedBranchHeadSha: targetSha,
+        branchDeletion: { kind: input.proof?.kind ?? 'remote-ancestor', expectedBranchHeadSha: targetSha, remoteBaseSha: input.evidence?.remoteBaseSha ?? targetSha },
+        evidence: input.evidence ?? { remoteBaseSha: targetSha, observedAt: nowIso(), source: 'snapshot-local' },
+      };
+    }
+    return { status: 'blocked', taskSlug, code: 'branch-missing', reason: `Local branch ${input.lock.branchName} is missing.` };
+  }
+  if (!input.proof || !input.evidence) {
+    return { status: 'blocked', taskSlug, code: 'delivery-proof-insufficient', reason: 'No typed remote-base delivery proof is available.' };
+  }
+  const proofExpectedHead = input.proof.kind === 'merged-pr-head' ? input.proof.prHeadSha : input.proof.branchHeadSha;
+  if (!input.branchHeadSha || input.branchHeadSha !== proofExpectedHead || input.evidence.remoteBaseSha !== input.proof.remoteBaseSha) {
+    return { status: 'blocked', taskSlug, code: 'delivery-proof-drift', reason: 'The local branch head or remote evidence revision changed after proof capture.' };
+  }
+  if (!input.proofContained) {
+    return { status: 'blocked', taskSlug, code: 'delivery-proof-insufficient', reason: 'The captured remote base does not contain the delivery proof target.' };
+  }
+  return {
+    status: 'eligible',
+    taskSlug,
+    expectedBranchHeadSha: input.branchHeadSha,
+    branchDeletion: {
+      kind: input.proof.kind,
+      expectedBranchHeadSha: input.branchHeadSha,
+      remoteBaseSha: input.proof.remoteBaseSha,
+    },
+    evidence: input.evidence,
+  };
+}
+
 export interface RemoveTaskArtifactsResult {
   // What was actually removed. False entries are either "already gone" or
   // "skipped because the safety check fired without --force"; the `errors`
@@ -557,19 +850,15 @@ export interface RemoveTaskArtifactsResult {
 
 /**
  * Tear down a task's worktree + local branch as the end-of-task close-out.
- * The lock file is the caller's responsibility — typically pruned just
- * before by `/clean --apply --task` so the operator's mental model is
- * "metadata lock, then the artifacts it pointed at."
+ * The lock file is the caller's responsibility and must be pruned only after
+ * both artifacts are gone, so a blocker or crash retains retry identity.
  *
  * Safety floor (skipped when `force === true`):
- * - Worktree must have no uncommitted or untracked content. The check uses
- *   `git status --porcelain` inside the worktree, so .gitignored files
- *   (node_modules symlink, build outputs) are tolerated.
- * - Branch must be merged by git's local ancestry rules, or its tree must
- *   match a caller-provided verified ref. The tree-match path covers
- *   squash-merged PR branches after production verification: the commits are
- *   not ancestors, but the branch content is already represented by the
- *   deployed merge SHA.
+ * - Worktree must have no tracked or untracked changes. Protected ignored
+ *   content is also rejected when `requireNoIgnoredContent` is enabled.
+ * - A forceful branch delete requires typed delivery authorization plus the
+ *   exact branch-head SHA captured by the assessor. Tree equality alone never
+ *   authorizes deletion.
  *
  * Refuses when the worktree being removed is the caller's current
  * directory — git rejects that and the operator should `cd` out first.
@@ -580,6 +869,11 @@ export function removeTaskArtifacts(options: {
   branchName: string;
   callerCwd: string;
   force: boolean;
+  expectedBranchHeadSha?: string;
+  branchDeletionAuthorized?: boolean;
+  disposableIgnoredPaths?: string[];
+  requireNoIgnoredContent?: boolean;
+  /** @deprecated Tree equality is diagnostic only and is intentionally ignored. */
   safeDeleteBranchRef?: string;
 }): RemoveTaskArtifactsResult {
   const warnings: string[] = [];
@@ -587,7 +881,12 @@ export function removeTaskArtifacts(options: {
   let worktreeRemoved = false;
   let branchRemoved = false;
 
-  const callerInsideTarget = normalizePath(options.callerCwd).startsWith(normalizePath(options.worktreePath));
+  if (canonicalPath(options.worktreePath) === canonicalPath(options.sharedRepoRoot)) {
+    errors.push(`Refusing to remove the primary shared checkout ${options.sharedRepoRoot}.`);
+    return { worktreeRemoved, branchRemoved, warnings, errors };
+  }
+
+  const callerInsideTarget = pathContainsOrEquals(options.worktreePath, options.callerCwd);
   if (callerInsideTarget && existsSync(options.worktreePath)) {
     errors.push(
       `Cannot remove worktree ${options.worktreePath} while inside it. ` +
@@ -605,12 +904,20 @@ export function removeTaskArtifacts(options: {
     worktreeRemoved = true;
   } else {
     if (!options.force) {
-      const status = runCommandCapture('git', ['status', '--porcelain'], { cwd: options.worktreePath });
-      if (status.ok && status.stdout.trim().length > 0) {
+      const status = inspectCleanupStatus({
+        worktreePath: options.worktreePath,
+        sharedRepoRoot: options.sharedRepoRoot,
+        disposableIgnoredPaths: options.disposableIgnoredPaths,
+      });
+      if (!status.ok) {
+        errors.push(`Could not inspect worktree ${options.worktreePath}: ${status.error ?? 'git status failed'}`);
+      } else if (status.trackedChanges > 0 || status.untrackedEntries.length > 0) {
         errors.push(
           `Worktree ${options.worktreePath} has uncommitted or untracked changes. ` +
           `Re-run with --force to remove anyway, or commit/stash first.`,
         );
+      } else if (options.requireNoIgnoredContent && status.protectedIgnoredEntries.length > 0) {
+        errors.push(`Worktree ${options.worktreePath} has protected ignored content: ${status.protectedIgnoredEntries.join(', ')}`);
       }
     }
     if (errors.length === 0) {
@@ -626,28 +933,52 @@ export function removeTaskArtifacts(options: {
     }
   }
 
-  // Step 2: local branch removal. Always attempt, even if worktree removal
-  // failed — the two artifacts are independent, and the caller can decide
-  // what to surface.
-  const branchExists = runGit(options.sharedRepoRoot, ['rev-parse', '--verify', `refs/heads/${options.branchName}`], true);
+  // Step 2: local branch removal. A failed worktree removal ends the attempt;
+  // deleting its still-checked-out branch would turn a recoverable blocker into
+  // a partial destructive transition.
+  if (!worktreeRemoved) return { worktreeRemoved, branchRemoved, warnings, errors };
+
+  const branchExists = runGit(options.sharedRepoRoot, ['rev-parse', '--verify', `refs/heads/${options.branchName}`], true)?.trim() ?? '';
   if (!branchExists) {
     warnings.push(`Local branch ${options.branchName} was already missing.`);
     branchRemoved = true;
   } else {
-    const safeTreeMatch = !options.force && options.safeDeleteBranchRef
-      ? branchTreeMatchesRef(options.sharedRepoRoot, options.branchName, options.safeDeleteBranchRef)
-      : false;
-    const deleteFlag = options.force || safeTreeMatch ? '-D' : '-d';
-    const result = runCommandCapture('git', ['branch', deleteFlag, options.branchName], { cwd: options.sharedRepoRoot });
+    if (!options.force && options.branchDeletionAuthorized) {
+      if (!options.expectedBranchHeadSha || branchExists !== options.expectedBranchHeadSha) {
+        errors.push(
+          `Branch ${options.branchName} moved after cleanup assessment ` +
+          `(expected ${shortRef(options.expectedBranchHeadSha ?? '(missing)')}, found ${shortRef(branchExists)}).`,
+        );
+        return { worktreeRemoved, branchRemoved, warnings, errors };
+      }
+    }
+    const deleteFlag = options.force ? '-D' : '-d';
+    // `git branch -D` performs a separate read and delete. A raw git process
+    // can move the ref after our assessment even while Pipelane holds the task
+    // lease, so use update-ref's expected-old CAS for typed delivery cleanup.
+    const result = !options.force && options.branchDeletionAuthorized
+      ? runCommandCapture(
+          'git',
+          ['update-ref', '-d', `refs/heads/${options.branchName}`, options.expectedBranchHeadSha ?? ''],
+          { cwd: options.sharedRepoRoot },
+        )
+      : runCommandCapture('git', ['branch', deleteFlag, options.branchName], { cwd: options.sharedRepoRoot });
     if (result.ok) {
       branchRemoved = true;
-      if (safeTreeMatch) {
+      if (!options.force && options.branchDeletionAuthorized) {
         warnings.push(
-          `Local branch ${options.branchName} was deleted because its tree matches verified ref ${shortRef(options.safeDeleteBranchRef ?? '')}.`,
+          `Local branch ${options.branchName} was deleted under typed delivery proof at ${shortRef(options.expectedBranchHeadSha ?? '')}.`,
         );
       }
     } else {
       const stderr = result.stderr || result.stdout || 'unknown error';
+      if (!options.force && options.branchDeletionAuthorized) {
+        errors.push(
+          `Branch ${options.branchName} moved while cleanup was deleting its assessed ref; ` +
+          `the branch was preserved. ${stderr}`,
+        );
+        return { worktreeRemoved, branchRemoved, warnings, errors };
+      }
       const isUnmerged = /not fully merged/i.test(stderr);
       errors.push(
         isUnmerged
@@ -703,7 +1034,7 @@ export function removeOrphanWorktree(options: {
   const errors: string[] = [];
   let worktreeRemoved = false;
 
-  const callerInsideTarget = normalizePath(options.callerCwd).startsWith(normalizePath(options.worktreePath));
+  const callerInsideTarget = pathContainsOrEquals(options.worktreePath, options.callerCwd);
   if (callerInsideTarget && existsSync(options.worktreePath)) {
     errors.push(
       `Cannot remove worktree ${options.worktreePath} while inside it. ` +
@@ -765,22 +1096,24 @@ export function classifyOrphan(worktreePath: string): OrphanClassification {
   if (!existsSync(worktreePath)) {
     return { trackedChanges: 0, untrackedFiles: 0, ignoredEntries: [], treeState: 'unknown' };
   }
-  const status = runCommandCapture('git', ['status', '--porcelain', '--ignored=matching'], { cwd: worktreePath });
+  const status = runCommandCapture(
+    'git',
+    ['status', '--porcelain=v1', '-z', '--ignored=matching', '--untracked-files=all'],
+    { cwd: worktreePath, preserveOutput: true },
+  );
   if (!status.ok) {
     return { trackedChanges: 0, untrackedFiles: 0, ignoredEntries: [], treeState: 'unknown' };
   }
   let tracked = 0;
   let untracked = 0;
   const ignored: string[] = [];
-  for (const rawLine of status.stdout.split('\n')) {
-    const line = rawLine.trimEnd();
-    if (!line) continue;
-    if (line.startsWith('!! ')) {
-      const candidate = line.slice(3).trim();
+  for (const entry of parsePorcelainV1Z(status.stdout)) {
+    if (entry.code === '!!') {
+      const candidate = entry.path;
       if (candidate.length > 0 && !isAllowedAutoCleanIgnoredPath(worktreePath, candidate)) {
         ignored.push(candidate);
       }
-    } else if (line.startsWith('?? ')) {
+    } else if (entry.code === '??') {
       untracked += 1;
     } else {
       tracked += 1;
@@ -795,13 +1128,10 @@ export function classifyOrphan(worktreePath: string): OrphanClassification {
 }
 
 function isAllowedAutoCleanIgnoredPath(worktreePath: string, ignoredPath: string): boolean {
-  const normalized = ignoredPath.replace(/\\/g, '/').replace(/\/+$/, '');
-  if (normalized !== 'node_modules') return false;
-  try {
-    return lstatSync(path.join(worktreePath, ignoredPath)).isSymbolicLink();
-  } catch {
-    return false;
-  }
+  const commonDir = runGit(worktreePath, ['rev-parse', '--git-common-dir'], true)?.trim();
+  if (!commonDir) return false;
+  const absoluteCommonDir = path.isAbsolute(commonDir) ? commonDir : path.resolve(worktreePath, commonDir);
+  return isVerifiedSharedNodeModulesLink(worktreePath, resolveSharedRepoRoot(absoluteCommonDir), ignoredPath);
 }
 
 export interface OrphanWorktree {

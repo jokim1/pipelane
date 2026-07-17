@@ -2,6 +2,7 @@ import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 
 import {
+  automaticWorktreeCleanupEnabled,
   formatWorkflowCommand,
   normalizeExistingPath,
   loadTaskLock,
@@ -23,6 +24,7 @@ import {
   pruneDeadTaskLocks,
   resolveTaskBaseRef,
   resolveTaskCommandIdentity,
+  resolveSharedRepoRoot,
   resolveTaskWorktreeRoot,
   saveNewTaskLock,
   type OrphanWorktree,
@@ -31,6 +33,7 @@ import { runGit } from '../state.ts';
 import { inferTaskSlugsFromBranchName, resolveCommandSurfaces } from './helpers.ts';
 import { taskBriefFromFlags } from '../review-data.ts';
 import { assertManagedLocalStateValid, assertManagedLocalStateValidForTree } from '../local-state.ts';
+import { reconcileDeliveredTaskWorkspaces } from './clean.ts';
 
 // v1.5: soft-warn when the operator has 3+ active tasks. Never blocks —
 // small teams legitimately juggle several lanes, but 24 half-alive
@@ -53,11 +56,27 @@ export async function handleNew(cwd: string, parsed: ParsedOperatorArgs): Promis
   const mode = context.modeState.mode;
   const surfaces = resolveCommandSurfaces(context, parsed.flags.surfaces);
   const { removed: removedLocks } = pruneDeadTaskLocks(context.commonDir, context.config, { minAgeMs: 0 });
+  const reconciliation = reconcileDeliveredTaskWorkspaces({
+    commonDir: context.commonDir,
+    config: context.config,
+    sharedRepoRoot: resolveSharedRepoRoot(context.commonDir),
+    callerCwd: cwd,
+    automatic: true,
+  });
   const existingLock = loadTaskLock(context.commonDir, context.config, taskSlug);
   const prunedTaskLock = findPrunedTaskLock(removedLocks, taskSlug);
   const warnings = prunedTaskLock
     ? [`Removed stale task lock for ${taskSlug}.`, ...prunedTaskLock.reasons]
     : [];
+  if (!automaticWorktreeCleanupEnabled(context.config)) {
+    warnings.push('Automatic worktree cleanup is disabled by machine-local repository policy; delivered-workspace reconciliation was skipped.');
+  }
+  if (reconciliation.closed.length > 0) {
+    warnings.push(`Closed ${reconciliation.closed.length} previously delivered task workspace${reconciliation.closed.length === 1 ? '' : 's'}.`);
+  }
+  for (const entry of reconciliation.skipped) {
+    if (entry.status !== 'cleaned') warnings.push(`Kept delivered task ${entry.taskSlug}: ${entry.reason}`);
+  }
 
   // v1.5: soft warn for WIP explosion. Runs AFTER pruneDeadTaskLocks so
   // the count reflects genuinely-active locks, not zombies a previous

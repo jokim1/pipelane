@@ -15,7 +15,7 @@ import {
   resolveWorkflowContext,
   runCommandCapture,
   runGit,
-  saveTaskLock,
+  saveReboundTaskLock,
   type ParsedOperatorArgs,
   type TaskLock,
   type WorkflowConfig,
@@ -275,7 +275,7 @@ function saveAdoptedTaskLock(options: {
     && options.existingLock.taskBrief.digest !== options.requestedBrief.digest
   );
   const retainBinding = sameBinding && !briefChangesBinding;
-  return saveTaskLock(options.commonDir, options.config, options.taskSlug, {
+  return saveReboundTaskLock(options.commonDir, options.config, options.taskSlug, {
     taskSlug: options.taskSlug,
     taskName: options.taskName,
     taskBindingId: retainBinding
@@ -290,6 +290,7 @@ function saveAdoptedTaskLock(options: {
     surfaces: options.surfaces,
     nextAction: options.existingLock?.nextAction,
     nextActionUpdatedAt: options.existingLock?.nextActionUpdatedAt,
+    cleanup: retainBinding ? options.existingLock?.cleanup : undefined,
     bindingHistory: history,
     updatedAt,
   });

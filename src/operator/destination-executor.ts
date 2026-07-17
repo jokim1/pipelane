@@ -19,7 +19,23 @@ import {
   evaluateDestinationRouteReviewSafety,
   recordDestinationRouteCompleted,
 } from './route-loop-safety.ts';
-import { resolveWorkflowContext, type ParsedOperatorArgs } from './state.ts';
+import {
+  acquireTaskWorkspaceLease,
+  ensureTaskBindingId,
+  loadDeliveryByPr,
+  loadTaskLock,
+  normalizeExistingPath,
+  resolveWorkflowContext,
+  WORKSPACE_LEASE_BINDING_ENV,
+  WORKSPACE_LEASE_CHILD_COMMAND_ENV,
+  WORKSPACE_LEASE_OWNER_COMMAND_ENV,
+  WORKSPACE_LEASE_TASK_ENV,
+  WORKSPACE_LEASE_TOKEN_ENV,
+  WORKSPACE_LEASE_TRANSFER_ENV,
+  type ParsedOperatorArgs,
+  type TaskWorkspaceLease,
+} from './state.ts';
+import { resolveSharedRepoRoot } from './task-workspaces.ts';
 
 export const DESTINATION_INTERNAL_STEP_ENV = 'PIPELANE_DESTINATION_INTERNAL_STEP';
 export const DESTINATION_APPROVED_ROUTE_FINGERPRINT_ENV = 'PIPELANE_DESTINATION_APPROVED_ROUTE_FINGERPRINT';
@@ -90,6 +106,8 @@ export async function executeDestinationRoute(
   };
   const captureOutput = parsed.flags.json;
   let routeCwd = routeExecutionCwd(plan, cwd);
+  let routeLease = acquireDestinationRouteWorkspaceLease(plan);
+  try {
   let currentPlan = replanDestination(routeCwd, parsed);
   const initialDrift = routeApprovalDrift(plan, currentPlan);
   if (initialDrift) {
@@ -120,9 +138,35 @@ export async function executeDestinationRoute(
     }
 
     const args = buildStepArgs(step, parsed, currentPlan);
+    const childCwd = routeCwd;
+    let continuationCwd = routeCwd;
+    if (step.id === 'merge') {
+      const context = resolveWorkflowContext(routeCwd);
+      const sharedCheckout = resolveSharedRepoRoot(context.commonDir);
+      if (!existsSync(sharedCheckout)) {
+        return failRouteGuard(execution, step.command, `primary shared checkout is unavailable: ${sharedCheckout}`);
+      }
+      try {
+        const sharedContext = resolveWorkflowContext(sharedCheckout);
+        if (normalizeExistingPath(sharedContext.commonDir) !== normalizeExistingPath(context.commonDir)) {
+          return failRouteGuard(execution, step.command, 'primary shared checkout resolves to a different Git common directory; the task workspace was preserved.');
+        }
+      } catch (error) {
+        return failRouteGuard(execution, step.command, `could not verify the primary shared checkout: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      try {
+        process.chdir(sharedCheckout);
+      } catch (error) {
+        return failRouteGuard(execution, step.command, `could not enter primary shared checkout: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      continuationCwd = sharedCheckout;
+    }
+    if (routeLease && !routeLease.transfer('command', `destination:${step.id}`)) {
+      return failRouteGuard(execution, step.command, 'destination route lost its workspace lease before starting the next step.');
+    }
     const result = spawnSync(process.execPath, [cliPath(), 'run', ...args], {
-      cwd: routeCwd,
-      env: buildStepEnv(step, currentPlan),
+      cwd: childCwd,
+      env: buildStepEnv(step, currentPlan, routeLease),
       encoding: 'utf8',
       stdio: captureOutput ? ['ignore', 'pipe', 'pipe'] : ['inherit', 'inherit', 'inherit'],
     });
@@ -133,7 +177,7 @@ export async function executeDestinationRoute(
     execution.steps.push({
       id: step.id,
       command: step.command,
-      cwd: routeCwd,
+      cwd: childCwd,
       exitCode,
       stdout,
       stderr,
@@ -144,17 +188,76 @@ export async function executeDestinationRoute(
       execution.failedStep = step.command;
       return execution;
     }
-    const nextPlan = replanDestination(routeCwd, parsed);
+    if (routeLease && !routeLease.transfer('command', 'destination-route')) {
+      if (step.id !== 'merge') {
+        return failRouteGuard(execution, step.command, 'destination route lost its workspace lease after the step completed.');
+      }
+      routeLease.release();
+      routeLease = null;
+    }
+    const nextPlan = replanDestination(continuationCwd, parsedForContinuation(parsed, currentPlan, step));
     const progressBlocker = validateStepProgress(plan, currentPlan, nextPlan, step);
     if (progressBlocker) {
       return failRouteGuard(execution, step.command, progressBlocker);
     }
     currentPlan = nextPlan;
-    routeCwd = routeExecutionCwd(currentPlan, routeCwd);
+    if (step.id === 'merge') plan = nextPlan;
+    routeCwd = step.id === 'merge'
+      ? continuationCwd
+      : routeExecutionCwd(currentPlan, continuationCwd);
     if (options.stopAfterFirstExecutableStep) {
       return execution;
     }
   }
+  } finally {
+    routeLease?.release();
+  }
+}
+
+function acquireDestinationRouteWorkspaceLease(plan: DestinationPlan): TaskWorkspaceLease | null {
+  const route = routeFingerprint(plan);
+  const approvedBindingId = typeof route.taskBindingId === 'string' ? route.taskBindingId.trim() : '';
+  if (!approvedBindingId || !plan.worktreePath?.trim() || !plan.taskSlug || plan.taskSlug === 'unknown') return null;
+  const context = resolveWorkflowContext(plan.worktreePath);
+  const prNumber = typeof route.prNumber === 'number' ? route.prNumber : Number.NaN;
+  const delivery = Number.isSafeInteger(prNumber) && prNumber > 0
+    ? loadDeliveryByPr(context.commonDir, context.config, prNumber)
+    : null;
+  const immutableDeliveryMatches = delivery !== null
+    && delivery.ownership === 'managed-task'
+    && delivery.taskSlug === plan.taskSlug
+    && delivery.taskBindingId === approvedBindingId
+    && delivery.mode === route.mode
+    && delivery.prHeadSha === route.headSha
+    && delivery.mergedSha === route.mergedSha
+    && delivery.mergedSha === route.targetSha;
+  if (immutableDeliveryMatches) return null;
+  const initial = loadTaskLock(context.commonDir, context.config, plan.taskSlug);
+  if (!initial) throw new Error(`Destination route task ${plan.taskSlug} no longer has its approved workspace binding.`);
+  const lock = initial.taskBindingId ? initial : ensureTaskBindingId(context.commonDir, context.config, initial.taskSlug);
+  if (!lock?.taskBindingId || lock.taskBindingId !== approvedBindingId) {
+    throw new Error(`Destination route task ${plan.taskSlug} no longer matches its approved workspace binding.`);
+  }
+  const acquired = acquireTaskWorkspaceLease(context.commonDir, context.config, {
+    taskSlug: lock.taskSlug,
+    taskBindingId: lock.taskBindingId,
+    command: 'destination-route',
+  });
+  if (acquired.acquired === false) throw new Error(acquired.reason);
+  return acquired.lease;
+}
+
+function parsedForContinuation(parsed: ParsedOperatorArgs, plan: DestinationPlan, step: DestinationStep): ParsedOperatorArgs {
+  if (step.id !== 'merge') return parsed;
+  const fp = routeFingerprint(plan);
+  return {
+    ...parsed,
+    flags: {
+      ...parsed.flags,
+      task: plan.taskSlug,
+      pr: typeof fp.prNumber === 'number' ? String(fp.prNumber) : parsed.flags.pr,
+    },
+  };
 }
 
 function routeExecutionCwd(plan: DestinationPlan, fallbackCwd: string): string {
@@ -284,7 +387,7 @@ function formatCommandArgument(arg: string): string {
   return JSON.stringify(sanitized);
 }
 
-function buildStepEnv(step: DestinationStep, plan: DestinationPlan): NodeJS.ProcessEnv {
+function buildStepEnv(step: DestinationStep, plan: DestinationPlan, lease: TaskWorkspaceLease | null): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     [DESTINATION_INTERNAL_STEP_ENV]: '1',
@@ -293,6 +396,20 @@ function buildStepEnv(step: DestinationStep, plan: DestinationPlan): NodeJS.Proc
   delete env.PIPELANE_DEPLOY_PROD_API_CONFIRMED;
   delete env[DESTINATION_ROUTE_PROD_CONFIRMED_ENV];
   delete env[DESTINATION_APPROVED_TARGET_SHA_ENV];
+  delete env[WORKSPACE_LEASE_TOKEN_ENV];
+  delete env[WORKSPACE_LEASE_TASK_ENV];
+  delete env[WORKSPACE_LEASE_BINDING_ENV];
+  delete env[WORKSPACE_LEASE_OWNER_COMMAND_ENV];
+  delete env[WORKSPACE_LEASE_CHILD_COMMAND_ENV];
+  delete env[WORKSPACE_LEASE_TRANSFER_ENV];
+  if (lease) {
+    env[WORKSPACE_LEASE_TOKEN_ENV] = lease.token;
+    env[WORKSPACE_LEASE_TASK_ENV] = lease.taskSlug;
+    env[WORKSPACE_LEASE_BINDING_ENV] = lease.taskBindingId;
+    env[WORKSPACE_LEASE_OWNER_COMMAND_ENV] = `destination:${step.id}`;
+    env[WORKSPACE_LEASE_CHILD_COMMAND_ENV] = step.id === 'deploy_staging' || step.id === 'deploy_prod' ? 'deploy' : step.id;
+    if (step.id === 'merge') env[WORKSPACE_LEASE_TRANSFER_ENV] = '1';
+  }
   if (step.id === 'deploy_prod' && process.env[DESTINATION_ROUTE_PROD_CONFIRMED_ENV] === '1') {
     env.PIPELANE_DEPLOY_PROD_API_CONFIRMED = '1';
   }
@@ -362,7 +479,9 @@ function validateStepProgress(
     return 'destination route stopped because the explicit deploy target SHA changed after approval. Re-run the destination command with a stable SHA.';
   }
 
-  const staticDrift = routeStaticDrift(approved, after);
+  const staticDrift = step.id === 'merge'
+    ? mergeCloseoutStaticDrift(approved, before, after)
+    : routeStaticDrift(approved, after);
   if (staticDrift) return staticDrift;
   if (after.blockers.length > 0) {
     return `destination route is blocked after ${step.command}: ${after.blockers.join('; ')}`;
@@ -379,7 +498,7 @@ function validateStepProgress(
     return `${step.command} completed but the destination route made no observable progress. Re-run the destination command after checking the step output.`;
   }
 
-  if (step.id !== 'pr' && afterFp.headSha !== beforeFp.headSha) {
+  if (step.id !== 'pr' && step.id !== 'merge' && afterFp.headSha !== beforeFp.headSha) {
     return 'destination route stopped because HEAD changed outside the PR creation step. Re-run the destination command to approve the new SHA.';
   }
   if (step.id !== 'pr' && afterFp.prNumber !== beforeFp.prNumber) {
@@ -425,6 +544,7 @@ function routeStaticFingerprint(plan: DestinationPlan): Record<string, unknown> 
   const fp = routeFingerprint(plan);
   return {
     taskSlug: fp.taskSlug,
+    taskBindingId: fp.taskBindingId,
     worktreePath: fp.worktreePath,
     mode: fp.mode,
     target: fp.target,
@@ -435,9 +555,45 @@ function routeStaticFingerprint(plan: DestinationPlan): Record<string, unknown> 
   };
 }
 
+function mergeCloseoutStaticDrift(
+  approved: DestinationPlan,
+  before: DestinationPlan,
+  after: DestinationPlan,
+): string {
+  const approvedFp = routeFingerprint(approved);
+  const beforeFp = routeFingerprint(before);
+  const afterFp = routeFingerprint(after);
+  const expectedSharedCheckout = approvedFp.sharedCheckoutPath;
+  if (
+    typeof expectedSharedCheckout !== 'string'
+    || normalizeExistingPath(String(afterFp.worktreePath ?? '')) !== normalizeExistingPath(expectedSharedCheckout)
+  ) {
+    return 'destination route stopped because merge continuation did not resolve to the approved primary shared checkout.';
+  }
+  if (approvedFp.taskBindingId) {
+    if (afterFp.taskBindingId !== approvedFp.taskBindingId) {
+      return 'destination route stopped because the task binding changed while closing the merged workspace.';
+    }
+    if (beforeFp.taskBindingId !== approvedFp.taskBindingId) {
+      return 'destination route stopped because the pre-merge task binding no longer matches the approved route.';
+    }
+  } else if (beforeFp.taskBindingId || afterFp.taskBindingId) {
+    return 'destination route stopped because a task binding appeared on an approved bindingless PR route.';
+  }
+  const expectedStatic = routeStaticFingerprint(approved);
+  const actualStatic = routeStaticFingerprint(after);
+  actualStatic.worktreePath = expectedStatic.worktreePath;
+  if (canonicalizeDestinationFingerprint(expectedStatic) !== canonicalizeDestinationFingerprint(actualStatic)) {
+    return 'destination route target changed while closing the merged workspace. Re-run the destination command to approve the current task, mode, surfaces, and deploy configuration.';
+  }
+  return '';
+}
+
 function routeFingerprint(plan: DestinationPlan): {
   taskSlug: string;
+  taskBindingId: unknown;
   worktreePath: unknown;
+  sharedCheckoutPath: unknown;
   mode: string;
   target: string;
   prNumber: unknown;
@@ -450,7 +606,9 @@ function routeFingerprint(plan: DestinationPlan): {
 } {
   const fp = plan.fingerprintInputs as {
     taskSlug?: string;
+    taskBindingId?: unknown;
     worktreePath?: unknown;
+    sharedCheckoutPath?: unknown;
     mode?: string;
     target?: string;
     prNumber?: unknown;
@@ -463,7 +621,9 @@ function routeFingerprint(plan: DestinationPlan): {
   };
   return {
     taskSlug: fp.taskSlug ?? '',
+    taskBindingId: fp.taskBindingId,
     worktreePath: fp.worktreePath,
+    sharedCheckoutPath: fp.sharedCheckoutPath,
     mode: fp.mode ?? '',
     target: fp.target ?? '',
     prNumber: fp.prNumber,
@@ -525,6 +685,7 @@ function buildStepArgs(step: DestinationStep, parsed: ParsedOperatorArgs, plan: 
     args.push('merge');
     pushTaskOrPr();
     if (parsed.flags.override) args.push('--override');
+    if (parsed.flags.keepWorktree) args.push('--keep-worktree');
     pushOpt('--reason', parsed.flags.reason);
     return args;
   }

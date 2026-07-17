@@ -197,6 +197,11 @@ export interface RouteSafetyConfig {
   stopOnMajorFindings?: boolean;
 }
 
+export interface CleanupConfig {
+  autoCloseDeliveredWorktrees?: boolean;
+  disposableIgnoredPaths?: string[];
+}
+
 export const DEFAULT_ROUTE_SAFETY: Required<RouteSafetyConfig> = {
   defaultFixReviewLoops: 1,
   defaultMinutes: 90,
@@ -241,6 +246,7 @@ export interface WorkflowConfig {
   reviewGates?: ReviewGatesConfig;
   routeSafety: RouteSafetyConfig;
   orchestrate?: OrchestrateConfig;
+  cleanup?: CleanupConfig;
 }
 
 // Legacy per-surface flags. They are preserved while reading older configs,
@@ -340,7 +346,80 @@ export interface TaskLock {
     toWorktreePath: string;
     fingerprint: string;
   }>;
+  cleanup?: TaskCleanupState;
 }
+
+export type AutoCleanupBlockerCode =
+  | 'automatic-cleanup-disabled'
+  | 'lock-too-young'
+  | 'unparseable-updated-at'
+  | 'lock-missing'
+  | 'worktree-missing'
+  | 'caller-inside'
+  | 'shared-checkout'
+  | 'shared-checkout-unavailable'
+  | 'branch-missing'
+  | 'detached'
+  | 'branch-mismatch'
+  | 'status-failed'
+  | 'uncommitted'
+  | 'ignored-content'
+  | 'delivery-not-found'
+  | 'delivery-ambiguous'
+  | 'delivery-proof-insufficient'
+  | 'delivery-proof-drift'
+  | 'workspace-busy'
+  | 'workspace-lease-malformed'
+  | 'artifact-removal-failed'
+  | 'state-conflict';
+
+export interface TaskCleanupState {
+  status: 'pending' | 'kept' | 'blocked';
+  requestId: string;
+  taskBindingId: string;
+  trigger: 'merge' | 'remote-base-reconcile' | 'manual';
+  requestedAt: string;
+  attemptedAt?: string;
+  targetRef: string;
+  targetSha: string;
+  blockerCode?: AutoCleanupBlockerCode;
+  blockerReason?: string;
+  retainedAt?: string;
+}
+
+export type TaskWorkspaceLeaseKind = 'command' | 'cleanup';
+
+export const WORKSPACE_LEASE_TOKEN_ENV = 'PIPELANE_INTERNAL_WORKSPACE_LEASE_TOKEN';
+export const WORKSPACE_LEASE_TASK_ENV = 'PIPELANE_INTERNAL_WORKSPACE_LEASE_TASK';
+export const WORKSPACE_LEASE_BINDING_ENV = 'PIPELANE_INTERNAL_WORKSPACE_LEASE_BINDING';
+export const WORKSPACE_LEASE_OWNER_COMMAND_ENV = 'PIPELANE_INTERNAL_WORKSPACE_LEASE_OWNER_COMMAND';
+export const WORKSPACE_LEASE_CHILD_COMMAND_ENV = 'PIPELANE_INTERNAL_WORKSPACE_LEASE_CHILD_COMMAND';
+export const WORKSPACE_LEASE_TRANSFER_ENV = 'PIPELANE_INTERNAL_WORKSPACE_LEASE_TRANSFER';
+
+export interface TaskWorkspaceLeaseOwner {
+  token: string;
+  pid: number;
+  taskSlug: string;
+  taskBindingId: string;
+  kind: TaskWorkspaceLeaseKind;
+  command: string;
+  acquiredAt: string;
+  heartbeatAt: string;
+}
+
+export interface TaskWorkspaceLease {
+  readonly token: string;
+  readonly taskSlug: string;
+  readonly taskBindingId: string;
+  readonly borrowed: boolean;
+  heartbeat(): boolean;
+  transfer(kind: TaskWorkspaceLeaseKind, command: string): boolean;
+  release(): boolean;
+}
+
+export type TaskWorkspaceLeaseResult =
+  | { acquired: true; lease: TaskWorkspaceLease }
+  | { acquired: false; code: 'workspace-busy' | 'workspace-lease-malformed'; reason: string; owner?: TaskWorkspaceLeaseOwner };
 
 export interface TaskBrief {
   objective: string;
@@ -354,6 +433,7 @@ export const TASK_LOCK_STALE_MS = 72 * 60 * 60 * 1000;
 
 export interface PrRecord {
   taskSlug: string;
+  taskBindingId?: string;
   branchName: string;
   title: string;
   number?: number;
@@ -361,6 +441,32 @@ export interface PrRecord {
   mergedSha?: string;
   mergedAt?: string;
   updatedAt: string;
+}
+
+export interface DeliveryRecord {
+  prNumber: number;
+  ownership: 'managed-task' | 'unmanaged-pr';
+  taskSlug: string;
+  taskBindingId?: string;
+  branchName: string;
+  mode: Mode;
+  surfaces: string[];
+  baseBranch: string;
+  prHeadSha: string;
+  mergedSha: string;
+  mergedAt: string;
+  title: string;
+  url: string;
+}
+
+export type DeliveryIntentRecord = Omit<DeliveryRecord, 'mergedSha' | 'mergedAt'> & {
+  recordedAt: string;
+};
+
+export interface PrState {
+  records: Record<string, PrRecord>;
+  deliveriesByPr?: Record<string, DeliveryRecord>;
+  deliveryIntentsByPr?: Record<string, DeliveryIntentRecord>;
 }
 
 export interface ActionRunRecord {
@@ -839,6 +945,8 @@ export type DeployEnvironmentLockClaimResult =
 export interface OperatorFlags {
   apply: boolean;
   allStale: boolean;
+  delivered: boolean;
+  keepWorktree: boolean;
   force: boolean;
   statusOnly: boolean;
   // Scoped bulk-apply variants for /clean. Each names a category that
@@ -989,6 +1097,8 @@ const TASK_BINDING_LOCKS_DIRNAME = 'task-binding-locks';
 const TASK_BINDING_LOCK_STALE_MS = 2 * 60 * 1000;
 const TASK_CLEANUP_LOCKS_DIRNAME = 'task-cleanup-locks';
 const TASK_CLEANUP_LOCK_STALE_MS = 10 * 60 * 1000;
+const PR_STATE_MUTATION_LOCK_DIRNAME = 'pr-state-mutation.lock';
+const PR_STATE_MUTATION_LOCK_STALE_MS = 2 * 60 * 1000;
 const ORPHAN_CLEANUP_LOCKS_DIRNAME = 'orphan-cleanup-locks';
 const INSTALL_MARKER_FILENAME = 'installed.json';
 const LEGACY_MIGRATION_FILENAME = 'legacy-migration.json';
@@ -1155,6 +1265,10 @@ export function defaultWorkflowConfig(
     },
     reviewGates: defaultReviewGatesConfig({ repoRoot: options.repoRoot }),
     routeSafety: { ...DEFAULT_ROUTE_SAFETY },
+    cleanup: {
+      autoCloseDeliveredWorktrees: true,
+      disposableIgnoredPaths: [],
+    },
   };
 }
 
@@ -1268,7 +1382,7 @@ export function runCommand(
 export function runCommandCapture(
   command: string,
   args: string[],
-  options: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number } = {},
+  options: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; preserveOutput?: boolean } = {},
 ): { ok: boolean; exitCode: number; stdout: string; stderr: string } {
   const result = spawnSync(command, args, {
     cwd: options.cwd,
@@ -1290,8 +1404,8 @@ export function runCommandCapture(
   return {
     ok: result.status === 0,
     exitCode: result.status ?? 1,
-    stdout: result.stdout?.trim() ?? '',
-    stderr: result.stderr?.trim() ?? '',
+    stdout: options.preserveOutput ? (result.stdout ?? '') : (result.stdout?.trim() ?? ''),
+    stderr: options.preserveOutput ? (result.stderr ?? '') : (result.stderr?.trim() ?? ''),
   };
 }
 
@@ -1417,6 +1531,7 @@ function mergeWorkflowLayers(
     if (overlay.syncDocs) next.syncDocs = { ...current.syncDocs, ...overlay.syncDocs };
     if (overlay.checks) next.checks = { ...current.checks, ...overlay.checks };
     if (overlay.routeSafety) next.routeSafety = { ...current.routeSafety, ...overlay.routeSafety };
+    if (overlay.cleanup) next.cleanup = { ...current.cleanup, ...overlay.cleanup };
     if (overlay.surfacePathMap) next.surfacePathMap = { ...current.surfacePathMap, ...overlay.surfacePathMap };
     delete (next as Record<string, unknown>).smoke;
     if (isRecord(overlay.orchestrate)) {
@@ -1523,9 +1638,40 @@ export function normalizeWorkflowConfig(
     reviewGates: normalizeReviewGatesConfig(withDefaults.reviewGates, { repoRoot: options.repoRoot }),
     routeSafety: normalizeRouteSafetyConfig(withDefaults.routeSafety),
     orchestrate: normalizeOrchestrateConfig(withDefaults.orchestrate),
+    cleanup: normalizeCleanupConfig(withDefaults.cleanup),
   } as WorkflowConfig & Record<string, unknown>;
   delete normalized.smoke;
   return normalized;
+}
+
+export function normalizeCleanupConfig(raw: CleanupConfig | undefined): CleanupConfig {
+  const disposableIgnoredPaths = Array.isArray(raw?.disposableIgnoredPaths)
+    ? [...new Set(raw.disposableIgnoredPaths.map((entry) => normalizeDisposableIgnoredPath(entry)))]
+    : [];
+  return {
+    autoCloseDeliveredWorktrees: raw?.autoCloseDeliveredWorktrees !== false,
+    disposableIgnoredPaths,
+  };
+}
+
+export function automaticWorktreeCleanupEnabled(config: WorkflowConfig): boolean {
+  return config.cleanup?.autoCloseDeliveredWorktrees !== false;
+}
+
+export function normalizeDisposableIgnoredPath(value: string): string {
+  if (typeof value !== 'string') throw new Error('Disposable ignored paths must be strings.');
+  const raw = value.trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+  if (!raw || raw === '.' || raw === '.git' || raw.startsWith('.git/') || path.isAbsolute(raw)) {
+    throw new Error(`Invalid disposable ignored path "${value}". Use a non-.git repository-relative directory.`);
+  }
+  const segments = raw.split('/');
+  if (segments.some((segment) => !segment || segment === '.' || segment === '..')) {
+    throw new Error(`Invalid disposable ignored path "${value}". Parent traversal and empty segments are not allowed.`);
+  }
+  if (/[*?\[\]{}!]/.test(raw)) {
+    throw new Error(`Invalid disposable ignored path "${value}". Globs are not allowed; configure exact roots.`);
+  }
+  return raw;
 }
 
 export const REVIEW_GATE_PHASES: readonly ReviewGatePhase[] = ['static', 'behavioral', 'ai-diff', 'instruction', 'runtime', 'human'];
@@ -1960,6 +2106,10 @@ export function prStatePath(commonDir: string, config: WorkflowConfig): string {
   return path.join(resolveStateDir(commonDir, config), PR_STATE_FILENAME);
 }
 
+function prStateMutationLockPath(commonDir: string, config: WorkflowConfig): string {
+  return path.join(resolveStateDir(commonDir, config), PR_STATE_MUTATION_LOCK_DIRNAME);
+}
+
 export function probeStatePath(commonDir: string, config: WorkflowConfig): string {
   return path.join(resolveStateDir(commonDir, config), PROBE_STATE_FILENAME);
 }
@@ -2172,47 +2322,297 @@ function taskCleanupLockPath(commonDir: string, config: WorkflowConfig, taskSlug
   return path.join(resolveStateDir(commonDir, config), TASK_CLEANUP_LOCKS_DIRNAME, `${taskSlug}.lock`);
 }
 
-function clearStaleTaskCleanupLock(lockPath: string): boolean {
-  if (!existsSync(lockPath)) return false;
+function taskWorkspaceLeaseOwnerPath(lockPath: string): string {
+  return path.join(lockPath, 'owner.json');
+}
+
+const activeProcessWorkspaceLeaseTokens = new Map<string, string>();
+
+function isCanonicalIsoTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(value)) return false;
+  return !Number.isNaN(Date.parse(value)) && new Date(value).toISOString() === value;
+}
+
+function processLiveness(pid: number): 'alive' | 'dead' | 'unverifiable' {
+  const injected = process.env.NODE_ENV === 'test'
+    ? process.env.PIPELANE_WORKSPACE_LEASE_TEST_LIVENESS
+    : undefined;
+  if (injected === 'alive' || injected === 'dead' || injected === 'unverifiable') return injected;
   try {
-    const ageMs = Date.now() - statSync(lockPath).mtimeMs;
-    if (ageMs <= TASK_CLEANUP_LOCK_STALE_MS) return false;
-    rmSync(lockPath, { recursive: true, force: true });
+    process.kill(pid, 0);
+    return 'alive';
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return 'dead';
+    return 'unverifiable';
+  }
+}
+
+function readTaskWorkspaceLeaseOwnerAtPath(lockPath: string): TaskWorkspaceLeaseOwner | null {
+  try {
+    const raw = JSON.parse(readFileSync(taskWorkspaceLeaseOwnerPath(lockPath), 'utf8')) as Partial<TaskWorkspaceLeaseOwner>;
+    if (typeof raw.token !== 'string' || !/^[a-f0-9]{64}$/u.test(raw.token)) return null;
+    if (!Number.isSafeInteger(raw.pid) || (raw.pid ?? 0) <= 0) return null;
+    if (typeof raw.taskSlug !== 'string' || !raw.taskSlug) return null;
+    if (typeof raw.taskBindingId !== 'string' || !raw.taskBindingId) return null;
+    if (raw.kind !== 'command' && raw.kind !== 'cleanup') return null;
+    if (typeof raw.command !== 'string' || !raw.command) return null;
+    if (!isCanonicalIsoTimestamp(raw.acquiredAt) || !isCanonicalIsoTimestamp(raw.heartbeatAt)) return null;
+    return raw as TaskWorkspaceLeaseOwner;
+  } catch {
+    return null;
+  }
+}
+
+function staleMalformedLeaseCanBeReclaimed(lockPath: string, staleMs: number): boolean {
+  try {
+    if (Date.now() - statSync(lockPath).mtimeMs <= staleMs) return false;
+    try {
+      const raw = JSON.parse(readFileSync(path.join(lockPath, 'owner.json'), 'utf8')) as { pid?: unknown };
+      if (Number.isSafeInteger(raw.pid) && (raw.pid as number) > 0) {
+        return processLiveness(raw.pid as number) === 'dead';
+      }
+    } catch {
+      // An ownerless or unreadable directory can only be reclaimed after its
+      // full stale window. This covers a crash between mkdir and owner write.
+    }
     return true;
   } catch {
     return false;
   }
 }
 
-export function acquireTaskCleanupLock(commonDir: string, config: WorkflowConfig, taskSlug: string): { acquired: true; release: () => void } | { acquired: false; reason: string } {
+function reclaimDeadTaskWorkspaceLease(lockPath: string): boolean {
+  if (!existsSync(lockPath)) return false;
+  const owner = readTaskWorkspaceLeaseOwnerAtPath(lockPath);
+  if (!owner) {
+    if (!staleMalformedLeaseCanBeReclaimed(lockPath, TASK_CLEANUP_LOCK_STALE_MS)) return false;
+    rmSync(lockPath, { recursive: true, force: true });
+    return true;
+  }
+  if (processLiveness(owner.pid) !== 'dead') return false;
+  if (Date.now() - Date.parse(owner.heartbeatAt) <= TASK_CLEANUP_LOCK_STALE_MS) return false;
+  const delayMs = Number.parseInt(process.env.PIPELANE_WORKSPACE_LEASE_TEST_RECLAIM_DELAY_MS ?? '', 10);
+  if (Number.isFinite(delayMs) && delayMs > 0) pauseSynchronously(delayMs);
+  rmSync(lockPath, { recursive: true, force: true });
+  return true;
+}
+
+export function inspectTaskWorkspaceLease(
+  commonDir: string,
+  config: WorkflowConfig,
+  taskSlug: string,
+): { status: 'unlocked' } | { status: 'owned'; owner: TaskWorkspaceLeaseOwner } | { status: 'malformed' } {
   const lockPath = taskCleanupLockPath(commonDir, config, taskSlug);
-  mkdirSync(path.dirname(lockPath), { recursive: true });
-  clearStaleTaskCleanupLock(lockPath);
-  let created = false;
+  const guard = acquireShortStateGuard(
+    `${lockPath}.guard`,
+    Date.now() + 750,
+    `Task ${taskSlug} workspace lease reclamation is busy; retry the command.`,
+  );
   try {
-    mkdirSync(lockPath);
-    created = true;
-    writeFileSync(
-      path.join(lockPath, 'owner.json'),
-      `${JSON.stringify({ taskSlug, pid: process.pid, acquiredAt: nowIso() }, null, 2)}\n`,
-      'utf8',
-    );
-    return { acquired: true, release: () => rmSync(lockPath, { recursive: true, force: true }) };
-  } catch (error) {
-    const err = error as NodeJS.ErrnoException;
-    if (err.code === 'EEXIST') {
-      return { acquired: false, reason: 'another cleanup already owns this task lock' };
-    }
-    if (created) rmSync(lockPath, { recursive: true, force: true });
-    return { acquired: false, reason: `could not acquire cleanup lock: ${err.message}` };
+    return inspectTaskWorkspaceLeaseUnlocked(lockPath);
+  } finally {
+    guard.release();
   }
 }
 
+function inspectTaskWorkspaceLeaseUnlocked(
+  lockPath: string,
+): { status: 'unlocked' } | { status: 'owned'; owner: TaskWorkspaceLeaseOwner } | { status: 'malformed' } {
+  if (!existsSync(lockPath)) return { status: 'unlocked' };
+  if (reclaimDeadTaskWorkspaceLease(lockPath)) return { status: 'unlocked' };
+  const owner = readTaskWorkspaceLeaseOwnerAtPath(lockPath);
+  return owner ? { status: 'owned', owner } : { status: 'malformed' };
+}
+
+function taskWorkspaceLeaseHandle(
+  lockPath: string,
+  owner: TaskWorkspaceLeaseOwner,
+  options: { borrowed: boolean; transferAllowed: boolean },
+): TaskWorkspaceLease {
+  let released = false;
+  let releaseAllowed = !options.borrowed;
+  activeProcessWorkspaceLeaseTokens.set(lockPath, owner.token);
+  const heartbeat = (): boolean => {
+    if (released) return false;
+    const current = readTaskWorkspaceLeaseOwnerAtPath(lockPath);
+    if (!current || current.token !== owner.token) return false;
+    const next = { ...current, heartbeatAt: nowIso() };
+    writeJsonFile(taskWorkspaceLeaseOwnerPath(lockPath), next);
+    Object.assign(owner, next);
+    return true;
+  };
+  const timer = setInterval(() => {
+    try {
+      heartbeat();
+    } catch {
+      // A failed heartbeat leaves the lease fail-closed. The owner PID still
+      // prevents reclamation while this command is alive.
+    }
+  }, Math.max(1_000, Math.floor(TASK_CLEANUP_LOCK_STALE_MS / 3)));
+  timer.unref();
+  return {
+    token: owner.token,
+    taskSlug: owner.taskSlug,
+    taskBindingId: owner.taskBindingId,
+    borrowed: options.borrowed,
+    heartbeat,
+    transfer(kind, command) {
+      if (released || !options.transferAllowed) return false;
+      const current = readTaskWorkspaceLeaseOwnerAtPath(lockPath);
+      if (!current || current.token !== owner.token) return false;
+      const next: TaskWorkspaceLeaseOwner = { ...current, kind, command, heartbeatAt: nowIso() };
+      writeJsonFile(taskWorkspaceLeaseOwnerPath(lockPath), next);
+      Object.assign(owner, next);
+      if (options.borrowed && options.transferAllowed && kind === 'cleanup') releaseAllowed = true;
+      return true;
+    },
+    release() {
+      if (released) return false;
+      clearInterval(timer);
+      released = true;
+      if (activeProcessWorkspaceLeaseTokens.get(lockPath) === owner.token) {
+        activeProcessWorkspaceLeaseTokens.delete(lockPath);
+      }
+      if (!releaseAllowed) return false;
+      const current = readTaskWorkspaceLeaseOwnerAtPath(lockPath);
+      if (!current || current.token !== owner.token) return false;
+      rmSync(lockPath, { recursive: true, force: true });
+      return true;
+    },
+  };
+}
+
+export function acquireTaskWorkspaceLease(
+  commonDir: string,
+  config: WorkflowConfig,
+  options: {
+    taskSlug: string;
+    taskBindingId: string;
+    kind?: TaskWorkspaceLeaseKind;
+    command: string;
+  },
+): TaskWorkspaceLeaseResult {
+  const lockPath = taskCleanupLockPath(commonDir, config, options.taskSlug);
+  mkdirSync(path.dirname(lockPath), { recursive: true });
+  let guard: ReturnType<typeof acquireShortStateGuard>;
+  try {
+    guard = acquireShortStateGuard(
+      `${lockPath}.guard`,
+      Date.now() + 750,
+      `Task ${options.taskSlug} workspace lease reclamation is busy; retry the command.`,
+    );
+  } catch (error) {
+    return { acquired: false, code: 'workspace-busy', reason: error instanceof Error ? error.message : String(error) };
+  }
+  try {
+    const existing = inspectTaskWorkspaceLeaseUnlocked(lockPath);
+    if (existing.status === 'malformed') {
+      return { acquired: false, code: 'workspace-lease-malformed', reason: `Task ${options.taskSlug} has an unreadable workspace lease owner; preserving the workspace.` };
+    }
+    if (existing.status === 'owned') {
+      return { acquired: false, code: 'workspace-busy', reason: `Task ${options.taskSlug} is in use by ${existing.owner.command}.`, owner: existing.owner };
+    }
+    const timestamp = nowIso();
+    const owner: TaskWorkspaceLeaseOwner = {
+      token: crypto.randomBytes(32).toString('hex'),
+      pid: process.pid,
+      taskSlug: options.taskSlug,
+      taskBindingId: options.taskBindingId,
+      kind: options.kind ?? 'command',
+      command: options.command,
+      acquiredAt: timestamp,
+      heartbeatAt: timestamp,
+    };
+    try {
+      mkdirSync(lockPath);
+      writeJsonFile(taskWorkspaceLeaseOwnerPath(lockPath), owner);
+      return { acquired: true, lease: taskWorkspaceLeaseHandle(lockPath, owner, { borrowed: false, transferAllowed: true }) };
+    } catch (error) {
+      const current = readTaskWorkspaceLeaseOwnerAtPath(lockPath);
+      if (current?.token === owner.token) rmSync(lockPath, { recursive: true, force: true });
+      const err = error as NodeJS.ErrnoException;
+      return { acquired: false, code: 'workspace-busy', reason: `Could not acquire workspace lease for ${options.taskSlug}: ${err.message}` };
+    }
+  } finally {
+    guard.release();
+  }
+}
+
+export function borrowTaskWorkspaceLease(
+  commonDir: string,
+  config: WorkflowConfig,
+  options: {
+    taskSlug: string;
+    taskBindingId: string;
+    token: string;
+    command: string;
+    transferAllowed?: boolean;
+  },
+): TaskWorkspaceLeaseResult {
+  const lockPath = taskCleanupLockPath(commonDir, config, options.taskSlug);
+  const owner = readTaskWorkspaceLeaseOwnerAtPath(lockPath);
+  if (!owner) {
+    return { acquired: false, code: 'workspace-lease-malformed', reason: `Task ${options.taskSlug} has no verifiable delegated workspace lease.` };
+  }
+  if (owner.token !== options.token || owner.taskBindingId !== options.taskBindingId || owner.command !== options.command) {
+    return { acquired: false, code: 'workspace-busy', reason: `Delegated workspace lease identity does not match task ${options.taskSlug}.`, owner };
+  }
+  return {
+    acquired: true,
+    lease: taskWorkspaceLeaseHandle(lockPath, owner, { borrowed: true, transferAllowed: options.transferAllowed === true }),
+  };
+}
+
+export function borrowDelegatedTaskWorkspaceLeaseFromEnvironment(
+  commonDir: string,
+  config: WorkflowConfig,
+  options: { taskSlug: string; taskBindingId: string; childCommand: string },
+): TaskWorkspaceLeaseResult | null {
+  const token = process.env[WORKSPACE_LEASE_TOKEN_ENV];
+  if (!token) return null;
+  const taskSlug = process.env[WORKSPACE_LEASE_TASK_ENV] ?? '';
+  const taskBindingId = process.env[WORKSPACE_LEASE_BINDING_ENV] ?? '';
+  const ownerCommand = process.env[WORKSPACE_LEASE_OWNER_COMMAND_ENV] ?? '';
+  const childCommand = process.env[WORKSPACE_LEASE_CHILD_COMMAND_ENV] ?? '';
+  const transferAllowed = process.env[WORKSPACE_LEASE_TRANSFER_ENV] === '1';
+  for (const key of [
+    WORKSPACE_LEASE_TOKEN_ENV,
+    WORKSPACE_LEASE_TASK_ENV,
+    WORKSPACE_LEASE_BINDING_ENV,
+    WORKSPACE_LEASE_OWNER_COMMAND_ENV,
+    WORKSPACE_LEASE_CHILD_COMMAND_ENV,
+    WORKSPACE_LEASE_TRANSFER_ENV,
+  ]) delete process.env[key];
+  if (taskSlug !== options.taskSlug || taskBindingId !== options.taskBindingId || childCommand !== options.childCommand) {
+    return { acquired: false, code: 'workspace-busy', reason: `Delegated workspace lease is not authorized for ${options.childCommand}.` };
+  }
+  return borrowTaskWorkspaceLease(commonDir, config, {
+    taskSlug,
+    taskBindingId,
+    token,
+    command: ownerCommand,
+    transferAllowed,
+  });
+}
+
+export function acquireTaskCleanupLock(commonDir: string, config: WorkflowConfig, taskSlug: string): { acquired: true; release: () => void } | { acquired: false; reason: string } {
+  const task = loadTaskLock(commonDir, config, taskSlug);
+  if (!task) return { acquired: false, reason: `No task lock found for ${taskSlug}.` };
+  const result = acquireTaskWorkspaceLease(commonDir, config, {
+    taskSlug,
+    taskBindingId: task.taskBindingId ?? legacyTaskBindingId(config, task),
+    kind: 'cleanup',
+    command: 'clean',
+  });
+  if (result.acquired === false) return { acquired: false, reason: result.reason };
+  const lease = result.lease;
+  return { acquired: true, release: () => { lease.release(); } };
+}
+
 function assertTaskCleanupUnlocked(commonDir: string, config: WorkflowConfig, taskSlug: string): void {
-  const lockPath = taskCleanupLockPath(commonDir, config, taskSlug);
-  clearStaleTaskCleanupLock(lockPath);
-  if (existsSync(lockPath)) {
-    throw new Error(`Task ${taskSlug} is being cleaned by another Pipelane process; retry after cleanup finishes.`);
+  const lease = inspectTaskWorkspaceLease(commonDir, config, taskSlug);
+  if (lease.status !== 'unlocked') {
+    throw new Error(`Task ${taskSlug} is protected by a Pipelane workspace lease; retry after the owning command finishes.`);
   }
 }
 
@@ -2225,6 +2625,17 @@ function orphanCleanupLockPath(commonDir: string, config: WorkflowConfig, worktr
   return path.join(resolveStateDir(commonDir, config), ORPHAN_CLEANUP_LOCKS_DIRNAME, `${key}.lock`);
 }
 
+function clearStaleOrphanCleanupLock(lockPath: string): boolean {
+  if (!existsSync(lockPath)) return false;
+  try {
+    if (Date.now() - statSync(lockPath).mtimeMs <= TASK_CLEANUP_LOCK_STALE_MS) return false;
+    rmSync(lockPath, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Same shape as acquireTaskCleanupLock, keyed on the orphan worktree's
  * absolute path. Used by `/clean --apply --safe-orphans` and
@@ -2235,7 +2646,7 @@ function orphanCleanupLockPath(commonDir: string, config: WorkflowConfig, worktr
 export function acquireOrphanCleanupLock(commonDir: string, config: WorkflowConfig, worktreePath: string): { acquired: true; release: () => void } | { acquired: false; reason: string } {
   const lockPath = orphanCleanupLockPath(commonDir, config, worktreePath);
   mkdirSync(path.dirname(lockPath), { recursive: true });
-  clearStaleTaskCleanupLock(lockPath);
+  clearStaleOrphanCleanupLock(lockPath);
   let created = false;
   try {
     mkdirSync(lockPath);
@@ -2647,13 +3058,192 @@ export function saveDeployState(commonDir: string, config: WorkflowConfig, value
   writeVersionedJsonFile('deployState', deployStatePath(commonDir, config), value);
 }
 
-export function loadPrState(commonDir: string, config: WorkflowConfig): { records: Record<string, PrRecord> } {
-  return readVersionedJsonFile('prState', commonDir, config, prStatePath(commonDir, config), { records: {} as Record<string, PrRecord> });
+function normalizePrState(raw: PrState): PrState {
+  const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : ({ records: {} } as PrState);
+  const records = source.records && typeof source.records === 'object' && !Array.isArray(source.records)
+    ? source.records
+    : {};
+  const deliveriesByPr = source.deliveriesByPr && typeof source.deliveriesByPr === 'object' && !Array.isArray(source.deliveriesByPr)
+    ? source.deliveriesByPr
+    : {};
+  const deliveryIntentsByPr = source.deliveryIntentsByPr && typeof source.deliveryIntentsByPr === 'object' && !Array.isArray(source.deliveryIntentsByPr)
+    ? source.deliveryIntentsByPr
+    : {};
+  return {
+    records: { ...records },
+    deliveriesByPr: { ...deliveriesByPr },
+    ...(Object.keys(deliveryIntentsByPr).length > 0
+      ? { deliveryIntentsByPr: { ...deliveryIntentsByPr } }
+      : {}),
+  };
 }
 
-export function savePrState(commonDir: string, config: WorkflowConfig, value: { records: Record<string, PrRecord> }): void {
+export function loadPrState(commonDir: string, config: WorkflowConfig): PrState {
+  const raw = readVersionedJsonFile<PrState>('prState', commonDir, config, prStatePath(commonDir, config), { records: {}, deliveriesByPr: {} });
+  return normalizePrState(raw);
+}
+
+interface PrStateMutationLeaseOwner {
+  token: string;
+  pid: number;
+  acquiredAt: string;
+}
+
+function readPrStateMutationLeaseOwner(lockPath: string): PrStateMutationLeaseOwner | null {
+  try {
+    const raw = JSON.parse(readFileSync(path.join(lockPath, 'owner.json'), 'utf8')) as Partial<PrStateMutationLeaseOwner>;
+    if (typeof raw.token !== 'string' || !/^[a-f0-9]{64}$/u.test(raw.token)) return null;
+    if (!Number.isSafeInteger(raw.pid) || (raw.pid ?? 0) <= 0) return null;
+    if (!isCanonicalIsoTimestamp(raw.acquiredAt)) return null;
+    return raw as PrStateMutationLeaseOwner;
+  } catch {
+    return null;
+  }
+}
+
+function pauseSynchronously(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+interface ShortStateGuardOwner {
+  token: string;
+  pid: number;
+  acquiredAt: string;
+}
+
+function readShortStateGuardOwner(guardPath: string): ShortStateGuardOwner | null {
+  try {
+    const raw = JSON.parse(readFileSync(path.join(guardPath, 'owner.json'), 'utf8')) as Partial<ShortStateGuardOwner>;
+    if (typeof raw.token !== 'string' || !/^[a-f0-9]{64}$/u.test(raw.token)) return null;
+    if (!Number.isSafeInteger(raw.pid) || (raw.pid ?? 0) <= 0) return null;
+    if (!isCanonicalIsoTimestamp(raw.acquiredAt)) return null;
+    return raw as ShortStateGuardOwner;
+  } catch {
+    return null;
+  }
+}
+
+function acquireShortStateGuard(
+  guardPath: string,
+  deadline: number,
+  busyMessage: string,
+): { release: () => boolean } {
+  mkdirSync(path.dirname(guardPath), { recursive: true });
+  while (true) {
+    const owner: ShortStateGuardOwner = {
+      token: crypto.randomBytes(32).toString('hex'),
+      pid: process.pid,
+      acquiredAt: nowIso(),
+    };
+    let created = false;
+    try {
+      mkdirSync(guardPath);
+      created = true;
+      writeJsonFile(path.join(guardPath, 'owner.json'), owner);
+      return {
+        release: () => {
+          const current = readShortStateGuardOwner(guardPath);
+          if (!current || current.token !== owner.token) return false;
+          rmSync(guardPath, { recursive: true, force: true });
+          return true;
+        },
+      };
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (created) rmSync(guardPath, { recursive: true, force: true });
+      if (err.code !== 'EEXIST') throw new Error(`${busyMessage}: ${err.message}`);
+      if (Date.now() >= deadline) throw new Error(busyMessage);
+      pauseSynchronously(10);
+    }
+  }
+}
+
+function acquirePrStateMutationLease(
+  commonDir: string,
+  config: WorkflowConfig,
+  waitMs = 750,
+): { release: () => boolean } {
+  const lockPath = prStateMutationLockPath(commonDir, config);
+  mkdirSync(path.dirname(lockPath), { recursive: true });
+  const deadline = Date.now() + Math.max(0, waitMs);
+  while (true) {
+    const guard = acquireShortStateGuard(
+      `${lockPath}.guard`,
+      deadline,
+      'PR state reclamation is busy; retry the command.',
+    );
+    let created = false;
+    try {
+      mkdirSync(lockPath);
+      created = true;
+      const owner: PrStateMutationLeaseOwner = {
+        token: crypto.randomBytes(32).toString('hex'),
+        pid: process.pid,
+        acquiredAt: nowIso(),
+      };
+      writeJsonFile(path.join(lockPath, 'owner.json'), owner);
+      return {
+        release: () => {
+          const current = readPrStateMutationLeaseOwner(lockPath);
+          if (!current || current.token !== owner.token) return false;
+          rmSync(lockPath, { recursive: true, force: true });
+          return true;
+        },
+      };
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (created) rmSync(lockPath, { recursive: true, force: true });
+      if (err.code !== 'EEXIST') throw new Error(`Could not acquire PR-state mutation lease: ${err.message}`);
+      const owner = readPrStateMutationLeaseOwner(lockPath);
+      const reclaimableOwner = owner
+        ? processLiveness(owner.pid) === 'dead' && Date.now() - Date.parse(owner.acquiredAt) > PR_STATE_MUTATION_LOCK_STALE_MS
+        : staleMalformedLeaseCanBeReclaimed(lockPath, PR_STATE_MUTATION_LOCK_STALE_MS);
+      if (reclaimableOwner) {
+        const delayMs = Number.parseInt(process.env.PIPELANE_PR_STATE_TEST_RECLAIM_DELAY_MS ?? '', 10);
+        if (Number.isFinite(delayMs) && delayMs > 0) pauseSynchronously(delayMs);
+        rmSync(lockPath, { recursive: true, force: true });
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        const detail = owner ? `owned by live or unverifiable PID ${owner.pid}` : 'owner is malformed or incomplete';
+        throw new Error(`PR state is busy (${detail}); retry the command.`);
+      }
+      pauseSynchronously(25);
+    } finally {
+      guard.release();
+    }
+  }
+}
+
+function writePrStateUnlocked(commonDir: string, config: WorkflowConfig, value: PrState): void {
   ensureStateDir(commonDir, config);
-  writeVersionedJsonFile('prState', prStatePath(commonDir, config), value);
+  writeVersionedJsonFile('prState', prStatePath(commonDir, config), normalizePrState(value));
+}
+
+function mutatePrState<T>(
+  commonDir: string,
+  config: WorkflowConfig,
+  update: (state: PrState) => T,
+): T {
+  const lease = acquirePrStateMutationLease(commonDir, config);
+  try {
+    const state = loadPrState(commonDir, config);
+    const result = update(state);
+    writePrStateUnlocked(commonDir, config, state);
+    return result;
+  } finally {
+    lease.release();
+  }
+}
+
+export function savePrState(commonDir: string, config: WorkflowConfig, value: PrState): void {
+  mutatePrState(commonDir, config, (current) => {
+    current.records = { ...current.records, ...value.records };
+    current.deliveriesByPr = { ...current.deliveriesByPr, ...value.deliveriesByPr };
+    if (value.deliveryIntentsByPr) {
+      current.deliveryIntentsByPr = { ...current.deliveryIntentsByPr, ...value.deliveryIntentsByPr };
+    }
+  });
 }
 
 export function loadActionState(commonDir: string, config: WorkflowConfig): ActionState {
@@ -3576,21 +4166,249 @@ export function loadPrRecord(commonDir: string, config: WorkflowConfig, taskSlug
 }
 
 export function savePrRecord(commonDir: string, config: WorkflowConfig, taskSlug: string, record: Omit<PrRecord, 'taskSlug' | 'updatedAt'> & { updatedAt?: string }): PrRecord {
-  const state = loadPrState(commonDir, config);
-  const next: PrRecord = {
-    ...(state.records[taskSlug] ?? {
+  return mutatePrState(commonDir, config, (state) => {
+    const previous = state.records[taskSlug];
+    const sameBinding = previous
+      && previous.branchName === record.branchName
+      && (previous.taskBindingId
+        ? previous.taskBindingId === record.taskBindingId
+        : true)
+      && (previous.number === undefined || record.number === undefined || previous.number === record.number);
+    const next: PrRecord = {
+      ...(sameBinding ? previous : {
+        taskSlug,
+        branchName: record.branchName,
+        title: record.title,
+        updatedAt: nowIso(),
+      }),
+      ...record,
       taskSlug,
-      branchName: record.branchName,
-      title: record.title,
-      updatedAt: nowIso(),
-    }),
+      updatedAt: record.updatedAt ?? nowIso(),
+    };
+    state.records[taskSlug] = next;
+    return next;
+  });
+}
+
+export function prRecordMatchesTaskLock(record: PrRecord | null | undefined, lock: TaskLock): record is PrRecord {
+  return Boolean(
+    record
+    && record.branchName === lock.branchName
+    && (record.taskBindingId
+      ? record.taskBindingId === lock.taskBindingId
+      : true),
+  );
+}
+
+function normalizeDeliveryRecord(record: DeliveryRecord): DeliveryRecord {
+  if (!Number.isSafeInteger(record.prNumber) || record.prNumber <= 0) {
+    throw new Error('Delivery record requires a positive safe PR number.');
+  }
+  if (record.ownership !== 'managed-task' && record.ownership !== 'unmanaged-pr') {
+    throw new Error(`Delivery record for PR #${record.prNumber} has invalid ownership.`);
+  }
+  if (record.ownership === 'managed-task' && !record.taskBindingId?.trim()) {
+    throw new Error(`Managed delivery record for PR #${record.prNumber} requires taskBindingId.`);
+  }
+  if (record.ownership === 'unmanaged-pr' && record.taskBindingId !== undefined) {
+    throw new Error(`Unmanaged delivery record for PR #${record.prNumber} must omit taskBindingId.`);
+  }
+  const requiredStrings: Array<[string, string]> = [
+    ['taskSlug', record.taskSlug],
+    ['branchName', record.branchName],
+    ['baseBranch', record.baseBranch],
+    ['prHeadSha', record.prHeadSha],
+    ['mergedSha', record.mergedSha],
+    ['mergedAt', record.mergedAt],
+    ['title', record.title],
+    ['url', record.url],
+  ];
+  const missing = requiredStrings.find(([, value]) => typeof value !== 'string' || !value.trim());
+  if (missing) throw new Error(`Delivery record for PR #${record.prNumber} requires ${missing[0]}.`);
+  if (record.mode !== 'build' && record.mode !== 'release') {
+    throw new Error(`Delivery record for PR #${record.prNumber} has invalid mode.`);
+  }
+  if (!Array.isArray(record.surfaces) || record.surfaces.some((surface) => typeof surface !== 'string' || !surface.trim())) {
+    throw new Error(`Delivery record for PR #${record.prNumber} has invalid surfaces.`);
+  }
+  return {
     ...record,
-    taskSlug,
-    updatedAt: record.updatedAt ?? nowIso(),
+    taskSlug: record.taskSlug.trim(),
+    taskBindingId: record.taskBindingId?.trim(),
+    branchName: record.branchName.trim(),
+    surfaces: [...new Set(record.surfaces.map((surface) => surface.trim()))],
+    baseBranch: record.baseBranch.trim(),
+    prHeadSha: record.prHeadSha.trim(),
+    mergedSha: record.mergedSha.trim(),
+    mergedAt: record.mergedAt.trim(),
+    title: record.title.trim(),
+    url: record.url.trim(),
   };
-  state.records[taskSlug] = next;
-  savePrState(commonDir, config, state);
-  return next;
+}
+
+export function saveDeliveryRecord(commonDir: string, config: WorkflowConfig, value: DeliveryRecord): DeliveryRecord {
+  const record = normalizeDeliveryRecord(value);
+  return mutatePrState(commonDir, config, (state) => {
+    const key = String(record.prNumber);
+    const existing = state.deliveriesByPr?.[key];
+    if (existing) {
+      if (JSON.stringify(normalizeDeliveryRecord(existing)) !== JSON.stringify(record)) {
+        throw new Error(`Delivery record conflict for PR #${record.prNumber}; immutable delivery history was preserved.`);
+      }
+      return existing;
+    }
+    state.deliveriesByPr ??= {};
+    state.deliveriesByPr[key] = record;
+    return record;
+  });
+}
+
+function normalizeDeliveryIntent(record: DeliveryIntentRecord): DeliveryIntentRecord {
+  if (!isCanonicalIsoTimestamp(record.recordedAt)) {
+    throw new Error(`Delivery intent for PR #${record.prNumber} requires recordedAt.`);
+  }
+  const normalized = normalizeDeliveryRecord({
+    ...record,
+    mergedSha: 'pending',
+    mergedAt: record.recordedAt,
+  });
+  return {
+    prNumber: normalized.prNumber,
+    ownership: normalized.ownership,
+    taskSlug: normalized.taskSlug,
+    ...(normalized.taskBindingId ? { taskBindingId: normalized.taskBindingId } : {}),
+    branchName: normalized.branchName,
+    mode: normalized.mode,
+    surfaces: normalized.surfaces,
+    baseBranch: normalized.baseBranch,
+    prHeadSha: normalized.prHeadSha,
+    title: normalized.title,
+    url: normalized.url,
+    recordedAt: record.recordedAt,
+  };
+}
+
+export function saveDeliveryIntent(
+  commonDir: string,
+  config: WorkflowConfig,
+  value: DeliveryIntentRecord,
+): DeliveryIntentRecord {
+  const intent = normalizeDeliveryIntent(value);
+  return mutatePrState(commonDir, config, (state) => {
+    const key = String(intent.prNumber);
+    const delivered = state.deliveriesByPr?.[key];
+    if (delivered) {
+      throw new Error(`Delivery intent for PR #${intent.prNumber} cannot replace immutable delivery history.`);
+    }
+    const existing = state.deliveryIntentsByPr?.[key];
+    if (existing && JSON.stringify(normalizeDeliveryIntent(existing)) !== JSON.stringify(intent)) {
+      throw new Error(`Delivery intent conflict for PR #${intent.prNumber}; the earlier merge identity was preserved.`);
+    }
+    state.deliveryIntentsByPr ??= {};
+    state.deliveryIntentsByPr[key] = intent;
+    return existing ?? intent;
+  });
+}
+
+export function loadDeliveryIntentByPr(
+  commonDir: string,
+  config: WorkflowConfig,
+  prNumber: number,
+): DeliveryIntentRecord | null {
+  const intent = loadPrState(commonDir, config).deliveryIntentsByPr?.[String(prNumber)];
+  if (!intent) return null;
+  try {
+    return normalizeDeliveryIntent(intent);
+  } catch {
+    return null;
+  }
+}
+
+export function finalizeDeliveryIntent(
+  commonDir: string,
+  config: WorkflowConfig,
+  options: {
+    prNumber: number;
+    mergedSha: string;
+    mergedAt: string;
+    title: string;
+    url: string;
+  },
+): DeliveryRecord {
+  return mutatePrState(commonDir, config, (state) => {
+    const key = String(options.prNumber);
+    const existingDelivery = state.deliveriesByPr?.[key];
+    const rawIntent = state.deliveryIntentsByPr?.[key];
+    if (!rawIntent) {
+      if (existingDelivery) return normalizeDeliveryRecord(existingDelivery);
+      throw new Error(`No durable pre-merge delivery intent exists for PR #${options.prNumber}.`);
+    }
+    const intent = normalizeDeliveryIntent(rawIntent);
+    const delivery = normalizeDeliveryRecord({
+      ...intent,
+      mergedSha: options.mergedSha,
+      mergedAt: options.mergedAt,
+      title: options.title,
+      url: options.url,
+    });
+    if (existingDelivery && JSON.stringify(normalizeDeliveryRecord(existingDelivery)) !== JSON.stringify(delivery)) {
+      throw new Error(`Delivery record conflict for PR #${options.prNumber}; immutable delivery history was preserved.`);
+    }
+    state.deliveriesByPr ??= {};
+    state.deliveriesByPr[key] = existingDelivery ?? delivery;
+    const previous = state.records[intent.taskSlug];
+    const samePr = previous
+      && previous.branchName === intent.branchName
+      && (previous.number === undefined || previous.number === intent.prNumber)
+      && (!previous.taskBindingId || previous.taskBindingId === intent.taskBindingId);
+    state.records[intent.taskSlug] = {
+      ...(samePr ? previous : {}),
+      taskSlug: intent.taskSlug,
+      ...(intent.taskBindingId ? { taskBindingId: intent.taskBindingId } : {}),
+      branchName: intent.branchName,
+      title: options.title,
+      number: intent.prNumber,
+      url: options.url,
+      mergedSha: options.mergedSha,
+      mergedAt: options.mergedAt,
+      updatedAt: nowIso(),
+    };
+    delete state.deliveryIntentsByPr?.[key];
+    if (state.deliveryIntentsByPr && Object.keys(state.deliveryIntentsByPr).length === 0) {
+      delete state.deliveryIntentsByPr;
+    }
+    return existingDelivery ?? delivery;
+  });
+}
+
+export function loadDeliveryByPr(commonDir: string, config: WorkflowConfig, prNumber: number): DeliveryRecord | null {
+  const record = loadPrState(commonDir, config).deliveriesByPr?.[String(prNumber)];
+  if (!record) return null;
+  try {
+    return normalizeDeliveryRecord(record);
+  } catch {
+    return null;
+  }
+}
+
+export function findDeliveriesByTask(
+  commonDir: string,
+  config: WorkflowConfig,
+  taskSlug: string,
+  taskBindingId?: string,
+): DeliveryRecord[] {
+  return Object.values(loadPrState(commonDir, config).deliveriesByPr ?? {})
+    .flatMap((record) => {
+      try {
+        return [normalizeDeliveryRecord(record)];
+      } catch {
+        return [];
+      }
+    })
+    .filter((record) => record.ownership === 'managed-task'
+      && record.taskSlug === taskSlug
+      && (taskBindingId === undefined || record.taskBindingId === taskBindingId))
+    .sort((left, right) => left.prNumber - right.prNumber);
 }
 
 export function loadTaskLock(commonDir: string, config: WorkflowConfig, taskSlug: string): TaskLock | null {
@@ -3629,6 +4447,21 @@ export function updateTaskBinding(
   taskSlug: string,
   update: (current: TaskLock) => TaskLock,
 ): TaskLock {
+  const workspaceLockPath = taskCleanupLockPath(commonDir, config, taskSlug);
+  const leaseToken = activeProcessWorkspaceLeaseTokens.get(workspaceLockPath);
+  if (leaseToken) {
+    const current = loadTaskLock(commonDir, config, taskSlug);
+    if (!current) throw new Error(`No task lock found for ${taskSlug}.`);
+    const taskBindingId = current.taskBindingId ?? legacyTaskBindingId(config, current);
+    const result = compareAndSetTaskLockWithWorkspaceLease(commonDir, config, {
+      taskSlug,
+      taskBindingId,
+      leaseToken,
+      update,
+    });
+    if (result.updated === false) throw new Error(`Task ${taskSlug} changed during lease-authorized update (${result.reason}).`);
+    return result.lock;
+  }
   const lockGuard = acquireTaskBindingLock(commonDir, config, taskSlug);
   try {
     const current = loadTaskLock(commonDir, config, taskSlug);
@@ -3640,10 +4473,141 @@ export function updateTaskBinding(
 }
 
 export function saveTaskLock(commonDir: string, config: WorkflowConfig, taskSlug: string, value: TaskLock): TaskLock {
+  const workspaceLockPath = taskCleanupLockPath(commonDir, config, taskSlug);
+  const leaseToken = activeProcessWorkspaceLeaseTokens.get(workspaceLockPath);
+  if (leaseToken) {
+    const taskBindingId = value.taskBindingId ?? legacyTaskBindingId(config, value);
+    const result = compareAndSetTaskLockWithWorkspaceLease(commonDir, config, {
+      taskSlug,
+      taskBindingId,
+      leaseToken,
+      update: () => value,
+    });
+    if (result.updated === false) throw new Error(`Task ${taskSlug} changed during lease-authorized save (${result.reason}).`);
+    return result.lock;
+  }
   assertTaskCleanupUnlocked(commonDir, config, taskSlug);
   ensureStateDir(commonDir, config);
   writeVersionedJsonFile('taskLock', taskLockPath(commonDir, config, taskSlug), value);
   return value;
+}
+
+export function saveReboundTaskLock(commonDir: string, config: WorkflowConfig, taskSlug: string, value: TaskLock): TaskLock {
+  const workspaceLockPath = taskCleanupLockPath(commonDir, config, taskSlug);
+  const leaseToken = activeProcessWorkspaceLeaseTokens.get(workspaceLockPath);
+  if (!leaseToken) return saveTaskLock(commonDir, config, taskSlug, value);
+  const current = loadTaskLock(commonDir, config, taskSlug);
+  if (!current) throw new Error(`No task lock found for ${taskSlug}.`);
+  const taskBindingId = current.taskBindingId ?? legacyTaskBindingId(config, current);
+  const nextTaskBindingId = value.taskBindingId ?? legacyTaskBindingId(config, value);
+  const result = compareAndSetTaskLockWithWorkspaceLease(commonDir, config, {
+    taskSlug,
+    taskBindingId,
+    nextTaskBindingId,
+    leaseToken,
+    update: () => value,
+  });
+  if (result.updated === false) throw new Error(`Task ${taskSlug} changed during lease-authorized rebind (${result.reason}).`);
+  return result.lock;
+}
+
+export type TaskLockCompareAndSetResult =
+  | { updated: true; lock: TaskLock }
+  | { updated: false; reason: 'lock-missing' | 'lease-lost' | 'binding-mismatch' | 'request-mismatch' };
+
+export function compareAndSetTaskLockWithWorkspaceLease(
+  commonDir: string,
+  config: WorkflowConfig,
+  options: {
+    taskSlug: string;
+    taskBindingId: string;
+    nextTaskBindingId?: string;
+    leaseToken: string;
+    expectedCleanupRequestId?: string;
+    update: (current: TaskLock) => TaskLock;
+  },
+): TaskLockCompareAndSetResult {
+  const lockPath = taskCleanupLockPath(commonDir, config, options.taskSlug);
+  const owner = readTaskWorkspaceLeaseOwnerAtPath(lockPath);
+  if (!owner || owner.token !== options.leaseToken || owner.taskBindingId !== options.taskBindingId) {
+    return { updated: false, reason: 'lease-lost' };
+  }
+  const guard = acquireTaskBindingLock(commonDir, config, options.taskSlug);
+  try {
+    const currentOwner = readTaskWorkspaceLeaseOwnerAtPath(lockPath);
+    if (!currentOwner || currentOwner.token !== options.leaseToken || currentOwner.taskBindingId !== options.taskBindingId) {
+      return { updated: false, reason: 'lease-lost' };
+    }
+    const current = loadTaskLock(commonDir, config, options.taskSlug);
+    if (!current) return { updated: false, reason: 'lock-missing' };
+    if ((current.taskBindingId ?? legacyTaskBindingId(config, current)) !== options.taskBindingId) {
+      return { updated: false, reason: 'binding-mismatch' };
+    }
+    if (options.expectedCleanupRequestId !== undefined && current.cleanup?.requestId !== options.expectedCleanupRequestId) {
+      return { updated: false, reason: 'request-mismatch' };
+    }
+    const next = options.update(current);
+    const nextTaskBindingId = next.taskBindingId ?? legacyTaskBindingId(config, next);
+    const expectedNextTaskBindingId = options.nextTaskBindingId ?? options.taskBindingId;
+    if (nextTaskBindingId !== expectedNextTaskBindingId) {
+      return { updated: false, reason: 'binding-mismatch' };
+    }
+    ensureStateDir(commonDir, config);
+    writeVersionedJsonFile('taskLock', taskLockPath(commonDir, config, options.taskSlug), next);
+    if (nextTaskBindingId !== options.taskBindingId) {
+      try {
+        writeJsonFile(taskWorkspaceLeaseOwnerPath(lockPath), {
+          ...currentOwner,
+          taskBindingId: nextTaskBindingId,
+          heartbeatAt: nowIso(),
+        });
+      } catch (error) {
+        // Keep the two-file transition fail-closed and restore the old binding
+        // if publishing the lease's new identity fails synchronously.
+        writeVersionedJsonFile('taskLock', taskLockPath(commonDir, config, options.taskSlug), current);
+        throw error;
+      }
+    }
+    return { updated: true, lock: next };
+  } finally {
+    guard.release();
+  }
+}
+
+export function removeTaskLockWithWorkspaceLease(
+  commonDir: string,
+  config: WorkflowConfig,
+  options: {
+    taskSlug: string;
+    taskBindingId: string;
+    leaseToken: string;
+    expectedCleanupRequestId?: string;
+  },
+): { removed: boolean; reason?: 'lock-missing' | 'lease-lost' | 'binding-mismatch' | 'request-mismatch' } {
+  const lockPath = taskCleanupLockPath(commonDir, config, options.taskSlug);
+  const owner = readTaskWorkspaceLeaseOwnerAtPath(lockPath);
+  if (!owner || owner.token !== options.leaseToken || owner.taskBindingId !== options.taskBindingId) {
+    return { removed: false, reason: 'lease-lost' };
+  }
+  const guard = acquireTaskBindingLock(commonDir, config, options.taskSlug);
+  try {
+    const currentOwner = readTaskWorkspaceLeaseOwnerAtPath(lockPath);
+    if (!currentOwner || currentOwner.token !== options.leaseToken || currentOwner.taskBindingId !== options.taskBindingId) {
+      return { removed: false, reason: 'lease-lost' };
+    }
+    const current = loadTaskLock(commonDir, config, options.taskSlug);
+    if (!current) return { removed: true };
+    if ((current.taskBindingId ?? legacyTaskBindingId(config, current)) !== options.taskBindingId) {
+      return { removed: false, reason: 'binding-mismatch' };
+    }
+    if (options.expectedCleanupRequestId !== undefined && current.cleanup?.requestId !== options.expectedCleanupRequestId) {
+      return { removed: false, reason: 'request-mismatch' };
+    }
+    unlinkSync(taskLockPath(commonDir, config, options.taskSlug));
+    return { removed: true };
+  } finally {
+    guard.release();
+  }
 }
 
 function acquireTaskBindingLock(commonDir: string, config: WorkflowConfig, taskSlug: string): { release: () => void } {
@@ -3667,6 +4631,17 @@ function acquireTaskBindingLock(commonDir: string, config: WorkflowConfig, taskS
 }
 
 export function removeTaskLock(commonDir: string, config: WorkflowConfig, taskSlug: string): void {
+  const workspaceLockPath = taskCleanupLockPath(commonDir, config, taskSlug);
+  const leaseToken = activeProcessWorkspaceLeaseTokens.get(workspaceLockPath);
+  if (leaseToken) {
+    const current = loadTaskLock(commonDir, config, taskSlug);
+    if (!current) return;
+    const taskBindingId = current.taskBindingId ?? legacyTaskBindingId(config, current);
+    const result = removeTaskLockWithWorkspaceLease(commonDir, config, { taskSlug, taskBindingId, leaseToken });
+    if (!result.removed) throw new Error(`Task ${taskSlug} changed during lease-authorized removal (${result.reason}).`);
+    return;
+  }
+  assertTaskCleanupUnlocked(commonDir, config, taskSlug);
   const targetPath = taskLockPath(commonDir, config, taskSlug);
   if (existsSync(targetPath)) {
     unlinkSync(targetPath);
@@ -3809,6 +4784,8 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
   const flags: OperatorFlags = {
     apply: false,
     allStale: false,
+    delivered: false,
+    keepWorktree: false,
     force: false,
     statusOnly: false,
     completedWithIgnored: false,
@@ -3980,6 +4957,18 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     if (flagName === '--all-stale') {
       rejectInlineValue('--all-stale');
       flags.allStale = true;
+      continue;
+    }
+
+    if (flagName === '--delivered') {
+      rejectInlineValue('--delivered');
+      flags.delivered = true;
+      continue;
+    }
+
+    if (flagName === '--keep-worktree') {
+      rejectInlineValue('--keep-worktree');
+      flags.keepWorktree = true;
       continue;
     }
 
@@ -4554,7 +5543,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       requireNoPositional('pipelane run pr [--task <task-name>] [--title <title>] [--message <message>] [--force-include <path>] [--override --reason <text>] [--plan|--yes]');
       return;
     case 'merge':
-      assertOnlyFlags(parsed, ['task', 'pr', 'title', 'message', 'forceInclude', 'override', 'reason', 'plan', 'yes']);
+      assertOnlyFlags(parsed, ['task', 'pr', 'title', 'message', 'forceInclude', 'override', 'reason', 'plan', 'yes', 'keepWorktree']);
       requirePositivePrNumber();
       if (parsed.flags.task.trim() && parsed.flags.pr.trim()) {
         throw new Error('merge cannot combine --task and --pr; choose one PR/task identity.');
@@ -4566,7 +5555,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         throw new Error('merge --override requires --reason <why review gate evidence is being skipped>.');
       }
       rejectPlanAndYes('merge');
-      requireNoPositional('pipelane run merge [--task <task-name> | --pr <number>] [--title <title>] [--message <message>] [--force-include <path>] [--override --reason <text>] [--plan|--yes]');
+      requireNoPositional('pipelane run merge [--task <task-name> | --pr <number>] [--keep-worktree] [--title <title>] [--message <message>] [--force-include <path>] [--override --reason <text>] [--plan|--yes]');
       return;
     case 'release-check':
       assertOnlyFlags(parsed, ['surfaces']);
@@ -4989,6 +5978,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       assertOnlyFlags(parsed, [
         'apply',
         'allStale',
+        'delivered',
         'task',
         'force',
         'statusOnly',
@@ -4996,7 +5986,8 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         'safeOrphans',
         'mergedOrphans',
       ]);
-      const bulkScopes: Array<'completedWithIgnored' | 'safeOrphans' | 'mergedOrphans'> = [];
+      const bulkScopes: Array<'delivered' | 'completedWithIgnored' | 'safeOrphans' | 'mergedOrphans'> = [];
+      if (parsed.flags.delivered) bulkScopes.push('delivered');
       if (parsed.flags.completedWithIgnored) bulkScopes.push('completedWithIgnored');
       if (parsed.flags.safeOrphans) bulkScopes.push('safeOrphans');
       if (parsed.flags.mergedOrphans) bulkScopes.push('mergedOrphans');
@@ -5007,12 +5998,12 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       }
       if (parsed.flags.statusOnly && (scopeFlagsGiven || parsed.flags.force)) {
         throw new Error(
-          'clean --status-only cannot be combined with --task, --all-stale, --completed-with-ignored, --safe-orphans, --merged-orphans, or --force.',
+          'clean --status-only cannot be combined with --task, --all-stale, --delivered, --completed-with-ignored, --safe-orphans, --merged-orphans, or --force.',
         );
       }
       if (!parsed.flags.apply && (scopeFlagsGiven || parsed.flags.force)) {
         throw new Error(
-          'clean only accepts --task, --all-stale, --completed-with-ignored, --safe-orphans, --merged-orphans, or --force when --apply is also passed.',
+          'clean only accepts --task, --all-stale, --delivered, --completed-with-ignored, --safe-orphans, --merged-orphans, or --force when --apply is also passed.',
         );
       }
       // Bulk scopes are mutually exclusive with each other and with
@@ -5031,7 +6022,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
           ].join('\n'));
         }
         throw new Error(
-          'clean --apply accepts exactly one scope: --task <slug>, --all-stale, --completed-with-ignored, --safe-orphans, or --merged-orphans.',
+          'clean --apply accepts exactly one scope: --task <slug>, --all-stale, --delivered, --completed-with-ignored, --safe-orphans, or --merged-orphans.',
         );
       }
       if (parsed.flags.force && !taskGiven) {
@@ -5040,7 +6031,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         );
       }
       requireNoPositional(
-        'pipelane run clean [--status-only | --apply (--task <task-name> [--force]|--all-stale|--completed-with-ignored|--safe-orphans|--merged-orphans)]',
+        'pipelane run clean [--status-only | --apply (--task <task-name> [--force]|--all-stale|--delivered|--completed-with-ignored|--safe-orphans|--merged-orphans)]',
       );
       return;
     }
@@ -5116,6 +6107,8 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
           'sha',
           'skipSmokeCoverage',
           'allStale',
+          'delivered',
+          'keepWorktree',
           'execute',
           'confirmToken',
         ]);
@@ -5231,6 +6224,8 @@ type OperatorFlagKey = keyof OperatorFlags;
 const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flags: OperatorFlags) => boolean }> = [
   { key: 'apply', label: '--apply', active: (flags) => flags.apply },
   { key: 'allStale', label: '--all-stale', active: (flags) => flags.allStale },
+  { key: 'delivered', label: '--delivered', active: (flags) => flags.delivered },
+  { key: 'keepWorktree', label: '--keep-worktree', active: (flags) => flags.keepWorktree },
   { key: 'force', label: '--force', active: (flags) => flags.force },
   { key: 'statusOnly', label: '--status-only', active: (flags) => flags.statusOnly },
   { key: 'completedWithIgnored', label: '--completed-with-ignored', active: (flags) => flags.completedWithIgnored },

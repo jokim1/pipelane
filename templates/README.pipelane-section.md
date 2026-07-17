@@ -30,9 +30,11 @@ to production and do not need required staging validation for the same SHA.
 {{ALIAS_NEW}}                    Let the AI infer the task name, or provide one if you want.
 {{ALIAS_ADOPT}}                  Track an existing branch/worktree instead of creating another one.
 {{ALIAS_PR}} --title "PR title"  Run pre-PR checks, commit, push, and open or update the PR.
-{{ALIAS_MERGE}}                  Merge the PR and record the merged SHA.
-{{ALIAS_CLEAN}}                  Clean up finished task state after production is verified.
+{{ALIAS_MERGE}}                  Merge the PR, record delivery, and close the clean task workspace.
 ```
+
+Continue from the primary shared checkout printed by merge. Pass
+`{{ALIAS_MERGE}} --keep-worktree` only when durable retention is intentional.
 
 ### Release Journey
 
@@ -45,11 +47,13 @@ same merged SHA before production can move.
 {{ALIAS_NEW}}                    Let the AI infer the task name, or provide one if you want.
 {{ALIAS_ADOPT}}                  Track an existing branch/worktree instead of creating another one.
 {{ALIAS_PR}} --title "PR title"  Run pre-PR checks, commit, push, and open or update the PR.
-{{ALIAS_MERGE}}                  Merge the PR and record the merged SHA.
-{{ALIAS_DEPLOY}} staging         Deploy the merged SHA to staging.
-{{ALIAS_DEPLOY}} prod            Promote that same SHA to production.
-{{ALIAS_CLEAN}}                  Clean up finished task state after production is verified.
+{{ALIAS_MERGE}}                  Merge the PR, record delivery, and close the clean task workspace.
+{{ALIAS_DEPLOY}} staging --pr <merged-pr-number>  From the shared checkout, deploy the immutable merged SHA.
+{{ALIAS_DEPLOY}} prod --pr <merged-pr-number>     Promote that same SHA to production.
 ```
+
+The explicit PR number lets deploy reconstruct the exact task mode and surfaces
+from immutable delivery history; the removed edit worktree is not needed.
 
 ### Helpful Anytime
 
@@ -75,11 +79,11 @@ same merged SHA before production can move.
 - `{{ALIAS_ADOPT}}`: bind an existing branch/worktree to a Pipelane task
 - `{{ALIAS_RESUME}}`: recover an existing task worktree
 - `{{ALIAS_PR}}`: run checks, commit, push, and open or update a PR
-- `{{ALIAS_MERGE}}`: merge the PR and record the merged SHA
+- `{{ALIAS_MERGE}}`: merge the PR, record immutable delivery history, and normally close the task workspace
 - `{{ALIAS_RELEASE}}`: enable or inspect the optional release module
 - `{{ALIAS_DEPLOY}}`: deploy to `staging` or `prod`
 - `/fix`: make durable root-cause fixes from findings
-- `{{ALIAS_CLEAN}}`: inspect and prune finished or stale task state
+- `{{ALIAS_CLEAN}}`: preview cleanup or explicitly retry retained, blocked, delivered, or stale task state
 - `{{ALIAS_DOCTOR}}`: diagnose deploy config and live probes
 - `{{ALIAS_ROLLBACK}}`: roll back to the last verified-good deploy
 
@@ -93,6 +97,15 @@ The default alias set can be changed in machine-local Pipelane config. If
 aliases change, rerun setup and reopen Claude/Codex so the new names are picked
 up. Aliases must be unique, and setup fails closed if an alias would overwrite
 an unrelated command.
+
+Automatic closeout is machine-local and enabled by default. Disable it with
+`pipelane configure --automatic-worktree-cleanup=false` and re-enable it with
+`true`. Bare `{{ALIAS_CLEAN}}` is non-destructive;
+`{{ALIAS_CLEAN}} --apply --delivered` retries delivered backlogs, while
+`--apply --task <slug>` is the only command that clears durable
+`--keep-worktree` retention. Unknown ignored content is protected unless it is
+inside an exact validated root configured with
+`pipelane configure --disposable-ignored-path=<root>`.
 
 ### What Each User Still Needs To Do
 

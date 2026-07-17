@@ -13,10 +13,11 @@ This repo uses `pipelane` for task workspaces, PR prep, merge handoff, and deplo
 - Use `{{ALIAS_DEVMODE}} status|build|release` to inspect or switch lanes.
 - Use `{{ALIAS_RELEASE}} status|enable|doctor` to inspect or enable the optional release module.
 - Use `{{ALIAS_PR}} --title "<pr title>"` to prepare or update the PR.
-- Use `{{ALIAS_MERGE}}` to merge the PR and record the merged SHA.
-- Use `{{ALIAS_DEPLOY}} staging|prod` to deploy the merged SHA.
+- Use `{{ALIAS_MERGE}}` to merge the PR, record the merged SHA, and normally close the clean task workspace. Use `--keep-worktree` only when the workspace must survive.
+- After successful merge closeout, continue from the primary shared checkout printed in the receipt; never return to or run another command from the removed path.
+- Use `{{ALIAS_DEPLOY}} staging|prod --pr <merged-pr-number>` from that shared checkout to deploy the immutable merged SHA.
 - Use `{{ALIAS_ROLLBACK}} staging|prod` to roll back the last deploy to the last-good SHA.
-- Use `{{ALIAS_CLEAN}}` for workflow cleanup status.
+- Use bare `{{ALIAS_CLEAN}}` for non-destructive cleanup status, `{{ALIAS_CLEAN}} --apply --delivered` to retry delivered backlog, or explicit `--apply --task <slug>` to clear durable retention.
 - Use `{{ALIAS_STATUS}}` for the one-screen cockpit of task + lane state.
 - Use `{{ALIAS_RELEASE}} enable` to initialize machine-local release config, `pipelane configure` to fill deploy values, and `{{ALIAS_RELEASE}} status` or `{{ALIAS_RELEASE}} doctor --probe` to inspect release readiness.
 - Use `/fix` for review findings, CI failures, bugs, and code-quality repairs.
@@ -36,6 +37,8 @@ This repo uses `pipelane` for task workspaces, PR prep, merge handoff, and deplo
 - Treat `{{ALIAS_REPO_GUARD}}` as the checkout guardrail.
 - Re-check `{{ALIAS_REPO_GUARD}} --task "<task-name>"` before implementation, `{{ALIAS_PR}}`, `{{ALIAS_MERGE}}`, and `{{ALIAS_DEPLOY}}`.
 - `{{ALIAS_PR}}` stages the active task worktree with `git add -A`, so keep the task workspace isolated.
+- Unknown ignored content blocks automatic closeout. Only machine-local, validated exact disposable roots configured with `pipelane configure --disposable-ignored-path=<root>` are tolerated.
+- The repository kill switch is `pipelane configure --automatic-worktree-cleanup=false`; re-enable with the same flag set to `true`.
 - When backend or multi-surface impact is plausible, use explicit `--surfaces`.
 
 ### Worktree deps setup

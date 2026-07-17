@@ -1,7 +1,8 @@
 import { existsSync } from 'node:fs';
 
-import type { DeployRecord, PrRecord, ProbeState, ReviewConsentRecord, ReviewOverrideRecord, ReviewRunRecord, TaskLock, WorkflowConfig } from '../state.ts';
+import type { AutoCleanupBlockerCode, DeliveryRecord, DeployRecord, PrRecord, ProbeState, ReviewConsentRecord, ReviewOverrideRecord, ReviewRunRecord, TaskLock, WorkflowConfig } from '../state.ts';
 import {
+  automaticWorktreeCleanupEnabled,
   DEFAULT_MODE,
   formatWorkflowCommand,
   loadAllTaskLocks,
@@ -9,10 +10,12 @@ import {
   loadPrRecord,
   loadReviewState,
   loadPrState,
+  prRecordMatchesTaskLock,
   loadProbeState,
   nowIso,
   reviewArtifactRoot,
   resolveWorkflowContext,
+  runCommandCapture,
   runGit,
   TASK_LOCK_STALE_MS,
 } from '../state.ts';
@@ -37,7 +40,13 @@ import {
   observeFrontendRuntime,
   type FrontendRuntimeObservation,
 } from '../runtime-observation.ts';
-import { TASK_LOCK_MIN_PRUNE_AGE_MS } from '../task-workspaces.ts';
+import {
+  assessTaskCleanup,
+  inspectCleanupStatus,
+  resolveSharedRepoRoot,
+  type CleanupEvidenceRevision,
+  type DeliveryProof,
+} from '../task-workspaces.ts';
 import {
   isActiveOrchestrationRun,
   listOrchestrationRunRecords,
@@ -112,12 +121,15 @@ export interface BranchRow {
   } | null;
   surfaces: string[];
   cleanup: {
+    status: 'not-applicable' | 'pending' | 'eligible' | 'kept' | 'blocked';
+    blockerCode: AutoCleanupBlockerCode | null;
     available: boolean;
     eligible: boolean;
     reason: string;
     stale: boolean;
     tag: string;
     evidence: string[];
+    evidenceRevision: CleanupEvidenceRevision | null;
   };
   pr: {
     number: number | null;
@@ -312,6 +324,14 @@ export interface SnapshotData {
   attention: unknown[];
   availableActions: ApiActionState[];
   branches: BranchRow[];
+  cleanupSummary: {
+    automaticEnabled: boolean;
+    pending: number;
+    eligible: number;
+    kept: number;
+    blocked: number;
+    blockedByCode: Record<string, number>;
+  };
 }
 
 export type ReviewSnapshotRecord = ReviewRunRecord & {
@@ -360,19 +380,25 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
     environment: 'prod',
   });
   const activeLock = locks.find((lock) => lock.branchName === currentBranch) ?? null;
-  const currentPrRecord = activeLock ? prState.records[activeLock.taskSlug] ?? null : null;
+  const currentPrRecord = activeLock && prRecordMatchesTaskLock(prState.records[activeLock.taskSlug], activeLock)
+    ? prState.records[activeLock.taskSlug]
+    : null;
   const branches = buildBranchRows({
     locks,
     config: context.config,
     repoRoot: context.repoRoot,
+    commonDir: context.commonDir,
+    callerCwd: context.repoRoot,
     currentBranch,
     baseBranch,
     baseBranchSha,
     prRecords: prState.records,
+    deliveries: Object.values(prState.deliveriesByPr ?? {}),
     deployRecords: deployState.records,
     mode,
     checkedAt,
   });
+  const cleanupSummary = buildCleanupSummary(branches, context.config);
 
   const worktreeToOriginAnalysis = analyzeWorktreeToOrigin({
     repoRoot: context.repoRoot,
@@ -577,6 +603,7 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
       attention,
       availableActions: buildBoardActions({ mode, releaseReadiness, branches, checkedAt }),
       branches,
+      cleanupSummary,
     },
   });
 }
@@ -1408,28 +1435,173 @@ export function buildBranchRows(options: {
   locks: TaskLock[];
   config: WorkflowConfig;
   repoRoot: string;
+  commonDir?: string;
+  callerCwd?: string;
   currentBranch: string;
   baseBranch: string;
   baseBranchSha: string;
   prRecords: Record<string, PrRecord>;
+  deliveries?: DeliveryRecord[];
   deployRecords: DeployRecord[];
   mode: string;
   checkedAt: string;
 }): BranchRow[] {
-  return options.locks.map((lock) =>
-    buildBranchRow({
+  const deliveries = options.deliveries ?? [];
+  const lockedRows = options.locks.map((lock) => {
+    const matchingDeliveries = deliveries.filter((delivery) =>
+      delivery.ownership === 'managed-task'
+      && delivery.taskSlug === lock.taskSlug
+      && Boolean(lock.taskBindingId)
+      && delivery.taskBindingId === lock.taskBindingId
+    );
+    const storedPr = prRecordMatchesTaskLock(options.prRecords[lock.taskSlug], lock)
+      ? options.prRecords[lock.taskSlug]
+      : null;
+    const prRecord = storedPr ?? (matchingDeliveries.length === 1
+      ? prRecordFromDelivery(matchingDeliveries[0])
+      : null);
+    return buildBranchRow({
       lock,
       config: options.config,
+      repoRoot: options.repoRoot,
+      commonDir: options.commonDir,
+      callerCwd: options.callerCwd,
+      currentBranch: options.currentBranch,
+      baseBranch: options.baseBranch,
+      baseBranchSha: options.baseBranchSha,
+      prRecord,
+      deliveries,
+      deployRecords: options.deployRecords,
+      mode: options.mode,
+      checkedAt: options.checkedAt,
+    });
+  });
+  const representedPrs = new Set(lockedRows.flatMap((row) => row.pr?.number ? [row.pr.number] : []));
+  const deliveryRows = deliveries
+    .filter((delivery) => !representedPrs.has(delivery.prNumber))
+    .map((delivery) => buildDeliveryBranchRow({
+      delivery,
       repoRoot: options.repoRoot,
       currentBranch: options.currentBranch,
       baseBranch: options.baseBranch,
       baseBranchSha: options.baseBranchSha,
-      prRecord: options.prRecords[lock.taskSlug] ?? null,
       deployRecords: options.deployRecords,
-      mode: options.mode,
       checkedAt: options.checkedAt,
+    }))
+    .filter((row) => row.availableActions.length > 0
+      || row.lanes.staging.state === 'running'
+      || row.lanes.production.state === 'running');
+  return [...lockedRows, ...deliveryRows];
+}
+
+function prRecordFromDelivery(delivery: DeliveryRecord): PrRecord {
+  return {
+    taskSlug: delivery.taskSlug,
+    ...(delivery.taskBindingId ? { taskBindingId: delivery.taskBindingId } : {}),
+    branchName: delivery.branchName,
+    title: delivery.title,
+    number: delivery.prNumber,
+    url: delivery.url,
+    mergedSha: delivery.mergedSha,
+    mergedAt: delivery.mergedAt,
+    updatedAt: delivery.mergedAt,
+  };
+}
+
+function buildDeliveryBranchRow(options: {
+  delivery: DeliveryRecord;
+  repoRoot: string;
+  currentBranch: string;
+  baseBranch: string;
+  baseBranchSha: string;
+  deployRecords: DeployRecord[];
+  checkedAt: string;
+}): BranchRow {
+  const { delivery, checkedAt } = options;
+  const prRecord = prRecordFromDelivery(delivery);
+  const localCell = buildApiStatusCell({
+    state: 'healthy',
+    reason: 'edit workspace closed after immutable delivery was recorded',
+    checkedAt,
+  });
+  const prCell = buildApiStatusCell({
+    state: 'healthy',
+    reason: `PR #${delivery.prNumber} merged`,
+    checkedAt,
+  });
+  const baseContained = Boolean(options.baseBranchSha)
+    && gitIsAncestor(options.repoRoot, delivery.mergedSha, options.baseBranchSha);
+  const baseCell = buildApiStatusCell({
+    state: baseContained ? 'healthy' : 'running',
+    reason: baseContained
+      ? `merged SHA is contained by ${options.baseBranch}`
+      : `merged SHA ${shortSha(delivery.mergedSha)} landed; waiting for origin/${options.baseBranch}`,
+    detail: `Base: ${options.baseBranch}`,
+    checkedAt,
+  });
+  const stagingCell = buildDeployCell({
+    environment: 'staging',
+    mode: delivery.mode,
+    mergedSha: delivery.mergedSha,
+    deployRecords: options.deployRecords,
+    checkedAt,
+  });
+  const productionCell = buildDeployCell({
+    environment: 'prod',
+    mode: delivery.mode,
+    mergedSha: delivery.mergedSha,
+    deployRecords: options.deployRecords,
+    checkedAt,
+  });
+  const cleanup: BranchRow['cleanup'] = {
+    status: 'not-applicable',
+    blockerCode: null,
+    available: false,
+    eligible: false,
+    reason: 'edit workspace already closed; immutable delivery history retained',
+    stale: false,
+    tag: 'closed',
+    evidence: [`PR #${delivery.prNumber} immutable delivery`],
+    evidenceRevision: null,
+  };
+  return {
+    name: delivery.branchName,
+    status: 'delivered',
+    current: delivery.branchName === options.currentBranch,
+    note: `PR #${delivery.prNumber} delivered; edit workspace closed`,
+    task: null,
+    surfaces: delivery.surfaces,
+    cleanup,
+    pr: {
+      number: delivery.prNumber,
+      state: 'MERGED',
+      url: delivery.url,
+      title: delivery.title,
+      mergedAt: delivery.mergedAt,
+    },
+    mergedSha: delivery.mergedSha,
+    lanes: {
+      local: localCell,
+      pr: prCell,
+      base: baseCell,
+      staging: stagingCell,
+      production: productionCell,
+    },
+    availableActions: buildBranchActions({
+      worktreeExists: false,
+      dirty: false,
+      prRecord,
+      mode: delivery.mode,
+      localCell,
+      prCell,
+      stagingCell,
+      productionCell,
+      cleanup,
+      taskSlug: delivery.taskSlug,
+      prNumber: delivery.prNumber,
+      checkedAt,
     }),
-  );
+  };
 }
 
 function buildCurrentCheckoutTruth(options: {
@@ -1924,10 +2096,13 @@ function buildBranchRow(options: {
   lock: TaskLock;
   config: WorkflowConfig;
   repoRoot: string;
+  commonDir?: string;
+  callerCwd?: string;
   currentBranch: string;
   baseBranch: string;
   baseBranchSha: string;
   prRecord: PrRecord | null;
+  deliveries: DeliveryRecord[];
   deployRecords: DeployRecord[];
   mode: string;
   checkedAt: string;
@@ -1978,10 +2153,16 @@ function buildBranchRow(options: {
   });
   const cleanup = buildBranchCleanup({
     lock,
+    config: options.config,
+    repoRoot: options.repoRoot,
+    commonDir: options.commonDir,
+    callerCwd: options.callerCwd ?? options.repoRoot,
+    baseBranch,
+    baseBranchSha,
+    deliveries: options.deliveries,
+    prRecord,
     worktreeExists,
     branchExists,
-    dirty,
-    prodVerified: Boolean(prRecord?.mergedSha) && productionCell.state === 'healthy',
     checkedAt,
   });
   const nextActionTiming = buildNextActionTiming(
@@ -2026,12 +2207,15 @@ function buildBranchRow(options: {
     },
     surfaces: lock.surfaces ?? [],
     cleanup: {
+      status: cleanup.status,
+      blockerCode: cleanup.blockerCode,
       available: cleanup.available,
       eligible: cleanup.eligible,
       reason: cleanup.reason,
       stale: cleanup.stale,
       tag: cleanup.tag,
       evidence: cleanup.evidence,
+      evidenceRevision: cleanup.evidenceRevision,
     },
     pr: prRecord
       ? {
@@ -2091,83 +2275,223 @@ export function buildNextActionTiming(
 
 function buildBranchCleanup(options: {
   lock: TaskLock;
+  config: WorkflowConfig;
+  repoRoot: string;
+  commonDir?: string;
+  callerCwd: string;
+  baseBranch: string;
+  baseBranchSha: string;
+  deliveries: DeliveryRecord[];
+  prRecord: PrRecord | null;
   worktreeExists: boolean;
   branchExists: boolean;
-  dirty: boolean;
-  prodVerified: boolean;
   checkedAt: string;
 }): BranchRow['cleanup'] {
-  const { lock, worktreeExists, branchExists, dirty, prodVerified, checkedAt } = options;
-  const evidence = [
-    ...(!worktreeExists ? [`saved worktree ${lock.worktreePath} no longer exists`] : []),
-    ...(!branchExists ? [`saved branch ${lock.branchName} no longer exists`] : []),
-  ];
-
-  if (evidence.length > 0) {
+  const { lock, worktreeExists, branchExists, checkedAt } = options;
+  const matchingDeliveries = options.deliveries.filter((delivery) =>
+    delivery.ownership === 'managed-task'
+    && delivery.taskSlug === lock.taskSlug
+    && Boolean(lock.taskBindingId)
+    && delivery.taskBindingId === lock.taskBindingId
+  );
+  const cleanupCandidate = Boolean(lock.cleanup || options.prRecord?.mergedSha || matchingDeliveries.length > 0);
+  if (!cleanupCandidate) {
+    const missingArtifacts = [
+      ...(!worktreeExists ? [`saved worktree ${lock.worktreePath} no longer exists`] : []),
+      ...(!branchExists ? [`saved branch ${lock.branchName} no longer exists`] : []),
+    ];
+    if (missingArtifacts.length > 0) {
+      return {
+        status: 'not-applicable',
+        blockerCode: null,
+        available: true,
+        eligible: true,
+        reason: missingArtifacts.join('; '),
+        stale: true,
+        tag: 'stale',
+        evidence: missingArtifacts,
+        evidenceRevision: null,
+      };
+    }
     return {
-      available: true,
-      eligible: true,
-      reason: evidence.join('; '),
-      stale: true,
-      tag: 'stale',
-      evidence,
-    };
-  }
-
-  if (dirty) {
-    return {
-      available: false,
-      eligible: false,
-      reason: 'dirty worktree',
-      stale: false,
-      tag: 'dirty',
-      evidence: [],
-    };
-  }
-
-  if (!prodVerified) {
-    return {
+      status: 'not-applicable',
+      blockerCode: null,
       available: false,
       eligible: false,
       reason: 'workspace still active',
       stale: false,
       tag: 'active',
       evidence: [],
+      evidenceRevision: null,
     };
   }
+  if (matchingDeliveries.length > 1) {
+    return blockedCleanupProjection(
+      'delivery-ambiguous',
+      `Multiple immutable deliveries match this task binding: ${matchingDeliveries.map((entry) => `#${entry.prNumber}`).join(', ')}.`,
+      lock,
+      worktreeExists,
+      branchExists,
+    );
+  }
 
-  const ageMs = lockAgeMs(lock.updatedAt, Date.parse(checkedAt));
-  if (ageMs === null) {
+  const branchHeadSha = branchExists
+    ? runGit(options.repoRoot, ['rev-parse', '--verify', `refs/heads/${lock.branchName}`], true)?.trim() ?? ''
+    : '';
+  const remoteBaseRef = `origin/${options.baseBranch}`;
+  const evidenceRevision: CleanupEvidenceRevision | null = options.baseBranchSha
+    ? { remoteBaseSha: options.baseBranchSha, observedAt: checkedAt, source: 'snapshot-local' }
+    : null;
+  const delivery = matchingDeliveries[0] ?? null;
+  let proof: DeliveryProof | null = null;
+  let proofContained = false;
+  if (delivery && branchHeadSha === delivery.prHeadSha && evidenceRevision) {
+    proof = {
+      kind: 'merged-pr-head',
+      prNumber: delivery.prNumber,
+      prHeadSha: delivery.prHeadSha,
+      mergedSha: delivery.mergedSha,
+      remoteBaseRef,
+      remoteBaseSha: evidenceRevision.remoteBaseSha,
+    };
+    proofContained = gitIsAncestor(options.repoRoot, delivery.mergedSha, evidenceRevision.remoteBaseSha);
+  } else if (branchHeadSha && evidenceRevision && gitIsAncestor(options.repoRoot, branchHeadSha, evidenceRevision.remoteBaseSha)) {
+    proof = {
+      kind: 'remote-ancestor',
+      branchHeadSha,
+      remoteBaseRef,
+      remoteBaseSha: evidenceRevision.remoteBaseSha,
+    };
+    proofContained = true;
+  }
+
+  const sharedRepoRoot = options.commonDir ? resolveSharedRepoRoot(options.commonDir) : null;
+  const status = worktreeExists && sharedRepoRoot
+    ? inspectCleanupStatus({
+      worktreePath: lock.worktreePath,
+      sharedRepoRoot,
+      disposableIgnoredPaths: options.config.cleanup?.disposableIgnoredPaths,
+    })
+    : {
+      ok: true,
+      trackedChanges: 0,
+      untrackedEntries: [],
+      ignoredEntries: [],
+      protectedIgnoredEntries: [],
+    };
+  const assessment = assessTaskCleanup({
+    automatic: true,
+    automaticEnabled: automaticWorktreeCleanupEnabled(options.config),
+    lock,
+    taskBindingId: lock.taskBindingId ?? '',
+    sharedRepoRoot,
+    callerCwd: options.callerCwd,
+    worktreeExists,
+    observedBranchName: worktreeExists
+      ? runGit(lock.worktreePath, ['branch', '--show-current'], true)?.trim() ?? ''
+      : '',
+    branchHeadSha,
+    branchExists,
+    status,
+    proof,
+    proofContained,
+    evidence: evidenceRevision,
+  });
+  const artifactEvidence = [
+    ...(!worktreeExists ? [`saved worktree ${lock.worktreePath} no longer exists`] : []),
+    ...(!branchExists ? [`saved branch ${lock.branchName} no longer exists`] : []),
+  ];
+  if (assessment.status === 'eligible') {
     return {
+      status: 'eligible',
+      blockerCode: null,
       available: true,
-      eligible: false,
-      reason: `prod is verified, but cleanup is blocked because updatedAt is missing or unparseable ("${lock.updatedAt ?? ''}")`,
-      stale: false,
-      tag: 'blocked',
-      evidence: [],
+      eligible: true,
+      reason: 'typed delivery proof and local workspace safety checks allow cleanup',
+      stale: artifactEvidence.length > 0,
+      tag: 'ready',
+      evidence: artifactEvidence,
+      evidenceRevision: assessment.evidence,
     };
   }
-
-  if (ageMs < TASK_LOCK_MIN_PRUNE_AGE_MS) {
-    const waitSeconds = Math.ceil((TASK_LOCK_MIN_PRUNE_AGE_MS - ageMs) / 1000);
+  if (assessment.status === 'kept') {
+    const disabled = assessment.reason === 'automatic-cleanup-disabled';
     return {
-      available: true,
+      status: 'kept',
+      blockerCode: disabled ? 'automatic-cleanup-disabled' : null,
+      available: false,
       eligible: false,
-      reason: `prod is verified; cleanup unlocks after the 5-minute prune floor in about ${waitSeconds}s`,
+      reason: disabled
+        ? 'automatic cleanup is disabled by machine-local repository policy'
+        : 'workspace retained by --keep-worktree until explicit scoped cleanup',
       stale: false,
-      tag: 'pending',
-      evidence: [],
+      tag: 'kept',
+      evidence: artifactEvidence,
+      evidenceRevision,
     };
   }
-
   return {
+    status: 'blocked',
+    blockerCode: assessment.code,
     available: true,
-    eligible: true,
-    reason: 'prod is verified; this task lock can be cleaned with /clean --apply --task',
-    stale: false,
-    tag: 'ready',
-    evidence: [],
+    eligible: false,
+    reason: assessment.reason,
+    stale: artifactEvidence.length > 0,
+    tag: 'blocked',
+    evidence: artifactEvidence,
+    evidenceRevision,
   };
+}
+
+function blockedCleanupProjection(
+  code: AutoCleanupBlockerCode,
+  reason: string,
+  lock: TaskLock,
+  worktreeExists: boolean,
+  branchExists: boolean,
+): BranchRow['cleanup'] {
+  return {
+    status: 'blocked',
+    blockerCode: code,
+    available: true,
+    eligible: false,
+    reason,
+    stale: !worktreeExists || !branchExists,
+    tag: 'blocked',
+    evidence: [
+      ...(!worktreeExists ? [`saved worktree ${lock.worktreePath} no longer exists`] : []),
+      ...(!branchExists ? [`saved branch ${lock.branchName} no longer exists`] : []),
+    ],
+    evidenceRevision: null,
+  };
+}
+
+function gitIsAncestor(repoRoot: string, ancestor: string, descendant: string): boolean {
+  if (!ancestor || !descendant) return false;
+  return runCommandCapture('git', ['merge-base', '--is-ancestor', ancestor, descendant], { cwd: repoRoot }).ok;
+}
+
+function buildCleanupSummary(branches: BranchRow[], config: WorkflowConfig): SnapshotData['cleanupSummary'] {
+  const summary: SnapshotData['cleanupSummary'] = {
+    automaticEnabled: automaticWorktreeCleanupEnabled(config),
+    pending: 0,
+    eligible: 0,
+    kept: 0,
+    blocked: 0,
+    blockedByCode: {},
+  };
+  for (const branch of branches) {
+    if (branch.cleanup.status === 'pending') summary.pending += 1;
+    if (branch.cleanup.status === 'eligible') summary.eligible += 1;
+    if (branch.cleanup.status === 'kept') summary.kept += 1;
+    if (branch.cleanup.status === 'blocked') {
+      summary.blocked += 1;
+      if (branch.cleanup.blockerCode) {
+        summary.blockedByCode[branch.cleanup.blockerCode] = (summary.blockedByCode[branch.cleanup.blockerCode] ?? 0) + 1;
+      }
+    }
+  }
+  return summary;
 }
 
 function lockAgeMs(updatedAt: string | undefined, now: number): number | null {
@@ -2188,10 +2512,11 @@ function buildBranchActions(options: {
   productionCell: ApiStatusCell;
   cleanup: BranchRow['cleanup'];
   taskSlug: string;
+  prNumber?: number;
   checkedAt: string;
 }): ApiActionState[] {
   const actions: ApiActionState[] = [];
-  const { worktreeExists, dirty, prRecord, mode, localCell, prCell, stagingCell, productionCell, cleanup, taskSlug, checkedAt } = options;
+  const { worktreeExists, dirty, prRecord, mode, localCell, prCell, stagingCell, productionCell, cleanup, taskSlug, prNumber, checkedAt } = options;
 
   if (!prRecord) {
     actions.push(buildApiActionState({
@@ -2242,6 +2567,7 @@ function buildBranchActions(options: {
         label: 'Deploy staging',
         state: stagingCell.state,
         reason: stagingCell.reason || 'deploy the merged SHA to staging',
+        ...(prNumber ? { defaultParams: { pr: String(prNumber) } } : {}),
         checkedAt,
       }));
     }
@@ -2253,6 +2579,7 @@ function buildBranchActions(options: {
         reason: productionCell.reason || 'deploy the merged SHA to production',
         risky: true,
         requiresConfirmation: true,
+        ...(prNumber ? { defaultParams: { pr: String(prNumber) } } : {}),
         checkedAt,
       }));
     }

@@ -20,13 +20,20 @@ import { handleTaskLock } from './commands/task-lock.ts';
 import { assertRepoOnboardedForDeploy as assertDeployRepoOnboarded } from './onboarding.ts';
 import { assertManagedLocalStateValid } from './local-state.ts';
 import {
+  acquireTaskWorkspaceLease,
+  borrowDelegatedTaskWorkspaceLeaseFromEnvironment,
+  ensureTaskBindingId,
+  loadAllTaskLocks,
+  normalizeExistingPath,
   parseOperatorArgs,
   resolveRepoRoot,
   resolveWorkflowContext,
   validateOperatorArgs,
   type ParsedOperatorArgs,
   type WorkflowContext,
+  type TaskWorkspaceLease,
 } from './state.ts';
+import { bootstrapWorktreeNodeModulesIfNeeded } from './task-workspaces.ts';
 
 export interface LoadedContext extends WorkflowContext {
   deployConfigText: string;
@@ -54,10 +61,16 @@ export async function runOperator(cwd: string, argv: string[]): Promise<void> {
 
   validateOperatorArgs(parsed);
   assertRepoOnboardedForDeploy(cwd, parsed);
-  const managedStateSensitivity = classifyOperatorManagedStateSensitivity(parsed);
-  if (managedStateSensitivity === 'current-state' || managedStateSensitivity === 'target-tree') {
-    assertManagedLocalStateValid(resolveRepoRoot(cwd));
-  }
+  const workspaceLease = acquireCurrentOperatorWorkspaceLease(cwd, parsed);
+  try {
+    if (!['merge', 'deploy', 'clean'].includes(command)) {
+      const bootstrap = bootstrapWorktreeNodeModulesIfNeeded(cwd);
+      if (bootstrap.message) process.stderr.write(`${bootstrap.message}\n`);
+    }
+    const managedStateSensitivity = classifyOperatorManagedStateSensitivity(parsed);
+    if (managedStateSensitivity === 'current-state' || managedStateSensitivity === 'target-tree') {
+      assertManagedLocalStateValid(resolveRepoRoot(cwd));
+    }
 
   if (command === 'devmode') {
     await handleDevmode(cwd, parsed);
@@ -135,7 +148,7 @@ export async function runOperator(cwd: string, argv: string[]): Promise<void> {
   }
 
   if (command === 'status') {
-    await handleStatus(cwd, parsed);
+    await handleStatus(cwd, parsed, { workspaceLease });
     return;
   }
 
@@ -155,6 +168,74 @@ export async function runOperator(cwd: string, argv: string[]): Promise<void> {
   }
 
   throw new Error(`Unknown Pipelane command "${command}". Run "pipelane run --help" to see supported commands.`);
+  } finally {
+    workspaceLease?.release();
+  }
+}
+
+function acquireCurrentOperatorWorkspaceLease(cwd: string, parsed: ParsedOperatorArgs): TaskWorkspaceLease | null {
+  if (!operatorUsesCurrentManagedWorkspace(parsed)) return null;
+  const context = resolveWorkflowContext(cwd);
+  const currentPath = normalizeExistingPath(context.repoRoot);
+  const candidate = loadAllTaskLocks(context.commonDir, context.config)
+    .find((lock) => normalizeExistingPath(lock.worktreePath) === currentPath);
+  if (!candidate) return null;
+  const lock = candidate.taskBindingId
+    ? candidate
+    : ensureTaskBindingId(context.commonDir, context.config, candidate.taskSlug);
+  if (!lock?.taskBindingId) throw new Error(`Task ${candidate.taskSlug} has no stable binding identity.`);
+  const delegated = borrowDelegatedTaskWorkspaceLeaseFromEnvironment(context.commonDir, context.config, {
+    taskSlug: lock.taskSlug,
+    taskBindingId: lock.taskBindingId,
+    childCommand: parsed.command,
+  });
+  if (delegated) {
+    if (delegated.acquired === false) throw new Error(delegated.reason);
+    return delegated.lease;
+  }
+  const acquired = acquireTaskWorkspaceLease(context.commonDir, context.config, {
+    taskSlug: lock.taskSlug,
+    taskBindingId: lock.taskBindingId,
+    command: parsed.command,
+  });
+  if (acquired.acquired === false) throw new Error(acquired.reason);
+  const reread = loadAllTaskLocks(context.commonDir, context.config).find((entry) => entry.taskSlug === lock.taskSlug);
+  if (!reread || reread.taskBindingId !== lock.taskBindingId || normalizeExistingPath(reread.worktreePath) !== currentPath) {
+    acquired.lease.release();
+    throw new Error(`Task ${lock.taskSlug} changed while ${parsed.command} acquired its workspace lease.`);
+  }
+  return acquired.lease;
+}
+
+export function operatorUsesCurrentManagedWorkspace(parsed: ParsedOperatorArgs): boolean {
+  switch (parsed.command) {
+    case 'new':
+    case 'adopt':
+    case 'resume':
+    case 'repo-guard':
+    case 'release-check':
+    case 'status':
+      return true;
+    case 'pr':
+      // A top-level --yes request is executed by the destination router, which
+      // acquires the route lease before spawning the internal PR step. The
+      // internal child still borrows that lease here.
+      return !parsed.flags.yes || process.env.PIPELANE_DESTINATION_INTERNAL_STEP === '1';
+    case 'api':
+      return parsed.positional[0] === 'snapshot';
+    case 'rollback':
+      return true;
+    case 'review': {
+      const subcommand = parsed.positional[0] ?? '';
+      return subcommand === '' || subcommand === 'run';
+    }
+    case 'orchestrate': {
+      const subcommand = parsed.positional[0] ?? '';
+      return ['', 'run', 'plan', 'analyze', 'prepare', 'dispatch', 'start', 'review'].includes(subcommand);
+    }
+    default:
+      return false;
+  }
 }
 
 export function classifyOperatorManagedStateSensitivity(parsed: ParsedOperatorArgs): ManagedLocalStateSensitivity {

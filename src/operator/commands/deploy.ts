@@ -1,4 +1,5 @@
 import readline from 'node:readline';
+import crypto from 'node:crypto';
 
 import {
   buildReleaseCheckMessage,
@@ -18,11 +19,19 @@ import {
 import { listMissingDeployConfiguration } from '../deploy-config-validation.ts';
 import {
   claimDeployEnvironmentLock,
+  acquireTaskWorkspaceLease,
+  borrowDelegatedTaskWorkspaceLeaseFromEnvironment,
+  compareAndSetTaskLockWithWorkspaceLease,
+  ensureTaskBindingId,
+  findDeliveriesByTask,
   formatWorkflowCommand,
   loadDeployState,
+  loadDeliveryByPr,
   loadPrRecord,
+  prRecordMatchesTaskLock,
   loadTaskLock,
   loadProbeState,
+  normalizeExistingPath,
   nowIso,
   printResult,
   removeDeployEnvironmentLock,
@@ -36,10 +45,12 @@ import {
   type DeployEnvironmentLock,
   type DeployRecord,
   type DeployStatus,
+  type DeliveryRecord,
   type DeployVerification,
   type ParsedOperatorArgs,
   type PrRecord,
   type TaskLock,
+  type TaskWorkspaceLease,
   type WorkflowConfig,
   type WorkflowContext,
 } from '../state.ts';
@@ -58,7 +69,6 @@ import {
   resolveSurfaceVerificationCommand,
   resolveCommandSurfaces,
   resolveDeployTargetForTask,
-  setNextAction,
   type LivePr,
 } from './helpers.ts';
 import { maybeHandleDestinationCommand } from './destination.ts';
@@ -76,6 +86,7 @@ import {
   observeCompletedDeployWorkflowRun,
 } from '../deploy-workflow-runs.ts';
 import { assertManagedLocalStateValid } from '../local-state.ts';
+import { bootstrapWorktreeNodeModulesIfNeeded } from '../task-workspaces.ts';
 
 function surfacesKey(surfaces: string[]): string {
   return [...surfaces].sort().join(',');
@@ -196,6 +207,7 @@ interface DeployCommandIdentity {
   branchName: string;
   lock: TaskLock | null;
   livePr: LivePr | null;
+  delivery: DeliveryRecord | null;
 }
 
 function resolveDeployCommandIdentity(
@@ -205,7 +217,26 @@ function resolveDeployCommandIdentity(
 ): DeployCommandIdentity {
   const explicitPr = parsed.flags.pr.trim();
   if (explicitPr) {
-    const pr = loadPrByNumber(context.repoRoot, parsePrNumberFlag(explicitPr));
+    const prNumber = parsePrNumberFlag(explicitPr);
+    const delivery = loadDeliveryByPr(context.commonDir, context.config, prNumber);
+    if (delivery) {
+      const candidateLock = delivery.ownership === 'managed-task' && delivery.taskBindingId
+        ? loadTaskLock(context.commonDir, context.config, delivery.taskSlug)
+        : null;
+      const lock = candidateLock !== null
+        && candidateLock.taskBindingId === delivery.taskBindingId
+        && normalizeExistingPath(candidateLock.worktreePath) === normalizeExistingPath(context.repoRoot)
+        ? candidateLock
+        : null;
+      return {
+        taskSlug: delivery.taskSlug,
+        branchName: delivery.branchName,
+        lock,
+        livePr: null,
+        delivery,
+      };
+    }
+    const pr = loadPrByNumber(context.repoRoot, prNumber);
     const currentBranch = runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
     const branchName = pr.headRefName?.trim() || currentBranch;
     const taskSlug = deriveTaskSlugFromPr(context.config, pr, branchName);
@@ -215,24 +246,45 @@ function resolveDeployCommandIdentity(
       branchName,
       lock,
       livePr: pr,
+      delivery: null,
     };
   }
 
   try {
     const { taskSlug, lock } = inferActiveTaskLock(context, options.explicitTask ?? parsed.flags.task);
+    const bindingId = lock.taskBindingId ?? ensureTaskBindingId(context.commonDir, context.config, taskSlug)?.taskBindingId;
+    const deliveries = bindingId ? findDeliveriesByTask(context.commonDir, context.config, taskSlug, bindingId) : [];
+    if (deliveries.length > 1) {
+      throw new Error(`Multiple delivery records match active task ${taskSlug}: ${deliveries.map((entry) => `#${entry.prNumber}`).join(', ')}. Pass --pr <number>.`);
+    }
     return {
       taskSlug,
       branchName: lock.branchName,
-      lock,
+      lock: bindingId ? loadTaskLock(context.commonDir, context.config, taskSlug) ?? lock : lock,
       livePr: null,
+      delivery: deliveries[0] ?? null,
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const explicitTask = options.explicitTask?.trim() || parsed.flags.task.trim();
+    if (explicitTask) {
+      const taskSlug = slugifyTaskName(explicitTask);
+      const deliveries = findDeliveriesByTask(context.commonDir, context.config, taskSlug);
+      if (deliveries.length === 1) {
+        const delivery = deliveries[0];
+        return { taskSlug, branchName: delivery.branchName, lock: null, livePr: null, delivery };
+      }
+      if (deliveries.length > 1) {
+        throw new Error([
+          `Delivery for task ${taskSlug} is ambiguous: ${deliveries.map((entry) => `#${entry.prNumber}`).join(', ')}.`,
+          `Retry with --pr <number>, for example --pr ${deliveries[0].prNumber}.`,
+        ].join('\n'));
+      }
+    }
     if (options.allowMissingTaskLock && explicitTask) {
       const taskSlug = slugifyTaskName(explicitTask);
       const branchName = runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? taskSlug;
-      return { taskSlug, branchName, lock: null, livePr: null };
+      return { taskSlug, branchName, lock: null, livePr: null, delivery: null };
     }
     if (!/^No task lock (matches|found)/.test(message) || explicitTask) {
       throw error;
@@ -255,6 +307,7 @@ function resolveDeployCommandIdentity(
       branchName,
       lock: null,
       livePr,
+      delivery: null,
     };
   }
 }
@@ -264,8 +317,22 @@ function resolveDeployPrRecord(
   identity: DeployCommandIdentity,
   environment: 'staging' | 'prod',
 ): PrRecord | null {
+  if (identity.delivery) {
+    return {
+      taskSlug: identity.delivery.taskSlug,
+      branchName: identity.delivery.branchName,
+      title: identity.delivery.title,
+      number: identity.delivery.prNumber,
+      url: identity.delivery.url,
+      mergedSha: identity.delivery.mergedSha,
+      mergedAt: identity.delivery.mergedAt,
+      updatedAt: identity.delivery.mergedAt,
+    };
+  }
   if (!identity.livePr) {
-    return loadPrRecord(context.commonDir, context.config, identity.taskSlug);
+    const record = loadPrRecord(context.commonDir, context.config, identity.taskSlug);
+    if (identity.lock) return prRecordMatchesTaskLock(record, identity.lock) ? record : null;
+    return record?.branchName === identity.branchName ? record : null;
   }
 
   const commandLabel = formatWorkflowCommand(context.config, 'deploy', environment);
@@ -275,7 +342,10 @@ function resolveDeployPrRecord(
     context.commonDir,
     context.config,
     identity.taskSlug,
-    prRecordFromLivePr(identity.livePr, branchName),
+    {
+      ...prRecordFromLivePr(identity.livePr, branchName),
+      ...(identity.lock?.taskBindingId ? { taskBindingId: identity.lock.taskBindingId } : {}),
+    },
   );
 }
 
@@ -284,14 +354,21 @@ export async function dispatchDeploy(
   parsed: ParsedOperatorArgs,
   options: DispatchDeployOptions = {},
 ): Promise<DispatchDeployResult> {
-  const context = resolveWorkflowContext(cwd);
+  let context = resolveWorkflowContext(cwd);
   assertManagedLocalStateValid(context.repoRoot);
+  const identity = resolveDeployCommandIdentity(context, parsed, options);
+  if (identity.delivery && context.modeState.mode !== identity.delivery.mode) {
+    context = { ...context, modeState: { ...context.modeState, mode: identity.delivery.mode } };
+  }
   const environment = options.environment ?? resolveDeployEnvironmentForMode(parsed.positional[0], context.modeState.mode);
   const surfacePositionals = parsed.positional.length > 0 ? parsed.positional.slice(1) : [];
   const explicitSurfaces = options.explicitSurfaces ?? [...parsed.flags.surfaces, ...surfacePositionals];
-  const identity = resolveDeployCommandIdentity(context, parsed, options);
   const { taskSlug } = identity;
-  ensureDeployCommandLease(context, identity);
+  const workspaceLease = ensureDeployCommandLease(context, identity);
+  const bootstrap = bootstrapWorktreeNodeModulesIfNeeded(context.repoRoot);
+  if (bootstrap.message) process.stderr.write(`${bootstrap.message}\n`);
+  const sharedCheckoutBefore = identity.delivery && !identity.lock ? snapshotCheckoutIdentity(context.repoRoot) : null;
+  try {
   const prRecord = resolveDeployPrRecord(context, identity, environment);
   const deployConfig = loadDeployConfig(context.repoRoot) ?? emptyDeployConfig();
   const workflowName = workflowNameForDeployEnvironment(context.config, deployConfig, environment);
@@ -330,18 +407,18 @@ export async function dispatchDeploy(
   const surfaces = resolveDeploySurfacesForTarget({
     context,
     explicitSurfaces,
-    fallbackSurfaces: identity.lock?.surfaces ?? [],
+    fallbackSurfaces: identity.delivery?.surfaces ?? identity.lock?.surfaces ?? [],
     targetSha: target.sha,
     surfacePathMap,
+    inferFromTarget: !identity.delivery,
   });
   if (surfaces.length === 0) {
     const timestamp = nowIso();
-    const cleanCommand = formatWorkflowCommand(context.config, 'clean', `--apply --task ${taskSlug}`);
     const delivered = noDeployTargetIsDelivered(context, target.sha, prRecord);
     const nextAction = delivered
-      ? `no deploy surfaces configured at ${target.sha.slice(0, 7)}, run ${cleanCommand}`
+      ? `no deploy surfaces configured at ${target.sha.slice(0, 7)}; delivery is complete`
       : `no deploy surfaces configured for ${target.sha.slice(0, 7)}; run ${formatWorkflowCommand(context.config, 'merge')} before cleanup`;
-    setNextAction(context.commonDir, context.config, taskSlug, nextAction);
+    recordDeployNextAction(context, identity, workspaceLease, nextAction);
     return {
       environment,
       sha: target.sha,
@@ -360,7 +437,7 @@ export async function dispatchDeploy(
         'No deploy surfaces are configured for this repo.',
         'Merge to the base branch is the delivery step.',
         delivered
-          ? `Next: run ${cleanCommand} to close out this workspace.`
+          ? 'Delivery is complete. Automatic merge closeout owns workspace cleanup.'
           : `Next: run ${formatWorkflowCommand(context.config, 'merge')} before cleaning up this workspace.`,
       ].join('\n'),
     };
@@ -595,7 +672,7 @@ export async function dispatchDeploy(
       const nextStage = environment === 'staging'
         ? `staging deploy requested at ${shortSha}, wait for verification`
         : `prod deploy requested at ${shortSha}, verify production`;
-      setNextAction(context.commonDir, context.config, taskSlug, nextStage);
+      recordDeployNextAction(context, identity, workspaceLease, nextStage);
       return {
         ...record,
         taskSlug,
@@ -638,10 +715,12 @@ export async function dispatchDeploy(
     }
 
     const shortSha = target.sha.slice(0, 7);
+    const deliveryPr = identity.delivery?.prNumber ?? prRecord?.number;
+    const deployIdentityArgs = deliveryPr ? ` --pr ${deliveryPr}` : '';
     const nextStage = environment === 'staging'
-      ? `staging verified at ${shortSha}, run ${formatWorkflowCommand(context.config, 'deploy', 'prod')} when ready to promote`
-      : `prod verified at ${shortSha}, run ${formatWorkflowCommand(context.config, 'clean', `--apply --task ${taskSlug}`)} to close out the workspace`;
-    setNextAction(context.commonDir, context.config, taskSlug, nextStage);
+      ? `staging verified at ${shortSha}, run ${formatWorkflowCommand(context.config, 'deploy', `prod${deployIdentityArgs}`)} when ready to promote`
+      : `production verified at ${shortSha}; delivery record remains available for rollback`;
+    recordDeployNextAction(context, identity, workspaceLease, nextStage);
 
     return {
       ...record,
@@ -659,26 +738,94 @@ export async function dispatchDeploy(
         formatDeployVerificationLine(record.verification),
         environment === 'staging'
           ? `Next: ${nextStage}`
-          : `Next: run ${formatWorkflowCommand(context.config, 'clean', `--apply --task ${taskSlug}`)} to close out this workspace (removes lock + worktree + local branch).`,
+          : 'Production delivery verified. The edit workspace may already be closed.',
       ].filter(Boolean).join('\n'),
     };
   } finally {
     releaseDeployEnvironmentLock(context.commonDir, deployEnvironmentLock);
   }
+  } finally {
+    workspaceLease?.release();
+    if (sharedCheckoutBefore) assertCheckoutIdentityUnchanged(context.repoRoot, sharedCheckoutBefore);
+  }
 }
 
-function ensureDeployCommandLease(context: WorkflowContext, identity: DeployCommandIdentity): void {
+function ensureDeployCommandLease(context: WorkflowContext, identity: DeployCommandIdentity): TaskWorkspaceLease | null {
   if (identity.lock) {
     ensureTaskLockMatchesCurrent(context, identity.lock);
-    return;
+    const lock = identity.lock.taskBindingId
+      ? identity.lock
+      : ensureTaskBindingId(context.commonDir, context.config, identity.lock.taskSlug);
+    if (!lock?.taskBindingId) throw new Error(`Task ${identity.taskSlug} has no stable binding identity.`);
+    const acquired = borrowDelegatedTaskWorkspaceLeaseFromEnvironment(context.commonDir, context.config, {
+      taskSlug: lock.taskSlug,
+      taskBindingId: lock.taskBindingId,
+      childCommand: 'deploy',
+    }) ?? acquireTaskWorkspaceLease(context.commonDir, context.config, {
+        taskSlug: lock.taskSlug,
+        taskBindingId: lock.taskBindingId,
+        command: 'deploy',
+      });
+    if (acquired.acquired === false) throw new Error(acquired.reason);
+    const reread = loadTaskLock(context.commonDir, context.config, lock.taskSlug);
+    if (!reread || reread.taskBindingId !== lock.taskBindingId || reread.branchName !== lock.branchName) {
+      acquired.lease.release();
+      throw new Error(`Task ${identity.taskSlug} changed while deploy acquired its workspace lease.`);
+    }
+    identity.lock = reread;
+    return acquired.lease;
   }
 
+  if (identity.delivery) return null;
   const sharedCheckoutBlocker = buildSharedCheckoutLeaseBlocker(context, 'deploy', {
     branchName: identity.branchName,
     taskSlug: identity.taskSlug,
   });
   if (sharedCheckoutBlocker) {
     throw new Error(sharedCheckoutBlocker);
+  }
+  return null;
+}
+
+function recordDeployNextAction(
+  context: WorkflowContext,
+  identity: DeployCommandIdentity,
+  workspaceLease: TaskWorkspaceLease | null,
+  nextAction: string,
+): void {
+  if (!identity.lock?.taskBindingId || !workspaceLease) return;
+  const updatedAt = nowIso();
+  compareAndSetTaskLockWithWorkspaceLease(context.commonDir, context.config, {
+    taskSlug: identity.lock.taskSlug,
+    taskBindingId: identity.lock.taskBindingId,
+    leaseToken: workspaceLease.token,
+    update: (current) => ({ ...current, nextAction, nextActionUpdatedAt: updatedAt, updatedAt }),
+  });
+}
+
+interface CheckoutIdentitySnapshot {
+  head: string;
+  branch: string;
+  indexDigest: string;
+  statusDigest: string;
+}
+
+function snapshotCheckoutIdentity(repoRoot: string): CheckoutIdentitySnapshot {
+  const index = runCommandCapture('git', ['ls-files', '--stage', '-z'], { cwd: repoRoot, preserveOutput: true });
+  const status = runCommandCapture('git', ['status', '--porcelain=v1', '-z', '--untracked-files=all'], { cwd: repoRoot, preserveOutput: true });
+  if (!index.ok || !status.ok) throw new Error('Could not snapshot the shared checkout before immutable delivery deploy.');
+  return {
+    head: runGit(repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '',
+    branch: runGit(repoRoot, ['branch', '--show-current'], true)?.trim() ?? '',
+    indexDigest: crypto.createHash('sha256').update(index.stdout).digest('hex'),
+    statusDigest: crypto.createHash('sha256').update(status.stdout).digest('hex'),
+  };
+}
+
+function assertCheckoutIdentityUnchanged(repoRoot: string, expected: CheckoutIdentitySnapshot): void {
+  const actual = snapshotCheckoutIdentity(repoRoot);
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error('Immutable delivery deploy changed the shared checkout HEAD, branch, index, or worktree status.');
   }
 }
 
@@ -810,9 +957,10 @@ function resolveDeploySurfacesForTarget(options: {
   fallbackSurfaces: string[];
   targetSha: string;
   surfacePathMap?: Record<string, string[]>;
+  inferFromTarget?: boolean;
 }): string[] {
   const surfaces = resolveCommandSurfaces(options.context, options.explicitSurfaces, options.fallbackSurfaces);
-  if (options.explicitSurfaces.length > 0) return surfaces;
+  if (options.explicitSurfaces.length > 0 || options.inferFromTarget === false) return surfaces;
 
   const inference = inferTargetSurfacesFromSurfacePathMap({
     repoRoot: options.context.repoRoot,

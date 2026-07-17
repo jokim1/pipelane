@@ -6,6 +6,9 @@ import path from 'node:path';
 import type { ParsedOperatorArgs } from '../state.ts';
 import {
   appendActionRunRecord,
+  automaticWorktreeCleanupEnabled,
+  ensureTaskBindingId,
+  loadAllTaskLocks,
   loadDeployState,
   loadProbeState,
   loadTaskLock,
@@ -14,9 +17,17 @@ import {
   resolveWorkflowContext,
   runGit,
   slugifyTaskName,
+  WORKSPACE_LEASE_BINDING_ENV,
+  WORKSPACE_LEASE_CHILD_COMMAND_ENV,
+  WORKSPACE_LEASE_OWNER_COMMAND_ENV,
+  WORKSPACE_LEASE_TASK_ENV,
+  WORKSPACE_LEASE_TOKEN_ENV,
+  WORKSPACE_LEASE_TRANSFER_ENV,
   type DeployRecord,
+  type TaskWorkspaceLease,
   type WorkflowContext,
 } from '../state.ts';
+import { resolveSharedRepoRoot } from '../task-workspaces.ts';
 import {
   computeDeployConfigFingerprint,
   emptyDeployConfig,
@@ -184,6 +195,7 @@ export function buildActionPreflightEnvelope(cwd: string, actionId: StableAction
   const risky = API_RISKY_ACTION_IDS.has(actionId);
   const requiresConfirmation = actionRequiresConfirmation(actionId, normalizedInputs);
   const checkedAt = nowIso();
+  const warnings = buildMergeCloseoutWarnings(context, actionId, normalizedInputs);
 
   const gate = evaluatePreflightGate(context, actionId, normalizedInputs);
   if (gate.allowed === false) {
@@ -197,7 +209,7 @@ export function buildActionPreflightEnvelope(cwd: string, actionId: StableAction
         missingInputs: gate.missingInputs ?? [],
         inputs: gate.inputs ?? [],
         defaultParams: gate.defaultParams ?? {},
-        warnings: [],
+        warnings,
         issues: gate.issues ?? [],
         review: gate.review ?? null,
         normalizedInputs,
@@ -236,7 +248,7 @@ export function buildActionPreflightEnvelope(cwd: string, actionId: StableAction
       missingInputs: [],
       inputs: [],
       defaultParams: {},
-      warnings: [],
+      warnings,
       issues: [],
       normalizedInputs,
       requiresConfirmation,
@@ -357,16 +369,17 @@ function evaluatePreflightGate(context: WorkflowContext, actionId: StableActionI
     const taskRaw = inputs.task;
     const task = typeof taskRaw === 'string' ? taskRaw.trim() : '';
     const allStale = inputs.allStale === true;
-    if (!task && !allStale) {
+    const delivered = inputs.delivered === true;
+    if (!task && !allStale && !delivered) {
       return {
         allowed: false,
-        reason: '/clean --apply requires scope: pass --task <slug> or --all-stale.',
+        reason: '/clean --apply requires scope: pass --task <slug>, --all-stale, or --delivered.',
       };
     }
-    if (task && allStale) {
+    if ([Boolean(task), allStale, delivered].filter(Boolean).length > 1) {
       return {
         allowed: false,
-        reason: '/clean --apply cannot combine --task and --all-stale.',
+        reason: '/clean --apply accepts exactly one of --task, --all-stale, or --delivered.',
       };
     }
   }
@@ -658,7 +671,13 @@ function buildDeployActionOnboardingBlock(
   });
 }
 
-export async function runActionExecute(cwd: string, actionId: StableActionId, parsed: ParsedOperatorArgs, confirmToken: string): Promise<ApiEnvelope<ActionExecutionData | ActionPreflightData>> {
+export async function runActionExecute(
+  cwd: string,
+  actionId: StableActionId,
+  parsed: ParsedOperatorArgs,
+  confirmToken: string,
+  options: { workspaceLease?: TaskWorkspaceLease | null } = {},
+): Promise<ApiEnvelope<ActionExecutionData | ActionPreflightData>> {
   const onboardingBlock = buildDeployActionOnboardingBlock(cwd, actionId, parsed);
   if (onboardingBlock) {
     return onboardingBlock;
@@ -671,6 +690,7 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
   const risky = API_RISKY_ACTION_IDS.has(actionId);
   const requiresConfirmation = actionRequiresConfirmation(actionId, normalizedInputs);
   const checkedAt = nowIso();
+  const warnings = buildMergeCloseoutWarnings(context, actionId, normalizedInputs);
   const gate = evaluatePreflightGate(context, actionId, normalizedInputs);
   if (gate.allowed === false) {
     persistActionPreflightBlockIfTaskScoped({
@@ -691,7 +711,7 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
         missingInputs: gate.missingInputs ?? [],
         inputs: gate.inputs ?? [],
         defaultParams: gate.defaultParams ?? {},
-        warnings: [],
+        warnings,
         issues: gate.issues ?? [],
         review: gate.review ?? null,
         normalizedInputs,
@@ -725,7 +745,7 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
           missingInputs: [],
           inputs: [],
           defaultParams: {},
-          warnings: [],
+          warnings,
           issues: [],
           normalizedInputs,
           requiresConfirmation,
@@ -746,7 +766,7 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
   const startedAt = nowIso();
   const result = actionId === 'git.catchupBase'
     ? runCatchupBase(cwd)
-    : runCliWithJson(cwd, buildUnderlyingArgs(actionId, parsed), buildChildEnv(actionId, destinationPlan));
+    : runCliWithJson(cwd, buildUnderlyingArgs(actionId, parsed), buildChildEnv(actionId, destinationPlan, options.workspaceLease));
   const finishedAt = nowIso();
   const failureReason = result.ok ? '' : describeExecutionFailure(actionId, result);
 
@@ -760,7 +780,7 @@ export async function runActionExecute(cwd: string, actionId: StableActionId, pa
       missingInputs: [],
       inputs: [],
       defaultParams: {},
-      warnings: [],
+      warnings,
       issues: [],
       normalizedInputs,
       requiresConfirmation,
@@ -891,6 +911,24 @@ function actionRequiresConfirmation(actionId: StableActionId, normalizedInputs: 
     && normalizedInputs.recover.trim().length > 0;
 }
 
+function buildMergeCloseoutWarnings(
+  context: WorkflowContext,
+  actionId: StableActionId,
+  normalizedInputs: Record<string, unknown>,
+): string[] {
+  const includesMerge = actionId === 'merge'
+    || (isRouteActionId(actionId) && routeStepsFromInputs(normalizedInputs).includes('merge'));
+  if (!includesMerge) return [];
+  if (normalizedInputs.keepWorktree === true) {
+    return ['This merge will retain the task worktree until an explicit scoped cleanup.'];
+  }
+  if (!automaticWorktreeCleanupEnabled(context.config)) {
+    return ['Automatic worktree cleanup is disabled; the merge will persist delivery and cleanup intent without removing the workspace.'];
+  }
+  const continuation = resolveSharedRepoRoot(context.commonDir);
+  return [`A successful merge normally closes the task worktree. Continue from the verified shared checkout: ${continuation}`];
+}
+
 function isRouteActionId(actionId: StableActionId): boolean {
   return actionId === 'route.merge'
     || actionId === 'route.deploy.staging'
@@ -945,7 +983,14 @@ function normalizeInputs(
         reason: flags.reason,
       };
     case 'merge':
-      return { task: flags.task, pr: flags.pr, override: flags.override, reason: flags.reason };
+      return {
+        task: flags.task,
+        pr: flags.pr,
+        override: flags.override,
+        reason: flags.reason,
+        keepWorktree: flags.keepWorktree,
+        ...resolveMergeCloseoutFingerprintInputs(cwd, flags.task),
+      };
     case 'deploy.staging':
       return { task: flags.task, pr: flags.pr, sha: flags.sha, surfaces: flags.surfaces };
     case 'deploy.prod':
@@ -968,13 +1013,24 @@ function normalizeInputs(
         message: flags.message,
         override: flags.override,
         reason: flags.reason,
+        keepWorktree: flags.keepWorktree,
         route: destinationPlan?.fingerprintInputs,
         routeBlockers: destinationPlan?.blockers ?? ['route could not be planned'],
+        closeoutCleanupPolicy: {
+          ...resolveCleanupPolicyFingerprintInputs(cwd),
+          automaticWorktreeCleanup: resolveAutomaticCleanupFingerprintInput(cwd),
+        },
       };
     case 'clean.plan':
       return {};
     case 'clean.apply':
-      return { task: flags.task, allStale: flags.allStale };
+      return {
+        task: flags.task,
+        allStale: flags.allStale,
+        delivered: flags.delivered,
+        cleanupTargets: resolveCleanupFingerprintInputs(cwd, flags.task),
+        cleanupPolicy: resolveCleanupPolicyFingerprintInputs(cwd),
+      };
     case 'doctor.diagnose':
       return {};
     case 'doctor.probe':
@@ -989,6 +1045,79 @@ function normalizeInputs(
       const resolved = resolveRollbackInputs(cwd, 'prod', flags.surfaces, flags.task);
       return { task: flags.task, surfaces: flags.surfaces, resolvedSurfaces: resolved?.surfaces, targetSha: resolved?.targetSha };
     }
+  }
+}
+
+function resolveCleanupFingerprintInputs(cwd: string | undefined, taskFlag: string): Array<Record<string, unknown>> {
+  if (!cwd) return [];
+  try {
+    const context = resolveWorkflowContext(cwd);
+    const taskSlug = taskFlag.trim() ? slugifyTaskName(taskFlag) : '';
+    const locks = loadAllTaskLocks(context.commonDir, context.config)
+      .filter((lock) => !taskSlug || lock.taskSlug === taskSlug)
+      .sort((left, right) => left.taskSlug.localeCompare(right.taskSlug));
+    const sharedRepoRoot = resolveSharedRepoRoot(context.commonDir);
+    return locks.map((lock) => ({
+      taskSlug: lock.taskSlug,
+      taskBindingId: lock.taskBindingId ?? '',
+      worktreePath: lock.worktreePath,
+      branchName: lock.branchName,
+      branchHeadSha: runGit(sharedRepoRoot, ['rev-parse', '--verify', `refs/heads/${lock.branchName}`], true)?.trim() ?? '',
+      cleanupRequestId: lock.cleanup?.requestId ?? '',
+      cleanupStatus: lock.cleanup?.status ?? '',
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function resolveCleanupPolicyFingerprintInputs(cwd: string | undefined): Record<string, unknown> {
+  if (!cwd) return {};
+  try {
+    const context = resolveWorkflowContext(cwd);
+    return {
+      disposableIgnoredPaths: [...(context.config.cleanup?.disposableIgnoredPaths ?? [])].sort(),
+    };
+  } catch {
+    return {};
+  }
+}
+
+function resolveAutomaticCleanupFingerprintInput(cwd: string | undefined): boolean {
+  if (!cwd) return false;
+  try {
+    const context = resolveWorkflowContext(cwd);
+    return automaticWorktreeCleanupEnabled(context.config);
+  } catch {
+    return false;
+  }
+}
+
+function resolveMergeCloseoutFingerprintInputs(cwd: string | undefined, taskFlag: string): Record<string, unknown> {
+  if (!cwd) return {};
+  try {
+    const context = resolveWorkflowContext(cwd);
+    const { lock: inferred } = inferActiveTaskLock(context, taskFlag);
+    const lock = inferred.taskBindingId
+      ? inferred
+      : ensureTaskBindingId(context.commonDir, context.config, inferred.taskSlug) ?? inferred;
+    return {
+      closeoutTaskBindingId: lock.taskBindingId ?? '',
+      closeoutWorktreePath: lock.worktreePath,
+      closeoutBranchHeadSha: runGit(context.repoRoot, ['rev-parse', '--verify', `refs/heads/${lock.branchName}`], true)?.trim() ?? '',
+      automaticWorktreeCleanup: automaticWorktreeCleanupEnabled(context.config),
+      closeoutDisposableIgnoredPaths: [...(context.config.cleanup?.disposableIgnoredPaths ?? [])].sort(),
+      continuationCheckout: resolveSharedRepoRoot(context.commonDir),
+    };
+  } catch {
+    return {
+      closeoutTaskBindingId: '',
+      closeoutWorktreePath: '',
+      closeoutBranchHeadSha: '',
+      automaticWorktreeCleanup: false,
+      closeoutDisposableIgnoredPaths: [],
+      continuationCheckout: '',
+    };
   }
 }
 
@@ -1157,6 +1286,7 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
       args.push('merge');
       pushOpt('--task', flags.task);
       pushOpt('--pr', flags.pr);
+      if (flags.keepWorktree) args.push('--keep-worktree');
       if (flags.override) args.push('--override');
       pushOpt('--reason', flags.reason);
       break;
@@ -1179,6 +1309,7 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
       args.push('merge', '--yes');
       pushRouteTaskOrPr();
       pushRoutePrMetadata();
+      if (flags.keepWorktree) args.push('--keep-worktree');
       if (flags.override) args.push('--override');
       pushOpt('--reason', flags.reason);
       break;
@@ -1203,6 +1334,7 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
     case 'clean.apply':
       args.push('clean', '--apply');
       pushOpt('--task', flags.task);
+      if (flags.delivered) args.push('--delivered');
       if (flags.allStale) args.push('--all-stale');
       break;
     case 'doctor.diagnose':
@@ -1246,7 +1378,11 @@ const TEST_HOOK_ENV_KEYS = [
   'PIPELANE_DOCTOR_FIX_STUB',
 ];
 
-function buildChildEnv(actionId: StableActionId, destinationPlan?: DestinationPlan | null): NodeJS.ProcessEnv {
+function buildChildEnv(
+  actionId: StableActionId,
+  destinationPlan?: DestinationPlan | null,
+  workspaceLease?: TaskWorkspaceLease | null,
+): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const key of TEST_HOOK_ENV_KEYS) {
     delete env[key];
@@ -1271,7 +1407,32 @@ function buildChildEnv(actionId: StableActionId, destinationPlan?: DestinationPl
     // Never let a stray bypass leak into other actions' execution.
     delete env.PIPELANE_DEPLOY_PROD_API_CONFIRMED;
   }
+  for (const key of [
+    WORKSPACE_LEASE_TOKEN_ENV,
+    WORKSPACE_LEASE_TASK_ENV,
+    WORKSPACE_LEASE_BINDING_ENV,
+    WORKSPACE_LEASE_OWNER_COMMAND_ENV,
+    WORKSPACE_LEASE_CHILD_COMMAND_ENV,
+    WORKSPACE_LEASE_TRANSFER_ENV,
+  ]) delete env[key];
+  if (workspaceLease && actionId !== 'git.catchupBase') {
+    env[WORKSPACE_LEASE_TOKEN_ENV] = workspaceLease.token;
+    env[WORKSPACE_LEASE_TASK_ENV] = workspaceLease.taskSlug;
+    env[WORKSPACE_LEASE_BINDING_ENV] = workspaceLease.taskBindingId;
+    env[WORKSPACE_LEASE_OWNER_COMMAND_ENV] = 'status';
+    env[WORKSPACE_LEASE_CHILD_COMMAND_ENV] = actionWorkspaceChildCommand(actionId);
+    if (actionId === 'merge' || actionId === 'clean.apply') env[WORKSPACE_LEASE_TRANSFER_ENV] = '1';
+  }
   return env;
+}
+
+function actionWorkspaceChildCommand(actionId: StableActionId): string {
+  if (actionId.startsWith('deploy.')) return 'deploy';
+  if (actionId.startsWith('rollback.')) return 'rollback';
+  if (actionId.startsWith('clean.')) return 'clean';
+  if (actionId.startsWith('route.deploy.')) return 'deploy';
+  if (actionId === 'route.merge') return 'merge';
+  return actionId.split('.')[0];
 }
 
 function runCliWithJson(cwd: string, args: string[], env: NodeJS.ProcessEnv = process.env): { ok: boolean; exitCode: number; stdout: string; stderr: string; parsed: unknown } {

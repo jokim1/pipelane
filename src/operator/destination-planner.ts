@@ -15,6 +15,7 @@ import {
 } from './release-gate.ts';
 import { bucketPathsBySurface } from './surface-map.ts';
 import { readWorktreeStatusSnapshot } from './worktree-status.ts';
+import { resolveSharedRepoRoot } from './task-workspaces.ts';
 import { inferTargetSurfacesFromSurfacePathMap, targetSurfaceInferenceBlockers } from './target-surface-map.ts';
 import {
   deploySurfaceContractConfigurationIssues,
@@ -25,14 +26,18 @@ import {
 } from './deploy-surface-contract.ts';
 import {
   loadDeployState,
+  findDeliveriesByTask,
+  loadDeliveryByPr,
   loadTaskLock,
   loadPrRecord,
+  prRecordMatchesTaskLock,
   formatWorkflowCommand,
   printResult,
   resolveWorkflowContext,
   runGit,
   slugifyTaskName,
   type DeployRecord,
+  type DeliveryRecord,
   type ParsedOperatorArgs,
   type PrRecord,
   type TaskLock,
@@ -114,6 +119,7 @@ export interface DestinationSnapshot {
   taskSlug: string;
   taskName: string;
   lock: TaskLock | null;
+  delivery: DeliveryRecord | null;
   livePr: LivePr | null;
   livePrError: string;
   prRecord: PrRecord | null;
@@ -167,7 +173,8 @@ export function destinationTargetForParsed(
 
 export function buildDestinationPlanForCommand(cwd: string, parsed: ParsedOperatorArgs): DestinationPlan | null {
   const context = resolveWorkflowContext(cwd);
-  const target = destinationTargetForParsed(parsed, context.modeState.mode, context.config);
+  const recordedDelivery = resolveUniqueRecordedDelivery(context, parsed).delivery;
+  const target = destinationTargetForParsed(parsed, recordedDelivery?.mode ?? context.modeState.mode, context.config);
   if (!target) return null;
   const snapshot = resolveDestinationSnapshot(context, parsed, target);
   return planDestination(snapshot, target);
@@ -180,44 +187,53 @@ export function resolveDestinationSnapshot(
 ): DestinationSnapshot {
   const explicitTaskSlug = parsed.flags.task.trim() ? slugifyTaskName(parsed.flags.task) : '';
   const explicitTaskLock = explicitTaskSlug ? loadTaskLock(context.commonDir, context.config, explicitTaskSlug) : null;
-  const routeContext = explicitTaskLock?.worktreePath && existsSync(explicitTaskLock.worktreePath)
+  const recordedDeliveryResolution = resolveUniqueRecordedDelivery(context, parsed, explicitTaskLock);
+  const delivery = recordedDeliveryResolution.delivery;
+  const routeContext = !delivery && explicitTaskLock?.worktreePath && existsSync(explicitTaskLock.worktreePath)
     ? resolveWorkflowContext(explicitTaskLock.worktreePath)
     : context;
-  const targetCommand = formatDestinationCommand(routeContext, parsed, target);
+  const targetCommand = formatDestinationCommand(routeContext, parsed, target, delivery?.mode);
   const worktree = readWorktreeStatusSnapshot(routeContext.repoRoot, { includeStatusDigest: true });
-  const branchName = worktree.branchName || runGit(routeContext.repoRoot, ['branch', '--show-current'], true)?.trim() || '';
-  const headSha = worktree.head || runGit(routeContext.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() || '';
+  const checkoutBranchName = worktree.branchName || runGit(routeContext.repoRoot, ['branch', '--show-current'], true)?.trim() || '';
+  const checkoutHeadSha = worktree.head || runGit(routeContext.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() || '';
+  const branchName = delivery?.branchName ?? checkoutBranchName;
+  const headSha = delivery?.prHeadSha ?? checkoutHeadSha;
   const deployConfig = loadDeployConfig(routeContext.repoRoot) ?? emptyDeployConfig();
   const contractEnvironment = target === 'prod_deployed' ? 'prod' : 'staging';
   const contractWorkflowName = workflowNameForDeployEnvironment(routeContext.config, deployConfig, contractEnvironment);
   const workingTreeSurfaceContract = loadDeploySurfaceContract(routeContext.repoRoot, contractWorkflowName);
   const workingTreeSurfacePathMap = resolveDeploySurfacePathMap(routeContext.config, workingTreeSurfaceContract);
-  const rawChangedPaths = worktree.dirty ? worktree.changedPaths : [];
+  const rawChangedPaths = worktree.dirty && !delivery ? worktree.changedPaths : [];
   const changedPaths = rawChangedPaths.filter(isDestinationRelevantChangedPath);
-  const dirty = worktree.dirty && (changedPaths.length > 0 || !worktree.statusDigestReliable);
+  const dirty = !delivery && worktree.dirty && (changedPaths.length > 0 || !worktree.statusDigestReliable);
   const { surfaces: changedBySurface, other: changedOther } = bucketPathsBySurface(changedPaths, workingTreeSurfacePathMap ?? {});
 
   let livePr: LivePr | null = null;
-  let livePrError = '';
+  let livePrError = recordedDeliveryResolution.error;
   let taskSlug = '';
   let taskName = '';
   let lock: TaskLock | null = null;
 
   const explicitPr = parsed.flags.pr.trim();
-  if (explicitPr) {
+  if (delivery) {
+    taskSlug = delivery.taskSlug;
+    lock = explicitTaskLock?.taskBindingId === delivery.taskBindingId ? explicitTaskLock : null;
+    taskName = lock?.taskName ?? delivery.title ?? taskSlug;
+  } else if (explicitPr) {
     try {
       livePr = loadPrByNumber(routeContext.repoRoot, Number.parseInt(explicitPr, 10));
       taskSlug = parsed.flags.task.trim()
         ? slugifyTaskName(parsed.flags.task)
         : deriveTaskSlugFromPr(routeContext.config, livePr, livePr.headRefName ?? branchName);
-      lock = taskSlug ? loadTaskLock(routeContext.commonDir, routeContext.config, taskSlug) : null;
+      const candidateLock = taskSlug ? loadTaskLock(routeContext.commonDir, routeContext.config, taskSlug) : null;
+      lock = candidateLock?.branchName === livePr.headRefName ? candidateLock : null;
       taskName = lock?.taskName ?? taskSlug;
     } catch (error) {
       livePrError = error instanceof Error ? error.message : String(error);
     }
   }
 
-  if (!taskSlug) {
+  if (!taskSlug && !recordedDeliveryResolution.error) {
     try {
       const inferred = inferActiveTaskLock(routeContext, parsed.flags.task);
       taskSlug = inferred.taskSlug;
@@ -229,7 +245,7 @@ export function resolveDestinationSnapshot(
     }
   }
 
-  if (!livePr && branchName) {
+  if (!delivery && !livePr && branchName) {
     try {
       livePr = loadOpenPrForBranch(routeContext.repoRoot, branchName);
     } catch (error) {
@@ -258,7 +274,12 @@ export function resolveDestinationSnapshot(
   }
   if (!taskName && !taskSlugInferredFromLocklessBranch) taskName = taskSlug;
 
-  const prRecord = taskSlug ? loadPrRecord(routeContext.commonDir, routeContext.config, taskSlug) : null;
+  const storedPrRecord = taskSlug ? loadPrRecord(routeContext.commonDir, routeContext.config, taskSlug) : null;
+  const prRecord = delivery
+    ? deliveryToPrRecord(delivery)
+    : lock
+      ? (prRecordMatchesTaskLock(storedPrRecord, lock) ? storedPrRecord : null)
+      : storedPrRecord?.branchName === branchName ? storedPrRecord : null;
   const deployState = loadDeployState(routeContext.commonDir, routeContext.config);
   const explicitDeploySha = parsed.command === 'deploy'
     ? parsed.flags.sha.trim()
@@ -269,7 +290,8 @@ export function resolveDestinationSnapshot(
   const explicitDeployShaError = explicitDeploySha && !resolvedExplicitDeploySha
     ? `Could not resolve ${explicitDeploySha}.`
     : '';
-  const targetSha = resolvedExplicitDeploySha || (explicitDeploySha ? explicitDeploySha : resolveReleaseSha(livePr, prRecord, headSha));
+  const targetSha = resolvedExplicitDeploySha
+    || (explicitDeploySha ? explicitDeploySha : delivery?.mergedSha ?? resolveReleaseSha(livePr, prRecord, headSha));
   const targetSurfaceContract = loadDeploySurfaceContractForTarget(
     routeContext.repoRoot,
     contractWorkflowName,
@@ -283,8 +305,13 @@ export function resolveDestinationSnapshot(
     deployConfig,
   );
   const explicitSurfaces = [...parsed.flags.surfaces, ...deploySurfacePositionals(parsed)];
-  const baseRequestedSurfaces = resolveCommandSurfaces(routeContext, explicitSurfaces, lock?.surfaces ?? []);
-  const surfaceInference = explicitSurfaces.length === 0
+  const baseRequestedSurfaces = resolveCommandSurfaces(routeContext, explicitSurfaces, delivery?.surfaces ?? lock?.surfaces ?? []);
+  const routeWillPersistDelivery = !delivery
+    && !explicitDeploySha
+    && target !== 'pr_open'
+    && !prRecord?.mergedSha
+    && !livePr?.mergeCommit?.oid;
+  const surfaceInference = explicitSurfaces.length === 0 && !delivery && !routeWillPersistDelivery
     ? inferTargetSurfacesFromSurfacePathMap({
       repoRoot: routeContext.repoRoot,
       config: routeContext.config,
@@ -307,7 +334,7 @@ export function resolveDestinationSnapshot(
     worktreePath: routeContext.repoRoot,
     commonDir: routeContext.commonDir,
     config: routeContext.config,
-    mode: routeContext.modeState.mode,
+    mode: delivery?.mode ?? routeContext.modeState.mode,
     branchName,
     headSha,
     targetSha,
@@ -326,6 +353,7 @@ export function resolveDestinationSnapshot(
     taskSlug,
     taskName,
     lock,
+    delivery,
     livePr,
     livePrError,
     prRecord,
@@ -371,11 +399,13 @@ export function planDestination(snapshot: DestinationSnapshot, target: Destinati
   });
   const fingerprintInputs = {
     taskSlug: snapshot.taskSlug,
+    taskBindingId: snapshot.delivery?.taskBindingId ?? snapshot.lock?.taskBindingId ?? null,
     mode: snapshot.mode,
     target,
     worktreePath: snapshot.worktreePath,
+    sharedCheckoutPath: resolveSharedRepoRoot(snapshot.commonDir),
     branchName: snapshot.branchName,
-    prNumber: snapshot.livePr?.number ?? snapshot.prRecord?.number ?? null,
+    prNumber: snapshot.delivery?.prNumber ?? snapshot.livePr?.number ?? snapshot.prRecord?.number ?? null,
     headSha: snapshot.headSha,
     targetSha: snapshot.targetSha,
     explicitDeploySha: snapshot.explicitDeploySha || null,
@@ -386,7 +416,7 @@ export function planDestination(snapshot: DestinationSnapshot, target: Destinati
       reliable: snapshot.worktreeStatusReliable,
       warnings: snapshot.worktreeStatusWarnings,
     },
-    mergedSha: snapshot.prRecord?.mergedSha ?? snapshot.livePr?.mergeCommit?.oid ?? null,
+    mergedSha: snapshot.delivery?.mergedSha ?? snapshot.prRecord?.mergedSha ?? snapshot.livePr?.mergeCommit?.oid ?? null,
     routeSteps: remainingSteps.map((step) => step.id),
     surfaces: [...snapshot.requestedSurfaces].sort(),
     deployConfigFingerprints: snapshot.deployConfigFingerprints,
@@ -529,6 +559,64 @@ function deploySurfacePositionals(parsed: ParsedOperatorArgs): string[] {
   return parsed.positional.slice(1);
 }
 
+function resolveUniqueRecordedDelivery(
+  context: WorkflowContext,
+  parsed: ParsedOperatorArgs,
+  explicitTaskLock?: TaskLock | null,
+): { delivery: DeliveryRecord | null; error: string } {
+  const explicitPr = parsed.flags.pr.trim();
+  if (explicitPr) {
+    if (!/^\d+$/u.test(explicitPr) || Number.parseInt(explicitPr, 10) <= 0) {
+      return { delivery: null, error: '' };
+    }
+    const delivery = loadDeliveryByPr(context.commonDir, context.config, Number.parseInt(explicitPr, 10));
+    if (!delivery) return { delivery: null, error: '' };
+    const explicitTaskSlug = parsed.flags.task.trim() ? slugifyTaskName(parsed.flags.task) : '';
+    if (explicitTaskSlug && explicitTaskSlug !== delivery.taskSlug) {
+      return {
+        delivery,
+        error: `PR #${delivery.prNumber} belongs to recorded task ${delivery.taskSlug}, not ${explicitTaskSlug}.`,
+      };
+    }
+    return { delivery, error: '' };
+  }
+
+  const explicitTask = parsed.flags.task.trim();
+  if (!explicitTask) return { delivery: null, error: '' };
+  const taskSlug = slugifyTaskName(explicitTask);
+  const lock = explicitTaskLock === undefined
+    ? loadTaskLock(context.commonDir, context.config, taskSlug)
+    : explicitTaskLock;
+  const deliveries = findDeliveriesByTask(
+    context.commonDir,
+    context.config,
+    taskSlug,
+    lock?.taskBindingId,
+  );
+  if (deliveries.length === 1) return { delivery: deliveries[0], error: '' };
+  if (deliveries.length > 1) {
+    return {
+      delivery: null,
+      error: `Delivery for task ${taskSlug} is ambiguous: ${deliveries.map((entry) => `#${entry.prNumber}`).join(', ')}. Retry with --pr <number>.`,
+    };
+  }
+  return { delivery: null, error: '' };
+}
+
+function deliveryToPrRecord(delivery: DeliveryRecord): PrRecord {
+  return {
+    taskSlug: delivery.taskSlug,
+    taskBindingId: delivery.taskBindingId,
+    branchName: delivery.branchName,
+    title: delivery.title,
+    number: delivery.prNumber,
+    url: delivery.url,
+    mergedSha: delivery.mergedSha,
+    mergedAt: delivery.mergedAt,
+    updatedAt: delivery.mergedAt,
+  };
+}
+
 function isBaseBranchName(config: WorkflowConfig, branchName: string): boolean {
   return branchName === config.baseBranch || branchName === 'main' || branchName === 'master';
 }
@@ -538,11 +626,16 @@ function isDestinationRelevantChangedPath(relativePath: string): boolean {
   return !normalized.startsWith('.pipelane/state/');
 }
 
-function formatDestinationCommand(context: WorkflowContext, parsed: ParsedOperatorArgs, target: DestinationMilestone): string {
+function formatDestinationCommand(
+  context: WorkflowContext,
+  parsed: ParsedOperatorArgs,
+  target: DestinationMilestone,
+  mode = context.modeState.mode,
+): string {
   if (parsed.command === 'deploy' && target === 'merged') return formatWorkflowCommand(context.config, 'merge');
   const alias = context.config.aliases[parsed.command as keyof typeof context.config.aliases] ?? `/${parsed.command}`;
   if (target === 'staging_deployed') return `${alias} staging`;
-  if (target === 'prod_deployed' && context.modeState.mode === 'build') return alias;
+  if (target === 'prod_deployed' && mode === 'build') return alias;
   if (target === 'prod_deployed') return `${alias} prod`;
   return alias;
 }
@@ -638,7 +731,9 @@ function buildDestinationBlockers(snapshot: DestinationSnapshot, target: Destina
 
   if (!snapshot.taskSlug) blockers.push('no active task could be inferred');
   blockers.push(...activeOrchestrationWorktreeBlockers(snapshot));
-  if (snapshot.livePrError && !snapshot.livePr && !snapshot.prRecord?.number) blockers.push(snapshot.livePrError);
+  if (snapshot.livePrError && (snapshot.delivery || (!snapshot.livePr && !snapshot.prRecord?.number))) {
+    blockers.push(snapshot.livePrError);
+  }
   if (snapshot.explicitDeployShaError) blockers.push(snapshot.explicitDeployShaError);
   const staleBaseBlocker = destinationStaleBaseBlocker(snapshot, steps);
   if (staleBaseBlocker) blockers.push(staleBaseBlocker);

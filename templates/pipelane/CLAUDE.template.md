@@ -18,9 +18,13 @@ This file is local-only operator state. Keep it git-ignored.
   3. `{{ALIAS_NEW}}`
   4. `{{ALIAS_PR}} --title "<pr title>"`
   5. `{{ALIAS_MERGE}}`
-  6. `{{ALIAS_DEPLOY}} staging`
-  7. `{{ALIAS_DEPLOY}} prod`
-  8. `{{ALIAS_CLEAN}}`
+  6. continue from the primary shared checkout printed by merge
+  7. `{{ALIAS_DEPLOY}} staging --pr <merged-pr-number>`
+  8. `{{ALIAS_DEPLOY}} prod --pr <merged-pr-number>`
+- Successful merge normally deletes the task worktree, exact local branch, and task lock. Do not return to the removed path.
+- Use `{{ALIAS_MERGE}} --keep-worktree` only for intentional durable retention. Clear it only with explicit `{{ALIAS_CLEAN}} --apply --task <slug>`.
+- Bare `{{ALIAS_CLEAN}}` is a non-destructive preview; `{{ALIAS_CLEAN}} --apply --delivered` retries delivered cleanup blockers.
+- Disable automatic closeout with `pipelane configure --automatic-worktree-cleanup=false`; re-enable with `true`.
 - Use `{{ALIAS_RESUME}} --task "<task-name>"` only when returning to an existing task workspace.
 - Use `{{ALIAS_STATUS}}` to see the cockpit before acting.
 - Use `{{ALIAS_RELEASE}} enable` to initialize machine-local release config, `{{ALIAS_RELEASE}} status` to inspect readiness, and `{{ALIAS_RELEASE}} doctor --probe` after a staging deploy to refresh the release gate's freshness check.
@@ -39,8 +43,8 @@ Key routing rules:
 - Adopt an existing external branch/worktree -> `{{ALIAS_ADOPT}} --task "<task-name>"`
 - Resume an existing task workspace -> `{{ALIAS_RESUME}}`
 - Prepare or update a PR -> `{{ALIAS_PR}}`
-- Merge the current PR -> `{{ALIAS_MERGE}}`
-- Deploy the merged SHA -> `{{ALIAS_DEPLOY}}`
+- Merge the current PR and normally close its workspace -> `{{ALIAS_MERGE}}`
+- Deploy the immutable merged SHA from the shared checkout -> `{{ALIAS_DEPLOY}} staging|prod --pr <merged-pr-number>`
 - Cleanup or stale workspace inspection -> `{{ALIAS_CLEAN}}`
 - One-screen cockpit of task + lane state -> `{{ALIAS_STATUS}}`
 - Release setup and readiness -> `{{ALIAS_RELEASE}} status|enable|doctor`
