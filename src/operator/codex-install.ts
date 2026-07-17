@@ -9,6 +9,7 @@ import {
   previousRuntimePath,
   readHostSkillPayloads,
   rollbackGlobalRuntime,
+  withGlobalRuntimeInstallLock,
   writeHostSkillPayloads,
   type HostRuntimeRollbackResult,
 } from './global-runtime.ts';
@@ -272,32 +273,37 @@ export function rollbackCodexManagedRuntime(): HostRuntimeRollbackResult {
   const skillsRoot = path.join(codexHome, 'skills');
   const pipelaneRoot = runtimeRoot(codexHome);
   const previousRoot = previousRuntimePath(pipelaneRoot);
-  // Pre-swap validation: an inconsistent payload set refuses before any swap.
-  const payloads = readHostSkillPayloads(previousRoot, `Retained runtime at ${previousRoot}`);
-  const retiredNames = readManagedSkillNames(skillsRoot, pipelaneRoot);
-  const result = rollbackGlobalRuntime(pipelaneRoot, { expectedHost: 'codex' });
-  if (!payloads) {
-    // The retained runtime predates host-skill payload retention: the dir swap
-    // succeeded, but wrappers cannot be restored in lockstep. Tell the operator
-    // how to re-sync them from the restored runtime itself.
-    return {
-      ...result,
-      wrappersRestored: false,
-      restoredSkills: [],
-      removedSkills: [],
-      skippedCollisions: [],
-      resyncCommand: `${path.join(pipelaneRoot, 'bin', 'pipelane')} install-codex`,
-    };
-  }
-  try {
-    const outcome = restoreCodexSkillWrappers(skillsRoot, retiredNames, payloads);
-    return { ...result, wrappersRestored: true, ...outcome, resyncCommand: null };
-  } catch (error) {
-    // Never leave the restored runtime active with half-written wrappers: put
-    // the runtimes back the way they were, then surface the wrapper error.
-    rollbackGlobalRuntime(pipelaneRoot, { expectedHost: 'codex' });
-    throw error;
-  }
+  // The payload snapshot, runtime swap, wrapper restoration, and compensation
+  // are one transaction under the shared install lock: a concurrent rollback
+  // or install must not interleave between the snapshot and the writes.
+  return withGlobalRuntimeInstallLock(pipelaneRoot, () => {
+    // Pre-swap validation: an inconsistent payload set refuses before any swap.
+    const payloads = readHostSkillPayloads(previousRoot, `Retained runtime at ${previousRoot}`);
+    const retiredNames = readManagedSkillNames(skillsRoot, pipelaneRoot);
+    const result = rollbackGlobalRuntime(pipelaneRoot, { expectedHost: 'codex', lockHeld: true });
+    if (!payloads) {
+      // The retained runtime predates host-skill payload retention: the dir swap
+      // succeeded, but wrappers cannot be restored in lockstep. Tell the operator
+      // how to re-sync them from the restored runtime itself.
+      return {
+        ...result,
+        wrappersRestored: false,
+        restoredSkills: [],
+        removedSkills: [],
+        skippedCollisions: [],
+        resyncCommand: `${path.join(pipelaneRoot, 'bin', 'pipelane')} install-codex`,
+      };
+    }
+    try {
+      const outcome = restoreCodexSkillWrappers(skillsRoot, retiredNames, payloads);
+      return { ...result, wrappersRestored: true, ...outcome, resyncCommand: null };
+    } catch (error) {
+      // Never leave the restored runtime active with half-written wrappers: put
+      // the runtimes back the way they were, then surface the wrapper error.
+      rollbackGlobalRuntime(pipelaneRoot, { expectedHost: 'codex', lockHeld: true });
+      throw error;
+    }
+  });
 }
 
 function restoreCodexSkillWrappers(
@@ -378,40 +384,46 @@ export function installCodexBootstrapSkill(
   });
 
   mkdirSync(skillsRoot, { recursive: true });
-  const installed: string[] = [];
-  const skipped: string[] = [];
-  const removedLegacySkills = pruneLegacyCodexWrappers(skillsRoot, pipelaneRoot, install.entries);
-  const entriesToInstall = install.entries.filter((entry) => assertOrSkipCollision(skillsRoot, entry, skipped));
-  installGlobalRuntime(pipelaneRoot, {
-    host: 'codex',
-    legacyMarkers: [MANAGED_CODEX_SKILLS_FILENAME],
+  // Pruning, the runtime install, generated assets, wrappers, the manifest,
+  // and payloads are one transaction under the shared install lock so a
+  // concurrent install or rollback cannot interleave a different generation.
+  return withGlobalRuntimeInstallLock(pipelaneRoot, () => {
+    const installed: string[] = [];
+    const skipped: string[] = [];
+    const removedLegacySkills = pruneLegacyCodexWrappers(skillsRoot, pipelaneRoot, install.entries);
+    const entriesToInstall = install.entries.filter((entry) => assertOrSkipCollision(skillsRoot, entry, skipped));
+    installGlobalRuntime(pipelaneRoot, {
+      host: 'codex',
+      legacyMarkers: [MANAGED_CODEX_SKILLS_FILENAME],
+      lockHeld: true,
+    });
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(path.join(binDir, 'run-pipelane.sh'), install.runnerScript, { mode: 0o755, encoding: 'utf8' });
+    writeFileSync(path.join(binDir, 'bootstrap-pipelane.sh'), install.bootstrapScript, { mode: 0o755, encoding: 'utf8' });
+
+    const managedNames: string[] = [];
+
+    for (const entry of entriesToInstall) {
+      writeSkill(skillsRoot, entry);
+      installed.push(entry.slashAlias);
+      managedNames.push(entry.name);
+    }
+
+    writeJsonFile(managedSkillsPath(pipelaneRoot), { skills: managedNames.sort() });
+    const managedNameSet = new Set(managedNames);
+    writeHostSkillPayloads(
+      pipelaneRoot,
+      install.entries
+        .filter((entry) => managedNameSet.has(entry.name))
+        .map((entry) => ({ name: entry.name, body: entry.body })),
+    );
+
+    return {
+      codexHome,
+      runtimeRoot: pipelaneRoot,
+      installed: installed.sort(),
+      skipped: skipped.sort(),
+      removedLegacySkills,
+    };
   });
-  mkdirSync(binDir, { recursive: true });
-  writeFileSync(path.join(binDir, 'run-pipelane.sh'), install.runnerScript, { mode: 0o755, encoding: 'utf8' });
-  writeFileSync(path.join(binDir, 'bootstrap-pipelane.sh'), install.bootstrapScript, { mode: 0o755, encoding: 'utf8' });
-
-  const managedNames: string[] = [];
-
-  for (const entry of entriesToInstall) {
-    writeSkill(skillsRoot, entry);
-    installed.push(entry.slashAlias);
-    managedNames.push(entry.name);
-  }
-
-  writeJsonFile(managedSkillsPath(pipelaneRoot), { skills: managedNames.sort() });
-  const managedNameSet = new Set(managedNames);
-  writeHostSkillPayloads(
-    pipelaneRoot,
-    install.entries
-      .filter((entry) => managedNameSet.has(entry.name))
-      .map((entry) => ({ name: entry.name, body: entry.body })),
-  );
-
-  return {
-    codexHome,
-    runtimeRoot: pipelaneRoot,
-    installed: installed.sort(),
-    skipped: skipped.sort(),
-    removedLegacySkills,
-  };
 }

@@ -40157,6 +40157,26 @@ test('managed runtime install records build-info provenance and retains a rollba
     assert.ok(JSON.parse(readFileSync(activeManifestPath, 'utf8')).skills.length > 0);
     const postEmptyManifestRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env);
     assert.match(postEmptyManifestRollback.stdout, /Rolled back the managed Claude runtime/);
+
+    // The whole host transaction holds the shared install lock: with the lock
+    // held by another process, neither install nor rollback touches the
+    // runtimes or wrappers — no snapshot/swap/restore interleaving is possible.
+    const lockDir = path.join(pipelaneHome, 'install.lock');
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(path.join(lockDir, 'owner.json'), `${JSON.stringify({ pid: 999999, acquiredAt: new Date().toISOString() })}\n`, 'utf8');
+    const wrapperBeforeLock = readFileSync(wrapperPath, 'utf8');
+    const previousMetadataBeforeLock = readFileSync(path.join(previousRoot, '.pipelane-runtime.json'), 'utf8');
+    const lockedRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+    assert.notEqual(lockedRollback.status, 0);
+    assert.match(lockedRollback.stderr, /Another pipelane runtime install appears to be in progress/);
+    const lockedInstall = runCli(['install-claude'], workspaceRoot, env, true);
+    assert.notEqual(lockedInstall.status, 0);
+    assert.match(lockedInstall.stderr, /Another pipelane runtime install appears to be in progress/);
+    assert.equal(readFileSync(wrapperPath, 'utf8'), wrapperBeforeLock);
+    assert.equal(readFileSync(path.join(previousRoot, '.pipelane-runtime.json'), 'utf8'), previousMetadataBeforeLock);
+    rmSync(lockDir, { recursive: true, force: true });
+    const unlockedRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.match(unlockedRollback.stdout, /Rolled back the managed Claude runtime/);
   } finally {
     rmSync(workspaceRoot, { recursive: true, force: true });
     rmSync(claudeHome, { recursive: true, force: true });

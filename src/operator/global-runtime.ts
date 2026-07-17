@@ -281,16 +281,29 @@ export function isManagedGlobalRuntime(targetRoot: string, legacyMarkers: string
   return legacyMarkers.length > 0 && legacyMarkers.every((relativePath) => existsSync(path.join(targetRoot, relativePath)));
 }
 
+// Host install/rollback flows read payloads, swap runtime directories, and
+// write generated assets + wrappers as ONE transaction. The mkdir lock is not
+// reentrant, so hosts hold it across the whole transaction via this wrapper
+// and pass lockHeld to the inner runtime operations.
+export function withGlobalRuntimeInstallLock<T>(targetRoot: string, fn: () => T): T {
+  const releaseLock = acquireInstallLock(targetRoot);
+  try {
+    return fn();
+  } finally {
+    releaseLock();
+  }
+}
+
 export function installGlobalRuntime(
   targetRoot: string,
-  options: { host: string; legacyMarkers?: string[] },
+  options: { host: string; legacyMarkers?: string[]; lockHeld?: boolean },
 ): { runtimeRoot: string; packageVersion: string } {
   const sourceRoot = packageRoot();
   ensureInstallableRuntime(sourceRoot);
 
   const parentDir = path.dirname(targetRoot);
   mkdirSync(parentDir, { recursive: true });
-  const releaseLock = acquireInstallLock(targetRoot);
+  const releaseLock = options.lockHeld ? () => {} : acquireInstallLock(targetRoot);
   const tempRoot = mkdtempSync(path.join(parentDir, '.pipelane-install-'));
   let asideRoot: string | null = null;
   let retainCurrentRuntime = true;
@@ -429,10 +442,10 @@ export interface RuntimeRollbackResult {
 
 export function rollbackGlobalRuntime(
   targetRoot: string,
-  options: { expectedHost?: string } = {},
+  options: { expectedHost?: string; lockHeld?: boolean } = {},
 ): RuntimeRollbackResult {
   const previousRoot = previousRuntimePath(targetRoot);
-  const releaseLock = acquireInstallLock(targetRoot);
+  const releaseLock = options.lockHeld ? () => {} : acquireInstallLock(targetRoot);
   try {
     if (!existsSync(previousRoot)) {
       throw new Error(`No pipelane-managed previous runtime is retained at ${previousRoot}; nothing to roll back to.`);
