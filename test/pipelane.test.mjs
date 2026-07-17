@@ -146,6 +146,11 @@ function buildCliChildEnv(env = {}) {
   for (const stateKey of ['PIPELANE_REVIEW_STATE_KEY', 'PIPELANE_DEPLOY_STATE_KEY', 'PIPELANE_PROBE_STATE_KEY']) {
     if (!(stateKey in env)) delete childEnv[stateKey];
   }
+  // Install provenance is test input, not ambient runner state. Tests that
+  // exercise update/install pinning pass these values explicitly.
+  for (const installKey of ['PIPELANE_INSTALL_SOURCE_SHA', 'PIPELANE_INSTALL_SPEC']) {
+    if (!(installKey in env)) delete childEnv[installKey];
+  }
   // Review gates run `npm test` from a process that exports reviewer/session
   // identity and live gate context. Keep fixture CLI calls hermetic so the suite
   // can exercise review paths from inside that outer gate. Tests of nested-gate
@@ -222,6 +227,30 @@ test('buildCliChildEnv scrubs live ambient review-gate context', () => {
     for (const key of keys) {
       assert.equal(scrubbed[key], undefined, `${key} should be scrubbed unless the fixture passes it explicitly`);
     }
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('buildCliChildEnv scrubs ambient install provenance unless explicitly supplied', () => {
+  const keys = ['PIPELANE_INSTALL_SOURCE_SHA', 'PIPELANE_INSTALL_SPEC'];
+  const previous = new Map(keys.map((key) => [key, process.env[key]]));
+  try {
+    process.env.PIPELANE_INSTALL_SOURCE_SHA = 'a'.repeat(40);
+    process.env.PIPELANE_INSTALL_SPEC = 'ambient-install-spec';
+    const scrubbed = buildCliChildEnv();
+    assert.equal(scrubbed.PIPELANE_INSTALL_SOURCE_SHA, undefined);
+    assert.equal(scrubbed.PIPELANE_INSTALL_SPEC, undefined);
+
+    const explicit = buildCliChildEnv({
+      PIPELANE_INSTALL_SOURCE_SHA: 'b'.repeat(40),
+      PIPELANE_INSTALL_SPEC: 'explicit-install-spec',
+    });
+    assert.equal(explicit.PIPELANE_INSTALL_SOURCE_SHA, 'b'.repeat(40));
+    assert.equal(explicit.PIPELANE_INSTALL_SPEC, 'explicit-install-spec');
   } finally {
     for (const [key, value] of previous) {
       if (value === undefined) delete process.env[key];
@@ -29777,15 +29806,16 @@ test('CLI command from a symlinked worktree does not update the shared checkout 
   }
 });
 
-test('update reports up-to-date when installed sha matches remote main', () => {
+test('update reports up-to-date when an abbreviated installed sha matches remote main', () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-bin-'));
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
   const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
   const sha = '0123456789abcdef0123456789abcdef01234567';
+  const installedSha = sha.slice(0, 12);
   try {
-    writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: sha });
-    installCodexRuntimeForUpdateTest(consumerRoot, { codexHome, pipelaneHome, sourceSha: sha });
+    writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha });
+    installCodexRuntimeForUpdateTest(consumerRoot, { codexHome, pipelaneHome, sourceSha: installedSha });
     makeFakeUpdateBin(binDir, { latestSha: sha });
 
     const result = spawnSync('node', [CLI_PATH, 'update', '--check', '--json'], {
@@ -29797,6 +29827,39 @@ test('update reports up-to-date when installed sha matches remote main', () => {
     const parsed = JSON.parse(result.stdout);
     assert.equal(parsed.action, 'up-to-date');
     assert.equal(parsed.status.upToDate, true);
+    assert.equal(parsed.status.installedSha, installedSha);
+  } finally {
+    rmSync(consumerRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('update does not report a dirty runtime as up-to-date at the same main sha', () => {
+  const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-consumer-'));
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-bin-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  const sha = '0123456789abcdef0123456789abcdef01234567';
+  try {
+    writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: sha });
+    installCodexRuntimeForUpdateTest(consumerRoot, { codexHome, pipelaneHome, sourceSha: sha });
+    const metadataPath = path.join(managedRuntimeRoot('codex', pipelaneHome), '.pipelane-runtime.json');
+    const metadata = JSON.parse(readFileSync(metadataPath, 'utf8'));
+    writeFileSync(metadataPath, `${JSON.stringify({ ...metadata, sourceDirty: true }, null, 2)}\n`, 'utf8');
+    makeFakeUpdateBin(binDir, { latestSha: sha });
+
+    const result = spawnSync('node', [CLI_PATH, 'update', '--check', '--json'], {
+      cwd: consumerRoot,
+      env: { ...process.env, CODEX_HOME: codexHome, PIPELANE_HOME: pipelaneHome, PATH: `${binDir}:${process.env.PATH}` },
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.action, 'checked');
+    assert.equal(parsed.status.upToDate, false);
+    assert.equal(parsed.status.sourceDirty, true);
     assert.equal(parsed.status.installedSha, sha);
   } finally {
     rmSync(consumerRoot, { recursive: true, force: true });
@@ -39669,7 +39732,7 @@ test('write-build-info records sha, dirty, and timestamp with env overrides', ()
       cwd: workDir,
       env: {
         ...process.env,
-        PIPELANE_BUILD_SHA: 'abc1234abc1234abc1234abc1234abc1234abc12',
+        PIPELANE_BUILD_SHA: 'ABC1234ABC1234ABC1234ABC1234ABC1234ABC12',
         PIPELANE_BUILD_DIRTY: '0',
         PIPELANE_BUILD_TIMESTAMP: '2026-07-16T00:00:00.000Z',
       },
@@ -39681,6 +39744,15 @@ test('write-build-info records sha, dirty, and timestamp with env overrides', ()
     assert.equal(info.sha, 'abc1234abc1234abc1234abc1234abc1234abc12');
     assert.equal(info.dirty, false);
     assert.equal(info.builtAt, '2026-07-16T00:00:00.000Z');
+
+    const invalid = spawnSync('node', [path.join(KIT_ROOT, 'scripts', 'write-build-info.mjs')], {
+      cwd: workDir,
+      env: { ...process.env, PIPELANE_BUILD_SHA: 'not-a-git-sha' },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.notEqual(invalid.status, 0);
+    assert.match(invalid.stderr, /PIPELANE_BUILD_SHA must be a 7-40 character hexadecimal git SHA/);
   } finally {
     rmSync(workDir, { recursive: true, force: true });
   }
@@ -39700,12 +39772,30 @@ test('managed runtime install records build-info provenance and retains a rollba
     const buildInfo = JSON.parse(readFileSync(path.join(KIT_ROOT, 'dist', 'build-info.json'), 'utf8'));
     assert.equal(metadata.sourceSha, buildInfo.sha);
     assert.equal(Boolean(metadata.sourceDirty), Boolean(buildInfo.dirty));
+    const cleanInstallEnv = { ...env, PIPELANE_INSTALL_SOURCE_SHA: buildInfo.sha };
+
+    // Reinstall must not delete an unrelated directory that happens to occupy
+    // the reserved rollback path.
+    const previousRoot = `${runtimeRoot}.previous`;
+    mkdirSync(previousRoot, { recursive: true });
+    writeFileSync(path.join(previousRoot, 'user-data.txt'), 'preserve me', 'utf8');
+    writeFileSync(path.join(runtimeRoot, 'sentinel-active-before-collision.txt'), 'active', 'utf8');
+    const unmanagedPrevious = runCli(['install-claude'], workspaceRoot, env, true);
+    assert.notEqual(unmanagedPrevious.status, 0);
+    assert.match(unmanagedPrevious.stderr, /already exists and is not managed by pipelane; refusing to replace it/);
+    assert.ok(existsSync(path.join(previousRoot, 'user-data.txt')));
+    assert.ok(existsSync(path.join(runtimeRoot, 'sentinel-active-before-collision.txt')));
+    rmSync(previousRoot, { recursive: true, force: true });
 
     // Reinstall retires the current runtime into `<root>.previous`.
     writeFileSync(path.join(runtimeRoot, 'sentinel-first-install.txt'), 'first', 'utf8');
-    runCli(['install-claude'], workspaceRoot, env);
-    const previousRoot = `${runtimeRoot}.previous`;
+    runCli(['install-claude'], workspaceRoot, cleanInstallEnv);
     assert.equal(existsSync(path.join(runtimeRoot, 'sentinel-first-install.txt')), false);
+    assert.ok(existsSync(path.join(previousRoot, 'sentinel-first-install.txt')));
+
+    // Refreshing an already-current clean runtime must preserve the genuinely
+    // older rollback target instead of replacing it with another current copy.
+    runCli(['install-claude'], workspaceRoot, cleanInstallEnv);
     assert.ok(existsSync(path.join(previousRoot, 'sentinel-first-install.txt')));
 
     // Rollback restores the retained runtime and keeps the retired one as the
@@ -39717,6 +39807,30 @@ test('managed runtime install records build-info provenance and retains a rollba
     const rollForward = runCli(['install-claude', '--rollback'], workspaceRoot, env);
     assert.match(rollForward.stdout, /Rolled back the managed Claude runtime/);
     assert.equal(existsSync(path.join(runtimeRoot, 'sentinel-first-install.txt')), false);
+    assert.ok(existsSync(path.join(previousRoot, 'sentinel-first-install.txt')));
+
+    // Rollback must not activate a retained runtime that cannot serve the
+    // durable host skills after the swap.
+    for (const relative of ['bin/run-pipelane.sh', 'bin/bootstrap-pipelane.sh', 'managed-skills.json']) {
+      const target = path.join(previousRoot, relative);
+      const body = readFileSync(target);
+      const mode = statSync(target).mode & 0o777;
+      rmSync(target, { force: true });
+      const damagedGeneratedAsset = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+      assert.notEqual(damagedGeneratedAsset.status, 0);
+      assert.match(damagedGeneratedAsset.stderr, new RegExp(`missing required generated runtime asset: ${relative.replaceAll('/', '\\/')}`));
+      assert.ok(existsSync(path.join(runtimeRoot, 'package.json')));
+      assert.ok(existsSync(path.join(previousRoot, 'sentinel-first-install.txt')));
+      writeFileSync(target, body, { mode });
+      chmodSync(target, mode);
+    }
+
+    // A damaged rollback target must never replace the working runtime.
+    rmSync(path.join(previousRoot, 'package.json'), { force: true });
+    const damaged = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+    assert.notEqual(damaged.status, 0);
+    assert.match(damaged.stderr, /Retained runtime .* is missing required runtime asset: package\.json/);
+    assert.ok(existsSync(path.join(runtimeRoot, 'package.json')));
     assert.ok(existsSync(path.join(previousRoot, 'sentinel-first-install.txt')));
 
     // Refuses when no previous runtime is retained.
@@ -39736,6 +39850,7 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
   const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
   const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
   const emptyHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-empty-'));
+  const corruptHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-corrupt-'));
   const parityScript = path.join(KIT_ROOT, 'scripts', 'runtime-parity-check.mjs');
   const runParity = (home) => spawnSync('node', [parityScript], {
     cwd: KIT_ROOT,
@@ -39752,6 +39867,48 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
     assert.match(pass.stdout, /\[claude\] review-surface contract probe: OK/);
     assert.match(pass.stdout, /\[claude\] review\/pr\/merge surface parity: OK/);
     assert.match(pass.stdout, /RESULT: PASS/);
+
+    // Build provenance accepts abbreviated Git SHAs. A short and full form of
+    // the same commit must compare equal instead of reporting false drift.
+    const runtimeBuildInfoPath = path.join(managedRuntimeRoot('claude', pipelaneHome), 'dist', 'build-info.json');
+    const runtimeBuildInfo = JSON.parse(readFileSync(runtimeBuildInfoPath, 'utf8'));
+    writeFileSync(runtimeBuildInfoPath, `${JSON.stringify({ ...runtimeBuildInfo, sha: runtimeBuildInfo.sha.slice(0, 7) }, null, 2)}\n`, 'utf8');
+    const abbreviatedSha = runParity(pipelaneHome);
+    assert.equal(abbreviatedSha.status, 0, `${abbreviatedSha.stdout}\n${abbreviatedSha.stderr}`);
+    assert.match(abbreviatedSha.stdout, /\[claude\] manifest parity: OK/);
+    writeFileSync(runtimeBuildInfoPath, `${JSON.stringify(runtimeBuildInfo, null, 2)}\n`, 'utf8');
+
+    // Package parity is insufficient when installer-generated entrypoints are
+    // absent: the durable host skills would have nothing usable to invoke.
+    for (const relative of ['bin/run-pipelane.sh', 'bin/bootstrap-pipelane.sh', 'managed-skills.json']) {
+      const target = path.join(managedRuntimeRoot('claude', pipelaneHome), relative);
+      const body = readFileSync(target);
+      const mode = statSync(target).mode & 0o777;
+      rmSync(target, { force: true });
+      const missingGeneratedAsset = runParity(pipelaneHome);
+      assert.equal(missingGeneratedAsset.status, 1, `${missingGeneratedAsset.stdout}\n${missingGeneratedAsset.stderr}`);
+      assert.match(missingGeneratedAsset.stdout, new RegExp(`${relative.replaceAll('/', '\\/')}: missing generated runtime asset`));
+      writeFileSync(target, body, { mode });
+      chmodSync(target, mode);
+    }
+
+    // A runtime directory that exists without its package manifest is broken,
+    // not equivalent to an uninstalled host.
+    mkdirSync(managedRuntimeRoot('claude', corruptHome), { recursive: true });
+    const corrupt = runParity(corruptHome);
+    assert.equal(corrupt.status, 1, `${corrupt.stdout}\n${corrupt.stderr}`);
+    assert.match(corrupt.stdout, /\[claude\] manifest parity: DRIFT/);
+    assert.match(corrupt.stdout, /RESULT: FAIL/);
+
+    // Generated runtime metadata is outside package.json's files list but is
+    // still required for a parity pass.
+    const metadataPath = path.join(managedRuntimeRoot('claude', pipelaneHome), '.pipelane-runtime.json');
+    const metadataBody = readFileSync(metadataPath, 'utf8');
+    rmSync(metadataPath, { force: true });
+    const missingMetadata = runParity(pipelaneHome);
+    assert.equal(missingMetadata.status, 1);
+    assert.match(missingMetadata.stdout, /\.pipelane-runtime\.json: missing or invalid managed-runtime metadata/);
+    writeFileSync(metadataPath, metadataBody, 'utf8');
 
     // Mutating a review-surface module inside the runtime is drift.
     const mutated = path.join(managedRuntimeRoot('claude', pipelaneHome), 'dist', 'operator', 'commands', 'review.js');
@@ -39771,6 +39928,7 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
     rmSync(claudeHome, { recursive: true, force: true });
     rmSync(pipelaneHome, { recursive: true, force: true });
     rmSync(emptyHome, { recursive: true, force: true });
+    rmSync(corruptHome, { recursive: true, force: true });
   }
 });
 

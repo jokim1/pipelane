@@ -38,6 +38,7 @@ export interface UpdateStatus {
   repoRoot: string;
   installedSha: string;
   installedShaShort: string;
+  sourceDirty: boolean;
   latestSha: string;
   latestShaShort: string;
   installedVersion: string;
@@ -72,6 +73,7 @@ export interface AutoUpdateResult {
 interface AutoUpdateCache {
   checkedAt: string;
   installedSha: string;
+  sourceDirty?: boolean;
   latestSha: string;
   upToDate: boolean;
   aheadBy?: number | null;
@@ -172,9 +174,24 @@ function managedRuntimeSourceSha(install: ManagedRuntimeInstall | null): string 
   return /^[a-f0-9]{7,40}$/i.test(sha) ? sha.toLowerCase() : '';
 }
 
+function sameGitSha(left: string, right: string): boolean {
+  const normalizedLeft = left.trim().toLowerCase();
+  const normalizedRight = right.trim().toLowerCase();
+  if (normalizedLeft === normalizedRight) return true;
+  if (!/^[a-f0-9]{7,40}$/.test(normalizedLeft) || !/^[a-f0-9]{7,40}$/.test(normalizedRight)) return false;
+  const [shorter, longer] = normalizedLeft.length < normalizedRight.length
+    ? [normalizedLeft, normalizedRight]
+    : [normalizedRight, normalizedLeft];
+  return longer.startsWith(shorter);
+}
+
 function managedRuntimeVersion(install: ManagedRuntimeInstall | null): string {
   return install?.metadata?.packageVersion?.trim()
     || (install ? readInstalledVersion(path.join(install.root, 'package.json')) : '');
+}
+
+function managedRuntimeSourceDirty(install: ManagedRuntimeInstall | null): boolean {
+  return install?.metadata?.sourceDirty === true;
 }
 
 // Repos can be current on the installed SHA yet still run an older review
@@ -218,16 +235,18 @@ export function maybeNotifyUpdate(cwd: string): AutoUpdateResult {
     return { checked: false, updated: false, skippedReason: 'durable Pipelane runtime is not installed', status: null };
   }
   const installedSha = managedRuntimeSourceSha(runtime);
+  const sourceDirty = managedRuntimeSourceDirty(runtime);
   if (!installedSha) {
     return { checked: false, updated: false, skippedReason: 'installed durable Pipelane commit is unknown', status: null };
   }
 
-  const cached = readFreshAutoUpdateCache(repoRoot, installedSha);
+  const cached = readFreshAutoUpdateCache(repoRoot, installedSha, sourceDirty);
   if (cached) {
     const status = {
       repoRoot,
       installedSha,
       installedShaShort: shortSha(installedSha),
+      sourceDirty,
       latestSha: cached.latestSha,
       latestShaShort: shortSha(cached.latestSha),
       installedVersion: managedRuntimeVersion(runtime),
@@ -251,7 +270,7 @@ export function maybeNotifyUpdate(cwd: string): AutoUpdateResult {
   try {
     status = collectUpdateStatus(repoRoot, { timeoutMs: autoUpdateTimeoutMs() });
   } catch (error) {
-    writeAutoUpdateFailureCache(repoRoot, installedSha, error);
+    writeAutoUpdateFailureCache(repoRoot, installedSha, sourceDirty, error);
     return { checked: false, updated: false, skippedReason: error instanceof Error ? error.message : String(error), status: null };
   }
 
@@ -286,6 +305,7 @@ export function refreshAutoUpdateCache(cwd: string): AutoUpdateResult {
     return { checked: false, updated: false, skippedReason: 'durable Pipelane runtime is not installed', status: null };
   }
   const installedSha = managedRuntimeSourceSha(runtime);
+  const sourceDirty = managedRuntimeSourceDirty(runtime);
   if (!installedSha) {
     return { checked: false, updated: false, skippedReason: 'installed durable Pipelane commit is unknown', status: null };
   }
@@ -301,7 +321,7 @@ export function refreshAutoUpdateCache(cwd: string): AutoUpdateResult {
     writeAutoUpdateCache(repoRoot, status);
     return { checked: true, updated: false, skippedReason: null, status };
   } catch (error) {
-    writeAutoUpdateFailureCache(repoRoot, installedSha, error);
+    writeAutoUpdateFailureCache(repoRoot, installedSha, sourceDirty, error);
     return { checked: false, updated: false, skippedReason: error instanceof Error ? error.message : String(error), status: null };
   } finally {
     releaseAutoUpdateRefreshLock(lockPath);
@@ -570,14 +590,14 @@ function releaseAutoUpdateRefreshLock(lockPath: string): void {
   }
 }
 
-function readFreshAutoUpdateCache(repoRoot: string, installedSha: string): AutoUpdateCache | null {
+function readFreshAutoUpdateCache(repoRoot: string, installedSha: string, sourceDirty: boolean): AutoUpdateCache | null {
   try {
     const cachePath = autoUpdateCachePath(repoRoot);
     if (!existsSync(cachePath)) {
       return null;
     }
     const cache = readJsonFile<AutoUpdateCache | null>(cachePath, null);
-    if (!cache || cache.installedSha !== installedSha || !cache.latestSha || !cache.checkedAt || typeof cache.upToDate !== 'boolean') {
+    if (!cache || cache.installedSha !== installedSha || Boolean(cache.sourceDirty) !== sourceDirty || !cache.latestSha || !cache.checkedAt || typeof cache.upToDate !== 'boolean') {
       return null;
     }
     const checkedAt = Date.parse(cache.checkedAt);
@@ -620,6 +640,7 @@ function writeAutoUpdateCache(repoRoot: string, status: UpdateStatus): void {
     writeJsonFile(autoUpdateCachePath(repoRoot), {
       checkedAt: new Date().toISOString(),
       installedSha: status.installedSha,
+      sourceDirty: status.sourceDirty,
       latestSha: status.latestSha,
       upToDate: status.upToDate,
       aheadBy: status.aheadBy,
@@ -630,13 +651,14 @@ function writeAutoUpdateCache(repoRoot: string, status: UpdateStatus): void {
   }
 }
 
-function writeAutoUpdateFailureCache(repoRoot: string, installedSha: string, error: unknown): void {
+function writeAutoUpdateFailureCache(repoRoot: string, installedSha: string, sourceDirty: boolean, error: unknown): void {
   try {
     writeJsonFile(autoUpdateCachePath(repoRoot), {
       checkedAt: new Date().toISOString(),
       installedSha,
+      sourceDirty,
       latestSha: installedSha,
-      upToDate: true,
+      upToDate: !sourceDirty,
       aheadBy: null,
       commits: [],
       failureReason: error instanceof Error ? error.message : String(error),
@@ -953,13 +975,15 @@ export function collectUpdateStatus(
     );
   }
   const installedVersion = managedRuntimeVersion(runtime);
+  const sourceDirty = managedRuntimeSourceDirty(runtime);
   const deadlineMs = options.timeoutMs === undefined ? null : Date.now() + options.timeoutMs;
   const latestSha = fetchLatestMainSha(remainingUpdateTimeoutMs(deadlineMs, options.timeoutMs));
-  const upToDate = Boolean(installedSha) && installedSha === latestSha;
+  const sameRevision = Boolean(installedSha) && sameGitSha(installedSha, latestSha);
+  const upToDate = sameRevision && !sourceDirty;
 
   let aheadBy: number | null = null;
   let commits: Array<{ sha: string; subject: string }> = [];
-  if (!upToDate && installedSha) {
+  if (!sameRevision && installedSha) {
     const compare = fetchCompare(installedSha, latestSha, remainingUpdateTimeoutMs(deadlineMs, options.timeoutMs));
     if (compare) {
       aheadBy = compare.aheadBy;
@@ -971,6 +995,7 @@ export function collectUpdateStatus(
     repoRoot,
     installedSha,
     installedShaShort: shortSha(installedSha),
+    sourceDirty,
     latestSha,
     latestShaShort: shortSha(latestSha),
     installedVersion,
@@ -984,15 +1009,17 @@ function collectUpdateStatusFromKnownLatest(repoRoot: string, latestSha: string)
   const runtime = primaryManagedRuntimeInstall();
   const installedSha = managedRuntimeSourceSha(runtime);
   const installedVersion = managedRuntimeVersion(runtime);
+  const sourceDirty = managedRuntimeSourceDirty(runtime);
   const normalizedLatestSha = latestSha.toLowerCase();
   return {
     repoRoot,
     installedSha,
     installedShaShort: shortSha(installedSha),
+    sourceDirty,
     latestSha: normalizedLatestSha,
     latestShaShort: shortSha(normalizedLatestSha),
     installedVersion,
-    upToDate: Boolean(installedSha) && installedSha === normalizedLatestSha,
+    upToDate: Boolean(installedSha) && sameGitSha(installedSha, normalizedLatestSha) && !sourceDirty,
     aheadBy: null,
     commits: [],
   };
@@ -1059,6 +1086,13 @@ function fetchCompare(
 
 export function formatAutoUpdateNotice(status: UpdateStatus): string {
   const installed = status.installedShaShort || '(unknown)';
+  if (status.sourceDirty) {
+    return [
+      `[pipelane] The installed Pipelane runtime at ${installed} was built from a dirty source tree.`,
+      '[pipelane] Run `/pipelane update` to replace it with the clean build from main.',
+      '',
+    ].join('\n');
+  }
   const lines = [
     `[pipelane] A new Pipelane update is available: ${installed} -> ${status.latestShaShort}.`,
     '[pipelane] Run `/pipelane update` to get the latest changes:',
@@ -1104,8 +1138,8 @@ function buildStatusMessage(status: UpdateStatus): string {
   }
 
   const lines = [
-    `pipelane has updates available.`,
-    `  Installed: ${status.installedShaShort || '(unknown sha)'} (v${status.installedVersion || '?'})`,
+    status.sourceDirty ? 'pipelane needs a clean runtime reinstall.' : 'pipelane has updates available.',
+    `  Installed: ${status.installedShaShort || '(unknown sha)'}${status.sourceDirty ? '-dirty' : ''} (v${status.installedVersion || '?'})`,
     `  Latest main: ${status.latestShaShort}`,
   ];
   if (status.aheadBy !== null) {

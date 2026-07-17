@@ -163,7 +163,7 @@ function writeSkill(skillsRoot: string, runtimeDir: string, entry: DesiredInstal
 }
 
 export function rollbackClaudeManagedRuntime(): RuntimeRollbackResult {
-  return rollbackGlobalRuntime(runtimeRoot(homeClaudeDir()));
+  return rollbackGlobalRuntime(runtimeRoot(homeClaudeDir()), { expectedHost: 'claude' });
 }
 
 export function installClaudeBootstrapSkill(

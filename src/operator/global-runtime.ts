@@ -6,6 +6,11 @@ import { fileURLToPath } from 'node:url';
 
 const MANAGED_RUNTIME_FILENAME = '.pipelane-runtime.json';
 const INSTALL_LOCK_STALE_MS = 10 * 60 * 1000;
+const GENERATED_RUNTIME_ASSETS = [
+  'managed-skills.json',
+  'bin/run-pipelane.sh',
+  'bin/bootstrap-pipelane.sh',
+] as const;
 
 interface RuntimePackageJson {
   version?: string;
@@ -39,12 +44,41 @@ function installableEntries(root: string): string[] {
   return [...new Set(['package.json', ...fromManifest])];
 }
 
-function ensureInstallableRuntime(root: string): void {
-  const required = ['package.json', 'bin/pipelane', 'dist/cli.js', 'templates'];
-  for (const relativePath of required) {
+function ensureInstallableRuntime(root: string, label = 'Current pipelane package'): void {
+  const required = [
+    { path: 'package.json', kind: 'file' },
+    { path: 'bin/pipelane', kind: 'file' },
+    { path: 'dist/cli.js', kind: 'file' },
+    { path: 'templates', kind: 'directory' },
+  ] as const;
+  for (const { path: relativePath, kind } of required) {
     if (!existsSync(path.join(root, relativePath))) {
-      throw new Error(`Current pipelane package is missing required runtime asset: ${relativePath}`);
+      throw new Error(`${label} is missing required runtime asset: ${relativePath}`);
     }
+    const stats = statSync(path.join(root, relativePath));
+    if ((kind === 'file' && !stats.isFile()) || (kind === 'directory' && !stats.isDirectory())) {
+      throw new Error(`${label} has an invalid required runtime asset: ${relativePath} must be a ${kind}.`);
+    }
+  }
+}
+
+function ensureRestorableRuntime(root: string, label: string): void {
+  ensureInstallableRuntime(root, label);
+  for (const relativePath of GENERATED_RUNTIME_ASSETS) {
+    if (!existsSync(path.join(root, relativePath))) {
+      throw new Error(`${label} is missing required generated runtime asset: ${relativePath}`);
+    }
+    if (!statSync(path.join(root, relativePath)).isFile()) {
+      throw new Error(`${label} has an invalid required generated runtime asset: ${relativePath} must be a file.`);
+    }
+  }
+  try {
+    const manifest = JSON.parse(readFileSync(path.join(root, 'managed-skills.json'), 'utf8')) as { skills?: unknown };
+    if (!Array.isArray(manifest.skills) || manifest.skills.some((entry) => typeof entry !== 'string')) {
+      throw new Error('skills must be an array of strings');
+    }
+  } catch (error) {
+    throw new Error(`${label} has an invalid managed-skills.json: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -105,6 +139,16 @@ function resolveRuntimeSourceProvenance(sourceRoot: string): RuntimeSourceProven
   } catch {
     return null;
   }
+}
+
+function sameRuntimeSource(left: ManagedRuntimeMetadata | null, right: ManagedRuntimeMetadata): boolean {
+  if (!left || left.host !== right.host || left.packageVersion !== right.packageVersion) return false;
+  if (left.sourceDirty === true || right.sourceDirty === true) return false;
+  const leftSha = left.sourceSha?.trim().toLowerCase() ?? '';
+  const rightSha = right.sourceSha?.trim().toLowerCase() ?? '';
+  if (!/^[a-f0-9]{7,40}$/.test(leftSha) || !/^[a-f0-9]{7,40}$/.test(rightSha)) return false;
+  const [shorter, longer] = leftSha.length < rightSha.length ? [leftSha, rightSha] : [rightSha, leftSha];
+  return longer.startsWith(shorter);
 }
 
 export function previousRuntimePath(targetRoot: string): string {
@@ -205,6 +249,19 @@ export function installGlobalRuntime(
     }
     writeFileSync(managedRuntimePath(tempRoot), `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
 
+    const previousRoot = previousRuntimePath(targetRoot);
+    if (existsSync(previousRoot)) {
+      const previousMetadata = readManagedRuntimeMetadata(previousRoot);
+      if (!previousMetadata) {
+        throw new Error(`${previousRoot} already exists and is not managed by pipelane; refusing to replace it.`);
+      }
+      if (previousMetadata.host !== options.host) {
+        throw new Error(`${previousRoot} belongs to host ${previousMetadata.host || 'unknown'}, not ${options.host}; refusing to replace it.`);
+      }
+    }
+    const preservePrevious = existsSync(previousRoot)
+      && sameRuntimeSource(readManagedRuntimeMetadata(targetRoot), metadata);
+
     if (existsSync(targetRoot)) {
       asideRoot = `${targetRoot}.previous-${process.pid}-${Date.now()}`;
       renameSync(targetRoot, asideRoot);
@@ -215,9 +272,12 @@ export function installGlobalRuntime(
       // a failed retention must not fail the already-completed install, so the
       // aside dir is left in place for manual recovery instead.
       try {
-        const previousRoot = previousRuntimePath(targetRoot);
-        rmSync(previousRoot, { recursive: true, force: true });
-        renameSync(asideRoot, previousRoot);
+        if (preservePrevious) {
+          rmSync(asideRoot, { recursive: true, force: true });
+        } else {
+          rmSync(previousRoot, { recursive: true, force: true });
+          renameSync(asideRoot, previousRoot);
+        }
       } catch {
         // Keep asideRoot on disk; it still holds the prior runtime.
       }
@@ -241,7 +301,10 @@ export interface RuntimeRollbackResult {
   retired: ManagedRuntimeMetadata | null;
 }
 
-export function rollbackGlobalRuntime(targetRoot: string): RuntimeRollbackResult {
+export function rollbackGlobalRuntime(
+  targetRoot: string,
+  options: { expectedHost?: string } = {},
+): RuntimeRollbackResult {
   const previousRoot = previousRuntimePath(targetRoot);
   const releaseLock = acquireInstallLock(targetRoot);
   try {
@@ -249,6 +312,13 @@ export function rollbackGlobalRuntime(targetRoot: string): RuntimeRollbackResult
     if (!restored) {
       throw new Error(`No pipelane-managed previous runtime is retained at ${previousRoot}; nothing to roll back to.`);
     }
+    if (options.expectedHost && restored.host !== options.expectedHost) {
+      throw new Error(`Retained runtime at ${previousRoot} belongs to host ${restored.host || 'unknown'}, not ${options.expectedHost}; refusing to activate it.`);
+    }
+    if (!restored.packageVersion?.trim() || !restored.installedAt?.trim()) {
+      throw new Error(`Retained runtime metadata at ${previousRoot} is incomplete; refusing to activate it.`);
+    }
+    ensureRestorableRuntime(previousRoot, `Retained runtime at ${previousRoot}`);
     if (existsSync(targetRoot) && !isManagedGlobalRuntime(targetRoot)) {
       throw new Error(`${targetRoot} exists and is not managed by pipelane; refusing to roll back over it.`);
     }

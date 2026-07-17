@@ -8,7 +8,12 @@ const temporaryPath = `${outputPath}.tmp-${process.pid}`;
 
 function resolveBuildSha() {
   const supplied = process.env.PIPELANE_BUILD_SHA?.trim();
-  if (supplied) return supplied;
+  if (supplied) {
+    if (!/^[a-f0-9]{7,40}$/i.test(supplied)) {
+      throw new Error('PIPELANE_BUILD_SHA must be a 7-40 character hexadecimal git SHA.');
+    }
+    return supplied.toLowerCase();
+  }
   try {
     return execFileSync('git', ['rev-parse', '--verify', 'HEAD'], {
       cwd: repoRoot,

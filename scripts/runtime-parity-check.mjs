@@ -28,6 +28,11 @@ const INSTALL_GENERATED = new Set([
   'bin/run-pipelane.sh',
   'bin/bootstrap-pipelane.sh',
 ]);
+const REQUIRED_GENERATED_ASSETS = [
+  'managed-skills.json',
+  'bin/run-pipelane.sh',
+  'bin/bootstrap-pipelane.sh',
+];
 const BUILD_INFO_RELATIVE = 'dist/build-info.json';
 const REVIEW_SURFACE_MODULES = [
   'dist/operator/commands/review.js',
@@ -56,6 +61,18 @@ function readJson(target) {
 
 function digestFile(target) {
   return createHash('sha256').update(readFileSync(target)).digest('hex');
+}
+
+function sameBuildSha(left, right) {
+  if (typeof left !== 'string' || typeof right !== 'string') return false;
+  const normalizedLeft = left.trim().toLowerCase();
+  const normalizedRight = right.trim().toLowerCase();
+  if (normalizedLeft === normalizedRight) return true;
+  if (!/^[a-f0-9]{7,40}$/.test(normalizedLeft) || !/^[a-f0-9]{7,40}$/.test(normalizedRight)) return false;
+  const [shorter, longer] = normalizedLeft.length < normalizedRight.length
+    ? [normalizedLeft, normalizedRight]
+    : [normalizedRight, normalizedLeft];
+  return longer.startsWith(shorter);
 }
 
 function walkFiles(root, relative = '') {
@@ -101,10 +118,49 @@ function buildInfoDrift(localTarget, runtimeTarget) {
   if (!local && !runtime) return null;
   if (!local || !runtime) return `${BUILD_INFO_RELATIVE}: missing on ${local ? 'runtime' : 'local'} side`;
   // builtAt is expected to differ between builds of the same tree.
-  if (local.sha !== runtime.sha || Boolean(local.dirty) !== Boolean(runtime.dirty)) {
+  if (!sameBuildSha(local.sha, runtime.sha) || Boolean(local.dirty) !== Boolean(runtime.dirty)) {
     return `${BUILD_INFO_RELATIVE}: local ${local.sha}${local.dirty ? '-dirty' : ''} vs runtime ${runtime.sha}${runtime.dirty ? '-dirty' : ''}`;
   }
   return null;
+}
+
+function runtimeMetadataDrift(host, runtimeRoot) {
+  const relative = '.pipelane-runtime.json';
+  const metadata = readJson(path.join(runtimeRoot, relative));
+  if (!metadata || metadata.managedBy !== 'pipelane') {
+    return [`${relative}: missing or invalid managed-runtime metadata`];
+  }
+  const drift = [];
+  if (metadata.host !== host) {
+    drift.push(`${relative}: expected host ${host}, found ${JSON.stringify(metadata.host)}`);
+  }
+  if (typeof metadata.packageVersion !== 'string' || metadata.packageVersion.trim().length === 0) {
+    drift.push(`${relative}: packageVersion is missing or invalid`);
+  }
+  if (typeof metadata.installedAt !== 'string' || Number.isNaN(Date.parse(metadata.installedAt))) {
+    drift.push(`${relative}: installedAt is missing or invalid`);
+  }
+  return drift;
+}
+
+function generatedRuntimeDrift(runtimeRoot) {
+  const drift = [];
+  for (const relative of REQUIRED_GENERATED_ASSETS) {
+    const target = path.join(runtimeRoot, relative);
+    if (!existsSync(target)) {
+      drift.push(`${relative}: missing generated runtime asset`);
+    } else if (!statSync(target).isFile()) {
+      drift.push(`${relative}: generated runtime asset is not a file`);
+    }
+  }
+  const manifestPath = path.join(runtimeRoot, 'managed-skills.json');
+  if (existsSync(manifestPath)) {
+    const manifest = readJson(manifestPath);
+    if (!manifest || !Array.isArray(manifest.skills) || manifest.skills.some((entry) => typeof entry !== 'string')) {
+      drift.push('managed-skills.json: invalid generated runtime manifest');
+    }
+  }
+  return drift;
 }
 
 function compareManifest(runtimeRoot) {
@@ -202,7 +258,7 @@ async function main() {
 
   const runtimeRoots = RUNTIME_HOSTS
     .map((host) => ({ host, root: path.join(pipelaneHomeDir(), 'runtimes', host) }))
-    .filter((entry) => existsSync(path.join(entry.root, 'package.json')));
+    .filter((entry) => existsSync(entry.root));
 
   if (runtimeRoots.length === 0) {
     lines.push('No managed runtimes are installed; nothing to compare.');
@@ -219,6 +275,7 @@ async function main() {
     lines.push(`[${host}] ${root} (${provenance}, installed ${metadata?.installedAt ?? 'unknown'})`);
 
     const manifest = compareManifest(root);
+    manifest.drift.unshift(...runtimeMetadataDrift(host, root), ...generatedRuntimeDrift(root));
     const surfaceProbe = await probeReviewSurface(root);
     const surfaceDigestDrift = manifest.drift.filter((entry) => REVIEW_SURFACE_MODULES.some((module) => entry.startsWith(module)));
 

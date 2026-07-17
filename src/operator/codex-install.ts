@@ -260,7 +260,7 @@ function writeSkill(skillsRoot: string, entry: DesiredInstallEntry): void {
 }
 
 export function rollbackCodexManagedRuntime(): RuntimeRollbackResult {
-  return rollbackGlobalRuntime(runtimeRoot(homeCodexDir()));
+  return rollbackGlobalRuntime(runtimeRoot(homeCodexDir()), { expectedHost: 'codex' });
 }
 
 export function installCodexBootstrapSkill(
