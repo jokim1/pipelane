@@ -1,30 +1,37 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 import {
   acquireOrphanCleanupLock,
-  acquireTaskCleanupLock,
+  acquireTaskWorkspaceLease,
+  automaticWorktreeCleanupEnabled,
+  compareAndSetTaskLockWithWorkspaceLease,
+  ensureTaskBindingId,
+  findDeliveriesByTask,
   formatWorkflowCommand,
-  loadDeployState,
   loadPrState,
+  prRecordMatchesTaskLock,
   loadTaskLock,
+  nowIso,
+  normalizeExistingPath,
   normalizePath,
   printResult,
   resolveWorkflowContext,
+  removeTaskLockWithWorkspaceLease,
   runCommandCapture,
   runGit,
+  saveDeliveryRecord,
   slugifyTaskName,
-  type DeployRecord,
   type ParsedOperatorArgs,
-  type PrRecord,
   type TaskLock,
+  type TaskWorkspaceLease,
   type WorkflowConfig,
 } from '../state.ts';
-import { resolveDeployStateKey } from '../integrity.ts';
-import { verificationPassed, verifyDeployRecord } from '../release-gate.ts';
 import {
-  branchTreeMatchesRef,
+  assessTaskCleanup,
   classifyOrphan,
+  inspectCleanupStatus,
   listActiveTaskLocks,
   listOrphanWorktrees,
   pruneDeadTaskLocks,
@@ -32,9 +39,10 @@ import {
   removeTaskArtifacts,
   resolveSharedRepoRoot,
   TASK_LOCK_MIN_PRUNE_AGE_MS,
+  type CleanupEvidenceRevision,
+  type DeliveryProof,
   type OrphanClassification,
   type OrphanWorktree,
-  type RemovedTaskLock,
 } from '../task-workspaces.ts';
 
 export async function handleClean(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
@@ -42,6 +50,10 @@ export async function handleClean(cwd: string, parsed: ParsedOperatorArgs): Prom
   const sharedRepoRoot = resolveSharedRepoRoot(context.commonDir);
 
   if (parsed.flags.apply) {
+    if (parsed.flags.delivered) {
+      await handleApplyDelivered(cwd, parsed, context.commonDir, context.config, sharedRepoRoot);
+      return;
+    }
     if (parsed.flags.completedWithIgnored) {
       await handleApplyCompletedWithIgnored(cwd, parsed, context.commonDir, context.config, sharedRepoRoot);
       return;
@@ -74,15 +86,12 @@ async function handleApplyTaskOrAllStale(
 ): Promise<void> {
   const taskFlag = parsed.flags.task.trim();
   const allStale = parsed.flags.allStale;
-  const prRecords = loadPrState(commonDir, config).records;
-  const deployRecords = loadTrustedDeployRecords(commonDir, config);
 
   if (!taskFlag && !allStale) {
     throw new Error([
       '/clean --apply requires scope.',
       'Pass --task <slug> to prune one lock, --all-stale to prune every dead lock,',
-      'or one of --completed-with-ignored, --safe-orphans, --merged-orphans for a bulk category.',
-      'Locks younger than 5 minutes are always kept even when scope is set.',
+      'or one of --delivered, --completed-with-ignored, --safe-orphans, --merged-orphans for a bulk category.',
     ].join('\n'));
   }
 
@@ -91,64 +100,531 @@ async function handleApplyTaskOrAllStale(
     throw new Error(`Could not derive a valid task slug from --task "${taskFlag}".`);
   }
 
-  const { removed, skipped } = pruneDeadTaskLocks(commonDir, config, {
-    taskSlug: targetSlug,
-    minAgeMs: readMinAgeOverride(),
-  });
-
-  // --task is the end-of-task closer: prune the lock, then tear down the
-  // worktree + local branch the lock pointed at. --all-stale stays
-  // metadata-only — it sweeps abandoned locks across many tasks and the
-  // blast radius of bulk worktree removal would be too high (e.g. an
-  // operator restarting the daemon would briefly orphan locks for live
-  // worktrees the operator wanted to keep).
-  const artifactResults = taskFlag
-    ? performArtifactRemoval({
-        removed,
-        sharedRepoRoot,
-        callerCwd: cwd,
-        force: parsed.flags.force,
-        safeDeleteBranchRefs: buildSafeDeleteBranchRefs(removed, prRecords, deployRecords),
-      })
-    : [];
-
-  const messageLines: string[] = [];
-  if (removed.length === 0) {
-    messageLines.push(
-      taskFlag
-        ? `No task lock matched --task ${targetSlug}.`
-        : 'No stale task locks were pruned.',
-    );
-  } else if (taskFlag) {
-    messageLines.push('Closed out task workspaces:');
-    for (const lock of removed) {
-      const result = artifactResults.find((entry) => entry.taskSlug === lock.taskSlug);
-      const parts = ['lock'];
-      if (result?.worktreeRemoved) parts.push('worktree');
-      if (result?.branchRemoved) parts.push('branch');
-      messageLines.push(`- ${lock.taskSlug}: removed ${parts.join(' + ')}`);
-      if (result) {
-        for (const warning of result.warnings) messageLines.push(`  note: ${warning}`);
-        for (const error of result.errors) messageLines.push(`  ! ${error}`);
-      }
+  if (allStale) {
+    const { removed, skipped } = pruneDeadTaskLocks(commonDir, config, { minAgeMs: readMinAgeOverride() });
+    const messageLines = removed.length > 0
+      ? ['Pruned stale task locks:', ...removed.map((entry) => `- ${entry.taskSlug}: ${entry.branchName} @ ${entry.worktreePath}`)]
+      : ['No stale task locks were pruned.'];
+    if (skipped.length > 0) {
+      messageLines.push('Kept:');
+      messageLines.push(...skipped.map((entry) => `- ${entry.taskSlug}: ${entry.reason}`));
     }
-  } else {
-    messageLines.push('Pruned stale task locks:');
-    messageLines.push(
-      ...removed.map((entry) => `- ${entry.taskSlug}: ${entry.branchName} @ ${entry.worktreePath}`),
-    );
-  }
-  if (skipped.length > 0) {
-    messageLines.push('Kept (too young to prune, <5 min):');
-    messageLines.push(...skipped.map((entry) => `- ${entry.taskSlug}: ${entry.reason}`));
+    printResult(parsed.flags, {
+      removed: removed.map((entry) => entry.taskSlug),
+      skipped: skipped.map((entry) => ({ taskSlug: entry.taskSlug, reason: entry.reason })),
+      artifacts: [],
+      message: messageLines.join('\n'),
+    });
+    return;
   }
 
-  printResult(parsed.flags, {
-    removed: removed.map((entry) => entry.taskSlug),
-    skipped: skipped.map((entry) => ({ taskSlug: entry.taskSlug, reason: entry.reason })),
-    artifacts: artifactResults,
-    message: messageLines.join('\n'),
+  const lock = targetSlug ? ensureTaskBindingId(commonDir, config, targetSlug) : null;
+  if (!lock?.taskBindingId) {
+    printResult(parsed.flags, {
+      removed: [],
+      skipped: targetSlug ? [{ taskSlug: targetSlug, reason: 'no active task lock found' }] : [],
+      artifacts: [],
+      message: `No task lock matched --task ${targetSlug}.`,
+    });
+    return;
+  }
+  const result = executeTaskWorkspaceCleanup({
+    commonDir,
+    config,
+    sharedRepoRoot,
+    callerCwd: enterSharedCheckoutForTerminalCleanup(lock, cwd, sharedRepoRoot, commonDir),
+    lock,
+    automatic: false,
+    trigger: 'manual',
+    force: parsed.flags.force,
   });
+  const parts = [];
+  if (result.status === 'cleaned') {
+    if (result.worktreeRemoved) parts.push('worktree');
+    if (result.branchRemoved) parts.push('branch');
+    parts.push('task lock');
+  }
+  const message = result.status === 'cleaned'
+    ? `Closed out ${result.taskSlug}: removed ${parts.join(' + ')}.`
+    : result.status === 'blocked'
+      ? `Cleanup blocked for ${result.taskSlug}: ${result.reason}`
+      : `Cleanup kept ${result.taskSlug}: ${result.reason}`;
+  printResult(parsed.flags, {
+    removed: result.status === 'cleaned' ? [result.taskSlug] : [],
+    skipped: result.status === 'cleaned' ? [] : [{ taskSlug: result.taskSlug, reason: result.reason }],
+    artifacts: [result],
+    cleanup: result,
+    message,
+  });
+}
+
+export type CleanupOutcome =
+  | {
+      status: 'cleaned';
+      taskSlug: string;
+      worktreeRemoved: boolean;
+      branchRemoved: boolean;
+      warnings: string[];
+    }
+  | {
+      status: 'kept';
+      taskSlug: string;
+      reason: 'operator-requested' | 'automatic-cleanup-disabled';
+    }
+  | {
+      status: 'blocked';
+      taskSlug: string;
+      code: import('../state.ts').AutoCleanupBlockerCode;
+      reason: string;
+      worktreeRemoved?: boolean;
+      branchRemoved?: boolean;
+    };
+
+export interface RemoteBaseEvidence {
+  ref: string;
+  sha: string;
+  revision: CleanupEvidenceRevision;
+}
+
+function refreshRemoteBaseEvidence(sharedRepoRoot: string, config: WorkflowConfig, source: CleanupEvidenceRevision['source']): RemoteBaseEvidence | null {
+  const ref = `origin/${config.baseBranch}`;
+  const fetched = runCommandCapture('git', ['fetch', 'origin', config.baseBranch, '--no-tags'], { cwd: sharedRepoRoot });
+  if (!fetched.ok) return null;
+  const sha = runGit(sharedRepoRoot, ['rev-parse', '--verify', ref], true)?.trim() ?? '';
+  if (!sha) return null;
+  return { ref, sha, revision: { remoteBaseSha: sha, observedAt: nowIso(), source } };
+}
+
+function gitObjectIsAncestor(repoRoot: string, ancestor: string, descendant: string): boolean {
+  if (!ancestor || !descendant) return false;
+  return runCommandCapture('git', ['merge-base', '--is-ancestor', ancestor, descendant], { cwd: repoRoot }).ok;
+}
+
+function resolveCleanupProof(
+  commonDir: string,
+  config: WorkflowConfig,
+  sharedRepoRoot: string,
+  lock: TaskLock,
+  taskBindingId: string,
+  branchHeadSha: string,
+  remote: RemoteBaseEvidence,
+): { proof: DeliveryProof | null; contained: boolean } {
+  if (branchHeadSha && gitObjectIsAncestor(sharedRepoRoot, branchHeadSha, remote.sha)) {
+    return {
+      proof: {
+        kind: 'remote-ancestor',
+        branchHeadSha,
+        remoteBaseRef: remote.ref,
+        remoteBaseSha: remote.sha,
+      },
+      contained: true,
+    };
+  }
+  const matches = findDeliveriesByTask(commonDir, config, lock.taskSlug, taskBindingId)
+    .filter((delivery) => delivery.branchName === lock.branchName
+      && delivery.prHeadSha === branchHeadSha
+      && gitObjectIsAncestor(sharedRepoRoot, delivery.mergedSha, remote.sha));
+  if (matches.length !== 1) return { proof: null, contained: false };
+  const delivery = matches[0];
+  return {
+    proof: {
+      kind: 'merged-pr-head',
+      prNumber: delivery.prNumber,
+      prHeadSha: delivery.prHeadSha,
+      mergedSha: delivery.mergedSha,
+      remoteBaseRef: remote.ref,
+      remoteBaseSha: remote.sha,
+    },
+    contained: true,
+  };
+}
+
+function backfillLegacyDeliveryForCleanup(options: {
+  commonDir: string;
+  config: WorkflowConfig;
+  sharedRepoRoot: string;
+  lock: TaskLock;
+  taskBindingId: string;
+  branchHeadSha: string;
+  remote: RemoteBaseEvidence | null;
+}): string | null {
+  if (findDeliveriesByTask(options.commonDir, options.config, options.lock.taskSlug, options.taskBindingId).length > 0) {
+    return null;
+  }
+  const record = loadPrState(options.commonDir, options.config).records[options.lock.taskSlug];
+  if (!record?.number || !record.mergedSha || !record.mergedAt || !record.url || !options.branchHeadSha) return null;
+  if (!prRecordMatchesTaskLock(record, options.lock)) return null;
+  // Legacy PR state did not persist the PR-head SHA. Never infer that an
+  // advanced local branch was the head that produced an older merge: doing so
+  // would turn merge evidence into authorization to delete unique commits.
+  // Equality is the only exact identity this legacy shape can establish.
+  if (record.mergedSha !== options.branchHeadSha) return null;
+  if (!options.remote || !gitObjectIsAncestor(options.sharedRepoRoot, record.mergedSha, options.remote.sha)) return null;
+  try {
+    saveDeliveryRecord(options.commonDir, options.config, {
+      prNumber: record.number,
+      ownership: 'managed-task',
+      taskSlug: options.lock.taskSlug,
+      taskBindingId: options.taskBindingId,
+      branchName: options.lock.branchName,
+      mode: options.lock.mode,
+      surfaces: options.lock.surfaces,
+      baseBranch: options.config.baseBranch,
+      prHeadSha: options.branchHeadSha,
+      mergedSha: record.mergedSha,
+      mergedAt: record.mergedAt,
+      title: record.title,
+      url: record.url,
+    });
+    return null;
+  } catch (error) {
+    return `Legacy delivery backfill failed: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
+function sharedCheckoutMatchesCommonDir(sharedRepoRoot: string, commonDir: string): boolean {
+  if (!existsSync(sharedRepoRoot)) return false;
+  const raw = runGit(sharedRepoRoot, ['rev-parse', '--git-common-dir'], true)?.trim() ?? '';
+  if (!raw) return false;
+  const resolved = path.isAbsolute(raw) ? raw : path.resolve(sharedRepoRoot, raw);
+  return normalizePath(resolved) === normalizePath(commonDir);
+}
+
+function enterSharedCheckoutForTerminalCleanup(
+  lock: TaskLock,
+  callerCwd: string,
+  sharedRepoRoot: string,
+  commonDir: string,
+): string {
+  if (!existsSync(lock.worktreePath)) return callerCwd;
+  const worktree = normalizeExistingPath(lock.worktreePath);
+  const caller = normalizeExistingPath(callerCwd);
+  const relative = path.relative(worktree, caller);
+  const callerInside = relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+  if (!callerInside) return callerCwd;
+  if (!sharedCheckoutMatchesCommonDir(sharedRepoRoot, commonDir)) {
+    throw new Error('Cannot leave the task worktree because the primary shared checkout could not be verified. The workspace was preserved.');
+  }
+  process.chdir(sharedRepoRoot);
+  return sharedRepoRoot;
+}
+
+function persistCleanupBlocker(
+  commonDir: string,
+  config: WorkflowConfig,
+  lock: TaskLock,
+  taskBindingId: string,
+  leaseToken: string,
+  requestId: string,
+  code: import('../state.ts').AutoCleanupBlockerCode,
+  reason: string,
+): void {
+  compareAndSetTaskLockWithWorkspaceLease(commonDir, config, {
+    taskSlug: lock.taskSlug,
+    taskBindingId,
+    leaseToken,
+    expectedCleanupRequestId: requestId,
+    update: (current) => ({
+      ...current,
+      cleanup: current.cleanup
+        ? { ...current.cleanup, status: 'blocked', attemptedAt: nowIso(), blockerCode: code, blockerReason: reason }
+        : current.cleanup,
+      updatedAt: nowIso(),
+    }),
+  });
+}
+
+export function executeTaskWorkspaceCleanup(options: {
+  commonDir: string;
+  config: WorkflowConfig;
+  sharedRepoRoot: string;
+  callerCwd: string;
+  lock: TaskLock;
+  automatic: boolean;
+  trigger: 'merge' | 'remote-base-reconcile' | 'manual';
+  force?: boolean;
+  allowIgnoredContent?: boolean;
+  remoteEvidence?: RemoteBaseEvidence | null;
+  workspaceLease?: TaskWorkspaceLease;
+}): CleanupOutcome {
+  const taskBindingId = options.lock.taskBindingId ?? '';
+  if (!taskBindingId) {
+    return { status: 'blocked', taskSlug: options.lock.taskSlug, code: 'state-conflict', reason: 'Task binding identity is missing.' };
+  }
+  if (options.automatic && options.lock.cleanup?.status === 'kept' && options.lock.cleanup.taskBindingId === taskBindingId) {
+    return { status: 'kept', taskSlug: options.lock.taskSlug, reason: 'operator-requested' };
+  }
+  const acquired = options.workspaceLease
+    ? { acquired: true as const, lease: options.workspaceLease }
+    : acquireTaskWorkspaceLease(options.commonDir, options.config, {
+        taskSlug: options.lock.taskSlug,
+        taskBindingId,
+        kind: 'cleanup',
+        command: options.trigger === 'merge' ? 'merge-cleanup' : 'clean',
+      });
+  if (acquired.acquired === false) {
+    return { status: 'blocked', taskSlug: options.lock.taskSlug, code: acquired.code, reason: acquired.reason };
+  }
+  const lease = acquired.lease;
+  if (lease.taskSlug !== options.lock.taskSlug || lease.taskBindingId !== taskBindingId) {
+    lease.release();
+    return { status: 'blocked', taskSlug: options.lock.taskSlug, code: 'state-conflict', reason: 'Workspace lease identity does not match cleanup task.' };
+  }
+  let requestId = '';
+  try {
+    const current = loadTaskLock(options.commonDir, options.config, options.lock.taskSlug);
+    if (!current || current.taskBindingId !== taskBindingId) {
+      return { status: 'blocked', taskSlug: options.lock.taskSlug, code: 'state-conflict', reason: 'Task lock changed before cleanup acquired ownership.' };
+    }
+    const branchHeadSha = runGit(options.sharedRepoRoot, ['rev-parse', '--verify', `refs/heads/${current.branchName}`], true)?.trim() ?? '';
+    const remote = options.remoteEvidence === undefined
+      ? refreshRemoteBaseEvidence(options.sharedRepoRoot, options.config, options.trigger === 'merge' ? 'merge-fetch' : 'reconcile-fetch')
+      : options.remoteEvidence;
+    const backfillError = backfillLegacyDeliveryForCleanup({
+      commonDir: options.commonDir,
+      config: options.config,
+      sharedRepoRoot: options.sharedRepoRoot,
+      lock: current,
+      taskBindingId,
+      branchHeadSha,
+      remote,
+    });
+    if (backfillError) {
+      return { status: 'blocked', taskSlug: current.taskSlug, code: 'state-conflict', reason: backfillError };
+    }
+    const proof = remote
+      ? resolveCleanupProof(options.commonDir, options.config, options.sharedRepoRoot, current, taskBindingId, branchHeadSha, remote)
+      : { proof: null, contained: false };
+    requestId = current.cleanup?.taskBindingId === taskBindingId && current.cleanup.status !== 'kept'
+      ? current.cleanup.requestId
+      : `cleanup-${crypto.randomUUID()}`;
+    const targetSha = proof.proof?.kind === 'merged-pr-head'
+      ? proof.proof.mergedSha
+      : proof.proof?.kind === 'remote-ancestor'
+        ? proof.proof.branchHeadSha
+        : branchHeadSha || remote?.sha || current.cleanup?.targetSha || '';
+    const intent = compareAndSetTaskLockWithWorkspaceLease(options.commonDir, options.config, {
+      taskSlug: current.taskSlug,
+      taskBindingId,
+      leaseToken: lease.token,
+      update: (latest) => ({
+        ...latest,
+        cleanup: {
+          status: 'pending',
+          requestId,
+          taskBindingId,
+          trigger: options.trigger,
+          requestedAt: latest.cleanup?.requestId === requestId ? latest.cleanup.requestedAt : nowIso(),
+          targetRef: remote?.ref ?? latest.cleanup?.targetRef ?? `refs/heads/${latest.branchName}`,
+          targetSha,
+        },
+        updatedAt: nowIso(),
+      }),
+    });
+    if (intent.updated === false) {
+      return { status: 'blocked', taskSlug: current.taskSlug, code: 'state-conflict', reason: `Could not persist cleanup intent (${intent.reason}).` };
+    }
+
+    if (!sharedCheckoutMatchesCommonDir(options.sharedRepoRoot, options.commonDir)) {
+      const reason = 'The primary shared checkout could not be verified against this repository.';
+      persistCleanupBlocker(options.commonDir, options.config, current, taskBindingId, lease.token, requestId, 'shared-checkout-unavailable', reason);
+      return { status: 'blocked', taskSlug: current.taskSlug, code: 'shared-checkout-unavailable', reason };
+    }
+
+    if (options.force) {
+      const artifacts = removeTaskArtifacts({
+        sharedRepoRoot: options.sharedRepoRoot,
+        worktreePath: current.worktreePath,
+        branchName: current.branchName,
+        callerCwd: options.callerCwd,
+        force: true,
+      });
+      if (artifacts.errors.length > 0 || !artifacts.worktreeRemoved || !artifacts.branchRemoved) {
+        const reason = artifacts.errors.join('; ') || 'Artifact removal did not complete.';
+        persistCleanupBlocker(options.commonDir, options.config, current, taskBindingId, lease.token, requestId, 'artifact-removal-failed', reason);
+        return { status: 'blocked', taskSlug: current.taskSlug, code: 'artifact-removal-failed', reason, worktreeRemoved: artifacts.worktreeRemoved, branchRemoved: artifacts.branchRemoved };
+      }
+      const removed = removeTaskLockWithWorkspaceLease(options.commonDir, options.config, {
+        taskSlug: current.taskSlug,
+        taskBindingId,
+        leaseToken: lease.token,
+        expectedCleanupRequestId: requestId,
+      });
+      if (!removed.removed) {
+        return { status: 'blocked', taskSlug: current.taskSlug, code: 'state-conflict', reason: `Artifacts were removed but task-lock CAS failed (${removed.reason}).`, worktreeRemoved: true, branchRemoved: true };
+      }
+      return { status: 'cleaned', taskSlug: current.taskSlug, worktreeRemoved: true, branchRemoved: true, warnings: artifacts.warnings };
+    }
+
+    const worktreeExists = existsSync(current.worktreePath);
+    const status = worktreeExists
+      ? inspectCleanupStatus({
+          worktreePath: current.worktreePath,
+          sharedRepoRoot: options.sharedRepoRoot,
+          disposableIgnoredPaths: options.config.cleanup?.disposableIgnoredPaths,
+        })
+      : { ok: true, trackedChanges: 0, untrackedEntries: [], ignoredEntries: [], protectedIgnoredEntries: [] };
+    if (options.allowIgnoredContent) status.protectedIgnoredEntries = [];
+    const observedBranchName = worktreeExists
+      ? runGit(current.worktreePath, ['branch', '--show-current'], true)?.trim() ?? ''
+      : '';
+    const assessment = assessTaskCleanup({
+      automatic: options.automatic,
+      automaticEnabled: automaticWorktreeCleanupEnabled(options.config),
+      lock: intent.lock,
+      taskBindingId,
+      sharedRepoRoot: options.sharedRepoRoot,
+      callerCwd: options.callerCwd,
+      worktreeExists,
+      observedBranchName,
+      branchHeadSha,
+      branchExists: Boolean(branchHeadSha),
+      status,
+      proof: proof.proof,
+      proofContained: proof.contained,
+      evidence: remote?.revision ?? null,
+    });
+    if (assessment.status === 'kept') return assessment;
+    if (assessment.status === 'blocked') {
+      persistCleanupBlocker(options.commonDir, options.config, current, taskBindingId, lease.token, requestId, assessment.code, assessment.reason);
+      return assessment;
+    }
+
+    const artifacts = removeTaskArtifacts({
+      sharedRepoRoot: options.sharedRepoRoot,
+      worktreePath: current.worktreePath,
+      branchName: current.branchName,
+      callerCwd: options.callerCwd,
+      force: false,
+      expectedBranchHeadSha: assessment.expectedBranchHeadSha,
+      branchDeletionAuthorized: true,
+      disposableIgnoredPaths: options.config.cleanup?.disposableIgnoredPaths,
+      requireNoIgnoredContent: !options.allowIgnoredContent,
+    });
+    if (artifacts.errors.length > 0 || !artifacts.worktreeRemoved || !artifacts.branchRemoved) {
+      const reason = artifacts.errors.join('; ') || 'Artifact removal did not complete.';
+      persistCleanupBlocker(options.commonDir, options.config, current, taskBindingId, lease.token, requestId, 'artifact-removal-failed', reason);
+      return { status: 'blocked', taskSlug: current.taskSlug, code: 'artifact-removal-failed', reason, worktreeRemoved: artifacts.worktreeRemoved, branchRemoved: artifacts.branchRemoved };
+    }
+    const removed = removeTaskLockWithWorkspaceLease(options.commonDir, options.config, {
+      taskSlug: current.taskSlug,
+      taskBindingId,
+      leaseToken: lease.token,
+      expectedCleanupRequestId: requestId,
+    });
+    if (!removed.removed) {
+      return { status: 'blocked', taskSlug: current.taskSlug, code: 'state-conflict', reason: `Artifacts were removed but task-lock CAS failed (${removed.reason}).`, worktreeRemoved: true, branchRemoved: true };
+    }
+    return { status: 'cleaned', taskSlug: current.taskSlug, worktreeRemoved: true, branchRemoved: true, warnings: artifacts.warnings };
+  } finally {
+    lease.release();
+  }
+}
+
+async function handleApplyDelivered(
+  cwd: string,
+  parsed: ParsedOperatorArgs,
+  commonDir: string,
+  config: WorkflowConfig,
+  sharedRepoRoot: string,
+): Promise<void> {
+  const result = reconcileDeliveredTaskWorkspaces({
+    commonDir,
+    config,
+    sharedRepoRoot,
+    callerCwd: cwd,
+    automatic: false,
+    minAgeMs: 0,
+  });
+  const { closed, skipped } = result;
+  const lines = closed.length > 0
+    ? [`Closed ${closed.length} delivered task workspace${closed.length === 1 ? '' : 's'}:`, ...closed.map((entry) => `- ${entry.taskSlug}`)]
+    : ['No delivered task workspaces were closed.'];
+  if (skipped.length > 0) {
+    lines.push('Kept:');
+    lines.push(...skipped.map((entry) => `- ${entry.taskSlug}: ${entry.status === 'cleaned' ? 'already cleaned' : entry.reason}`));
+  }
+  printResult(parsed.flags, { closed: closed.map((entry) => entry.taskSlug), skipped, artifacts: closed, message: lines.join('\n') });
+}
+
+export function reconcileDeliveredTaskWorkspaces(options: {
+  commonDir: string;
+  config: WorkflowConfig;
+  sharedRepoRoot: string;
+  callerCwd: string;
+  automatic: boolean;
+  taskSlugs?: string[];
+  minAgeMs?: number;
+  allowIgnoredContent?: boolean;
+}): { closed: CleanupOutcome[]; skipped: CleanupOutcome[]; remoteAvailable: boolean } {
+  if (options.automatic && !automaticWorktreeCleanupEnabled(options.config)) {
+    const requested = options.taskSlugs ? new Set(options.taskSlugs) : null;
+    const skipped: CleanupOutcome[] = requested
+      ? listActiveTaskLocks(options.commonDir, options.config)
+        .filter((lock) => requested.has(lock.taskSlug))
+        .map((lock) => ({ status: 'kept', taskSlug: lock.taskSlug, reason: 'automatic-cleanup-disabled' }))
+      : [];
+    return { closed: [], skipped, remoteAvailable: false };
+  }
+  const remote = refreshRemoteBaseEvidence(options.sharedRepoRoot, options.config, 'reconcile-fetch');
+  const requested = options.taskSlugs ? new Set(options.taskSlugs) : null;
+  const closed: CleanupOutcome[] = [];
+  const skipped: CleanupOutcome[] = [];
+  for (const observed of listActiveTaskLocks(options.commonDir, options.config)) {
+    if (requested && !requested.has(observed.taskSlug)) continue;
+    const lock = observed.taskBindingId ? observed : ensureTaskBindingId(options.commonDir, options.config, observed.taskSlug);
+    if (!lock?.taskBindingId) continue;
+    if (lock.cleanup?.status === 'kept') {
+      skipped.push({ status: 'kept', taskSlug: lock.taskSlug, reason: 'operator-requested' });
+      continue;
+    }
+    if (!isDeliveredReconciliationCandidate(options.commonDir, options.config, options.sharedRepoRoot, lock, remote) && !requested) {
+      continue;
+    }
+    const age = lockAgeMs(lock.updatedAt, Date.now());
+    const minAge = options.minAgeMs ?? readMinAgeOverride() ?? TASK_LOCK_MIN_PRUNE_AGE_MS;
+    if (age === null || age < minAge) {
+      skipped.push({ status: 'blocked', taskSlug: lock.taskSlug, code: age === null ? 'unparseable-updated-at' : 'lock-too-young', reason: age === null ? 'Task updatedAt is missing or invalid.' : `Task is below the ${Math.round(minAge / 1000)}s reconciliation floor.` });
+      continue;
+    }
+    const result = executeTaskWorkspaceCleanup({
+      commonDir: options.commonDir,
+      config: options.config,
+      sharedRepoRoot: options.sharedRepoRoot,
+      callerCwd: options.callerCwd,
+      lock,
+      automatic: options.automatic,
+      trigger: 'remote-base-reconcile',
+      remoteEvidence: remote,
+      allowIgnoredContent: options.allowIgnoredContent,
+    });
+    (result.status === 'cleaned' ? closed : skipped).push(result);
+  }
+  return { closed, skipped, remoteAvailable: remote !== null };
+}
+
+function isDeliveredReconciliationCandidate(
+  commonDir: string,
+  config: WorkflowConfig,
+  sharedRepoRoot: string,
+  lock: TaskLock,
+  remote: RemoteBaseEvidence | null,
+): boolean {
+  if (lock.cleanup) return true;
+  if (!remote || !lock.taskBindingId) return false;
+  const branchHeadSha = runGit(sharedRepoRoot, ['rev-parse', '--verify', `refs/heads/${lock.branchName}`], true)?.trim() ?? '';
+  if (findDeliveriesByTask(commonDir, config, lock.taskSlug, lock.taskBindingId).some((delivery) =>
+    delivery.branchName === lock.branchName
+    && delivery.prHeadSha === branchHeadSha
+    && gitObjectIsAncestor(sharedRepoRoot, delivery.mergedSha, remote.sha)
+  )) return true;
+  const legacy = loadPrState(commonDir, config).records[lock.taskSlug];
+  return Boolean(
+    legacy?.number
+    && prRecordMatchesTaskLock(legacy, lock)
+    && legacy.mergedSha
+    && gitObjectIsAncestor(sharedRepoRoot, legacy.mergedSha, remote.sha),
+  );
 }
 
 async function handleApplyCompletedWithIgnored(
@@ -158,44 +634,53 @@ async function handleApplyCompletedWithIgnored(
   config: WorkflowConfig,
   sharedRepoRoot: string,
 ): Promise<void> {
-  // Scope: every active task lock that pipelane already knows is
-  // prod-verified-merged, with the only blocker being ignored content
-  // (dist/, build outputs). Same safety chain as auto-cleanup, just opting
-  // into "I know there's build output here, please proceed."
-  const result = closeSafeCompletedTaskWorkspaces({
-    commonDir,
-    config,
-    sharedRepoRoot,
-    callerCwd: cwd,
-    minAgeMs: readMinAgeOverride(),
-    allowIgnoredContent: true,
-  });
+  const remote = refreshRemoteBaseEvidence(sharedRepoRoot, config, 'reconcile-fetch');
+  const closed: CleanupOutcome[] = [];
+  const skipped: CleanupOutcome[] = [];
+  for (const observed of listActiveTaskLocks(commonDir, config)) {
+    const lock = observed.taskBindingId ? observed : ensureTaskBindingId(commonDir, config, observed.taskSlug);
+    if (!lock?.taskBindingId) continue;
+    if (lock.cleanup?.status === 'kept') {
+      skipped.push({ status: 'kept', taskSlug: lock.taskSlug, reason: 'operator-requested' });
+      continue;
+    }
+    if (!isDeliveredReconciliationCandidate(commonDir, config, sharedRepoRoot, lock, remote)) {
+      continue;
+    }
+    const result = executeTaskWorkspaceCleanup({
+      commonDir,
+      config,
+      sharedRepoRoot,
+      callerCwd: cwd,
+      lock,
+      automatic: false,
+      trigger: 'manual',
+      allowIgnoredContent: true,
+      remoteEvidence: remote,
+    });
+    (result.status === 'cleaned' ? closed : skipped).push(result);
+  }
 
   const lines: string[] = [];
-  if (result.closed.length === 0) {
-    lines.push('No prod-verified task workspaces were eligible for cleanup with ignored content.');
+  if (closed.length === 0) {
+    lines.push('No delivered task workspaces were eligible for cleanup with ignored content.');
   } else {
-    lines.push(`Closed out ${result.closed.length} prod-verified task workspace${result.closed.length === 1 ? '' : 's'} (allowing ignored build output):`);
-    for (const entry of result.closed) {
-      const parts = ['lock'];
-      if (entry.worktreeRemoved) parts.push('worktree');
-      if (entry.branchRemoved) parts.push('branch');
-      lines.push(`- ${entry.taskSlug}: removed ${parts.join(' + ')}`);
-      for (const warning of entry.warnings) lines.push(`  note: ${warning}`);
-      for (const error of entry.errors) lines.push(`  ! ${error}`);
+    lines.push(`Closed out ${closed.length} delivered task workspace${closed.length === 1 ? '' : 's'} (allowing ignored build output):`);
+    for (const entry of closed) {
+      lines.push(`- ${entry.taskSlug}: removed worktree + branch + task lock`);
     }
   }
-  if (result.skipped.length > 0) {
+  if (skipped.length > 0) {
     lines.push('Kept for manual review:');
-    for (const entry of result.skipped) {
-      lines.push(`- ${entry.taskSlug}: ${entry.reason}`);
+    for (const entry of skipped) {
+      lines.push(`- ${entry.taskSlug}: ${entry.status === 'cleaned' ? 'already cleaned' : entry.reason}`);
     }
   }
 
   printResult(parsed.flags, {
-    closed: result.closed.map((entry) => entry.taskSlug),
-    skipped: result.skipped,
-    artifacts: result.closed,
+    closed: closed.map((entry) => entry.taskSlug),
+    skipped,
+    artifacts: closed,
     message: lines.join('\n'),
   });
 }
@@ -394,7 +879,9 @@ async function handleStatus(
     sharedRepoRoot,
     callerCwd: cwd,
     minAgeMs: readMinAgeOverride(),
-    dryRun: parsed.flags.statusOnly,
+    // Bare /clean and --status-only are both previews. No task lifecycle state
+    // or artifacts change without the explicit --apply boundary.
+    dryRun: true,
   });
   const activeLocks = listActiveTaskLocks(commonDir, config);
   const orphans = listOrphanWorktrees(commonDir, config);
@@ -415,18 +902,9 @@ async function handleStatus(
 
   const lines: string[] = [];
   if (autoCleanup.closed.length > 0) {
-    lines.push(parsed.flags.statusOnly ? 'Would close safe completed task workspaces:' : 'Closed out safe completed task workspaces:');
+    lines.push('Would close safe completed task workspaces:');
     for (const result of autoCleanup.closed) {
-      if (parsed.flags.statusOnly) {
-        lines.push(`- ${result.taskSlug}: would remove lock + worktree + branch`);
-        continue;
-      }
-      const parts = ['lock'];
-      if (result.worktreeRemoved) parts.push('worktree');
-      if (result.branchRemoved) parts.push('branch');
-      lines.push(`- ${result.taskSlug}: removed ${parts.join(' + ')}`);
-      for (const warning of result.warnings) lines.push(`  note: ${warning}`);
-      for (const error of result.errors) lines.push(`  ! ${error}`);
+      lines.push(`- ${result.taskSlug}: would remove lock + worktree + branch`);
     }
     lines.push('');
   }
@@ -466,14 +944,14 @@ async function handleStatus(
   } else {
     // No actionable categories — keep the user oriented with the flag list
     // so they can still drive the rare cases (--task <slug>, --all-stale).
-    lines.push(`${formatWorkflowCommand(config, 'clean')} closes completed, prod-verified task workspaces automatically when safety checks pass.`);
+    lines.push(`${formatWorkflowCommand(config, 'clean')} previews delivered task workspaces that pass the cleanup safety checks.`);
     lines.push(`Run ${formatWorkflowCommand(config, 'clean')} --status-only to preview cleanup without removing anything,`);
     lines.push(`Run ${formatWorkflowCommand(config, 'clean')} --apply --all-stale to prune every stale task lock,`);
     lines.push(`or ${formatWorkflowCommand(config, 'clean')} --apply --task <slug> to close out one task explicitly.`);
   }
 
   printResult(parsed.flags, {
-    autoCleaned: parsed.flags.statusOnly ? [] : autoCleanup.closed.map((entry) => entry.taskSlug),
+    autoCleaned: [],
     autoCleanCandidates: autoCleanup.closed.map((entry) => entry.taskSlug),
     autoCleanSkipped: autoCleanup.skipped,
     artifacts: autoCleanup.closed,
@@ -533,7 +1011,7 @@ function buildActionMenu(state: {
   }
   if (state.ignoredOnlyCandidates.length > 0) {
     items.push({
-      label: `Close out ${state.ignoredOnlyCandidates.length} prod-verified task workspace${pluralize(state.ignoredOnlyCandidates.length)} blocked only on ignored build output`,
+      label: `Close out ${state.ignoredOnlyCandidates.length} delivered task workspace${pluralize(state.ignoredOnlyCandidates.length)} blocked only on ignored build output`,
       command: `${state.cleanCommandPrefix} --apply --completed-with-ignored`,
       count: state.ignoredOnlyCandidates.length,
     });
@@ -744,54 +1222,14 @@ export interface ArtifactRemovalSummary {
   errors: string[];
 }
 
-function performArtifactRemoval(options: {
-  removed: RemovedTaskLock[];
-  sharedRepoRoot: string;
-  callerCwd: string;
-  force: boolean;
-  safeDeleteBranchRefs?: Map<string, string>;
-}): ArtifactRemovalSummary[] {
-  return options.removed.map((lock) => {
-    const result = removeTaskArtifacts({
-      sharedRepoRoot: options.sharedRepoRoot,
-      worktreePath: lock.worktreePath,
-      branchName: lock.branchName,
-      callerCwd: options.callerCwd,
-      force: options.force,
-      safeDeleteBranchRef: options.safeDeleteBranchRefs?.get(lock.taskSlug),
-    });
-    return {
-      taskSlug: lock.taskSlug,
-      worktreeRemoved: result.worktreeRemoved,
-      branchRemoved: result.branchRemoved,
-      warnings: result.warnings,
-      errors: result.errors,
-    };
-  });
-}
-
-export type AutoCleanupBlockerCode =
-  | 'lock-too-young'
-  | 'unparseable-updated-at'
-  | 'lock-missing'
-  | 'not-prod-verified'
-  | 'worktree-missing'
-  | 'caller-inside'
-  | 'branch-missing'
-  | 'detached'
-  | 'branch-mismatch'
-  | 'status-failed'
-  | 'uncommitted'
-  | 'ignored-content'
-  | 'tree-mismatch'
-  | 'busy';
+export type AutoCleanupBlockerCode = import('../state.ts').AutoCleanupBlockerCode;
 
 export interface AutoCleanupSkip {
   taskSlug: string;
   reason: string;
   // Structured blocker code — drives the action-menu categorization. The
   // 'ignored-content' code is what `/clean --apply --completed-with-ignored`
-  // targets: pipelane already verified prod-merge, the only thing left is
+  // targets: Pipelane already proved remote delivery, and the only thing left is
   // the operator's call on whether dist/build output should be discarded.
   code: AutoCleanupBlockerCode;
 }
@@ -808,282 +1246,136 @@ export function closeSafeCompletedTaskWorkspaces(options: {
   // safety chain still has to pass. Used by --completed-with-ignored.
   allowIgnoredContent?: boolean;
 }): { closed: ArtifactRemovalSummary[]; skipped: AutoCleanupSkip[] } {
-  const prRecords = loadPrState(options.commonDir, options.config).records;
-  const deployRecords = loadTrustedDeployRecords(options.commonDir, options.config);
-  const minAgeMs = options.minAgeMs ?? readMinAgeOverride() ?? TASK_LOCK_MIN_PRUNE_AGE_MS;
   const requestedTaskSlugs = options.taskSlugs
     ? [...new Set(options.taskSlugs.map((slug) => slug.trim()).filter(Boolean))]
     : null;
-  const requested = requestedTaskSlugs ? new Set(requestedTaskSlugs) : null;
-  const observed = new Set<string>();
-  const closed: ArtifactRemovalSummary[] = [];
-  const skipped: AutoCleanupSkip[] = [];
-
-  for (const observedLock of listActiveTaskLocks(options.commonDir, options.config)) {
-    if (requested && !requested.has(observedLock.taskSlug)) continue;
-    observed.add(observedLock.taskSlug);
-    let releaseCleanupLock: (() => void) | null = null;
-    if (!options.dryRun) {
-      const cleanupLock = acquireTaskCleanupLock(options.commonDir, options.config, observedLock.taskSlug);
-      if (cleanupLock.acquired === false) {
-        skipped.push({ taskSlug: observedLock.taskSlug, reason: cleanupLock.reason, code: 'busy' });
-        continue;
-      }
-      releaseCleanupLock = cleanupLock.release;
-    }
-
-    try {
-      const lock = options.dryRun
-        ? observedLock
-        : loadTaskLock(options.commonDir, options.config, observedLock.taskSlug);
-      if (!lock) {
-        skipped.push({
-          taskSlug: observedLock.taskSlug,
-          reason: 'task lock disappeared before auto-clean could inspect it',
-          code: 'busy',
-        });
-        continue;
-      }
-
-      const safeDeleteBranchRef = resolveVerifiedProdCleanupRef(lock, prRecords, deployRecords);
-      if (!safeDeleteBranchRef) {
-        if (requested) {
-          skipped.push({
-            taskSlug: lock.taskSlug,
-            reason: 'task has no merged PR SHA plus verified prod deploy evidence yet',
-            code: 'not-prod-verified',
-          });
-        }
-        continue;
-      }
-
-      const blocker = explainAutoCleanupBlocker({
-        lock,
-        safeDeleteBranchRef,
-        sharedRepoRoot: options.sharedRepoRoot,
-        callerCwd: options.callerCwd,
-        minAgeMs,
-        allowIgnoredContent: options.allowIgnoredContent === true,
-      });
-      if (blocker) {
-        skipped.push({ taskSlug: lock.taskSlug, reason: blocker.message, code: blocker.code });
-        continue;
-      }
-
-      if (options.dryRun) {
-        closed.push({
-          taskSlug: lock.taskSlug,
-          worktreeRemoved: false,
-          branchRemoved: false,
-          warnings: [],
-          errors: [],
-        });
-        continue;
-      }
-
-      const result = removeTaskArtifacts({
-        sharedRepoRoot: options.sharedRepoRoot,
-        worktreePath: lock.worktreePath,
-        branchName: lock.branchName,
-        callerCwd: options.callerCwd,
-        force: false,
-        safeDeleteBranchRef,
-      });
-      if (result.errors.length > 0 || !result.worktreeRemoved || !result.branchRemoved) {
-        skipped.push({
-          taskSlug: lock.taskSlug,
-          reason: result.errors.join('; ') || 'artifact removal did not complete',
-          code: 'busy',
-        });
-        continue;
-      }
-
-      const pruned = pruneDeadTaskLocks(options.commonDir, options.config, {
-        taskSlug: lock.taskSlug,
-        minAgeMs,
-      });
-      if (pruned.removed.length === 0) {
-        skipped.push({
-          taskSlug: lock.taskSlug,
-          reason: pruned.skipped[0]?.reason ?? 'lock was already removed before auto-clean could prune it',
-          code: 'busy',
-        });
-        continue;
-      }
-
-      closed.push({
-        taskSlug: lock.taskSlug,
-        worktreeRemoved: result.worktreeRemoved,
-        branchRemoved: result.branchRemoved,
-        warnings: result.warnings,
-        errors: result.errors,
-      });
-    } finally {
-      releaseCleanupLock?.();
-    }
+  if (options.dryRun) {
+    return previewDeliveredTaskWorkspaces({ ...options, taskSlugs: requestedTaskSlugs ?? undefined });
   }
-
-  if (requested) {
-    for (const taskSlug of requested) {
-      if (!observed.has(taskSlug)) {
-        skipped.push({
-          taskSlug,
-          reason: 'no active task lock found; task may already be cleaned',
-          code: 'lock-missing',
-        });
+  const result = reconcileDeliveredTaskWorkspaces({
+    commonDir: options.commonDir,
+    config: options.config,
+    sharedRepoRoot: options.sharedRepoRoot,
+    callerCwd: options.callerCwd,
+    automatic: true,
+    taskSlugs: requestedTaskSlugs ?? undefined,
+    minAgeMs: options.minAgeMs,
+    allowIgnoredContent: options.allowIgnoredContent,
+  });
+  const closed = result.closed.flatMap<ArtifactRemovalSummary>((entry) => entry.status === 'cleaned'
+    ? [{
+        taskSlug: entry.taskSlug,
+        worktreeRemoved: entry.worktreeRemoved,
+        branchRemoved: entry.branchRemoved,
+        warnings: entry.warnings,
+        errors: [],
+      }]
+    : []);
+  const skipped = result.skipped.flatMap<AutoCleanupSkip>((entry) => entry.status === 'blocked'
+    ? [{ taskSlug: entry.taskSlug, reason: entry.reason, code: entry.code }]
+    : entry.status === 'kept'
+      ? [{
+          taskSlug: entry.taskSlug,
+          reason: entry.reason === 'operator-requested' ? 'workspace retained by --keep-worktree' : 'automatic cleanup is disabled',
+          code: entry.reason === 'operator-requested' ? 'state-conflict' : 'automatic-cleanup-disabled',
+        }]
+      : []);
+  if (requestedTaskSlugs) {
+    const observed = new Set([...closed, ...skipped].map((entry) => entry.taskSlug));
+    for (const taskSlug of requestedTaskSlugs) {
+      if (!observed.has(taskSlug) && !loadTaskLock(options.commonDir, options.config, taskSlug)) {
+        skipped.push({ taskSlug, reason: 'no active task lock found; task may already be cleaned', code: 'lock-missing' });
       }
     }
   }
-
   return { closed, skipped };
 }
 
-function loadTrustedDeployRecords(commonDir: string, config: WorkflowConfig): DeployRecord[] {
-  const records = loadDeployState(commonDir, config).records.filter(isDeployRecordObject);
-  const stateKey = resolveDeployStateKey();
-  return stateKey ? records.filter((record) => verifyDeployRecord(record, stateKey)) : records;
-}
-
-function buildSafeDeleteBranchRefs(
-  removed: RemovedTaskLock[],
-  prRecords: Record<string, PrRecord>,
-  deployRecords: DeployRecord[],
-): Map<string, string> {
-  const refs = new Map<string, string>();
-  for (const lock of removed) {
-    const ref = resolveVerifiedProdCleanupRef(lock, prRecords, deployRecords);
-    if (ref) refs.set(lock.taskSlug, ref);
-  }
-  return refs;
-}
-
-function resolveVerifiedProdCleanupRef(
-  lock: Pick<TaskLock, 'taskSlug' | 'surfaces'>,
-  prRecords: Record<string, PrRecord>,
-  deployRecords: DeployRecord[],
-): string | null {
-  const mergedSha = normalizeGitSha(prRecords[lock.taskSlug]?.mergedSha);
-  if (!mergedSha) return null;
-  // No-deploy repos intentionally produce no prod DeployRecord. The recorded
-  // merge SHA is enough evidence, because branch deletion still requires the
-  // task branch tree to match this ref before using `git branch -D`.
-  if (Array.isArray(lock.surfaces) && lock.surfaces.length === 0) {
-    return mergedSha;
-  }
-
-  for (let index = deployRecords.length - 1; index >= 0; index -= 1) {
-    const record = deployRecords[index] as unknown;
-    if (!isDeployRecordObject(record)) continue;
-    if (deployRecordQualifiesForCleanup(record, lock.taskSlug, mergedSha, lock.surfaces)) {
-      return mergedSha;
-    }
-  }
-
-  return null;
-}
-
-function deployRecordQualifiesForCleanup(record: DeployRecord, taskSlug: string, mergedSha: string, requiredSurfaces: string[]): boolean {
-  if (record.environment !== 'prod') return false;
-  if (record.taskSlug !== taskSlug) return false;
-  if (normalizeGitSha(record.sha) !== mergedSha) return false;
-  if (record.status !== 'succeeded') return false;
-  if (!isValidIsoTimestamp(record.verifiedAt)) return false;
-  if (typeof record.configFingerprint !== 'string' || !/^[a-f0-9]{64}$/i.test(record.configFingerprint)) return false;
-  if (!Array.isArray(record.surfaces) || record.surfaces.length === 0) return false;
-  const surfacesRequired = Array.isArray(requiredSurfaces) ? requiredSurfaces : [];
-  if (!surfacesRequired.every((surface) => record.surfaces.includes(surface))) return false;
-  return record.surfaces.every((surface) => deployRecordSurfaceVerified(record, surface));
-}
-
-function deployRecordSurfaceVerified(record: DeployRecord, surface: string): boolean {
-  const perSurface = record.verificationBySurface?.[surface];
-  if (perSurface) return verificationPassed(perSurface);
-  if (surface === 'frontend' && record.verification) return verificationPassed(record.verification);
-  return false;
-}
-
-function explainAutoCleanupBlocker(options: {
-  lock: TaskLock;
-  safeDeleteBranchRef: string;
+function previewDeliveredTaskWorkspaces(options: {
+  commonDir: string;
+  config: WorkflowConfig;
   sharedRepoRoot: string;
   callerCwd: string;
-  minAgeMs: number;
-  allowIgnoredContent: boolean;
-}): { message: string; code: AutoCleanupBlockerCode } | null {
-  const ageMs = lockAgeMs(options.lock.updatedAt, Date.now());
-  if (ageMs === null) {
-    return {
-      message: `updatedAt is missing or unparseable ("${options.lock.updatedAt ?? ''}")`,
-      code: 'unparseable-updated-at',
-    };
-  }
-  if (ageMs < options.minAgeMs) {
-    return {
-      message: `updatedAt ${options.lock.updatedAt} is ${Math.round(ageMs / 1000)}s old — below the ${Math.round(options.minAgeMs / 1000)}s prune floor`,
-      code: 'lock-too-young',
-    };
-  }
-
-  if (!existsSync(options.lock.worktreePath)) {
-    return {
-      message: 'saved worktree is missing; use --apply --all-stale for stale lock pruning',
-      code: 'worktree-missing',
-    };
-  }
-  if (isSameOrInside(options.lock.worktreePath, options.callerCwd)) {
-    return {
-      message: `cannot remove worktree ${options.lock.worktreePath} while running inside it`,
-      code: 'caller-inside',
-    };
-  }
-
-  const branchExists = runGit(options.sharedRepoRoot, ['rev-parse', '--verify', `refs/heads/${options.lock.branchName}`], true);
-  if (!branchExists) {
-    return {
-      message: 'saved branch is missing; use --apply --all-stale for stale lock pruning',
-      code: 'branch-missing',
-    };
-  }
-
-  const worktreeBranch = runGit(options.lock.worktreePath, ['branch', '--show-current'], true)?.trim() ?? '';
-  if (!worktreeBranch) {
-    return {
-      message: `saved worktree ${options.lock.worktreePath} is detached or has no current branch`,
-      code: 'detached',
-    };
-  }
-  if (worktreeBranch !== options.lock.branchName) {
-    return {
-      message: `saved worktree branch ${worktreeBranch} does not match saved branch ${options.lock.branchName}`,
-      code: 'branch-mismatch',
-    };
-  }
-
-  const status = runCommandCapture('git', ['status', '--porcelain'], { cwd: options.lock.worktreePath });
-  if (!status.ok) {
-    return {
-      message: `could not inspect worktree status: ${status.stderr || status.stdout || 'git status failed'}`,
-      code: 'status-failed',
-    };
-  }
-  if (status.stdout.trim().length > 0) {
-    return { message: 'worktree has uncommitted or untracked changes', code: 'uncommitted' };
-  }
-  if (!options.allowIgnoredContent) {
-    const ignoredBlocker = explainIgnoredContentBlocker(options.lock.worktreePath);
-    if (ignoredBlocker) {
-      return { message: ignoredBlocker, code: 'ignored-content' };
+  taskSlugs?: string[];
+  minAgeMs?: number;
+  allowIgnoredContent?: boolean;
+}): { closed: ArtifactRemovalSummary[]; skipped: AutoCleanupSkip[] } {
+  const localRemoteRef = `origin/${options.config.baseBranch}`;
+  const localRemoteSha = runGit(options.sharedRepoRoot, ['rev-parse', '--verify', localRemoteRef], true)?.trim() ?? '';
+  const remote: RemoteBaseEvidence | null = localRemoteSha
+    ? {
+        ref: localRemoteRef,
+        sha: localRemoteSha,
+        revision: { remoteBaseSha: localRemoteSha, observedAt: nowIso(), source: 'snapshot-local' },
+      }
+    : null;
+  const requested = options.taskSlugs ? new Set(options.taskSlugs) : null;
+  const observed = new Set<string>();
+  const closed: ArtifactRemovalSummary[] = [];
+  const skipped: AutoCleanupSkip[] = [];
+  const minAge = options.minAgeMs ?? readMinAgeOverride() ?? TASK_LOCK_MIN_PRUNE_AGE_MS;
+  for (const lock of listActiveTaskLocks(options.commonDir, options.config)) {
+    if (requested && !requested.has(lock.taskSlug)) continue;
+    observed.add(lock.taskSlug);
+    if (!lock.taskBindingId) {
+      skipped.push({ taskSlug: lock.taskSlug, code: 'state-conflict', reason: 'Task binding identity is missing.' });
+      continue;
+    }
+    if (!isDeliveredReconciliationCandidate(options.commonDir, options.config, options.sharedRepoRoot, lock, remote)) continue;
+    const age = lockAgeMs(lock.updatedAt, Date.now());
+    if (age === null || age < minAge) {
+      skipped.push({
+        taskSlug: lock.taskSlug,
+        code: age === null ? 'unparseable-updated-at' : 'lock-too-young',
+        reason: age === null ? 'Task updatedAt is missing or invalid.' : `Task is below the ${Math.round(minAge / 1000)}s reconciliation floor.`,
+      });
+      continue;
+    }
+    const branchHeadSha = runGit(options.sharedRepoRoot, ['rev-parse', '--verify', `refs/heads/${lock.branchName}`], true)?.trim() ?? '';
+    const proof = remote
+      ? resolveCleanupProof(options.commonDir, options.config, options.sharedRepoRoot, lock, lock.taskBindingId, branchHeadSha, remote)
+      : { proof: null, contained: false };
+    const worktreeExists = existsSync(lock.worktreePath);
+    const status = worktreeExists
+      ? inspectCleanupStatus({
+          worktreePath: lock.worktreePath,
+          sharedRepoRoot: options.sharedRepoRoot,
+          disposableIgnoredPaths: options.config.cleanup?.disposableIgnoredPaths,
+        })
+      : { ok: true, trackedChanges: 0, untrackedEntries: [], ignoredEntries: [], protectedIgnoredEntries: [] };
+    if (options.allowIgnoredContent) status.protectedIgnoredEntries = [];
+    const assessment = assessTaskCleanup({
+      automatic: true,
+      automaticEnabled: automaticWorktreeCleanupEnabled(options.config),
+      lock,
+      taskBindingId: lock.taskBindingId,
+      sharedRepoRoot: options.sharedRepoRoot,
+      callerCwd: options.callerCwd,
+      worktreeExists,
+      observedBranchName: worktreeExists ? runGit(lock.worktreePath, ['branch', '--show-current'], true)?.trim() ?? '' : '',
+      branchHeadSha,
+      branchExists: Boolean(branchHeadSha),
+      status,
+      proof: proof.proof,
+      proofContained: proof.contained,
+      evidence: remote?.revision ?? null,
+    });
+    if (assessment.status === 'eligible') {
+      closed.push({ taskSlug: lock.taskSlug, worktreeRemoved: false, branchRemoved: false, warnings: [], errors: [] });
+    } else if (assessment.status === 'blocked') {
+      skipped.push({ taskSlug: lock.taskSlug, code: assessment.code, reason: assessment.reason });
+    } else {
+      skipped.push({
+        taskSlug: lock.taskSlug,
+        code: assessment.reason === 'automatic-cleanup-disabled' ? 'automatic-cleanup-disabled' : 'state-conflict',
+        reason: assessment.reason === 'automatic-cleanup-disabled' ? 'automatic cleanup is disabled' : 'workspace retained by --keep-worktree',
+      });
     }
   }
-
-  if (!branchTreeMatchesRef(options.sharedRepoRoot, options.lock.branchName, options.safeDeleteBranchRef)) {
-    return {
-      message: `branch tree differs from verified prod SHA ${options.safeDeleteBranchRef.slice(0, 7)}`,
-      code: 'tree-mismatch',
-    };
+  for (const taskSlug of requested ?? []) {
+    if (!observed.has(taskSlug)) skipped.push({ taskSlug, code: 'lock-missing', reason: 'no active task lock found; task may already be cleaned' });
   }
-
-  return null;
+  return { closed, skipped };
 }
 
 function lockAgeMs(updatedAt: string | undefined, now: number): number | null {
@@ -1091,37 +1383,6 @@ function lockAgeMs(updatedAt: string | undefined, now: number): number | null {
   const parsed = Date.parse(updatedAt);
   if (!Number.isFinite(parsed)) return null;
   return Math.max(0, now - parsed);
-}
-
-function normalizeGitSha(value: unknown): string | null {
-  if (typeof value !== 'string') return null;
-  const trimmed = value.trim();
-  return /^[a-f0-9]{7,40}$/i.test(trimmed) ? trimmed : null;
-}
-
-function isValidIsoTimestamp(value: unknown): boolean {
-  return typeof value === 'string' && value.trim().length > 0 && Number.isFinite(Date.parse(value));
-}
-
-function isDeployRecordObject(value: unknown): value is DeployRecord {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
-}
-
-function explainIgnoredContentBlocker(worktreePath: string): string | null {
-  const classification = classifyOrphan(worktreePath);
-  if (classification.treeState === 'unknown') {
-    return `could not inspect ignored worktree content (git status --ignored failed)`;
-  }
-  if (classification.ignoredEntries.length === 0) return null;
-  const sample = classification.ignoredEntries.slice(0, 3).join(', ');
-  const suffix = classification.ignoredEntries.length > 3 ? `, +${classification.ignoredEntries.length - 3} more` : '';
-  return `worktree has ignored local files (${sample}${suffix}); use --apply --completed-with-ignored or --apply --task <slug> when deleting ignored content is intentional`;
-}
-
-function isSameOrInside(parentPath: string, childPath: string): boolean {
-  const parent = normalizePath(parentPath);
-  const child = normalizePath(childPath);
-  return child === parent || child.startsWith(`${parent}${path.sep}`);
 }
 
 function formatOrphanLine(entry: OrphanWithMetadata): string {

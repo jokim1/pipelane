@@ -121,14 +121,18 @@ function resolveBranchRow(cwd: string, branchName: string): BranchRow {
   const currentBranch = runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
   const baseBranchSha = runGit(context.repoRoot, ['rev-parse', '--verify', `origin/${context.config.baseBranch}`], true)?.trim() ?? '';
   const checkedAt = nowIso();
+  const prState = loadPrState(context.commonDir, context.config);
   const rows = buildBranchRows({
     locks: loadAllTaskLocks(context.commonDir, context.config),
     config: context.config,
     repoRoot: context.repoRoot,
+    commonDir: context.commonDir,
+    callerCwd: context.repoRoot,
     currentBranch,
     baseBranch: context.config.baseBranch,
     baseBranchSha,
-    prRecords: loadPrState(context.commonDir, context.config).records,
+    prRecords: prState.records,
+    deliveries: Object.values(prState.deliveriesByPr ?? {}),
     deployRecords: loadDeployState(context.commonDir, context.config).records,
     mode: context.modeState.mode,
     checkedAt,

@@ -15,6 +15,7 @@ import {
 } from '../release-gate.ts';
 import {
   loadWorkflowConfig,
+  normalizeDisposableIgnoredPath,
   normalizeRouteSafetyConfig,
   patchReadableWorkflowConfig,
   resolveRepoRoot,
@@ -65,6 +66,9 @@ export interface ConfigureOptions {
   surfaceProductionDeployCommands?: Record<string, string>;
   surfaceProductionVerificationCommands?: Record<string, string>;
   surfaceProductionHealthchecks?: Record<string, string>;
+  automaticWorktreeCleanup?: boolean;
+  disposableIgnoredPaths?: string[];
+  clearDisposableIgnoredPaths?: boolean;
 }
 
 export interface ConfigureResult {
@@ -153,6 +157,30 @@ export function parseConfigureArgs(argv: string[]): ConfigureOptions {
     if (token === '--rotate-secrets') {
       options.provisionSecrets = true;
       options.rotateSecrets = true;
+      continue;
+    }
+    if (token.startsWith('--automatic-worktree-cleanup=')) {
+      options.automaticWorktreeCleanup = parseBool(
+        token.slice('--automatic-worktree-cleanup='.length),
+        '--automatic-worktree-cleanup',
+      );
+      continue;
+    }
+    if (token === '--automatic-worktree-cleanup') {
+      throw new Error('Flag --automatic-worktree-cleanup requires =true or =false.');
+    }
+    if (token.startsWith('--disposable-ignored-path=')) {
+      const value = token.slice('--disposable-ignored-path='.length);
+      if (!value.trim()) throw new Error('Flag --disposable-ignored-path requires a non-empty repository-relative root.');
+      options.disposableIgnoredPaths ??= [];
+      options.disposableIgnoredPaths.push(value);
+      continue;
+    }
+    if (token === '--disposable-ignored-path') {
+      throw new Error('Flag --disposable-ignored-path requires =<repo-relative-root>.');
+    }
+    if (token === '--clear-disposable-ignored-paths') {
+      options.clearDisposableIgnoredPaths = true;
       continue;
     }
     if (token.startsWith('--approve-secret-manifest=')) {
@@ -248,6 +276,48 @@ export async function handleConfigure(cwd: string, argv: string[]): Promise<Conf
   const workflowConfig = loadWorkflowConfig(repoRoot);
   const configPath = resolveSharedDeployConfigPath(repoRoot);
   const loadedConfig = loadDeployConfig(repoRoot) ?? emptyDeployConfig();
+  if (hasCleanupOverrides(options)) {
+    if (options.provisionSecrets || hasDeployOverrides(options)) {
+      throw new Error('Cleanup-policy flags are a standalone configure mode and cannot be combined with deploy-value or secret-provisioning flags.');
+    }
+    if (options.clearDisposableIgnoredPaths && (options.disposableIgnoredPaths?.length ?? 0) > 0) {
+      throw new Error('--clear-disposable-ignored-paths cannot be combined with --disposable-ignored-path.');
+    }
+    const normalizedRoots = options.disposableIgnoredPaths?.map((entry) => normalizeDisposableIgnoredPath(entry));
+    const cleanupWrite = patchReadableWorkflowConfig(repoRoot, (raw) => {
+      const currentCleanup = raw.cleanup && typeof raw.cleanup === 'object' && !Array.isArray(raw.cleanup)
+        ? raw.cleanup as Record<string, unknown>
+        : {};
+      return {
+        ...raw,
+        cleanup: {
+          ...currentCleanup,
+          ...(options.automaticWorktreeCleanup === undefined
+            ? {}
+            : { autoCloseDeliveredWorktrees: options.automaticWorktreeCleanup }),
+          ...(normalizedRoots === undefined && !options.clearDisposableIgnoredPaths
+            ? {}
+            : { disposableIgnoredPaths: options.clearDisposableIgnoredPaths ? [] : [...new Set(normalizedRoots)] }),
+        },
+      };
+    });
+    const effective = loadWorkflowConfig(repoRoot).cleanup;
+    const cleanupResult = {
+      automaticWorktreeCleanup: effective?.autoCloseDeliveredWorktrees !== false,
+      disposableIgnoredPaths: effective?.disposableIgnoredPaths ?? [],
+    };
+    if (options.json) {
+      process.stdout.write(`${JSON.stringify(cleanupResult, null, 2)}\n`);
+    } else {
+      process.stdout.write([
+        `Automatic worktree cleanup: ${cleanupResult.automaticWorktreeCleanup ? 'enabled' : 'disabled'}`,
+        `Disposable ignored roots: ${cleanupResult.disposableIgnoredPaths.length > 0 ? cleanupResult.disposableIgnoredPaths.join(', ') : '(none)'}`,
+        `Disable: pipelane configure --automatic-worktree-cleanup=false`,
+        `Re-enable: pipelane configure --automatic-worktree-cleanup=true`,
+      ].join('\n') + '\n');
+    }
+    return { repoRoot, configPath: cleanupWrite.configPath, config: loadedConfig };
+  }
   if (options.provisionSecrets) {
     if (options.json || hasDeployOverrides(options)) {
       throw new Error('--provision-secrets is a standalone configure mode and cannot be combined with --json or deploy-value flags.');
@@ -315,6 +385,12 @@ function hasDeployOverrides(options: ConfigureOptions): boolean {
     if (options[key] !== undefined) return true;
   }
   return false;
+}
+
+function hasCleanupOverrides(options: ConfigureOptions): boolean {
+  return options.automaticWorktreeCleanup !== undefined
+    || options.disposableIgnoredPaths !== undefined
+    || options.clearDisposableIgnoredPaths === true;
 }
 
 function registerContractCustomSurfaces(base: DeployConfig, surfaces: string[]): DeployConfig {
@@ -1232,6 +1308,9 @@ Usage:
   pipelane configure                 Interactive prompts for every field
   pipelane configure --json [flags]  Non-interactive; emits the final DeployConfig JSON
   pipelane configure --provision-secrets [--rotate-secrets] --approve-secret-manifest=<sha256>
+  pipelane configure --automatic-worktree-cleanup=true|false [--json]
+  pipelane configure --disposable-ignored-path=<root> [--disposable-ignored-path=<root> ...] [--json]
+  pipelane configure --clear-disposable-ignored-paths [--json]
 
 Repository-secret provisioning reads the app-owned
 .github/pipelane-provisioning.json manifest. Existing secrets are preserved by
@@ -1239,6 +1318,9 @@ default; --rotate-secrets explicitly replaces every declared value. Pipelane
 does not require secrets or a corpus in repositories without this manifest.
 
 Flags (all optional; any omitted field keeps its current value):
+  --automatic-worktree-cleanup=true|false
+  --disposable-ignored-path=<repo-relative-root>  Repeatable; replaces the configured set
+  --clear-disposable-ignored-paths
   --platform=<value>
   --frontend-production-url=<url>
   --frontend-production-workflow=<name>

@@ -255,6 +255,7 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
   prUrl = refreshedPr?.url ?? prUrl;
 
   savePrRecord(context.commonDir, context.config, taskSlug, {
+    ...(lock?.taskBindingId ? { taskBindingId: lock.taskBindingId } : {}),
     branchName,
     title: prTitle,
     number: prNumber,

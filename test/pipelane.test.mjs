@@ -4086,6 +4086,29 @@ test('new creates a fresh task workspace and resume restores it', () => {
   }
 });
 
+test('new reconciliation preserves clean task workspaces without delivery identity', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Delivery Candidate Safety');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const idle = JSON.parse(runCli(['run', 'new', '--task', 'Idle Task', '--json'], repoRoot).stdout);
+    const idleLockPath = path.join(sharedStateDir(repoRoot), 'task-locks', `${idle.taskSlug}.json`);
+
+    runCli(
+      ['run', 'new', '--task', 'Next Task', '--json'],
+      repoRoot,
+      { PIPELANE_CLEAN_MIN_AGE_MS: '0' },
+    );
+
+    assert.equal(existsSync(idle.worktreePath), true, 'remote ancestry alone must not make an idle task disposable');
+    assert.equal(existsSync(idleLockPath), true);
+    assert.equal(localBranchExists(repoRoot, idle.branch), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('adopt claims an externally-created worktree and resume restores it', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const externalParent = mkdtempSync(path.join(os.tmpdir(), 'pipelane-external-worktree-'));
@@ -17997,12 +18020,17 @@ function upsertPrRecord(repoRoot, taskSlug, mergedSha, options = {}) {
   const state = existsSync(targetPath)
     ? JSON.parse(readFileSync(targetPath, 'utf8'))
     : { records: {} };
+  const number = options.number ?? Math.max(
+    0,
+    ...Object.values(state.records).map((record) => Number(record.number) || 0),
+  ) + 1;
   state.records[taskSlug] = {
     taskSlug,
     branchName: options.branchName || run('git', ['branch', '--show-current'], repoRoot),
     title: options.title || 'Deploy gate test',
-    number: options.number ?? 1,
-    url: options.url || `https://example.test/pr/${options.number ?? 1}`,
+    number,
+    url: options.url || `https://example.test/pr/${number}`,
+    ...(options.taskBindingId ? { taskBindingId: options.taskBindingId } : {}),
     mergedSha,
     mergedAt: options.mergedAt || '2026-04-22T00:00:00Z',
     updatedAt: options.updatedAt || '2026-04-22T00:00:00Z',
@@ -18181,11 +18209,13 @@ async function writeSucceededDeployRecord(repoRoot, environment, sha, surfaces =
 async function createVerifiedAutoCleanCandidate(repoRoot, taskName, taskSlug, options = {}) {
   const created = JSON.parse(runCli(['run', 'new', '--task', taskName, '--json'], repoRoot).stdout);
   const mergedSha = options.mergedSha || run('git', ['rev-parse', 'HEAD'], repoRoot);
-  writePrRecord(repoRoot, taskSlug, mergedSha);
-
   const stateDir = path.join(sharedStateDir(repoRoot));
   const lockPath = path.join(stateDir, 'task-locks', `${taskSlug}.json`);
   const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+  upsertPrRecord(repoRoot, taskSlug, mergedSha, {
+    branchName: created.branch,
+    taskBindingId: lock.taskBindingId,
+  });
   await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, options.deploySurfaces || lock.surfaces, { taskSlug });
   if (Object.prototype.hasOwnProperty.call(options, 'updatedAt')) {
     if (options.updatedAt === undefined) {
@@ -18199,7 +18229,7 @@ async function createVerifiedAutoCleanCandidate(repoRoot, taskName, taskSlug, op
   if (options.branchName) lock.branchName = options.branchName;
   writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`, 'utf8');
 
-  return { created, lockPath, stateDir, mergedSha };
+  return { created, lockPath, stateDir, mergedSha, taskBindingId: lock.taskBindingId };
 }
 
 async function writeStagingSucceededRecord(repoRoot, surfaces, options = {}) {
@@ -19551,8 +19581,8 @@ test('pr, merge, deploy, and task-lock work with a fake gh adapter', () => {
 
     const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
     assert.equal(merged.mergedSha, 'deadbeefcafebabe');
-    assert.match(merged.message, /Build mode: the live environment updates automatically from main after merge/);
-    assert.match(merged.message, /Merge to the base branch is the delivery step/);
+    assert.match(merged.message, /Build delivery is complete from main/);
+    assert.match(merged.message, /Workspace cleanup blocked/);
 
     const firstDeploy = JSON.parse(runCli(['run', 'deploy', 'prod', '--async', '--json'], created.worktreePath, env).stdout);
     assert.equal(firstDeploy.status, 'requested');
@@ -19571,6 +19601,372 @@ test('pr, merge, deploy, and task-lock work with a fake gh adapter', () => {
     assert.ok(ghState.workflows[0].args.includes('sha=deadbeefcafebabe'));
     assert.ok(ghState.workflows[0].args.includes('surfaces=frontend,edge,sql'));
     assert.ok(ghState.workflows[0].args.includes('bypass_staging_guard=true'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('merge closes a clean managed workspace and persists immutable delivery history', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_PR_MERGE_PUSH_HEAD: '1',
+  };
+  try {
+    writePipelaneConfig(repoRoot, 'Automatic Closeout');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Automatic Closeout', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'close me\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Automatic Closeout', '--json'], created.worktreePath, env);
+    const branchHead = run('git', ['rev-parse', 'HEAD'], created.worktreePath);
+
+    const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
+    assert.equal(merged.mergedSha, branchHead);
+    assert.equal(merged.cleanup.status, 'cleaned');
+    assert.match(merged.message, /Workspace cleanup: removed worktree \+ local branch \+ task lock/);
+    assert.equal(merged.message.includes(`Continue from: ${realpathSync(repoRoot)}`), true);
+    assert.equal(existsSync(created.worktreePath), false);
+    assert.equal(localBranchExists(repoRoot, created.branch), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`)), false);
+
+    const prState = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'pr-state.json'), 'utf8'));
+    assert.equal(prState.deliveriesByPr['1'].ownership, 'managed-task');
+    assert.equal(prState.deliveriesByPr['1'].taskSlug, created.taskSlug);
+    assert.equal(prState.deliveriesByPr['1'].prHeadSha, branchHead);
+    assert.equal(prState.deliveriesByPr['1'].mergedSha, branchHead);
+
+    const snapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    const deliveredRow = snapshot.data.branches.find((entry) => entry.pr?.number === 1);
+    assert.equal(deliveredRow.status, 'delivered');
+    assert.equal(deliveredRow.task, null, 'delivery history must remain visible after the task lock is removed');
+    assert.equal(deliveredRow.cleanup.tag, 'closed');
+    const prodAction = deliveredRow.availableActions.find((action) => action.id === 'deploy.prod');
+    assert.deepEqual(prodAction.defaultParams, { pr: '1' }, 'post-cleanup deploy actions must target immutable PR identity');
+
+    const details = JSON.parse(runCli(['run', 'api', 'branch', '--branch', created.branch], repoRoot).stdout);
+    const withoutFreshnessTimestamps = (actions) => actions.map(({ freshness, ...action }) => ({
+      ...action,
+      freshness: { state: freshness.state },
+    }));
+    assert.deepEqual(
+      withoutFreshnessTimestamps(details.data.branch.availableActions),
+      withoutFreshnessTimestamps(deliveredRow.availableActions),
+      'branch detail and snapshot must project identical actions after cleanup',
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('merge retry finalizes durable delivery identity after a crash following the remote squash merge', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_PR_MERGE_PUSH_HEAD: '1',
+  };
+  try {
+    writePipelaneConfig(repoRoot, 'Crash-safe Merge Intent');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Crash-safe Merge Intent', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'survive the crash window\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Crash-safe Merge Intent', '--json'], created.worktreePath, env);
+    const branchHead = run('git', ['rev-parse', 'HEAD'], created.worktreePath);
+
+    const crashed = runCli(['run', 'merge', '--json'], created.worktreePath, {
+      ...env,
+      PIPELANE_MERGE_CRASH_AFTER_REMOTE_MERGE: '1',
+    }, true);
+    assert.equal(crashed.status, 1);
+    assert.match(crashed.stderr, /Injected crash after remote merge and before delivery finalization/);
+    const pendingState = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'pr-state.json'), 'utf8'));
+    assert.equal(pendingState.deliveryIntentsByPr['1'].prHeadSha, branchHead);
+    assert.equal(pendingState.deliveriesByPr?.['1'], undefined);
+
+    const recovered = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
+    assert.equal(recovered.mergedSha, branchHead);
+    assert.match(recovered.message, /Recovered durable delivery intent for already-merged PR #1/);
+    const finalState = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'pr-state.json'), 'utf8'));
+    assert.equal(finalState.deliveryIntentsByPr, undefined);
+    assert.equal(finalState.deliveriesByPr['1'].prHeadSha, branchHead);
+    assert.equal(finalState.records[created.taskSlug].mergedSha, branchHead);
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.prMergeCalls.length, 1, 'recovery must not issue a second remote merge');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('merge refuses to reconcile an already-merged PR without durable pre-merge intent', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+  try {
+    writePipelaneConfig(repoRoot, 'Missing Merge Intent');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Missing Merge Intent', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'remote merge without local intent\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Missing Merge Intent', '--json'], created.worktreePath, env);
+    const branchHead = run('git', ['rev-parse', 'HEAD'], created.worktreePath);
+    run('git', ['push', 'origin', 'HEAD:refs/heads/main'], created.worktreePath);
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    ghState.prs[created.branch].state = 'MERGED';
+    ghState.prs[created.branch].mergeCommit = { oid: branchHead };
+    ghState.prs[created.branch].mergedAt = '2026-04-13T00:00:00Z';
+    writeFileSync(ghStateFile, `${JSON.stringify(ghState, null, 2)}\n`, 'utf8');
+
+    const rejected = runCli(['run', 'merge', '--pr', '1', '--json'], created.worktreePath, env, true);
+    assert.equal(rejected.status, 1);
+    assert.match(rejected.stderr, /no durable pre-merge delivery intent exists/);
+    const prState = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'pr-state.json'), 'utf8'));
+    assert.equal(prState.deliveriesByPr?.['1'], undefined);
+    assert.equal(existsSync(created.worktreePath), true);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`)), true);
+    assert.equal(JSON.parse(readFileSync(ghStateFile, 'utf8')).prMergeCalls.length, 0);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('merge refuses crash recovery when durable intent no longer matches the task binding', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_PR_MERGE_PUSH_HEAD: '1',
+  };
+  try {
+    writePipelaneConfig(repoRoot, 'Mismatched Merge Intent');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Mismatched Merge Intent', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'crash before intent mismatch\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Mismatched Merge Intent', '--json'], created.worktreePath, env);
+    const crashed = runCli(['run', 'merge', '--json'], created.worktreePath, {
+      ...env,
+      PIPELANE_MERGE_CRASH_AFTER_REMOTE_MERGE: '1',
+    }, true);
+    assert.equal(crashed.status, 1);
+
+    const prStatePath = path.join(sharedStateDir(repoRoot), 'pr-state.json');
+    const prState = JSON.parse(readFileSync(prStatePath, 'utf8'));
+    prState.deliveryIntentsByPr['1'].taskBindingId = 'mismatched-binding';
+    writeFileSync(prStatePath, `${JSON.stringify(prState, null, 2)}\n`, 'utf8');
+
+    const rejected = runCli(['run', 'merge', '--json'], created.worktreePath, env, true);
+    assert.equal(rejected.status, 1);
+    assert.match(rejected.stderr, /does not match the current task binding and merge target/);
+    const finalState = JSON.parse(readFileSync(prStatePath, 'utf8'));
+    assert.equal(finalState.deliveriesByPr?.['1'], undefined);
+    assert.equal(existsSync(created.worktreePath), true);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`)), true);
+    assert.equal(JSON.parse(readFileSync(ghStateFile, 'utf8')).prMergeCalls.length, 1, 'recovery never issues a second merge');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('reusing a cleaned task slug cannot inherit the prior PR identity or merged SHA', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_PR_MERGE_PUSH_HEAD: '1',
+  };
+  try {
+    writePipelaneConfig(repoRoot, 'Task Slug Reuse');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const first = JSON.parse(runCli(['run', 'new', '--task', 'Reusable Task', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(first.worktreePath, 'first.txt'), 'first delivery\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'First Reusable Task', '--json'], first.worktreePath, env);
+    runCli(['run', 'merge', '--json'], first.worktreePath, env);
+
+    const second = JSON.parse(runCli(['run', 'new', '--task', 'Reusable Task', '--json'], repoRoot).stdout);
+    assert.notEqual(second.branch, first.branch);
+    writeFileSync(path.join(second.worktreePath, 'second.txt'), 'second delivery\n', 'utf8');
+    const plan = JSON.parse(runCli(
+      ['run', 'deploy', 'staging', '--plan', '--json'],
+      second.worktreePath,
+      env,
+      true,
+    ).stdout);
+    assert.ok(plan.remainingSteps.some((step) => step.id === 'pr'));
+    assert.ok(plan.remainingSteps.some((step) => step.id === 'merge'));
+
+    writePassingReviewEvidence(second.worktreePath);
+    runCli(['run', 'pr', '--title', 'Second Reusable Task', '--json'], second.worktreePath, env);
+    const prState = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'pr-state.json'), 'utf8'));
+    const record = prState.records[second.taskSlug];
+    assert.equal(record.branchName, second.branch);
+    assert.equal(record.taskBindingId, JSON.parse(readFileSync(
+      path.join(sharedStateDir(repoRoot), 'task-locks', `${second.taskSlug}.json`),
+      'utf8',
+    )).taskBindingId);
+    assert.equal(record.number, 2);
+    assert.equal(record.mergedSha, undefined);
+    assert.equal(record.mergedAt, undefined);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('merge --keep-worktree is durable until explicit scoped clean', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_PR_MERGE_PUSH_HEAD: '1',
+  };
+  try {
+    writePipelaneConfig(repoRoot, 'Durable Retention');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Durable Retention', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'retain me\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Durable Retention', '--json'], created.worktreePath, env);
+    const merged = JSON.parse(runCli(['run', 'merge', '--keep-worktree', '--json'], created.worktreePath, env).stdout);
+    assert.equal(merged.cleanup.status, 'kept');
+    assert.equal(existsSync(created.worktreePath), true);
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`);
+    assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).cleanup.status, 'kept');
+
+    runCli(['run', 'adopt', '--json'], created.worktreePath);
+    assert.equal(
+      JSON.parse(readFileSync(lockPath, 'utf8')).cleanup.status,
+      'kept',
+      're-adopting the same binding must preserve durable retention',
+    );
+
+    runCli(['run', 'clean', '--status-only', '--json'], repoRoot, { PIPELANE_CLEAN_MIN_AGE_MS: '0' });
+    runCli(['run', 'new', '--task', 'Unrelated Followup', '--json'], repoRoot, { PIPELANE_CLEAN_MIN_AGE_MS: '0' });
+    assert.equal(existsSync(created.worktreePath), true, 'preview and /new reconciliation must respect durable retention');
+    assert.equal(existsSync(lockPath), true);
+
+    const cleaned = JSON.parse(runCli(['run', 'clean', '--apply', '--task', created.taskSlug, '--json'], repoRoot).stdout);
+    assert.equal(cleaned.cleanup.status, 'cleaned');
+    assert.equal(existsSync(created.worktreePath), false);
+    assert.equal(existsSync(lockPath), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('api merge forwards --keep-worktree through confirmed execution', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_PR_MERGE_PUSH_HEAD: '1',
+  };
+  try {
+    writePipelaneConfig(repoRoot, 'API Durable Retention');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'API Durable Retention', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'retain through api\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'API Durable Retention', '--json'], created.worktreePath, env);
+
+    const preflight = JSON.parse(runCli(
+      ['run', 'api', 'action', 'merge', '--keep-worktree'],
+      created.worktreePath,
+      env,
+    ).stdout);
+    assert.equal(preflight.data.preflight.normalizedInputs.keepWorktree, true);
+    assert.match(preflight.data.preflight.warnings.join('\n'), /retain the task worktree/);
+    const token = preflight.data.preflight.confirmation.token;
+
+    const executed = runCli([
+      'run', 'api', 'action', 'merge', '--keep-worktree',
+      '--execute', '--confirm-token', token,
+    ], created.worktreePath, env);
+    assert.equal(executed.status, 0);
+    assert.equal(existsSync(created.worktreePath), true);
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`);
+    assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).cleanup.status, 'kept');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('machine-local cleanup kill switch preserves merge delivery and shared-checkout deploy resumes by PR', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_PR_MERGE_PUSH_HEAD: '1',
+  };
+  try {
+    writePipelaneConfig(repoRoot, 'Cleanup Kill Switch');
+    writeFullDeployConfigState(repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.buildMode.autoDeployOnMerge = false;
+    });
+    runCli(['configure', '--automatic-worktree-cleanup=false'], repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Cleanup Kill Switch', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'policy off\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Cleanup Kill Switch', '--json'], created.worktreePath, env);
+    const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
+    assert.equal(merged.cleanup.status, 'kept');
+    assert.equal(merged.cleanup.reason, 'automatic-cleanup-disabled');
+    assert.equal(existsSync(created.worktreePath), true);
+
+    runCli(['configure', '--automatic-worktree-cleanup=true'], repoRoot);
+    const cleaned = JSON.parse(runCli(['run', 'clean', '--apply', '--task', created.taskSlug, '--json'], repoRoot).stdout);
+    assert.equal(cleaned.cleanup.status, 'cleaned');
+    const before = {
+      branch: run('git', ['branch', '--show-current'], repoRoot),
+      head: run('git', ['rev-parse', 'HEAD'], repoRoot),
+      status: run('git', ['status', '--porcelain=v1'], repoRoot),
+    };
+    const deployed = JSON.parse(runCli(['run', 'deploy', 'prod', '--pr', '1', '--async', '--json'], repoRoot, env).stdout);
+    assert.equal(deployed.sha, merged.mergedSha);
+    assert.equal(deployed.taskSlug, created.taskSlug);
+    assert.deepEqual({
+      branch: run('git', ['branch', '--show-current'], repoRoot),
+      head: run('git', ['rev-parse', 'HEAD'], repoRoot),
+      status: run('git', ['status', '--porcelain=v1'], repoRoot),
+    }, before, 'delivery deploy must not mutate the shared checkout');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -21364,7 +21760,7 @@ test('fix tokens enforce one no-change attempt, expiry, mismatch, and atomic con
       runCliAsync(concurrentArgs, created.worktreePath),
     ]);
     assert.deepEqual(concurrent.map((result) => result.status).sort(), [0, 1]);
-    assert.match(concurrent.find((result) => result.status === 1).stderr, /already consumed; replay is not allowed|route safety state is locked/);
+    assert.match(concurrent.find((result) => result.status === 1).stderr, /already consumed; replay is not allowed|route safety state is locked|is in use by resume/);
     route = latestRouteSafetyRecord(created.worktreePath);
     assert.equal(route.fixAttempts.filter((attempt) => attempt.tokenDigest === createHash('sha256').update(concurrentToken).digest('hex') && attempt.consumedAt).length, 1);
 
@@ -21882,8 +22278,682 @@ test('legacy task locks receive one deterministic binding id without invented in
     assert.equal(second.taskBindingId, expected);
     assert.equal(first.taskBrief, undefined, 'migration must not promote a task label into authoritative intent');
     assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'task-binding-locks', 'legacy-binding.lock')), false);
+    const legacyPrRecord = {
+      taskSlug: legacyLock.taskSlug,
+      branchName: legacyLock.branchName,
+      title: 'Legacy delivery',
+      number: 1,
+      mergedSha: run('git', ['rev-parse', 'HEAD'], repoRoot),
+      mergedAt: '2026-01-02T03:04:05.000Z',
+      updatedAt: '2026-01-02T03:04:05.000Z',
+    };
+    assert.equal(state.prRecordMatchesTaskLock(legacyPrRecord, first), true);
+    state.savePrState(context.commonDir, context.config, {
+      records: { [legacyLock.taskSlug]: legacyPrRecord },
+      deliveriesByPr: {},
+    });
+    const migratedPrRecord = state.savePrRecord(context.commonDir, context.config, legacyLock.taskSlug, {
+      ...legacyPrRecord,
+      taskBindingId: first.taskBindingId,
+    });
+    assert.equal(migratedPrRecord.taskBindingId, first.taskBindingId, 'the next exact save persists the legacy record binding');
+    assert.equal(
+      state.prRecordMatchesTaskLock(legacyPrRecord, {
+        ...first,
+        taskBindingId: state.newTaskBindingId(),
+        branchName: 'codex/reused-task-new-generation',
+      }),
+      false,
+      'a new task generation with a different branch must not inherit the legacy delivery record',
+    );
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('automatic cleanup configuration is machine-local, durable, and validates exact roots', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Cleanup Policy');
+    const disabled = JSON.parse(runCli([
+      'configure',
+      '--automatic-worktree-cleanup=false',
+      '--json',
+    ], repoRoot).stdout);
+    assert.equal(disabled.automaticWorktreeCleanup, false);
+
+    const configured = JSON.parse(runCli([
+      'configure',
+      '--automatic-worktree-cleanup=true',
+      '--disposable-ignored-path=dist/cache',
+      '--disposable-ignored-path=tmp/generated',
+      '--json',
+    ], repoRoot).stdout);
+    assert.equal(configured.automaticWorktreeCleanup, true);
+    assert.deepEqual(configured.disposableIgnoredPaths, ['dist/cache', 'tmp/generated']);
+
+    const persisted = JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8'));
+    assert.deepEqual(persisted.cleanup, {
+      autoCloseDeliveredWorktrees: true,
+      disposableIgnoredPaths: ['dist/cache', 'tmp/generated'],
+    });
+    const invalid = runCli(['configure', '--disposable-ignored-path=../escape', '--json'], repoRoot, {}, true);
+    assert.equal(invalid.status, 1);
+    assert.match(invalid.stderr, /Parent traversal/);
+    assert.deepEqual(JSON.parse(readFileSync(machinePipelaneConfigPath(repoRoot), 'utf8')).cleanup, persisted.cleanup);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('immutable delivery history preserves concurrent distinct PR writes and rejects conflicts', async () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Delivery History');
+    const stateUrl = pathToFileURL(path.join(KIT_ROOT, 'src', 'operator', 'state.ts')).href;
+    const childSource = `
+      const state = await import(process.env.TEST_STATE_URL);
+      const context = state.resolveWorkflowContext(process.env.TEST_REPO);
+      const prNumber = Number(process.env.TEST_PR);
+      state.saveDeliveryRecord(context.commonDir, context.config, {
+        prNumber,
+        ownership: 'managed-task',
+        taskSlug: 'delivery-' + prNumber,
+        taskBindingId: 'binding-' + prNumber,
+        branchName: 'codex/delivery-' + prNumber,
+        mode: 'build',
+        surfaces: ['frontend'],
+        baseBranch: 'main',
+        prHeadSha: String(prNumber).repeat(40).slice(0, 40),
+        mergedSha: String(prNumber + 2).repeat(40).slice(0, 40),
+        mergedAt: '2026-07-16T00:00:00.000Z',
+        title: 'Delivery ' + prNumber,
+        url: 'https://example.test/pr/' + prNumber,
+      });
+    `;
+    const runWriter = (prNumber) => new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['--input-type=module', '-e', childSource], {
+        cwd: repoRoot,
+        env: buildCliChildEnv({
+          TEST_STATE_URL: stateUrl,
+          TEST_REPO: repoRoot,
+          TEST_PR: String(prNumber),
+        }),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stderr = '';
+      child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+      child.on('error', reject);
+      child.on('exit', (code) => code === 0 ? resolve() : reject(new Error(stderr || `writer exited ${code}`)));
+    });
+    await Promise.all([runWriter(1), runWriter(2)]);
+
+    const state = await import(stateUrl);
+    const context = state.resolveWorkflowContext(repoRoot);
+    assert.equal(state.loadDeliveryByPr(context.commonDir, context.config, 1)?.taskSlug, 'delivery-1');
+    assert.equal(state.loadDeliveryByPr(context.commonDir, context.config, 2)?.taskSlug, 'delivery-2');
+    const first = state.loadDeliveryByPr(context.commonDir, context.config, 1);
+    assert.doesNotThrow(() => state.saveDeliveryRecord(context.commonDir, context.config, first));
+    assert.throws(
+      () => state.saveDeliveryRecord(context.commonDir, context.config, { ...first, mergedSha: 'f'.repeat(40) }),
+      /immutable delivery history was preserved/,
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('workspace lease blocks a second live owner and releases by exact token', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Workspace Lease');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Lease Target', '--json'], repoRoot).stdout);
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = state.resolveWorkflowContext(repoRoot);
+    const lock = state.loadTaskLock(context.commonDir, context.config, created.taskSlug);
+    const first = state.acquireTaskWorkspaceLease(context.commonDir, context.config, {
+      taskSlug: lock.taskSlug,
+      taskBindingId: lock.taskBindingId,
+      command: 'first-owner',
+    });
+    assert.equal(first.acquired, true);
+    const second = state.acquireTaskWorkspaceLease(context.commonDir, context.config, {
+      taskSlug: lock.taskSlug,
+      taskBindingId: lock.taskBindingId,
+      command: 'second-owner',
+    });
+    assert.equal(second.acquired, false);
+    assert.equal(second.code, 'workspace-busy');
+    assert.equal(first.lease.release(), true);
+    const third = state.acquireTaskWorkspaceLease(context.commonDir, context.config, {
+      taskSlug: lock.taskSlug,
+      taskBindingId: lock.taskBindingId,
+      command: 'third-owner',
+    });
+    assert.equal(third.acquired, true);
+    assert.equal(third.lease.release(), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('delegated workspace leases reject identity mismatches and consume authorization environment', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+  const envKeys = [
+    state.WORKSPACE_LEASE_TOKEN_ENV,
+    state.WORKSPACE_LEASE_TASK_ENV,
+    state.WORKSPACE_LEASE_BINDING_ENV,
+    state.WORKSPACE_LEASE_OWNER_COMMAND_ENV,
+    state.WORKSPACE_LEASE_CHILD_COMMAND_ENV,
+    state.WORKSPACE_LEASE_TRANSFER_ENV,
+  ];
+  const previousEnv = new Map(envKeys.map((key) => [key, process.env[key]]));
+  let ownerLease;
+  try {
+    writePipelaneConfig(repoRoot, 'Delegated Lease Identity');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Delegated Lease Identity', '--json'], repoRoot).stdout);
+    const context = state.resolveWorkflowContext(repoRoot);
+    const lock = state.loadTaskLock(context.commonDir, context.config, created.taskSlug);
+    const acquired = state.acquireTaskWorkspaceLease(context.commonDir, context.config, {
+      taskSlug: lock.taskSlug,
+      taskBindingId: lock.taskBindingId,
+      command: 'status',
+    });
+    assert.equal(acquired.acquired, true);
+    ownerLease = acquired.lease;
+
+    const validEnv = {
+      [state.WORKSPACE_LEASE_TOKEN_ENV]: ownerLease.token,
+      [state.WORKSPACE_LEASE_TASK_ENV]: lock.taskSlug,
+      [state.WORKSPACE_LEASE_BINDING_ENV]: lock.taskBindingId,
+      [state.WORKSPACE_LEASE_OWNER_COMMAND_ENV]: 'status',
+      [state.WORKSPACE_LEASE_CHILD_COMMAND_ENV]: 'merge',
+      [state.WORKSPACE_LEASE_TRANSFER_ENV]: '1',
+    };
+    const mismatches = [
+      [state.WORKSPACE_LEASE_TOKEN_ENV, 'f'.repeat(64)],
+      [state.WORKSPACE_LEASE_TASK_ENV, 'another-task'],
+      [state.WORKSPACE_LEASE_BINDING_ENV, 'another-binding'],
+      [state.WORKSPACE_LEASE_OWNER_COMMAND_ENV, 'another-owner'],
+      [state.WORKSPACE_LEASE_CHILD_COMMAND_ENV, 'deploy'],
+    ];
+    for (const [key, value] of mismatches) {
+      Object.assign(process.env, validEnv, { [key]: value });
+      const borrowed = state.borrowDelegatedTaskWorkspaceLeaseFromEnvironment(context.commonDir, context.config, {
+        taskSlug: lock.taskSlug,
+        taskBindingId: lock.taskBindingId,
+        childCommand: 'merge',
+      });
+      assert.equal(borrowed.acquired, false, `${key} mismatch must be rejected`);
+      assert.equal(borrowed.code, 'workspace-busy');
+      for (const consumedKey of envKeys) assert.equal(process.env[consumedKey], undefined);
+      assert.equal(state.inspectTaskWorkspaceLease(context.commonDir, context.config, lock.taskSlug).status, 'owned');
+    }
+
+    Object.assign(process.env, validEnv);
+    delete process.env[state.WORKSPACE_LEASE_TRANSFER_ENV];
+    const nonTransferable = state.borrowDelegatedTaskWorkspaceLeaseFromEnvironment(context.commonDir, context.config, {
+      taskSlug: lock.taskSlug,
+      taskBindingId: lock.taskBindingId,
+      childCommand: 'merge',
+    });
+    assert.equal(nonTransferable.acquired, true);
+    assert.equal(nonTransferable.lease.transfer('cleanup', 'merge-cleanup'), false);
+    assert.equal(nonTransferable.lease.release(), false, 'a borrowed non-transferable handle cannot release its owner');
+    assert.equal(state.inspectTaskWorkspaceLease(context.commonDir, context.config, lock.taskSlug).status, 'owned');
+    assert.equal(ownerLease.release(), true);
+    ownerLease = undefined;
+  } finally {
+    ownerLease?.release();
+    for (const key of envKeys) {
+      const previous = previousEnv.get(key);
+      if (previous === undefined) delete process.env[key];
+      else process.env[key] = previous;
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('managed-workspace command classification pins every protected command and subcommand', async () => {
+  const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+  const operator = await import(path.join(KIT_ROOT, 'src', 'operator', 'index.ts'));
+  const cases = [
+    [['new'], true],
+    [['adopt'], true],
+    [['resume'], true],
+    [['repo-guard'], true],
+    [['release-check'], true],
+    [['status'], true],
+    [['pr'], true],
+    [['pr', '--yes'], false],
+    [['api', 'snapshot'], true],
+    [['api', 'action'], false],
+    [['rollback', 'staging'], true],
+    [['review'], true],
+    [['review', 'run'], true],
+    [['review', 'pass'], false],
+    [['orchestrate'], true],
+    [['orchestrate', 'run'], true],
+    [['orchestrate', 'plan'], true],
+    [['orchestrate', 'analyze'], true],
+    [['orchestrate', 'prepare'], true],
+    [['orchestrate', 'dispatch'], true],
+    [['orchestrate', 'start'], true],
+    [['orchestrate', 'review'], true],
+    [['orchestrate', 'status'], false],
+  ];
+  for (const [argv, expected] of cases) {
+    assert.equal(operator.operatorUsesCurrentManagedWorkspace(state.parseOperatorArgs(argv)), expected, argv.join(' '));
+  }
+});
+
+test('ordinary rollback participates in the current managed workspace lease protocol', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Rollback Lease');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Rollback Lease', '--json'], repoRoot).stdout);
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const operator = await import(path.join(KIT_ROOT, 'src', 'operator', 'index.ts'));
+    const parsed = state.parseOperatorArgs(['rollback', 'staging']);
+    assert.equal(operator.operatorUsesCurrentManagedWorkspace(parsed), true);
+    assert.equal(operator.classifyOperatorManagedStateSensitivity(parsed), 'independent-recovery');
+
+    const context = state.resolveWorkflowContext(repoRoot);
+    const lock = state.loadTaskLock(context.commonDir, context.config, created.taskSlug);
+    const held = state.acquireTaskWorkspaceLease(context.commonDir, context.config, {
+      taskSlug: lock.taskSlug,
+      taskBindingId: lock.taskBindingId,
+      command: 'concurrent-cleanup',
+    });
+    assert.equal(held.acquired, true);
+    const blocked = runCli(['run', 'rollback', 'staging', '--json'], created.worktreePath, {}, true);
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /in use by concurrent-cleanup/);
+    const blockedReview = runCli(['run', 'review', '--json'], created.worktreePath, {}, true);
+    assert.equal(blockedReview.status, 1);
+    assert.match(blockedReview.stderr, /in use by concurrent-cleanup/);
+    assert.equal(held.lease.release(), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('workspace leases recover stale crash and legacy owners but preserve fresh or unverifiable owners', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const previousLiveness = process.env.PIPELANE_WORKSPACE_LEASE_TEST_LIVENESS;
+  try {
+    writePipelaneConfig(repoRoot, 'Workspace Lease Recovery');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Lease Recovery', '--json'], repoRoot).stdout);
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = state.resolveWorkflowContext(repoRoot);
+    const lock = state.loadTaskLock(context.commonDir, context.config, created.taskSlug);
+    const leasePath = path.join(sharedStateDir(repoRoot), 'task-cleanup-locks', `${created.taskSlug}.lock`);
+    const staleTime = new Date(Date.now() - 11 * 60 * 1000);
+
+    mkdirSync(leasePath, { recursive: true });
+    writeFileSync(path.join(leasePath, 'owner.json'), `${JSON.stringify({
+      taskSlug: created.taskSlug,
+      pid: 2_147_483_647,
+      acquiredAt: staleTime.toISOString(),
+    })}\n`, 'utf8');
+    utimesSync(leasePath, staleTime, staleTime);
+    process.env.PIPELANE_WORKSPACE_LEASE_TEST_LIVENESS = 'dead';
+    const recoveredLegacy = state.acquireTaskWorkspaceLease(context.commonDir, context.config, {
+      taskSlug: lock.taskSlug,
+      taskBindingId: lock.taskBindingId,
+      command: 'recovered-legacy-owner',
+    });
+    assert.equal(recoveredLegacy.acquired, true);
+    assert.equal(recoveredLegacy.lease.release(), true);
+
+    mkdirSync(leasePath, { recursive: true });
+    utimesSync(leasePath, staleTime, staleTime);
+    const recoveredOwnerless = state.acquireTaskWorkspaceLease(context.commonDir, context.config, {
+      taskSlug: lock.taskSlug,
+      taskBindingId: lock.taskBindingId,
+      command: 'recovered-ownerless-crash',
+    });
+    assert.equal(recoveredOwnerless.acquired, true);
+    assert.equal(recoveredOwnerless.lease.release(), true);
+
+    mkdirSync(leasePath, { recursive: true });
+    writeFileSync(path.join(leasePath, 'owner.json'), `${JSON.stringify({
+      token: 'a'.repeat(64),
+      pid: 2_147_483_647,
+      taskSlug: lock.taskSlug,
+      taskBindingId: lock.taskBindingId,
+      kind: 'command',
+      command: 'unverifiable-owner',
+      acquiredAt: staleTime.toISOString(),
+      heartbeatAt: staleTime.toISOString(),
+    })}\n`, 'utf8');
+    process.env.PIPELANE_WORKSPACE_LEASE_TEST_LIVENESS = 'unverifiable';
+    const unverifiable = state.acquireTaskWorkspaceLease(context.commonDir, context.config, {
+      taskSlug: lock.taskSlug,
+      taskBindingId: lock.taskBindingId,
+      command: 'must-not-reclaim-unverifiable',
+    });
+    assert.equal(unverifiable.acquired, false);
+    assert.equal(unverifiable.code, 'workspace-busy');
+    assert.equal(existsSync(leasePath), true);
+
+    process.env.PIPELANE_WORKSPACE_LEASE_TEST_LIVENESS = 'dead';
+    const recoveredDead = state.acquireTaskWorkspaceLease(context.commonDir, context.config, {
+      taskSlug: lock.taskSlug,
+      taskBindingId: lock.taskBindingId,
+      command: 'recovered-dead-owner',
+    });
+    assert.equal(recoveredDead.acquired, true);
+    assert.equal(recoveredDead.lease.release(), true);
+
+    mkdirSync(leasePath, { recursive: true });
+    writeFileSync(path.join(leasePath, 'owner.json'), '{"pid":2147483647}\n', 'utf8');
+    const freshMalformed = state.acquireTaskWorkspaceLease(context.commonDir, context.config, {
+      taskSlug: lock.taskSlug,
+      taskBindingId: lock.taskBindingId,
+      command: 'must-not-reclaim-fresh',
+    });
+    assert.equal(freshMalformed.acquired, false);
+    assert.equal(freshMalformed.code, 'workspace-lease-malformed');
+    rmSync(leasePath, { recursive: true, force: true });
+
+    const first = state.acquireTaskWorkspaceLease(context.commonDir, context.config, {
+      taskSlug: lock.taskSlug,
+      taskBindingId: lock.taskBindingId,
+      command: 'exact-token-owner',
+    });
+    assert.equal(first.acquired, true);
+    const ownerPath = path.join(leasePath, 'owner.json');
+    const replacedOwner = JSON.parse(readFileSync(ownerPath, 'utf8'));
+    replacedOwner.token = 'f'.repeat(64);
+    writeFileSync(ownerPath, `${JSON.stringify(replacedOwner)}\n`, 'utf8');
+    assert.equal(first.lease.release(), false, 'a lease must never release a replacement owner');
+    assert.equal(existsSync(leasePath), true);
+  } finally {
+    if (previousLiveness === undefined) delete process.env.PIPELANE_WORKSPACE_LEASE_TEST_LIVENESS;
+    else process.env.PIPELANE_WORKSPACE_LEASE_TEST_LIVENESS = previousLiveness;
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('two workspace lease reclaimers cannot delete a newly acquired owner', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Workspace Lease ABA');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Workspace Lease ABA', '--json'], repoRoot).stdout);
+    const stateUrl = pathToFileURL(path.join(KIT_ROOT, 'src', 'operator', 'state.ts')).href;
+    const state = await import(stateUrl);
+    const context = state.resolveWorkflowContext(repoRoot);
+    const lock = state.loadTaskLock(context.commonDir, context.config, created.taskSlug);
+    const leasePath = path.join(sharedStateDir(repoRoot), 'task-cleanup-locks', `${created.taskSlug}.lock`);
+    const staleAt = new Date(Date.now() - 11 * 60 * 1000).toISOString();
+    mkdirSync(leasePath, { recursive: true });
+    writeFileSync(path.join(leasePath, 'owner.json'), `${JSON.stringify({
+      token: 'a'.repeat(64),
+      pid: 2_147_483_647,
+      taskSlug: lock.taskSlug,
+      taskBindingId: lock.taskBindingId,
+      kind: 'command',
+      command: 'crashed-owner',
+      acquiredAt: staleAt,
+      heartbeatAt: staleAt,
+    })}\n`, 'utf8');
+
+    const childSource = `
+      const state = await import(process.env.TEST_STATE_URL);
+      const context = state.resolveWorkflowContext(process.env.TEST_REPO);
+      const result = state.acquireTaskWorkspaceLease(context.commonDir, context.config, {
+        taskSlug: process.env.TEST_TASK,
+        taskBindingId: process.env.TEST_BINDING,
+        command: process.env.TEST_COMMAND,
+      });
+      process.stdout.write(JSON.stringify(result.acquired
+        ? { acquired: true, token: result.lease.token }
+        : { acquired: false, code: result.code }));
+    `;
+    const contend = (command) => new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['--input-type=module', '-e', childSource], {
+        cwd: repoRoot,
+        env: buildCliChildEnv({
+          TEST_STATE_URL: stateUrl,
+          TEST_REPO: repoRoot,
+          TEST_TASK: lock.taskSlug,
+          TEST_BINDING: lock.taskBindingId,
+          TEST_COMMAND: command,
+          PIPELANE_WORKSPACE_LEASE_TEST_LIVENESS: 'dead',
+          PIPELANE_WORKSPACE_LEASE_TEST_RECLAIM_DELAY_MS: '150',
+        }),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+      child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+      child.on('error', reject);
+      child.on('exit', (code) => code === 0
+        ? resolve(JSON.parse(stdout))
+        : reject(new Error(stderr || `workspace contender exited ${code}`)));
+    });
+
+    const results = await Promise.all([contend('reclaimer-one'), contend('reclaimer-two')]);
+    assert.equal(results.filter((result) => result.acquired).length, 1);
+    assert.equal(results.filter((result) => !result.acquired && result.code === 'workspace-busy').length, 1);
+    const owner = JSON.parse(readFileSync(path.join(leasePath, 'owner.json'), 'utf8'));
+    assert.equal(owner.token, results.find((result) => result.acquired).token, 'the winning owner must remain installed');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('PR state mutation recovers an ownerless stale acquisition crash', async () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'PR State Lease Recovery');
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = state.resolveWorkflowContext(repoRoot);
+    const leasePath = path.join(sharedStateDir(repoRoot), 'pr-state-mutation.lock');
+    mkdirSync(leasePath, { recursive: true });
+    const staleTime = new Date(Date.now() - 3 * 60 * 1000);
+    utimesSync(leasePath, staleTime, staleTime);
+
+    state.savePrState(context.commonDir, context.config, { records: {}, deliveriesByPr: {} });
+
+    assert.equal(existsSync(leasePath), false);
+    assert.deepEqual(state.loadPrState(context.commonDir, context.config), { records: {}, deliveriesByPr: {} });
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('two PR-state reclaimers preserve both mutations without an ABA deletion', async () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'PR State ABA');
+    const stateUrl = pathToFileURL(path.join(KIT_ROOT, 'src', 'operator', 'state.ts')).href;
+    const state = await import(stateUrl);
+    const context = state.resolveWorkflowContext(repoRoot);
+    const leasePath = path.join(sharedStateDir(repoRoot), 'pr-state-mutation.lock');
+    const staleAt = new Date(Date.now() - 3 * 60 * 1000).toISOString();
+    mkdirSync(leasePath, { recursive: true });
+    writeFileSync(path.join(leasePath, 'owner.json'), `${JSON.stringify({
+      token: 'b'.repeat(64),
+      pid: 2_147_483_647,
+      acquiredAt: staleAt,
+    })}\n`, 'utf8');
+
+    const childSource = `
+      const state = await import(process.env.TEST_STATE_URL);
+      const context = state.resolveWorkflowContext(process.env.TEST_REPO);
+      state.savePrRecord(context.commonDir, context.config, process.env.TEST_TASK, {
+        taskBindingId: 'binding-' + process.env.TEST_TASK,
+        branchName: 'codex/' + process.env.TEST_TASK,
+        title: process.env.TEST_TASK,
+        number: Number(process.env.TEST_PR),
+      });
+    `;
+    const mutate = (taskSlug, prNumber) => new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['--input-type=module', '-e', childSource], {
+        cwd: repoRoot,
+        env: buildCliChildEnv({
+          TEST_STATE_URL: stateUrl,
+          TEST_REPO: repoRoot,
+          TEST_TASK: taskSlug,
+          TEST_PR: String(prNumber),
+          PIPELANE_WORKSPACE_LEASE_TEST_LIVENESS: 'dead',
+          PIPELANE_PR_STATE_TEST_RECLAIM_DELAY_MS: '150',
+        }),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stderr = '';
+      child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+      child.on('error', reject);
+      child.on('exit', (code) => code === 0 ? resolve() : reject(new Error(stderr || `PR-state contender exited ${code}`)));
+    });
+
+    await Promise.all([mutate('reclaimer-one', 1), mutate('reclaimer-two', 2)]);
+    const prState = state.loadPrState(context.commonDir, context.config);
+    assert.equal(prState.records['reclaimer-one'].number, 1);
+    assert.equal(prState.records['reclaimer-two'].number, 2);
+    assert.equal(existsSync(leasePath), false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('delivered reconciliation finishes a crash window after artifacts disappeared but before lock removal', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Cleanup Crash Recovery');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Cleanup Crash Recovery', '--json'], repoRoot).stdout);
+    const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`);
+    const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+    const targetSha = run('git', ['rev-parse', created.branch], repoRoot);
+    lock.cleanup = {
+      status: 'pending',
+      requestId: 'cleanup-crash-recovery',
+      taskBindingId: lock.taskBindingId,
+      trigger: 'merge',
+      requestedAt: '2026-07-16T00:00:00.000Z',
+      targetRef: 'origin/main',
+      targetSha,
+    };
+    lock.updatedAt = '2026-07-16T00:00:00.000Z';
+    writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`, 'utf8');
+
+    execFileSync('git', ['worktree', 'remove', '--force', created.worktreePath], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    execFileSync('git', ['branch', '-D', created.branch], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const reconciled = JSON.parse(runCli(['run', 'clean', '--apply', '--delivered', '--json'], repoRoot).stdout);
+    assert.deepEqual(reconciled.closed, [created.taskSlug]);
+    assert.equal(existsSync(lockPath), false, 'retry prunes the surviving lock last');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('cleanup status protects unknown ignored content and rejects configured symlink escapes', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const outside = mkdtempSync(path.join(os.tmpdir(), 'pipelane-ignored-outside-'));
+  try {
+    writePipelaneConfig(repoRoot, 'Ignored Safety');
+    writeFileSync(path.join(repoRoot, '.gitignore'), 'dist\ntracked-root/*.cache\n', 'utf8');
+    mkdirSync(path.join(repoRoot, 'tracked-root'), { recursive: true });
+    writeFileSync(path.join(repoRoot, 'tracked-root', 'source.txt'), 'tracked\n', 'utf8');
+    commitAll(repoRoot, 'Adopt ignored policy');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Ignored Safety', '--json'], repoRoot).stdout);
+    mkdirSync(path.join(created.worktreePath, 'dist'), { recursive: true });
+    writeFileSync(path.join(created.worktreePath, 'dist', 'cache.bin'), 'generated', 'utf8');
+    const workspaces = await import(path.join(KIT_ROOT, 'src', 'operator', 'task-workspaces.ts'));
+    const protectedStatus = workspaces.inspectCleanupStatus({
+      worktreePath: created.worktreePath,
+      sharedRepoRoot: repoRoot,
+    });
+    assert.deepEqual(protectedStatus.protectedIgnoredEntries, ['dist/']);
+    const disposableStatus = workspaces.inspectCleanupStatus({
+      worktreePath: created.worktreePath,
+      sharedRepoRoot: repoRoot,
+      disposableIgnoredPaths: ['dist'],
+    });
+    assert.deepEqual(disposableStatus.protectedIgnoredEntries, []);
+
+    writeFileSync(path.join(created.worktreePath, 'tracked-root', 'valuable.cache'), 'keep', 'utf8');
+    const trackedRootStatus = workspaces.inspectCleanupStatus({
+      worktreePath: created.worktreePath,
+      sharedRepoRoot: repoRoot,
+      disposableIgnoredPaths: ['dist', 'tracked-root'],
+    });
+    assert.deepEqual(
+      trackedRootStatus.protectedIgnoredEntries,
+      ['tracked-root/valuable.cache'],
+      'a configured root that contains tracked paths must remain protected',
+    );
+    rmSync(path.join(created.worktreePath, 'tracked-root', 'valuable.cache'), { force: true });
+
+    rmSync(path.join(created.worktreePath, 'dist'), { recursive: true, force: true });
+    writeFileSync(path.join(outside, 'valuable.txt'), 'keep', 'utf8');
+    symlinkSync(outside, path.join(created.worktreePath, 'dist'), 'dir');
+    const escapedStatus = workspaces.inspectCleanupStatus({
+      worktreePath: created.worktreePath,
+      sharedRepoRoot: repoRoot,
+      disposableIgnoredPaths: ['dist'],
+    });
+    assert.deepEqual(escapedStatus.protectedIgnoredEntries, ['dist']);
+  } finally {
+    rmSync(outside, { recursive: true, force: true });
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('task artifact cleanup preserves a branch that moved after delivery assessment', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Branch Drift Safety');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Branch Drift Safety', '--json'], repoRoot).stdout);
+    const assessedHead = run('git', ['rev-parse', 'HEAD'], created.worktreePath);
+    writeFileSync(path.join(created.worktreePath, 'later.txt'), 'later local commit\n', 'utf8');
+    commitLocal(created.worktreePath, 'Advance branch after cleanup assessment');
+    const movedHead = run('git', ['rev-parse', 'HEAD'], created.worktreePath);
+    const workspaces = await import(path.join(KIT_ROOT, 'src', 'operator', 'task-workspaces.ts'));
+
+    const result = workspaces.removeTaskArtifacts({
+      sharedRepoRoot: repoRoot,
+      worktreePath: created.worktreePath,
+      branchName: created.branch,
+      callerCwd: repoRoot,
+      force: false,
+      expectedBranchHeadSha: assessedHead,
+      branchDeletionAuthorized: true,
+      requireNoIgnoredContent: true,
+    });
+
+    assert.equal(result.worktreeRemoved, true);
+    assert.equal(result.branchRemoved, false);
+    assert.match(result.errors.join('\n'), /moved after cleanup assessment/);
+    assert.equal(run('git', ['rev-parse', created.branch], repoRoot), movedHead);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
   }
 });
 
@@ -22514,19 +23584,14 @@ test('lockless PR branch can report, merge by PR number, and deploy the merged P
     assert.doesNotMatch(`${openDeploy.stdout}\n${openDeploy.stderr}`, /option 1|option 2/);
     assert.equal(existsSync(lockPath), false, 'failed lockless deploy must not recreate the task lock');
 
-    const currentBranch = run('git', ['branch', '--show-current'], repoRoot);
-    const merged = JSON.parse(runCli(['run', 'merge', '--pr', '1', '--json'], repoRoot, env).stdout);
-    assert.equal(merged.mergedSha, 'deadbeefcafebabe');
-    assert.match(merged.message, /Pull request merged on GitHub/);
-    assert.match(merged.message, new RegExp(`Current worktree branch remains ${currentBranch}\\.`));
-    assert.equal(existsSync(lockPath), false, 'lockless merge must not recreate the task lock');
-
-    const deployed = JSON.parse(runCli(['run', 'deploy', 'staging', '--pr', '1', '--json'], repoRoot, env).stdout);
-    assert.equal(deployed.environment, 'staging');
-    assert.equal(deployed.sha, 'deadbeefcafebabe');
-    assert.equal(deployed.taskSlug, 'canvas-selection-arrows');
-    assert.equal(deployed.status, 'succeeded');
-    assert.equal(existsSync(lockPath), false, 'lockless deploy must not recreate the task lock');
+    const routedResult = runCli([
+      'run', 'deploy', 'staging', '--pr', '1', '--yes', '--json',
+    ], repoRoot, env, true);
+    assert.equal(routedResult.status, 0, `${routedResult.stderr}\n${routedResult.stdout}`);
+    const routed = JSON.parse(routedResult.stdout);
+    assert.deepEqual(routed.execution.steps.map((step) => step.id), ['merge', 'deploy_staging']);
+    assert.equal(routed.execution.completed, true);
+    assert.equal(existsSync(lockPath), false, 'a lockless merge-to-deploy route must not recreate the task lock');
 
     const prState = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'pr-state.json'), 'utf8'));
     assert.equal(prState.records['canvas-selection-arrows'].number, 1);
@@ -22537,6 +23602,53 @@ test('lockless PR branch can report, merge by PR number, and deploy the merged P
     assert.equal(ghState.workflows.length, 1);
     assert.ok(ghState.workflows[0].args.includes('environment=staging'));
     assert.ok(ghState.workflows[0].args.includes('sha=deadbeefcafebabe'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('a bindingless old-PR route cannot lease a newer workspace that reused the task slug', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+  };
+  try {
+    writePipelaneConfig(repoRoot, 'Route Binding Isolation');
+    runCli(['setup'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const original = JSON.parse(runCli(['run', 'new', '--task', 'Reusable Route', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(original.worktreePath, 'old.txt'), 'old PR\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Old Reusable Route', '--json'], original.worktreePath, env);
+    rmSync(path.join(sharedStateDir(repoRoot), 'task-locks', `${original.taskSlug}.json`), { force: true });
+
+    const replacement = JSON.parse(runCli(['run', 'new', '--task', 'Reusable Route', '--force', '--json'], repoRoot).stdout);
+    const replacementLockPath = path.join(sharedStateDir(repoRoot), 'task-locks', `${replacement.taskSlug}.json`);
+    const replacementBinding = JSON.parse(readFileSync(replacementLockPath, 'utf8')).taskBindingId;
+
+    const routedResult = runCli(['run', 'merge', '--pr', '1', '--yes', '--json'], repoRoot, env, true);
+    assert.equal(routedResult.status, 0, `${routedResult.stderr}\n${routedResult.stdout}`);
+    const routed = JSON.parse(routedResult.stdout);
+    assert.deepEqual(routed.execution.steps.map((step) => step.id), ['merge']);
+    assert.equal(existsSync(replacement.worktreePath), true, 'the newer workspace must remain untouched');
+    assert.equal(
+      JSON.parse(readFileSync(replacementLockPath, 'utf8')).taskBindingId,
+      replacementBinding,
+      'the route must not acquire, transfer, or rewrite the newer binding',
+    );
+    assert.equal(
+      existsSync(path.join(sharedStateDir(repoRoot), 'task-cleanup-locks', `${replacement.taskSlug}.lock`)),
+      false,
+      'a bindingless old-PR route must not leave a lease on the replacement workspace',
+    );
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -22787,7 +23899,7 @@ test('merge --pr blocks in the shared checkout when the PR task is leased elsewh
   }
 });
 
-test('deploy --pr blocks in the shared checkout when the PR task is leased elsewhere', () => {
+test('deploy --pr uses immutable delivery state from the shared checkout while the old task workspace remains', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
   const ghStateFile = path.join(ghBin, 'gh-state.json');
@@ -22814,15 +23926,169 @@ test('deploy --pr blocks in the shared checkout when the PR task is leased elsew
     runCli(['run', 'pr', '--title', 'Lease Deploy', '--json'], created.worktreePath, env);
     runCli(['run', 'merge', '--json'], created.worktreePath, env);
 
-    const blocked = runCli(['run', 'deploy', 'staging', '--pr', '1', '--json'], repoRoot, env, true);
-    assert.equal(blocked.status, 1);
-    assert.match(blocked.stderr, /Task lock mismatch/);
-    assert.match(blocked.stderr, /expected branch codex\/lease-deploy-/);
-    assert.match(blocked.stderr, new RegExp(`expected worktree ${created.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    const deployed = JSON.parse(runCli(['run', 'deploy', 'staging', '--pr', '1', '--json'], repoRoot, env).stdout);
+    assert.equal(deployed.status, 'succeeded');
+    assert.equal(deployed.sha, 'deadbeefcafebabe');
+    assert.equal(deployed.taskSlug, created.taskSlug);
 
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
     assert.equal(ghState.prMergeCalls.length, 1);
-    assert.equal(ghState.workflows.length, 0, 'shared-checkout deploy must not dispatch a workflow');
+    assert.equal(ghState.workflows.length, 1, 'shared-checkout deploy dispatches from immutable delivery state');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('deploy --pr preserves the immutable delivery surfaces instead of re-inferring a subset', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_PR_MERGE_PUSH_HEAD: '1',
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Immutable Delivery Surfaces');
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigState(repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.buildMode.autoDeployOnMerge = false;
+      config.surfacePathMap = {
+        frontend: ['feature.txt'],
+        edge: ['edge/'],
+        sql: ['sql/'],
+      };
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli([
+      'run', 'new', '--task', 'Immutable Delivery Surfaces', '--surfaces', 'frontend,edge', '--json',
+    ], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'frontend-only diff with two recorded delivery surfaces\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Immutable Delivery Surfaces', '--json'], created.worktreePath, env);
+    runCli(['run', 'merge', '--keep-worktree', '--json'], created.worktreePath, env);
+    runCli(['run', 'adopt', '--surfaces', 'sql', '--json'], created.worktreePath);
+
+    const deployed = JSON.parse(runCli(['run', 'deploy', 'staging', '--pr', '1', '--json'], created.worktreePath, env).stdout);
+    assert.deepEqual(deployed.surfaces, ['frontend', 'edge']);
+
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.workflows.length, 1);
+    assert.ok(ghState.workflows[0].args.includes('surfaces=frontend,edge'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('destination route deploys a managed immutable delivery after automatic workspace cleanup', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_PR_MERGE_PUSH_HEAD: '1',
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Closed Delivery Route');
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigState(repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.buildMode.autoDeployOnMerge = false;
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Closed Delivery Route', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'close before routed deploy\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Closed Delivery Route', '--json'], created.worktreePath, env);
+    const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
+    assert.equal(merged.cleanup.status, 'cleaned');
+    assert.equal(existsSync(created.worktreePath), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`)), false);
+    const replacement = JSON.parse(runCli(['run', 'new', '--task', 'Closed Delivery Route', '--json'], repoRoot).stdout);
+    const replacementLockPath = path.join(sharedStateDir(repoRoot), 'task-locks', `${replacement.taskSlug}.json`);
+    const replacementBinding = JSON.parse(readFileSync(replacementLockPath, 'utf8')).taskBindingId;
+
+    const result = runCli([
+      'run', 'deploy', 'staging', '--pr', '1', '--surfaces', 'frontend', '--yes', '--json',
+    ], repoRoot, env, true);
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+    const routed = JSON.parse(result.stdout);
+    assert.deepEqual(routed.execution.steps.map((step) => step.id), ['deploy_staging']);
+    assert.equal(routed.execution.completed, true);
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.ok(ghState.workflows[0].args.includes('surfaces=frontend'));
+    assert.equal(existsSync(replacement.worktreePath), true, 'the newer task generation remains active');
+    assert.equal(
+      JSON.parse(readFileSync(replacementLockPath, 'utf8')).taskBindingId,
+      replacementBinding,
+      'the immutable delivery route never leases or rewrites the newer task generation',
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('managed merge-to-deploy route continues from immutable delivery after closeout', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_PR_MERGE_PUSH_HEAD: '1',
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Managed Closeout Route');
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigState(repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.buildMode.autoDeployOnMerge = false;
+      config.surfacePathMap = {
+        frontend: ['feature.txt'],
+        edge: ['edge/'],
+        sql: ['sql/'],
+      };
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+
+    const created = JSON.parse(runCli([
+      'run', 'new', '--task', 'Managed Closeout Route', '--surfaces', 'frontend,edge', '--json',
+    ], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'merge and continue from shared checkout\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Managed Closeout Route', '--json'], created.worktreePath, env);
+
+    const result = runCli(['run', 'deploy', 'staging', '--pr', '1', '--yes', '--json'], created.worktreePath, env, true);
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+    const routed = JSON.parse(result.stdout);
+    assert.deepEqual(routed.execution.steps.map((step) => step.id), ['merge', 'deploy_staging']);
+    assert.equal(routed.execution.completed, true);
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.ok(ghState.workflows[0].args.includes('surfaces=frontend,edge'));
+    assert.equal(existsSync(created.worktreePath), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`)), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -22886,7 +24152,7 @@ test('merge skips auto-deploy in build mode when autoDeployOnMerge is disabled',
     const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
     assert.equal(merged.mergedSha, 'deadbeefcafebabe');
     assert.match(merged.message, /auto-deploy is disabled/);
-    assert.match(merged.message, /Next: run \/deploy\./);
+    assert.match(merged.message, /Next: \/deploy --pr 1 from the shared checkout\./);
     assert.doesNotMatch(merged.message, /\/deploy prod|production/);
 
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
@@ -22926,28 +24192,18 @@ test('merge treats empty configured surfaces as no-deploy build delivery', () =>
 
     const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
     assert.match(merged.mergedSha, /^[a-f0-9]{40}$/);
-    assert.match(merged.message, /No deploy surfaces are configured/);
-    assert.match(merged.message, /Merge to the base branch is the delivery step/);
-    assert.match(merged.message, /Next: run \/clean --apply --task no-deploy/);
+    assert.match(merged.message, /Build delivery is complete from main/);
+    assert.equal(merged.cleanup.status, 'cleaned');
 
     const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', 'no-deploy.json');
-    const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
-    assert.match(lock.nextAction, /no deploy surfaces configured/);
-    assert.match(lock.nextAction, /\/clean --apply --task no-deploy/);
+    assert.equal(existsSync(lockPath), false);
 
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
     assert.equal(ghState.prMergeCalls.length, 1);
     assert.equal(ghState.workflows.length, 0);
 
-    const cleaned = JSON.parse(runCli(['run', 'clean', '--apply', '--task', 'no-deploy', '--json'], repoRoot, {
-      PIPELANE_CLEAN_MIN_AGE_MS: '0',
-    }).stdout);
-    assert.deepEqual(cleaned.removed, ['no-deploy']);
-    assert.equal(cleaned.artifacts[0].worktreeRemoved, true);
-    assert.equal(cleaned.artifacts[0].branchRemoved, true);
-    assert.ok(!existsSync(lockPath), 'no-deploy clean must remove the task lock');
-    assert.ok(!existsSync(created.worktreePath), 'no-deploy clean must remove the worktree');
-    assert.equal(localBranchExists(repoRoot, created.branch), false, 'no-deploy clean must remove the squash-merged branch');
+    assert.ok(!existsSync(created.worktreePath), 'merge closeout must remove the worktree');
+    assert.equal(localBranchExists(repoRoot, created.branch), false, 'merge closeout must remove the delivered branch');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -22973,25 +24229,24 @@ test('merge refreshes origin/base and leaves local main untouched', () => {
     runCli(['run', 'devmode', 'release', '--override', '--reason', 'test merge receipt'], repoRoot);
 
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Merge Receipt', '--json'], repoRoot).stdout);
-    const branchName = run('git', ['branch', '--show-current'], created.worktreePath);
     const localMainBefore = run('git', ['rev-parse', 'main'], repoRoot);
 
     writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
     runCli(['run', 'pr', '--title', 'Merge Receipt', '--json'], created.worktreePath, env);
 
     const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
-    const originMainAfter = run('git', ['rev-parse', 'origin/main'], created.worktreePath);
+    const originMainAfter = run('git', ['rev-parse', 'origin/main'], repoRoot);
     const localMainAfter = run('git', ['rev-parse', 'main'], repoRoot);
 
     assert.equal(originMainAfter, merged.mergedSha);
     assert.equal(localMainAfter, localMainBefore, 'local main should remain untouched');
     assert.notEqual(localMainAfter, merged.mergedSha, 'merge must not fast-forward the local main branch');
-    assert.equal(run('git', ['branch', '--show-current'], created.worktreePath), branchName);
+    assert.equal(existsSync(created.worktreePath), false);
     assert.match(merged.message, /Refreshed origin\/main:/);
-    assert.match(merged.message, /Remote base matches the merged SHA/);
-    assert.match(merged.message, /Current worktree branch remains/);
+    assert.match(merged.message, /Remote base contains merged SHA/);
+    assert.match(merged.message, /Workspace cleanup: removed worktree \+ local branch \+ task lock/);
     assert.match(merged.message, /Local base checkouts were not changed/);
-    assert.match(merged.message, /Stay in this task worktree and deploy staging from here/);
+    assert.match(merged.message, /Next: \/deploy staging --pr 1 from the shared checkout/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -23311,14 +24566,15 @@ test('build-mode deploy prod skips cleanly when no surfaces are configured', () 
     assert.equal(deployed.dispatchMode, 'skipped');
     assert.deepEqual(deployed.surfaces, []);
     assert.match(deployed.message, /No deploy surfaces are configured/);
-    assert.match(deployed.message, /Next: run \/clean --apply --task no-deploy-target/);
+    assert.match(deployed.message, /Automatic merge closeout owns workspace cleanup/);
 
     const lock = JSON.parse(readFileSync(
       path.join(sharedStateDir(repoRoot), 'task-locks', 'no-deploy-target.json'),
       'utf8',
     ));
     assert.match(lock.nextAction, /no deploy surfaces configured/);
-    assert.match(lock.nextAction, /\/clean --apply --task no-deploy-target/);
+    assert.match(lock.nextAction, /delivery is complete/);
+    assert.equal(lock.nextActionUpdatedAt, lock.updatedAt, 'deploy refreshes the breadcrumb timestamp with its text');
 
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
     assert.equal(ghState.workflows.length, 0, 'deploy should not dispatch a workflow when no surfaces exist');
@@ -24008,8 +25264,8 @@ test('build-mode merge treats auto-deploy-on-merge as merge delivery without man
     runCli(['run', 'pr', '--title', 'Push Deploy', '--json'], created.worktreePath, env);
     const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
 
-    assert.match(merged.message, /Build mode: the live environment updates automatically from main after merge/);
-    assert.match(merged.message, /Merge to the base branch is the delivery step/);
+    assert.match(merged.message, /Build delivery is complete from main/);
+    assert.equal(merged.cleanup.status, 'cleaned');
     const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
     assert.equal(ghState.workflows.length, 0);
   } finally {
@@ -25275,7 +26531,7 @@ test('api snapshot tags stale cleanup candidates and exposes apply-all-stale act
   }
 });
 
-test('api snapshot exposes scoped cleanup after production verification and explains prune floor', async () => {
+test('api snapshot exposes scoped cleanup from typed remote delivery proof without a prune-floor delay', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
 
   try {
@@ -25284,11 +26540,14 @@ test('api snapshot exposes scoped cleanup after production verification and expl
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Verified Cleanup', '--json'], repoRoot).stdout);
     const mergedSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
     const stateDir = path.join(sharedStateDir(repoRoot));
+    const lockPath = path.join(stateDir, 'task-locks', 'verified-cleanup.json');
+    const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
     mkdirSync(stateDir, { recursive: true });
     writeFileSync(path.join(stateDir, 'pr-state.json'), JSON.stringify({
       records: {
         'verified-cleanup': {
           taskSlug: 'verified-cleanup',
+          taskBindingId: lock.taskBindingId,
           branchName: created.branch,
           title: 'Verified cleanup',
           number: 42,
@@ -25299,41 +26558,25 @@ test('api snapshot exposes scoped cleanup after production verification and expl
         },
       },
     }, null, 2), 'utf8');
-    const lockPath = path.join(stateDir, 'task-locks', 'verified-cleanup.json');
-    const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
     await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, lock.surfaces, { taskSlug: 'verified-cleanup' });
 
-    const pendingEnvelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
-    const pendingBranch = pendingEnvelope.data.branches.find((entry) => entry.task?.taskSlug === 'verified-cleanup');
-    assert.ok(pendingBranch, 'verified branch row is present');
-    assert.equal(pendingBranch.cleanup.available, true);
-    assert.equal(pendingBranch.cleanup.eligible, false);
-    assert.equal(pendingBranch.cleanup.stale, false);
-    assert.equal(pendingBranch.cleanup.tag, 'pending');
-    assert.match(pendingBranch.cleanup.reason, /5-minute prune floor/);
-    const pendingClean = pendingBranch.availableActions.find((action) => action.id === 'clean.apply');
-    assert.ok(pendingClean, 'branch exposes cleanup action during prune-floor wait');
-    assert.equal(pendingClean.state, 'blocked');
-    assert.deepEqual(pendingClean.defaultParams, { task: 'verified-cleanup' });
+    const envelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
+    const branch = envelope.data.branches.find((entry) => entry.task?.taskSlug === 'verified-cleanup');
+    assert.ok(branch, 'verified branch row is present');
+    assert.equal(branch.cleanup.available, true);
+    assert.equal(branch.cleanup.eligible, true);
+    assert.equal(branch.cleanup.stale, false);
+    assert.equal(branch.cleanup.tag, 'ready');
+    assert.match(branch.cleanup.reason, /typed delivery proof/);
+    const clean = branch.availableActions.find((action) => action.id === 'clean.apply');
+    assert.ok(clean, 'branch exposes scoped cleanup as soon as the shared assessment is eligible');
+    assert.equal(clean.state, 'awaiting_preflight');
+    assert.deepEqual(clean.defaultParams, { task: 'verified-cleanup' });
     assert.equal(
-      pendingEnvelope.data.availableActions.some((action) => action.id === 'clean.apply'),
+      envelope.data.availableActions.some((action) => action.id === 'clean.apply'),
       false,
       'repo-wide all-stale cleanup stays hidden for non-stale completed tasks',
     );
-
-    lock.updatedAt = '2026-04-17T00:00:00Z';
-    writeFileSync(lockPath, JSON.stringify(lock, null, 2), 'utf8');
-
-    const readyEnvelope = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
-    const readyBranch = readyEnvelope.data.branches.find((entry) => entry.task?.taskSlug === 'verified-cleanup');
-    assert.equal(readyBranch.cleanup.available, true);
-    assert.equal(readyBranch.cleanup.eligible, true);
-    assert.equal(readyBranch.cleanup.stale, false);
-    assert.equal(readyBranch.cleanup.tag, 'ready');
-    assert.match(readyBranch.cleanup.reason, /prod is verified/);
-    const readyClean = readyBranch.availableActions.find((action) => action.id === 'clean.apply');
-    assert.equal(readyClean.state, 'awaiting_preflight');
-    assert.deepEqual(readyClean.defaultParams, { task: 'verified-cleanup' });
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -25447,7 +26690,7 @@ test('clean --apply --task closes out the workspace: lock + worktree + merged br
     });
     const envelope = JSON.parse(result.stdout);
     assert.deepEqual(envelope.removed, ['drop-live']);
-    assert.match(envelope.message, /Closed out task workspaces/);
+    assert.match(envelope.message, /Closed out drop-live/);
 
     // Lock file is gone.
     const dropLockPath = path.join(sharedStateDir(repoRoot), 'task-locks', 'drop-live.json');
@@ -25469,14 +26712,14 @@ test('clean --apply --task closes out the workspace: lock + worktree + merged br
     assert.equal(envelope.artifacts[0].taskSlug, 'drop-live');
     assert.equal(envelope.artifacts[0].worktreeRemoved, true);
     assert.equal(envelope.artifacts[0].branchRemoved, true);
-    assert.deepEqual(envelope.artifacts[0].errors, []);
+    assert.match(envelope.artifacts[0].warnings.join('\n'), /deleted under typed delivery proof/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
   }
 });
 
-test('clean auto-closes a prod-verified task when the branch tree matches the deployed squash SHA', async () => {
+test('clean preview never treats tree equality with a deployed squash SHA as delivery proof', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
@@ -25506,17 +26749,17 @@ test('clean auto-closes a prod-verified task when the branch tree matches the de
       PIPELANE_CLEAN_MIN_AGE_MS: '0',
     });
     const envelope = JSON.parse(result.stdout);
-    assert.deepEqual(envelope.autoCleaned, ['auto-safe']);
-    assert.match(envelope.message, /Closed out safe completed task workspaces/);
-    assert.equal(existsSync(lockPath), false, 'auto clean removes the lock');
-    assert.equal(existsSync(created.worktreePath), false, 'auto clean removes the worktree');
+    assert.deepEqual(envelope.autoCleaned, []);
+    assert.deepEqual(envelope.autoCleanCandidates, []);
+    assert.equal(existsSync(lockPath), true, 'tree equality alone must not remove the lock');
+    assert.equal(existsSync(created.worktreePath), true, 'tree equality alone must not remove the worktree');
 
     const branchProbe = spawnSync('git', ['rev-parse', '--verify', `refs/heads/${created.branch}`], {
       cwd: repoRoot,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    assert.notEqual(branchProbe.status, 0, 'auto clean removes the squash-merged branch');
+    assert.equal(branchProbe.status, 0, 'tree equality alone must not delete the unique branch commit');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -25549,18 +26792,20 @@ test('clean keeps a completed task when prod verification does not cover every r
   }
 });
 
-test('clean ignores malformed deploy record entries while finding a verified prod cleanup ref', async () => {
+test('clean preview derives cleanup eligibility independently of malformed deploy history', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
     commitAll(repoRoot, 'Adopt pipelane');
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Malformed Deploy History', '--json'], repoRoot).stdout);
     const mergedSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
-    writePrRecord(repoRoot, 'malformed-deploy-history', mergedSha);
-
     const stateDir = path.join(sharedStateDir(repoRoot));
     const lockPath = path.join(stateDir, 'task-locks', 'malformed-deploy-history.json');
     const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+    upsertPrRecord(repoRoot, 'malformed-deploy-history', mergedSha, {
+      branchName: lock.branchName,
+      taskBindingId: lock.taskBindingId,
+    });
     await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, lock.surfaces, { taskSlug: 'malformed-deploy-history' });
     const deployStatePath = path.join(stateDir, 'deploy-state.json');
     const deployState = JSON.parse(readFileSync(deployStatePath, 'utf8'));
@@ -25575,16 +26820,17 @@ test('clean ignores malformed deploy record entries while finding a verified pro
       PIPELANE_CLEAN_MIN_AGE_MS: '0',
     });
     const envelope = JSON.parse(result.stdout);
-    assert.deepEqual(envelope.autoCleaned, ['malformed-deploy-history']);
-    assert.equal(existsSync(lockPath), false, 'auto clean removes the lock despite malformed history entries');
-    assert.equal(existsSync(created.worktreePath), false, 'auto clean removes the worktree despite malformed history entries');
+    assert.deepEqual(envelope.autoCleaned, []);
+    assert.deepEqual(envelope.autoCleanCandidates, ['malformed-deploy-history']);
+    assert.equal(existsSync(lockPath), true, 'preview keeps the lock despite malformed history entries');
+    assert.equal(existsSync(created.worktreePath), true, 'preview keeps the worktree despite malformed history entries');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
   }
 });
 
-test('clean requires a trusted signed prod deploy record when deploy-state signing is enabled', async () => {
+test('clean preview uses remote delivery proof regardless of deploy-state signing', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
@@ -25599,8 +26845,9 @@ test('clean requires a trusted signed prod deploy record when deploy-state signi
     const unsignedEnvelope = JSON.parse(unsigned.stdout);
     assert.deepEqual(unsignedEnvelope.autoCleaned, []);
     assert.deepEqual(unsignedEnvelope.autoCleanSkipped, []);
-    assert.ok(existsSync(lockPath), 'unsigned deploy record must not authorize auto-clean');
-    assert.ok(existsSync(created.worktreePath), 'unsigned deploy record keeps the worktree');
+    assert.deepEqual(unsignedEnvelope.autoCleanCandidates, ['unsigned-deploy-state']);
+    assert.ok(existsSync(lockPath), 'preview keeps the lock');
+    assert.ok(existsSync(created.worktreePath), 'preview keeps the worktree');
 
     const mod = await import(path.join(KIT_ROOT, 'src', 'operator', 'release-gate.ts'));
     const deployStatePath = path.join(sharedStateDir(repoRoot), 'deploy-state.json');
@@ -25613,9 +26860,10 @@ test('clean requires a trusted signed prod deploy record when deploy-state signi
       PIPELANE_DEPLOY_STATE_KEY: key,
     });
     const signedEnvelope = JSON.parse(signed.stdout);
-    assert.deepEqual(signedEnvelope.autoCleaned, ['unsigned-deploy-state']);
-    assert.equal(existsSync(lockPath), false, 'signed deploy record authorizes auto-clean');
-    assert.equal(existsSync(created.worktreePath), false, 'signed deploy record removes the worktree');
+    assert.deepEqual(signedEnvelope.autoCleaned, []);
+    assert.deepEqual(signedEnvelope.autoCleanCandidates, ['unsigned-deploy-state']);
+    assert.equal(existsSync(lockPath), true, 'deploy signing does not change preview mutation boundaries');
+    assert.equal(existsSync(created.worktreePath), true, 'deploy signing does not make bare clean destructive');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -25629,10 +26877,12 @@ test('clean keeps a prod-verified task when the worktree is dirty', async () => 
     commitAll(repoRoot, 'Adopt pipelane');
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Dirty Verified', '--json'], repoRoot).stdout);
     const mergedSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
-    writePrRecord(repoRoot, 'dirty-verified', mergedSha);
-
     const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', 'dirty-verified.json');
     const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+    upsertPrRecord(repoRoot, 'dirty-verified', mergedSha, {
+      branchName: lock.branchName,
+      taskBindingId: lock.taskBindingId,
+    });
     await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, lock.surfaces, { taskSlug: 'dirty-verified' });
     lock.updatedAt = '2026-04-17T00:00:00Z';
     writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`, 'utf8');
@@ -25644,7 +26894,7 @@ test('clean keeps a prod-verified task when the worktree is dirty', async () => 
     const envelope = JSON.parse(result.stdout);
     assert.deepEqual(envelope.autoCleaned, []);
     assert.equal(envelope.autoCleanSkipped[0].taskSlug, 'dirty-verified');
-    assert.match(envelope.autoCleanSkipped[0].reason, /uncommitted or untracked changes/);
+    assert.match(envelope.autoCleanSkipped[0].reason, /tracked or untracked changes/);
     assert.ok(existsSync(lockPath), 'dirty completed lock is kept');
     assert.ok(existsSync(created.worktreePath), 'dirty completed worktree is kept');
     assert.equal(localBranchExists(repoRoot, created.branch), true, 'dirty completed branch is kept');
@@ -25669,7 +26919,7 @@ test('clean keeps a prod-verified task when ignored local files are present', as
     const envelope = JSON.parse(result.stdout);
     assert.deepEqual(envelope.autoCleaned, []);
     assert.equal(envelope.autoCleanSkipped[0].taskSlug, 'ignored-local-data');
-    assert.match(envelope.autoCleanSkipped[0].reason, /ignored local files/);
+    assert.match(envelope.autoCleanSkipped[0].reason, /Protected ignored content remains/);
     assert.ok(existsSync(lockPath), 'ignored-file lock is kept');
     assert.ok(existsSync(path.join(created.worktreePath, '.env.local')), 'ignored local data is kept');
     assert.equal(localBranchExists(repoRoot, created.branch), true, 'ignored-file branch is kept');
@@ -25694,7 +26944,7 @@ test('clean keeps a prod-verified task when the lock timestamp is malformed', as
     const envelope = JSON.parse(result.stdout);
     assert.deepEqual(envelope.autoCleaned, []);
     assert.equal(envelope.autoCleanSkipped[0].taskSlug, 'malformed-lock-time');
-    assert.match(envelope.autoCleanSkipped[0].reason, /updatedAt is missing or unparseable/);
+    assert.match(envelope.autoCleanSkipped[0].reason, /updatedAt is missing or invalid/);
     assert.ok(existsSync(lockPath), 'malformed timestamp lock is kept');
     assert.ok(existsSync(created.worktreePath), 'malformed timestamp worktree is kept');
     assert.equal(localBranchExists(repoRoot, created.branch), true, 'malformed timestamp branch is kept');
@@ -25717,7 +26967,7 @@ test('clean keeps a prod-verified task that is still inside the prune floor', as
     const envelope = JSON.parse(result.stdout);
     assert.deepEqual(envelope.autoCleaned, []);
     assert.equal(envelope.autoCleanSkipped[0].taskSlug, 'fresh-verified');
-    assert.match(envelope.autoCleanSkipped[0].reason, /below the 300s prune floor/);
+    assert.match(envelope.autoCleanSkipped[0].reason, /below the 300s reconciliation floor/);
     assert.ok(existsSync(lockPath), 'fresh verified lock is kept');
     assert.ok(existsSync(created.worktreePath), 'fresh verified worktree is kept');
     assert.equal(localBranchExists(repoRoot, created.branch), true, 'fresh verified branch is kept');
@@ -25727,7 +26977,7 @@ test('clean keeps a prod-verified task that is still inside the prune floor', as
   }
 });
 
-test('clean keeps a prod-verified lock whose saved worktree is missing', async () => {
+test('clean preview reports a remotely delivered branch as eligible when its worktree is already missing', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
@@ -25743,9 +26993,9 @@ test('clean keeps a prod-verified lock whose saved worktree is missing', async (
     });
     const envelope = JSON.parse(result.stdout);
     assert.deepEqual(envelope.autoCleaned, []);
-    assert.equal(envelope.autoCleanSkipped[0].taskSlug, 'missing-worktree-verified');
-    assert.match(envelope.autoCleanSkipped[0].reason, /saved worktree is missing/);
-    assert.ok(existsSync(lockPath), 'missing-worktree lock is kept for explicit stale pruning');
+    assert.deepEqual(envelope.autoCleanCandidates, ['missing-worktree-verified']);
+    assert.deepEqual(envelope.autoCleanSkipped, []);
+    assert.ok(existsSync(lockPath), 'preview keeps the retry lock');
     assert.equal(existsSync(created.worktreePath), false, 'worktree was already missing before clean ran');
     assert.equal(localBranchExists(repoRoot, created.branch), true, 'missing-worktree branch is kept');
   } finally {
@@ -25754,7 +27004,7 @@ test('clean keeps a prod-verified lock whose saved worktree is missing', async (
   }
 });
 
-test('clean keeps a prod-verified task when the saved branch is missing', async () => {
+test('clean preview leaves a missing saved branch alone without exact delivery identity', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
@@ -25768,8 +27018,8 @@ test('clean keeps a prod-verified task when the saved branch is missing', async 
     });
     const envelope = JSON.parse(result.stdout);
     assert.deepEqual(envelope.autoCleaned, []);
-    assert.equal(envelope.autoCleanSkipped[0].taskSlug, 'missing-branch-verified');
-    assert.match(envelope.autoCleanSkipped[0].reason, /saved branch is missing/);
+    assert.deepEqual(envelope.autoCleanCandidates, []);
+    assert.deepEqual(envelope.autoCleanSkipped, []);
     assert.ok(existsSync(lockPath), 'missing-branch lock is kept');
     assert.ok(existsSync(created.worktreePath), 'missing-branch worktree is kept');
     assert.equal(localBranchExists(repoRoot, created.branch), true, 'actual task branch is kept');
@@ -25785,7 +27035,9 @@ test('clean keeps a prod-verified task when the saved worktree is checked out on
     writePipelaneConfig(repoRoot, 'Demo App');
     commitAll(repoRoot, 'Adopt pipelane');
     const primary = await createVerifiedAutoCleanCandidate(repoRoot, 'Branch Mismatch Primary', 'branch-mismatch-primary');
+    runCli(['configure', '--automatic-worktree-cleanup=false'], repoRoot);
     const other = JSON.parse(runCli(['run', 'new', '--task', 'Branch Mismatch Other', '--json'], repoRoot).stdout);
+    runCli(['configure', '--automatic-worktree-cleanup=true'], repoRoot);
 
     const lock = JSON.parse(readFileSync(primary.lockPath, 'utf8'));
     lock.worktreePath = other.worktreePath;
@@ -25797,7 +27049,7 @@ test('clean keeps a prod-verified task when the saved worktree is checked out on
     const envelope = JSON.parse(result.stdout);
     assert.deepEqual(envelope.autoCleaned, []);
     assert.equal(envelope.autoCleanSkipped[0].taskSlug, 'branch-mismatch-primary');
-    assert.match(envelope.autoCleanSkipped[0].reason, /does not match saved branch/);
+    assert.match(envelope.autoCleanSkipped[0].reason, /Expected branch .* found/);
     assert.ok(existsSync(primary.lockPath), 'branch-mismatch lock is kept');
     assert.ok(existsSync(primary.created.worktreePath), 'original worktree is kept');
     assert.ok(existsSync(other.worktreePath), 'unrelated worktree is kept');
@@ -25821,7 +27073,7 @@ test('clean keeps a prod-verified task when invoked from inside the target workt
     const envelope = JSON.parse(result.stdout);
     assert.deepEqual(envelope.autoCleaned, []);
     assert.equal(envelope.autoCleanSkipped[0].taskSlug, 'inside-auto-clean');
-    assert.match(envelope.autoCleanSkipped[0].reason, /while running inside it/);
+    assert.match(envelope.autoCleanSkipped[0].reason, /process is still inside/);
     assert.ok(existsSync(lockPath), 'inside-target lock is kept');
     assert.ok(existsSync(created.worktreePath), 'inside-target worktree is kept');
     assert.equal(localBranchExists(repoRoot, created.branch), true, 'inside-target branch is kept');
@@ -25858,23 +27110,28 @@ test('clean keeps a prod-verified task when the prod deploy record lacks health 
   }
 });
 
-test('clean keeps a prod-verified task when the branch tree differs from deployed prod', async () => {
+test('clean delivered reconciliation never backfills an advanced legacy branch as the historical PR head', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
     commitAll(repoRoot, 'Adopt pipelane');
-    const { created, lockPath, mergedSha } = await createVerifiedAutoCleanCandidate(repoRoot, 'Diverged Verified', 'diverged-verified');
+    const { created, lockPath, mergedSha, taskBindingId } = await createVerifiedAutoCleanCandidate(repoRoot, 'Diverged Verified', 'diverged-verified');
     writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'local branch diverged\n', 'utf8');
     execFileSync('git', ['add', 'feature.txt'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
     execFileSync('git', ['commit', '-m', 'diverge from deployed tree'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    upsertPrRecord(repoRoot, 'diverged-verified', mergedSha, {
+      number: 77,
+      branchName: created.branch,
+      taskBindingId,
+    });
 
-    const result = runCli(['run', 'clean', '--json'], repoRoot, {
+    const result = runCli(['run', 'clean', '--apply', '--delivered', '--json'], repoRoot, {
       PIPELANE_CLEAN_MIN_AGE_MS: '0',
     });
     const envelope = JSON.parse(result.stdout);
-    assert.deepEqual(envelope.autoCleaned, []);
-    assert.equal(envelope.autoCleanSkipped[0].taskSlug, 'diverged-verified');
-    assert.match(envelope.autoCleanSkipped[0].reason, new RegExp(`branch tree differs from verified prod SHA ${mergedSha.slice(0, 7)}`));
+    assert.deepEqual(envelope.closed, []);
+    assert.equal(envelope.skipped[0].taskSlug, 'diverged-verified');
+    assert.equal(envelope.skipped[0].code, 'delivery-proof-insufficient');
     assert.ok(existsSync(lockPath), 'diverged lock is kept');
     assert.ok(existsSync(created.worktreePath), 'diverged worktree is kept');
     assert.equal(localBranchExists(repoRoot, created.branch), true, 'diverged branch is kept');
@@ -25900,11 +27157,13 @@ test('clean --apply --task refuses to remove a worktree with uncommitted changes
     });
     const envelope = JSON.parse(result.stdout);
 
-    // Lock pruning still happens — that's pure metadata. Artifact teardown
-    // is what stalls.
-    assert.deepEqual(envelope.removed, ['dirty-wip']);
-    assert.equal(envelope.artifacts[0].worktreeRemoved, false);
-    assert.match(envelope.artifacts[0].errors.join('\n'), /uncommitted or untracked changes/);
+    // The task lock is retry identity and is removed last, so every artifact
+    // and the lock survive a safety blocker.
+    assert.deepEqual(envelope.removed, []);
+    assert.equal(envelope.cleanup.status, 'blocked');
+    assert.equal(envelope.cleanup.code, 'uncommitted');
+    assert.match(envelope.cleanup.reason, /tracked or untracked changes/);
+    assert.ok(existsSync(path.join(sharedStateDir(repoRoot), 'task-locks', 'dirty-wip.json')));
 
     // Worktree + branch must still exist after the safety refusal.
     assert.ok(existsSync(created.worktreePath), 'dirty worktree must survive without --force');
@@ -25963,10 +27222,11 @@ test('clean --apply --task refuses to delete an unmerged branch without --force'
       PIPELANE_CLEAN_MIN_AGE_MS: '0',
     });
     const envelope = JSON.parse(result.stdout);
-    assert.deepEqual(envelope.removed, ['unmerged-work']);
-    assert.equal(envelope.artifacts[0].worktreeRemoved, true, 'clean worktree should still be removed');
-    assert.equal(envelope.artifacts[0].branchRemoved, false, 'unmerged branch must survive without --force');
-    assert.match(envelope.artifacts[0].errors.join('\n'), /not fully merged/);
+    assert.deepEqual(envelope.removed, []);
+    assert.equal(envelope.cleanup.status, 'blocked');
+    assert.equal(envelope.cleanup.code, 'delivery-proof-insufficient');
+    assert.equal(existsSync(created.worktreePath), true, 'worktree survives when typed delivery proof is absent');
+    assert.ok(existsSync(path.join(sharedStateDir(repoRoot), 'task-locks', 'unmerged-work.json')));
 
     // Branch must still exist after the safety refusal.
     const branchProbe = spawnSync('git', ['rev-parse', '--verify', `refs/heads/${created.branch}`], {
@@ -25981,23 +27241,23 @@ test('clean --apply --task refuses to delete an unmerged branch without --force'
   }
 });
 
-test('clean --apply --task refuses when invoked from inside the target worktree', () => {
+test('clean --apply --task moves to the verified shared checkout before removing its current worktree', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
     commitAll(repoRoot, 'Adopt pipelane');
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Self Removal', '--json'], repoRoot).stdout);
 
-    // Run /clean from inside the worktree it's trying to remove. git would
-    // refuse anyway, but the wrapper turns that into an actionable hint.
+    // Terminal scoped cleanup can safely leave the task checkout in-process
+    // after verifying that the shared checkout belongs to the same repository.
     const result = runCli(['run', 'clean', '--apply', '--task', 'Self Removal', '--json'], created.worktreePath, {
       PIPELANE_CLEAN_MIN_AGE_MS: '0',
     });
     const envelope = JSON.parse(result.stdout);
     assert.deepEqual(envelope.removed, ['self-removal']);
-    assert.equal(envelope.artifacts[0].worktreeRemoved, false);
-    assert.match(envelope.artifacts[0].errors.join('\n'), /Cannot remove worktree .* while inside it/);
-    assert.ok(existsSync(created.worktreePath), 'worktree must survive the self-removal refusal');
+    assert.equal(envelope.artifacts[0].worktreeRemoved, true);
+    assert.equal(envelope.artifacts[0].branchRemoved, true);
+    assert.equal(existsSync(created.worktreePath), false, 'terminal cleanup removes its former checkout');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -26335,33 +27595,12 @@ test('clean --apply --completed-with-ignored bulk-removes prod-verified workspac
     commitAll(repoRoot, 'Adopt pipelane');
 
     // Two prod-verified candidates with ignored build output. The shared
-    // helper writePrRecord overwrites pr-state.json each call, so write
-    // PR records manually to keep both tasks in pipelane's prod-verified
-    // chain.
+    // helper upserts complete PR records, so both exact bindings remain in the
+    // delivery chain.
+    runCli(['configure', '--automatic-worktree-cleanup=false'], repoRoot);
     const first = await createVerifiedAutoCleanCandidate(repoRoot, 'Built One', 'built-one');
     const second = await createVerifiedAutoCleanCandidate(repoRoot, 'Built Two', 'built-two');
-    const stateDir = path.join(sharedStateDir(repoRoot));
-    const prStatePath = path.join(stateDir, 'pr-state.json');
-    writeFileSync(prStatePath, `${JSON.stringify({
-      records: {
-        'built-one': {
-          taskSlug: 'built-one',
-          branchName: first.created.branch,
-          title: 'Built One',
-          mergedSha: first.mergedSha,
-          mergedAt: '2026-04-22T00:00:00Z',
-          updatedAt: '2026-04-22T00:00:00Z',
-        },
-        'built-two': {
-          taskSlug: 'built-two',
-          branchName: second.created.branch,
-          title: 'Built Two',
-          mergedSha: second.mergedSha,
-          mergedAt: '2026-04-22T00:00:00Z',
-          updatedAt: '2026-04-22T00:00:00Z',
-        },
-      },
-    }, null, 2)}\n`, 'utf8');
+    runCli(['configure', '--automatic-worktree-cleanup=true'], repoRoot);
     for (const candidate of [first, second]) {
       mkdirSync(path.join(candidate.created.worktreePath, 'dist'), { recursive: true });
       writeFileSync(path.join(candidate.created.worktreePath, 'dist', 'bundle.js'), 'console.log(1)\n', 'utf8');
@@ -26397,7 +27636,7 @@ test('clean --apply --completed-with-ignored leaves uncommitted source alone', a
     const envelope = JSON.parse(result.stdout);
     assert.deepEqual(envelope.closed, []);
     assert.equal(envelope.skipped[0].taskSlug, 'dirty-source');
-    assert.match(envelope.skipped[0].reason, /uncommitted or untracked changes/);
+    assert.match(envelope.skipped[0].reason, /tracked or untracked changes/);
     assert.ok(existsSync(dirty.lockPath));
     assert.ok(existsSync(dirty.created.worktreePath));
   } finally {
@@ -28915,12 +30154,15 @@ test('api snapshot emits a wire-compatible envelope', () => {
     assert.match(branch.name, /^codex\/snapshot-task-[a-f0-9]{4}$/);
     assert.equal(branch.task.taskSlug, 'snapshot-task');
     assert.deepEqual(branch.cleanup, {
+      status: 'not-applicable',
+      blockerCode: null,
       available: false,
       eligible: false,
       reason: 'workspace still active',
       stale: false,
       tag: 'active',
       evidence: [],
+      evidenceRevision: null,
     });
     for (const laneKey of ['local', 'pr', 'base', 'staging', 'production']) {
       assert.ok(branch.lanes[laneKey], `lane ${laneKey} present`);
@@ -29245,6 +30487,38 @@ test('api action execute: risky action accepts a matching confirm token and runs
   }
 });
 
+test('api clean confirmation is invalidated when its cleanup target manifest changes', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Cleanup Confirmation Identity');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const first = JSON.parse(runCli(['run', 'new', '--task', 'First Cleanup Target', '--json'], repoRoot).stdout);
+    const preflight = JSON.parse(runCli(
+      ['run', 'api', 'action', 'clean.apply', '--delivered'],
+      repoRoot,
+    ).stdout);
+    const token = preflight.data.preflight.confirmation.token;
+    assert.equal(preflight.data.preflight.normalizedInputs.cleanupTargets.length, 1);
+    assert.equal(preflight.data.preflight.normalizedInputs.cleanupTargets[0].taskBindingId.length > 0, true);
+
+    runCli(['run', 'new', '--task', 'Second Cleanup Target', '--json'], repoRoot);
+    const executed = runCli(
+      ['run', 'api', 'action', 'clean.apply', '--delivered', '--execute', '--confirm-token', token],
+      repoRoot,
+      {},
+      true,
+    );
+    const envelope = JSON.parse(executed.stdout);
+    assert.notEqual(executed.status, 0);
+    assert.equal(envelope.ok, false);
+    assert.match(envelope.data.preflight.reason, /confirmation|fingerprint|match/i);
+    assert.equal(existsSync(first.worktreePath), true);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
 test('api action preflight: clean.apply without scope returns allowed:false state:blocked and no token', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   try {
@@ -29274,10 +30548,12 @@ test('api action execute: non-risky clean.plan runs without a token and does not
     commitAll(repoRoot, 'Adopt pipelane');
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Plan Only', '--json'], repoRoot).stdout);
     const mergedSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
-    writePrRecord(repoRoot, 'plan-only', mergedSha);
-
     const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', 'plan-only.json');
     const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+    upsertPrRecord(repoRoot, 'plan-only', mergedSha, {
+      branchName: lock.branchName,
+      taskBindingId: lock.taskBindingId,
+    });
     await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, lock.surfaces, { taskSlug: 'plan-only' });
     lock.updatedAt = '2026-04-17T00:00:00Z';
     writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`, 'utf8');
@@ -29301,9 +30577,12 @@ test('api action execute: non-risky clean.plan runs without a token and does not
 async function seedStatusCleanupCandidate(repoRoot, taskName) {
   const created = JSON.parse(runCli(['run', 'new', '--task', taskName, '--json'], repoRoot).stdout);
   const mergedSha = run('git', ['rev-parse', 'HEAD'], repoRoot);
-  writePrRecord(repoRoot, created.taskSlug, mergedSha);
   const lockPath = path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`);
   const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+  upsertPrRecord(repoRoot, created.taskSlug, mergedSha, {
+    branchName: lock.branchName,
+    taskBindingId: lock.taskBindingId,
+  });
   await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, lock.surfaces, { taskSlug: created.taskSlug });
   lock.updatedAt = '2026-04-17T00:00:00Z';
   writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`, 'utf8');
@@ -29385,6 +30664,43 @@ test('status interactive action approval executes through api action and records
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('status delegates its managed workspace lease to an approved child action', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  try {
+    writePipelaneConfig(repoRoot, 'Status Lease Delegation');
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Status Lease Delegation', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'status-change.txt'), 'delegate this action\n', 'utf8');
+    writePassingReviewEvidence(created.worktreePath);
+
+    const result = runCli(['run', 'status'], created.worktreePath, {
+      PATH: `${ghBin}:${process.env.PATH}`,
+      GH_STATE_FILE: ghStateFile,
+      PIPELANE_STATUS_INPUT: 'Status Lease Delegation\ny\n',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Action completed: pr executed/);
+    assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /workspace-busy|in use by status/);
+    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
+    assert.equal(ghState.prs[created.branch].state, 'OPEN');
+    assert.equal(
+      existsSync(path.join(sharedStateDir(repoRoot), 'task-cleanup-locks', `${created.taskSlug}.lock`)),
+      false,
+      'the outer status command must release the delegated lease after the child exits',
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
   }
 });
 
@@ -34058,6 +35374,7 @@ test('v1.1 /rollback staging dispatches + verifies + persists rollbackOfSha', ()
     const prState = JSON.parse(readFileSync(prStatePath, 'utf8'));
     const prKey = Object.keys(prState.records)[0];
     prState.records[prKey].mergedSha = goodSha;
+    prState.deliveriesByPr['1'].mergedSha = goodSha;
     writeFileSync(prStatePath, JSON.stringify(prState, null, 2), 'utf8');
 
     // First staging deploy = the known-good one to roll back to.
@@ -34325,6 +35642,7 @@ test('v1.1 fixup: re-running /rollback after a successful rollback refuses (casc
     const prStatePath = path.join(sharedStateDir(repoRoot), 'pr-state.json');
     const prState = JSON.parse(readFileSync(prStatePath, 'utf8'));
     prState.records[Object.keys(prState.records)[0]].mergedSha = goodSha;
+    prState.deliveriesByPr['1'].mergedSha = goodSha;
     writeFileSync(prStatePath, JSON.stringify(prState, null, 2), 'utf8');
     // good → bad → rollback (succeeds). Re-running rollback should
     // refuse instead of cascading to an older sha.
@@ -35946,6 +37264,40 @@ test('destination route execution runs explicit task PR step inside the attached
   }
 });
 
+test('destination route execution can start with --yes inside the managed task worktree', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(fakeBin, 'gh-state.json');
+  writeFakeGh(fakeBin, ghStateFile);
+  const env = { PATH: `${fakeBin}:${process.env.PATH}`, GH_STATE_FILE: ghStateFile };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Managed Route Lease');
+    runCli(['setup'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+    });
+    commitAll(repoRoot, 'configure pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Managed Route Lease', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'route from task worktree\n', 'utf8');
+    writePassingReviewEvidence(created.worktreePath);
+
+    const result = runCli(
+      ['run', 'pr', '--title', 'Managed Route Lease', '--yes', '--json'],
+      created.worktreePath,
+      env,
+    );
+    assert.equal(result.status, 0);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.execution.steps[0].cwd, created.worktreePath);
+    assert.doesNotMatch(result.stderr, /in use by pr|workspace-busy/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
 test('destination routes infer a task slug from a dirty lockless branch', () => {
   const repoRoot = createRepo();
   try {
@@ -36410,6 +37762,8 @@ test('api route actions re-check review evidence at execute time', () => {
     const preflight = JSON.parse(runCli(routeArgs, created.worktreePath, env).stdout);
     const token = preflight.data.preflight.confirmation.token;
     assert.ok(token);
+    assert.match(preflight.data.preflight.warnings.join('\n'), /normally closes the task worktree/);
+    assert.match(preflight.data.preflight.normalizedInputs.route.taskBindingId, /^task-binding-/);
 
     writeFileSync(featurePath, 'changed after route preflight\n', 'utf8');
     const executed = runCli(
@@ -36475,6 +37829,53 @@ test('api route actions forward approved PR title and message into the PR child'
       encoding: 'utf8',
     }).trim();
     assert.equal(commitSubject, 'approved commit message');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
+test('api route merge continues from the shared checkout after automatic workspace closeout', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(fakeBin, 'gh-state.json');
+  writeFakeGh(fakeBin, ghStateFile);
+  const env = {
+    PATH: `${fakeBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_PR_MERGE_PUSH_HEAD: '1',
+  };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Route Automatic Closeout');
+    runCli(['setup'], repoRoot);
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.buildMode = { ...config.buildMode, autoDeployOnMerge: false };
+    });
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Route Automatic Closeout', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'route closeout\n', 'utf8');
+    writePassingReviewEvidence(created.worktreePath);
+
+    const routeArgs = [
+      'run', 'api', 'action', 'route.merge',
+      '--task', 'Route Automatic Closeout',
+      '--title', 'Route Automatic Closeout',
+      '--message', 'route automatic closeout',
+    ];
+    const preflight = JSON.parse(runCli(routeArgs, created.worktreePath, env).stdout);
+    const token = preflight.data.preflight.confirmation.token;
+    const executed = JSON.parse(runCli(
+      [...routeArgs, '--execute', '--confirm-token', token],
+      created.worktreePath,
+      env,
+    ).stdout);
+
+    assert.equal(executed.ok, true, executed.message);
+    assert.equal(existsSync(created.worktreePath), false);
+    assert.equal(localBranchExists(repoRoot, created.branch), false);
+    assert.equal(existsSync(path.join(sharedStateDir(repoRoot), 'task-locks', `${created.taskSlug}.json`)), false);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -36796,6 +38197,23 @@ test('orchestrate review auto-cleans only completed verified slice worktrees', a
       title: 'Orchestration slice cleanup',
       number: 77,
     });
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = state.resolveWorkflowContext(repoRoot);
+    state.saveDeliveryRecord(context.commonDir, context.config, {
+      prNumber: 77,
+      ownership: 'managed-task',
+      taskSlug: slice.taskSlug,
+      taskBindingId: sliceLock.taskBindingId,
+      branchName: slice.branchName,
+      mode: sliceLock.mode,
+      surfaces: sliceLock.surfaces,
+      baseBranch: 'main',
+      prHeadSha: mergedSha,
+      mergedSha: run('git', ['rev-parse', 'origin/main'], repoRoot),
+      mergedAt: '2026-04-22T00:00:00.000Z',
+      title: 'Orchestration slice cleanup',
+      url: 'https://example.test/pr/77',
+    });
     await writeSucceededDeployRecord(repoRoot, 'prod', mergedSha, sliceLock.surfaces, { taskSlug: slice.taskSlug });
 
     const reviewed = JSON.parse(runCli(['run', 'orchestrate', 'review', '--run-id', planned.runId, '--json'], repoRoot, {
@@ -36872,8 +38290,8 @@ test('orchestrate review records cleanup skip when merge deploy evidence is not 
     assert.equal(reviewed.run.status, 'completed');
     assert.deepEqual(reviewed.autoCleanup.closed, []);
     assert.equal(reviewed.autoCleanup.skipped[0].taskSlug, slice.taskSlug);
-    assert.equal(reviewed.autoCleanup.skipped[0].code, 'not-prod-verified');
-    assert.match(reviewed.autoCleanup.skipped[0].reason, /no merged PR SHA plus verified prod deploy evidence/);
+    assert.equal(reviewed.autoCleanup.skipped[0].code, 'delivery-proof-insufficient');
+    assert.match(reviewed.autoCleanup.skipped[0].reason, /No typed remote-base delivery proof is available/);
     assert.ok(existsSync(sliceLockPath), 'unverified completed slice lock is kept');
     assert.ok(existsSync(slice.worktreePath), 'unverified completed slice worktree is kept');
     assert.equal(localBranchExists(repoRoot, slice.branchName), true, 'unverified completed slice branch is kept');

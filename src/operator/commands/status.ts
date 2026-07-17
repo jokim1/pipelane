@@ -31,6 +31,7 @@ import {
   type PrRecord,
   type StatusDecisionRecord,
   type TaskLock,
+  type TaskWorkspaceLease,
   type WorkflowConfig,
 } from '../state.ts';
 import { renderLaneLine, renderStateGlyph, sanitizeForTerminal } from './helpers.ts';
@@ -54,7 +55,11 @@ import { renderLaneLine, renderStateGlyph, sanitizeForTerminal } from './helpers
 // directly (not the envelope) because they're time-series / set-diff
 // questions the snapshot doesn't pre-aggregate. Only one view flag may
 // be set at a time; the default (no flag) still renders the cockpit.
-export async function handleStatus(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
+export async function handleStatus(
+  cwd: string,
+  parsed: ParsedOperatorArgs,
+  options: { workspaceLease?: TaskWorkspaceLease | null } = {},
+): Promise<void> {
   const { week, stuck, blastSha, json } = parsed.flags;
   const viewCount = [week, stuck, Boolean(blastSha.trim())].filter(Boolean).length;
   if (viewCount > 1) {
@@ -120,7 +125,7 @@ export async function handleStatus(cwd: string, parsed: ParsedOperatorArgs): Pro
     color: process.stdout.isTTY === true && !noColor,
   });
   process.stdout.write(rendered.endsWith('\n') ? rendered : `${rendered}\n`);
-  await maybeRunInteractiveStatusAction(cwd, parsed, envelope);
+  await maybeRunInteractiveStatusAction(cwd, parsed, envelope, options.workspaceLease);
 }
 
 export interface RenderCockpitOptions {
@@ -153,6 +158,7 @@ async function maybeRunInteractiveStatusAction(
   cwd: string,
   parsed: ParsedOperatorArgs,
   envelope: ApiEnvelope<SnapshotData>,
+  workspaceLease?: TaskWorkspaceLease | null,
 ): Promise<void> {
   if (!canPromptForStatusAction()) return;
   const candidate = chooseStatusActionCandidate(envelope.data);
@@ -219,7 +225,9 @@ async function maybeRunInteractiveStatusAction(
     }
 
     const confirmToken = preflight.confirmation?.token ?? '';
-    const executed = await runActionExecute(cwd, candidate.id, resolved.parsed, confirmToken);
+    const executed = await runActionExecute(cwd, candidate.id, resolved.parsed, confirmToken, {
+      workspaceLease,
+    });
     const execution = hasActionExecution(executed.data) ? executed.data.execution : null;
     decision = {
       ...decision,
@@ -506,7 +514,7 @@ export function renderCockpit(
   options: RenderCockpitOptions = {},
 ): string {
   const color = options.color === true;
-  const { boardContext, branches, sourceHealth, attention, orchestration } = envelope.data;
+  const { boardContext, branches, sourceHealth, attention, orchestration, cleanupSummary } = envelope.data;
   const baseBranch = boardContext.baseBranch;
 
   const lines: string[] = [];
@@ -619,6 +627,9 @@ export function renderCockpit(
       lines.push(...renderBranch(branch, baseBranch, color));
     }
   }
+  lines.push('');
+
+  lines.push(...renderCleanupSummary(cleanupSummary, color));
   lines.push('');
 
   lines.push(colorize('SOURCES', color, 'bold'));
@@ -806,7 +817,31 @@ function renderBranch(branch: BranchRow, baseBranch: string, color: boolean): st
   if (lockNextAction) {
     detail.push(`    next: ${sanitizeForTerminal(lockNextAction)}${formatNextActionTiming(branch.task?.nextActionAgeMs ?? null, branch.task?.nextActionStale ?? false)}`);
   }
+  if (branch.cleanup?.status && branch.cleanup.status !== 'not-applicable') {
+    const blocker = branch.cleanup.blockerCode ? ` code=${sanitizeForTerminal(branch.cleanup.blockerCode)}` : '';
+    detail.push(`    cleanup: ${sanitizeForTerminal(branch.cleanup.status)}${blocker} — ${sanitizeForTerminal(branch.cleanup.reason)}`);
+    if (branch.cleanup.evidenceRevision) {
+      detail.push(`      evidence: ${sanitizeForTerminal(branch.cleanup.evidenceRevision.source)} ${sanitizeForTerminal(branch.cleanup.evidenceRevision.remoteBaseSha.slice(0, 12))} observed ${sanitizeForTerminal(branch.cleanup.evidenceRevision.observedAt)}`);
+    }
+  }
   return [header, laneLine, ...detail];
+}
+
+function renderCleanupSummary(
+  summary: SnapshotData['cleanupSummary'] | undefined,
+  color: boolean,
+): string[] {
+  const lines = [colorize('WORKSPACE CLEANUP', color, 'bold')];
+  if (!summary) {
+    lines.push('  cleanup summary unavailable; refresh with the current Pipelane runtime');
+    return lines;
+  }
+  lines.push(`  automatic=${summary.automaticEnabled ? 'enabled' : 'disabled'} pending=${summary.pending} eligible=${summary.eligible} kept=${summary.kept} blocked=${summary.blocked}`);
+  const blockerCounts = Object.entries(summary.blockedByCode)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([code, count]) => `${sanitizeForTerminal(code)}=${count}`);
+  if (blockerCounts.length > 0) lines.push(`  blockers: ${blockerCounts.join(', ')}`);
+  return lines;
 }
 
 function formatNextActionTiming(ageMs: number | null, stale: boolean): string {

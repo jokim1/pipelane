@@ -1,6 +1,6 @@
 # Release Workflow
 
-Last updated: July 13, 2026
+Last updated: July 16, 2026
 Status: canonical maintainer workflow for {{DISPLAY_NAME}}
 
 This document is the full operator guide for this repo's pipelane setup.
@@ -20,6 +20,7 @@ follow safely without improvising repo behavior.
 - `{{ALIAS_NEW}}` is the canonical task-start command
 - `{{ALIAS_ADOPT}}` binds external task branches/worktrees without duplicating them
 - `{{ALIAS_RESUME}}` is the recovery command
+- `{{ALIAS_MERGE}}` normally closes the clean task worktree after confirmed delivery; `--keep-worktree` retains it durably
 - `{{ALIAS_RELEASE}}` is the release-module setup and status command
 - `/fix` is the durable repair loop for bugs, review findings, CI failures, and code-quality repairs
 - `repo-guard` is internal-only
@@ -231,7 +232,8 @@ User-facing journey:
 2. `{{ALIAS_NEW}}`
 3. `{{ALIAS_PR}} --title "<pr title>"`
 4. `{{ALIAS_MERGE}}`
-5. `{{ALIAS_CLEAN}}`
+
+After merge, continue from the primary shared checkout printed in the receipt.
 
 ### Release mode user journey
 
@@ -250,9 +252,34 @@ User-facing journey:
 3. `{{ALIAS_NEW}}`
 4. `{{ALIAS_PR}} --title "<pr title>"`
 5. `{{ALIAS_MERGE}}`
-6. `{{ALIAS_DEPLOY}} staging`
-7. `{{ALIAS_DEPLOY}} prod`
-8. `{{ALIAS_CLEAN}}`
+6. from the reported shared checkout, `{{ALIAS_DEPLOY}} staging --pr <merged-pr-number>`
+7. `{{ALIAS_DEPLOY}} prod --pr <merged-pr-number>`
+
+The explicit PR number lets deploy resolve the exact merged SHA, mode, and
+surfaces from immutable delivery history; it does not need the removed edit
+worktree.
+
+## Automatic task-workspace closeout
+
+Successful `{{ALIAS_MERGE}}` removes the clean task worktree, its exact local
+branch, and the task lock after the remote base is proven to contain the merge.
+Dirty, untracked, detached, mismatched, unknown ignored, or actively leased
+workspaces survive with a stable blocker code. A merge remains successful when
+local cleanup is blocked.
+
+- retain intentionally: `{{ALIAS_MERGE}} --keep-worktree`
+- explicitly clear retention/retry: `{{ALIAS_CLEAN}} --apply --task <slug>`
+- retry delivered backlog: `{{ALIAS_CLEAN}} --apply --delivered`
+- preview only: bare `{{ALIAS_CLEAN}}` or `{{ALIAS_CLEAN}} --status-only`
+- disable globally for this machine/repository:
+  `pipelane configure --automatic-worktree-cleanup=false`
+- re-enable: `pipelane configure --automatic-worktree-cleanup=true`
+- replace validated disposable ignored roots with repeatable
+  `pipelane configure --disposable-ignored-path=<root>`
+
+Disposable declarations are exact repository-relative roots. Symlink escapes,
+tracked paths, and unknown ignored content remain protected. `{{ALIAS_STATUS}}`
+shows policy state plus pending, eligible, kept, and blocked counts by code.
 
 ## Build Mode
 
@@ -296,7 +323,7 @@ Surfaces:
 
 ## Cleanup
 
-`{{ALIAS_CLEAN}}` closes completed, prod-verified task workspaces automatically when the local safety checks pass, then reports anything left. Use `--status-only` for a non-mutating preview, `--apply --all-stale` to prune stale task locks in bulk, or `--apply --task <slug>` to close a specific task explicitly.
+`{{ALIAS_CLEAN}}` is a non-mutating preview of delivered-workspace cleanup readiness. Use `--apply --delivered` to retry delivered workspaces in bulk, `--apply --all-stale` for metadata-only stale-lock pruning, or `--apply --task <slug>` to close a specific task explicitly. Production verification is not required when typed remote-base delivery proof is available.
 
 ## Supporting Files
 

@@ -102,15 +102,17 @@ before production moves:
 /pipelane review
 /pr
 /merge
-/deploy staging
+# continue from the shared checkout printed by merge
+/deploy staging --pr <merged-pr-number>
 /release status
-/deploy prod
+/deploy prod --pr <merged-pr-number>
 ```
 
 Safe release means:
 
 - review evidence exists before PR handoff
-- the merged SHA is recorded
+- immutable delivery history records the merged SHA, task mode, and surfaces
+- a clean task worktree normally closes after merge; `--keep-worktree` retains it
 - staging verifies the same SHA that production will receive
 - deploys are tied to the expected surfaces
 - health checks and verification commands produce evidence
@@ -268,11 +270,16 @@ continue through staging and production:
 /pipelane review
 /pr
 /merge
-/deploy staging
+# continue from the shared checkout printed by merge
+/deploy staging --pr <merged-pr-number>
 /release status
-/deploy prod
+/deploy prod --pr <merged-pr-number>
 /pipelane web
 ```
+
+Bare `/clean` is a non-destructive preview. Use `/clean --apply --delivered`
+to retry delivered cleanup backlogs, or `/clean --apply --task <slug>` to
+clear intentional `--keep-worktree` retention and retry that exact task.
 
 ## Requirements
 
