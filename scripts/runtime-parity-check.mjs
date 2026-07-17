@@ -530,12 +530,19 @@ async function main() {
     lines.push(`[${host}] ${root} (${provenance}, installed ${metadata?.installedAt ?? 'unknown'})`);
 
     const rootDrift = runtimeRootDrift(root);
-    const manifest = compareManifest(root);
+    // An invalid root is already authoritative drift. Do not follow a runtime
+    // root symlink or treat a regular file as a directory while collecting
+    // secondary diagnostics from a tree that is outside the trust boundary.
+    const manifest = rootDrift.length === 0
+      ? compareManifest(root)
+      : { drift: [...rootDrift], compared: 0 };
     // Never execute modules from a runtime whose packaged bytes already
     // differ. The behavioral probe is only safe after content parity proves
     // the imported module and all of its packaged dependencies are local bits.
     const surfaceProbe = rootDrift.length === 0 && manifest.drift.length === 0 ? await probeReviewSurface(root) : null;
-    manifest.drift.unshift(...rootDrift, ...runtimeMetadataDrift(host, root), ...await generatedRuntimeDrift(host, root));
+    if (rootDrift.length === 0) {
+      manifest.drift.unshift(...runtimeMetadataDrift(host, root), ...await generatedRuntimeDrift(host, root));
+    }
     const surfaceDigestDrift = manifest.drift.filter((entry) => REVIEW_SURFACE_MODULES.some((module) => entry.startsWith(module)));
 
     if (manifest.drift.length === 0) {
@@ -564,8 +571,10 @@ async function main() {
       ? `[${host}] review/pr/merge surface parity: OK`
       : `[${host}] review/pr/merge surface parity: DRIFT (${surfaceDigestDrift.length} module(s))`);
 
-    const wrapperDrift = await managedSkillWrapperDrift(host, root);
-    if (wrapperDrift.length === 0) {
+    const wrapperDrift = rootDrift.length === 0 ? await managedSkillWrapperDrift(host, root) : null;
+    if (wrapperDrift === null) {
+      lines.push(`[${host}] managed skill wrappers: SKIPPED (invalid runtime root)`);
+    } else if (wrapperDrift.length === 0) {
       lines.push(`[${host}] managed skill wrappers: OK (manifest, payloads, and installed wrappers agree)`);
     } else {
       failed = true;

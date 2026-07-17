@@ -378,7 +378,10 @@ export function installCodexBootstrapSkill(
   });
 
   mkdirSync(skillsRoot, { recursive: true });
+  const installed: string[] = [];
+  const skipped: string[] = [];
   const removedLegacySkills = pruneLegacyCodexWrappers(skillsRoot, pipelaneRoot, install.entries);
+  const entriesToInstall = install.entries.filter((entry) => assertOrSkipCollision(skillsRoot, entry, skipped));
   installGlobalRuntime(pipelaneRoot, {
     host: 'codex',
     legacyMarkers: [MANAGED_CODEX_SKILLS_FILENAME],
@@ -387,14 +390,9 @@ export function installCodexBootstrapSkill(
   writeFileSync(path.join(binDir, 'run-pipelane.sh'), install.runnerScript, { mode: 0o755, encoding: 'utf8' });
   writeFileSync(path.join(binDir, 'bootstrap-pipelane.sh'), install.bootstrapScript, { mode: 0o755, encoding: 'utf8' });
 
-  const installed: string[] = [];
-  const skipped: string[] = [];
   const managedNames: string[] = [];
 
-  for (const entry of install.entries) {
-    if (!assertOrSkipCollision(skillsRoot, entry, skipped)) {
-      continue;
-    }
+  for (const entry of entriesToInstall) {
     writeSkill(skillsRoot, entry);
     installed.push(entry.slashAlias);
     managedNames.push(entry.name);

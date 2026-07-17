@@ -39777,6 +39777,50 @@ test('write-build-info records sha, dirty, and timestamp with env overrides', ()
   }
 });
 
+test('write-build-info derives sha and dirty state from the source git tree', () => {
+  const workDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-build-info-git-'));
+  const env = { ...process.env };
+  delete env.PIPELANE_BUILD_SHA;
+  delete env.PIPELANE_BUILD_DIRTY;
+  delete env.PIPELANE_BUILD_TIMESTAMP;
+  try {
+    execFileSync('git', ['init', '-b', 'main'], { cwd: workDir, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: workDir });
+    execFileSync('git', ['config', 'user.name', 'Pipelane Test'], { cwd: workDir });
+    writeFileSync(path.join(workDir, '.gitignore'), 'dist/\n', 'utf8');
+    writeFileSync(path.join(workDir, 'source.txt'), 'clean\n', 'utf8');
+    execFileSync('git', ['add', '.gitignore', 'source.txt'], { cwd: workDir });
+    execFileSync('git', ['commit', '-m', 'Initial source'], { cwd: workDir, stdio: 'ignore' });
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workDir, encoding: 'utf8' }).trim();
+
+    const clean = spawnSync('node', [path.join(KIT_ROOT, 'scripts', 'write-build-info.mjs')], {
+      cwd: workDir,
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(clean.status, 0, clean.stderr);
+    assert.deepEqual(
+      (({ sha, dirty }) => ({ sha, dirty }))(JSON.parse(readFileSync(path.join(workDir, 'dist', 'build-info.json'), 'utf8'))),
+      { sha: head, dirty: false },
+    );
+
+    writeFileSync(path.join(workDir, 'source.txt'), 'dirty\n', 'utf8');
+    const dirty = spawnSync('node', [path.join(KIT_ROOT, 'scripts', 'write-build-info.mjs')], {
+      cwd: workDir,
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(dirty.status, 0, dirty.stderr);
+    const dirtyInfo = JSON.parse(readFileSync(path.join(workDir, 'dist', 'build-info.json'), 'utf8'));
+    assert.equal(dirtyInfo.sha, head);
+    assert.equal(dirtyInfo.dirty, true);
+  } finally {
+    rmSync(workDir, { recursive: true, force: true });
+  }
+});
+
 function runParity(pipelaneHome, env = {}) {
   return spawnSync('node', [path.join(KIT_ROOT, 'scripts', 'runtime-parity-check.mjs')], {
     cwd: KIT_ROOT,
@@ -39802,6 +39846,22 @@ test('managed runtime install records build-info provenance and retains a rollba
     assert.equal(Boolean(metadata.sourceDirty), Boolean(buildInfo.dirty));
     const cleanInstallEnv = { ...env, PIPELANE_INSTALL_SOURCE_SHA: buildInfo.sha };
 
+    // Required wrapper collisions are preflighted before the active runtime is
+    // published, so a normal user error cannot leave a partial live runtime.
+    const requiredCollisionPath = path.join(claudeHome, 'skills', 'new', 'SKILL.md');
+    const managedRequiredBody = readFileSync(requiredCollisionPath, 'utf8');
+    const activeMetadataBody = readFileSync(path.join(runtimeRoot, '.pipelane-runtime.json'), 'utf8');
+    writeFileSync(requiredCollisionPath, '# User-owned required collision\n', 'utf8');
+    writeFileSync(path.join(runtimeRoot, 'preflight-sentinel.txt'), 'active\n', 'utf8');
+    const requiredCollision = runCli(['install-claude'], workspaceRoot, cleanInstallEnv, true);
+    assert.notEqual(requiredCollision.status, 0);
+    assert.match(requiredCollision.stderr, /Claude skill alias collision/);
+    assert.equal(readFileSync(requiredCollisionPath, 'utf8'), '# User-owned required collision\n');
+    assert.equal(readFileSync(path.join(runtimeRoot, '.pipelane-runtime.json'), 'utf8'), activeMetadataBody);
+    assert.ok(existsSync(path.join(runtimeRoot, 'preflight-sentinel.txt')));
+    assert.equal(existsSync(`${runtimeRoot}.previous`), false);
+    writeFileSync(requiredCollisionPath, managedRequiredBody, 'utf8');
+
     // Reinstall must not delete an unrelated directory that happens to occupy
     // the reserved rollback path.
     const previousRoot = `${runtimeRoot}.previous`;
@@ -39820,6 +39880,18 @@ test('managed runtime install records build-info provenance and retains a rollba
     runCli(['install-claude'], workspaceRoot, cleanInstallEnv);
     assert.equal(existsSync(path.join(runtimeRoot, 'sentinel-first-install.txt')), false);
     assert.ok(existsSync(path.join(previousRoot, 'sentinel-first-install.txt')));
+
+    // A same-revision refresh must not preserve a rollback target whose
+    // metadata cannot pass the rollback validator.
+    const retainedMetadataPath = path.join(previousRoot, '.pipelane-runtime.json');
+    const retainedMetadataBody = readFileSync(retainedMetadataPath, 'utf8');
+    const retainedMetadata = JSON.parse(retainedMetadataBody);
+    writeFileSync(retainedMetadataPath, `${JSON.stringify({ ...retainedMetadata, packageVersion: '' }, null, 2)}\n`, 'utf8');
+    const incompleteRetained = runCli(['install-claude'], workspaceRoot, cleanInstallEnv, true);
+    assert.notEqual(incompleteRetained.status, 0);
+    assert.match(incompleteRetained.stderr, /incomplete managed runtime metadata; refusing to preserve it as a rollback target/);
+    assert.ok(existsSync(path.join(previousRoot, 'sentinel-first-install.txt')));
+    writeFileSync(retainedMetadataPath, retainedMetadataBody, 'utf8');
 
     // Refreshing an already-current clean runtime must preserve the genuinely
     // older rollback target instead of replacing it with another current copy.
@@ -39856,6 +39928,22 @@ test('managed runtime install records build-info provenance and retains a rollba
     runCli(['install-claude', '--rollback'], workspaceRoot, env);
     assert.doesNotMatch(readFileSync(wrapperPath, 'utf8'), /LOCKSTEP_MARKER/);
 
+    // A user-owned skill that takes over a managed alias between installs must
+    // survive rollback and roll-forward unchanged.
+    const collisionSkill = 'pipelane';
+    assert.ok(manifestNames.includes(collisionSkill), 'expected the required /pipelane dispatcher skill');
+    const collisionWrapperPath = path.join(claudeHome, 'skills', collisionSkill, 'SKILL.md');
+    const managedCollisionBody = readFileSync(collisionWrapperPath, 'utf8');
+    const userCollisionBody = '# User-owned Claude skill\n';
+    writeFileSync(collisionWrapperPath, userCollisionBody, 'utf8');
+    const collisionRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.match(collisionRollback.stdout, new RegExp(`Left unmanaged skills in place \\(name collisions\\): ${collisionSkill}`));
+    assert.equal(readFileSync(collisionWrapperPath, 'utf8'), userCollisionBody);
+    const collisionRollForward = runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.match(collisionRollForward.stdout, new RegExp(`Left unmanaged skills in place \\(name collisions\\): ${collisionSkill}`));
+    assert.equal(readFileSync(collisionWrapperPath, 'utf8'), userCollisionBody);
+    writeFileSync(collisionWrapperPath, managedCollisionBody, 'utf8');
+
     if (process.platform !== 'win32') {
       // A restore failure mid-flight must compensate: wrappers return to
       // their pre-rollback bytes and the runtime swap is undone.
@@ -39891,7 +39979,7 @@ test('managed runtime install records build-info provenance and retains a rollba
       symlinkSync(externalProbeDir, retainedProbeDir, 'dir');
       const symlinkedPayloadRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
       assert.notEqual(symlinkedPayloadRollback.status, 0);
-      assert.match(symlinkedPayloadRollback.stderr, /invalid host-skill payload directory/);
+      assert.match(symlinkedPayloadRollback.stderr, new RegExp(`contains a symbolic link in its runtime tree: host-skills/${probeSkill}`));
       assert.equal(readFileSync(wrapperPath, 'utf8'), wrapperBeforeSymlinkRefusal);
       rmSync(retainedProbeDir, { force: true });
       renameSync(externalProbeDir, retainedProbeDir);
@@ -39902,11 +39990,26 @@ test('managed runtime install records build-info provenance and retains a rollba
       symlinkSync(path.join(pipelaneHome, 'missing-retained-payload-root'), retainedPayloadRoot, 'dir');
       const brokenPayloadRootRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
       assert.notEqual(brokenPayloadRootRollback.status, 0);
-      assert.match(brokenPayloadRootRollback.stderr, /invalid host-skill payload root/);
+      assert.match(brokenPayloadRootRollback.stderr, /contains a symbolic link in its runtime tree: host-skills/);
       assert.equal(readFileSync(wrapperPath, 'utf8'), wrapperBeforeSymlinkRefusal);
       rmSync(retainedPayloadRoot, { force: true });
       renameSync(externalRetainedPayloadRoot, retainedPayloadRoot);
     }
+
+    // A hostile retained manifest must be rejected before a payload path can
+    // escape the retained runtime root.
+    const traversalManifestBody = readFileSync(previousManifestPath, 'utf8');
+    const outsideSkillDir = path.join(pipelaneHome, 'outside-retained-skill');
+    const outsideSentinel = path.join(outsideSkillDir, 'SKILL.md');
+    mkdirSync(outsideSkillDir, { recursive: true });
+    writeFileSync(outsideSentinel, 'outside sentinel\n', 'utf8');
+    writeFileSync(previousManifestPath, `${JSON.stringify({ skills: ['../../../outside-retained-skill'] }, null, 2)}\n`, 'utf8');
+    const traversalRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+    assert.notEqual(traversalRollback.status, 0);
+    assert.match(traversalRollback.stderr, /Unsafe managed skill name in runtime payloads/);
+    assert.equal(readFileSync(outsideSentinel, 'utf8'), 'outside sentinel\n');
+    writeFileSync(previousManifestPath, traversalManifestBody, 'utf8');
+    rmSync(outsideSkillDir, { recursive: true, force: true });
 
     // An empty retained manifest cannot authorize a mass wrapper prune.
     const editedPreviousManifest = readFileSync(previousManifestPath, 'utf8');
@@ -39976,11 +40079,22 @@ test('managed runtime install records build-info provenance and retains a rollba
       symlinkSync(path.join(runtimeRoot, 'bin', 'pipelane'), retainedBin);
       const symlinkedBin = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
       assert.notEqual(symlinkedBin.status, 0);
-      assert.match(symlinkedBin.stderr, /required runtime asset: bin\/pipelane must be a file/);
+      assert.match(symlinkedBin.stderr, /contains a symbolic link in its runtime tree: bin\/pipelane/);
       assert.ok(existsSync(path.join(runtimeRoot, 'package.json')));
       rmSync(retainedBin, { force: true });
       writeFileSync(retainedBin, retainedBinBody, { mode: retainedBinMode });
       chmodSync(retainedBin, retainedBinMode);
+
+      const retainedBinDir = path.join(previousRoot, 'bin');
+      const externalRetainedBinDir = path.join(pipelaneHome, 'external-retained-bin');
+      renameSync(retainedBinDir, externalRetainedBinDir);
+      symlinkSync(externalRetainedBinDir, retainedBinDir, 'dir');
+      const symlinkedBinParent = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+      assert.notEqual(symlinkedBinParent.status, 0);
+      assert.match(symlinkedBinParent.stderr, /contains a symbolic link in its runtime tree: bin/);
+      assert.ok(existsSync(path.join(runtimeRoot, 'package.json')));
+      rmSync(retainedBinDir, { force: true });
+      renameSync(externalRetainedBinDir, retainedBinDir);
 
       // The retained runtime root itself must be a real directory. Otherwise a
       // local symlink can redirect the durable runtime outside PIPELANE_HOME.
@@ -40072,12 +40186,21 @@ test('install-codex normalizes a legacy runtime before retaining and rolling it 
     const probeSkill = manifestNames[0];
     const retainedPayloadPath = path.join(previousRoot, 'host-skills', probeSkill, 'SKILL.md');
     const retainedPayload = readFileSync(retainedPayloadPath, 'utf8');
+    const codexWrapperPath = path.join(codexHome, 'skills', probeSkill, 'SKILL.md');
+    const currentCodexWrapperBody = readFileSync(codexWrapperPath, 'utf8');
     writeFileSync(retainedPayloadPath, `${retainedPayload}\nCODEX_LOCKSTEP_MARKER\n`, 'utf8');
 
     const rollback = runCli(['install-codex', '--rollback'], workspaceRoot, env);
     assert.match(rollback.stdout, /Rolled back the managed Codex runtime/);
     assert.ok(existsSync(path.join(runtimeRoot, 'sentinel-legacy-runtime.txt')));
-    assert.match(readFileSync(path.join(codexHome, 'skills', probeSkill, 'SKILL.md'), 'utf8'), /CODEX_LOCKSTEP_MARKER/);
+    assert.match(readFileSync(codexWrapperPath, 'utf8'), /CODEX_LOCKSTEP_MARKER/);
+
+    const userCodexWrapperBody = '# User-owned Codex skill\n';
+    writeFileSync(codexWrapperPath, userCodexWrapperBody, 'utf8');
+    const collisionRollForward = runCli(['install-codex', '--rollback'], workspaceRoot, env);
+    assert.match(collisionRollForward.stdout, new RegExp(`Left unmanaged skills in place \\(name collisions\\): ${probeSkill}`));
+    assert.equal(readFileSync(codexWrapperPath, 'utf8'), userCodexWrapperBody);
+    writeFileSync(codexWrapperPath, currentCodexWrapperBody, 'utf8');
   } finally {
     rmSync(workspaceRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -40092,6 +40215,7 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
   const emptyHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-empty-'));
   const corruptHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-corrupt-'));
   const brokenLinkHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-broken-link-'));
+  const fileRootHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-file-root-'));
   try {
     runCli(['install-claude'], workspaceRoot, { CLAUDE_HOME: claudeHome, PIPELANE_HOME: pipelaneHome });
 
@@ -40146,6 +40270,17 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
     const brokenRuntimeLink = runParity(brokenLinkHome);
     assert.equal(brokenRuntimeLink.status, 1, `${brokenRuntimeLink.stdout}\n${brokenRuntimeLink.stderr}`);
     assert.match(brokenRuntimeLink.stdout, /runtime root: expected a real directory/);
+
+    // A regular file at the runtime root is structured drift too. The checker
+    // must not crash with ENOTDIR before printing its result protocol.
+    mkdirSync(path.join(fileRootHome, 'runtimes'), { recursive: true });
+    writeFileSync(managedRuntimeRoot('claude', fileRootHome), 'not a runtime\n', 'utf8');
+    const fileRuntimeRoot = runParity(fileRootHome);
+    assert.equal(fileRuntimeRoot.status, 1, `${fileRuntimeRoot.stdout}\n${fileRuntimeRoot.stderr}`);
+    assert.match(fileRuntimeRoot.stdout, /runtime root: expected a real directory/);
+    assert.match(fileRuntimeRoot.stdout, /managed skill wrappers: SKIPPED \(invalid runtime root\)/);
+    assert.match(fileRuntimeRoot.stdout, /RESULT: FAIL/);
+    assert.doesNotMatch(fileRuntimeRoot.stderr, /ENOTDIR/);
 
     // Generated runtime metadata is outside package.json's files list but is
     // still required for a parity pass.
@@ -40335,6 +40470,7 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
     rmSync(emptyHome, { recursive: true, force: true });
     rmSync(corruptHome, { recursive: true, force: true });
     rmSync(brokenLinkHome, { recursive: true, force: true });
+    rmSync(fileRootHome, { recursive: true, force: true });
   }
 });
 

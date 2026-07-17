@@ -234,7 +234,6 @@ function restoreClaudeSkillWrappers(
       if (
         existsSync(targetDir)
         && !isManagedClaudeSkill(skillsRoot, skillName)
-        && skillName !== PIPELANE_DISPATCH_SKILL_NAME
       ) {
         // A foreign (unmanaged) skill occupies this name; never clobber it
         // during a rollback.
@@ -286,20 +285,18 @@ export function installClaudeBootstrapSkill(
   });
 
   mkdirSync(skillsRoot, { recursive: true });
+  const installed: string[] = [];
+  const skipped: string[] = [];
+  const entriesToInstall = install.entries.filter((entry) => assertOrSkipCollision(skillsRoot, entry, skipped));
   const removedLegacySkills = pruneRemovedManagedClaudeSkills(skillsRoot, pipelaneRoot, install.entries);
   installGlobalRuntime(pipelaneRoot, { host: 'claude' });
   mkdirSync(binDir, { recursive: true });
   writeFileSync(path.join(binDir, 'run-pipelane.sh'), install.runnerScript, { mode: 0o755, encoding: 'utf8' });
   writeFileSync(path.join(binDir, 'bootstrap-pipelane.sh'), install.bootstrapScript, { mode: 0o755, encoding: 'utf8' });
 
-  const installed: string[] = [];
-  const skipped: string[] = [];
   const managedNames: string[] = [];
 
-  for (const entry of install.entries) {
-    if (!assertOrSkipCollision(skillsRoot, entry, skipped)) {
-      continue;
-    }
+  for (const entry of entriesToInstall) {
     writeSkill(skillsRoot, pipelaneRoot, entry);
     installed.push(entry.slashAlias);
     managedNames.push(entry.name);

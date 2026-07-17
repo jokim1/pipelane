@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { accessSync, constants, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { accessSync, constants, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -77,8 +77,24 @@ function ensureRuntimeRootDirectory(root: string, label: string): void {
   }
 }
 
+function ensureSymlinkFreeRuntimeTree(root: string, label: string, relative = ''): void {
+  const directory = relative ? path.join(root, relative) : root;
+  for (const entry of readdirSync(directory)) {
+    const childRelative = relative ? path.join(relative, entry) : entry;
+    const child = path.join(root, childRelative);
+    const stats = lstatSync(child);
+    if (stats.isSymbolicLink()) {
+      throw new Error(`${label} contains a symbolic link in its runtime tree: ${childRelative}`);
+    }
+    if (stats.isDirectory()) {
+      ensureSymlinkFreeRuntimeTree(root, label, childRelative);
+    }
+  }
+}
+
 function ensureRestorableRuntime(root: string, label: string): void {
   ensureRuntimeRootDirectory(root, label);
+  ensureSymlinkFreeRuntimeTree(root, label);
   ensureInstallableRuntime(root, label);
   for (const relativePath of GENERATED_RUNTIME_ASSETS) {
     if (!existsSync(path.join(root, relativePath))) {
@@ -339,10 +355,13 @@ export function installGlobalRuntime(
       if (!previousMetadata) {
         throw new Error(`${previousRoot} already exists and is not managed by pipelane; refusing to replace it.`);
       }
-      ensureRestorableRuntime(previousRoot, `Retained runtime at ${previousRoot}`);
       if (previousMetadata.host !== options.host) {
         throw new Error(`${previousRoot} belongs to host ${previousMetadata.host || 'unknown'}, not ${options.host}; refusing to replace it.`);
       }
+      if (!isCompleteRuntimeMetadata(previousMetadata, options.host)) {
+        throw new Error(`${previousRoot} has incomplete managed runtime metadata; refusing to preserve it as a rollback target.`);
+      }
+      ensureRestorableRuntime(previousRoot, `Retained runtime at ${previousRoot}`);
     }
     const preservePrevious = existsSync(previousRoot)
       && sameRuntimeSource(readManagedRuntimeMetadata(targetRoot), metadata);
@@ -535,6 +554,13 @@ export function writeHostSkillPayloads(targetRoot: string, payloads: HostSkillPa
 // validated BEFORE the legacy no-payload branch so a payload-less runtime
 // cannot smuggle an empty manifest past the refusal.
 export function readHostSkillPayloads(targetRoot: string, label: string): Map<string, string> | null {
+  try {
+    ensureRuntimeRootDirectory(targetRoot, label);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+  ensureSymlinkFreeRuntimeTree(targetRoot, label);
   let names: string[] = [];
   try {
     const manifest = JSON.parse(readFileSync(path.join(targetRoot, 'managed-skills.json'), 'utf8')) as { skills?: unknown };
