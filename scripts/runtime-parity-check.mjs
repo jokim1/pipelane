@@ -64,6 +64,16 @@ function readJson(target) {
   }
 }
 
+function pathEntryExists(target) {
+  try {
+    lstatSync(target);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
 function digestFile(target) {
   return createHash('sha256').update(readFileSync(target)).digest('hex');
 }
@@ -186,6 +196,13 @@ function runtimeMetadataDrift(host, runtimeRoot) {
   return drift;
 }
 
+function runtimeRootDrift(runtimeRoot) {
+  const stats = lstatSync(runtimeRoot);
+  return stats.isDirectory()
+    ? []
+    : ['runtime root: expected a real directory, not a symbolic link or other file'];
+}
+
 async function generatedRuntimeDrift(host, runtimeRoot) {
   const drift = [];
   for (const relative of REQUIRED_GENERATED_ASSETS) {
@@ -285,6 +302,7 @@ async function expectedHostSkillNames(host, runtimeRoot) {
   return {
     all: new Set(install.entries.map((entry) => entry.name)),
     required: new Set(install.entries.filter((entry) => entry.required).map((entry) => entry.name)),
+    bodies: new Map(install.entries.map((entry) => [entry.name, entry.body])),
   };
 }
 
@@ -329,12 +347,26 @@ async function managedSkillWrapperDrift(host, runtimeRoot) {
     drift.push('host-skills: runtime carries no skill payloads (predates payload retention; reinstall to restore wrapper parity)');
     return drift;
   }
+  if (!lstatSync(payloadRoot).isDirectory()) {
+    drift.push('host-skills: payload root must be a real directory, not a symbolic link or other file');
+    return drift;
+  }
   const skillsRoot = hostSkillsRootFor(host);
   for (const name of names) {
+    const payloadDir = path.join(payloadRoot, name);
     const payloadPath = path.join(payloadRoot, name, 'SKILL.md');
+    if (!existsSync(payloadDir) || !lstatSync(payloadDir).isDirectory()) {
+      drift.push(`host-skills/${name}: payload directory must be a real directory`);
+      continue;
+    }
     if (!existsSync(payloadPath) || !lstatSync(payloadPath).isFile()) {
       drift.push(`host-skills/${name}/SKILL.md: payload missing for manifest skill`);
       continue;
+    }
+    const payloadBody = readFileSync(payloadPath, 'utf8');
+    const expectedBody = expected?.bodies.get(name);
+    if (expectedBody !== undefined && payloadBody !== expectedBody) {
+      drift.push(`host-skills/${name}/SKILL.md: payload content differs from local renderer`);
     }
     const wrapperPath = path.join(skillsRoot, name, 'SKILL.md');
     if (!existsSync(wrapperPath) || !lstatSync(wrapperPath).isFile()) {
@@ -481,7 +513,7 @@ async function main() {
 
   const runtimeRoots = RUNTIME_HOSTS
     .map((host) => ({ host, root: path.join(pipelaneHomeDir(), 'runtimes', host) }))
-    .filter((entry) => existsSync(entry.root));
+    .filter((entry) => pathEntryExists(entry.root));
 
   if (runtimeRoots.length === 0) {
     lines.push('No managed runtimes are installed; nothing to compare.');
@@ -497,12 +529,13 @@ async function main() {
       : 'sourceSha unknown';
     lines.push(`[${host}] ${root} (${provenance}, installed ${metadata?.installedAt ?? 'unknown'})`);
 
+    const rootDrift = runtimeRootDrift(root);
     const manifest = compareManifest(root);
     // Never execute modules from a runtime whose packaged bytes already
     // differ. The behavioral probe is only safe after content parity proves
     // the imported module and all of its packaged dependencies are local bits.
-    const surfaceProbe = manifest.drift.length === 0 ? await probeReviewSurface(root) : null;
-    manifest.drift.unshift(...runtimeMetadataDrift(host, root), ...await generatedRuntimeDrift(host, root));
+    const surfaceProbe = rootDrift.length === 0 && manifest.drift.length === 0 ? await probeReviewSurface(root) : null;
+    manifest.drift.unshift(...rootDrift, ...runtimeMetadataDrift(host, root), ...await generatedRuntimeDrift(host, root));
     const surfaceDigestDrift = manifest.drift.filter((entry) => REVIEW_SURFACE_MODULES.some((module) => entry.startsWith(module)));
 
     if (manifest.drift.length === 0) {

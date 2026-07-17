@@ -555,11 +555,23 @@ export function readHostSkillPayloads(targetRoot: string, label: string): Map<st
     // installed wrappers. Refuse instead of trusting it.
     throw new Error(`${label} has a managed-skills manifest that lists no skills; refusing to roll back to an inconsistent runtime.`);
   }
-  if (!existsSync(path.join(targetRoot, HOST_SKILLS_DIRNAME))) {
-    return null;
+  const payloadRoot = path.join(targetRoot, HOST_SKILLS_DIRNAME);
+  let payloadRootStats;
+  try {
+    payloadRootStats = lstatSync(payloadRoot);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+  if (!payloadRootStats.isDirectory()) {
+    throw new Error(`${label} has an invalid host-skill payload root; refusing to follow a symbolic link or other file.`);
   }
   const payloads = new Map<string, string>();
   for (const name of names) {
+    const payloadDir = path.join(payloadRoot, name);
+    if (!existsSync(payloadDir) || !lstatSync(payloadDir).isDirectory()) {
+      throw new Error(`${label} has an invalid host-skill payload directory for ${name}; refusing to follow a symbolic link or other file.`);
+    }
     const target = hostSkillPayloadPath(targetRoot, name);
     if (!existsSync(target) || !lstatSync(target).isFile()) {
       throw new Error(`${label} is missing the host-skill payload for ${name}; refusing to roll back to an inconsistent runtime.`);

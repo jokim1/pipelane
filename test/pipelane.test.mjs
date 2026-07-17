@@ -39883,6 +39883,31 @@ test('managed runtime install records build-info provenance and retains a rollba
     runCli(['install-claude', '--rollback'], workspaceRoot, env);
     assert.ok(existsSync(path.join(claudeHome, 'skills', pruneSkill, 'SKILL.md')));
 
+    if (process.platform !== 'win32') {
+      const retainedProbeDir = path.join(previousRoot, 'host-skills', probeSkill);
+      const externalProbeDir = path.join(pipelaneHome, 'external-retained-probe-skill');
+      const wrapperBeforeSymlinkRefusal = readFileSync(wrapperPath, 'utf8');
+      renameSync(retainedProbeDir, externalProbeDir);
+      symlinkSync(externalProbeDir, retainedProbeDir, 'dir');
+      const symlinkedPayloadRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+      assert.notEqual(symlinkedPayloadRollback.status, 0);
+      assert.match(symlinkedPayloadRollback.stderr, /invalid host-skill payload directory/);
+      assert.equal(readFileSync(wrapperPath, 'utf8'), wrapperBeforeSymlinkRefusal);
+      rmSync(retainedProbeDir, { force: true });
+      renameSync(externalProbeDir, retainedProbeDir);
+
+      const retainedPayloadRoot = path.join(previousRoot, 'host-skills');
+      const externalRetainedPayloadRoot = path.join(pipelaneHome, 'external-retained-payload-root');
+      renameSync(retainedPayloadRoot, externalRetainedPayloadRoot);
+      symlinkSync(path.join(pipelaneHome, 'missing-retained-payload-root'), retainedPayloadRoot, 'dir');
+      const brokenPayloadRootRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+      assert.notEqual(brokenPayloadRootRollback.status, 0);
+      assert.match(brokenPayloadRootRollback.stderr, /invalid host-skill payload root/);
+      assert.equal(readFileSync(wrapperPath, 'utf8'), wrapperBeforeSymlinkRefusal);
+      rmSync(retainedPayloadRoot, { force: true });
+      renameSync(externalRetainedPayloadRoot, retainedPayloadRoot);
+    }
+
     // An empty retained manifest cannot authorize a mass wrapper prune.
     const editedPreviousManifest = readFileSync(previousManifestPath, 'utf8');
     writeFileSync(previousManifestPath, `${JSON.stringify({ skills: [] })}\n`, 'utf8');
@@ -40043,9 +40068,16 @@ test('install-codex normalizes a legacy runtime before retaining and rolling it 
     assert.equal(retainedMetadata.host, 'codex');
     assert.ok(existsSync(path.join(previousRoot, 'sentinel-legacy-runtime.txt')));
 
+    const manifestNames = JSON.parse(readFileSync(path.join(previousRoot, 'managed-skills.json'), 'utf8')).skills;
+    const probeSkill = manifestNames[0];
+    const retainedPayloadPath = path.join(previousRoot, 'host-skills', probeSkill, 'SKILL.md');
+    const retainedPayload = readFileSync(retainedPayloadPath, 'utf8');
+    writeFileSync(retainedPayloadPath, `${retainedPayload}\nCODEX_LOCKSTEP_MARKER\n`, 'utf8');
+
     const rollback = runCli(['install-codex', '--rollback'], workspaceRoot, env);
     assert.match(rollback.stdout, /Rolled back the managed Codex runtime/);
     assert.ok(existsSync(path.join(runtimeRoot, 'sentinel-legacy-runtime.txt')));
+    assert.match(readFileSync(path.join(codexHome, 'skills', probeSkill, 'SKILL.md'), 'utf8'), /CODEX_LOCKSTEP_MARKER/);
   } finally {
     rmSync(workspaceRoot, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
@@ -40059,6 +40091,7 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
   const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
   const emptyHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-empty-'));
   const corruptHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-corrupt-'));
+  const brokenLinkHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-broken-link-'));
   try {
     runCli(['install-claude'], workspaceRoot, { CLAUDE_HOME: claudeHome, PIPELANE_HOME: pipelaneHome });
 
@@ -40101,6 +40134,18 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
     assert.equal(corrupt.status, 1, `${corrupt.stdout}\n${corrupt.stderr}`);
     assert.match(corrupt.stdout, /\[claude\] manifest parity: DRIFT/);
     assert.match(corrupt.stdout, /RESULT: FAIL/);
+
+    // A broken symlink still occupies the managed runtime path. Treat it as a
+    // corrupt runtime rather than silently reporting that nothing is installed.
+    mkdirSync(path.join(brokenLinkHome, 'runtimes'), { recursive: true });
+    symlinkSync(
+      path.join(brokenLinkHome, 'missing-claude-runtime'),
+      managedRuntimeRoot('claude', brokenLinkHome),
+      'dir',
+    );
+    const brokenRuntimeLink = runParity(brokenLinkHome);
+    assert.equal(brokenRuntimeLink.status, 1, `${brokenRuntimeLink.stdout}\n${brokenRuntimeLink.stderr}`);
+    assert.match(brokenRuntimeLink.stdout, /runtime root: expected a real directory/);
 
     // Generated runtime metadata is outside package.json's files list but is
     // still required for a parity pass.
@@ -40194,6 +40239,53 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
     assert.match(tamperedWrapper.stdout, new RegExp(`skills/${wrapperSkill}/SKILL\\.md: installed wrapper content differs from runtime payload`));
     writeFileSync(installedWrapperPath, installedWrapperBody, 'utf8');
 
+    // The payload and installed wrapper are not independent authorities. If
+    // both drift to the same bytes, parity must still reject them against the
+    // locally rendered wrapper contract.
+    const wrapperPayloadPath = path.join(wrapperRuntimeRoot, 'host-skills', wrapperSkill, 'SKILL.md');
+    const wrapperPayloadBody = readFileSync(wrapperPayloadPath, 'utf8');
+    const colludingTamper = `${installedWrapperBody}\nMATCHING_PAYLOAD_AND_WRAPPER_TAMPER\n`;
+    writeFileSync(wrapperPayloadPath, colludingTamper, 'utf8');
+    writeFileSync(installedWrapperPath, colludingTamper, 'utf8');
+    const matchingTamper = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+    assert.equal(matchingTamper.status, 1);
+    assert.match(matchingTamper.stdout, new RegExp(`host-skills/${wrapperSkill}/SKILL\\.md: payload content differs from local renderer`));
+    writeFileSync(wrapperPayloadPath, wrapperPayloadBody, 'utf8');
+    writeFileSync(installedWrapperPath, installedWrapperBody, 'utf8');
+
+    if (process.platform !== 'win32') {
+      // Every payload path component is part of the runtime trust boundary;
+      // parent-directory symlinks must not redirect parity or rollback reads.
+      const payloadSkillDir = path.dirname(wrapperPayloadPath);
+      const externalPayloadDir = path.join(pipelaneHome, 'external-payload-skill');
+      renameSync(payloadSkillDir, externalPayloadDir);
+      symlinkSync(externalPayloadDir, payloadSkillDir, 'dir');
+      const symlinkedPayloadDir = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+      assert.equal(symlinkedPayloadDir.status, 1);
+      assert.match(symlinkedPayloadDir.stdout, new RegExp(`host-skills/${wrapperSkill}: payload directory must be a real directory`));
+      rmSync(payloadSkillDir, { force: true });
+      renameSync(externalPayloadDir, payloadSkillDir);
+
+      const externalPayloadFile = path.join(pipelaneHome, 'external-payload.md');
+      renameSync(wrapperPayloadPath, externalPayloadFile);
+      symlinkSync(externalPayloadFile, wrapperPayloadPath);
+      const symlinkedPayloadFile = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+      assert.equal(symlinkedPayloadFile.status, 1);
+      assert.match(symlinkedPayloadFile.stdout, new RegExp(`host-skills/${wrapperSkill}/SKILL\\.md: payload missing`));
+      rmSync(wrapperPayloadPath, { force: true });
+      renameSync(externalPayloadFile, wrapperPayloadPath);
+
+      const payloadRoot = path.join(wrapperRuntimeRoot, 'host-skills');
+      const externalPayloadRoot = path.join(pipelaneHome, 'external-payload-root');
+      renameSync(payloadRoot, externalPayloadRoot);
+      symlinkSync(externalPayloadRoot, payloadRoot, 'dir');
+      const symlinkedPayloadRoot = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+      assert.equal(symlinkedPayloadRoot.status, 1);
+      assert.match(symlinkedPayloadRoot.stdout, /host-skills: payload root must be a real directory/);
+      rmSync(payloadRoot, { force: true });
+      renameSync(externalPayloadRoot, payloadRoot);
+    }
+
     // A payload the manifest does not record must be drift.
     const ghostPayloadDir = path.join(wrapperRuntimeRoot, 'host-skills', 'ghost-skill');
     mkdirSync(ghostPayloadDir, { recursive: true });
@@ -40242,6 +40334,30 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
     rmSync(pipelaneHome, { recursive: true, force: true });
     rmSync(emptyHome, { recursive: true, force: true });
     rmSync(corruptHome, { recursive: true, force: true });
+    rmSync(brokenLinkHome, { recursive: true, force: true });
+  }
+});
+
+test('runtime parity exercises Codex host paths and managed marker detection', () => {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-parity-codex-ws-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-parity-codex-home-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-parity-codex-runtime-'));
+  try {
+    runCli(['install-codex'], workspaceRoot, { CODEX_HOME: codexHome, PIPELANE_HOME: pipelaneHome });
+    const pass = runParity(pipelaneHome, { CODEX_HOME: codexHome });
+    assert.equal(pass.status, 0, `${pass.stdout}\n${pass.stderr}`);
+    assert.match(pass.stdout, /\[codex\] managed skill wrappers: OK/);
+
+    const orphanDir = path.join(codexHome, 'skills', 'orphan-codex-skill');
+    mkdirSync(orphanDir, { recursive: true });
+    writeFileSync(path.join(orphanDir, 'SKILL.md'), '<!-- pipelane:codex-global-skill:orphan-codex-skill -->\nretired command\n', 'utf8');
+    const orphan = runParity(pipelaneHome, { CODEX_HOME: codexHome });
+    assert.equal(orphan.status, 1);
+    assert.match(orphan.stdout, /skills\/orphan-codex-skill\/SKILL\.md: managed wrapper not recorded/);
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
   }
 });
 
@@ -40271,6 +40387,26 @@ test('signing key classes auto-provision persisted keys, including convergence-s
     }
     for (const keyFile of ['orchestration-state.key', 'review-consent-state.key', 'convergence-state.key']) {
       assert.ok(existsSync(path.join(pipelaneHome, 'keys', keyFile)), `${keyFile} should be provisioned on disk`);
+    }
+
+    const invalidOverride = spawnSync('node', ['--input-type=module', '-e', script], {
+      cwd: KIT_ROOT,
+      env: {
+        ...process.env,
+        PIPELANE_HOME: pipelaneHome,
+        PIPELANE_ORCHESTRATION_STATE_KEY: 'short',
+        PIPELANE_REVIEW_CONSENT_STATE_KEY: 'short',
+        PIPELANE_CONVERGENCE_STATE_KEY: 'short',
+      },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(invalidOverride.status, 0, invalidOverride.stderr);
+    for (const entry of JSON.parse(invalidOverride.stdout)) {
+      assert.equal(entry.source, 'env');
+      assert.equal(entry.persisted, true);
+      assert.equal(entry.provisioned, false, `${entry.name} must reject an invalid active override`);
+      assert.match(entry.error, /too short/);
     }
 
     // Ambient env overrides are not machine-wide provisioning: with the

@@ -160,9 +160,10 @@ export function collectSigningKeyStatus(): SigningKeyStatus[] {
   return classes.map((entry) => {
     const envOverride = Boolean(process.env[entry.envName]?.trim());
     try {
-      if (!envOverride) {
-        entry.resolve();
-      }
+      // Always resolve: without an override this provisions the persisted key;
+      // with one it validates the active override before doctor certifies the
+      // machine's signing-key state.
+      entry.resolve();
       const persisted = existsSync(entry.path);
       const persistedKey = persisted ? readFileSync(entry.path, 'utf8').trim() : '';
       // A persisted file only counts as provisioned when its contents would
