@@ -143,7 +143,13 @@ function buildCliChildEnv(env = {}) {
   // Hermeticity: a developer/CI shell may export pipelane signing keys. Scrub them
   // unless a test explicitly passes one, so C2 signature gating and C1 exact run
   // status assertions do not drift with the ambient environment.
-  for (const stateKey of ['PIPELANE_REVIEW_STATE_KEY', 'PIPELANE_DEPLOY_STATE_KEY', 'PIPELANE_PROBE_STATE_KEY']) {
+  for (const stateKey of [
+    'PIPELANE_REVIEW_STATE_KEY',
+    'PIPELANE_DEPLOY_STATE_KEY',
+    'PIPELANE_PROBE_STATE_KEY',
+    'PIPELANE_REVIEW_CONSENT_STATE_KEY',
+    'PIPELANE_CONVERGENCE_STATE_KEY',
+  ]) {
     if (!(stateKey in env)) delete childEnv[stateKey];
   }
   // Install provenance is test input, not ambient runner state. Tests that
@@ -15675,6 +15681,8 @@ test('review command gates do not inherit pipelane state signing keys', () => {
       'PIPELANE_ORCHESTRATION_STATE_KEY',
       'PIPELANE_DEPLOY_STATE_KEY',
       'PIPELANE_PROBE_STATE_KEY',
+      'PIPELANE_REVIEW_CONSENT_STATE_KEY',
+      'PIPELANE_CONVERGENCE_STATE_KEY',
     ];
     const command = `${process.execPath} -e ${JSON.stringify(`for (const key of ${JSON.stringify(forbiddenKeys)}) { if (process.env[key]) process.exit(7); }`)}`;
     writeSingleCommandReviewGate(repoRoot, {
@@ -15687,6 +15695,8 @@ test('review command gates do not inherit pipelane state signing keys', () => {
       PIPELANE_ORCHESTRATION_STATE_KEY: DEFAULT_ORCHESTRATION_STATE_KEY,
       PIPELANE_DEPLOY_STATE_KEY: 'deploy-state-key-for-gate-isolation',
       PIPELANE_PROBE_STATE_KEY: 'probe-state-key-for-gate-isolation',
+      PIPELANE_REVIEW_CONSENT_STATE_KEY: 'review-consent-state-key-for-gate-isolation',
+      PIPELANE_CONVERGENCE_STATE_KEY: 'convergence-state-key-for-gate-isolation',
     }).stdout);
     const gate = report.gates.find((entry) => entry.gateId === 'no-state-keys');
 
@@ -17878,6 +17888,8 @@ test('orchestration workers never receive orchestration key, even when allowlist
         "if (keyPath) { try { persisted=fs.readFileSync(keyPath, 'utf8').trim(); } catch {} }",
         "fs.writeFileSync('worker-env-key.txt', process.env.PIPELANE_ORCHESTRATION_STATE_KEY || 'missing');",
         "fs.writeFileSync('worker-env-key-file.txt', process.env.PIPELANE_ORCHESTRATION_STATE_KEY_FILE || 'missing');",
+        "fs.writeFileSync('worker-env-review-consent-key.txt', process.env.PIPELANE_REVIEW_CONSENT_STATE_KEY || 'missing');",
+        "fs.writeFileSync('worker-env-convergence-key.txt', process.env.PIPELANE_CONVERGENCE_STATE_KEY || 'missing');",
         "fs.writeFileSync('worker-env-pipelane-home.txt', process.env.PIPELANE_HOME || 'missing');",
         "fs.writeFileSync('worker-persisted-key-read.txt', persisted);",
         "fs.writeFileSync('pipelane-slice-change.txt', 'change');",
@@ -17891,6 +17903,8 @@ test('orchestration workers never receive orchestration key, even when allowlist
       const worktreePath = started.run.slices[0].worktreePath;
       assert.equal(readFileSync(path.join(worktreePath, 'worker-env-key.txt'), 'utf8'), 'missing');
       assert.equal(readFileSync(path.join(worktreePath, 'worker-env-key-file.txt'), 'utf8'), 'missing');
+      assert.equal(readFileSync(path.join(worktreePath, 'worker-env-review-consent-key.txt'), 'utf8'), 'missing');
+      assert.equal(readFileSync(path.join(worktreePath, 'worker-env-convergence-key.txt'), 'utf8'), 'missing');
       assert.equal(readFileSync(path.join(worktreePath, 'worker-env-pipelane-home.txt'), 'utf8'), 'missing');
       assert.equal(readFileSync(path.join(worktreePath, 'worker-persisted-key-read.txt'), 'utf8'), 'missing');
       const signingKey = Object.hasOwn(extraEnv, 'PIPELANE_ORCHESTRATION_STATE_KEY') && extraEnv.PIPELANE_ORCHESTRATION_STATE_KEY === undefined
@@ -17910,6 +17924,11 @@ test('orchestration workers never receive orchestration key, even when allowlist
     runAndCheck('worker key file stripped from allowlist', {
       PIPELANE_ORCHESTRATE_WORKER_ENV_ALLOW: 'PIPELANE_ORCHESTRATION_STATE_KEY_FILE',
       PIPELANE_ORCHESTRATION_STATE_KEY_FILE: path.join(repoRoot, 'operator-key.txt'),
+    });
+    runAndCheck('worker convergence keys stripped from allowlist', {
+      PIPELANE_ORCHESTRATE_WORKER_ENV_ALLOW: 'PIPELANE_REVIEW_CONSENT_STATE_KEY,PIPELANE_CONVERGENCE_STATE_KEY',
+      PIPELANE_REVIEW_CONSENT_STATE_KEY: 'review-consent-state-key-for-worker-isolation',
+      PIPELANE_CONVERGENCE_STATE_KEY: 'convergence-state-key-for-worker-isolation',
     });
     runAndCheck('worker persisted key home stripped from allowlist', {
       PIPELANE_ORCHESTRATION_STATE_KEY: undefined,
@@ -39758,6 +39777,15 @@ test('write-build-info records sha, dirty, and timestamp with env overrides', ()
   }
 });
 
+function runParity(pipelaneHome) {
+  return spawnSync('node', [path.join(KIT_ROOT, 'scripts', 'runtime-parity-check.mjs')], {
+    cwd: KIT_ROOT,
+    env: { ...process.env, PIPELANE_HOME: pipelaneHome },
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
 test('managed runtime install records build-info provenance and retains a rollback runtime', () => {
   const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-rollback-ws-'));
   const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
@@ -39825,6 +39853,38 @@ test('managed runtime install records build-info provenance and retains a rollba
       chmodSync(target, mode);
     }
 
+    const generatedRunnerPath = path.join(managedRuntimeRoot('claude', pipelaneHome), 'bin', 'run-pipelane.sh');
+    const generatedRunnerBody = readFileSync(generatedRunnerPath, 'utf8');
+    writeFileSync(generatedRunnerPath, `${generatedRunnerBody}\necho PARITY_MISSED_TAMPER\n`, { mode: 0o755, encoding: 'utf8' });
+    const generatedContentDrift = runParity(pipelaneHome);
+    assert.equal(generatedContentDrift.status, 1);
+    assert.match(generatedContentDrift.stdout, /bin\/run-pipelane\.sh: generated runtime content differs/);
+    writeFileSync(generatedRunnerPath, generatedRunnerBody, { mode: 0o755, encoding: 'utf8' });
+
+    if (process.platform !== 'win32') {
+      const retainedRunner = path.join(previousRoot, 'bin', 'run-pipelane.sh');
+      const retainedRunnerMode = statSync(retainedRunner).mode & 0o777;
+      chmodSync(retainedRunner, 0o001);
+      const nonExecutableRunner = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+      assert.notEqual(nonExecutableRunner.status, 0);
+      assert.match(nonExecutableRunner.stderr, /required generated runtime asset: bin\/run-pipelane\.sh must be executable/);
+      assert.ok(existsSync(path.join(runtimeRoot, 'package.json')));
+      chmodSync(retainedRunner, retainedRunnerMode);
+
+      const retainedBin = path.join(previousRoot, 'bin', 'pipelane');
+      const retainedBinBody = readFileSync(retainedBin);
+      const retainedBinMode = statSync(retainedBin).mode & 0o777;
+      rmSync(retainedBin, { force: true });
+      symlinkSync(path.join(runtimeRoot, 'bin', 'pipelane'), retainedBin);
+      const symlinkedBin = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+      assert.notEqual(symlinkedBin.status, 0);
+      assert.match(symlinkedBin.stderr, /required runtime asset: bin\/pipelane must be a file/);
+      assert.ok(existsSync(path.join(runtimeRoot, 'package.json')));
+      rmSync(retainedBin, { force: true });
+      writeFileSync(retainedBin, retainedBinBody, { mode: retainedBinMode });
+      chmodSync(retainedBin, retainedBinMode);
+    }
+
     // A damaged rollback target must never replace the working runtime.
     rmSync(path.join(previousRoot, 'package.json'), { force: true });
     const damaged = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
@@ -39851,13 +39911,6 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
   const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
   const emptyHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-empty-'));
   const corruptHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-corrupt-'));
-  const parityScript = path.join(KIT_ROOT, 'scripts', 'runtime-parity-check.mjs');
-  const runParity = (home) => spawnSync('node', [parityScript], {
-    cwd: KIT_ROOT,
-    env: { ...process.env, PIPELANE_HOME: home },
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
   try {
     runCli(['install-claude'], workspaceRoot, { CLAUDE_HOME: claudeHome, PIPELANE_HOME: pipelaneHome });
 
@@ -39909,6 +39962,67 @@ test('runtime parity check passes on a fresh install, flags drift, and tolerates
     assert.equal(missingMetadata.status, 1);
     assert.match(missingMetadata.stdout, /\.pipelane-runtime\.json: missing or invalid managed-runtime metadata/);
     writeFileSync(metadataPath, metadataBody, 'utf8');
+
+    // Runtime metadata is update/provenance authority. It must agree with the
+    // build-info shipped in the same runtime, not merely be well-shaped JSON.
+    const mismatchedMetadata = JSON.parse(metadataBody);
+    writeFileSync(metadataPath, `${JSON.stringify({ ...mismatchedMetadata, sourceSha: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' }, null, 2)}\n`, 'utf8');
+    const mismatchedProvenance = runParity(pipelaneHome);
+    assert.equal(mismatchedProvenance.status, 1);
+    assert.match(mismatchedProvenance.stdout, /source provenance does not match dist\/build-info\.json/);
+    writeFileSync(metadataPath, metadataBody, 'utf8');
+
+    writeFileSync(metadataPath, `${JSON.stringify({ ...JSON.parse(metadataBody), packageVersion: '999.0.0' }, null, 2)}\n`, 'utf8');
+    const mismatchedPackageVersion = runParity(pipelaneHome);
+    assert.equal(mismatchedPackageVersion.status, 1);
+    assert.match(mismatchedPackageVersion.stdout, /packageVersion "999\.0\.0" does not match package\.json version/);
+    writeFileSync(metadataPath, metadataBody, 'utf8');
+
+    if (process.platform !== 'win32') {
+      const runtimeRunner = path.join(managedRuntimeRoot('claude', pipelaneHome), 'bin', 'run-pipelane.sh');
+      const runtimeRunnerMode = statSync(runtimeRunner).mode & 0o777;
+      chmodSync(runtimeRunner, 0o001);
+      const nonExecutableRuntime = runParity(pipelaneHome);
+      assert.equal(nonExecutableRuntime.status, 1);
+      assert.match(nonExecutableRuntime.stdout, /bin\/run-pipelane\.sh: runtime entrypoint is not executable/);
+      chmodSync(runtimeRunner, runtimeRunnerMode);
+
+      const runtimeBin = path.join(managedRuntimeRoot('claude', pipelaneHome), 'bin', 'pipelane');
+      const runtimeBinBody = readFileSync(runtimeBin);
+      const runtimeBinMode = statSync(runtimeBin).mode & 0o777;
+      rmSync(runtimeBin, { force: true });
+      symlinkSync(path.join(KIT_ROOT, 'bin', 'pipelane'), runtimeBin);
+      const symlinkedRuntime = runParity(pipelaneHome);
+      assert.equal(symlinkedRuntime.status, 1);
+      assert.match(symlinkedRuntime.stdout, /bin\/pipelane: runtime entrypoint is not a regular file/);
+      rmSync(runtimeBin, { force: true });
+      writeFileSync(runtimeBin, runtimeBinBody, { mode: runtimeBinMode });
+      chmodSync(runtimeBin, runtimeBinMode);
+
+      const runtimeReviewData = path.join(managedRuntimeRoot('claude', pipelaneHome), 'dist', 'operator', 'review-data.js');
+      const runtimeReviewDataBody = readFileSync(runtimeReviewData);
+      rmSync(runtimeReviewData, { force: true });
+      symlinkSync(path.join(KIT_ROOT, 'dist', 'operator', 'review-data.js'), runtimeReviewData);
+      const symlinkedPayload = runParity(pipelaneHome);
+      assert.equal(symlinkedPayload.status, 1);
+      assert.match(symlinkedPayload.stdout, /runtime dist\/operator\/review-data\.js: symbolic links are not allowed in runtime payloads/);
+      assert.match(symlinkedPayload.stdout, /review-surface contract probe: SKIPPED \(package content drift\)/);
+      rmSync(runtimeReviewData, { force: true });
+      writeFileSync(runtimeReviewData, runtimeReviewDataBody, 'utf8');
+    }
+
+    // Package drift must be reported without evaluating code from the drifted
+    // runtime. The parity checker is an integrity boundary, not an execution
+    // path for the code it is deciding whether to trust.
+    const runtimePolicy = path.join(managedRuntimeRoot('claude', pipelaneHome), 'dist', 'operator', 'review-gate-policy.js');
+    const runtimePolicyBody = readFileSync(runtimePolicy, 'utf8');
+    writeFileSync(runtimePolicy, `${runtimePolicyBody}\nthrow new Error('DRIFTED_RUNTIME_WAS_EXECUTED');\n`, 'utf8');
+    const guardedProbe = runParity(pipelaneHome);
+    assert.equal(guardedProbe.status, 1);
+    assert.match(guardedProbe.stdout, /dist\/operator\/review-gate-policy\.js: content differs/);
+    assert.match(guardedProbe.stdout, /review-surface contract probe: SKIPPED \(package content drift\)/);
+    assert.doesNotMatch(guardedProbe.stderr, /DRIFTED_RUNTIME_WAS_EXECUTED/);
+    writeFileSync(runtimePolicy, runtimePolicyBody, 'utf8');
 
     // Mutating a review-surface module inside the runtime is drift.
     const mutated = path.join(managedRuntimeRoot('claude', pipelaneHome), 'dist', 'operator', 'commands', 'review.js');
