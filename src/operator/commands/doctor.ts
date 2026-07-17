@@ -6,6 +6,7 @@ import {
   computeUrlFingerprint,
   CONVERGENCE_STATE_KEY_ENV,
   convergenceStateKeyPath,
+  MIN_STATE_KEY_LENGTH,
   ORCHESTRATION_STATE_KEY_ENV,
   orchestrationStateKeyPath,
   resolveConvergenceStateKey,
@@ -164,16 +165,24 @@ export function collectSigningKeyStatus(): SigningKeyStatus[] {
       }
       const persisted = existsSync(entry.path);
       const persistedKey = persisted ? readFileSync(entry.path, 'utf8').trim() : '';
+      // A persisted file only counts as provisioned when its contents would
+      // pass the resolver's own validation; an env override must not let a
+      // junk file certify machine-wide readiness.
+      const persistedValid = persistedKey.length >= MIN_STATE_KEY_LENGTH;
+      let error: string | null = null;
+      if (envOverride && !persisted) {
+        error = `${entry.envName} override is active but no persisted key file exists; unset the override or provision ${entry.path}.`;
+      } else if (persisted && !persistedValid) {
+        error = `Persisted key at ${entry.path} is invalid (shorter than ${MIN_STATE_KEY_LENGTH} characters); rotate or re-provision it.`;
+      }
       return {
         name: entry.name,
         path: entry.path,
         source: envOverride ? 'env' as const : 'file' as const,
         persisted,
-        provisioned: persisted,
-        fingerprint: persisted && persistedKey ? stateKeyFingerprint(persistedKey) : null,
-        error: envOverride && !persisted
-          ? `${entry.envName} override is active but no persisted key file exists; unset the override or provision ${entry.path}.`
-          : null,
+        provisioned: persisted && persistedValid,
+        fingerprint: persisted && persistedValid ? stateKeyFingerprint(persistedKey) : null,
+        error,
       };
     } catch (error) {
       return {

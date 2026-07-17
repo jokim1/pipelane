@@ -40004,6 +40004,20 @@ test('managed runtime install records build-info provenance and retains a rollba
     assert.ok(refreshedMetadata.packageVersion.trim().length > 0);
     const damagedRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env);
     assert.match(damagedRollback.stdout, /Rolled back the managed Claude runtime/);
+
+    // A corrupted empty-manifest active runtime must never rotate over a
+    // valid rollback target at reinstall.
+    const shaC = 'c'.repeat(40);
+    const activeManifestPath = path.join(runtimeRoot, 'managed-skills.json');
+    const previousMetadataBefore = JSON.parse(readFileSync(path.join(previousRoot, '.pipelane-runtime.json'), 'utf8'));
+    writeFileSync(activeManifestPath, `${JSON.stringify({ skills: [] })}\n`, 'utf8');
+    const emptyManifestReinstall = runCli(['install-claude'], workspaceRoot, { ...env, PIPELANE_INSTALL_SOURCE_SHA: shaC });
+    assert.equal(emptyManifestReinstall.status, 0);
+    const previousMetadataAfter = JSON.parse(readFileSync(path.join(previousRoot, '.pipelane-runtime.json'), 'utf8'));
+    assert.equal(previousMetadataAfter.sourceSha, previousMetadataBefore.sourceSha, 'valid rollback target must survive an empty-manifest retiree');
+    assert.ok(JSON.parse(readFileSync(activeManifestPath, 'utf8')).skills.length > 0);
+    const postEmptyManifestRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.match(postEmptyManifestRollback.stdout, /Rolled back the managed Claude runtime/);
   } finally {
     rmSync(workspaceRoot, { recursive: true, force: true });
     rmSync(claudeHome, { recursive: true, force: true });
@@ -40283,6 +40297,26 @@ test('signing key classes auto-provision persisted keys, including convergence-s
         assert.equal(entry.persisted, false);
         assert.equal(entry.provisioned, false, `${entry.name} must not report an env override as provisioned`);
         assert.match(entry.error, /override is active but no persisted key file exists/);
+      }
+
+      // A junk persisted file must not certify readiness either: under valid
+      // overrides, files shorter than the resolver's minimum are invalid.
+      mkdirSync(path.join(overrideHome, 'keys'), { recursive: true });
+      for (const keyFile of ['orchestration-state.key', 'review-consent-state.key', 'convergence-state.key']) {
+        writeFileSync(path.join(overrideHome, 'keys', keyFile), 'short', 'utf8');
+      }
+      const junkPersisted = spawnSync('node', ['--input-type=module', '-e', script], {
+        cwd: KIT_ROOT,
+        env: overrideEnv,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      assert.equal(junkPersisted.status, 0, junkPersisted.stderr);
+      for (const entry of JSON.parse(junkPersisted.stdout)) {
+        assert.equal(entry.persisted, true);
+        assert.equal(entry.provisioned, false, `${entry.name} must not certify an invalid persisted key`);
+        assert.equal(entry.fingerprint, null);
+        assert.match(entry.error, /invalid \(shorter than/);
       }
     } finally {
       rmSync(overrideHome, { recursive: true, force: true });

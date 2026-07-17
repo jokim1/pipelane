@@ -98,8 +98,11 @@ function ensureRestorableRuntime(root: string, label: string): void {
   }
   try {
     const manifest = JSON.parse(readFileSync(path.join(root, 'managed-skills.json'), 'utf8')) as { skills?: unknown };
-    if (!Array.isArray(manifest.skills) || manifest.skills.some((entry) => typeof entry !== 'string')) {
-      throw new Error('skills must be an array of strings');
+    // Empty manifests are refused here too: retention shares this predicate,
+    // and a corrupted empty-manifest runtime must never rotate over a valid
+    // rollback target.
+    if (!Array.isArray(manifest.skills) || manifest.skills.length === 0 || manifest.skills.some((entry) => typeof entry !== 'string')) {
+      throw new Error('skills must be a non-empty array of strings');
     }
   } catch (error) {
     throw new Error(`${label} has an invalid managed-skills.json: ${error instanceof Error ? error.message : String(error)}`);
