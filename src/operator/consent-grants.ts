@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import {
@@ -92,6 +92,41 @@ export interface GrantRefusal {
 
 export function consentGrantsDir(commonDir: string, config: WorkflowConfig): string {
   return path.join(resolveStateDir(commonDir, config), CONSENT_GRANTS_DIRNAME);
+}
+
+// ---------------------------------------------------------------------------
+// Human-surface proof. Same-user code can ultimately rewrite any local state,
+// so the enforceable property is not cryptographic impossibility — it is that
+// NO exported call mints on bare invocation: the Board path demands the live
+// dashboard's browser-session preimage (held only by the running server and
+// the page it served), and the TTY path demands a real interactive terminal.
+// An agent can only reach a mint by deliberately forging an attestation
+// artifact, which is the same class of act as editing signed state directly —
+// visible, deliberate, and auditable, never accidental compliance.
+// ---------------------------------------------------------------------------
+
+export function boardSessionDigestPath(commonDir: string, config: WorkflowConfig): string {
+  return path.join(resolveStateDir(commonDir, config), 'board-session.digest');
+}
+
+// Called by the dashboard server at startup: publishes the sha256 digest of
+// its per-process browser-session token. The digest does not reveal the
+// token; approvals must present the preimage.
+export function recordBoardSessionDigest(commonDir: string, config: WorkflowConfig, sessionToken: string): void {
+  mkdirSync(path.dirname(boardSessionDigestPath(commonDir, config)), { recursive: true });
+  writeFileSync(boardSessionDigestPath(commonDir, config), `${crypto.createHash('sha256').update(sessionToken).digest('hex')}\n`, 'utf8');
+}
+
+function verifyBoardSessionProof(commonDir: string, config: WorkflowConfig, proof: string): boolean {
+  let recorded = '';
+  try {
+    recorded = readFileSync(boardSessionDigestPath(commonDir, config), 'utf8').trim();
+  } catch {
+    return false;
+  }
+  if (!/^[a-f0-9]{64}$/.test(recorded) || !proof) return false;
+  const presented = crypto.createHash('sha256').update(proof).digest('hex');
+  return crypto.timingSafeEqual(Buffer.from(recorded, 'hex'), Buffer.from(presented, 'hex'));
 }
 
 function consentGrantsLockPath(commonDir: string, config: WorkflowConfig): string {
@@ -310,48 +345,71 @@ export function requestBudgetExtensionCard(
   });
 }
 
-// Board approval path. The caller (dashboard server) is responsible for the
-// human-surface gauntlet (loopback origin + browser session token); this
-// function enforces record integrity, expiry, and one-grant-per-card.
+// Board approval path. The dashboard server fronts this with its mutation
+// gauntlet (loopback origin + browser session token + JSON content type) and
+// passes the presented session token through as `boardSessionProof`; this
+// function independently verifies the proof against the running server's
+// published digest, so a bare module call cannot mint (D11). The whole
+// approval is idempotent: the grant id derives from (cardId, mutationIndex),
+// so a crash between the grant write and the card update re-converges on
+// re-approval instead of minting a duplicate one-use grant.
 export function approveBudgetConsentCard(
   commonDir: string,
   config: WorkflowConfig,
   cardId: string,
-  options: { decidedBy: string; decisionReason?: string },
+  options: { decidedBy: string; decisionReason?: string; boardSessionProof: string },
 ): { card: BudgetConsentCard; grant: BudgetExtensionGrant } {
+  if (!verifyBoardSessionProof(commonDir, config, options.boardSessionProof)) {
+    throw new Error('Board approval requires the live dashboard browser-session proof; approval is human-surface only (D11). Open the Board and decide the card there.');
+  }
   return withConsentGrantsLock(commonDir, config, () => {
     const raw = readConsentRecord(cardPath(commonDir, config, cardId));
     if (!raw || !isBudgetConsentCard(raw)) throw new Error(`Consent card ${cardId} was not found.`);
     const card = raw as BudgetConsentCard;
     if (!verifyRecord(card)) throw new Error(`Consent card ${cardId} failed signature verification and was refused (fail-closed).`);
-    if (card.status !== 'pending') throw new Error(`Consent card ${cardId} is ${card.status}; only a pending card can be approved.`);
+    const grantId = deterministicGrantIdForCard(card.id, card.mutationIndex);
+    if (card.status !== 'pending') {
+      // Crash-repair convergence: a card already approved with its
+      // deterministic grant intact returns that same decision.
+      if (card.status === 'approved' && card.grantId === grantId) {
+        const existing = readConsentRecord(grantPath(commonDir, config, grantId));
+        if (existing && isBudgetExtensionGrant(existing)) {
+          return { card, grant: existing as BudgetExtensionGrant };
+        }
+      }
+      throw new Error(`Consent card ${cardId} is ${card.status}; only a pending card can be approved.`);
+    }
     if (Date.parse(card.expiresAt) < Date.now()) {
       persistCard(commonDir, config, { ...card, status: 'expired', decidedAt: nowIso(), decidedBy: 'expiry-sweep' });
       throw new Error(`Consent card ${cardId} expired at ${card.expiresAt}; ask the requester to file a fresh request.`);
     }
     const mintedAt = nowIso();
-    const grant: BudgetExtensionGrant = {
-      schemaVersion: 1,
-      id: `budget-grant-${new Date(mintedAt).toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto.randomUUID().slice(0, 8)}`,
-      kind: 'budget-extension',
-      source: 'board',
-      cardId: card.id,
-      choiceFingerprint: choiceFingerprintForCard(card.id, card.mutationIndex),
-      scopeHash: card.scopeHash,
-      lineageKey: card.lineageKey,
-      taskSlug: card.taskSlug,
-      branchName: card.branchName,
-      aiRunsDelta: card.aiRunsDelta,
-      activeMinutesDelta: card.activeMinutesDelta,
-      fixReviewLoopsDelta: card.fixReviewLoopsDelta,
-      reason: card.reason,
-      reasonDigest: card.reasonDigest,
-      mintedAt,
-      mintedBy: options.decidedBy,
-      expiresAt: new Date(Date.now() + BUDGET_GRANT_TTL_MS).toISOString(),
-      keyId: '',
-    };
-    persistGrant(commonDir, config, grant);
+    const previous = readConsentRecord(grantPath(commonDir, config, grantId));
+    const grant: BudgetExtensionGrant = previous && isBudgetExtensionGrant(previous) && previous.cardId === card.id
+      // A grant already minted for this exact card+mutation (crash before the
+      // card update) is reused verbatim — one-use means one artifact.
+      ? previous as BudgetExtensionGrant
+      : persistGrant(commonDir, config, {
+          schemaVersion: 1,
+          id: grantId,
+          kind: 'budget-extension',
+          source: 'board',
+          cardId: card.id,
+          choiceFingerprint: choiceFingerprintForCard(card.id, card.mutationIndex),
+          scopeHash: card.scopeHash,
+          lineageKey: card.lineageKey,
+          taskSlug: card.taskSlug,
+          branchName: card.branchName,
+          aiRunsDelta: card.aiRunsDelta,
+          activeMinutesDelta: card.activeMinutesDelta,
+          fixReviewLoopsDelta: card.fixReviewLoopsDelta,
+          reason: card.reason,
+          reasonDigest: card.reasonDigest,
+          mintedAt,
+          mintedBy: options.decidedBy,
+          expiresAt: new Date(Date.now() + BUDGET_GRANT_TTL_MS).toISOString(),
+          keyId: '',
+        });
     const decided: BudgetConsentCard = {
       ...card,
       status: 'approved',
@@ -362,6 +420,10 @@ export function approveBudgetConsentCard(
     };
     return { card: persistCard(commonDir, config, decided), grant };
   });
+}
+
+function deterministicGrantIdForCard(cardId: string, mutationIndex: number): string {
+  return `budget-grant-${crypto.createHash('sha256').update(canonicalize({ cardId, mutationIndex })).digest('hex').slice(0, 24)}`;
 }
 
 export function denyBudgetConsentCard(
@@ -389,12 +451,17 @@ export function denyBudgetConsentCard(
 // TTY typed-phrase path (option-4 pattern): the interactive operator mints a
 // grant directly; issuance and the identity of the typing human are the same
 // surface, so the grant records source 'tty' and is immediately consumable.
+// The mint itself re-checks for a real interactive terminal so a headless
+// process cannot reach it as a library call (D11).
 export function mintTtyBudgetExtensionGrant(
   commonDir: string,
   config: WorkflowConfig,
   scope: BudgetExtensionScope,
   options: { mintedBy: string; confirmationPhrase: string },
 ): BudgetExtensionGrant {
+  if (!process.stdin.isTTY) {
+    throw new Error('TTY budget-extension grants require an interactive operator terminal; no non-interactive path mints a grant (D11). File a consent request and approve it on the Board instead.');
+  }
   return withConsentGrantsLock(commonDir, config, () => {
     const mintedAt = nowIso();
     const grant: BudgetExtensionGrant = {
@@ -425,53 +492,98 @@ export function mintTtyBudgetExtensionGrant(
   });
 }
 
-// One-use consumption. Every refusal names its reason (§8-S1 acceptance:
-// expired / reused / wrong-scope fixtures refuse with reason).
+function selectConsumableGrant(
+  commonDir: string,
+  config: WorkflowConfig,
+  options: { lineageKey: string; grantId?: string; excludeGrantIds?: string[] },
+): { grant: BudgetExtensionGrant } | { refusal: GrantRefusal } {
+  const { grants } = listRecords(commonDir, config);
+  // Grants the caller's ledger already consumed are history, not candidates:
+  // excluding them keeps their 'reused' state from masking the real answer
+  // ("nothing consumable exists") on implicit consumption paths.
+  const excluded = new Set(options.excludeGrantIds ?? []);
+  const candidates = grants.filter((grant) =>
+    (options.grantId ? grant.id === options.grantId : grant.lineageKey === options.lineageKey)
+    && !excluded.has(grant.id));
+  if (candidates.length === 0) {
+    return { refusal: { code: 'missing' as const, message: 'No budget-extension grant exists for this task lineage. Extension requires a Board approval or an interactive operator terminal.' } };
+  }
+  const refusals: GrantRefusal[] = [];
+  for (const grant of candidates) {
+    if (!verifyRecord(grant)) {
+      refusals.push({ code: 'invalid-signature', message: `Grant ${grant.id} failed convergence-key signature verification and was refused (fail-closed).` });
+      continue;
+    }
+    if (grant.lineageKey !== options.lineageKey) {
+      refusals.push({ code: 'wrong-scope', message: `Grant ${grant.id} is scoped to a different task lineage and cannot extend this task.` });
+      continue;
+    }
+    if (grant.scopeHash !== budgetExtensionScopeHash({
+      lineageKey: grant.lineageKey,
+      taskSlug: grant.taskSlug,
+      branchName: grant.branchName,
+      aiRunsDelta: grant.aiRunsDelta,
+      activeMinutesDelta: grant.activeMinutesDelta,
+      fixReviewLoopsDelta: grant.fixReviewLoopsDelta,
+      reason: grant.reason,
+    })) {
+      refusals.push({ code: 'wrong-scope', message: `Grant ${grant.id} scope hash does not match its recorded scope; the grant was refused.` });
+      continue;
+    }
+    if (grant.consumedAt) {
+      refusals.push({ code: 'reused', message: `Grant ${grant.id} was already consumed at ${grant.consumedAt}; grants are one-use.` });
+      continue;
+    }
+    if (Date.parse(grant.expiresAt) < Date.now()) {
+      refusals.push({ code: 'expired', message: `Grant ${grant.id} expired at ${grant.expiresAt}; request a fresh extension.` });
+      continue;
+    }
+    return { grant };
+  }
+  return { refusal: refusals[0] ?? { code: 'missing' as const, message: 'No consumable budget-extension grant exists for this task lineage.' } };
+}
+
+// Read-only validation half of consumption: the budget ledger peeks, applies
+// the allowance to its own store first, and only then marks the artifact —
+// so a crash can never burn an approved one-use grant before its allowance
+// landed (the ledger's consumedGrants list is the exactly-once authority).
+export function peekConsumableBudgetExtensionGrant(
+  commonDir: string,
+  config: WorkflowConfig,
+  options: { lineageKey: string; grantId?: string; excludeGrantIds?: string[] },
+): { grant: BudgetExtensionGrant } | { refusal: GrantRefusal } {
+  return withConsentGrantsLock(commonDir, config, () => selectConsumableGrant(commonDir, config, options));
+}
+
+// Marks the one-use artifact consumed. Idempotent: repairing a crash window
+// where the allowance was applied but the mark was lost re-marks silently.
+export function markBudgetExtensionGrantConsumed(
+  commonDir: string,
+  config: WorkflowConfig,
+  grantId: string,
+): BudgetExtensionGrant {
+  return withConsentGrantsLock(commonDir, config, () => {
+    const raw = readConsentRecord(grantPath(commonDir, config, grantId));
+    if (!raw || !isBudgetExtensionGrant(raw)) throw new Error(`Budget-extension grant ${grantId} was not found.`);
+    const grant = raw as BudgetExtensionGrant;
+    if (grant.consumedAt) return grant;
+    const consumed: BudgetExtensionGrant = { ...grant, consumedAt: nowIso() };
+    return persistGrant(commonDir, config, consumed);
+  });
+}
+
+// One-shot consumption for callers that hold no ledger of their own (tests,
+// tooling). Store code should use peek + apply + mark instead.
 export function consumeBudgetExtensionGrant(
   commonDir: string,
   config: WorkflowConfig,
   options: { lineageKey: string; grantId?: string },
 ): { grant: BudgetExtensionGrant } | { refusal: GrantRefusal } {
   return withConsentGrantsLock(commonDir, config, () => {
-    const { grants } = listRecords(commonDir, config);
-    const candidates = grants.filter((grant) => (options.grantId ? grant.id === options.grantId : grant.lineageKey === options.lineageKey));
-    if (candidates.length === 0) {
-      return { refusal: { code: 'missing' as const, message: 'No budget-extension grant exists for this task lineage. Extension requires a Board approval or an interactive operator terminal.' } };
-    }
-    const refusals: GrantRefusal[] = [];
-    for (const grant of candidates) {
-      if (!verifyRecord(grant)) {
-        refusals.push({ code: 'invalid-signature', message: `Grant ${grant.id} failed convergence-key signature verification and was refused (fail-closed).` });
-        continue;
-      }
-      if (grant.lineageKey !== options.lineageKey) {
-        refusals.push({ code: 'wrong-scope', message: `Grant ${grant.id} is scoped to a different task lineage and cannot extend this task.` });
-        continue;
-      }
-      if (grant.scopeHash !== budgetExtensionScopeHash({
-        lineageKey: grant.lineageKey,
-        taskSlug: grant.taskSlug,
-        branchName: grant.branchName,
-        aiRunsDelta: grant.aiRunsDelta,
-        activeMinutesDelta: grant.activeMinutesDelta,
-        fixReviewLoopsDelta: grant.fixReviewLoopsDelta,
-        reason: grant.reason,
-      })) {
-        refusals.push({ code: 'wrong-scope', message: `Grant ${grant.id} scope hash does not match its recorded scope; the grant was refused.` });
-        continue;
-      }
-      if (grant.consumedAt) {
-        refusals.push({ code: 'reused', message: `Grant ${grant.id} was already consumed at ${grant.consumedAt}; grants are one-use.` });
-        continue;
-      }
-      if (Date.parse(grant.expiresAt) < Date.now()) {
-        refusals.push({ code: 'expired', message: `Grant ${grant.id} expired at ${grant.expiresAt}; request a fresh extension.` });
-        continue;
-      }
-      const consumed: BudgetExtensionGrant = { ...grant, consumedAt: nowIso() };
-      persistGrant(commonDir, config, consumed);
-      return { grant: consumed };
-    }
-    return { refusal: refusals[0] ?? { code: 'missing' as const, message: 'No consumable budget-extension grant exists for this task lineage.' } };
+    const outcome = selectConsumableGrant(commonDir, config, options);
+    if ('refusal' in outcome) return outcome;
+    const consumed: BudgetExtensionGrant = { ...outcome.grant, consumedAt: nowIso() };
+    persistGrant(commonDir, config, consumed);
+    return { grant: consumed };
   });
 }

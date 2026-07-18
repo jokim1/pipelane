@@ -784,6 +784,11 @@ export interface ReviewRunRecord {
   intent?: ReviewIntent;
   target?: ReviewTargetManifest;
   gates: ReviewGateRunRecord[];
+  // Convergence S1 (D14): AI gate launches from fix-first restart attempts
+  // whose gate records were superseded by the final attempt. The budget
+  // ledger adds these to the final attempt's launches so restarts are never
+  // undercharged.
+  supersededAiLaunches?: number;
   signature?: string;
 }
 
@@ -3756,12 +3761,31 @@ export function withRouteSafetyStateLock<T>(commonDir: string, config: WorkflowC
 }
 
 export function loadTaskBudgetState(commonDir: string, config: WorkflowConfig): TaskBudgetState {
-  const raw = readVersionedJsonFile<TaskBudgetState>('taskBudgetState', commonDir, config, taskBudgetStatePath(commonDir, config), { entries: {} });
-  if (!raw || typeof raw !== 'object' || !isRecord(raw.entries)) return { entries: {} };
+  // Fail-closed store (D16 spirit): the budget ledger is authorization state.
+  // An ABSENT file is a legitimate fresh install; a PRESENT file that cannot
+  // be parsed or contains an unreadable entry must never quietly become a
+  // fresh budget — that would let corruption (or vandalism) re-mint spend.
+  const statePath = taskBudgetStatePath(commonDir, config);
+  const failClosed = (detail: string): never => {
+    throw new Error(`task-budget-state at ${statePath} is unreadable (${detail}). The budget ledger fails closed: repair or restore the file (see task-budget-archive.jsonl and the completion journal for history) before running gated commands.`);
+  };
+  if (existsSync(statePath)) {
+    try {
+      JSON.parse(readFileSync(statePath, 'utf8'));
+    } catch (error) {
+      failClosed(error instanceof Error ? error.message : String(error));
+    }
+  }
+  const raw = readVersionedJsonFile<TaskBudgetState>('taskBudgetState', commonDir, config, statePath, { entries: {} });
+  if (!raw || typeof raw !== 'object' || !isRecord(raw.entries)) {
+    if (existsSync(statePath)) failClosed('entries map missing');
+    return { entries: {} };
+  }
   const entries: Record<string, TaskBudgetRecord> = {};
   for (const [lineageKey, entry] of Object.entries(raw.entries)) {
     const normalized = normalizeTaskBudgetRecord(entry);
-    if (normalized) entries[lineageKey] = normalized;
+    if (!normalized) failClosed(`entry ${lineageKey.slice(0, 12)} failed validation`);
+    entries[lineageKey] = normalized;
   }
   const state: TaskBudgetState = { entries };
   if (typeof raw.latestPausedLineageKey === 'string' && entries[raw.latestPausedLineageKey]) {
@@ -3821,7 +3845,9 @@ function normalizeTaskBudgetRecord(value: unknown): TaskBudgetRecord | null {
     if (digests.length > 0) record.migratedFromRouteDigests = digests;
   }
   if (Array.isArray(raw.consumedGrants)) {
-    const grants = raw.consumedGrants.filter(isTaskBudgetConsumedGrant).slice(0, 20);
+    // Never truncate: every consumed grant contributes allowance, and the
+    // list is already bounded by taskBudget.maxLifetimeExtensions.
+    const grants = raw.consumedGrants.filter(isTaskBudgetConsumedGrant);
     if (grants.length > 0) record.consumedGrants = grants;
   }
   return record;
@@ -4094,6 +4120,7 @@ function isReviewRunRecord(value: unknown): value is ReviewRunRecord {
     && (raw.taskBindingId === undefined || typeof raw.taskBindingId === 'string')
     && (raw.intent === undefined || isReviewIntent(raw.intent))
     && (raw.target === undefined || isReviewTargetManifest(raw.target))
+    && (raw.supersededAiLaunches === undefined || (typeof raw.supersededAiLaunches === 'number' && Number.isSafeInteger(raw.supersededAiLaunches) && raw.supersededAiLaunches >= 0))
     && (raw.signature === undefined || typeof raw.signature === 'string')
     && (
       raw.worktreeStatusWarnings === undefined

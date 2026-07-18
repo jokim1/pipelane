@@ -58,8 +58,9 @@ import {
   type ReviewCompletionRecord,
 } from './completion-journal.ts';
 import {
-  consumeBudgetExtensionGrant,
+  markBudgetExtensionGrantConsumed,
   mintTtyBudgetExtensionGrant,
+  peekConsumableBudgetExtensionGrant,
   requestBudgetExtensionCard,
   type BudgetExtensionGrant,
   type BudgetExtensionScope,
@@ -541,7 +542,10 @@ export function classifyReviewRunDebits(reviewRun: ReviewRunRecord): ReviewCompl
   const findingFailures = failedBlocking.filter((gate) => !gateIsInfraFailure(gate));
   const infraOnly = reviewRun.status === 'failed' && failedBlocking.length > 0 && findingFailures.length === 0 && infraFailures.length > 0;
   return {
-    aiRunLaunches: launched.length,
+    // F5: fix-first restarts replace the gate array, so the final record
+    // carries the superseded attempts' launch count explicitly — every
+    // launched model call debits (D14), restarts included.
+    aiRunLaunches: launched.length + Math.max(0, reviewRun.supersededAiLaunches ?? 0),
     activeMillis: Math.max(0, reviewRun.durationMs || 0),
     fixReviewLoops: reviewRun.status === 'failed' && findingFailures.length > 0 ? 1 : 0,
     infraOnly,
@@ -588,13 +592,28 @@ function reEstimateBudgetAtFirstReview(context: WorkflowContext, record: TaskBud
 }
 
 // Replays journal records that were appended but never marked applied — the
-// crash-between-debit-and-evidence window (D15) — exactly once.
-function replayUnappliedCompletions(context: WorkflowContext, record: TaskBudgetRecord): void {
+// crash-between-debit-and-evidence window (D15) — into the in-memory record,
+// and returns the replayed run ids. The caller MUST persist the mutated
+// state BEFORE marking those ids applied (finalizeAppliedCompletionMarks):
+// marking first would let a crash between the marker and the save lose the
+// debits permanently. The inverse crash (saved but unmarked) is safe because
+// applyCompletionDebits is idempotent via countedReviewRunIds.
+function replayUnappliedCompletions(context: Pick<WorkflowContext, 'commonDir' | 'config'>, record: TaskBudgetRecord): string[] {
   const unapplied = readUnappliedCompletionRecords(context.commonDir, context.config, record.lineageKey);
   for (const completion of unapplied) {
     applyCompletionDebits(record, completion);
-    markReviewCompletionApplied(context.commonDir, context.config, record.lineageKey, completion.reviewRunId);
   }
+  return unapplied.map((completion) => completion.reviewRunId);
+}
+
+// Appends the applied markers for run ids whose debits are now durably saved.
+function finalizeAppliedCompletionMarks(context: Pick<WorkflowContext, 'commonDir' | 'config'>, lineageKey: string, reviewRunIds: string[]): void {
+  if (reviewRunIds.length === 0) return;
+  withTaskCompletionLock(context.commonDir, context.config, lineageKey, () => {
+    for (const reviewRunId of reviewRunIds) {
+      markReviewCompletionApplied(context.commonDir, context.config, lineageKey, reviewRunId);
+    }
+  });
 }
 
 function effectiveTaskBudgetLimits(record: TaskBudgetRecord): { fixReviewLoops: number; activeMinutes: number; aiRuns: number } {
@@ -631,7 +650,7 @@ type BudgetLimitReason = { reason: string; exhausted: boolean };
 
 function taskBudgetLimitReason(
   record: TaskBudgetRecord,
-  options: { willRunAiReview: boolean },
+  options: { expectedAiLaunches: number },
 ): BudgetLimitReason | null {
   if (record.legacyMigration?.status === 'pending') {
     return { reason: 'legacy route history is ambiguous and requires an explicit audited migration choice', exhausted: false };
@@ -642,8 +661,21 @@ function taskBudgetLimitReason(
   if (activeMinutesUsed(record) >= limits.activeMinutes) {
     return { reason: `review budget exhausted: active execution minutes reached ${limits.activeMinutes}`, exhausted: true };
   }
-  if (options.willRunAiReview && record.aiRunLaunches >= limits.aiRuns) {
-    return { reason: `review budget exhausted: AI runs reached ${limits.aiRuns}`, exhausted: true };
+  if (options.expectedAiLaunches > 0) {
+    if (record.aiRunLaunches >= limits.aiRuns) {
+      return { reason: `review budget exhausted: AI runs reached ${limits.aiRuns}`, exhausted: true };
+    }
+    // F4 pre-charge: the cap is hard — a run may not start if its launch
+    // batch would cross the limit. Exception: a task that has launched
+    // nothing yet gets its first batch even when the configured gate stack
+    // is wider than the base budget (one bounded overshoot beats a lane
+    // that can never start); every later batch must fit.
+    if (record.aiRunLaunches > 0 && record.aiRunLaunches + options.expectedAiLaunches > limits.aiRuns) {
+      return {
+        reason: `review budget exhausted: ${record.aiRunLaunches} AI runs spent and this run would launch ${options.expectedAiLaunches} more, exceeding ${limits.aiRuns}`,
+        exhausted: true,
+      };
+    }
   }
   if (record.fixReviewLoops >= limits.fixReviewLoops && record.lastReviewStatus !== 'passed') {
     return { reason: `fix/review loops reached ${limits.fixReviewLoops}; a verified audited fix attempt re-arms one rerun`, exhausted: false };
@@ -770,15 +802,31 @@ export function cleanTaskBudgetArtifactsForTask(
         (filter.taskSlug && entry.taskSlug === filter.taskSlug && entry.branchName === filter.branchName)
         || (!entry.taskSlug && entry.branchName === filter.branchName));
       if (matches.length === 0) return;
+      const context = { commonDir, config };
+      const cleanedKeys = new Set<string>();
+      const marksByLineage = new Map<string, string[]>();
       for (const entry of matches) {
+        // F6: unapplied journal spend replays into the entry BEFORE the
+        // archive line is written, so /clean can never discard completed
+        // debits. A journal that fails closed (tamper/corruption) keeps the
+        // entry and its journal in place for repair instead of deleting them.
+        try {
+          marksByLineage.set(entry.lineageKey, replayUnappliedCompletions(context, entry));
+        } catch {
+          continue;
+        }
         appendTaskBudgetArchiveSummary(commonDir, config, entry);
-        pruneAppliedCompletionJournal(commonDir, config, entry.lineageKey);
         delete state.entries[entry.lineageKey];
         if (state.latestPausedLineageKey === entry.lineageKey) state.latestPausedLineageKey = undefined;
+        cleanedKeys.add(entry.lineageKey);
       }
+      if (cleanedKeys.size === 0) return;
       saveTaskBudgetState(commonDir, config, state);
+      for (const lineageKey of cleanedKeys) {
+        finalizeAppliedCompletionMarks(context, lineageKey, marksByLineage.get(lineageKey) ?? []);
+        pruneAppliedCompletionJournal(commonDir, config, lineageKey);
+      }
       const parkedState = loadParkedTasks(commonDir, config);
-      const cleanedKeys = new Set(matches.map((entry) => entry.lineageKey));
       const remaining = parkedState.records.filter((entry) => !cleanedKeys.has(entry.lineageKey));
       if (remaining.length !== parkedState.records.length) {
         saveParkedTasks(commonDir, config, { records: remaining });
@@ -852,9 +900,13 @@ export async function evaluateDestinationRouteReviewSafety(
   const record = withTaskBudgetStateLock(context.commonDir, context.config, () => {
     const state = loadTaskBudgetState(context.commonDir, context.config);
     const entry = ensureTaskBudgetRecord(context, state, identity);
-    replayUnappliedCompletions(context, entry);
-    if (evidence.latest) recordJournaledReviewRun(context, entry, evidence.latest);
+    const pendingMarks = replayUnappliedCompletions(context, entry);
+    if (evidence.latest) {
+      const marked = recordJournaledReviewRun(context, entry, evidence.latest);
+      if (marked) pendingMarks.push(marked);
+    }
     saveTaskBudgetState(context.commonDir, context.config, state);
+    finalizeAppliedCompletionMarks(context, entry.lineageKey, pendingMarks);
     return entry;
   });
   if (record.legacyMigration?.status === 'pending') {
@@ -872,7 +924,7 @@ export async function evaluateDestinationRouteReviewSafety(
   const config = normalizeRouteSafetyConfig(context.config.routeSafety);
   const hasAcceptableFindings = reviewEvidenceIssuesAreAcceptableFindings(evidence);
 
-  const limit = taskBudgetLimitReason(record, { willRunAiReview: false });
+  const limit = taskBudgetLimitReason(record, { expectedAiLaunches: 0 });
   const findingReason = hasAcceptableFindings && config.stopOnMajorFindings
     ? 'blocking/major review findings are present'
     : '';
@@ -898,17 +950,24 @@ export function guardReviewRunStartForTaskBudget(
   return withTaskBudgetStateLock(context.commonDir, context.config, () => {
     const state = loadTaskBudgetState(context.commonDir, context.config);
     const record = ensureTaskBudgetRecord(context, state, identity);
-    replayUnappliedCompletions(context, record);
+    const pendingMarks = replayUnappliedCompletions(context, record);
     reEstimateBudgetAtFirstReview(context, record);
-    const willRunAiReview = reviewRunMayUseAi(context.config.reviewGates?.gates ?? [], parsed);
-    const limit = taskBudgetLimitReason(record, { willRunAiReview });
+    // F4: pre-charge the cap. A run that would launch more AI gates than the
+    // remaining budget covers must not start — otherwise "AI runs reached 8"
+    // can finish at 11/8. The only allowed overshoot is a task's very first
+    // launch batch (spent == 0), so a gate stack wider than the base budget
+    // degrades to one bounded batch instead of bricking the lane.
+    const expectedAiLaunches = expectedAiLaunchCount(context.config.reviewGates?.gates ?? [], parsed);
+    const limit = taskBudgetLimitReason(record, { expectedAiLaunches });
     if (!limit) {
       saveTaskBudgetState(context.commonDir, context.config, state);
+      finalizeAppliedCompletionMarks(context, record.lineageKey, pendingMarks);
       return { action: 'continue', message: '' };
     }
     markPaused(state, record, limit.reason);
     const parked = limit.exhausted ? parkTaskBudgetRecord(context, record, limit.reason) : null;
     saveTaskBudgetState(context.commonDir, context.config, state);
+    finalizeAppliedCompletionMarks(context, record.lineageKey, pendingMarks);
     return {
       action: 'stop',
       message: parked
@@ -929,32 +988,40 @@ export function recordReviewRunForTaskBudget(
   return withTaskBudgetStateLock(context.commonDir, context.config, () => {
     const state = loadTaskBudgetState(context.commonDir, context.config);
     const record = ensureTaskBudgetRecord(context, state, identity);
-    replayUnappliedCompletions(context, record);
+    const pendingMarks = replayUnappliedCompletions(context, record);
     reEstimateBudgetAtFirstReview(context, record);
-    const debits = recordJournaledReviewRun(context, record, reviewRun);
+    const marked = recordJournaledReviewRun(context, record, reviewRun);
+    if (marked) pendingMarks.push(marked);
+    // Classification is pure, so messaging works the same whether this call
+    // debited the run or an earlier journal pass (F2a) already did.
+    const debits = classifyReviewRunDebits(reviewRun);
+    const persistAndFinalize = (): void => {
+      saveTaskBudgetState(context.commonDir, context.config, state);
+      finalizeAppliedCompletionMarks(context, record.lineageKey, pendingMarks);
+    };
     if (reviewRun.status === 'passed' && record.legacyMigration?.status !== 'pending') {
       record.pauseReason = undefined;
       record.pausedAt = undefined;
-      saveTaskBudgetState(context.commonDir, context.config, state);
+      persistAndFinalize();
       return { action: 'continue', message: '' };
     }
 
     const config = normalizeRouteSafetyConfig(context.config.routeSafety);
-    const limit = taskBudgetLimitReason(record, { willRunAiReview: false });
-    const infraReason = debits?.infraOnly
+    const limit = taskBudgetLimitReason(record, { expectedAiLaunches: 0 });
+    const infraReason = debits.infraOnly
       ? 'gate-unavailable: a review gate infra-failed (AI runs debited, no fix/review loop counted)'
       : '';
-    const findingReason = reviewRun.status === 'failed' && !debits?.infraOnly && config.stopOnMajorFindings
+    const findingReason = reviewRun.status === 'failed' && !debits.infraOnly && config.stopOnMajorFindings
       ? 'blocking/major review findings are present'
       : '';
     const reason = limit?.exhausted ? limit.reason : (findingReason || infraReason || limit?.reason || '');
     if (!reason) {
-      saveTaskBudgetState(context.commonDir, context.config, state);
+      persistAndFinalize();
       return { action: 'continue', message: '' };
     }
     markPaused(state, record, reason);
     const parked = limit?.exhausted ? parkTaskBudgetRecord(context, record, reason) : null;
-    saveTaskBudgetState(context.commonDir, context.config, state);
+    persistAndFinalize();
     return {
       action: 'stop',
       message: parked
@@ -969,31 +1036,59 @@ export function recordReviewRunForTaskBudget(
 }
 
 // The D15 completion transaction for a review run: journal the debits inside
-// the task-scoped lock, apply them to the budget entry, then mark applied.
-// Idempotent per reviewRunId at every step, so crash replay is exactly-once.
+// the task-scoped lock and apply them to the in-memory entry. The caller
+// saves the mutated state and only then marks the run applied — the
+// journal-record → store-write → marker ordering is what makes every crash
+// window replayable exactly-once. Returns the run id to mark, or null when
+// the run was already counted.
 function recordJournaledReviewRun(
   context: WorkflowContext,
   record: TaskBudgetRecord,
   reviewRun: ReviewRunRecord,
-): ReviewCompletionDebits | null {
+): string | null {
   if (record.countedReviewRunIds.includes(reviewRun.id)) {
     record.lastReviewRunId = reviewRun.id;
     record.lastReviewStatus = reviewRun.status;
     recordFixRerunTransition(record, reviewRun);
     return null;
   }
-  return withTaskCompletionLock(context.commonDir, context.config, record.lineageKey, () => {
-    const completion = appendReviewCompletionRecord(context.commonDir, context.config, {
+  const completion = withTaskCompletionLock(context.commonDir, context.config, record.lineageKey, () =>
+    appendReviewCompletionRecord(context.commonDir, context.config, {
       lineageKey: record.lineageKey,
       taskSlug: record.taskSlug,
       branchName: record.branchName,
       reviewRunId: reviewRun.id,
       reviewStatus: reviewRun.status,
       debits: classifyReviewRunDebits(reviewRun),
-    });
-    applyCompletionDebits(record, completion, reviewRun);
-    markReviewCompletionApplied(context.commonDir, context.config, record.lineageKey, reviewRun.id);
-    return completion.debits;
+    }));
+  applyCompletionDebits(record, completion, reviewRun);
+  return reviewRun.id;
+}
+
+// F2a: the durable-debit half of review completion, run BEFORE review
+// evidence is persisted. Evidence-then-debit ordering would let a crash
+// leave chargeable AI work recorded as usable evidence with no spend; this
+// journals and saves the debits first, so the worst crash outcome is spend
+// without evidence — the conservative direction (D14: tokens died; they
+// count).
+export function journalReviewRunForTaskBudget(
+  cwd: string,
+  parsed: ParsedOperatorArgs,
+  reviewRun: ReviewRunRecord,
+): void {
+  const context = resolveWorkflowContext(cwd);
+  const plan = buildReviewRoutePlan(cwd, parsed);
+  const identity = plan ? budgetIdentityForPlan(context, plan) : budgetIdentityForCurrentReview(context);
+  const pendingMarks: string[] = [];
+  withTaskBudgetStateLock(context.commonDir, context.config, () => {
+    const state = loadTaskBudgetState(context.commonDir, context.config);
+    const record = ensureTaskBudgetRecord(context, state, identity);
+    pendingMarks.push(...replayUnappliedCompletions(context, record));
+    reEstimateBudgetAtFirstReview(context, record);
+    const marked = recordJournaledReviewRun(context, record, reviewRun);
+    if (marked) pendingMarks.push(marked);
+    saveTaskBudgetState(context.commonDir, context.config, state);
+    finalizeAppliedCompletionMarks(context, record.lineageKey, pendingMarks);
   });
 }
 
@@ -1100,14 +1195,37 @@ function applyGrantToRecord(record: TaskBudgetRecord, grant: BudgetExtensionGran
   return consumed;
 }
 
-function consumeGrantForRecord(
+// F3b crash-repair: the entry's consumedGrants list is the exactly-once
+// authority. Any listed grant whose one-use artifact is still unmarked
+// (crash between the ledger save and the artifact mark) gets its mark
+// repaired before new consumption is considered.
+function repairConsumedGrantMarks(context: WorkflowContext, record: TaskBudgetRecord): void {
+  for (const consumed of record.consumedGrants ?? []) {
+    try {
+      markBudgetExtensionGrantConsumed(context.commonDir, context.config, consumed.grantId);
+    } catch {
+      // A missing artifact cannot be repaired; the ledger entry remains the
+      // authoritative record of the consumed allowance.
+    }
+  }
+}
+
+// Applies one approved grant to the record (in-memory). The caller MUST
+// persist the state and then call markBudgetExtensionGrantConsumed with the
+// returned grantId — ledger-before-artifact ordering means a crash can only
+// leave a repairable unmarked artifact, never a burned-but-unapplied grant.
+function consumeGrantIntoRecord(
   context: WorkflowContext,
   record: TaskBudgetRecord,
-): { message: string } {
+): { message: string; grantId: string } {
   if (remainingLifetimeExtensions(context, record) <= 0) {
     throw new Error(EXTENSION_CEILING_MESSAGE);
   }
-  const outcome = consumeBudgetExtensionGrant(context.commonDir, context.config, { lineageKey: record.lineageKey });
+  repairConsumedGrantMarks(context, record);
+  const outcome = peekConsumableBudgetExtensionGrant(context.commonDir, context.config, {
+    lineageKey: record.lineageKey,
+    excludeGrantIds: (record.consumedGrants ?? []).map((consumed) => consumed.grantId),
+  });
   if ('refusal' in outcome) {
     throw new Error(outcome.refusal.message);
   }
@@ -1119,6 +1237,7 @@ function consumeGrantForRecord(
   }), ...(record.resumes ?? [])].slice(0, 20);
   const limits = effectiveTaskBudgetLimits(record);
   return {
+    grantId: outcome.grant.id,
     message: [
       `Consumed one-use budget-extension grant ${consumed.grantId} (${consumed.source === 'board' ? 'Board approval' : 'operator terminal'}).`,
       `Extension: +${consumed.fixReviewLoopsDelta} fix/review loop${consumed.fixReviewLoopsDelta === 1 ? '' : 's'}, +${consumed.aiRunsDelta} AI runs, +${consumed.activeMinutesDelta} active minutes.`,
@@ -1146,9 +1265,13 @@ export function consumePendingBudgetExtensionForCheckout(cwd: string): { message
       if (!record.parkedAt) return null;
       throw new Error(EXTENSION_CEILING_MESSAGE);
     }
-    const outcome = consumeBudgetExtensionGrant(context.commonDir, context.config, { lineageKey: record.lineageKey });
-    if ('refusal' in outcome) {
-      if (outcome.refusal.code === 'missing') {
+    repairConsumedGrantMarks(context, record);
+    const peeked = peekConsumableBudgetExtensionGrant(context.commonDir, context.config, {
+      lineageKey: record.lineageKey,
+      excludeGrantIds: (record.consumedGrants ?? []).map((consumed) => consumed.grantId),
+    });
+    if ('refusal' in peeked) {
+      if (peeked.refusal.code === 'missing') {
         if (!record.parkedAt) return null;
         throw new Error([
           `Task parked: ${record.taskSlug || '<unbound>'} (${record.branchName}).`,
@@ -1156,25 +1279,12 @@ export function consumePendingBudgetExtensionForCheckout(cwd: string): { message
           'human approval on the Board or an interactive operator terminal.',
         ].join('\n'));
       }
-      throw new Error(outcome.refusal.message);
+      throw new Error(peeked.refusal.message);
     }
-    const consumed = applyGrantToRecord(record, outcome.grant);
-    unparkTaskBudgetRecord(context, record);
-    record.updatedAt = nowIso();
-    record.resumes = [makeResumeRecord('budget-extension-grant', outcome.grant.source === 'tty' ? 'tty' : 'resume', {
-      reason: outcome.grant.reason,
-    }), ...(record.resumes ?? [])].slice(0, 20);
+    const outcome = consumeGrantIntoRecord(context, record);
     saveTaskBudgetState(context.commonDir, context.config, state);
-    const limits = effectiveTaskBudgetLimits(record);
-    return {
-      message: [
-        `Consumed one-use budget-extension grant ${consumed.grantId} (${consumed.source === 'board' ? 'Board approval' : 'operator terminal'}).`,
-        `Extension: +${consumed.fixReviewLoopsDelta} fix/review loop${consumed.fixReviewLoopsDelta === 1 ? '' : 's'}, +${consumed.aiRunsDelta} AI runs, +${consumed.activeMinutesDelta} active minutes.`,
-        `Lifetime extensions used: ${record.lifetimeExtensions}/${normalizeTaskBudgetConfig(context.config.taskBudget).maxLifetimeExtensions}.`,
-        `Budget now: loops ${record.fixReviewLoops}/${limits.fixReviewLoops}, AI runs ${record.aiRunLaunches}/${limits.aiRuns}, active minutes ${activeMinutesUsed(record)}/${limits.activeMinutes}.`,
-        `Next: rerun ${record.targetCommand}.`,
-      ].join('\n'),
-    };
+    markBudgetExtensionGrantConsumed(context.commonDir, context.config, outcome.grantId);
+    return { message: outcome.message };
   });
 }
 
@@ -1909,8 +2019,9 @@ async function pauseTaskBudget(
         const state = loadTaskBudgetState(context.commonDir, context.config);
         const current = state.entries[record.lineageKey];
         if (!current) throw new Error('The paused task lineage disappeared while the grant was being minted.');
-        const outcome = consumeGrantForRecord(context, current);
+        const outcome = consumeGrantIntoRecord(context, current);
         saveTaskBudgetState(context.commonDir, context.config, state);
+        markBudgetExtensionGrantConsumed(context.commonDir, context.config, outcome.grantId);
         return outcome;
       });
       return { action: 'stop', message: consumed.message };
@@ -2155,13 +2266,19 @@ function recordFixRerunTransition(record: TaskBudgetRecord, reviewRun: ReviewRun
   if (reviewRun.status === 'passed') candidate.rerunPassedAt = reviewRun.finishedAt || nowIso();
 }
 
-function reviewRunMayUseAi(gates: Array<{ id: string; type: string; blocking?: boolean }>, parsed: ParsedOperatorArgs): boolean {
-  if (parsed.flags.reviewDryRun) return false;
+function expectedAiLaunchCount(gates: Array<{ id: string; type: string; blocking?: boolean }>, parsed: ParsedOperatorArgs): number {
+  if (parsed.flags.reviewDryRun) return 0;
   const gateFilter = parsed.flags.reviewGate.trim();
-  return gates.some((gate) =>
+  return gates.filter((gate) =>
     (gate.type === 'skill' || gate.type === 'agent')
     && (!gateFilter || gate.id === gateFilter)
-  );
+  ).length;
+}
+
+// Exported for the review runner (F5): counts the launched AI gates of a
+// superseded fix-first attempt so restarts are charged, not forgotten.
+export function countLaunchedAiGates(gates: ReviewGateRunRecord[]): number {
+  return gates.filter(gateWasLaunched).length;
 }
 
 function buildReviewRoutePlan(cwd: string, parsed: ParsedOperatorArgs): DestinationPlan | null {

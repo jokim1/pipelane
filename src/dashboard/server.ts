@@ -23,6 +23,7 @@ import {
   approveBudgetConsentCard,
   denyBudgetConsentCard,
   listBudgetConsentCards,
+  recordBoardSessionDigest,
 } from '../operator/consent-grants.ts';
 
 const DEFAULT_HOST = '127.0.0.1';
@@ -679,6 +680,16 @@ function printDashboardBanner(options: DashboardServerOptions, actualPort: numbe
 export async function startDashboardServer(options: DashboardServerOptions): Promise<void> {
   const uiFilePath = getUiFilePath();
   const browserSessionToken = randomBytes(32).toString('base64url');
+  // D11: publish this server's session-token digest so the consent-grants
+  // module can demand the token PREIMAGE as human-surface proof on approval.
+  // Best-effort: a repo without pipelane state simply has no approvable cards.
+  try {
+    const context = resolveWorkflowContext(options.repoRoot);
+    recordBoardSessionDigest(context.commonDir, context.config, browserSessionToken);
+  } catch {
+    // Consent approvals will refuse without a published digest; the rest of
+    // the dashboard works normally.
+  }
   const loopbackHost = normalizeLoopbackHost(options.host);
   let actualPort = options.port;
   let dashboardSettings = options.settings;
@@ -1211,6 +1222,10 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
             const outcome = approveBudgetConsentCard(context.commonDir, context.config, cardId, {
               decidedBy: 'board-operator',
               ...(decisionReason ? { decisionReason } : {}),
+              // The gauntlet already validated this header; the module
+              // re-verifies it against the published digest so a bare module
+              // call can never mint (D11).
+              boardSessionProof: singleRequestHeader(req, BOARD_SESSION_HEADER),
             });
             sendJson(res, 200, { ok: true, card: outcome.card, grantId: outcome.grant.id });
           } else {

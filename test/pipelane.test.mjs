@@ -40815,12 +40815,31 @@ test('convergence S1: codexskill ledger replay parks within two AI runs and the 
     assert.match(cockpit, /AI runs: 69\//);
 
     // Board approval mints a one-use signed grant; `pipelane resume` consumes
-    // it exactly once and un-parks.
+    // it exactly once and un-parks. Approval demands the live Board session
+    // preimage (D11) — the test publishes a digest exactly like the running
+    // dashboard server does, then presents the preimage.
     const consents = await import(path.join(KIT_ROOT, 'src', 'operator', 'consent-grants.ts'));
     const pendingCard = afterBurst.cards.find((card) => card.status === 'pending');
-    const approved = consents.approveBudgetConsentCard(context.commonDir, context.config, pendingCard.id, { decidedBy: 'board-operator' });
+    const boardToken = 'synthetic-board-session-token-for-replay-test';
+    assert.throws(
+      () => consents.approveBudgetConsentCard(context.commonDir, context.config, pendingCard.id, { decidedBy: 'board-operator', boardSessionProof: boardToken }),
+      /human-surface only/,
+      'approval must refuse before any dashboard published a session digest',
+    );
+    consents.recordBoardSessionDigest(context.commonDir, context.config, boardToken);
+    assert.throws(
+      () => consents.approveBudgetConsentCard(context.commonDir, context.config, pendingCard.id, { decidedBy: 'board-operator', boardSessionProof: 'wrong-preimage' }),
+      /human-surface only/,
+      'a wrong session preimage must refuse',
+    );
+    const approved = consents.approveBudgetConsentCard(context.commonDir, context.config, pendingCard.id, { decidedBy: 'board-operator', boardSessionProof: boardToken });
     assert.equal(approved.card.status, 'approved');
     assert.match(approved.grant.signature, /^[a-f0-9]{64}$/);
+    // F3a: re-approval converges on the same deterministic one-use grant
+    // instead of minting a duplicate.
+    const reApproved = consents.approveBudgetConsentCard(context.commonDir, context.config, pendingCard.id, { decidedBy: 'board-operator', boardSessionProof: boardToken });
+    assert.equal(reApproved.grant.id, approved.grant.id);
+    assert.equal(listConsentRecords(created.worktreePath).grants.length, 1, 're-approval must not mint a duplicate grant');
 
     const consumed = JSON.parse(runCli(['run', 'resume', '--json'], created.worktreePath).stdout);
     assert.match(consumed.message, /Consumed one-use budget-extension grant/);
@@ -40836,18 +40855,37 @@ test('convergence S1: codexskill ledger replay parks within two AI runs and the 
     assert.equal(reuse.refusal.code, 'reused');
     assert.match(reuse.refusal.message, /already consumed/);
 
+    // D11: the TTY mint refuses outright without a real interactive terminal.
+    assert.throws(
+      () => consents.mintTtyBudgetExtensionGrant(context.commonDir, context.config, {
+        lineageKey: unparked.lineageKey,
+        taskSlug: unparked.taskSlug,
+        branchName: unparked.branchName,
+        aiRunsDelta: 2,
+        activeMinutesDelta: 45,
+        fixReviewLoopsDelta: 1,
+        reason: 'synthetic tty fixture',
+      }, { mintedBy: 'test', confirmationPhrase: 'extend budget for test' }),
+      /interactive operator terminal/,
+    );
+
     // Expired and tampered grants refuse with their reasons (fail-closed).
+    // Fixtures mint through the Board path (digest published above).
     const integrity = await import(path.join(KIT_ROOT, 'src', 'operator', 'integrity.ts'));
     const key = integrity.resolveConvergenceStateKey();
-    const expiredGrant = consents.mintTtyBudgetExtensionGrant(context.commonDir, context.config, {
-      lineageKey: unparked.lineageKey,
-      taskSlug: unparked.taskSlug,
-      branchName: unparked.branchName,
-      aiRunsDelta: 2,
-      activeMinutesDelta: 45,
-      fixReviewLoopsDelta: 1,
-      reason: 'synthetic expiry fixture',
-    }, { mintedBy: 'test', confirmationPhrase: 'extend budget for test' });
+    const mintFixtureGrant = (scopeReason) => {
+      const fixtureCard = consents.requestBudgetExtensionCard(context.commonDir, context.config, {
+        lineageKey: unparked.lineageKey,
+        taskSlug: unparked.taskSlug,
+        branchName: unparked.branchName,
+        aiRunsDelta: 2,
+        activeMinutesDelta: 45,
+        fixReviewLoopsDelta: 1,
+        reason: scopeReason,
+      }, { provider: 'test', sessionId: null, source: 'test' }).card;
+      return consents.approveBudgetConsentCard(context.commonDir, context.config, fixtureCard.id, { decidedBy: 'board-operator', boardSessionProof: boardToken }).grant;
+    };
+    const expiredGrant = mintFixtureGrant('synthetic expiry fixture');
     const grantPath = path.join(sharedStateDir(created.worktreePath), 'consent-grants', `${expiredGrant.id}.json`);
     const expiredPayload = JSON.parse(readFileSync(grantPath, 'utf8'));
     expiredPayload.expiresAt = '2000-01-01T00:00:00.000Z';
@@ -40864,7 +40902,7 @@ test('convergence S1: codexskill ledger replay parks within two AI runs and the 
     assert.match(tampered.refusal.message, /refused \(fail-closed\)/);
 
     // Wrong scope: a grant for a different task lineage cannot extend this one.
-    const foreignGrant = consents.mintTtyBudgetExtensionGrant(context.commonDir, context.config, {
+    const foreignCard = consents.requestBudgetExtensionCard(context.commonDir, context.config, {
       lineageKey: 'f'.repeat(64),
       taskSlug: 'another-task',
       branchName: 'codex/another-task',
@@ -40872,7 +40910,8 @@ test('convergence S1: codexskill ledger replay parks within two AI runs and the 
       activeMinutesDelta: 45,
       fixReviewLoopsDelta: 1,
       reason: 'synthetic wrong-scope fixture',
-    }, { mintedBy: 'test', confirmationPhrase: 'extend budget for another-task' });
+    }, { provider: 'test', sessionId: null, source: 'test' }).card;
+    const foreignGrant = consents.approveBudgetConsentCard(context.commonDir, context.config, foreignCard.id, { decidedBy: 'board-operator', boardSessionProof: boardToken }).grant;
     const wrongScope = consents.consumeBudgetExtensionGrant(context.commonDir, context.config, { lineageKey: unparked.lineageKey, grantId: foreignGrant.id });
     assert.equal(wrongScope.refusal.code, 'wrong-scope');
     assert.match(wrongScope.refusal.message, /different task lineage/);
@@ -40948,7 +40987,8 @@ test('convergence S1: completion journal replays a crash between debit and evide
     assert.equal(entry.aiRunLaunches, 3, 'replay is exactly-once: a marker prevents double debits');
 
     // Tampered journal line: fail-closed refusal, no unverified record applied.
-    const raw = readFileSync(journalPath, 'utf8').trim().split('\n');
+    const pristineJournal = readFileSync(journalPath, 'utf8');
+    const raw = pristineJournal.trim().split('\n');
     const tamperedLine = JSON.parse(raw[0]);
     tamperedLine.debits = { ...tamperedLine.debits, aiRunLaunches: 999 };
     raw[0] = JSON.stringify(tamperedLine);
@@ -40956,6 +40996,27 @@ test('convergence S1: completion journal replays a crash between debit and evide
     const blocked = runCli(['run', 'review', '--json'], created.worktreePath, {}, true);
     assert.equal(blocked.status, 1);
     assert.match(`${blocked.stdout}\n${blocked.stderr}`, /failed convergence-key signature verification|refused \(fail-closed\)/);
+    writeFileSync(journalPath, pristineJournal, 'utf8');
+
+    // F6: /clean replays unapplied journal spend into the archive summary
+    // instead of discarding it with the entry.
+    journal.appendReviewCompletionRecord(context.commonDir, context.config, {
+      lineageKey: entry.lineageKey,
+      taskSlug: entry.taskSlug,
+      branchName: entry.branchName,
+      reviewRunId: 'synthetic-crashed-run-2',
+      reviewStatus: 'passed',
+      debits: { aiRunLaunches: 2, activeMillis: 30_000, fixReviewLoops: 0, infraOnly: false },
+    });
+    const cleaned = runCli(['run', 'clean', '--apply', '--task', created.taskSlug, '--force', '--json'], repoRoot, { PIPELANE_CLEAN_MIN_AGE_MS: '0' });
+    assert.match(cleaned.stdout, /"removed"/);
+    const archiveLines = readFileSync(path.join(sharedStateDir(repoRoot), 'task-budget-archive.jsonl'), 'utf8')
+      .split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    const archived = archiveLines.find((line) => line.lineageKey === entry.lineageKey);
+    assert.ok(archived, 'the cleaned entry archived a summary line');
+    assert.equal(archived.spent.aiRunLaunches, 5, 'unapplied journal spend (3 replayed earlier + 2 pending) rode into the archive');
+    assert.equal(existsSync(journalPath), false, 'the fully-applied journal truncated on /clean');
+    assert.equal(readTaskBudgetState(repoRoot).entries[entry.lineageKey], undefined);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -41267,13 +41328,16 @@ test('convergence S1: board consent endpoints refuse untrusted mutations and min
     assert.equal(minted[0].cardId, card.id);
     assert.match(minted[0].signature, /^[a-f0-9]{64}$/);
 
-    // Approving a decided card refuses.
+    // Re-approving converges on the same deterministic one-use grant (F3a
+    // crash repair) instead of minting a duplicate.
     const replay = await requestDashboard(server, `/api/consents/${encodeURIComponent(card.id)}/approve`, {
       method: 'POST',
       headers: validHeaders,
       body: JSON.stringify({}),
     });
-    assert.equal(replay.status, 409);
+    assert.equal(replay.status, 200);
+    assert.equal(replay.json.grantId, approved.json.grantId);
+    assert.equal(listConsentRecords(repoRoot).grants.length, 1, 're-approval must not mint a duplicate grant');
   } finally {
     if (server) {
       server.processHandle.kill('SIGTERM');
@@ -41301,5 +41365,105 @@ test('convergence S1: budget-extension consent is never minted through action co
     );
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('convergence S1: hard AI-run precharge, grant-mark crash repair, and fail-closed ledger loading', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const gateMarker = path.join(mkdtempSync(path.join(os.tmpdir(), 'pipelane-s1-precharge-')), 'gate-ran');
+  try {
+    writePipelaneConfig(repoRoot, 'Precharge Repo', {
+      prePrChecks: [],
+      reviewGates: { policyVersion: 2, planReview: { gates: [] }, gates: [] },
+    });
+    commitAll(repoRoot, 'Configure precharge fixture');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Precharge Ledger', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'precharge\n', 'utf8');
+    const first = JSON.parse(runCli(['run', 'review', '--json'], created.worktreePath).stdout);
+    assert.equal(first.status, 'passed');
+    const entry = latestRouteSafetyRecord(created.worktreePath);
+    const budgetStatePath = path.join(sharedStateDir(created.worktreePath), 'task-budget-state.json');
+
+    // F4: a run whose launch batch would cross the cap must not start. Seed
+    // 7/8 spent, then configure a 3-gate AI stack: 7 + 3 > 8 refuses before
+    // any launch, so "AI runs reached 8" can never finish at 11/8.
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.reviewGates = {
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: ['alpha', 'beta', 'gamma'].map((name) => ({
+          id: `stub-${name}`, phase: 'ai-diff', type: 'skill', blocking: true, skill: `stub-${name}`,
+          command: `node -e "require('node:fs').writeFileSync(${JSON.stringify(gateMarker)}, 'ran'); console.log('passed')"`,
+        })),
+      };
+    });
+    let budgetState = JSON.parse(readFileSync(budgetStatePath, 'utf8'));
+    budgetState.entries[entry.lineageKey].aiRunLaunches = 7;
+    budgetState.entries[entry.lineageKey].aiRunsBudget = 8;
+    writeFileSync(budgetStatePath, `${JSON.stringify(budgetState, null, 2)}\n`, 'utf8');
+    const precharge = runCli(['run', 'review', '--json'], created.worktreePath, {}, true);
+    assert.equal(precharge.status, 1);
+    assert.match(`${precharge.stdout}\n${precharge.stderr}`, /7 AI runs spent and this run would launch 3 more, exceeding 8/);
+    assert.match(`${precharge.stdout}\n${precharge.stderr}`, /Task parked:/);
+    assert.equal(existsSync(gateMarker), false, 'the precharge refusal must fire before any gate launches');
+
+    // F3b: the ledger's consumedGrants list is the exactly-once authority —
+    // an applied-but-unmarked grant artifact (crash window) repairs to
+    // consumed instead of granting a second allowance.
+    updateWorkflowConfig(repoRoot, (config) => {
+      config.prePrChecks = [];
+      config.reviewGates = { policyVersion: 2, planReview: { gates: [] }, gates: [] };
+    });
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const consents = await import(path.join(KIT_ROOT, 'src', 'operator', 'consent-grants.ts'));
+    const integrity = await import(path.join(KIT_ROOT, 'src', 'operator', 'integrity.ts'));
+    const context = state.resolveWorkflowContext(created.worktreePath);
+    const boardToken = 'synthetic-board-session-for-precharge-test';
+    consents.recordBoardSessionDigest(context.commonDir, context.config, boardToken);
+    const card = consents.requestBudgetExtensionCard(context.commonDir, context.config, {
+      lineageKey: entry.lineageKey,
+      taskSlug: entry.taskSlug,
+      branchName: entry.branchName,
+      aiRunsDelta: 4,
+      activeMinutesDelta: 45,
+      fixReviewLoopsDelta: 1,
+      reason: 'repair-window fixture',
+    }, { provider: 'test', sessionId: null, source: 'test' }).card;
+    const grant = consents.approveBudgetConsentCard(context.commonDir, context.config, card.id, {
+      decidedBy: 'board-operator', boardSessionProof: boardToken,
+    }).grant;
+    const consumed = JSON.parse(runCli(['run', 'resume', '--json'], created.worktreePath).stdout);
+    assert.match(consumed.message, /Consumed one-use budget-extension grant/);
+    budgetState = JSON.parse(readFileSync(budgetStatePath, 'utf8'));
+    assert.equal(budgetState.entries[entry.lineageKey].lifetimeExtensions, 1);
+
+    // Simulate the crash window: allowance saved in the ledger, artifact mark
+    // lost.
+    const grantFile = path.join(sharedStateDir(created.worktreePath), 'consent-grants', `${grant.id}.json`);
+    const grantPayload = JSON.parse(readFileSync(grantFile, 'utf8'));
+    delete grantPayload.consumedAt;
+    grantPayload.signature = integrity.signSignedPayload(grantPayload, integrity.resolveConvergenceStateKey());
+    writeFileSync(grantFile, `${JSON.stringify(grantPayload, null, 2)}\n`, 'utf8');
+    budgetState = JSON.parse(readFileSync(budgetStatePath, 'utf8'));
+    budgetState.entries[entry.lineageKey].pausedAt = new Date().toISOString();
+    budgetState.entries[entry.lineageKey].pauseReason = 'repair-window fixture pause';
+    writeFileSync(budgetStatePath, `${JSON.stringify(budgetState, null, 2)}\n`, 'utf8');
+    runCli(['run', 'resume', '--json'], created.worktreePath);
+    const repaired = JSON.parse(readFileSync(grantFile, 'utf8'));
+    assert.ok(repaired.consumedAt, 'the unmarked artifact repaired to consumed');
+    budgetState = JSON.parse(readFileSync(budgetStatePath, 'utf8'));
+    assert.equal(budgetState.entries[entry.lineageKey].lifetimeExtensions, 1, 'repair must not double-apply the allowance');
+
+    // F7: a present-but-corrupt ledger fails closed instead of quietly
+    // re-minting fresh budgets.
+    writeFileSync(budgetStatePath, '{"schemaVersion":1,"entries":{oops', 'utf8');
+    const failClosed = runCli(['run', 'review', '--json'], created.worktreePath, {}, true);
+    assert.equal(failClosed.status, 1);
+    assert.match(`${failClosed.stdout}\n${failClosed.stderr}`, /fails closed|unreadable/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(path.dirname(gateMarker), { recursive: true, force: true });
   }
 });

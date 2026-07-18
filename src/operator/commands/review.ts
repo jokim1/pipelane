@@ -82,7 +82,9 @@ import {
   type ReviewPlanGateConfig,
 } from '../state.ts';
 import {
+  countLaunchedAiGates,
   guardReviewRunStartForTaskBudget,
+  journalReviewRunForTaskBudget,
   recordReviewRunForTaskBudget,
 } from '../task-budget.ts';
 import {
@@ -2729,6 +2731,11 @@ async function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): Promise
     },
   });
 
+  // D15 ordering: the budget debit journals durably BEFORE the run becomes
+  // usable review evidence. A crash between the two leaves charged-but-
+  // unevidenced work (conservative, D14) instead of evidence that was never
+  // charged.
+  journalReviewRunForTaskBudget(cwd, parsed, record);
   appendArtifactBackedReviewRun({
     root: reviewArtifactRoot(context.commonDir, context.config),
     runId: record.id,
@@ -2931,6 +2938,7 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
     attemptNumber,
   });
   let gateRecords: ReviewGateRunRecord[] = [];
+  let supersededAiLaunches = 0;
 
   for (;;) {
     const result = runReviewAttempt({
@@ -2972,6 +2980,10 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
       break;
     }
 
+    // A fix-first restart replaces this attempt's gate records with the next
+    // attempt's. The launched AI calls still happened and still cost tokens,
+    // so their count rides the final record for the budget debit (D14).
+    supersededAiLaunches += countLaunchedAiGates(result.gates);
     attemptNumber += 1;
   }
 
@@ -3003,6 +3015,7 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
     ...(options.taskBindingId ? { taskBindingId: options.taskBindingId } : {}),
     ...(attempt.intent ? { intent: attempt.intent } : {}),
     ...(attempt.target ? { target: attempt.target } : {}),
+    ...(supersededAiLaunches > 0 ? { supersededAiLaunches } : {}),
     gates: gateRecords,
   };
 }
