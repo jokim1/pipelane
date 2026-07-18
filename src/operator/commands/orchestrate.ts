@@ -54,7 +54,16 @@ import {
   type OrchestrationSliceWorkerRecord,
   type OrchestrationSourceSnapshot,
 } from '../orchestration-ledger.ts';
-import { ORCHESTRATION_STATE_KEY_ENV, ORCHESTRATION_STATE_KEY_FILE_ENV, resolveOrchestrationStateKey, signSignedPayload, verifySignedPayload, resolveReviewStateKey } from '../integrity.ts';
+import {
+  CONVERGENCE_STATE_KEY_ENV,
+  ORCHESTRATION_STATE_KEY_ENV,
+  ORCHESTRATION_STATE_KEY_FILE_ENV,
+  REVIEW_CONSENT_STATE_KEY_ENV,
+  resolveOrchestrationStateKey,
+  resolveReviewStateKey,
+  signSignedPayload,
+  verifySignedPayload,
+} from '../integrity.ts';
 import {
   blockingAiReviewEvidenceBlocker,
   classifyReviewEvidenceIndependence,
@@ -130,6 +139,8 @@ const WORKER_SECRET_ENV_KEYS = [
   'PIPELANE_REVIEW_STATE_KEY',
   'PIPELANE_DEPLOY_STATE_KEY',
   'PIPELANE_PROBE_STATE_KEY',
+  REVIEW_CONSENT_STATE_KEY_ENV,
+  CONVERGENCE_STATE_KEY_ENV,
 ] as const;
 const WORKER_CREDENTIAL_ENV_PATTERN = /(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASS|COOKIE|SESSION|API_KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIALS?|AUTH)(?:_|$)/i;
 const WORKER_CREDENTIAL_ENV_PREFIXES = [

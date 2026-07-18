@@ -2,7 +2,22 @@ import { closeSync, existsSync, lstatSync, openSync, readFileSync, readlinkSync,
 import path from 'node:path';
 import readline from 'node:readline';
 
-import { computeUrlFingerprint, resolveProbeStateKey, signSignedPayload } from '../integrity.ts';
+import {
+  computeUrlFingerprint,
+  CONVERGENCE_STATE_KEY_ENV,
+  convergenceStateKeyPath,
+  MIN_STATE_KEY_LENGTH,
+  ORCHESTRATION_STATE_KEY_ENV,
+  orchestrationStateKeyPath,
+  resolveConvergenceStateKey,
+  resolveOrchestrationStateKey,
+  resolveProbeStateKey,
+  resolveReviewConsentStateKey,
+  REVIEW_CONSENT_STATE_KEY_ENV,
+  reviewConsentStateKeyPath,
+  signSignedPayload,
+  stateKeyFingerprint,
+} from '../integrity.ts';
 import {
   additionalDeploySurfaceNames,
   emptyDeployConfig,
@@ -116,7 +131,72 @@ export interface DiagnoseReport {
     present: boolean;
     records: ProbeRecord[];
   };
+  signingKeys: SigningKeyStatus[];
   message: string;
+}
+
+export interface SigningKeyStatus {
+  name: string;
+  path: string;
+  source: 'file' | 'env';
+  persisted: boolean;
+  provisioned: boolean;
+  fingerprint: string | null;
+  error: string | null;
+}
+
+// Resolving a persisted key auto-provisions it, so running /doctor is the
+// fleet-wide (machine-wide) provisioning step E4 requires before any
+// convergence enforcement flips. "provisioned" means the persisted key FILE
+// exists — an ambient env override is reported as its own source and never
+// counts as machine-wide provisioning, because a later run without the
+// override would mint a different key.
+export function collectSigningKeyStatus(): SigningKeyStatus[] {
+  const classes: Array<{ name: string; path: string; envName: string; resolve: () => string }> = [
+    { name: 'orchestration-state', path: orchestrationStateKeyPath(), envName: ORCHESTRATION_STATE_KEY_ENV, resolve: resolveOrchestrationStateKey },
+    { name: 'review-consent-state', path: reviewConsentStateKeyPath(), envName: REVIEW_CONSENT_STATE_KEY_ENV, resolve: resolveReviewConsentStateKey },
+    { name: 'convergence-state', path: convergenceStateKeyPath(), envName: CONVERGENCE_STATE_KEY_ENV, resolve: resolveConvergenceStateKey },
+  ];
+  return classes.map((entry) => {
+    const envOverride = Boolean(process.env[entry.envName]?.trim());
+    try {
+      // Always resolve: without an override this provisions the persisted key;
+      // with one it validates the active override before doctor certifies the
+      // machine's signing-key state.
+      entry.resolve();
+      const persisted = existsSync(entry.path);
+      const persistedKey = persisted ? readFileSync(entry.path, 'utf8').trim() : '';
+      // A persisted file only counts as provisioned when its contents would
+      // pass the resolver's own validation; an env override must not let a
+      // junk file certify machine-wide readiness.
+      const persistedValid = persistedKey.length >= MIN_STATE_KEY_LENGTH;
+      let error: string | null = null;
+      if (envOverride && !persisted) {
+        error = `${entry.envName} override is active but no persisted key file exists; unset the override or provision ${entry.path}.`;
+      } else if (persisted && !persistedValid) {
+        error = `Persisted key at ${entry.path} is invalid (shorter than ${MIN_STATE_KEY_LENGTH} characters); rotate or re-provision it.`;
+      }
+      return {
+        name: entry.name,
+        path: entry.path,
+        source: envOverride ? 'env' as const : 'file' as const,
+        persisted,
+        provisioned: persisted && persistedValid,
+        fingerprint: persisted && persistedValid ? stateKeyFingerprint(persistedKey) : null,
+        error,
+      };
+    } catch (error) {
+      return {
+        name: entry.name,
+        path: entry.path,
+        source: envOverride ? 'env' as const : 'file' as const,
+        persisted: existsSync(entry.path),
+        provisioned: false,
+        fingerprint: null,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  });
 }
 
 function runDiagnose(context: WorkflowContext, parsed: ParsedOperatorArgs): void {
@@ -161,6 +241,15 @@ export function buildDiagnoseReport(context: WorkflowContext): DiagnoseReport {
     lines.push(`  Runtime versions: managed ${versionSkew.managedVersion}, ignored repo-local ${versionSkew.localVersion}`);
     lines.push('  Warning: durable commands use the machine-local runtime; remove or update the repo-local install only if legacy tooling still calls it.');
   }
+  const signingKeys = collectSigningKeyStatus();
+  lines.push('  Signing keys:');
+  for (const key of signingKeys) {
+    if (key.provisioned) {
+      lines.push(`    - ${key.name}: provisioned (fingerprint ${key.fingerprint})${key.source === 'env' ? ' with env override active' : ''}`);
+    } else {
+      lines.push(`    - ${key.name}: NOT provisioned (${key.error})`);
+    }
+  }
   const latestStaging = latestProbeRecordsBySurface(probeState.records, 'staging');
   if (latestStaging.length === 0) {
     lines.push(`  Probe state: no probes recorded. Run \`${formatWorkflowCommand(context.config, 'doctor', '--probe')}\`.`);
@@ -187,6 +276,7 @@ export function buildDiagnoseReport(context: WorkflowContext): DiagnoseReport {
     platform,
     missingFields: missing,
     probeState: { present: probeState.records.length > 0, records: probeState.records },
+    signingKeys,
     message: lines.join('\n'),
   };
 }

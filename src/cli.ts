@@ -6,8 +6,8 @@ import readline from 'node:readline/promises';
 
 import { handlePipelane } from './dashboard/launcher.ts';
 import { getDashboardOptions, startDashboardServer } from './dashboard/server.ts';
-import { installClaudeBootstrapSkill } from './operator/claude-install.ts';
-import { installCodexBootstrapSkill } from './operator/codex-install.ts';
+import { installClaudeBootstrapSkill, rollbackClaudeManagedRuntime } from './operator/claude-install.ts';
+import { installCodexBootstrapSkill, rollbackCodexManagedRuntime } from './operator/codex-install.ts';
 import { handleConfigure } from './operator/commands/configure.ts';
 import {
   applyAgentsGuidanceMigrationsWithApproval,
@@ -39,8 +39,8 @@ Commands:
   configure [--json] [surface flags...]
   configure --provision-secrets [--rotate-secrets] --approve-secret-manifest=<sha256>
   update [--check] [--yes] [--json]
-  install-claude [--verbose]
-  install-codex [--verbose]
+  install-claude [--verbose] [--rollback]
+  install-codex [--verbose] [--rollback]
   install-npm-guard
   verify
   dashboard [--repo <repo-root>] [--host <host>] [--port <port>]
@@ -108,20 +108,63 @@ function parseSetupArgs(args: string[]): { yes: boolean; provisionSecrets: boole
   return { yes, provisionSecrets, rotateSecrets, ...(approvalId ? { approvalId } : {}) };
 }
 
-function parseVerboseArg(args: string[], command: string): boolean {
+function parseInstallArgs(args: string[], command: string): { verbose: boolean; rollback: boolean } {
   let verbose = false;
+  let rollback = false;
   for (const token of args) {
     if (token === '--verbose') {
       verbose = true;
       continue;
     }
+    if (token === '--rollback') {
+      rollback = true;
+      continue;
+    }
     if (token === '--help' || token === '-h') {
-      process.stdout.write(`pipelane ${command} [--verbose]\n`);
+      process.stdout.write(`pipelane ${command} [--verbose] [--rollback]\n`);
       process.exit(0);
     }
     throw new Error(`Unknown flag for pipelane ${command}: ${token}`);
   }
-  return verbose;
+  return { verbose, rollback };
+}
+
+function formatRuntimeRollbackLines(
+  host: string,
+  result: {
+    runtimeRoot: string;
+    restored: { sourceSha?: string; packageVersion: string; installedAt: string };
+    retired: { sourceSha?: string } | null;
+    wrappersRestored: boolean;
+    restoredSkills: string[];
+    removedSkills: string[];
+    skippedCollisions: string[];
+    resyncCommand: string | null;
+  },
+): string[] {
+  const restoredRef = result.restored.sourceSha?.slice(0, 7) ?? 'unknown sha';
+  const lines = [
+    `Rolled back the managed ${host} runtime at ${result.runtimeRoot}.`,
+    `Restored: ${restoredRef} (v${result.restored.packageVersion}, installed ${result.restored.installedAt}).`,
+  ];
+  lines.push(result.retired
+    ? `Retired runtime (${result.retired.sourceSha?.slice(0, 7) ?? 'unknown sha'}) is retained as the new previous; rerun with --rollback to roll forward again.`
+    : 'No runtime was active before the rollback, so nothing was retired.');
+  if (result.wrappersRestored) {
+    lines.push(`Restored ${result.restoredSkills.length} managed skill wrapper(s) in lockstep with the runtime.`);
+    if (result.removedSkills.length > 0) {
+      lines.push(`Removed wrappers the restored runtime does not provide: ${result.removedSkills.join(', ')}.`);
+    }
+    if (result.skippedCollisions.length > 0) {
+      lines.push(`Left unmanaged skills in place (name collisions): ${result.skippedCollisions.join(', ')}.`);
+    }
+  } else {
+    lines.push('Restored runtime predates host-skill payload retention; installed skill wrappers were left as-is.');
+    if (result.resyncCommand) {
+      lines.push(`Re-sync wrappers from the restored runtime with: ${result.resyncCommand}`);
+    }
+  }
+  return lines;
 }
 
 // Commands that operate outside the worktree. Skip the worktree symlink for
@@ -343,7 +386,12 @@ async function main(): Promise<void> {
   }
 
   if (command === 'install-codex') {
-    const verbose = parseVerboseArg(rest, 'install-codex');
+    const { verbose, rollback } = parseInstallArgs(rest, 'install-codex');
+    if (rollback) {
+      const rollbackResult = rollbackCodexManagedRuntime();
+      process.stdout.write(formatRuntimeRollbackLines('Codex', rollbackResult).join('\n') + '\n');
+      return;
+    }
     const result = installCodexBootstrapSkill();
     const lines = [
       `Installed ${result.installed.length} durable Pipelane Codex commands in ${result.codexHome}.`,
@@ -365,7 +413,12 @@ async function main(): Promise<void> {
   }
 
   if (command === 'install-claude') {
-    const verbose = parseVerboseArg(rest, 'install-claude');
+    const { verbose, rollback } = parseInstallArgs(rest, 'install-claude');
+    if (rollback) {
+      const rollbackResult = rollbackClaudeManagedRuntime();
+      process.stdout.write(formatRuntimeRollbackLines('Claude', rollbackResult).join('\n') + '\n');
+      return;
+    }
     const result = installClaudeBootstrapSkill();
     const lines = [`Installed ${result.installed.length} durable Pipelane Claude commands in ${result.claudeHome}.`];
     lines.push(...legacyRepoLocalInstallNoticeLines(process.cwd()));

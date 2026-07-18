@@ -143,8 +143,19 @@ function buildCliChildEnv(env = {}) {
   // Hermeticity: a developer/CI shell may export pipelane signing keys. Scrub them
   // unless a test explicitly passes one, so C2 signature gating and C1 exact run
   // status assertions do not drift with the ambient environment.
-  for (const stateKey of ['PIPELANE_REVIEW_STATE_KEY', 'PIPELANE_DEPLOY_STATE_KEY', 'PIPELANE_PROBE_STATE_KEY']) {
+  for (const stateKey of [
+    'PIPELANE_REVIEW_STATE_KEY',
+    'PIPELANE_DEPLOY_STATE_KEY',
+    'PIPELANE_PROBE_STATE_KEY',
+    'PIPELANE_REVIEW_CONSENT_STATE_KEY',
+    'PIPELANE_CONVERGENCE_STATE_KEY',
+  ]) {
     if (!(stateKey in env)) delete childEnv[stateKey];
+  }
+  // Install provenance is test input, not ambient runner state. Tests that
+  // exercise update/install pinning pass these values explicitly.
+  for (const installKey of ['PIPELANE_INSTALL_SOURCE_SHA', 'PIPELANE_INSTALL_SPEC']) {
+    if (!(installKey in env)) delete childEnv[installKey];
   }
   // Review gates run `npm test` from a process that exports reviewer/session
   // identity and live gate context. Keep fixture CLI calls hermetic so the suite
@@ -222,6 +233,30 @@ test('buildCliChildEnv scrubs live ambient review-gate context', () => {
     for (const key of keys) {
       assert.equal(scrubbed[key], undefined, `${key} should be scrubbed unless the fixture passes it explicitly`);
     }
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('buildCliChildEnv scrubs ambient install provenance unless explicitly supplied', () => {
+  const keys = ['PIPELANE_INSTALL_SOURCE_SHA', 'PIPELANE_INSTALL_SPEC'];
+  const previous = new Map(keys.map((key) => [key, process.env[key]]));
+  try {
+    process.env.PIPELANE_INSTALL_SOURCE_SHA = 'a'.repeat(40);
+    process.env.PIPELANE_INSTALL_SPEC = 'ambient-install-spec';
+    const scrubbed = buildCliChildEnv();
+    assert.equal(scrubbed.PIPELANE_INSTALL_SOURCE_SHA, undefined);
+    assert.equal(scrubbed.PIPELANE_INSTALL_SPEC, undefined);
+
+    const explicit = buildCliChildEnv({
+      PIPELANE_INSTALL_SOURCE_SHA: 'b'.repeat(40),
+      PIPELANE_INSTALL_SPEC: 'explicit-install-spec',
+    });
+    assert.equal(explicit.PIPELANE_INSTALL_SOURCE_SHA, 'b'.repeat(40));
+    assert.equal(explicit.PIPELANE_INSTALL_SPEC, 'explicit-install-spec');
   } finally {
     for (const [key, value] of previous) {
       if (value === undefined) delete process.env[key];
@@ -15646,6 +15681,8 @@ test('review command gates do not inherit pipelane state signing keys', () => {
       'PIPELANE_ORCHESTRATION_STATE_KEY',
       'PIPELANE_DEPLOY_STATE_KEY',
       'PIPELANE_PROBE_STATE_KEY',
+      'PIPELANE_REVIEW_CONSENT_STATE_KEY',
+      'PIPELANE_CONVERGENCE_STATE_KEY',
     ];
     const command = `${process.execPath} -e ${JSON.stringify(`for (const key of ${JSON.stringify(forbiddenKeys)}) { if (process.env[key]) process.exit(7); }`)}`;
     writeSingleCommandReviewGate(repoRoot, {
@@ -15658,6 +15695,8 @@ test('review command gates do not inherit pipelane state signing keys', () => {
       PIPELANE_ORCHESTRATION_STATE_KEY: DEFAULT_ORCHESTRATION_STATE_KEY,
       PIPELANE_DEPLOY_STATE_KEY: 'deploy-state-key-for-gate-isolation',
       PIPELANE_PROBE_STATE_KEY: 'probe-state-key-for-gate-isolation',
+      PIPELANE_REVIEW_CONSENT_STATE_KEY: 'review-consent-state-key-for-gate-isolation',
+      PIPELANE_CONVERGENCE_STATE_KEY: 'convergence-state-key-for-gate-isolation',
     }).stdout);
     const gate = report.gates.find((entry) => entry.gateId === 'no-state-keys');
 
@@ -17849,6 +17888,8 @@ test('orchestration workers never receive orchestration key, even when allowlist
         "if (keyPath) { try { persisted=fs.readFileSync(keyPath, 'utf8').trim(); } catch {} }",
         "fs.writeFileSync('worker-env-key.txt', process.env.PIPELANE_ORCHESTRATION_STATE_KEY || 'missing');",
         "fs.writeFileSync('worker-env-key-file.txt', process.env.PIPELANE_ORCHESTRATION_STATE_KEY_FILE || 'missing');",
+        "fs.writeFileSync('worker-env-review-consent-key.txt', process.env.PIPELANE_REVIEW_CONSENT_STATE_KEY || 'missing');",
+        "fs.writeFileSync('worker-env-convergence-key.txt', process.env.PIPELANE_CONVERGENCE_STATE_KEY || 'missing');",
         "fs.writeFileSync('worker-env-pipelane-home.txt', process.env.PIPELANE_HOME || 'missing');",
         "fs.writeFileSync('worker-persisted-key-read.txt', persisted);",
         "fs.writeFileSync('pipelane-slice-change.txt', 'change');",
@@ -17862,6 +17903,8 @@ test('orchestration workers never receive orchestration key, even when allowlist
       const worktreePath = started.run.slices[0].worktreePath;
       assert.equal(readFileSync(path.join(worktreePath, 'worker-env-key.txt'), 'utf8'), 'missing');
       assert.equal(readFileSync(path.join(worktreePath, 'worker-env-key-file.txt'), 'utf8'), 'missing');
+      assert.equal(readFileSync(path.join(worktreePath, 'worker-env-review-consent-key.txt'), 'utf8'), 'missing');
+      assert.equal(readFileSync(path.join(worktreePath, 'worker-env-convergence-key.txt'), 'utf8'), 'missing');
       assert.equal(readFileSync(path.join(worktreePath, 'worker-env-pipelane-home.txt'), 'utf8'), 'missing');
       assert.equal(readFileSync(path.join(worktreePath, 'worker-persisted-key-read.txt'), 'utf8'), 'missing');
       const signingKey = Object.hasOwn(extraEnv, 'PIPELANE_ORCHESTRATION_STATE_KEY') && extraEnv.PIPELANE_ORCHESTRATION_STATE_KEY === undefined
@@ -17881,6 +17924,11 @@ test('orchestration workers never receive orchestration key, even when allowlist
     runAndCheck('worker key file stripped from allowlist', {
       PIPELANE_ORCHESTRATE_WORKER_ENV_ALLOW: 'PIPELANE_ORCHESTRATION_STATE_KEY_FILE',
       PIPELANE_ORCHESTRATION_STATE_KEY_FILE: path.join(repoRoot, 'operator-key.txt'),
+    });
+    runAndCheck('worker convergence keys stripped from allowlist', {
+      PIPELANE_ORCHESTRATE_WORKER_ENV_ALLOW: 'PIPELANE_REVIEW_CONSENT_STATE_KEY,PIPELANE_CONVERGENCE_STATE_KEY',
+      PIPELANE_REVIEW_CONSENT_STATE_KEY: 'review-consent-state-key-for-worker-isolation',
+      PIPELANE_CONVERGENCE_STATE_KEY: 'convergence-state-key-for-worker-isolation',
     });
     runAndCheck('worker persisted key home stripped from allowlist', {
       PIPELANE_ORCHESTRATION_STATE_KEY: undefined,
@@ -29777,15 +29825,16 @@ test('CLI command from a symlinked worktree does not update the shared checkout 
   }
 });
 
-test('update reports up-to-date when installed sha matches remote main', () => {
+test('update reports up-to-date when an abbreviated installed sha matches remote main', () => {
   const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-consumer-'));
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-bin-'));
   const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
   const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
   const sha = '0123456789abcdef0123456789abcdef01234567';
+  const installedSha = sha.slice(0, 12);
   try {
-    writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: sha });
-    installCodexRuntimeForUpdateTest(consumerRoot, { codexHome, pipelaneHome, sourceSha: sha });
+    writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha });
+    installCodexRuntimeForUpdateTest(consumerRoot, { codexHome, pipelaneHome, sourceSha: installedSha });
     makeFakeUpdateBin(binDir, { latestSha: sha });
 
     const result = spawnSync('node', [CLI_PATH, 'update', '--check', '--json'], {
@@ -29797,6 +29846,39 @@ test('update reports up-to-date when installed sha matches remote main', () => {
     const parsed = JSON.parse(result.stdout);
     assert.equal(parsed.action, 'up-to-date');
     assert.equal(parsed.status.upToDate, true);
+    assert.equal(parsed.status.installedSha, installedSha);
+  } finally {
+    rmSync(consumerRoot, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('update does not report a dirty runtime as up-to-date at the same main sha', () => {
+  const consumerRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-consumer-'));
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-update-bin-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  const sha = '0123456789abcdef0123456789abcdef01234567';
+  try {
+    writeFakeConsumer(consumerRoot, { installedVersion: '0.2.0', installedSha: sha });
+    installCodexRuntimeForUpdateTest(consumerRoot, { codexHome, pipelaneHome, sourceSha: sha });
+    const metadataPath = path.join(managedRuntimeRoot('codex', pipelaneHome), '.pipelane-runtime.json');
+    const metadata = JSON.parse(readFileSync(metadataPath, 'utf8'));
+    writeFileSync(metadataPath, `${JSON.stringify({ ...metadata, sourceDirty: true }, null, 2)}\n`, 'utf8');
+    makeFakeUpdateBin(binDir, { latestSha: sha });
+
+    const result = spawnSync('node', [CLI_PATH, 'update', '--check', '--json'], {
+      cwd: consumerRoot,
+      env: { ...process.env, CODEX_HOME: codexHome, PIPELANE_HOME: pipelaneHome, PATH: `${binDir}:${process.env.PATH}` },
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.action, 'checked');
+    assert.equal(parsed.status.upToDate, false);
+    assert.equal(parsed.status.sourceDirty, true);
     assert.equal(parsed.status.installedSha, sha);
   } finally {
     rmSync(consumerRoot, { recursive: true, force: true });
@@ -39656,4 +39738,925 @@ test('first strict review TTY intent prompt uses an editable label suggestion an
     ask: async () => rejectedAnswers.shift(),
   });
   assert.equal(rejected, null);
+});
+
+// ---------------------------------------------------------------------------
+// Convergence S0: runtime provenance, rollback, parity, key provisioning
+// ---------------------------------------------------------------------------
+
+test('write-build-info records sha, dirty, and timestamp with env overrides', () => {
+  const workDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-build-info-'));
+  try {
+    const result = spawnSync('node', [path.join(KIT_ROOT, 'scripts', 'write-build-info.mjs')], {
+      cwd: workDir,
+      env: {
+        ...process.env,
+        PIPELANE_BUILD_SHA: 'ABC1234ABC1234ABC1234ABC1234ABC1234ABC12',
+        PIPELANE_BUILD_DIRTY: '0',
+        PIPELANE_BUILD_TIMESTAMP: '2026-07-16T00:00:00.000Z',
+      },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const info = JSON.parse(readFileSync(path.join(workDir, 'dist', 'build-info.json'), 'utf8'));
+    assert.equal(info.sha, 'abc1234abc1234abc1234abc1234abc1234abc12');
+    assert.equal(info.dirty, false);
+    assert.equal(info.builtAt, '2026-07-16T00:00:00.000Z');
+
+    const invalid = spawnSync('node', [path.join(KIT_ROOT, 'scripts', 'write-build-info.mjs')], {
+      cwd: workDir,
+      env: { ...process.env, PIPELANE_BUILD_SHA: 'not-a-git-sha' },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.notEqual(invalid.status, 0);
+    assert.match(invalid.stderr, /PIPELANE_BUILD_SHA must be a 7-40 character hexadecimal git SHA/);
+  } finally {
+    rmSync(workDir, { recursive: true, force: true });
+  }
+});
+
+test('write-build-info derives sha and dirty state from the source git tree', () => {
+  const workDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-build-info-git-'));
+  const env = { ...process.env };
+  delete env.PIPELANE_BUILD_SHA;
+  delete env.PIPELANE_BUILD_DIRTY;
+  delete env.PIPELANE_BUILD_TIMESTAMP;
+  try {
+    execFileSync('git', ['init', '-b', 'main'], { cwd: workDir, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: workDir });
+    execFileSync('git', ['config', 'user.name', 'Pipelane Test'], { cwd: workDir });
+    writeFileSync(path.join(workDir, '.gitignore'), 'dist/\n', 'utf8');
+    writeFileSync(path.join(workDir, 'source.txt'), 'clean\n', 'utf8');
+    execFileSync('git', ['add', '.gitignore', 'source.txt'], { cwd: workDir });
+    execFileSync('git', ['commit', '-m', 'Initial source'], { cwd: workDir, stdio: 'ignore' });
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workDir, encoding: 'utf8' }).trim();
+
+    const clean = spawnSync('node', [path.join(KIT_ROOT, 'scripts', 'write-build-info.mjs')], {
+      cwd: workDir,
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(clean.status, 0, clean.stderr);
+    assert.deepEqual(
+      (({ sha, dirty }) => ({ sha, dirty }))(JSON.parse(readFileSync(path.join(workDir, 'dist', 'build-info.json'), 'utf8'))),
+      { sha: head, dirty: false },
+    );
+
+    writeFileSync(path.join(workDir, 'source.txt'), 'dirty\n', 'utf8');
+    const dirty = spawnSync('node', [path.join(KIT_ROOT, 'scripts', 'write-build-info.mjs')], {
+      cwd: workDir,
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(dirty.status, 0, dirty.stderr);
+    const dirtyInfo = JSON.parse(readFileSync(path.join(workDir, 'dist', 'build-info.json'), 'utf8'));
+    assert.equal(dirtyInfo.sha, head);
+    assert.equal(dirtyInfo.dirty, true);
+  } finally {
+    rmSync(workDir, { recursive: true, force: true });
+  }
+});
+
+function runParity(pipelaneHome, env = {}) {
+  return spawnSync('node', [path.join(KIT_ROOT, 'scripts', 'runtime-parity-check.mjs')], {
+    cwd: KIT_ROOT,
+    env: { ...process.env, PIPELANE_HOME: pipelaneHome, ...env },
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
+test('managed runtime install records build-info provenance and retains a rollback runtime', () => {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-rollback-ws-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  try {
+    const env = { CLAUDE_HOME: claudeHome, PIPELANE_HOME: pipelaneHome };
+    runCli(['install-claude'], workspaceRoot, env);
+    const runtimeRoot = managedRuntimeRoot('claude', pipelaneHome);
+    const metadata = JSON.parse(readFileSync(path.join(runtimeRoot, '.pipelane-runtime.json'), 'utf8'));
+    // Provenance: dist/build-info.json identifies the tree the installed dist
+    // was built from and must win over the source root's git HEAD.
+    const buildInfo = JSON.parse(readFileSync(path.join(KIT_ROOT, 'dist', 'build-info.json'), 'utf8'));
+    assert.equal(metadata.sourceSha, buildInfo.sha);
+    assert.equal(Boolean(metadata.sourceDirty), Boolean(buildInfo.dirty));
+    const cleanInstallEnv = { ...env, PIPELANE_INSTALL_SOURCE_SHA: buildInfo.sha };
+
+    // Required wrapper collisions are preflighted before the active runtime is
+    // published, so a normal user error cannot leave a partial live runtime.
+    const requiredCollisionPath = path.join(claudeHome, 'skills', 'new', 'SKILL.md');
+    const managedRequiredBody = readFileSync(requiredCollisionPath, 'utf8');
+    const activeMetadataBody = readFileSync(path.join(runtimeRoot, '.pipelane-runtime.json'), 'utf8');
+    writeFileSync(requiredCollisionPath, '# User-owned required collision\n', 'utf8');
+    writeFileSync(path.join(runtimeRoot, 'preflight-sentinel.txt'), 'active\n', 'utf8');
+    const requiredCollision = runCli(['install-claude'], workspaceRoot, cleanInstallEnv, true);
+    assert.notEqual(requiredCollision.status, 0);
+    assert.match(requiredCollision.stderr, /Claude skill alias collision/);
+    assert.equal(readFileSync(requiredCollisionPath, 'utf8'), '# User-owned required collision\n');
+    assert.equal(readFileSync(path.join(runtimeRoot, '.pipelane-runtime.json'), 'utf8'), activeMetadataBody);
+    assert.ok(existsSync(path.join(runtimeRoot, 'preflight-sentinel.txt')));
+    assert.equal(existsSync(`${runtimeRoot}.previous`), false);
+    writeFileSync(requiredCollisionPath, managedRequiredBody, 'utf8');
+
+    // Reinstall must not delete an unrelated directory that happens to occupy
+    // the reserved rollback path.
+    const previousRoot = `${runtimeRoot}.previous`;
+    mkdirSync(previousRoot, { recursive: true });
+    writeFileSync(path.join(previousRoot, 'user-data.txt'), 'preserve me', 'utf8');
+    writeFileSync(path.join(runtimeRoot, 'sentinel-active-before-collision.txt'), 'active', 'utf8');
+    const unmanagedPrevious = runCli(['install-claude'], workspaceRoot, env, true);
+    assert.notEqual(unmanagedPrevious.status, 0);
+    assert.match(unmanagedPrevious.stderr, /already exists and is not managed by pipelane; refusing to replace it/);
+    assert.ok(existsSync(path.join(previousRoot, 'user-data.txt')));
+    assert.ok(existsSync(path.join(runtimeRoot, 'sentinel-active-before-collision.txt')));
+    rmSync(previousRoot, { recursive: true, force: true });
+
+    // Reinstall retires the current runtime into `<root>.previous`.
+    writeFileSync(path.join(runtimeRoot, 'sentinel-first-install.txt'), 'first', 'utf8');
+    runCli(['install-claude'], workspaceRoot, cleanInstallEnv);
+    assert.equal(existsSync(path.join(runtimeRoot, 'sentinel-first-install.txt')), false);
+    assert.ok(existsSync(path.join(previousRoot, 'sentinel-first-install.txt')));
+
+    // A same-revision refresh must not preserve a rollback target whose
+    // metadata cannot pass the rollback validator.
+    const retainedMetadataPath = path.join(previousRoot, '.pipelane-runtime.json');
+    const retainedMetadataBody = readFileSync(retainedMetadataPath, 'utf8');
+    const retainedMetadata = JSON.parse(retainedMetadataBody);
+    writeFileSync(retainedMetadataPath, `${JSON.stringify({ ...retainedMetadata, packageVersion: '' }, null, 2)}\n`, 'utf8');
+    const incompleteRetained = runCli(['install-claude'], workspaceRoot, cleanInstallEnv, true);
+    assert.notEqual(incompleteRetained.status, 0);
+    assert.match(incompleteRetained.stderr, /incomplete managed runtime metadata; refusing to preserve it as a rollback target/);
+    assert.ok(existsSync(path.join(previousRoot, 'sentinel-first-install.txt')));
+    writeFileSync(retainedMetadataPath, retainedMetadataBody, 'utf8');
+
+    // Refreshing an already-current clean runtime must preserve the genuinely
+    // older rollback target instead of replacing it with another current copy.
+    runCli(['install-claude'], workspaceRoot, cleanInstallEnv);
+    assert.ok(existsSync(path.join(previousRoot, 'sentinel-first-install.txt')));
+
+    // Rollback restores the retained runtime and keeps the retired one as the
+    // new previous, so a second rollback rolls forward again.
+    const rollback = runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.match(rollback.stdout, /Rolled back the managed Claude runtime/);
+    assert.ok(existsSync(path.join(runtimeRoot, 'sentinel-first-install.txt')));
+    assert.equal(existsSync(path.join(previousRoot, 'sentinel-first-install.txt')), false);
+    const rollForward = runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.match(rollForward.stdout, /Rolled back the managed Claude runtime/);
+    assert.equal(existsSync(path.join(runtimeRoot, 'sentinel-first-install.txt')), false);
+    assert.ok(existsSync(path.join(previousRoot, 'sentinel-first-install.txt')));
+
+    // Installed wrappers restore in lockstep with the runtime: the runtime
+    // carries its wrapper payloads, and rollback writes the restored
+    // runtime's payloads over the newer install's wrappers.
+    const manifestNames = JSON.parse(readFileSync(path.join(runtimeRoot, 'managed-skills.json'), 'utf8')).skills;
+    assert.ok(Array.isArray(manifestNames) && manifestNames.length > 1, 'expected at least two managed skills');
+    const probeSkill = manifestNames[0];
+    const wrapperPath = path.join(claudeHome, 'skills', probeSkill, 'SKILL.md');
+    const payloadPath = path.join(runtimeRoot, 'host-skills', probeSkill, 'SKILL.md');
+    assert.ok(existsSync(payloadPath), 'install should retain host-skill payloads inside the runtime');
+    assert.equal(readFileSync(wrapperPath, 'utf8'), readFileSync(payloadPath, 'utf8'));
+    const previousPayloadPath = path.join(previousRoot, 'host-skills', probeSkill, 'SKILL.md');
+    const previousPayload = readFileSync(previousPayloadPath, 'utf8');
+    writeFileSync(previousPayloadPath, `${previousPayload}\nLOCKSTEP_MARKER\n`, 'utf8');
+    const wrapperRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.match(wrapperRollback.stdout, /Restored \d+ managed skill wrapper\(s\) in lockstep/);
+    assert.match(readFileSync(wrapperPath, 'utf8'), /LOCKSTEP_MARKER/);
+    runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.doesNotMatch(readFileSync(wrapperPath, 'utf8'), /LOCKSTEP_MARKER/);
+
+    // A user-owned skill that takes over a managed alias between installs must
+    // survive rollback and roll-forward unchanged.
+    const collisionSkill = 'pipelane';
+    assert.ok(manifestNames.includes(collisionSkill), 'expected the required /pipelane dispatcher skill');
+    const collisionWrapperPath = path.join(claudeHome, 'skills', collisionSkill, 'SKILL.md');
+    const managedCollisionBody = readFileSync(collisionWrapperPath, 'utf8');
+    const userCollisionBody = '# User-owned Claude skill\n';
+    writeFileSync(collisionWrapperPath, userCollisionBody, 'utf8');
+    const collisionRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.match(collisionRollback.stdout, new RegExp(`Left unmanaged skills in place \\(name collisions\\): ${collisionSkill}`));
+    assert.equal(readFileSync(collisionWrapperPath, 'utf8'), userCollisionBody);
+    const collisionRollForward = runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.match(collisionRollForward.stdout, new RegExp(`Left unmanaged skills in place \\(name collisions\\): ${collisionSkill}`));
+    assert.equal(readFileSync(collisionWrapperPath, 'utf8'), userCollisionBody);
+    writeFileSync(collisionWrapperPath, managedCollisionBody, 'utf8');
+
+    if (process.platform !== 'win32') {
+      // A restore failure mid-flight must compensate: wrappers return to
+      // their pre-rollback bytes and the runtime swap is undone.
+      const skillsRootDir = path.join(claudeHome, 'skills');
+      const wrapperBeforeFailure = readFileSync(wrapperPath, 'utf8');
+      chmodSync(skillsRootDir, 0o555);
+      const failedRestore = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+      chmodSync(skillsRootDir, 0o755);
+      assert.notEqual(failedRestore.status, 0);
+      assert.equal(readFileSync(wrapperPath, 'utf8'), wrapperBeforeFailure);
+      assert.equal(existsSync(path.join(runtimeRoot, 'sentinel-first-install.txt')), false);
+      assert.ok(existsSync(path.join(previousRoot, 'sentinel-first-install.txt')));
+    }
+
+    // Rollback prunes wrappers the restored runtime does not provide, and
+    // rolling forward restores them.
+    const pruneSkill = manifestNames[1];
+    const previousManifestPath = path.join(previousRoot, 'managed-skills.json');
+    const previousManifest = JSON.parse(readFileSync(previousManifestPath, 'utf8'));
+    writeFileSync(previousManifestPath, `${JSON.stringify({ skills: previousManifest.skills.filter((name) => name !== pruneSkill) }, null, 2)}\n`, 'utf8');
+    rmSync(path.join(previousRoot, 'host-skills', pruneSkill), { recursive: true, force: true });
+    const pruneRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.match(pruneRollback.stdout, new RegExp(`Removed wrappers the restored runtime does not provide: ${pruneSkill}`));
+    assert.equal(existsSync(path.join(claudeHome, 'skills', pruneSkill)), false);
+    runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.ok(existsSync(path.join(claudeHome, 'skills', pruneSkill, 'SKILL.md')));
+
+    if (process.platform !== 'win32') {
+      const retainedProbeDir = path.join(previousRoot, 'host-skills', probeSkill);
+      const externalProbeDir = path.join(pipelaneHome, 'external-retained-probe-skill');
+      const wrapperBeforeSymlinkRefusal = readFileSync(wrapperPath, 'utf8');
+      renameSync(retainedProbeDir, externalProbeDir);
+      symlinkSync(externalProbeDir, retainedProbeDir, 'dir');
+      const symlinkedPayloadRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+      assert.notEqual(symlinkedPayloadRollback.status, 0);
+      assert.match(symlinkedPayloadRollback.stderr, new RegExp(`contains a symbolic link in its runtime tree: host-skills/${probeSkill}`));
+      assert.equal(readFileSync(wrapperPath, 'utf8'), wrapperBeforeSymlinkRefusal);
+      rmSync(retainedProbeDir, { force: true });
+      renameSync(externalProbeDir, retainedProbeDir);
+
+      const retainedPayloadRoot = path.join(previousRoot, 'host-skills');
+      const externalRetainedPayloadRoot = path.join(pipelaneHome, 'external-retained-payload-root');
+      renameSync(retainedPayloadRoot, externalRetainedPayloadRoot);
+      symlinkSync(path.join(pipelaneHome, 'missing-retained-payload-root'), retainedPayloadRoot, 'dir');
+      const brokenPayloadRootRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+      assert.notEqual(brokenPayloadRootRollback.status, 0);
+      assert.match(brokenPayloadRootRollback.stderr, /contains a symbolic link in its runtime tree: host-skills/);
+      assert.equal(readFileSync(wrapperPath, 'utf8'), wrapperBeforeSymlinkRefusal);
+      rmSync(retainedPayloadRoot, { force: true });
+      renameSync(externalRetainedPayloadRoot, retainedPayloadRoot);
+    }
+
+    // A hostile retained manifest must be rejected before a payload path can
+    // escape the retained runtime root.
+    const traversalManifestBody = readFileSync(previousManifestPath, 'utf8');
+    const outsideSkillDir = path.join(pipelaneHome, 'outside-retained-skill');
+    const outsideSentinel = path.join(outsideSkillDir, 'SKILL.md');
+    mkdirSync(outsideSkillDir, { recursive: true });
+    writeFileSync(outsideSentinel, 'outside sentinel\n', 'utf8');
+    writeFileSync(previousManifestPath, `${JSON.stringify({ skills: ['../../../outside-retained-skill'] }, null, 2)}\n`, 'utf8');
+    const traversalRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+    assert.notEqual(traversalRollback.status, 0);
+    assert.match(traversalRollback.stderr, /Unsafe managed skill name in runtime payloads/);
+    assert.equal(readFileSync(outsideSentinel, 'utf8'), 'outside sentinel\n');
+    writeFileSync(previousManifestPath, traversalManifestBody, 'utf8');
+    rmSync(outsideSkillDir, { recursive: true, force: true });
+
+    // An empty retained manifest cannot authorize a mass wrapper prune.
+    const editedPreviousManifest = readFileSync(previousManifestPath, 'utf8');
+    writeFileSync(previousManifestPath, `${JSON.stringify({ skills: [] })}\n`, 'utf8');
+    const emptyManifestRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+    assert.notEqual(emptyManifestRollback.status, 0);
+    assert.match(emptyManifestRollback.stderr, /lists no skills; refusing to roll back/);
+    assert.ok(existsSync(wrapperPath));
+    assert.equal(existsSync(path.join(runtimeRoot, 'sentinel-first-install.txt')), false);
+    writeFileSync(previousManifestPath, editedPreviousManifest, 'utf8');
+
+    // A retained runtime that predates payload retention still swaps, with an
+    // explicit re-sync instruction instead of silently mixed wrappers.
+    rmSync(path.join(previousRoot, 'host-skills'), { recursive: true, force: true });
+    const legacySwap = runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.match(legacySwap.stdout, /predates host-skill payload retention/);
+    assert.match(legacySwap.stdout, /install-claude/);
+    runCli(['install-claude', '--rollback'], workspaceRoot, env);
+
+    // A payload-less runtime cannot smuggle an empty manifest past the
+    // refusal: manifest validity is checked before the legacy branch.
+    const legacyManifestBody = readFileSync(previousManifestPath, 'utf8');
+    writeFileSync(previousManifestPath, `${JSON.stringify({ skills: [] })}\n`, 'utf8');
+    const emptyLegacyRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+    assert.notEqual(emptyLegacyRollback.status, 0);
+    assert.match(emptyLegacyRollback.stderr, /lists no skills; refusing to roll back/);
+    writeFileSync(previousManifestPath, legacyManifestBody, 'utf8');
+
+    // Rollback must not activate a retained runtime that cannot serve the
+    // durable host skills after the swap.
+    for (const relative of ['bin/run-pipelane.sh', 'bin/bootstrap-pipelane.sh', 'managed-skills.json']) {
+      const target = path.join(previousRoot, relative);
+      const body = readFileSync(target);
+      const mode = statSync(target).mode & 0o777;
+      rmSync(target, { force: true });
+      const damagedGeneratedAsset = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+      assert.notEqual(damagedGeneratedAsset.status, 0);
+      assert.match(damagedGeneratedAsset.stderr, new RegExp(`missing required generated runtime asset: ${relative.replaceAll('/', '\\/')}`));
+      assert.ok(existsSync(path.join(runtimeRoot, 'package.json')));
+      assert.ok(existsSync(path.join(previousRoot, 'sentinel-first-install.txt')));
+      writeFileSync(target, body, { mode });
+      chmodSync(target, mode);
+    }
+
+    const generatedRunnerPath = path.join(managedRuntimeRoot('claude', pipelaneHome), 'bin', 'run-pipelane.sh');
+    const generatedRunnerBody = readFileSync(generatedRunnerPath, 'utf8');
+    writeFileSync(generatedRunnerPath, `${generatedRunnerBody}\necho PARITY_MISSED_TAMPER\n`, { mode: 0o755, encoding: 'utf8' });
+    const generatedContentDrift = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+    assert.equal(generatedContentDrift.status, 1);
+    assert.match(generatedContentDrift.stdout, /bin\/run-pipelane\.sh: generated runtime content differs/);
+    writeFileSync(generatedRunnerPath, generatedRunnerBody, { mode: 0o755, encoding: 'utf8' });
+
+    if (process.platform !== 'win32') {
+      const retainedRunner = path.join(previousRoot, 'bin', 'run-pipelane.sh');
+      const retainedRunnerMode = statSync(retainedRunner).mode & 0o777;
+      chmodSync(retainedRunner, 0o001);
+      const nonExecutableRunner = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+      assert.notEqual(nonExecutableRunner.status, 0);
+      assert.match(nonExecutableRunner.stderr, /required generated runtime asset: bin\/run-pipelane\.sh must be executable/);
+      assert.ok(existsSync(path.join(runtimeRoot, 'package.json')));
+      chmodSync(retainedRunner, retainedRunnerMode);
+
+      const retainedBin = path.join(previousRoot, 'bin', 'pipelane');
+      const retainedBinBody = readFileSync(retainedBin);
+      const retainedBinMode = statSync(retainedBin).mode & 0o777;
+      rmSync(retainedBin, { force: true });
+      symlinkSync(path.join(runtimeRoot, 'bin', 'pipelane'), retainedBin);
+      const symlinkedBin = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+      assert.notEqual(symlinkedBin.status, 0);
+      assert.match(symlinkedBin.stderr, /contains a symbolic link in its runtime tree: bin\/pipelane/);
+      assert.ok(existsSync(path.join(runtimeRoot, 'package.json')));
+      rmSync(retainedBin, { force: true });
+      writeFileSync(retainedBin, retainedBinBody, { mode: retainedBinMode });
+      chmodSync(retainedBin, retainedBinMode);
+
+      const retainedBinDir = path.join(previousRoot, 'bin');
+      const externalRetainedBinDir = path.join(pipelaneHome, 'external-retained-bin');
+      renameSync(retainedBinDir, externalRetainedBinDir);
+      symlinkSync(externalRetainedBinDir, retainedBinDir, 'dir');
+      const symlinkedBinParent = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+      assert.notEqual(symlinkedBinParent.status, 0);
+      assert.match(symlinkedBinParent.stderr, /contains a symbolic link in its runtime tree: bin/);
+      assert.ok(existsSync(path.join(runtimeRoot, 'package.json')));
+      rmSync(retainedBinDir, { force: true });
+      renameSync(externalRetainedBinDir, retainedBinDir);
+
+      // The retained runtime root itself must be a real directory. Otherwise a
+      // local symlink can redirect the durable runtime outside PIPELANE_HOME.
+      const retainedElsewhere = `${previousRoot}-symlink-target`;
+      renameSync(previousRoot, retainedElsewhere);
+      symlinkSync(retainedElsewhere, previousRoot, 'dir');
+      const symlinkedPreviousRoot = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+      assert.notEqual(symlinkedPreviousRoot.status, 0);
+      assert.match(symlinkedPreviousRoot.stderr, /must be a real directory, not a symbolic link or other file/);
+      assert.ok(existsSync(path.join(runtimeRoot, 'package.json')));
+      assert.equal(lstatSync(previousRoot).isSymbolicLink(), true);
+      rmSync(previousRoot, { force: true });
+      renameSync(retainedElsewhere, previousRoot);
+    }
+
+    // A damaged rollback target must never replace the working runtime.
+    rmSync(path.join(previousRoot, 'package.json'), { force: true });
+    const damaged = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+    assert.notEqual(damaged.status, 0);
+    assert.match(damaged.stderr, /Retained runtime .* is missing required runtime asset: package\.json/);
+    assert.ok(existsSync(path.join(runtimeRoot, 'package.json')));
+    assert.ok(existsSync(path.join(previousRoot, 'sentinel-first-install.txt')));
+
+    // Refuses when no previous runtime is retained.
+    rmSync(previousRoot, { recursive: true, force: true });
+    const refused = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+    assert.notEqual(refused.status, 0);
+    assert.match(refused.stderr, /No pipelane-managed previous runtime/);
+
+    // A current runtime with damaged managed metadata is discarded at
+    // reinstall instead of being advertised as a rollback target, and a
+    // genuinely good prior rollback target is preserved.
+    const shaA = 'a'.repeat(40);
+    const shaB = 'b'.repeat(40);
+    runCli(['install-claude'], workspaceRoot, { ...env, PIPELANE_INSTALL_SOURCE_SHA: shaA });
+    writeFileSync(path.join(runtimeRoot, 'sentinel-good-previous.txt'), 'good', 'utf8');
+    runCli(['install-claude'], workspaceRoot, { ...env, PIPELANE_INSTALL_SOURCE_SHA: shaB });
+    assert.ok(existsSync(path.join(previousRoot, 'sentinel-good-previous.txt')));
+    const activeMetadataPath = path.join(runtimeRoot, '.pipelane-runtime.json');
+    const activeMetadata = JSON.parse(readFileSync(activeMetadataPath, 'utf8'));
+    writeFileSync(activeMetadataPath, `${JSON.stringify({ ...activeMetadata, packageVersion: '' }, null, 2)}\n`, 'utf8');
+    const discardDamaged = runCli(['install-claude'], workspaceRoot, { ...env, PIPELANE_INSTALL_SOURCE_SHA: shaB });
+    assert.equal(discardDamaged.status, 0);
+    assert.ok(existsSync(path.join(previousRoot, 'sentinel-good-previous.txt')), 'good rollback target must be preserved over a damaged retiree');
+    const refreshedMetadata = JSON.parse(readFileSync(activeMetadataPath, 'utf8'));
+    assert.ok(refreshedMetadata.packageVersion.trim().length > 0);
+    const damagedRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.match(damagedRollback.stdout, /Rolled back the managed Claude runtime/);
+
+    // A corrupted empty-manifest active runtime must never rotate over a
+    // valid rollback target at reinstall.
+    const shaC = 'c'.repeat(40);
+    const activeManifestPath = path.join(runtimeRoot, 'managed-skills.json');
+    const previousMetadataBefore = JSON.parse(readFileSync(path.join(previousRoot, '.pipelane-runtime.json'), 'utf8'));
+    writeFileSync(activeManifestPath, `${JSON.stringify({ skills: [] })}\n`, 'utf8');
+    const emptyManifestReinstall = runCli(['install-claude'], workspaceRoot, { ...env, PIPELANE_INSTALL_SOURCE_SHA: shaC });
+    assert.equal(emptyManifestReinstall.status, 0);
+    const previousMetadataAfter = JSON.parse(readFileSync(path.join(previousRoot, '.pipelane-runtime.json'), 'utf8'));
+    assert.equal(previousMetadataAfter.sourceSha, previousMetadataBefore.sourceSha, 'valid rollback target must survive an empty-manifest retiree');
+    assert.ok(JSON.parse(readFileSync(activeManifestPath, 'utf8')).skills.length > 0);
+    const postEmptyManifestRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.match(postEmptyManifestRollback.stdout, /Rolled back the managed Claude runtime/);
+
+    // The whole host transaction holds the shared install lock: with the lock
+    // held by another process, neither install nor rollback touches the
+    // runtimes or wrappers — no snapshot/swap/restore interleaving is possible.
+    const lockDir = path.join(pipelaneHome, 'install.lock');
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(path.join(lockDir, 'owner.json'), `${JSON.stringify({ pid: 999999, acquiredAt: new Date().toISOString() })}\n`, 'utf8');
+    const wrapperBeforeLock = readFileSync(wrapperPath, 'utf8');
+    const previousMetadataBeforeLock = readFileSync(path.join(previousRoot, '.pipelane-runtime.json'), 'utf8');
+    const lockedRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env, true);
+    assert.notEqual(lockedRollback.status, 0);
+    assert.match(lockedRollback.stderr, /Another pipelane runtime install appears to be in progress/);
+    const lockedInstall = runCli(['install-claude'], workspaceRoot, env, true);
+    assert.notEqual(lockedInstall.status, 0);
+    assert.match(lockedInstall.stderr, /Another pipelane runtime install appears to be in progress/);
+    assert.equal(readFileSync(wrapperPath, 'utf8'), wrapperBeforeLock);
+    assert.equal(readFileSync(path.join(previousRoot, '.pipelane-runtime.json'), 'utf8'), previousMetadataBeforeLock);
+    rmSync(lockDir, { recursive: true, force: true });
+    const unlockedRollback = runCli(['install-claude', '--rollback'], workspaceRoot, env);
+    assert.match(unlockedRollback.stdout, /Rolled back the managed Claude runtime/);
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('install-codex normalizes a legacy runtime before retaining and rolling it back', () => {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-rollback-codex-ws-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-codex-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  try {
+    const env = { CODEX_HOME: codexHome, PIPELANE_HOME: pipelaneHome };
+    runCli(['install-codex'], workspaceRoot, env);
+    const runtimeRoot = managedRuntimeRoot('codex', pipelaneHome);
+    const previousRoot = `${runtimeRoot}.previous`;
+    rmSync(path.join(runtimeRoot, '.pipelane-runtime.json'), { force: true });
+    writeFileSync(path.join(runtimeRoot, 'sentinel-legacy-runtime.txt'), 'legacy', 'utf8');
+
+    runCli(['install-codex'], workspaceRoot, env);
+    const retainedMetadata = JSON.parse(readFileSync(path.join(previousRoot, '.pipelane-runtime.json'), 'utf8'));
+    assert.equal(retainedMetadata.managedBy, 'pipelane');
+    assert.equal(retainedMetadata.host, 'codex');
+    assert.ok(existsSync(path.join(previousRoot, 'sentinel-legacy-runtime.txt')));
+
+    const manifestNames = JSON.parse(readFileSync(path.join(previousRoot, 'managed-skills.json'), 'utf8')).skills;
+    const probeSkill = manifestNames[0];
+    const retainedPayloadPath = path.join(previousRoot, 'host-skills', probeSkill, 'SKILL.md');
+    const retainedPayload = readFileSync(retainedPayloadPath, 'utf8');
+    const codexWrapperPath = path.join(codexHome, 'skills', probeSkill, 'SKILL.md');
+    const currentCodexWrapperBody = readFileSync(codexWrapperPath, 'utf8');
+    writeFileSync(retainedPayloadPath, `${retainedPayload}\nCODEX_LOCKSTEP_MARKER\n`, 'utf8');
+
+    const rollback = runCli(['install-codex', '--rollback'], workspaceRoot, env);
+    assert.match(rollback.stdout, /Rolled back the managed Codex runtime/);
+    assert.ok(existsSync(path.join(runtimeRoot, 'sentinel-legacy-runtime.txt')));
+    assert.match(readFileSync(codexWrapperPath, 'utf8'), /CODEX_LOCKSTEP_MARKER/);
+
+    const userCodexWrapperBody = '# User-owned Codex skill\n';
+    writeFileSync(codexWrapperPath, userCodexWrapperBody, 'utf8');
+    const collisionRollForward = runCli(['install-codex', '--rollback'], workspaceRoot, env);
+    assert.match(collisionRollForward.stdout, new RegExp(`Left unmanaged skills in place \\(name collisions\\): ${probeSkill}`));
+    assert.equal(readFileSync(codexWrapperPath, 'utf8'), userCodexWrapperBody);
+    writeFileSync(codexWrapperPath, currentCodexWrapperBody, 'utf8');
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('runtime parity check passes on a fresh install, flags drift, and tolerates missing runtimes', () => {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-parity-ws-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-claude-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-'));
+  const emptyHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-empty-'));
+  const corruptHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-corrupt-'));
+  const brokenLinkHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-broken-link-'));
+  const fileRootHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-file-root-'));
+  try {
+    runCli(['install-claude'], workspaceRoot, { CLAUDE_HOME: claudeHome, PIPELANE_HOME: pipelaneHome });
+
+    const pass = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+    assert.equal(pass.status, 0, `${pass.stdout}\n${pass.stderr}`);
+    assert.match(pass.stdout, /\[claude\] manifest parity: OK/);
+    assert.match(pass.stdout, /\[claude\] review-surface contract probe: OK/);
+    assert.match(pass.stdout, /\[claude\] review\/pr\/merge surface parity: OK/);
+    assert.match(pass.stdout, /\[claude\] managed skill wrappers: OK/);
+    assert.match(pass.stdout, /RESULT: PASS/);
+
+    // Build provenance accepts abbreviated Git SHAs. A short and full form of
+    // the same commit must compare equal instead of reporting false drift.
+    const runtimeBuildInfoPath = path.join(managedRuntimeRoot('claude', pipelaneHome), 'dist', 'build-info.json');
+    const runtimeBuildInfo = JSON.parse(readFileSync(runtimeBuildInfoPath, 'utf8'));
+    writeFileSync(runtimeBuildInfoPath, `${JSON.stringify({ ...runtimeBuildInfo, sha: runtimeBuildInfo.sha.slice(0, 7) }, null, 2)}\n`, 'utf8');
+    const abbreviatedSha = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+    assert.equal(abbreviatedSha.status, 0, `${abbreviatedSha.stdout}\n${abbreviatedSha.stderr}`);
+    assert.match(abbreviatedSha.stdout, /\[claude\] manifest parity: OK/);
+    writeFileSync(runtimeBuildInfoPath, `${JSON.stringify(runtimeBuildInfo, null, 2)}\n`, 'utf8');
+
+    // Package parity is insufficient when installer-generated entrypoints are
+    // absent: the durable host skills would have nothing usable to invoke.
+    for (const relative of ['bin/run-pipelane.sh', 'bin/bootstrap-pipelane.sh', 'managed-skills.json']) {
+      const target = path.join(managedRuntimeRoot('claude', pipelaneHome), relative);
+      const body = readFileSync(target);
+      const mode = statSync(target).mode & 0o777;
+      rmSync(target, { force: true });
+      const missingGeneratedAsset = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+      assert.equal(missingGeneratedAsset.status, 1, `${missingGeneratedAsset.stdout}\n${missingGeneratedAsset.stderr}`);
+      assert.match(missingGeneratedAsset.stdout, new RegExp(`${relative.replaceAll('/', '\\/')}: missing generated runtime asset`));
+      writeFileSync(target, body, { mode });
+      chmodSync(target, mode);
+    }
+
+    // A runtime directory that exists without its package manifest is broken,
+    // not equivalent to an uninstalled host.
+    mkdirSync(managedRuntimeRoot('claude', corruptHome), { recursive: true });
+    const corrupt = runParity(corruptHome);
+    assert.equal(corrupt.status, 1, `${corrupt.stdout}\n${corrupt.stderr}`);
+    assert.match(corrupt.stdout, /\[claude\] manifest parity: DRIFT/);
+    assert.match(corrupt.stdout, /RESULT: FAIL/);
+
+    // A broken symlink still occupies the managed runtime path. Treat it as a
+    // corrupt runtime rather than silently reporting that nothing is installed.
+    mkdirSync(path.join(brokenLinkHome, 'runtimes'), { recursive: true });
+    symlinkSync(
+      path.join(brokenLinkHome, 'missing-claude-runtime'),
+      managedRuntimeRoot('claude', brokenLinkHome),
+      'dir',
+    );
+    const brokenRuntimeLink = runParity(brokenLinkHome);
+    assert.equal(brokenRuntimeLink.status, 1, `${brokenRuntimeLink.stdout}\n${brokenRuntimeLink.stderr}`);
+    assert.match(brokenRuntimeLink.stdout, /runtime root: expected a real directory/);
+
+    // A regular file at the runtime root is structured drift too. The checker
+    // must not crash with ENOTDIR before printing its result protocol.
+    mkdirSync(path.join(fileRootHome, 'runtimes'), { recursive: true });
+    writeFileSync(managedRuntimeRoot('claude', fileRootHome), 'not a runtime\n', 'utf8');
+    const fileRuntimeRoot = runParity(fileRootHome);
+    assert.equal(fileRuntimeRoot.status, 1, `${fileRuntimeRoot.stdout}\n${fileRuntimeRoot.stderr}`);
+    assert.match(fileRuntimeRoot.stdout, /runtime root: expected a real directory/);
+    assert.match(fileRuntimeRoot.stdout, /managed skill wrappers: SKIPPED \(invalid runtime root\)/);
+    assert.match(fileRuntimeRoot.stdout, /RESULT: FAIL/);
+    assert.doesNotMatch(fileRuntimeRoot.stderr, /ENOTDIR/);
+
+    // Generated runtime metadata is outside package.json's files list but is
+    // still required for a parity pass.
+    const metadataPath = path.join(managedRuntimeRoot('claude', pipelaneHome), '.pipelane-runtime.json');
+    const metadataBody = readFileSync(metadataPath, 'utf8');
+    rmSync(metadataPath, { force: true });
+    const missingMetadata = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+    assert.equal(missingMetadata.status, 1);
+    assert.match(missingMetadata.stdout, /\.pipelane-runtime\.json: missing or invalid managed-runtime metadata/);
+    writeFileSync(metadataPath, metadataBody, 'utf8');
+
+    // Runtime metadata is update/provenance authority. It must agree with the
+    // build-info shipped in the same runtime, not merely be well-shaped JSON.
+    const mismatchedMetadata = JSON.parse(metadataBody);
+    writeFileSync(metadataPath, `${JSON.stringify({ ...mismatchedMetadata, sourceSha: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' }, null, 2)}\n`, 'utf8');
+    const mismatchedProvenance = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+    assert.equal(mismatchedProvenance.status, 1);
+    assert.match(mismatchedProvenance.stdout, /source provenance does not match dist\/build-info\.json/);
+    writeFileSync(metadataPath, metadataBody, 'utf8');
+
+    writeFileSync(metadataPath, `${JSON.stringify({ ...JSON.parse(metadataBody), packageVersion: '999.0.0' }, null, 2)}\n`, 'utf8');
+    const mismatchedPackageVersion = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+    assert.equal(mismatchedPackageVersion.status, 1);
+    assert.match(mismatchedPackageVersion.stdout, /packageVersion "999\.0\.0" does not match package\.json version/);
+    writeFileSync(metadataPath, metadataBody, 'utf8');
+
+    if (process.platform !== 'win32') {
+      const runtimeRunner = path.join(managedRuntimeRoot('claude', pipelaneHome), 'bin', 'run-pipelane.sh');
+      const runtimeRunnerMode = statSync(runtimeRunner).mode & 0o777;
+      chmodSync(runtimeRunner, 0o001);
+      const nonExecutableRuntime = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+      assert.equal(nonExecutableRuntime.status, 1);
+      assert.match(nonExecutableRuntime.stdout, /bin\/run-pipelane\.sh: runtime entrypoint is not executable/);
+      chmodSync(runtimeRunner, runtimeRunnerMode);
+
+      const runtimeBin = path.join(managedRuntimeRoot('claude', pipelaneHome), 'bin', 'pipelane');
+      const runtimeBinBody = readFileSync(runtimeBin);
+      const runtimeBinMode = statSync(runtimeBin).mode & 0o777;
+      rmSync(runtimeBin, { force: true });
+      symlinkSync(path.join(KIT_ROOT, 'bin', 'pipelane'), runtimeBin);
+      const symlinkedRuntime = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+      assert.equal(symlinkedRuntime.status, 1);
+      assert.match(symlinkedRuntime.stdout, /bin\/pipelane: runtime entrypoint is not a regular file/);
+      rmSync(runtimeBin, { force: true });
+      writeFileSync(runtimeBin, runtimeBinBody, { mode: runtimeBinMode });
+      chmodSync(runtimeBin, runtimeBinMode);
+
+      const runtimeReviewData = path.join(managedRuntimeRoot('claude', pipelaneHome), 'dist', 'operator', 'review-data.js');
+      const runtimeReviewDataBody = readFileSync(runtimeReviewData);
+      rmSync(runtimeReviewData, { force: true });
+      symlinkSync(path.join(KIT_ROOT, 'dist', 'operator', 'review-data.js'), runtimeReviewData);
+      const symlinkedPayload = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+      assert.equal(symlinkedPayload.status, 1);
+      assert.match(symlinkedPayload.stdout, /runtime dist\/operator\/review-data\.js: symbolic links are not allowed in runtime payloads/);
+      assert.match(symlinkedPayload.stdout, /review-surface contract probe: SKIPPED \(package content drift\)/);
+      rmSync(runtimeReviewData, { force: true });
+      writeFileSync(runtimeReviewData, runtimeReviewDataBody, 'utf8');
+    }
+
+    // Package drift must be reported without evaluating code from the drifted
+    // runtime. The parity checker is an integrity boundary, not an execution
+    // path for the code it is deciding whether to trust.
+    const runtimePolicy = path.join(managedRuntimeRoot('claude', pipelaneHome), 'dist', 'operator', 'review-gate-policy.js');
+    const runtimePolicyBody = readFileSync(runtimePolicy, 'utf8');
+    writeFileSync(runtimePolicy, `${runtimePolicyBody}\nthrow new Error('DRIFTED_RUNTIME_WAS_EXECUTED');\n`, 'utf8');
+    const guardedProbe = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+    assert.equal(guardedProbe.status, 1);
+    assert.match(guardedProbe.stdout, /dist\/operator\/review-gate-policy\.js: content differs/);
+    assert.match(guardedProbe.stdout, /review-surface contract probe: SKIPPED \(package content drift\)/);
+    assert.doesNotMatch(guardedProbe.stderr, /DRIFTED_RUNTIME_WAS_EXECUTED/);
+    writeFileSync(runtimePolicy, runtimePolicyBody, 'utf8');
+
+    // Managed-skill wrapper trust: an emptied manifest must be drift, not PASS.
+    const wrapperRuntimeRoot = managedRuntimeRoot('claude', pipelaneHome);
+    const skillManifestPath = path.join(wrapperRuntimeRoot, 'managed-skills.json');
+    const skillManifestBody = readFileSync(skillManifestPath, 'utf8');
+    writeFileSync(skillManifestPath, `${JSON.stringify({ skills: [] })}\n`, 'utf8');
+    const emptiedManifest = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+    assert.equal(emptiedManifest.status, 1);
+    assert.match(emptiedManifest.stdout, /managed-skills\.json: no managed skills recorded/);
+    assert.match(emptiedManifest.stdout, /\[claude\] managed skill wrappers: DRIFT/);
+    writeFileSync(skillManifestPath, skillManifestBody, 'utf8');
+
+    // A tampered installed wrapper must be drift.
+    const wrapperSkill = JSON.parse(skillManifestBody).skills[0];
+    const installedWrapperPath = path.join(claudeHome, 'skills', wrapperSkill, 'SKILL.md');
+    const installedWrapperBody = readFileSync(installedWrapperPath, 'utf8');
+    writeFileSync(installedWrapperPath, `${installedWrapperBody}\nWRAPPER_TAMPER\n`, 'utf8');
+    const tamperedWrapper = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+    assert.equal(tamperedWrapper.status, 1);
+    assert.match(tamperedWrapper.stdout, new RegExp(`skills/${wrapperSkill}/SKILL\\.md: installed wrapper content differs from runtime payload`));
+    writeFileSync(installedWrapperPath, installedWrapperBody, 'utf8');
+
+    // The payload and installed wrapper are not independent authorities. If
+    // both drift to the same bytes, parity must still reject them against the
+    // locally rendered wrapper contract.
+    const wrapperPayloadPath = path.join(wrapperRuntimeRoot, 'host-skills', wrapperSkill, 'SKILL.md');
+    const wrapperPayloadBody = readFileSync(wrapperPayloadPath, 'utf8');
+    const colludingTamper = `${installedWrapperBody}\nMATCHING_PAYLOAD_AND_WRAPPER_TAMPER\n`;
+    writeFileSync(wrapperPayloadPath, colludingTamper, 'utf8');
+    writeFileSync(installedWrapperPath, colludingTamper, 'utf8');
+    const matchingTamper = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+    assert.equal(matchingTamper.status, 1);
+    assert.match(matchingTamper.stdout, new RegExp(`host-skills/${wrapperSkill}/SKILL\\.md: payload content differs from local renderer`));
+    writeFileSync(wrapperPayloadPath, wrapperPayloadBody, 'utf8');
+    writeFileSync(installedWrapperPath, installedWrapperBody, 'utf8');
+
+    if (process.platform !== 'win32') {
+      // Every payload path component is part of the runtime trust boundary;
+      // parent-directory symlinks must not redirect parity or rollback reads.
+      const payloadSkillDir = path.dirname(wrapperPayloadPath);
+      const externalPayloadDir = path.join(pipelaneHome, 'external-payload-skill');
+      renameSync(payloadSkillDir, externalPayloadDir);
+      symlinkSync(externalPayloadDir, payloadSkillDir, 'dir');
+      const symlinkedPayloadDir = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+      assert.equal(symlinkedPayloadDir.status, 1);
+      assert.match(symlinkedPayloadDir.stdout, new RegExp(`host-skills/${wrapperSkill}: payload directory must be a real directory`));
+      rmSync(payloadSkillDir, { force: true });
+      renameSync(externalPayloadDir, payloadSkillDir);
+
+      const externalPayloadFile = path.join(pipelaneHome, 'external-payload.md');
+      renameSync(wrapperPayloadPath, externalPayloadFile);
+      symlinkSync(externalPayloadFile, wrapperPayloadPath);
+      const symlinkedPayloadFile = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+      assert.equal(symlinkedPayloadFile.status, 1);
+      assert.match(symlinkedPayloadFile.stdout, new RegExp(`host-skills/${wrapperSkill}/SKILL\\.md: payload missing`));
+      rmSync(wrapperPayloadPath, { force: true });
+      renameSync(externalPayloadFile, wrapperPayloadPath);
+
+      const payloadRoot = path.join(wrapperRuntimeRoot, 'host-skills');
+      const externalPayloadRoot = path.join(pipelaneHome, 'external-payload-root');
+      renameSync(payloadRoot, externalPayloadRoot);
+      symlinkSync(externalPayloadRoot, payloadRoot, 'dir');
+      const symlinkedPayloadRoot = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+      assert.equal(symlinkedPayloadRoot.status, 1);
+      assert.match(symlinkedPayloadRoot.stdout, /host-skills: payload root must be a real directory/);
+      rmSync(payloadRoot, { force: true });
+      renameSync(externalPayloadRoot, payloadRoot);
+    }
+
+    // A payload the manifest does not record must be drift.
+    const ghostPayloadDir = path.join(wrapperRuntimeRoot, 'host-skills', 'ghost-skill');
+    mkdirSync(ghostPayloadDir, { recursive: true });
+    writeFileSync(path.join(ghostPayloadDir, 'SKILL.md'), 'ghost', 'utf8');
+    const ghostPayload = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+    assert.equal(ghostPayload.status, 1);
+    assert.match(ghostPayload.stdout, /host-skills\/ghost-skill: payload not recorded in managed-skills\.json/);
+    rmSync(ghostPayloadDir, { recursive: true, force: true });
+
+    // The manifest is not its own completeness authority: a truncated manifest
+    // (even with matching payloads) must be flagged against the local tree's
+    // expected skill set.
+    const fullManifestNames = JSON.parse(skillManifestBody).skills;
+    writeFileSync(skillManifestPath, `${JSON.stringify({ skills: [fullManifestNames[0]] })}\n`, 'utf8');
+    const truncatedManifest = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+    assert.equal(truncatedManifest.status, 1);
+    assert.match(truncatedManifest.stdout, /managed-skills\.json: required skill .+ is missing from the manifest/);
+    writeFileSync(skillManifestPath, skillManifestBody, 'utf8');
+
+    // An installed wrapper carrying the managed marker but absent from the
+    // manifest is an exposed retired command, not a passing fleet.
+    const orphanDir = path.join(claudeHome, 'skills', 'orphan-skill');
+    mkdirSync(orphanDir, { recursive: true });
+    writeFileSync(path.join(orphanDir, 'SKILL.md'), '<!-- pipelane:claude-global-skill:orphan-skill -->\nretired command\n', 'utf8');
+    const orphanWrapper = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+    assert.equal(orphanWrapper.status, 1);
+    assert.match(orphanWrapper.stdout, /skills\/orphan-skill\/SKILL\.md: managed wrapper not recorded in managed-skills\.json/);
+    rmSync(orphanDir, { recursive: true, force: true });
+
+    // Mutating a review-surface module inside the runtime is drift.
+    const mutated = path.join(managedRuntimeRoot('claude', pipelaneHome), 'dist', 'operator', 'commands', 'review.js');
+    writeFileSync(mutated, `${readFileSync(mutated, 'utf8')}\n// drift\n`, 'utf8');
+    const fail = runParity(pipelaneHome, { CLAUDE_HOME: claudeHome });
+    assert.equal(fail.status, 1);
+    assert.match(fail.stdout, /dist\/operator\/commands\/review\.js: content differs/);
+    assert.match(fail.stdout, /\[claude\] review\/pr\/merge surface parity: DRIFT/);
+    assert.match(fail.stdout, /RESULT: FAIL/);
+
+    // No runtimes installed: informative, not an error.
+    const none = runParity(emptyHome);
+    assert.equal(none.status, 0, `${none.stdout}\n${none.stderr}`);
+    assert.match(none.stdout, /No managed runtimes are installed/);
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(claudeHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+    rmSync(emptyHome, { recursive: true, force: true });
+    rmSync(corruptHome, { recursive: true, force: true });
+    rmSync(brokenLinkHome, { recursive: true, force: true });
+    rmSync(fileRootHome, { recursive: true, force: true });
+  }
+});
+
+test('runtime parity exercises Codex host paths and managed marker detection', () => {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-parity-codex-ws-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-parity-codex-home-'));
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-parity-codex-runtime-'));
+  try {
+    runCli(['install-codex'], workspaceRoot, { CODEX_HOME: codexHome, PIPELANE_HOME: pipelaneHome });
+    const pass = runParity(pipelaneHome, { CODEX_HOME: codexHome });
+    assert.equal(pass.status, 0, `${pass.stdout}\n${pass.stderr}`);
+    assert.match(pass.stdout, /\[codex\] managed skill wrappers: OK/);
+
+    const orphanDir = path.join(codexHome, 'skills', 'orphan-codex-skill');
+    mkdirSync(orphanDir, { recursive: true });
+    writeFileSync(path.join(orphanDir, 'SKILL.md'), '<!-- pipelane:codex-global-skill:orphan-codex-skill -->\nretired command\n', 'utf8');
+    const orphan = runParity(pipelaneHome, { CODEX_HOME: codexHome });
+    assert.equal(orphan.status, 1);
+    assert.match(orphan.stdout, /skills\/orphan-codex-skill\/SKILL\.md: managed wrapper not recorded/);
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('signing key classes auto-provision persisted keys, including convergence-state', () => {
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-keys-'));
+  const script = [
+    `const doctor = await import(${JSON.stringify(pathToFileURL(path.join(KIT_ROOT, 'src', 'operator', 'commands', 'doctor.ts')).href)});`,
+    'process.stdout.write(JSON.stringify(doctor.collectSigningKeyStatus()));',
+  ].join('\n');
+  try {
+    const env = { ...process.env, PIPELANE_HOME: pipelaneHome };
+    delete env.PIPELANE_ORCHESTRATION_STATE_KEY;
+    delete env.PIPELANE_REVIEW_CONSENT_STATE_KEY;
+    delete env.PIPELANE_CONVERGENCE_STATE_KEY;
+    const result = spawnSync('node', ['--input-type=module', '-e', script], {
+      cwd: KIT_ROOT,
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const statuses = JSON.parse(result.stdout);
+    assert.deepEqual(statuses.map((entry) => entry.name).sort(), ['convergence-state', 'orchestration-state', 'review-consent-state']);
+    for (const entry of statuses) {
+      assert.equal(entry.provisioned, true, `${entry.name}: ${entry.error}`);
+      assert.match(entry.fingerprint, /^[a-f0-9]{16}$/);
+    }
+    for (const keyFile of ['orchestration-state.key', 'review-consent-state.key', 'convergence-state.key']) {
+      assert.ok(existsSync(path.join(pipelaneHome, 'keys', keyFile)), `${keyFile} should be provisioned on disk`);
+    }
+
+    const invalidOverride = spawnSync('node', ['--input-type=module', '-e', script], {
+      cwd: KIT_ROOT,
+      env: {
+        ...process.env,
+        PIPELANE_HOME: pipelaneHome,
+        PIPELANE_ORCHESTRATION_STATE_KEY: 'short',
+        PIPELANE_REVIEW_CONSENT_STATE_KEY: 'short',
+        PIPELANE_CONVERGENCE_STATE_KEY: 'short',
+      },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(invalidOverride.status, 0, invalidOverride.stderr);
+    for (const entry of JSON.parse(invalidOverride.stdout)) {
+      assert.equal(entry.source, 'env');
+      assert.equal(entry.persisted, true);
+      assert.equal(entry.provisioned, false, `${entry.name} must reject an invalid active override`);
+      assert.match(entry.error, /too short/);
+    }
+
+    // Ambient env overrides are not machine-wide provisioning: with the
+    // overrides set and no persisted files, every class must report
+    // unprovisioned with an explicit override error.
+    const overrideHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-keys-env-'));
+    try {
+      const overrideEnv = {
+        ...process.env,
+        PIPELANE_HOME: overrideHome,
+        PIPELANE_ORCHESTRATION_STATE_KEY: 'o'.repeat(48),
+        PIPELANE_REVIEW_CONSENT_STATE_KEY: 'r'.repeat(48),
+        PIPELANE_CONVERGENCE_STATE_KEY: 'c'.repeat(48),
+      };
+      const overridden = spawnSync('node', ['--input-type=module', '-e', script], {
+        cwd: KIT_ROOT,
+        env: overrideEnv,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      assert.equal(overridden.status, 0, overridden.stderr);
+      for (const entry of JSON.parse(overridden.stdout)) {
+        assert.equal(entry.source, 'env');
+        assert.equal(entry.persisted, false);
+        assert.equal(entry.provisioned, false, `${entry.name} must not report an env override as provisioned`);
+        assert.match(entry.error, /override is active but no persisted key file exists/);
+      }
+
+      // A junk persisted file must not certify readiness either: under valid
+      // overrides, files shorter than the resolver's minimum are invalid.
+      mkdirSync(path.join(overrideHome, 'keys'), { recursive: true });
+      for (const keyFile of ['orchestration-state.key', 'review-consent-state.key', 'convergence-state.key']) {
+        writeFileSync(path.join(overrideHome, 'keys', keyFile), 'short', 'utf8');
+      }
+      const junkPersisted = spawnSync('node', ['--input-type=module', '-e', script], {
+        cwd: KIT_ROOT,
+        env: overrideEnv,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      assert.equal(junkPersisted.status, 0, junkPersisted.stderr);
+      for (const entry of JSON.parse(junkPersisted.stdout)) {
+        assert.equal(entry.persisted, true);
+        assert.equal(entry.provisioned, false, `${entry.name} must not certify an invalid persisted key`);
+        assert.equal(entry.fingerprint, null);
+        assert.match(entry.error, /invalid \(shorter than/);
+      }
+    } finally {
+      rmSync(overrideHome, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+test('review policy update notice fires only for repos on an older policyVersion', () => {
+  const repoRoot = createRepo();
+  const pipelaneHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-home-policy-'));
+  const script = [
+    `const state = await import(${JSON.stringify(pathToFileURL(path.join(KIT_ROOT, 'src', 'operator', 'state.ts')).href)});`,
+    `const update = await import(${JSON.stringify(pathToFileURL(path.join(KIT_ROOT, 'src', 'operator', 'update.ts')).href)});`,
+    "const { mkdirSync, writeFileSync } = await import('node:fs');",
+    "const path = (await import('node:path')).default;",
+    'const repoRoot = process.argv[1];',
+    'const configPath = state.resolveMachineConfigPath(repoRoot);',
+    'mkdirSync(path.dirname(configPath), { recursive: true });',
+    'const base = { projectKey: "fixture", displayName: "Fixture" };',
+    'if (process.argv[2] === "seed") writeFileSync(configPath, JSON.stringify({ ...base, reviewGates: {} }, null, 2));',
+    'process.stdout.write(JSON.stringify({ notice: update.reviewPolicyUpdateNotice(repoRoot), configPath }));',
+  ].join('\n');
+  try {
+    const seed = spawnSync('node', ['--input-type=module', '-e', script, repoRoot, 'seed'], {
+      cwd: KIT_ROOT,
+      env: { ...process.env, PIPELANE_HOME: pipelaneHome },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(seed.status, 0, seed.stderr);
+    const { notice: legacyNotice } = JSON.parse(seed.stdout);
+    assert.match(legacyNotice, /policyVersion 2/);
+    assert.match(legacyNotice, /review setup --enforcement-mode strict-v3/);
+
+    const migrated = runCli(['review', 'setup', '--enforcement-mode', 'strict-v3', '--json'], repoRoot, { PIPELANE_HOME: pipelaneHome });
+    assert.equal(migrated.status, 0, migrated.stderr);
+    const after = spawnSync('node', ['--input-type=module', '-e', script, repoRoot, 'read'], {
+      cwd: KIT_ROOT,
+      env: { ...process.env, PIPELANE_HOME: pipelaneHome },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(after.status, 0, after.stderr);
+    assert.equal(JSON.parse(after.stdout).notice, null);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(pipelaneHome, { recursive: true, force: true });
+  }
 });
