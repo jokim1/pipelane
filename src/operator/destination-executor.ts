@@ -18,7 +18,7 @@ import {
   ROUTE_SAFETY_FINGERPRINT_ENV,
   evaluateDestinationRouteReviewSafety,
   recordDestinationRouteCompleted,
-} from './route-loop-safety.ts';
+} from './task-budget.ts';
 import {
   acquireTaskWorkspaceLease,
   ensureTaskBindingId,

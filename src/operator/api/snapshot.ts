@@ -1,6 +1,9 @@
 import { existsSync } from 'node:fs';
 
-import type { AutoCleanupBlockerCode, DeliveryRecord, DeployRecord, PrRecord, ProbeState, ReviewConsentRecord, ReviewOverrideRecord, ReviewRunRecord, TaskLock, WorkflowConfig } from '../state.ts';
+import type { AutoCleanupBlockerCode, DeliveryRecord, DeployRecord, ParkedTaskRecord, PrRecord, ProbeState, ReviewConsentRecord, ReviewOverrideRecord, ReviewRunRecord, TaskLock, WorkflowConfig } from '../state.ts';
+import { loadParkedTasks } from '../state.ts';
+import { listBudgetConsentCards, type BudgetConsentCard } from '../consent-grants.ts';
+import { summarizeTaskBudgetForCheckout } from '../task-budget.ts';
 import {
   automaticWorktreeCleanupEnabled,
   DEFAULT_MODE,
@@ -320,6 +323,25 @@ export interface SnapshotData {
     latestOverride: ReviewOverrideRecord | null;
   };
   orchestration: OrchestrationSnapshot;
+  // Convergence v1 S1: budget/consent surfacing for the Board — pending
+  // budget-extension consent cards awaiting a human decision, parked tasks
+  // (terminal until extended), and the current checkout's budget meters.
+  taskBudget: {
+    pendingConsents: BudgetConsentCard[];
+    parked: ParkedTaskRecord[];
+    current: null | {
+      taskSlug: string;
+      branchName: string;
+      lineageKey: string;
+      parked: boolean;
+      paused: boolean;
+      pauseReason: string | null;
+      lifetimeExtensions: number;
+      maxLifetimeExtensions: number;
+      used: { fixReviewLoops: number; aiRunLaunches: number; activeMinutes: number };
+      limits: { fixReviewLoops: number; aiRuns: number; activeMinutes: number };
+    };
+  };
   sourceHealth: SourceHealthEntry[];
   attention: unknown[];
   availableActions: ApiActionState[];
@@ -599,6 +621,7 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
         latestOverride: reviewState.overrides[0] ?? null,
       },
       orchestration,
+      taskBudget: buildTaskBudgetSnapshot(context),
       sourceHealth,
       attention,
       availableActions: buildBoardActions({ mode, releaseReadiness, branches, checkedAt }),
@@ -606,6 +629,28 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
       cleanupSummary,
     },
   });
+}
+
+function buildTaskBudgetSnapshot(context: ReturnType<typeof resolveWorkflowContext>): SnapshotData['taskBudget'] {
+  let pendingConsents: BudgetConsentCard[] = [];
+  let parked: ParkedTaskRecord[] = [];
+  let current: SnapshotData['taskBudget']['current'] = null;
+  try {
+    pendingConsents = listBudgetConsentCards(context.commonDir, context.config, { status: 'pending' });
+  } catch {
+    // A locked or unreadable consent store must not take down the snapshot.
+  }
+  try {
+    parked = loadParkedTasks(context.commonDir, context.config).records;
+  } catch {
+    // Same: parked surfacing is best-effort display state.
+  }
+  try {
+    current = summarizeTaskBudgetForCheckout(context);
+  } catch {
+    // Same: budget meters are display state.
+  }
+  return { pendingConsents, parked, current };
 }
 
 function attachReviewPresentation(

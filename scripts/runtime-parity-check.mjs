@@ -48,7 +48,7 @@ const REVIEW_SURFACE_MODULES = [
   'dist/operator/review-gates.js',
   'dist/operator/review-gate-policy.js',
   'dist/operator/review-data.js',
-  'dist/operator/route-loop-safety.js',
+  'dist/operator/task-budget.js',
 ];
 
 function pipelaneHomeDir() {

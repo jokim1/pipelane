@@ -209,6 +209,53 @@ export const DEFAULT_ROUTE_SAFETY: Required<RouteSafetyConfig> = {
   stopOnMajorFindings: true,
 };
 
+// Convergence v1 §4.3: task-budget sizing constants. Budgets are sized once at
+// entry creation (aiRuns = clamp(base + ceil(changedLines / perChangedLines),
+// base, max); activeMinutes = perFourRuns × ceil(aiRuns / 4)), re-estimated
+// once at the first counted review, never after.
+export interface TaskBudgetConfig {
+  aiRunsBase?: number;
+  aiRunsPerChangedLines?: number;
+  aiRunsMax?: number;
+  activeMinutesPerFourRuns?: number;
+  maxLifetimeExtensions?: number;
+}
+
+export const DEFAULT_TASK_BUDGET: Required<TaskBudgetConfig> = {
+  aiRunsBase: 8,
+  aiRunsPerChangedLines: 1000,
+  aiRunsMax: 20,
+  activeMinutesPerFourRuns: 45,
+  maxLifetimeExtensions: 2,
+};
+
+export function normalizeTaskBudgetConfig(raw: TaskBudgetConfig | undefined): Required<TaskBudgetConfig> {
+  if (!isRecord(raw)) return { ...DEFAULT_TASK_BUDGET };
+  return {
+    aiRunsBase: positiveConfigInteger(raw.aiRunsBase) ?? DEFAULT_TASK_BUDGET.aiRunsBase,
+    aiRunsPerChangedLines: positiveConfigInteger(raw.aiRunsPerChangedLines) ?? DEFAULT_TASK_BUDGET.aiRunsPerChangedLines,
+    aiRunsMax: positiveConfigInteger(raw.aiRunsMax) ?? DEFAULT_TASK_BUDGET.aiRunsMax,
+    activeMinutesPerFourRuns: positiveConfigInteger(raw.activeMinutesPerFourRuns) ?? DEFAULT_TASK_BUDGET.activeMinutesPerFourRuns,
+    maxLifetimeExtensions: positiveConfigInteger(raw.maxLifetimeExtensions) ?? DEFAULT_TASK_BUDGET.maxLifetimeExtensions,
+  };
+}
+
+export function sizeTaskBudget(
+  config: Required<TaskBudgetConfig>,
+  routeSafety: Required<RouteSafetyConfig>,
+  changedLinesEstimate: number,
+): { aiRunsBudget: number; activeMinutesBudget: number; fixReviewLoopsBudget: number } {
+  const changed = Number.isFinite(changedLinesEstimate) && changedLinesEstimate > 0
+    ? Math.ceil(changedLinesEstimate / config.aiRunsPerChangedLines)
+    : 0;
+  const aiRunsBudget = Math.min(config.aiRunsMax, Math.max(config.aiRunsBase, config.aiRunsBase + changed));
+  return {
+    aiRunsBudget,
+    activeMinutesBudget: config.activeMinutesPerFourRuns * Math.ceil(aiRunsBudget / 4),
+    fixReviewLoopsBudget: routeSafety.defaultFixReviewLoops,
+  };
+}
+
 export interface WorkflowConfig {
   version: number;
   projectKey: string;
@@ -245,6 +292,9 @@ export interface WorkflowConfig {
   surfacePathMap?: Record<string, string[]>;
   reviewGates?: ReviewGatesConfig;
   routeSafety: RouteSafetyConfig;
+  // Convergence v1 §4.3/§5: task-budget sizing constants. Optional; absent
+  // configs use DEFAULT_TASK_BUDGET.
+  taskBudget?: TaskBudgetConfig;
   orchestrate?: OrchestrateConfig;
   cleanup?: CleanupConfig;
 }
@@ -756,7 +806,7 @@ export interface ReviewState {
   findingDispositions?: ReviewFindingDispositionRecord[];
 }
 
-export type RouteSafetyResumeKind = 'one-more-loop' | 'more-loops-and-minutes' | 'until-review-passes' | 'accept-findings' | 'fix-attempt' | 'legacy-import' | 'legacy-fresh-start';
+export type RouteSafetyResumeKind = 'one-more-loop' | 'more-loops-and-minutes' | 'until-review-passes' | 'accept-findings' | 'fix-attempt' | 'legacy-import' | 'legacy-fresh-start' | 'budget-extension-grant';
 
 export interface RouteSafetyResumeRecord {
   id: string;
@@ -873,6 +923,94 @@ export interface RouteSafetyRecord {
 export interface RouteSafetyState {
   routes: Record<string, RouteSafetyRecord>;
   latestPausedRouteFingerprintDigest?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Convergence v1 S1 — Task Budget Ledger (successor to route-safety, §4.3).
+//
+// Entries are keyed by taskSlug + branchName lineage (falling back to branch
+// alone), explicitly NOT the destination-plan fingerprint: PR-opening,
+// rebinding, fingerprint churn, and state-root divergence do not create fresh
+// budgets (RC4). The legacy route-safety-state store becomes read-only
+// migration input the first time a task-budget entry binds to it.
+// ---------------------------------------------------------------------------
+
+export interface TaskBudgetGrantAllowance {
+  aiRunsDelta: number;
+  activeMinutesDelta: number;
+  fixReviewLoopsDelta: number;
+}
+
+// One consumed budget-extension grant, denormalized onto the entry for audit.
+// The authoritative one-use grant artifact lives in the consent-grants store.
+export interface TaskBudgetConsumedGrant extends TaskBudgetGrantAllowance {
+  grantId: string;
+  source: 'board' | 'tty';
+  consumedAt: string;
+  reason: string;
+}
+
+export interface TaskBudgetRecord extends RouteSafetyRecord {
+  budgetVersion: 1;
+  // Store key: sha256 of the canonical {serializationVersion, projectKey,
+  // taskSlug, branchName} lineage fingerprint.
+  lineageKey: string;
+  // Sized budgets (§4.3 formula; re-estimated once at first counted review).
+  aiRunsBudget: number;
+  activeMinutesBudget: number;
+  fixReviewLoopsBudget: number;
+  changedLinesEstimate?: number;
+  budgetSizedAt?: string;
+  budgetReEstimatedAt?: string;
+  // D14 currency split. aiRunLaunches counts every launched AI gate/judge
+  // call, including infra failures and timeouts. activeMillisUsed accumulates
+  // ACTIVE execution time (review-run windows), never wall-clock idle.
+  // fixReviewLoops (inherited) counts finding-failures only; infra failures
+  // never increment it.
+  aiRunLaunches: number;
+  activeMillisUsed: number;
+  infraFailureRuns?: number;
+  // D11 grants: consumed extensions (ceiling: taskBudget.maxLifetimeExtensions).
+  lifetimeExtensions: number;
+  consumedGrants?: TaskBudgetConsumedGrant[];
+  // Terminal park state (§4.3 exhaustion semantics).
+  parkedAt?: string;
+  parkReason?: string;
+  // Audit: every task-binding id observed on this lineage (rebinding transfers
+  // the entry instead of minting a new one).
+  observedTaskBindingIds?: string[];
+  migratedFromRouteDigests?: string[];
+}
+
+export interface TaskBudgetState {
+  entries: Record<string, TaskBudgetRecord>;
+  latestPausedLineageKey?: string;
+  // Set when the legacy route-safety-state store was first consulted for
+  // migration; from that point route-safety-state is frozen read-only.
+  legacyRouteSafetyFrozenAt?: string;
+}
+
+// §4.3 exhaustion semantics: parked is a terminal state for autonomous
+// execution, surfaced in /status and the Board, with a queued consent request.
+export interface ParkedTaskRecord {
+  taskSlug: string;
+  branch: string;
+  lineageKey: string;
+  parkedAt: string;
+  reason: string;
+  openFindingIds: string[];
+  budgetSpent: {
+    aiRunLaunches: number;
+    activeMinutes: number;
+    fixReviewLoops: number;
+  };
+  unblockHints: string[];
+  notified: boolean;
+  pendingConsentCardId?: string;
+}
+
+export interface ParkedTasksState {
+  records: ParkedTaskRecord[];
 }
 
 export type DeployStatus = 'requested' | 'succeeded' | 'failed' | 'unknown';
@@ -1081,6 +1219,9 @@ const REVIEW_ACCEPTANCE_STATE_FILENAME = 'review-acceptance-state.json';
 const REVIEW_STATE_LOCK_FILENAME = 'review-state.lock';
 const ROUTE_SAFETY_STATE_FILENAME = 'route-safety-state.json';
 const ROUTE_SAFETY_STATE_LOCK_FILENAME = 'route-safety-state.lock';
+const TASK_BUDGET_STATE_FILENAME = 'task-budget-state.json';
+const TASK_BUDGET_STATE_LOCK_FILENAME = 'task-budget-state.lock';
+const PARKED_TASKS_FILENAME = 'parked-tasks.json';
 const REVIEW_STATE_MAX_RECORDS = 20;
 const REVIEW_OVERRIDE_MAX_RECORDS = 50;
 const REVIEW_ACCEPTANCE_MAX_RECORDS = 200;
@@ -1144,6 +1285,8 @@ export const STATE_SCHEMA_VERSIONS = {
   reviewState: 2,
   reviewAcceptanceState: 1,
   routeSafetyState: 1,
+  taskBudgetState: 1,
+  parkedTasks: 1,
   orchestrationRun: 2,
   orchestrationObservations: 1,
   deployConfig: 1,
@@ -1173,6 +1316,8 @@ export const STATE_MIGRATIONS: Record<StateKind, Record<number, (raw: Record<str
   },
   reviewAcceptanceState: {},
   routeSafetyState: {},
+  taskBudgetState: {},
+  parkedTasks: {},
   orchestrationRun: {
     // v1 -> v2 (G1): providerPrompt/confirmationPrompt are no longer persisted
     // on the slice record. The worker prompt is derived from the resolved
@@ -1531,6 +1676,7 @@ function mergeWorkflowLayers(
     if (overlay.syncDocs) next.syncDocs = { ...current.syncDocs, ...overlay.syncDocs };
     if (overlay.checks) next.checks = { ...current.checks, ...overlay.checks };
     if (overlay.routeSafety) next.routeSafety = { ...current.routeSafety, ...overlay.routeSafety };
+    if (overlay.taskBudget) next.taskBudget = { ...current.taskBudget, ...overlay.taskBudget };
     if (overlay.cleanup) next.cleanup = { ...current.cleanup, ...overlay.cleanup };
     if (overlay.surfacePathMap) next.surfacePathMap = { ...current.surfacePathMap, ...overlay.surfacePathMap };
     delete (next as Record<string, unknown>).smoke;
@@ -1637,6 +1783,7 @@ export function normalizeWorkflowConfig(
     surfacePathMap: normalizeSurfacePathMap(withDefaults.surfacePathMap),
     reviewGates: normalizeReviewGatesConfig(withDefaults.reviewGates, { repoRoot: options.repoRoot }),
     routeSafety: normalizeRouteSafetyConfig(withDefaults.routeSafety),
+    taskBudget: normalizeTaskBudgetConfig(withDefaults.taskBudget),
     orchestrate: normalizeOrchestrateConfig(withDefaults.orchestrate),
     cleanup: normalizeCleanupConfig(withDefaults.cleanup),
   } as WorkflowConfig & Record<string, unknown>;
@@ -2088,6 +2235,18 @@ export function reviewAcceptanceStatePath(commonDir: string, config: WorkflowCon
 
 export function routeSafetyStatePath(commonDir: string, config: WorkflowConfig): string {
   return path.join(resolveStateDir(commonDir, config), ROUTE_SAFETY_STATE_FILENAME);
+}
+
+export function taskBudgetStatePath(commonDir: string, config: WorkflowConfig): string {
+  return path.join(resolveStateDir(commonDir, config), TASK_BUDGET_STATE_FILENAME);
+}
+
+export function parkedTasksPath(commonDir: string, config: WorkflowConfig): string {
+  return path.join(resolveStateDir(commonDir, config), PARKED_TASKS_FILENAME);
+}
+
+function taskBudgetStateLockPath(commonDir: string, config: WorkflowConfig): string {
+  return path.join(resolveStateDir(commonDir, config), TASK_BUDGET_STATE_LOCK_FILENAME);
 }
 
 function reviewStateLockPath(commonDir: string, config: WorkflowConfig): string {
@@ -3575,6 +3734,10 @@ export function loadRouteSafetyState(commonDir: string, config: WorkflowConfig):
   };
 }
 
+// Convergence v1 S1 (§4.3): route-safety-state is FROZEN read-only audit
+// history. The task-budget ledger (task-budget-state.json) is the successor
+// store; production code only reads this file as D6 migration input. This
+// writer exists solely so tests can fabricate legacy fixtures.
 export function saveRouteSafetyState(commonDir: string, config: WorkflowConfig, value: RouteSafetyState): void {
   ensureStateDir(commonDir, config);
   writeVersionedJsonFile('routeSafetyState', routeSafetyStatePath(commonDir, config), value);
@@ -3590,6 +3753,115 @@ export function withRouteSafetyStateLock<T>(commonDir: string, config: WorkflowC
   } finally {
     lock.release();
   }
+}
+
+export function loadTaskBudgetState(commonDir: string, config: WorkflowConfig): TaskBudgetState {
+  const raw = readVersionedJsonFile<TaskBudgetState>('taskBudgetState', commonDir, config, taskBudgetStatePath(commonDir, config), { entries: {} });
+  if (!raw || typeof raw !== 'object' || !isRecord(raw.entries)) return { entries: {} };
+  const entries: Record<string, TaskBudgetRecord> = {};
+  for (const [lineageKey, entry] of Object.entries(raw.entries)) {
+    const normalized = normalizeTaskBudgetRecord(entry);
+    if (normalized) entries[lineageKey] = normalized;
+  }
+  const state: TaskBudgetState = { entries };
+  if (typeof raw.latestPausedLineageKey === 'string' && entries[raw.latestPausedLineageKey]) {
+    state.latestPausedLineageKey = raw.latestPausedLineageKey;
+  }
+  if (typeof raw.legacyRouteSafetyFrozenAt === 'string') state.legacyRouteSafetyFrozenAt = raw.legacyRouteSafetyFrozenAt;
+  return state;
+}
+
+export function saveTaskBudgetState(commonDir: string, config: WorkflowConfig, value: TaskBudgetState): void {
+  ensureStateDir(commonDir, config);
+  writeVersionedJsonFile('taskBudgetState', taskBudgetStatePath(commonDir, config), value);
+}
+
+export function withTaskBudgetStateLock<T>(commonDir: string, config: WorkflowConfig, fn: () => T): T {
+  const lock = acquireDirectoryStateLock(
+    taskBudgetStateLockPath(commonDir, config),
+    'task budget state is locked: another process is updating the task budget ledger. Wait and retry.',
+  );
+  try {
+    return fn();
+  } finally {
+    lock.release();
+  }
+}
+
+function normalizeTaskBudgetRecord(value: unknown): TaskBudgetRecord | null {
+  const base = normalizeRouteSafetyRecord(value);
+  if (!base) return null;
+  const raw = value as Record<string, unknown>;
+  if (raw.budgetVersion !== 1 || typeof raw.lineageKey !== 'string' || raw.lineageKey.trim().length === 0) return null;
+  const record: TaskBudgetRecord = {
+    ...base,
+    budgetVersion: 1,
+    lineageKey: raw.lineageKey,
+    aiRunsBudget: nonNegativeInteger(raw.aiRunsBudget),
+    activeMinutesBudget: nonNegativeInteger(raw.activeMinutesBudget),
+    fixReviewLoopsBudget: nonNegativeInteger(raw.fixReviewLoopsBudget),
+    aiRunLaunches: nonNegativeInteger(raw.aiRunLaunches),
+    activeMillisUsed: nonNegativeInteger(raw.activeMillisUsed),
+    lifetimeExtensions: nonNegativeInteger(raw.lifetimeExtensions),
+  };
+  const changedLinesEstimate = nonNegativeInteger(raw.changedLinesEstimate);
+  if (changedLinesEstimate > 0 || raw.changedLinesEstimate === 0) record.changedLinesEstimate = changedLinesEstimate;
+  if (typeof raw.budgetSizedAt === 'string') record.budgetSizedAt = raw.budgetSizedAt;
+  if (typeof raw.budgetReEstimatedAt === 'string') record.budgetReEstimatedAt = raw.budgetReEstimatedAt;
+  const infraFailureRuns = nonNegativeInteger(raw.infraFailureRuns);
+  if (infraFailureRuns > 0) record.infraFailureRuns = infraFailureRuns;
+  if (typeof raw.parkedAt === 'string') record.parkedAt = raw.parkedAt;
+  if (typeof raw.parkReason === 'string') record.parkReason = raw.parkReason;
+  if (Array.isArray(raw.observedTaskBindingIds)) {
+    const ids = [...new Set(raw.observedTaskBindingIds.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0))].slice(0, 20);
+    if (ids.length > 0) record.observedTaskBindingIds = ids;
+  }
+  if (Array.isArray(raw.migratedFromRouteDigests)) {
+    const digests = raw.migratedFromRouteDigests.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0).slice(0, 50);
+    if (digests.length > 0) record.migratedFromRouteDigests = digests;
+  }
+  if (Array.isArray(raw.consumedGrants)) {
+    const grants = raw.consumedGrants.filter(isTaskBudgetConsumedGrant).slice(0, 20);
+    if (grants.length > 0) record.consumedGrants = grants;
+  }
+  return record;
+}
+
+function isTaskBudgetConsumedGrant(value: unknown): value is TaskBudgetConsumedGrant {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return typeof raw.grantId === 'string'
+    && (raw.source === 'board' || raw.source === 'tty')
+    && typeof raw.consumedAt === 'string'
+    && typeof raw.reason === 'string'
+    && typeof raw.aiRunsDelta === 'number'
+    && typeof raw.activeMinutesDelta === 'number'
+    && typeof raw.fixReviewLoopsDelta === 'number';
+}
+
+export function loadParkedTasks(commonDir: string, config: WorkflowConfig): ParkedTasksState {
+  const raw = readVersionedJsonFile<ParkedTasksState>('parkedTasks', commonDir, config, parkedTasksPath(commonDir, config), { records: [] });
+  if (!raw || !Array.isArray(raw.records)) return { records: [] };
+  return { records: raw.records.filter(isParkedTaskRecord).slice(0, 100) };
+}
+
+export function saveParkedTasks(commonDir: string, config: WorkflowConfig, value: ParkedTasksState): void {
+  ensureStateDir(commonDir, config);
+  writeVersionedJsonFile('parkedTasks', parkedTasksPath(commonDir, config), value);
+}
+
+function isParkedTaskRecord(value: unknown): value is ParkedTaskRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return typeof raw.taskSlug === 'string'
+    && typeof raw.branch === 'string'
+    && typeof raw.lineageKey === 'string'
+    && typeof raw.parkedAt === 'string'
+    && typeof raw.reason === 'string'
+    && Array.isArray(raw.openFindingIds)
+    && Array.isArray(raw.unblockHints)
+    && typeof raw.notified === 'boolean'
+    && isRecord(raw.budgetSpent);
 }
 
 function normalizeRouteSafetyRecord(value: unknown): RouteSafetyRecord | null {
@@ -3672,6 +3944,7 @@ function normalizeRouteSafetyResumeRecord(value: unknown): RouteSafetyResumeReco
       && raw.kind !== 'fix-attempt'
       && raw.kind !== 'legacy-import'
       && raw.kind !== 'legacy-fresh-start'
+      && raw.kind !== 'budget-extension-grant'
     )
   ) {
     return null;
@@ -4130,7 +4403,7 @@ function acquireReviewStateLock(commonDir: string, config: WorkflowConfig): { re
   );
 }
 
-function acquireDirectoryStateLock(lockPath: string, lockedMessage: string): { release: () => void } {
+export function acquireDirectoryStateLock(lockPath: string, lockedMessage: string): { release: () => void } {
   mkdirSync(path.dirname(lockPath), { recursive: true });
   clearStaleReviewStateLock(lockPath);
   try {

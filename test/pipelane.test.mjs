@@ -18207,17 +18207,26 @@ function appendDeployRecord(repoRoot, record) {
 }
 
 function readRouteSafetyState(repoRoot) {
+  // The legacy frozen store: only D6 migration fixtures read it now.
   const statePath = path.join(sharedStateDir(repoRoot), 'route-safety-state.json');
   return existsSync(statePath)
     ? JSON.parse(readFileSync(statePath, 'utf8'))
     : { routes: {} };
 }
 
+function readTaskBudgetState(repoRoot) {
+  const statePath = path.join(sharedStateDir(repoRoot), 'task-budget-state.json');
+  return existsSync(statePath)
+    ? JSON.parse(readFileSync(statePath, 'utf8'))
+    : { entries: {} };
+}
+
 function latestRouteSafetyRecord(repoRoot) {
-  const state = readRouteSafetyState(repoRoot);
-  const digest = state.latestPausedRouteFingerprintDigest;
-  if (digest && state.routes[digest]) return state.routes[digest];
-  return Object.values(state.routes ?? {}).sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)))[0] ?? null;
+  // Convergence S1: budgets live in the lineage-keyed task-budget ledger.
+  const state = readTaskBudgetState(repoRoot);
+  const key = state.latestPausedLineageKey;
+  if (key && state.entries?.[key]) return state.entries[key];
+  return Object.values(state.entries ?? {}).sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)))[0] ?? null;
 }
 
 async function writeSucceededDeployRecord(repoRoot, environment, sha, surfaces = ['frontend'], options = {}) {
@@ -21330,10 +21339,12 @@ test('route safety TTY menu keeps explicit choices but omits an unavailable audi
   try {
     writePipelaneConfig(repoRoot, 'Demo App');
     const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
-    const safety = await import(path.join(KIT_ROOT, 'src', 'operator', 'route-loop-safety.ts'));
+    const safety = await import(path.join(KIT_ROOT, 'src', 'operator', 'task-budget.ts'));
     const context = state.resolveWorkflowContext(repoRoot);
     const record = {
-      routeFingerprintDigest: 'abcdef1234567890',
+      budgetVersion: 1,
+      lineageKey: 'c'.repeat(64),
+      routeFingerprintDigest: 'c'.repeat(64),
       routeFingerprint: '{}',
       targetCommand: '/pr',
       taskSlug: 'route-safety',
@@ -21344,8 +21355,14 @@ test('route safety TTY menu keeps explicit choices but omits an unavailable audi
       fixReviewLoops: 1,
       aiReviewRuns: 1,
       countedReviewRunIds: ['review-1'],
+      aiRunsBudget: 8,
+      activeMinutesBudget: 90,
+      fixReviewLoopsBudget: 1,
+      aiRunLaunches: 1,
+      activeMillisUsed: 5 * 60 * 1000,
+      lifetimeExtensions: 0,
     };
-    const menu = safety.renderRouteSafetyInteractiveMenu(context, record, {
+    const menu = safety.renderTaskBudgetInteractiveMenu(context, record, {
       reason: 'blocking/major review findings are present',
       issues: [{
         status: 'incomplete',
@@ -21367,14 +21384,13 @@ test('route safety TTY menu keeps explicit choices but omits an unavailable audi
 
     assert.match(menu, /1\. Stop here and show review findings/);
     assert.doesNotMatch(menu, /request-audited-fix|resume --request-fix/);
-    assert.match(menu, /3\. Choose how many more loops and minutes to allow/);
+    assert.match(menu, /3\. Extend this task budget with a typed confirmation/);
     assert.match(menu, /4\. Proceed anyway for this exact target and route/);
-    assert.match(menu, /5\. Keep going until review passes, with explicit limits/);
-    assert.match(menu, /fix\/review loops/i);
-    assert.match(menu, /minutes/i);
-    assert.match(menu, /AI review runs/i);
+    assert.doesNotMatch(menu, /Keep going until review passes/);
+    assert.match(menu, /Fix\/review loops: 1\/1/);
+    assert.match(menu, /AI runs: 1\/8/);
+    assert.match(menu, /Active minutes: 5\/90/);
     assert.match(menu, /lacks compatible capability evidence/);
-    assert.doesNotMatch(menu, /\bbudget\b|\bcap\b/i);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -21423,13 +21439,16 @@ test('route safety pauses non-TTY PR flow on blocking review findings and reuses
       assert.equal(result.status, 1);
       assert.match(result.stderr, /Route-bound delivery paused before \/pr/);
       assert.match(result.stderr, /blocking\/major review findings/);
-      assert.match(result.stderr, /pipelane resume --one-more-loop/);
-      assert.match(result.stderr, /pipelane resume --more-loops=2 --more-minutes=45/);
-      assert.match(result.stderr, /pipelane resume --until-review-passes --max-more-loops=3 --max-more-minutes=120/);
-      assert.match(result.stderr, /pipelane resume --accept-findings/);
-      assert.match(result.stderr, /pipelane run review override --gate always-fails/);
-      assert.match(result.stderr, /Recommended recovery: request one audited host fix attempt, repair every blocking finding/);
-      assert.doesNotMatch(result.stderr, /\bbudget\b|\bcap\b/i);
+      // Convergence S1 (§4.3): non-TTY pause output carries no resume or
+      // bypass command strings — recovery is Board/TTY only.
+      assert.doesNotMatch(result.stderr, /pipelane resume --one-more-loop/);
+      assert.doesNotMatch(result.stderr, /pipelane resume --more-loops/);
+      assert.doesNotMatch(result.stderr, /pipelane resume --until-review-passes/);
+      assert.doesNotMatch(result.stderr, /pipelane resume --accept-findings/);
+      assert.doesNotMatch(result.stderr, /pipelane run review override --gate/);
+      assert.match(result.stderr, /available on the Board or an interactive operator terminal/);
+      assert.match(result.stderr, /Programmatic budget extension is not supported/);
+      assert.match(result.stderr, /Fix\/review loops: 1\//);
     }
 
     const routeRecord = latestRouteSafetyRecord(created.worktreePath);
@@ -21660,7 +21679,9 @@ process.stdout.write(JSON.stringify({ status: fixed ? 'passed' : 'failed', findi
     const blockedText = blocked.stderr;
     for (const finding of failedReview.gates[0].findings) assert.match(blockedText, new RegExp(finding.title));
     assert.ok(blockedText.indexOf('Fixture label obscures') < blockedText.indexOf('Review recovery choices:'));
-    assert.match(blockedText, /pipelane resume --request-fix/);
+    // §4.3: the pause names the audited fix action but prints no resume
+    // command strings; /fix knows the verb.
+    assert.doesNotMatch(blockedText, /pipelane resume --request-fix/);
     assert.match(blockedText, /request-audited-fix/);
 
     const requested = JSON.parse(runCli(['run', 'resume', '--request-fix', '--json'], created.worktreePath).stdout);
@@ -21669,7 +21690,7 @@ process.stdout.write(JSON.stringify({ status: fixed ? 'passed' : 'failed', findi
     const tokenMatch = requested.message.match(/--fix-token="([A-Za-z0-9_-]+)"/);
     assert.ok(tokenMatch, requested.message);
     const token = tokenMatch[1];
-    let persistedRouteText = readFileSync(path.join(sharedStateDir(created.worktreePath), 'route-safety-state.json'), 'utf8');
+    let persistedRouteText = readFileSync(path.join(sharedStateDir(created.worktreePath), 'task-budget-state.json'), 'utf8');
     assert.doesNotMatch(persistedRouteText, new RegExp(token));
     let route = latestRouteSafetyRecord(created.worktreePath);
     const lineageDigest = route.lineageDigest;
@@ -21732,7 +21753,7 @@ process.stdout.write(JSON.stringify({ status: fixed ? 'passed' : 'failed', findi
     route = latestRouteSafetyRecord(created.worktreePath);
     assert.ok(route.fixAttempts.find((entry) => entry.id === fixAttemptId).routeCompletedAt);
     assert.equal(route.lineageDigest, lineageDigest);
-    persistedRouteText = readFileSync(path.join(sharedStateDir(created.worktreePath), 'route-safety-state.json'), 'utf8');
+    persistedRouteText = readFileSync(path.join(sharedStateDir(created.worktreePath), 'task-budget-state.json'), 'utf8');
     assert.doesNotMatch(persistedRouteText, new RegExp(token));
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
@@ -21774,13 +21795,16 @@ test('fix tokens enforce one no-change attempt, expiry, mismatch, and atomic con
     const blocked = runCli(['run', 'pr', '--title', 'Fix Token Edges', '--json'], created.worktreePath, prEnv, true);
     assert.equal(blocked.status, 1);
 
-    const ordinaryResume = JSON.parse(runCli(['run', 'resume', '--one-more-loop', '--json'], created.worktreePath).stdout);
-    assert.doesNotMatch(ordinaryResume.message, /fixed|repair completed/i);
+    // D11: a non-interactive extension attempt refuses hard and files a
+    // consent card; it must not interfere with the audited fix-token flow.
+    const ordinaryResume = runCli(['run', 'resume', '--one-more-loop', '--json'], created.worktreePath, {}, true);
+    assert.equal(ordinaryResume.status, 1);
+    assert.match(ordinaryResume.stderr, /Budget extension refused: programmatic resume is not supported/);
     const invalid = runCli([
       'run', 'resume', '--fix-token', 'not-a-real-token', '--verification-file', verificationFile, '--json',
     ], created.worktreePath, {}, true);
     assert.equal(invalid.status, 1);
-    assert.match(invalid.stderr, /invalid for this route lineage/);
+    assert.match(invalid.stderr, /invalid for this task lineage/);
 
     const firstToken = fixTokenFromMessage(JSON.parse(runCli(['run', 'resume', '--request-fix', '--json'], created.worktreePath).stdout).message);
     const noChange = JSON.parse(runCli([
@@ -21808,15 +21832,15 @@ test('fix tokens enforce one no-change attempt, expiry, mismatch, and atomic con
       runCliAsync(concurrentArgs, created.worktreePath),
     ]);
     assert.deepEqual(concurrent.map((result) => result.status).sort(), [0, 1]);
-    assert.match(concurrent.find((result) => result.status === 1).stderr, /already consumed; replay is not allowed|route safety state is locked|is in use by resume/);
+    assert.match(concurrent.find((result) => result.status === 1).stderr, /already consumed; replay is not allowed|task budget state is locked|completion journal .* is locked|is in use by resume/);
     route = latestRouteSafetyRecord(created.worktreePath);
     assert.equal(route.fixAttempts.filter((attempt) => attempt.tokenDigest === createHash('sha256').update(concurrentToken).digest('hex') && attempt.consumedAt).length, 1);
 
     writeFileSync(featurePath, 'initial failed target\n', 'utf8');
     const expiringToken = fixTokenFromMessage(JSON.parse(runCli(['run', 'resume', '--request-fix', '--json'], created.worktreePath).stdout).message);
-    const routeStatePath = path.join(sharedStateDir(created.worktreePath), 'route-safety-state.json');
+    const routeStatePath = path.join(sharedStateDir(created.worktreePath), 'task-budget-state.json');
     let routeState = JSON.parse(readFileSync(routeStatePath, 'utf8'));
-    const activeRoute = routeState.routes[route.lineageDigest];
+    const activeRoute = routeState.entries[route.lineageKey];
     activeRoute.fixAttempts.find((attempt) => attempt.tokenDigest === createHash('sha256').update(expiringToken).digest('hex')).expiresAt = '2000-01-01T00:00:00.000Z';
     writeFileSync(routeStatePath, `${JSON.stringify(routeState, null, 2)}\n`, 'utf8');
     const expired = runCli(['run', 'resume', '--fix-token', expiringToken, '--verification-file', verificationFile, '--json'], created.worktreePath, {}, true);
@@ -21825,11 +21849,11 @@ test('fix tokens enforce one no-change attempt, expiry, mismatch, and atomic con
 
     const mismatchedToken = fixTokenFromMessage(JSON.parse(runCli(['run', 'resume', '--request-fix', '--json'], created.worktreePath).stdout).message);
     routeState = JSON.parse(readFileSync(routeStatePath, 'utf8'));
-    routeState.routes[route.lineageDigest].currentAttemptDigest = '0'.repeat(64);
+    routeState.entries[route.lineageKey].currentAttemptDigest = '0'.repeat(64);
     writeFileSync(routeStatePath, `${JSON.stringify(routeState, null, 2)}\n`, 'utf8');
     const mismatched = runCli(['run', 'resume', '--fix-token', mismatchedToken, '--verification-file', verificationFile, '--json'], created.worktreePath, {}, true);
     assert.equal(mismatched.status, 1);
-    assert.match(mismatched.stderr, /does not match the exact task binding, route lineage, failed attempt, and review run/);
+    assert.match(mismatched.stderr, /does not match the exact task binding, task lineage, failed attempt, and review run/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -21948,9 +21972,13 @@ test('cleaned abandoned task and recreated slug cannot reuse its fix token or al
       'run', 'resume', '--fix-token', oldToken, '--verification-file', verificationFile, '--json',
     ], replacement.worktreePath, {}, true);
     assert.equal(oldTokenReuse.status, 1);
-    assert.match(oldTokenReuse.stderr, /invalid for this route lineage/);
-    const allRoutes = Object.values(readRouteSafetyState(replacement.worktreePath).routes);
-    assert.ok(allRoutes.some((route) => route.lineageDigest === oldRoute.lineageDigest && route.fixAttempts?.[0]?.tokenDigest));
+    assert.match(oldTokenReuse.stderr, /invalid for this task lineage/);
+    // D10: /clean archived the abandoned lineage to a summary line; the
+    // replacement lineage carries none of its attempts or spend.
+    const archiveLines = readFileSync(path.join(sharedStateDir(replacement.worktreePath), 'task-budget-archive.jsonl'), 'utf8')
+      .split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    assert.ok(archiveLines.some((line) => line.lineageKey === oldRoute.lineageKey));
+    assert.equal(readTaskBudgetState(replacement.worktreePath).entries[oldRoute.lineageKey], undefined, 'the abandoned entry archived out of the live ledger');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -21991,7 +22019,9 @@ test('review and route blockers retain both failed report and diagnostics before
     const blocked = runCli(['run', 'pr', '--title', 'Retain Failure Output', '--json'], created.worktreePath, {}, true);
     assert.equal(blocked.status, 1);
     const reportIndex = blocked.stderr.indexOf('retained finding: null input crashes');
-    const choicesIndex = blocked.stderr.indexOf('Resume commands:');
+    // §4.3 removed the non-TTY resume-command menu; the recovery heading is
+    // the surviving anchor for the ordering contract.
+    const choicesIndex = blocked.stderr.indexOf('Review recovery choices:');
     assert.ok(reportIndex >= 0, blocked.stderr);
     assert.ok(blocked.stderr.includes('provider diagnostic: model exited cleanly'), blocked.stderr);
     assert.ok(choicesIndex > reportIndex, 'all retained failure output must appear before recovery choices');
@@ -22017,6 +22047,7 @@ test('route safety explicit resume overrides can accept findings and continue', 
     runCli(['setup'], repoRoot);
     updateWorkflowConfig(repoRoot, (config) => {
       config.prePrChecks = [];
+      config.routeSafety = { defaultFixReviewLoops: 3, defaultMinutes: 90, defaultAiReviewRuns: 3, stopOnMajorFindings: true };
       config.reviewGates = {
         policyVersion: 2,
         planReview: { gates: [] },
@@ -22037,8 +22068,11 @@ test('route safety explicit resume overrides can accept findings and continue', 
     const paused = runCli(['run', 'pr', '--title', 'Route Safety Resume', '--json'], created.worktreePath, env, true);
     assert.equal(paused.status, 1);
 
-    const oneMore = JSON.parse(runCli(['run', 'resume', '--one-more-loop', '--json'], created.worktreePath).stdout);
-    assert.match(oneMore.message, /Allowed one more fix\/review loop/);
+    // D11: the old self-granted allowance now refuses hard; acceptance is the
+    // informed-consent path and needs no budget extension.
+    const oneMore = runCli(['run', 'resume', '--one-more-loop', '--json'], created.worktreePath, {}, true);
+    assert.equal(oneMore.status, 1);
+    assert.match(oneMore.stderr, /Budget extension refused: programmatic resume is not supported/);
     const accepted = JSON.parse(runCli(['run', 'resume', '--accept-findings', '--reason', 'risk accepted for this exact PR', '--json'], created.worktreePath).stdout);
     assert.match(accepted.message, /Accepted current review findings/);
 
@@ -23073,6 +23107,7 @@ test('route safety accept-findings is bound to the accepted review run id', () =
     runCli(['setup'], repoRoot);
     updateWorkflowConfig(repoRoot, (config) => {
       config.prePrChecks = [];
+      config.routeSafety = { defaultFixReviewLoops: 3, defaultMinutes: 90, defaultAiReviewRuns: 3, stopOnMajorFindings: true };
       config.reviewGates = {
         policyVersion: 2,
         planReview: { gates: [] },
@@ -23092,7 +23127,6 @@ test('route safety accept-findings is bound to the accepted review run id', () =
     const firstReview = JSON.parse(runCli(['run', 'review', '--json'], created.worktreePath, {}, true).stdout);
     const paused = runCli(['run', 'pr', '--title', 'Route Safety Review Id', '--json'], created.worktreePath, env, true);
     assert.equal(paused.status, 1);
-    runCli(['run', 'resume', '--one-more-loop', '--json'], created.worktreePath);
     runCli(['run', 'resume', '--accept-findings', '--reason', 'accept only the first review run', '--json'], created.worktreePath);
 
     const secondReview = JSON.parse(runCli(['run', 'review', '--json'], created.worktreePath, {}, true).stdout);
@@ -23117,9 +23151,12 @@ test('route safety pending review stop exits non-zero', () => {
     writePipelaneConfig(repoRoot, 'Demo App');
     const ageRouteSafetyState = [
       'const fs = require("node:fs");',
-      `const statePath = ${JSON.stringify(path.join(sharedStateDir(repoRoot), 'route-safety-state.json'))};`,
+      `const statePath = ${JSON.stringify(path.join(sharedStateDir(repoRoot), 'task-budget-state.json'))};`,
       'const state = JSON.parse(fs.readFileSync(statePath, "utf8"));',
-      'for (const route of Object.values(state.routes || {})) route.firstStartedAt = "2000-01-01T00:00:00.000Z";',
+      // D14: budgets meter accumulated ACTIVE execution, so the fixture
+      // inflates activeMillisUsed; aging firstStartedAt no longer spends
+      // anything (wall-clock idle is free by design).
+      'for (const entry of Object.values(state.entries || {})) entry.activeMillisUsed = 91 * 60 * 1000;',
       'fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\\n");',
     ].join(' ');
     updateWorkflowConfig(repoRoot, (config) => {
@@ -23156,8 +23193,16 @@ test('route safety pending review stop exits non-zero', () => {
     assert.equal(review.status, 1);
     const payload = JSON.parse(review.stdout);
     assert.equal(payload.status, 'pending');
-    assert.match(payload.message, /Route-bound delivery paused before \/pr/);
-    assert.match(payload.message, /minutes reached 1/);
+    // Active-minutes exhaustion is terminal (§4.3): the lane parks with the
+    // terminal statement and no resume command strings.
+    assert.match(payload.message, /Task parked:/);
+    assert.match(payload.message, /active execution minutes reached 90/);
+    assert.match(payload.message, /Programmatic resume is not/);
+    assert.doesNotMatch(payload.message, /pipelane resume --/);
+    const parkedState = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'parked-tasks.json'), 'utf8'));
+    assert.equal(parkedState.records.length, 1);
+    assert.match(parkedState.records[0].reason, /active execution minutes/);
+    assert.equal(parkedState.records[0].notified, true);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -23272,9 +23317,11 @@ test('stable route lineage conservatively auto-migrates an unambiguous legacy ca
       countedReviewRunIds: runIds,
       resumes: [{
         id: `legacy-resume-${digest.slice(0, 2)}`,
+        // The first candidate carries a human (tty) allowance; the second is
+        // an agent self-grant, which D11 refuses to honor as budget.
         kind: 'more-loops-and-minutes',
         recordedAt: '2026-06-01T12:00:00.000Z',
-        source: 'resume',
+        source: digest === firstDigest ? 'tty' : 'resume',
         moreLoops: digest === firstDigest ? 1 : 3,
         moreMinutes: digest === firstDigest ? 10 : 5,
       }],
@@ -23288,19 +23335,24 @@ test('stable route lineage conservatively auto-migrates an unambiguous legacy ca
 
     const blocked = runCli(['run', 'review', '--json'], created.worktreePath, {}, true);
     assert.equal(blocked.status, 1);
-    const migratedState = state.loadRouteSafetyState(context.commonDir, context.config);
-    const lineage = Object.values(migratedState.routes).find((record) => record.lineageVersion === 1);
+    const budgetState = readTaskBudgetState(created.worktreePath);
+    const lineage = Object.values(budgetState.entries).find((record) => record.taskSlug === created.taskSlug);
     assert.ok(lineage);
     assert.equal(lineage.legacyMigration.status, 'imported');
     assert.deepEqual(new Set(lineage.legacyMigration.candidateDigests), new Set([firstDigest, secondDigest]));
     assert.equal(lineage.firstStartedAt, '2026-05-01T00:00:00.000Z');
     assert.equal(lineage.fixReviewLoops, 3);
     assert.equal(lineage.aiReviewRuns, 2);
-    assert.equal(lineage.legacyMigration.extraLoops, 3, 'duplicate legacy allowances use the maximum, not a sum');
-    assert.equal(lineage.legacyMigration.extraMinutes, 10, 'each legacy allowance dimension migrates conservatively');
+    assert.equal(lineage.aiRunLaunches, 2, 'legacy run counts import as the launch-count floor');
+    // D11: only the human (tty) allowance carries forward; the agent
+    // self-granted 3-loop allowance is not honored as budget.
+    assert.equal(lineage.legacyMigration.extraLoops, 1, 'only tty-sourced legacy allowances migrate');
+    assert.equal(lineage.legacyMigration.extraMinutes, 10, 'only tty-sourced legacy allowances migrate');
     assert.deepEqual(new Set(lineage.countedReviewRunIds), new Set(['legacy-review-a', 'legacy-review-b']));
-    assert.ok(migratedState.routes[firstDigest], 'legacy source records remain preserved');
-    assert.ok(migratedState.routes[secondDigest], 'legacy source records remain preserved');
+    const legacyState = state.loadRouteSafetyState(context.commonDir, context.config);
+    assert.ok(legacyState.routes[firstDigest], 'legacy source records remain preserved read-only');
+    assert.ok(legacyState.routes[secondDigest], 'legacy source records remain preserved read-only');
+    assert.ok(budgetState.legacyRouteSafetyFrozenAt, 'the legacy store freezes at first migration consult');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -23353,12 +23405,13 @@ test('ambiguous legacy route history requires audited selected import and never 
     assert.match(blockedOutput, /legacy route history is ambiguous/);
     assert.match(blockedOutput, new RegExp(`legacy-import:${selectedDigest}`));
     assert.match(blockedOutput, /legacy-fresh-start/);
-    let migratedState = state.loadRouteSafetyState(context.commonDir, context.config);
-    let lineage = Object.values(migratedState.routes).find((record) => record.lineageVersion === 1);
+    let budgetState = readTaskBudgetState(created.worktreePath);
+    let lineage = Object.values(budgetState.entries).find((record) => record.taskSlug === created.taskSlug);
     assert.equal(lineage.legacyMigration.status, 'pending');
     assert.equal(lineage.fixReviewLoops, 0, 'an ambiguous budget may not be silently attached');
-    assert.ok(migratedState.routes[selectedDigest]);
-    assert.ok(migratedState.routes[competingDigest]);
+    const preservedState = state.loadRouteSafetyState(context.commonDir, context.config);
+    assert.ok(preservedState.routes[selectedDigest]);
+    assert.ok(preservedState.routes[competingDigest]);
 
     const imported = JSON.parse(runCli([
       'run', 'resume',
@@ -23367,14 +23420,15 @@ test('ambiguous legacy route history requires audited selected import and never 
       '--json',
     ], created.worktreePath).stdout);
     assert.match(imported.message, /Imported the preserved budget/);
-    migratedState = state.loadRouteSafetyState(context.commonDir, context.config);
-    lineage = Object.values(migratedState.routes).find((record) => record.lineageVersion === 1);
+    budgetState = readTaskBudgetState(created.worktreePath);
+    lineage = Object.values(budgetState.entries).find((record) => record.taskSlug === created.taskSlug);
     assert.equal(lineage.legacyMigration.status, 'imported');
     assert.equal(lineage.legacyMigration.sourceDigest, selectedDigest);
     assert.equal(lineage.legacyMigration.reason, 'this preserved route is the audited predecessor of the active task binding');
     assert.equal(lineage.fixReviewLoops, 4);
     assert.equal(lineage.aiReviewRuns, 4);
-    assert.ok(migratedState.routes[competingDigest], 'unselected ambiguous candidates remain preserved');
+    const preservedAfter = state.loadRouteSafetyState(context.commonDir, context.config);
+    assert.ok(preservedAfter.routes[competingDigest], 'unselected ambiguous candidates remain preserved');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -40658,5 +40712,594 @@ test('review policy update notice fires only for repos on an older policyVersion
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(pipelaneHome, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Convergence v1 S1 — budget integrity acceptance tests (plan §8-S1).
+// ---------------------------------------------------------------------------
+
+function listConsentRecords(repoRoot) {
+  const dir = path.join(sharedStateDir(repoRoot), 'consent-grants');
+  if (!existsSync(dir)) return { cards: [], grants: [] };
+  const cards = [];
+  const grants = [];
+  for (const entry of readdirSync(dir)) {
+    if (!entry.endsWith('.json')) continue;
+    const record = JSON.parse(readFileSync(path.join(dir, entry), 'utf8'));
+    if (String(record.id ?? '').startsWith('consent-card-')) cards.push(record);
+    if (String(record.id ?? '').startsWith('budget-grant-')) grants.push(record);
+  }
+  return { cards, grants };
+}
+
+test('convergence S1: codexskill ledger replay parks within two AI runs and the resume burst mints nothing', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const gateMarker = path.join(mkdtempSync(path.join(os.tmpdir(), 'pipelane-s1-marker-')), 'gate-ran');
+  try {
+    writePipelaneConfig(repoRoot, 'Codexskill Replay', {
+      prePrChecks: [],
+      reviewGates: {
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: [{
+          id: 'stub-ai-review', phase: 'ai-diff', type: 'skill', blocking: true,
+          skill: 'stub-review',
+          command: `node -e "require('node:fs').writeFileSync(${JSON.stringify(gateMarker)}, 'ran'); console.log('passed')"`,
+        }],
+      },
+    });
+    commitAll(repoRoot, 'Configure codexskill replay fixture');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Codexskill Replay', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'replayed change\n', 'utf8');
+
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const generator = await import(pathToFileURL(path.join(KIT_ROOT, 'test', 'fixtures', 'convergence', 'generate-codexskill-ledger.mjs')).href);
+    const context = state.resolveWorkflowContext(created.worktreePath);
+    const spec = generator.loadCodexskillShapeSpec();
+    assert.equal(spec.reviewPasses, 69, 'shape spec pins the audited pass count');
+    assert.equal(spec.resumeBurst.count, 20, 'shape spec pins the audited burst size');
+    const branchName = run('git', ['branch', '--show-current'], created.worktreePath);
+    const headSha = run('git', ['rev-parse', 'HEAD'], created.worktreePath);
+    const legacyRoute = generator.generateCodexskillLegacyRoute(spec, {
+      taskSlug: created.taskSlug,
+      branchName,
+      headSha,
+    });
+    state.saveRouteSafetyState(context.commonDir, context.config, { routes: { [legacyRoute.routeFingerprintDigest]: legacyRoute } });
+
+    // Replay: the unambiguous legacy lineage auto-binds with its counters, so
+    // the sized budget is already overspent and the lane parks terminally
+    // before launching a single further model call (≤ 2 AI runs satisfied
+    // with 0).
+    const review = runCli(['run', 'review', '--json'], created.worktreePath, {}, true);
+    assert.equal(review.status, 1);
+    const output = `${review.stdout}\n${review.stderr}`;
+    assert.match(output, /Task parked:/);
+    assert.match(output, /review budget exhausted: AI runs reached/);
+    assert.match(output, /terminal state for autonomous execution/);
+    assert.match(output, /pending consent request has been filed/);
+    assert.doesNotMatch(output, /pipelane resume --/);
+    assert.equal(existsSync(gateMarker), false, 'the parked lane must not launch the AI gate');
+
+    const budgetEntry = latestRouteSafetyRecord(created.worktreePath);
+    assert.equal(budgetEntry.aiRunLaunches, 69, 'legacy run counts import as launch-count floor');
+    assert.equal(budgetEntry.legacyMigration.status, 'imported');
+    assert.ok(budgetEntry.parkedAt);
+    assert.equal(budgetEntry.legacyMigration.extraLoops ?? 0, 0, 'the 20-grant non-interactive burst is not honored as budget');
+
+    const parked = JSON.parse(readFileSync(path.join(sharedStateDir(created.worktreePath), 'parked-tasks.json'), 'utf8'));
+    assert.equal(parked.records.length, 1);
+    assert.equal(parked.records[0].taskSlug, created.taskSlug);
+    assert.equal(parked.records[0].notified, true);
+    assert.ok(parked.records[0].pendingConsentCardId);
+    assert.deepEqual(parked.records[0].budgetSpent.aiRunLaunches, 69);
+
+    // 20 rapid non-interactive resume attempts: hard refusals, exactly one
+    // pending card, and no token or grant material in any output.
+    for (let index = 0; index < 20; index += 1) {
+      const attempt = runCli(['run', 'resume', '--one-more-loop', '--json'], created.worktreePath, {}, true);
+      assert.equal(attempt.status, 1, `burst attempt ${index} must refuse`);
+      assert.match(attempt.stderr, /Budget extension refused: programmatic resume is not supported|consent request .* is already pending|pending consent request/);
+      assert.doesNotMatch(attempt.stderr, /budget-grant-/);
+      assert.doesNotMatch(`${attempt.stdout}`, /budget-grant-/);
+    }
+    const afterBurst = listConsentRecords(created.worktreePath);
+    assert.equal(afterBurst.cards.filter((card) => card.status === 'pending').length, 1, '20 rapid resumes leave exactly one pending card');
+    assert.equal(afterBurst.grants.length, 0, 'no code path minted a grant non-interactively');
+
+    // /status surfaces the terminal state and both budget currencies.
+    const cockpit = runCli(['run', 'status'], created.worktreePath).stdout;
+    assert.match(cockpit, /PARKED TASKS/);
+    assert.match(cockpit, /PENDING BUDGET CONSENTS/);
+    assert.match(cockpit, /AI runs: 69\//);
+
+    // Board approval mints a one-use signed grant; `pipelane resume` consumes
+    // it exactly once and un-parks.
+    const consents = await import(path.join(KIT_ROOT, 'src', 'operator', 'consent-grants.ts'));
+    const pendingCard = afterBurst.cards.find((card) => card.status === 'pending');
+    const approved = consents.approveBudgetConsentCard(context.commonDir, context.config, pendingCard.id, { decidedBy: 'board-operator' });
+    assert.equal(approved.card.status, 'approved');
+    assert.match(approved.grant.signature, /^[a-f0-9]{64}$/);
+
+    const consumed = JSON.parse(runCli(['run', 'resume', '--json'], created.worktreePath).stdout);
+    assert.match(consumed.message, /Consumed one-use budget-extension grant/);
+    assert.match(consumed.message, /Lifetime extensions used: 1\/2/);
+    const unparked = latestRouteSafetyRecord(created.worktreePath);
+    assert.equal(unparked.parkedAt, undefined);
+    assert.equal(unparked.lifetimeExtensions, 1);
+    const parkedAfter = JSON.parse(readFileSync(path.join(sharedStateDir(created.worktreePath), 'parked-tasks.json'), 'utf8'));
+    assert.equal(parkedAfter.records.length, 0, 'consuming the grant un-parks');
+
+    // One-use: replaying the consumed grant refuses with the reuse reason.
+    const reuse = consents.consumeBudgetExtensionGrant(context.commonDir, context.config, { lineageKey: unparked.lineageKey, grantId: approved.grant.id });
+    assert.equal(reuse.refusal.code, 'reused');
+    assert.match(reuse.refusal.message, /already consumed/);
+
+    // Expired and tampered grants refuse with their reasons (fail-closed).
+    const integrity = await import(path.join(KIT_ROOT, 'src', 'operator', 'integrity.ts'));
+    const key = integrity.resolveConvergenceStateKey();
+    const expiredGrant = consents.mintTtyBudgetExtensionGrant(context.commonDir, context.config, {
+      lineageKey: unparked.lineageKey,
+      taskSlug: unparked.taskSlug,
+      branchName: unparked.branchName,
+      aiRunsDelta: 2,
+      activeMinutesDelta: 45,
+      fixReviewLoopsDelta: 1,
+      reason: 'synthetic expiry fixture',
+    }, { mintedBy: 'test', confirmationPhrase: 'extend budget for test' });
+    const grantPath = path.join(sharedStateDir(created.worktreePath), 'consent-grants', `${expiredGrant.id}.json`);
+    const expiredPayload = JSON.parse(readFileSync(grantPath, 'utf8'));
+    expiredPayload.expiresAt = '2000-01-01T00:00:00.000Z';
+    expiredPayload.signature = integrity.signSignedPayload(expiredPayload, key);
+    writeFileSync(grantPath, `${JSON.stringify(expiredPayload, null, 2)}\n`, 'utf8');
+    const expired = consents.consumeBudgetExtensionGrant(context.commonDir, context.config, { lineageKey: unparked.lineageKey, grantId: expiredGrant.id });
+    assert.equal(expired.refusal.code, 'expired');
+    assert.match(expired.refusal.message, /expired/);
+
+    expiredPayload.aiRunsDelta = 999;
+    writeFileSync(grantPath, `${JSON.stringify(expiredPayload, null, 2)}\n`, 'utf8');
+    const tampered = consents.consumeBudgetExtensionGrant(context.commonDir, context.config, { lineageKey: unparked.lineageKey, grantId: expiredGrant.id });
+    assert.equal(tampered.refusal.code, 'invalid-signature');
+    assert.match(tampered.refusal.message, /refused \(fail-closed\)/);
+
+    // Wrong scope: a grant for a different task lineage cannot extend this one.
+    const foreignGrant = consents.mintTtyBudgetExtensionGrant(context.commonDir, context.config, {
+      lineageKey: 'f'.repeat(64),
+      taskSlug: 'another-task',
+      branchName: 'codex/another-task',
+      aiRunsDelta: 2,
+      activeMinutesDelta: 45,
+      fixReviewLoopsDelta: 1,
+      reason: 'synthetic wrong-scope fixture',
+    }, { mintedBy: 'test', confirmationPhrase: 'extend budget for another-task' });
+    const wrongScope = consents.consumeBudgetExtensionGrant(context.commonDir, context.config, { lineageKey: unparked.lineageKey, grantId: foreignGrant.id });
+    assert.equal(wrongScope.refusal.code, 'wrong-scope');
+    assert.match(wrongScope.refusal.message, /different task lineage/);
+
+    // Lifetime ceiling: with maxLifetimeExtensions consumed, further requests
+    // point at /fix rethink or a new task.
+    const budgetStatePath = path.join(sharedStateDir(created.worktreePath), 'task-budget-state.json');
+    const budgetState = JSON.parse(readFileSync(budgetStatePath, 'utf8'));
+    for (const entry of Object.values(budgetState.entries)) {
+      entry.lifetimeExtensions = 2;
+      entry.pausedAt = new Date().toISOString();
+      entry.pauseReason = 'synthetic ceiling fixture';
+    }
+    writeFileSync(budgetStatePath, `${JSON.stringify(budgetState, null, 2)}\n`, 'utf8');
+    const ceiling = runCli(['run', 'resume', '--one-more-loop', '--json'], created.worktreePath, {}, true);
+    assert.equal(ceiling.status, 1);
+    assert.match(ceiling.stderr, /consumed its lifetime budget extensions/);
+    assert.match(ceiling.stderr, /fix rethink/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(path.dirname(gateMarker), { recursive: true, force: true });
+  }
+});
+
+test('convergence S1: completion journal replays a crash between debit and evidence exactly once and refuses tampering', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Journal Repo', {
+      prePrChecks: [],
+      reviewGates: { policyVersion: 2, planReview: { gates: [] }, gates: [] },
+    });
+    commitAll(repoRoot, 'Configure journal fixture');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Journal Crash Replay', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'journaled change\n', 'utf8');
+
+    const first = JSON.parse(runCli(['run', 'review', '--json'], created.worktreePath).stdout);
+    assert.equal(first.status, 'passed');
+    let entry = latestRouteSafetyRecord(created.worktreePath);
+    const journalPath = path.join(sharedStateDir(created.worktreePath), 'completion-journal', `${entry.lineageKey}.jsonl`);
+    assert.ok(existsSync(journalPath), 'review completion writes the per-task journal');
+    const journalLines = readFileSync(journalPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    assert.ok(journalLines.some((line) => line.kind === 'review-completion'));
+    assert.ok(journalLines.some((line) => line.kind === 'applied'));
+    for (const line of journalLines) assert.match(line.signature, /^[a-f0-9]{64}$/);
+
+    // Crash window (D15): a completion record journaled but never applied —
+    // the next lane entry replays it exactly once.
+    const journal = await import(path.join(KIT_ROOT, 'src', 'operator', 'completion-journal.ts'));
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = state.resolveWorkflowContext(created.worktreePath);
+    journal.appendReviewCompletionRecord(context.commonDir, context.config, {
+      lineageKey: entry.lineageKey,
+      taskSlug: entry.taskSlug,
+      branchName: entry.branchName,
+      reviewRunId: 'synthetic-crashed-run',
+      reviewStatus: 'passed',
+      debits: { aiRunLaunches: 3, activeMillis: 60_000, fixReviewLoops: 0, infraOnly: false },
+    });
+    const beforeReplay = latestRouteSafetyRecord(created.worktreePath);
+    assert.equal(beforeReplay.countedReviewRunIds.includes('synthetic-crashed-run'), false);
+
+    const second = JSON.parse(runCli(['run', 'review', '--json'], created.worktreePath).stdout);
+    assert.equal(second.status, 'passed');
+    entry = latestRouteSafetyRecord(created.worktreePath);
+    assert.ok(entry.countedReviewRunIds.includes('synthetic-crashed-run'), 'the crashed completion replayed');
+    assert.equal(entry.aiRunLaunches, 3, 'replay applied the journaled debits');
+    assert.equal(entry.fixReviewLoops, 0, 'a passed completion never consumes the convergence allowance');
+
+    const third = JSON.parse(runCli(['run', 'review', '--json'], created.worktreePath).stdout);
+    assert.equal(third.status, 'passed');
+    entry = latestRouteSafetyRecord(created.worktreePath);
+    assert.equal(entry.aiRunLaunches, 3, 'replay is exactly-once: a marker prevents double debits');
+
+    // Tampered journal line: fail-closed refusal, no unverified record applied.
+    const raw = readFileSync(journalPath, 'utf8').trim().split('\n');
+    const tamperedLine = JSON.parse(raw[0]);
+    tamperedLine.debits = { ...tamperedLine.debits, aiRunLaunches: 999 };
+    raw[0] = JSON.stringify(tamperedLine);
+    writeFileSync(journalPath, `${raw.join('\n')}\n`, 'utf8');
+    const blocked = runCli(['run', 'review', '--json'], created.worktreePath, {}, true);
+    assert.equal(blocked.status, 1);
+    assert.match(`${blocked.stdout}\n${blocked.stderr}`, /failed convergence-key signature verification|refused \(fail-closed\)/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('convergence S1: a branch-alone budget lineage transfers to the slug lineage instead of forking (RC4 dual-root class)', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Lineage Transfer', {
+      prePrChecks: [],
+      reviewGates: { policyVersion: 2, planReview: { gates: [] }, gates: [] },
+    });
+    commitAll(repoRoot, 'Configure lineage transfer');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Lineage Transfer', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'transfer\n', 'utf8');
+    const branchName = run('git', ['branch', '--show-current'], created.worktreePath);
+
+    // A caller that could not see the task lock (the S0 dual-state-root
+    // sighting) creates a branch-alone entry with spend on it.
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = state.resolveWorkflowContext(created.worktreePath);
+    state.withTaskBudgetStateLock(context.commonDir, context.config, () => {
+      const budgetState = state.loadTaskBudgetState(context.commonDir, context.config);
+      const lineageKey = 'a'.repeat(64);
+      budgetState.entries[lineageKey] = {
+        budgetVersion: 1,
+        lineageKey,
+        lineageDigest: lineageKey,
+        lineageFingerprint: '{"synthetic":"branch-alone"}',
+        routeFingerprintDigest: lineageKey,
+        routeFingerprint: '{"synthetic":"branch-alone"}',
+        targetCommand: '/pr',
+        taskSlug: '',
+        branchName,
+        headSha: run('git', ['rev-parse', 'HEAD'], created.worktreePath),
+        firstStartedAt: '2026-07-17T00:00:00.000Z',
+        updatedAt: '2026-07-17T00:00:00.000Z',
+        fixReviewLoops: 0,
+        aiReviewRuns: 2,
+        countedReviewRunIds: ['dual-root-run-1', 'dual-root-run-2'],
+        aiRunsBudget: 8,
+        activeMinutesBudget: 90,
+        fixReviewLoopsBudget: 1,
+        aiRunLaunches: 2,
+        activeMillisUsed: 120000,
+        lifetimeExtensions: 0,
+      };
+      state.saveTaskBudgetState(context.commonDir, context.config, budgetState);
+    });
+
+    const review = JSON.parse(runCli(['run', 'review', '--json'], created.worktreePath).stdout);
+    assert.equal(review.status, 'passed');
+    const budgetState = readTaskBudgetState(created.worktreePath);
+    const entries = Object.values(budgetState.entries);
+    assert.equal(entries.length, 1, 'the slug-resolved caller must transfer the branch-alone entry, not fork a fresh budget');
+    assert.equal(entries[0].taskSlug, created.taskSlug);
+    assert.equal(entries[0].aiRunLaunches, 2, 'transferred entries keep their spend');
+    assert.ok(entries[0].countedReviewRunIds.includes('dual-root-run-1'));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('convergence S1: rollback wrapper compensation never deletes an unmanaged collision dir', async () => {
+  const stage = mkdtempSync(path.join(os.tmpdir(), 'pipelane-s1-compensation-'));
+  const lockedDir = path.join(stage, 'claude-skills', 'locked-managed');
+  try {
+    for (const host of ['claude', 'codex']) {
+      const skillsRoot = path.join(stage, `${host}-skills`);
+      const runtimeDir = path.join(stage, `${host}-runtime`);
+      mkdirSync(skillsRoot, { recursive: true });
+      mkdirSync(runtimeDir, { recursive: true });
+
+      // A foreign (user-owned, unmanaged) dir occupies a payload name.
+      const foreignDir = path.join(skillsRoot, 'foreign-skill');
+      mkdirSync(foreignDir, { recursive: true });
+      writeFileSync(path.join(foreignDir, 'user-data.txt'), 'irreplaceable user content\n', 'utf8');
+
+      // A managed retired wrapper whose removal fails mid-transaction.
+      const marker = host === 'claude'
+        ? '<!-- pipelane:claude-global-skill:locked-managed -->'
+        : '<!-- pipelane:codex-global-skill:locked-managed -->';
+      const managedDir = path.join(skillsRoot, 'locked-managed');
+      mkdirSync(managedDir, { recursive: true });
+      writeFileSync(path.join(managedDir, 'SKILL.md'), `${marker}\nmanaged wrapper\n`, 'utf8');
+      chmodSync(managedDir, 0o555);
+
+      const installer = await import(path.join(KIT_ROOT, 'src', 'operator', `${host}-install.ts`));
+      const restore = host === 'claude' ? installer.restoreClaudeSkillWrappers : installer.restoreCodexSkillWrappers;
+      const invoke = () => (host === 'claude'
+        ? restore(skillsRoot, runtimeDir, new Set(['locked-managed']), new Map([['foreign-skill', 'restored body\n']]))
+        : restore(skillsRoot, new Set(['locked-managed']), new Map([['foreign-skill', 'restored body\n']])));
+      try {
+        assert.throws(invoke, /EACCES|EPERM|ENOTEMPTY/, `${host}: the locked managed wrapper must fail the transaction`);
+      } finally {
+        chmodSync(managedDir, 0o755);
+      }
+      assert.ok(existsSync(path.join(foreignDir, 'user-data.txt')), `${host}: compensation must not delete the unmanaged collision dir`);
+      assert.equal(readFileSync(path.join(foreignDir, 'user-data.txt'), 'utf8'), 'irreplaceable user content\n');
+      assert.ok(!existsSync(path.join(foreignDir, 'SKILL.md')), `${host}: compensation must not scribble a wrapper into the foreign dir`);
+    }
+  } finally {
+    try {
+      if (existsSync(lockedDir)) chmodSync(lockedDir, 0o755);
+    } catch {}
+    rmSync(stage, { recursive: true, force: true });
+  }
+});
+
+test('convergence S1: /merge-scoped gate consents are consumed through the material-tree channel', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Merge Consent', {
+      prePrChecks: [],
+      reviewGates: {
+        policyVersion: 2,
+        planReview: { gates: [] },
+        gates: [{ id: 'always-fails', phase: 'static', type: 'command', blocking: true, command: 'node -e "process.exit(1)"' }],
+      },
+    });
+    commitAll(repoRoot, 'Configure merge consent');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Merge Consent', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'merge consent\n', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Merge consent change'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const review = runCli(['run', 'review', '--json'], created.worktreePath, {}, true);
+    assert.equal(review.status, 1);
+
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const enforcement = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-enforcement.ts'));
+    const context = state.resolveWorkflowContext(created.worktreePath);
+    const mergeCommand = state.formatWorkflowCommand(context.config, 'merge');
+
+    const override = runCli([
+      'run', 'review', 'override',
+      '--gate', 'always-fails',
+      '--scope', mergeCommand,
+      '--reason', 'S0 lane bug regression: consent recorded from the checkout must satisfy the merge target',
+      '--json',
+    ], created.worktreePath, {}, true);
+    assert.equal(override.status, 0, override.stderr);
+
+    const branchName = run('git', ['branch', '--show-current'], created.worktreePath);
+    const sha = run('git', ['rev-parse', 'HEAD'], created.worktreePath);
+    const treeHash = run('git', ['rev-parse', `${sha}^{tree}`], created.worktreePath);
+    const lock = state.ensureTaskBindingId(context.commonDir, context.config, created.taskSlug);
+    const mergeTarget = {
+      branchName,
+      sha,
+      worktreeStatusDigest: '',
+      worktreeStatusReliable: false,
+      worktreeStatusWarnings: [`review target is PR branch ${branchName}, not the current checkout`],
+      worktreeMaterialTreeHash: treeHash,
+      worktreeMaterialTreeReliable: true,
+      worktreeMaterialTreeWarnings: [],
+      taskBindingId: lock.taskBindingId,
+      reviewTargetDigest: createHash('sha256').update(JSON.stringify({ version: 2, branchName, sha, worktreeStatusDigest: '', worktreeMaterialTreeHash: treeHash })).digest('hex'),
+    };
+
+    const evidence = enforcement.evaluateReviewEvidenceForPr(context, { command: mergeCommand, target: mergeTarget });
+    assert.equal(evidence.allowed, true, 'the recorded /merge consent must satisfy the PR-branch merge target via the material-tree channel');
+    assert.ok(evidence.bypassedIssues.length > 0);
+    assert.match(evidence.message, /explicit exact-scope consent authorizes this action/);
+
+    // A different tree is a different content identity: no consent applies.
+    const emptyTree = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+    const foreignEvidence = enforcement.evaluateReviewEvidenceForPr(context, {
+      command: mergeCommand,
+      target: { ...mergeTarget, worktreeMaterialTreeHash: emptyTree },
+    });
+    assert.equal(foreignEvidence.allowed, false, 'a consent never follows a different material tree');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('convergence S1: /clean accepts a squash merge landed outside /merge only when trees are byte-identical', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Squash Clean', {
+      prePrChecks: [],
+      reviewGates: { policyVersion: 2, planReview: { gates: [] }, gates: [] },
+    });
+    commitAll(repoRoot, 'Configure squash clean');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Squash Clean', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'squash delivered\n', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Squash delivered change'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    const branchHead = run('git', ['rev-parse', 'HEAD'], created.worktreePath);
+    const branchTree = run('git', ['rev-parse', `${branchHead}^{tree}`], created.worktreePath);
+
+    // A squash merge performed outside /merge: a NEW sha on the base branch
+    // carrying the branch's exact tree.
+    const baseSha = run('git', ['rev-parse', 'origin/main'], created.worktreePath);
+    const squashSha = run('git', ['commit-tree', branchTree, '-p', baseSha, '-m', 'Squash Clean (#77)'], created.worktreePath);
+    execFileSync('git', ['push', 'origin', `${squashSha}:refs/heads/main`], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['fetch', 'origin', 'main'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = state.resolveWorkflowContext(repoRoot);
+    state.savePrRecord(context.commonDir, context.config, created.taskSlug, {
+      branchName: created.branchName ?? run('git', ['branch', '--show-current'], created.worktreePath),
+      title: 'Squash Clean',
+      number: 77,
+      url: 'https://example.test/pr/77',
+      mergedSha: squashSha,
+      mergedAt: new Date().toISOString(),
+    });
+
+    // Phase A: the branch advances past the squash — trees differ, so merge
+    // evidence must NOT authorize deleting the unique commit.
+    writeFileSync(path.join(created.worktreePath, 'extra.txt'), 'not yet delivered\n', 'utf8');
+    execFileSync('git', ['add', '.'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['commit', '-m', 'Post-squash work'], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    const refused = runCli(['run', 'clean', '--apply', '--task', created.taskSlug, '--json'], repoRoot, { PIPELANE_CLEAN_MIN_AGE_MS: '0' }, true);
+    assert.ok(existsSync(created.worktreePath), 'an advanced branch must not be cleaned on squash evidence');
+    assert.doesNotMatch(`${refused.stdout}`, /"status":\s*"cleaned"/);
+
+    // Phase B: back at the squash-delivered tree, the byte-identical proof
+    // authorizes cleanup.
+    execFileSync('git', ['reset', '--hard', branchHead], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    const cleaned = runCli(['run', 'clean', '--apply', '--task', created.taskSlug, '--json'], repoRoot, { PIPELANE_CLEAN_MIN_AGE_MS: '0' });
+    assert.match(cleaned.stdout, /"status":\s*"cleaned"/);
+    assert.equal(existsSync(created.worktreePath), false, 'the squash-delivered worktree is removed');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('convergence S1: board consent endpoints refuse untrusted mutations and mint only behind the session gauntlet', async () => {
+  const repoRoot = createRepo();
+  const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-s1-board-'));
+  const fixtureFile = path.join(fakeBin, 'workflow-api-fixture.json');
+  const env = {
+    PATH: `${fakeBin}:${process.env.PATH}`,
+    WORKFLOW_API_FIXTURE_FILE: fixtureFile,
+    PIPELANE_DASHBOARD_API_BIN: path.join(fakeBin, 'pipelane'),
+    PIPELANE_DASHBOARD_HOME: path.join(fakeBin, 'dashboard-state'),
+  };
+  writeFakePipelane(fakeBin, fixtureFile);
+  writeFileSync(fixtureFile, JSON.stringify(makeDashboardFixture(), null, 2) + '\n', 'utf8');
+
+  let server;
+  try {
+    writePipelaneConfig(repoRoot, 'Consent Board');
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const consents = await import(path.join(KIT_ROOT, 'src', 'operator', 'consent-grants.ts'));
+    const context = state.resolveWorkflowContext(repoRoot);
+    const { card } = consents.requestBudgetExtensionCard(context.commonDir, context.config, {
+      lineageKey: 'e'.repeat(64),
+      taskSlug: 'board-consent-task',
+      branchName: 'codex/board-consent-task',
+      aiRunsDelta: 2,
+      activeMinutesDelta: 45,
+      fixReviewLoopsDelta: 1,
+      reason: 'synthetic board approval fixture',
+    }, { provider: 'test', sessionId: null, source: 'test' });
+
+    server = await startDashboardServer(repoRoot, env);
+    const boardSession = await readDashboardBrowserSession(server);
+    const validHeaders = dashboardMutationHeaders(server, boardSession.token);
+
+    // The mutation gauntlet fronts the consent decision endpoints.
+    const noSession = await requestDashboard(server, `/api/consents/${encodeURIComponent(card.id)}/approve`, {
+      method: 'POST',
+      headers: Object.fromEntries(Object.entries(validHeaders).filter(([name]) => name !== 'X-Pipelane-Board-Session')),
+      body: JSON.stringify({}),
+    });
+    assert.equal(noSession.status, 403);
+    assert.equal(noSession.json?.error, 'board_invalid_session');
+
+    const wrongOrigin = await requestDashboard(server, `/api/consents/${encodeURIComponent(card.id)}/approve`, {
+      method: 'POST',
+      headers: { ...validHeaders, Origin: 'https://attacker.example' },
+      body: JSON.stringify({}),
+    });
+    assert.equal(wrongOrigin.status, 403);
+    assert.equal(wrongOrigin.json?.error, 'board_invalid_origin');
+    assert.equal(listConsentRecords(repoRoot).grants.length, 0, 'refused mutations must not mint');
+
+    // Denial requires a reason.
+    const denyNoReason = await requestDashboard(server, `/api/consents/${encodeURIComponent(card.id)}/deny`, {
+      method: 'POST',
+      headers: validHeaders,
+      body: JSON.stringify({}),
+    });
+    assert.equal(denyNoReason.status, 400);
+
+    // The full gauntlet mints exactly one signed grant.
+    const listed = await requestDashboard(server, '/api/consents', { method: 'GET' });
+    assert.equal(listed.status, 200);
+    assert.ok(listed.json.cards.some((entry) => entry.id === card.id && entry.status === 'pending'));
+
+    const approved = await requestDashboard(server, `/api/consents/${encodeURIComponent(card.id)}/approve`, {
+      method: 'POST',
+      headers: validHeaders,
+      body: JSON.stringify({}),
+    });
+    assert.equal(approved.status, 200, JSON.stringify(approved.json));
+    assert.match(approved.json.grantId, /^budget-grant-/);
+    const minted = listConsentRecords(repoRoot).grants;
+    assert.equal(minted.length, 1);
+    assert.equal(minted[0].source, 'board');
+    assert.equal(minted[0].cardId, card.id);
+    assert.match(minted[0].signature, /^[a-f0-9]{64}$/);
+
+    // Approving a decided card refuses.
+    const replay = await requestDashboard(server, `/api/consents/${encodeURIComponent(card.id)}/approve`, {
+      method: 'POST',
+      headers: validHeaders,
+      body: JSON.stringify({}),
+    });
+    assert.equal(replay.status, 409);
+  } finally {
+    if (server) {
+      server.processHandle.kill('SIGTERM');
+      await once(server.processHandle, 'exit').catch(() => undefined);
+    }
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
+test('convergence S1: budget-extension consent is never minted through action confirmation tokens', async () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Confirm Guard');
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const confirmTokens = await import(path.join(KIT_ROOT, 'src', 'operator', 'api', 'confirm-tokens.ts'));
+    const context = state.resolveWorkflowContext(repoRoot);
+    assert.throws(
+      () => confirmTokens.createActionConfirmation(context.commonDir, context.config, {
+        actionId: 'budget.extension.request',
+        fingerprint: 'f'.repeat(64),
+        normalizedInputs: {},
+      }),
+      /cannot be minted via action confirmation tokens/,
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
   }
 });

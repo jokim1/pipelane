@@ -82,9 +82,9 @@ import {
   type ReviewPlanGateConfig,
 } from '../state.ts';
 import {
-  guardReviewRunStartForRouteSafety,
-  recordReviewRunForRouteSafety,
-} from '../route-loop-safety.ts';
+  guardReviewRunStartForTaskBudget,
+  recordReviewRunForTaskBudget,
+} from '../task-budget.ts';
 import {
   currentCheckoutReviewEvidenceTarget,
   evaluateReviewEvidenceForPr,
@@ -2664,7 +2664,7 @@ async function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): Promise
   const gateFilter = parsed.flags.reviewGate.trim();
   const dryRun = parsed.flags.reviewDryRun;
   const activeSurfaces = context.modeState.requestedSurfaces ?? context.config.surfaces;
-  const startSafety = guardReviewRunStartForRouteSafety(cwd, parsed);
+  const startSafety = guardReviewRunStartForTaskBudget(cwd, parsed);
   if (startSafety.action === 'stop') {
     printResult(parsed.flags, {
       command: 'review',
@@ -2735,7 +2735,7 @@ async function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): Promise
     appendRecord: () => appendReviewRunRecord(context.commonDir, context.config, record),
   });
   pruneReviewArtifacts(context, false);
-  const routeSafety = recordReviewRunForRouteSafety(cwd, parsed, record);
+  const routeSafety = recordReviewRunForTaskBudget(cwd, parsed, record);
 
   const report = {
     command: 'review',

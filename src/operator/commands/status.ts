@@ -514,7 +514,7 @@ export function renderCockpit(
   options: RenderCockpitOptions = {},
 ): string {
   const color = options.color === true;
-  const { boardContext, branches, sourceHealth, attention, orchestration, cleanupSummary } = envelope.data;
+  const { boardContext, branches, sourceHealth, attention, orchestration, cleanupSummary, taskBudget } = envelope.data;
   const baseBranch = boardContext.baseBranch;
 
   const lines: string[] = [];
@@ -593,6 +593,8 @@ export function renderCockpit(
 
   lines.push(...renderOrchestration(orchestration, color));
   lines.push('');
+
+  lines.push(...renderTaskBudget(taskBudget, color));
 
   lines.push(...renderAttention(attention as ApiIssue[], color));
   lines.push('');
@@ -696,6 +698,52 @@ function renderReview(
   }
   if (presentation.nextAction) {
     lines.push(`  next: ${sanitizeForTerminal(presentation.nextAction.command)} (${sanitizeForTerminal(presentation.nextAction.summary)})`);
+  }
+  return lines;
+}
+
+// Convergence v1 S1 (§4.3/§6): budget meters (both currencies), pending
+// consent requests, and the parked-task list. Parked is a terminal state for
+// autonomous execution; the cockpit is one of the surfaces that keeps it
+// visible until a human decides.
+function renderTaskBudget(taskBudget: SnapshotData['taskBudget'] | undefined, color: boolean): string[] {
+  if (!taskBudget) return [];
+  const lines: string[] = [];
+  const current = taskBudget.current;
+  if (current) {
+    lines.push(colorize('TASK BUDGET', color, 'bold'));
+    const meter = (label: string, used: number, limit: number): string =>
+      `  ${label}: ${used}/${limit}${used >= limit ? ' (exhausted)' : ''}`;
+    lines.push(`  task: ${sanitizeForTerminal(current.taskSlug || '<unbound>')} (${sanitizeForTerminal(current.branchName)})`);
+    lines.push(meter('fix/review loops', current.used.fixReviewLoops, current.limits.fixReviewLoops));
+    lines.push(meter('AI runs', current.used.aiRunLaunches, current.limits.aiRuns));
+    lines.push(meter('active minutes', current.used.activeMinutes, current.limits.activeMinutes));
+    lines.push(`  extensions used: ${current.lifetimeExtensions}/${current.maxLifetimeExtensions}`);
+    if (current.parked) {
+      lines.push(colorize(`  ⚠ PARKED: ${sanitizeForTerminal(current.pauseReason ?? 'review budget exhausted')}`, color, 'red'));
+    } else if (current.paused && current.pauseReason) {
+      lines.push(colorize(`  paused: ${sanitizeForTerminal(current.pauseReason)}`, color, 'yellow'));
+    }
+    lines.push('');
+  }
+  if (taskBudget.pendingConsents.length > 0) {
+    lines.push(colorize('PENDING BUDGET CONSENTS', color, 'bold'));
+    for (const card of taskBudget.pendingConsents) {
+      lines.push(`  ${sanitizeForTerminal(card.taskSlug || card.branchName)}: +${card.fixReviewLoopsDelta} loops, +${card.aiRunsDelta} AI runs, +${card.activeMinutesDelta} active min — ${sanitizeForTerminal(card.reason)}`);
+      lines.push(`    decide on the Board (card ${sanitizeForTerminal(card.id)}, expires ${sanitizeForTerminal(card.expiresAt)})`);
+    }
+    lines.push('');
+  }
+  if (taskBudget.parked.length > 0) {
+    lines.push(colorize('PARKED TASKS', color, 'bold'));
+    for (const entry of taskBudget.parked) {
+      lines.push(colorize(`  ${sanitizeForTerminal(entry.taskSlug || entry.branch)}: ${sanitizeForTerminal(entry.reason)}`, color, 'red'));
+      lines.push(`    parked ${sanitizeForTerminal(entry.parkedAt)} · spent ${entry.budgetSpent.aiRunLaunches} AI runs / ${entry.budgetSpent.activeMinutes} active min · ${entry.openFindingIds.length} open finding(s)`);
+      for (const hint of entry.unblockHints) {
+        lines.push(`    - ${sanitizeForTerminal(hint)}`);
+      }
+    }
+    lines.push('');
   }
   return lines;
 }

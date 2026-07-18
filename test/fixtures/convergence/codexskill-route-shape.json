@@ -1,0 +1,31 @@
+{
+  "description": "Shape spec for the codexskill review-loop saga replay fixture (D9). Numbers are pinned from the real 2026-07 ledgers; every string is synthetic. This spec doubles as documentation of the incident: 69 full review passes on one task, a 20-grant non-interactive resume burst recorded in a 5-second window, 1-2 new warnings per pass, occasional multi-finding passes, exact-duplicate re-reports, 3 infra-failure interleavings (provider exit, checkout mutation mid-review, timeout), and 2 same-tree repeat reviews.",
+  "schemaVersion": 1,
+  "reviewPasses": 69,
+  "resumeBurst": {
+    "count": 20,
+    "kind": "until-review-passes",
+    "source": "resume",
+    "maxMoreLoops": 3,
+    "maxMoreMinutes": 120,
+    "burstWindowSeconds": 5
+  },
+  "recordedBudget": {
+    "defaultFixReviewLoops": 1,
+    "defaultMinutes": 90,
+    "defaultAiReviewRuns": 1
+  },
+  "severityMixPerPass": {
+    "warningsMin": 1,
+    "warningsMax": 2,
+    "multiFindingPassEvery": 9
+  },
+  "exactDuplicateEvery": 7,
+  "infraFailureInterleavings": ["provider-exit", "checkout-mutation", "timeout"],
+  "sameTreeRepeatReviews": 2,
+  "syntheticFindingStems": [
+    "Recovery path skips the focused regression",
+    "Session pruning misses the tombstone case",
+    "Retry envelope drops the idempotency key"
+  ]
+}

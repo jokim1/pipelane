@@ -166,19 +166,34 @@ function consentMatchesTarget(
   enforcementMode: ReviewConsentRecord['enforcementMode'],
   currentReviewRunId: string,
 ): boolean {
-  return consent.policyVersion === policyVersion
-    && consent.enforcementMode === enforcementMode
-    && consent.taskBindingId === target.taskBindingId
-    && consent.branchName === target.branchName
-    && consent.sha === target.sha
-    && consent.worktreeStatusDigest === target.worktreeStatusDigest
+  if (
+    consent.policyVersion !== policyVersion
+    || consent.enforcementMode !== enforcementMode
+    || consent.taskBindingId !== target.taskBindingId
+    || consent.branchName !== target.branchName
+    || consent.sha !== target.sha
+    || consent.routeAction !== routeAction
+  ) {
+    return false;
+  }
+  if (consent.kind === 'accept-findings' && !(currentReviewRunId.length > 0 && consent.reviewRunId === currentReviewRunId)) {
+    return false;
+  }
+  const exactWorktreeChannel = consent.worktreeStatusDigest === target.worktreeStatusDigest
     && consent.worktreeMaterialTreeHash === target.worktreeMaterialTreeHash
-    && consent.reviewTargetDigest === target.reviewTargetDigest
-    && consent.routeAction === routeAction
-    && (
-      consent.kind !== 'accept-findings'
-      || (currentReviewRunId.length > 0 && consent.reviewRunId === currentReviewRunId)
-    );
+    && consent.reviewTargetDigest === target.reviewTargetDigest;
+  if (exactWorktreeChannel) return true;
+  // E1-class material-tree channel (S0 lane bug: recorded --scope="/merge"
+  // consents were never consumed). `/merge` evaluates against the PR-branch
+  // target, which carries no worktree status digest and a synthetic target
+  // digest, so the exact-worktree channel above can never match a consent
+  // recorded from the checkout. A byte-identical material tree at the same
+  // branch and sha is the same exact content identity, so it satisfies the
+  // consent scope on its own — the same dual-channel rule /pr and /merge use
+  // for review evidence.
+  return Boolean(consent.worktreeMaterialTreeHash)
+    && target.worktreeMaterialTreeReliable === true
+    && consent.worktreeMaterialTreeHash === target.worktreeMaterialTreeHash;
 }
 
 export function selectCurrentReviewConsents(
