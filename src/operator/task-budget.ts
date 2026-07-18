@@ -541,8 +541,18 @@ function importSuccessorBudget(
     target.lastReviewStatus = source.lastReviewStatus;
   }
   // Carry the source's completion journal so unapplied crash records still
-  // replay under the merged lineage, then retire the source entry.
+  // replay under the merged lineage. Pending cards and unconsumed grants move
+  // with it as authorization state, then the source entry can be retired
+  // without leaving a reusable approval under the old lineage.
   migrateCompletionJournalLineage(context.commonDir, context.config, source.lineageKey, target.lineageKey);
+  migrateConsentArtifactsLineage(
+    context.commonDir,
+    context.config,
+    source.lineageKey,
+    target.lineageKey,
+    target.taskSlug,
+    target.branchName,
+  );
   delete state.entries[source.lineageKey];
   if (state.latestPausedLineageKey === source.lineageKey) state.latestPausedLineageKey = target.lineageKey;
   // Effective limits already fold consumedGrants in, so no extra migration
@@ -881,12 +891,17 @@ export function cleanTaskBudgetArtifactsForTask(
         } catch {
           continue;
         }
-        appendTaskBudgetArchiveSummary(commonDir, config, entry);
         // Revoke stranded consent artifacts BEFORE dropping the entry: a
         // recreated slug+branch resolves to the same lineage key, so an
         // unconsumed grant or pending card left behind would be an
         // authorization-reuse hole (the fix-token-reuse class, one lane over).
-        revokeConsentArtifactsForLineage(commonDir, config, entry.lineageKey);
+        // Fail-closed: if revocation didn't fully succeed, KEEP the entry so a
+        // recreated lineage resolves to it (bounded by its own ceiling and
+        // consumed-grant history) rather than to a fresh budget beside a live
+        // grant; the next /clean retries.
+        const revocation = revokeConsentArtifactsForLineage(commonDir, config, entry.lineageKey);
+        if (!revocation.ok) continue;
+        appendTaskBudgetArchiveSummary(commonDir, config, entry);
         delete state.entries[entry.lineageKey];
         if (state.latestPausedLineageKey === entry.lineageKey) state.latestPausedLineageKey = undefined;
         cleanedKeys.add(entry.lineageKey);
@@ -2351,18 +2366,28 @@ function recordFixRerunTransition(record: TaskBudgetRecord, reviewRun: ReviewRun
   if (reviewRun.status === 'passed') candidate.rerunPassedAt = reviewRun.finishedAt || nowIso();
 }
 
-function expectedAiLaunchCount(gates: Array<{ id: string; type: string; phase?: string; blocking?: boolean }>, parsed: ParsedOperatorArgs): number {
+function expectedAiLaunchCount(
+  gates: Array<{ id: string; type: string; phase?: string; blocking?: boolean; when?: string; whenChanged?: string[]; profiles?: unknown[] }>,
+  parsed: ParsedOperatorArgs,
+): number {
   if (parsed.flags.reviewDryRun) return 0;
   const gateFilter = parsed.flags.reviewGate.trim();
   const phaseFilter = parsed.flags.reviewPhase.trim();
-  // Mirror the runner's gate selection (review.ts): a --phase or --gate
-  // filter narrows the launch set, so precharge must honor both. Otherwise a
-  // zero-AI `review --phase static` could terminally park a task sitting near
-  // its AI limit.
+  // The precharge is a HARD pre-launch cap, so it must never over-count: the
+  // runner skips gates by whenChanged/when(risk)/profile/surface at execution
+  // time (needing the diff + active surfaces, unavailable here), so a gate
+  // carrying any such condition MIGHT not launch. Count only gates that will
+  // launch unconditionally. Under-counting a conditional gate that does run
+  // leaves a bounded, safe-direction overshoot, charged by the post-run debit
+  // and hard-stopped at the next run's at-cap check; over-counting would
+  // terminally park a task whose gates would legally fit (round-2 finding).
   return gates.filter((gate) =>
     (gate.type === 'skill' || gate.type === 'agent')
     && (!gateFilter || gate.id === gateFilter)
     && (!phaseFilter || gate.phase === phaseFilter)
+    && !gate.when
+    && !(gate.whenChanged && gate.whenChanged.length > 0)
+    && !(gate.profiles && gate.profiles.length > 0)
   ).length;
 }
 
@@ -2370,6 +2395,15 @@ function expectedAiLaunchCount(gates: Array<{ id: string; type: string; phase?: 
 // superseded fix-first attempt so restarts are charged, not forgotten.
 export function countLaunchedAiGates(gates: ReviewGateRunRecord[]): number {
   return gates.filter(gateWasLaunched).length;
+}
+
+// Test-only surface for the precharge forecast (round-3 conditional-gate
+// exclusion). Not part of the runtime API.
+export function expectedAiLaunchCountForTest(
+  gates: Array<{ id: string; type: string; phase?: string; when?: string; whenChanged?: string[]; profiles?: unknown[] }>,
+  parsed: ParsedOperatorArgs,
+): number {
+  return expectedAiLaunchCount(gates, parsed);
 }
 
 function buildReviewRoutePlan(cwd: string, parsed: ParsedOperatorArgs): DestinationPlan | null {

@@ -3785,6 +3785,9 @@ export function loadTaskBudgetState(commonDir: string, config: WorkflowConfig): 
   for (const [lineageKey, entry] of Object.entries(raw.entries)) {
     const normalized = normalizeTaskBudgetRecord(entry);
     if (!normalized) failClosed(`entry ${lineageKey.slice(0, 12)} failed validation`);
+    // The map key IS the lineage identity; a record filed under a different
+    // key (or the traversal-shaped key rejected above) is corruption.
+    if (normalized.lineageKey !== lineageKey) failClosed(`entry ${lineageKey.slice(0, 12)} lineageKey mismatch`);
     entries[lineageKey] = normalized;
   }
   const state: TaskBudgetState = { entries };
@@ -3816,7 +3819,10 @@ function normalizeTaskBudgetRecord(value: unknown): TaskBudgetRecord | null {
   const base = normalizeRouteSafetyRecord(value);
   if (!base) return null;
   const raw = value as Record<string, unknown>;
-  if (raw.budgetVersion !== 1 || typeof raw.lineageKey !== 'string' || raw.lineageKey.trim().length === 0) return null;
+  // lineageKey must be a 64-char sha256 hex digest: it is used as a filename
+  // for the per-task completion journal, so a traversal-shaped value (`../…`)
+  // could otherwise steer signed journal writes outside the state dir.
+  if (raw.budgetVersion !== 1 || typeof raw.lineageKey !== 'string' || !/^[a-f0-9]{64}$/.test(raw.lineageKey)) return null;
   // Authorization counters must fail closed, not coerce. task-budget-state is
   // a v1-only store (no legacy shape), so every currency field is always
   // written; a present-but-non-numeric field is corruption, and coercing it
@@ -3827,12 +3833,13 @@ function normalizeTaskBudgetRecord(value: unknown): TaskBudgetRecord | null {
   const aiRunsBudget = requiredCounter(raw.aiRunsBudget);
   const activeMinutesBudget = requiredCounter(raw.activeMinutesBudget);
   const fixReviewLoopsBudget = requiredCounter(raw.fixReviewLoopsBudget);
+  const fixReviewLoops = requiredCounter(raw.fixReviewLoops);
   const aiRunLaunches = requiredCounter(raw.aiRunLaunches);
   const activeMillisUsed = requiredCounter(raw.activeMillisUsed);
   const lifetimeExtensions = requiredCounter(raw.lifetimeExtensions);
   if (
     aiRunsBudget === null || activeMinutesBudget === null || fixReviewLoopsBudget === null
-    || aiRunLaunches === null || activeMillisUsed === null || lifetimeExtensions === null
+    || fixReviewLoops === null || aiRunLaunches === null || activeMillisUsed === null || lifetimeExtensions === null
   ) {
     return null;
   }
@@ -3843,6 +3850,7 @@ function normalizeTaskBudgetRecord(value: unknown): TaskBudgetRecord | null {
     aiRunsBudget,
     activeMinutesBudget,
     fixReviewLoopsBudget,
+    fixReviewLoops,
     aiRunLaunches,
     activeMillisUsed,
     lifetimeExtensions,
@@ -3867,21 +3875,40 @@ function normalizeTaskBudgetRecord(value: unknown): TaskBudgetRecord | null {
     // Never truncate: every consumed grant contributes allowance, and the
     // list is already bounded by taskBudget.maxLifetimeExtensions.
     const grants = raw.consumedGrants.filter(isTaskBudgetConsumedGrant);
+    // Exactly-once: a duplicate grantId would stack the same allowance twice.
+    // A malformed entry that drops a grant, or a duplicate that inflates one,
+    // fails the whole record closed rather than silently under/over-counting.
+    if (grants.length !== raw.consumedGrants.length) return null;
+    if (new Set(grants.map((grant) => grant.grantId)).size !== grants.length) return null;
+    // lifetimeExtensions is bumped in lockstep with consumedGrants on every
+    // mint path, so a ledger claiming more extensions than it can evidence is
+    // corrupt.
+    if (record.lifetimeExtensions < grants.length) return null;
     if (grants.length > 0) record.consumedGrants = grants;
+  } else if (record.lifetimeExtensions > 0) {
+    // Extensions claimed with no grant evidence at all.
+    return null;
   }
   return record;
+}
+
+function isSafeNonNegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
 function isTaskBudgetConsumedGrant(value: unknown): value is TaskBudgetConsumedGrant {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const raw = value as Record<string, unknown>;
+  // Deltas must be safe nonnegative integers: a JSON `1e309` parses to
+  // Infinity and would bypass every limit comparison; negatives and
+  // fractions have no meaning as an allowance. Fail the record, not coerce.
   return typeof raw.grantId === 'string'
     && (raw.source === 'board' || raw.source === 'tty')
     && typeof raw.consumedAt === 'string'
     && typeof raw.reason === 'string'
-    && typeof raw.aiRunsDelta === 'number'
-    && typeof raw.activeMinutesDelta === 'number'
-    && typeof raw.fixReviewLoopsDelta === 'number';
+    && isSafeNonNegativeInteger(raw.aiRunsDelta)
+    && isSafeNonNegativeInteger(raw.activeMinutesDelta)
+    && isSafeNonNegativeInteger(raw.fixReviewLoopsDelta);
 }
 
 export function loadParkedTasks(commonDir: string, config: WorkflowConfig): ParkedTasksState {
@@ -3904,9 +3931,17 @@ function isParkedTaskRecord(value: unknown): value is ParkedTaskRecord {
     && typeof raw.parkedAt === 'string'
     && typeof raw.reason === 'string'
     && Array.isArray(raw.openFindingIds)
+    && raw.openFindingIds.every((entry) => typeof entry === 'string')
     && Array.isArray(raw.unblockHints)
+    && raw.unblockHints.every((entry) => typeof entry === 'string')
     && typeof raw.notified === 'boolean'
-    && isRecord(raw.budgetSpent);
+    && isRecord(raw.budgetSpent)
+    // parked-tasks.json is unsigned and its budgetSpent values render into the
+    // Board. Require safe nonnegative integers so a crafted value can never
+    // reach innerHTML as markup (defense-in-depth alongside the UI escaping).
+    && isSafeNonNegativeInteger((raw.budgetSpent as Record<string, unknown>).aiRunLaunches)
+    && isSafeNonNegativeInteger((raw.budgetSpent as Record<string, unknown>).activeMinutes)
+    && isSafeNonNegativeInteger((raw.budgetSpent as Record<string, unknown>).fixReviewLoops);
 }
 
 function normalizeRouteSafetyRecord(value: unknown): RouteSafetyRecord | null {

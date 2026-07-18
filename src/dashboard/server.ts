@@ -1219,8 +1219,16 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
                 return;
               }
             }
-            const expectedMutationIndex = typeof body.mutationIndex === 'number' ? body.mutationIndex : undefined;
-            const expectedScopeHash = typeof body.scopeHash === 'string' ? body.scopeHash : undefined;
+            const expectedMutationIndex = typeof body.mutationIndex === 'number' && Number.isSafeInteger(body.mutationIndex) && body.mutationIndex >= 0
+              ? body.mutationIndex
+              : undefined;
+            const expectedScopeHash = typeof body.scopeHash === 'string' && /^[a-f0-9]{64}$/.test(body.scopeHash)
+              ? body.scopeHash
+              : undefined;
+            if (expectedMutationIndex === undefined || expectedScopeHash === undefined) {
+              sendJson(res, 400, buildTransportFailure('Approving a consent card requires the exact mutation index and scope hash displayed on the Board. Refresh the card and review its current scope before approving.'));
+              return;
+            }
             const outcome = approveBudgetConsentCard(context.commonDir, context.config, cardId, {
               decidedBy: 'board-operator',
               ...(decisionReason ? { decisionReason } : {}),
@@ -1230,8 +1238,8 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
               boardSessionProof: singleRequestHeader(req, BOARD_SESSION_HEADER),
               // The page echoes the mutation index + scope hash it displayed
               // so a raced re-request cannot mint a scope the human never saw.
-              ...(expectedMutationIndex !== undefined ? { expectedMutationIndex } : {}),
-              ...(expectedScopeHash !== undefined ? { expectedScopeHash } : {}),
+              expectedMutationIndex,
+              expectedScopeHash,
             });
             sendJson(res, 200, { ok: true, card: outcome.card, grantId: outcome.grant.id });
           } else {

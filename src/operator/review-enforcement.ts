@@ -189,9 +189,13 @@ function consentMatchesTarget(
   // digest, so the exact-worktree channel above can never match a consent
   // recorded from the checkout. A byte-identical material tree at the same
   // branch and sha is the same exact content identity, so it satisfies the
-  // consent scope on its own — the same dual-channel rule /pr and /merge use
-  // for review evidence.
-  return Boolean(consent.worktreeMaterialTreeHash)
+  // consent scope on its own. This exception is limited to the synthetic PR-
+  // branch target used by /merge; ordinary checkout targets must still match
+  // every exact-scope digest so base/policy context changes invalidate consent.
+  const syntheticPrBranchTarget = target.worktreeStatusReliable === false
+    && target.worktreeStatusDigest === '';
+  return syntheticPrBranchTarget
+    && Boolean(consent.worktreeMaterialTreeHash)
     && target.worktreeMaterialTreeReliable === true
     && consent.worktreeMaterialTreeHash === target.worktreeMaterialTreeHash;
 }

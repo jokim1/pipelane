@@ -267,11 +267,14 @@ export function listBudgetConsentCards(
   config: WorkflowConfig,
   filter: { lineageKey?: string; status?: ConsentCardStatus } = {},
 ): BudgetConsentCard[] {
-  return listRecords(commonDir, config).cards
-    .map((card) => expireStalePendingCard(commonDir, config, card))
-    .filter((card) => verifyRecord(card))
-    .filter((card) => (!filter.lineageKey || card.lineageKey === filter.lineageKey)
-      && (!filter.status || card.status === filter.status));
+  return withConsentGrantsLock(commonDir, config, () =>
+    listRecords(commonDir, config).cards
+      // Verify before any expiry write. Otherwise a shape-valid tampered card
+      // could be re-signed while being expired.
+      .filter((card) => verifyRecord(card))
+      .map((card) => expireStalePendingCard(commonDir, config, card))
+      .filter((card) => (!filter.lineageKey || card.lineageKey === filter.lineageKey)
+        && (!filter.status || card.status === filter.status)));
 }
 
 export function listBudgetExtensionGrants(
@@ -295,8 +298,9 @@ export function requestBudgetExtensionCard(
   return withConsentGrantsLock(commonDir, config, () => {
     const scopeHash = budgetExtensionScopeHash(scope);
     const pending = listRecords(commonDir, config).cards
+      .filter((card) => verifyRecord(card))
       .map((card) => expireStalePendingCard(commonDir, config, card))
-      .filter((card) => card.status === 'pending' && card.lineageKey === scope.lineageKey && verifyRecord(card));
+      .filter((card) => card.status === 'pending' && card.lineageKey === scope.lineageKey);
     const existing = pending[0];
     if (existing) {
       if (existing.scopeHash === scopeHash) {
@@ -600,7 +604,10 @@ export function migrateConsentArtifactsLineage(
   withConsentGrantsLock(commonDir, config, () => {
     const { cards, grants } = listRecords(commonDir, config);
     for (const card of cards) {
-      if (card.lineageKey !== fromLineageKey || card.status !== 'pending') continue;
+      if (card.lineageKey !== fromLineageKey) continue;
+      if (!verifyRecord(card)) {
+        throw new Error(`Consent card ${card.id} failed signature verification during lineage migration and was refused (fail-closed).`);
+      }
       const migrated: BudgetConsentCard = {
         ...card,
         lineageKey: toLineageKey,
@@ -620,6 +627,9 @@ export function migrateConsentArtifactsLineage(
     }
     for (const grant of grants) {
       if (grant.lineageKey !== fromLineageKey) continue;
+      if (!verifyRecord(grant)) {
+        throw new Error(`Budget-extension grant ${grant.id} failed signature verification during lineage migration and was refused (fail-closed).`);
+      }
       const migrated: BudgetExtensionGrant = {
         ...grant,
         lineageKey: toLineageKey,
@@ -642,13 +652,15 @@ export function migrateConsentArtifactsLineage(
 
 // Revokes every consent artifact of a lineage on task /clean: pending cards
 // are marked denied and unconsumed grants are marked consumed, so a recreated
-// slug+branch (same lineage key) cannot inherit a stranded approval. Returns
-// the count revoked. Best-effort by contract — never throws.
+// slug+branch (same lineage key) cannot inherit a stranded approval.
+// Fail-closed: `ok` is false if the lock or any write failed, so the caller
+// MUST NOT delete the budget entry (which would strand a still-live grant a
+// recreated lineage could consume). Retryable on the next /clean.
 export function revokeConsentArtifactsForLineage(
   commonDir: string,
   config: WorkflowConfig,
   lineageKey: string,
-): number {
+): { ok: boolean; revoked: number } {
   try {
     return withConsentGrantsLock(commonDir, config, () => {
       const { cards, grants } = listRecords(commonDir, config);
@@ -664,10 +676,15 @@ export function revokeConsentArtifactsForLineage(
         persistGrant(commonDir, config, { ...grant, consumedAt: revokedAt });
         revoked += 1;
       }
-      return revoked;
+      // A residual unconsumed grant or pending card means a write silently
+      // failed; report not-ok so the caller preserves the entry for retry.
+      const residual = listRecords(commonDir, config);
+      const stranded = residual.grants.some((grant) => grant.lineageKey === lineageKey && !grant.consumedAt)
+        || residual.cards.some((card) => card.lineageKey === lineageKey && card.status === 'pending');
+      return { ok: !stranded, revoked };
     });
   } catch {
-    return 0;
+    return { ok: false, revoked: 0 };
   }
 }
 

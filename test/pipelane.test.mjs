@@ -22142,6 +22142,11 @@ test('signed review consent is exact-scope and never relabels failed evidence as
     assert.match(stored.consents[0].signature, /^[a-f0-9]{64}$/);
     assert.equal(stored.consents[0].taskBindingId, lock.taskBindingId);
     assert.equal(enforcement.evaluateReviewEvidenceForPr(context, { command: '/merge' }).allowed, false);
+    const changedTargetDigest = enforcement.evaluateReviewEvidenceForPr(context, {
+      command: '/pr',
+      target: { ...consented.target, reviewTargetDigest: '0'.repeat(64) },
+    });
+    assert.equal(changedTargetDigest.allowed, false, 'material-tree equality alone must not revive an ordinary checkout consent after its exact target digest changes');
     const changedPolicyContext = {
       ...context,
       config: { ...context.config, reviewGates: { ...context.config.reviewGates, policyVersion: 3 } },
@@ -40916,12 +40921,46 @@ test('convergence S1: codexskill ledger replay parks within two AI runs and the 
     assert.equal(wrongScope.refusal.code, 'wrong-scope');
     assert.match(wrongScope.refusal.message, /different task lineage/);
 
+    // A shape-valid but signature-invalid record must never be laundered into
+    // a valid grant by lineage migration.
+    const tamperedMigrationCard = consents.requestBudgetExtensionCard(context.commonDir, context.config, {
+      lineageKey: 'e'.repeat(64),
+      taskSlug: 'tampered-migration-source',
+      branchName: 'codex/tampered-migration-source',
+      aiRunsDelta: 2,
+      activeMinutesDelta: 45,
+      fixReviewLoopsDelta: 1,
+      reason: 'tampered migration fixture',
+    }, { provider: 'test', sessionId: null, source: 'test' }).card;
+    const tamperedMigrationPath = path.join(sharedStateDir(created.worktreePath), 'consent-grants', `${tamperedMigrationCard.id}.json`);
+    const tamperedMigrationPayload = JSON.parse(readFileSync(tamperedMigrationPath, 'utf8'));
+    tamperedMigrationPayload.aiRunsDelta = 999;
+    writeFileSync(tamperedMigrationPath, `${JSON.stringify(tamperedMigrationPayload, null, 2)}\n`, 'utf8');
+    assert.throws(
+      () => consents.migrateConsentArtifactsLineage(
+        context.commonDir,
+        context.config,
+        tamperedMigrationCard.lineageKey,
+        '1'.repeat(64),
+        'tampered-migration-target',
+        'codex/tampered-migration-target',
+      ),
+      /failed signature verification during lineage migration/,
+    );
+
     // Lifetime ceiling: with maxLifetimeExtensions consumed, further requests
     // point at /fix rethink or a new task.
     const budgetStatePath = path.join(sharedStateDir(created.worktreePath), 'task-budget-state.json');
     const budgetState = JSON.parse(readFileSync(budgetStatePath, 'utf8'));
     for (const entry of Object.values(budgetState.entries)) {
-      entry.lifetimeExtensions = 2;
+      // The ledger fails closed if lifetimeExtensions isn't evidenced by that
+      // many consumed grants, so grow both consistently to the ceiling.
+      const grants = Array.isArray(entry.consumedGrants) ? [...entry.consumedGrants] : [];
+      while (grants.length < 2) {
+        grants.push({ grantId: `budget-grant-ceiling-fixture-${grants.length}`, source: 'board', consumedAt: new Date().toISOString(), reason: 'ceiling fixture', aiRunsDelta: 2, activeMinutesDelta: 45, fixReviewLoopsDelta: 1 });
+      }
+      entry.consumedGrants = grants;
+      entry.lifetimeExtensions = grants.length;
       entry.pausedAt = new Date().toISOString();
       entry.pauseReason = 'synthetic ceiling fixture';
     }
@@ -41315,10 +41354,19 @@ test('convergence S1: board consent endpoints refuse untrusted mutations and min
     assert.equal(listed.status, 200);
     assert.ok(listed.json.cards.some((entry) => entry.id === card.id && entry.status === 'pending'));
 
-    const approved = await requestDashboard(server, `/api/consents/${encodeURIComponent(card.id)}/approve`, {
+    const missingScope = await requestDashboard(server, `/api/consents/${encodeURIComponent(card.id)}/approve`, {
       method: 'POST',
       headers: validHeaders,
       body: JSON.stringify({}),
+    });
+    assert.equal(missingScope.status, 400);
+    assert.match(missingScope.json.message, /exact mutation index and scope hash/);
+    assert.equal(listConsentRecords(repoRoot).grants.length, 0, 'approval without the displayed scope must not mint');
+
+    const approved = await requestDashboard(server, `/api/consents/${encodeURIComponent(card.id)}/approve`, {
+      method: 'POST',
+      headers: validHeaders,
+      body: JSON.stringify({ mutationIndex: card.mutationIndex, scopeHash: card.scopeHash }),
     });
     assert.equal(approved.status, 200, JSON.stringify(approved.json));
     assert.match(approved.json.grantId, /^budget-grant-/);
@@ -41333,7 +41381,7 @@ test('convergence S1: board consent endpoints refuse untrusted mutations and min
     const replay = await requestDashboard(server, `/api/consents/${encodeURIComponent(card.id)}/approve`, {
       method: 'POST',
       headers: validHeaders,
-      body: JSON.stringify({}),
+      body: JSON.stringify({ mutationIndex: card.mutationIndex, scopeHash: card.scopeHash }),
     });
     assert.equal(replay.status, 200);
     assert.equal(replay.json.grantId, approved.json.grantId);
@@ -41485,6 +41533,13 @@ test('convergence S1: hard AI-run precharge, grant-mark crash repair, and fail-c
     assert.equal(badField.status, 1, 'a valid-JSON ledger with a corrupt counter must fail closed');
     assert.match(`${badField.stdout}\n${badField.stderr}`, /fails closed|unreadable/);
 
+    const malformedLoopCounter = JSON.parse(JSON.stringify(goodState));
+    malformedLoopCounter.entries[goodEntryKey].fixReviewLoops = 'not-a-number';
+    writeFileSync(budgetStatePath, `${JSON.stringify(malformedLoopCounter, null, 2)}\n`, 'utf8');
+    const badLoopCounter = runCli(['run', 'review', '--json'], created.worktreePath, {}, true);
+    assert.equal(badLoopCounter.status, 1, 'a corrupt spent-loop counter must not be coerced to zero');
+    assert.match(`${badLoopCounter.stdout}\n${badLoopCounter.stderr}`, /fails closed|unreadable/);
+
     writeFileSync(budgetStatePath, '{"schemaVersion":1,"entries":{oops', 'utf8');
     const failClosed = runCli(['run', 'review', '--json'], created.worktreePath, {}, true);
     assert.equal(failClosed.status, 1);
@@ -41572,13 +41627,44 @@ test('convergence S1 (round 2): D6 import of a successor budget lineage preserve
     const branchName = run('git', ['branch', '--show-current'], created.worktreePath);
 
     const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const consents = await import(path.join(KIT_ROOT, 'src', 'operator', 'consent-grants.ts'));
     const context = state.resolveWorkflowContext(created.worktreePath);
+    const sourceKey = 'a'.repeat(64);
+
+    // Real pending and approved-but-unconsumed artifacts under the source
+    // lineage must move with the imported budget instead of remaining reusable
+    // under the retired identity.
+    const boardToken = 'synthetic-board-session-successor-import';
+    consents.recordBoardSessionDigest(context.commonDir, context.config, boardToken);
+    const sourceGrantCard = consents.requestBudgetExtensionCard(context.commonDir, context.config, {
+      lineageKey: sourceKey,
+      taskSlug: 'older-slug-same-branch',
+      branchName,
+      aiRunsDelta: 3,
+      activeMinutesDelta: 30,
+      fixReviewLoopsDelta: 1,
+      reason: 'approved predecessor extension',
+    }, { provider: 'test', sessionId: null, source: 'test' }).card;
+    const sourceGrant = consents.approveBudgetConsentCard(context.commonDir, context.config, sourceGrantCard.id, {
+      decidedBy: 'board-operator',
+      boardSessionProof: boardToken,
+      expectedMutationIndex: sourceGrantCard.mutationIndex,
+      expectedScopeHash: sourceGrantCard.scopeHash,
+    }).grant;
+    const sourcePendingCard = consents.requestBudgetExtensionCard(context.commonDir, context.config, {
+      lineageKey: sourceKey,
+      taskSlug: 'older-slug-same-branch',
+      branchName,
+      aiRunsDelta: 2,
+      activeMinutesDelta: 20,
+      fixReviewLoopsDelta: 1,
+      reason: 'pending predecessor extension',
+    }, { provider: 'test', sessionId: null, source: 'test' }).card;
 
     // Seed a second budget entry on the SAME branch under a different slug
     // (the branch-reuse ambiguity class), carrying real spend + a consumed
     // grant, then force the active entry into a pending ambiguous migration
     // whose candidate is that successor entry.
-    const sourceKey = 'a'.repeat(64);
     state.withTaskBudgetStateLock(context.commonDir, context.config, () => {
       const budgetState = state.loadTaskBudgetState(context.commonDir, context.config);
       const active = budgetState.entries[entry.lineageKey];
@@ -41616,6 +41702,92 @@ test('convergence S1 (round 2): D6 import of a successor budget lineage preserve
     assert.equal((merged.consumedGrants ?? []).length, 1, 'successor consumed grant preserved');
     assert.equal(merged.consumedGrants[0].grantId, 'budget-grant-successor-fixture');
     assert.equal(budgetState.entries[sourceKey], undefined, 'the imported source entry is retired so spend cannot double-count');
+    assert.equal(consents.listBudgetExtensionGrants(context.commonDir, context.config, { lineageKey: sourceKey }).length, 0, 'the retired lineage must retain no grant artifacts');
+    assert.ok(consents.listBudgetExtensionGrants(context.commonDir, context.config, { lineageKey: entry.lineageKey }).some((grant) => grant.id === sourceGrant.id));
+    assert.equal(consents.listBudgetConsentCards(context.commonDir, context.config, { lineageKey: sourceKey }).length, 0, 'the retired lineage must retain no consent cards');
+    assert.ok(consents.listBudgetConsentCards(context.commonDir, context.config, { lineageKey: entry.lineageKey }).some((card) => card.id === sourcePendingCard.id));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('convergence S1 (round 3): ledger validation fails closed on inflated/duplicate grants, traversal keys, and XSS-shaped parked state', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Round3 Repo', {
+      prePrChecks: [],
+      reviewGates: { policyVersion: 2, planReview: { gates: [] }, gates: [] },
+    });
+    commitAll(repoRoot, 'Configure round3 fixture');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Round3 Validation', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'round3\n', 'utf8');
+    runCli(['run', 'review', '--json'], created.worktreePath);
+    const entry = latestRouteSafetyRecord(created.worktreePath);
+    const budgetStatePath = path.join(sharedStateDir(created.worktreePath), 'task-budget-state.json');
+    const pristine = readFileSync(budgetStatePath, 'utf8');
+
+    const withEntry = (mutate) => {
+      const s = JSON.parse(pristine);
+      mutate(s, s.entries[entry.lineageKey]);
+      writeFileSync(budgetStatePath, `${JSON.stringify(s, null, 2)}\n`, 'utf8');
+      return runCli(['run', 'review', '--json'], created.worktreePath, {}, true);
+    };
+
+    // Infinity delta (JSON 1e309) must fail closed, not become an unbounded
+    // allowance.
+    const infinite = withEntry((_s, e) => {
+      e.lifetimeExtensions = 1;
+      e.consumedGrants = [{ grantId: 'g-inf', source: 'board', consumedAt: new Date().toISOString(), reason: 'x', aiRunsDelta: 1e309, activeMinutesDelta: 45, fixReviewLoopsDelta: 1 }];
+    });
+    assert.equal(infinite.status, 1);
+    assert.match(`${infinite.stdout}\n${infinite.stderr}`, /fails closed|unreadable/);
+
+    // Duplicate grant ids (allowance stacking) must fail closed.
+    const dup = withEntry((_s, e) => {
+      e.lifetimeExtensions = 2;
+      const g = { grantId: 'g-dup', source: 'board', consumedAt: new Date().toISOString(), reason: 'x', aiRunsDelta: 2, activeMinutesDelta: 45, fixReviewLoopsDelta: 1 };
+      e.consumedGrants = [g, { ...g }];
+    });
+    assert.equal(dup.status, 1);
+    assert.match(`${dup.stdout}\n${dup.stderr}`, /fails closed|unreadable/);
+
+    // A traversal-shaped lineage key (used as a journal filename) must fail
+    // closed, and a key that doesn't match its map slot must too.
+    const traversal = withEntry((s, e) => {
+      delete s.entries[entry.lineageKey];
+      e.lineageKey = '../../../../etc/evil';
+      s.entries['../../../../etc/evil'] = e;
+    });
+    assert.equal(traversal.status, 1);
+    assert.match(`${traversal.stdout}\n${traversal.stderr}`, /fails closed|unreadable/);
+
+    // Restore a clean ledger, then poison parked-tasks.json with an
+    // XSS-shaped budgetSpent value: the loader must drop it so nothing reaches
+    // the Board's innerHTML.
+    writeFileSync(budgetStatePath, pristine, 'utf8');
+    const parkedPath = path.join(sharedStateDir(created.worktreePath), 'parked-tasks.json');
+    writeFileSync(parkedPath, JSON.stringify({ records: [{
+      taskSlug: 'evil', branch: 'evil', lineageKey: entry.lineageKey,
+      parkedAt: new Date().toISOString(), reason: 'x',
+      openFindingIds: [], unblockHints: [], notified: true,
+      budgetSpent: { aiRunLaunches: '<img src=x onerror=alert(1)>', activeMinutes: 0, fixReviewLoops: 0 },
+    }] }), 'utf8');
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = state.resolveWorkflowContext(created.worktreePath);
+    const loaded = state.loadParkedTasks(context.commonDir, context.config);
+    assert.equal(loaded.records.length, 0, 'a non-integer budgetSpent value must be rejected at load');
+
+    // Precharge excludes conditional gates: a whenChanged-gated AI gate near
+    // the cap must not park a task whose unconditional gates fit.
+    const budget = await import(path.join(KIT_ROOT, 'src', 'operator', 'task-budget.ts'));
+    const gates = [
+      { id: 'always', type: 'skill', phase: 'ai-diff' },
+      { id: 'conditional', type: 'skill', phase: 'ai-diff', whenChanged: ['docs/**'] },
+      { id: 'risk', type: 'skill', phase: 'ai-diff', when: 'risk:auth' },
+    ];
+    const parsed = { flags: { reviewDryRun: false, reviewGate: '', reviewPhase: '' } };
+    assert.equal(budget.expectedAiLaunchCountForTest(gates, parsed), 1, 'only the unconditional AI gate is precharged');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });

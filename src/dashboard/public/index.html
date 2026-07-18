@@ -5011,13 +5011,23 @@
     }
 
     function parkedTaskMarkup(entry) {
+      // parked-tasks.json is unsigned state. The loader validates budgetSpent
+      // as safe integers, but coerce with Number() here too so a crafted value
+      // can never reach innerHTML as markup (defense-in-depth); all string
+      // fields go through escapeHtml.
+      const spent = entry.budgetSpent || {};
+      const aiRuns = Number(spent.aiRunLaunches) || 0;
+      const activeMin = Number(spent.activeMinutes) || 0;
+      const loops = Number(spent.fixReviewLoops) || 0;
+      const openCount = Array.isArray(entry.openFindingIds) ? entry.openFindingIds.length : 0;
+      const hints = Array.isArray(entry.unblockHints) ? entry.unblockHints : [];
       return `
         <div class="card">
           <div class="card-title">Parked: ${escapeHtml(entry.taskSlug || entry.branch)}</div>
           <div class="card-body">
             <div>${escapeHtml(entry.reason)}</div>
-            <div class="footer-note">parked ${escapeHtml(entry.parkedAt)} · spent ${entry.budgetSpent.aiRunLaunches} AI runs / ${entry.budgetSpent.activeMinutes} active min / ${entry.budgetSpent.fixReviewLoops} loops · ${entry.openFindingIds.length} open finding(s)</div>
-            <div class="footer-note">${entry.unblockHints.map((hint) => escapeHtml(hint)).join(' · ')}</div>
+            <div class="footer-note">parked ${escapeHtml(entry.parkedAt)} · spent ${aiRuns} AI runs / ${activeMin} active min / ${loops} loops · ${openCount} open finding(s)</div>
+            <div class="footer-note">${hints.map((hint) => escapeHtml(hint)).join(' · ')}</div>
           </div>
         </div>`;
     }
