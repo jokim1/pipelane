@@ -357,7 +357,7 @@ export function approveBudgetConsentCard(
   commonDir: string,
   config: WorkflowConfig,
   cardId: string,
-  options: { decidedBy: string; decisionReason?: string; boardSessionProof: string },
+  options: { decidedBy: string; decisionReason?: string; boardSessionProof: string; expectedMutationIndex?: number; expectedScopeHash?: string },
 ): { card: BudgetConsentCard; grant: BudgetExtensionGrant } {
   if (!verifyBoardSessionProof(commonDir, config, options.boardSessionProof)) {
     throw new Error('Board approval requires the live dashboard browser-session proof; approval is human-surface only (D11). Open the Board and decide the card there.');
@@ -367,6 +367,16 @@ export function approveBudgetConsentCard(
     if (!raw || !isBudgetConsentCard(raw)) throw new Error(`Consent card ${cardId} was not found.`);
     const card = raw as BudgetConsentCard;
     if (!verifyRecord(card)) throw new Error(`Consent card ${cardId} failed signature verification and was refused (fail-closed).`);
+    // A re-request mutates a pending card in place (bumping mutationIndex).
+    // The human approves the exact scope they saw: reject if the card moved
+    // since the Board rendered it, so a raced re-request can never mint a
+    // broader grant than was displayed (D11).
+    if (options.expectedMutationIndex !== undefined && card.mutationIndex !== options.expectedMutationIndex) {
+      throw new Error(`Consent card ${cardId} changed since it was displayed (saw mutation ${options.expectedMutationIndex}, now ${card.mutationIndex}); re-open the Board and review the current request before approving.`);
+    }
+    if (options.expectedScopeHash !== undefined && card.scopeHash !== options.expectedScopeHash) {
+      throw new Error(`Consent card ${cardId} scope changed since it was displayed; re-open the Board and review the current request before approving.`);
+    }
     const grantId = deterministicGrantIdForCard(card.id, card.mutationIndex);
     if (card.status !== 'pending') {
       // Crash-repair convergence: a card already approved with its
@@ -570,6 +580,95 @@ export function markBudgetExtensionGrantConsumed(
     const consumed: BudgetExtensionGrant = { ...grant, consumedAt: nowIso() };
     return persistGrant(commonDir, config, consumed);
   });
+}
+
+// Migrates every consent artifact of `fromLineageKey` to `toLineageKey` when a
+// budget lineage is re-keyed (D6 branch-reuse import / dual-root transfer), so
+// an approved grant is not stranded under the retired key where a recreated
+// slug could later consume it. Pending cards, approved-but-unconsumed grants,
+// and consumed grants all move; the scope hash is recomputed for the new
+// lineage and the record re-signed.
+export function migrateConsentArtifactsLineage(
+  commonDir: string,
+  config: WorkflowConfig,
+  fromLineageKey: string,
+  toLineageKey: string,
+  toTaskSlug: string,
+  toBranchName: string,
+): void {
+  if (fromLineageKey === toLineageKey) return;
+  withConsentGrantsLock(commonDir, config, () => {
+    const { cards, grants } = listRecords(commonDir, config);
+    for (const card of cards) {
+      if (card.lineageKey !== fromLineageKey || card.status !== 'pending') continue;
+      const migrated: BudgetConsentCard = {
+        ...card,
+        lineageKey: toLineageKey,
+        taskSlug: toTaskSlug,
+        branchName: toBranchName,
+        scopeHash: budgetExtensionScopeHash({
+          lineageKey: toLineageKey,
+          taskSlug: toTaskSlug,
+          branchName: toBranchName,
+          aiRunsDelta: card.aiRunsDelta,
+          activeMinutesDelta: card.activeMinutesDelta,
+          fixReviewLoopsDelta: card.fixReviewLoopsDelta,
+          reason: card.reason,
+        }),
+      };
+      persistCard(commonDir, config, migrated);
+    }
+    for (const grant of grants) {
+      if (grant.lineageKey !== fromLineageKey) continue;
+      const migrated: BudgetExtensionGrant = {
+        ...grant,
+        lineageKey: toLineageKey,
+        taskSlug: toTaskSlug,
+        branchName: toBranchName,
+        scopeHash: budgetExtensionScopeHash({
+          lineageKey: toLineageKey,
+          taskSlug: toTaskSlug,
+          branchName: toBranchName,
+          aiRunsDelta: grant.aiRunsDelta,
+          activeMinutesDelta: grant.activeMinutesDelta,
+          fixReviewLoopsDelta: grant.fixReviewLoopsDelta,
+          reason: grant.reason,
+        }),
+      };
+      persistGrant(commonDir, config, migrated);
+    }
+  });
+}
+
+// Revokes every consent artifact of a lineage on task /clean: pending cards
+// are marked denied and unconsumed grants are marked consumed, so a recreated
+// slug+branch (same lineage key) cannot inherit a stranded approval. Returns
+// the count revoked. Best-effort by contract — never throws.
+export function revokeConsentArtifactsForLineage(
+  commonDir: string,
+  config: WorkflowConfig,
+  lineageKey: string,
+): number {
+  try {
+    return withConsentGrantsLock(commonDir, config, () => {
+      const { cards, grants } = listRecords(commonDir, config);
+      let revoked = 0;
+      const revokedAt = nowIso();
+      for (const card of cards) {
+        if (card.lineageKey !== lineageKey || card.status !== 'pending') continue;
+        persistCard(commonDir, config, { ...card, status: 'denied', decidedAt: revokedAt, decidedBy: 'clean-revoke', decisionReason: 'task cleaned; pending consent revoked' });
+        revoked += 1;
+      }
+      for (const grant of grants) {
+        if (grant.lineageKey !== lineageKey || grant.consumedAt) continue;
+        persistGrant(commonDir, config, { ...grant, consumedAt: revokedAt });
+        revoked += 1;
+      }
+      return revoked;
+    });
+  } catch {
+    return 0;
+  }
 }
 
 // One-shot consumption for callers that hold no ledger of their own (tests,

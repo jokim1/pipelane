@@ -59,9 +59,11 @@ import {
 } from './completion-journal.ts';
 import {
   markBudgetExtensionGrantConsumed,
+  migrateConsentArtifactsLineage,
   mintTtyBudgetExtensionGrant,
   peekConsumableBudgetExtensionGrant,
   requestBudgetExtensionCard,
+  revokeConsentArtifactsForLineage,
   type BudgetExtensionGrant,
   type BudgetExtensionScope,
 } from './consent-grants.ts';
@@ -247,15 +249,37 @@ function budgetIdentityForCurrentCheckout(context: WorkflowContext): { lineageKe
 // Entry lifecycle: ensure/transfer/migrate + sizing.
 // ---------------------------------------------------------------------------
 
-function estimateChangedLines(context: WorkflowContext): number {
-  const base = context.config.baseBranch;
-  if (!base) return 0;
-  const raw = runGit(context.repoRoot, ['diff', '--shortstat', `${base}...HEAD`], true)
-    ?? runGit(context.repoRoot, ['diff', '--shortstat', `origin/${base}...HEAD`], true)
-    ?? '';
+function shortstatChangedLines(raw: string | null | undefined): number {
+  if (!raw) return 0;
   const insertions = /(\d+) insertion/.exec(raw)?.[1] ?? '0';
   const deletions = /(\d+) deletion/.exec(raw)?.[1] ?? '0';
   return Number.parseInt(insertions, 10) + Number.parseInt(deletions, 10);
+}
+
+function estimateChangedLines(context: WorkflowContext): number {
+  const base = context.config.baseBranch;
+  if (!base) return 0;
+  // Review runs BEFORE the PR commit, so budget sizing must include the
+  // uncommitted work being reviewed, not just merge-base...HEAD. Committed
+  // range (three-dot) and the worktree diff vs HEAD are disjoint, so summing
+  // them never double-counts; untracked additions are added on top. Sizing
+  // against the full reviewed material keeps a large dirty change from
+  // getting the minimum budget and parking prematurely.
+  const committed = shortstatChangedLines(
+    runGit(context.repoRoot, ['diff', '--shortstat', `${base}...HEAD`], true)
+    ?? runGit(context.repoRoot, ['diff', '--shortstat', `origin/${base}...HEAD`], true),
+  );
+  const worktree = shortstatChangedLines(runGit(context.repoRoot, ['diff', '--shortstat', 'HEAD'], true));
+  // `git diff HEAD` covers tracked (staged + unstaged) changes but not
+  // untracked files; add each untracked file's line count so a big new file
+  // under review is sized in too. Bounded to keep pathological trees cheap.
+  const untrackedFiles = (runGit(context.repoRoot, ['ls-files', '--others', '--exclude-standard'], true) ?? '')
+    .split('\n').map((line) => line.trim()).filter(Boolean).slice(0, 500);
+  let untrackedLines = 0;
+  for (const file of untrackedFiles) {
+    untrackedLines += shortstatChangedLines(runGit(context.repoRoot, ['diff', '--shortstat', '--no-index', '--', '/dev/null', file], true));
+  }
+  return committed + worktree + untrackedLines;
 }
 
 function recordObservedBinding(record: TaskBudgetRecord, taskBindingId: string): void {
@@ -401,10 +425,13 @@ function rekeyTaskBudgetRecord(
   timestamp: string,
 ): TaskBudgetRecord {
   const wasLatestPaused = state.latestPausedLineageKey === entry.lineageKey;
+  const previousLineageKey = entry.lineageKey;
   delete state.entries[entry.lineageKey];
-  // The identity transfer carries the completion journal so an unapplied
-  // crash record under the old lineage still replays exactly once (D15).
-  migrateCompletionJournalLineage(context.commonDir, context.config, entry.lineageKey, identity.lineageKey);
+  // The identity transfer carries the completion journal AND the consent
+  // artifacts so neither an unapplied crash record (D15) nor an approved
+  // grant is stranded under the retired lineage key.
+  migrateCompletionJournalLineage(context.commonDir, context.config, previousLineageKey, identity.lineageKey);
+  migrateConsentArtifactsLineage(context.commonDir, context.config, previousLineageKey, identity.lineageKey, identity.taskSlug, identity.branchName);
   entry.lineageKey = identity.lineageKey;
   entry.lineageDigest = identity.lineageKey;
   entry.lineageFingerprint = identity.lineageFingerprint;
@@ -482,6 +509,45 @@ function importLegacyBudget(target: TaskBudgetRecord, sources: RouteSafetyRecord
     ...(extraLoops > 0 ? { extraLoops } : {}),
     ...(extraMinutes > 0 ? { extraMinutes } : {}),
   };
+}
+
+// Merge a successor task-budget entry into `record` when an audited D6 choice
+// imports one budget lineage into another (branch reuse across slugs). Unlike
+// importLegacyBudget, this preserves every S1 currency and authorization
+// artifact: launches, active millis, lifetime extensions, and consumed grants
+// all carry forward at their maxima, and the source entry is removed so its
+// spend and grants cannot be double-counted.
+function importSuccessorBudget(
+  context: WorkflowContext,
+  state: TaskBudgetState,
+  target: TaskBudgetRecord,
+  source: TaskBudgetRecord,
+): { extraLoops?: number; extraMinutes?: number } {
+  target.firstStartedAt = [target.firstStartedAt, source.firstStartedAt].sort()[0] ?? target.firstStartedAt;
+  target.fixReviewLoops = Math.max(target.fixReviewLoops, source.fixReviewLoops);
+  target.aiReviewRuns = Math.max(target.aiReviewRuns, source.aiReviewRuns);
+  target.aiRunLaunches = Math.max(target.aiRunLaunches, source.aiRunLaunches);
+  target.activeMillisUsed = Math.max(target.activeMillisUsed, source.activeMillisUsed);
+  target.infraFailureRuns = Math.max(target.infraFailureRuns ?? 0, source.infraFailureRuns ?? 0) || undefined;
+  target.countedReviewRunIds = [...new Set([...target.countedReviewRunIds, ...source.countedReviewRunIds])].slice(0, 50);
+  // Authorization artifacts: consumed grants and the lifetime-extension count
+  // both transfer so the ceiling cannot be reset by re-keying.
+  const mergedGrants = [...(target.consumedGrants ?? []), ...(source.consumedGrants ?? [])];
+  const byGrantId = new Map(mergedGrants.map((grant) => [grant.grantId, grant]));
+  target.consumedGrants = [...byGrantId.values()];
+  target.lifetimeExtensions = target.consumedGrants.length;
+  if (source.lastReviewRunId && (!target.lastReviewRunId || source.updatedAt > target.updatedAt)) {
+    target.lastReviewRunId = source.lastReviewRunId;
+    target.lastReviewStatus = source.lastReviewStatus;
+  }
+  // Carry the source's completion journal so unapplied crash records still
+  // replay under the merged lineage, then retire the source entry.
+  migrateCompletionJournalLineage(context.commonDir, context.config, source.lineageKey, target.lineageKey);
+  delete state.entries[source.lineageKey];
+  if (state.latestPausedLineageKey === source.lineageKey) state.latestPausedLineageKey = target.lineageKey;
+  // Effective limits already fold consumedGrants in, so no extra migration
+  // allowance is added here (that would double-count the grants).
+  return {};
 }
 
 function legacyTtyResumeAllowanceTotals(record: RouteSafetyRecord): { extraLoops: number; extraMinutes: number } {
@@ -816,6 +882,11 @@ export function cleanTaskBudgetArtifactsForTask(
           continue;
         }
         appendTaskBudgetArchiveSummary(commonDir, config, entry);
+        // Revoke stranded consent artifacts BEFORE dropping the entry: a
+        // recreated slug+branch resolves to the same lineage key, so an
+        // unconsumed grant or pending card left behind would be an
+        // authorization-reuse hole (the fix-token-reuse class, one lane over).
+        revokeConsentArtifactsForLineage(commonDir, config, entry.lineageKey);
         delete state.entries[entry.lineageKey];
         if (state.latestPausedLineageKey === entry.lineageKey) state.latestPausedLineageKey = undefined;
         cleanedKeys.add(entry.lineageKey);
@@ -1190,7 +1261,11 @@ function applyGrantToRecord(record: TaskBudgetRecord, grant: BudgetExtensionGran
     activeMinutesDelta: grant.activeMinutesDelta,
     fixReviewLoopsDelta: grant.fixReviewLoopsDelta,
   };
-  record.consumedGrants = [consumed, ...(record.consumedGrants ?? [])].slice(0, 20);
+  // Never truncate: each entry is the exactly-once record of a consumed
+  // allowance and contributes to effective limits; the list is already
+  // bounded by maxLifetimeExtensions. Slicing to 20 would silently drop
+  // allowance and one-use history when a repo configures a higher ceiling.
+  record.consumedGrants = [consumed, ...(record.consumedGrants ?? [])];
   record.lifetimeExtensions += 1;
   return consumed;
 }
@@ -1417,12 +1492,22 @@ function applyLegacyMigrationChoice(
       throw new Error(`Legacy candidate ${sourceDigest.slice(0, 12)} is not one of this migration's preserved candidates.`);
     }
     const budgetSource = state.entries[sourceDigest];
-    const legacySource = loadRouteSafetyState(context.commonDir, context.config).routes[sourceDigest];
-    const source = budgetSource ?? legacySource;
-    if (!source) {
-      throw new Error(`Legacy candidate ${sourceDigest.slice(0, 12)} is no longer available. Re-run the route command before choosing a migration.`);
+    let allowances: { extraLoops?: number; extraMinutes?: number };
+    if (budgetSource) {
+      // The chosen candidate is a successor task-budget entry (the
+      // branch-reuse ambiguity class my own code creates). importLegacyBudget
+      // is written for the legacy RouteSafetyRecord shape and would substitute
+      // aiReviewRuns for launches and drop activeMillisUsed / lifetimeExtensions
+      // / consumedGrants. Currency-preserving merge instead: every spend and
+      // authorization artifact carries forward conservatively.
+      allowances = importSuccessorBudget(context, state, record, budgetSource);
+    } else {
+      const legacySource = loadRouteSafetyState(context.commonDir, context.config).routes[sourceDigest];
+      if (!legacySource) {
+        throw new Error(`Legacy candidate ${sourceDigest.slice(0, 12)} is no longer available. Re-run the route command before choosing a migration.`);
+      }
+      allowances = importLegacyBudget(record, [legacySource]);
     }
-    const allowances = importLegacyBudget(record, [source]);
     resume = makeResumeRecord('legacy-import', 'resume', {
       reason,
       legacyMigrationAction: 'import',
@@ -1437,7 +1522,7 @@ function applyLegacyMigrationChoice(
       ...allowances,
     };
     record.migratedFromRouteDigests = [...new Set([...(record.migratedFromRouteDigests ?? []), sourceDigest])].slice(0, 50);
-    message = `Imported the preserved budget from legacy lineage ${sourceDigest.slice(0, 12)} by explicit informed choice.`;
+    message = `Imported the preserved budget from lineage ${sourceDigest.slice(0, 12)} by explicit informed choice.`;
   }
   record.resumes = [resume, ...(record.resumes ?? [])].slice(0, 20);
   record.pauseReason = undefined;
@@ -2266,12 +2351,18 @@ function recordFixRerunTransition(record: TaskBudgetRecord, reviewRun: ReviewRun
   if (reviewRun.status === 'passed') candidate.rerunPassedAt = reviewRun.finishedAt || nowIso();
 }
 
-function expectedAiLaunchCount(gates: Array<{ id: string; type: string; blocking?: boolean }>, parsed: ParsedOperatorArgs): number {
+function expectedAiLaunchCount(gates: Array<{ id: string; type: string; phase?: string; blocking?: boolean }>, parsed: ParsedOperatorArgs): number {
   if (parsed.flags.reviewDryRun) return 0;
   const gateFilter = parsed.flags.reviewGate.trim();
+  const phaseFilter = parsed.flags.reviewPhase.trim();
+  // Mirror the runner's gate selection (review.ts): a --phase or --gate
+  // filter narrows the launch set, so precharge must honor both. Otherwise a
+  // zero-AI `review --phase static` could terminally park a task sitting near
+  // its AI limit.
   return gates.filter((gate) =>
     (gate.type === 'skill' || gate.type === 'agent')
     && (!gateFilter || gate.id === gateFilter)
+    && (!phaseFilter || gate.phase === phaseFilter)
   ).length;
 }
 

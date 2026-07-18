@@ -3817,16 +3817,35 @@ function normalizeTaskBudgetRecord(value: unknown): TaskBudgetRecord | null {
   if (!base) return null;
   const raw = value as Record<string, unknown>;
   if (raw.budgetVersion !== 1 || typeof raw.lineageKey !== 'string' || raw.lineageKey.trim().length === 0) return null;
+  // Authorization counters must fail closed, not coerce. task-budget-state is
+  // a v1-only store (no legacy shape), so every currency field is always
+  // written; a present-but-non-numeric field is corruption, and coercing it
+  // to 0 would re-mint spent budget. Reject the record so loadTaskBudgetState
+  // fails closed instead of silently zeroing the ledger.
+  const requiredCounter = (field: unknown): number | null =>
+    (typeof field === 'number' && Number.isSafeInteger(field) && field >= 0) ? field : null;
+  const aiRunsBudget = requiredCounter(raw.aiRunsBudget);
+  const activeMinutesBudget = requiredCounter(raw.activeMinutesBudget);
+  const fixReviewLoopsBudget = requiredCounter(raw.fixReviewLoopsBudget);
+  const aiRunLaunches = requiredCounter(raw.aiRunLaunches);
+  const activeMillisUsed = requiredCounter(raw.activeMillisUsed);
+  const lifetimeExtensions = requiredCounter(raw.lifetimeExtensions);
+  if (
+    aiRunsBudget === null || activeMinutesBudget === null || fixReviewLoopsBudget === null
+    || aiRunLaunches === null || activeMillisUsed === null || lifetimeExtensions === null
+  ) {
+    return null;
+  }
   const record: TaskBudgetRecord = {
     ...base,
     budgetVersion: 1,
     lineageKey: raw.lineageKey,
-    aiRunsBudget: nonNegativeInteger(raw.aiRunsBudget),
-    activeMinutesBudget: nonNegativeInteger(raw.activeMinutesBudget),
-    fixReviewLoopsBudget: nonNegativeInteger(raw.fixReviewLoopsBudget),
-    aiRunLaunches: nonNegativeInteger(raw.aiRunLaunches),
-    activeMillisUsed: nonNegativeInteger(raw.activeMillisUsed),
-    lifetimeExtensions: nonNegativeInteger(raw.lifetimeExtensions),
+    aiRunsBudget,
+    activeMinutesBudget,
+    fixReviewLoopsBudget,
+    aiRunLaunches,
+    activeMillisUsed,
+    lifetimeExtensions,
   };
   const changedLinesEstimate = nonNegativeInteger(raw.changedLinesEstimate);
   if (changedLinesEstimate > 0 || raw.changedLinesEstimate === 0) record.changedLinesEstimate = changedLinesEstimate;

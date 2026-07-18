@@ -41408,6 +41408,18 @@ test('convergence S1: hard AI-run precharge, grant-mark crash repair, and fail-c
     assert.match(`${precharge.stdout}\n${precharge.stderr}`, /Task parked:/);
     assert.equal(existsSync(gateMarker), false, 'the precharge refusal must fire before any gate launches');
 
+    // gstack#7: the same 7/8 state must NOT park a zero-AI phase-filtered
+    // review — precharge honors --phase, so a static-only pass launches
+    // nothing and is not charged.
+    let phaseState = JSON.parse(readFileSync(budgetStatePath, 'utf8'));
+    delete phaseState.entries[entry.lineageKey].parkedAt;
+    delete phaseState.entries[entry.lineageKey].parkReason;
+    writeFileSync(budgetStatePath, `${JSON.stringify(phaseState, null, 2)}\n`, 'utf8');
+    const parkedPath = path.join(sharedStateDir(created.worktreePath), 'parked-tasks.json');
+    if (existsSync(parkedPath)) writeFileSync(parkedPath, JSON.stringify({ records: [] }), 'utf8');
+    const staticReview = runCli(['run', 'review', '--phase', 'static', '--json'], created.worktreePath, {}, true);
+    assert.doesNotMatch(`${staticReview.stdout}\n${staticReview.stderr}`, /AI runs reached|would launch/);
+
     // F3b: the ledger's consumedGrants list is the exactly-once authority —
     // an applied-but-unmarked grant artifact (crash window) repairs to
     // consumed instead of granting a second allowance.
@@ -41433,6 +41445,12 @@ test('convergence S1: hard AI-run precharge, grant-mark crash repair, and fail-c
     const grant = consents.approveBudgetConsentCard(context.commonDir, context.config, card.id, {
       decidedBy: 'board-operator', boardSessionProof: boardToken,
     }).grant;
+    // `resume` consumes a grant only for a paused/parked lineage; re-establish
+    // the pause the phase-static step above cleared.
+    budgetState = JSON.parse(readFileSync(budgetStatePath, 'utf8'));
+    budgetState.entries[entry.lineageKey].pausedAt = new Date().toISOString();
+    budgetState.entries[entry.lineageKey].pauseReason = 'repair-window fixture pause';
+    writeFileSync(budgetStatePath, `${JSON.stringify(budgetState, null, 2)}\n`, 'utf8');
     const consumed = JSON.parse(runCli(['run', 'resume', '--json'], created.worktreePath).stdout);
     assert.match(consumed.message, /Consumed one-use budget-extension grant/);
     budgetState = JSON.parse(readFileSync(budgetStatePath, 'utf8'));
@@ -41456,7 +41474,17 @@ test('convergence S1: hard AI-run precharge, grant-mark crash repair, and fail-c
     assert.equal(budgetState.entries[entry.lineageKey].lifetimeExtensions, 1, 'repair must not double-apply the allowance');
 
     // F7: a present-but-corrupt ledger fails closed instead of quietly
-    // re-minting fresh budgets.
+    // re-minting fresh budgets — both malformed JSON syntax AND valid JSON
+    // whose authorization counter has the wrong type.
+    const goodState = JSON.parse(readFileSync(budgetStatePath, 'utf8'));
+    const goodEntryKey = Object.keys(goodState.entries)[0];
+    const malformedField = JSON.parse(JSON.stringify(goodState));
+    malformedField.entries[goodEntryKey].aiRunLaunches = 'not-a-number';
+    writeFileSync(budgetStatePath, `${JSON.stringify(malformedField, null, 2)}\n`, 'utf8');
+    const badField = runCli(['run', 'review', '--json'], created.worktreePath, {}, true);
+    assert.equal(badField.status, 1, 'a valid-JSON ledger with a corrupt counter must fail closed');
+    assert.match(`${badField.stdout}\n${badField.stderr}`, /fails closed|unreadable/);
+
     writeFileSync(budgetStatePath, '{"schemaVersion":1,"entries":{oops', 'utf8');
     const failClosed = runCli(['run', 'review', '--json'], created.worktreePath, {}, true);
     assert.equal(failClosed.status, 1);
@@ -41465,5 +41493,131 @@ test('convergence S1: hard AI-run precharge, grant-mark crash repair, and fail-c
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
     rmSync(path.dirname(gateMarker), { recursive: true, force: true });
+  }
+});
+
+test('convergence S1 (round 2): consent scope-staleness, clean revocation, and successor-lineage import preserve authorization', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Round2 Repo', {
+      prePrChecks: [],
+      reviewGates: { policyVersion: 2, planReview: { gates: [] }, gates: [] },
+    });
+    commitAll(repoRoot, 'Configure round2 fixture');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Round2 Consent', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'round2\n', 'utf8');
+    runCli(['run', 'review', '--json'], created.worktreePath);
+    const entry = latestRouteSafetyRecord(created.worktreePath);
+
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const consents = await import(path.join(KIT_ROOT, 'src', 'operator', 'consent-grants.ts'));
+    const context = state.resolveWorkflowContext(created.worktreePath);
+    const boardToken = 'synthetic-board-session-round2';
+    consents.recordBoardSessionDigest(context.commonDir, context.config, boardToken);
+
+    // karp#3: a card re-requested with a wider scope bumps mutationIndex; an
+    // approval carrying the stale index the operator saw is rejected.
+    const scope = (aiRunsDelta, reason) => ({
+      lineageKey: entry.lineageKey, taskSlug: entry.taskSlug, branchName: entry.branchName,
+      aiRunsDelta, activeMinutesDelta: 45, fixReviewLoopsDelta: 1, reason,
+    });
+    const first = consents.requestBudgetExtensionCard(context.commonDir, context.config, scope(2, 'modest ask'), { provider: 'test', sessionId: null, source: 'test' });
+    assert.equal(first.card.mutationIndex, 0);
+    const widened = consents.requestBudgetExtensionCard(context.commonDir, context.config, scope(19, 'suddenly huge ask'), { provider: 'test', sessionId: null, source: 'test' });
+    assert.equal(widened.card.id, first.card.id, 'a re-request supersedes the pending card in place');
+    assert.equal(widened.card.mutationIndex, 1);
+    assert.throws(
+      () => consents.approveBudgetConsentCard(context.commonDir, context.config, first.card.id, {
+        decidedBy: 'board-operator', boardSessionProof: boardToken, expectedMutationIndex: 0,
+      }),
+      /changed since it was displayed/,
+      'approving the stale mutation index must refuse',
+    );
+    const approved = consents.approveBudgetConsentCard(context.commonDir, context.config, first.card.id, {
+      decidedBy: 'board-operator', boardSessionProof: boardToken, expectedMutationIndex: 1, expectedScopeHash: widened.card.scopeHash,
+    });
+    assert.equal(approved.grant.aiRunsDelta, 19, 'approval mints exactly the displayed (current) scope');
+
+    // gstack#6: /clean revokes the unconsumed grant so a recreated slug+branch
+    // cannot inherit it.
+    const cleaned = runCli(['run', 'clean', '--apply', '--task', created.taskSlug, '--force', '--json'], repoRoot, { PIPELANE_CLEAN_MIN_AGE_MS: '0' });
+    assert.match(cleaned.stdout, /"removed"/);
+    const grantsAfterClean = consents.listBudgetExtensionGrants(context.commonDir, context.config, { lineageKey: entry.lineageKey, unconsumedOnly: true });
+    assert.equal(grantsAfterClean.length, 0, 'clean must revoke the stranded unconsumed grant');
+
+    // Recreate the same slug: the fresh lineage cannot consume the revoked grant.
+    const replacement = JSON.parse(runCli(['run', 'new', '--task', created.taskSlug, '--json'], repoRoot).stdout);
+    writeFileSync(path.join(replacement.worktreePath, 'feature.txt'), 'round2 again\n', 'utf8');
+    runCli(['run', 'review', '--json'], replacement.worktreePath);
+    const reuse = consents.consumeBudgetExtensionGrant(context.commonDir, context.config, { lineageKey: entry.lineageKey });
+    assert.ok('refusal' in reuse, 'a recreated slug must not consume the revoked grant');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('convergence S1 (round 2): D6 import of a successor budget lineage preserves every currency and grant', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Successor Import', {
+      prePrChecks: [],
+      reviewGates: { policyVersion: 2, planReview: { gates: [] }, gates: [] },
+    });
+    commitAll(repoRoot, 'Configure successor import');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Successor Import', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'successor\n', 'utf8');
+    runCli(['run', 'review', '--json'], created.worktreePath);
+    const entry = latestRouteSafetyRecord(created.worktreePath);
+    const branchName = run('git', ['branch', '--show-current'], created.worktreePath);
+
+    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
+    const context = state.resolveWorkflowContext(created.worktreePath);
+
+    // Seed a second budget entry on the SAME branch under a different slug
+    // (the branch-reuse ambiguity class), carrying real spend + a consumed
+    // grant, then force the active entry into a pending ambiguous migration
+    // whose candidate is that successor entry.
+    const sourceKey = 'a'.repeat(64);
+    state.withTaskBudgetStateLock(context.commonDir, context.config, () => {
+      const budgetState = state.loadTaskBudgetState(context.commonDir, context.config);
+      const active = budgetState.entries[entry.lineageKey];
+      budgetState.entries[sourceKey] = {
+        ...active,
+        lineageKey: sourceKey,
+        lineageDigest: sourceKey,
+        routeFingerprintDigest: sourceKey,
+        taskSlug: 'older-slug-same-branch',
+        aiRunLaunches: 6,
+        activeMillisUsed: 12 * 60 * 1000,
+        fixReviewLoops: 2,
+        lifetimeExtensions: 1,
+        consumedGrants: [{ grantId: 'budget-grant-successor-fixture', source: 'board', consumedAt: new Date().toISOString(), reason: 'prior extension', aiRunsDelta: 4, activeMinutesDelta: 45, fixReviewLoopsDelta: 1 }],
+        countedReviewRunIds: ['successor-run-1'],
+      };
+      active.legacyMigration = { status: 'pending', candidateDigests: [sourceKey] };
+      budgetState.latestPausedLineageKey = active.lineageKey;
+      active.pausedAt = new Date().toISOString();
+      active.pauseReason = 'ambiguous successor migration fixture';
+      state.saveTaskBudgetState(context.commonDir, context.config, budgetState);
+    });
+
+    const imported = JSON.parse(runCli([
+      'run', 'resume', '--scope', `legacy-import:${sourceKey}`,
+      '--reason', 'the older same-branch lineage is the audited predecessor', '--json',
+    ], created.worktreePath).stdout);
+    assert.match(imported.message, /Imported the preserved budget/);
+
+    const budgetState = readTaskBudgetState(created.worktreePath);
+    const merged = budgetState.entries[entry.lineageKey];
+    assert.equal(merged.aiRunLaunches, 6, 'successor launches preserved (not substituted by aiReviewRuns)');
+    assert.equal(merged.activeMillisUsed, 12 * 60 * 1000, 'successor active millis preserved');
+    assert.equal(merged.lifetimeExtensions, 1, 'successor lifetime-extension count preserved');
+    assert.equal((merged.consumedGrants ?? []).length, 1, 'successor consumed grant preserved');
+    assert.equal(merged.consumedGrants[0].grantId, 'budget-grant-successor-fixture');
+    assert.equal(budgetState.entries[sourceKey], undefined, 'the imported source entry is retired so spend cannot double-count');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
   }
 });

@@ -1219,6 +1219,8 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
                 return;
               }
             }
+            const expectedMutationIndex = typeof body.mutationIndex === 'number' ? body.mutationIndex : undefined;
+            const expectedScopeHash = typeof body.scopeHash === 'string' ? body.scopeHash : undefined;
             const outcome = approveBudgetConsentCard(context.commonDir, context.config, cardId, {
               decidedBy: 'board-operator',
               ...(decisionReason ? { decisionReason } : {}),
@@ -1226,6 +1228,10 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
               // re-verifies it against the published digest so a bare module
               // call can never mint (D11).
               boardSessionProof: singleRequestHeader(req, BOARD_SESSION_HEADER),
+              // The page echoes the mutation index + scope hash it displayed
+              // so a raced re-request cannot mint a scope the human never saw.
+              ...(expectedMutationIndex !== undefined ? { expectedMutationIndex } : {}),
+              ...(expectedScopeHash !== undefined ? { expectedScopeHash } : {}),
             });
             sendJson(res, 200, { ok: true, card: outcome.card, grantId: outcome.grant.id });
           } else {
