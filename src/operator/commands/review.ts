@@ -100,14 +100,12 @@ import {
   providerNativeJsonSchema,
   parseLegacyRoleEquivalentEnvelope,
   ReviewProtocolFramer,
-  renderDispositionedReviewFindingsPrompt,
   renderStrictReviewPrompt,
   resolveReviewIntent,
   resolveRoleEquivalentCapability,
   resolveTrustedSkillCapability,
   taskBriefIntentText,
   type BuiltReviewTarget,
-  type ReviewDispositionPromptEntry,
   type ResolvedReviewCapability,
   type TrustedSkillRoot,
 } from '../review-contract.ts';
@@ -4877,7 +4875,6 @@ function renderAiReviewGatePrompt(options: {
   repoRoot: string;
   baseBranch: string;
   changedFiles: string[];
-  dispositionedFindings?: ReviewDispositionPromptEntry[];
 }): string {
   const { gate, repoRoot, baseBranch, changedFiles } = options;
   const target = formatAiReviewGateTarget(gate);
@@ -4918,9 +4915,6 @@ function renderAiReviewGatePrompt(options: {
     ...truncated,
     '',
     ...mutationPolicy,
-    ...(options.dispositionedFindings && options.dispositionedFindings.length > 0
-      ? [...renderDispositionedReviewFindingsPrompt(options.dispositionedFindings), '']
-      : []),
     'Report blocking correctness, security, data-loss, regression, or test-coverage issues.',
     'If the requested skill or slash command is unavailable, perform the closest equivalent review yourself.',
     '',
