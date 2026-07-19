@@ -35,8 +35,9 @@ interface PackageJsonShape {
 
 export function resolvePipelaneRuntimeIdentity(moduleUrl = import.meta.url): PipelaneRuntimeIdentity {
   const modulePath = fileURLToPath(moduleUrl);
-  const source = modulePath.includes(`${path.sep}dist${path.sep}`) ? 'dist' : 'src';
-  const packageRoot = resolvePackageRoot(modulePath);
+  const packageRootDir = findPackageRootDir(modulePath);
+  const source = modulePath.startsWith(path.join(packageRootDir, 'dist') + path.sep) ? 'dist' : 'src';
+  const packageRoot = canonicalizePackageRoot(packageRootDir);
   const packageJson = readJsonFile<PackageJsonShape>(path.join(packageRoot, 'package.json')) ?? {};
   const buildInfo = source === 'dist'
     ? readJsonFile<BuildInfoFile>(path.join(packageRoot, 'dist', 'build-info.json'))
@@ -78,19 +79,21 @@ export function buildRuntimeWarnings(identity: PipelaneRuntimeIdentity, cwd: str
   return warnings;
 }
 
-function resolvePackageRoot(modulePath: string): string {
+function findPackageRootDir(modulePath: string): string {
   let current = path.dirname(modulePath);
   while (true) {
-    if (existsSync(path.join(current, 'package.json'))) {
-      try {
-        return realpathSync(current);
-      } catch {
-        return path.resolve(current);
-      }
-    }
+    if (existsSync(path.join(current, 'package.json'))) return current;
     const parent = path.dirname(current);
     if (parent === current) return path.resolve(path.dirname(modulePath), '..');
     current = parent;
+  }
+}
+
+function canonicalizePackageRoot(packageRootDir: string): string {
+  try {
+    return realpathSync(packageRootDir);
+  } catch {
+    return path.resolve(packageRootDir);
   }
 }
 

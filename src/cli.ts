@@ -336,11 +336,10 @@ async function maybeApplyLessonsMigrationAfterPrompt(
 
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
-  const runtimeIdentity = resolvePipelaneRuntimeIdentity();
 
   if (command === '--version' || command === '-v') {
     assertNoArgs(rest, '--version');
-    process.stdout.write(`${formatPipelaneVersion(runtimeIdentity)}\n`);
+    process.stdout.write(`${formatPipelaneVersion(resolvePipelaneRuntimeIdentity())}\n`);
     return;
   }
 
@@ -358,6 +357,7 @@ async function main(): Promise<void> {
     // Keep the structured stdout contract intact for --json callers. The
     // identity line is deliberately the first stderr line so a combined
     // terminal/agent transcript still answers exactly which build ran.
+    const runtimeIdentity = resolvePipelaneRuntimeIdentity();
     process.stderr.write(`${formatPipelaneRuntimeBanner(runtimeIdentity)}\n`);
     for (const warning of buildRuntimeWarnings(runtimeIdentity, process.cwd())) {
       process.stderr.write(`${warning}\n`);

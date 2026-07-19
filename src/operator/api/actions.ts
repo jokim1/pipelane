@@ -887,14 +887,14 @@ function describeExecutionFailure(
   actionId: StableActionId,
   result: ReturnType<typeof runCliWithJson>,
 ): string {
-  if (result.stderr) {
-    return result.stderr;
-  }
   if (result.parsed && typeof result.parsed === 'object') {
     const message = (result.parsed as { message?: unknown }).message;
     if (typeof message === 'string' && message.trim()) {
       return message.trim();
     }
+  }
+  if (result.stderr) {
+    return result.stderr;
   }
   if (typeof result.parsed === 'string' && result.parsed.trim()) {
     return result.parsed.trim();
@@ -1435,6 +1435,24 @@ function actionWorkspaceChildCommand(actionId: StableActionId): string {
   return actionId.split('.')[0];
 }
 
+const RUNTIME_IDENTITY_BANNER_LINE = /^pipelane v.+ \((?:[0-9a-fA-F]{7}|unknown)(?:-dirty)?\) from /;
+const RUNTIME_IDENTITY_WARNING_LINES = [
+  /^Warning: running \S+ but repo pins \S+ — run npm install or point npx at the repo install\.$/,
+  /^Warning: dist\/ is older than the newest src\/ file in .+ — run npm run build\.$/,
+];
+
+function stripRuntimeIdentityPreamble(stderr: string): string {
+  const lines = stderr.split('\n');
+  let start = 0;
+  if (start < lines.length && RUNTIME_IDENTITY_BANNER_LINE.test(lines[start])) {
+    start += 1;
+    while (start < lines.length && RUNTIME_IDENTITY_WARNING_LINES.some((pattern) => pattern.test(lines[start]))) {
+      start += 1;
+    }
+  }
+  return lines.slice(start).join('\n');
+}
+
 function runCliWithJson(cwd: string, args: string[], env: NodeJS.ProcessEnv = process.env): { ok: boolean; exitCode: number; stdout: string; stderr: string; parsed: unknown } {
   const cliPath = resolveCliEntry();
   const result = spawnSync(process.execPath, [cliPath, ...args], {
@@ -1444,7 +1462,7 @@ function runCliWithJson(cwd: string, args: string[], env: NodeJS.ProcessEnv = pr
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const stdout = result.stdout?.trim() ?? '';
-  const stderr = result.stderr?.trim() ?? '';
+  const stderr = stripRuntimeIdentityPreamble(result.stderr ?? '').trim();
   let parsed: unknown = null;
   if (stdout) {
     try {

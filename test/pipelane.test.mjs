@@ -404,6 +404,80 @@ test('runtime identity warns when a host repo pin differs from the running build
   ]);
 });
 
+test('runtime identity classifies a src checkout under a dist-named parent directory as src', async () => {
+  const runtimeIdentity = await import(pathToFileURL(path.join(KIT_ROOT, 'src', 'runtime-identity.ts')).href);
+  const parentRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-dist-parent-'));
+  const checkoutRoot = path.join(parentRoot, 'dist', 'demo-pipelane');
+  mkdirSync(path.join(checkoutRoot, 'src'), { recursive: true });
+  writeFileSync(path.join(checkoutRoot, 'package.json'), `${JSON.stringify({ name: 'pipelane', version: '3.2.1' })}\n`, 'utf8');
+  writeFileSync(path.join(checkoutRoot, 'src', 'runtime-identity.ts'), 'export {};\n', 'utf8');
+  run('git', ['init'], checkoutRoot);
+  run('git', ['config', 'user.email', 'test@example.com'], checkoutRoot);
+  run('git', ['config', 'user.name', 'Test User'], checkoutRoot);
+  run('git', ['add', '.'], checkoutRoot);
+  run('git', ['commit', '-m', 'initial'], checkoutRoot);
+
+  const identity = runtimeIdentity.resolvePipelaneRuntimeIdentity(
+    pathToFileURL(path.join(checkoutRoot, 'src', 'runtime-identity.ts')).href,
+  );
+  assert.equal(identity.source, 'src');
+  assert.equal(identity.version, '3.2.1');
+  assert.match(identity.sha, /^[0-9a-f]{40}$/);
+  assert.equal(identity.sha, run('git', ['rev-parse', 'HEAD'], checkoutRoot));
+  assert.equal(identity.dirty, false);
+  assert.equal(identity.packageRoot, realpathSync(checkoutRoot));
+});
+
+test('runtime identity warns when a dist install is older than its own src', async () => {
+  const runtimeIdentity = await import(pathToFileURL(path.join(KIT_ROOT, 'src', 'runtime-identity.ts')).href);
+  const packageRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-dist-staleness-'));
+  mkdirSync(path.join(packageRoot, 'src'), { recursive: true });
+  mkdirSync(path.join(packageRoot, 'dist'), { recursive: true });
+  mkdirSync(path.join(packageRoot, '.git'), { recursive: true });
+  writeFileSync(path.join(packageRoot, 'src', 'cli.ts'), 'export {};\n', 'utf8');
+  const identity = {
+    version: '0.2.0',
+    sha: 'abcdef0123456789',
+    dirty: false,
+    builtAt: '2000-01-01T00:00:00.000Z',
+    packageRoot,
+    source: 'dist',
+  };
+  const staleWarning = `Warning: dist/ is older than the newest src/ file in ${packageRoot} — run npm run build.`;
+
+  assert.deepEqual(runtimeIdentity.buildRuntimeWarnings(identity, packageRoot), [staleWarning]);
+  assert.deepEqual(
+    runtimeIdentity.buildRuntimeWarnings({ ...identity, builtAt: new Date(Date.now() + 60_000).toISOString() }, packageRoot),
+    [],
+  );
+
+  const distCli = path.join(packageRoot, 'dist', 'cli.js');
+  writeFileSync(distCli, 'module.exports = {};\n', 'utf8');
+  const past = new Date('2000-01-02T00:00:00.000Z');
+  utimesSync(distCli, past, past);
+  assert.deepEqual(runtimeIdentity.buildRuntimeWarnings({ ...identity, builtAt: null }, packageRoot), [staleWarning]);
+  writeFileSync(distCli, 'module.exports = {};\n', 'utf8');
+  assert.deepEqual(runtimeIdentity.buildRuntimeWarnings({ ...identity, builtAt: null }, packageRoot), []);
+});
+
+test('api action failure envelopes prefer semantic errors over the runtime identity banner', () => {
+  const repoRoot = createRepo();
+  try {
+    writePipelaneConfig(repoRoot);
+    const executed = runCli(['run', 'api', 'action', 'doctor.probe', '--execute'], repoRoot, {}, true);
+    assert.notEqual(executed.status, 0);
+    assert.match(executed.stderr.split(/\r?\n/)[0], /^pipelane v/);
+    const envelope = JSON.parse(executed.stdout);
+    assert.equal(envelope.ok, false);
+    assert.match(envelope.message, /^doctor\.probe failed: No machine-local deploy configuration saved\./);
+    assert.doesNotMatch(envelope.message, /pipelane v/);
+    assert.doesNotMatch(envelope.data.execution.stderr, /pipelane v/);
+    assert.match(envelope.data.execution.stderr, /No machine-local deploy configuration saved\./);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 function writeManualReviewFiles(repoRoot, name, options = {}) {
   const root = path.join(repoRoot, '.manual-review-fixtures');
   mkdirSync(root, { recursive: true });
