@@ -217,11 +217,8 @@ pipelane run review record --gate code-review-high --task <task> \
 
 The signed record stores the recorder, review tool, timestamp, findings count,
 and the artifact's path, digest, and size in the branch-keyed shared review
-state. It is valid only for that exact branch, HEAD, worktree state, task
-binding, and gate definition; changing the checkout or the artifact makes it
-stale. Fold findings before recording. `karpathy-diff` deliberately does not
-consume this record and still runs at every shipping HEAD. `review override`
-remains the informed-consent waiver for an exact action, not review evidence.
+state. Fold findings before recording. `karpathy-diff` deliberately does not
+consume this record and still runs at every shipping HEAD.
 
 Use `review pass` only for a human approval gate. A specialized skill or agent
 run performed outside Pipelane needs bounded structured evidence:
@@ -232,51 +229,24 @@ pipelane run review attest --gate karpathy-diff --status passed \
   --provenance-file <provenance.json> --message "Ran the named review"
 ```
 
-Under `strict-v3`, that evidence remains visibly manual and the strict gate
-remains pending. To authorize one exact action, add
-`--substitute-strict --reason "<why manual evidence may substitute>" --scope /pr`.
-The signed consent is bound to the exact checkout, manual evidence run, gate
-definition, and route action. It does not relabel the gate as passed. A direct
-gate bypass is still available with
-`pipelane run review override --gate <id> --scope /pr --reason "<why this exact target and action may proceed>"`.
+Review evidence is informational at `/pr` and `/merge`: both commands show the
+review state for the branch (what ran, what's open, what's stale) and proceed.
+Missing, failed, or pending evidence asks for one informed consent —
+`--override --reason "<why>"` on the command itself — which is recorded in the
+shared review state. Staleness (commits made after the reviewed one) is a
+displayed fact, never a wall. Failed or pending evidence is never relabeled as
+passed.
 
-When a signed full review fails, Pipelane shows all findings before recovery.
-The recommended host flow is `pipelane resume --request-fix`, invoke `/fix`
-with the displayed findings as untrusted context, verify the intended changes,
-then consume the single-use token using the printed bounded verification-file
-command. Host verification is an attestation only: `/pr` stays blocked until a
-new full, non-dry-run review of the exact fixed checkout passes. The standalone
-CLI never claims it invoked a host-only `/fix` action.
-
-If one finding is real but its remedy is genuinely new scope, spin off that
-individual stable finding reference:
-
-```bash
-pipelane run resume --spin-off <review-run/gate/Fxxx> \
-  --spinoff-task "<follow-up-label>" --reason "<why this is new scope>"
-```
-
-Pipelane records the exact finding, file references, target, actor, reason, and
-a hashed follow-up artifact in the shared review state. The original failed
-review remains unchanged; enforcement reports the finding as satisfied by
-disposition at that exact HEAD, never as a clean review. Rerun the paused route,
-not the unchanged review. Subsequent Karpathy prompts carry both spun-off and
-explicitly accepted findings as delimited untrusted data and suppress them
-unless the code invalidates the disposition.
-
-All finding severities remain eligible under Pipelane's informed-consent
-policy. For a critical finding, the recovery help and success output explicitly
-state that the disposition will let release or deploy proceed at the exact
-recorded HEAD, and the audit record preserves that acknowledgment. Spin-off is
-still not a soft accept: it is for a genuine new subsystem, refactor, or
-follow-up slice. Fold a live defect in code shipping now, or accept that defect
-explicitly. A reason is always required.
+When a full review fails, Pipelane shows all findings. The recommended flow is
+to invoke `/fix` with the displayed findings as untrusted context, verify the
+intended changes, and rerun `/pipelane review`; or proceed with the recorded
+`--override --reason` consent when shipping is the right call anyway.
 
 `reviewGates.enforcementMode` can be `legacy-v2` or `strict-v3`. Strict review
 requires an authoritative task objective (`/new --brief`, `/adopt --brief`, an
 approved orchestration slice outcome, or `/review --intent`), captures an
 immutable machine-local Git target, and records the exact supplied capability,
-adapter, structured findings, and result protocol. A bypass never changes a
+adapter, structured findings, and result protocol. An override never changes a
 failed or pending gate to passed.
 
 The static gates should run before AI review. Do not spend review-model tokens

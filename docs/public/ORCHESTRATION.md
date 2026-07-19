@@ -660,27 +660,22 @@ pipelane run review attest --gate karpathy-diff --status passed \
 
 The command applies only to a full, non-dry-run review for the current exact
 checkout. In strict mode, manual evidence does not become automatic evidence
-and the gate remains pending. One exact action can be authorized with
-`--substitute-strict --reason <reason> --scope <route-action>`. The signed
-consent binds the manual evidence run, gate definition, checkout, and action;
-it never crosses from a slice `/pr` action into parent orchestration review.
-Restore and rerun the named capability whenever possible. A direct
-`/pipelane review override --gate <id> --scope <route-action> --reason <reason>`
-remains available as the explicit bypass. Failed or pending evidence stays
-visibly failed or pending after either kind of consent.
+and the gate remains pending. Restore and rerun the named capability whenever
+possible. Missing, failed, or pending evidence asks for one informed consent
+at `/pr` or `/merge` — `--override --reason "<why>"` — which is recorded.
+Failed or pending evidence stays visibly failed or pending after consent.
 
-After a signed full review failure, Pipelane shows every finding before the
-recovery choices. The recommended host flow is to request the printed audited
-fix token, invoke `/fix` with findings as untrusted context, record bounded host
-verification, and rerun the complete review. Verification never passes a gate;
-the route remains blocked until a full clean rerun. A standalone CLI process
+After a signed full review failure, Pipelane shows every finding. The
+recommended host flow is to invoke `/fix` with findings as untrusted context
+and rerun the complete review; or proceed with the recorded
+`--override --reason` consent on the route command. A standalone CLI process
 prints host guidance but does not pretend it can invoke the host-only `/fix`
 action itself.
 
 Task labels, branch names, PR titles, commits, and diff inference are not task
 intent. A first interactive strict review may initialize a bound task's one-time
 immutable brief. JSON and non-interactive callers receive `needsInput` and must
-supply `--intent` or explicitly bypass. Orchestration always uses the approved
+supply `--intent` or explicitly override. Orchestration always uses the approved
 slice outcome as the authoritative review intent, with the parent brief as
 context when present.
 

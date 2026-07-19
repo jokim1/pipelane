@@ -121,23 +121,13 @@ pipelane run review record --gate code-review-high --task <task> \
   --findings-count <n> --artifact <review-report>
 ```
 
-The record is evidence, not a waiver, and is bound to the exact branch, HEAD,
-worktree state, task, artifact digest, and gate definition. A new commit makes
-it stale. `karpathy-diff` still runs at each shipping HEAD as a clean-pass
-check, not a discovery engine. Use `review pass` only for human approval gates;
-use `review override` only for an explicit informed-consent waiver.
-
-When a real review finding requires a separate subsystem or follow-up slice,
-record the individual disposition with
-`pipelane run resume --spin-off <review-run/gate/Fxxx> --spinoff-task "<label>" --reason "<why this is new scope>"`.
-Pipelane writes a durable hashed follow-up artifact and carries the disposition
-into later Karpathy prompts as delimited untrusted data. The original review
-stays failed; the finding is shown as satisfied by disposition at that exact
-HEAD, so rerun the paused route rather than spending tokens on an unchanged
-review. All severities remain eligible. Spinning off a critical finding records
-explicit informed consent that it will not block release or deploy at that
-HEAD. Do not spin off a live defect in code shipping now; fold it or accept it
-explicitly.
+The record is evidence, not a waiver. A new commit after the reviewed one is
+displayed as staleness ("N files changed since the reviewed commit"), never a
+wall. `karpathy-diff` still runs at each shipping HEAD as a clean-pass check,
+not a discovery engine. Use `review pass` only for human approval gates.
+Missing, failed, or pending review evidence asks for one informed consent at
+`/pr` or `/merge` — `--override --reason "<why>"` — which is recorded; failed
+or pending evidence is never relabeled as passed.
 
 Use `/fix` to repair bugs, review findings, CI failures, and code-quality
 issues. Use `/fix rethink` for planning-only architecture review before large
