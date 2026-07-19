@@ -475,6 +475,12 @@ export async function dispatchDeploy(
   // staging-parity gates below. The prod typed-SHA confirmation is never
   // overridable.
   const gateOverrideReason = parsed.flags.override ? parsed.flags.reason.trim() : '';
+  // Reason stamped on the deploy record when a gate is overridden. Usually the
+  // deploy-time --override --reason; a still-active legacy release-mode
+  // override (devmode release --override) also bypasses the readiness gate
+  // below and is recorded here so the bypass is never silent. Deploy-time
+  // consent takes precedence when both are present.
+  let recordedGateOverrideReason = gateOverrideReason;
   const gateOverrideLines: string[] = [];
   const deployOverrideHint = `Or proceed with informed consent: ${formatWorkflowCommand(context.config, 'deploy', environment)} --override --reason "<why this deploy may proceed>". The reason is recorded on the deploy record.`;
   if (context.modeState.mode === 'release' && environment === 'prod') {
@@ -491,14 +497,18 @@ export async function dispatchDeploy(
       probeState,
       surfaces,
     });
-    if (!readiness.ready && !context.modeState.override) {
-      if (!gateOverrideReason) {
+    if (!readiness.ready) {
+      const modeStateOverrideReason = context.modeState.override
+        ? `release-mode override (devmode): ${context.modeState.override.reason}`
+        : '';
+      if (!gateOverrideReason && !modeStateOverrideReason) {
         throw new Error([
           buildReleaseCheckMessage(readiness, surfaces, context.config),
           deployOverrideHint,
         ].join('\n\n'));
       }
-      gateOverrideLines.push(`Release-readiness gate overridden by informed consent: ${gateOverrideReason}`);
+      if (!gateOverrideReason) recordedGateOverrideReason = modeStateOverrideReason;
+      gateOverrideLines.push(`Release-readiness gate overridden by informed consent: ${gateOverrideReason || modeStateOverrideReason}`);
     }
   }
 
@@ -678,7 +688,7 @@ export async function dispatchDeploy(
       workflowRunUrl: run?.url,
       idempotencyKey,
       triggeredBy,
-      ...(gateOverrideLines.length > 0 ? { gateOverrideReason } : {}),
+      ...(gateOverrideLines.length > 0 ? { gateOverrideReason: recordedGateOverrideReason } : {}),
     };
     for (const line of gateOverrideLines) {
       process.stderr.write(`${line}\n`);

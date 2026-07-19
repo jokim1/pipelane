@@ -1044,7 +1044,10 @@ export interface DeployRecord {
   triggeredBy?: string;
   failureReason?: string;
   // Recorded when the operator overrode the release-readiness or
-  // staging-parity gate for this deploy with --override --reason.
+  // staging-parity gate for this deploy with --override --reason, or when a
+  // still-active release-mode override (devmode release --override) bypassed
+  // the readiness gate — its stored reason is carried over so the bypass is
+  // never silent. Deploy-time consent wins when both are present.
   gateOverrideReason?: string;
 }
 

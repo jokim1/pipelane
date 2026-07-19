@@ -24009,6 +24009,54 @@ test('deploy prod blocks without staging parity and proceeds with a recorded ove
   }
 });
 
+test('deploy prod records an active release-mode override as gateOverrideReason instead of bypassing readiness silently', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigState(repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    runCli(['run', 'devmode', 'release', '--override', '--reason', 'staging probes are down', '--json'], repoRoot);
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Legacy Override', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Legacy Override', '--json'], created.worktreePath, env);
+    runCli(['run', 'merge', '--json'], created.worktreePath, env);
+    runCli(['run', 'deploy', 'staging', '--json'], created.worktreePath, env);
+
+    // Release readiness is NOT ready (no staging probe was ever recorded) but
+    // staging parity passes. No deploy-time --override is given: the active
+    // release-mode override must proceed AND stamp its stored reason on the
+    // deploy record — never bypass the readiness gate silently.
+    const result = runCli(['run', 'deploy', 'prod', '--json'], created.worktreePath, {
+      ...env,
+      PIPELANE_DESTINATION_INTERNAL_STEP: '1',
+      PIPELANE_DEPLOY_PROD_CONFIRM_STUB: 'DEAD',
+    });
+    const deployed = JSON.parse(result.stdout);
+    assert.equal(deployed.status, 'succeeded');
+    assert.equal(deployed.gateOverrideReason, 'release-mode override (devmode): staging probes are down');
+    assert.match(deployed.message, /Release-readiness gate overridden by informed consent: release-mode override \(devmode\): staging probes are down/);
+    assert.match(result.stderr, /Release-readiness gate overridden by informed consent: release-mode override \(devmode\): staging probes are down/);
+    const deployState = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'deploy-state.json'), 'utf8'));
+    const prodRecord = deployState.records.find((record) => record.environment === 'prod');
+    assert.equal(prodRecord.gateOverrideReason, 'release-mode override (devmode): staging probes are down');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
 test('merge fails closed when gh never reports mergeCommit.oid', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
@@ -39417,9 +39465,3 @@ test('convergence S1: /clean accepts a squash merge landed outside /merge only w
     rmSync(remoteRoot, { recursive: true, force: true });
   }
 });
-
-
-
-
-
-
