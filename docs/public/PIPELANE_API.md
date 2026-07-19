@@ -164,11 +164,12 @@ the checkout is behind the configured base branch. Clients should surface the
 reason and have the operator rebase before retrying, rather than confirming
 or executing a stale route.
 
-When review evidence blocks one of those actions, `preflight.review` contains
-the same typed presentation used by `/status` and the board. Clients should
-render all relevant findings and protocol errors before the recovery and
-exact-scope bypass choices in `preflight.reason`. A bypass remains consent for
-that scope; it does not change a failed or pending gate to passed.
+When review evidence is not green for one of those actions, `preflight.review`
+contains the same typed presentation used by `/status` and the board. Clients
+should render all relevant findings and protocol errors from
+`preflight.reason`, then proceed with the single recorded `override` +
+`reason` consent when the operator chooses to continue. An override remains
+consent; it does not change a failed or pending gate to passed.
 
 `doctor.fix` is intentionally **not** exposed as an API action — it is
 interactive (TTY prompts for platform + URLs) and lives behind

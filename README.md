@@ -152,8 +152,10 @@ Then run it before PR handoff:
 /pipelane review
 ```
 
-`/pr` checks that the evidence is fresh, complete, and bound to the current
-branch and HEAD. If review fails, fix the root cause and run review again.
+`/pr` shows the review state for the branch — what ran, what's open, what's
+stale — and proceeds. Missing, failed, or pending evidence asks for one
+recorded `--override --reason` consent. If review fails, fix the root cause
+and run review again.
 
 ### 4. `/pipelane web`
 

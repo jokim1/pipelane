@@ -147,9 +147,11 @@ it shows the saved grouped gate state or inferred recommended defaults without
 rewriting config. Mutating flags such as `--toggle`, `--enable`, `--disable`,
 `--install`, and `--reset` write immediately and reprint the grouped state.
 `/pipelane review` runs the
-configured gates against the current diff and writes evidence. `/pr` enforces
-fresh, unfiltered evidence for the current branch, HEAD, and worktree state
-before commit, push, or PR handoff.
+configured gates against the current diff and writes evidence. `/pr` shows the
+branch's review state (what ran, what's open, what's stale) before commit,
+push, or PR handoff; missing, failed, or pending evidence asks for one
+recorded `--override --reason` consent, and staleness is displayed, never a
+wall.
 
 Plain `/pipelane setup` remains the machine-local repo setup and repair path. Do not use
 `/pipelane setup review-gates`.
@@ -474,11 +476,11 @@ orchestration review when review state signing is enabled. Set the same
 `PIPELANE_REVIEW_STATE_KEY` for the standalone slice `/pipelane review`,
 `/pipelane review pass` or `/pipelane review attest`, and parent
 `/pipelane orchestrate review` commands. Unsigned manual evidence stays visible
-in the slice worktree but does not complete orchestration review gates. A
-strict manual substitution is authorized only for its recorded route action;
-a slice substitution scoped to `/pr` is never promoted into parent
-orchestration review. Complete the named automatic gate in orchestration or use
-the orchestration command's own explicit informed-consent mechanism.
+in the slice worktree but does not complete orchestration review gates, and
+substitution-requested manual evidence is never promoted into parent
+orchestration review. Complete the named automatic gate in orchestration; a
+recorded `--override --reason` consent on `/pr` or `/merge` covers only that
+route command, never an orchestration review gate.
 
 ## Config Contract
 

@@ -39,7 +39,7 @@ User-facing slash commands:
 | `/resume` | Recover an existing task worktree. |
 | `/repo-guard` | Verify that the checkout is safe for task work. |
 | `/pipelane review` | Run configured review gates and write evidence for the current diff. |
-| `/pr` | Enforce review evidence, run pre-PR checks, commit, push, and open or update a PR. |
+| `/pr` | Show review state, run pre-PR checks, commit, push, and open or update a PR. |
 | `/merge` | Merge the PR, record immutable delivery history, and close the clean task workspace. Pass `--keep-worktree` to retain it. |
 | `/release` | Enable or inspect the optional release module. |
 | `/deploy` | Deploy the merged SHA to `staging` or `prod`. |
@@ -111,7 +111,10 @@ merged SHA before production moves.
 ```
 
 Release mode fails closed when deploy config, staging evidence, or probe health
-is missing. `/release enable` initializes machine-local release module state,
+is missing. Staging-parity and release-readiness run at `/deploy` and can be
+overridden with informed consent — `--override --reason "<why>"`, recorded on
+the deploy record — while the typed-SHA production confirmation is never
+overridable. `/release enable` initializes machine-local release module state,
 `/release status` explains readiness without failing non-zero, and
 `/release doctor --probe` refreshes live healthcheck evidence. Automation
 should keep using `pipelane run release-check` when blocked readiness must fail
@@ -132,7 +135,7 @@ For current Pipelane flows, verification happens in this order:
 
 1. local implementation checks, run by the agent or developer
 2. `/pipelane review` static gates, behavioral gates, AI review gates, runtime gates, and human gates
-3. `/pr` review-evidence enforcement plus pre-PR checks from machine-local Pipelane config
+3. `/pr` review-evidence display plus pre-PR checks from machine-local Pipelane config
 4. CI checks on the PR
 5. `/merge` SHA recording
 6. `/deploy staging --pr <merged-pr-number>` in release mode
@@ -155,7 +158,8 @@ Pipelane is intentionally conservative:
   interactive confirmation or explicit `--yes`; tracked conflicts fail closed.
 - `/merge` records immutable delivery history, proves `origin/<base>` contains the merge, and closes only a clean, exact-bound task workspace.
 - `--keep-worktree` is durable until explicit `/clean --apply --task <slug>`.
-- release-mode `/deploy prod` requires same-SHA staging evidence.
+- release-mode `/deploy prod` requires same-SHA staging evidence unless
+  overridden with a recorded `--override --reason`.
 - production deploys and rollback require explicit confirmation.
 - `/clean` refuses dirty, too-young, missing-evidence, protected ignored content, and unsafe workspaces; bare/status-only use is non-destructive.
 

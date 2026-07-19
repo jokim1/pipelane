@@ -31,9 +31,9 @@ design note.
 Decisions captured through 2026-07-13:
 
 - `/pipelane review setup`, `/pipelane review`, machine-local evidence, and
-  `/pr` enforcement form the shipped review-gate foundation. Review evidence
-  must bind the exact PR head and reviewed material tree; stale or anonymous
-  evidence fails closed.
+  `/pr` review display form the shipped review-gate foundation. Superseded
+  2026-07 by consent relief: review evidence is informational at `/pr` and
+  `/merge` — see "PR and review strategy" below.
 - Review gates remain ordered by phase: static, behavioral, AI diff,
   instruction, runtime, then human gates. Cheap deterministic checks run before
   AI review, and fix-first gstack `/review` runs before read-only confirmations.
