@@ -293,7 +293,6 @@ function reviewPresentationForEvidence(
       ? projectReviewRun(evidence.latest, {
         artifactRoot: reviewArtifactRoot(context.commonDir, context.config),
         relation: 'current',
-        consents: evidence.consents,
       })
     : null;
 }
@@ -999,6 +998,7 @@ function normalizeInputs(
         pr: flags.pr,
         sha: flags.sha,
         surfaces: flags.surfaces,
+        override: flags.override,
         reason: flags.reason,
       };
     case 'route.merge':
@@ -1303,6 +1303,7 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
       pushOpt('--pr', flags.pr);
       pushOpt('--sha', flags.sha);
       pushSurfaces();
+      if (flags.override) args.push('--override');
       pushOpt('--reason', flags.reason);
       break;
     case 'route.merge':
@@ -1326,6 +1327,7 @@ function buildUnderlyingArgs(actionId: StableActionId, parsed: ParsedOperatorArg
       pushRoutePrMetadata();
       pushOpt('--sha', flags.sha);
       pushSurfaces();
+      if (flags.override) args.push('--override');
       pushOpt('--reason', flags.reason);
       break;
     case 'clean.plan':

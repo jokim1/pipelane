@@ -17,6 +17,12 @@ Do not pass a raw unquoted `#625` token to a shell; `#` starts a shell
 comment before Pipelane can parse it.
 
 Release mode requires staging before production for the same merged SHA and surface set.
+Staging-parity and health readiness can be overridden with informed consent:
+`--override --reason "<why>"` (the reason is recorded on the deploy record).
+An active release-mode override (`{{ALIAS_DEVMODE}} release --override --reason`)
+also satisfies the readiness gate; its stored reason is recorded on the deploy
+record the same way, and a deploy-time `--override --reason` takes precedence.
+The typed-SHA production confirmation is never overridable.
 
 Production deploys in release mode require typed-SHA-prefix confirmation. The operator
 prompts for the first 4 characters of the target SHA before dispatching; surface the

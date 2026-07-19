@@ -102,10 +102,25 @@ function verifyLine(line: { signature?: string; keyId?: string }): boolean {
   return verifySignedPayload(line, key);
 }
 
-function readJournalLines(journalPath: string): JournalLine[] {
-  if (!existsSync(journalPath)) return [];
+interface JournalRead {
+  lines: JournalLine[];
+  unreadable: string[];
+}
+
+// The journal is advisory recording state: a line that cannot be parsed or
+// verified is reported to stderr and skipped — it never blocks a command. Its
+// raw text is retained in `unreadable` and rewritten verbatim by every writer,
+// because a skipped line may be an unapplied crash-replay record and every
+// writer rewrites the whole file.
+function readJournal(journalPath: string): JournalRead {
+  if (!existsSync(journalPath)) return { lines: [], unreadable: [] };
   const rawText = readFileSync(journalPath, 'utf8');
   const lines: JournalLine[] = [];
+  const unreadable: string[] = [];
+  const skip = (index: number, rawLine: string, detail: string): void => {
+    process.stderr.write(`Completion journal ${journalPath} line ${index + 1} ${detail}; the line is skipped and preserved for repair.\n`);
+    unreadable.push(rawLine);
+  };
   for (const [index, rawLine] of rawText.split('\n').entries()) {
     const trimmed = rawLine.trim();
     if (!trimmed) continue;
@@ -113,29 +128,46 @@ function readJournalLines(journalPath: string): JournalLine[] {
     try {
       parsed = JSON.parse(trimmed);
     } catch {
-      throw new Error(`Completion journal ${journalPath} line ${index + 1} is not valid JSON. The journal is refused (fail-closed); repair or remove the corrupted journal before continuing.`);
+      skip(index, trimmed, 'is not valid JSON');
+      continue;
     }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new Error(`Completion journal ${journalPath} line ${index + 1} is not a journal record. The journal is refused (fail-closed).`);
+      skip(index, trimmed, 'is not a journal record');
+      continue;
     }
     const record = parsed as JournalLine;
     if (record.kind !== 'review-completion' && record.kind !== 'applied') {
-      throw new Error(`Completion journal ${journalPath} line ${index + 1} has unknown kind. The journal is refused (fail-closed).`);
+      skip(index, trimmed, 'has unknown kind');
+      continue;
     }
     if (!verifyLine(record)) {
-      throw new Error(`Completion journal ${journalPath} line ${index + 1} failed convergence-key signature verification. The journal is refused (fail-closed); no unverified completion record is ever applied.`);
+      skip(index, trimmed, 'failed signature verification');
+      continue;
     }
     lines.push(record);
   }
-  return lines;
+  return { lines, unreadable };
 }
 
-function writeJournalLines(journalPath: string, lines: JournalLine[]): void {
+// True when the journal holds at least one line that could not be read, so a
+// caller that would retire the journal keeps it in place for repair instead.
+export function completionJournalHasUnreadableLines(
+  commonDir: string,
+  config: WorkflowConfig,
+  lineageKey: string,
+): boolean {
+  const journalPath = completionJournalPath(commonDir, config, lineageKey);
+  if (!existsSync(journalPath)) return false;
+  return readJournal(journalPath).unreadable.length > 0;
+}
+
+function writeJournalLines(journalPath: string, lines: JournalLine[], unreadable: string[] = []): void {
   const dir = path.dirname(journalPath);
   mkdirSync(dir, { recursive: true });
   const tmpPath = path.join(dir, `.${path.basename(journalPath)}.tmp-${process.pid}-${Date.now()}`);
+  const serialized = [...unreadable, ...lines.map((line) => JSON.stringify(line))];
   try {
-    writeFileSync(tmpPath, lines.map((line) => JSON.stringify(line)).join('\n') + (lines.length > 0 ? '\n' : ''), 'utf8');
+    writeFileSync(tmpPath, serialized.join('\n') + (serialized.length > 0 ? '\n' : ''), 'utf8');
     renameSync(tmpPath, journalPath);
   } finally {
     rmSync(tmpPath, { force: true });
@@ -150,7 +182,7 @@ export function appendReviewCompletionRecord(
   record: Omit<ReviewCompletionRecord, 'schemaVersion' | 'kind' | 'recordedAt' | 'keyId' | 'signature'>,
 ): ReviewCompletionRecord {
   const journalPath = completionJournalPath(commonDir, config, record.lineageKey);
-  const lines = readJournalLines(journalPath);
+  const { lines, unreadable } = readJournal(journalPath);
   const existing = lines.find((line): line is ReviewCompletionRecord =>
     line.kind === 'review-completion' && line.reviewRunId === record.reviewRunId);
   if (existing) return existing;
@@ -161,7 +193,7 @@ export function appendReviewCompletionRecord(
     recordedAt: nowIso(),
     keyId: '',
   });
-  writeJournalLines(journalPath, [...lines, full]);
+  writeJournalLines(journalPath, [...lines, full], unreadable);
   return full;
 }
 
@@ -172,7 +204,7 @@ export function markReviewCompletionApplied(
   reviewRunId: string,
 ): void {
   const journalPath = completionJournalPath(commonDir, config, lineageKey);
-  const lines = readJournalLines(journalPath);
+  const { lines, unreadable } = readJournal(journalPath);
   if (lines.some((line) => line.kind === 'applied' && line.reviewRunId === reviewRunId)) return;
   const marker: AppliedMarkerRecord = signLine({
     schemaVersion: 1,
@@ -182,7 +214,7 @@ export function markReviewCompletionApplied(
     appliedAt: nowIso(),
     keyId: '',
   });
-  writeJournalLines(journalPath, [...lines, marker]);
+  writeJournalLines(journalPath, [...lines, marker], unreadable);
 }
 
 // Records journaled but never marked applied — the crash-replay input.
@@ -191,7 +223,7 @@ export function readUnappliedCompletionRecords(
   config: WorkflowConfig,
   lineageKey: string,
 ): ReviewCompletionRecord[] {
-  const lines = readJournalLines(completionJournalPath(commonDir, config, lineageKey));
+  const { lines } = readJournal(completionJournalPath(commonDir, config, lineageKey));
   const applied = new Set(lines.filter((line) => line.kind === 'applied').map((line) => line.reviewRunId));
   return lines.filter((line): line is ReviewCompletionRecord =>
     line.kind === 'review-completion' && !applied.has(line.reviewRunId));
@@ -211,18 +243,20 @@ export function migrateCompletionJournalLineage(
   const fromPath = completionJournalPath(commonDir, config, fromLineageKey);
   if (!existsSync(fromPath)) return;
   const toPath = completionJournalPath(commonDir, config, toLineageKey);
-  const fromLines = readJournalLines(fromPath);
-  const toLines = readJournalLines(toPath);
-  const seen = new Set(toLines.map((line) => `${line.kind}:${line.reviewRunId}`));
-  const merged = [...toLines];
-  for (const line of fromLines) {
+  const from = readJournal(fromPath);
+  const to = readJournal(toPath);
+  const seen = new Set(to.lines.map((line) => `${line.kind}:${line.reviewRunId}`));
+  const merged = [...to.lines];
+  for (const line of from.lines) {
     if (seen.has(`${line.kind}:${line.reviewRunId}`)) continue;
     // Re-sign under the new lineage key value so replay verification of the
     // migrated line matches its stored lineage.
     merged.push(signLine({ ...line, lineageKey: toLineageKey, signature: undefined, keyId: '' } as JournalLine & { keyId: string }));
     seen.add(`${line.kind}:${line.reviewRunId}`);
   }
-  writeJournalLines(toPath, merged);
+  // Unreadable lines migrate verbatim, so removing the old file cannot be the
+  // step that destroys them.
+  writeJournalLines(toPath, merged, [...to.unreadable, ...from.unreadable]);
   rmSync(fromPath, { force: true });
 }
 
@@ -236,6 +270,9 @@ export function pruneAppliedCompletionJournal(
 ): boolean {
   const journalPath = completionJournalPath(commonDir, config, lineageKey);
   if (!existsSync(journalPath)) return false;
+  // An unreadable line may itself be an unapplied completion record, so the
+  // journal is not "fully applied" and must survive for repair.
+  if (readJournal(journalPath).unreadable.length > 0) return false;
   if (readUnappliedCompletionRecords(commonDir, config, lineageKey).length > 0) return false;
   rmSync(journalPath, { force: true });
   return true;

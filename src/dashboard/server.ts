@@ -8,23 +8,14 @@ import { fileURLToPath } from 'node:url';
 
 import {
   DEFAULT_WORKFLOW_ALIASES,
-  loadParkedTasks,
-  loadTaskBudgetState,
   loadTaskLock,
   loadWorkflowConfig,
-  normalizeTaskBudgetConfig,
   resolveReadableConfigPath,
   resolveWorkflowContext,
   slugifyTaskName,
   type WorkflowCommand,
 } from '../operator/state.ts';
 import { isStableActionBrowserExposed } from '../operator/api/actions.ts';
-import {
-  approveBudgetConsentCard,
-  denyBudgetConsentCard,
-  listBudgetConsentCards,
-  recordBoardSessionDigest,
-} from '../operator/consent-grants.ts';
 
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = 3033;
@@ -680,16 +671,6 @@ function printDashboardBanner(options: DashboardServerOptions, actualPort: numbe
 export async function startDashboardServer(options: DashboardServerOptions): Promise<void> {
   const uiFilePath = getUiFilePath();
   const browserSessionToken = randomBytes(32).toString('base64url');
-  // D11: publish this server's session-token digest so the consent-grants
-  // module can demand the token PREIMAGE as human-surface proof on approval.
-  // Best-effort: a repo without pipelane state simply has no approvable cards.
-  try {
-    const context = resolveWorkflowContext(options.repoRoot);
-    recordBoardSessionDigest(context.commonDir, context.config, browserSessionToken);
-  } catch {
-    // Consent approvals will refuse without a published digest; the rest of
-    // the dashboard works normally.
-  }
   const loopbackHost = normalizeLoopbackHost(options.host);
   let actualPort = options.port;
   let dashboardSettings = options.settings;
@@ -1174,89 +1155,6 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           ok: true,
           execution: executionSnapshot(record),
         });
-        return;
-      }
-
-      // Convergence v1 S1 (D11): budget-extension consent cards. Approvals
-      // mint IN-PROCESS behind the mutation gauntlet above (loopback + Origin
-      // + browser-session token + JSON content-type) — deliberately not a CLI
-      // action, so no non-interactive caller can reach a mint by spawning
-      // pipelane. The gauntlet is the human-surface proof for the grant.
-      if (method === 'GET' && pathname === '/api/consents') {
-        try {
-          const context = resolveWorkflowContext(options.repoRoot);
-          const cards = listBudgetConsentCards(context.commonDir, context.config);
-          const parked = loadParkedTasks(context.commonDir, context.config).records;
-          sendJson(res, 200, { ok: true, cards, parked });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          sendJson(res, 500, buildTransportFailure('Could not list consent cards.', '', message));
-        }
-        return;
-      }
-
-      if (method === 'POST' && pathname.startsWith('/api/consents/') && (pathname.endsWith('/approve') || pathname.endsWith('/deny'))) {
-        const approving = pathname.endsWith('/approve');
-        const suffixLength = approving ? '/approve'.length : '/deny'.length;
-        const cardId = decodeURIComponent(pathname.slice('/api/consents/'.length, -suffixLength).replace(/\/$/, ''));
-        if (!cardId) {
-          sendJson(res, 400, buildTransportFailure('Consent decisions require a card id.'));
-          return;
-        }
-        try {
-          const body = await readJsonBody(req);
-          const decisionReason = typeof body.reason === 'string' ? body.reason.trim() : '';
-          const context = resolveWorkflowContext(options.repoRoot);
-          if (approving) {
-            const card = listBudgetConsentCards(context.commonDir, context.config).find((entry) => entry.id === cardId);
-            if (card) {
-              const entry = loadTaskBudgetState(context.commonDir, context.config).entries[card.lineageKey];
-              const ceiling = normalizeTaskBudgetConfig(context.config.taskBudget).maxLifetimeExtensions;
-              if (entry && entry.lifetimeExtensions >= ceiling) {
-                sendJson(res, 409, buildTransportFailure(
-                  `Task ${card.taskSlug || card.branchName} has consumed its ${ceiling} lifetime budget extensions; approving would mint an unusable grant. The remaining paths are /fix rethink or a new task.`,
-                ));
-                return;
-              }
-            }
-            const expectedMutationIndex = typeof body.mutationIndex === 'number' && Number.isSafeInteger(body.mutationIndex) && body.mutationIndex >= 0
-              ? body.mutationIndex
-              : undefined;
-            const expectedScopeHash = typeof body.scopeHash === 'string' && /^[a-f0-9]{64}$/.test(body.scopeHash)
-              ? body.scopeHash
-              : undefined;
-            if (expectedMutationIndex === undefined || expectedScopeHash === undefined) {
-              sendJson(res, 400, buildTransportFailure('Approving a consent card requires the exact mutation index and scope hash displayed on the Board. Refresh the card and review its current scope before approving.'));
-              return;
-            }
-            const outcome = approveBudgetConsentCard(context.commonDir, context.config, cardId, {
-              decidedBy: 'board-operator',
-              ...(decisionReason ? { decisionReason } : {}),
-              // The gauntlet already validated this header; the module
-              // re-verifies it against the published digest so a bare module
-              // call can never mint (D11).
-              boardSessionProof: singleRequestHeader(req, BOARD_SESSION_HEADER),
-              // The page echoes the mutation index + scope hash it displayed
-              // so a raced re-request cannot mint a scope the human never saw.
-              expectedMutationIndex,
-              expectedScopeHash,
-            });
-            sendJson(res, 200, { ok: true, card: outcome.card, grantId: outcome.grant.id });
-          } else {
-            if (!decisionReason) {
-              sendJson(res, 400, buildTransportFailure('Denying a consent card requires a reason.'));
-              return;
-            }
-            const card = denyBudgetConsentCard(context.commonDir, context.config, cardId, {
-              decidedBy: 'board-operator',
-              decisionReason,
-            });
-            sendJson(res, 200, { ok: true, card });
-          }
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          sendJson(res, 409, buildTransportFailure(`Could not ${approving ? 'approve' : 'deny'} consent card ${cardId}.`, '', message));
-        }
         return;
       }
 

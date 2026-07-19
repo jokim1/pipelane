@@ -10,9 +10,6 @@ import { readVerifiedReviewArtifact } from './review-artifacts.ts';
 const REVIEW_GATE_RESULT_LINE = /^PIPELANE_REVIEW_GATE_RESULT=(?:passed|failed|\{.*\})\s*$/gm;
 
 export const REVIEW_FINDINGS_HEADING = 'Review findings:';
-export const REVIEW_RECOVERY_HEADING = 'Review recovery choices:';
-export const REVIEW_FIX_ACTION_ID = 'request-audited-fix';
-export const REVIEW_FIX_ACTION_LABEL = 'Fix the shown findings now through one audited host attempt';
 
 export type ReviewPresentationRelation = 'current' | 'recent' | 'embedded';
 export type ReviewPresentationTextSource = 'artifact' | 'legacy-stdout' | 'legacy-stderr';

@@ -4,7 +4,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync,
 import os from 'node:os';
 import path from 'node:path';
 
-import { computeUrlFingerprint, resolveProbeStateKey, resolveReviewConsentStateKey, resolveReviewStateKey, signSignedPayload, verifySignedPayload } from './integrity.ts';
+import { computeUrlFingerprint, resolveProbeStateKey, resolveReviewStateKey, signSignedPayload, verifySignedPayload } from './integrity.ts';
 import { buildDefaultReviewGatesConfig } from './review-gates.ts';
 
 export type Mode = 'build' | 'release';
@@ -806,9 +806,7 @@ export interface ReviewOverrideRecord {
 export interface ReviewState {
   records: ReviewRunRecord[];
   overrides: ReviewOverrideRecord[];
-  consents?: ReviewConsentRecord[];
   externalEvidence?: ReviewExternalEvidenceRecord[];
-  findingDispositions?: ReviewFindingDispositionRecord[];
 }
 
 export type RouteSafetyResumeKind = 'one-more-loop' | 'more-loops-and-minutes' | 'until-review-passes' | 'accept-findings' | 'fix-attempt' | 'legacy-import' | 'legacy-fresh-start' | 'budget-extension-grant';
@@ -946,8 +944,8 @@ export interface TaskBudgetGrantAllowance {
   fixReviewLoopsDelta: number;
 }
 
-// One consumed budget-extension grant, denormalized onto the entry for audit.
-// The authoritative one-use grant artifact lives in the consent-grants store.
+// One consumed budget-extension grant, denormalized onto the entry. Kept for
+// tolerant reads of pre-relief ledgers; nothing mints grants anymore.
 export interface TaskBudgetConsumedGrant extends TaskBudgetGrantAllowance {
   grantId: string;
   source: 'board' | 'tty';
@@ -989,33 +987,9 @@ export interface TaskBudgetRecord extends RouteSafetyRecord {
 
 export interface TaskBudgetState {
   entries: Record<string, TaskBudgetRecord>;
-  latestPausedLineageKey?: string;
-  // Set when the legacy route-safety-state store was first consulted for
-  // migration; from that point route-safety-state is frozen read-only.
-  legacyRouteSafetyFrozenAt?: string;
-}
-
-// §4.3 exhaustion semantics: parked is a terminal state for autonomous
-// execution, surfaced in /status and the Board, with a queued consent request.
-export interface ParkedTaskRecord {
-  taskSlug: string;
-  branch: string;
-  lineageKey: string;
-  parkedAt: string;
-  reason: string;
-  openFindingIds: string[];
-  budgetSpent: {
-    aiRunLaunches: number;
-    activeMinutes: number;
-    fixReviewLoops: number;
-  };
-  unblockHints: string[];
-  notified: boolean;
-  pendingConsentCardId?: string;
-}
-
-export interface ParkedTasksState {
-  records: ParkedTaskRecord[];
+  // Entries that failed validation on load, kept under their own key so a
+  // rewrite never erases recorded spend a later repair could recover.
+  unreadableEntries?: Record<string, unknown>;
 }
 
 export type DeployStatus = 'requested' | 'succeeded' | 'failed' | 'unknown';
@@ -1070,6 +1044,12 @@ export interface DeployRecord {
   idempotencyKey?: string;
   triggeredBy?: string;
   failureReason?: string;
+  // Recorded when the operator overrode the release-readiness or
+  // staging-parity gate for this deploy with --override --reason, or when a
+  // still-active release-mode override (devmode release --override) bypassed
+  // the readiness gate — its stored reason is carried over so the bypass is
+  // never silent. Deploy-time consent wins when both are present.
+  gateOverrideReason?: string;
 }
 
 export interface DeployEnvironmentLock {
@@ -1173,17 +1153,6 @@ export interface OperatorFlags {
   orchestrationPurgeWorktrees: boolean;
   orchestrationResealUnsigned: boolean;
   orchestrationTrustsLocalState: boolean;
-  oneMoreLoop: boolean;
-  moreLoops: string;
-  moreMinutes: string;
-  untilReviewPasses: boolean;
-  maxMoreLoops: string;
-  maxMoreMinutes: string;
-  acceptFindings: boolean;
-  requestFix: boolean;
-  fixToken: string;
-  verificationFile: string;
-  noChangeReason: string;
   reviewStatus: string;
   reviewReportFile: string;
   reviewFindingsFile: string;
@@ -1193,8 +1162,6 @@ export interface OperatorFlags {
   reviewSummary: string;
   reviewFindingsCount: string;
   reviewArtifact: string;
-  spinOff: string;
-  spinoffTask: string;
 }
 
 export interface ParsedOperatorArgs {
@@ -1222,18 +1189,12 @@ const ACTION_STATE_FILENAME = 'action-state.json';
 const REVIEW_STATE_FILENAME = 'review-state.json';
 const REVIEW_ACCEPTANCE_STATE_FILENAME = 'review-acceptance-state.json';
 const REVIEW_STATE_LOCK_FILENAME = 'review-state.lock';
-const ROUTE_SAFETY_STATE_FILENAME = 'route-safety-state.json';
-const ROUTE_SAFETY_STATE_LOCK_FILENAME = 'route-safety-state.lock';
 const TASK_BUDGET_STATE_FILENAME = 'task-budget-state.json';
 const TASK_BUDGET_STATE_LOCK_FILENAME = 'task-budget-state.lock';
-const PARKED_TASKS_FILENAME = 'parked-tasks.json';
 const REVIEW_STATE_MAX_RECORDS = 20;
 const REVIEW_OVERRIDE_MAX_RECORDS = 50;
 const REVIEW_ACCEPTANCE_MAX_RECORDS = 200;
-const REVIEW_CONSENT_MAX_RECORDS = 200;
 const REVIEW_EXTERNAL_EVIDENCE_MAX_RECORDS = 200;
-const REVIEW_FINDING_DISPOSITION_MAX_RECORDS = 500;
-const REVIEW_FOLLOW_UP_DIRNAME = 'review-follow-ups';
 const ACTION_STATE_MAX_DECISIONS = 100;
 const REVIEW_STATE_LOCK_STALE_MS = 2 * 60 * 1000;
 const DEPLOY_CONFIG_FILENAME = 'deploy-config.json';
@@ -1289,9 +1250,7 @@ export const STATE_SCHEMA_VERSIONS = {
   actionState: 1,
   reviewState: 2,
   reviewAcceptanceState: 1,
-  routeSafetyState: 1,
   taskBudgetState: 1,
-  parkedTasks: 1,
   orchestrationRun: 2,
   orchestrationObservations: 1,
   deployConfig: 1,
@@ -1316,13 +1275,10 @@ export const STATE_MIGRATIONS: Record<StateKind, Record<number, (raw: Record<str
     1: (raw) => ({
       ...raw,
       externalEvidence: Array.isArray(raw.externalEvidence) ? raw.externalEvidence : [],
-      findingDispositions: Array.isArray(raw.findingDispositions) ? raw.findingDispositions : [],
     }),
   },
   reviewAcceptanceState: {},
-  routeSafetyState: {},
   taskBudgetState: {},
-  parkedTasks: {},
   orchestrationRun: {
     // v1 -> v2 (G1): providerPrompt/confirmationPrompt are no longer persisted
     // on the slice record. The worker prompt is derived from the resolved
@@ -2206,10 +2162,6 @@ export function reviewArtifactRoot(commonDir: string, config: WorkflowConfig): s
   return path.join(resolveStateDir(commonDir, config), 'review-artifacts');
 }
 
-export function reviewFindingFollowUpRoot(commonDir: string, config: WorkflowConfig): string {
-  return path.join(resolveStateDir(commonDir, config), REVIEW_FOLLOW_UP_DIRNAME);
-}
-
 export function recordedReviewArtifactReference(artifactPath: string): ReviewRecordedArtifactReference {
   const resolved = realpathSync(path.resolve(artifactPath));
   const stat = statSync(resolved);
@@ -2238,16 +2190,8 @@ export function reviewAcceptanceStatePath(commonDir: string, config: WorkflowCon
   return path.join(resolveStateDir(commonDir, config), REVIEW_ACCEPTANCE_STATE_FILENAME);
 }
 
-export function routeSafetyStatePath(commonDir: string, config: WorkflowConfig): string {
-  return path.join(resolveStateDir(commonDir, config), ROUTE_SAFETY_STATE_FILENAME);
-}
-
 export function taskBudgetStatePath(commonDir: string, config: WorkflowConfig): string {
   return path.join(resolveStateDir(commonDir, config), TASK_BUDGET_STATE_FILENAME);
-}
-
-export function parkedTasksPath(commonDir: string, config: WorkflowConfig): string {
-  return path.join(resolveStateDir(commonDir, config), PARKED_TASKS_FILENAME);
 }
 
 function taskBudgetStateLockPath(commonDir: string, config: WorkflowConfig): string {
@@ -2256,10 +2200,6 @@ function taskBudgetStateLockPath(commonDir: string, config: WorkflowConfig): str
 
 function reviewStateLockPath(commonDir: string, config: WorkflowConfig): string {
   return path.join(resolveStateDir(commonDir, config), REVIEW_STATE_LOCK_FILENAME);
-}
-
-function routeSafetyStateLockPath(commonDir: string, config: WorkflowConfig): string {
-  return path.join(resolveStateDir(commonDir, config), ROUTE_SAFETY_STATE_LOCK_FILENAME);
 }
 
 export function deployConfigPath(commonDir: string, config: WorkflowConfig): string {
@@ -3529,9 +3469,7 @@ export function loadReviewState(commonDir: string, config: WorkflowConfig): Revi
   const raw = readVersionedJsonFile<ReviewState>('reviewState', commonDir, config, reviewStatePath(commonDir, config), {
     records: [],
     overrides: [],
-    consents: [],
     externalEvidence: [],
-    findingDispositions: [],
   });
   const stateKey = resolveReviewStateKey();
   const records = Array.isArray(raw?.records)
@@ -3542,20 +3480,11 @@ export function loadReviewState(commonDir: string, config: WorkflowConfig): Revi
     ? raw.overrides.filter(isReviewOverrideRecord).slice(0, REVIEW_OVERRIDE_MAX_RECORDS)
       .filter((record) => !stateKey || verifySignedPayload(record, stateKey))
     : [];
-  const consentKey = resolveReviewConsentStateKey();
-  const consents = Array.isArray(raw?.consents)
-    ? raw.consents.filter(isReviewConsentRecord).slice(0, REVIEW_CONSENT_MAX_RECORDS)
-      .filter((record) => verifySignedPayload(record, consentKey))
-    : [];
   const externalEvidence = Array.isArray(raw?.externalEvidence)
     ? raw.externalEvidence.filter(isReviewExternalEvidenceRecord).slice(0, REVIEW_EXTERNAL_EVIDENCE_MAX_RECORDS)
       .filter((record) => !stateKey || verifySignedPayload(record, stateKey))
     : [];
-  const findingDispositions = Array.isArray(raw?.findingDispositions)
-    ? raw.findingDispositions.filter(isReviewFindingDispositionRecord).slice(0, REVIEW_FINDING_DISPOSITION_MAX_RECORDS)
-      .filter((record) => !stateKey || verifySignedPayload(record, stateKey))
-    : [];
-  return { records, overrides, consents, externalEvidence, findingDispositions };
+  return { records, overrides, externalEvidence };
 }
 
 export function saveReviewState(commonDir: string, config: WorkflowConfig, value: ReviewState): void {
@@ -3563,9 +3492,7 @@ export function saveReviewState(commonDir: string, config: WorkflowConfig, value
   writeVersionedJsonFile('reviewState', reviewStatePath(commonDir, config), {
     records: value.records.slice(0, REVIEW_STATE_MAX_RECORDS),
     overrides: (value.overrides ?? []).slice(0, REVIEW_OVERRIDE_MAX_RECORDS),
-    consents: (value.consents ?? []).slice(0, REVIEW_CONSENT_MAX_RECORDS),
     externalEvidence: (value.externalEvidence ?? []).slice(0, REVIEW_EXTERNAL_EVIDENCE_MAX_RECORDS),
-    findingDispositions: (value.findingDispositions ?? []).slice(0, REVIEW_FINDING_DISPOSITION_MAX_RECORDS),
   });
 }
 
@@ -3657,20 +3584,6 @@ export function appendReviewOverrideRecord(commonDir: string, config: WorkflowCo
   }
 }
 
-export function appendReviewConsentRecord(commonDir: string, config: WorkflowConfig, record: ReviewConsentRecord): ReviewConsentRecord {
-  const lock = acquireReviewStateLock(commonDir, config);
-  try {
-    const state = loadReviewState(commonDir, config);
-    const consentKey = resolveReviewConsentStateKey();
-    const persisted = { ...record, signature: signSignedPayload(record, consentKey) };
-    state.consents = [persisted, ...(state.consents ?? [])].slice(0, REVIEW_CONSENT_MAX_RECORDS);
-    saveReviewState(commonDir, config, state);
-    return persisted;
-  } finally {
-    lock.release();
-  }
-}
-
 export function appendReviewExternalEvidenceRecord(
   commonDir: string,
   config: WorkflowConfig,
@@ -3689,24 +3602,6 @@ export function appendReviewExternalEvidenceRecord(
   }
 }
 
-export function appendReviewFindingDispositionRecord(
-  commonDir: string,
-  config: WorkflowConfig,
-  record: ReviewFindingDispositionRecord,
-): ReviewFindingDispositionRecord {
-  const lock = acquireReviewStateLock(commonDir, config);
-  try {
-    const state = loadReviewState(commonDir, config);
-    const stateKey = resolveReviewStateKey();
-    const persisted = stateKey ? { ...record, signature: signSignedPayload(record, stateKey) } : record;
-    state.findingDispositions = [persisted, ...(state.findingDispositions ?? [])].slice(0, REVIEW_FINDING_DISPOSITION_MAX_RECORDS);
-    saveReviewState(commonDir, config, state);
-    return persisted;
-  } finally {
-    lock.release();
-  }
-}
-
 export function withReviewStateLock<T>(commonDir: string, config: WorkflowConfig, fn: () => T): T {
   const lock = acquireReviewStateLock(commonDir, config);
   try {
@@ -3716,91 +3611,61 @@ export function withReviewStateLock<T>(commonDir: string, config: WorkflowConfig
   }
 }
 
-export function loadRouteSafetyState(commonDir: string, config: WorkflowConfig): RouteSafetyState {
-  const raw = readVersionedJsonFile<RouteSafetyState>('routeSafetyState', commonDir, config, routeSafetyStatePath(commonDir, config), { routes: {} });
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { routes: {} };
-  const routes: Record<string, RouteSafetyRecord> = {};
-  const rawRoutes = (raw as { routes?: unknown }).routes;
-  if (rawRoutes && typeof rawRoutes === 'object' && !Array.isArray(rawRoutes)) {
-    for (const [digest, record] of Object.entries(rawRoutes)) {
-      const normalized = normalizeRouteSafetyRecord(record);
-      if (normalized && (normalized.lineageDigest === digest || normalized.routeFingerprintDigest === digest)) {
-        routes[digest] = normalized;
-      }
-    }
-  }
-  const latestPausedRouteFingerprintDigest = typeof raw.latestPausedRouteFingerprintDigest === 'string'
-    && routes[raw.latestPausedRouteFingerprintDigest]
-    ? raw.latestPausedRouteFingerprintDigest
-    : undefined;
-  return {
-    routes,
-    ...(latestPausedRouteFingerprintDigest ? { latestPausedRouteFingerprintDigest } : {}),
-  };
-}
-
-// Convergence v1 S1 (§4.3): route-safety-state is FROZEN read-only audit
-// history. The task-budget ledger (task-budget-state.json) is the successor
-// store; production code only reads this file as D6 migration input. This
-// writer exists solely so tests can fabricate legacy fixtures.
-export function saveRouteSafetyState(commonDir: string, config: WorkflowConfig, value: RouteSafetyState): void {
-  ensureStateDir(commonDir, config);
-  writeVersionedJsonFile('routeSafetyState', routeSafetyStatePath(commonDir, config), value);
-}
-
-export function withRouteSafetyStateLock<T>(commonDir: string, config: WorkflowConfig, fn: () => T): T {
-  const lock = acquireDirectoryStateLock(
-    routeSafetyStateLockPath(commonDir, config),
-    'route safety state is locked: another process is updating the route lineage. Wait and retry.',
-  );
-  try {
-    return fn();
-  } finally {
-    lock.release();
-  }
-}
-
 export function loadTaskBudgetState(commonDir: string, config: WorkflowConfig): TaskBudgetState {
-  // Fail-closed store (D16 spirit): the budget ledger is authorization state.
-  // An ABSENT file is a legitimate fresh install; a PRESENT file that cannot
-  // be parsed or contains an unreadable entry must never quietly become a
-  // fresh budget — that would let corruption (or vandalism) re-mint spend.
+  // The budget ledger is advisory display state. A file that cannot be
+  // parsed, or an entry that fails validation, is reported to stderr and
+  // skipped — it never blocks a command.
   const statePath = taskBudgetStatePath(commonDir, config);
-  const failClosed = (detail: string): never => {
-    throw new Error(`task-budget-state at ${statePath} is unreadable (${detail}). The budget ledger fails closed: repair or restore the file (see task-budget-archive.jsonl and the completion journal for history) before running gated commands.`);
+  const warn = (detail: string): void => {
+    process.stderr.write(`task-budget-state at ${statePath} is partially unreadable (${detail}); the advisory budget ledger continues without it.\n`);
   };
   if (existsSync(statePath)) {
     try {
       JSON.parse(readFileSync(statePath, 'utf8'));
     } catch (error) {
-      failClosed(error instanceof Error ? error.message : String(error));
+      warn(error instanceof Error ? error.message : String(error));
+      return { entries: {} };
     }
   }
   const raw = readVersionedJsonFile<TaskBudgetState>('taskBudgetState', commonDir, config, statePath, { entries: {} });
   if (!raw || typeof raw !== 'object' || !isRecord(raw.entries)) {
-    if (existsSync(statePath)) failClosed('entries map missing');
+    if (existsSync(statePath)) warn('entries map missing');
     return { entries: {} };
   }
   const entries: Record<string, TaskBudgetRecord> = {};
+  const unreadableEntries: Record<string, unknown> = isRecord(raw.unreadableEntries)
+    ? { ...raw.unreadableEntries }
+    : {};
   for (const [lineageKey, entry] of Object.entries(raw.entries)) {
     const normalized = normalizeTaskBudgetRecord(entry);
-    if (!normalized) failClosed(`entry ${lineageKey.slice(0, 12)} failed validation`);
+    if (!normalized) {
+      warn(`entry ${lineageKey.slice(0, 12)} failed validation`);
+      unreadableEntries[lineageKey] = entry;
+      continue;
+    }
     // The map key IS the lineage identity; a record filed under a different
-    // key (or the traversal-shaped key rejected above) is corruption.
-    if (normalized.lineageKey !== lineageKey) failClosed(`entry ${lineageKey.slice(0, 12)} lineageKey mismatch`);
+    // key (or a traversal-shaped key rejected above) is corruption.
+    if (normalized.lineageKey !== lineageKey) {
+      warn(`entry ${lineageKey.slice(0, 12)} lineageKey mismatch`);
+      unreadableEntries[lineageKey] = entry;
+      continue;
+    }
     entries[lineageKey] = normalized;
   }
-  const state: TaskBudgetState = { entries };
-  if (typeof raw.latestPausedLineageKey === 'string' && entries[raw.latestPausedLineageKey]) {
-    state.latestPausedLineageKey = raw.latestPausedLineageKey;
-  }
-  if (typeof raw.legacyRouteSafetyFrozenAt === 'string') state.legacyRouteSafetyFrozenAt = raw.legacyRouteSafetyFrozenAt;
-  return state;
+  return { entries, unreadableEntries };
 }
 
 export function saveTaskBudgetState(commonDir: string, config: WorkflowConfig, value: TaskBudgetState): void {
   ensureStateDir(commonDir, config);
-  writeVersionedJsonFile('taskBudgetState', taskBudgetStatePath(commonDir, config), value);
+  // Quarantined entries are rewritten verbatim under their own key: skipping a
+  // record on load must not let the next save silently zero its spend, and
+  // ensureTaskBudgetRecord may have minted a fresh entry under the same
+  // lineage key in the meantime.
+  const unreadableEntries = value.unreadableEntries ?? {};
+  writeVersionedJsonFile('taskBudgetState', taskBudgetStatePath(commonDir, config), {
+    entries: value.entries,
+    ...(Object.keys(unreadableEntries).length > 0 ? { unreadableEntries } : {}),
+  });
 }
 
 export function withTaskBudgetStateLock<T>(commonDir: string, config: WorkflowConfig, fn: () => T): T {
@@ -3827,7 +3692,8 @@ function normalizeTaskBudgetRecord(value: unknown): TaskBudgetRecord | null {
   // a v1-only store (no legacy shape), so every currency field is always
   // written; a present-but-non-numeric field is corruption, and coercing it
   // to 0 would re-mint spent budget. Reject the record so loadTaskBudgetState
-  // fails closed instead of silently zeroing the ledger.
+  // quarantines it — the raw entry is warned about, skipped, and preserved
+  // across saves for repair instead of being silently zeroed.
   const requiredCounter = (field: unknown): number | null =>
     (typeof field === 'number' && Number.isSafeInteger(field) && field >= 0) ? field : null;
   const aiRunsBudget = requiredCounter(raw.aiRunsBudget);
@@ -3909,39 +3775,6 @@ function isTaskBudgetConsumedGrant(value: unknown): value is TaskBudgetConsumedG
     && isSafeNonNegativeInteger(raw.aiRunsDelta)
     && isSafeNonNegativeInteger(raw.activeMinutesDelta)
     && isSafeNonNegativeInteger(raw.fixReviewLoopsDelta);
-}
-
-export function loadParkedTasks(commonDir: string, config: WorkflowConfig): ParkedTasksState {
-  const raw = readVersionedJsonFile<ParkedTasksState>('parkedTasks', commonDir, config, parkedTasksPath(commonDir, config), { records: [] });
-  if (!raw || !Array.isArray(raw.records)) return { records: [] };
-  return { records: raw.records.filter(isParkedTaskRecord).slice(0, 100) };
-}
-
-export function saveParkedTasks(commonDir: string, config: WorkflowConfig, value: ParkedTasksState): void {
-  ensureStateDir(commonDir, config);
-  writeVersionedJsonFile('parkedTasks', parkedTasksPath(commonDir, config), value);
-}
-
-function isParkedTaskRecord(value: unknown): value is ParkedTaskRecord {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const raw = value as Record<string, unknown>;
-  return typeof raw.taskSlug === 'string'
-    && typeof raw.branch === 'string'
-    && typeof raw.lineageKey === 'string'
-    && typeof raw.parkedAt === 'string'
-    && typeof raw.reason === 'string'
-    && Array.isArray(raw.openFindingIds)
-    && raw.openFindingIds.every((entry) => typeof entry === 'string')
-    && Array.isArray(raw.unblockHints)
-    && raw.unblockHints.every((entry) => typeof entry === 'string')
-    && typeof raw.notified === 'boolean'
-    && isRecord(raw.budgetSpent)
-    // parked-tasks.json is unsigned and its budgetSpent values render into the
-    // Board. Require safe nonnegative integers so a crafted value can never
-    // reach innerHTML as markup (defense-in-depth alongside the UI escaping).
-    && isSafeNonNegativeInteger((raw.budgetSpent as Record<string, unknown>).aiRunLaunches)
-    && isSafeNonNegativeInteger((raw.budgetSpent as Record<string, unknown>).activeMinutes)
-    && isSafeNonNegativeInteger((raw.budgetSpent as Record<string, unknown>).fixReviewLoops);
 }
 
 function normalizeRouteSafetyRecord(value: unknown): RouteSafetyRecord | null {
@@ -4215,33 +4048,6 @@ function isReviewOverrideRecord(value: unknown): value is ReviewOverrideRecord {
     && (raw.signature === undefined || typeof raw.signature === 'string');
 }
 
-function isReviewConsentRecord(value: unknown): value is ReviewConsentRecord {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const raw = value as Record<string, unknown>;
-  return typeof raw.id === 'string'
-    && (raw.kind === 'gate-bypass' || raw.kind === 'accept-findings' || raw.kind === 'manual-substitution')
-    && typeof raw.gateId === 'string'
-    && typeof raw.gateDefinitionHash === 'string'
-    && typeof raw.policyVersion === 'number'
-    && Number.isSafeInteger(raw.policyVersion)
-    && (raw.enforcementMode === 'legacy-v2' || raw.enforcementMode === 'strict-v3')
-    && typeof raw.taskBindingId === 'string'
-    && (raw.reviewRunId === undefined || typeof raw.reviewRunId === 'string')
-    && typeof raw.originalGateState === 'string'
-    && typeof raw.branchName === 'string'
-    && typeof raw.sha === 'string'
-    && typeof raw.worktreeStatusDigest === 'string'
-    && typeof raw.worktreeMaterialTreeHash === 'string'
-    && typeof raw.reviewTargetDigest === 'string'
-    && typeof raw.routeAction === 'string'
-    && isReviewActorIdentity(raw.actor)
-    && typeof raw.source === 'string'
-    && typeof raw.reason === 'string'
-    && typeof raw.reasonHash === 'string'
-    && typeof raw.recordedAt === 'string'
-    && (raw.signature === undefined || typeof raw.signature === 'string');
-}
-
 function isReviewAcceptanceRecord(value: unknown): value is ReviewAcceptanceRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const raw = value as Record<string, unknown>;
@@ -4303,33 +4109,6 @@ function isReviewExternalEvidenceRecord(value: unknown): value is ReviewExternal
     && isReviewRecordedArtifactReference(raw.artifact)
     && isReviewActorIdentity(raw.recorder)
     && typeof raw.recordedAt === 'string'
-    && (raw.signature === undefined || typeof raw.signature === 'string');
-}
-
-function isReviewFindingDispositionRecord(value: unknown): value is ReviewFindingDispositionRecord {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const raw = value as Record<string, unknown>;
-  return typeof raw.id === 'string'
-    && raw.kind === 'spin-off'
-    && typeof raw.findingRef === 'string'
-    && typeof raw.reviewRunId === 'string'
-    && typeof raw.gateId === 'string'
-    && isReviewFinding(raw.finding)
-    && typeof raw.followUpTask === 'string'
-    && typeof raw.reason === 'string'
-    && typeof raw.reasonHash === 'string'
-    && raw.dispositionEffect === 'satisfies-finding-at-exact-head'
-    && typeof raw.criticalRiskAcknowledged === 'boolean'
-    && typeof raw.taskBindingId === 'string'
-    && typeof raw.branchName === 'string'
-    && typeof raw.sha === 'string'
-    && typeof raw.worktreeStatusDigest === 'string'
-    && typeof raw.worktreeMaterialTreeHash === 'string'
-    && typeof raw.reviewTargetDigest === 'string'
-    && isReviewActorIdentity(raw.actor)
-    && raw.source === 'resume --spin-off'
-    && typeof raw.recordedAt === 'string'
-    && isReviewRecordedArtifactReference(raw.artifact)
     && (raw.signature === undefined || typeof raw.signature === 'string');
 }
 
@@ -5207,17 +4986,6 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     orchestrationPurgeWorktrees: false,
     orchestrationResealUnsigned: false,
     orchestrationTrustsLocalState: false,
-    oneMoreLoop: false,
-    moreLoops: '',
-    moreMinutes: '',
-    untilReviewPasses: false,
-    maxMoreLoops: '',
-    maxMoreMinutes: '',
-    acceptFindings: false,
-    requestFix: false,
-    fixToken: '',
-    verificationFile: '',
-    noChangeReason: '',
     reviewStatus: '',
     reviewReportFile: '',
     reviewFindingsFile: '',
@@ -5227,8 +4995,6 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     reviewSummary: '',
     reviewFindingsCount: '',
     reviewArtifact: '',
-    spinOff: '',
-    spinoffTask: '',
   };
 
   const setPrFromShorthand = (raw: string, source: string): void => {
@@ -5432,63 +5198,6 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       flags.briefFile = readFlagValue('--brief-file');
       continue;
     }
-    if (flagName === '--one-more-loop') {
-      rejectInlineValue('--one-more-loop');
-      flags.oneMoreLoop = true;
-      continue;
-    }
-    if (flagName === '--more-loops') {
-      flags.moreLoops = readFlagValue('--more-loops').trim();
-      continue;
-    }
-    if (flagName === '--more-minutes') {
-      flags.moreMinutes = readFlagValue('--more-minutes').trim();
-      continue;
-    }
-    if (flagName === '--until-review-passes') {
-      rejectInlineValue('--until-review-passes');
-      flags.untilReviewPasses = true;
-      continue;
-    }
-    if (flagName === '--max-more-loops') {
-      flags.maxMoreLoops = readFlagValue('--max-more-loops').trim();
-      continue;
-    }
-    if (flagName === '--max-more-minutes') {
-      flags.maxMoreMinutes = readFlagValue('--max-more-minutes').trim();
-      continue;
-    }
-    if (flagName === '--accept-findings') {
-      rejectInlineValue('--accept-findings');
-      flags.acceptFindings = true;
-      continue;
-    }
-    if (flagName === '--spin-off') {
-      flags.spinOff = readFlagValue('--spin-off').trim();
-      continue;
-    }
-    if (flagName === '--spinoff-task') {
-      flags.spinoffTask = readFlagValue('--spinoff-task').trim();
-      continue;
-    }
-    if (flagName === '--request-fix') {
-      rejectInlineValue('--request-fix');
-      flags.requestFix = true;
-      continue;
-    }
-    if (flagName === '--fix-token') {
-      flags.fixToken = readFlagValue('--fix-token').trim();
-      continue;
-    }
-    if (flagName === '--verification-file') {
-      flags.verificationFile = readFlagValue('--verification-file').trim();
-      continue;
-    }
-    if (flagName === '--no-change-reason') {
-      flags.noChangeReason = readFlagValue('--no-change-reason');
-      continue;
-    }
-
     if (flagName === '--branch') {
       flags.branch = readFlagValue('--branch');
       continue;
@@ -5877,9 +5586,8 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       if (parsed.flags.brief.trim() && parsed.flags.briefFile.trim()) throw new Error('adopt cannot combine --brief and --brief-file.');
       return;
     case 'resume':
-      assertOnlyFlags(parsed, ['task', 'oneMoreLoop', 'moreLoops', 'moreMinutes', 'untilReviewPasses', 'maxMoreLoops', 'maxMoreMinutes', 'acceptFindings', 'spinOff', 'spinoffTask', 'requestFix', 'fixToken', 'verificationFile', 'noChangeReason', 'reason', 'scope']);
-      requireNoPositional('pipelane run resume [--task <task-name>] [--one-more-loop | --more-loops <n> --more-minutes <n> | --until-review-passes --max-more-loops <n> --max-more-minutes <n> | --accept-findings | --spin-off <finding-ref> --spinoff-task <task-label> --reason <why-new-scope>]');
-      validateResumeRouteSafetyFlags(parsed);
+      assertOnlyFlags(parsed, ['task']);
+      requireNoPositional('pipelane run resume [--task <task-name>]');
       return;
     case 'repo-guard':
       assertOnlyFlags(parsed, ['task', 'mode', 'surfaces', 'offline']);
@@ -5955,7 +5663,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       }
       return;
     case 'deploy':
-      assertOnlyFlags(parsed, ['task', 'pr', 'sha', 'surfaces', 'async', 'skipSmokeCoverage', 'reason', 'title', 'message', 'forceInclude', 'plan', 'yes']);
+      assertOnlyFlags(parsed, ['task', 'pr', 'sha', 'surfaces', 'async', 'skipSmokeCoverage', 'override', 'reason', 'title', 'message', 'forceInclude', 'plan', 'yes']);
       requirePositivePrNumber();
       if (
         parsed.positional.length > 0
@@ -5968,8 +5676,11 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       if (parsed.flags.skipSmokeCoverage) {
         throw new Error('--skip-smoke-coverage is no longer supported. Pipelane release deploys use deploy verification and healthchecks; QA smoke coverage belongs in a separate QA workflow.');
       }
-      if (parsed.flags.reason) {
-        throw new Error('deploy does not accept --reason.');
+      if (parsed.flags.reason && !parsed.flags.override) {
+        throw new Error('deploy only accepts --reason together with --override.');
+      }
+      if (parsed.flags.override && !parsed.flags.reason.trim()) {
+        throw new Error('deploy --override requires --reason <why staging-parity or health readiness is being overridden>.');
       }
       if (parsed.flags.task.trim() && parsed.flags.pr.trim()) {
         throw new Error('deploy cannot combine --task and --pr; choose one PR/task identity.');
@@ -6043,15 +5754,6 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
         if (!parsed.flags.reviewArtifact.trim()) throw new Error('review record requires --artifact <path>.');
         return;
       }
-      if (subcommand === 'override') {
-        assertOnlyFlags(parsed, ['reviewGate', 'reason', 'scope']);
-        if (parsed.positional.length !== 1) {
-          throw new Error('review override requires exactly: pipelane run review override --gate <id> --reason <informed-consent-reason> [--scope <exact-route-action>]');
-        }
-        if (!parsed.flags.reviewGate.trim()) throw new Error('review override requires --gate <id>.');
-        if (!parsed.flags.reason.trim()) throw new Error('review override requires --reason <informed-consent-reason>.');
-        return;
-      }
       if (subcommand === 'gc') {
         assertOnlyFlags(parsed, []);
         if (parsed.positional.length !== 1) throw new Error('review gc accepts no additional arguments.');
@@ -6059,7 +5761,7 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       }
       assertOnlyFlags(parsed, ['reviewDryRun', 'reviewGate', 'reviewPhase', 'reviewIntent']);
       if (parsed.positional.length > 0) {
-        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review record --gate code-review-high --task <task> --tool <name> --summary <text> --findings-count <n> --artifact <path> [--sha <expected-head>], pipelane run review pass --gate <id> --message <text>, pipelane run review attest --gate <id> --status <passed|failed> --report-file <path> --findings-file <path> --provenance-file <path> --message <text> [--substitute-strict --reason <reason> --scope <action>], pipelane run review override --gate <id> --reason <text> [--scope <action>], or pipelane run review setup [gate[,gate...]...] [--yes] [--reset] [--print] [--list-gates] [--toggle <gate[,gate...]>] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]');
+        throw new Error('review requires: pipelane run review [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human], pipelane run review record --gate code-review-high --task <task> --tool <name> --summary <text> --findings-count <n> --artifact <path> [--sha <expected-head>], pipelane run review pass --gate <id> --message <text>, pipelane run review attest --gate <id> --status <passed|failed> --report-file <path> --findings-file <path> --provenance-file <path> --message <text> [--substitute-strict --reason <reason> --scope <action>], or pipelane run review setup [gate[,gate...]...] [--yes] [--reset] [--print] [--list-gates] [--toggle <gate[,gate...]>] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]');
       }
       const phase = parsed.flags.reviewPhase.trim();
       if (phase && !includesString(REVIEW_GATE_PHASES, phase)) {
@@ -6508,71 +6210,6 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
   }
 }
 
-function validateResumeRouteSafetyFlags(parsed: ParsedOperatorArgs): void {
-  const hasMigrationScope = parsed.flags.scope.trim().length > 0;
-  const modes = [
-    parsed.flags.oneMoreLoop,
-    parsed.flags.moreLoops.trim().length > 0 || parsed.flags.moreMinutes.trim().length > 0,
-    parsed.flags.untilReviewPasses || parsed.flags.maxMoreLoops.trim().length > 0 || parsed.flags.maxMoreMinutes.trim().length > 0,
-    parsed.flags.acceptFindings || hasMigrationScope,
-    parsed.flags.spinOff.trim().length > 0 || parsed.flags.spinoffTask.trim().length > 0,
-    parsed.flags.requestFix,
-    parsed.flags.fixToken.trim().length > 0 || parsed.flags.verificationFile.trim().length > 0 || parsed.flags.noChangeReason.trim().length > 0,
-  ].filter(Boolean).length;
-  if (modes === 0) return;
-  if (parsed.flags.task.trim()) {
-    throw new Error('resume route-loop overrides do not accept --task; run the printed resume command from the paused checkout.');
-  }
-  if (modes > 1) {
-    throw new Error('resume accepts one route-loop action at a time: --request-fix, --fix-token/--verification-file, --one-more-loop, --more-loops/--more-minutes, --until-review-passes, --accept-findings, or --spin-off.');
-  }
-  if ((parsed.flags.acceptFindings || hasMigrationScope) && !parsed.flags.reason.trim()) {
-    throw new Error('resume --accept-findings and legacy migration choices require --reason <informed-consent-reason>.');
-  }
-  if (parsed.flags.spinOff.trim() || parsed.flags.spinoffTask.trim()) {
-    if (!parsed.flags.spinOff.trim()) throw new Error('resume --spinoff-task requires --spin-off <finding-ref>.');
-    if (!parsed.flags.spinoffTask.trim()) throw new Error('resume --spin-off requires --spinoff-task <new-task-label>.');
-    if (!parsed.flags.reason.trim()) throw new Error('resume --spin-off requires --reason <why this finding belongs in new scope>.');
-  }
-  if (parsed.flags.reason.trim() && !parsed.flags.acceptFindings && !parsed.flags.spinOff.trim() && !hasMigrationScope) {
-    throw new Error('resume only accepts --reason with --accept-findings, --spin-off, or an explicit legacy migration --scope.');
-  }
-  if (parsed.flags.fixToken.trim() && !parsed.flags.verificationFile.trim()) {
-    throw new Error('resume --fix-token requires --verification-file <bounded-host-verification.json>.');
-  }
-  if (parsed.flags.verificationFile.trim() && !parsed.flags.fixToken.trim()) {
-    throw new Error('resume --verification-file requires the exact printed --fix-token.');
-  }
-  if (parsed.flags.noChangeReason.trim() && !parsed.flags.fixToken.trim()) {
-    throw new Error('resume --no-change-reason is only valid with --fix-token and --verification-file.');
-  }
-  if (hasMigrationScope && !/^legacy-(?:import:[a-f0-9]{64}|fresh-start)$/.test(parsed.flags.scope.trim())) {
-    throw new Error('resume --scope must be legacy-import:<candidate-digest> or legacy-fresh-start.');
-  }
-  const requirePositive = (flag: string, value: string): void => {
-    if (!/^[1-9]\d*$/.test(value.trim()) || !Number.isSafeInteger(Number.parseInt(value.trim(), 10))) {
-      throw new Error(`${flag} requires a safe positive integer.`);
-    }
-  };
-  if (parsed.flags.moreLoops.trim() || parsed.flags.moreMinutes.trim()) {
-    if (!parsed.flags.moreLoops.trim() || !parsed.flags.moreMinutes.trim()) {
-      throw new Error('resume --more-loops must be combined with --more-minutes.');
-    }
-    requirePositive('--more-loops', parsed.flags.moreLoops);
-    requirePositive('--more-minutes', parsed.flags.moreMinutes);
-  }
-  if (parsed.flags.untilReviewPasses || parsed.flags.maxMoreLoops.trim() || parsed.flags.maxMoreMinutes.trim()) {
-    if (!parsed.flags.untilReviewPasses) {
-      throw new Error('resume --max-more-loops and --max-more-minutes require --until-review-passes.');
-    }
-    if (!parsed.flags.maxMoreLoops.trim() || !parsed.flags.maxMoreMinutes.trim()) {
-      throw new Error('resume --until-review-passes requires --max-more-loops and --max-more-minutes.');
-    }
-    requirePositive('--max-more-loops', parsed.flags.maxMoreLoops);
-    requirePositive('--max-more-minutes', parsed.flags.maxMoreMinutes);
-  }
-}
-
 type OperatorFlagKey = keyof OperatorFlags;
 
 const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flags: OperatorFlags) => boolean }> = [
@@ -6600,19 +6237,6 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'task', label: '--task', active: (flags) => flags.task.trim().length > 0 },
   { key: 'brief', label: '--brief', active: (flags) => flags.brief.trim().length > 0 },
   { key: 'briefFile', label: '--brief-file', active: (flags) => flags.briefFile.trim().length > 0 },
-  { key: 'oneMoreLoop', label: '--one-more-loop', active: (flags) => flags.oneMoreLoop },
-  { key: 'moreLoops', label: '--more-loops', active: (flags) => flags.moreLoops.trim().length > 0 },
-  { key: 'moreMinutes', label: '--more-minutes', active: (flags) => flags.moreMinutes.trim().length > 0 },
-  { key: 'untilReviewPasses', label: '--until-review-passes', active: (flags) => flags.untilReviewPasses },
-  { key: 'maxMoreLoops', label: '--max-more-loops', active: (flags) => flags.maxMoreLoops.trim().length > 0 },
-  { key: 'maxMoreMinutes', label: '--max-more-minutes', active: (flags) => flags.maxMoreMinutes.trim().length > 0 },
-  { key: 'acceptFindings', label: '--accept-findings', active: (flags) => flags.acceptFindings },
-  { key: 'spinOff', label: '--spin-off', active: (flags) => flags.spinOff.trim().length > 0 },
-  { key: 'spinoffTask', label: '--spinoff-task', active: (flags) => flags.spinoffTask.trim().length > 0 },
-  { key: 'requestFix', label: '--request-fix', active: (flags) => flags.requestFix },
-  { key: 'fixToken', label: '--fix-token', active: (flags) => flags.fixToken.trim().length > 0 },
-  { key: 'verificationFile', label: '--verification-file', active: (flags) => flags.verificationFile.trim().length > 0 },
-  { key: 'noChangeReason', label: '--no-change-reason', active: (flags) => flags.noChangeReason.trim().length > 0 },
   { key: 'branch', label: '--branch', active: (flags) => flags.branch.trim().length > 0 },
   { key: 'file', label: '--file', active: (flags) => flags.file.trim().length > 0 },
   { key: 'title', label: '--title', active: (flags) => flags.title.trim().length > 0 },

@@ -2103,19 +2103,6 @@
         </div>
       </section>
 
-      <section class="panel" id="consents-panel" style="display:none">
-        <div class="panel-header">
-          <div class="panel-title">Budget Consents</div>
-          <div class="footer-note" id="consents-summary">Pending budget-extension requests and parked tasks.</div>
-        </div>
-        <div class="panel-body">
-          <p class="section-copy">A pending card is a task asking a human for more review budget. Approving mints a one-use signed grant the task consumes on its next <code>resume</code>; denying records the refusal. Parked tasks are terminal until a grant is approved or the task is redesigned.</p>
-          <div class="cards" id="consent-cards"></div>
-          <div class="cards" id="parked-tasks"></div>
-          <div id="consent-feedback" class="footer-note"></div>
-        </div>
-      </section>
-
       <section class="panel" id="board-actions-panel">
         <div class="panel-header">
           <div class="panel-title">Board Actions</div>
@@ -2590,7 +2577,7 @@
         { command: '/pipelane review setup', description: 'Select review gates, print the effective stack, and list available gates.' },
         { command: '/pipelane review', description: 'Run configured review gates, write evidence, and surface pending AI/manual gates.' },
         { command: '/pipelane review pass', description: 'Record a clean human approval gate for the current exact target.' },
-        { command: '/pipelane review attest', description: 'Attach bounded report, findings, and provenance files for a specialized manual review; strict substitution requires exact-scope informed consent.' },
+        { command: '/pipelane review attest', description: 'Attach bounded report, findings, and provenance files for a specialized manual review.' },
         { command: '/pipelane orchestrate plan', description: 'Compile an implementation plan into a durable slice ledger without running workers.' },
         { command: '/pipelane orchestrate prepare', description: 'Create slice worktrees from a durable orchestration ledger without starting provider agents.' },
         { command: '/pipelane orchestrate dispatch', description: 'Write provider handoff prompts for prepared orchestration slices without starting agents.' },
@@ -4459,7 +4446,6 @@
       render();
       try {
         state.snapshot = await fetchJson(`/api/snapshot${force ? '?refresh=1' : ''}`);
-        await loadConsents();
         const branches = state.snapshot?.data?.branches || [];
         const stillExists = branches.some((branch) => branch.name === state.selectedBranchName);
         if (!stillExists) {
@@ -4967,7 +4953,6 @@
       renderHelpPanel();
       renderHero();
       renderAttention();
-      renderConsents();
       renderReview();
       renderActiveTask();
       renderBranchTable();
@@ -4977,116 +4962,6 @@
       document.getElementById('help-button').disabled = state.loading.help;
       document.getElementById('refresh-button').disabled = state.loading.snapshot;
     }
-
-    // Convergence v1 S1 (D11): pending budget-extension consent cards. The
-    // approve/deny POSTs carry the browser-session token via fetchJson; the
-    // server mints the one-use signed grant in-process behind that gauntlet.
-    async function loadConsents() {
-      try {
-        const data = await fetchJson('/api/consents');
-        state.consents = { cards: data.cards || [], parked: data.parked || [] };
-      } catch (error) {
-        state.consents = { cards: [], parked: [], error: error.message };
-      }
-    }
-
-    function consentCardMarkup(card) {
-      const scope = `+${card.fixReviewLoopsDelta} loop${card.fixReviewLoopsDelta === 1 ? '' : 's'}, +${card.aiRunsDelta} AI runs, +${card.activeMinutesDelta} active min`;
-      const decided = card.status !== 'pending';
-      return `
-        <div class="card" data-consent-card="${escapeHtml(card.id)}">
-          <div class="card-title">${escapeHtml(card.taskSlug || card.branchName)} <span class="pill"><span>${escapeHtml(card.status)}</span></span></div>
-          <div class="card-body">
-            <div><strong>Requested:</strong> ${escapeHtml(scope)}</div>
-            <div><strong>Reason:</strong> ${escapeHtml(card.reason)}</div>
-            <div class="footer-note">card ${escapeHtml(card.id)} · branch ${escapeHtml(card.branchName)} · expires ${escapeHtml(card.expiresAt)}</div>
-            ${decided ? '' : `
-              <div class="action-grid">
-                <button data-consent-approve="${escapeHtml(card.id)}">Approve extension</button>
-                <button data-consent-deny="${escapeHtml(card.id)}">Deny</button>
-              </div>
-            `}
-          </div>
-        </div>`;
-    }
-
-    function parkedTaskMarkup(entry) {
-      // parked-tasks.json is unsigned state. The loader validates budgetSpent
-      // as safe integers, but coerce with Number() here too so a crafted value
-      // can never reach innerHTML as markup (defense-in-depth); all string
-      // fields go through escapeHtml.
-      const spent = entry.budgetSpent || {};
-      const aiRuns = Number(spent.aiRunLaunches) || 0;
-      const activeMin = Number(spent.activeMinutes) || 0;
-      const loops = Number(spent.fixReviewLoops) || 0;
-      const openCount = Array.isArray(entry.openFindingIds) ? entry.openFindingIds.length : 0;
-      const hints = Array.isArray(entry.unblockHints) ? entry.unblockHints : [];
-      return `
-        <div class="card">
-          <div class="card-title">Parked: ${escapeHtml(entry.taskSlug || entry.branch)}</div>
-          <div class="card-body">
-            <div>${escapeHtml(entry.reason)}</div>
-            <div class="footer-note">parked ${escapeHtml(entry.parkedAt)} · spent ${aiRuns} AI runs / ${activeMin} active min / ${loops} loops · ${openCount} open finding(s)</div>
-            <div class="footer-note">${hints.map((hint) => escapeHtml(hint)).join(' · ')}</div>
-          </div>
-        </div>`;
-    }
-
-    function renderConsents() {
-      const panel = document.getElementById('consents-panel');
-      if (!panel) return;
-      const consents = state.consents || { cards: [], parked: [] };
-      const pending = consents.cards.filter((card) => card.status === 'pending');
-      const show = pending.length > 0 || consents.parked.length > 0 || consents.error;
-      panel.style.display = show ? '' : 'none';
-      if (!show) return;
-      document.getElementById('consents-summary').textContent = consents.error
-        ? `Consent store unavailable: ${consents.error}`
-        : `${pending.length} pending request(s) · ${consents.parked.length} parked task(s)`;
-      document.getElementById('consent-cards').innerHTML = pending.map(consentCardMarkup).join('')
-        || '<div class="empty-state">No pending budget-extension requests.</div>';
-      document.getElementById('parked-tasks').innerHTML = consents.parked.map(parkedTaskMarkup).join('');
-    }
-
-    document.body.addEventListener('click', async (event) => {
-      const approve = event.target.closest('[data-consent-approve]');
-      const deny = event.target.closest('[data-consent-deny]');
-      if (!approve && !deny) return;
-      const cardId = approve
-        ? approve.getAttribute('data-consent-approve')
-        : deny.getAttribute('data-consent-deny');
-      const feedback = document.getElementById('consent-feedback');
-      try {
-        if (approve) {
-          // Echo the exact mutation index + scope hash this card was rendered
-          // with, so the server rejects approval if a raced re-request changed
-          // the scope since the operator saw it (D11).
-          const card = (state.consents?.cards || []).find((entry) => entry.id === cardId);
-          const result = await fetchJson(`/api/consents/${encodeURIComponent(cardId)}/approve`, {
-            method: 'POST',
-            body: JSON.stringify(card
-              ? { mutationIndex: card.mutationIndex, scopeHash: card.scopeHash }
-              : {}),
-          });
-          feedback.textContent = `Approved ${cardId}: one-use grant ${result.grantId} minted. The task consumes it on its next resume.`;
-        } else {
-          const reason = window.prompt('Reason for denying this budget extension?') || '';
-          if (!reason.trim()) {
-            feedback.textContent = 'Denial cancelled: a reason is required.';
-            return;
-          }
-          await fetchJson(`/api/consents/${encodeURIComponent(cardId)}/deny`, {
-            method: 'POST',
-            body: JSON.stringify({ reason }),
-          });
-          feedback.textContent = `Denied ${cardId}.`;
-        }
-      } catch (error) {
-        feedback.textContent = `Consent decision failed: ${error.message}`;
-      }
-      await loadConsents();
-      renderConsents();
-    });
 
     document.body.addEventListener('pointerdown', (event) => {
       const target = event.target.closest('[data-branch-resize]');

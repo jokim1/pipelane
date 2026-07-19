@@ -31,9 +31,9 @@ design note.
 Decisions captured through 2026-07-13:
 
 - `/pipelane review setup`, `/pipelane review`, machine-local evidence, and
-  `/pr` enforcement form the shipped review-gate foundation. Review evidence
-  must bind the exact PR head and reviewed material tree; stale or anonymous
-  evidence fails closed.
+  `/pr` review display form the shipped review-gate foundation. Superseded
+  2026-07 by consent relief: review evidence is informational at `/pr` and
+  `/merge` — see "PR and review strategy" below.
 - Review gates remain ordered by phase: static, behavioral, AI diff,
   instruction, runtime, then human gates. Cheap deterministic checks run before
   AI review, and fix-first gstack `/review` runs before read-only confirmations.
@@ -222,9 +222,10 @@ listed here.
   scope.
 - Pre-PR checks: `npm test`, `npm run typecheck`, `npm run build`.
   Configured in `templates/project-pipelane.json` `prePrChecks`.
-- Review evidence must identify its reviewer and bind the current PR head and
-  material tree. A passing gate from an older commit, different tree, or
-  unauthenticated reviewer cannot authorize `/pr` or a destination route.
+- Review evidence is informational at `/pr` and `/merge` (2026-07 consent
+  relief): the commands show what ran, what's open, and what's stale, and
+  proceed. Missing, failed, or pending evidence asks for one recorded
+  `--override --reason` consent. Staleness never voids evidence.
 - PR path deny list enforced in `pipelane run pr` before the silent
   `git add -A`: `CLAUDE.md`, `.env`, `.env.*`, `*.pem`, `*.p12`,
   `id_rsa*`, `*.key`. See `DEFAULT_PR_PATH_DENY_LIST` in `state.ts`.

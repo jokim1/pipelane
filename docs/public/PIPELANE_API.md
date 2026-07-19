@@ -66,10 +66,13 @@ that ignore unknown fields parse every revision transparently. See
   - `probeState` — rollup of per-surface staging probes: one of
     `healthy | degraded | stale | unknown`. See `doctor.probe` below.
 - `boardContext.activeTask` / `overallFreshness`.
-- `review.current` is evidence for the current checkout only; `review.recent`
-  is branch history and must not be treated as current. `review.latest` remains
-  a compatibility alias for `review.current` through the 0.2.x line and is
-  removed in 0.3.0.
+- `review.current` is the latest full review run recorded for the current
+  branch; `review.recent` is older branch history and must not be treated as
+  current. `review.current` is branch-scoped, not checkout-bound: commits or
+  edits made after the reviewed commit leave it current but stale, and clients
+  should render that staleness rather than discard the evidence.
+  `review.latest` remains a compatibility alias for `review.current` through
+  the 0.2.x line and is removed in 0.3.0.
 - `review.current.presentation` and `review.recent.presentation` are derived,
   control-safe display data. They include the relation (`current` or `recent`),
   checkout identity, gate and finding counts, every structured finding,
@@ -164,11 +167,12 @@ the checkout is behind the configured base branch. Clients should surface the
 reason and have the operator rebase before retrying, rather than confirming
 or executing a stale route.
 
-When review evidence blocks one of those actions, `preflight.review` contains
-the same typed presentation used by `/status` and the board. Clients should
-render all relevant findings and protocol errors before the recovery and
-exact-scope bypass choices in `preflight.reason`. A bypass remains consent for
-that scope; it does not change a failed or pending gate to passed.
+When review evidence is not green for one of those actions, `preflight.review`
+contains the same typed presentation used by `/status` and the board. Clients
+should render all relevant findings and protocol errors from
+`preflight.reason`, then proceed with the single recorded `override` +
+`reason` consent when the operator chooses to continue. An override remains
+consent; it does not change a failed or pending gate to passed.
 
 `doctor.fix` is intentionally **not** exposed as an API action — it is
 interactive (TTY prompts for platform + URLs) and lives behind

@@ -7,18 +7,12 @@ import { fileURLToPath } from 'node:url';
 import {
   buildDestinationPlanForCommand,
   canonicalizeDestinationFingerprint,
-  destinationPlanFingerprintDigest,
   type DestinationMilestone,
   type DestinationPlan,
   type DestinationStep,
 } from './destination-planner.ts';
 import { sanitizeForTerminal } from './commands/helpers.ts';
 import { evaluateReviewEvidenceForPr, reviewEvidenceOverrideReason } from './review-enforcement.ts';
-import {
-  ROUTE_SAFETY_FINGERPRINT_ENV,
-  evaluateDestinationRouteReviewSafety,
-  recordDestinationRouteCompleted,
-} from './task-budget.ts';
 import {
   acquireTaskWorkspaceLease,
   ensureTaskBindingId,
@@ -117,7 +111,6 @@ export async function executeDestinationRoute(
   while (true) {
     const step = nextExecutableStep(currentPlan);
     if (!step) {
-      recordDestinationRouteCompleted(resolveWorkflowContext(routeCwd), currentPlan);
       return execution;
     }
 
@@ -130,10 +123,7 @@ export async function executeDestinationRoute(
       const reviewEvidence = evaluateReviewEvidenceForPr(context, { command: step.command });
       const overrideReason = reviewEvidenceOverrideReason(parsed.flags);
       if (!reviewEvidence.allowed && !overrideReason) {
-        const pause = await evaluateDestinationRouteReviewSafety(context, currentPlan, reviewEvidence);
-        if (pause.action === 'stop') {
-          return failRouteGuard(execution, step.command, pause.message);
-        }
+        return failRouteGuard(execution, step.command, reviewEvidence.message);
       }
     }
 
@@ -391,7 +381,6 @@ function buildStepEnv(step: DestinationStep, plan: DestinationPlan, lease: TaskW
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     [DESTINATION_INTERNAL_STEP_ENV]: '1',
-    [ROUTE_SAFETY_FINGERPRINT_ENV]: destinationPlanFingerprintDigest(plan),
   };
   delete env.PIPELANE_DEPLOY_PROD_API_CONFIRMED;
   delete env[DESTINATION_ROUTE_PROD_CONFIRMED_ENV];
@@ -705,6 +694,7 @@ function buildStepArgs(step: DestinationStep, parsed: ParsedOperatorArgs, plan: 
     pushTaskOrPr();
     pushApprovedDeploySha();
     pushSurfaces();
+    if (parsed.flags.override) args.push('--override');
     pushOpt('--reason', parsed.flags.reason);
     return args;
   }

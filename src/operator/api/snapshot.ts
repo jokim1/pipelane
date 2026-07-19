@@ -1,8 +1,6 @@
 import { existsSync } from 'node:fs';
 
-import type { AutoCleanupBlockerCode, DeliveryRecord, DeployRecord, ParkedTaskRecord, PrRecord, ProbeState, ReviewConsentRecord, ReviewOverrideRecord, ReviewRunRecord, TaskLock, WorkflowConfig } from '../state.ts';
-import { loadParkedTasks } from '../state.ts';
-import { listBudgetConsentCards, type BudgetConsentCard } from '../consent-grants.ts';
+import type { AutoCleanupBlockerCode, DeliveryRecord, DeployRecord, PrRecord, ProbeState, ReviewOverrideRecord, ReviewRunRecord, TaskLock, WorkflowConfig } from '../state.ts';
 import { summarizeTaskBudgetForCheckout } from '../task-budget.ts';
 import {
   automaticWorktreeCleanupEnabled,
@@ -90,7 +88,6 @@ import {
 } from './envelope.ts';
 import {
   evaluateReviewEvidenceForPr,
-  selectCurrentReviewConsents,
   selectCurrentReviewEvidenceRecord,
   type ReviewEvidenceCheckResult,
 } from '../review-enforcement.ts';
@@ -323,21 +320,12 @@ export interface SnapshotData {
     latestOverride: ReviewOverrideRecord | null;
   };
   orchestration: OrchestrationSnapshot;
-  // Convergence v1 S1: budget/consent surfacing for the Board — pending
-  // budget-extension consent cards awaiting a human decision, parked tasks
-  // (terminal until extended), and the current checkout's budget meters.
+  // Advisory budget meters for the current checkout.
   taskBudget: {
-    pendingConsents: BudgetConsentCard[];
-    parked: ParkedTaskRecord[];
     current: null | {
       taskSlug: string;
       branchName: string;
       lineageKey: string;
-      parked: boolean;
-      paused: boolean;
-      pauseReason: string | null;
-      lifetimeExtensions: number;
-      maxLifetimeExtensions: number;
       used: { fixReviewLoops: number; aiRunLaunches: number; activeMinutes: number };
       limits: { fixReviewLoops: number; aiRuns: number; activeMinutes: number };
     };
@@ -374,11 +362,10 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
   const reviewState = loadReviewState(context.commonDir, context.config);
   const reviewEvidence = evaluateReviewEvidenceForPr(context);
   const currentReview = selectCurrentReviewEvidenceRecord(context, reviewState.records);
-  const currentReviewConsents = selectCurrentReviewConsents(context, currentReview);
   const recentReview = reviewState.records.find((record) => record.id !== currentReview?.id) ?? null;
   const artifactRoot = reviewArtifactRoot(context.commonDir, context.config);
   const currentReviewSnapshot = currentReview
-    ? attachReviewPresentation(currentReview, artifactRoot, 'current', currentReviewConsents)
+    ? attachReviewPresentation(currentReview, artifactRoot, 'current')
     : null;
   const recentReviewSnapshot = recentReview
     ? attachReviewPresentation(recentReview, artifactRoot, 'recent')
@@ -632,36 +619,24 @@ export async function buildWorkflowApiSnapshot(cwd: string): Promise<ApiEnvelope
 }
 
 function buildTaskBudgetSnapshot(context: ReturnType<typeof resolveWorkflowContext>): SnapshotData['taskBudget'] {
-  let pendingConsents: BudgetConsentCard[] = [];
-  let parked: ParkedTaskRecord[] = [];
   let current: SnapshotData['taskBudget']['current'] = null;
-  try {
-    pendingConsents = listBudgetConsentCards(context.commonDir, context.config, { status: 'pending' });
-  } catch {
-    // A locked or unreadable consent store must not take down the snapshot.
-  }
-  try {
-    parked = loadParkedTasks(context.commonDir, context.config).records;
-  } catch {
-    // Same: parked surfacing is best-effort display state.
-  }
   try {
     current = summarizeTaskBudgetForCheckout(context);
   } catch {
-    // Same: budget meters are display state.
+    // Budget meters are display state; an unreadable ledger must not take
+    // down the snapshot.
   }
-  return { pendingConsents, parked, current };
+  return { current };
 }
 
 function attachReviewPresentation(
   record: ReviewRunRecord,
   artifactRoot: string,
   relation: ReviewRunPresentation['relation'],
-  consents: ReviewConsentRecord[] = [],
 ): ReviewSnapshotRecord {
   return {
     ...record,
-    presentation: projectReviewRun(record, { artifactRoot, relation, consents }),
+    presentation: projectReviewRun(record, { artifactRoot, relation }),
   };
 }
 

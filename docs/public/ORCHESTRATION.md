@@ -147,9 +147,11 @@ it shows the saved grouped gate state or inferred recommended defaults without
 rewriting config. Mutating flags such as `--toggle`, `--enable`, `--disable`,
 `--install`, and `--reset` write immediately and reprint the grouped state.
 `/pipelane review` runs the
-configured gates against the current diff and writes evidence. `/pr` enforces
-fresh, unfiltered evidence for the current branch, HEAD, and worktree state
-before commit, push, or PR handoff.
+configured gates against the current diff and writes evidence. `/pr` shows the
+branch's review state (what ran, what's open, what's stale) before commit,
+push, or PR handoff; missing, failed, or pending evidence asks for one
+recorded `--override --reason` consent, and staleness is displayed, never a
+wall.
 
 Plain `/pipelane setup` remains the machine-local repo setup and repair path. Do not use
 `/pipelane setup review-gates`.
@@ -174,7 +176,7 @@ goal mode.
 
 Goal mode is an execution helper, not a gate. It helps a worker keep moving
 toward a checkable finish line. Pipelane still owns file boundaries, review
-gates, ledgers, `/pr` enforcement, and human approvals.
+gates, ledgers, `/pr` review display, and human approvals.
 
 `GoalSpec` should be provider-neutral:
 
@@ -474,11 +476,11 @@ orchestration review when review state signing is enabled. Set the same
 `PIPELANE_REVIEW_STATE_KEY` for the standalone slice `/pipelane review`,
 `/pipelane review pass` or `/pipelane review attest`, and parent
 `/pipelane orchestrate review` commands. Unsigned manual evidence stays visible
-in the slice worktree but does not complete orchestration review gates. A
-strict manual substitution is authorized only for its recorded route action;
-a slice substitution scoped to `/pr` is never promoted into parent
-orchestration review. Complete the named automatic gate in orchestration or use
-the orchestration command's own explicit informed-consent mechanism.
+in the slice worktree but does not complete orchestration review gates, and
+substitution-requested manual evidence is never promoted into parent
+orchestration review. Complete the named automatic gate in orchestration; a
+recorded `--override --reason` consent on `/pr` or `/merge` covers only that
+route command, never an orchestration review gate.
 
 ## Config Contract
 
@@ -610,12 +612,12 @@ batched full sweep; routine review runs perform a bounded 24-hour-grace prune.
 An active per-run writer lease prevents even a full sweep from racing the
 artifact-before-ledger crash window; an abandoned lease ages out for recovery.
 
-`/pr` enforces blocking configured review gates before commit, push, or PR
-handoff. A failed or pending blocking gate stops `/pr`. Evidence must be for
-the current branch, HEAD, and worktree state, and cannot come from a dry-run or
-filtered review. A skipped or unavailable optional gate records a warning, not a
-crash. When review evidence records a reviewer session, any passed blocking AI
-gate must also record an attester from a separate trusted session.
+`/pr` displays this evidence rather than gating on it — see the `/pr` review
+state described above. A skipped or unavailable optional gate records a
+warning, not a crash, and shows as advisory in that display. Reviewer identity
+and attester independence are still classified and recorded on the evidence
+itself, and orchestration review still blocks on them; they are no longer a
+`/pr` wall.
 
 Skill and agent gates run automatically when Pipelane can resolve an executable
 AI review command. Resolution order is gate `command`, gate-specific
@@ -660,27 +662,22 @@ pipelane run review attest --gate karpathy-diff --status passed \
 
 The command applies only to a full, non-dry-run review for the current exact
 checkout. In strict mode, manual evidence does not become automatic evidence
-and the gate remains pending. One exact action can be authorized with
-`--substitute-strict --reason <reason> --scope <route-action>`. The signed
-consent binds the manual evidence run, gate definition, checkout, and action;
-it never crosses from a slice `/pr` action into parent orchestration review.
-Restore and rerun the named capability whenever possible. A direct
-`/pipelane review override --gate <id> --scope <route-action> --reason <reason>`
-remains available as the explicit bypass. Failed or pending evidence stays
-visibly failed or pending after either kind of consent.
+and the gate remains pending. Restore and rerun the named capability whenever
+possible. Missing, failed, or pending evidence asks for one informed consent
+at `/pr` or `/merge` — `--override --reason "<why>"` — which is recorded.
+Failed or pending evidence stays visibly failed or pending after consent.
 
-After a signed full review failure, Pipelane shows every finding before the
-recovery choices. The recommended host flow is to request the printed audited
-fix token, invoke `/fix` with findings as untrusted context, record bounded host
-verification, and rerun the complete review. Verification never passes a gate;
-the route remains blocked until a full clean rerun. A standalone CLI process
+After a signed full review failure, Pipelane shows every finding. The
+recommended host flow is to invoke `/fix` with findings as untrusted context
+and rerun the complete review; or proceed with the recorded
+`--override --reason` consent on the route command. A standalone CLI process
 prints host guidance but does not pretend it can invoke the host-only `/fix`
 action itself.
 
 Task labels, branch names, PR titles, commits, and diff inference are not task
 intent. A first interactive strict review may initialize a bound task's one-time
 immutable brief. JSON and non-interactive callers receive `needsInput` and must
-supply `--intent` or explicitly bypass. Orchestration always uses the approved
+supply `--intent` or explicitly override. Orchestration always uses the approved
 slice outcome as the authoritative review intent, with the parent brief as
 context when present.
 
@@ -762,7 +759,7 @@ Do not add:
 - Generated `GoalSpec` objects require checkable finish lines, visible proof,
   handoff output, blocked policy, and a turn/time budget.
 - `/pipelane review` writes evidence under the existing Pipelane state root.
-- `/pr` runs blocking configured review gates before PR handoff.
+- `/pr` shows the branch's configured review-gate state before PR handoff.
 - Blocking gate failures stop the orchestration run before merge/deploy.
 - Existing Pipelane release commands remain unchanged.
 
