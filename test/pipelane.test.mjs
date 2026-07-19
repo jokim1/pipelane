@@ -24057,6 +24057,104 @@ test('deploy prod records an active release-mode override as gateOverrideReason 
   }
 });
 
+test('destination route forwards --override --reason to the deploy prod child and records gateOverrideReason', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+    PIPELANE_DEPLOY_PROD_CONFIRM_STUB: 'DEAD',
+  };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigState(repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    runCli(['run', 'devmode', 'release', '--override', '--reason', 'route-override-test', '--json'], repoRoot);
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Route Override Forwarding', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Route Override Forwarding', '--json'], created.worktreePath, env);
+    runCli(['run', 'merge', '--json'], created.worktreePath, env);
+
+    // No staging deploy: the prod staging-parity gate fires inside the routed
+    // deploy_prod child, and the forwarded --override --reason pair is the
+    // only thing that lets it proceed with a recorded reason.
+    const routed = runCli([
+      'run', 'deploy', 'prod', '--yes', '--override', '--reason', 'routed override ships the hotfix', '--json',
+    ], created.worktreePath, env);
+    assert.equal(routed.status, 0, routed.stderr);
+    const deployState = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'deploy-state.json'), 'utf8'));
+    const prodRecord = deployState.records.find((record) => record.environment === 'prod');
+    assert.ok(prodRecord, 'the routed deploy_prod child must dispatch');
+    assert.equal(prodRecord.gateOverrideReason, 'routed override ships the hotfix', 'the routed child must record the forwarded override reason');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('api action route.deploy.prod forwards --override --reason and records gateOverrideReason', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    runCli(['setup'], repoRoot);
+    writeFullDeployConfigState(repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    runCli(['run', 'devmode', 'release', '--override', '--reason', 'api-route-override-test', '--json'], repoRoot);
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Api Override Forwarding', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Api Override Forwarding', '--json'], created.worktreePath, env);
+    runCli(['run', 'merge', '--json'], created.worktreePath, env);
+
+    // No probe state: release-readiness fails inside the routed deploy_prod
+    // child, so the API-built child command must carry the --override
+    // --reason pair or the deploy parser rejects it before the gate records.
+    const preflightResult = runCli(
+      ['run', 'api', 'action', 'route.deploy.prod', '--task', 'Api Override Forwarding', '--override', '--reason', 'api override ships the hotfix'],
+      created.worktreePath,
+      env,
+      true,
+    );
+    const preflight = JSON.parse(preflightResult.stdout);
+    const token = preflight.data?.preflight?.confirmation?.token;
+    assert.ok(token, `route preflight must issue a confirm token: ${preflightResult.stdout.slice(0, 900)}`);
+
+    const executed = runCli(
+      ['run', 'api', 'action', 'route.deploy.prod', '--task', 'Api Override Forwarding', '--override', '--reason', 'api override ships the hotfix', '--execute', '--confirm-token', token],
+      created.worktreePath,
+      env,
+      true,
+    );
+    const envelope = JSON.parse(executed.stdout);
+    assert.equal(envelope.ok, true, JSON.stringify(envelope).slice(0, 1200));
+    assert.equal(envelope.data.execution.exitCode, 0);
+    const deployState = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'deploy-state.json'), 'utf8'));
+    const prodRecord = deployState.records.find((record) => record.environment === 'prod');
+    assert.ok(prodRecord, 'the API route must dispatch the deploy_prod child');
+    assert.equal(prodRecord.gateOverrideReason, 'api override ships the hotfix', 'the API route child must record the forwarded override reason');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
 test('merge fails closed when gh never reports mergeCommit.oid', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
