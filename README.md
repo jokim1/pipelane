@@ -210,6 +210,13 @@ re-renders the installed Claude/Codex skills), or by rerunning the install
 commands above. Until then, installed copies keep serving the previous
 contract.
 
+To confirm which Pipelane build is actually running, use `pipelane --version`.
+Every `pipelane run` command also prints the same identity line (version, short
+build SHA with a `-dirty` marker for unclean builds, and install path) as its
+first stderr line — structured `--json` output on stdout stays untouched — and
+warns on startup when the running build differs from the `pipelane` SHA the
+repo pins, or when a built install is older than its own `src/`.
+
 Set up a repo:
 
 ```text
