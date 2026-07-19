@@ -47,8 +47,8 @@ import {
 import {
   evaluateDestinationRouteReviewSafety,
   recordDestinationRouteCompleted,
-  routeSafetyAcceptsReviewFindings,
-} from '../route-loop-safety.ts';
+  taskBudgetAcceptsReviewFindings,
+} from '../task-budget.ts';
 import { buildDestinationPlanForCommand } from '../destination-planner.ts';
 import { assertManagedLocalStateValid } from '../local-state.ts';
 import { declaredPrivateSourcePaths } from '../secret-provisioning.ts';
@@ -139,7 +139,7 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
   const reviewEvidence = evaluateReviewEvidenceForPr(context);
   if (!reviewEvidence.allowed && reviewOverrideReason) {
     reviewOverrideApplied = true;
-  } else if (!reviewEvidence.allowed && !routeSafetyAcceptsReviewFindings(cwd, parsed, reviewEvidence)) {
+  } else if (!reviewEvidence.allowed && !taskBudgetAcceptsReviewFindings(cwd, parsed, reviewEvidence)) {
     let acceptedByPrompt = false;
     if (reviewEvidence.latest) {
       const routePlan = buildDestinationPlanForCommand(cwd, parsed);
@@ -161,7 +161,7 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
   const postCheckReviewEvidence = evaluateReviewEvidenceForPr(context);
   if (!postCheckReviewEvidence.allowed && reviewOverrideReason) {
     reviewOverrideApplied = true;
-  } else if (!postCheckReviewEvidence.allowed && !routeSafetyAcceptsReviewFindings(cwd, parsed, postCheckReviewEvidence)) {
+  } else if (!postCheckReviewEvidence.allowed && !taskBudgetAcceptsReviewFindings(cwd, parsed, postCheckReviewEvidence)) {
     let acceptedByPrompt = false;
     if (postCheckReviewEvidence.latest) {
       const routePlan = buildDestinationPlanForCommand(cwd, parsed);

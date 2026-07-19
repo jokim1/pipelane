@@ -9,14 +9,15 @@ import {
 } from '../task-workspaces.ts';
 import { loadTaskLock } from '../state.ts';
 import {
-  applyRouteSafetyResumeOverride,
-  hasRouteSafetyResumeOverride,
-} from '../route-loop-safety.ts';
+  applyTaskBudgetResumeOverride,
+  consumePendingBudgetExtensionForCheckout,
+  hasTaskBudgetResumeOverride,
+} from '../task-budget.ts';
 
 export async function handleResume(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const context = resolveWorkflowContext(cwd);
-  if (hasRouteSafetyResumeOverride(parsed.flags)) {
-    const result = applyRouteSafetyResumeOverride(cwd, parsed);
+  if (hasTaskBudgetResumeOverride(parsed.flags)) {
+    const result = applyTaskBudgetResumeOverride(cwd, parsed);
     printResult(parsed.flags, {
       command: 'resume',
       routeFingerprintDigest: result.record.routeFingerprintDigest,
@@ -24,6 +25,16 @@ export async function handleResume(cwd: string, parsed: ParsedOperatorArgs): Pro
       message: result.message,
     });
     return;
+  }
+  // §6: plain `pipelane resume` doubles as un-park — when the current
+  // checkout's task lineage is paused or parked and a Board-approved grant
+  // exists, consume it (one-use) before any workspace-resume behavior.
+  if (!parsed.flags.task.trim()) {
+    const consumed = consumePendingBudgetExtensionForCheckout(cwd);
+    if (consumed) {
+      printResult(parsed.flags, { command: 'resume', message: consumed.message });
+      return;
+    }
   }
   // Implicit prune on resume keeps the no-arg flow working even if a prior
   // session left half-written locks. The 5-min floor is /clean --apply's job.

@@ -2,6 +2,8 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
+import { cleanTaskBudgetArtifactsForTask } from '../task-budget.ts';
+
 import {
   acquireOrphanCleanupLock,
   acquireTaskWorkspaceLease,
@@ -257,8 +259,16 @@ function backfillLegacyDeliveryForCleanup(options: {
   // Legacy PR state did not persist the PR-head SHA. Never infer that an
   // advanced local branch was the head that produced an older merge: doing so
   // would turn merge evidence into authorization to delete unique commits.
-  // Equality is the only exact identity this legacy shape can establish.
-  if (record.mergedSha !== options.branchHeadSha) return null;
+  // Two exact identities qualify: SHA equality (merge-commit lands the branch
+  // head itself), or byte-identical trees (a squash merge landed outside
+  // /merge mints a new SHA, but an identical tree proves every byte of the
+  // branch head is already on the base — S0 lane bug #9). A branch that
+  // advanced after the squash has a different tree and stays protected.
+  if (record.mergedSha !== options.branchHeadSha) {
+    const mergedTree = runGit(options.sharedRepoRoot, ['rev-parse', '--verify', `${record.mergedSha}^{tree}`], true)?.trim() ?? '';
+    const branchTree = runGit(options.sharedRepoRoot, ['rev-parse', '--verify', `${options.branchHeadSha}^{tree}`], true)?.trim() ?? '';
+    if (!mergedTree || !branchTree || mergedTree !== branchTree) return null;
+  }
   if (!options.remote || !gitObjectIsAncestor(options.sharedRepoRoot, record.mergedSha, options.remote.sha)) return null;
   try {
     saveDeliveryRecord(options.commonDir, options.config, {
@@ -453,6 +463,10 @@ export function executeTaskWorkspaceCleanup(options: {
       if (!removed.removed) {
         return { status: 'blocked', taskSlug: current.taskSlug, code: 'state-conflict', reason: `Artifacts were removed but task-lock CAS failed (${removed.reason}).`, worktreeRemoved: true, branchRemoved: true };
       }
+      cleanTaskBudgetArtifactsForTask(options.commonDir, options.config, {
+        taskSlug: current.taskSlug,
+        branchName: current.branchName,
+      });
       return { status: 'cleaned', taskSlug: current.taskSlug, worktreeRemoved: true, branchRemoved: true, warnings: artifacts.warnings };
     }
 
@@ -515,6 +529,10 @@ export function executeTaskWorkspaceCleanup(options: {
     if (!removed.removed) {
       return { status: 'blocked', taskSlug: current.taskSlug, code: 'state-conflict', reason: `Artifacts were removed but task-lock CAS failed (${removed.reason}).`, worktreeRemoved: true, branchRemoved: true };
     }
+    cleanTaskBudgetArtifactsForTask(options.commonDir, options.config, {
+      taskSlug: current.taskSlug,
+      branchName: current.branchName,
+    });
     return { status: 'cleaned', taskSlug: current.taskSlug, worktreeRemoved: true, branchRemoved: true, warnings: artifacts.warnings };
   } finally {
     lease.release();

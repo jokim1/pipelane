@@ -101,6 +101,14 @@ export function createActionConfirmation(
   config: WorkflowConfig,
   payload: { actionId: string; fingerprint: string; normalizedInputs: Record<string, unknown> },
 ): ConfirmationRecord {
+  // Convergence v1 S1 (D11): the budget-extension record class is never
+  // minted through preflight confirmation tokens. Issuance is human-surface
+  // only — a Board approval of a pending consent card or a TTY typed phrase.
+  // This guard keeps the self-mint path structurally closed even if a future
+  // action id is added carelessly.
+  if (payload.actionId === 'budget.extension' || payload.actionId.startsWith('budget.extension.')) {
+    throw new Error('Budget-extension consent cannot be minted via action confirmation tokens. File a consent request (pipelane resume) and approve it on the Board or an interactive operator terminal.');
+  }
   ensureApiConfirmationDir(commonDir, config);
   sweepExpiredApiConfirmations(commonDir, config);
   const token = crypto.randomBytes(16).toString('hex');

@@ -41,7 +41,7 @@ import {
   reviewEvidenceOverrideReason,
   type ReviewEvidenceTarget,
 } from '../review-enforcement.ts';
-import { routeSafetyAcceptsReviewFindings } from '../route-loop-safety.ts';
+import { taskBudgetAcceptsReviewFindings } from '../task-budget.ts';
 import {
   buildSharedCheckoutLeaseBlocker,
   buildStaleBaseBlocker,
@@ -375,7 +375,7 @@ function assertReviewEvidenceReadyForMerge(
   if (!reviewEvidence.allowed && overrideReason) {
     return true;
   }
-  if (!reviewEvidence.allowed && !routeSafetyAcceptsReviewFindings(cwd, parsed, reviewEvidence)) {
+  if (!reviewEvidence.allowed && !taskBudgetAcceptsReviewFindings(cwd, parsed, reviewEvidence)) {
     throw new Error(reviewEvidence.message);
   }
   return false;

@@ -306,7 +306,7 @@ export function rollbackCodexManagedRuntime(): HostRuntimeRollbackResult {
   });
 }
 
-function restoreCodexSkillWrappers(
+export function restoreCodexSkillWrappers(
   skillsRoot: string,
   retiredNames: Set<string>,
   payloads: Map<string, string>,
@@ -320,12 +320,18 @@ function restoreCodexSkillWrappers(
   for (const skillName of touchable) {
     snapshots.set(skillName, readSkillBody(skillsRoot, skillName));
   }
+  // Compensation scope: only names this restore actually mutated. A foreign
+  // (unmanaged) collision dir also snapshots as body===null — an unbounded
+  // compensation rm would delete user data the restore itself deliberately
+  // skipped (S0 accepted finding #4).
+  const mutated = new Set<string>();
   try {
     const removedSkills: string[] = [];
     for (const skillName of retiredNames) {
       if (payloads.has(skillName) || !isManagedCodexSkill(skillsRoot, skillName)) {
         continue;
       }
+      mutated.add(skillName);
       rmSync(skillDirPath(skillsRoot, skillName), { recursive: true, force: true });
       removedSkills.push(skillName);
     }
@@ -339,6 +345,7 @@ function restoreCodexSkillWrappers(
         skippedCollisions.push(skillName);
         continue;
       }
+      mutated.add(skillName);
       writeSkill(skillsRoot, { name: skillName, body });
       restoredSkills.push(skillName);
     }
@@ -349,6 +356,12 @@ function restoreCodexSkillWrappers(
     };
   } catch (error) {
     for (const [skillName, body] of snapshots) {
+      if (!mutated.has(skillName)) {
+        // Untouched by this restore (e.g. a skipped foreign collision dir):
+        // there is nothing to compensate, and rm'ing here would destroy
+        // unmanaged user content.
+        continue;
+      }
       try {
         if (body === null) {
           rmSync(skillDirPath(skillsRoot, skillName), { recursive: true, force: true });
