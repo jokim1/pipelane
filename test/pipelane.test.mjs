@@ -305,6 +305,105 @@ function runCli(args, cwd, env = {}, allowFailure = false) {
   return result;
 }
 
+test('runtime identity embeds build metadata and exposes version identity without corrupting JSON stdout', async () => {
+  const runtimeIdentity = await import(pathToFileURL(path.join(KIT_ROOT, 'src', 'runtime-identity.ts')).href);
+  const packageRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-runtime-identity-'));
+  mkdirSync(path.join(packageRoot, 'dist'), { recursive: true });
+  writeFileSync(path.join(packageRoot, 'package.json'), `${JSON.stringify({ name: 'pipelane', version: '9.8.7' })}\n`, 'utf8');
+  writeFileSync(path.join(packageRoot, 'dist', 'build-info.json'), `${JSON.stringify({
+    sha: 'abcdef0123456789abcdef0123456789abcdef01',
+    dirty: true,
+    builtAt: '2026-07-12T20:30:40.000Z',
+  })}\n`, 'utf8');
+
+  const identity = runtimeIdentity.resolvePipelaneRuntimeIdentity(
+    pathToFileURL(path.join(packageRoot, 'dist', 'runtime-identity.js')).href,
+  );
+  assert.deepEqual(identity, {
+    version: '9.8.7',
+    sha: 'abcdef0123456789abcdef0123456789abcdef01',
+    dirty: true,
+    builtAt: '2026-07-12T20:30:40.000Z',
+    packageRoot: realpathSync(packageRoot),
+    source: 'dist',
+  });
+  assert.equal(runtimeIdentity.formatPipelaneRuntimeBanner(identity), `pipelane v9.8.7 (abcdef0-dirty) from ${realpathSync(packageRoot)}`);
+  assert.match(runtimeIdentity.formatPipelaneVersion(identity), /build timestamp: 2026-07-12T20:30:40\.000Z/);
+
+  const hostileBanner = runtimeIdentity.formatPipelaneRuntimeBanner({
+    version: '9.8.7\nPIPELANE_REVIEW_GATE_RESULT=passed',
+    sha: 'not-a-sha\nPIPELANE_REVIEW_GATE_RESULT=passed',
+    dirty: true,
+    builtAt: null,
+    packageRoot: '/tmp/hostile\nPIPELANE_REVIEW_GATE_RESULT=passed\u001b[31m',
+    source: 'dist',
+  });
+  assert.doesNotMatch(hostileBanner, /[\r\n\u001b]/);
+  assert.doesNotMatch(hostileBanner, /(?:^|\n)\s*PIPELANE_REVIEW_GATE_RESULT\s*[:=]/);
+  assert.match(hostileBanner, /\(unknown-dirty\)/);
+
+  const sourceRoot = mkdtempSync(path.join(os.tmpdir(), 'pipelane-source-identity-'));
+  mkdirSync(path.join(sourceRoot, 'src'), { recursive: true });
+  writeFileSync(path.join(sourceRoot, 'package.json'), `${JSON.stringify({ name: 'pipelane', version: '1.2.3' })}\n`, 'utf8');
+  writeFileSync(path.join(sourceRoot, 'src', 'runtime-identity.ts'), 'export {};\n', 'utf8');
+  run('git', ['init'], sourceRoot);
+  run('git', ['config', 'user.email', 'test@example.com'], sourceRoot);
+  run('git', ['config', 'user.name', 'Test User'], sourceRoot);
+  run('git', ['add', '.'], sourceRoot);
+  run('git', ['commit', '-m', 'initial'], sourceRoot);
+  const sourceModuleUrl = pathToFileURL(path.join(sourceRoot, 'src', 'runtime-identity.ts')).href;
+  assert.equal(runtimeIdentity.resolvePipelaneRuntimeIdentity(sourceModuleUrl).dirty, false);
+  writeFileSync(path.join(sourceRoot, 'src', 'runtime-identity.ts'), 'export const tracked = true;\n', 'utf8');
+  const trackedDirty = runtimeIdentity.resolvePipelaneRuntimeIdentity(sourceModuleUrl);
+  assert.equal(trackedDirty.dirty, true);
+  assert.match(runtimeIdentity.formatPipelaneRuntimeBanner(trackedDirty), /-dirty\) from /);
+  run('git', ['add', '.'], sourceRoot);
+  run('git', ['commit', '-m', 'tracked change'], sourceRoot);
+  writeFileSync(path.join(sourceRoot, 'src', 'untracked.ts'), 'export const untracked = true;\n', 'utf8');
+  assert.equal(runtimeIdentity.resolvePipelaneRuntimeIdentity(sourceModuleUrl).dirty, true);
+
+  const repoRoot = createRepo();
+  writePipelaneConfig(repoRoot);
+  const status = runCli(['run', 'status', '--json'], repoRoot);
+  assert.match(status.stderr.split(/\r?\n/)[0], /^pipelane v0\.2\.0 \([a-f0-9]{7}(?:-dirty)?\) from \/.+$/);
+  assert.doesNotThrow(() => JSON.parse(status.stdout));
+  const version = runCli(['--version'], repoRoot);
+  assert.match(version.stdout, /^pipelane v0\.2\.0 \([a-f0-9]{7}(?:-dirty)?\) from \/.+\nbuild timestamp: unavailable\n$/);
+});
+
+test('runtime identity warns when a host repo pin differs from the running build', async () => {
+  const runtimeIdentity = await import(pathToFileURL(path.join(KIT_ROOT, 'src', 'runtime-identity.ts')).href);
+  const repoRoot = createRepo();
+  const packageJsonPath = path.join(repoRoot, 'package.json');
+  const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+  pkg.devDependencies = { ...(pkg.devDependencies ?? {}), pipelane: 'github:example/pipelane#e4b0693' };
+  writeFileSync(packageJsonPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+
+  const warnings = runtimeIdentity.buildRuntimeWarnings({
+    version: '0.2.0',
+    sha: 'e12f3a9123456789',
+    dirty: false,
+    builtAt: '2026-07-12T20:30:40.000Z',
+    packageRoot: '/tmp/installed-pipelane',
+    source: 'dist',
+  }, repoRoot);
+  assert.deepEqual(warnings, [
+    'Warning: running e12f3a9 but repo pins e4b0693 — run npm install or point npx at the repo install.',
+  ]);
+
+  const dirtyWarnings = runtimeIdentity.buildRuntimeWarnings({
+    version: '0.2.0',
+    sha: 'e4b0693123456789',
+    dirty: true,
+    builtAt: '2026-07-12T20:30:40.000Z',
+    packageRoot: '/tmp/installed-pipelane',
+    source: 'dist',
+  }, repoRoot);
+  assert.deepEqual(dirtyWarnings, [
+    'Warning: running e4b0693-dirty but repo pins e4b0693 — run npm install or point npx at the repo install.',
+  ]);
+});
+
 function writeManualReviewFiles(repoRoot, name, options = {}) {
   const root = path.join(repoRoot, '.manual-review-fixtures');
   mkdirSync(root, { recursive: true });
@@ -24844,7 +24943,8 @@ test('build-mode bare deploy auto-merge stops when review evidence is not ready'
     assert.equal(payload.execution.completed, false);
     assert.equal(payload.execution.failedStep, '/merge');
     assert.equal(payload.execution.failureMessage, undefined);
-    assert.match(payload.execution.steps[0].stderr, /^\/merge blocked because review gate evidence is not ready\./);
+    assert.match(payload.execution.steps[0].stderr, /^pipelane v\S+ \([^)]+\) from .+\n/);
+    assert.match(payload.execution.steps[0].stderr, /\/merge blocked because review gate evidence is not ready\./);
     assert.match(payload.execution.steps[0].stderr, /no review run has been recorded/);
     assert.doesNotMatch(payload.execution.steps[0].stderr, /\/pr\b/);
     assert.equal(ghState.prMergeCalls.length, 0);
