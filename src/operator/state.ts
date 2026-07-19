@@ -165,31 +165,6 @@ export interface ReviewConsentRecord {
   signature?: string;
 }
 
-export type OrchestrateGoalConfirmationMode = 'confirm' | 'auto' | 'off';
-export const GOAL_PROVIDERS = ['codex', 'claude', 'generic'] as const;
-export type GoalProvider = (typeof GOAL_PROVIDERS)[number];
-export const DEFAULT_GOAL_PROVIDER: GoalProvider = 'codex';
-
-export interface OrchestrateConfig {
-  baseBranch?: string;
-  maxConcurrentSlices?: number;
-  goalMode?: {
-    default?: OrchestrateGoalConfirmationMode;
-    maxTurns?: number;
-    maxMinutes?: number;
-    requireConfirmationFor?: string[];
-  };
-  hardStops?: {
-    maxIterationsPerSlice?: number;
-    maxReviewLoops?: number;
-    maxMinutesPerSlice?: number;
-    // B2: stop a slice's review auto-fix once its canonical no-progress signature
-    // repeats this many consecutive times (default 2). Guards against looping on a
-    // fix that never changes the failure.
-    maxStalledIterations?: number;
-  };
-}
-
 export interface RouteSafetyConfig {
   defaultFixReviewLoops?: number;
   defaultMinutes?: number;
@@ -295,7 +270,6 @@ export interface WorkflowConfig {
   // Convergence v1 §4.3/§5: task-budget sizing constants. Optional; absent
   // configs use DEFAULT_TASK_BUDGET.
   taskBudget?: TaskBudgetConfig;
-  orchestrate?: OrchestrateConfig;
   cleanup?: CleanupConfig;
 }
 
@@ -548,7 +522,7 @@ export interface StatusDecisionRecord {
   actor: string;
   branchName: string;
   headSha: string;
-  source: 'board' | 'branch' | 'orchestration';
+  source: 'board' | 'branch';
   taskSlug?: string;
   runId?: string;
   sliceId?: string;
@@ -668,7 +642,7 @@ export interface ReviewReportArtifactReference {
 
 export interface ReviewIntent {
   text: string;
-  source: 'explicit-unbound' | 'orchestration-slice' | 'task-brief';
+  source: 'explicit-unbound' | 'task-brief';
   digest: string;
   taskBindingId?: string;
 }
@@ -1137,22 +1111,6 @@ export interface OperatorFlags {
   reviewPhase: string;
   reviewIntent: string;
   reviewEnforcementMode: string;
-  goalSliceId: string;
-  goalOutcome: string;
-  goalPlanFile: string;
-  goalProvider: string;
-  goalMaxTurns: string;
-  goalMaxMinutes: string;
-  orchestrationRunId: string;
-  goalSlicesFile: string;
-  orchestrationAnalysisFile: string;
-  orchestrationDrafts: string;
-  scopeThrough: string;
-  orchestrationBaseBranch: string;
-  orchestrationAbandon: boolean;
-  orchestrationPurgeWorktrees: boolean;
-  orchestrationResealUnsigned: boolean;
-  orchestrationTrustsLocalState: boolean;
   reviewStatus: string;
   reviewReportFile: string;
   reviewFindingsFile: string;
@@ -1251,8 +1209,6 @@ export const STATE_SCHEMA_VERSIONS = {
   reviewState: 2,
   reviewAcceptanceState: 1,
   taskBudgetState: 1,
-  orchestrationRun: 2,
-  orchestrationObservations: 1,
   deployConfig: 1,
   taskLock: 1,
 } as const;
@@ -1279,26 +1235,6 @@ export const STATE_MIGRATIONS: Record<StateKind, Record<number, (raw: Record<str
   },
   reviewAcceptanceState: {},
   taskBudgetState: {},
-  orchestrationRun: {
-    // v1 -> v2 (G1): providerPrompt/confirmationPrompt are no longer persisted
-    // on the slice record. The worker prompt is derived from the resolved
-    // goalSpec at dispatch time (Decision 1 — kills the stale-prompt class).
-    // Strip the dead fields from in-flight v1 ledgers on read so they shed them
-    // on the next save; goalSpec + provider remain, so derivation is lossless.
-    1: (raw) => {
-      if (Array.isArray(raw.slices)) {
-        raw.slices = raw.slices.map((slice) => {
-          if (!slice || typeof slice !== 'object' || Array.isArray(slice)) return slice;
-          const next = { ...(slice as Record<string, unknown>) };
-          delete next.providerPrompt;
-          delete next.confirmationPrompt;
-          return next;
-        });
-      }
-      return raw;
-    },
-  },
-  orchestrationObservations: {},
   deployConfig: {},
   taskLock: {},
 };
@@ -1447,7 +1383,7 @@ function sleepSyncMs(ms: number): void {
 // short escalating backoff. A retried spawn is safe because the process never
 // started; a real non-zero exit (or after the retry budget) propagates as-is so
 // callers still fail closed. Prevents intermittent EAGAIN under load from
-// crashing long-running work such as an orchestration review pass.
+// crashing long-running review passes.
 export function runWithTransientSpawnRetry<T>(operation: () => T): T {
   for (let attempt = 0; ; attempt++) {
     try {
@@ -1641,18 +1577,6 @@ function mergeWorkflowLayers(
     if (overlay.cleanup) next.cleanup = { ...current.cleanup, ...overlay.cleanup };
     if (overlay.surfacePathMap) next.surfacePathMap = { ...current.surfacePathMap, ...overlay.surfacePathMap };
     delete (next as Record<string, unknown>).smoke;
-    if (isRecord(overlay.orchestrate)) {
-      next.orchestrate = {
-        ...current.orchestrate,
-        ...overlay.orchestrate,
-        goalMode: isRecord(overlay.orchestrate.goalMode)
-          ? { ...current.orchestrate?.goalMode, ...overlay.orchestrate.goalMode }
-          : current.orchestrate?.goalMode,
-        hardStops: isRecord(overlay.orchestrate.hardStops)
-          ? { ...current.orchestrate?.hardStops, ...overlay.orchestrate.hardStops }
-          : current.orchestrate?.hardStops,
-      };
-    }
     if (overlay.reviewGates) {
       next.reviewGates = {
         ...current.reviewGates,
@@ -1745,7 +1669,6 @@ export function normalizeWorkflowConfig(
     reviewGates: normalizeReviewGatesConfig(withDefaults.reviewGates, { repoRoot: options.repoRoot }),
     routeSafety: normalizeRouteSafetyConfig(withDefaults.routeSafety),
     taskBudget: normalizeTaskBudgetConfig(withDefaults.taskBudget),
-    orchestrate: normalizeOrchestrateConfig(withDefaults.orchestrate),
     cleanup: normalizeCleanupConfig(withDefaults.cleanup),
   } as WorkflowConfig & Record<string, unknown>;
   delete normalized.smoke;
@@ -1785,38 +1708,6 @@ export function normalizeDisposableIgnoredPath(value: string): string {
 export const REVIEW_GATE_PHASES: readonly ReviewGatePhase[] = ['static', 'behavioral', 'ai-diff', 'instruction', 'runtime', 'human'];
 const REVIEW_GATE_TYPES: readonly ReviewGateType[] = ['command', 'skill', 'agent', 'approval', 'pipelane'];
 const REVIEW_PLAN_GATE_TYPES: readonly ReviewPlanGateConfig['type'][] = ['skill', 'agent', 'approval'];
-const ORCHESTRATE_GOAL_CONFIRMATION_MODES: readonly OrchestrateGoalConfirmationMode[] = ['confirm', 'auto', 'off'];
-
-function normalizeOrchestrateConfig(raw: OrchestrateConfig | undefined): OrchestrateConfig | undefined {
-  if (!isRecord(raw)) return undefined;
-
-  const goalMode = isRecord(raw.goalMode) ? raw.goalMode : undefined;
-  const hardStops = isRecord(raw.hardStops) ? raw.hardStops : undefined;
-  const baseBranch = cleanString(raw.baseBranch);
-  return {
-    ...(baseBranch ? { baseBranch } : {}),
-    maxConcurrentSlices: positiveConfigInteger(raw.maxConcurrentSlices),
-    goalMode: goalMode
-      ? {
-          default: includesString(ORCHESTRATE_GOAL_CONFIRMATION_MODES, goalMode.default)
-            ? goalMode.default
-            : undefined,
-          maxTurns: positiveConfigInteger(goalMode.maxTurns),
-          maxMinutes: positiveConfigInteger(goalMode.maxMinutes),
-          requireConfirmationFor: cleanStringList(goalMode.requireConfirmationFor),
-        }
-      : undefined,
-    hardStops: hardStops
-      ? {
-          maxIterationsPerSlice: positiveConfigInteger(hardStops.maxIterationsPerSlice),
-          maxReviewLoops: positiveConfigInteger(hardStops.maxReviewLoops),
-          maxMinutesPerSlice: positiveConfigInteger(hardStops.maxMinutesPerSlice),
-          maxStalledIterations: positiveConfigInteger(hardStops.maxStalledIterations),
-        }
-      : undefined,
-  };
-}
-
 function positiveConfigInteger(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
@@ -3424,7 +3315,7 @@ function normalizeStatusDecisionRecord(value: unknown): StatusDecisionRecord | n
     || typeof raw.actor !== 'string'
     || typeof raw.branchName !== 'string'
     || typeof raw.headSha !== 'string'
-    || (raw.source !== 'board' && raw.source !== 'branch' && raw.source !== 'orchestration')
+    || (raw.source !== 'board' && raw.source !== 'branch')
   ) {
     return null;
   }
@@ -4233,7 +4124,7 @@ function isReviewIntent(value: unknown): value is ReviewIntent {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const raw = value as Record<string, unknown>;
   return typeof raw.text === 'string'
-    && (raw.source === 'explicit-unbound' || raw.source === 'orchestration-slice' || raw.source === 'task-brief')
+    && (raw.source === 'explicit-unbound' || raw.source === 'task-brief')
     && typeof raw.digest === 'string'
     && (raw.taskBindingId === undefined || typeof raw.taskBindingId === 'string');
 }
@@ -4970,22 +4861,6 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
     reviewPhase: '',
     reviewIntent: '',
     reviewEnforcementMode: '',
-    goalSliceId: '',
-    goalOutcome: '',
-    goalPlanFile: '',
-    goalProvider: '',
-    goalMaxTurns: '',
-    goalMaxMinutes: '',
-    orchestrationRunId: '',
-    goalSlicesFile: '',
-    orchestrationAnalysisFile: '',
-    orchestrationDrafts: '',
-    scopeThrough: '',
-    orchestrationBaseBranch: '',
-    orchestrationAbandon: false,
-    orchestrationPurgeWorktrees: false,
-    orchestrationResealUnsigned: false,
-    orchestrationTrustsLocalState: false,
     reviewStatus: '',
     reviewReportFile: '',
     reviewFindingsFile: '',
@@ -5393,75 +5268,6 @@ export function parseOperatorArgs(argv: string[]): ParsedOperatorArgs {
       flags.reviewEnforcementMode = readFlagValue('--enforcement-mode').trim();
       continue;
     }
-    if (flagName === '--slice-id') {
-      flags.goalSliceId = readFlagValue('--slice-id').trim();
-      continue;
-    }
-    if (flagName === '--outcome') {
-      flags.goalOutcome = readFlagValue('--outcome').trim();
-      continue;
-    }
-    if (flagName === '--plan-file') {
-      flags.goalPlanFile = readFlagValue('--plan-file').trim();
-      continue;
-    }
-    if (flagName === '--provider') {
-      flags.goalProvider = readFlagValue('--provider').trim();
-      continue;
-    }
-    if (flagName === '--max-turns') {
-      flags.goalMaxTurns = readFlagValue('--max-turns').trim();
-      continue;
-    }
-    if (flagName === '--max-minutes') {
-      flags.goalMaxMinutes = readFlagValue('--max-minutes').trim();
-      continue;
-    }
-    if (flagName === '--run-id') {
-      flags.orchestrationRunId = readFlagValue('--run-id').trim();
-      continue;
-    }
-    if (flagName === '--slices-file') {
-      flags.goalSlicesFile = readFlagValue('--slices-file').trim();
-      continue;
-    }
-    if (flagName === '--analysis-file') {
-      flags.orchestrationAnalysisFile = readFlagValue('--analysis-file').trim();
-      continue;
-    }
-    if (flagName === '--drafts') {
-      flags.orchestrationDrafts = readFlagValue('--drafts').trim();
-      continue;
-    }
-    if (flagName === '--through') {
-      flags.scopeThrough = readFlagValue('--through').trim();
-      continue;
-    }
-    if (flagName === '--base-branch') {
-      flags.orchestrationBaseBranch = readFlagValue('--base-branch').trim();
-      continue;
-    }
-    if (flagName === '--abandon') {
-      rejectInlineValue('--abandon');
-      flags.orchestrationAbandon = true;
-      continue;
-    }
-    if (flagName === '--purge-worktrees') {
-      rejectInlineValue('--purge-worktrees');
-      flags.orchestrationPurgeWorktrees = true;
-      continue;
-    }
-    if (flagName === '--reseal-unsigned') {
-      rejectInlineValue('--reseal-unsigned');
-      flags.orchestrationResealUnsigned = true;
-      continue;
-    }
-    if (flagName === '--i-understand-this-trusts-local-state') {
-      rejectInlineValue('--i-understand-this-trusts-local-state');
-      flags.orchestrationTrustsLocalState = true;
-      continue;
-    }
-
     if (token.startsWith('--')) {
       throw new Error(`Unknown flag "${flagName}" for pipelane run. Run "pipelane run --help" for supported commands and flags.`);
     }
@@ -5772,236 +5578,6 @@ export function validateOperatorArgs(parsed: ParsedOperatorArgs): void {
       }
       return;
     }
-    case 'orchestrate': {
-      const subcommand = parsed.positional[0] ?? '';
-      if (subcommand === '' || subcommand === 'run') {
-        assertOnlyFlags(parsed, [
-          'goalSliceId',
-          'goalOutcome',
-          'goalPlanFile',
-          'goalProvider',
-          'goalMaxTurns',
-          'goalMaxMinutes',
-          'orchestrationRunId',
-          'offline',
-          'plan',
-          'preview',
-          'yes',
-          'goalSlicesFile',
-          'orchestrationAnalysisFile',
-          'orchestrationDrafts',
-          'orchestrationBaseBranch',
-        ]);
-        if (parsed.positional.length > (subcommand === 'run' ? 1 : 0)) {
-          throw new Error('orchestrate requires: pipelane run orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes] [--analysis-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>], or pipelane run orchestrate <goal-spec|plan|analyze|prepare|dispatch|start|review|plan-review|scope|outline|finalize|upgrade-ledger> ...');
-        }
-        if (parsed.flags.yes && (parsed.flags.preview || parsed.flags.plan)) {
-          throw new Error('orchestrate cannot combine --yes with --preview or --plan.');
-        }
-        if (parsed.flags.yes && !parsed.flags.goalPlanFile.trim() && !parsed.flags.goalOutcome.trim()) {
-          throw new Error('orchestrate --yes requires --plan-file <path> or --outcome <text>.');
-        }
-        if (parsed.flags.orchestrationDrafts.trim()) {
-          throw new Error('orchestrate --drafts is not supported in v1.');
-        }
-        if (parsed.flags.goalSlicesFile.trim() && !parsed.flags.goalPlanFile.trim()) {
-          throw new Error('orchestrate --slices-file requires --plan-file <path>.');
-        }
-        if (parsed.flags.goalSlicesFile.trim() && !parsed.flags.yes) {
-          throw new Error('orchestrate --slices-file is only valid with --yes in the bare orchestrate flow, or with orchestrate analyze/plan.');
-        }
-        if (parsed.flags.orchestrationAnalysisFile.trim() && !parsed.flags.yes) {
-          throw new Error('orchestrate --analysis-file is only valid with --yes in the bare orchestrate flow, or with orchestrate analyze.');
-        }
-        if (parsed.flags.orchestrationRunId.trim()) {
-          const newRunFlags = [
-            ['--slice-id', parsed.flags.goalSliceId],
-            ['--outcome', parsed.flags.goalOutcome],
-            ['--plan-file', parsed.flags.goalPlanFile],
-            ['--provider', parsed.flags.goalProvider],
-            ['--max-turns', parsed.flags.goalMaxTurns],
-            ['--max-minutes', parsed.flags.goalMaxMinutes],
-            ['--slices-file', parsed.flags.goalSlicesFile],
-            ['--analysis-file', parsed.flags.orchestrationAnalysisFile],
-            ['--drafts', parsed.flags.orchestrationDrafts],
-            ['--base-branch', parsed.flags.orchestrationBaseBranch],
-          ].filter(([, value]) => value.trim()).map(([flag]) => flag);
-          if (parsed.flags.offline) newRunFlags.push('--offline');
-          if (parsed.flags.plan) newRunFlags.push('--plan');
-          if (parsed.flags.preview) newRunFlags.push('--preview');
-          if (parsed.flags.yes) newRunFlags.push('--yes');
-          if (newRunFlags.length > 0) {
-            throw new Error(`orchestrate --run-id only shows an existing run and cannot combine with: ${newRunFlags.join(', ')}.`);
-          }
-        }
-        const provider = parsed.flags.goalProvider.trim();
-        if (provider && !includesString(GOAL_PROVIDERS, provider)) {
-          throw new Error(`--provider must be one of: ${GOAL_PROVIDERS.join(', ')}.`);
-        }
-        for (const [flag, value] of [
-          ['--max-turns', parsed.flags.goalMaxTurns],
-          ['--max-minutes', parsed.flags.goalMaxMinutes],
-        ] as const) {
-          if (value.trim() && (!/^[1-9]\d*$/.test(value.trim()) || !Number.isSafeInteger(Number.parseInt(value.trim(), 10)))) {
-            throw new Error(`${flag} requires a safe positive integer.`);
-          }
-        }
-        return;
-      }
-      if (subcommand === 'analyze') {
-        assertOnlyFlags(parsed, [
-          'goalPlanFile',
-          'goalSlicesFile',
-          'orchestrationRunId',
-          'orchestrationAnalysisFile',
-          'orchestrationDrafts',
-        ]);
-        if (parsed.positional.length !== 1) {
-          throw new Error('orchestrate analyze requires exactly: pipelane run orchestrate analyze (--plan-file <path> | --run-id <id>) --analysis-file <path> [--slices-file <path>]');
-        }
-        if (parsed.flags.orchestrationDrafts.trim()) {
-          throw new Error('orchestrate analyze --drafts is not supported in v1.');
-        }
-        if (!parsed.flags.orchestrationAnalysisFile.trim()) {
-          throw new Error('orchestrate analyze requires --analysis-file <path>.');
-        }
-        if (parsed.flags.goalPlanFile.trim() && parsed.flags.orchestrationRunId.trim()) {
-          throw new Error('orchestrate analyze cannot combine --plan-file and --run-id.');
-        }
-        if (!parsed.flags.goalPlanFile.trim() && !parsed.flags.orchestrationRunId.trim()) {
-          throw new Error('orchestrate analyze requires --plan-file <path> or --run-id <id>.');
-        }
-        if (parsed.flags.goalSlicesFile.trim() && !parsed.flags.goalPlanFile.trim()) {
-          throw new Error('orchestrate analyze --slices-file requires --plan-file <path>.');
-        }
-        return;
-      }
-      if (subcommand === 'plan-review') {
-        const action = parsed.positional[1] ?? '';
-        if (action !== 'pass' && action !== 'bypass') {
-          throw new Error('orchestrate plan-review requires exactly: pipelane run orchestrate plan-review <pass|bypass> --run-id <id> --gate <id> (--message <text> | --reason <text>)');
-        }
-        assertOnlyFlags(parsed, action === 'pass'
-          ? ['orchestrationRunId', 'reviewGate', 'message']
-          : ['orchestrationRunId', 'reviewGate', 'reason']);
-        if (parsed.positional.length !== 2) {
-          throw new Error(`orchestrate plan-review ${action} requires exactly: pipelane run orchestrate plan-review ${action} --run-id <id> --gate <id> ${action === 'pass' ? '--message <text>' : '--reason <text>'}`);
-        }
-        if (!parsed.flags.orchestrationRunId.trim()) {
-          throw new Error(`orchestrate plan-review ${action} requires --run-id <id>.`);
-        }
-        if (!parsed.flags.reviewGate.trim()) {
-          throw new Error(`orchestrate plan-review ${action} requires --gate <id>.`);
-        }
-        if (action === 'pass' && !parsed.flags.message.trim()) {
-          throw new Error('orchestrate plan-review pass requires --message <text>.');
-        }
-        if (action === 'bypass' && !parsed.flags.reason.trim()) {
-          throw new Error('orchestrate plan-review bypass requires --reason <text>.');
-        }
-        return;
-      }
-      if (subcommand !== 'goal-spec' && subcommand !== 'plan' && subcommand !== 'prepare' && subcommand !== 'dispatch' && subcommand !== 'start' && subcommand !== 'review' && subcommand !== 'scope' && subcommand !== 'outline' && subcommand !== 'finalize' && subcommand !== 'upgrade-ledger') {
-        throw new Error('orchestrate requires exactly: pipelane run orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes], or pipelane run orchestrate <goal-spec|plan|analyze|prepare|dispatch|start|review|plan-review|scope|outline|finalize|upgrade-ledger> [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--slices-file <path>] [--analysis-file <path>] [--run-id <id>] [--through <slice-id>] [--provider codex|claude|generic]');
-      }
-      if (subcommand === 'scope' || subcommand === 'outline' || subcommand === 'finalize' || subcommand === 'upgrade-ledger') {
-        assertOnlyFlags(parsed, subcommand === 'scope'
-          ? ['orchestrationRunId', 'scopeThrough']
-          : subcommand === 'upgrade-ledger'
-            ? ['orchestrationRunId', 'orchestrationResealUnsigned', 'reason', 'orchestrationTrustsLocalState']
-            : subcommand === 'finalize'
-              ? ['orchestrationRunId', 'orchestrationAbandon', 'orchestrationPurgeWorktrees', 'reason']
-              : ['orchestrationRunId']);
-        if (parsed.positional.length !== 1) {
-          throw new Error(`orchestrate ${subcommand} requires exactly: pipelane run orchestrate ${subcommand} --run-id <id>${subcommand === 'scope' ? ' --through <slice-id>' : subcommand === 'upgrade-ledger' ? ' [--reseal-unsigned --reason <text> --i-understand-this-trusts-local-state]' : ''}`);
-        }
-        if (!parsed.flags.orchestrationRunId.trim()) {
-          throw new Error(`orchestrate ${subcommand} requires --run-id <id>.`);
-        }
-        if (subcommand === 'scope' && !parsed.flags.scopeThrough.trim()) {
-          throw new Error('orchestrate scope requires --through <slice-id>.');
-        }
-        if (subcommand === 'finalize' && parsed.flags.orchestrationPurgeWorktrees && !parsed.flags.orchestrationAbandon) {
-          throw new Error('orchestrate finalize --purge-worktrees requires --abandon.');
-        }
-        if (subcommand === 'finalize' && parsed.flags.orchestrationPurgeWorktrees && !parsed.flags.reason.trim()) {
-          throw new Error('orchestrate finalize --purge-worktrees requires --reason <text>.');
-        }
-        if (subcommand === 'upgrade-ledger') {
-          const resealFlagCount = [
-            parsed.flags.orchestrationResealUnsigned,
-            parsed.flags.reason.trim().length > 0,
-            parsed.flags.orchestrationTrustsLocalState,
-          ].filter(Boolean).length;
-          if (resealFlagCount > 0 && resealFlagCount < 3) {
-            throw new Error('orchestrate upgrade-ledger resealing requires all of: --reseal-unsigned --reason <text> --i-understand-this-trusts-local-state.');
-          }
-        }
-        return;
-      }
-      if (subcommand === 'prepare' || subcommand === 'dispatch' || subcommand === 'start' || subcommand === 'review') {
-        assertOnlyFlags(parsed, subcommand === 'start'
-          ? ['orchestrationRunId', 'goalSliceId', 'force']
-          : subcommand === 'review'
-            ? ['orchestrationRunId', 'goalSliceId', 'reviewDryRun', 'reviewGate', 'reviewPhase']
-            : ['orchestrationRunId', 'offline']);
-        if (parsed.positional.length !== 1) {
-          throw new Error(`orchestrate ${subcommand} requires exactly: pipelane run orchestrate ${subcommand} --run-id <id>${subcommand === 'prepare' ? ' [--offline]' : subcommand === 'start' ? ' [--slice-id <id>] [--force]' : subcommand === 'review' ? ' [--slice-id <id>] [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human]' : ''}`);
-        }
-        if (!parsed.flags.orchestrationRunId.trim()) {
-          throw new Error(`orchestrate ${subcommand} requires --run-id <id>.`);
-        }
-        if (subcommand === 'dispatch' && parsed.flags.offline) {
-          throw new Error('orchestrate dispatch does not accept --offline.');
-        }
-        const phase = parsed.flags.reviewPhase.trim();
-        if (subcommand === 'review' && phase && !includesString(REVIEW_GATE_PHASES, phase)) {
-          throw new Error(`--phase must be one of: ${REVIEW_GATE_PHASES.join(', ')}.`);
-        }
-        return;
-      }
-      assertOnlyFlags(parsed, [
-        'goalSliceId',
-        'goalOutcome',
-        'goalPlanFile',
-        'goalProvider',
-        'goalMaxTurns',
-        'goalMaxMinutes',
-        'goalSlicesFile',
-        'orchestrationDrafts',
-        'orchestrationBaseBranch',
-      ]);
-      if (parsed.positional.length !== 1) {
-        throw new Error(`orchestrate ${subcommand} requires exactly: pipelane run orchestrate ${subcommand} [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--slices-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]`);
-      }
-      if (subcommand === 'plan' && !parsed.flags.goalPlanFile.trim() && !parsed.flags.goalOutcome.trim()) {
-        throw new Error('orchestrate plan requires --plan-file <path> or --outcome <text>.');
-      }
-      if (parsed.flags.orchestrationDrafts.trim()) {
-        throw new Error(`orchestrate ${subcommand} --drafts is not supported in v1.`);
-      }
-      if (parsed.flags.goalSlicesFile.trim()) {
-        if (subcommand !== 'plan') {
-          throw new Error('orchestrate --slices-file is only valid with: pipelane run orchestrate plan.');
-        }
-        if (!parsed.flags.goalPlanFile.trim()) {
-          throw new Error('orchestrate plan --slices-file requires --plan-file <path>.');
-        }
-      }
-      const provider = parsed.flags.goalProvider.trim();
-      if (provider && !includesString(GOAL_PROVIDERS, provider)) {
-        throw new Error(`--provider must be one of: ${GOAL_PROVIDERS.join(', ')}.`);
-      }
-      for (const [flag, value] of [
-        ['--max-turns', parsed.flags.goalMaxTurns],
-        ['--max-minutes', parsed.flags.goalMaxMinutes],
-      ] as const) {
-        if (value.trim() && (!/^[1-9]\d*$/.test(value.trim()) || !Number.isSafeInteger(Number.parseInt(value.trim(), 10)))) {
-          throw new Error(`${flag} requires a safe positive integer.`);
-        }
-      }
-      return;
-    }
     case 'local-state': {
       const subcommand = parsed.positional[0] ?? '';
       if (subcommand === 'list') {
@@ -6275,22 +5851,6 @@ const FLAG_RENDERERS: Array<{ key: OperatorFlagKey; label: string; active: (flag
   { key: 'reviewSummary', label: '--summary', active: (flags) => flags.reviewSummary.trim().length > 0 },
   { key: 'reviewFindingsCount', label: '--findings-count', active: (flags) => flags.reviewFindingsCount.trim().length > 0 },
   { key: 'reviewArtifact', label: '--artifact', active: (flags) => flags.reviewArtifact.trim().length > 0 },
-  { key: 'goalSliceId', label: '--slice-id', active: (flags) => flags.goalSliceId.trim().length > 0 },
-  { key: 'goalOutcome', label: '--outcome', active: (flags) => flags.goalOutcome.trim().length > 0 },
-  { key: 'goalPlanFile', label: '--plan-file', active: (flags) => flags.goalPlanFile.trim().length > 0 },
-  { key: 'goalProvider', label: '--provider', active: (flags) => flags.goalProvider.trim().length > 0 },
-  { key: 'goalMaxTurns', label: '--max-turns', active: (flags) => flags.goalMaxTurns.trim().length > 0 },
-  { key: 'goalMaxMinutes', label: '--max-minutes', active: (flags) => flags.goalMaxMinutes.trim().length > 0 },
-  { key: 'orchestrationRunId', label: '--run-id', active: (flags) => flags.orchestrationRunId.trim().length > 0 },
-  { key: 'goalSlicesFile', label: '--slices-file', active: (flags) => flags.goalSlicesFile.trim().length > 0 },
-  { key: 'orchestrationAnalysisFile', label: '--analysis-file', active: (flags) => flags.orchestrationAnalysisFile.trim().length > 0 },
-  { key: 'orchestrationDrafts', label: '--drafts', active: (flags) => flags.orchestrationDrafts.trim().length > 0 },
-  { key: 'scopeThrough', label: '--through', active: (flags) => flags.scopeThrough.trim().length > 0 },
-  { key: 'orchestrationBaseBranch', label: '--base-branch', active: (flags) => flags.orchestrationBaseBranch.trim().length > 0 },
-  { key: 'orchestrationAbandon', label: '--abandon', active: (flags) => flags.orchestrationAbandon },
-  { key: 'orchestrationPurgeWorktrees', label: '--purge-worktrees', active: (flags) => flags.orchestrationPurgeWorktrees },
-  { key: 'orchestrationResealUnsigned', label: '--reseal-unsigned', active: (flags) => flags.orchestrationResealUnsigned },
-  { key: 'orchestrationTrustsLocalState', label: '--i-understand-this-trusts-local-state', active: (flags) => flags.orchestrationTrustsLocalState },
 ];
 
 function assertOnlyFlags(parsed: ParsedOperatorArgs, allowed: OperatorFlagKey[]): void {

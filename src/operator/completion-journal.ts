@@ -19,7 +19,7 @@ import {
 // executes inside one task-scoped lock section: append an idempotent
 // completion record keyed by reviewRunId, apply the store writes, then append
 // an applied marker. Crash recovery replays unapplied records exactly-once —
-// the same transaction-marker pattern as the orchestration ledger. Every line
+// the same transaction-marker pattern as other append-only state. Every line
 // is HMAC-signed with the convergence-state key and fail-closed (D16): a line
 // that fails verification refuses the journal instead of degrading to trust.
 

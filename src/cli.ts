@@ -38,7 +38,7 @@ import {
 } from './runtime-identity.ts';
 
 function printTopLevelHelp(): void {
-  process.stdout.write(`Pipelane - build, release, and development orchestration for AI-assisted codebases
+  process.stdout.write(`Pipelane - build, review, and release workflows for AI-assisted codebases
 
 Commands:
   setup [--yes] [--provision-secrets] [--rotate-secrets] [--approve-secret-manifest=<sha256>]
@@ -220,11 +220,10 @@ function legacyRepoLocalInstallNoticeLines(cwd: string): string[] {
 }
 
 // Per-alias guidance for an optional skill whose name collided with a pre-existing
-// unmanaged skill (so install skipped it). /fix and /orchestrate have always-installed
-// pipelane-namespaced equivalents; anything else just needs the conflict resolved.
+// unmanaged skill (so install skipped it). /fix has a pipelane-namespaced
+// equivalent; anything else just needs the conflict resolved.
 function skippedSkillFallback(slashAlias: string): string {
   if (slashAlias === '/fix') return 'use /pipelane-fix';
-  if (slashAlias === '/orchestrate') return 'use /pipelane orchestrate';
   return 'rename or remove the conflicting skill and re-run install';
 }
 

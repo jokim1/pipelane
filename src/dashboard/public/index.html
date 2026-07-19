@@ -2573,18 +2573,11 @@
         { command: 'Runtime gates', description: 'Use browser QA, deploy health checks, and staging evidence where the surface needs live proof.' },
         { command: 'Human gates', description: 'Keep merge, production deploy, rollback, schema, auth, billing, and secrets explicitly approved.' },
       ];
-      const orchestrationRows = [
+      const reviewCommandRows = [
         { command: '/pipelane review setup', description: 'Select review gates, print the effective stack, and list available gates.' },
         { command: '/pipelane review', description: 'Run configured review gates, write evidence, and surface pending AI/manual gates.' },
         { command: '/pipelane review pass', description: 'Record a clean human approval gate for the current exact target.' },
         { command: '/pipelane review attest', description: 'Attach bounded report, findings, and provenance files for a specialized manual review.' },
-        { command: '/pipelane orchestrate plan', description: 'Compile an implementation plan into a durable slice ledger without running workers.' },
-        { command: '/pipelane orchestrate prepare', description: 'Create slice worktrees from a durable orchestration ledger without starting provider agents.' },
-        { command: '/pipelane orchestrate dispatch', description: 'Write provider handoff prompts for prepared orchestration slices without starting agents.' },
-        { command: '/pipelane orchestrate start', description: 'Run or retry configured slice workers and record redacted prompt, log, and exit evidence without merging or deploying.' },
-        { command: '/pipelane orchestrate goal-spec', description: 'Draft a provider-neutral GoalSpec from a plan before assigning a slice to Codex or Claude.' },
-        { command: 'Slice ledger', description: 'Planned: record slices, worktrees, owners, gate results, retries, and evidence for resume.' },
-        { command: 'Board visibility', description: 'Planned: show orchestration runs and gate status without replacing the release cockpit.' },
       ];
 
       overlay.classList.add('open');
@@ -2596,7 +2589,7 @@
         ${helpSection('Build Journey', buildRows)}
         ${helpSection('Release Journey', releaseRows)}
         ${helpSection('Review Gate Order', reviewRows)}
-        ${helpSection('Review And Orchestration', orchestrationRows)}
+        ${helpSection('Review Commands', reviewCommandRows)}
         ${helpSection('Helpful Anytime', helpfulRows)}
         ${helpSection('Web Commands', webRows)}
       `;

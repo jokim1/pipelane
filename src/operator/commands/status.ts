@@ -295,21 +295,6 @@ function createStatusPrompter(): StatusPrompter {
 }
 
 function chooseStatusActionCandidate(data: SnapshotData): StatusActionCandidate | null {
-  const orchestrationAction = data.orchestration?.activeRun?.nextAction ?? null;
-  if (orchestrationAction && isStableActionId(orchestrationAction.id) && isSelectableLaneState(orchestrationAction.state, false)) {
-    return {
-      id: orchestrationAction.id,
-      label: orchestrationAction.label,
-      reason: orchestrationAction.reason,
-      risky: orchestrationAction.risky,
-      requiresConfirmation: orchestrationAction.requiresConfirmation,
-      inputs: [],
-      defaultParams: {},
-      source: 'orchestration',
-      ...(data.orchestration?.activeRun?.id ? { runId: data.orchestration.activeRun.id } : {}),
-    };
-  }
-
   const currentBranch = data.branches.find((branch) => branch.current);
   const branchAction = currentBranch?.availableActions.find(isSelectableApiAction);
   if (branchAction) {
@@ -514,7 +499,7 @@ export function renderCockpit(
   options: RenderCockpitOptions = {},
 ): string {
   const color = options.color === true;
-  const { boardContext, branches, sourceHealth, attention, orchestration, cleanupSummary, taskBudget } = envelope.data;
+  const { boardContext, branches, sourceHealth, attention, cleanupSummary, taskBudget } = envelope.data;
   const baseBranch = boardContext.baseBranch;
 
   const lines: string[] = [];
@@ -587,9 +572,6 @@ export function renderCockpit(
     lines.push(`  proceed anyway with informed consent: ${sanitizeForTerminal(prAction)} --override --reason "<why>" (recorded; evidence is never relabeled passed).`);
     lines.push('');
   }
-
-  lines.push(...renderOrchestration(orchestration, color));
-  lines.push('');
 
   lines.push(...renderTaskBudget(taskBudget, color));
 
@@ -712,49 +694,6 @@ function renderTaskBudget(taskBudget: SnapshotData['taskBudget'] | undefined, co
   lines.push(meter('AI runs', current.used.aiRunLaunches, current.limits.aiRuns));
   lines.push(meter('active minutes', current.used.activeMinutes, current.limits.activeMinutes));
   lines.push('');
-  return lines;
-}
-
-function renderOrchestration(
-  orchestration: SnapshotData['orchestration'] | undefined,
-  color: boolean,
-): string[] {
-  if (!orchestration) return [];
-  const lines = [colorize('ORCHESTRATION', color, 'bold')];
-  const activeRun = orchestration.activeRun;
-  if (!activeRun) {
-    lines.push('  no active orchestration runs');
-    if (orchestration.runs.length > 0) {
-      const latest = orchestration.runs[0];
-      lines.push(`  latest: ${sanitizeForTerminal(latest.id)} [${sanitizeForTerminal(latest.status)}] ${sanitizeForTerminal(latest.title)}`);
-    }
-    lines.push(`  next: ${sanitizeForTerminal(orchestration.availableActions[0]?.command ?? '/pipelane orchestrate')}`);
-    return lines;
-  }
-
-  lines.push(`  active: ${sanitizeForTerminal(activeRun.id)} [${colorize(activeRun.state, color, toneForState(activeRun.state))}] ${sanitizeForTerminal(activeRun.title)}`);
-  lines.push(
-    `  progress: workers ${activeRun.counts.workerSucceeded}/${activeRun.sliceCount} succeeded, reviews ${activeRun.counts.trustedReviewComplete}/${activeRun.sliceCount} trusted, failed ${activeRun.counts.failed}, blocked ${activeRun.counts.blocked}`,
-  );
-  if (activeRun.nextAction) {
-    lines.push(`  next: ${sanitizeForTerminal(activeRun.nextAction.command)} (${sanitizeForTerminal(activeRun.nextAction.reason)})`);
-  }
-  if (orchestration.humanInbox.length > 0) {
-    lines.push('  inbox:');
-    for (const item of orchestration.humanInbox.slice(0, 5)) {
-      lines.push(`    - ${sanitizeForTerminal(item.title)}: ${sanitizeForTerminal(item.message)}`);
-    }
-  }
-  lines.push('  slices:');
-  for (const slice of activeRun.slices.slice(0, 8)) {
-    const worker = slice.workerStatus ?? 'none';
-    const review = slice.trustedReviewComplete ? `trusted:${slice.reviewEvidenceLabel}` : slice.reviewEvidenceLabel;
-    const worktree = slice.missingWorktree ? ` worktree=missing:${sanitizeForTerminal(slice.missingWorktree.worktreePath)}` : '';
-    lines.push(`    - ${sanitizeForTerminal(slice.id)}: ${sanitizeForTerminal(slice.status)} provider=${sanitizeForTerminal(slice.provider)} worker=${sanitizeForTerminal(worker)} review=${sanitizeForTerminal(review)}${worktree}`);
-  }
-  if (activeRun.slices.length > 8) {
-    lines.push(`    +${activeRun.slices.length - 8} more slice${activeRun.slices.length - 8 === 1 ? '' : 's'}`);
-  }
   return lines;
 }
 

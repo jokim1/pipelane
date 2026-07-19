@@ -12,7 +12,6 @@
     "scripts",
     "templates",
     "docs/public/RELEASE_WORKFLOW.md",
-    "docs/public/ORCHESTRATION.md",
     "docs/public/PIPELANE_BOARD.md",
     "docs/public/PIPELANE_API.md",
     "docs/public/SECRET_PROVISIONING.md",
@@ -51,8 +50,7 @@
     "pipelane:board": "pipelane board",
     "pipelane:update": "pipelane update",
     "pipelane:api": "pipelane run api",
-    "pipelane:review": "pipelane run review",
-    "pipelane:orchestrate": "pipelane run orchestrate"
+    "pipelane:review": "pipelane run review"
   },
   "engines": {
     "node": ">=22.0.0"

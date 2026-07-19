@@ -1,12 +1,12 @@
 # Pipelane
 
-**Pipelane is a vibe coding orchestrator and release manager.**
+**Pipelane is a local review, refactor, and release runner for AI-assisted codebases.**
 
 AI agents can now produce code faster than teams can review, merge, deploy, and
-recover from it. Pipelane is the operating layer around that work: it turns a
-plan into agent-executed slices, forces evidence-producing review, moves the
-approved change through release, and gives you a cockpit for seeing what is safe
-to do next.
+recover from it. Pipelane is the operating layer around that work: it creates
+safe task workspaces, forces evidence-producing review, moves the approved
+change through release, and gives you a cockpit for seeing what is safe to do
+next.
 
 Pipelane is local-first. Your repo, GitHub, CI, and deploy provider stay the
 source of truth. Pipelane coordinates them so AI-generated work does not become
@@ -27,9 +27,8 @@ PLAN -> BUILD -> EVAL -> RELEASE -> LOOP
 Pipelane exists because AI output is probabilistic. A better prompt helps, but
 it does not make the result deterministic. The durable answer is a system:
 
-- define the goal before building
-- break the work into reviewable slices
-- run agents in isolated workspaces
+- define the task before building
+- run work in isolated task workspaces
 - evaluate their output with evidence, not vibes
 - put independent review evidence in front of a human before PR handoff
 - promote only verified changes through release
@@ -42,7 +41,7 @@ Pipelane records what happened and keeps release safety intact.
 
 Pipelane gives an AI-assisted codebase four things:
 
-1. **Orchestration**: turn a plan into agent work, slice by slice.
+1. **Task workspaces**: create or adopt isolated branches for AI-assisted work.
 2. **Review gates**: convert "looks good" into evidence you see before you ship.
 3. **Safe release**: move verified changes through build or release mode.
 4. **Operator visibility**: show branches, PRs, deploys, blockers, and cleanup
@@ -54,31 +53,17 @@ makes AI coding operational.
 
 ## Core Workflows
 
-### 1. `/orchestrate`
+### 1. `/new`, `/adopt`, and `/resume`
 
-`/orchestrate` is the main vibe-coding workflow.
-
-You give Pipelane a plan. Pipelane turns it into implementation slices, assigns
-safe workspaces, runs agent loops, records evidence, and returns reviewed work
-ready for the normal PR and release path.
-
-Use it when a task is bigger than one obvious edit:
-
-- multi-file features
-- refactors with clear acceptance criteria
-- migrations across repeated patterns
-- work that benefits from parallel agent slices
-- anything where you want an audit trail of what each agent did
-
-The important product behavior is simple:
+Pipelane starts by putting work in a tracked task workspace. Create a new task
+workspace when Pipelane should own the branch, adopt one when another tool or
+human already created it, and resume when you need to return to existing work.
 
 ```text
-/orchestrate
+/new --task "Add billing export"
+/adopt --task "Existing migration work"
+/resume
 ```
-
-Pipelane handles the lower-level slice planning, worker handoff, review loop,
-and ledger details. Those internals exist for recovery and debugging, but they
-are not the user journey.
 
 ### 2. `/deploy` and Safe Release
 
@@ -88,7 +73,7 @@ Pipelane separates day-to-day build flow from protected release flow.
 Build mode is for repos where production already deploys safely after merge:
 
 ```text
-/orchestrate
+/new --task "Ship dashboard filters"
 /pipelane review
 /pr
 /merge
@@ -98,7 +83,7 @@ Release mode is for changes that must prove the exact merged SHA in staging
 before production moves:
 
 ```text
-/orchestrate
+/new --task "Ship dashboard filters"
 /pipelane review
 /pr
 /merge
@@ -163,7 +148,7 @@ and run review again.
 
 `/pipelane web` opens the local Pipelane Board.
 
-The board is the visual cockpit for orchestration and release management. It
+The board is the visual cockpit for review and release management. It
 shows the state Pipelane already knows:
 
 - what needs attention
@@ -180,8 +165,7 @@ shows the state Pipelane already knows:
 ```
 
 The board is not a second source of truth. It reads the repo's Pipelane API and
-shows what the repo reports. The direction is to make orchestration status
-visible here too: active runs, slices, blockers, review state, and evidence.
+shows what the repo reports.
 
 ## Why This Matters
 
@@ -277,7 +261,7 @@ when production deploys from the base branch automatically; in release mode,
 continue through staging and production:
 
 ```text
-/orchestrate
+/new --task "Ship dashboard filters"
 /pipelane review
 /pr
 /merge
@@ -338,6 +322,5 @@ Source layout:
 ## More Detail
 
 - [Release workflow reference](docs/public/RELEASE_WORKFLOW.md)
-- [Orchestration reference](docs/public/ORCHESTRATION.md)
 - [Pipelane Board reference](docs/public/PIPELANE_BOARD.md)
 - [Pipelane API reference](docs/public/PIPELANE_API.md)

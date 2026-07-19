@@ -29,7 +29,6 @@ import { readWorktreeStatusSnapshot, type WorktreeStatusSnapshot } from '../work
 import {
   CONVERGENCE_STATE_KEY_ENV,
   DEPLOY_STATE_KEY_ENV,
-  ORCHESTRATION_STATE_KEY_ENV,
   PROBE_STATE_KEY_ENV,
   REVIEW_CONSENT_STATE_KEY_ENV,
   REVIEW_STATE_KEY_ENV,
@@ -164,7 +163,6 @@ const REVIEW_GATE_COMMAND_LOCK_CRASH_GRACE_MS = 150;
 const AI_REVIEW_GATE_SCRUBBED_SESSION_ENV_KEYS = [
   'PIPELANE_AUTHOR_SESSION_ID',
   'PIPELANE_WORKER_SESSION_ID',
-  'PIPELANE_ORCHESTRATE_WORKER_SESSION_ID',
   'PIPELANE_AGENT_SESSION_ID',
   'PIPELANE_REVIEW_GATE_SESSION_ID',
   'CODEX_SESSION_ID',
@@ -2714,7 +2712,7 @@ function pruneReviewArtifacts(
 
 export function collectReviewIntentCandidates(
   context: ReturnType<typeof resolveWorkflowContext>,
-  options: { explicitIntent?: string; orchestrationOutcome?: string } = {},
+  options: { explicitIntent?: string } = {},
 ): { candidates: ReviewIntentCandidate[]; taskBindingId?: string; lock: TaskLock | null } {
   const branchName = runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
   const lockCandidate = loadAllTaskLocks(context.commonDir, context.config).find((candidate) =>
@@ -2723,9 +2721,6 @@ export function collectReviewIntentCandidates(
   ) ?? null;
   const lock = lockCandidate ? ensureTaskBindingId(context.commonDir, context.config, lockCandidate.taskSlug) : null;
   const candidates: ReviewIntentCandidate[] = [];
-  if (options.orchestrationOutcome?.trim()) {
-    candidates.push({ text: options.orchestrationOutcome, source: 'orchestration-slice', authoritative: true });
-  }
   if (lock?.taskBrief) {
     candidates.push({ text: taskBriefIntentText(lock.taskBrief), source: 'task-brief', authoritative: true });
   }
@@ -3335,7 +3330,7 @@ function nestedReviewGateFailureSummary(context: ReviewGateInheritedContext): st
   return [
     `nested review gate execution blocked: inherited ${REVIEW_GATE_DEPTH_ENV}=${context.depth} from live parent pid ${context.parentPid}`,
     `gate ${context.gateId}${parentRun} in ${context.repoRoot}.`,
-    `A review gate attempted to invoke another Pipelane review/orchestrate review executable gate path while already inside a review gate.`,
+    `A review gate attempted to invoke another Pipelane review executable gate path while already inside a review gate.`,
     `Set ${UNSAFE_ALLOW_NESTED_REVIEW_GATES_ENV}=1 only for debugging to bypass this fail-closed guard.`,
   ].join(' ');
 }
@@ -3349,7 +3344,6 @@ function gateSubprocessEnv(options: {
 } = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   delete env[REVIEW_STATE_KEY_ENV];
-  delete env[ORCHESTRATION_STATE_KEY_ENV];
   delete env[DEPLOY_STATE_KEY_ENV];
   delete env[PROBE_STATE_KEY_ENV];
   delete env[REVIEW_CONSENT_STATE_KEY_ENV];
@@ -5149,8 +5143,8 @@ function manualGateSummary(gate: ReviewGateConfig): string {
   return `manual gate pending: ${gate.id}`;
 }
 
-// Exported for B1: the orchestration material-change check reuses this exact
-// committed+staged+unstaged+untracked detection to decide if a slice is `empty`.
+// Exported for tests: use this exact committed+staged+unstaged+untracked
+// detection when checking whether a route produced material changes.
 export function collectChangedFiles(repoRoot: string, baseBranch: string): string[] {
   const compareRef = runGit(repoRoot, ['rev-parse', '--verify', `origin/${baseBranch}`], true)?.trim()
     ? `origin/${baseBranch}`

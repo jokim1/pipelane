@@ -88,13 +88,12 @@ export function resolveReviewIntent(
   }));
   const authoritative = normalized.filter((candidate) => candidate.authoritative);
   const rejectedLabels = normalized.filter((candidate) => !candidate.authoritative).map((candidate) => candidate.text);
-  const slice = uniqueCandidate(authoritative.filter((candidate) => candidate.source === 'orchestration-slice'), 'orchestration slice outcomes');
   const brief = uniqueCandidate(authoritative.filter((candidate) => candidate.source === 'task-brief'), 'task briefs');
   const explicit = uniqueCandidate(authoritative.filter((candidate) => candidate.source === 'explicit-unbound'), 'explicit intents');
-  if (!slice && brief && explicit && brief.text !== explicit.text) {
+  if (brief && explicit && brief.text !== explicit.text) {
     throw new Error('The active task binding already has an immutable brief that conflicts with --intent. Rebind with /pipelane adopt --force --brief <objective> to create an audited new task binding.');
   }
-  const selected = slice ?? brief ?? explicit;
+  const selected = brief ?? explicit;
   if (!selected) {
     return {
       status: 'needs-input',
@@ -102,8 +101,7 @@ export function resolveReviewIntent(
       rejectedLabels,
     };
   }
-  const context = slice && brief ? `\n\nBound task context:\n${brief.text}` : '';
-  const text = `${selected.text}${context}`;
+  const text = selected.text;
   return {
     status: 'resolved',
     intent: {
