@@ -9,12 +9,10 @@ import {
   inferTaskSlugFromBranchName,
   latestCommitSubject,
   loadOpenPrForBranch,
-  resolveCommandSurfaces,
   setNextAction,
   deriveTaskSlugFromPr,
   type LivePr,
 } from './helpers.ts';
-import { buildReleaseCheckMessage, emptyDeployConfig, evaluateReleaseReadiness, loadDeployConfig } from '../release-gate.ts';
 import { maybeHandleDestinationCommand } from './destination.ts';
 import {
   applyTaskBindingRecovery,
@@ -23,10 +21,7 @@ import {
 } from '../task-binding.ts';
 import {
   ensureTaskBindingId,
-  loadDeployState,
   formatWorkflowCommand,
-  loadPrRecord,
-  loadProbeState,
   printResult,
   resolveWorkflowContext,
   runGh,
@@ -40,16 +35,10 @@ import {
 import {
   evaluateReviewEvidenceForPr,
   formatReviewEvidenceOverrideMessage,
+  formatReviewEvidenceStatusLines,
   recordReviewEvidenceOverride,
-  recordReviewEvidenceConsents,
   reviewEvidenceOverrideReason,
 } from '../review-enforcement.ts';
-import {
-  evaluateDestinationRouteReviewSafety,
-  recordDestinationRouteCompleted,
-  taskBudgetAcceptsReviewFindings,
-} from '../task-budget.ts';
-import { buildDestinationPlanForCommand } from '../destination-planner.ts';
 import { assertManagedLocalStateValid } from '../local-state.ts';
 import { declaredPrivateSourcePaths } from '../secret-provisioning.ts';
 
@@ -97,25 +86,6 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
     ensureTaskLockMatchesCurrent(context, lock);
   }
 
-  const surfaces = resolveCommandSurfaces(context, parsed.flags.surfaces, lock?.surfaces ?? []);
-  if (context.modeState.mode === 'release') {
-    const deployState = loadDeployState(context.commonDir, context.config);
-    const probeState = loadProbeState(context.commonDir, context.config);
-    const readiness = evaluateReleaseReadiness({
-      config: context.config,
-      deployConfig: loadDeployConfig(context.repoRoot) ?? emptyDeployConfig(),
-      deployRecords: deployState.records,
-      probeState,
-      surfaces,
-    });
-    if (!readiness.ready && !context.modeState.override) {
-      throw new Error([
-        `${formatWorkflowCommand(context.config, 'pr')} blocked before staging or committing because release mode is not ready.`,
-        buildReleaseCheckMessage(readiness, surfaces, context.config),
-      ].join('\n\n'));
-    }
-  }
-
   const branchName = runGit(context.repoRoot, ['branch', '--show-current']) ?? '';
   const staleBaseBlocker = buildStaleBaseBlocker(context, 'pr');
   if (staleBaseBlocker) {
@@ -134,46 +104,19 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
     prTitle = existingPr?.title || latestCommitSubject(context.repoRoot);
   }
 
-  const reviewOverrideReason = reviewEvidenceOverrideReason(parsed.flags);
-  let reviewOverrideApplied = false;
+  // Review evidence is informational: evaluate once, display the state, and
+  // proceed. Missing, failed, or pending evidence asks for the single
+  // --override --reason consent, which is recorded and never re-checked.
   const reviewEvidence = evaluateReviewEvidenceForPr(context);
-  if (!reviewEvidence.allowed && reviewOverrideReason) {
-    reviewOverrideApplied = true;
-  } else if (!reviewEvidence.allowed && !taskBudgetAcceptsReviewFindings(cwd, parsed, reviewEvidence)) {
-    let acceptedByPrompt = false;
-    if (reviewEvidence.latest) {
-      const routePlan = buildDestinationPlanForCommand(cwd, parsed);
-      if (routePlan) {
-        const pause = await evaluateDestinationRouteReviewSafety(context, routePlan, reviewEvidence);
-        if (pause.action === 'stop') {
-          throw new Error(pause.message || reviewEvidence.message);
-        }
-        acceptedByPrompt = true;
-      }
-    }
-    if (!acceptedByPrompt) throw new Error(reviewEvidence.message);
+  const reviewOverrideReason = reviewEvidenceOverrideReason(parsed.flags);
+  const reviewOverrideApplied = !reviewEvidence.allowed && Boolean(reviewOverrideReason);
+  if (!reviewEvidence.allowed && !reviewOverrideReason) {
+    throw new Error(reviewEvidence.message);
   }
+  const reviewStatusLines = formatReviewEvidenceStatusLines(reviewEvidence);
 
   for (const check of context.config.prePrChecks) {
     runShell(context.repoRoot, check, parsed.flags.json);
-  }
-
-  const postCheckReviewEvidence = evaluateReviewEvidenceForPr(context);
-  if (!postCheckReviewEvidence.allowed && reviewOverrideReason) {
-    reviewOverrideApplied = true;
-  } else if (!postCheckReviewEvidence.allowed && !taskBudgetAcceptsReviewFindings(cwd, parsed, postCheckReviewEvidence)) {
-    let acceptedByPrompt = false;
-    if (postCheckReviewEvidence.latest) {
-      const routePlan = buildDestinationPlanForCommand(cwd, parsed);
-      if (routePlan) {
-        const pause = await evaluateDestinationRouteReviewSafety(context, routePlan, postCheckReviewEvidence);
-        if (pause.action === 'stop') {
-          throw new Error(pause.message || postCheckReviewEvidence.message);
-        }
-        acceptedByPrompt = true;
-      }
-    }
-    if (!acceptedByPrompt) throw new Error(postCheckReviewEvidence.message);
   }
 
   if (dirty) {
@@ -201,23 +144,6 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
   }
 
   if (reviewOverrideApplied) {
-    const finalReviewEvidence = evaluateReviewEvidenceForPr(context, {
-      command: formatWorkflowCommand(context.config, 'pr'),
-    });
-    if (!finalReviewEvidence.allowed) {
-      recordReviewEvidenceConsents(
-        context,
-        finalReviewEvidence,
-        formatWorkflowCommand(context.config, 'pr'),
-        reviewOverrideReason,
-      );
-      const consented = evaluateReviewEvidenceForPr(context, {
-        command: formatWorkflowCommand(context.config, 'pr'),
-      });
-      if (!consented.allowed) {
-        throw new Error('Exact-scope review consent did not authorize the final PR target; no remote action was attempted.');
-      }
-    }
     recordReviewEvidenceOverride(context, formatWorkflowCommand(context.config, 'pr'), reviewOverrideReason);
   }
 
@@ -268,14 +194,9 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
     taskSlug,
     prNumber ? `PR #${prNumber} open, awaiting CI` : 'PR created, awaiting CI',
   );
-  if (process.env.PIPELANE_DESTINATION_INTERNAL_STEP !== '1') {
-    const completedPlan = buildDestinationPlanForCommand(cwd, parsed);
-    if (completedPlan) recordDestinationRouteCompleted(context, completedPlan);
-  }
-  const reviewOverrideMessage = reviewOverrideApplied
-    ? formatReviewEvidenceOverrideMessage(formatWorkflowCommand(context.config, 'pr'), reviewOverrideReason)
-    : '';
-  const reviewOverrideMessages = reviewOverrideMessage ? [reviewOverrideMessage] : [];
+  const reviewOverrideMessages = reviewOverrideApplied
+    ? [formatReviewEvidenceOverrideMessage(formatWorkflowCommand(context.config, 'pr'), reviewOverrideReason)]
+    : [];
 
   printResult(parsed.flags, {
     taskSlug,
@@ -287,6 +208,7 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
       `Task: ${taskSlug}`,
       `Branch: ${branchName}`,
       `PR: ${prUrl || 'created'}`,
+      ...reviewStatusLines,
       ...reviewOverrideMessages,
       `Next: run ${formatWorkflowCommand(context.config, 'merge')}.`,
     ].join('\n'),

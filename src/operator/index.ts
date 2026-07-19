@@ -325,7 +325,6 @@ Pipelane commands:
   review record --gate code-review-high --task <task> --tool <name> --summary <text> --findings-count <n> --artifact <path> [--sha <expected-head>]
   review pass --gate <id> --message <text>
   review attest --gate <id> --status <passed|failed> --report-file <path> --findings-file <path> --provenance-file <path> --message <text> [--substitute-strict --reason <reason> --scope <exact-route-action>]
-  review override --gate <id> --reason <informed-consent-reason> [--scope <exact-route-action>]
   review setup [gate[,gate...]...] [--yes] [--reset] [--print] [--list-gates] [--toggle <gate[,gate...]>] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]
   orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes] [--analysis-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]
   orchestrate goal-spec [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]

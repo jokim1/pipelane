@@ -470,6 +470,13 @@ export async function dispatchDeploy(
   let trustedRecords = stateKey
     ? deployState.records.filter((record) => verifyDeployRecord(record, stateKey))
     : deployState.records;
+  // Deploy-time gate overrides: --override --reason records the reason on the
+  // deploy record and proceeds past the release-readiness (health/probe) and
+  // staging-parity gates below. The prod typed-SHA confirmation is never
+  // overridable.
+  const gateOverrideReason = parsed.flags.override ? parsed.flags.reason.trim() : '';
+  const gateOverrideLines: string[] = [];
+  const deployOverrideHint = `Or proceed with informed consent: ${formatWorkflowCommand(context.config, 'deploy', environment)} --override --reason "<why this deploy may proceed>". The reason is recorded on the deploy record.`;
   if (context.modeState.mode === 'release' && environment === 'prod') {
     // v1.2 readiness is now observed, not asserted. Only production deploys
     // require the release-readiness gate. Staging deploys are the remediation
@@ -485,13 +492,20 @@ export async function dispatchDeploy(
       surfaces,
     });
     if (!readiness.ready && !context.modeState.override) {
-      throw new Error(buildReleaseCheckMessage(readiness, surfaces, context.config));
+      if (!gateOverrideReason) {
+        throw new Error([
+          buildReleaseCheckMessage(readiness, surfaces, context.config),
+          deployOverrideHint,
+        ].join('\n\n'));
+      }
+      gateOverrideLines.push(`Release-readiness gate overridden by informed consent: ${gateOverrideReason}`);
     }
   }
 
   // Prod gate (v0.2): staging must have a verified-succeeded deploy for
   // the same (sha, surfaces, taskSlug). Records missing `status` don't
-  // qualify — legacy records fail closed.
+  // qualify — legacy records fail closed. Overridable only with a recorded
+  // reason (staging-parity is a blocking moment in the release lane).
   if (context.modeState.mode === 'release' && environment === 'prod') {
     const staging = findMatchingSucceededDeploy({
       records: trustedRecords,
@@ -501,27 +515,36 @@ export async function dispatchDeploy(
       taskSlug,
     });
     if (!staging) {
-      throw new Error([
-        `deploy prod blocked: no succeeded staging deploy found for SHA ${target.sha.slice(0, 7)}`,
-        `with surfaces ${surfaces.join(',')} and task ${taskSlug}.`,
-        `Run ${formatWorkflowCommand(context.config, 'deploy', 'staging')} first, wait for it to report status=succeeded.`,
-      ].join('\n'));
-    }
-    // v1.2: tighten the prod gate with the same per-surface + fingerprint +
-    // signature invariants as the staging-readiness gate.
-    const disqualification = disqualifyDeployRecord({
-      record: staging,
-      surfaces,
-      // The record being checked is a STAGING record, so compare its stored
-      // fingerprint against the current STAGING config slice, not prod.
-      expectedFingerprint: computeDeployConfigFingerprint(deployConfig, 'staging'),
-      stateKey,
-    });
-    if (disqualification) {
-      throw new Error([
-        `deploy prod blocked: matching staging record is not promotable — ${disqualification}.`,
-        `Re-run ${formatWorkflowCommand(context.config, 'deploy', 'staging')} and let it verify before promoting.`,
-      ].join('\n'));
+      if (!gateOverrideReason) {
+        throw new Error([
+          `deploy prod blocked: no succeeded staging deploy found for SHA ${target.sha.slice(0, 7)}`,
+          `with surfaces ${surfaces.join(',')} and task ${taskSlug}.`,
+          `Run ${formatWorkflowCommand(context.config, 'deploy', 'staging')} first, wait for it to report status=succeeded.`,
+          deployOverrideHint,
+        ].join('\n'));
+      }
+      gateOverrideLines.push(`Staging-parity gate overridden by informed consent (no succeeded staging deploy for ${target.sha.slice(0, 7)}): ${gateOverrideReason}`);
+    } else {
+      // v1.2: tighten the prod gate with the same per-surface + fingerprint +
+      // signature invariants as the staging-readiness gate.
+      const disqualification = disqualifyDeployRecord({
+        record: staging,
+        surfaces,
+        // The record being checked is a STAGING record, so compare its stored
+        // fingerprint against the current STAGING config slice, not prod.
+        expectedFingerprint: computeDeployConfigFingerprint(deployConfig, 'staging'),
+        stateKey,
+      });
+      if (disqualification) {
+        if (!gateOverrideReason) {
+          throw new Error([
+            `deploy prod blocked: matching staging record is not promotable — ${disqualification}.`,
+            `Re-run ${formatWorkflowCommand(context.config, 'deploy', 'staging')} and let it verify before promoting.`,
+            deployOverrideHint,
+          ].join('\n'));
+        }
+        gateOverrideLines.push(`Staging-parity gate overridden by informed consent (${disqualification}): ${gateOverrideReason}`);
+      }
     }
   }
 
@@ -655,7 +678,11 @@ export async function dispatchDeploy(
       workflowRunUrl: run?.url,
       idempotencyKey,
       triggeredBy,
+      ...(gateOverrideLines.length > 0 ? { gateOverrideReason } : {}),
     };
+    for (const line of gateOverrideLines) {
+      process.stderr.write(`${line}\n`);
+    }
 
     // Persist the 'requested' record immediately so an interrupted run
     // still leaves a breadcrumb in deploy-state.json. Sign it if signing
@@ -735,6 +762,7 @@ export async function dispatchDeploy(
           ? `Workflow: ${workflowName} (push-triggered on ${context.config.baseBranch})`
           : `Workflow: ${workflowName}`,
         run?.url ? `Workflow run: ${run.url}` : '',
+        ...gateOverrideLines,
         formatDeployVerificationLine(record.verification),
         environment === 'staging'
           ? `Next: ${nextStage}`

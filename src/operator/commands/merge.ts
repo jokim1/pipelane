@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import crypto from 'node:crypto';
 
 import {
@@ -36,12 +35,10 @@ import { bootstrapWorktreeNodeModulesIfNeeded, resolveSharedRepoRoot } from '../
 import {
   evaluateReviewEvidenceForPr,
   formatReviewEvidenceOverrideMessage,
+  formatReviewEvidenceStatusLines,
   recordReviewEvidenceOverride,
-  recordReviewEvidenceConsents,
   reviewEvidenceOverrideReason,
-  type ReviewEvidenceTarget,
 } from '../review-enforcement.ts';
-import { taskBudgetAcceptsReviewFindings } from '../task-budget.ts';
 import {
   buildSharedCheckoutLeaseBlocker,
   buildStaleBaseBlocker,
@@ -143,37 +140,29 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
         if (staleBaseBlocker) throw new Error(staleBaseBlocker);
       }
 
-      const reviewTarget = resolveReviewEvidenceTargetForPr(context, pr);
+      // Review evidence is informational: evaluate once against the PR head,
+      // display the state, and proceed. Missing, failed, or pending evidence
+      // asks for the single --override --reason consent, which is recorded
+      // and never re-checked.
+      const reviewTarget = resolveMergeHeadTarget(context, pr);
+      const reviewEvidence = evaluateReviewEvidenceForPr(context, {
+        command: formatWorkflowCommand(context.config, 'merge'),
+        target: reviewTarget,
+      });
       const reviewOverrideReason = reviewEvidenceOverrideReason(parsed.flags);
-      let reviewOverrideApplied = assertReviewEvidenceReadyForMerge(cwd, parsed, context, reviewTarget);
-      watchPrChecks(context.repoRoot, pr.number);
-      const checkedPr = loadPrByNumber(context.repoRoot, pr.number);
-      assertPrIsOpenForMerge(checkedPr);
-      const checkedReviewTarget = resolveReviewEvidenceTargetForPr(context, checkedPr);
-      reviewOverrideApplied = assertReviewEvidenceReadyForMerge(cwd, parsed, context, checkedReviewTarget) || reviewOverrideApplied;
+      const reviewOverrideApplied = !reviewEvidence.allowed && Boolean(reviewOverrideReason);
+      if (!reviewEvidence.allowed && !reviewOverrideReason) {
+        throw new Error(reviewEvidence.message);
+      }
+      lines.push(...formatReviewEvidenceStatusLines(reviewEvidence));
       if (reviewOverrideApplied) {
-        const finalEvidence = evaluateReviewEvidenceForPr(context, {
-          command: formatWorkflowCommand(context.config, 'merge'),
-          target: checkedReviewTarget,
-        });
-        if (!finalEvidence.allowed) {
-          recordReviewEvidenceConsents(
-            context,
-            finalEvidence,
-            formatWorkflowCommand(context.config, 'merge'),
-            reviewOverrideReason,
-            'gate-bypass',
-            checkedReviewTarget,
-          );
-          const consented = evaluateReviewEvidenceForPr(context, {
-            command: formatWorkflowCommand(context.config, 'merge'),
-            target: checkedReviewTarget,
-          });
-          if (!consented.allowed) throw new Error('Exact-scope review consent did not authorize the final merge target; no merge was attempted.');
-        }
         recordReviewEvidenceOverride(context, formatWorkflowCommand(context.config, 'merge'), reviewOverrideReason);
         lines.push(formatReviewEvidenceOverrideMessage(formatWorkflowCommand(context.config, 'merge'), reviewOverrideReason));
       }
+      watchPrChecks(context.repoRoot, pr.number);
+      const checkedPr = loadPrByNumber(context.repoRoot, pr.number);
+      assertPrIsOpenForMerge(checkedPr);
+      const mergeHeadTarget = resolveMergeHeadTarget(context, checkedPr);
       saveDeliveryIntent(context.commonDir, context.config, {
         prNumber: checkedPr.number,
         ownership: managedLock ? 'managed-task' : 'unmanaged-pr',
@@ -183,13 +172,13 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
         mode: managedLock?.mode ?? context.modeState.mode,
         surfaces: managedLock?.surfaces ?? context.config.surfaces,
         baseBranch: context.config.baseBranch,
-        prHeadSha: checkedReviewTarget.sha,
+        prHeadSha: mergeHeadTarget.sha,
         title: checkedPr.title,
         url: checkedPr.url,
         recordedAt: pendingIntent?.recordedAt ?? nowIso(),
       });
       runGh(context.repoRoot, [
-        'pr', 'merge', String(pr.number), '--squash', '--match-head-commit', checkedReviewTarget.sha,
+        'pr', 'merge', String(pr.number), '--squash', '--match-head-commit', mergeHeadTarget.sha,
       ]);
       if (process.env.NODE_ENV === 'test' && process.env.PIPELANE_MERGE_CRASH_AFTER_REMOTE_MERGE === '1') {
         throw new Error('Injected crash after remote merge and before delivery finalization.');
@@ -361,27 +350,10 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
   }
 }
 
-function assertReviewEvidenceReadyForMerge(
-  cwd: string,
-  parsed: ParsedOperatorArgs,
-  context: WorkflowContext,
-  target?: ReviewEvidenceTarget,
-): boolean {
-  const reviewEvidence = evaluateReviewEvidenceForPr(context, {
-    command: formatWorkflowCommand(context.config, 'merge'),
-    target,
-  });
-  const overrideReason = reviewEvidenceOverrideReason(parsed.flags);
-  if (!reviewEvidence.allowed && overrideReason) {
-    return true;
-  }
-  if (!reviewEvidence.allowed && !taskBudgetAcceptsReviewFindings(cwd, parsed, reviewEvidence)) {
-    throw new Error(reviewEvidence.message);
-  }
-  return false;
-}
-
-function resolveReviewEvidenceTargetForPr(context: WorkflowContext, pr: LivePr): ReviewEvidenceTarget {
+// Resolves the PR head branch and sha. Merge still needs a pinnable sha for
+// `--match-head-commit` (merging exactly the head whose checks were watched);
+// review evidence itself is informational and evaluated against the branch.
+function resolveMergeHeadTarget(context: WorkflowContext, pr: LivePr): { branchName: string; sha: string } {
   const branchName = pr.headRefName?.trim() ?? '';
   fetchPrBranch(context.repoRoot, branchName);
   const sha = resolvePrHeadSha(context.repoRoot, branchName, pr.headRefOid?.trim() ?? '');
@@ -391,38 +363,7 @@ function resolveReviewEvidenceTargetForPr(context: WorkflowContext, pr: LivePr):
       `Fetch the PR branch or rerun ${formatWorkflowCommand(context.config, 'pr')} from the task worktree, then retry ${formatWorkflowCommand(context.config, 'merge')}.`,
     ].join('\n'));
   }
-  const treeHash = runGit(context.repoRoot, ['rev-parse', '--verify', `${sha}^{tree}`], true)?.trim() ?? '';
-  if (!treeHash) {
-    throw new Error([
-      `${formatWorkflowCommand(context.config, 'merge')} blocked because PR branch ${branchName} tree could not be resolved.`,
-      `Fetch the PR branch, then retry ${formatWorkflowCommand(context.config, 'merge')}.`,
-    ].join('\n'));
-  }
-
-  const lock = loadAllTaskLocks(context.commonDir, context.config).find((candidate) => candidate.branchName === branchName);
-  const taskBindingId = lock
-    ? ensureTaskBindingId(context.commonDir, context.config, lock.taskSlug)?.taskBindingId ?? ''
-    : '';
-  const reviewTargetDigest = createHash('sha256').update(JSON.stringify({
-    version: 2,
-    branchName,
-    sha,
-    worktreeStatusDigest: '',
-    worktreeMaterialTreeHash: treeHash,
-  })).digest('hex');
-  return {
-    branchName,
-    sha,
-    worktreeStatusDigest: '',
-    worktreeStatusReliable: false,
-    worktreeStatusWarnings: [`review target is PR branch ${branchName}, not the current checkout`],
-    worktreeMaterialTreeHash: treeHash,
-    worktreeMaterialTreeReliable: true,
-    worktreeMaterialTreeWarnings: [],
-    taskBindingId,
-    reviewTargetDigest,
-    headLabel: `PR branch ${branchName} HEAD`,
-  };
+  return { branchName, sha };
 }
 
 function fetchPrBranch(repoRoot: string, branchName: string): void {

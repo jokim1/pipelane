@@ -582,12 +582,9 @@ export function renderCockpit(
     lines.push(review.current
       ? `  current evidence used ${sanitizeForTerminal(review.current.enforcementMode ?? 'legacy-v2')} policy ${sanitizeForTerminal(String(review.current.policyVersion ?? 'unknown'))}; strict-v3 policy ${review.policyVersion} requires a rerun.`
       : '  this checkout has no current strict-v3 review evidence; unrelated recent history is not substituted.');
-    lines.push('  normal development remains available; the next gated release action needs one explicit choice.');
+    lines.push('  normal development remains available.');
     lines.push('  recommended: /pipelane review --intent "<what this change should accomplish>", repair any findings, then rerun.');
-    for (const gateId of review.blockingGateIds) {
-      lines.push(`  proceed anyway: /pipelane review override --gate ${sanitizeForTerminal(gateId)} --scope=${JSON.stringify(prAction)} --reason "<why this exact target and action may proceed>"`);
-    }
-    lines.push('  A bypass remains recorded as user consent; failed or pending evidence is never relabeled passed.');
+    lines.push(`  proceed anyway with informed consent: ${sanitizeForTerminal(prAction)} --override --reason "<why>" (recorded; evidence is never relabeled passed).`);
     lines.push('');
   }
 
@@ -702,49 +699,19 @@ function renderReview(
   return lines;
 }
 
-// Convergence v1 S1 (§4.3/§6): budget meters (both currencies), pending
-// consent requests, and the parked-task list. Parked is a terminal state for
-// autonomous execution; the cockpit is one of the surfaces that keeps it
-// visible until a human decides.
+// Advisory budget meters (both currencies) for the current checkout.
 function renderTaskBudget(taskBudget: SnapshotData['taskBudget'] | undefined, color: boolean): string[] {
-  if (!taskBudget) return [];
-  const lines: string[] = [];
+  if (!taskBudget?.current) return [];
   const current = taskBudget.current;
-  if (current) {
-    lines.push(colorize('TASK BUDGET', color, 'bold'));
-    const meter = (label: string, used: number, limit: number): string =>
-      `  ${label}: ${used}/${limit}${used >= limit ? ' (exhausted)' : ''}`;
-    lines.push(`  task: ${sanitizeForTerminal(current.taskSlug || '<unbound>')} (${sanitizeForTerminal(current.branchName)})`);
-    lines.push(meter('fix/review loops', current.used.fixReviewLoops, current.limits.fixReviewLoops));
-    lines.push(meter('AI runs', current.used.aiRunLaunches, current.limits.aiRuns));
-    lines.push(meter('active minutes', current.used.activeMinutes, current.limits.activeMinutes));
-    lines.push(`  extensions used: ${current.lifetimeExtensions}/${current.maxLifetimeExtensions}`);
-    if (current.parked) {
-      lines.push(colorize(`  ⚠ PARKED: ${sanitizeForTerminal(current.pauseReason ?? 'review budget exhausted')}`, color, 'red'));
-    } else if (current.paused && current.pauseReason) {
-      lines.push(colorize(`  paused: ${sanitizeForTerminal(current.pauseReason)}`, color, 'yellow'));
-    }
-    lines.push('');
-  }
-  if (taskBudget.pendingConsents.length > 0) {
-    lines.push(colorize('PENDING BUDGET CONSENTS', color, 'bold'));
-    for (const card of taskBudget.pendingConsents) {
-      lines.push(`  ${sanitizeForTerminal(card.taskSlug || card.branchName)}: +${card.fixReviewLoopsDelta} loops, +${card.aiRunsDelta} AI runs, +${card.activeMinutesDelta} active min — ${sanitizeForTerminal(card.reason)}`);
-      lines.push(`    decide on the Board (card ${sanitizeForTerminal(card.id)}, expires ${sanitizeForTerminal(card.expiresAt)})`);
-    }
-    lines.push('');
-  }
-  if (taskBudget.parked.length > 0) {
-    lines.push(colorize('PARKED TASKS', color, 'bold'));
-    for (const entry of taskBudget.parked) {
-      lines.push(colorize(`  ${sanitizeForTerminal(entry.taskSlug || entry.branch)}: ${sanitizeForTerminal(entry.reason)}`, color, 'red'));
-      lines.push(`    parked ${sanitizeForTerminal(entry.parkedAt)} · spent ${entry.budgetSpent.aiRunLaunches} AI runs / ${entry.budgetSpent.activeMinutes} active min · ${entry.openFindingIds.length} open finding(s)`);
-      for (const hint of entry.unblockHints) {
-        lines.push(`    - ${sanitizeForTerminal(hint)}`);
-      }
-    }
-    lines.push('');
-  }
+  const lines: string[] = [];
+  lines.push(colorize('TASK BUDGET (advisory)', color, 'bold'));
+  const meter = (label: string, used: number, limit: number): string =>
+    `  ${label}: ${used}/${limit}${used >= limit ? ' (over the advisory stop-loss)' : ''}`;
+  lines.push(`  task: ${sanitizeForTerminal(current.taskSlug || '<unbound>')} (${sanitizeForTerminal(current.branchName)})`);
+  lines.push(meter('fix/review loops', current.used.fixReviewLoops, current.limits.fixReviewLoops));
+  lines.push(meter('AI runs', current.used.aiRunLaunches, current.limits.aiRuns));
+  lines.push(meter('active minutes', current.used.activeMinutes, current.limits.activeMinutes));
+  lines.push('');
   return lines;
 }
 

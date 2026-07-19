@@ -70,7 +70,7 @@ import {
   createReviewActorIdentity,
   resolveReviewActorIdentity,
 } from '../review-identity.ts';
-import { reviewGateDefinitionHash, reviewRunsTargetSameCheckout } from '../review-enforcement.ts';
+import { reviewGateDefinitionHash } from '../review-enforcement.ts';
 import { appendArtifactBackedReviewRun } from '../review-artifacts.ts';
 import { projectReviewRun, renderReviewPresentation } from '../review-output.ts';
 import { buildReviewRunRecord, collectChangedFiles, collectReviewIntentCandidates } from './review.ts';
@@ -3510,7 +3510,23 @@ function selectMatchingAttestedManualGateEvidence(
 
 function reviewRunMatchesEquivalentGateEvidence(expected: ReviewRunRecord, evidence: ReviewRunRecord): boolean {
   return reviewRunCoversFullGateSet(evidence)
-    && reviewRunsTargetSameCheckout(expected, evidence);
+    && evidence.branchName === expected.branchName
+    && evidence.sha === expected.sha
+    && reviewRunMatchesExpectedWorktree(expected, evidence);
+}
+
+function reviewRunMatchesExpectedWorktree(expected: ReviewRunRecord, evidence: ReviewRunRecord): boolean {
+  if (
+    expected.worktreeStatusReliable !== false
+    && evidence.worktreeStatusReliable !== false
+    && evidence.worktreeStatusDigest === (expected.worktreeStatusDigest ?? '')
+  ) {
+    return true;
+  }
+  return evidence.worktreeMaterialTreeReliable === true
+    && expected.worktreeMaterialTreeReliable === true
+    && Boolean(evidence.worktreeMaterialTreeHash)
+    && evidence.worktreeMaterialTreeHash === expected.worktreeMaterialTreeHash;
 }
 
 function reviewAcceptanceMatchesGate(

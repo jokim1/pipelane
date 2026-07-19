@@ -83,14 +83,11 @@ import {
 } from '../state.ts';
 import {
   countLaunchedAiGates,
-  guardReviewRunStartForTaskBudget,
   journalReviewRunForTaskBudget,
   recordReviewRunForTaskBudget,
 } from '../task-budget.ts';
 import {
   currentCheckoutReviewEvidenceTarget,
-  evaluateReviewEvidenceForPr,
-  recordReviewEvidenceConsents,
   reviewEvidenceTargetsEqual,
   reviewGateDefinitionHash,
   type ReviewEvidenceTarget,
@@ -409,10 +406,6 @@ export async function handleReview(cwd: string, parsed: ParsedOperatorArgs): Pro
     handleReviewRecord(cwd, parsed);
     return;
   }
-  if (subcommand === 'override') {
-    handleReviewOverride(cwd, parsed);
-    return;
-  }
   if (subcommand === 'gc') {
     handleReviewGc(cwd, parsed);
     return;
@@ -517,51 +510,6 @@ function handleReviewGc(cwd: string, parsed: ParsedOperatorArgs): void {
     status: result.errors.length > 0 ? 'degraded' : 'complete',
     ...result,
     message: `Review artifact GC scanned ${result.scanned}, kept ${result.referenced} referenced, deleted ${result.deleted}, skipped ${result.skipped}, errors ${result.errors.length}.`,
-  });
-}
-
-function handleReviewOverride(cwd: string, parsed: ParsedOperatorArgs): void {
-  const context = resolveWorkflowContext(cwd);
-  const gateId = parsed.flags.reviewGate.trim();
-  const reason = parsed.flags.reason.trim();
-  const routeAction = normalizeReviewDataField(
-    parsed.flags.scope.trim() || formatWorkflowCommand(context.config, 'pr'),
-    {
-      field: 'manual review route action',
-      maxBytes: REVIEW_DATA_LIMITS.reasonBytes,
-      redact: true,
-    },
-  );
-  const configuredGate = context.config.reviewGates?.gates?.find((gate) => gate.id === gateId && gate.blocking !== false);
-  if (!configuredGate) {
-    throw new Error(`review override requires a configured blocking gate; ${gateId || '<empty>'} is not in the current blocking gate set.`);
-  }
-  const evidence = evaluateReviewEvidenceForPr(context, { command: routeAction });
-  const allIssues = [...evidence.issues, ...evidence.bypassedIssues];
-  const matchingGateIssues = allIssues.filter((issue) => issue.gateId === gateId);
-  const matching = matchingGateIssues.length > 0
-    ? matchingGateIssues
-    : allIssues.filter((issue) => !issue.gateId).map((issue) => ({ ...issue, gateId }));
-  if (matching.length === 0) {
-    throw new Error(`review override found no blocking ${gateId} evidence for the current exact target and route action ${routeAction}.`);
-  }
-  const consents = recordReviewEvidenceConsents(context, {
-    ...evidence,
-    issues: matching,
-    bypassedIssues: [],
-  }, routeAction, reason);
-  printResult(parsed.flags, {
-    command: 'review override',
-    status: 'bypassed',
-    gateId,
-    routeAction,
-    consents,
-    message: [
-      `Recorded exact-scope informed consent for ${gateId}.`,
-      `Route action: ${routeAction}`,
-      `Reason: ${reason}`,
-      'The failed or pending gate remains failed or pending; it was not relabeled as passed.',
-    ].join('\n'),
   });
 }
 
@@ -830,26 +778,8 @@ function handleReviewAttest(cwd: string, parsed: ParsedOperatorArgs): void {
     throw error;
   }
 
-  let consents: ReviewConsentRecord[] = [];
-  if (substituteStrict) {
-    const evidence = evaluateReviewEvidenceForPr(context, {
-      latestOverride: persisted,
-      command: routeAction,
-      target: evidenceTarget,
-    });
-    const gateIssues = [...evidence.issues, ...evidence.bypassedIssues].filter((issue) => issue.gateId === gateId);
-    if (gateIssues.length === 0) {
-      throw new Error(`manual substitution for ${gateId} found no strict gate evidence requiring authorization; no consent was recorded.`);
-    }
-    consents = recordReviewEvidenceConsents(context, {
-      ...evidence,
-      issues: gateIssues,
-      bypassedIssues: [],
-    }, routeAction, parsed.flags.reason, 'manual-substitution', evidenceTarget);
-  }
-
   const evidencePath = reviewStatePath(context.commonDir, context.config);
-  const report: ReviewAttestReport & { routeAction?: string; consents?: typeof consents } = {
+  const report: ReviewAttestReport & { routeAction?: string } = {
     command: 'review attest',
     status: status === 'failed'
       ? 'recorded-failed'
@@ -862,8 +792,8 @@ function handleReviewAttest(cwd: string, parsed: ParsedOperatorArgs): void {
     repoRoot: context.repoRoot,
     evidencePath,
     gateId,
-    ...(substituteStrict ? { routeAction, consents } : {}),
-    message: renderReviewAttestReport(persisted, manualGate, evidencePath, routeAction, consents),
+    ...(substituteStrict ? { routeAction } : {}),
+    message: renderReviewAttestReport(persisted, manualGate, evidencePath, routeAction, []),
   };
   printResult(parsed.flags, report);
 }
@@ -1019,7 +949,7 @@ function resolveReviewPassTarget(options: {
     throw new Error(`review pass only accepts manual gates. Gate ${gateId} is type ${expectedGate.type}; rerun /pipelane review to execute it.`);
   }
   if (options.config.reviewGates?.enforcementMode === 'strict-v3' && reviewGateExecutionPolicy(expectedGate).capability === 'strict-skill') {
-    throw new Error(`review pass cannot substitute for strict skill gate ${gateId}. Restore the trusted skill and adapter, rerun /pipelane review, or use /pipelane review override --gate ${gateId} --scope /pr --reason "<why this exact target and action may proceed>".`);
+    throw new Error(`review pass cannot substitute for strict skill gate ${gateId}. Restore the trusted skill and adapter, rerun /pipelane review, or proceed with informed consent: /pr --override --reason "<why>".`);
   }
 
   const currentBranch = runGit(options.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
@@ -2666,25 +2596,6 @@ async function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): Promise
   const gateFilter = parsed.flags.reviewGate.trim();
   const dryRun = parsed.flags.reviewDryRun;
   const activeSurfaces = context.modeState.requestedSurfaces ?? context.config.surfaces;
-  const startSafety = guardReviewRunStartForTaskBudget(cwd, parsed);
-  if (startSafety.action === 'stop') {
-    printResult(parsed.flags, {
-      command: 'review',
-      status: 'pending',
-      runId: null,
-      repoRoot: context.repoRoot,
-      evidencePath: reviewStatePath(context.commonDir, context.config),
-      dryRun,
-      gateFilter: gateFilter || null,
-      phaseFilter: phaseFilter || null,
-      changedFiles: [],
-      gates: [],
-      message: startSafety.message,
-    });
-    process.exitCode = 1;
-    return;
-  }
-
   const nonTtyProgress = !process.stdout.isTTY && !parsed.flags.json;
   if (nonTtyProgress) process.stderr.write(`${formatReviewPrepareProgress()}\n`);
   const changedFiles = collectChangedFiles(context.repoRoot, context.config.baseBranch);
@@ -2731,10 +2642,9 @@ async function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): Promise
     },
   });
 
-  // D15 ordering: the budget debit journals durably BEFORE the run becomes
-  // usable review evidence. A crash between the two leaves charged-but-
-  // unevidenced work (conservative, D14) instead of evidence that was never
-  // charged.
+  // The budget debit journals durably BEFORE the run becomes usable review
+  // evidence. A crash between the two leaves charged-but-unevidenced work
+  // (conservative) instead of evidence that was never charged.
   journalReviewRunForTaskBudget(cwd, parsed, record);
   appendArtifactBackedReviewRun({
     root: reviewArtifactRoot(context.commonDir, context.config),
@@ -2742,7 +2652,7 @@ async function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): Promise
     appendRecord: () => appendReviewRunRecord(context.commonDir, context.config, record),
   });
   pruneReviewArtifacts(context, false);
-  const routeSafety = recordReviewRunForTaskBudget(cwd, parsed, record);
+  const budgetAdvisory = recordReviewRunForTaskBudget(cwd, parsed, record);
 
   const report = {
     command: 'review',
@@ -2758,20 +2668,17 @@ async function handleReviewRun(cwd: string, parsed: ParsedOperatorArgs): Promise
     ...(context.config.reviewGates?.enforcementMode === 'strict-v3' && !record.intent ? {
       needsInput: true,
       intentCommand: '/pipelane review --intent "<what this change should accomplish>"',
-      bypassCommands: selectedGates
-        .filter((gate) => gate.blocking !== false && (gate.type === 'skill' || gate.type === 'agent'))
-        .map((gate) => `/pipelane review override --gate ${gate.id} --scope /pr --reason "<why this exact target and action may proceed>"`),
     } : {}),
     message: [
       checklist && !liveChecklist ? renderReviewChecklist(checklist.snapshot()) : '',
       renderReviewRunReport(record, reviewStatePath(context.commonDir, context.config), reviewArtifactRoot(context.commonDir, context.config)),
-      routeSafety.action === 'stop' ? routeSafety.message : '',
+      budgetAdvisory,
     ].filter(Boolean).join('\n\n'),
   };
 
   printResult(parsed.flags, report);
 
-  if (record.status === 'failed' || routeSafety.action === 'stop') {
+  if (record.status === 'failed') {
     process.exitCode = 1;
   }
 }
@@ -4470,21 +4377,21 @@ function runStrictAiReviewGate(options: {
   if (!intent) {
     return finishGate(base, startMs, {
       status: 'pending',
-      summary: `${options.strictPreparationError ?? 'no authoritative task intent was supplied'}; rerun /pipelane review --intent "<what this change should accomplish>" or proceed with /pipelane review override --gate ${gate.id} --scope /pr --reason "<why this exact target and action may proceed>"`,
+      summary: `${options.strictPreparationError ?? 'no authoritative task intent was supplied'}; rerun /pipelane review --intent "<what this change should accomplish>" or proceed with informed consent: /pr --override --reason "<why>"`,
       capability: unavailableCapability(),
     });
   }
   if (!builtTarget) {
     return finishGate(base, startMs, {
       status: 'failed',
-      summary: `${options.strictPreparationError ?? 'strict review could not capture the immutable target'} Recover the base/history or stabilize the checkout, rerun /pipelane review, or proceed with /pipelane review override --gate ${gate.id} --scope /pr --reason "<why this exact target and action may proceed>".`,
+      summary: `${options.strictPreparationError ?? 'strict review could not capture the immutable target'} Recover the base/history or stabilize the checkout, rerun /pipelane review, or proceed with informed consent: /pr --override --reason "<why>".`,
       capability: unavailableCapability(),
     });
   }
   if (!resolved) {
     return finishGate(base, startMs, {
       status: 'pending',
-      summary: `strict ${gate.id} has no enabled native structured-review adapter; restore an enabled Codex or Claude adapter, rerun review, or proceed with /pipelane review override --gate ${gate.id} --scope /pr --reason "<why this exact target and action may proceed>"`,
+      summary: `strict ${gate.id} has no enabled native structured-review adapter; restore an enabled Codex or Claude adapter, rerun review, or proceed with informed consent: /pr --override --reason "<why>"`,
       capability: unavailableCapability(),
     });
   }
@@ -4495,7 +4402,7 @@ function runStrictAiReviewGate(options: {
       if (!strict) {
         return finishGate({ ...base, command: auditedCommand }, startMs, {
           status: 'pending',
-          summary: `strict skill ${gate.skill?.trim() || gate.id} is unavailable from trusted machine-local roots; install or restore the exact skill, rerun review, or proceed with /pipelane review override --gate ${gate.id} --scope /pr --reason "<why this exact target and action may proceed>"`,
+          summary: `strict skill ${gate.skill?.trim() || gate.id} is unavailable from trusted machine-local roots; install or restore the exact skill, rerun review, or proceed with informed consent: /pr --override --reason "<why>"`,
           capability: unavailableCapability(),
         });
       }
@@ -4646,7 +4553,7 @@ function runStrictAiReviewGate(options: {
   if (targetInvalidation) {
     return finishGate({ ...base, command: auditedCommand }, startMs, {
       status: 'failed',
-      summary: `${targetInvalidation}. The report is diagnostics only; stabilize the writer, legitimately ignore generated churn, rerun review, or use /pipelane review override --gate ${gate.id} --scope /pr --reason "<why this exact target and action may proceed>".`,
+      summary: `${targetInvalidation}. The report is diagnostics only; stabilize the writer, legitimately ignore generated churn, rerun review, or proceed with informed consent: /pr --override --reason "<why>".`,
       exitCode,
       capability: capability.evidence,
       reportArtifact,
@@ -5518,17 +5425,14 @@ function renderReviewRunReport(record: ReviewRunRecord, evidencePath: string, ar
   } else if (configChangePending) {
     lines.push('', `Recommended: inspect the review config diff, then record approval with /pipelane review pass --gate ${REVIEW_CONFIG_CHANGE_GATE_ID} --message "<what changed and why it is trusted>".`);
   } else if (record.status === 'pending') {
-    lines.push('', 'Recommended: complete pending AI/manual gates, then rerun or attach their evidence before PR enforcement.');
+    lines.push('', 'Recommended: complete pending AI/manual gates, then rerun or attach their evidence.');
   } else {
     lines.push('', 'Next: continue to /pr when ready.');
   }
 
-  const bypassable = record.gates.filter((gate) => gate.blocking && (gate.status === 'failed' || gate.status === 'pending'));
-  if (bypassable.length > 0) {
-    lines.push('', 'Proceed anyway only with exact-scope informed consent (the gate remains failed or pending):');
-    for (const gate of bypassable) {
-      lines.push(`- /pipelane review override --gate ${gate.gateId} --scope /pr --reason "<why this exact target and action may proceed>"`);
-    }
+  const openGates = record.gates.filter((gate) => gate.blocking && (gate.status === 'failed' || gate.status === 'pending'));
+  if (openGates.length > 0) {
+    lines.push('', 'Or proceed with informed consent (the gate remains failed or pending): /pr --override --reason "<why this may proceed without green review>".');
   }
 
   return lines.join('\n');

@@ -102,10 +102,15 @@ function verifyLine(line: { signature?: string; keyId?: string }): boolean {
   return verifySignedPayload(line, key);
 }
 
+// The journal is advisory recording state: a line that cannot be parsed or
+// verified is reported to stderr and skipped — it never blocks a command.
 function readJournalLines(journalPath: string): JournalLine[] {
   if (!existsSync(journalPath)) return [];
   const rawText = readFileSync(journalPath, 'utf8');
   const lines: JournalLine[] = [];
+  const warn = (index: number, detail: string): void => {
+    process.stderr.write(`Completion journal ${journalPath} line ${index + 1} ${detail}; the line is skipped.\n`);
+  };
   for (const [index, rawLine] of rawText.split('\n').entries()) {
     const trimmed = rawLine.trim();
     if (!trimmed) continue;
@@ -113,17 +118,21 @@ function readJournalLines(journalPath: string): JournalLine[] {
     try {
       parsed = JSON.parse(trimmed);
     } catch {
-      throw new Error(`Completion journal ${journalPath} line ${index + 1} is not valid JSON. The journal is refused (fail-closed); repair or remove the corrupted journal before continuing.`);
+      warn(index, 'is not valid JSON');
+      continue;
     }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new Error(`Completion journal ${journalPath} line ${index + 1} is not a journal record. The journal is refused (fail-closed).`);
+      warn(index, 'is not a journal record');
+      continue;
     }
     const record = parsed as JournalLine;
     if (record.kind !== 'review-completion' && record.kind !== 'applied') {
-      throw new Error(`Completion journal ${journalPath} line ${index + 1} has unknown kind. The journal is refused (fail-closed).`);
+      warn(index, 'has unknown kind');
+      continue;
     }
     if (!verifyLine(record)) {
-      throw new Error(`Completion journal ${journalPath} line ${index + 1} failed convergence-key signature verification. The journal is refused (fail-closed); no unverified completion record is ever applied.`);
+      warn(index, 'failed signature verification');
+      continue;
     }
     lines.push(record);
   }
