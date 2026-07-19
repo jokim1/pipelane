@@ -963,6 +963,20 @@ test('[T46] local-state merge deploy rollback and scoped cleanup retain independ
   assert.equal(apiActions.classifyStableActionManagedStateSensitivity('clean.apply'), 'independent-recovery');
 });
 
+test('[T47] local-state every operator and stable API action is explicitly classified and unknown fails closed', () => {
+  const operatorCases = [
+    ['devmode'], ['new'], ['adopt'], ['resume'], ['repo-guard'], ['task-lock'], ['pr'], ['merge'], ['release'], ['release-check'], ['deploy'], ['clean'],
+    ['review'], ['review', 'gc'], ['review', 'setup'], ['review', 'pass'], ['review', 'attest'], ['review', 'override'],
+    ['local-state', 'list'], ['status'], ['doctor'], ['rollback', 'prod'], ['api'],
+  ];
+  for (const args of operatorCases) assert.doesNotThrow(() => operator.classifyOperatorManagedStateSensitivity(state.parseOperatorArgs(args)), args.join(' '));
+  assert.throws(() => operator.classifyOperatorManagedStateSensitivity({ command: 'future-command', positional: [], flags: {} }), /not classified/);
+  assert.throws(() => operator.classifyOperatorManagedStateSensitivity(state.parseOperatorArgs(['orchestrate'])), /not classified/);
+  assert.deepEqual([...apiActions.STABLE_ACTION_IDS].sort(), Object.keys(apiActions.STABLE_ACTION_MANAGED_STATE_SENSITIVITY).sort());
+  for (const actionId of apiActions.STABLE_ACTION_IDS) assert.doesNotThrow(() => apiActions.classifyStableActionManagedStateSensitivity(actionId));
+  assert.throws(() => apiActions.classifyStableActionManagedStateSensitivity('future.action'), /not classified/);
+});
+
 test('[T48] local-state new and worktree-creating repo-guard reject conflicting base before writes', () => {
   for (const command of ['new', 'repo-guard']) {
     const repoRoot = createRepo();

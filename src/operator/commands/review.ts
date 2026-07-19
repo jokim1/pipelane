@@ -3248,7 +3248,7 @@ function orderReviewGates(gates: ReviewGateConfig[]): ReviewGateConfig[] {
 // pipelane state-signing key — a malicious gate command could otherwise read
 // a state-signing key and forge signed evidence, defeating the signature
 // guarantees whose trust boundary is "worker-influenced code does not hold keys". The
-// orchestrator PARENT keeps the key (for signing + attestation via
+// review command PARENT keeps the key (for signing + attestation via
 // appendReviewRunRecord); only the gate child is scrubbed.
 type ReviewGateInheritedContext =
   | { status: 'top-level'; depth: 0 }

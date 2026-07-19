@@ -524,8 +524,6 @@ export interface StatusDecisionRecord {
   headSha: string;
   source: 'board' | 'branch';
   taskSlug?: string;
-  runId?: string;
-  sliceId?: string;
   preflightAllowed?: boolean;
   preflightReason?: string;
   executionExitCode?: number;
@@ -3335,8 +3333,6 @@ function normalizeStatusDecisionRecord(value: unknown): StatusDecisionRecord | n
     source: raw.source,
   };
   if (typeof raw.taskSlug === 'string') record.taskSlug = raw.taskSlug;
-  if (typeof raw.runId === 'string') record.runId = raw.runId;
-  if (typeof raw.sliceId === 'string') record.sliceId = raw.sliceId;
   if (typeof raw.preflightAllowed === 'boolean') record.preflightAllowed = raw.preflightAllowed;
   if (typeof raw.preflightReason === 'string') record.preflightReason = raw.preflightReason;
   if (typeof raw.executionExitCode === 'number') record.executionExitCode = raw.executionExitCode;

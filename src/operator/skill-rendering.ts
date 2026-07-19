@@ -393,10 +393,10 @@ fi
 
 print_pipelane_help() {
   cat <<'PIPELANE_HELP'
-Pipelane is a build, release, and development orchestrator for AI-assisted
-codebases. It keeps task worktrees, PRs, review gates, deploy promotion,
-rollback, cleanup, and multi-agent implementation work on an explicit path so
-agents do not invent local process or skip release safety.
+Pipelane runs build, review, and release workflows for AI-assisted codebases.
+It keeps task worktrees, PRs, review gates, deploy promotion, rollback, and
+cleanup on an explicit path so agents do not invent local process or skip
+release safety.
 
 The normal first-run path is clean: /pipelane setup uses the machine-local
 runtime and must not create tracked repo-local adapters, command files, Codex

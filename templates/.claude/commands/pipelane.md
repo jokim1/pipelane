@@ -12,7 +12,6 @@ Parse `$ARGUMENTS` by whitespace. Evaluate only the first token.
 - Exactly equals `board` → **WEB BOARD MODE** compatibility alias. Strip the leading `board` token and pass the rest to `pipelane:board`.
 - Exactly equals `status` → **STATUS MODE**. Strip the leading `status` token and pass the rest to `pipelane:status`.
 - Exactly equals `review` → **REVIEW MODE**. Strip the leading `review` token and pass the rest to `pipelane:review`.
-- Exactly equals `orchestrate` → **ORCHESTRATION MODE**. Strip the leading `orchestrate` token and pass the rest to `pipelane:orchestrate`.
 - Exactly equals `update` → **UPDATE MODE**. Strip the leading `update` token and pass the rest to `pipelane:update`.
 - Anything else → **UNKNOWN MODE**. Do not run shell commands; show the journey overview plus `Unknown /pipelane subcommand: <token>`.
 
@@ -97,20 +96,6 @@ Helpful anytime:
   {{ALIAS_ROLLBACK}} prod        Roll back production to the last verified-good deploy.
   /fix                           Fix bugs, review findings, CI failures, and code-quality issues.
   /fix rethink                   Plan a larger codebase restructure before changing code.
-  /pipelane orchestrate analyze --plan-file <path> --analysis-file <path>
-                                  Record plan analysis before any worktree is created.
-  /pipelane orchestrate plan --plan-file <path>
-                                  Compile a plan into a durable slice ledger; analyze before prepare.
-  /pipelane orchestrate prepare --run-id <id>
-                                  Create slice worktrees from a run ledger.
-  /pipelane orchestrate dispatch --run-id <id>
-                                  Write provider handoff prompts for prepared slices.
-  /pipelane orchestrate start --run-id <id> [--slice-id <id>] [--force]
-                                  Start or retry configured workers and record per-slice evidence.
-  /pipelane orchestrate review --run-id <id> [--slice-id <id>]
-                                  Run review gates over completed worker slices.
-  /pipelane orchestrate goal-spec --plan-file <path>
-                                  Draft one provider-neutral GoalSpec without writing a run ledger.
   /pipelane web                  Open the local Pipelane Board.
   /pipelane update --check       Check whether Pipelane itself has updates.
 ```
@@ -250,71 +235,6 @@ exactly. Gate values may be repeated or comma-separated, for example
 If `$REST` starts with `setup` and includes any flag or selection, run the
 command directly. Do not add shell pipes to setup commands that may need
 interactivity.
-
----
-
-## ORCHESTRATION MODE
-
-Run advanced subcommands directly:
-
-```bash
-run_pipelane orchestrate $REST
-```
-
-where `$REST` is `$ARGUMENTS` with the leading `orchestrate` token stripped. Use this
-direct path for the low-level subcommands: `plan`, `analyze`, `plan-review`,
-`prepare`, `dispatch`, `start`, `review`, `scope`, `outline`, `finalize`, and
-`goal-spec`. Display the output directly.
-
-### `/pipelane orchestrate <plan-file>` — communicative driven flow
-
-When the operator points orchestrate at a plan file (or a goal to implement), do NOT
-just run `--yes` and wait silently. Drive a slice-by-slice flow that keeps them
-oriented:
-
-1. **Read the plan yourself.** Print **Plan read** in bullets (strengths, then
-   risks/gaps) plus a **coverage map** that accounts for every plan section as
-   in-scope (→ a slice), deferred, or excluded (one-line reason). Nothing silently
-   dropped.
-2. **Decompose** into phases and slices. Write a scratch JSON
-   `{ "slices": [{ "id", "title", "phase", "text" }], "coverage": [{ "section", "disposition", "sliceId", "reason" }] }`
-   plus an analysis JSON with the real plan SHA-256, analyzer identity, strengths,
-   risks, ambiguities, sensitiveAreas, and recommendedScope. Record analysis WITHOUT
-   starting workers and capture the run id:
-   `/pipelane orchestrate analyze --plan-file <real-plan> --analysis-file <analysis.json> --slices-file <scratch.json> --json`.
-   The ledger's audit source stays bound to the real plan, not either scratch file.
-3. **Relay the CLI outline verbatim** (`/pipelane orchestrate outline --run-id <id>`),
-   then print the **review model** in bullets (static checks, tests, independent AI
-   review of each slice diff, human confirm on sensitive slices).
-4. **Recommend a scope** — full, or a justified partial boundary (sensitive phase
-   first). Offer approve / edit scope / cancel; for partial run
-   `/pipelane orchestrate scope --run-id <id> --through <last-slice-id-in-scope>`.
-5. Before prepare, complete every pending plan-review gate: run the configured
-   reviewer, then record `/pipelane orchestrate plan-review pass --run-id <id> --gate <gate-id> --message <summary>`
-   or consciously bypass with `/pipelane orchestrate plan-review bypass --run-id <id> --gate <gate-id> --reason <reason>`.
-   Then drive in order: `prepare`, `dispatch`, then per in-scope slice
-   `start --run-id <id> --slice-id <id>` then `review --run-id <id> --slice-id <id>`,
-   and after **each** slice relay `/pipelane orchestrate outline --run-id <id>` so the
-   updated outline shows where the run is. Never use `--yes` here.
-6. When the in-scope slices pass: if the outline lists deferred slices, the run is
-   `paused` — tell the operator a later `/pipelane orchestrate` resumes it (re-scope
-   `--through <next>`, continue). Use `/pipelane orchestrate finalize --run-id <id> --abandon`
-   only to deliberately abandon the deferred remainder (kept in the ledger for audit).
-
-Host-visible slice checklist:
-
-- Mirror the latest CLI outline into the host's visible task list before
-  prepare/dispatch/start and after every slice settles. Use one item per
-  in-scope slice, with the phase and slice title in the item text.
-- In Claude Code, use TodoWrite when it is available. In Codex App, use
-  update_plan when it is available. If the host does not expose a task-list tool,
-  relay the CLI outline verbatim instead.
-- Keep exactly one slice `in_progress`: the slice named by the outline's
-  `Current:` line. Mark reviewed/done slices `completed`; leave queued, blocked,
-  failed, and deferred slices `pending` unless the host has a more specific state.
-
-If the plan compiles to a single unstructured slice, say so and propose a phase/slice
-breakdown before running one long opaque slice.
 
 ---
 

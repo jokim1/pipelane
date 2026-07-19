@@ -143,8 +143,6 @@ interface StatusActionCandidate {
   source: StatusDecisionRecord['source'];
   taskSlug?: string;
   branchName?: string;
-  runId?: string;
-  sliceId?: string;
 }
 
 interface StatusPrompter {
@@ -180,8 +178,6 @@ async function maybeRunInteractiveStatusAction(
     headSha: runGit(context.repoRoot, ['rev-parse', '--verify', 'HEAD'], true)?.trim() ?? '',
     source: candidate.source,
     ...(candidate.taskSlug ? { taskSlug: candidate.taskSlug } : {}),
-    ...(candidate.runId ? { runId: candidate.runId } : {}),
-    ...(candidate.sliceId ? { sliceId: candidate.sliceId } : {}),
   };
   saveStatusDecisionRecord(context.commonDir, context.config, decision);
 

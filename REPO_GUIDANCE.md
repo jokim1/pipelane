@@ -24,8 +24,8 @@ every breaking change.
 
 ## Current roadmap memory
 
-Review gates and `/orchestrate` v1a are shipped command behavior. Treat
-`docs/public/ORCHESTRATION.md` as the current operator contract, not a future
+Review gates are shipped command behavior. Treat
+`docs/public/RELEASE_WORKFLOW.md` as the current operator contract, not a future
 design note.
 
 Decisions captured through 2026-07-13:
@@ -37,10 +37,10 @@ Decisions captured through 2026-07-13:
 - Review gates remain ordered by phase: static, behavioral, AI diff,
   instruction, runtime, then human gates. Cheap deterministic checks run before
   AI review, and fix-first gstack `/review` runs before read-only confirmations.
-- `/orchestrate` v1a uses provider-neutral `GoalSpec` objects, signed run
-  ledgers, leased task worktrees, independent review gates, and route-bound
-  delivery handoff. It may prepare and review work, but it must not bypass
-  `/pr`, `/merge`, `/deploy`, `/rollback`, or `/clean`.
+- Pipelane is a local review/refactor/release runner, not an agent
+  orchestrator. Multi-agent fan-out was removed 2026-07; operators bring their
+  own orchestration tooling and it must not bypass `/pr`, `/merge`, `/deploy`,
+  `/rollback`, or `/clean`.
 - Deploy surfaces are consumer-defined. Configured custom names and repo-owned,
   workflow-bound surface contracts must flow through planning, execution,
   readiness, status, and deploy verification without hard-coded allowlists.
@@ -265,8 +265,8 @@ transcript; no consent gate (section name is legacy).
   coverage for both open-PR and post-merge states.
 - **CI workflow files** (`.github/workflows/*.yml`). Consumer CI
   depends on the template file shapes published through pipelane.
-- **`orchestrate` config schema, gate catalog, or command adapters.**
-  These will affect how AI agents review and move production code.
+- **Review gate catalog, gate config schema, or review command adapters.**
+  These affect how AI agents review and move production code.
   Changes require matching docs, tests, template updates, and explicit
   static-gates-before-AI-review behavior.
 
