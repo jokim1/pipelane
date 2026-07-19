@@ -113,7 +113,6 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
   if (!reviewEvidence.allowed && !reviewOverrideReason) {
     throw new Error(reviewEvidence.message);
   }
-  const reviewStatusLines = formatReviewEvidenceStatusLines(reviewEvidence);
 
   for (const check of context.config.prePrChecks) {
     runShell(context.repoRoot, check, parsed.flags.json);
@@ -142,6 +141,12 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
     }
     runGit(context.repoRoot, ['commit', '-m', parsed.flags.message.trim() || prTitle]);
   }
+
+  // Re-read after the commit so the reported staleness and worktree state
+  // describe the head being pushed, not the one the gate decision was made on.
+  const reviewStatusLines = formatReviewEvidenceStatusLines(
+    dirty ? evaluateReviewEvidenceForPr(context) : reviewEvidence,
+  );
 
   if (reviewOverrideApplied) {
     recordReviewEvidenceOverride(context, formatWorkflowCommand(context.config, 'pr'), reviewOverrideReason);

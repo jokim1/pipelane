@@ -4,7 +4,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync,
 import os from 'node:os';
 import path from 'node:path';
 
-import { computeUrlFingerprint, resolveProbeStateKey, resolveReviewConsentStateKey, resolveReviewStateKey, signSignedPayload, verifySignedPayload } from './integrity.ts';
+import { computeUrlFingerprint, resolveProbeStateKey, resolveReviewStateKey, signSignedPayload, verifySignedPayload } from './integrity.ts';
 import { buildDefaultReviewGatesConfig } from './review-gates.ts';
 
 export type Mode = 'build' | 'release';
@@ -806,9 +806,7 @@ export interface ReviewOverrideRecord {
 export interface ReviewState {
   records: ReviewRunRecord[];
   overrides: ReviewOverrideRecord[];
-  consents?: ReviewConsentRecord[];
   externalEvidence?: ReviewExternalEvidenceRecord[];
-  findingDispositions?: ReviewFindingDispositionRecord[];
 }
 
 export type RouteSafetyResumeKind = 'one-more-loop' | 'more-loops-and-minutes' | 'until-review-passes' | 'accept-findings' | 'fix-attempt' | 'legacy-import' | 'legacy-fresh-start' | 'budget-extension-grant';
@@ -989,6 +987,9 @@ export interface TaskBudgetRecord extends RouteSafetyRecord {
 
 export interface TaskBudgetState {
   entries: Record<string, TaskBudgetRecord>;
+  // Entries that failed validation on load, kept under their own key so a
+  // rewrite never erases recorded spend a later repair could recover.
+  unreadableEntries?: Record<string, unknown>;
 }
 
 export type DeployStatus = 'requested' | 'succeeded' | 'failed' | 'unknown';
@@ -1193,9 +1194,7 @@ const TASK_BUDGET_STATE_LOCK_FILENAME = 'task-budget-state.lock';
 const REVIEW_STATE_MAX_RECORDS = 20;
 const REVIEW_OVERRIDE_MAX_RECORDS = 50;
 const REVIEW_ACCEPTANCE_MAX_RECORDS = 200;
-const REVIEW_CONSENT_MAX_RECORDS = 200;
 const REVIEW_EXTERNAL_EVIDENCE_MAX_RECORDS = 200;
-const REVIEW_FINDING_DISPOSITION_MAX_RECORDS = 500;
 const ACTION_STATE_MAX_DECISIONS = 100;
 const REVIEW_STATE_LOCK_STALE_MS = 2 * 60 * 1000;
 const DEPLOY_CONFIG_FILENAME = 'deploy-config.json';
@@ -1276,7 +1275,6 @@ export const STATE_MIGRATIONS: Record<StateKind, Record<number, (raw: Record<str
     1: (raw) => ({
       ...raw,
       externalEvidence: Array.isArray(raw.externalEvidence) ? raw.externalEvidence : [],
-      findingDispositions: Array.isArray(raw.findingDispositions) ? raw.findingDispositions : [],
     }),
   },
   reviewAcceptanceState: {},
@@ -3471,9 +3469,7 @@ export function loadReviewState(commonDir: string, config: WorkflowConfig): Revi
   const raw = readVersionedJsonFile<ReviewState>('reviewState', commonDir, config, reviewStatePath(commonDir, config), {
     records: [],
     overrides: [],
-    consents: [],
     externalEvidence: [],
-    findingDispositions: [],
   });
   const stateKey = resolveReviewStateKey();
   const records = Array.isArray(raw?.records)
@@ -3484,20 +3480,11 @@ export function loadReviewState(commonDir: string, config: WorkflowConfig): Revi
     ? raw.overrides.filter(isReviewOverrideRecord).slice(0, REVIEW_OVERRIDE_MAX_RECORDS)
       .filter((record) => !stateKey || verifySignedPayload(record, stateKey))
     : [];
-  const consentKey = resolveReviewConsentStateKey();
-  const consents = Array.isArray(raw?.consents)
-    ? raw.consents.filter(isReviewConsentRecord).slice(0, REVIEW_CONSENT_MAX_RECORDS)
-      .filter((record) => verifySignedPayload(record, consentKey))
-    : [];
   const externalEvidence = Array.isArray(raw?.externalEvidence)
     ? raw.externalEvidence.filter(isReviewExternalEvidenceRecord).slice(0, REVIEW_EXTERNAL_EVIDENCE_MAX_RECORDS)
       .filter((record) => !stateKey || verifySignedPayload(record, stateKey))
     : [];
-  const findingDispositions = Array.isArray(raw?.findingDispositions)
-    ? raw.findingDispositions.filter(isReviewFindingDispositionRecord).slice(0, REVIEW_FINDING_DISPOSITION_MAX_RECORDS)
-      .filter((record) => !stateKey || verifySignedPayload(record, stateKey))
-    : [];
-  return { records, overrides, consents, externalEvidence, findingDispositions };
+  return { records, overrides, externalEvidence };
 }
 
 export function saveReviewState(commonDir: string, config: WorkflowConfig, value: ReviewState): void {
@@ -3505,9 +3492,7 @@ export function saveReviewState(commonDir: string, config: WorkflowConfig, value
   writeVersionedJsonFile('reviewState', reviewStatePath(commonDir, config), {
     records: value.records.slice(0, REVIEW_STATE_MAX_RECORDS),
     overrides: (value.overrides ?? []).slice(0, REVIEW_OVERRIDE_MAX_RECORDS),
-    consents: (value.consents ?? []).slice(0, REVIEW_CONSENT_MAX_RECORDS),
     externalEvidence: (value.externalEvidence ?? []).slice(0, REVIEW_EXTERNAL_EVIDENCE_MAX_RECORDS),
-    findingDispositions: (value.findingDispositions ?? []).slice(0, REVIEW_FINDING_DISPOSITION_MAX_RECORDS),
   });
 }
 
@@ -3648,26 +3633,39 @@ export function loadTaskBudgetState(commonDir: string, config: WorkflowConfig): 
     return { entries: {} };
   }
   const entries: Record<string, TaskBudgetRecord> = {};
+  const unreadableEntries: Record<string, unknown> = isRecord(raw.unreadableEntries)
+    ? { ...raw.unreadableEntries }
+    : {};
   for (const [lineageKey, entry] of Object.entries(raw.entries)) {
     const normalized = normalizeTaskBudgetRecord(entry);
     if (!normalized) {
       warn(`entry ${lineageKey.slice(0, 12)} failed validation`);
+      unreadableEntries[lineageKey] = entry;
       continue;
     }
     // The map key IS the lineage identity; a record filed under a different
     // key (or a traversal-shaped key rejected above) is corruption.
     if (normalized.lineageKey !== lineageKey) {
       warn(`entry ${lineageKey.slice(0, 12)} lineageKey mismatch`);
+      unreadableEntries[lineageKey] = entry;
       continue;
     }
     entries[lineageKey] = normalized;
   }
-  return { entries };
+  return { entries, unreadableEntries };
 }
 
 export function saveTaskBudgetState(commonDir: string, config: WorkflowConfig, value: TaskBudgetState): void {
   ensureStateDir(commonDir, config);
-  writeVersionedJsonFile('taskBudgetState', taskBudgetStatePath(commonDir, config), value);
+  // Quarantined entries are rewritten verbatim under their own key: skipping a
+  // record on load must not let the next save silently zero its spend, and
+  // ensureTaskBudgetRecord may have minted a fresh entry under the same
+  // lineage key in the meantime.
+  const unreadableEntries = value.unreadableEntries ?? {};
+  writeVersionedJsonFile('taskBudgetState', taskBudgetStatePath(commonDir, config), {
+    entries: value.entries,
+    ...(Object.keys(unreadableEntries).length > 0 ? { unreadableEntries } : {}),
+  });
 }
 
 export function withTaskBudgetStateLock<T>(commonDir: string, config: WorkflowConfig, fn: () => T): T {
@@ -3694,7 +3692,8 @@ function normalizeTaskBudgetRecord(value: unknown): TaskBudgetRecord | null {
   // a v1-only store (no legacy shape), so every currency field is always
   // written; a present-but-non-numeric field is corruption, and coercing it
   // to 0 would re-mint spent budget. Reject the record so loadTaskBudgetState
-  // fails closed instead of silently zeroing the ledger.
+  // quarantines it — the raw entry is warned about, skipped, and preserved
+  // across saves for repair instead of being silently zeroed.
   const requiredCounter = (field: unknown): number | null =>
     (typeof field === 'number' && Number.isSafeInteger(field) && field >= 0) ? field : null;
   const aiRunsBudget = requiredCounter(raw.aiRunsBudget);
@@ -4049,33 +4048,6 @@ function isReviewOverrideRecord(value: unknown): value is ReviewOverrideRecord {
     && (raw.signature === undefined || typeof raw.signature === 'string');
 }
 
-function isReviewConsentRecord(value: unknown): value is ReviewConsentRecord {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const raw = value as Record<string, unknown>;
-  return typeof raw.id === 'string'
-    && (raw.kind === 'gate-bypass' || raw.kind === 'accept-findings' || raw.kind === 'manual-substitution')
-    && typeof raw.gateId === 'string'
-    && typeof raw.gateDefinitionHash === 'string'
-    && typeof raw.policyVersion === 'number'
-    && Number.isSafeInteger(raw.policyVersion)
-    && (raw.enforcementMode === 'legacy-v2' || raw.enforcementMode === 'strict-v3')
-    && typeof raw.taskBindingId === 'string'
-    && (raw.reviewRunId === undefined || typeof raw.reviewRunId === 'string')
-    && typeof raw.originalGateState === 'string'
-    && typeof raw.branchName === 'string'
-    && typeof raw.sha === 'string'
-    && typeof raw.worktreeStatusDigest === 'string'
-    && typeof raw.worktreeMaterialTreeHash === 'string'
-    && typeof raw.reviewTargetDigest === 'string'
-    && typeof raw.routeAction === 'string'
-    && isReviewActorIdentity(raw.actor)
-    && typeof raw.source === 'string'
-    && typeof raw.reason === 'string'
-    && typeof raw.reasonHash === 'string'
-    && typeof raw.recordedAt === 'string'
-    && (raw.signature === undefined || typeof raw.signature === 'string');
-}
-
 function isReviewAcceptanceRecord(value: unknown): value is ReviewAcceptanceRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const raw = value as Record<string, unknown>;
@@ -4137,33 +4109,6 @@ function isReviewExternalEvidenceRecord(value: unknown): value is ReviewExternal
     && isReviewRecordedArtifactReference(raw.artifact)
     && isReviewActorIdentity(raw.recorder)
     && typeof raw.recordedAt === 'string'
-    && (raw.signature === undefined || typeof raw.signature === 'string');
-}
-
-function isReviewFindingDispositionRecord(value: unknown): value is ReviewFindingDispositionRecord {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const raw = value as Record<string, unknown>;
-  return typeof raw.id === 'string'
-    && raw.kind === 'spin-off'
-    && typeof raw.findingRef === 'string'
-    && typeof raw.reviewRunId === 'string'
-    && typeof raw.gateId === 'string'
-    && isReviewFinding(raw.finding)
-    && typeof raw.followUpTask === 'string'
-    && typeof raw.reason === 'string'
-    && typeof raw.reasonHash === 'string'
-    && raw.dispositionEffect === 'satisfies-finding-at-exact-head'
-    && typeof raw.criticalRiskAcknowledged === 'boolean'
-    && typeof raw.taskBindingId === 'string'
-    && typeof raw.branchName === 'string'
-    && typeof raw.sha === 'string'
-    && typeof raw.worktreeStatusDigest === 'string'
-    && typeof raw.worktreeMaterialTreeHash === 'string'
-    && typeof raw.reviewTargetDigest === 'string'
-    && isReviewActorIdentity(raw.actor)
-    && raw.source === 'resume --spin-off'
-    && typeof raw.recordedAt === 'string'
-    && isReviewRecordedArtifactReference(raw.artifact)
     && (raw.signature === undefined || typeof raw.signature === 'string');
 }
 

@@ -998,6 +998,7 @@ function normalizeInputs(
         pr: flags.pr,
         sha: flags.sha,
         surfaces: flags.surfaces,
+        override: flags.override,
         reason: flags.reason,
       };
     case 'route.merge':

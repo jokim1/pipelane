@@ -155,11 +155,14 @@ export async function handleMerge(cwd: string, parsed: ParsedOperatorArgs): Prom
         throw new Error(reviewEvidence.message);
       }
       lines.push(...formatReviewEvidenceStatusLines(reviewEvidence));
+      watchPrChecks(context.repoRoot, pr.number);
+      // Recorded only once red CI can no longer abort the merge: the override
+      // record is durable and /status reports it forever, so it must not
+      // outlive a merge that never happened.
       if (reviewOverrideApplied) {
         recordReviewEvidenceOverride(context, formatWorkflowCommand(context.config, 'merge'), reviewOverrideReason);
         lines.push(formatReviewEvidenceOverrideMessage(formatWorkflowCommand(context.config, 'merge'), reviewOverrideReason));
       }
-      watchPrChecks(context.repoRoot, pr.number);
       const checkedPr = loadPrByNumber(context.repoRoot, pr.number);
       assertPrIsOpenForMerge(checkedPr);
       const mergeHeadTarget = resolveMergeHeadTarget(context, checkedPr);

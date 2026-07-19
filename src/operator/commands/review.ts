@@ -4230,7 +4230,6 @@ function runAiReviewGate(options: {
     repoRoot,
     baseBranch,
     changedFiles,
-    dispositionedFindings: collectDispositionedKarpathyFindings({ repoRoot, commonDir, config, gateId: gate.id }),
   });
   let beforeStatus: WorktreeStatusSnapshot;
   let afterStatus: WorktreeStatusSnapshot;
@@ -4472,7 +4471,6 @@ function runStrictAiReviewGate(options: {
     target: builtTarget.manifest,
     changedFiles,
     capability,
-    dispositionedFindings: collectDispositionedKarpathyFindings({ repoRoot, commonDir, config, gateId: gate.id }),
   });
   let completion: StrictProviderCompletion;
   try {
@@ -4933,65 +4931,6 @@ function renderAiReviewGatePrompt(options: {
     '- Do not omit the result marker after running tests, even when there are no findings.',
     '- If you are uncertain whether the review completed, print the failed marker.',
   ].join('\n');
-}
-
-function collectDispositionedKarpathyFindings(options: {
-  repoRoot: string;
-  commonDir: string;
-  config: WorkflowConfig;
-  gateId: string;
-}): ReviewDispositionPromptEntry[] {
-  if (options.gateId !== 'karpathy-diff') return [];
-  const target = currentCheckoutReviewEvidenceTarget(options.repoRoot);
-  const state = loadReviewState(options.commonDir, options.config);
-  const entries: ReviewDispositionPromptEntry[] = [];
-  for (const disposition of state.findingDispositions ?? []) {
-    if (
-      disposition.gateId !== options.gateId
-      || disposition.branchName !== target.branchName
-      || disposition.sha !== target.sha
-      || disposition.worktreeStatusDigest !== target.worktreeStatusDigest
-      || disposition.worktreeMaterialTreeHash !== target.worktreeMaterialTreeHash
-      || disposition.taskBindingId !== target.taskBindingId
-      || disposition.reviewTargetDigest !== target.reviewTargetDigest
-    ) continue;
-    entries.push({
-      disposition: 'spin-off',
-      findingRef: disposition.findingRef,
-      severity: disposition.finding.severity,
-      title: disposition.finding.title,
-      ...(disposition.finding.location ? { location: disposition.finding.location } : {}),
-      reason: disposition.reason,
-      followUpTask: disposition.followUpTask,
-    });
-  }
-  for (const consent of state.consents ?? []) {
-    if (
-      consent.kind !== 'accept-findings'
-      || consent.gateId !== options.gateId
-      || consent.branchName !== target.branchName
-      || consent.sha !== target.sha
-      || consent.worktreeStatusDigest !== target.worktreeStatusDigest
-      || consent.worktreeMaterialTreeHash !== target.worktreeMaterialTreeHash
-      || consent.taskBindingId !== target.taskBindingId
-      || consent.reviewTargetDigest !== target.reviewTargetDigest
-      || !consent.reviewRunId
-    ) continue;
-    const review = state.records.find((record) => record.id === consent.reviewRunId);
-    const gate = review?.gates.find((candidate) => candidate.gateId === options.gateId);
-    for (const finding of gate?.findings ?? []) {
-      entries.push({
-        disposition: 'accepted',
-        findingRef: `${review!.id}/${gate!.gateId}/${finding.id}`,
-        severity: finding.severity,
-        title: finding.title,
-        ...(finding.location ? { location: finding.location } : {}),
-        reason: consent.reason,
-      });
-    }
-  }
-  const unique = new Map(entries.map((entry) => [`${entry.disposition}\0${entry.findingRef}`, entry]));
-  return [...unique.values()];
 }
 
 function reviewGateCheckoutMutationSummary(

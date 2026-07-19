@@ -31,6 +31,7 @@ import {
 } from './state.ts';
 import {
   appendReviewCompletionRecord,
+  completionJournalHasUnreadableLines,
   markReviewCompletionApplied,
   migrateCompletionJournalLineage,
   pruneAppliedCompletionJournal,
@@ -587,6 +588,7 @@ export function cleanTaskBudgetArtifactsForTask(
         // line is written, so /clean can never discard completed debits. A
         // journal that cannot be read keeps the entry and its journal in
         // place for repair instead of deleting them.
+        if (completionJournalHasUnreadableLines(commonDir, config, entry.lineageKey)) continue;
         try {
           marksByLineage.set(entry.lineageKey, replayUnappliedCompletions(context, entry));
         } catch {

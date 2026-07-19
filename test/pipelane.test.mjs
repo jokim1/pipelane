@@ -23953,6 +23953,83 @@ test('api action deploy.prod --execute bypasses the TTY prompt via the API env v
   }
 });
 
+test('api action deploy.prod rejects a non-override confirm token replayed with --override', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    PIPELANE_DEPLOY_WATCH_STUB: 'succeeded',
+    PIPELANE_DEPLOY_HEALTHCHECK_STUB_STATUS: '200',
+  };
+
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    commitAll(repoRoot, 'Adopt pipelane');
+    runCli(['run', 'devmode', 'release', '--override', '--reason', 'prod-override-binding-test', '--json'], repoRoot);
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Prod Override Binding', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'hello\n', 'utf8');
+    runCli(['run', 'pr', '--title', 'Prod Override Binding', '--json'], created.worktreePath, env);
+    runCli(['run', 'merge', '--json'], created.worktreePath, env);
+    runCli(['run', 'deploy', 'staging', '--json'], created.worktreePath, env);
+
+    const reason = 'ship the hotfix';
+
+    // The human confirmed a deploy WITHOUT --override. deploy.prod forwards the
+    // override pair into the child, so the override bit has to be part of the
+    // fingerprint: otherwise this token authorizes a prod deploy that skips
+    // release-readiness and staging-parity with no typed-SHA prompt.
+    const nonOverrideToken = JSON.parse(runCli(
+      ['run', 'api', 'action', 'deploy.prod', '--task', 'Prod Override Binding', '--reason', reason],
+      created.worktreePath,
+      env,
+    ).stdout).data.preflight.confirmation.token;
+    assert.ok(nonOverrideToken, 'the non-override preflight must issue a confirm token');
+
+    const replayed = runCli(
+      ['run', 'api', 'action', 'deploy.prod', '--task', 'Prod Override Binding', '--override', '--reason', reason,
+        '--execute', '--confirm-token', nonOverrideToken],
+      created.worktreePath,
+      env,
+      true,
+    );
+    assert.notEqual(replayed.status, 0, 'an override prod deploy must not consume a non-override confirmation');
+    assert.match(
+      `${replayed.stdout}${replayed.stderr}`,
+      /no longer matches the current action target/,
+      `expected a fingerprint mismatch, got: ${replayed.stdout.slice(0, 600)}${replayed.stderr.slice(0, 600)}`,
+    );
+
+    // Control: the same reason confirmed WITH --override executes, so the
+    // rejection above is caused by the override bit and nothing else. It also
+    // holds the adversarial P1 forwarding in place — the child must still
+    // receive the pair and record the reason on the deploy record.
+    const matchingToken = JSON.parse(runCli(
+      ['run', 'api', 'action', 'deploy.prod', '--task', 'Prod Override Binding', '--override', '--reason', reason],
+      created.worktreePath,
+      env,
+    ).stdout).data.preflight.confirmation.token;
+    const executed = JSON.parse(runCli(
+      ['run', 'api', 'action', 'deploy.prod', '--task', 'Prod Override Binding', '--override', '--reason', reason,
+        '--execute', '--confirm-token', matchingToken],
+      created.worktreePath,
+      env,
+    ).stdout);
+    assert.equal(executed.ok, true, JSON.stringify(executed).slice(0, 900));
+    assert.equal(executed.data.execution.exitCode, 0);
+    const deployState = JSON.parse(readFileSync(path.join(sharedStateDir(repoRoot), 'deploy-state.json'), 'utf8'));
+    const prodRecord = deployState.records.find((record) => record.environment === 'prod');
+    assert.ok(prodRecord, 'the confirmed override deploy must dispatch the prod child');
+    assert.equal(prodRecord.gateOverrideReason, reason, 'the API child must record the forwarded override reason');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
 test('deploy prod blocks without staging parity and proceeds with a recorded override reason', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
@@ -39398,6 +39475,50 @@ test('review prints the advisory task-budget line and a corrupt ledger only warn
     assert.equal(second.status, 0, second.stderr);
     assert.match(second.stderr, /task-budget-state .* partially unreadable/);
     assert.match(JSON.parse(second.stdout).message, /Task budget \(advisory\)/);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('a task-budget entry that fails validation is quarantined, not erased by the next save', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Quarantined Budget', {
+      prePrChecks: [],
+      reviewGates: { policyVersion: 2, planReview: { gates: [] }, gates: [] },
+    });
+    commitAll(repoRoot, 'Configure quarantined budget');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Quarantined Budget', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'quarantine\n', 'utf8');
+    runCli(['run', 'review', '--json'], created.worktreePath);
+
+    const budgetPath = path.join(sharedStateDir(repoRoot), 'task-budget-state.json');
+    const before = JSON.parse(readFileSync(budgetPath, 'utf8'));
+    const lineageKey = Object.keys(before.entries)[0];
+    assert.ok(lineageKey, 'the first review must record a budget entry');
+    assert.equal(typeof before.entries[lineageKey].aiRunLaunches, 'number', 'the entry carries counter spend');
+
+    // Corrupt one authorization counter: normalizeTaskBudgetRecord rejects the
+    // record, so the entry is skipped on load and ensureTaskBudgetRecord mints
+    // a fresh zero-spend record under the same lineage key. The next save must
+    // not be what permanently erases the original spend.
+    const corrupted = JSON.parse(JSON.stringify(before));
+    corrupted.entries[lineageKey].aiRunLaunches = 'many';
+    writeFileSync(budgetPath, JSON.stringify(corrupted, null, 2), 'utf8');
+
+    const second = runCli(['run', 'review', '--json'], created.worktreePath, {}, true);
+    assert.equal(second.status, 0, second.stderr);
+    assert.match(second.stderr, /failed validation/);
+
+    const after = JSON.parse(readFileSync(budgetPath, 'utf8'));
+    assert.ok(after.unreadableEntries, 'the rejected entry must be preserved for repair');
+    assert.deepEqual(
+      after.unreadableEntries[lineageKey],
+      corrupted.entries[lineageKey],
+      'the quarantined entry must survive the rewrite verbatim',
+    );
+    assert.ok(after.entries[lineageKey], 'the fresh entry keeps the advisory meter running');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });

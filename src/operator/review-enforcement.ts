@@ -250,20 +250,32 @@ export function formatReviewEvidenceStatusLines(evidence: ReviewEvidenceCheckRes
     return lines;
   }
   const latest = evidence.latest;
-  const failed = latest.gates.filter((gate) => gate.blocking !== false && gate.status === 'failed');
-  const pending = latest.gates.filter((gate) => gate.blocking !== false && gate.status === 'pending');
+  // Every gate is counted, blocking or not: an advisory gate that failed still
+  // belongs on the surface that now carries the whole review signal. The
+  // per-gate label marks which of them are advisory.
+  const failed = latest.gates.filter((gate) => gate.status === 'failed');
+  const pending = latest.gates.filter((gate) => gate.status === 'pending');
   const passed = latest.gates.filter((gate) => gate.status === 'passed');
+  const skipped = latest.gates.filter((gate) => gate.status === 'skipped');
+  const gateLabel = (gate: ReviewGateRunRecord): string =>
+    gate.blocking === false ? `${gate.gateId} (advisory)` : gate.gateId;
   const scopeNote = latest.dryRun === true
     ? ' [dry run]'
     : (latest.gateFilter || latest.phaseFilter)
       ? ' [filtered]'
       : '';
-  lines.push(`Review: ${latest.id}${scopeNote} — ${latest.status} at ${shortSha(latest.sha)} (${passed.length} passed, ${failed.length} failed, ${pending.length} pending).`);
+  const counts = [
+    `${passed.length} passed`,
+    `${failed.length} failed`,
+    `${pending.length} pending`,
+    ...(skipped.length > 0 ? [`${skipped.length} skipped`] : []),
+  ].join(', ');
+  lines.push(`Review: ${latest.id}${scopeNote} — ${latest.status} at ${shortSha(latest.sha)} (${counts}).`);
   if (failed.length > 0) {
-    lines.push(`Open failed gates: ${failed.map((gate) => gate.gateId).join(', ')}.`);
+    lines.push(`Open failed gates: ${failed.map(gateLabel).join(', ')}.`);
   }
   if (pending.length > 0) {
-    lines.push(`Open pending gates: ${pending.map((gate) => gate.gateId).join(', ')}.`);
+    lines.push(`Open pending gates: ${pending.map(gateLabel).join(', ')}.`);
   }
   const staleness = evidence.staleness;
   if (staleness) {
