@@ -1148,6 +1148,8 @@ export const STATE_SCHEMA_VERSIONS = {
   orchestrationObservations: 1,
   deployConfig: 1,
   taskLock: 1,
+  reviewVerdictEntry: 1,
+  reviewVerdictPins: 1,
 } as const;
 
 export type StateKind = keyof typeof STATE_SCHEMA_VERSIONS;
@@ -1195,6 +1197,8 @@ export const STATE_MIGRATIONS: Record<StateKind, Record<number, (raw: Record<str
   orchestrationObservations: {},
   deployConfig: {},
   taskLock: {},
+  reviewVerdictEntry: {},
+  reviewVerdictPins: {},
 };
 
 // v1.2: doctor.probe records. One entry per (environment, surface). Written
@@ -2052,6 +2056,13 @@ export function reviewStatePath(commonDir: string, config: WorkflowConfig): stri
 
 export function reviewArtifactRoot(commonDir: string, config: WorkflowConfig): string {
   return path.join(resolveStateDir(commonDir, config), 'review-artifacts');
+}
+
+// Convergence v1 verdict cache store (plan §4.4/§5, slice S2). Entry schema,
+// signing, lookup, and eviction live in review-verdicts.ts; state.ts only
+// registers the store location.
+export function reviewVerdictsRoot(commonDir: string, config: WorkflowConfig): string {
+  return path.join(resolveStateDir(commonDir, config), 'review-verdicts');
 }
 
 export function reviewFindingFollowUpRoot(commonDir: string, config: WorkflowConfig): string {

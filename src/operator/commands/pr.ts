@@ -38,11 +38,13 @@ import {
   type TaskLock,
 } from '../state.ts';
 import {
+  backfillReviewEvidenceMaterialTreeFromCommit,
   evaluateReviewEvidenceForPr,
   formatReviewEvidenceOverrideMessage,
   recordReviewEvidenceOverride,
   recordReviewEvidenceConsents,
   reviewEvidenceOverrideReason,
+  type ReviewEvidenceCheckResult,
 } from '../review-enforcement.ts';
 import {
   evaluateDestinationRouteReviewSafety,
@@ -52,6 +54,7 @@ import {
 import { buildDestinationPlanForCommand } from '../destination-planner.ts';
 import { assertManagedLocalStateValid } from '../local-state.ts';
 import { declaredPrivateSourcePaths } from '../secret-provisioning.ts';
+import { readWorktreeStatusSnapshot } from '../worktree-status.ts';
 
 export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise<void> {
   const context = resolveWorkflowContext(cwd);
@@ -176,6 +179,30 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
     if (!acceptedByPrompt) throw new Error(postCheckReviewEvidence.message);
   }
 
+  // E1 (merge-channel parity): when the matched record lacks a reliable
+  // material identity, capture the reviewed checkout's write-tree BEFORE
+  // staging. The backfill below only certifies the commit if its tree equals
+  // this snapshot, so content introduced during the commit itself (pre-commit
+  // hooks, concurrent writers) can never be blessed as reviewed. The snapshot
+  // must also still match the status digest the evidence was evaluated
+  // against — any drift means the checkout is no longer the reviewed state.
+  const materialBackfillRunId = resolveMaterialBackfillRunId(postCheckReviewEvidence);
+  let materialBackfillIntendedTree = '';
+  if (materialBackfillRunId) {
+    const preCommitSnapshot = readWorktreeStatusSnapshot(context.repoRoot, {
+      includeStatusDigest: true,
+      includeMaterialTreeHash: true,
+    });
+    if (
+      preCommitSnapshot.statusDigestReliable
+      && preCommitSnapshot.statusDigest === postCheckReviewEvidence.target?.worktreeStatusDigest
+      && preCommitSnapshot.materialTreeReliable === true
+      && preCommitSnapshot.materialTreeHash
+    ) {
+      materialBackfillIntendedTree = preCommitSnapshot.materialTreeHash;
+    }
+  }
+
   if (dirty) {
     const changedPaths = collectChangedPaths(context.repoRoot);
     const denyHits = findDenyListHits(
@@ -198,6 +225,10 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
       throw new Error('No staged changes were found after git add -A.');
     }
     runGit(context.repoRoot, ['commit', '-m', parsed.flags.message.trim() || prTitle]);
+  }
+
+  if (materialBackfillRunId && materialBackfillIntendedTree) {
+    backfillReviewEvidenceMaterialTreeFromCommit(context, materialBackfillRunId, materialBackfillIntendedTree);
   }
 
   if (reviewOverrideApplied) {
@@ -291,6 +322,26 @@ export async function handlePr(cwd: string, parsed: ParsedOperatorArgs): Promise
       `Next: run ${formatWorkflowCommand(context.config, 'merge')}.`,
     ].join('\n'),
   });
+}
+
+// E1 backfill applies only when the matched record lacks a reliable material
+// identity AND the match came through the status-digest channel — that channel
+// is what proves the record describes exactly the content /pr just committed.
+function resolveMaterialBackfillRunId(evidence: ReviewEvidenceCheckResult): string {
+  const latest = evidence.latest;
+  const target = evidence.target;
+  if (!latest || !target) return '';
+  // Backfill is an evidence upgrade, not an override channel. Only a clean,
+  // currently-valid pass may acquire the post-commit material identity. In
+  // particular, /pr can override stale-SHA evidence that /merge must reject;
+  // laundering that record through backfill would erase the distinction.
+  if (!evidence.allowed || evidence.bypassedIssues.length > 0) return '';
+  if (latest.status !== 'passed') return '';
+  if (latest.branchName !== target.branchName || latest.sha !== target.sha) return '';
+  if (latest.worktreeMaterialTreeReliable === true && latest.worktreeMaterialTreeHash) return '';
+  if (!target.worktreeStatusReliable || latest.worktreeStatusReliable === false) return '';
+  if ((latest.worktreeStatusDigest ?? '') !== target.worktreeStatusDigest) return '';
+  return latest.id;
 }
 
 function resolvePrTaskBinding(

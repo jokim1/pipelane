@@ -33,6 +33,7 @@ import {
 } from '../state.ts';
 import { executeTaskWorkspaceCleanup, type CleanupOutcome, type RemoteBaseEvidence } from './clean.ts';
 import { bootstrapWorktreeNodeModulesIfNeeded, resolveSharedRepoRoot } from '../task-workspaces.ts';
+import { readWorktreeStatusSnapshot } from '../worktree-status.ts';
 import {
   evaluateReviewEvidenceForPr,
   formatReviewEvidenceOverrideMessage,
@@ -410,12 +411,41 @@ function resolveReviewEvidenceTargetForPr(context: WorkflowContext, pr: LivePr):
     worktreeStatusDigest: '',
     worktreeMaterialTreeHash: treeHash,
   })).digest('hex');
-  return {
-    branchName,
-    sha,
+
+  // E1 (merge-channel parity): when /merge runs from the exact PR-head
+  // checkout — same branch, same HEAD, and a clean tree whose write-tree
+  // equals the PR commit's tree — the checkout's own status digest identifies
+  // precisely the content being merged. Carrying it lets a reliable
+  // status-digest record match satisfy /merge exactly as it satisfies /pr.
+  // Detached-PR merges (or drifted checkouts) keep the material-only channel,
+  // and legacy material-tree-only records remain acceptable either way.
+  let statusIdentity = {
     worktreeStatusDigest: '',
     worktreeStatusReliable: false,
     worktreeStatusWarnings: [`review target is PR branch ${branchName}, not the current checkout`],
+  };
+  const checkout = readWorktreeStatusSnapshot(context.repoRoot, {
+    includeStatusDigest: true,
+    includeMaterialTreeHash: true,
+  });
+  if (
+    checkout.branchName === branchName
+    && checkout.head === sha
+    && checkout.statusDigestReliable
+    && checkout.materialTreeReliable === true
+    && checkout.materialTreeHash === treeHash
+  ) {
+    statusIdentity = {
+      worktreeStatusDigest: checkout.statusDigest,
+      worktreeStatusReliable: true,
+      worktreeStatusWarnings: [],
+    };
+  }
+
+  return {
+    branchName,
+    sha,
+    ...statusIdentity,
     worktreeMaterialTreeHash: treeHash,
     worktreeMaterialTreeReliable: true,
     worktreeMaterialTreeWarnings: [],

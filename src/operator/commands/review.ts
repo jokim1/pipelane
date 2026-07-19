@@ -27,6 +27,7 @@ import {
 } from '../review-gate-policy.ts';
 import { readWorktreeStatusSnapshot, type WorktreeStatusSnapshot } from '../worktree-status.ts';
 import {
+  canonicalize,
   CONVERGENCE_STATE_KEY_ENV,
   DEPLOY_STATE_KEY_ENV,
   ORCHESTRATION_STATE_KEY_ENV,
@@ -34,6 +35,11 @@ import {
   REVIEW_CONSENT_STATE_KEY_ENV,
   REVIEW_STATE_KEY_ENV,
 } from '../integrity.ts';
+import {
+  lookupReviewVerdict,
+  recordReviewVerdict,
+  type ReviewVerdictScope,
+} from '../review-verdicts.ts';
 import {
   appendReviewAcceptanceRecord,
   appendReviewExternalEvidenceRecord,
@@ -86,6 +92,10 @@ import {
   recordReviewRunForRouteSafety,
 } from '../route-loop-safety.ts';
 import {
+  collectChangedFiles,
+  collectDispositionedKarpathyFindings,
+  computeFullReviewedScopeDigest,
+  computeReviewVerdictContractDigest,
   currentCheckoutReviewEvidenceTarget,
   evaluateReviewEvidenceForPr,
   recordReviewEvidenceConsents,
@@ -93,6 +103,11 @@ import {
   reviewGateDefinitionHash,
   type ReviewEvidenceTarget,
 } from '../review-enforcement.ts';
+
+// Re-exported for existing consumers (orchestrate.ts imports it from here);
+// the implementation moved to review-enforcement.ts so evidence-time verdict
+// scope reconstruction shares the exact same derivation.
+export { collectChangedFiles } from '../review-enforcement.ts';
 import {
   adaptProviderCompletion,
   buildReviewTargetManifest,
@@ -103,6 +118,7 @@ import {
   ReviewProtocolFramer,
   renderDispositionedReviewFindingsPrompt,
   renderStrictReviewPrompt,
+  resolveBaseTip,
   resolveReviewIntent,
   resolveRoleEquivalentCapability,
   resolveTrustedSkillCapability,
@@ -2942,6 +2958,7 @@ export function buildReviewRunRecord(options: BuildReviewRunRecordOptions): Revi
       dryRun: options.dryRun,
       activeSurfaces: options.activeSurfaces,
       profileContext: options.profileContext,
+      taskBindingId: options.taskBindingId,
       attempt,
       onGateStart: options.onGateStart,
       onGateFinish: options.onGateFinish,
@@ -3105,6 +3122,7 @@ function runReviewAttempt(options: {
   dryRun: boolean;
   activeSurfaces: string[];
   profileContext?: ReviewProfileContext;
+  taskBindingId?: string;
   attempt: ReviewRunAttemptInput;
   onGateStart?: (gate: ReviewGateConfig) => void;
   onGateFinish?: (gate: ReviewGateRunRecord) => void;
@@ -3133,6 +3151,8 @@ function runReviewAttempt(options: {
           strictPreparationError: options.attempt.strictPreparationError,
           activeSurfaces: options.activeSurfaces,
           profileContext: options.profileContext,
+          worktreeStatus: options.attempt.worktreeStatus,
+          taskBindingId: options.taskBindingId,
           deferAiGate,
         });
     options.onGateFinish?.(record);
@@ -3976,6 +3996,8 @@ function runReviewGate(options: {
   strictPreparationError?: string;
   activeSurfaces: string[];
   profileContext?: ReviewProfileContext;
+  worktreeStatus?: WorktreeStatusSnapshot;
+  taskBindingId?: string;
   // B4: when a blocking deterministic gate has already failed this run, defer the
   // expensive AI judge to `pending` instead of invoking it.
   deferAiGate?: boolean;
@@ -4055,7 +4077,34 @@ function runReviewGate(options: {
         externalEvidenceId: evidence.id,
       });
     }
-    return runAiReviewGate({
+    // Verdict cache consult (§4.4): the scope key is computed from the exact
+    // state the reviewer would see; a signed mode-compatible hit replays the
+    // recorded verdict with zero model invocations. Signature, key, and
+    // rotation validity are enforced fail-closed inside the store (D16).
+    const verdictScope = !dryRun && !reviewConfigChanged && process.env.PIPELANE_REVIEW_NO_VERDICT_CACHE !== '1'
+      ? computeAiReviewGateVerdictScope({
+          gate,
+          repoRoot,
+          commonDir,
+          config,
+          baseBranch,
+          changedFiles,
+          intent: options.intent,
+          worktreeStatus: options.worktreeStatus,
+        })
+      : null;
+    if (verdictScope) {
+      const replay = replayCachedAiReviewGateVerdict({
+        base,
+        startMs,
+        gate,
+        commonDir,
+        config,
+        scope: verdictScope,
+      });
+      if (replay) return replay;
+    }
+    const record = runAiReviewGate({
       base,
       startMs,
       gate,
@@ -4071,6 +4120,18 @@ function runReviewGate(options: {
       builtTarget: options.builtTarget,
       strictPreparationError: options.strictPreparationError,
     });
+    if (verdictScope) {
+      maybeRecordAiReviewGateVerdict({
+        commonDir,
+        config,
+        repoRoot,
+        runId,
+        taskBindingId: options.taskBindingId,
+        scope: verdictScope,
+        record,
+      });
+    }
+    return record;
   }
 
   if (gate.type !== 'command' && gate.type !== 'pipelane') {
@@ -4221,6 +4282,146 @@ function resolveRecordedExternalReviewEvidence(options: {
     };
   }
   return { record };
+}
+
+// Scope-qualified verdict-cache key (D13) for one AI gate execution. Every
+// field must be recomputable before the gate spawns; when any identity input
+// is unreliable the gate simply does not participate in the cache
+// (fail-closed to a normal review). Contract and reviewed-scope digests come
+// from the helpers shared with the E6 evidence path so runner and evidence
+// keys can never drift. Delta scopes arrive with slice S5 — until then every
+// runner-produced entry is reviewMode=full with an empty deltaBaseTree.
+//
+// strict-v3 is deliberately NOT cached in S2 (returns null). The pre-S3
+// contractDigest does not capture the strict reviewer's separately-resolved
+// trusted-skill contract bytes, and a self-contained strict entry needs the
+// full result-envelope + verified-artifact evidence shape that S3's bundled
+// judge contract (D3) introduces. Until then strict reviews always re-run;
+// the fleet ships legacy-v2 today (S0 §7.2), so this defers value that does
+// not yet exist rather than dropping value in use.
+function computeAiReviewGateVerdictScope(options: {
+  gate: ReviewGateConfig;
+  repoRoot: string;
+  commonDir: string;
+  config: WorkflowConfig;
+  baseBranch: string;
+  changedFiles: string[];
+  intent?: ReviewIntent;
+  worktreeStatus?: WorktreeStatusSnapshot;
+}): ReviewVerdictScope | null {
+  const { gate, config } = options;
+  if ((config.reviewGates?.enforcementMode ?? 'legacy-v2') === 'strict-v3') return null;
+  const worktreeStatus = options.worktreeStatus;
+  if (!worktreeStatus || worktreeStatus.materialTreeReliable !== true || !worktreeStatus.materialTreeHash) {
+    return null;
+  }
+  let contractDigest: string;
+  try {
+    contractDigest = computeReviewVerdictContractDigest({
+      repoRoot: options.repoRoot,
+      commonDir: options.commonDir,
+      config,
+      gateId: gate.id,
+    });
+  } catch {
+    return null;
+  }
+  let baseTipOid: string;
+  try {
+    baseTipOid = resolveBaseTip(options.repoRoot, options.baseBranch);
+  } catch {
+    return null;
+  }
+  return {
+    gateId: gate.id,
+    gateDefinitionHash: reviewGateDefinitionHash(gate),
+    contractDigest,
+    materialTreeHash: worktreeStatus.materialTreeHash,
+    baseTipOid,
+    reviewMode: 'full',
+    deltaBaseTree: '',
+    reviewedScopeDigest: computeFullReviewedScopeDigest(options.changedFiles),
+    intentDigest: options.intent?.digest ?? '',
+  };
+}
+
+// Replays a signed legacy cache hit as this run's gate record. Authorization-
+// relevant fields come ONLY from trusted sources: `status` and `attester` from
+// the signed cache entry, and the gate definition from `base` (the current
+// config). A retained original run supplies presentation detail (findings,
+// tails) for display, but review-state records are unsigned under the
+// compatibility default — so they are treated as presentation-only and can
+// never inject an attester or status that authorizes /pr or /merge. (strict-v3
+// never produces a scope, so this is only ever called for legacy.)
+function replayCachedAiReviewGateVerdict(options: {
+  base: Omit<ReviewGateRunRecord, 'status' | 'summary' | 'finishedAt' | 'durationMs'>;
+  startMs: number;
+  gate: ReviewGateConfig;
+  commonDir: string;
+  config: WorkflowConfig;
+  scope: ReviewVerdictScope;
+}): ReviewGateRunRecord | null {
+  const entry = lookupReviewVerdict(options.commonDir, options.config, options.scope);
+  if (!entry) return null;
+  const originalGate = loadReviewState(options.commonDir, options.config).records
+    .find((record) => record.id === entry.reviewRunId)
+    ?.gates.find((gateRecord) =>
+      gateRecord.gateId === options.gate.id
+      && gateRecord.status === entry.status
+      && !gateRecord.externalEvidenceId
+    );
+  const presentation: Partial<ReviewGateRunRecord> = originalGate
+    ? {
+        ...(originalGate.findings ? { findings: originalGate.findings } : {}),
+        ...(originalGate.stdoutTail ? { stdoutTail: originalGate.stdoutTail } : {}),
+        ...(originalGate.stderrTail ? { stderrTail: originalGate.stderrTail } : {}),
+      }
+    : {};
+  return finishGate(options.base, options.startMs, {
+    ...presentation,
+    status: entry.status,
+    summary: originalGate
+      ? `verdict cache hit (run ${entry.reviewRunId}): ${originalGate.summary}`
+      : entry.status === 'passed'
+        ? `verdict cache hit: this exact review scope passed in run ${entry.reviewRunId} at ${entry.recordedAt}; no model was invoked`
+        : `verdict cache hit: this exact review scope failed in run ${entry.reviewRunId} at ${entry.recordedAt}${entry.findingIds.length > 0 ? ` (findings: ${entry.findingIds.join(', ')})` : ''}; the tree is unchanged, so the recorded verdict stands`,
+    ...(entry.attester ? { attester: entry.attester } : {}),
+  });
+}
+
+// Writes a verdict entry after a legacy AI gate completes (strict-v3 never
+// produces a scope in S2, so this only runs for legacy). Only passes are
+// cached: legacy runs expose no discriminator between a real `failed` and an
+// infra failure, so a `failed` must re-review (D14 taxonomy arrives with S6).
+function maybeRecordAiReviewGateVerdict(options: {
+  commonDir: string;
+  config: WorkflowConfig;
+  repoRoot: string;
+  runId: string;
+  taskBindingId?: string;
+  scope: ReviewVerdictScope;
+  record: ReviewGateRunRecord;
+}): void {
+  const { record, scope } = options;
+  if (record.status !== 'passed') return;
+  if (record.externalEvidenceId) return;
+  // The verdict must describe the keyed tree. A fix-first gate may mutate the
+  // checkout and still pass; the outer review loop restarts on that mutation,
+  // but this write happens before the restart detector, so independently
+  // re-check the exact material identity before caching.
+  if (readReviewGateWorktreeStatus(options.repoRoot).materialTreeHash !== scope.materialTreeHash) return;
+  recordReviewVerdict(options.commonDir, options.config, {
+    scope,
+    status: record.status,
+    findingIds: (record.findings ?? []).map((finding) => finding.id),
+    attester: record.attester ?? null,
+    reviewRunId: options.runId,
+    recordedAt: record.finishedAt,
+    tokensUsed: 0,
+    pinLineage: options.taskBindingId
+      || runGit(options.repoRoot, ['branch', '--show-current'], true)?.trim()
+      || undefined,
+  });
 }
 
 function runAiReviewGate(options: {
@@ -5015,65 +5216,6 @@ function renderAiReviewGatePrompt(options: {
   ].join('\n');
 }
 
-function collectDispositionedKarpathyFindings(options: {
-  repoRoot: string;
-  commonDir: string;
-  config: WorkflowConfig;
-  gateId: string;
-}): ReviewDispositionPromptEntry[] {
-  if (options.gateId !== 'karpathy-diff') return [];
-  const target = currentCheckoutReviewEvidenceTarget(options.repoRoot);
-  const state = loadReviewState(options.commonDir, options.config);
-  const entries: ReviewDispositionPromptEntry[] = [];
-  for (const disposition of state.findingDispositions ?? []) {
-    if (
-      disposition.gateId !== options.gateId
-      || disposition.branchName !== target.branchName
-      || disposition.sha !== target.sha
-      || disposition.worktreeStatusDigest !== target.worktreeStatusDigest
-      || disposition.worktreeMaterialTreeHash !== target.worktreeMaterialTreeHash
-      || disposition.taskBindingId !== target.taskBindingId
-      || disposition.reviewTargetDigest !== target.reviewTargetDigest
-    ) continue;
-    entries.push({
-      disposition: 'spin-off',
-      findingRef: disposition.findingRef,
-      severity: disposition.finding.severity,
-      title: disposition.finding.title,
-      ...(disposition.finding.location ? { location: disposition.finding.location } : {}),
-      reason: disposition.reason,
-      followUpTask: disposition.followUpTask,
-    });
-  }
-  for (const consent of state.consents ?? []) {
-    if (
-      consent.kind !== 'accept-findings'
-      || consent.gateId !== options.gateId
-      || consent.branchName !== target.branchName
-      || consent.sha !== target.sha
-      || consent.worktreeStatusDigest !== target.worktreeStatusDigest
-      || consent.worktreeMaterialTreeHash !== target.worktreeMaterialTreeHash
-      || consent.taskBindingId !== target.taskBindingId
-      || consent.reviewTargetDigest !== target.reviewTargetDigest
-      || !consent.reviewRunId
-    ) continue;
-    const review = state.records.find((record) => record.id === consent.reviewRunId);
-    const gate = review?.gates.find((candidate) => candidate.gateId === options.gateId);
-    for (const finding of gate?.findings ?? []) {
-      entries.push({
-        disposition: 'accepted',
-        findingRef: `${review!.id}/${gate!.gateId}/${finding.id}`,
-        severity: finding.severity,
-        title: finding.title,
-        ...(finding.location ? { location: finding.location } : {}),
-        reason: consent.reason,
-      });
-    }
-  }
-  const unique = new Map(entries.map((entry) => [`${entry.disposition}\0${entry.findingRef}`, entry]));
-  return [...unique.values()];
-}
-
 function reviewGateCheckoutMutationSummary(
   label: string,
   before: WorktreeStatusSnapshot,
@@ -5298,31 +5440,6 @@ function manualGateSummary(gate: ReviewGateConfig): string {
 
 // Exported for B1: the orchestration material-change check reuses this exact
 // committed+staged+unstaged+untracked detection to decide if a slice is `empty`.
-export function collectChangedFiles(repoRoot: string, baseBranch: string): string[] {
-  const compareRef = runGit(repoRoot, ['rev-parse', '--verify', `origin/${baseBranch}`], true)?.trim()
-    ? `origin/${baseBranch}`
-    : baseBranch;
-  const mergeBase = runGit(repoRoot, ['merge-base', 'HEAD', compareRef], true)?.trim() ?? '';
-  const outputs = [
-    mergeBase ? runGit(repoRoot, ['diff', '--name-only', `${mergeBase}...HEAD`], true) ?? '' : '',
-    runGit(repoRoot, ['diff', '--cached', '--name-only'], true) ?? '',
-    runGit(repoRoot, ['diff', '--name-only'], true) ?? '',
-    runGit(repoRoot, ['ls-files', '--others', '--exclude-standard'], true) ?? '',
-  ];
-  const seen = new Set<string>();
-  const files: string[] = [];
-  for (const output of outputs) {
-    for (const line of output.split(/\r?\n/)) {
-      const file = line.trim();
-      if (file && !seen.has(file)) {
-        seen.add(file);
-        files.push(file);
-      }
-    }
-  }
-  return files;
-}
-
 function maybeAddReviewConfigChangeGate(
   gates: ReviewGateConfig[],
   options: {

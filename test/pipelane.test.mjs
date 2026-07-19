@@ -7345,6 +7345,933 @@ test('review fails read-only AI skill gate when command commits to HEAD', () => 
   }
 });
 
+// --- Convergence v1 S2: verdict cache (plan §4.4, §8-S2) ---
+
+function writeAiOnlyReviewGates(repoRoot, extraCommandGate = null) {
+  const configPath = writePipelaneConfig(repoRoot, 'Demo App');
+  const config = JSON.parse(readFileSync(configPath, 'utf8'));
+  config.reviewGates = {
+    planReview: { gates: [] },
+    gates: [
+      ...(extraCommandGate ? [extraCommandGate] : []),
+      { id: 'gstack-review', phase: 'ai-diff', type: 'skill', skill: 'review', userCommands: ['/review'], blocking: true },
+      { id: 'karpathy-diff', phase: 'ai-diff', type: 'skill', skill: 'karpathy-diff', userCommands: ['/karpathy diff'], blocking: true },
+    ],
+  };
+  // S2 fixtures re-run review on purpose; keep route safety from pausing the
+  // repeat runs (a cache-replayed run still debits the AI-run counter until
+  // the S1 currency split lands).
+  config.routeSafety = { defaultFixReviewLoops: 5, defaultMinutes: 240, defaultAiReviewRuns: 20, stopOnMajorFindings: true };
+  writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+  return configPath;
+}
+
+function verdictCacheDir(repoRoot) {
+  return path.join(sharedStateDir(repoRoot), 'review-verdicts');
+}
+
+function listVerdictEntryFiles(repoRoot) {
+  const root = verdictCacheDir(repoRoot);
+  if (!existsSync(root)) return [];
+  return readdirSync(root).filter((name) => name.endsWith('.json') && name !== 'last-verdict-trees.json');
+}
+
+function aiReviewLogLines(logPath) {
+  return existsSync(logPath) ? readFileSync(logPath, 'utf8').trim().split(/\r?\n/).filter(Boolean) : [];
+}
+
+test('review verdict cache replays same-tree AI verdicts without model invocations', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const aiShim = createAiReviewShimEnv();
+  const logPath = path.join(aiShim.binDir, 'ai-review-log.txt');
+  const commandLogPath = path.join(aiShim.binDir, 'command-gate-log.txt');
+  const env = {
+    ...aiShim.env,
+    PIPELANE_TEST_AI_REVIEW_LOG: logPath,
+    PIPELANE_REVIEW_PROVIDER: 'codex',
+  };
+  try {
+    writeAiOnlyReviewGates(repoRoot, {
+      id: 'typecheck',
+      phase: 'static',
+      type: 'command',
+      blocking: true,
+      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('node:fs').appendFileSync(${JSON.stringify(commandLogPath)}, 'typecheck\\n', 'utf8')`)}`,
+    });
+    commitAll(repoRoot, 'Adopt verdict cache review gates');
+    writeFileSync(path.join(repoRoot, 'feature.txt'), 'cache me\n', 'utf8');
+
+    const first = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, env).stdout);
+    assert.equal(first.status, 'passed');
+    assert.deepEqual(aiReviewLogLines(logPath), ['gstack-review', 'karpathy-diff']);
+    const entries = listVerdictEntryFiles(repoRoot);
+    assert.equal(entries.length, 2, 'one signed verdict entry per AI gate');
+    const sampleEntry = JSON.parse(readFileSync(path.join(verdictCacheDir(repoRoot), entries[0]), 'utf8'));
+    assert.equal(sampleEntry.scope.reviewMode, 'full');
+    assert.equal(sampleEntry.scope.deltaBaseTree, '');
+    assert.equal(sampleEntry.status, 'passed');
+    assert.match(sampleEntry.sig, /^[a-f0-9]{64}$/);
+    assert.match(sampleEntry.keyId, /^[a-f0-9]{16}$/);
+    const evidence = JSON.parse(readFileSync(first.evidencePath, 'utf8'));
+    assert.equal(sampleEntry.reviewRunId, evidence.records[0].id, 'entry provenance points at the recording run');
+
+    // Unchanged tree: the second run replays both verdicts with 0 model
+    // invocations (§8-S2 acceptance) while deterministic gates still execute.
+    const second = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, env).stdout);
+    assert.equal(second.status, 'passed');
+    assert.deepEqual(aiReviewLogLines(logPath), ['gstack-review', 'karpathy-diff'], 'no new AI spawns on an unchanged tree');
+    for (const gateId of ['gstack-review', 'karpathy-diff']) {
+      const gate = second.gates.find((candidate) => candidate.gateId === gateId);
+      assert.equal(gate.status, 'passed');
+      assert.match(gate.summary, /verdict cache hit/);
+    }
+    assert.equal(readFileSync(commandLogPath, 'utf8'), 'typecheck\ntypecheck\n', 'command gates are not cached by S2');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(aiShim.binDir, { recursive: true, force: true });
+  }
+});
+
+test('review verdict cache misses on tree change and on base tip movement', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const aiShim = createAiReviewShimEnv();
+  const logPath = path.join(aiShim.binDir, 'ai-review-log.txt');
+  const env = {
+    ...aiShim.env,
+    PIPELANE_TEST_AI_REVIEW_LOG: logPath,
+    PIPELANE_REVIEW_PROVIDER: 'codex',
+  };
+  try {
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{ id: 'karpathy-diff', phase: 'ai-diff', type: 'skill', skill: 'karpathy-diff', userCommands: ['/karpathy diff'], blocking: true }],
+    };
+    config.routeSafety = { defaultFixReviewLoops: 5, defaultMinutes: 240, defaultAiReviewRuns: 20, stopOnMajorFindings: true };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt single AI review gate');
+    writeFileSync(path.join(repoRoot, 'feature.txt'), 'v1\n', 'utf8');
+
+    runCli(['run', 'review', '--json'], repoRoot, env);
+    assert.equal(aiReviewLogLines(logPath).length, 1);
+    runCli(['run', 'review', '--json'], repoRoot, env);
+    assert.equal(aiReviewLogLines(logPath).length, 1, 'same tree hits the cache');
+
+    writeFileSync(path.join(repoRoot, 'feature.txt'), 'v2\n', 'utf8');
+    runCli(['run', 'review', '--json'], repoRoot, env);
+    assert.equal(aiReviewLogLines(logPath).length, 2, 'material tree change misses');
+
+    // Base movement (the rebase-class invalidation): origin/main advances while
+    // the local tree stays byte-identical — baseTipOid changes, so the cached
+    // verdict must not be reused (§8-S2: rebase ⇒ miss).
+    advanceRemoteMain(remoteRoot, 'unrelated-base-advance.txt');
+    execFileSync('git', ['fetch', 'origin'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    runCli(['run', 'review', '--json'], repoRoot, env);
+    assert.equal(aiReviewLogLines(logPath).length, 3, 'baseTipOid change misses');
+    runCli(['run', 'review', '--json'], repoRoot, env);
+    assert.equal(aiReviewLogLines(logPath).length, 3, 'new base tip caches again');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(aiShim.binDir, { recursive: true, force: true });
+  }
+});
+
+test('review verdict cache is fail-closed: tampered, unsigned, keyless, and rotated entries all miss', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const aiShim = createAiReviewShimEnv();
+  const logPath = path.join(aiShim.binDir, 'ai-review-log.txt');
+  const env = {
+    ...aiShim.env,
+    PIPELANE_TEST_AI_REVIEW_LOG: logPath,
+    PIPELANE_REVIEW_PROVIDER: 'codex',
+  };
+  const keyA = 'verdict-cache-rotation-test-key-aaaaaaaa';
+  const keyB = 'verdict-cache-rotation-test-key-bbbbbbbb';
+  try {
+    const configPath = writePipelaneConfig(repoRoot, 'Demo App');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{ id: 'karpathy-diff', phase: 'ai-diff', type: 'skill', skill: 'karpathy-diff', userCommands: ['/karpathy diff'], blocking: true }],
+    };
+    config.routeSafety = { defaultFixReviewLoops: 5, defaultMinutes: 240, defaultAiReviewRuns: 20, stopOnMajorFindings: true };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt single AI review gate');
+    writeFileSync(path.join(repoRoot, 'feature.txt'), 'sign me\n', 'utf8');
+
+    runCli(['run', 'review', '--json'], repoRoot, env);
+    assert.equal(aiReviewLogLines(logPath).length, 1);
+    const entryPath = () => path.join(verdictCacheDir(repoRoot), listVerdictEntryFiles(repoRoot)[0]);
+
+    // Bad signature: flip payload content under the recorded signature.
+    const tampered = JSON.parse(readFileSync(entryPath(), 'utf8'));
+    tampered.recordedAt = new Date(Date.now() + 1000).toISOString();
+    writeFileSync(entryPath(), JSON.stringify(tampered, null, 2) + '\n', 'utf8');
+    runCli(['run', 'review', '--json'], repoRoot, env);
+    assert.equal(aiReviewLogLines(logPath).length, 2, 'tampered entry is a miss (fail-closed re-review)');
+
+    // Missing signature.
+    const unsigned = JSON.parse(readFileSync(entryPath(), 'utf8'));
+    delete unsigned.sig;
+    writeFileSync(entryPath(), JSON.stringify(unsigned, null, 2) + '\n', 'utf8');
+    runCli(['run', 'review', '--json'], repoRoot, env);
+    assert.equal(aiReviewLogLines(logPath).length, 3, 'unsigned entry is a miss');
+
+    // Unresolvable key (explicit key below the minimum length): consult and
+    // write must both fail closed without crashing the run.
+    const beforeKeyless = readFileSync(entryPath(), 'utf8');
+    const keylessRun = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, {
+      ...env,
+      PIPELANE_CONVERGENCE_STATE_KEY: 'too-short',
+    }).stdout);
+    assert.equal(keylessRun.status, 'passed');
+    assert.equal(aiReviewLogLines(logPath).length, 4, 'absent/invalid signing key never trusts the cache');
+    assert.equal(readFileSync(entryPath(), 'utf8'), beforeKeyless, 'no unsigned entry is written without a key');
+
+    // Key rotation: entries signed under the retired key invalidate to a miss,
+    // then re-derive under the active key.
+    runCli(['run', 'review', '--json'], repoRoot, { ...env, PIPELANE_CONVERGENCE_STATE_KEY: keyA });
+    assert.equal(aiReviewLogLines(logPath).length, 5, 'rotated key invalidates prior-key entries');
+    runCli(['run', 'review', '--json'], repoRoot, { ...env, PIPELANE_CONVERGENCE_STATE_KEY: keyA });
+    assert.equal(aiReviewLogLines(logPath).length, 5, 'same key hits the re-derived entry');
+    runCli(['run', 'review', '--json'], repoRoot, { ...env, PIPELANE_CONVERGENCE_STATE_KEY: keyB });
+    assert.equal(aiReviewLogLines(logPath).length, 6, 'second rotation invalidates again');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(aiShim.binDir, { recursive: true, force: true });
+  }
+});
+
+test('verdict cache: delta entries never satisfy full lookups; pinned entries survive LRU pressure', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const stateMod = await import(pathToFileURL(path.join(KIT_ROOT, 'dist', 'operator', 'state.js')).href);
+    const verdicts = await import(pathToFileURL(path.join(KIT_ROOT, 'dist', 'operator', 'review-verdicts.js')).href);
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+    const scopeOf = (patch = {}) => ({
+      gateId: 'gstack-review',
+      gateDefinitionHash: 'g'.repeat(64),
+      contractDigest: 'c'.repeat(64),
+      materialTreeHash: 'm'.repeat(40),
+      baseTipOid: 'b'.repeat(40),
+      reviewMode: 'full',
+      deltaBaseTree: '',
+      reviewedScopeDigest: 'r'.repeat(64),
+      intentDigest: '',
+      ...patch,
+    });
+    const valueOf = (patch = {}) => ({
+      status: 'passed',
+      findingIds: [],
+      attester: null,
+      reviewRunId: 'review-unit-run',
+      recordedAt: new Date().toISOString(),
+      ...patch,
+    });
+
+    // D13 mode compatibility: a delta verdict never satisfies a full-mode
+    // requirement. Every consumer is an exact-scope consumer, so the full
+    // scope (reviewMode=full, empty deltaBaseTree) can never resolve a delta
+    // entry — and scope fields beyond the mode discriminate too.
+    const deltaScope = scopeOf({ reviewMode: 'delta', deltaBaseTree: 'd'.repeat(40) });
+    assert.ok(verdicts.recordReviewVerdict(context.commonDir, context.config, { scope: deltaScope, ...valueOf() }));
+    assert.equal(verdicts.lookupReviewVerdict(context.commonDir, context.config, scopeOf()), null);
+    assert.ok(verdicts.lookupReviewVerdict(context.commonDir, context.config, deltaScope), 'exact delta scope still resolves for the inner loop (S5)');
+
+    const fullEntry = verdicts.recordReviewVerdict(context.commonDir, context.config, { scope: scopeOf(), ...valueOf({ reviewRunId: 'review-unit-full' }) });
+    assert.ok(fullEntry);
+    assert.equal(verdicts.lookupReviewVerdict(context.commonDir, context.config, scopeOf()).reviewRunId, 'review-unit-full');
+    // Any single qualifier change is a miss: same tree, different base tip.
+    assert.equal(verdicts.lookupReviewVerdict(context.commonDir, context.config, scopeOf({ baseTipOid: 'e'.repeat(40) })), null);
+    assert.equal(verdicts.lookupReviewVerdict(context.commonDir, context.config, scopeOf({ contractDigest: 'f'.repeat(64) })), null);
+    assert.equal(verdicts.lookupReviewVerdict(context.commonDir, context.config, scopeOf({ intentDigest: 'i'.repeat(64) })), null);
+
+    // Pinning under LRU pressure (D10/D13): a live-evidence entry (reviewRunId
+    // present in review-state) and a lastVerdictTree entry survive while
+    // unpinned filler is evicted; the cap holds at 200.
+    const dryRun = JSON.parse(runCli(['run', 'review', '--dry-run', '--json'], repoRoot).stdout);
+    const liveRunId = JSON.parse(readFileSync(dryRun.evidencePath, 'utf8')).records[0].id;
+    const liveScope = scopeOf({ materialTreeHash: 'a1'.repeat(20) });
+    assert.ok(verdicts.recordReviewVerdict(context.commonDir, context.config, { scope: liveScope, ...valueOf({ reviewRunId: liveRunId }) }));
+    const pinnedTreeScope = scopeOf({ materialTreeHash: 'a2'.repeat(20) });
+    assert.ok(verdicts.recordReviewVerdict(context.commonDir, context.config, {
+      scope: pinnedTreeScope,
+      ...valueOf({ reviewRunId: 'review-unit-pinned-tree' }),
+      pinLineage: 'task-pin-lineage',
+    }));
+    for (let index = 0; index < 210; index += 1) {
+      const filler = scopeOf({ materialTreeHash: createHash('sha1').update(`filler-${index}`).digest('hex') });
+      assert.ok(verdicts.recordReviewVerdict(context.commonDir, context.config, { scope: filler, ...valueOf({ reviewRunId: `review-unit-filler-${index}` }) }));
+    }
+    const remaining = listVerdictEntryFiles(repoRoot);
+    assert.equal(remaining.length, verdicts.REVIEW_VERDICT_CACHE_MAX_ENTRIES, 'LRU cap holds');
+    assert.ok(verdicts.lookupReviewVerdict(context.commonDir, context.config, liveScope), 'live-evidence entry survives LRU pressure');
+    assert.ok(verdicts.lookupReviewVerdict(context.commonDir, context.config, pinnedTreeScope), 'lastVerdictTree entry survives LRU pressure');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('verdict cache: same-tree base-tip variants do not pin unboundedly (cap holds)', async () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const stateMod = await import(pathToFileURL(path.join(KIT_ROOT, 'dist', 'operator', 'state.js')).href);
+    const verdicts = await import(pathToFileURL(path.join(KIT_ROOT, 'dist', 'operator', 'review-verdicts.js')).href);
+    const context = stateMod.resolveWorkflowContext(repoRoot);
+    const value = () => ({ status: 'passed', findingIds: [], attester: null, reviewRunId: 'review-unit-same-tree', recordedAt: new Date().toISOString() });
+
+    // One lineage/gate reviews the SAME material tree 210 times as the base
+    // branch advances (distinct baseTipOid each time, identical content). Under
+    // material-tree pinning every variant stayed pinned and the store grew past
+    // the cap (the reported 210/200). With exact per-(lineage,gate) pinning each
+    // review supersedes the prior pin, so only the current one is pinned and the
+    // stale base-tip variants evict — the cap holds.
+    let lastScope = null;
+    for (let index = 0; index < 210; index += 1) {
+      lastScope = {
+        gateId: 'gstack-review',
+        gateDefinitionHash: 'g'.repeat(64),
+        contractDigest: 'c'.repeat(64),
+        materialTreeHash: 'm'.repeat(40),
+        baseTipOid: createHash('sha1').update(`base-${index}`).digest('hex'),
+        reviewMode: 'full',
+        deltaBaseTree: '',
+        reviewedScopeDigest: 'r'.repeat(64),
+        intentDigest: '',
+      };
+      assert.ok(verdicts.recordReviewVerdict(context.commonDir, context.config, {
+        scope: lastScope,
+        ...value(),
+        pinLineage: 'single-lineage',
+      }));
+    }
+    assert.equal(listVerdictEntryFiles(repoRoot).length, verdicts.REVIEW_VERDICT_CACHE_MAX_ENTRIES, 'same-tree base-tip variants do not defeat the cap');
+    assert.ok(verdicts.lookupReviewVerdict(context.commonDir, context.config, lastScope), 'the current (latest) verdict for the lineage survives');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+  }
+});
+
+test('pr backfills status-matched review evidence with the commit tree so merge consumes one review (E1)', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const aiShim = createAiReviewShimEnv();
+  const logPath = path.join(aiShim.binDir, 'ai-review-log.txt');
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_PR_MERGE_PUSH_HEAD: '1',
+    ...aiShim.env,
+    PIPELANE_TEST_AI_REVIEW_LOG: logPath,
+    PIPELANE_REVIEW_PROVIDER: 'codex',
+  };
+  try {
+    writeAiOnlyReviewGates(repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'E1 Chain', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'ship me\n', 'utf8');
+
+    const review = JSON.parse(runCli(['run', 'review', '--json'], created.worktreePath, env).stdout);
+    assert.equal(review.status, 'passed');
+    assert.deepEqual(aiReviewLogLines(logPath), ['gstack-review', 'karpathy-diff']);
+
+    // Simulate the E1 gap class: the record matched /pr via the status-digest
+    // channel but carries no reliable material identity. (The hermetic test
+    // env records no ambient reviewer identity, so give the record a worker
+    // session from the other provider family the way seeded evidence does.)
+    const evidenceState = JSON.parse(readFileSync(review.evidencePath, 'utf8'));
+    delete evidenceState.records[0].worktreeMaterialTreeHash;
+    delete evidenceState.records[0].worktreeMaterialTreeReliable;
+    delete evidenceState.records[0].worktreeMaterialTreeWarnings;
+    evidenceState.records[0].authorIdentity = {
+      provider: 'claude',
+      sessionId: hashedSessionId('e1-chain-worker-session'),
+      source: 'CLAUDE_SESSION_ID',
+    };
+    evidenceState.records[0].reviewer = evidenceState.records[0].authorIdentity;
+    writeFileSync(review.evidencePath, JSON.stringify(evidenceState, null, 2) + '\n', 'utf8');
+
+    const prResult = runCli(['run', 'pr', '--title', 'E1 Chain', '--json'], created.worktreePath, env, true);
+    assert.equal(prResult.status, 0, prResult.stderr);
+    const branchHead = run('git', ['rev-parse', 'HEAD'], created.worktreePath);
+    const headTree = run('git', ['rev-parse', 'HEAD^{tree}'], created.worktreePath);
+    const backfilled = JSON.parse(readFileSync(review.evidencePath, 'utf8')).records
+      .find((record) => record.id === evidenceState.records[0].id);
+    assert.equal(backfilled.worktreeMaterialTreeHash, headTree, 'pr backfills its commit tree onto the record');
+    assert.equal(backfilled.worktreeMaterialTreeReliable, true);
+    assert.match((backfilled.worktreeMaterialTreeWarnings ?? []).join(' '), /backfilled/);
+
+    // /merge must accept the same review through its material channel — the
+    // whole pr→commit→merge chain consumes exactly one review (§8-S2).
+    const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
+    assert.equal(merged.mergedSha, branchHead);
+    assert.deepEqual(aiReviewLogLines(logPath), ['gstack-review', 'karpathy-diff'], 'no additional review was consumed by pr or merge');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(aiShim.binDir, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('pr override never backfills stale review evidence into merge-authorizing material evidence (E1)', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_PR_MERGE_PUSH_HEAD: '1',
+  };
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'No Override Backfill', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'reviewed revision\n', 'utf8');
+    commitLocal(created.worktreePath, 'Reviewed revision');
+    const reviewed = writePassingReviewEvidence(created.worktreePath);
+    const stateFile = path.join(sharedStateDir(created.worktreePath), 'review-state.json');
+    const state = JSON.parse(readFileSync(stateFile, 'utf8'));
+    delete state.records[0].worktreeMaterialTreeHash;
+    delete state.records[0].worktreeMaterialTreeReliable;
+    delete state.records[0].worktreeMaterialTreeWarnings;
+    writeFileSync(stateFile, JSON.stringify(state, null, 2) + '\n', 'utf8');
+
+    // Both revisions are clean, so they share the status-digest channel even
+    // though HEAD changed. /pr may explicitly bypass that stale-SHA issue,
+    // but the /pr-only consent must not mint reusable /merge evidence.
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'unreviewed revision\n', 'utf8');
+    commitLocal(created.worktreePath, 'Unreviewed revision');
+    const prResult = runCli([
+      'run', 'pr', '--title', 'No Override Backfill', '--override', '--reason',
+      'PR-only stale review acceptance', '--json',
+    ], created.worktreePath, env, true);
+    assert.equal(prResult.status, 0, prResult.stderr);
+    const afterPr = JSON.parse(readFileSync(stateFile, 'utf8')).records
+      .find((record) => record.id === reviewed.id);
+    assert.equal(afterPr.worktreeMaterialTreeHash, undefined, 'override-authorized evidence is never backfilled');
+
+    const mergeResult = runCli(['run', 'merge', '--json'], created.worktreePath, env, true);
+    assert.notEqual(mergeResult.status, 0, 'merge still requires review or its own exact-scope consent');
+    assert.match(mergeResult.stderr, /review gate evidence is not ready|review/i);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('merge accepts legacy material-tree-only review records (E1 regression guard)', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_PR_MERGE_PUSH_HEAD: '1',
+  };
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Legacy Material Only', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'material only\n', 'utf8');
+    commitLocal(created.worktreePath, 'Legacy material only change');
+
+    // A legacy-shaped record: no status-digest identity at all, only the
+    // material tree of this exact committed checkout.
+    writePassingReviewEvidence(created.worktreePath, {
+      removeWorktreeStatusDigest: true,
+      worktreeStatusReliable: false,
+    });
+
+    const prResult = runCli(['run', 'pr', '--title', 'Legacy Material Only', '--json'], created.worktreePath, env, true);
+    assert.equal(prResult.status, 0, prResult.stderr);
+    const branchHead = run('git', ['rev-parse', 'HEAD'], created.worktreePath);
+    const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
+    assert.equal(merged.mergedSha, branchHead, 'material-tree-only records remain acceptable to /merge');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('merge accepts a status-digest review record from the pr-head checkout (E1 merge-channel parity)', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_PR_MERGE_PUSH_HEAD: '1',
+  };
+  try {
+    writePipelaneConfig(repoRoot, 'Demo App');
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Status Channel Merge', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'status channel\n', 'utf8');
+    const prResult = runCli(['run', 'pr', '--title', 'Status Channel Merge', '--json'], created.worktreePath, env);
+    assert.equal(prResult.status, 0, prResult.stderr);
+
+    // Re-seed evidence on the now-clean PR-head checkout, then strip every
+    // material identity: the record can only match through the status-digest
+    // channel, which /merge historically never had.
+    writePassingReviewEvidence(created.worktreePath);
+    const stateFile = path.join(sharedStateDir(created.worktreePath), 'review-state.json');
+    const state = JSON.parse(readFileSync(stateFile, 'utf8'));
+    delete state.records[0].worktreeMaterialTreeHash;
+    delete state.records[0].worktreeMaterialTreeReliable;
+    delete state.records[0].worktreeMaterialTreeWarnings;
+    writeFileSync(stateFile, JSON.stringify(state, null, 2) + '\n', 'utf8');
+
+    const branchHead = run('git', ['rev-parse', 'HEAD'], created.worktreePath);
+    const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
+    assert.equal(merged.mergedSha, branchHead, 'merge accepts the status-digest channel exactly as /pr does');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('pr accepts a pending AI gate satisfied by a full-mode verdict cache entry (E6)', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const aiShim = createAiReviewShimEnv();
+  const logPath = path.join(aiShim.binDir, 'ai-review-log.txt');
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    ...aiShim.env,
+    PIPELANE_TEST_AI_REVIEW_LOG: logPath,
+    PIPELANE_REVIEW_PROVIDER: 'codex',
+  };
+  try {
+    writeAiOnlyReviewGates(repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'E6 Cache Evidence', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'cache evidence\n', 'utf8');
+
+    const review = JSON.parse(runCli(['run', 'review', '--json'], created.worktreePath, env).stdout);
+    assert.equal(review.status, 'passed');
+    assert.deepEqual(aiReviewLogLines(logPath), ['gstack-review', 'karpathy-diff']);
+
+    // Degrade the stored record: karpathy-diff back to pending (e.g. adapter
+    // unavailable on a later evaluation). The signed full-mode cache entry for
+    // this exact tree must satisfy the evidence check instead (E6). The
+    // hermetic env records no ambient reviewer identity, so give the record a
+    // worker session from the other provider family like seeded evidence does.
+    const evidenceState = JSON.parse(readFileSync(review.evidencePath, 'utf8'));
+    const record = evidenceState.records[0];
+    record.status = 'pending';
+    record.authorIdentity = {
+      provider: 'claude',
+      sessionId: hashedSessionId('e6-cache-worker-session'),
+      source: 'CLAUDE_SESSION_ID',
+    };
+    record.reviewer = record.authorIdentity;
+    const gate = record.gates.find((candidate) => candidate.gateId === 'karpathy-diff');
+    gate.status = 'pending';
+    gate.summary = 'degraded to pending for the E6 fixture';
+    writeFileSync(review.evidencePath, JSON.stringify(evidenceState, null, 2) + '\n', 'utf8');
+
+    const prResult = runCli(['run', 'pr', '--title', 'E6 Cache Evidence', '--json'], created.worktreePath, env, true);
+    assert.equal(prResult.status, 0, prResult.stderr);
+    assert.match(JSON.parse(prResult.stdout).message, /pull request/i);
+    assert.deepEqual(aiReviewLogLines(logPath), ['gstack-review', 'karpathy-diff'], 'the cache satisfied evidence without a new model invocation');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(aiShim.binDir, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('strict-v3 pending gates get no verdict-cache rescue (strict caching deferred to S3)', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-strict-e6-codex-'));
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  const reviewScript = path.join(repoRoot, '.git', 'strict-e6-review.mjs');
+  writeFakeGh(ghBin, ghStateFile);
+  writeFileSync(reviewScript, `import { readFileSync } from 'node:fs';
+readFileSync(0, 'utf8');
+process.stdout.write(JSON.stringify({ status: 'passed', findings: [], report: 'Strict E6 seed clean.' }));
+`, 'utf8');
+  const skillDir = path.join(codexHome, 'skills', 'karpathy-diff');
+  mkdirSync(skillDir, { recursive: true });
+  writeFileSync(path.join(skillDir, 'SKILL.md'), '---\nname: karpathy-diff\n---\nRead-only traceability review.\n', 'utf8');
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    CODEX_HOME: codexHome,
+    PIPELANE_REVIEW_KARPATHY_DIFF_PROVIDER: 'codex',
+  };
+  try {
+    writePipelaneConfig(repoRoot, 'Strict E6 Intent', {
+      routeSafety: { defaultFixReviewLoops: 5, defaultMinutes: 240, defaultAiReviewRuns: 20, stopOnMajorFindings: true },
+      reviewGates: {
+        enforcementMode: 'strict-v3', policyVersion: 3, planReview: { gates: [] },
+        gates: [{
+          id: 'karpathy-diff', phase: 'ai-diff', type: 'skill', blocking: true,
+          skill: 'karpathy-diff', userCommands: ['/karpathy diff'],
+          command: `${JSON.stringify(process.execPath)} ${JSON.stringify(reviewScript)}`,
+        }],
+      },
+    });
+    commitAll(repoRoot, 'Adopt strict E6 review');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Strict E6 Intent', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'strict cache evidence\n', 'utf8');
+    const review = JSON.parse(runCli([
+      'run', 'review', '--intent', 'Review the strict E6 seed intent', '--json',
+    ], created.worktreePath, env).stdout);
+    assert.equal(review.status, 'passed');
+    // Strict-v3 writes no cache entry, so there is nothing to rescue a pending
+    // gate — the seed review persists but no verdict store is populated.
+    assert.deepEqual(listVerdictEntryFiles(created.worktreePath), [], 'strict-v3 wrote no verdict entry');
+
+    // Recast the passed run as a dry-run seed and add a fresh pending run for
+    // the same tree. With no cache and no equivalent full-run evidence, the
+    // pending gate stays blocking through `/pr`.
+    const state = JSON.parse(readFileSync(review.evidencePath, 'utf8'));
+    const seed = state.records[0];
+    seed.dryRun = true;
+    const pending = JSON.parse(JSON.stringify(seed));
+    pending.id = `${seed.id}-pending`;
+    pending.dryRun = false;
+    pending.status = 'pending';
+    pending.authorIdentity = {
+      provider: 'claude',
+      sessionId: hashedSessionId('strict-e6-worker-session'),
+      source: 'CLAUDE_SESSION_ID',
+    };
+    pending.reviewer = pending.authorIdentity;
+    pending.gates = pending.gates.map((gate) => {
+      const next = { ...gate, status: 'pending', summary: 'pending strict gate with no cache to satisfy it' };
+      delete next.result;
+      delete next.findings;
+      delete next.reportArtifact;
+      delete next.attester;
+      return next;
+    });
+    state.records = [pending, seed];
+    writeFileSync(review.evidencePath, JSON.stringify(state, null, 2) + '\n', 'utf8');
+
+    const prResult = runCli(['run', 'pr', '--title', 'Strict E6 Intent', '--json'], created.worktreePath, env, true);
+    assert.notEqual(prResult.status, 0, 'strict pending gate is not rescued by any cache entry');
+    assert.match(prResult.stderr, /review gate evidence is not ready|pending/i);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('merge attaches a cache-satisfied pending gate across the pr commit boundary (E6)', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const aiShim = createAiReviewShimEnv();
+  const logPath = path.join(aiShim.binDir, 'ai-review-log.txt');
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    GH_PR_MERGE_PUSH_HEAD: '1',
+    ...aiShim.env,
+    PIPELANE_TEST_AI_REVIEW_LOG: logPath,
+    PIPELANE_REVIEW_PROVIDER: 'codex',
+  };
+  try {
+    writeAiOnlyReviewGates(repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'E6 Across Commit', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'cache across commit\n', 'utf8');
+
+    // Seed the cache: a clean review writes verdict entries for this tree.
+    const review = JSON.parse(runCli(['run', 'review', '--json'], created.worktreePath, env).stdout);
+    assert.equal(review.status, 'passed');
+    assert.deepEqual(aiReviewLogLines(logPath), ['gstack-review', 'karpathy-diff']);
+
+    // Degrade the persisted record so karpathy-diff is pending: only the signed
+    // cache entry can satisfy it. Give the record a cross-provider worker
+    // identity (hermetic env records none).
+    const evidenceState = JSON.parse(readFileSync(review.evidencePath, 'utf8'));
+    const record = evidenceState.records[0];
+    record.status = 'pending';
+    record.authorIdentity = { provider: 'claude', sessionId: hashedSessionId('e6-commit-worker'), source: 'CLAUDE_SESSION_ID' };
+    record.reviewer = record.authorIdentity;
+    const gate = record.gates.find((candidate) => candidate.gateId === 'karpathy-diff');
+    gate.status = 'pending';
+    gate.summary = 'degraded to pending for the across-commit E6 fixture';
+    writeFileSync(review.evidencePath, JSON.stringify(evidenceState, null, 2) + '\n', 'utf8');
+
+    // /pr commits (HEAD SHA moves; the committed tree is exactly the reviewed
+    // content, so /pr backfills the material tree). E6 attaches pre-commit.
+    const prResult = runCli(['run', 'pr', '--title', 'E6 Across Commit', '--json'], created.worktreePath, env, true);
+    assert.equal(prResult.status, 0, prResult.stderr);
+    assert.deepEqual(aiReviewLogLines(logPath), ['gstack-review', 'karpathy-diff'], 'no new model invocation through pr');
+
+    // At /merge the stored record's SHA is the pre-commit SHA, but the material
+    // tree matches (E1 backfill). The relaxed evidence guard + E6 reattach the
+    // cache hit so the pending gate is satisfied without re-review.
+    const branchHead = run('git', ['rev-parse', 'HEAD'], created.worktreePath);
+    const merged = JSON.parse(runCli(['run', 'merge', '--json'], created.worktreePath, env).stdout);
+    assert.equal(merged.mergedSha, branchHead, 'merge accepted the cache-satisfied pending gate across the commit boundary');
+    assert.deepEqual(aiReviewLogLines(logPath), ['gstack-review', 'karpathy-diff'], 'merge consumed no additional review');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(aiShim.binDir, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('verdict replay sources the attester from the signed entry, not the unsigned run record', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const aiShim = createAiReviewShimEnv();
+  const logPath = path.join(aiShim.binDir, 'ai-review-log.txt');
+  const env = {
+    ...aiShim.env,
+    PIPELANE_TEST_AI_REVIEW_LOG: logPath,
+    PIPELANE_REVIEW_PROVIDER: 'codex',
+  };
+  try {
+    const configPath = writePipelaneConfig(repoRoot, 'Attester Provenance');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{ id: 'gstack-review', phase: 'ai-diff', type: 'skill', skill: 'review', userCommands: ['/review'], blocking: true }],
+    };
+    config.routeSafety = { defaultFixReviewLoops: 5, defaultMinutes: 240, defaultAiReviewRuns: 20, stopOnMajorFindings: true };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Adopt attester-provenance gate');
+    writeFileSync(path.join(repoRoot, 'feature.txt'), 'provenance\n', 'utf8');
+
+    const first = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, env).stdout);
+    assert.equal(first.status, 'passed');
+    assert.equal(aiReviewLogLines(logPath).length, 1);
+    // The signed cache entry holds the real attester from when the gate ran.
+    const stateFile = path.join(sharedStateDir(repoRoot), 'review-state.json');
+    const signedAttester = first.gates.find((g) => g.gateId === 'gstack-review').attester;
+    assert.ok(signedAttester && signedAttester.provider, 'the run recorded a real attester');
+
+    // Tamper the UNSIGNED review-state record's gate attester with a fabricated
+    // identity — the class of edit an attacker without the signing key can make.
+    const state = JSON.parse(readFileSync(stateFile, 'utf8'));
+    const tampered = { provider: 'forged-provider', sessionId: 'sha256:forgedforged00', source: 'FORGED_SESSION_ID' };
+    state.records[0].gates.find((g) => g.gateId === 'gstack-review').attester = tampered;
+    writeFileSync(stateFile, JSON.stringify(state, null, 2) + '\n', 'utf8');
+
+    // Re-review the unchanged tree → cache hit → replay. The replayed gate's
+    // attester must come from the SIGNED entry, never the tampered record.
+    const second = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, env).stdout);
+    assert.equal(second.status, 'passed');
+    assert.equal(aiReviewLogLines(logPath).length, 1, 'cache replay: no new model invocation');
+    const replayedAttester = second.gates.find((g) => g.gateId === 'gstack-review').attester;
+    assert.match(second.gates.find((g) => g.gateId === 'gstack-review').summary, /verdict cache hit/);
+    assert.deepEqual(replayedAttester, signedAttester, 'attester is sourced from the signed entry');
+    assert.notEqual(replayedAttester.provider, 'forged-provider', 'the tampered unsigned attester is never used');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(aiShim.binDir, { recursive: true, force: true });
+  }
+});
+
+test('pr backfill refuses a commit tree mutated by a pre-commit hook (E1 fail-closed)', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const aiShim = createAiReviewShimEnv();
+  const logPath = path.join(aiShim.binDir, 'ai-review-log.txt');
+  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
+  const ghStateFile = path.join(ghBin, 'gh-state.json');
+  writeFakeGh(ghBin, ghStateFile);
+  const env = {
+    PATH: `${ghBin}:${process.env.PATH}`,
+    GH_STATE_FILE: ghStateFile,
+    ...aiShim.env,
+    PIPELANE_TEST_AI_REVIEW_LOG: logPath,
+    PIPELANE_REVIEW_PROVIDER: 'codex',
+  };
+  try {
+    writeAiOnlyReviewGates(repoRoot);
+    commitAll(repoRoot, 'Adopt pipelane');
+    const created = JSON.parse(runCli(['run', 'new', '--task', 'Hook Mutation', '--json'], repoRoot).stdout);
+    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'reviewed content\n', 'utf8');
+
+    const review = JSON.parse(runCli(['run', 'review', '--json'], created.worktreePath, env).stdout);
+    assert.equal(review.status, 'passed');
+
+    // Same E1 gap class as the happy-path test: no reliable material identity
+    // on the record, so /pr would want to backfill from its commit.
+    const evidenceState = JSON.parse(readFileSync(review.evidencePath, 'utf8'));
+    const recordId = evidenceState.records[0].id;
+    delete evidenceState.records[0].worktreeMaterialTreeHash;
+    delete evidenceState.records[0].worktreeMaterialTreeReliable;
+    delete evidenceState.records[0].worktreeMaterialTreeWarnings;
+    evidenceState.records[0].authorIdentity = {
+      provider: 'claude',
+      sessionId: hashedSessionId('hook-mutation-worker-session'),
+      source: 'CLAUDE_SESSION_ID',
+    };
+    evidenceState.records[0].reviewer = evidenceState.records[0].authorIdentity;
+    writeFileSync(review.evidencePath, JSON.stringify(evidenceState, null, 2) + '\n', 'utf8');
+
+    // A pre-commit hook smuggles unreviewed content into the commit. The hook
+    // lives OUTSIDE the worktree so installing it does not itself change the
+    // reviewed worktree state.
+    const hooksDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-test-hooks-'));
+    writeFileSync(path.join(hooksDir, 'pre-commit'), '#!/bin/sh\nprintf "smuggled" > smuggled-by-hook.txt\ngit add smuggled-by-hook.txt\n', { mode: 0o755, encoding: 'utf8' });
+    execFileSync('git', ['config', 'core.hooksPath', hooksDir], { cwd: created.worktreePath, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const prResult = runCli(['run', 'pr', '--title', 'Hook Mutation', '--json'], created.worktreePath, env, true);
+    assert.equal(prResult.status, 0, prResult.stderr);
+    assert.equal(readFileSync(path.join(created.worktreePath, 'smuggled-by-hook.txt'), 'utf8'), 'smuggled', 'the hook ran');
+
+    // The mutated commit tree must NOT be certified as reviewed material.
+    const afterPr = JSON.parse(readFileSync(review.evidencePath, 'utf8')).records
+      .find((record) => record.id === recordId);
+    assert.equal(afterPr.worktreeMaterialTreeHash, undefined, 'backfill refused the hook-mutated tree');
+
+    // And /merge consequently refuses the unreviewed content.
+    const mergeResult = runCli(['run', 'merge', '--json'], created.worktreePath, env, true);
+    assert.notEqual(mergeResult.status, 0, 'merge must not accept the hook-mutated commit');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(aiShim.binDir, { recursive: true, force: true });
+    rmSync(ghBin, { recursive: true, force: true });
+  }
+});
+
+test('strict-v3 reviews do not populate the verdict cache (deferred to S3)', () => {
+  const repoRoot = createRepo();
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'pipelane-strict-cache-codex-'));
+  const invocationLog = path.join(mkdtempSync(path.join(os.tmpdir(), 'pipelane-strict-cache-log-')), 'invocations.txt');
+  const reviewScript = path.join(repoRoot, '.git', 'strict-cache-review.mjs');
+  writeFileSync(reviewScript, `import { appendFileSync, readFileSync } from 'node:fs';
+readFileSync(0, 'utf8');
+appendFileSync(process.env.PIPELANE_TEST_STRICT_CACHE_LOG, 'invoked\\n', 'utf8');
+process.stdout.write(JSON.stringify({ status: 'passed', findings: [], report: 'Strict review clean.' }));
+`, 'utf8');
+  const skillDir = path.join(codexHome, 'skills', 'karpathy-diff');
+  mkdirSync(skillDir, { recursive: true });
+  writeFileSync(path.join(skillDir, 'SKILL.md'), '---\nname: karpathy-diff\n---\nRead-only traceability review.\n', 'utf8');
+  const reviewEnv = {
+    CODEX_HOME: codexHome,
+    PIPELANE_REVIEW_KARPATHY_DIFF_PROVIDER: 'codex',
+    PIPELANE_TEST_STRICT_CACHE_LOG: invocationLog,
+  };
+  try {
+    writePipelaneConfig(repoRoot, 'Strict No Cache', {
+      routeSafety: { defaultFixReviewLoops: 5, defaultMinutes: 240, defaultAiReviewRuns: 20, stopOnMajorFindings: true },
+      reviewGates: {
+        enforcementMode: 'strict-v3', policyVersion: 3, planReview: { gates: [] },
+        gates: [{
+          id: 'karpathy-diff', phase: 'ai-diff', type: 'skill', blocking: true,
+          skill: 'karpathy-diff', userCommands: ['/karpathy diff'],
+          command: `${JSON.stringify(process.execPath)} ${JSON.stringify(reviewScript)}`,
+        }],
+      },
+    });
+    commitLocal(repoRoot, 'Configure strict no-cache');
+    writeFileSync(path.join(repoRoot, 'feature.txt'), 'strict cache\n', 'utf8');
+
+    const first = JSON.parse(runCli([
+      'run', 'review', '--intent', 'Verify strict is not cached', '--json',
+    ], repoRoot, reviewEnv).stdout);
+    assert.equal(first.status, 'passed');
+    assert.equal(readFileSync(invocationLog, 'utf8'), 'invoked\n');
+    assert.deepEqual(listVerdictEntryFiles(repoRoot), [], 'strict-v3 writes no verdict entries in S2');
+
+    // Unchanged tree + same intent: strict-v3 caching is deferred to S3, so the
+    // provider must run again (no replay). The pre-S3 contract digest cannot
+    // yet capture the strict trusted-skill contract; caching lands with the S3
+    // judge contract (D3).
+    const second = JSON.parse(runCli([
+      'run', 'review', '--intent', 'Verify strict is not cached', '--json',
+    ], repoRoot, reviewEnv).stdout);
+    assert.equal(second.status, 'passed');
+    assert.equal(readFileSync(invocationLog, 'utf8'), 'invoked\ninvoked\n', 'strict re-runs the provider; no cache replay');
+    const replayed = second.gates.find((gate) => gate.gateId === 'karpathy-diff');
+    assert.doesNotMatch(replayed.summary, /verdict cache hit/);
+    assert.deepEqual(listVerdictEntryFiles(repoRoot), []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(path.dirname(invocationLog), { recursive: true, force: true });
+  }
+});
+
+test('legacy fix-first mutation never caches a verdict for the pre-fix tree', () => {
+  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
+  const invocationDir = mkdtempSync(path.join(os.tmpdir(), 'pipelane-fix-cache-log-'));
+  const invocationLog = path.join(invocationDir, 'invocations.txt');
+  const reviewScript = path.join(repoRoot, '.git', 'fix-cache-review.mjs');
+  // A legacy AI reviewer (plain PIPELANE_REVIEW_GATE_RESULT protocol) that, on
+  // the first pass over a "broken" tree, fixes it and passes — the fix-first
+  // mutation path. The verdict must never be cached for the pre-fix tree.
+  writeFileSync(reviewScript, `import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+readFileSync(0, 'utf8');
+appendFileSync(process.env.PIPELANE_TEST_FIX_CACHE_LOG, 'invoked\\n', 'utf8');
+const feature = new URL('../feature.txt', import.meta.url);
+if (readFileSync(feature, 'utf8') === 'broken\\n') writeFileSync(feature, 'fixed\\n', 'utf8');
+console.log('PIPELANE_REVIEW_GATE_RESULT=passed');
+`, 'utf8');
+  const env = {
+    PIPELANE_REVIEW_GSTACK_REVIEW_COMMAND: `${JSON.stringify(process.execPath)} ${JSON.stringify(reviewScript)}`,
+    PIPELANE_REVIEW_GSTACK_REVIEW_PROVIDER: 'codex',
+    PIPELANE_TEST_FIX_CACHE_LOG: invocationLog,
+  };
+  try {
+    const configPath = writePipelaneConfig(repoRoot, 'Fix First Cache');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.reviewGates = {
+      planReview: { gates: [] },
+      gates: [{ id: 'gstack-review', phase: 'ai-diff', type: 'skill', skill: 'review', userCommands: ['/review'], blocking: true }],
+    };
+    config.routeSafety = { defaultFixReviewLoops: 5, defaultMinutes: 240, defaultAiReviewRuns: 20, stopOnMajorFindings: true };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    commitAll(repoRoot, 'Configure fix-first cache gate');
+    writeFileSync(path.join(repoRoot, 'feature.txt'), 'broken\n', 'utf8');
+
+    const first = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, env).stdout);
+    assert.equal(first.status, 'passed');
+    assert.equal(readFileSync(path.join(repoRoot, 'feature.txt'), 'utf8'), 'fixed\n');
+    assert.equal(aiReviewLogLines(invocationLog).length, 2, 'mutation restarts and reviews the fixed tree');
+
+    // Recreate the byte-identical pre-fix tree. If the first attempt had cached
+    // its pass under that pre-fix key, this run would replay and skip the fixer.
+    writeFileSync(path.join(repoRoot, 'feature.txt'), 'broken\n', 'utf8');
+    const second = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, env).stdout);
+    assert.equal(second.status, 'passed');
+    assert.equal(readFileSync(path.join(repoRoot, 'feature.txt'), 'utf8'), 'fixed\n');
+    assert.equal(aiReviewLogLines(invocationLog).length, 3, 'pre-fix tree is a cache miss and invokes the fixer');
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(remoteRoot, { recursive: true, force: true });
+    rmSync(invocationDir, { recursive: true, force: true });
+  }
+});
+
 test('orchestrate bare command --yes completes when configured AI review gate passes', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const createdWorktrees = [];
@@ -39468,7 +40395,11 @@ test('dual-mode setup, review, route enforcement, and rollback preserve legacy b
     assert.equal(rollback.effective.enforcementMode, 'legacy-v2');
     const rerun = JSON.parse(runCli(['run', 'review', '--json'], repoRoot).stdout);
     assert.equal(rerun.status, 'passed');
-    assert.equal(readFileSync(invoked, 'utf8'), '11');
+    // S2 verdict cache: the rollback re-run targets the exact tree the first
+    // legacy pass certified, so the signed verdict replays with zero provider
+    // invocations (the strict interlude wrote no cacheable verdict).
+    assert.equal(readFileSync(invoked, 'utf8'), '1');
+    assert.match(rerun.gates[0].summary, /verdict cache hit/);
     context = state.resolveWorkflowContext(repoRoot);
     assert.equal(enforcement.evaluateReviewEvidenceForPr(context, { command: '/pr' }).allowed, true);
   } finally {

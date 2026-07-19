@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import {
   canonicalize,
   resolveReviewStateKey,
+  signSignedPayload,
 } from './integrity.ts';
 import {
   appendReviewOverrideRecord,
@@ -17,6 +18,8 @@ import {
   normalizeExistingPath,
   resolveWorkflowContext,
   runGit,
+  saveReviewState,
+  withReviewStateLock,
   type GateDefinitionHash,
   type OperatorFlags,
   type ReviewAcceptanceRecord,
@@ -26,11 +29,13 @@ import {
   type ReviewGateConfig,
   type ReviewGateRunRecord,
   type ReviewRunRecord,
+  type WorkflowConfig,
   type WorkflowContext,
 } from './state.ts';
 import { blockingAiReviewEvidenceBlocker, resolveReviewActorIdentity } from './review-identity.ts';
+import { lookupReviewVerdict, type ReviewVerdictEntry, type ReviewVerdictScope } from './review-verdicts.ts';
 import { REVIEW_GATES_POLICY_VERSION } from './review-gate-policy.ts';
-import { buildReviewTargetManifest } from './review-contract.ts';
+import { buildReviewTargetManifest, resolveBaseTip, type ReviewDispositionPromptEntry } from './review-contract.ts';
 import { readVerifiedReviewArtifact } from './review-artifacts.ts';
 import { reviewArtifactRoot } from './state.ts';
 import { projectReviewRun, renderReviewPresentation } from './review-output.ts';
@@ -846,9 +851,20 @@ function attachEquivalentReviewGateEvidence(options: {
 }): ReviewRunRecord {
   const { reviewRun } = options;
   if (!reviewRunCoversFullGateSet(reviewRun)) return reviewRun;
+  // A reviewed record identifies the current content when the branch matches
+  // and either the recorded SHA equals the current SHA or the reliable
+  // material tree matches exactly (same content, different commit — the E1
+  // channel). The latter is what lets a review recorded before a `/pr` commit
+  // still attach equivalent evidence at `/merge` on the resulting commit,
+  // whose tree the /pr backfill certified identical.
+  const shaOrMaterialMatches = reviewRun.sha === options.currentSha
+    || reviewRecordMaterialTreeMatchesCurrentWorktree(reviewRun, {
+      currentWorktreeMaterialTreeHash: options.currentWorktreeMaterialTreeHash,
+      currentWorktreeMaterialTreeReliable: options.currentWorktreeMaterialTreeReliable,
+    });
   if (
     reviewRun.branchName !== options.currentBranch
-    || reviewRun.sha !== options.currentSha
+    || !shaOrMaterialMatches
     || !reviewRecordMatchesCurrentWorktree(reviewRun, options)
   ) {
     return reviewRun;
@@ -876,6 +892,29 @@ function attachEquivalentReviewGateEvidence(options: {
       recordedAt: acceptance.recordedAt,
       gate: reviewAcceptanceToGate(pendingGate, acceptance),
     });
+  }
+
+  // E6: a mode-compatible verdict-cache hit is equivalent to a fresh pass for
+  // the exact current tree. Every consumer performs an exact-scope lookup —
+  // all nine D13 qualifiers (gate definition, contract, tree, base tip,
+  // review mode, reviewed scope, intent) are recomputed here and any that
+  // cannot be reconstructed makes the cache a miss. Only full-mode entries
+  // can qualify (delta scopes never equal a full scope), and signature/key
+  // validity is enforced inside the store (D16).
+  if (options.currentWorktreeMaterialTreeReliable === true && options.currentWorktreeMaterialTreeHash) {
+    const configuredGates = options.context.config.reviewGates?.gates ?? [];
+    for (const pendingGate of pendingManualGates) {
+      const configuredGate = configuredGates.find((candidate) => candidate.id === pendingGate.gateId);
+      if (!configuredGate) continue;
+      const candidate = verdictCacheEvidenceCandidate({
+        context: options.context,
+        configuredGate,
+        pendingGate,
+        currentWorktreeMaterialTreeHash: options.currentWorktreeMaterialTreeHash,
+        allRecords: options.allRecords,
+      });
+      if (candidate) evidenceCandidates.push(candidate);
+    }
   }
 
   evidenceCandidates.sort((a, b) => b.recordedAt.localeCompare(a.recordedAt));
@@ -919,6 +958,311 @@ function attachEquivalentReviewGateEvidence(options: {
   return attached
     ? { ...reviewRun, status: summarizeReviewRunStatus(gates), gates }
     : reviewRun;
+}
+
+// Pre-S3 contract identity: until the bundled judge/finder contract ships with
+// its own digest (D3, slice S3), the reviewer contract consumed by an AI gate
+// is pinned by the enforcement mode + policy version that render it, plus the
+// gate's dispositioned-findings context — a recorded spin-off disposition
+// changes the instructions the reviewer receives ("do not re-report"), so a
+// verdict issued without that context must never be replayed after it exists.
+// Shared by the review runner (write + consult) and the E6 evidence path so
+// the two sides can never drift.
+export function computeReviewVerdictContractDigest(options: {
+  repoRoot: string;
+  commonDir: string;
+  config: WorkflowConfig;
+  gateId: string;
+}): string {
+  const enforcementMode = options.config.reviewGates?.enforcementMode ?? 'legacy-v2';
+  const policyVersion = options.config.reviewGates?.policyVersion ?? REVIEW_GATES_POLICY_VERSION;
+  const dispositionsDigest = crypto.createHash('sha256')
+    .update(canonicalize(collectDispositionedKarpathyFindings(options)))
+    .digest('hex');
+  return crypto.createHash('sha256').update(canonicalize({
+    contract: 'pre-s3-gate-policy',
+    enforcementMode,
+    policyVersion,
+    dispositionsDigest,
+  })).digest('hex');
+}
+
+// Full-mode reviewed-scope digest over the exact path set a full review
+// covers (D13's reviewedScopeDigest until S5 introduces delta hunk sets).
+export function computeFullReviewedScopeDigest(changedFiles: string[]): string {
+  return crypto.createHash('sha256').update(canonicalize({
+    scope: 'full-changed-paths',
+    paths: [...changedFiles].sort(),
+  })).digest('hex');
+}
+
+// E6 scope reconstruction (legacy-v2 only): every D13 qualifier except
+// intentDigest, derived from the current checkout. Returns null — a cache
+// miss — whenever the current checkout is not exactly the evidence tree or any
+// qualifier cannot be recomputed, so stale-base/stale-contract/stale-scope
+// entries can never satisfy an evidence check. strict-v3 does not participate
+// in the verdict cache in S2 (see computeAiReviewGateVerdictScope), so callers
+// never reach here under strict.
+function computeEvidenceVerdictScopeBase(
+  context: WorkflowContext,
+  configuredGate: ReviewGateConfig,
+  currentWorktreeMaterialTreeHash: string,
+): Omit<ReviewVerdictScope, 'intentDigest'> | null {
+  const config = context.config;
+  const checkout = currentCheckoutReviewEvidenceTarget(context.repoRoot);
+  if (
+    checkout.worktreeMaterialTreeReliable !== true
+    || checkout.worktreeMaterialTreeHash !== currentWorktreeMaterialTreeHash
+  ) {
+    return null;
+  }
+  let contractDigest: string;
+  try {
+    contractDigest = computeReviewVerdictContractDigest({
+      repoRoot: context.repoRoot,
+      commonDir: context.commonDir,
+      config,
+      gateId: configuredGate.id,
+    });
+  } catch {
+    return null;
+  }
+  let baseTipOid: string;
+  try {
+    baseTipOid = resolveBaseTip(context.repoRoot, config.baseBranch);
+  } catch {
+    return null;
+  }
+  return {
+    gateId: configuredGate.id,
+    gateDefinitionHash: reviewGateDefinitionHash(configuredGate),
+    contractDigest,
+    materialTreeHash: currentWorktreeMaterialTreeHash,
+    baseTipOid,
+    reviewMode: 'full',
+    deltaBaseTree: '',
+    reviewedScopeDigest: computeFullReviewedScopeDigest(collectChangedFiles(context.repoRoot, config.baseBranch)),
+  };
+}
+
+// E6 candidate construction via exact-scope lookup (legacy-v2). The signed
+// entry proves the verdict; the original gate record (resolved by reviewRunId
+// provenance when review-state still retains it) supplies full evidence
+// fidelity — findings, capability, result envelope, and report artifact. The
+// entry's key already binds the CONFIGURED gate definition, so the original
+// record is matched by identity (gateId/status/manual), not by re-hashing its
+// runtime command fields; when the run was pruned, the entry's own attested
+// pass is accepted (D7).
+function verdictCacheEvidenceCandidate(options: {
+  context: WorkflowContext;
+  configuredGate: ReviewGateConfig;
+  pendingGate: ReviewGateRunRecord;
+  currentWorktreeMaterialTreeHash: string;
+  allRecords: ReviewRunRecord[];
+}): { recordedAt: string; gate: ReviewGateRunRecord } | null {
+  const { context, configuredGate, pendingGate } = options;
+  if (context.config.reviewGates?.enforcementMode === 'strict-v3') return null;
+  const scopeBase = computeEvidenceVerdictScopeBase(context, configuredGate, options.currentWorktreeMaterialTreeHash);
+  if (!scopeBase) return null;
+  const hit = lookupReviewVerdict(context.commonDir, context.config, { ...scopeBase, intentDigest: '' });
+  if (!hit || hit.status !== 'passed') return null;
+  const originalGate = findOriginalVerdictGateRecord(options.allRecords, hit, pendingGate.gateId);
+  return originalGate
+    ? originalGateVerdictCandidate(pendingGate, originalGate, hit)
+    : {
+        recordedAt: hit.recordedAt,
+        gate: {
+          ...pendingGate,
+          status: 'passed',
+          summary: `verdict cache hit: full-mode passed verdict for this exact scope recorded ${hit.recordedAt} by review run ${hit.reviewRunId}`,
+          startedAt: hit.recordedAt,
+          finishedAt: hit.recordedAt,
+          durationMs: 0,
+          ...(hit.attester ? { attester: hit.attester } : {}),
+        },
+      };
+}
+
+function findOriginalVerdictGateRecord(
+  records: ReviewRunRecord[],
+  hit: ReviewVerdictEntry,
+  gateId: string,
+): ReviewGateRunRecord | null {
+  const run = records.find((record) => record.id === hit.reviewRunId);
+  return run?.gates.find((gate) =>
+    gate.gateId === gateId
+    && gate.status === hit.status
+    && !gate.externalEvidenceId
+    && isPassedManualReviewGate(gate)
+  ) ?? null;
+}
+
+// The candidate keeps the pending gate's definition fields (current config),
+// takes the authorization-relevant `attester` from the SIGNED cache hit, and
+// imports only presentation (findings, tails) from the retained original run.
+// Review-state records are unsigned under the compatibility default, so nothing
+// authorization-relevant is ever sourced from them — editing the retained
+// record cannot swap in a fabricated independent identity to satisfy the AI-
+// independence check (legacy is the only cached mode; capability/result/report
+// are strict-only evidence and are intentionally not carried here).
+function originalGateVerdictCandidate(
+  pendingGate: ReviewGateRunRecord,
+  originalGate: ReviewGateRunRecord,
+  hit: ReviewVerdictEntry,
+): { recordedAt: string; gate: ReviewGateRunRecord } {
+  return {
+    recordedAt: hit.recordedAt,
+    gate: {
+      ...pendingGate,
+      status: 'passed',
+      summary: `verdict cache hit (run ${hit.reviewRunId}): ${originalGate.summary}`,
+      startedAt: hit.recordedAt,
+      finishedAt: hit.recordedAt,
+      durationMs: 0,
+      ...(hit.attester ? { attester: hit.attester } : {}),
+      ...(originalGate.findings ? { findings: originalGate.findings } : {}),
+      ...(originalGate.stdoutTail ? { stdoutTail: originalGate.stdoutTail } : {}),
+      ...(originalGate.stderrTail ? { stderrTail: originalGate.stderrTail } : {}),
+    },
+  };
+}
+
+// Dispositioned-findings context for a gate at the current checkout: spin-off
+// dispositions and accepted findings that the next reviewer round is told not
+// to re-report. Lives here (not commands/review.ts) because both the prompt
+// renderers and the verdict-cache scope computation consume it, and the cache
+// side must never drift from what the prompt actually contained.
+export function collectDispositionedKarpathyFindings(options: {
+  repoRoot: string;
+  commonDir: string;
+  config: WorkflowConfig;
+  gateId: string;
+}): ReviewDispositionPromptEntry[] {
+  if (options.gateId !== 'karpathy-diff') return [];
+  const target = currentCheckoutReviewEvidenceTarget(options.repoRoot);
+  const state = loadReviewState(options.commonDir, options.config);
+  const entries: ReviewDispositionPromptEntry[] = [];
+  for (const disposition of state.findingDispositions ?? []) {
+    if (
+      disposition.gateId !== options.gateId
+      || disposition.branchName !== target.branchName
+      || disposition.sha !== target.sha
+      || disposition.worktreeStatusDigest !== target.worktreeStatusDigest
+      || disposition.worktreeMaterialTreeHash !== target.worktreeMaterialTreeHash
+      || disposition.taskBindingId !== target.taskBindingId
+      || disposition.reviewTargetDigest !== target.reviewTargetDigest
+    ) continue;
+    entries.push({
+      disposition: 'spin-off',
+      findingRef: disposition.findingRef,
+      severity: disposition.finding.severity,
+      title: disposition.finding.title,
+      ...(disposition.finding.location ? { location: disposition.finding.location } : {}),
+      reason: disposition.reason,
+      followUpTask: disposition.followUpTask,
+    });
+  }
+  for (const consent of state.consents ?? []) {
+    if (
+      consent.kind !== 'accept-findings'
+      || consent.gateId !== options.gateId
+      || consent.branchName !== target.branchName
+      || consent.sha !== target.sha
+      || consent.worktreeStatusDigest !== target.worktreeStatusDigest
+      || consent.worktreeMaterialTreeHash !== target.worktreeMaterialTreeHash
+      || consent.taskBindingId !== target.taskBindingId
+      || consent.reviewTargetDigest !== target.reviewTargetDigest
+      || !consent.reviewRunId
+    ) continue;
+    const review = state.records.find((record) => record.id === consent.reviewRunId);
+    const gate = review?.gates.find((candidate) => candidate.gateId === options.gateId);
+    for (const finding of gate?.findings ?? []) {
+      entries.push({
+        disposition: 'accepted',
+        findingRef: `${review!.id}/${gate!.gateId}/${finding.id}`,
+        severity: finding.severity,
+        title: finding.title,
+        ...(finding.location ? { location: finding.location } : {}),
+        reason: consent.reason,
+      });
+    }
+  }
+  const unique = new Map(entries.map((entry) => [`${entry.disposition}\0${entry.findingRef}`, entry]));
+  return [...unique.values()];
+}
+
+// Changed-file collection for review scope. Lives here so evidence-time scope
+// reconstruction and the review runner share one derivation (re-exported from
+// commands/review.ts for existing consumers).
+export function collectChangedFiles(repoRoot: string, baseBranch: string): string[] {
+  const compareRef = runGit(repoRoot, ['rev-parse', '--verify', `origin/${baseBranch}`], true)?.trim()
+    ? `origin/${baseBranch}`
+    : baseBranch;
+  const mergeBase = runGit(repoRoot, ['merge-base', 'HEAD', compareRef], true)?.trim() ?? '';
+  const outputs = [
+    mergeBase ? runGit(repoRoot, ['diff', '--name-only', `${mergeBase}...HEAD`], true) ?? '' : '',
+    runGit(repoRoot, ['diff', '--cached', '--name-only'], true) ?? '',
+    runGit(repoRoot, ['diff', '--name-only'], true) ?? '',
+    runGit(repoRoot, ['ls-files', '--others', '--exclude-standard'], true) ?? '',
+  ];
+  const seen = new Set<string>();
+  const files: string[] = [];
+  for (const output of outputs) {
+    for (const line of output.split(/\r?\n/)) {
+      const file = line.trim();
+      if (file && !seen.has(file)) {
+        seen.add(file);
+        files.push(file);
+      }
+    }
+  }
+  return files;
+}
+
+// E1 (merge-channel parity): /pr validated this record against the pre-commit
+// checkout through the status-digest channel, then committed exactly that
+// content. Backfilling the commit's tree hash as the record's material
+// identity transfers that trust into the channel /merge can always check, so
+// a record whose material capture was unreliable still satisfies /merge the
+// way it satisfied /pr. The caller supplies `expectedCommitTree` — the
+// write-tree of the reviewed pre-commit checkout — and the backfill refuses
+// unless the committed HEAD tree equals it, so content introduced during the
+// commit itself (a pre-commit hook, a concurrent writer restaging files) can
+// never be certified as reviewed. Records that already carry a reliable
+// material identity are left untouched, and legacy material-tree-only records
+// remain acceptable to /merge unchanged.
+export function backfillReviewEvidenceMaterialTreeFromCommit(
+  context: WorkflowContext,
+  reviewRunId: string,
+  expectedCommitTree: string,
+): string | null {
+  if (!reviewRunId) return null;
+  if (!/^[a-f0-9]{40,64}$/i.test(expectedCommitTree)) return null;
+  const branchName = runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
+  const headTree = runGit(context.repoRoot, ['rev-parse', '--verify', 'HEAD^{tree}'], true)?.trim() ?? '';
+  if (!branchName || !/^[a-f0-9]{40,64}$/i.test(headTree)) return null;
+  if (headTree !== expectedCommitTree) return null;
+  return withReviewStateLock(context.commonDir, context.config, () => {
+    const state = loadReviewState(context.commonDir, context.config);
+    const index = state.records.findIndex((record) => record.id === reviewRunId);
+    if (index < 0) return null;
+    const record = state.records[index];
+    if (record.branchName !== branchName) return null;
+    if (record.worktreeMaterialTreeReliable === true && record.worktreeMaterialTreeHash) return null;
+    const { signature: _signature, ...unsignedFields } = {
+      ...record,
+      worktreeMaterialTreeHash: headTree,
+      worktreeMaterialTreeReliable: true,
+      worktreeMaterialTreeWarnings: ['material identity backfilled from the /pr commit tree (E1 merge-channel parity)'],
+    };
+    const unsigned: ReviewRunRecord = unsignedFields;
+    const stateKey = resolveReviewStateKey();
+    state.records[index] = stateKey
+      ? { ...unsigned, signature: signSignedPayload(unsigned, stateKey) }
+      : unsigned;
+    saveReviewState(context.commonDir, context.config, state);
+    return headTree;
+  });
 }
 
 export function reviewGateDefinitionHash(gate: ReviewGateConfig | ReviewGateRunRecord): GateDefinitionHash {

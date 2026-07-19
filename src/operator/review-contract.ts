@@ -352,7 +352,9 @@ export function changedMaterialPaths(before: BuiltReviewTarget, after: BuiltRevi
     .map((key) => afterByPath.get(key)?.displayPath ?? beforeByPath.get(key)?.displayPath ?? `raw-path:${key}`);
 }
 
-function resolveBaseTip(repoRoot: string, label: string): string {
+// Exported for the S2 verdict cache: the cache key's baseTipOid must use the
+// exact base-resolution semantics the strict target manifest already binds.
+export function resolveBaseTip(repoRoot: string, label: string): string {
   const candidates = label.startsWith('refs/') ? [label] : [`refs/remotes/origin/${label}`, label];
   for (const candidate of candidates) {
     const result = spawnSync('git', ['rev-parse', '--verify', `${candidate}^{commit}`], { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
