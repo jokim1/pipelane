@@ -66,10 +66,13 @@ that ignore unknown fields parse every revision transparently. See
   - `probeState` — rollup of per-surface staging probes: one of
     `healthy | degraded | stale | unknown`. See `doctor.probe` below.
 - `boardContext.activeTask` / `overallFreshness`.
-- `review.current` is evidence for the current checkout only; `review.recent`
-  is branch history and must not be treated as current. `review.latest` remains
-  a compatibility alias for `review.current` through the 0.2.x line and is
-  removed in 0.3.0.
+- `review.current` is the latest full review run recorded for the current
+  branch; `review.recent` is older branch history and must not be treated as
+  current. `review.current` is branch-scoped, not checkout-bound: commits or
+  edits made after the reviewed commit leave it current but stale, and clients
+  should render that staleness rather than discard the evidence.
+  `review.latest` remains a compatibility alias for `review.current` through
+  the 0.2.x line and is removed in 0.3.0.
 - `review.current.presentation` and `review.recent.presentation` are derived,
   control-safe display data. They include the relation (`current` or `recent`),
   checkout identity, gate and finding counts, every structured finding,

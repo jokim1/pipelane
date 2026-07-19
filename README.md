@@ -31,7 +31,7 @@ it does not make the result deterministic. The durable answer is a system:
 - break the work into reviewable slices
 - run agents in isolated workspaces
 - evaluate their output with evidence, not vibes
-- require independent review before PR handoff
+- put independent review evidence in front of a human before PR handoff
 - promote only verified changes through release
 - make status, blockers, and rollback visible
 
@@ -43,7 +43,7 @@ Pipelane records what happened and keeps release safety intact.
 Pipelane gives an AI-assisted codebase four things:
 
 1. **Orchestration**: turn a plan into agent work, slice by slice.
-2. **Review gates**: convert "looks good" into evidence that can block a PR.
+2. **Review gates**: convert "looks good" into evidence you see before you ship.
 3. **Safe release**: move verified changes through build or release mode.
 4. **Operator visibility**: show branches, PRs, deploys, blockers, and cleanup
    in one local web view.
@@ -110,10 +110,12 @@ before production moves:
 
 Safe release means:
 
-- review evidence exists before PR handoff
+- review evidence is shown before PR handoff, and shipping without it records
+  an explicit `--override --reason` consent
 - immutable delivery history records the merged SHA, task mode, and surfaces
 - a clean task worktree normally closes after merge; `--keep-worktree` retains it
-- staging verifies the same SHA that production will receive
+- staging verifies the same SHA that production will receive, unless a recorded
+  `--override --reason` consent promotes without it
 - deploys are tied to the expected surfaces
 - health checks and verification commands produce evidence
 - production promotion is explicit

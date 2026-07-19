@@ -176,7 +176,7 @@ goal mode.
 
 Goal mode is an execution helper, not a gate. It helps a worker keep moving
 toward a checkable finish line. Pipelane still owns file boundaries, review
-gates, ledgers, `/pr` enforcement, and human approvals.
+gates, ledgers, `/pr` review display, and human approvals.
 
 `GoalSpec` should be provider-neutral:
 
@@ -612,12 +612,12 @@ batched full sweep; routine review runs perform a bounded 24-hour-grace prune.
 An active per-run writer lease prevents even a full sweep from racing the
 artifact-before-ledger crash window; an abandoned lease ages out for recovery.
 
-`/pr` enforces blocking configured review gates before commit, push, or PR
-handoff. A failed or pending blocking gate stops `/pr`. Evidence must be for
-the current branch, HEAD, and worktree state, and cannot come from a dry-run or
-filtered review. A skipped or unavailable optional gate records a warning, not a
-crash. When review evidence records a reviewer session, any passed blocking AI
-gate must also record an attester from a separate trusted session.
+`/pr` displays this evidence rather than gating on it — see the `/pr` review
+state described above. A skipped or unavailable optional gate records a
+warning, not a crash, and shows as advisory in that display. Reviewer identity
+and attester independence are still classified and recorded on the evidence
+itself, and orchestration review still blocks on them; they are no longer a
+`/pr` wall.
 
 Skill and agent gates run automatically when Pipelane can resolve an executable
 AI review command. Resolution order is gate `command`, gate-specific
@@ -759,7 +759,7 @@ Do not add:
 - Generated `GoalSpec` objects require checkable finish lines, visible proof,
   handoff output, blocked policy, and a turn/time budget.
 - `/pipelane review` writes evidence under the existing Pipelane state root.
-- `/pr` runs blocking configured review gates before PR handoff.
+- `/pr` shows the branch's configured review-gate state before PR handoff.
 - Blocking gate failures stop the orchestration run before merge/deploy.
 - Existing Pipelane release commands remain unchanged.
 

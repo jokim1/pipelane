@@ -71,7 +71,7 @@ Fast path. Merge hands off to production deploy.
   {{ALIAS_DEVMODE}} build        Set the repo to build mode. Usually set once, until you switch lanes.
   {{ALIAS_NEW}}                  Create a named task worktree from the described task.
   /pipelane review              Run review gates and write evidence for the current diff.
-  {{ALIAS_PR}} --title "PR title"  Enforce review evidence, run checks, commit, push, and open or update the PR.
+  {{ALIAS_PR}} --title "PR title"  Show review state, run checks, commit, push, and open or update the PR.
   {{ALIAS_MERGE}}                Merge the PR. In build mode, this hands off to the prod deploy path.
   {{ALIAS_CLEAN}}                Clean up finished task state after the release is complete.
 
@@ -82,7 +82,7 @@ Protected path. Promote the same merged SHA through staging, healthcheck verific
   {{ALIAS_DEVMODE}} release      Set the repo to release mode. Usually set once, until you switch lanes.
   {{ALIAS_NEW}}                  Create a named task worktree from the described task.
   /pipelane review              Run review gates and write evidence for the current diff.
-  {{ALIAS_PR}} --title "PR title"  Enforce review evidence, run checks, commit, push, and open or update the PR.
+  {{ALIAS_PR}} --title "PR title"  Show review state, run checks, commit, push, and open or update the PR.
   {{ALIAS_MERGE}}                Merge the PR and record the merged SHA.
   {{ALIAS_DEPLOY}} staging       Deploy the merged SHA to staging.
   {{ALIAS_DEPLOY}} prod          Promote the same merged SHA to production.
