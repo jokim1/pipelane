@@ -14973,7 +14973,7 @@ test('review attest records structured clean manual gates against current review
   }
 });
 
-test('strict specialized manual attestations retain failures and require signed exact-scope substitution', async () => {
+test('strict specialized manual attestations retain failures and stay visibly manual', async () => {
   const repoRoot = createRepo();
   try {
     writePipelaneConfig(repoRoot, 'Strict Manual Review', {
@@ -15042,54 +15042,20 @@ test('strict specialized manual attestations retain failures and require signed 
       '--substitute-strict', '--reason', 'Trusted manual review is authorized for this exact PR target', '--scope', '/pr', '--json',
     ], repoRoot, { CODEX_SESSION_ID: 'strict-manual-attester' }).stdout);
     assert.equal(substituted.status, 'manual-review-substituted');
-    assert.equal(substituted.consents[0].kind, 'manual-substitution');
-    assert.match(substituted.consents[0].signature, /^[a-f0-9]{64}$/);
     stateJson = JSON.parse(readFileSync(substituted.evidencePath, 'utf8'));
     gate = stateJson.records[0].gates[0];
     assert.equal(gate.status, 'pending');
     assert.equal(gate.capability.effectiveCapability, 'manual-attestation');
     assert.equal(gate.capability.contractSupplied, false);
     assert.equal(gate.manualAttestation.substitutionRequested, true);
-
-    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
-    const enforcement = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-enforcement.ts'));
-    const context = state.resolveWorkflowContext(repoRoot);
-    const allowed = enforcement.evaluateReviewEvidenceForPr(context, { command: '/pr' });
-    assert.equal(allowed.allowed, true);
-    assert.equal(allowed.consents[0].kind, 'manual-substitution');
-    assert.match(allowed.message, /manual review substituted/i);
-    assert.equal(enforcement.evaluateReviewEvidenceForPr(context, { command: '/merge' }).allowed, false);
+    assert.equal((stateJson.consents ?? []).length, 0, 'attest records evidence, never exact-scope consent records');
 
     const snapshot = JSON.parse(runCli(['run', 'status', '--json'], repoRoot).stdout);
     const presentation = snapshot.data.review.current.presentation;
     assert.equal(presentation.gates[0].evidenceKind, 'manual-attestation');
-    assert.equal(presentation.authorizations[0].label, 'manual review substituted');
     assert.equal(presentation.gates[0].capability, undefined);
     const dashboardHtml = readFileSync(path.join(KIT_ROOT, 'src', 'dashboard', 'public', 'index.html'), 'utf8');
     assert.match(dashboardHtml, /MANUAL ATTESTATION/);
-    assert.match(dashboardHtml, /manual-substitution/);
-    assert.match(dashboardHtml, /Underlying capability remains manual-attestation/);
-
-    runCli([
-      'run', 'review', 'attest', '--gate', 'karpathy-diff', '--status', 'passed',
-      '--report-file', cleanFiles.reportFile, '--findings-file', cleanFiles.findingsFile,
-      '--provenance-file', cleanFiles.provenanceFile, '--message', 'Manual Karpathy review is clean for merge',
-      '--substitute-strict', '--reason', 'Authorize this manual evidence for merge only', '--scope', '/merge', '--json',
-    ], repoRoot, { CODEX_SESSION_ID: 'strict-manual-attester' });
-    const mergeSnapshot = JSON.parse(runCli(['run', 'status', '--json'], repoRoot).stdout);
-    assert.ok(
-      mergeSnapshot.data.review.current.presentation.authorizations.some((authorization) => authorization.routeAction === '/merge'),
-      'status/API presentation must retain exact-target authorizations for non-PR actions',
-    );
-
-    runCli([
-      'run', 'review', 'attest', '--gate', 'karpathy-diff', '--status', 'failed',
-      '--report-file', failedFiles.reportFile, '--findings-file', failedFiles.findingsFile,
-      '--provenance-file', failedFiles.provenanceFile, '--message', 'A later manual review found a blocker', '--json',
-    ], repoRoot, { CODEX_SESSION_ID: 'strict-manual-attester' });
-    const staleConsent = enforcement.evaluateReviewEvidenceForPr(context, { command: '/pr' });
-    assert.equal(staleConsent.allowed, false, 'a consent bound to older manual evidence must not authorize a later failed attestation');
-    assert.equal(staleConsent.consents.some((consent) => consent.kind === 'manual-substitution'), true, 'the stale consent remains auditable');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -15099,7 +15065,6 @@ test('manual review and host verification files are bounded, sanitized, and sche
   const root = mkdtempSync(path.join(os.tmpdir(), 'pipelane-manual-ingestion-'));
   try {
     const manual = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-manual.ts'));
-    const fixAttempts = await import(path.join(KIT_ROOT, 'src', 'operator', 'fix-attempts.ts'));
     const data = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-data.ts'));
     const reportFile = path.join(root, 'report.txt');
     const findingsFile = path.join(root, 'findings.json');
@@ -15125,60 +15090,11 @@ test('manual review and host verification files are bounded, sanitized, and sche
     writeFileSync(provenanceFile, JSON.stringify({ source: 'host', command: '/review', exitCode: 1, output: 'review crashed' }), 'utf8');
     assert.throws(() => manual.readManualReviewInput({ status: 'passed', reportFile, findingsFile, provenanceFile }), /requires.*exitCode 0/);
 
-    const verificationFile = path.join(root, 'verification.json');
-    writeFileSync(verificationFile, JSON.stringify({ source: 'host\u001b[2J', commands: [{ command: 'npm test', exitCode: 0, output: 'TOKEN=secret-value' }] }), 'utf8');
-    const verification = fixAttempts.readFixVerificationFile(verificationFile);
-    assert.equal(verification.commands[0].source, 'host-attestation');
-    assert.doesNotMatch(verification.source, /\u001b/);
-    assert.match(verification.commands[0].outputDigest, /^[a-f0-9]{64}$/);
-    assert.doesNotMatch(JSON.stringify(verification), /secret-value/);
-    writeFileSync(verificationFile, JSON.stringify({ source: 'host', commands: [] }), 'utf8');
-    assert.throws(() => fixAttempts.readFixVerificationFile(verificationFile), /commands must be a non-empty array/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('strict manual substitutions remain active across sequential specialized-gate attestations on the exact target', async () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Sequential Strict Manual Review', {
-      reviewGates: {
-        enforcementMode: 'strict-v3',
-        policyVersion: 3,
-        planReview: { gates: [] },
-        gates: [
-          { id: 'karpathy-diff', phase: 'ai-diff', type: 'skill', skill: 'karpathy-diff', userCommands: ['/karpathy diff'], blocking: true },
-          { id: 'karpathy-audit', phase: 'instruction', type: 'skill', skill: 'karpathy-audit', userCommands: ['/karpathy audit'], blocking: true },
-        ],
-      },
-    });
-    commitLocal(repoRoot, 'Configure sequential strict manual review');
-    const diffFiles = writeManualReviewFiles(repoRoot, 'sequential-karpathy-diff');
-    const auditFiles = writeManualReviewFiles(repoRoot, 'sequential-karpathy-audit');
-    assert.equal(JSON.parse(runCli(['run', 'review', '--intent', 'Verify two specialized gates', '--json'], repoRoot).stdout).status, 'pending');
-
-    const attest = (gateId, files, reason) => JSON.parse(runCli([
-      ...manualReviewAttestArgs(gateId, files, `${gateId} manual review is clean`).slice(0, -1),
-      '--substitute-strict', '--reason', reason, '--scope', '/pr', '--json',
-    ], repoRoot, { CODEX_SESSION_ID: `${gateId}-manual-attester` }).stdout);
-    const first = attest('karpathy-diff', diffFiles, 'Authorize the exact-target manual diff review');
-    assert.equal(first.status, 'manual-review-substituted');
-    const second = attest('karpathy-audit', auditFiles, 'Authorize the exact-target manual instruction audit');
-    assert.equal(second.status, 'manual-review-substituted');
-
-    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
-    const enforcement = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-enforcement.ts'));
-    const evidence = enforcement.evaluateReviewEvidenceForPr(state.resolveWorkflowContext(repoRoot), { command: '/pr' });
-    assert.equal(evidence.allowed, true);
-    assert.equal(evidence.consents.length, 2);
-    assert.deepEqual(new Set(evidence.consents.map((consent) => consent.gateId)), new Set(['karpathy-diff', 'karpathy-audit']));
-    assert.equal(evidence.latest.gates.every((gate) => gate.capability.effectiveCapability === 'manual-attestation'), true);
-    assert.equal(enforcement.evaluateReviewEvidenceForPr(state.resolveWorkflowContext(repoRoot), { command: '/merge' }).allowed, false);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
 
 test('review pass rejects specialized independent AI gates with the exact attest recovery command', () => {
   const repoRoot = createRepo();
@@ -21320,67 +21236,6 @@ test('pr blocks clean already-pushed open PRs without review evidence', () => {
   }
 });
 
-test('route safety TTY menu keeps explicit choices but omits an unavailable audited fix action', async () => {
-  const repoRoot = createRepo();
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    const state = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
-    const safety = await import(path.join(KIT_ROOT, 'src', 'operator', 'task-budget.ts'));
-    const context = state.resolveWorkflowContext(repoRoot);
-    const record = {
-      budgetVersion: 1,
-      lineageKey: 'c'.repeat(64),
-      routeFingerprintDigest: 'c'.repeat(64),
-      routeFingerprint: '{}',
-      targetCommand: '/pr',
-      taskSlug: 'route-safety',
-      branchName: 'main',
-      headSha: run('git', ['rev-parse', 'HEAD'], repoRoot),
-      firstStartedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      fixReviewLoops: 1,
-      aiReviewRuns: 1,
-      countedReviewRunIds: ['review-1'],
-      aiRunsBudget: 8,
-      activeMinutesBudget: 90,
-      fixReviewLoopsBudget: 1,
-      aiRunLaunches: 1,
-      activeMillisUsed: 5 * 60 * 1000,
-      lifetimeExtensions: 0,
-    };
-    const menu = safety.renderTaskBudgetInteractiveMenu(context, record, {
-      reason: 'blocking/major review findings are present',
-      issues: [{
-        status: 'incomplete',
-        gateId: 'ai-review',
-        message: 'blocking gate ai-review lacks compatible capability evidence',
-        blocking: true,
-        gate: {
-          gateId: 'ai-review',
-          phase: 'ai-diff',
-          type: 'skill',
-          blocking: true,
-          status: 'passed',
-          summary: 'adapter returned a report without capability attestation',
-          findings: [],
-        },
-      }],
-      latest: null,
-    });
-
-    assert.match(menu, /1\. Stop here and show review findings/);
-    assert.doesNotMatch(menu, /request-audited-fix|resume --request-fix/);
-    assert.match(menu, /3\. Extend this task budget with a typed confirmation/);
-    assert.match(menu, /4\. Proceed anyway for this exact target and route/);
-    assert.doesNotMatch(menu, /Keep going until review passes/);
-    assert.match(menu, /Fix\/review loops: 1\/1/);
-    assert.match(menu, /AI runs: 1\/8/);
-    assert.match(menu, /Active minutes: 5\/90/);
-    assert.match(menu, /lacks compatible capability evidence/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-  }
-});
 
 
 
@@ -38035,8 +37890,7 @@ test('strict karpathy execution requires intent and trusted contract, adapts nat
     assert.match(review.message, /Second finding/);
     assert.match(review.message, /Third finding/);
     assert.ok(review.message.indexOf('Third finding') < review.message.indexOf('Recommended: repair failed blocking gates'));
-    assert.ok(review.message.indexOf('Recommended: repair failed blocking gates') < review.message.indexOf('Proceed anyway only with exact-scope informed consent'));
-    assert.match(review.message, /review override --gate karpathy-diff --scope \/pr/);
+    assert.match(review.message, /Or proceed with informed consent \(the gate remains failed or pending\): \/pr --override --reason/);
     const snapshot = JSON.parse(runCli(['run', 'api', 'snapshot'], repoRoot).stdout);
     const presentation = snapshot.data.review.current.presentation;
     assert.deepEqual(presentation.gates[0].findings.map((entry) => entry.id), ['F001', 'F002', 'F003']);
@@ -38307,8 +38161,7 @@ test('status gives active strict upgrades exact intent, rerun, and per-gate proc
     assert.match(output, /normal development remains available/);
     assert.match(output, /\/pipelane review --intent/);
     assert.match(output, /repair any findings, then rerun/);
-    assert.match(output, /review override --gate karpathy-diff/);
-    assert.match(output, /review override --gate typecheck/);
+    assert.match(output, /proceed anyway with informed consent: \/pr --override --reason/);
     assert.match(output, /never relabeled passed/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
