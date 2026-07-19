@@ -7,7 +7,6 @@ import { fileURLToPath } from 'node:url';
 import {
   buildDestinationPlanForCommand,
   canonicalizeDestinationFingerprint,
-  destinationPlanFingerprintDigest,
   type DestinationMilestone,
   type DestinationPlan,
   type DestinationStep,
@@ -695,6 +694,7 @@ function buildStepArgs(step: DestinationStep, parsed: ParsedOperatorArgs, plan: 
     pushTaskOrPr();
     pushApprovedDeploySha();
     pushSurfaces();
+    if (parsed.flags.override) args.push('--override');
     pushOpt('--reason', parsed.flags.reason);
     return args;
   }

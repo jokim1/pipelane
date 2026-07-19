@@ -311,8 +311,7 @@ Pipelane commands:
   devmode
   new
   adopt
-  resume [--spin-off <review-run/gate/Fxxx> --spinoff-task <label> --reason <why-new-scope>]
-         Spin-off records exact-HEAD informed consent for genuine new scope, including critical findings.
+  resume [--task <task-name>]
   repo-guard
   pr
   merge
