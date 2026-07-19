@@ -30,6 +30,12 @@ import { resolveRepoRoot } from './operator/state.ts';
 import { bootstrapWorktreeNodeModulesIfNeeded } from './operator/task-workspaces.ts';
 import { maybeNotifyUpdate, parseUpdateArgs, runUpdate } from './operator/update.ts';
 import { runVerify } from './operator/verify.ts';
+import {
+  buildRuntimeWarnings,
+  formatPipelaneRuntimeBanner,
+  formatPipelaneVersion,
+  resolvePipelaneRuntimeIdentity,
+} from './runtime-identity.ts';
 
 function printTopLevelHelp(): void {
   process.stdout.write(`Pipelane - build, release, and development orchestration for AI-assisted codebases
@@ -47,6 +53,7 @@ Commands:
   board [stop|status] [--repo <repo-root>] [--port <port>] [--no-open]
   review [review args...]
   run <operator command...>
+  --version
 
 Examples:
   pipelane install-codex
@@ -331,6 +338,12 @@ async function maybeApplyLessonsMigrationAfterPrompt(
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
 
+  if (command === '--version' || command === '-v') {
+    assertNoArgs(rest, '--version');
+    process.stdout.write(`${formatPipelaneVersion(resolvePipelaneRuntimeIdentity())}\n`);
+    return;
+  }
+
   if (!command || command === '--help' || command === '-h') {
     printTopLevelHelp();
     return;
@@ -339,6 +352,17 @@ async function main(): Promise<void> {
   if (command === 'init' || command === 'bootstrap' || command === 'sync-docs') {
     handleUnsupportedRepoLocalAdapterCommand(command, rest);
     return;
+  }
+
+  if (command === 'run') {
+    // Keep the structured stdout contract intact for --json callers. The
+    // identity line is deliberately the first stderr line so a combined
+    // terminal/agent transcript still answers exactly which build ran.
+    const runtimeIdentity = resolvePipelaneRuntimeIdentity();
+    process.stderr.write(`${formatPipelaneRuntimeBanner(runtimeIdentity)}\n`);
+    for (const warning of buildRuntimeWarnings(runtimeIdentity, process.cwd())) {
+      process.stderr.write(`${warning}\n`);
+    }
   }
 
   // Auto-link shared node_modules into externally-created worktrees (Claude
