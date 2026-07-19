@@ -53,6 +53,7 @@ Commands:
   board [stop|status] [--repo <repo-root>] [--port <port>] [--no-open]
   review [review args...]
   run <operator command...>
+  --version
 
 Examples:
   pipelane install-codex
