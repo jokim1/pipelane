@@ -946,8 +946,8 @@ export interface TaskBudgetGrantAllowance {
   fixReviewLoopsDelta: number;
 }
 
-// One consumed budget-extension grant, denormalized onto the entry for audit.
-// The authoritative one-use grant artifact lives in the consent-grants store.
+// One consumed budget-extension grant, denormalized onto the entry. Kept for
+// tolerant reads of pre-relief ledgers; nothing mints grants anymore.
 export interface TaskBudgetConsumedGrant extends TaskBudgetGrantAllowance {
   grantId: string;
   source: 'board' | 'tty';

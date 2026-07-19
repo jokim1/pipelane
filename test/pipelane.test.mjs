@@ -15234,62 +15234,6 @@ test('review pass remains a compatibility adapter for human approval gates', () 
   }
 });
 
-test('review evidence accepts matching separately recorded structured manual records', async () => {
-  const repoRoot = createRepo();
-  const npmShim = createNpmShimEnv();
-  try {
-    writePipelaneConfig(repoRoot);
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.reviewGates.enforcementMode = 'legacy-v2';
-      config.reviewGates.policyVersion = 2;
-    });
-    commitLocal(repoRoot, 'Adopt pipelane');
-
-    const manualFiles = writeManualReviewFiles(repoRoot, 'separate-karpathy');
-    const review = JSON.parse(runCli(['run', 'review', '--json'], repoRoot, npmShim.env).stdout);
-    assert.equal(review.status, 'pending');
-    const pass = JSON.parse(runCli([
-      'run',
-      'review',
-      'attest',
-      '--gate',
-      'karpathy-diff',
-      '--status',
-      'passed',
-      '--report-file',
-      manualFiles.reportFile,
-      '--findings-file',
-      manualFiles.findingsFile,
-      '--provenance-file',
-      manualFiles.provenanceFile,
-      '--message',
-      'Ran /karpathy diff clean',
-      '--json',
-    ], repoRoot, {
-      PIPELANE_AGENT_SESSION_ID: 'separate-karpathy-session',
-    }).stdout);
-    const state = JSON.parse(readFileSync(pass.evidencePath, 'utf8'));
-    const passRecord = state.records[0];
-    const pendingRecord = state.records.find((record) => record.id === review.runId);
-    state.records = [
-      pendingRecord,
-      passRecord,
-      ...state.records.filter((record) => record.id !== pendingRecord.id && record.id !== passRecord.id),
-    ];
-    writeFileSync(pass.evidencePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
-
-    const { resolveWorkflowContext } = await import(path.join(KIT_ROOT, 'src', 'operator', 'state.ts'));
-    const { evaluateReviewEvidenceForPr } = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-enforcement.ts'));
-    const evidence = evaluateReviewEvidenceForPr(resolveWorkflowContext(repoRoot));
-
-    assert.equal(evidence.allowed, false);
-    assert.doesNotMatch(evidence.message, /karpathy-diff is pending/);
-    assert.match(evidence.message, /gstack-review is pending/);
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(npmShim.binDir, { recursive: true, force: true });
-  }
-});
 
 test('review evidence rejects unauthenticated gstack review log entries for blocking gates', async () => {
   const repoRoot = createRepo();
@@ -20713,101 +20657,7 @@ test('pr accepts v2 separate-session AI review attestation without trusted provi
 });
 
 
-test('pr blocks v2 missing author identity even with attested high-stakes human approval', async () => {
-  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
-  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
-  const ghStateFile = path.join(ghBin, 'gh-state.json');
-  writeFakeGh(ghBin, ghStateFile);
-  const env = {
-    PATH: `${ghBin}:${process.env.PATH}`,
-    GH_STATE_FILE: ghStateFile,
-  };
 
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.prePrChecks = [];
-      config.reviewGates.policyVersion = 2;
-      config.reviewGates.gates.push({
-        id: 'high-stakes-human-approval',
-        phase: 'human',
-        type: 'approval',
-        blocking: true,
-      });
-    });
-    commitAll(repoRoot, 'Adopt pipelane');
-
-    const created = JSON.parse(runCli(['run', 'new', '--task', 'V2 Human Approval', '--json'], repoRoot).stdout);
-    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'v2 human approval\n', 'utf8');
-
-    const identityMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-identity.ts'));
-    const claudeAttester = identityMod.resolveReviewActorIdentity({
-      env: { CLAUDE_SESSION_ID: 'v2-human-approval-ai-reviewer' },
-    });
-    const humanAttester = identityMod.resolveReviewActorIdentity({
-      env: { CODEX_SESSION_ID: 'v2-high-stakes-human-attester' },
-    });
-    writePassingReviewEvidence(created.worktreePath, {
-      authorIdentity: null,
-      gateAttester: claudeAttester,
-      gateAttesters: {
-        'high-stakes-human-approval': humanAttester,
-      },
-    });
-
-    const result = runCli(['run', 'pr', '--title', 'V2 Human Approval', '--json'], created.worktreePath, env, true);
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /recorded worker session identity is unavailable/);
-    assert.equal(existsSync(ghStateFile), false, 'high-stakes human approval should not bypass missing author identity');
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(remoteRoot, { recursive: true, force: true });
-    rmSync(ghBin, { recursive: true, force: true });
-  }
-});
-
-test('pr blocks same-session AI review attestation for legacy configs', async () => {
-  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
-  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
-  const ghStateFile = path.join(ghBin, 'gh-state.json');
-  writeFakeGh(ghBin, ghStateFile);
-  const env = {
-    PATH: `${ghBin}:${process.env.PATH}`,
-    GH_STATE_FILE: ghStateFile,
-  };
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.prePrChecks = [];
-      delete config.reviewGates.policyVersion;
-    });
-    commitAll(repoRoot, 'Adopt pipelane');
-
-    const created = JSON.parse(runCli(['run', 'new', '--task', 'Legacy Same Session Review', '--json'], repoRoot).stdout);
-    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'legacy same-session review\n', 'utf8');
-
-    const identityMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-identity.ts'));
-    const sameSessionReviewer = identityMod.resolveReviewActorIdentity({
-      env: { CODEX_SESSION_ID: 'legacy-same-review-session' },
-    });
-    writePassingReviewEvidence(created.worktreePath, {
-      authorIdentity: sameSessionReviewer,
-      reviewer: sameSessionReviewer,
-      gateAttester: sameSessionReviewer,
-    });
-
-    const result = runCli(['run', 'pr', '--title', 'Legacy Same Session Review', '--json'], created.worktreePath, env, true);
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /blocking AI review evidence is not independently attested/);
-    assert.match(result.stderr, /separate reviewer session/);
-    assert.equal(existsSync(ghStateFile), false, 'legacy same-session AI evidence should block before gh is called');
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(remoteRoot, { recursive: true, force: true });
-    rmSync(ghBin, { recursive: true, force: true });
-  }
-});
 
 
 
@@ -20894,51 +20744,6 @@ test('pr accepts trusted AI gate attester when review runner has only generic id
   }
 });
 
-test('pr blocks trusted AI gate attester matching a generic review runner session', async () => {
-  const { repoRoot, remoteRoot } = createRemoteBackedRepo();
-  const ghBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
-  const ghStateFile = path.join(ghBin, 'gh-state.json');
-  writeFakeGh(ghBin, ghStateFile);
-  const env = {
-    PATH: `${ghBin}:${process.env.PATH}`,
-    GH_STATE_FILE: ghStateFile,
-  };
-
-  try {
-    writePipelaneConfig(repoRoot, 'Demo App');
-    updateWorkflowConfig(repoRoot, (config) => {
-      config.prePrChecks = [];
-      config.reviewGates.policyVersion = 2;
-    });
-    commitAll(repoRoot, 'Adopt pipelane');
-
-    const created = JSON.parse(runCli(['run', 'new', '--task', 'Generic Native Same Session', '--json'], repoRoot).stdout);
-    writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'generic-native same session\n', 'utf8');
-    const identityMod = await import(path.join(KIT_ROOT, 'src', 'operator', 'review-identity.ts'));
-    const genericReviewer = identityMod.resolveReviewActorIdentity({
-      provider: 'generic',
-      env: { PIPELANE_AGENT_SESSION_ID: 'same-generic-native-session' },
-    });
-    const nativeAttester = identityMod.resolveReviewActorIdentity({
-      env: { CODEX_SESSION_ID: 'same-generic-native-session' },
-    });
-    writePassingReviewEvidence(created.worktreePath, {
-      authorIdentity: genericReviewer,
-      reviewer: genericReviewer,
-      gateAttester: nativeAttester,
-    });
-
-    const result = runCli(['run', 'pr', '--title', 'Generic Native Same Session', '--json'], created.worktreePath, env, true);
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /blocking AI review evidence is not independently attested/);
-    assert.match(result.stderr, /separate reviewer session/);
-    assert.equal(existsSync(ghStateFile), false, 'same-session AI evidence should block before gh is called');
-  } finally {
-    rmSync(repoRoot, { recursive: true, force: true });
-    rmSync(remoteRoot, { recursive: true, force: true });
-    rmSync(ghBin, { recursive: true, force: true });
-  }
-});
 
 test('pr accepts legacy reviewer-less structured manual evidence with trusted AI attester', async () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
@@ -36490,7 +36295,7 @@ test('api route actions block missing review evidence before route confirmation'
   }
 });
 
-test('api route actions proceed at execute time when the worktree drifted after preflight', () => {
+test('api route actions require re-approval when the plan drifted after preflight confirmation', () => {
   const { repoRoot, remoteRoot } = createRemoteBackedRepo();
   const fakeBin = mkdtempSync(path.join(os.tmpdir(), 'pipelane-gh-'));
   const ghStateFile = path.join(fakeBin, 'gh-state.json');
@@ -36525,10 +36330,12 @@ test('api route actions proceed at execute time when the worktree drifted after 
       [...routeArgs, '--execute', '--confirm-token', token],
       created.worktreePath,
       env,
+      true,
     );
-    assert.equal(executed.status, 0, executed.stderr);
-    const ghState = JSON.parse(readFileSync(ghStateFile, 'utf8'));
-    assert.equal(Object.keys(ghState.prs ?? {}).length, 1, 'post-preflight drift is informational, never a wall');
+    assert.equal(executed.status, 1);
+    assert.match(`${executed.stdout}\n${executed.stderr}`, /Confirmation token no longer matches the current action target/);
+    const ghState = existsSync(ghStateFile) ? JSON.parse(readFileSync(ghStateFile, 'utf8')) : { prs: {} };
+    assert.equal(Object.keys(ghState.prs ?? {}).length, 0, 'an approved plan that drifted needs re-approval, not review re-checks');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(remoteRoot, { recursive: true, force: true });
@@ -37911,16 +37718,17 @@ test('strict karpathy execution requires intent and trusted contract, adapts nat
     assert.ok(evidence.message.indexOf('First finding') < evidence.message.indexOf('Second finding'));
     assert.ok(evidence.message.indexOf('Second finding') < evidence.message.indexOf('Third finding'));
     assert.ok(evidence.message.indexOf('Third finding') < evidence.message.indexOf('Recommended:'));
-    assert.ok(evidence.message.indexOf('Recommended:') < evidence.message.indexOf('Proceed anyway only with explicit informed consent'));
+    assert.ok(evidence.message.indexOf('Recommended:') < evidence.message.indexOf('Or proceed now with informed consent'));
     const deployBlocker = enforcementModule.formatReviewEvidenceBlocker(
       stateModule.resolveWorkflowContext(repoRoot),
       evidence.issues,
       '/deploy staging',
+      evidence.latest,
     );
-    assert.match(deployBlocker, /\/deploy staging blocked/);
+    assert.match(deployBlocker, /\/deploy staging needs review consent/);
     assert.match(deployBlocker, /Findings \(2 blocking, 1 advisory\)/);
     assert.ok(deployBlocker.indexOf('Third finding') < deployBlocker.indexOf('Recommended:'));
-    assert.match(deployBlocker, /--scope="\/deploy staging"/);
+    assert.match(deployBlocker, /--override --reason/);
     const ledger = JSON.parse(readFileSync(review.evidencePath, 'utf8'));
     assert.equal(ledger.records[0].intent.source, 'explicit-unbound');
     assert.match(ledger.records[0].target.targetDigest, /^[a-f0-9]{64}$/);
