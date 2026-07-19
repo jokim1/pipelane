@@ -45,6 +45,7 @@ export interface ReviewEvidenceStaleness {
 
 export interface ReviewEvidenceCheckResult {
   allowed: boolean;
+  gatesConfigured: boolean;
   latest: ReviewRunRecord | null;
   issues: ReviewEvidenceIssue[];
   staleness: ReviewEvidenceStaleness | null;
@@ -101,6 +102,7 @@ export function evaluateReviewEvidenceForPr(
   if (expectedGates.length === 0) {
     return {
       allowed: true,
+      gatesConfigured: false,
       latest: options.latestOverride ?? reviewState.records[0] ?? null,
       issues: [],
       staleness: null,
@@ -110,13 +112,14 @@ export function evaluateReviewEvidenceForPr(
   const target = options.target ?? currentBranchHeadTarget(context.repoRoot);
   const latest = options.latestOverride !== undefined
     ? options.latestOverride
-    : selectLatestFullReviewRunForBranch(reviewState.records, target.branchName);
+    : selectLatestReviewRunForBranch(reviewState.records, target.branchName);
   const issues = collectReviewEvidenceIssues(latest, expectedGates);
   const staleness = computeReviewEvidenceStaleness(context.repoRoot, latest, target, !options.target);
   const routeAction = options.command ?? formatWorkflowCommand(context.config, 'pr');
 
   return {
     allowed: issues.length === 0,
+    gatesConfigured: true,
     latest,
     issues,
     staleness,
@@ -133,13 +136,8 @@ function currentBranchHeadTarget(repoRoot: string): { branchName: string; sha: s
   };
 }
 
-function selectLatestFullReviewRunForBranch(records: ReviewRunRecord[], branchName: string): ReviewRunRecord | null {
-  return records.find((record) =>
-    record.branchName === branchName
-    && record.dryRun !== true
-    && !record.gateFilter
-    && !record.phaseFilter
-  ) ?? null;
+function selectLatestReviewRunForBranch(records: ReviewRunRecord[], branchName: string): ReviewRunRecord | null {
+  return records.find((record) => record.branchName === branchName) ?? null;
 }
 
 export function selectCurrentReviewEvidenceRecord(
@@ -147,7 +145,11 @@ export function selectCurrentReviewEvidenceRecord(
   records: ReviewRunRecord[] = loadReviewState(context.commonDir, context.config).records,
 ): ReviewRunRecord | null {
   const branchName = runGit(context.repoRoot, ['branch', '--show-current'], true)?.trim() ?? '';
-  return selectLatestFullReviewRunForBranch(records, branchName);
+  return selectLatestReviewRunForBranch(records, branchName);
+}
+
+function reviewRunIsFull(record: ReviewRunRecord): boolean {
+  return record.dryRun !== true && !record.gateFilter && !record.phaseFilter;
 }
 
 function collectReviewEvidenceIssues(
@@ -163,6 +165,18 @@ function collectReviewEvidenceIssues(
   }
 
   const issues: ReviewEvidenceIssue[] = [];
+  if (latest.dryRun === true) {
+    issues.push({
+      status: 'missing',
+      message: `latest review ${latest.id} was a dry run; run a full review`,
+    });
+  }
+  if (latest.gateFilter || latest.phaseFilter) {
+    issues.push({
+      status: 'missing',
+      message: `latest review ${latest.id} was filtered${latest.gateFilter ? ` by gate ${latest.gateFilter}` : ''}${latest.phaseFilter ? ` by phase ${latest.phaseFilter}` : ''}; run a full review`,
+    });
+  }
   for (const gate of latest.gates) {
     if (gate.blocking === false) continue;
     if (gate.status === 'failed') {
@@ -172,7 +186,7 @@ function collectReviewEvidenceIssues(
         message: `blocking gate ${gate.gateId} failed: ${gate.summary}`,
         gate,
       });
-    } else if (gate.status === 'pending') {
+    } else if (gate.status === 'pending' && latest.dryRun !== true) {
       issues.push({
         status: 'pending',
         gateId: gate.gateId,
@@ -182,14 +196,16 @@ function collectReviewEvidenceIssues(
     }
   }
 
-  const observedGateIds = new Set(latest.gates.map((gate) => gate.gateId));
-  for (const gateConfig of blockingGates) {
-    if (!observedGateIds.has(gateConfig.id)) {
-      issues.push({
-        status: 'missing',
-        gateId: gateConfig.id,
-        message: `configured gate ${gateConfig.id} has not run yet (latest review ${latest.id} predates it)`,
-      });
+  if (reviewRunIsFull(latest)) {
+    const observedGateIds = new Set(latest.gates.map((gate) => gate.gateId));
+    for (const gateConfig of blockingGates) {
+      if (!observedGateIds.has(gateConfig.id)) {
+        issues.push({
+          status: 'missing',
+          gateId: gateConfig.id,
+          message: `configured gate ${gateConfig.id} has not run yet (latest review ${latest.id} predates it)`,
+        });
+      }
     }
   }
 
@@ -227,6 +243,7 @@ function computeReviewEvidenceStaleness(
 // The informational block shown by /pr and /merge regardless of outcome:
 // what ran, what's open, what's stale.
 export function formatReviewEvidenceStatusLines(evidence: ReviewEvidenceCheckResult): string[] {
+  if (!evidence.gatesConfigured) return [];
   const lines: string[] = [];
   if (!evidence.latest) {
     lines.push('Review: no full review run recorded for this branch.');
@@ -236,7 +253,12 @@ export function formatReviewEvidenceStatusLines(evidence: ReviewEvidenceCheckRes
   const failed = latest.gates.filter((gate) => gate.blocking !== false && gate.status === 'failed');
   const pending = latest.gates.filter((gate) => gate.blocking !== false && gate.status === 'pending');
   const passed = latest.gates.filter((gate) => gate.status === 'passed');
-  lines.push(`Review: ${latest.id} — ${latest.status} at ${shortSha(latest.sha)} (${passed.length} passed, ${failed.length} failed, ${pending.length} pending).`);
+  const scopeNote = latest.dryRun === true
+    ? ' [dry run]'
+    : (latest.gateFilter || latest.phaseFilter)
+      ? ' [filtered]'
+      : '';
+  lines.push(`Review: ${latest.id}${scopeNote} — ${latest.status} at ${shortSha(latest.sha)} (${passed.length} passed, ${failed.length} failed, ${pending.length} pending).`);
   if (failed.length > 0) {
     lines.push(`Open failed gates: ${failed.map((gate) => gate.gateId).join(', ')}.`);
   }
