@@ -17,7 +17,7 @@ Verified on 2026-07-20 in this worktree:
 ## Gotchas
 
 - Do not edit `templates/AGENTS.md` when changing guidance for this repo. That file is shipped template content for consumers.
-- `CLAUDE.md` is local-only operator state: gitignored, untracked, and kept out of `pipelane run pr` staging by `DEFAULT_PR_PATH_DENY_LIST` in `src/operator/state.ts`. Symlink it to this file locally so Claude-based tools read the same guidance, but do not commit that symlink.
+- `CLAUDE.md` is a tracked symlink to this file so Claude-based tools read the same guidance. Keep the symlink target as `AGENTS.md`.
 - `dist/` is build output from TypeScript plus copied dashboard assets; regenerate it with `npm run build` instead of hand-editing.
 - The package has zero runtime dependencies. New runtime deps are a deliberate product decision; see `REPO_GUIDANCE.md`.
 - Command templates under `templates/.claude/commands/` are managed consumer-facing surfaces. Preserve marker and consumer-extension conventions described in `REPO_GUIDANCE.md`.
