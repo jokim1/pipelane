@@ -1552,6 +1552,18 @@ function readPackageJsonName(repoRoot: string): string | null {
   }
 }
 
+// Config blocks for features pipelane has removed. A legacy config that still
+// carries one parses fine, but the key must be dropped on every path that can
+// write config back to disk, or a materialized machine-local config would
+// resurrect a dead feature's settings. Add retired keys here, not inline.
+const RETIRED_WORKFLOW_CONFIG_KEYS = ['smoke', 'orchestrate'] as const;
+
+function stripRetiredWorkflowConfigKeys(config: object): void {
+  for (const key of RETIRED_WORKFLOW_CONFIG_KEYS) {
+    delete (config as Record<string, unknown>)[key];
+  }
+}
+
 // Layer a stack of Partial<WorkflowConfig>s on top of a full base, with deep
 // merge for the nested record-valued fields pipelane treats compositionally
 // (aliases, syncDocs, routeSafety, etc.). Later overlays win. The output is a
@@ -1574,7 +1586,7 @@ function mergeWorkflowLayers(
     if (overlay.taskBudget) next.taskBudget = { ...current.taskBudget, ...overlay.taskBudget };
     if (overlay.cleanup) next.cleanup = { ...current.cleanup, ...overlay.cleanup };
     if (overlay.surfacePathMap) next.surfacePathMap = { ...current.surfacePathMap, ...overlay.surfacePathMap };
-    delete (next as Record<string, unknown>).smoke;
+    stripRetiredWorkflowConfigKeys(next);
     if (overlay.reviewGates) {
       next.reviewGates = {
         ...current.reviewGates,
@@ -1669,7 +1681,7 @@ export function normalizeWorkflowConfig(
     taskBudget: normalizeTaskBudgetConfig(withDefaults.taskBudget),
     cleanup: normalizeCleanupConfig(withDefaults.cleanup),
   } as WorkflowConfig & Record<string, unknown>;
-  delete normalized.smoke;
+  stripRetiredWorkflowConfigKeys(normalized);
   return normalized;
 }
 

@@ -21,7 +21,7 @@ accept `--text`. Every response is an `ApiEnvelope` (see below).
 
 ```jsonc
 {
-  "schemaVersion": "2026-04-25",
+  "schemaVersion": "2026-07-19",
   // command is "pipelane.api.snapshot" or "pipelane.api.action"
   "command": "pipelane.api.snapshot",
   "ok": true,
@@ -353,6 +353,14 @@ expand the deploy set instead of silently selecting only one affected surface.
 - `STABLE_ACTION_IDS` is append-only. Removing or renaming an ID is a
   breaking change and bumps the schema version.
 - Lane states in `CANONICAL_LANE_STATES` are append-only.
+
+### Envelope schema removals
+
+- **`2026-07-19` removal:** orchestration was removed from Pipelane, so
+  snapshot `data.orchestration` and the `orchestration.runs` entry in
+  `data.sourceHealth` no longer appear. Readers that dereferenced either one
+  must drop it; there is no replacement field, because Pipelane no longer
+  runs agent fan-out.
 
 ### Deploy Configuration schema
 

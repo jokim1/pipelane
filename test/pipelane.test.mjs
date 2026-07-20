@@ -484,27 +484,6 @@ function writeManualReviewFiles(repoRoot, name, options = {}) {
   return { reportFile, findingsFile, provenanceFile };
 }
 
-function manualReviewAttestArgs(gateId, files, message) {
-  return [
-    'run',
-    'review',
-    'attest',
-    '--gate',
-    gateId,
-    '--status',
-    'passed',
-    '--report-file',
-    files.reportFile,
-    '--findings-file',
-    files.findingsFile,
-    '--provenance-file',
-    files.provenanceFile,
-    '--message',
-    message,
-    '--json',
-  ];
-}
-
 function fixTokenFromMessage(message) {
   const match = String(message).match(/--fix-token="([A-Za-z0-9_-]+)"/);
   assert.ok(match, `expected exact token-bearing resume command in:\n${message}`);
@@ -520,10 +499,6 @@ function scriptsWithPreinstallGuard(scripts = {}) {
 
 function hashedSessionId(value) {
   return `sha256:${createHash('sha256').update(value).digest('hex').slice(0, 16)}`;
-}
-
-function sha256Text(value) {
-  return createHash('sha256').update(value).digest('hex');
 }
 
 function shouldSeedPassingReviewEvidence(args) {
@@ -738,14 +713,6 @@ function seedLegacyRepoLocalFootprint(repoRoot) {
     'pipelane:configure': 'pipelane configure',
   };
   writeFileSync(packageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`, 'utf8');
-}
-
-// B1: a worker that simulates produced code. It writes a marker file so the
-// slice registers a material change (otherwise an exit-0-no-change worker is
-// correctly classified `empty`), then runs any extra JS. Backtick-quoted so the
-// inner require('fs') needs no escaping.
-function passWorker(extra = '') {
-  return `node -e "require('fs').writeFileSync('pipelane-slice-change.txt', 'change');${extra}"`;
 }
 
 function createNpmShimEnv() {
@@ -20342,7 +20309,7 @@ test('api snapshot emits a wire-compatible envelope', () => {
     const result = runCli(['run', 'api', 'snapshot'], repoRoot);
     const envelope = JSON.parse(result.stdout);
 
-    assert.equal(envelope.schemaVersion, '2026-04-25');
+    assert.equal(envelope.schemaVersion, '2026-07-19');
     assert.equal(envelope.command, 'pipelane.api.snapshot');
     assert.equal(envelope.ok, true);
     assert.ok(Array.isArray(envelope.warnings));
@@ -20610,7 +20577,7 @@ test('api action preflight: non-risky action returns no confirmation', () => {
     commitAll(repoRoot, 'Adopt pipelane');
 
     const envelope = JSON.parse(runCli(['run', 'api', 'action', 'resume'], repoRoot).stdout);
-    assert.equal(envelope.schemaVersion, '2026-04-25');
+    assert.equal(envelope.schemaVersion, '2026-07-19');
     assert.equal(envelope.command, 'pipelane.api.action');
     assert.equal(envelope.data.action.id, 'resume');
     assert.equal(envelope.data.action.risky, false);

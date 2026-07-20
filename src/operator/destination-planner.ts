@@ -825,11 +825,6 @@ function buildDestinationBlockers(snapshot: DestinationSnapshot, target: Destina
   return [...new Set(blockers)];
 }
 
-function shellQuote(value: string): string {
-  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(value)) return value;
-  return `'${value.replaceAll("'", "'\\''")}'`;
-}
-
 function destinationStaleBaseBlocker(snapshot: DestinationSnapshot, steps: DestinationStep[]): string {
   if (steps.some((step) => step.id === 'pr')) {
     return buildStaleBaseBlockerForRepo({
