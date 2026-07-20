@@ -1,9 +1,10 @@
 import { nowIso } from '../state.ts';
 
-// Bumped 2026-04-25: action inputs can expose structured choice options.
-// Readers that ignore the new fields still parse correctly because the
-// extension is additive-only.
-export const WORKFLOW_API_SCHEMA_VERSION = '2026-04-25';
+// Bumped 2026-07-19: orchestration was removed from Pipelane, so snapshot
+// `data.orchestration` and the `orchestration.runs` source-health entry are
+// gone. Field removal is not additive, so readers pinned to the previous
+// version must be updated rather than silently ignoring the gap.
+export const WORKFLOW_API_SCHEMA_VERSION = '2026-07-19';
 
 export const CANONICAL_LANE_STATES = [
   'healthy',

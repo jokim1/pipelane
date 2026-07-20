@@ -7,10 +7,7 @@ import {
   CONVERGENCE_STATE_KEY_ENV,
   convergenceStateKeyPath,
   MIN_STATE_KEY_LENGTH,
-  ORCHESTRATION_STATE_KEY_ENV,
-  orchestrationStateKeyPath,
   resolveConvergenceStateKey,
-  resolveOrchestrationStateKey,
   resolveProbeStateKey,
   resolveReviewConsentStateKey,
   REVIEW_CONSENT_STATE_KEY_ENV,
@@ -153,7 +150,6 @@ export interface SigningKeyStatus {
 // override would mint a different key.
 export function collectSigningKeyStatus(): SigningKeyStatus[] {
   const classes: Array<{ name: string; path: string; envName: string; resolve: () => string }> = [
-    { name: 'orchestration-state', path: orchestrationStateKeyPath(), envName: ORCHESTRATION_STATE_KEY_ENV, resolve: resolveOrchestrationStateKey },
     { name: 'review-consent-state', path: reviewConsentStateKeyPath(), envName: REVIEW_CONSENT_STATE_KEY_ENV, resolve: resolveReviewConsentStateKey },
     { name: 'convergence-state', path: convergenceStateKeyPath(), envName: CONVERGENCE_STATE_KEY_ENV, resolve: resolveConvergenceStateKey },
   ];

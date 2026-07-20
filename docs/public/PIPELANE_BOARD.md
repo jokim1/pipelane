@@ -81,39 +81,13 @@ Shows the quick Pipelane guide:
 - build journey slash commands
 - release journey slash commands
 - static, behavioral, AI, runtime, and human review gate order
-- orchestration layer notes
+- `/pipelane review` setup, run, pass, and attest commands
 - helpful anytime commands
 - `/fix` and `/fix rethink`
 - `/pipelane web`, `/pipelane status`, and `/pipelane update --check`
 
 The drawer renders configured aliases from the repo when available, falling back to the default
 slash command names only when alias config cannot be loaded.
-
-## Orchestration Visibility
-
-`/pipelane orchestrate goal-spec`, `/pipelane orchestrate plan`,
-`/pipelane orchestrate prepare`, `/pipelane orchestrate dispatch`, and
-`/pipelane orchestrate start`, and `/pipelane orchestrate review` are
-shipped as orchestration surfaces: they draft provider-neutral goals, write
-durable slice ledgers, assign slice worktrees, and write provider handoff
-prompts. Start can run explicitly configured workers and record log/exit
-evidence, including `--force` retries for failed or stale running workers.
-Review runs the configured gate snapshot over completed worker slices and
-records per-slice gate evidence. These commands do not merge, deploy, or
-cleanup. The board should add
-read-only visibility for orchestration runs without changing the existing
-branch, PR, deploy, rollback, and cleanup model.
-
-The planned orchestration panel should show:
-
-- active orchestration runs
-- implementation slices and their worktrees
-- static, behavioral, AI, runtime, and human gate status
-- blocking gate failures and next actions
-- links to evidence recorded by the run ledger
-
-Static gates should appear before AI review gates. The board should make it
-obvious when lint, typecheck, tests, or build failed before any AI review ran.
 
 ### Review
 

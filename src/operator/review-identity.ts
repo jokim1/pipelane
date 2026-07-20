@@ -14,7 +14,6 @@ export type ReviewIndependenceLabel =
   | 'unknown';
 
 const SESSION_ID_ENV_KEYS = [
-  'PIPELANE_ORCHESTRATE_WORKER_SESSION_ID',
   'PIPELANE_REVIEW_GATE_SESSION_ID',
   'PIPELANE_AGENT_SESSION_ID',
   'CODEX_SESSION_ID',
@@ -25,7 +24,6 @@ const SESSION_ID_ENV_KEYS = [
 ] as const;
 
 const SESSION_ID_ENV_SOURCES: Array<{ key: typeof SESSION_ID_ENV_KEYS[number]; provider: string | null }> = [
-  { key: 'PIPELANE_ORCHESTRATE_WORKER_SESSION_ID', provider: null },
   { key: 'PIPELANE_REVIEW_GATE_SESSION_ID', provider: null },
   { key: 'PIPELANE_AGENT_SESSION_ID', provider: null },
   { key: 'CODEX_SESSION_ID', provider: 'codex' },
@@ -38,19 +36,16 @@ const SESSION_ID_ENV_SOURCES: Array<{ key: typeof SESSION_ID_ENV_KEYS[number]; p
 const PROVIDER_ENV_KEYS = [
   'PIPELANE_AGENT_PROVIDER',
   'PIPELANE_REVIEW_PROVIDER',
-  'PIPELANE_ORCHESTRATE_PROVIDER',
 ] as const;
 
 const AUTHOR_SESSION_ENV_KEYS = [
   'PIPELANE_AUTHOR_SESSION_ID',
   'PIPELANE_WORKER_SESSION_ID',
-  'PIPELANE_ORCHESTRATE_WORKER_SESSION_ID',
 ] as const;
 
 const AUTHOR_PROVIDER_ENV_KEYS = [
   'PIPELANE_AUTHOR_PROVIDER',
   'PIPELANE_WORKER_PROVIDER',
-  'PIPELANE_ORCHESTRATE_PROVIDER',
   'PIPELANE_AGENT_PROVIDER',
 ] as const;
 
@@ -272,7 +267,6 @@ function knownProvider(provider: string): boolean {
 
 function hasTrustedWorkerProviderIdentity(identity: ReviewActorIdentity): boolean {
   if (!identity.sessionId) return false;
-  if (identity.source === 'PIPELANE_ORCHESTRATE_WORKER_SESSION_ID') return true;
   return knownProvider(identity.provider)
     && TRUSTED_REVIEWER_PROVIDER_SOURCES.get(identity.source) === identity.provider;
 }
@@ -302,10 +296,6 @@ function selectSessionEnvValue(
   env: NodeJS.ProcessEnv,
   targetProvider: string,
 ): { key: string; value: string; provider: string | null } | null {
-  const workerSession = env.PIPELANE_ORCHESTRATE_WORKER_SESSION_ID?.trim();
-  if (workerSession) {
-    return { key: 'PIPELANE_ORCHESTRATE_WORKER_SESSION_ID', value: workerSession, provider: null };
-  }
   const reviewGateSession = env.PIPELANE_REVIEW_GATE_SESSION_ID?.trim();
   if (reviewGateSession) {
     return { key: 'PIPELANE_REVIEW_GATE_SESSION_ID', value: reviewGateSession, provider: null };

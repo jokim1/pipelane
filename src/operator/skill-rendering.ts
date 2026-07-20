@@ -10,7 +10,6 @@ export const PIPELANE_FIX_SKILL_NAME = 'pipelane-fix';
 export const PIPELANE_TASK_WORKSPACE_SKILL_NAME = 'pipelane-task-workspace';
 export const FIX_SKILL_NAME = 'fix';
 export const LESSON_SKILL_NAME = 'lesson';
-export const ORCHESTRATE_SKILL_NAME = 'orchestrate';
 
 export const MACHINE_CODEX_SKILL_MARKER_PREFIX = '<!-- pipelane:codex-global-skill:';
 export const MACHINE_CLAUDE_SKILL_MARKER_PREFIX = '<!-- pipelane:claude-global-skill:';
@@ -23,7 +22,7 @@ export interface DesiredInstallEntry {
   name: string;
   slashAlias: string;
   body: string;
-  command?: WorkflowCommand | 'pipelane' | 'orchestrate';
+  command?: WorkflowCommand | 'pipelane';
   required: boolean;
 }
 
@@ -38,7 +37,7 @@ export interface DesiredInstall {
 export interface WorkflowSkillBodyOptions {
   host: HostInstall;
   scope: HostInstallScope;
-  command: WorkflowCommand | 'pipelane' | 'orchestrate';
+  command: WorkflowCommand | 'pipelane';
   slashAlias: string;
   runnerPath: string;
   markerPrefix: string;
@@ -71,64 +70,6 @@ export function buildSkillMarker(prefix: string, name: string): string {
   return `${prefix}${name} -->`;
 }
 
-function renderOrchestrationGuidance(invocation: string, trigger: string): string {
-  return `## Orchestration behavior (${invocation} <plan-file>)
-
-${trigger}, do NOT just run \`--yes\` and wait silently. Drive a communicative,
-slice-by-slice flow and keep the operator oriented at every step:
-
-1. Read the plan file yourself. Print **Plan read** as bullets: strengths, then
-   risks/gaps. Then print a **coverage map** that accounts for every section of the
-   plan as one of: in-scope (maps to a slice), deferred, or excluded (with a
-   one-line reason). Nothing is silently dropped.
-2. Decompose the plan into phases and slices. Write a slices JSON file to a scratch path:
-   \`{ "slices": [ { "id", "title", "phase", "text" } ], "coverage": [ { "section", "disposition": "slice|deferred|excluded", "sliceId", "reason" } ] }\`
-   Then write an analysis JSON file with the real plan file's SHA-256 as \`sourceSha256\`,
-   your analyzer identity, \`identityReliable\`, strengths, risks, ambiguities,
-   sensitiveAreas, and recommendedScope. Record analysis WITHOUT starting workers
-   and capture the run id:
-   \`${invocation} analyze --plan-file <real-plan> --analysis-file <analysis.json> --slices-file <scratch.json> --json\`
-   The run's audit source stays bound to the real plan file, not either scratch file.
-3. Relay the CLI outline verbatim (do not hand-format it):
-   \`${invocation} outline --run-id <id>\`
-   Then print the **review model** as bullets: static checks, tests, independent AI
-   review of each slice diff, and human confirm on sensitive slices.
-4. **Recommend a scope**: the full plan, or a justified partial boundary (e.g. land
-   a sensitive schema/RLS phase first because everything depends on it). Offer:
-   approve / edit scope / cancel. For a partial scope run
-   \`${invocation} scope --run-id <id> --through <last-slice-id-in-scope>\`.
-5. Before prepare, complete every pending plan-review gate: run the configured
-   reviewer, then record \`${invocation} plan-review pass --run-id <id> --gate <gate-id> --message <summary>\`
-   or consciously bypass with \`${invocation} plan-review bypass --run-id <id> --gate <gate-id> --reason <reason>\`.
-   Then drive in order: \`${invocation} prepare --run-id <id>\`,
-   then \`${invocation} dispatch --run-id <id>\`, then for each in-scope
-   slice \`${invocation} start --run-id <id> --slice-id <id>\` followed by
-   \`${invocation} review --run-id <id> --slice-id <id>\`. After EACH
-   slice, relay \`${invocation} outline --run-id <id>\` so the operator
-   sees the updated outline and where the run is. Never use \`--yes\` on this path.
-6. When the in-scope slices pass: if the outline shows deferred slices, tell the
-   operator the run is paused and a later \`${invocation}\` resumes it
-   (re-scope with \`--through <next>\`, then continue). Use
-   \`${invocation} finalize --run-id <id> --abandon\` only to deliberately abandon
-   the deferred remainder (it is kept in the ledger with a reason for audit).
-
-Host-visible slice checklist:
-
-- Mirror the latest CLI outline into the host's visible task list before
-  prepare/dispatch/start and after every slice settles. Use one item per
-  in-scope slice, with the phase and slice title in the item text.
-- In Claude Code, use TodoWrite when it is available. In Codex App, use
-  update_plan when it is available. If the host does not expose a task-list tool,
-  relay the CLI outline verbatim instead.
-- Keep exactly one slice \`in_progress\`: the slice named by the outline's
-  \`Current:\` line. Mark reviewed/done slices \`completed\`; leave queued,
-  blocked, failed, and deferred slices \`pending\` unless the host has a more
-  specific state.
-
-If the plan compiles to a single unstructured slice, say so and propose a
-phase/slice breakdown before running one long opaque slice.`;
-}
-
 function renderFailedReviewHandoffGuidance(): string {
   return `## Failed-review handoff
 
@@ -150,19 +91,7 @@ complete printed \`/pipelane review attest\` command with report, findings,
 provenance, and status; never replace it with bare \`review pass\`.`;
 }
 
-function renderWorkflowSkillGuidance(command: WorkflowCommand | 'pipelane' | 'orchestrate', slashAlias: string): string {
-  if (command === 'orchestrate') {
-    return `${renderOrchestrationGuidance(slashAlias, `When you invoke \`${slashAlias}\` with a plan file (or a goal to implement)`)}
-
-## Argument handling
-
-If the argument looks like a path (it contains \`/\` or ends in \`.md\`) but no
-such file exists, stop and report "plan file not found" instead of treating it as
-a goal to implement. Forward any extra flags (e.g. \`--provider\`, \`--max-minutes\`)
-as separate tokens; never fold them into the plan-file path.
-
-${renderFailedReviewHandoffGuidance()}`;
-  }
+function renderWorkflowSkillGuidance(command: WorkflowCommand | 'pipelane', slashAlias: string): string {
   if (command === 'pipelane') {
     return `
 ## Setup and configure behavior
@@ -266,8 +195,6 @@ captured/non-TTY runs print one final checklist snapshot before the review repor
 Markers are \`[~]\` current, \`[x]\` passed, \`[!]\` failed/blocking, \`[-]\`
 skipped, and \`[ ]\` pending/manual gates. \`${slashAlias} review --json\` stays
 machine-readable and does not print the checklist.
-
-${renderOrchestrationGuidance(`${slashAlias} orchestrate`, 'When the first token is `orchestrate` and a plan file (or a goal to implement) is given')}
 
 ${renderFailedReviewHandoffGuidance()}
 `;
@@ -466,10 +393,10 @@ fi
 
 print_pipelane_help() {
   cat <<'PIPELANE_HELP'
-Pipelane is a build, release, and development orchestrator for AI-assisted
-codebases. It keeps task worktrees, PRs, review gates, deploy promotion,
-rollback, cleanup, and multi-agent implementation work on an explicit path so
-agents do not invent local process or skip release safety.
+Pipelane runs build, review, and release workflows for AI-assisted codebases.
+It keeps task worktrees, PRs, review gates, deploy promotion, rollback, and
+cleanup on an explicit path so agents do not invent local process or skip
+release safety.
 
 The normal first-run path is clean: /pipelane setup uses the machine-local
 runtime and must not create tracked repo-local adapters, command files, Codex
@@ -513,7 +440,7 @@ Status and UI:
 Review gates:
   /pipelane review [--dry-run] [--gate <id>] [--phase <phase>]
       Run configured review gates for the current diff and write evidence that
-      /pr and orchestrated slice review can trust.
+      /pr can trust.
 
   /pipelane review attest --gate <id> --status failed|passed --report-file <path>
       --findings-file <path> --provenance-file <path> --message <what-ran>
@@ -525,17 +452,6 @@ Review gates:
       Choose the pre-PR review model. This is different from /pipelane setup;
       it configures quality gates such as tests, self-review, independent AI
       review, instruction audit, and human approval for high-stakes changes.
-
-Orchestration:
-  /pipelane orchestrate --plan-file <file> --analysis-file <file> --yes
-      Turn a plan into reviewed implementation slices with isolated worktrees,
-      worker prompts, status tracking, and per-slice review before merge.
-
-  /pipelane orchestrate plan|analyze|prepare|dispatch|start|review|plan-review
-      Run one orchestration phase at a time.
-
-  /pipelane orchestrate goal-spec [--plan-file <file>] [--slice-id <id>]
-      Draft a provider-neutral implementation goal spec.
 
 Build and release companion commands:
   /new              Create an isolated task worktree.
@@ -582,9 +498,6 @@ run_pipelane() {
         ;;
       review)
         exec "$bin" run review "$@"
-        ;;
-      orchestrate)
-        exec "$bin" run orchestrate "$@"
         ;;
       update)
         exec "$bin" update "$@"
@@ -690,26 +603,6 @@ export function desiredHostInstall(
       name: PIPELANE_TASK_WORKSPACE_SKILL_NAME,
       description: 'Use before code-changing work to verify or create a Pipelane task worktree.',
       body: renderTaskWorkspaceGuardPrompt(paths.runnerPath),
-      markerPrefix,
-    }),
-  });
-
-  // Top-level /orchestrate alias. Drives the same guided slice-by-slice flow as
-  // `/pipelane orchestrate` (shared renderOrchestrationGuidance), just discoverable
-  // at the top level. required:false so an existing non-pipelane /orchestrate skill
-  // is skipped gracefully instead of failing the whole install.
-  entries.push({
-    kind: 'workflow',
-    name: ORCHESTRATE_SKILL_NAME,
-    slashAlias: `/${ORCHESTRATE_SKILL_NAME}`,
-    command: 'orchestrate',
-    required: false,
-    body: renderWorkflowSkillBody({
-      host,
-      scope,
-      command: 'orchestrate',
-      slashAlias: `/${ORCHESTRATE_SKILL_NAME}`,
-      runnerPath: paths.runnerPath,
       markerPrefix,
     }),
   });

@@ -7,7 +7,6 @@ import { handleDoctor } from './commands/doctor.ts';
 import { handleMerge } from './commands/merge.ts';
 import { handleLocalState } from './commands/local-state.ts';
 import { handleNew } from './commands/new.ts';
-import { handleOrchestrate } from './commands/orchestrate.ts';
 import { handlePr } from './commands/pr.ts';
 import { handleRelease } from './commands/release.ts';
 import { handleReleaseCheck } from './commands/release-check.ts';
@@ -137,11 +136,6 @@ export async function runOperator(cwd: string, argv: string[]): Promise<void> {
     return;
   }
 
-  if (command === 'orchestrate') {
-    await handleOrchestrate(cwd, parsed);
-    return;
-  }
-
   if (command === 'local-state') {
     await handleLocalState(cwd, parsed);
     return;
@@ -229,10 +223,6 @@ export function operatorUsesCurrentManagedWorkspace(parsed: ParsedOperatorArgs):
       const subcommand = parsed.positional[0] ?? '';
       return subcommand === '' || subcommand === 'run';
     }
-    case 'orchestrate': {
-      const subcommand = parsed.positional[0] ?? '';
-      return ['', 'run', 'plan', 'analyze', 'prepare', 'dispatch', 'start', 'review'].includes(subcommand);
-    }
     default:
       return false;
   }
@@ -268,16 +258,6 @@ export function classifyOperatorManagedStateSensitivity(parsed: ParsedOperatorAr
       if (subcommand === 'gc') return 'independent-recovery';
       if (subcommand === 'setup' || subcommand === 'pass' || subcommand === 'attest' || subcommand === 'record' || subcommand === 'override') return 'observe';
       throw new Error(`Managed local-state sensitivity is not classified for review ${subcommand}.`);
-    }
-    case 'orchestrate': {
-      const subcommand = parsed.positional[0] ?? '';
-      if (subcommand === '' || subcommand === 'run' || subcommand === 'plan' || subcommand === 'analyze') return 'current-state';
-      if (subcommand === 'prepare') return 'target-tree';
-      if (subcommand === 'dispatch' || subcommand === 'start' || subcommand === 'review') return 'current-state';
-      if (subcommand === 'finalize') return 'independent-recovery';
-      if (subcommand === 'goal-spec' || subcommand === 'plan-review' || subcommand === 'scope'
-        || subcommand === 'outline' || subcommand === 'upgrade-ledger') return 'observe';
-      throw new Error(`Managed local-state sensitivity is not classified for orchestrate ${subcommand}.`);
     }
     default:
       throw new Error(`Managed local-state sensitivity is not classified for operator command ${parsed.command || '(empty)'}.`);
@@ -325,15 +305,6 @@ Pipelane commands:
   review pass --gate <id> --message <text>
   review attest --gate <id> --status <passed|failed> --report-file <path> --findings-file <path> --provenance-file <path> --message <text> [--substitute-strict --reason <reason> --scope <exact-route-action>]
   review setup [gate[,gate...]...] [--yes] [--reset] [--print] [--list-gates] [--toggle <gate[,gate...]>] [--enable <gate[,gate...]>] [--disable <gate[,gate...]>] [--install <gate[,gate...]>]
-  orchestrate [--plan-file <path> | --outcome <text>] [--preview|--plan|--yes] [--analysis-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]
-  orchestrate goal-spec [--slice-id <id>] [--outcome <text>] [--plan-file <path>] [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]
-  orchestrate plan [--slice-id <id>] (--plan-file <path> | --outcome <text>) [--provider codex|claude|generic] [--max-turns <n>] [--max-minutes <n>]
-  orchestrate analyze (--plan-file <path> | --run-id <id>) --analysis-file <path> [--slices-file <path>]
-  orchestrate plan-review <pass|bypass> --run-id <id> --gate <id> (--message <text> | --reason <text>)
-  orchestrate prepare --run-id <id> [--offline]
-  orchestrate dispatch --run-id <id>
-  orchestrate start --run-id <id> [--slice-id <id>] [--force]
-  orchestrate review --run-id <id> [--slice-id <id>] [--dry-run] [--gate <id>] [--phase static|behavioral|ai-diff|instruction|runtime|human]
   local-state list [--json]
   local-state add --path <path> --reason <text> [--yes]
   local-state remove --path <path> [--yes]

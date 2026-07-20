@@ -142,9 +142,7 @@ For current Pipelane flows, verification happens in this order:
 7. `/deploy prod --pr <merged-pr-number>`
 8. automatic terminal workspace closeout after delivery proof; `/clean` is the retry/recovery surface
 
-The orchestration foundation makes this ordering explicit by separating
-deterministic gates from AI/manual gates before PR handoff.
-See [Orchestration Roadmap](./ORCHESTRATION.md).
+This ordering separates deterministic gates from AI/manual gates before PR handoff.
 
 ## Safe Defaults
 
@@ -247,8 +245,8 @@ intended changes, and rerun `/pipelane review`; or proceed with the recorded
 `--override --reason` consent when shipping is the right call anyway.
 
 `reviewGates.enforcementMode` can be `legacy-v2` or `strict-v3`. Strict review
-requires an authoritative task objective (`/new --brief`, `/adopt --brief`, an
-approved orchestration slice outcome, or `/review --intent`), captures an
+requires an authoritative task objective (`/new --brief`, `/adopt --brief`, or
+`/review --intent`), captures an
 immutable machine-local Git target, and records the exact supplied capability,
 adapter, structured findings, and result protocol. An override never changes a
 failed or pending gate to passed.

@@ -8,8 +8,6 @@ export const PROBE_STATE_KEY_ENV = 'PIPELANE_PROBE_STATE_KEY';
 export const REVIEW_STATE_KEY_ENV = 'PIPELANE_REVIEW_STATE_KEY';
 export const REVIEW_CONSENT_STATE_KEY_ENV = 'PIPELANE_REVIEW_CONSENT_STATE_KEY';
 export const CONVERGENCE_STATE_KEY_ENV = 'PIPELANE_CONVERGENCE_STATE_KEY';
-export const ORCHESTRATION_STATE_KEY_ENV = 'PIPELANE_ORCHESTRATION_STATE_KEY';
-export const ORCHESTRATION_STATE_KEY_FILE_ENV = 'PIPELANE_ORCHESTRATION_STATE_KEY_FILE';
 export const MIN_STATE_KEY_LENGTH = 32;
 
 export function canonicalize(value: unknown): string {
@@ -99,7 +97,7 @@ export function resolveConvergenceStateKey(): string {
 
 function validateRequiredStateKey(name: string, raw: string | undefined, sourceLabel = name): string {
   if (raw === undefined) {
-    throw new Error(`${name} is missing; set a signing key of at least ${MIN_STATE_KEY_LENGTH} characters before mutating or reading signed orchestration ledgers.`);
+    throw new Error(`${name} is missing; set a signing key of at least ${MIN_STATE_KEY_LENGTH} characters before mutating or reading signed state.`);
   }
   if (raw.trim().length === 0) {
     throw new Error(`${sourceLabel} is blank; set a signing key of at least ${MIN_STATE_KEY_LENGTH} characters.`);
@@ -118,15 +116,6 @@ export function resolveRequiredStateKey(name: string): string {
 function pipelaneHomeDir(): string {
   const override = process.env.PIPELANE_HOME?.trim();
   return override ? path.resolve(override) : path.join(os.homedir(), '.pipelane');
-}
-
-export function orchestrationStateKeyPath(): string {
-  const override = process.env[ORCHESTRATION_STATE_KEY_FILE_ENV]?.trim();
-  return override ? path.resolve(override) : path.join(pipelaneHomeDir(), 'keys', 'orchestration-state.key');
-}
-
-function readOrCreatePersistedOrchestrationStateKey(): string {
-  return readOrCreatePersistedStateKey(orchestrationStateKeyPath(), ORCHESTRATION_STATE_KEY_ENV);
 }
 
 function readOrCreatePersistedStateKey(keyPath: string, envName: string): string {
@@ -163,13 +152,6 @@ function readOrCreatePersistedStateKey(keyPath: string, envName: string): string
       keyPath,
     );
   }
-}
-
-export function resolveOrchestrationStateKey(): string {
-  if (process.env[ORCHESTRATION_STATE_KEY_ENV] !== undefined) {
-    return resolveRequiredStateKey(ORCHESTRATION_STATE_KEY_ENV);
-  }
-  return readOrCreatePersistedOrchestrationStateKey();
 }
 
 export function stateKeyFingerprint(key: string): string {

@@ -46,10 +46,6 @@ import {
 } from './state.ts';
 import { observeCompletedDeployWorkflowRun } from './deploy-workflow-runs.ts';
 import {
-  scanOrchestrationRunDiagnostics,
-  selectActiveSlices,
-} from './orchestration-ledger.ts';
-import {
   buildStaleBaseBlockerForRepo,
   deriveTaskSlugFromPr,
   inferActiveTaskLock,
@@ -730,7 +726,6 @@ function buildDestinationBlockers(snapshot: DestinationSnapshot, target: Destina
   const needsDeploySideEffect = needsStagingDeploy || needsProdDeploy;
 
   if (!snapshot.taskSlug) blockers.push('no active task could be inferred');
-  blockers.push(...activeOrchestrationWorktreeBlockers(snapshot));
   if (snapshot.livePrError && (snapshot.delivery || (!snapshot.livePr && !snapshot.prRecord?.number))) {
     blockers.push(snapshot.livePrError);
   }
@@ -828,38 +823,6 @@ function buildDestinationBlockers(snapshot: DestinationSnapshot, target: Destina
     blockers.push(...listPendingDeployBlockers(snapshot, 'prod', snapshot.requestedSurfaces));
   }
   return [...new Set(blockers)];
-}
-
-function activeOrchestrationWorktreeBlockers(snapshot: DestinationSnapshot): string[] {
-  if (snapshot.taskSlug) return [];
-  if (!isBaseBranchName(snapshot.config, snapshot.branchName)) return [];
-
-  const scan = scanOrchestrationRunDiagnostics(snapshot.commonDir, snapshot.config);
-  const hints = scan.records.filter((run) => run.status !== 'completed').flatMap((run) =>
-    selectActiveSlices(run)
-      .filter((slice) => slice.taskSlug && slice.worktreePath && !slice.excludedReason)
-      .map((slice) => ({
-        runId: run.id,
-        sliceId: slice.id,
-        taskSlug: slice.taskSlug ?? '',
-        worktreePath: slice.worktreePath ?? '',
-      })),
-  );
-  if (hints.length === 0) return [];
-
-  const first = hints[0];
-  const command = `${snapshot.targetCommand} --task ${first.taskSlug}`;
-  return [[
-    `active orchestration run ${first.runId} owns slice ${first.sliceId} in task worktree ${first.worktreePath};`,
-    `do not run ${snapshot.targetCommand} from ${snapshot.branchName}.`,
-    `Run: cd ${shellQuote(first.worktreePath)} && ${command}`,
-    hints.length > 1 ? `(${hints.length - 1} additional orchestration task worktree(s) also exist.)` : '',
-  ].filter(Boolean).join(' ')];
-}
-
-function shellQuote(value: string): string {
-  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(value)) return value;
-  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 function destinationStaleBaseBlocker(snapshot: DestinationSnapshot, steps: DestinationStep[]): string {
