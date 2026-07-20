@@ -110,7 +110,7 @@ cleaner approach failed.
   consumer repos as literal `{{VAR}}`.
 - **Probe freshness is load-bearing for the release gate.** Staging
   probes older than 24h flip the release lane fail-closed. Do not extend
-  the freshness window without re-reading `docs/RELEASE_WORKFLOW.md`.
+  the freshness window without re-reading `docs/public/RELEASE_WORKFLOW.md`.
 - **Target deploy-surface inference is commit-scoped.** A workflow-bound
   contract is resolved from the target SHA, with the configured base as the
   compatibility fallback. Before merge, diff the target against the remote
