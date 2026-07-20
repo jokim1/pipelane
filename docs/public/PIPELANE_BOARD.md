@@ -81,6 +81,7 @@ Shows the quick Pipelane guide:
 - build journey slash commands
 - release journey slash commands
 - static, behavioral, AI, runtime, and human review gate order
+- `/pipelane review` setup, run, pass, and attest commands
 - helpful anytime commands
 - `/fix` and `/fix rethink`
 - `/pipelane web`, `/pipelane status`, and `/pipelane update --check`

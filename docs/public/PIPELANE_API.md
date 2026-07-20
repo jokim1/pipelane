@@ -32,9 +32,11 @@ accept `--text`. Every response is an `ApiEnvelope` (see below).
 }
 ```
 
-The `schemaVersion` is bumped only on additive-breaking changes — readers
-that ignore unknown fields parse every revision transparently. See
-`src/operator/api/envelope.ts` for the current canonical types.
+The `schemaVersion` is bumped only when readers cannot absorb the change by
+ignoring unknown fields. Within a version the envelope stays additive-only, but
+a bump may also remove fields, so check "Envelope schema removals" below before
+pinning a reader to one. See `src/operator/api/envelope.ts` for the current
+canonical types.
 
 ### Lane states
 
