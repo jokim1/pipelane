@@ -310,9 +310,8 @@ export const DEFAULT_BRANCH_PREFIX = 'codex/';
 // before the silent `git add -A`. Keep this list short and unambiguous —
 // the goal is "operator forgot to gitignore their secrets" not general
 // pre-commit hooks. Override in machine-local Pipelane config when a repo legit
-// tracks one of these (e.g. a docs-only `CLAUDE.md`).
+// tracks one of these.
 export const DEFAULT_PR_PATH_DENY_LIST = [
-  'CLAUDE.md',
   '.env',
   '.env.*',
   '*.pem',

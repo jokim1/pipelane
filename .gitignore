@@ -4,7 +4,6 @@ dist/
 *.log
 
 # Local-only operator state — never tracked.
-CLAUDE.md
 .claude/
 
 # Internal docs (specs, strategy, interim notes). Public docs live under docs/public/.

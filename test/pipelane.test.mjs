@@ -594,7 +594,6 @@ function writePipelaneConfig(repoRoot, displayName = 'Demo App', patch = {}) {
       'npm run build',
     ],
     prPathDenyList: [
-      'CLAUDE.md',
       '.env',
       '.env.*',
       '*.pem',
@@ -15757,8 +15756,8 @@ test('pr blocks denied paths and --force-include overrides per-path', () => {
     writePipelaneConfig(repoRoot, 'Demo App');
     commitAll(repoRoot, 'Adopt pipelane');
     const created = JSON.parse(runCli(['run', 'new', '--task', 'Deny Guard', '--json'], repoRoot).stdout);
-    // A denied file (operator-local CLAUDE.md) + a .env secret + a harmless
-    // feature file. The first two should block; the third is fine.
+    // A tracked guidance symlink is fine; the .env secret should block before
+    // the harmless feature file is staged.
     writeFileSync(path.join(created.worktreePath, 'feature.txt'), 'feature\n', 'utf8');
     writeFileSync(path.join(created.worktreePath, 'CLAUDE.md'), '# local\n', 'utf8');
     writeFileSync(path.join(created.worktreePath, '.env'), 'TOKEN=secret\n', 'utf8');
@@ -15767,7 +15766,7 @@ test('pr blocks denied paths and --force-include overrides per-path', () => {
     const blocked = runCli(['run', 'pr', '--title', 'Deny Guard', '--json'], created.worktreePath, env, true);
     assert.equal(blocked.status, 1);
     assert.match(blocked.stderr, /prPathDenyList/);
-    assert.match(blocked.stderr, /CLAUDE\.md \(matched CLAUDE\.md\)/);
+    assert.doesNotMatch(blocked.stderr, /CLAUDE\.md/);
     assert.match(blocked.stderr, /\.env \(matched \.env\)/);
 
     // Nothing should have been staged or committed yet.
@@ -15777,10 +15776,10 @@ test('pr blocks denied paths and --force-include overrides per-path', () => {
     }).trim();
     assert.equal(stagedAfterBlock, '', 'no files staged after deny-list block');
 
-    // Force-include both denied files to allow the PR through. This is
+    // Force-include the denied file to allow the PR through. This is
     // explicit, per-path: no global flag to disable the check.
     const ok = runCli(
-      ['run', 'pr', '--title', 'Deny Guard', '--force-include', 'CLAUDE.md', '--force-include', '.env', '--json'],
+      ['run', 'pr', '--title', 'Deny Guard', '--force-include', '.env', '--json'],
       created.worktreePath,
       env,
     );

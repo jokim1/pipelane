@@ -227,8 +227,8 @@ listed here.
   proceed. Missing, failed, or pending evidence asks for one recorded
   `--override --reason` consent. Staleness never voids evidence.
 - PR path deny list enforced in `pipelane run pr` before the silent
-  `git add -A`: `CLAUDE.md`, `.env`, `.env.*`, `*.pem`, `*.p12`,
-  `id_rsa*`, `*.key`. See `DEFAULT_PR_PATH_DENY_LIST` in `state.ts`.
+  `git add -A`: `.env`, `.env.*`, `*.pem`, `*.p12`, `id_rsa*`,
+  `*.key`. See `DEFAULT_PR_PATH_DENY_LIST` in `state.ts`.
 - CI blocks merges on failed PR checks (PR #46).
 - Commits are signed (GPG); never skip signing. Never use `--no-verify`
   or `--amend` unless the user explicitly asks.

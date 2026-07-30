@@ -14,7 +14,6 @@
     "npm run build"
   ],
   "prPathDenyList": [
-    "CLAUDE.md",
     ".env",
     ".env.*",
     "*.pem",
